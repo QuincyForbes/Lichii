@@ -118,10 +118,13 @@ public:
     ActorOverlay(const Device& device, MemoryAllocator& allocator, const OcarinaActorMesh& mesh,
                  const ActorTransforms& transforms, VkImageView depth_view, VkSampler sampler,
                  VkImageView motion_view, VkExtent2D extent_)
-        : extent{extent_}, index_count{static_cast<u32>(mesh.indices.size())}, vertex_bytes{mesh.vertices.size()},
-          vertices{UploadActorData(allocator, std::as_bytes(std::span{mesh.vertices}),
+        : extent{extent_}, index_count{static_cast<u32>(mesh.indices.size())},
+          vertex_bytes{mesh.vertices.size()}, vertex_address{mesh.vertex_address},
+          index_address{mesh.index_address}, base_vertex{mesh.base_vertex},
+          bound_depth_view{depth_view}, bound_sampler{sampler},
+          vertices{UploadActorData(allocator, std::as_bytes(mesh.vertices),
                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)},
-          indices{UploadActorData(allocator, std::as_bytes(std::span{mesh.indices}),
+          indices{UploadActorData(allocator, std::as_bytes(mesh.indices),
                                   VK_BUFFER_USAGE_INDEX_BUFFER_BIT)},
           current{UploadActorData(allocator, std::as_bytes(std::span{mesh.current_bones}),
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)},
@@ -209,8 +212,8 @@ public:
     /// Reuse the mesh and update the two poses only while the vertex and index data still match.
     bool Update(const Device& device, const OcarinaActorMesh& mesh,
                 const ActorTransforms& transforms, VkImageView depth_view, VkSampler sampler) {
-        const auto vertex_data = std::as_bytes(std::span{mesh.vertices});
-        const auto index_data = std::as_bytes(std::span{mesh.indices});
+        const auto vertex_data = std::as_bytes(mesh.vertices);
+        const auto index_data = std::as_bytes(mesh.indices);
         if (vertex_data.size() != vertex_bytes || mesh.indices.size() != index_count) {
             return false;
         }
@@ -218,17 +221,27 @@ public:
             std::memcpy(buffer.Mapped().data(), data.data(), data.size());
             buffer.Flush();
         };
-        upload(vertices, vertex_data);
-        upload(indices, index_data);
+        if (mesh.vertex_address != vertex_address || mesh.index_address != index_address ||
+            mesh.base_vertex != base_vertex) {
+            upload(vertices, vertex_data);
+            upload(indices, index_data);
+            vertex_address = mesh.vertex_address;
+            index_address = mesh.index_address;
+            base_vertex = mesh.base_vertex;
+        }
         upload(current, std::as_bytes(std::span{mesh.current_bones}));
         upload(previous, std::as_bytes(std::span{mesh.previous_bones}));
         upload(uniform, std::as_bytes(std::span{&transforms, 1}));
-        const VkDescriptorImageInfo depth{sampler, depth_view, VK_IMAGE_LAYOUT_GENERAL};
-        const VkWriteDescriptorSet write{
-            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[0], 3, 0, 1,
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &depth,
-        };
-        device.GetLogical().UpdateDescriptorSets(write, {});
+        if (depth_view != bound_depth_view || sampler != bound_sampler) {
+            const VkDescriptorImageInfo depth{sampler, depth_view, VK_IMAGE_LAYOUT_GENERAL};
+            const VkWriteDescriptorSet write{
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[0], 3, 0, 1,
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &depth,
+            };
+            device.GetLogical().UpdateDescriptorSets(write, {});
+            bound_depth_view = depth_view;
+            bound_sampler = sampler;
+        }
         return true;
     }
 
@@ -320,6 +333,11 @@ private:
     VkExtent2D extent;
     u32 index_count;
     size_t vertex_bytes;
+    GPUVAddr vertex_address{};
+    GPUVAddr index_address{};
+    s32 base_vertex{};
+    VkImageView bound_depth_view{};
+    VkSampler bound_sampler{};
     vk::Buffer vertices, indices, current, previous, uniform;
     vk::DescriptorSetLayout set_layout;
     vk::DescriptorPool descriptor_pool;
@@ -715,13 +733,15 @@ bool OcarinaLiveDlss::Record(VkImageView color, VkImageView depth, VkImageView t
         {static_cast<f32>(extent.width), static_cast<f32>(extent.height), 0, 0},
     };
     // Without Link's pose (dialogue, cutscenes, first person) the motion comes from the camera alone.
-    if (mesh.indices.empty()) {
-        resources.overlay.reset();
-    } else if (!resources.overlay ||
-               !resources.overlay->Update(state.device, mesh, actor_transforms, depth, sampler)) {
-        resources.overlay = std::make_unique<ActorOverlay>(state.device, state.allocator, mesh,
-                                                            actor_transforms, depth, sampler,
-                                                            *resources.motion_view, extent);
+    const ActorOverlay* active_overlay = nullptr;
+    if (!mesh.indices.empty()) {
+        if (!resources.overlay ||
+            !resources.overlay->Update(state.device, mesh, actor_transforms, depth, sampler)) {
+            resources.overlay = std::make_unique<ActorOverlay>(state.device, state.allocator, mesh,
+                                                                actor_transforms, depth, sampler,
+                                                                *resources.motion_view, extent);
+        }
+        active_overlay = resources.overlay.get();
     }
 
     state.scheduler.RequestOutsideRenderPassOperationContext();
@@ -730,7 +750,7 @@ bool OcarinaLiveDlss::Record(VkImageView color, VkImageView depth, VkImageView t
     state.queue.AddImage(*resources.motion_view);
     resources.tick = state.scheduler.CurrentTick();
     state.motion_pass.Record(state.scheduler, state.queue.UpdateData(), *transform,
-                             *resources.motion, extent, resources.overlay.get());
+                             *resources.motion, extent, active_overlay);
     state.queue.Acquire(state.scheduler, 2);
     state.queue.AddSampledImage(color, sampler);
     state.queue.AddImage(*resources.color_view);

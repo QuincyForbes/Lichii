@@ -326,6 +326,14 @@ private:
         std::array<f32, 4> origin{};
         std::array<f32, 280 * 12> bones{};
     } oot_actor, oot_previous_actor;
+    struct OcarinaActorMeshCache {
+        const Tegra::MemoryManager* channel{};
+        GPUVAddr vertex{};
+        GPUVAddr indices{};
+        s32 base_vertex{};
+        std::vector<u8> vertices;
+        std::vector<u16> index_data;
+    } oot_actor_mesh_cache;
 #endif
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;

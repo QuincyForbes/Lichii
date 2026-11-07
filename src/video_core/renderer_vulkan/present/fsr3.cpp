@@ -75,7 +75,7 @@ void FSR3::CreateSampler(const Device& device) {
 void FSR3::CreateShaders(const Device& device) {
     m_vert_shader = BuildShader(device, VULKAN_FIDELITYFX_FSR_VERT_SPV);
 
-    if (device.IsFloat16Supported()) {
+    if (device.IsHostFloat16Supported()) {
         m_easu_shader = BuildShader(device, VULKAN_FIDELITYFX_FSR_EASU_FP16_FRAG_SPV);
         m_rcas_shader = BuildShader(device, VULKAN_FIDELITYFX_FSR_RCAS_FP16_FRAG_SPV);
     } else {
