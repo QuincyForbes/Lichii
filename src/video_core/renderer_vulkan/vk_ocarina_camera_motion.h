@@ -5,6 +5,7 @@
 
 #include <array>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "common/common_types.h"
@@ -19,8 +20,11 @@ class MemoryAllocator;
 class Scheduler;
 
 struct OcarinaActorMesh {
-    std::vector<u8> vertices;
-    std::vector<u16> indices;
+    std::span<const u8> vertices;
+    std::span<const u16> indices;
+    GPUVAddr vertex_address{};
+    GPUVAddr index_address{};
+    s32 base_vertex{};
     std::array<f32, 4> current_origin;
     std::array<f32, 4> previous_origin;
     std::array<f32, 280 * 12> current_bones;

@@ -2352,40 +2352,64 @@ bool RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
         now.indices != before.indices || now.base_vertex != before.base_vertex) {
         return false;
     }
-    const auto read = [&](GPUVAddr address, void* dst, size_t size) {
-        if (!gpu_memory->IsContinuousRange(address, size) ||
-            !gpu_memory->IsFullyMappedRange(address, size)) {
-            return false;
-        }
+    auto& cache = oot_actor_mesh_cache;
+    const auto can_stay_cached = [&](GPUVAddr address, size_t size) {
         const auto device_address = gpu_memory->GpuToCpuAddress(address);
-        if (!device_address || buffer_cache.IsRegionGpuModified(*device_address, size) ||
-            gpu.HasPendingCPUWrites(*device_address, size)) {
-            return false;
-        }
-        gpu_memory->ReadBlockUnsafe(address, dst, size);
-        return true;
+        return device_address && !buffer_cache.IsRegionGpuModified(*device_address, size) &&
+               !gpu.HasPendingCPUWrites(*device_address, size);
     };
     constexpr size_t index_count = 9702;
     constexpr size_t stride = 48;
-    std::vector<u16> indices(index_count);
-    if (!read(now.indices, indices.data(), indices.size() * sizeof(u16))) {
-        return false;
-    }
-    const auto [minimum, maximum] = std::ranges::minmax(indices);
-    const s64 first = static_cast<s64>(now.base_vertex) + minimum;
-    const u32 vertex_count = static_cast<u32>(maximum) - minimum + 1;
-    if (first < 0 || first > (1 << 20) || vertex_count > 16384) {
-        return false;
-    }
-    std::vector<u8> vertices(vertex_count * stride);
-    if (!read(now.vertex + first * stride, vertices.data(), vertices.size())) {
-        return false;
-    }
-    for (u16& index : indices) {
-        index -= minimum;
+    if (cache.channel != now.channel || cache.vertex != now.vertex ||
+        cache.indices != now.indices || cache.base_vertex != now.base_vertex ||
+        cache.index_data.size() != index_count || cache.vertices.empty() ||
+        !can_stay_cached(now.indices, index_count * sizeof(u16))) {
+        const auto read = [&](GPUVAddr address, void* dst, size_t size) {
+            if (!gpu_memory->IsContinuousRange(address, size) ||
+                !gpu_memory->IsFullyMappedRange(address, size) ||
+                !can_stay_cached(address, size)) {
+                return false;
+            }
+            gpu_memory->ReadBlockUnsafe(address, dst, size);
+            return true;
+        };
+        cache.index_data.resize(index_count);
+        if (!read(now.indices, cache.index_data.data(), cache.index_data.size() * sizeof(u16))) {
+            cache.vertices.clear();
+            return false;
+        }
+        const auto [minimum, maximum] = std::ranges::minmax(cache.index_data);
+        const s64 first = static_cast<s64>(now.base_vertex) + minimum;
+        const u32 vertex_count = static_cast<u32>(maximum) - minimum + 1;
+        if (first < 0 || first > (1 << 20) || vertex_count > 16384) {
+            cache.vertices.clear();
+            return false;
+        }
+        cache.vertices.resize(vertex_count * stride);
+        if (!read(now.vertex + first * stride, cache.vertices.data(), cache.vertices.size())) {
+            cache.vertices.clear();
+            return false;
+        }
+        for (u16& index : cache.index_data) {
+            index -= minimum;
+        }
+        cache.channel = now.channel;
+        cache.vertex = now.vertex;
+        cache.indices = now.indices;
+        cache.base_vertex = now.base_vertex;
     }
 
-    mesh = {std::move(vertices), std::move(indices), now.origin, before.origin, now.bones, before.bones};
+    mesh = {
+        .vertices = cache.vertices,
+        .indices = cache.index_data,
+        .vertex_address = now.vertex,
+        .index_address = now.indices,
+        .base_vertex = now.base_vertex,
+        .current_origin = now.origin,
+        .previous_origin = before.origin,
+        .current_bones = now.bones,
+        .previous_bones = before.bones,
+    };
     return true;
 }
 
@@ -2858,7 +2882,7 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     info.scaled_width = scaled ? resolution.ScaleUp(info.width) : info.width;
     info.scaled_height = scaled ? resolution.ScaleUp(info.height) : info.height;
 #ifdef EGLANTINE_STREAMLINE
-    if (oot_4k_scene_frame == render_trace_frame && info.image &&
+    if (oot_live_dlss && oot_4k_scene_frame == render_trace_frame && info.image &&
         info.image == oot_4k_guest_present && info.image_view &&
         info.width == 2560 && info.height == 1440 && !scaled &&
         image_view->format == VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM &&

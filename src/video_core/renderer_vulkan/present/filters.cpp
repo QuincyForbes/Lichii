@@ -81,7 +81,7 @@ std::unique_ptr<WindowAdaptPass> MakeLanczos(const Device& device, VkFormat fram
 
 std::unique_ptr<WindowAdaptPass> MakeScaleForce(const Device& device, VkFormat frame_format) {
     auto const select_fn = [&]() {
-        return device.IsFloat16Supported()
+        return device.IsHostFloat16Supported()
             ? BuildShader(device, VULKAN_PRESENT_SCALEFORCE_FP16_FRAG_SPV)
             : BuildShader(device, VULKAN_PRESENT_SCALEFORCE_FP32_FRAG_SPV);
     };
