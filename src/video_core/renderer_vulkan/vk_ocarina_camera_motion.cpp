@@ -126,9 +126,9 @@ public:
                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)},
           indices{UploadActorData(allocator, std::as_bytes(mesh.indices),
                                   VK_BUFFER_USAGE_INDEX_BUFFER_BIT)},
-          current{UploadActorData(allocator, std::as_bytes(std::span{mesh.current_bones}),
+          current{UploadActorData(allocator, std::as_bytes(mesh.current_bones),
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)},
-          previous{UploadActorData(allocator, std::as_bytes(std::span{mesh.previous_bones}),
+          previous{UploadActorData(allocator, std::as_bytes(mesh.previous_bones),
                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)},
           uniform{UploadActorData(allocator, std::as_bytes(std::span{&transforms, 1}),
                                   VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)} {
@@ -229,8 +229,8 @@ public:
             index_address = mesh.index_address;
             base_vertex = mesh.base_vertex;
         }
-        upload(current, std::as_bytes(std::span{mesh.current_bones}));
-        upload(previous, std::as_bytes(std::span{mesh.previous_bones}));
+        upload(current, std::as_bytes(mesh.current_bones));
+        upload(previous, std::as_bytes(mesh.previous_bones));
         upload(uniform, std::as_bytes(std::span{&transforms, 1}));
         if (depth_view != bound_depth_view || sampler != bound_sampler) {
             const VkDescriptorImageInfo depth{sampler, depth_view, VK_IMAGE_LAYOUT_GENERAL};

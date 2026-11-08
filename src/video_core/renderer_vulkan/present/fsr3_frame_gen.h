@@ -33,7 +33,7 @@ public:
     ~Fsr3FrameGen();
 
     void Process(const Device& device, Scheduler& scheduler, VkImage current_frame,
-                 VkImageView current_view, u64 frame_count);
+                 VkImageView current_view, u64 frame_count, bool dispatch_flow = true);
 
     void Generate(const Device& device, Scheduler& scheduler, VkImageView destination_storage_view,
                   float blend_factor, float flow_scale);

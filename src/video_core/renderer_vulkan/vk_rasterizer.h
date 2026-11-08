@@ -325,7 +325,9 @@ private:
         s32 base_vertex{};
         std::array<f32, 4> origin{};
         std::array<f32, 280 * 12> bones{};
-    } oot_actor, oot_previous_actor;
+    };
+    std::array<OcarinaActorPose, 2> oot_actor_poses{};
+    u32 oot_actor_pose_index{};
     struct OcarinaActorMeshCache {
         const Tegra::MemoryManager* channel{};
         GPUVAddr vertex{};

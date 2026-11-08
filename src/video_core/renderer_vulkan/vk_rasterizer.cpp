@@ -2394,7 +2394,8 @@ void RasterizerVulkan::TrackOcarinaCamera() {
 /// Capture the skinning pose of the recognized Link draw for frame-to-frame motion.
 void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect) {
     if (shader_hash != 0x28c6e527634f814aULL || !is_indexed || is_indirect ||
-        !OcarinaDlssEnabled() || oot_actor.frame == render_trace_frame) {
+        !OcarinaDlssEnabled() ||
+        oot_actor_poses[oot_actor_pose_index].frame == render_trace_frame) {
         return;
     }
     const auto& draw = maxwell3d->draw_manager.draw_state;
@@ -2415,14 +2416,8 @@ void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool 
         return;
     }
 
-    OcarinaActorPose pose{
-        .frame = render_trace_frame,
-        .channel = gpu_memory,
-        .vertex = stream.Address(),
-        .indices = draw.index_buffer.IndexStart(),
-        .base_vertex = static_cast<s32>(draw.base_index),
-    };
-    bool origin_found{}, bones_found{};
+    std::optional<GPUVAddr> origin_addr;
+    std::optional<GPUVAddr> bones_addr;
     buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
                                                 const auto& binding, u32 size, const auto*, u32) {
         if (stage != 0 || storage || (index != 4 && index != 6) ||
@@ -2430,24 +2425,30 @@ void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool 
             return;
         }
         if (index == 4 && size >= 0x40 + 3 * sizeof(f32)) {
-            device_memory.ReadBlockUnsafe(binding.device_addr + 0x40, pose.origin.data(), 3 * sizeof(f32));
-            origin_found = true;
+            origin_addr = binding.device_addr + 0x40;
         }
         if (index == 6 && size == 13568) {
-            device_memory.ReadBlockUnsafe(binding.device_addr, pose.bones.data(), sizeof(pose.bones));
-            bones_found = true;
+            bones_addr = binding.device_addr;
         }
     });
-    if (origin_found && bones_found) {
-        oot_previous_actor = oot_actor;
-        oot_actor = pose;
+    if (origin_addr && bones_addr) {
+        oot_actor_pose_index ^= 1U;
+        auto& pose = oot_actor_poses[oot_actor_pose_index];
+        pose.frame = render_trace_frame;
+        pose.channel = gpu_memory;
+        pose.vertex = stream.Address();
+        pose.indices = draw.index_buffer.IndexStart();
+        pose.base_vertex = static_cast<s32>(draw.base_index);
+        pose.origin = {};
+        device_memory.ReadBlockUnsafe(*origin_addr, pose.origin.data(), 3 * sizeof(f32));
+        device_memory.ReadBlockUnsafe(*bones_addr, pose.bones.data(), sizeof(pose.bones));
     }
 }
 
 /// Read the shared mesh only when both poses refer to the same vertex and index buffers.
 void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
-    const auto& now = oot_actor;
-    const auto& before = oot_previous_actor;
+    const auto& now = oot_actor_poses[oot_actor_pose_index];
+    const auto& before = oot_actor_poses[oot_actor_pose_index ^ 1U];
     if (now.frame != render_trace_frame || before.frame + 1 != now.frame ||
         now.channel != gpu_memory || before.channel != now.channel || now.vertex != before.vertex ||
         now.indices != before.indices || now.base_vertex != before.base_vertex) {
