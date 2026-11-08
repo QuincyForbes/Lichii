@@ -641,7 +641,17 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const DescriptorUpdateEntry* const descriptor_data{guest_descriptor_queue.UpdateData()};
     VkDeviceSize descriptor_buffer_offset{};
     u32 descriptor_buffer_chunk{};
-    if (uses_descriptor_buffer) {
+    const bool reuse_allocation =
+        uses_descriptor_buffer && has_last_descriptor_buffer &&
+        last_descriptor_buffer_generation == descriptor_buffer_ring.CurrentGeneration() &&
+        last_descriptor_payload.size() == num_descriptor_entries &&
+        std::memcmp(last_descriptor_payload.data(), descriptor_data,
+                    num_descriptor_entries * sizeof(DescriptorUpdateEntry)) == 0;
+    if (reuse_allocation) {
+        descriptor_buffer_offset = last_descriptor_buffer_offset;
+        descriptor_buffer_chunk = last_descriptor_buffer_chunk;
+        descriptor_buffer_ring.TouchFrame(scheduler);
+    } else if (uses_descriptor_buffer) {
         const DescriptorBufferRing::Allocation alloc{
             descriptor_buffer_ring.Allocate(scheduler, descriptor_buffer_layout.size)};
         if (!alloc.host) {
@@ -651,6 +661,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         WriteDescriptorBuffer(device, descriptor_buffer_layout, descriptor_data, alloc.host);
         descriptor_buffer_offset = alloc.offset;
         descriptor_buffer_chunk = alloc.chunk;
+        has_last_descriptor_buffer = true;
+        last_descriptor_buffer_offset = alloc.offset;
+        last_descriptor_buffer_chunk = alloc.chunk;
+        last_descriptor_buffer_generation = alloc.generation;
+        last_descriptor_payload.assign(descriptor_data,
+                                       descriptor_data + num_descriptor_entries);
     }
 
     const bool bind_descriptor_buffer{

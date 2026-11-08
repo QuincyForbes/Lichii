@@ -24,6 +24,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/macro_hle_oot.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
@@ -1106,6 +1107,13 @@ struct Maxwell3D::FrontState {
         u64 dispatch_writes;
     };
     std::unordered_map<u64, DmaSnapshot> dma_snapshots;
+    bool oot_macros{true};
+    bool oot_dump{};
+    bool oot_log_call{};
+    std::array<OotMacros::Id, 0x80> oot_macro{};
+    std::array<u32, 0x80> oot_start{};
+    std::array<u64, 0x80> oot_generation{};
+    std::vector<u32> oot_writes;
 };
 
 namespace {
@@ -1223,6 +1231,13 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         std::memcpy(front->shadow.data(), shadow_state.reg_array.data(), sizeof(front->shadow));
         front->control = shadow_state.shadow_ram_control;
         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
+        static const bool oot_macros_on = [] {
+            const char* value = std::getenv("EDEN_NX2_OOT_MACROS");
+            return value == nullptr || value[0] != '0';
+        }();
+        front->oot_macros = oot_macros_on && OotMacros::HasHandlers();
+        front->oot_dump = OotMacros::DumpEnabled();
+        front->oot_generation.fill(~u64{0});
         front->executing_macro = executing_macro;
         front->parameters = std::move(macro_params);
         macro_params.clear();
@@ -1649,7 +1664,8 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     fs.executing_macro = 0;
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
-    const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+    const u32 slot = ((method - MacroRegistersStart) >> 1) & 0x7f;
+    const u32 start = positions[slot];
     VideoCommon::Nx2Profile::CountMethod(method, false);
     // EDEN_NX2_MACRO_TRACE=<method>: the first calls of that macro, parameters and writes.
     static const u32 traced = [] {
@@ -1671,39 +1687,62 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
-        const auto parameter_count = fs.parameters.size();
-        const auto read = [&fs](u32 address) {
-            return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
-        };
-        const auto emit = [&](u32 address, u32 value) {
-            if (trace) [[unlikely]] {
-                trace_text += fmt::format(" {:x}={:x}", address, value);
+        OotMacros::Id replacement = OotMacros::Id::None;
+        if (!trace && (fs.oot_macros || fs.oot_dump) && slot < fs.oot_macro.size()) {
+            if (fs.oot_generation[slot] != engine.native_code_generation ||
+                fs.oot_start[slot] != start) [[unlikely]] {
+                fs.oot_generation[slot] = engine.native_code_generation;
+                fs.oot_start[slot] = start;
+                const OotMacros::Macro* const found =
+                    fs.oot_macros ? OotMacros::Find(OotMacros::HashMacro(engine.native_code, start))
+                                  : nullptr;
+                fs.oot_macro[slot] = found != nullptr ? found->id : OotMacros::Id::None;
+                if (fs.oot_dump) {
+                    OotMacros::DumpCode(method, start, engine.native_code);
+                }
             }
-            if (address >= MacroRegistersStart) {
-                return false;
+            replacement = fs.oot_macro[slot];
+            if (fs.oot_dump) [[unlikely]] {
+                fs.oot_log_call = OotMacros::WantCallLog(method);
+                fs.oot_writes.clear();
             }
-            FrontWrite(split, fs, address, value, true, true);
-            // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
-            if (address == 0x157 || address == 0x158) {
-                FrontDmaRead(split, fs, method, address, value);
-            }
-            return true;
-        };
-#ifdef ARCHITECTURE_x86_64
-        if (!engine.native_jit) {
-            engine.native_jit = std::make_shared<TuringMacroJit>();
         }
-        engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
-        const auto result = engine.native_jit->Execute(
-            start, fs.parameters, std::span<u32>{native_data_ram}, read, emit);
+        if (replacement == OotMacros::Id::None ||
+            !FrontRunOotMacro(split, fs, method, replacement)) {
+            const auto parameter_count = fs.parameters.size();
+            const auto read = [&fs](u32 address) {
+                return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
+            };
+            const auto emit = [&](u32 address, u32 value) {
+                if (trace) [[unlikely]] {
+                    trace_text += fmt::format(" {:x}={:x}", address, value);
+                }
+                if (address >= MacroRegistersStart) {
+                    return false;
+                }
+                FrontWrite(split, fs, address, value, true, true);
+                // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
+                if (address == 0x157 || address == 0x158) {
+                    FrontDmaRead(split, fs, method, address, value);
+                }
+                return true;
+            };
+#ifdef ARCHITECTURE_x86_64
+            if (!engine.native_jit) {
+                engine.native_jit = std::make_shared<TuringMacroJit>();
+            }
+            engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
+            const auto result = engine.native_jit->Execute(
+                start, fs.parameters, std::span<u32>{native_data_ram}, read, emit);
 #else
-        const auto result =
-            engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read, emit);
+            const auto result =
+                engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read, emit);
 #endif
-        if (!result.success) {
-            engine.native_execution_failed = true;
-            LOG_ERROR(HW_GPU, "Native MME (split front) failed: start={:#x}, consumed={}/{}, error={}",
-                      start, result.consumed, parameter_count, result.error);
+            if (!result.success) {
+                engine.native_execution_failed = true;
+                LOG_ERROR(HW_GPU, "Native MME (split front) failed: start={:#x}, consumed={}/{}, error={}",
+                          start, result.consumed, parameter_count, result.error);
+            }
         }
     }
     if (trace) [[unlikely]] {
@@ -2389,6 +2428,63 @@ void Maxwell3D::FinishFrontMacro(Core::System& system) {
     // What ProcessMacro and CallMacroMethod do around the macro.
     ConsumeSink(system);
     draw_manager.DrawDeferred(*this);
+}
+
+struct Maxwell3D::OotContext {
+    Maxwell3D& engine;
+    VideoCommon::GpuSplit& split;
+    FrontState& fs;
+    u32 macro_method;
+
+    [[nodiscard]] u32 Count() const {
+        return static_cast<u32>(fs.parameters.size());
+    }
+    [[nodiscard]] u32 Param(u32 index) const {
+        return fs.parameters[index];
+    }
+    [[nodiscard]] u32* Dram() {
+        return engine.native_data_ram.data();
+    }
+    [[nodiscard]] u32 Read(u32 method) const {
+        return method < Regs::NUM_REGS ? fs.regs[method] : 0U;
+    }
+    [[nodiscard]] bool OcclusionHle() const {
+        return false;
+    }
+    void FoldFirstInstance() {}
+    void Emit(u32 method, u32 value) {
+        if (method >= MacroRegistersStart) [[unlikely]] {
+            Fail("method past the macro range");
+            return;
+        }
+        if (fs.oot_log_call) [[unlikely]] {
+            fs.oot_writes.push_back(method);
+            fs.oot_writes.push_back(value);
+        }
+        engine.FrontWrite(split, fs, method, value, true, true);
+        if (method == 0x157 || method == 0x158) [[unlikely]] {
+            engine.FrontDmaRead(split, fs, macro_method, method, value);
+        }
+    }
+    void EmitRepeated(const std::array<u32, 2>* writes, u32 count, u32 times) {
+        for (u32 repeat = 0; repeat < times; ++repeat) {
+            for (u32 i = 0; i < count; ++i) {
+                Emit(writes[i][0], writes[i][1]);
+            }
+        }
+    }
+    void Fail(const char* error) {
+        engine.GetNativeMacroEngine().native_execution_failed = true;
+        LOG_ERROR(HW_GPU, "Native MME (split front, OoT macro {:#x}) failed: {}", macro_method,
+                  error);
+    }
+};
+
+bool Maxwell3D::FrontRunOotMacro(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                 OotMacros::Id id) {
+    static_assert(sizeof(native_data_ram) == OotMacros::DataRamWords * sizeof(u32));
+    OotContext context{*this, split, fs, method};
+    return OotMacros::Run(id, context);
 }
 
 } // namespace Tegra::Engines
