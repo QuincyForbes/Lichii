@@ -655,7 +655,9 @@ void PinCurrentThread(PinnedRole role) {
     if (setting != nullptr && setting[0] == '0') {
         return;
     }
-    // Physical cores of processor group 0, as masks of their logical processors.
+    // Physical cores of processor group 0, as masks of their logical processors. On hybrid CPUs
+    // (Intel P/E cores, interleaved on Arrow Lake: P0,P1,E2..E9,P10..P13,E14..E21,P22,P23), keep
+    // only the highest EfficiencyClass so GpuBack (cores[2]) and GuestCore never land on E-cores.
     static const std::vector<KAFFINITY> cores = [] {
         std::vector<KAFFINITY> result;
         DWORD length = 0;
@@ -665,10 +667,20 @@ void PinCurrentThread(PinnedRole role) {
         if (!GetLogicalProcessorInformationEx(RelationProcessorCore, info, &length)) {
             return result;
         }
+        BYTE best_class = 0;
         for (DWORD offset = 0; offset < length;) {
             auto* entry =
                 reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
             if (entry->Processor.GroupCount > 0 && entry->Processor.GroupMask[0].Group == 0) {
+                best_class = (std::max)(best_class, entry->Processor.EfficiencyClass);
+            }
+            offset += entry->Size;
+        }
+        for (DWORD offset = 0; offset < length;) {
+            auto* entry =
+                reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+            if (entry->Processor.GroupCount > 0 && entry->Processor.GroupMask[0].Group == 0 &&
+                entry->Processor.EfficiencyClass == best_class) {
                 result.push_back(entry->Processor.GroupMask[0].Mask);
             }
             offset += entry->Size;
