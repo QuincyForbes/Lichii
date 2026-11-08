@@ -1701,6 +1701,18 @@ void QueryCacheRuntime::Barriers(bool is_prebarrier) {
     }
 }
 
+void QueryCacheRuntime::NoteGuestWrittenRanges(std::span<VideoCommon::GuestWrittenRange> ranges) {
+    std::scoped_lock lk(impl->buffer_cache.mutex);
+    for (VideoCommon::GuestWrittenRange& range : ranges) {
+        const DAddr page_begin = Common::AlignDown(range.address, Core::DEVICE_PAGESIZE);
+        const DAddr page_end = Common::AlignUp(range.address + range.size, Core::DEVICE_PAGESIZE);
+        range.needs_copy = impl->buffer_cache.IsRegionGpuModified(page_begin, page_end - page_begin);
+        if (range.mark && !range.needs_copy) {
+            impl->buffer_cache.WriteMemory(range.address, range.size);
+        }
+    }
+}
+
 template <typename SyncValuesType>
 void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer base_src_buffer) {
     if (values.size() == 0) {
@@ -1750,6 +1762,9 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
             const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
             const auto [buffer, offset] = impl->buffer_cache.ObtainCPUBuffer(
                 pair.first, static_cast<u32>(pair.second - pair.first), sync_info, post_op);
+            if (VideoCommon::LazyPayloadSync()) {
+                buffer->MarkUsage(offset, pair.second - pair.first);
+            }
             impl->buffers_to_upload_to.emplace_back(buffer->Handle(), offset);
         }
     });

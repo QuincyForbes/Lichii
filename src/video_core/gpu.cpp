@@ -455,6 +455,10 @@ void GPU::ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callb
     impl->ForEachPendingCpuWrite(callback);
 }
 
+void GPU::CollectHandoffWrite(DAddr addr, u64 size) {
+    impl->system.GetGPUDirtyMemoryManager().back().Collect(addr, size);
+}
+
 void GPU::OnCommandListEnd() {
     impl->OnCommandListEnd();
 }

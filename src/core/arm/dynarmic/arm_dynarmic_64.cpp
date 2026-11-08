@@ -616,9 +616,7 @@ void ArmDynarmic64::GetContext(Kernel::Svc::ThreadContext& ctx) const {
     Dynarmic::A64::Jit const& j = *m_jit;
     auto gpr = j.GetRegisters();
     auto fpr = j.GetVectors();
-    // TODO: this is inconvenient
-    for (size_t i = 0; i < 29; i++)
-        ctx.r[i] = gpr[i];
+    std::memcpy(ctx.r.data(), gpr.data(), 29 * sizeof(u64));
     ctx.fp = gpr[29];
     ctx.lr = gpr[30];
     ctx.sp = j.GetSP();
@@ -632,10 +630,8 @@ void ArmDynarmic64::GetContext(Kernel::Svc::ThreadContext& ctx) const {
 
 void ArmDynarmic64::SetContext(const Kernel::Svc::ThreadContext& ctx) {
     Dynarmic::A64::Jit& j = *m_jit;
-    // TODO: this is inconvenient
     std::array<u64, 31> gpr;
-    for (size_t i = 0; i < 29; i++)
-        gpr[i] = ctx.r[i];
+    std::memcpy(gpr.data(), ctx.r.data(), 29 * sizeof(u64));
     gpr[29] = ctx.fp;
     gpr[30] = ctx.lr;
     j.SetRegisters(gpr);

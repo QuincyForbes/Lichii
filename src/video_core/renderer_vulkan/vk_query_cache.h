@@ -42,6 +42,10 @@ public:
 
     void Barriers(bool is_prebarrier);
 
+    /// EDEN_NX2_QUERY_LAZY_SYNC: each range to mark is marked CPU-written in the buffer cache, as
+    /// a guest CPU write is, unless its pages hold GPU-written data (needs_copy).
+    void NoteGuestWrittenRanges(std::span<VideoCommon::GuestWrittenRange> ranges);
+
     void EndHostConditionalRendering();
 
     void PauseHostConditionalRendering();

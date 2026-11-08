@@ -1577,7 +1577,10 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         // Banks slide through larger buffers, a new address per draw: compare each page with
         // its last contents and mark only the pages that changed.
         if (native_indirect_page_snapshots.size() >= 16384) {
-            native_indirect_page_snapshots.clear();
+            const auto oldest = std::ranges::min_element(
+                native_indirect_page_snapshots, {},
+                [](const auto& entry) { return entry.second.checked_frame; });
+            native_indirect_page_snapshots.erase(oldest);
         }
         const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = device_addr + check_size;
@@ -1863,7 +1866,10 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
     }
     if (native_indirect_page_snapshots.size() >= 16384) {
-        native_indirect_page_snapshots.clear();
+        const auto oldest = std::ranges::min_element(
+            native_indirect_page_snapshots, {},
+            [](const auto& entry) { return entry.second.checked_frame; });
+        native_indirect_page_snapshots.erase(oldest);
     }
     const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
     const DAddr end = device_addr + (std::min<u64>)(mapped_size, size);
@@ -3074,6 +3080,19 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
             u8* const src_pointer = staging_pointer.data() + copy.src_offset;
             const DAddr device_addr = buffer.CpuAddr() + copy.dst_offset;
             device_memory.ReadBlockUnsafe(device_addr, src_pointer, copy.size);
+            if (!native_indirect_page_snapshots.empty()) {
+                const DAddr first_page = Common::AlignUp(device_addr, Core::DEVICE_PAGESIZE);
+                const DAddr last_page =
+                    Common::AlignDown(device_addr + copy.size, Core::DEVICE_PAGESIZE);
+                for (DAddr page = first_page; page < last_page; page += Core::DEVICE_PAGESIZE) {
+                    if (const auto it = native_indirect_page_snapshots.find(page);
+                        it != native_indirect_page_snapshots.end()) {
+                        std::memcpy(it->second.words.data(), src_pointer + (page - device_addr),
+                                    Core::DEVICE_PAGESIZE);
+                        it->second.checked_frame = frame_tick;
+                    }
+                }
+            }
             // Large uploads are mostly geometry the host GPU now has its own copy of: TickFrame
             // marks their guest memory cold (see TextureCache::RefreshContents).
             if (copy.size >= 256_KiB) {

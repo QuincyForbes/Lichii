@@ -108,6 +108,20 @@ public:
         skipped_fences = 0;
         should_flush |= query_cache.HasUncommittedFlushes();
         query_cache.CommitAsyncFlushes();
+        const bool stubbed = !should_flush && committed_flushes == 0;
+        if constexpr (can_async_check) {
+            if (stubbed && FenceFold()) {
+                if (!delay_fence) {
+                    func();
+                }
+                FoldStubbedFence(delay_fence, func);
+                if (delay_fence) {
+                    SubmitDeferredWork();
+                }
+                rasterizer.InvalidateGPUCache();
+                return;
+            }
+        }
         TFence new_fence = CreateFence(!should_flush);
         if constexpr (can_async_check) {
             guard.lock();
@@ -122,6 +136,9 @@ public:
             uncommitted_operations.reserve(64);
         }
         pending_flushes.push_back(committed_flushes);
+        if constexpr (can_async_check) {
+            pending_query_pops.push_back(1);
+        }
         QueueFence(new_fence);
         if (!delay_fence) {
             func();
@@ -314,24 +331,29 @@ private:
             TFence fence;
             OperationList operations;
             u8 flushes;
+            u32 query_pops;
         };
         std::vector<Released> batch;
         batch.reserve(MaxBatch);
         const auto take_front = [&] {
             batch.push_back({std::move(fences.front()), std::move(pending_operations.front()),
-                             pending_flushes.front()});
+                             pending_flushes.front(), pending_query_pops.front()});
             fences.pop();
             pending_operations.pop_front();
             pending_flushes.pop_front();
+            pending_query_pops.pop_front();
         };
         while (!stop_token.stop_requested()) {
             {
                 std::unique_lock lock(guard);
-                cv.wait(lock, [&] { return stop_token.stop_requested() || !fences.empty(); });
+                cv.wait(lock, [&] {
+                    return stop_token.stop_requested() || (!fences.empty() && !inline_running);
+                });
                 if (stop_token.stop_requested()) [[unlikely]] {
                     return;
                 }
                 take_front();
+                fence_thread_busy = true;
             }
             if (!batch.front().fence->IsStubbed()) {
                 WaitFence(batch.front().fence);
@@ -363,7 +385,9 @@ private:
             }
             // Queries and operations keep their per-fence order.
             for (Released& released : batch) {
-                query_cache.PopAsyncFlushes();
+                for (u32 i = 0; i < released.query_pops; ++i) {
+                    query_cache.PopAsyncFlushes();
+                }
                 for (auto& operation : released.operations) {
                     operation();
                 }
@@ -377,7 +401,84 @@ private:
             // Only once their operations ran: FencesQuiet must not see a fence as gone before.
             fences_in_flight.fetch_sub(static_cast<u32>(batch.size()), std::memory_order_release);
             batch.clear();
+            {
+                std::scoped_lock lock(guard);
+                fence_thread_busy = false;
+            }
         }
+    }
+
+    static bool FenceFold() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_FENCE_FOLD");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+
+    void FoldStubbedFence(bool delay_fence, std::function<void()>& func) {
+        std::unique_lock lock{guard};
+        if (!fences.empty()) {
+            {
+                std::scoped_lock ops_lock{uncommitted_guard};
+                auto& operations = pending_operations.back();
+                for (auto& operation : uncommitted_operations) {
+                    operations.emplace_back(std::move(operation));
+                }
+                uncommitted_operations.clear();
+                if (delay_fence) {
+                    operations.emplace_back(std::move(func));
+                }
+            }
+            ++pending_query_pops.back();
+            work_epoch.fetch_add(1, std::memory_order_release);
+            return;
+        }
+        if (!fence_thread_busy && !inline_running && GpuSplit::OnBackThread()) {
+            inline_running = true;
+            fences_in_flight.fetch_add(1, std::memory_order_relaxed);
+            work_epoch.fetch_add(1, std::memory_order_release);
+            OperationList operations;
+            {
+                std::scoped_lock ops_lock{uncommitted_guard};
+                operations.swap(uncommitted_operations);
+            }
+            lock.unlock();
+            query_cache.PopAsyncFlushes();
+            for (auto& operation : operations) {
+                operation();
+            }
+            if (delay_fence) {
+                func();
+            }
+            fences_in_flight.fetch_sub(1, std::memory_order_release);
+            lock.lock();
+            inline_running = false;
+            const bool queued = !fences.empty();
+            lock.unlock();
+            if (queued) {
+                cv.notify_all();
+            }
+            return;
+        }
+        TFence new_fence = CreateFence(true);
+        {
+            std::scoped_lock ops_lock{uncommitted_guard};
+            if (delay_fence) {
+                uncommitted_operations.emplace_back(std::move(func));
+            }
+            pending_operations.emplace_back(std::move(uncommitted_operations));
+            uncommitted_operations.clear();
+            uncommitted_operations.reserve(64);
+        }
+        pending_flushes.push_back(0);
+        pending_query_pops.push_back(1);
+        QueueFence(new_fence);
+        fences.push(std::move(new_fence));
+        fences_in_flight.fetch_add(1, std::memory_order_relaxed);
+        work_epoch.fetch_add(1, std::memory_order_release);
+        lock.unlock();
+        cv.notify_all();
     }
 
     /// The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
@@ -510,9 +611,12 @@ private:
     OperationList uncommitted_operations;
     std::deque<OperationList> pending_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
+    std::deque<u32> pending_query_pops;
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
     std::atomic<u32> fences_in_flight{}; ///< Fences made whose operations have not run yet
     std::atomic<u64> work_epoch{};       ///< Bumped by every fence and fence operation added
+    bool fence_thread_busy{};
+    bool inline_running{};
 
     std::mutex guard;
     std::mutex ring_guard;

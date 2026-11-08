@@ -213,11 +213,29 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         if constexpr (requires(const Image& image) { image.MemoryBlock(); }) {
             std::vector<ImageId> candidates;
             const size_t limit = num_iterations * 8;
+            candidates.reserve(limit);
             lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId image_id) {
                 candidates.push_back(image_id);
                 return candidates.size() >= limit;
             });
             if (candidates.empty()) {
+                return;
+            }
+            static const bool gc_skip = [] {
+                const char* value = std::getenv("EDEN_NX2_TC_GC_SKIP");
+                return value == nullptr || value[0] != '0';
+            }();
+            if (gc_skip && std::none_of(candidates.begin(), candidates.end(), [&](ImageId image_id) {
+                    const auto& image = slot_images[image_id];
+                    if (True(image.flags & ImageFlagBits::IsDecoding)) {
+                        return false;
+                    }
+                    const bool must_download =
+                        IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+                    return !((!aggressive_mode && !evict_old_costly &&
+                              True(image.flags & ImageFlagBits::CostlyLoad)) ||
+                             (!high_priority_mode && must_download));
+                })) {
                 return;
             }
             if (block_image_bytes_frame == ~0ULL || frame_tick - block_image_bytes_frame >= 60) {

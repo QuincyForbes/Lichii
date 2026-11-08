@@ -291,24 +291,42 @@ void Scheduler::MarkFrameEnd(u64 frame) {
     }
 }
 
-void Scheduler::DispatchWork() {
+void Scheduler::DispatchWork(bool lazy) {
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
     }
-    if (chunk && !chunk->Empty()) {
-        // Waking the worker is a system call (~2% of the GPU thread at one dispatch per 8
-        // draws): skip it while the worker is still busy, it pops the queue before waiting.
-        bool wake;
-        {
-            std::scoped_lock ql{queue_mutex};
+    static const bool lazy_wake = [] {
+        const char* value = std::getenv("EDEN_NX2_LAZY_WAKE");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool has_work = chunk && !chunk->Empty();
+    if (!has_work && !(lazy_queued && !lazy)) {
+        return;
+    }
+    lazy = lazy && lazy_wake;
+    bool wake;
+    {
+        std::scoped_lock ql{queue_mutex};
+        if (has_work) {
             work_queue.push(std::move(chunk));
-            wake = worker_waiting;
         }
-        if (wake) {
-            event_cv.notify_all();
-        }
+        wake = worker_waiting && !work_queue.empty() && (!lazy || work_queue.size() >= 2);
+        lazy_queued = worker_waiting && !wake && !work_queue.empty();
+    }
+    if (wake) {
+        event_cv.notify_all();
+    }
+    if (has_work) {
         AcquireNewChunk();
     }
+}
+
+bool Scheduler::RenderPassMatches(const Framebuffer* framebuffer) const {
+    const VkExtent2D render_area = framebuffer->RenderArea();
+    return state.renderpass != VK_NULL_HANDLE && framebuffer->RenderPass() == state.renderpass &&
+           framebuffer->Handle() == state.framebuffer &&
+           render_area.width == state.render_area.width &&
+           render_area.height == state.render_area.height;
 }
 
 void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass renderpass,
