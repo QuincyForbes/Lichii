@@ -140,6 +140,8 @@ public:
 protected:
     template <bool remove_from_cache, typename Func>
     void IterateCache(VAddr addr, std::size_t size, Func&& func) {
+        // invoke_result_t: with invoke_result (the trait, never bool) callbacks returning bool
+        // never ended the walk early.
         static constexpr bool RETURNS_BOOL =
             std::is_same_v<std::invoke_result_t<Func, QueryLocation>, bool>;
         const u64 addr_begin = addr;
