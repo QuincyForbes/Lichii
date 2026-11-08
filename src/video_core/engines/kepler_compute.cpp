@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+﻿// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
@@ -991,19 +991,19 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     if (!BypassEnabled(program_id)) {
         return false;
     }
-    auto* const state = rasterizer->OotNetworkBypass();
-    if (!state) {
+    auto* const bypass = rasterizer->OotNetworkBypass();
+    if (!bypass) {
         return false;
     }
     // The tonemap pass draws before the network every frame; until it has been seen (menus, the
     // first frame) the network runs as usual. Its first passes are skipped only while the output
     // pass is being replaced, so a failed replacement brings the whole network back next frame.
-    const GPUVAddr tonemapped = state->tonemapped_image.load(std::memory_order_relaxed);
+    const GPUVAddr tonemapped = bypass->tonemapped_image.load(std::memory_order_relaxed);
     if (tonemapped == 0) {
         return false;
     }
     if (native_key == PrepassProgramKey || native_key == NetworkProgramKey) {
-        return state->output_replaced.load(std::memory_order_relaxed);
+        return bypass->output_replaced.load(std::memory_order_relaxed);
     }
     if (native_key != OutputProgramKey) {
         return false;
@@ -1011,7 +1011,7 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     const auto output = ConstBuffer0Image(OutputImageHandleOffset);
     if (!output || output->format != Texture::TextureFormat::B10G11R11 || output->Address() == 0 ||
         output->Address() == tonemapped || !output->IsBlockLinear()) {
-        state->output_replaced.store(false, std::memory_order_relaxed);
+        bypass->output_replaced.store(false, std::memory_order_relaxed);
         static bool warned = false;
         if (!std::exchange(warned, true)) {
             LOG_WARNING(HW_GPU, "Ocarina of Time: unexpected network output image; not replaced");
@@ -1049,7 +1049,7 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
         .src_y1 = height,
     };
     const bool copied = rasterizer->AccelerateSurfaceCopy(source, destination, config);
-    state->output_replaced.store(copied, std::memory_order_relaxed);
+    bypass->output_replaced.store(copied, std::memory_order_relaxed);
     static bool logged = false;
     if (!std::exchange(logged, true)) {
         LOG_INFO(HW_GPU,
