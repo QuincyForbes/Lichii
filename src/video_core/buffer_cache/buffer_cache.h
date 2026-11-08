@@ -109,6 +109,8 @@ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
 
 template <class P>
 void BufferCache<P>::TickFrame() {
+    // Read once per frame: FindBuffer asked for it on every binding of every draw.
+    fence_behavior_accurate = Settings::IsGPUFenceBehaviorAccurate();
     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
     if (!channel_state) {
         return;
@@ -656,7 +658,7 @@ void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr
     // is still what FindBuffer returns: keep the binding with its buffer_id. The contents are
     // read at the draw as before. FindBuffer waits for writes with accurate GPU fences: keep that.
     const bool use_memo = (VideoCore::Nx2Debug::Experiment(18) & 1) != 0 &&
-                          !Settings::IsGPUFenceBehaviorAccurate();
+                          !fence_behavior_accurate;
     if (use_memo && memo.epoch == binding_epoch && memo.gpu_addr == gpu_addr &&
         memo.size == size && memo.channel == static_cast<const void*>(channel_state) &&
         current.device_addr == memo.device_addr && current.size == size &&
@@ -2354,7 +2356,7 @@ void BufferCache<P>::ResolveStorageBinding(size_t memo_stage, u32 index, Binding
     // EDEN_NX2_EXP18 & 2: what FindBuffer and a ResolveMultiRangeStorage finding one range gave
     // last time, while the binding, the mappings and the set of buffers are unchanged.
     const bool use_memo = (VideoCore::Nx2Debug::Experiment(18) & 2) != 0 &&
-                          !Settings::IsGPUFenceBehaviorAccurate();
+                          !fence_behavior_accurate;
     // Before the lookup: a mapping change during it leaves a memo that never matches.
     const u64 map_serial = gpu_memory->MapSerial();
     const size_t as_id = gpu_memory->GetID();
@@ -2735,8 +2737,7 @@ BufferId BufferCache<P>::FindBuffer(DAddr device_addr, u32 size, bool sparse_com
     if (buffer_id) {
         Buffer& buffer = slot_buffers[buffer_id];
         if (buffer.IsInBounds(device_addr, size)) {
-            const bool should_sync = Settings::IsGPUFenceBehaviorAccurate();
-            if (should_sync) {
+            if (fence_behavior_accurate) {
                 SynchronizeBufferWrites(buffer);
             }
             bool usable = true;
