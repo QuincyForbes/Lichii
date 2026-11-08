@@ -91,45 +91,43 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
                                   const DescriptorUpdateEntry* payload, u8* host) {
     const vk::Device& dev = device.GetLogical();
     for (const DescriptorBufferBinding& binding : layout.bindings) {
-        for (u32 index = 0; index < binding.count; ++index) {
-            const DescriptorUpdateEntry& entry = *(payload++);
-            const VkDescriptorAddressInfoEXT address_info{
+        VkDescriptorGetInfoEXT get_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+            .pNext = nullptr,
+            .type = binding.type,
+            .data{},
+        };
+        u8* dst = host + binding.offset;
+        switch (binding.type) {
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
+            VkDescriptorAddressInfoEXT address_info{
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
                 .pNext = nullptr,
-                .address = entry.address.address,
-                .range = entry.address.range,
-                .format = entry.address.format,
             };
-            VkDescriptorGetInfoEXT get_info{
-                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
-                .pNext = nullptr,
-                .type = binding.type,
-                .data{},
-            };
-            switch (binding.type) {
-            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
-                get_info.data.pUniformBuffer = &address_info;
-                break;
-            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
-                get_info.data.pStorageBuffer = &address_info;
-                break;
-            case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
-                get_info.data.pUniformTexelBuffer = &address_info;
-                break;
-            case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
-                get_info.data.pStorageTexelBuffer = &address_info;
-                break;
-            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-                get_info.data.pCombinedImageSampler = &entry.image;
-                break;
-            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
-                get_info.data.pStorageImage = &entry.image;
-                break;
-            default:
-                continue;
+            get_info.data.pUniformBuffer = &address_info;
+            for (u32 index = 0; index < binding.count; ++index, dst += binding.stride) {
+                const DescriptorUpdateEntry& entry = *(payload++);
+                address_info.address = entry.address.address;
+                address_info.range = entry.address.range;
+                address_info.format = entry.address.format;
+                dev.GetDescriptorEXT(get_info, binding.stride, dst);
             }
-            dev.GetDescriptorEXT(get_info, binding.stride,
-                                 host + binding.offset + index * binding.stride);
+            break;
+        }
+        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+            for (u32 index = 0; index < binding.count; ++index, dst += binding.stride) {
+                const DescriptorUpdateEntry& entry = *(payload++);
+                get_info.data.pCombinedImageSampler = &entry.image;
+                dev.GetDescriptorEXT(get_info, binding.stride, dst);
+            }
+            break;
+        default:
+            payload += binding.count;
+            break;
         }
     }
 }

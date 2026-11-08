@@ -134,7 +134,7 @@ Result KConditionVariable::SignalToAddress(KernelCore& kernel, KProcessAddress a
         }
 
         // Synchronize memory before proceeding.
-        std::atomic_thread_fence(std::memory_order_seq_cst);
+        std::atomic_thread_fence(std::memory_order_release);
 
         // Write the value to userspace.
         Result result{ResultSuccess};

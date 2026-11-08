@@ -12,9 +12,7 @@ void main() {
         return;
     }
     // The guest upscaler squares its encoded RGB before writing the linear target.
-    vec3 sampled = all(equal(textureSize(dlss_color, 0), extent))
-        ? texelFetch(dlss_color, pixel, 0).rgb
-        : textureLod(dlss_color, (vec2(pixel) + 0.5) / vec2(extent), 0).rgb;
+    vec3 sampled = textureLod(dlss_color, (vec2(pixel) + 0.5) / vec2(extent), 0).rgb;
     vec3 color = max(sampled, vec3(0.0));
     imageStore(guest_color, pixel, vec4(color * color, 1.0));
 }

@@ -366,7 +366,7 @@ const u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) const {
 bool MemoryManager::HandlePointerCacheEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_HANDLE_PTR_CACHE");
-        return value != nullptr && value[0] != '0';
+        return value == nullptr || value[0] != '0';
     }();
     return enabled;
 }

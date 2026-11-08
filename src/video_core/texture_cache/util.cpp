@@ -1123,7 +1123,7 @@ std::vector<BufferImageCopy> UnswizzleImageRects(Tegra::MemoryManager& gpu_memor
             const GPUVAddr row_addr = gpu_addr + level.offset +
                                       u64{row} * level.blocks_per_row * level.block_bytes +
                                       u64{blocks.first_block} * level.block_bytes;
-            swizzled.assign(row_bytes, 0);
+            swizzled.resize(row_bytes);
             gpu_memory.ReadBlockUnsafe(row_addr, swizzled.data(), row_bytes);
             UnswizzleTexture(output.subspan(output_offset, bytes), swizzled, 1U << bpp_log2, width,
                              texel_rows, 1, level.block_height, 0, 0,

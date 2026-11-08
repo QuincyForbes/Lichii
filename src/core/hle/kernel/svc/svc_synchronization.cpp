@@ -62,23 +62,32 @@ Result WaitSynchronization(Core::System& system, int32_t* out_index, u64 user_ha
     R_UNLESS(0 <= num_handles && num_handles <= Svc::ArgumentHandleCountMax, ResultOutOfRange);
 
     // Get the synchronization context.
-    auto& handle_table = GetCurrentProcess(system.Kernel()).GetHandleTable();
-    auto objs = GetCurrentThread(system.Kernel()).GetSynchronizationObjectBuffer();
-    auto handles = GetCurrentThread(system.Kernel()).GetHandleBuffer();
+    auto& kernel = system.Kernel();
+    KThread* const cur_thread = GetCurrentThreadPointer(kernel);
+    KProcess* const cur_process = cur_thread->GetOwnerProcess();
+    auto& handle_table = cur_process->GetHandleTable();
+    auto objs = cur_thread->GetSynchronizationObjectBuffer();
+    auto handles = cur_thread->GetHandleBuffer();
 
     // Copy user handles.
     if (num_handles > 0) {
         // Get the handles.
-        R_UNLESS(GetCurrentMemory(system.Kernel()).ReadBlock(user_handles, handles.data(), sizeof(Handle) * num_handles), ResultInvalidPointer);
+        auto& memory = cur_process->GetMemory();
+        const size_t byte_size = sizeof(Handle) * static_cast<size_t>(num_handles);
+        if (const u8* const span = memory.GetSpan(user_handles, byte_size); span != nullptr) [[likely]] {
+            std::memcpy(handles.data(), span, byte_size);
+        } else {
+            R_UNLESS(memory.ReadBlock(user_handles, handles.data(), byte_size), ResultInvalidPointer);
+        }
 
         // Convert the handles to objects.
-        R_UNLESS(handle_table.GetMultipleObjects<KSynchronizationObject>(system.Kernel(), objs.data(), handles.data(), num_handles), ResultInvalidHandle);
+        R_UNLESS(handle_table.GetMultipleObjects<KSynchronizationObject>(kernel, objs.data(), handles.data(), num_handles), ResultInvalidHandle);
     }
 
     // Ensure handles are closed when we're done.
     SCOPE_EXIT {
         for (auto i = 0; i < num_handles; ++i) {
-            objs[i]->Close(system.Kernel());
+            objs[i]->Close(kernel);
         }
     };
 

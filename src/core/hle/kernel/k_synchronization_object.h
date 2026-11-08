@@ -23,8 +23,8 @@ class KSynchronizationObject : public KAutoObjectWithList {
 
 public:
     struct ThreadListNode {
-        ThreadListNode* next{};
-        KThread* thread{};
+        ThreadListNode* next;
+        KThread* thread;
     };
 
     static Result Wait(KernelCore& kernel, s32* out_index, KSynchronizationObject** objects, const s32 num_objects, s64 timeout);

@@ -65,12 +65,34 @@ void EmitX64::EmitVoid(EmitContext&, IR::Inst*) {
 
 bool IsZeroExtendedU32Producer(const IR::Inst* inst) noexcept {
     switch (inst->GetOpcode()) {
-    case IR::Opcode::A64GetW:              // mov r32, [mem]
-    case IR::Opcode::A64ReadMemory32:      // mov r32, [mem]; the fallbacks zero-extend
-    case IR::Opcode::LeastSignificantWord: // mov r32, r32
-    case IR::Opcode::Add32:                // add/adc/lea r32
-    case IR::Opcode::Sub32:                // sub/sbb/add/lea r32
-    case IR::Opcode::ConditionalSelect32:  // cmovcc r32 always clears the upper half
+    case IR::Opcode::A64GetW:
+    case IR::Opcode::A64ReadMemory8:
+    case IR::Opcode::A64ReadMemory16:
+    case IR::Opcode::A64ReadMemory32:
+    case IR::Opcode::LeastSignificantWord:
+    case IR::Opcode::LeastSignificantHalf:
+    case IR::Opcode::LeastSignificantByte:
+    case IR::Opcode::Add32:
+    case IR::Opcode::Sub32:
+    case IR::Opcode::And32:
+    case IR::Opcode::AndNot32:
+    case IR::Opcode::Eor32:
+    case IR::Opcode::Or32:
+    case IR::Opcode::Not32:
+    case IR::Opcode::Mul32:
+    case IR::Opcode::UnsignedDiv32:
+    case IR::Opcode::LogicalShiftLeftMasked32:
+    case IR::Opcode::LogicalShiftRightMasked32:
+    case IR::Opcode::ArithmeticShiftRightMasked32:
+    case IR::Opcode::RotateRightMasked32:
+    case IR::Opcode::SignExtendByteToWord:
+    case IR::Opcode::SignExtendHalfToWord:
+    case IR::Opcode::ZeroExtendByteToWord:
+    case IR::Opcode::ZeroExtendHalfToWord:
+    case IR::Opcode::ByteReverseWord:
+    case IR::Opcode::CountLeadingZeros32:
+    case IR::Opcode::ExtractRegister32:
+    case IR::Opcode::ConditionalSelect32:
         return true;
     default:
         return false;

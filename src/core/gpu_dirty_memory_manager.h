@@ -35,7 +35,9 @@ public:
                 if (IsValid(tmp.address)) {
                     std::scoped_lock lk(guard);
                     back_buffer.emplace_back(tmp);
-                    current.exchange(t, std::memory_order_relaxed);
+                    has_back.store(true, std::memory_order_release);
+                    current.exchange(t, std::memory_order_seq_cst);
+                    NoteAnyWrites();
                     return;
                 }
                 tmp.address = t.address;
@@ -45,13 +47,39 @@ public:
                 return;
             }
             tmp.mask |= t.mask;
-        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
+        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_seq_cst,
                                                 std::memory_order_relaxed));
+        if (!IsValid(original.address)) {
+            NoteAnyWrites();
+        }
+    }
+
+    [[nodiscard]] static bool AnyWrites() {
+        return any_writes.load(std::memory_order_seq_cst) ||
+               any_gatherers.load(std::memory_order_seq_cst) != 0;
+    }
+
+    static void BeginGather() {
+        any_gatherers.fetch_add(1, std::memory_order_seq_cst);
+        any_writes.exchange(false, std::memory_order_seq_cst);
+    }
+
+    static void EndGather() {
+        any_gatherers.fetch_sub(1, std::memory_order_seq_cst);
+    }
+
+    bool MayHaveWrites() const {
+        return IsValid(current.load(std::memory_order_acquire).address) ||
+               has_back.load(std::memory_order_acquire) ||
+               has_front.load(std::memory_order_acquire);
     }
 
     /// Calls `callback` for each write collected and not yet applied, without consuming them: those
     /// still collecting and those a Gather is handing out.
     void ForEachPending(const std::function<void(PAddr, size_t)>& callback) {
+        if (!MayHaveWrites()) {
+            return;
+        }
         std::vector<TransformAddress> pending;
         {
             std::scoped_lock gather_lk(gather_guard);
@@ -74,16 +102,22 @@ public:
         std::scoped_lock gather_lk(gather_guard);
         {
             std::scoped_lock lk(guard);
-            TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
+            TransformAddress t = current.exchange(default_transform, std::memory_order_seq_cst);
             front_buffer.swap(back_buffer);
+            has_back.store(false, std::memory_order_relaxed);
             if (IsValid(t.address)) {
                 front_buffer.emplace_back(t);
             }
+            has_front.store(!front_buffer.empty(), std::memory_order_release);
         }
         for (auto& transform : front_buffer) {
             ForEachRun(transform, callback);
         }
-        front_buffer.clear();
+        {
+            std::scoped_lock lk(guard);
+            front_buffer.clear();
+            has_front.store(false, std::memory_order_release);
+        }
     }
 
     /// Returns true when collected writes not yet gathered overlap [address, address + size).
@@ -106,6 +140,11 @@ public:
             return true;
         }
         for (const TransformAddress& t : back_buffer) {
+            if (overlaps(t)) {
+                return true;
+            }
+        }
+        for (const TransformAddress& t : front_buffer) {
             if (overlaps(t)) {
                 return true;
             }
@@ -144,9 +183,18 @@ private:
     constexpr static size_t align_mask = align_size - 1;
     constexpr static TransformAddress default_transform = {.address = ~0U, .mask = 0U};
 
-    bool IsValid(PAddr address) {
+    static constexpr bool IsValid(PAddr address) {
         return address < (1ULL << 39);
     }
+
+    static void NoteAnyWrites() {
+        if (!any_writes.load(std::memory_order_seq_cst)) {
+            any_writes.store(true, std::memory_order_seq_cst);
+        }
+    }
+
+    static inline std::atomic<bool> any_writes{true};
+    static inline std::atomic<u32> any_gatherers{};
 
     template <typename T>
     T CreateMask(size_t top_bit, size_t minor_bit) {
@@ -169,6 +217,8 @@ private:
     }
 
     std::atomic<TransformAddress> current{};
+    std::atomic<bool> has_back{};
+    std::atomic<bool> has_front{};
     std::mutex guard;
     std::mutex gather_guard;
     std::vector<TransformAddress> back_buffer;

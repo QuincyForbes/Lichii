@@ -747,7 +747,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT, {},
                            {}, {}, pre_barriers);
 
-    if (blit_supported) {
+    if (blit_supported && (frame->width != extent.width || frame->height != extent.height)) {
         cmdbuf.BlitImage(*frame->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          MakeImageBlit(frame->width, frame->height, extent.width, extent.height),

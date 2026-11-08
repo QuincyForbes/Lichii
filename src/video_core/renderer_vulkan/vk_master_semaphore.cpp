@@ -64,16 +64,12 @@ void MasterSemaphore::Refresh() {
         return;
     }
 
-    u64 this_tick{};
-    u64 counter{};
-    do {
-        this_tick = gpu_tick.load(std::memory_order_acquire);
-        counter = semaphore.GetCounter();
-        if (counter < this_tick) {
-            return;
-        }
-    } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
-                                             std::memory_order_relaxed));
+    const u64 counter = semaphore.GetCounter();
+    u64 this_tick = gpu_tick.load(std::memory_order_acquire);
+    while (counter > this_tick &&
+           !gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
+                                           std::memory_order_relaxed)) {
+    }
 }
 
 void MasterSemaphore::Wait(u64 tick) {

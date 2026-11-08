@@ -284,7 +284,8 @@ public:
         return !AsyncBufferDownloads();
     }
 
-    bool InlineMemory(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer);
+    bool InlineMemory(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer,
+                      bool* pages_clean = nullptr);
 
     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size);
 
@@ -477,11 +478,12 @@ public:
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
+    std::atomic<u64> gpu_modified_serial{};
     /// The guest words of each page of native programs' indirectly read banks when last checked:
     /// unchanged pages keep their tracking (marking them CPU-modified costs two mprotect calls
     /// per page).
     struct NativeBankPage {
-        std::array<u8, Core::DEVICE_PAGESIZE> words;
+        alignas(32) std::array<u8, Core::DEVICE_PAGESIZE> words;
         /// EDEN_NX2_EXP4 & 2: the bytes of the page compared during draw `checked_draw`.
         u64 checked_draw = 0;
         u32 checked_begin = 0;

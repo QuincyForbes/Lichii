@@ -50,7 +50,7 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
 [[nodiscard]] inline bool UniformInPlaceCompareEnabled() noexcept {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_UBO_INPLACE");
-        return value != nullptr && value[0] != '0';
+        return value == nullptr || value[0] != '0';
     }();
     return enabled;
 }

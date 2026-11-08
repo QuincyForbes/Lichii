@@ -1286,7 +1286,9 @@ void EmitFPVectorMulAdd(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
 
     if constexpr (fsize != 16) {
         const bool fpcr_controlled = inst->GetArg(3).GetU1();
-        const bool needs_rounding_correction = ctx.FPCR(fpcr_controlled).FZ();
+        const bool needs_rounding_correction =
+            ctx.FPCR(fpcr_controlled).FZ() &&
+            !ctx.HasOptimization(OptimizationFlag::Unsafe_ReducedErrorFP);
         const bool needs_nan_correction = !(ctx.FPCR(fpcr_controlled).DN() || ctx.HasOptimization(OptimizationFlag::Unsafe_InaccurateNaN));
 
         if (code.HasHostFeature(HostFeature::FMA) && !needs_rounding_correction && !needs_nan_correction) {
@@ -1298,7 +1300,9 @@ void EmitFPVectorMulAdd(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
 
             MaybeStandardFPSCRValue(code, ctx, fpcr_controlled, [&] {
                 FCODE(vfmadd231p)(result, xmm_b, xmm_c);
-                ForceToDefaultNaN<fsize>(code, ctx.FPCR(fpcr_controlled), result);
+                if (!ctx.HasOptimization(OptimizationFlag::Unsafe_InaccurateNaN)) {
+                    ForceToDefaultNaN<fsize>(code, ctx.FPCR(fpcr_controlled), result);
+                }
             });
 
             ctx.reg_alloc.DefineValue(code, inst, result);

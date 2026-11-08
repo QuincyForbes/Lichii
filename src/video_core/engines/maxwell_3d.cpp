@@ -1281,17 +1281,11 @@ void Maxwell3D::FrontTrackIndexDraws(FrontState& fs, u32 method) {
 }
 
 bool Maxwell3D::FrontSkipsIndexFirst(FrontState& fs, u32 method, u32 value, bool shadow_kept) {
-    // EDEN_NX2_EXP2: index_buffer.first written with its value. On the back it only stores the
-    // register and sets Dirty::IndexBuffer (an instance loop method: no deferred draw flush, and
-    // the draw manager reads the register when it draws). The flag matters only when the index
-    // buffer binding is stale for the next register-indexed draw; that draw needs an
-    // index_buffer.count write (draw_indexed), which always sets the flag, unless the count was
-    // written before an inline or small index draw that rebound and consumed the flag (then the
-    // write is sent).
     if (method != MAXWELL3D_REG_INDEX(index_buffer.first) || !fs.skip_same || !shadow_kept ||
         fs.regs[method] != value || fs.other_index_draw) {
         return false;
     }
+    fs.draw_pending = true;
     ++fs.exp_skipped;
     return true;
 }
@@ -1333,7 +1327,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     // EXP14: an unchanged state register (6.6M of Ocarina's 11.4M macro writes a second) is
     // dropped before the checks below, as the same-value skip further down would.
     if (!execution_mask[method] && fs.regs[method] == value && shadow_kept && fs.skip_same &&
-        fs.same_experiment == 0 && fs.early_same != 0) [[likely]] {
+        fs.early_same != 0) [[likely]] {
         if (Profile::Enabled()) [[unlikely]] {
             Profile::Add(Profile::Counter::MethodWrites, 1);
             Profile::Add(Profile::Counter::SameValueWrites, 1);
@@ -2451,7 +2445,16 @@ struct Maxwell3D::OotContext {
     [[nodiscard]] bool OcclusionHle() const {
         return false;
     }
-    void FoldFirstInstance() {}
+    void FoldFirstInstance() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_FOLD_INSTANCE");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (enabled) {
+            split.Defer([maxwell3d = &engine] { maxwell3d->draw_manager.FoldFirstInstance(); },
+                        VideoCommon::GpuSplit::Effect::None);
+        }
+    }
     void Emit(u32 method, u32 value) {
         if (method >= MacroRegistersStart) [[unlikely]] {
             Fail("method past the macro range");
@@ -2467,7 +2470,34 @@ struct Maxwell3D::OotContext {
         }
     }
     void EmitRepeated(const std::array<u32, 2>* writes, u32 count, u32 times) {
-        for (u32 repeat = 0; repeat < times; ++repeat) {
+        if (times == 0) {
+            return;
+        }
+        for (u32 i = 0; i < count; ++i) {
+            Emit(writes[i][0], writes[i][1]);
+        }
+        if (times <= 1) {
+            return;
+        }
+        if (!fs.oot_log_call && fs.control != Regs::ShadowRamControl::Replay && count == 3 &&
+            writes[0][0] == MAXWELL3D_REG_INDEX(draw.begin) &&
+            ((writes[0][1] >> 26) & 3) ==
+                static_cast<u32>(Regs::Draw::InstanceId::Subsequent) &&
+            writes[1][0] == MAXWELL3D_REG_INDEX(index_buffer.count) &&
+            writes[2][0] == MAXWELL3D_REG_INDEX(draw.end)) {
+            const u32 more = times - 1;
+            split.Defer(
+                [maxwell3d = &engine, more] {
+                    maxwell3d->draw_manager.draw_state.instance_count += more;
+                },
+                VideoCommon::GpuSplit::Effect::Gpu);
+            if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::MethodWrites,
+                                             u64{count} * more);
+            }
+            return;
+        }
+        for (u32 repeat = 1; repeat < times; ++repeat) {
             for (u32 i = 0; i < count; ++i) {
                 Emit(writes[i][0], writes[i][1]);
             }

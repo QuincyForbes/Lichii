@@ -610,8 +610,10 @@ static void EmitFPMulAdd(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, bo
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
 
     if constexpr (fsize != 16) {
-        const bool needs_rounding_correction = ctx.FPCR().FZ();
-        const bool needs_nan_correction = !ctx.FPCR().DN();
+        const bool needs_rounding_correction =
+            ctx.FPCR().FZ() && !ctx.HasOptimization(OptimizationFlag::Unsafe_ReducedErrorFP);
+        const bool needs_nan_correction =
+            !(ctx.FPCR().DN() || ctx.HasOptimization(OptimizationFlag::Unsafe_InaccurateNaN));
 
         if (code.HasHostFeature(HostFeature::FMA) && !needs_rounding_correction && !needs_nan_correction) {
             const Xbyak::Xmm result = ctx.reg_alloc.UseScratchXmm(code, args[0]);
@@ -623,7 +625,7 @@ static void EmitFPMulAdd(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, bo
             } else {
                 FCODE(vfmadd231s)(result, operand2, operand3);
             }
-            if (ctx.FPCR().DN()) {
+            if (ctx.FPCR().DN() && !ctx.HasOptimization(OptimizationFlag::Unsafe_InaccurateNaN)) {
                 ForceToDefaultNaN<fsize>(code, result);
             }
 

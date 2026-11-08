@@ -646,17 +646,19 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     submitted = true;
 #ifdef EGLANTINE_STREAMLINE
-    constexpr u64 final_vertex = 0x16aff33d999f993fULL;
-    constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
-    const auto hashes = pipeline->ShaderHashes();
-    if (oot_4k_scene_frame == render_trace_frame && hashes[5] == final_fragment &&
-        std::ranges::find(hashes, final_vertex) != hashes.end()) {
-        const auto target_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
-        if (target_id) {
-            const auto& target = texture_cache.GetImageView(target_id);
-            if (target.size.width == 2560 && target.size.height == 1440 &&
-                target.format == VideoCore::Surface::PixelFormat::A8B8G8R8_SRGB) {
-                oot_4k_guest_present = target.ImageHandle();
+    if (oot_4k_scene_frame == render_trace_frame) {
+        constexpr u64 final_vertex = 0x16aff33d999f993fULL;
+        constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
+        const auto& hashes = pipeline->ShaderHashes();
+        if (hashes[5] == final_fragment &&
+            std::ranges::find(hashes, final_vertex) != hashes.end()) {
+            const auto target_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
+            if (target_id) {
+                const auto& target = texture_cache.GetImageView(target_id);
+                if (target.size.width == 2560 && target.size.height == 1440 &&
+                    target.format == VideoCore::Surface::PixelFormat::A8B8G8R8_SRGB) {
+                    oot_4k_guest_present = target.ImageHandle();
+                }
             }
         }
     }
@@ -2447,29 +2449,31 @@ void RasterizerVulkan::TrackOcarinaCamera() {
         return;
     }
 
-    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
-                                                const auto& binding, u32 bound_size,
-                                                const auto*, u32) {
-        std::array<f32, 0x230 / sizeof(f32)> camera;
-        if (stage != 0 || storage || index != 3 || bound_size < sizeof(camera) ||
-            buffer_cache.IsRegionGpuModified(binding.device_addr, sizeof(camera))) {
-            return;
-        }
-        device_memory.ReadBlockUnsafe(binding.device_addr, camera.data(), sizeof(camera));
-        constexpr size_t extent_offset = 0x120 / sizeof(f32);
-        constexpr size_t projection_wz = 0xa8 / sizeof(f32);
-        if (camera[extent_offset] != static_cast<f32>(color.size.width) ||
-            camera[extent_offset + 1] != static_cast<f32>(color.size.height) ||
-            camera[projection_wz] != -1.0f || camera[projection_wz + 1] != 0.0f) {
-            return;
-        }
-        const std::span values{camera};
-        oot_camera_sample_frame = render_trace_frame;
-        oot_motion.camera_channel = gpu_memory;
-        oot_motion.extent = {color.size.width, color.size.height};
-        std::copy_n(values.begin() + 0x30 / sizeof(f32), 16, oot_motion.current.begin());
-        std::copy_n(values.begin() + 0x180 / sizeof(f32), 16, oot_motion.previous.begin());
-    });
+    const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[3];
+    constexpr size_t camera_bytes = 0x230;
+    if (!cbuf.enabled || cbuf.size < camera_bytes) {
+        return;
+    }
+    const auto device_addr = gpu_memory->GpuToCpuAddress(cbuf.address);
+    if (!device_addr || buffer_cache.IsRegionGpuModified(*device_addr, camera_bytes)) {
+        return;
+    }
+    std::array<f32, 2> extent_check{};
+    std::array<f32, 2> proj_check{};
+    device_memory.ReadBlockUnsafe(*device_addr + 0x120, extent_check.data(), sizeof(extent_check));
+    device_memory.ReadBlockUnsafe(*device_addr + 0xa8, proj_check.data(), sizeof(proj_check));
+    if (extent_check[0] != static_cast<f32>(color.size.width) ||
+        extent_check[1] != static_cast<f32>(color.size.height) ||
+        proj_check[0] != -1.0f || proj_check[1] != 0.0f) {
+        return;
+    }
+    oot_camera_sample_frame = render_trace_frame;
+    oot_motion.camera_channel = gpu_memory;
+    oot_motion.extent = {color.size.width, color.size.height};
+    device_memory.ReadBlockUnsafe(*device_addr + 0x30, oot_motion.current.data(),
+                                  sizeof(oot_motion.current));
+    device_memory.ReadBlockUnsafe(*device_addr + 0x180, oot_motion.previous.data(),
+                                  sizeof(oot_motion.previous));
 }
 
 /// Capture the skinning pose of the recognized Link draw for frame-to-frame motion.
@@ -2497,33 +2501,28 @@ void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool 
         return;
     }
 
-    std::optional<GPUVAddr> origin_addr;
-    std::optional<GPUVAddr> bones_addr;
-    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
-                                                const auto& binding, u32 size, const auto*, u32) {
-        if (stage != 0 || storage || (index != 4 && index != 6) ||
-            buffer_cache.IsRegionGpuModified(binding.device_addr, size)) {
-            return;
-        }
-        if (index == 4 && size >= 0x40 + 3 * sizeof(f32)) {
-            origin_addr = binding.device_addr + 0x40;
-        }
-        if (index == 6 && size == 13568) {
-            bones_addr = binding.device_addr;
-        }
-    });
-    if (origin_addr && bones_addr) {
-        oot_actor_pose_index ^= 1U;
-        auto& pose = oot_actor_poses[oot_actor_pose_index];
-        pose.frame = render_trace_frame;
-        pose.channel = gpu_memory;
-        pose.vertex = stream.Address();
-        pose.indices = draw.index_buffer.IndexStart();
-        pose.base_vertex = static_cast<s32>(draw.base_index);
-        pose.origin = {};
-        device_memory.ReadBlockUnsafe(*origin_addr, pose.origin.data(), 3 * sizeof(f32));
-        device_memory.ReadBlockUnsafe(*bones_addr, pose.bones.data(), sizeof(pose.bones));
+    const auto& cbufs = maxwell3d->state.shader_stages[0].const_buffers;
+    if (!cbufs[4].enabled || cbufs[4].size < 0x40 + 3 * sizeof(f32) ||
+        !cbufs[6].enabled || cbufs[6].size != 13568) {
+        return;
     }
+    const auto origin_dev = gpu_memory->GpuToCpuAddress(cbufs[4].address);
+    const auto bones_dev = gpu_memory->GpuToCpuAddress(cbufs[6].address);
+    if (!origin_dev || !bones_dev ||
+        buffer_cache.IsRegionGpuModified(*origin_dev, cbufs[4].size) ||
+        buffer_cache.IsRegionGpuModified(*bones_dev, cbufs[6].size)) {
+        return;
+    }
+    oot_actor_pose_index ^= 1U;
+    auto& pose = oot_actor_poses[oot_actor_pose_index];
+    pose.frame = render_trace_frame;
+    pose.channel = gpu_memory;
+    pose.vertex = stream.Address();
+    pose.indices = draw.index_buffer.IndexStart();
+    pose.base_vertex = static_cast<s32>(draw.base_index);
+    pose.origin = {};
+    device_memory.ReadBlockUnsafe(*origin_dev + 0x40, pose.origin.data(), 3 * sizeof(f32));
+    device_memory.ReadBlockUnsafe(*bones_dev, pose.bones.data(), sizeof(pose.bones));
 }
 
 /// Read the shared mesh only when both poses refer to the same vertex and index buffers.
@@ -3025,22 +3024,97 @@ void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t cop
         gpu_memory->WriteBlock(address, memory.data(), copy_size);
         return;
     }
-    gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+    static const bool inline_fast = [] {
+        const char* value = std::getenv("EDEN_NX2_INLINE_FAST");
+        return value == nullptr || value[0] != '0';
+    }();
+    bool written = false;
+    if (inline_fast && copy_size != 0 &&
+        (address & Core::DEVICE_PAGEMASK) + copy_size <= Core::DEVICE_PAGESIZE &&
+        (address + copy_size <= Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) ||
+         address >= Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed))) {
+        struct MappedPage {
+            const Tegra::MemoryManager* memory{};
+            size_t id{};
+            GPUVAddr page{~GPUVAddr{0}};
+            u64 serial{};
+            bool mapped{};
+        };
+        thread_local MappedPage last{};
+        const GPUVAddr page = address & ~static_cast<GPUVAddr>(Core::DEVICE_PAGEMASK);
+        const u64 serial = gpu_memory->MapSerial();
+        if (last.memory != gpu_memory || last.id != gpu_memory->GetID() || last.page != page ||
+            last.serial != serial) {
+            last = MappedPage{
+                .memory = gpu_memory,
+                .id = gpu_memory->GetID(),
+                .page = page,
+                .serial = serial,
+                .mapped = gpu_memory->MaxContinuousRange(page, Core::DEVICE_PAGESIZE) >=
+                          Core::DEVICE_PAGESIZE,
+            };
+        }
+        if (last.mapped) {
+            if (u8* const pointer = device_memory.GetPointer<u8>(*cpu_addr)) {
+                std::memcpy(pointer, memory.data(), copy_size);
+                written = true;
+            }
+        }
+    }
+    if (!written) {
+        gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+    }
     // EDEN_NX2_INLINE_DEFER=0: invalidate every cache at once (for comparisons).
     static const bool defer = [] {
         const char* value = std::getenv("EDEN_NX2_INLINE_DEFER");
         return value == nullptr || value[0] != '0';
     }();
+    static const bool i2m_coalesce = [] {
+        const char* value = std::getenv("EDEN_NX2_I2M_COALESCE");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const bool per_page_list = [] {
+        const char* value = std::getenv("EDEN_NX2_I2M_LIST_PAGE");
+        return value == nullptr || value[0] != '0';
+    }();
     // One cache at a time: holding both while waiting for either (std::lock) waited longer, the
     // fencing thread and CPU write traps holding one of them most of the time.
-    bool uploaded;
-    {
+    bool uploaded = false;
+    struct CleanPage {
+        const void* cache{};
+        DAddr page{~DAddr{0}};
+        u64 serial{};
+    };
+    thread_local CleanPage clean{};
+    const DAddr device_page = *cpu_addr & ~static_cast<DAddr>(Core::DEVICE_PAGEMASK);
+    const bool one_page = copy_size != 0 && (*cpu_addr & Core::DEVICE_PAGEMASK) + copy_size <=
+                                                Core::DEVICE_PAGESIZE;
+    const bool known_clean =
+        i2m_coalesce && defer && one_page &&
+        clean.cache == &buffer_cache && clean.page == device_page &&
+        clean.serial == buffer_cache.gpu_modified_serial.load(std::memory_order_relaxed) &&
+        (per_page_list ? !Tegra::Nx2IsCommandListPage(device_page)
+                       : !Tegra::g_nx2_has_command_list_pages.load(std::memory_order_relaxed));
+    if (!known_clean) {
         std::scoped_lock lock{buffer_cache.mutex};
         // Guest memory has the words now: a command list copy of the page no longer does.
         buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
-        uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory);
+        bool page_clean = false;
+        uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory,
+                                             per_page_list ? &page_clean : nullptr);
         if (!uploaded && !defer) {
             buffer_cache.WriteMemory(*cpu_addr, copy_size);
+        }
+        clean.cache = nullptr;
+        if (i2m_coalesce && !uploaded && one_page &&
+            (per_page_list ? page_clean
+                           : !buffer_cache.IsRegionGpuModified(device_page,
+                                                               Core::DEVICE_PAGESIZE))) {
+            clean = CleanPage{
+                .cache = &buffer_cache,
+                .page = device_page,
+                .serial = buffer_cache.gpu_modified_serial.load(std::memory_order_relaxed),
+            };
         }
     }
     // Pending query results must not land over the new words later: drop them now.

@@ -3106,8 +3106,14 @@ public:
         void DrawDeferred(Maxwell3D& maxwell3d, bool loop_continues = false);
         /// Instances after the first wait to be drawn together (DrawDeferred).
         [[nodiscard]] bool HasDeferredDraw() const noexcept {
-            return draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0;
+            return (draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0) ||
+                   first_folded;
         }
+        void FoldFirstInstance() noexcept {
+            fold_first_instance = true;
+        }
+        bool fold_first_instance{};
+        bool first_folded{};
         /// Methods an instance loop writes between its draws; any other write ends the loop.
         [[nodiscard]] static bool IsInstanceLoopMethod(u32 method) noexcept;
         void DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances);

@@ -1216,19 +1216,32 @@ void PipelineCache::BuildCleanWatch(bool patch) {
 bool PipelineCache::CleanInputsUnchanged() const {
     const u32* const words = maxwell3d->regs.reg_array.data();
     const u32* saved = clean.snapshot.data();
-    for (const CleanLookup::Range& range : clean.ranges) {
-        if (std::memcmp(words + range.first, saved, range.count * sizeof(u32)) != 0) {
-            return false;
+    const auto ranges_equal = [words](const std::vector<CleanLookup::Range>& ranges,
+                                      const u32*& snap) {
+        for (const CleanLookup::Range& range : ranges) {
+            const u32* const reg = words + range.first;
+            if (range.count == 1) {
+                if (reg[0] != snap[0]) {
+                    return false;
+                }
+            } else if (range.count == 2) {
+                if ((reg[0] ^ snap[0]) | (reg[1] ^ snap[1])) {
+                    return false;
+                }
+            } else if (std::memcmp(reg, snap, range.count * sizeof(u32)) != 0) {
+                return false;
+            }
+            snap += range.count;
         }
-        saved += range.count;
+        return true;
+    };
+    if (!ranges_equal(clean.ranges, saved)) {
+        return false;
     }
     if (maxwell3d->regs.transform_feedback_enabled != 0) {
         saved = clean.xfb_snapshot.data();
-        for (const CleanLookup::Range& range : clean.xfb_ranges) {
-            if (std::memcmp(words + range.first, saved, range.count * sizeof(u32)) != 0) {
-                return false;
-            }
-            saved += range.count;
+        if (!ranges_equal(clean.xfb_ranges, saved)) {
+            return false;
         }
     }
     return true;

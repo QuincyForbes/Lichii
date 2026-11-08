@@ -2122,20 +2122,6 @@ Result KPageTableBase::SetMemoryAttribute(KProcessAddress addr, size_t size, KMe
     // We're going to perform an update, so create a helper.
     KScopedPageTableUpdater updater(this);
 
-    // If we need to, perform a change attribute operation.
-    if (True(mask & KMemoryAttribute::Uncached)) {
-        // Determine the new attribute.
-        const KMemoryAttribute new_attr =
-            static_cast<KMemoryAttribute>(((old_attr & ~mask) | (attr & mask)));
-
-        // Perform operation.
-        const KPageProperties properties = {old_perm, false,
-                                            True(new_attr & KMemoryAttribute::Uncached),
-                                            DisableMergeAttribute::None};
-        R_TRY(this->Operate(updater.GetPageList(), addr, num_pages, 0, false, properties,
-                            OperationType::ChangePermissionsAndRefreshAndFlush, false));
-    }
-
     // Update the blocks.
     m_memory_block_manager.UpdateAttribute(std::addressof(allocator), addr, num_pages, mask, attr);
 

@@ -661,9 +661,9 @@ struct Memory::Impl {
     }
 
     void RasterizerArmReadTraps(u64 vaddr, u64 size) {
+        read_trap_generation.fetch_add(1, std::memory_order_release);
         if (vaddr == 0 || size == 0 || !AddressSpaceContains(*current_page_table, vaddr, size) ||
             !ReadTrapsEnabled()) {
-            read_trap_generation.fetch_add(1, std::memory_order_release);
             return;
         }
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
@@ -672,6 +672,7 @@ struct Memory::Impl {
         u64 run_pages = 0;
         const auto protect_run = [&] {
             if (run_pages > 0) {
+                read_trap_generation.fetch_add(1, std::memory_order_release);
                 host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
                                      Common::MemoryPermission{});
                 run_pages = 0;
@@ -680,33 +681,31 @@ struct Memory::Impl {
         for (u64 page = vaddr >> YUZU_PAGEBITS; page != page_end; ++page) {
             const bool cached = std::as_const(current_page_table->entries)[page].Type() ==
                                 Common::PageType::RasterizerCachedMemory;
-            armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
             if (!cached || !armed_read_traps.insert(page).second) {
-                armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
                 protect_run();
                 continue;
             }
+            armed_trap_pages.Set(page);
+            armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
             if (run_pages == 0) {
                 run_begin = page;
             }
             ++run_pages;
         }
         protect_run();
-        read_trap_generation.fetch_add(1, std::memory_order_release);
     }
 
     bool ReadTrapArmed(u64 vaddr, u64 size) {
         if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
             return false;
         }
-        std::scoped_lock lk{read_trap_mutex};
-        const auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
-        return it != armed_read_traps.end() && *it <= ((vaddr + size - 1) >> YUZU_PAGEBITS);
+        return armed_trap_pages.Any(vaddr, size);
     }
 
     /// Takes read permission away again from armed pages that were just cached again.
     void ProtectArmedPages(u64 vaddr, u64 size) {
-        if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
+        if (armed_read_trap_count.load(std::memory_order_relaxed) == 0 ||
+            !armed_trap_pages.Any(vaddr, size)) {
             return;
         }
         std::scoped_lock lk{read_trap_mutex};
@@ -719,7 +718,8 @@ struct Memory::Impl {
 
     /// A slow-path read of a cached page: its trap, if any, has done its job.
     void DisarmReadTraps(u64 vaddr, size_t size) {
-        if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
+        if (armed_read_trap_count.load(std::memory_order_relaxed) == 0 ||
+            !armed_trap_pages.Any(vaddr, size)) {
             return;
         }
         std::scoped_lock lk{read_trap_mutex};
@@ -729,6 +729,7 @@ struct Memory::Impl {
             // Still cached (this read came through the rasterizer path): writes stay trapped.
             host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
                                  Common::MemoryPermission::Read);
+            armed_trap_pages.Clear(*it);
             it = armed_read_traps.erase(it);
             armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
         }
@@ -1129,9 +1130,58 @@ struct Memory::Impl {
         u64 generation{};
     };
 
+    struct ArmedTrapBitmap {
+        static constexpr u64 MaxAddressBits = 39;
+        static constexpr u64 NumPages = 1ULL << (MaxAddressBits - YUZU_PAGEBITS);
+        static constexpr u64 NumWords = NumPages / 64;
+        std::unique_ptr<std::atomic<u64>[]> words{
+            std::make_unique<std::atomic<u64>[]>(NumWords)};
+
+        bool Any(u64 vaddr, u64 size) const noexcept {
+            if (size == 0) {
+                return false;
+            }
+            const u64 first = vaddr >> YUZU_PAGEBITS;
+            const u64 last = (vaddr + size - 1) >> YUZU_PAGEBITS;
+            if (last >= NumPages) [[unlikely]] {
+                return false;
+            }
+            for (u64 page = first; page <= last;) {
+                const u64 bit = page & 63;
+                const u64 count = (std::min<u64>)(64 - bit, last - page + 1);
+                const u64 mask = (count == 64 ? ~u64{0} : (u64{1} << count) - 1) << bit;
+                if (words[page >> 6].load(std::memory_order_acquire) & mask) {
+                    return true;
+                }
+                page += count;
+            }
+            return false;
+        }
+
+        bool Set(u64 page) noexcept {
+            if (page >= NumPages) [[unlikely]] {
+                return false;
+            }
+            const u64 mask = 1ULL << (page & 63);
+            auto& word = words[page >> 6];
+            if (word.load(std::memory_order_relaxed) & mask) {
+                return false;
+            }
+            return (word.fetch_or(mask, std::memory_order_release) & mask) == 0;
+        }
+
+        void Clear(u64 page) noexcept {
+            if (page >= NumPages) [[unlikely]] {
+                return;
+            }
+            words[page >> 6].fetch_and(~(1ULL << (page & 63)), std::memory_order_release);
+        }
+    };
+
     std::array<ReadAreaCache, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_generations{};
     std::atomic<u64> read_trap_generation{};
+    ArmedTrapBitmap armed_trap_pages{};
     std::set<u64> armed_read_traps;
     std::atomic<size_t> armed_read_trap_count{};
     std::mutex read_trap_mutex;

@@ -109,10 +109,35 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
+        static const bool fast_path = [] {
+            const char* value = std::getenv("EDEN_NX2_DIRTY_FASTPATH");
+            return value == nullptr || value[0] != '0';
+        }();
+        static const bool any_flag = [] {
+            const char* value = std::getenv("EDEN_NX2_DIRTY_ANY");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (fast_path && any_flag) {
+            if (!Core::GPUDirtyMemoryManager::AnyWrites()) {
+                return;
+            }
+            Core::GPUDirtyMemoryManager::BeginGather();
+        } else if (fast_path) {
+            bool may_have_writes = false;
+            for (auto& manager : system.GetGPUDirtyMemoryManager()) {
+                may_have_writes |= manager.MayHaveWrites();
+            }
+            if (!may_have_writes) {
+                return;
+            }
+        }
         std::vector<std::pair<DAddr, u64>> writes;
         std::function<void(PAddr, size_t)> callback_writes(
             [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
         system.GatherGPUDirtyMemory(callback_writes);
+        if (fast_path && any_flag) {
+            Core::GPUDirtyMemoryManager::EndGather();
+        }
         if (!writes.empty()) {
             renderer->ReadRasterizer()->OnCacheInvalidations(writes);
         }
@@ -444,7 +469,7 @@ void GPU::InvalidateGPUCache() {
 
 bool GPU::HasPendingCPUWrites(DAddr addr, u64 size) {
     for (auto& manager : impl->system.GetGPUDirtyMemoryManager()) {
-        if (manager.Overlaps(addr, size)) {
+        if (manager.MayHaveWrites() && manager.Overlaps(addr, size)) {
             return true;
         }
     }

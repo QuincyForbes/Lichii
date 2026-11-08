@@ -278,21 +278,11 @@ void FixedPipelineState::RefreshBlending(Tegra::Engines::Maxwell3D& maxwell3d) {
 }
 
 u64 FixedPipelineState::DynamicAttributeTypes(const Maxwell& regs) noexcept {
-    static constexpr std::array LUT{
-        0u, // Invalid
-        1u, // SignedNorm
-        1u, // UnsignedNorm
-        2u, // SignedInt
-        3u, // UnsignedInt
-        1u, // UnsignedScaled
-        1u, // SignedScaled
-        1u, // Float
-    };
     const auto& attrs = regs.vertex_attrib_format;
     u64 types = 0;
     for (size_t i = 0; i < Maxwell::NumVertexAttributes; ++i) {
         const u32 mask = attrs[i].constant != 0 ? 0 : 3;
-        const u32 type = LUT[static_cast<size_t>(attrs[i].type.Value())];
+        const u32 type = (0x55dcU >> (static_cast<u32>(attrs[i].type.Value()) * 2)) & 3u;
         types |= static_cast<u64>(type & mask) << (i * 2);
     }
     return types;

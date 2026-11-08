@@ -22,11 +22,12 @@ public:
     explicit KAbstractSchedulerLock(KernelCore& kernel) : m_kernel{kernel} {}
 
     bool IsLockedByCurrentThread() const {
-        return m_owner_thread == GetCurrentThreadPointer(m_kernel);
+        return m_owner_thread.load(std::memory_order_relaxed) == GetCurrentThreadPointer(m_kernel);
     }
 
     void Lock() {
-        if (this->IsLockedByCurrentThread()) {
+        KThread* const cur_thread = GetCurrentThreadPointer(m_kernel);
+        if (m_owner_thread.load(std::memory_order_relaxed) == cur_thread) {
             // If we already own the lock, the lock count should be > 0.
             // For debug, ensure this is true.
             ASSERT(m_lock_count > 0);
@@ -39,7 +40,7 @@ public:
             ASSERT(m_owner_thread == nullptr);
 
             // Take ownership of the lock.
-            m_owner_thread = GetCurrentThreadPointer(m_kernel);
+            m_owner_thread.store(cur_thread, std::memory_order_relaxed);
         }
 
         // Increment the lock count.
@@ -60,7 +61,7 @@ public:
                 SchedulerType::UpdateHighestPriorityThreads(m_kernel);
 
             // Note that we no longer hold the lock, and unlock the spinlock.
-            m_owner_thread = nullptr;
+            m_owner_thread.store(nullptr, std::memory_order_relaxed);
             m_spin_lock.Unlock();
 
             // Enable scheduling, and perform a rescheduling operation.

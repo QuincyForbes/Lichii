@@ -28,8 +28,7 @@ layout(std140, binding = 2, row_major) uniform Transforms {
 } transforms;
 
 void blend_joint(vec4 local, uint joint, float weight, inout vec3 current, inout vec3 previous) {
-    if (weight != 0 && joint < uint(current_pose.bones.length()) &&
-        joint < uint(previous_pose.bones.length())) {
+    if (weight != 0 && joint < 280u) {
         current += (current_pose.bones[joint] * local) * weight;
         previous += (previous_pose.bones[joint] * local) * weight;
     }
@@ -43,8 +42,10 @@ void main() {
         blend_joint(local, joints[i], weights[i], current, previous);
     }
 #ifdef OCARINA_EIGHT_WEIGHTS
-    for (int i = 0; i < 4; ++i) {
-        blend_joint(local, extra_joints[i], extra_weights[i], current, previous);
+    if (any(notEqual(extra_weights, vec4(0.0)))) {
+        for (int i = 0; i < 4; ++i) {
+            blend_joint(local, extra_joints[i], extra_weights[i], current, previous);
+        }
     }
 #endif
     gl_Position = transforms.current_view_projection * vec4(current + transforms.current_origin.xyz, 1);

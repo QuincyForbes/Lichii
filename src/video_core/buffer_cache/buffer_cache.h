@@ -192,6 +192,15 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
         const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
         if (!gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
             if (!Nx2Perf::Verify()) {
+                static const bool dirty_write_skip = [] {
+                    const char* value = std::getenv("EDEN_NX2_DIRTY_WRITE_SKIP");
+                    return value == nullptr || value[0] != '0';
+                }();
+                if (dirty_write_skip &&
+                    memory_tracker.IsRegionFullyCpuModified(device_addr, size)) {
+                    MarkVertexBuffersStale(device_addr, size);
+                    return;
+                }
                 memory_tracker.MarkRegionAsCpuModified(device_addr, size);
                 MarkVertexBuffersStale(device_addr, size);
                 return;
@@ -559,6 +568,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     const bool has_new_downloads = tmp_intervals.size() != 0;
     for (const auto& pair : tmp_intervals) {
         gpu_modified_ranges.Add(pair.first, pair.second);
+        gpu_modified_serial.fetch_add(1, std::memory_order_relaxed);
         if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
             Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
             Nx2NoteListWrite(buffer_b, pair.first, pair.second);
@@ -1924,7 +1934,32 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             continue;
         }
         ++stats.compared[reason];
-        if (std::memcmp(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE) == 0) {
+        const u8* const snap = snapshot.words.data();
+        bool same = true;
+#if defined(_M_X64) || defined(__x86_64__)
+        for (size_t off = 0; off < Core::DEVICE_PAGESIZE; off += 128) {
+            const __m256i d0 = _mm256_xor_si256(
+                _mm256_load_si256(reinterpret_cast<const __m256i*>(snap + off)),
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(guest + off)));
+            const __m256i d1 = _mm256_xor_si256(
+                _mm256_load_si256(reinterpret_cast<const __m256i*>(snap + off + 32)),
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(guest + off + 32)));
+            const __m256i d2 = _mm256_xor_si256(
+                _mm256_load_si256(reinterpret_cast<const __m256i*>(snap + off + 64)),
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(guest + off + 64)));
+            const __m256i d3 = _mm256_xor_si256(
+                _mm256_load_si256(reinterpret_cast<const __m256i*>(snap + off + 96)),
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(guest + off + 96)));
+            const __m256i acc = _mm256_or_si256(_mm256_or_si256(d0, d1), _mm256_or_si256(d2, d3));
+            if (!_mm256_testz_si256(acc, acc)) {
+                same = false;
+                break;
+            }
+        }
+#else
+        same = std::memcmp(snap, guest, Core::DEVICE_PAGESIZE) == 0;
+#endif
+        if (same) {
             continue;
         }
         ++stats.changed[reason];
@@ -2490,6 +2525,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
+    gpu_modified_serial.fetch_add(1, std::memory_order_relaxed);
     QueueFenceDownload(device_addr, size);
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
         Tegra::Nx2MarkGpuWritten(device_addr, size);
@@ -2961,6 +2997,13 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
                       device_addr, size);
         }
     }
+    static const bool sync_precheck = [] {
+        const char* value = std::getenv("EDEN_NX2_SYNC_PRECHECK");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (sync_precheck && skip_clean && !memory_tracker.IsRegionUploadDirty(device_addr, size)) {
+        return true;
+    }
     const auto for_each_upload_range = [&](auto&& func) {
         if (skip_clean) {
             memory_tracker.ForEachDirtyUploadRange(device_addr, size, func);
@@ -3108,14 +3151,18 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
 
 template <class P>
 bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
-                                  std::span<const u8> inlined_buffer) {
-    const bool is_dirty = IsRegionRegistered(dest_address, copy_size);
-    if (!is_dirty) {
-        return false;
-    }
+                                  std::span<const u8> inlined_buffer, bool* pages_clean) {
     DAddr aligned_start = Common::AlignDown(dest_address, DEVICE_PAGESIZE);
     DAddr aligned_end = Common::AlignUp(dest_address + copy_size, DEVICE_PAGESIZE);
-    if (!IsRegionGpuModified(aligned_start, aligned_end - aligned_start)) {
+    const bool clean = !IsRegionGpuModified(aligned_start, aligned_end - aligned_start);
+    if (pages_clean != nullptr) {
+        *pages_clean = clean;
+    }
+    if (clean) {
+        return false;
+    }
+    const bool is_dirty = IsRegionRegistered(dest_address, copy_size);
+    if (!is_dirty) {
         return false;
     }
 

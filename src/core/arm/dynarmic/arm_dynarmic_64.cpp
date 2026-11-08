@@ -386,6 +386,15 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // Timing
     config.wall_clock_cntpct = m_uses_wall_clock;
     config.enable_cycle_counting = !m_uses_wall_clock;
+#if defined(ARCHITECTURE_x86_64)
+    if (m_uses_wall_clock && Common::g_wall_clock.IsNative() &&
+        Settings::values.cpu_clock.GetValue() == Settings::CpuClock::Normal &&
+        !Settings::values.sync_core_speed.GetValue() &&
+        Nx2EnvOn("EDEN_NX2_INLINE_CNTPCT")) {
+        config.inline_cntpct_tsc_factor =
+            Common::g_wall_clock.cntpct_rdtsc_factor.load(std::memory_order_relaxed);
+    }
+#endif
 
     // Code cache size
 #if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
@@ -459,6 +468,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         if (Settings::values.cpuopt_unsafe_reduce_fp_error) {
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
         }
+        if (Settings::values.cpuopt_unsafe_ignore_standard_fpcr) {
+            config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
+        }
         if (Settings::values.cpuopt_unsafe_inaccurate_nan) {
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
         }
@@ -473,6 +485,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     case Settings::CpuAccuracy::Auto:
         config.unsafe_optimizations = true;
         config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
+        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
+        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
+        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
         config.fastmem_address_space_bits = 64;
         config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
         break;

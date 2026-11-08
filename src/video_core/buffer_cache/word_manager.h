@@ -375,6 +375,62 @@ struct WordManager {
         return mask & ~clean_words;
     }
 
+    /// IsRegionModified(Type::GPU, ...) for the bytes [first, last] of one word.
+    [[nodiscard]] bool IsWordRangeGpuModified(u64 first, u64 last) const noexcept {
+        const size_t word = first / BYTES_PER_WORD;
+        const u64 first_page = (first % BYTES_PER_WORD) / BYTES_PER_PAGE;
+        const u64 last_page = (last % BYTES_PER_WORD) / BYTES_PER_PAGE;
+        const u64 mask = (~u64{0} >> (63 - (last_page - first_page))) << first_page;
+        return (heap[num_words * size_t(Type::GPU) + word] &
+                ~heap[num_words * size_t(Type::Untracked) + word] & mask) != 0;
+    }
+
+    /// Whether a page of [offset, offset + size) is CPU-dirty or unprotected (what an upload walk
+    /// finds or changes). Clean words are skipped through clean_words.
+    [[nodiscard]] bool IsRangeUploadDirty(u64 offset, u64 size) const noexcept {
+        if (size == 0) {
+            return false;
+        }
+        const u64 end = offset + size;
+        u64 dirty = DirtyWords(offset / BYTES_PER_WORD, (end - 1) / BYTES_PER_WORD);
+        while (dirty != 0) {
+            const size_t word = static_cast<size_t>(std::countr_zero(dirty));
+            dirty &= dirty - 1;
+            const u64 word_begin = word * BYTES_PER_WORD;
+            const u64 begin = (std::max)(offset, word_begin) - word_begin;
+            const u64 stop = (std::min)(end, word_begin + BYTES_PER_WORD) - word_begin;
+            const u64 first_page = begin / BYTES_PER_PAGE;
+            const u64 last_page = (stop - 1) / BYTES_PER_PAGE;
+            const u64 mask = (~u64{0} >> (63 - (last_page - first_page))) << first_page;
+            if (((heap[num_words * size_t(Type::CPU) + word] |
+                  heap[num_words * size_t(Type::Untracked) + word]) & mask) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Whether every page of [offset, offset + size) is CPU-dirty (marking it again changes no
+    /// tracker state). False for an empty range.
+    [[nodiscard]] bool IsRangeFullyCpuModified(u64 offset, u64 size) const noexcept {
+        if (size == 0) {
+            return false;
+        }
+        const u64 end = offset + size;
+        for (u64 word = offset / BYTES_PER_WORD; word <= (end - 1) / BYTES_PER_WORD; ++word) {
+            const u64 word_begin = word * BYTES_PER_WORD;
+            const u64 begin = (std::max)(offset, word_begin) - word_begin;
+            const u64 stop = (std::min)(end, word_begin + BYTES_PER_WORD) - word_begin;
+            const u64 first_page = begin / BYTES_PER_PAGE;
+            const u64 last_page = (stop - 1) / BYTES_PER_PAGE;
+            const u64 mask = (~u64{0} >> (63 - (last_page - first_page))) << first_page;
+            if ((heap[num_words * size_t(Type::CPU) + word] & mask) != mask) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /// Recounts the clean words: true when clean_words matches the CPU and Untracked words.
     [[nodiscard]] bool CleanWordsHold() const noexcept {
         const std::span<const u64> cpu_words = Span(Type::CPU);
