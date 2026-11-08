@@ -22,6 +22,10 @@ namespace Tegra {
 class MemoryManager;
 }
 
+namespace VideoCommon {
+class GpuSplit;
+}
+
 namespace VideoCore {
 class RasterizerInterface;
 }
@@ -51,6 +55,9 @@ public:
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 
+    void FrontMethod(VideoCommon::GpuSplit& split, u32 method, const u32* words, u32 count,
+                     bool non_incrementing);
+
     struct Regs {
         static constexpr size_t NUM_REGS = 0x7F;
 
@@ -76,7 +83,13 @@ public:
 
 private:
     void ConsumeSinkImpl(Core::System& system) override;
+    MemoryManager& memory_manager;
     Upload::State upload_state;
+    std::array<u32, Regs::NUM_REGS> front_regs{};
+    bool front_upload_known{};
+    u64 front_upload_device{};
+    u32 front_upload_size{};
+    u32 front_upload_offset{};
 };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

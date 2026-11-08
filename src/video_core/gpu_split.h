@@ -504,25 +504,42 @@ public:
         }
         return NotedWriteSince(since, begin, size);
     }
+    [[nodiscard]] u64 PendingWriteCount() const noexcept {
+        return pending_write_count;
+    }
     /// The noted-write part of MayBeWrittenSince: a NoteMemoryWrite sent after `since` overlaps
     /// [begin, begin + size), or more were noted since than are remembered.
-    [[nodiscard]] bool NotedWriteSince(u64 since, u64 begin, u64 size) const {
+    [[nodiscard]] bool NotedWriteSince(u64 since, u64 begin, u64 size,
+                                       u64* checked_writes = nullptr) const {
         if (last_memory_writer_position <= since) {
+            if (checked_writes != nullptr) {
+                *checked_writes = pending_write_count;
+            }
             return false;
         }
+        const u64 from = checked_writes != nullptr ? *checked_writes : 0;
+        if (pending_write_count <= from) {
+            return false;
+        }
+        const u64 to_scan = pending_write_count - from;
+        if (to_scan > pending_writes.size()) {
+            return true;
+        }
         const u64 end = begin + size;
-        const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
-        for (u64 scanned = 0; scanned < remembered; ++scanned) {
+        for (u64 scanned = 0; scanned < to_scan; ++scanned) {
             const PendingWrite& write =
                 pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
             if (write.position <= since) {
-                return false;
+                break;
             }
             if (write.begin < end && begin < write.end) {
                 return true;
             }
         }
-        return remembered == pending_writes.size();
+        if (checked_writes != nullptr) {
+            *checked_writes = pending_write_count;
+        }
+        return false;
     }
     /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
     /// report, a semaphore release). size ~0 means an unknown range.

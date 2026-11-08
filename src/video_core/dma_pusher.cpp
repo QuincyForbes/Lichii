@@ -30,6 +30,7 @@
 #include "video_core/command_fetch_order.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/engines/kepler_memory.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
@@ -664,6 +665,15 @@ void DmaPusher::CallMethod(u32 argument) {
             return;
         }
         const auto engine_type = subchannel_type[dma_state.subchannel];
+        if (engine_type == Engines::EngineTypes::Maxwell3D && split.Active() &&
+            split.FrontMacros()) [[likely]] {
+            auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
+            if (maxwell3d->GetNativeMacroEngine().native_turing) {
+                maxwell3d->FrontCallMethod(system, split, dma_state.method, argument,
+                                           dma_state.is_last_call);
+                return;
+            }
+        }
         const bool writer = split.Active() &&
                             WritesMemory(subchannel, engine_type, dma_state.method, 1);
         // Copies and blits are GPU work for the front's reads (GpuSplit::Effect).
@@ -672,8 +682,9 @@ void DmaPusher::CallMethod(u32 argument) {
                                 ? VideoCommon::GpuSplit::Effect::Gpu
                                 : VideoCommon::GpuSplit::Effect::Unknown;
         const bool memory_writer = split.Active() &&
-                                   (engine_type == Engines::EngineTypes::KeplerMemory ||
-                                    engine_type == Engines::EngineTypes::Fermi2D);
+                                   engine_type == Engines::EngineTypes::Fermi2D &&
+                                   dma_state.method < subchannel->execution_mask.size() &&
+                                   subchannel->execution_mask[dma_state.method];
         // Whether the engine's front noted what the work sent writes (GpuSplit::NoteWriter).
         bool classified = false;
         SCOPE_EXIT {
@@ -687,14 +698,7 @@ void DmaPusher::CallMethod(u32 argument) {
             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
             if (split.FrontMacros()) {
                 const auto type = subchannel_type[dma_state.subchannel];
-                if (type == Engines::EngineTypes::Maxwell3D) {
-                    auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
-                    if (maxwell3d->GetNativeMacroEngine().native_turing) {
-                        maxwell3d->FrontCallMethod(system, split, dma_state.method, argument,
-                                                   dma_state.is_last_call);
-                        return;
-                    }
-                } else if (type == Engines::EngineTypes::KeplerCompute) {
+                if (type == Engines::EngineTypes::KeplerCompute) {
                     auto* const compute = static_cast<Engines::KeplerCompute*>(subchannel);
                     if (compute->FrontRunsMacros()) {
                         compute->FrontCallMethod(system, split, dma_state.method, argument,
@@ -710,6 +714,9 @@ void DmaPusher::CallMethod(u32 argument) {
                 static_cast<Engines::MaxwellDMA*>(subchannel)->FrontMethod(
                     split, dma_state.method, &argument, 1);
                 classified = true;
+            } else if (engine_type == Engines::EngineTypes::KeplerMemory) {
+                static_cast<Engines::KeplerMemory*>(subchannel)->FrontMethod(
+                    split, dma_state.method, &argument, 1, false);
             }
             return;
         }
@@ -740,6 +747,15 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             return;
         }
         const auto engine_type = subchannel_type[dma_state.subchannel];
+        if (engine_type == Engines::EngineTypes::Maxwell3D && split.Active() &&
+            split.FrontMacros()) [[likely]] {
+            auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
+            if (maxwell3d->GetNativeMacroEngine().native_turing) {
+                maxwell3d->FrontCallMultiMethod(system, split, dma_state.method, base_start,
+                                                num_methods, dma_state.method_count);
+                return;
+            }
+        }
         const bool writer = split.Active() &&
                             WritesMemory(subchannel, engine_type, dma_state.method,
                                          dma_state.non_incrementing ? 1 : num_methods);
@@ -748,9 +764,17 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                                     engine_type == Engines::EngineTypes::Fermi2D
                                 ? VideoCommon::GpuSplit::Effect::Gpu
                                 : VideoCommon::GpuSplit::Effect::Unknown;
-        const bool memory_writer = split.Active() &&
-                                   (engine_type == Engines::EngineTypes::KeplerMemory ||
-                                    engine_type == Engines::EngineTypes::Fermi2D);
+        bool memory_writer = false;
+        if (split.Active() && engine_type == Engines::EngineTypes::Fermi2D) {
+            const u32 count = dma_state.non_incrementing ? 1 : num_methods;
+            for (u32 i = 0; i < count; ++i) {
+                const u32 m = dma_state.method + i;
+                if (m < subchannel->execution_mask.size() && subchannel->execution_mask[m]) {
+                    memory_writer = true;
+                    break;
+                }
+            }
+        }
         // Whether the engine's front noted what the work sent writes (GpuSplit::NoteWriter).
         bool classified = false;
         SCOPE_EXIT {
@@ -764,14 +788,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
             if (split.FrontMacros()) {
                 const auto type = subchannel_type[dma_state.subchannel];
-                if (type == Engines::EngineTypes::Maxwell3D) {
-                    auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
-                    if (maxwell3d->GetNativeMacroEngine().native_turing) {
-                        maxwell3d->FrontCallMultiMethod(system, split, dma_state.method, base_start,
-                                                        num_methods, dma_state.method_count);
-                        return;
-                    }
-                } else if (type == Engines::EngineTypes::KeplerCompute) {
+                if (type == Engines::EngineTypes::KeplerCompute) {
                     auto* const compute = static_cast<Engines::KeplerCompute*>(subchannel);
                     if (compute->FrontRunsMacros()) {
                         compute->FrontCallMultiMethod(system, split, dma_state.method, base_start,
@@ -787,6 +804,9 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                 static_cast<Engines::MaxwellDMA*>(subchannel)->FrontMethod(
                     split, dma_state.method, base_start, num_methods);
                 classified = true;
+            } else if (engine_type == Engines::EngineTypes::KeplerMemory) {
+                static_cast<Engines::KeplerMemory*>(subchannel)->FrontMethod(
+                    split, dma_state.method, base_start, num_methods, dma_state.non_incrementing);
             }
             return;
         }

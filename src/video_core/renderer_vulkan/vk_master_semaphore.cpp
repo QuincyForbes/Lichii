@@ -193,6 +193,7 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
             .signalSemaphoreInfoCount = num_signal_semaphores,
             .pSignalSemaphoreInfos = signal_infos.data(),
         };
+        Refresh();
         return device.GetGraphicsQueue().Submit2(submit_info2);
     }
 

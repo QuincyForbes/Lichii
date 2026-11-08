@@ -154,7 +154,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
     /// The most device memory the collector lets the cache fill before it collects in earnest,
     /// on every GPU (ApplyThresholdOverrides).
-    static constexpr u64 MaxCriticalMemory = 5_GiB;
+    static constexpr u64 MaxCriticalMemory = 24_GiB;
     static constexpr size_t GC_EMERGENCY_COUNTS = 2;
 
     using Runtime = typename P::Runtime;
@@ -263,6 +263,10 @@ public:
 
     /// Refresh the state for graphics/compute image view and sampler descriptors
     void SynchronizeDescriptors(bool compute);
+
+    [[nodiscard]] u64 BindingsEpoch() const noexcept {
+        return bindings_epoch;
+    }
 
     /// Updates the Render Targets if they can be rescaled
     /// @retval True if the Render Targets have been rescaled.
@@ -445,6 +449,11 @@ private:
 
     /// Find or create a view for a render target with the given image parameters
     [[nodiscard]] ImageViewId FindRenderTargetView(const ImageInfo& info, GPUVAddr gpu_addr);
+    using RenderTargetLookupKey = std::array<u32, 12>;
+    [[nodiscard]] ImageViewId FindRenderTargetViewMemo(const RenderTargetLookupKey& key,
+                                                       const ImageInfo& info, GPUVAddr gpu_addr);
+    [[nodiscard]] bool RenderTargetsStillPrepared() const;
+    void NoteRenderTargetsPrepared();
 
     /// Iterates over all the images in a region calling func
     template <typename Func>
@@ -539,10 +548,30 @@ private:
 
     RenderTargets render_targets;
     u64 render_targets_serial = 0;
+    struct RenderTargetLookupMemo {
+        RenderTargetLookupKey key{};
+        u64 epoch = 0;
+        u64 frame_bumps = 0;
+        const void* channel{};
+        const void* memory{};
+        ImageViewId view{};
+    };
+    u64 frame_epoch_bumps = 0;
+    std::array<RenderTargetLookupMemo, 32> rt_lookup_memos{};
+    u32 find_image_matches = 0;
+    struct RenderTargetsPrepared {
+        bool valid = false;
+        u64 serial = 0;
+        u64 modification_tick = 0;
+        u64 frame_tick = 0;
+        u64 bindings_epoch = 0;
+        std::array<ImageViewId, NUM_RT + 1> views{};
+    } rt_prepared;
     u32 rt_active_mask = 0;
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};
     u64 texture_bindings_serial = 0;
+    u64 bindings_epoch = 1;
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;

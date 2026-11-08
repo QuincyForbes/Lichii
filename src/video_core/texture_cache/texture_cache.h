@@ -433,8 +433,7 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     critical_memory = (std::min)(critical_memory, MaxCriticalMemory);
     expected_memory =
         (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
-    minimum_memory =
-        (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
+    minimum_memory = expected_memory - (std::min)(expected_memory, u64{1_GiB});
     // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB override the collector's thresholds.
     for (const auto& [name, target] : {std::pair{"EDEN_NX2_TC_EXPECTED_MIB", &expected_memory},
                                        std::pair{"EDEN_NX2_TC_CRITICAL_MIB", &critical_memory}}) {
@@ -519,14 +518,13 @@ void TextureCache<P>::TickFrame() {
                     critical_memory =
                         budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
-                    // Log the first values and real changes (the budget moves by a few MiB all
-                    // the time).
+                    ApplyThresholdOverrides(false);
                     const u64 change = critical_memory > old_critical
                                            ? critical_memory - old_critical
                                            : old_critical - critical_memory;
                     const bool log = budget_check_frames == 1 || change >= 256_MiB;
-                    ApplyThresholdOverrides(log);
                     if (log) {
+                        ApplyThresholdOverrides(true);
                         LOG_INFO(HW_GPU,
                                  "Memory margins: base {} MiB, out of memory {} MiB, block slack {} MiB",
                                  margin >> 20, pressure_margin >> 20, slack_margin >> 20);
@@ -665,6 +663,8 @@ void TextureCache<P>::TickFrame() {
 
     runtime.TickFrame();
     ++frame_tick;
+    ++bindings_epoch;
+    ++frame_epoch_bumps;
 
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
         for (auto& buffer : async_buffers_death_ring) {
@@ -868,6 +868,7 @@ void TextureCache<P>::SynchronizeDescriptors(bool compute) {
             bindings_changed = true;
         if (bindings_changed) {
             ++texture_bindings_serial;
+            ++bindings_epoch;
         }
     } else {
         const bool linked_tsc = maxwell3d->regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding;
@@ -880,6 +881,7 @@ void TextureCache<P>::SynchronizeDescriptors(bool compute) {
             bindings_changed = true;
         if (bindings_changed) {
             ++texture_bindings_serial;
+            ++bindings_epoch;
         }
     }
 }
@@ -992,14 +994,23 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     clearing_render_targets = is_clear;
     auto& flags = maxwell3d->dirty.flags;
     if (!flags[Dirty::RenderTargets]) {
+        if (!is_clear && RenderTargetsStillPrepared()) {
+            return;
+        }
         for (size_t index = 0; index < NUM_RT; ++index) {
             ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
             PrepareImageView(color_buffer_id, true, is_clear && IsFullClear(color_buffer_id));
         }
         const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
         PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
+        if (is_clear) {
+            rt_prepared.valid = false;
+        } else {
+            NoteRenderTargetsPrepared();
+        }
         return;
     }
+    rt_prepared.valid = false;
 
     const VideoCommon::RenderTargets previous_render_targets = render_targets;
     const bool rescaled = RescaleRenderTargets();
@@ -1052,6 +1063,56 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     }
 
     flags[Dirty::DepthBiasGlobal] = true;
+}
+
+template <class P>
+bool TextureCache<P>::RenderTargetsStillPrepared() const {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_RT_FAST");
+        return value == nullptr || value[0] != '0';
+    }();
+    const auto& prepared = rt_prepared;
+    if (!enabled || !prepared.valid || prepared.serial != render_targets_serial ||
+        prepared.modification_tick != modification_tick || prepared.frame_tick != frame_tick ||
+        prepared.bindings_epoch != bindings_epoch) {
+        return false;
+    }
+    for (size_t index = 0; index <= NUM_RT; ++index) {
+        const ImageViewId id =
+            index < NUM_RT ? render_targets.color_buffer_ids[index] : render_targets.depth_buffer_id;
+        if (id != prepared.views[index]) {
+            return false;
+        }
+        if (!id) {
+            continue;
+        }
+        const ImageViewBase& image_view = slot_image_views[id];
+        if (image_view.IsBuffer()) {
+            continue;
+        }
+        const ImageBase& image = slot_images[image_view.image_id];
+        if (False(image.flags & ImageFlagBits::GpuModified) ||
+            True(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::SparseTiles |
+                                ImageFlagBits::SparseLayers | ImageFlagBits::UnwrittenSparse)) ||
+            !image.aliased_images.empty()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <class P>
+void TextureCache<P>::NoteRenderTargetsPrepared() {
+    auto& prepared = rt_prepared;
+    prepared.valid = true;
+    prepared.serial = render_targets_serial;
+    prepared.modification_tick = modification_tick;
+    prepared.frame_tick = frame_tick;
+    prepared.bindings_epoch = bindings_epoch;
+    for (size_t index = 0; index < NUM_RT; ++index) {
+        prepared.views[index] = render_targets.color_buffer_ids[index];
+    }
+    prepared.views[NUM_RT] = render_targets.depth_buffer_id;
 }
 
 template <class P>
@@ -1134,6 +1195,7 @@ template <class P>
 void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
     ClearStale(cpu_addr, size);
     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
+        ++bindings_epoch;
         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
             // Written at last: a backed image replaces it where it is used next.
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
@@ -1277,6 +1339,7 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
                             [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
+        ++bindings_epoch;
         if (False(image.flags & ImageFlagBits::CpuModified)) {
             image.flags |= ImageFlagBits::CpuModified;
             if (True(image.flags & ImageFlagBits::Tracked)) {
@@ -2398,6 +2461,7 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     }
     const TICEntry config = TextureViewHeader(raw_config, native);
     const ImageInfo info(config);
+    ++bindings_epoch;
     if (info.type == ImageType::Buffer) {
         const ImageViewInfo view_info(config, 0);
         return slot_image_views.insert(runtime, info, view_info, config.Address());
@@ -2431,6 +2495,7 @@ ImageId TextureCache<P>::FindOrInsertImage(const ImageInfo& info, GPUVAddr gpu_a
 template <class P>
 ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                    RelaxedOptions options) {
+    find_image_matches = 0;
     const std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
     if (!cpu_addr) {
         return ImageId{};
@@ -2467,6 +2532,7 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
         return false;
     };
     ForEachImageInRegion(*cpu_addr, CalculateGuestSizeInBytes(info), lambda);
+    find_image_matches = static_cast<u32>(image_ids.size());
     if (image_ids.size() <= 1) [[likely]] {
         return image_id;
     }
@@ -2507,6 +2573,7 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
 
 template <class P>
 void TextureCache<P>::InvalidateScale(Image& image) {
+    ++bindings_epoch;
     if (image.scale_tick <= frame_tick) {
         image.scale_tick = frame_tick + 1;
     }
@@ -2954,6 +3021,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
     Image& new_image = slot_images[new_image_id];
+    ++bindings_epoch;
 
     new_image.allocation_tick = frame_tick;
     {
@@ -3419,7 +3487,13 @@ ImageViewId TextureCache<P>::FindColorBuffer(size_t index) {
         return ImageViewId{};
     }
     const ImageInfo info(regs.rt[index], regs.anti_alias_samples_mode);
-    return FindRenderTargetView(info, gpu_addr);
+    static constexpr size_t RtWords = 10;
+    static_assert(sizeof(rt) >= RtWords * sizeof(u32));
+    RenderTargetLookupKey key{};
+    key[0] = static_cast<u32>(index) + 1;
+    std::memcpy(&key[1], &rt, RtWords * sizeof(u32));
+    key[1 + RtWords] = static_cast<u32>(regs.anti_alias_samples_mode);
+    return FindRenderTargetViewMemo(key, info, gpu_addr);
 }
 
 template <class P>
@@ -3433,7 +3507,46 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
         return ImageViewId{};
     }
     const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
-    return FindRenderTargetView(info, gpu_addr);
+    static_assert(sizeof(regs.zeta) == 5 * sizeof(u32) && sizeof(regs.zeta_size) == 3 * sizeof(u32));
+    RenderTargetLookupKey key{};
+    key[0] = 0x100;
+    std::memcpy(&key[1], &regs.zeta, sizeof(regs.zeta));
+    std::memcpy(&key[6], &regs.zeta_size, sizeof(regs.zeta_size));
+    key[9] = static_cast<u32>(regs.anti_alias_samples_mode);
+    return FindRenderTargetViewMemo(key, info, gpu_addr);
+}
+
+template <class P>
+ImageViewId TextureCache<P>::FindRenderTargetViewMemo(const RenderTargetLookupKey& key,
+                                                      const ImageInfo& info, GPUVAddr gpu_addr) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_RT_LOOKUP_MEMO");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled || info.type == ImageType::Linear) {
+        return FindRenderTargetView(info, gpu_addr);
+    }
+    u64 hash = 0xcbf29ce484222325ULL;
+    for (const u32 word : key) {
+        hash = (hash ^ word) * 0x100000001b3ULL;
+    }
+    RenderTargetLookupMemo& memo = rt_lookup_memos[(hash ^ (hash >> 29)) % rt_lookup_memos.size()];
+    if (memo.epoch != 0 && memo.channel == channel_state && memo.memory == gpu_memory &&
+        bindings_epoch - memo.epoch == frame_epoch_bumps - memo.frame_bumps && memo.key == key) {
+        return memo.view;
+    }
+    const u64 epoch = bindings_epoch;
+    find_image_matches = 0;
+    const ImageViewId view = FindRenderTargetView(info, gpu_addr);
+    if (bindings_epoch == epoch && find_image_matches == 1 && view && view != NULL_IMAGE_VIEW_ID) {
+        memo.key = key;
+        memo.epoch = epoch;
+        memo.frame_bumps = frame_epoch_bumps;
+        memo.channel = channel_state;
+        memo.memory = gpu_memory;
+        memo.view = view;
+    }
+    return view;
 }
 
 template <class P>
@@ -3677,6 +3790,7 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
     }
     const ImageViewId image_view_id = slot_image_views.insert(runtime, info, image_id, image, slot_images);
     image.InsertView(info, image_view_id);
+    ++bindings_epoch;
     return image_view_id;
 }
 
@@ -3852,6 +3966,7 @@ template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
+    ++bindings_epoch;
     MarkStale(image);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
@@ -3965,6 +4080,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
 
 template <class P>
 void TextureCache<P>::RemoveImageViewReferences(std::span<const ImageViewId> removed_views) {
+    ++bindings_epoch;
     for (const ImageViewId removed : removed_views) {
         const auto refs = image_view_descriptors.find(removed);
         if (refs == image_view_descriptors.end()) {
@@ -4112,6 +4228,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
                         image.gpu_addr);
             Tegra::Nx2SparseMarkWritten(image.gpu_addr, image.guest_size_bytes);
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
+            ++bindings_epoch;
         }
         MarkModification(image);
     }

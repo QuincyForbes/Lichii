@@ -471,7 +471,14 @@ u64 BufferCacheRuntime::CurrentTick() {
 }
 
 bool BufferCacheRuntime::IsFree(u64 tick) {
-    return scheduler.IsFree(tick);
+    if (scheduler.IsFree(tick)) {
+        return true;
+    }
+    if (tick < scheduler.CurrentTick()) {
+        scheduler.GetMasterSemaphore().Refresh();
+        return scheduler.IsFree(tick);
+    }
+    return false;
 }
 
 void BufferCacheRuntime::Wait(u64 tick) {

@@ -1080,6 +1080,7 @@ struct Maxwell3D::FrontState {
     bool upload_known{};
     /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
     bool instance_loop{};
+    u32 pending_instances{};
     /// EDEN_NX2_EXP2, read in Front(): same-value index_buffer.first writes are not sent.
     int same_experiment{};
     int early_same{}; ///< EXP14, read once per front call like same_experiment
@@ -1105,6 +1106,7 @@ struct Maxwell3D::FrontState {
         /// to miss the page (GpuSplit::WritersMayWriteSince, DispatchesMayWriteSince).
         u64 writer_ranges;
         u64 dispatch_writes;
+        u64 pending_writes;
     };
     std::unordered_map<u64, DmaSnapshot> dma_snapshots;
     bool oot_macros{true};
@@ -1426,6 +1428,11 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         ++fs.exp_sent;
         FrontReportSameWrites(fs);
     }
+    if (fs.pending_instances != 0) [[unlikely]] {
+        const u32 more = std::exchange(fs.pending_instances, 0);
+        split.Defer([this, more] { draw_manager.draw_state.instance_count += more; },
+                    VideoCommon::GpuSplit::Effect::Gpu);
+    }
     if (from_macro && (execution_mask[method] || !VideoCommon::GpuSplit::MacroSink())) {
         split.MacroWrite(this, method, argument, effect);
     } else {
@@ -1631,6 +1638,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             }
         }
     }
+    if (fs.pending_instances != 0) [[unlikely]] {
+        const u32 more = std::exchange(fs.pending_instances, 0);
+        split.Defer([this, more] { draw_manager.draw_state.instance_count += more; },
+                    VideoCommon::GpuSplit::Effect::Gpu);
+    }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr, effect);
     if (write_end != 0) {
         // Uploaded words, unless the shadow RAM replays other values for them on the back.
@@ -1743,6 +1755,11 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         LOG_INFO(HW_GPU, "{}", trace_text);
     }
     fs.parameters.clear();
+    if (fs.pending_instances != 0) {
+        const u32 more = std::exchange(fs.pending_instances, 0);
+        split.Defer([this, more] { draw_manager.draw_state.instance_count += more; },
+                    VideoCommon::GpuSplit::Effect::Gpu);
+    }
     if (fs.draw_pending) {
         fs.draw_pending = false;
         split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
@@ -1860,22 +1877,33 @@ void Maxwell3D::FrontTrackInstanceLoop(FrontState& fs, u32 method, u32 value) {
 }
 
 bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool shadow_kept) {
+    const bool was_loop = fs.instance_loop;
     FrontTrackInstanceLoop(fs, method, value);
-    switch (method) {
-    case MAXWELL3D_REG_INDEX(draw.end):
-    case MAXWELL3D_REG_INDEX(vertex_buffer.first):
-    case MAXWELL3D_REG_INDEX(vertex_buffer.count):
-        break;
-    default:
-        return false;
-    }
     if (!fs.skip_same || !shadow_kept || fs.regs[method] != value) {
         return false;
     }
-    // Instance loop methods flush no deferred draw, and the draw manager ignores these: DrawEnd
-    // draws nothing in an instance loop, and it only reads the vertex buffer first and count
-    // (index_buffer writes also mark the index buffer dirty, so they are always sent).
-    return method != MAXWELL3D_REG_INDEX(draw.end) || fs.instance_loop;
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(draw.begin):
+        if (was_loop && fs.instance_loop) {
+            ++fs.pending_instances;
+            fs.draw_pending = true;
+            return true;
+        }
+        return false;
+    case MAXWELL3D_REG_INDEX(index_buffer.count):
+        if (was_loop && fs.instance_loop && !fs.other_index_draw) {
+            fs.draw_pending = true;
+            return true;
+        }
+        return false;
+    case MAXWELL3D_REG_INDEX(draw.end):
+        return fs.instance_loop;
+    case MAXWELL3D_REG_INDEX(vertex_buffer.first):
+    case MAXWELL3D_REG_INDEX(vertex_buffer.count):
+        return true;
+    default:
+        return false;
+    }
 }
 
 void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
@@ -2057,8 +2085,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 if (!ranged_writers) {
                     reason = writer_since                             ? 1
                              : split.LastUnrangedPosition() > since ? 2
-                             : split.NotedWriteSince(since, *device, read_bytes) ? 3
-                                                                                 : 4;
+                             : split.NotedWriteSince(since, page << 12, 0x1000,
+                                                     &snapshot.pending_writes)
+                                 ? 3
+                                 : 4;
                 } else if (split.WritersMayWriteSince(since, page << 12, 0x1000,
                                                       &snapshot.writer_ranges)) {
                     // Whole pages: the ranges found to miss one need no second look.
@@ -2067,7 +2097,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                                                    : writer_overlaps);
                 } else if (split.LastUnrangedPosition() > since) {
                     reason = 2;
-                } else if (split.NotedWriteSince(since, *device, read_bytes)) {
+                } else if (split.NotedWriteSince(since, page << 12, 0x1000,
+                                                 &snapshot.pending_writes)) {
                     reason = 3;
                 } else {
                     // Last: the only check that may wait.
@@ -2140,7 +2171,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     }
                     for (u64 page = first_page; page <= last_page; ++page) {
                         fs.dma_snapshots[page] = {split.SentPosition(), split.WriterRangeCount(),
-                                                  split.DispatchWriteCount()};
+                                                  split.DispatchWriteCount(),
+                                                  split.PendingWriteCount()};
                     }
                     memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
                 }
