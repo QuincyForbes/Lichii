@@ -1059,7 +1059,21 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean() {
     }
 
     TakeCleanSnapshot();
+    if (dynamic_features.has_dynamic_vertex_input) {
+        graphics_key.state.attribute_types = vertex_attribute_types;
+    }
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    if (dynamic_features.has_dynamic_vertex_input) {
+        vertex_attribute_types = graphics_key.state.attribute_types;
+        std::array<u64, Maxwell::MaxShaderProgram> attribute_masks{};
+        for (size_t stage = 0; stage < Maxwell::MaxShaderProgram; ++stage) {
+            if (graphics_key.unique_hashes[stage] != 0) {
+                attribute_masks[stage] = shader_infos[stage]->vertex_attribute_mask;
+            }
+        }
+        graphics_key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
+            vertex_attribute_types, graphics_key.unique_hashes, attribute_masks);
+    }
     if (current_pipeline) {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
         if (next) {
@@ -1087,10 +1101,10 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         current_pipeline = nullptr;
         return nullptr;
     }
-    graphics_key.state.Refresh(*maxwell3d, dynamic_features);
     if (dynamic_features.has_dynamic_vertex_input) {
         graphics_key.state.attribute_types = vertex_attribute_types;
     }
+    graphics_key.state.Refresh(*maxwell3d, dynamic_features);
 
     if (dynamic_features.has_dynamic_vertex_input) {
         // Refresh only rewrites the types when the vertex input changes, so the masked copy in the
