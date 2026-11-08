@@ -27,8 +27,8 @@ struct OcarinaActorMesh {
     s32 base_vertex{};
     std::array<f32, 4> current_origin;
     std::array<f32, 4> previous_origin;
-    std::array<f32, 280 * 12> current_bones;
-    std::array<f32, 280 * 12> previous_bones;
+    std::span<const f32> current_bones;
+    std::span<const f32> previous_bones;
 };
 
 #ifdef EGLANTINE_STREAMLINE

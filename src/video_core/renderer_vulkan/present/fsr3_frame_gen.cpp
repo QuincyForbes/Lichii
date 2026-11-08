@@ -277,7 +277,7 @@ void Fsr3FrameGen::CreatePipelines(const Device& device) {
 }
 
 void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage current_frame,
-                           VkImageView current_view, u64 frame_count) {
+                           VkImageView current_view, u64 frame_count, bool dispatch_flow) {
     if (!m_has_history) {
         // First frame: populate history and current-frame copy via batched dual-copy
         scheduler.Record([this, current_frame](vk::CommandBuffer cmdbuf) {
@@ -285,6 +285,16 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
         });
         m_has_history = true;
         m_last_frame_count = frame_count;
+        return;
+    }
+
+    if (!dispatch_flow) {
+        scheduler.Record([this, current_frame](vk::CommandBuffer cmdbuf) {
+            CopyImageToImage(cmdbuf, *m_current_image, *m_history_image, m_extent);
+            CopyImageToImage(cmdbuf, current_frame, *m_current_image, m_extent);
+        });
+        m_last_frame_count = frame_count;
+        m_flow_valid = false;
         return;
     }
 

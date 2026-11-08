@@ -244,7 +244,8 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
 
     if (use_fsr3 && fsr3_chain) {
         scheduler.RequestOutsideRenderPassOperationContext();
-        fsr3_chain->Process(device, scheduler, *frame->image, *frame->storage_view, count);
+        fsr3_chain->Process(device, scheduler, *frame->image, *frame->storage_view, count,
+                            generated);
     } else if (chain) {
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.Record([this, source = *frame->image, extent, count,
