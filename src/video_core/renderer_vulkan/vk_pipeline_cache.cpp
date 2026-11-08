@@ -986,11 +986,11 @@ void PlacePrebuildThread(bool quiet) {
     }
 }
 
-// EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
+// Preload every cached pipeline at boot across all worker threads unless EDEN_NX2_PRELOAD_ALL_PIPELINES=0.
 bool PreloadAllPipelines() {
     static const bool all = [] {
         const char* value = std::getenv("EDEN_NX2_PRELOAD_ALL_PIPELINES");
-        return value != nullptr && value[0] == '1';
+        return value == nullptr || value[0] != '0';
     }();
     return all;
 }

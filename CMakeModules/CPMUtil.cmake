@@ -1055,13 +1055,18 @@ function(AddCIPackage)
         list(GET sha512sum_status 0 sha512sum_error)
 
         if(sha512sum_error)
-            message(FATAL_ERROR "[CPMUtil] Failed to download sha512sum "
-                "for ${ARTIFACT_NAME} from ${sha512sum_url}")
+            string(TOLOWER "${ARTIFACT_PACKAGE}" _lower_pkg)
+            if(EXISTS "${CPM_SOURCE_CACHE}/${_lower_pkg}/${ARTIFACT_VERSION}-${pkgname}")
+                set(sha512sum_hash "0")
+            else()
+                message(FATAL_ERROR "[CPMUtil] Failed to download sha512sum "
+                    "for ${ARTIFACT_NAME} from ${sha512sum_url}")
+            endif()
+        else()
+            file(READ "${sha512sum_file}" sha512sum_hash)
+            string(STRIP "${sha512sum_hash}" sha512sum_hash)
+            file(REMOVE "${sha512sum_file}")
         endif()
-
-        file(READ "${sha512sum_file}" sha512sum_hash)
-        string(STRIP "${sha512sum_hash}" sha512sum_hash)
-        file(REMOVE "${sha512sum_file}")
 
         AddPackage(
             NAME ${ARTIFACT_PACKAGE}

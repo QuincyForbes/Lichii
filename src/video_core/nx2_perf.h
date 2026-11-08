@@ -90,7 +90,7 @@ inline bool On(Opt opt) {
         const unsigned default_off = bit(Opt::CleanWords) |
                                      bit(Opt::IndexRebind) | bit(Opt::SubmitBudget) |
                                      bit(Opt::FenceFlush) | bit(Opt::FragmentBarrier) |
-                                     bit(Opt::FrontSleep) | bit(Opt::AsyncPipelines) |
+                                     bit(Opt::FrontSleep) |
                                      bit(Opt::Bounds);
         unsigned mask = (default_off & ~names("EDEN_NX2_PERF_ON")) | names("EDEN_NX2_PERF_OFF");
         mask |= bit(Opt::SplitOverlap);

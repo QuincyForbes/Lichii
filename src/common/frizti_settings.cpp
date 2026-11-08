@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+﻿// SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <fmt/format.h>
 #include "common/frizti_settings.h"
@@ -22,24 +22,22 @@ std::string_view Trim(std::string_view text) {
 }
 } // namespace
 
-std::vector<BasicSetting*> TunedSettings(Values& values) {
+std::vector<BasicSetting*> TunedSettings(Values& vals) {
     // One line per setting; bump Revision when this list or a default here changes.
     return {
-        &values.gpu_accuracy,             // Low
-        &values.dma_accuracy,             // Default
-        &values.gpu_fence_behavior,       // Default
-        &values.vsync_mode,               // Mailbox: the host frame pacer times presents
-        &values.async_presentation,       // On: the host frame pacer runs on the present thread
-        &values.use_asynchronous_shaders, // On: unbuilt pipelines skip draws, no freeze
-        &values.use_docked_mode,          // Docked
-        &values.memory_layout_mode,       // 8 GB: Ocarina's own memory size
-        &values.nvdec_emulation,          // GPU: Ocarina's cutscene videos
-        &values.scaling_filter,           // ScaleForce (newer Lichii builds seed FSR)
-        &values.resolution_setup,         // 1x: a higher scale left over from other games costs fps
-        &values.anti_aliasing,            // FXAA
-        &values.cpu_accuracy,             // Auto
-        &values.use_disk_shader_cache,    // On: no shader rebuild every boot
-        &values.use_vulkan_driver_pipeline_cache, // On
+        &vals.gpu_accuracy,             // Low
+        &vals.dma_accuracy,             // Default
+        &vals.gpu_fence_behavior,       // Default
+        &vals.vsync_mode,               // Mailbox: the host frame pacer times presents
+        &vals.async_presentation,       // On: the host frame pacer runs on the present thread
+        &vals.use_asynchronous_shaders, // On: unbuilt pipelines skip draws, no freeze
+        &vals.use_docked_mode,          // Docked
+        &vals.memory_layout_mode,       // 8 GB: Ocarina's own memory size
+        &vals.nvdec_emulation,          // GPU: Ocarina's cutscene videos
+        &vals.resolution_setup,         // 1x: a higher scale left over from other games costs fps
+        &vals.cpu_accuracy,             // Auto
+        &vals.use_disk_shader_cache,    // On: no shader rebuild every boot
+        &vals.use_vulkan_driver_pipeline_cache, // On
     };
 }
 
@@ -128,9 +126,9 @@ std::vector<Change> ReconcilePerGame(std::span<BasicSetting* const> settings, co
     return changes;
 }
 
-std::vector<Change> FixDockedController(Values& values) {
-    auto& player = values.players.GetValue(true)[0];
-    if (values.use_docked_mode.GetValue(true) != ConsoleMode::Docked ||
+std::vector<Change> FixDockedController(Values& vals) {
+    auto& player = vals.players.GetValue(true)[0];
+    if (vals.use_docked_mode.GetValue(true) != ConsoleMode::Docked ||
         player.controller_type != ControllerType::Handheld) {
         return {};
     }
@@ -139,20 +137,20 @@ std::vector<Change> FixDockedController(Values& values) {
 }
 
 std::map<std::string, std::string> GlobalValues(std::span<BasicSetting* const> settings) {
-    std::map<std::string, std::string> values;
+    std::map<std::string, std::string> vals;
     for (const BasicSetting* const setting : settings) {
-        values.emplace(setting->GetLabel(), setting->ToStringGlobal());
+        vals.emplace(setting->GetLabel(), setting->ToStringGlobal());
     }
-    return values;
+    return vals;
 }
 
 std::map<std::string, std::string> PerGameValues(std::span<BasicSetting* const> settings) {
-    std::map<std::string, std::string> values;
+    std::map<std::string, std::string> vals;
     for (const BasicSetting* const setting : settings) {
-        values.emplace(setting->GetLabel(),
+        vals.emplace(setting->GetLabel(),
                        setting->UsingGlobal() ? std::string{UseGlobal} : setting->ToString());
     }
-    return values;
+    return vals;
 }
 
 std::string FormatChanges(std::span<const Change> changes) {

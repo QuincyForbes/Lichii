@@ -137,6 +137,14 @@ inline void LoadExperiments() {
         // (VideoCommon::HandleIsStoragePointer). Ocarina of Time's Zora's River waterfall
         // flickered every other frame in bursts without it.
         g_experiments[21].store(1, std::memory_order_relaxed);
+        // EXP5 = 1: background pipeline prebuild threads run at idle priority on efficiency cores.
+        g_experiments[5].store(1, std::memory_order_relaxed);
+        // EXP17 = 1: streamed uniform copies reused across stages by guest range (#641 wave 5).
+        g_experiments[17].store(1, std::memory_order_relaxed);
+        // EXP18 = 7: UBO rebind memo + storage FindBuffer memo + once-per-frame LRU touch (#641).
+        g_experiments[18].store(7, std::memory_order_relaxed);
+        // EXP19 = 2: live pipeline lookup without Refresh, with #641 patches for blend/vertex input.
+        g_experiments[19].store(2, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {
