@@ -369,6 +369,10 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
     // the reader snapshotted another core's result while its reservation survived — its
     // store then succeeded where hardware fails it, a double-claim that Ocarina of Time
     // showed as system-wide gamma and foliage flicker.
+    const bool locked_monitor = UseLockedExclusiveMonitor();
+    if (locked_monitor) {
+        EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
+    }
     const auto fastmem_marker = ShouldFastmem(ctx, inst);
     if (fastmem_marker) {
         SharedLabel abort = ctx.GenSharedLabel(), end = ctx.GenSharedLabel();
@@ -398,6 +402,9 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
     EmitWriteMemoryMov<bitsize>(code, tmp, value_idx, false);
     code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
     code.mov(qword[tmp], vaddr);
+    if (locked_monitor) {
+        EmitExclusiveUnlock(code, conf, tmp, tmp2.cvt32());
+    }
 
     if constexpr (bitsize == 128) {
         ctx.reg_alloc.DefineValue(code, inst, Xbyak::Xmm{value_idx});
@@ -445,6 +452,10 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
     // heavily; that convoy was the CPU-side frame cost). Contended same-address stores still
     // arbitrate correctly: the guest-memory CMPXCHG below fails for the loser, which is the
     // spurious-failure outcome LL/SC retry loops are written for.
+    const bool locked_monitor = UseLockedExclusiveMonitor();
+    if (locked_monitor) {
+        EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
+    }
     SharedLabel end = ctx.GenSharedLabel();
 
     code.mov(status, u32(1));
@@ -530,6 +541,9 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
     }
 
     code.L(*end);
+    if (locked_monitor) {
+        EmitExclusiveUnlock(code, conf, tmp, eax);
+    }
     ctx.reg_alloc.DefineValue(code, inst, status);
     EmitCheckMemoryAbort(ctx, inst);
 }

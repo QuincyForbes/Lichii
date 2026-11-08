@@ -9,6 +9,7 @@
 #pragma once
 
 #include <bit>
+#include <cstdlib>
 #include <utility>
 #include "dynarmic/backend/x64/xbyak.h"
 
@@ -381,6 +382,16 @@ const void* EmitWriteMemoryMov(BlockOfCode& code, const Xbyak::RegExp& addr, int
         }
         return fastmem_location;
     }
+}
+
+/// EDEN_NX2_LOCKED_MONITOR=1 restores the global monitor spinlock around the inline exclusive
+/// fast paths, to compare against the lock-free ordering.
+inline bool UseLockedExclusiveMonitor() {
+    static const bool locked = [] {
+        const char* const value = std::getenv("EDEN_NX2_LOCKED_MONITOR");
+        return value != nullptr && *value != '\0' && *value != '0';
+    }();
+    return locked;
 }
 
 template<typename UserConfig>
