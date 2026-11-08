@@ -107,6 +107,8 @@ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
 
 template <class P>
 void BufferCache<P>::TickFrame() {
+    // Read once per frame: FindBuffer asked for it on every binding of every draw.
+    fence_behavior_accurate = Settings::IsGPUFenceBehaviorAccurate();
     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
     if (!channel_state) {
         return;
@@ -2392,8 +2394,7 @@ BufferId BufferCache<P>::FindBuffer(DAddr device_addr, u32 size, bool sparse_com
     if (buffer_id) {
         Buffer& buffer = slot_buffers[buffer_id];
         if (buffer.IsInBounds(device_addr, size)) {
-            const bool should_sync = Settings::IsGPUFenceBehaviorAccurate();
-            if (should_sync) {
+            if (fence_behavior_accurate) {
                 SynchronizeBufferWrites(buffer);
             }
             bool usable = true;
