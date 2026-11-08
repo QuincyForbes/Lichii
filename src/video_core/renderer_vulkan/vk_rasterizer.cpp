@@ -2250,8 +2250,9 @@ bool RasterizerVulkan::OcarinaDlssEnabled() const {
 /// Capture the two camera matrices from a draw targeting the scene color and depth.
 void RasterizerVulkan::TrackOcarinaCamera(std::span<const u64> shader_hashes) {
     constexpr u64 scene_vertex_shader = 0x46cc6aaba42f700fULL;
-    if (!OcarinaDlssEnabled() || oot_camera_sample_frame == render_trace_frame ||
-        std::ranges::find(shader_hashes, scene_vertex_shader) == shader_hashes.end()) {
+    if (oot_camera_sample_frame == render_trace_frame ||
+        std::ranges::find(shader_hashes, scene_vertex_shader) == shader_hashes.end() ||
+        !OcarinaDlssEnabled()) {
         return;
     }
 
