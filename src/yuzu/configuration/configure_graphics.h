@@ -119,6 +119,7 @@ private:
 
     QWidget* nvidia_dlss_widget{};
     QWidget* nvidia_dlss_preset_widget{};
+    QWidget* ocarina_dlss_mode_widget{};
     QWidget* frame_gen_widget{};
     QComboBox* frame_gen_type_combobox{};
     QLabel* lossless_status_label{};

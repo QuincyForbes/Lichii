@@ -240,6 +240,47 @@ TEST_CASE("Built-in Max Resolution patch is listed and loaded for Ocarina's main
     REQUIRE_FALSE(builtin_enabled());
 }
 
+TEST_CASE("Built-in DLSS render scale follows the DLSS mode and is not listed",
+          "[patch_manager]") {
+    constexpr size_t ScaleOffset = sizeof(Loader::NSOHeader) + 0x806420;
+    constexpr u32 ScaleOne = 0x52A7F009;
+    constexpr u32 ScaleUltra = 0x52A7E009;
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+    auto nso = MakeMain(OcarinaBuildId, TbzInstruction);
+    nso.resize(ScaleOffset + 0x100);
+    std::memcpy(nso.data() + ScaleOffset, &ScaleOne, sizeof(ScaleOne));
+    const auto scale = [&] { return WordAt(manager.PatchNSO(nso, "main"), ScaleOffset); };
+
+    auto& dlss = Settings::values.nvidia_dlss;
+    auto& mode = Settings::values.ocarina_dlss_mode;
+    const bool previous_dlss = dlss.GetValue();
+    const auto previous_mode = mode.GetValue();
+
+    dlss.SetValue(true);
+    mode.SetValue(Settings::OcarinaDlssMode::Quality);
+    CHECK(scale() == ScaleOne);
+    mode.SetValue(Settings::OcarinaDlssMode::UltraPerformance);
+#ifdef EGLANTINE_STREAMLINE
+    CHECK(scale() == ScaleUltra);
+    Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Off);
+    CHECK(scale() == ScaleOne);
+    Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Auto);
+#else
+    CHECK(scale() == ScaleOne);
+    CHECK(ScaleUltra != ScaleOne);
+#endif
+    const auto patches = manager.GetPatches();
+    CHECK(std::ranges::none_of(patches, [](const FileSys::Patch& patch) {
+        return patch.name.find("render scale") != std::string::npos;
+    }));
+    dlss.SetValue(false);
+    CHECK(scale() == ScaleOne);
+
+    dlss.SetValue(previous_dlss);
+    mode.SetValue(previous_mode);
+}
+
 TEST_CASE("Built-in patch kind settings: game choice, then global, then default",
           "[patch_manager]") {
     PatchManagerTestContext context;

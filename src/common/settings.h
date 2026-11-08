@@ -418,6 +418,10 @@ struct Values {
     // still overrides it.
     Setting<DlssPreset> nvidia_dlss_preset{linkage, DlssPreset::K, "nvidia_dlss_preset",
                                            Category::Renderer};
+    // Ocarina of Time's render resolution under Max Resolution, as a DLSS mode to 4K. Global only,
+    // like nvidia_dlss.
+    Setting<OcarinaDlssMode> ocarina_dlss_mode{linkage, OcarinaDlssMode::Quality,
+                                               "ocarina_dlss_mode", Category::Renderer};
     // Apple only: MetalFX temporal upscaling in place of a game's DLSS and of Ocarina of Time's
     // upscaler (what NVIDIA DLSS does on Windows). Global only, like nvidia_dlss.
     Setting<bool> metalfx_temporal{linkage, false, "metalfx_temporal", Category::Renderer};

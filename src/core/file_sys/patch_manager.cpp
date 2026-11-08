@@ -73,6 +73,8 @@ struct BuiltinPatch {
     std::string_view game{};
     std::string_view description{};
     std::string_view effect{};
+    // When set, the patch applies only with this DLSS mode chosen and is not listed in Add-Ons.
+    std::optional<Settings::OcarinaDlssMode> render_scale{};
 };
 
 constexpr std::string_view ENABLED_PREFIX = "enabled:";
@@ -132,6 +134,17 @@ bool MaxResolutionDefault() {
     return enabled;
 }
 
+// A shared config can carry the mode into a build without NVIDIA DLSS, where nothing would
+// upscale the smaller scene.
+bool RenderScaleChosen([[maybe_unused]] Settings::OcarinaDlssMode mode) {
+#ifdef EGLANTINE_STREAMLINE
+    return Settings::values.nvidia_dlss.GetValue() &&
+           Settings::values.ocarina_dlss_mode.GetValue() == mode;
+#else
+    return false;
+#endif
+}
+
 bool OotNativeZstdEnabled() {
     static const bool enabled = OotEnvSwitch("EDEN_NX2_OOT_NATIVE_ZSTD", true);
     return enabled;
@@ -146,6 +159,23 @@ constexpr std::array<u8, 4> MAX_RESOLUTION_ORIGINAL{0xE8, 0x41, 0x00, 0x36};
 constexpr std::array<u8, 4> MAX_RESOLUTION_BRANCH{0x0F, 0x02, 0x00, 0x14};
 constexpr std::array MAX_RESOLUTION_RECORDS{
     BuiltinPatchRecord{0x805BD0, MAX_RESOLUTION_BRANCH, MAX_RESOLUTION_ORIGINAL},
+};
+
+// Render scale for "NVIDIA DLSS mode in Ocarina of Time", on top of Max Resolution: its
+// fixed-scale path returns 1.0 of 2560x1440 (main+0x806420: mov w9, #0x3f800000). Quality keeps
+// it; the other modes load a lower scale.
+constexpr std::array<u8, 4> RENDER_SCALE_ONE{0x09, 0xF0, 0xA7, 0x52};         // #0x3f800000, 1.0
+constexpr std::array<u8, 4> RENDER_SCALE_BALANCED{0xE9, 0xEB, 0xA7, 0x52};    // #0x3f5f0000, ~1254p
+constexpr std::array<u8, 4> RENDER_SCALE_PERFORMANCE{0x09, 0xE8, 0xA7, 0x52}; // #0x3f400000, 1080p
+constexpr std::array<u8, 4> RENDER_SCALE_ULTRA{0x09, 0xE0, 0xA7, 0x52};       // #0x3f000000, 720p
+constexpr std::array RENDER_BALANCED_RECORDS{
+    BuiltinPatchRecord{0x806420, RENDER_SCALE_BALANCED, RENDER_SCALE_ONE},
+};
+constexpr std::array RENDER_PERFORMANCE_RECORDS{
+    BuiltinPatchRecord{0x806420, RENDER_SCALE_PERFORMANCE, RENDER_SCALE_ONE},
+};
+constexpr std::array RENDER_ULTRA_RECORDS{
+    BuiltinPatchRecord{0x806420, RENDER_SCALE_ULTRA, RENDER_SCALE_ONE},
 };
 
 constexpr std::array<u8, 4> DYNAMIC_FPS_ORIGINAL{0x28, 0x18, 0x20, 0x1E};
@@ -396,6 +426,40 @@ constexpr std::array BUILTIN_PATCHES{
                        "resolution toward 480p when the GPU is busy.",
         .effect = "Sharper image; more GPU work, and the game can no longer drop resolution to "
                   "hold its frame rate.",
+    },
+    // Lower render scales under Max Resolution, chosen by Settings ocarina_dlss_mode.
+    BuiltinPatch{
+        .name = "DLSS Balanced render scale (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_BALANCED_RECORDS,
+        .default_on = MaxResolutionDefault,
+        .kind = BuiltinPatchKind::Resolution,
+        .game = OOT_GAME,
+        .render_scale = Settings::OcarinaDlssMode::Balanced,
+    },
+    BuiltinPatch{
+        .name = "DLSS Performance render scale (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_PERFORMANCE_RECORDS,
+        .default_on = MaxResolutionDefault,
+        .kind = BuiltinPatchKind::Resolution,
+        .game = OOT_GAME,
+        .render_scale = Settings::OcarinaDlssMode::Performance,
+    },
+    BuiltinPatch{
+        .name = "DLSS Ultra Performance render scale (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_ULTRA_RECORDS,
+        .default_on = MaxResolutionDefault,
+        .kind = BuiltinPatchKind::Resolution,
+        .game = OOT_GAME,
+        .render_scale = Settings::OcarinaDlssMode::UltraPerformance,
     },
     // Dark's routine with a tail that also lowers the step above 60 fps, so the game keeps real
     // speed at any frame rate limit (Settings frame_rate_limit).
@@ -1038,6 +1102,9 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
     std::vector<std::string_view> replaced;
     for (const auto& patch : BUILTIN_PATCHES) {
         if (patch.title_id != title_id || patch.module != name) {
+            continue;
+        }
+        if (patch.render_scale && !RenderScaleChosen(*patch.render_scale)) {
             continue;
         }
         const auto decision = Decide(patch, disabled);
@@ -1714,7 +1781,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id) {
+        if (patch.title_id != title_id || patch.render_scale) {
             continue;
         }
         const auto builtin_disabled = GetDisabledAddons();

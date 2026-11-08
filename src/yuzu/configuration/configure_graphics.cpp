@@ -422,6 +422,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     };
     nvidia_dlss_widget = held(Settings::values.nvidia_dlss);
     nvidia_dlss_preset_widget = held(Settings::values.nvidia_dlss_preset);
+    ocarina_dlss_mode_widget = held(Settings::values.ocarina_dlss_mode);
     frame_gen_widget = held(Settings::values.frame_gen);
     metalfx_temporal_widget = held(Settings::values.metalfx_temporal);
 
@@ -694,6 +695,7 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
 #endif
     ConfigurationShared::SetUnavailable(nvidia_dlss_widget, dlss_reason);
     ConfigurationShared::SetUnavailable(nvidia_dlss_preset_widget, dlss_reason);
+    ConfigurationShared::SetUnavailable(ocarina_dlss_mode_widget, dlss_reason);
 
     QString frame_gen_reason;
 #ifndef HAS_LSFG

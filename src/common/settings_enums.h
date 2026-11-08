@@ -152,6 +152,7 @@ ENUM(ScalingFilter, NearestNeighbor, Bilinear, Bicubic, Gaussian, Lanczos, Scale
 ENUM(AntiAliasing, None, Fxaa, Smaa);
 ENUM(OotAntiAliasing, Game, NoSharpening, Fsr3);
 ENUM(DlssPreset, Default, J, K, L, M);
+ENUM(OcarinaDlssMode, Quality, Balanced, Performance, UltraPerformance);
 ENUM(GamePatchMode, Auto, On, Off);
 ENUM(AspectRatio, R16_9, R4_3, R21_9, R16_10, Stretch);
 ENUM(ConsoleMode, Handheld, Docked);

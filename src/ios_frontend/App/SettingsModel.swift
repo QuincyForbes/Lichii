@@ -212,6 +212,7 @@ enum SettingsCatalog {
     static let unavailableReasons: [String: String] = [
         "nvidia_dlss": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.",
         "nvidia_dlss_preset": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.",
+        "ocarina_dlss_mode": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.",
         "backend": "iOS has one graphics API: Vulkan through MoltenVK.",
         "cpu_backend": "iOS runs games with the Dynarmic JIT only.",
         "nvdec_emulation": "Lichii decodes game videos on the CPU on iOS and sets this at every boot.",
@@ -403,6 +404,7 @@ enum SettingLabels {
         "backend": "Graphics API",
         "cpu_backend": "CPU Backend",
         "nvidia_dlss_preset": "DLSS Preset",
+        "ocarina_dlss_mode": "DLSS Mode in Ocarina of Time",
         "game_dlss_network": "Game's Own DLSS Network",
         "oot_anti_aliasing": "Ocarina of Time Anti-Aliasing",
         "accelerate_astc": "ASTC Decoding",

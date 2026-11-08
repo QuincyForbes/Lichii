@@ -3148,7 +3148,11 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
 /// Track the scene depth on its reader dispatch, or try to replace a recognized upscale dispatch.
 bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace) {
     constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
-    const bool upscale_4k = replace && pipeline.ShaderHash() == ComputePipeline::Ocarina1440pShader;
+    const u64 upscale_hash = pipeline.ShaderHash();
+    const bool upscale_4k =
+        replace && (upscale_hash == ComputePipeline::Ocarina1440pShader ||
+                    upscale_hash == ComputePipeline::Ocarina1440pScaledShader ||
+                    upscale_hash == ComputePipeline::Ocarina1440pScaledFieldShader);
     if ((!replace && pipeline.ShaderHash() != depth_reader) || !OcarinaTemporalEnabled()) {
         return false;
     }
@@ -3234,8 +3238,10 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     using VideoCore::Surface::PixelFormat;
     const auto extent = oot_motion.extent;
     const bool native_size = pipeline.ShaderHash() == ComputePipeline::OcarinaFullSizeShader;
+    // 4K: any 16:9 scene up to 2560x1440 (the lower ocarina_dlss_mode render scales).
     const bool valid_extents = upscale_4k
-        ? extent.width == 2560 && extent.height == 1440 &&
+        ? extent.width <= 2560 &&
+            std::abs(static_cast<int>(extent.width * 9) - static_cast<int>(extent.height * 16)) <= 32 &&
             target.size.width == 2560 && target.size.height == 1440
         : native_size
         ? target.size.width == extent.width && target.size.height == extent.height
