@@ -385,6 +385,17 @@ struct Values {
                                                            Specialization::Percentage,
                                                        true,
                                                        true};
+    // Switch 2 VSync event rate. Games start frames on it, so above 60 only games with a
+    // real-time step (e.g. the Ocarina "FPS Unlock" built-in) keep their speed.
+    SwitchableSetting<u16, true> frame_rate_limit{linkage,
+                                                  60,
+                                                  30,
+                                                  240,
+                                                  "nx2_frame_rate_limit",
+                                                  Category::Renderer,
+                                                  Specialization::Scalar,
+                                                  true,
+                                                  false};
     // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS. Global only: a per-game
     // value (left in some players' OoT configs) silently overrode the checkbox, which then showed
     // unchecked and greyed once the game ran (2026-11-09, an RTX 5080 player).
