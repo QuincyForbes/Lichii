@@ -2346,7 +2346,9 @@ bool RasterizerVulkan::OcarinaDlssEnabled() const {
 /// materials draw with several vertex shaders, so any draw into a scene-sized target qualifies;
 /// the camera buffer's contents are checked below.
 void RasterizerVulkan::TrackOcarinaCamera() {
-    if (!OcarinaDlssEnabled()) {
+    if ((oot_camera_sample_frame == render_trace_frame && oot_motion.extent.width >= 2560 &&
+         oot_motion.extent.height >= 1440) ||
+        !OcarinaDlssEnabled()) {
         return;
     }
 

@@ -236,11 +236,11 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     options.mode = ModeFor(in.render_size, in.upscale_size);
     options.outputWidth = in.upscale_size.width;
     options.outputHeight = in.upscale_size.height;
-    options.colorBuffersHDR =
-        in.hdr && EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0 ? sl::eTrue : sl::eFalse;
-    options.useAutoExposure =
-        in.hdr && EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0 ? sl::eTrue : sl::eFalse;
-    const sl::DLSSPreset preset = Preset();
+    static const bool env_hdr = EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0;
+    static const bool env_auto_exposure = EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0;
+    static const sl::DLSSPreset preset = Preset();
+    options.colorBuffersHDR = in.hdr && env_hdr ? sl::eTrue : sl::eFalse;
+    options.useAutoExposure = in.hdr && env_auto_exposure ? sl::eTrue : sl::eFalse;
     options.dlaaPreset = preset;
     options.qualityPreset = preset;
     options.balancedPreset = preset;
