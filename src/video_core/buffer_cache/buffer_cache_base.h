@@ -701,6 +701,56 @@ private:
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);
 
+    struct SyncSkip {
+        const Buffer* buffer{};
+        DAddr device_addr{};
+        u32 size{};
+        u64 gen{};
+        u64 epoch{};
+        u64 binding_epoch{};
+        u64 region_sum{};
+    };
+    static constexpr u32 SYNC_SKIP_BITS = 10;
+    std::array<SyncSkip, size_t{1} << SYNC_SKIP_BITS> sync_skip{};
+    u64 cpu_dirty_epoch = 1;
+
+    static constexpr u32 SKIP_REGION_BITS = 18;
+    static constexpr size_t SKIP_REGION_SLOTS = 4096;
+    static constexpr u64 MAX_SKIP_REGIONS = 64;
+    std::array<u64, SKIP_REGION_SLOTS> skip_region_gen{};
+
+    [[nodiscard]] static u64 SkipRegionCount(DAddr device_addr, u64 size) noexcept {
+        const u64 first = device_addr >> SKIP_REGION_BITS;
+        const u64 last = (device_addr + (size == 0 ? 0 : size - 1)) >> SKIP_REGION_BITS;
+        return last - first + 1;
+    }
+
+    [[nodiscard]] u64 SkipRegionSum(DAddr device_addr, u64 size) const noexcept {
+        const u64 first = device_addr >> SKIP_REGION_BITS;
+        const u64 count = SkipRegionCount(device_addr, size);
+        u64 sum = 0;
+        for (u64 region = first; region != first + count; ++region) {
+            sum += skip_region_gen[region % SKIP_REGION_SLOTS];
+        }
+        return sum;
+    }
+
+    void BumpSkipRegions(DAddr device_addr, u64 size) noexcept {
+        const u64 first = device_addr >> SKIP_REGION_BITS;
+        const u64 count = SkipRegionCount(device_addr, size);
+        if (count >= SKIP_REGION_SLOTS) {
+            for (u64& gen : skip_region_gen) {
+                ++gen;
+            }
+            return;
+        }
+        for (u64 region = first; region != first + count; ++region) {
+            ++skip_region_gen[region % SKIP_REGION_SLOTS];
+        }
+    }
+
+    void NoteCpuDirty(DAddr device_addr, u64 size);
+
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 
     Common::SlotVector<Buffer> slot_buffers;
@@ -892,6 +942,46 @@ private:
     /// nothing they depend on changed.
     void ResolveStorageBinding(size_t memo_stage, u32 index, Binding& binding, bool is_written,
                                std::vector<MultiRangeSegment>& pool);
+
+    struct StorageResolveCache {
+        u64 epoch{};
+        u64 map_serial{};
+        size_t as_id{};
+        const void* channel{};
+        u64 enabled{};
+        u64 written{};
+        std::array<Binding, NUM_STORAGE_BUFFERS> bindings{};
+        std::vector<MultiRangeSegment> segments;
+    };
+    std::array<StorageResolveCache, NUM_STAGES> graphics_storage_resolve{};
+    StorageResolveCache compute_storage_resolve{};
+
+    bool ReuseStorageResolve(StorageResolveCache& cache, std::span<Binding> bindings, u64 enabled,
+                             u64 written, std::vector<MultiRangeSegment>& pool);
+
+    void StoreStorageResolve(StorageResolveCache& cache, std::span<const Binding> bindings,
+                             u64 enabled, u64 written,
+                             const std::vector<MultiRangeSegment>& pool, u64 start_epoch);
+
+    struct GeometryMemo {
+        u64 epoch{};
+        u64 map_serial{};
+        size_t as_id{};
+        const void* channel{};
+        GPUVAddr begin{};
+        GPUVAddr end{};
+        u64 extra{};
+        Binding binding{};
+    };
+    std::array<GeometryMemo, NUM_VERTEX_BUFFERS> vertex_memo{};
+    GeometryMemo index_memo{};
+    std::array<GeometryMemo, NUM_COMPUTE_UNIFORM_BUFFERS> compute_uniform_memo{};
+
+    [[nodiscard]] bool ReuseGeometry(const GeometryMemo& memo, GPUVAddr begin, GPUVAddr end,
+                                     u64 extra) const;
+
+    void StoreGeometry(GeometryMemo& memo, GPUVAddr begin, GPUVAddr end, u64 extra,
+                       const Binding& binding);
 
     /// EDEN_NX2_TABLE_POINTER_TRACE: last table entry and size bound per table pointer slot.
     std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;

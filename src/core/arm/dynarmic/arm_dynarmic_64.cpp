@@ -393,6 +393,10 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         Nx2EnvOn("EDEN_NX2_INLINE_CNTPCT")) {
         config.inline_cntpct_tsc_factor =
             Common::g_wall_clock.cntpct_rdtsc_factor.load(std::memory_order_relaxed);
+        if (Nx2EnvOn("EDEN_NX2_CNTPCT_PAUSE")) {
+            config.inline_cntpct_last_ticks = &m_cb->m_last_cntpct;
+            config.inline_cntpct_spin_ticks = static_cast<u32>(m_cb->m_spin_ticks);
+        }
     }
 #endif
 

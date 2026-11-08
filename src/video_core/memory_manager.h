@@ -295,6 +295,7 @@ private:
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash2{};
 
     bool native_tiling{};
+    bool has_big_pages{};
     mutable std::mutex guard;
     /// Bumped after each page table change; readers keep their MappingSnapshot until then.
     std::atomic<u64> map_serial{};

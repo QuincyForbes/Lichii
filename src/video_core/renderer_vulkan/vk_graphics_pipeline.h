@@ -168,10 +168,10 @@ public:
     }
 
     [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
-        if (key == current_key) {
+        const u64 tag = TransitionTag(current_key);
+        if (self_tag == tag && key == current_key) {
             return this;
         }
-        const u64 tag = TransitionTag(current_key);
         for (size_t index = 0; index < transition_tags.size(); ++index) {
             GraphicsPipeline* const next = transitions[index];
             if (transition_tags[index] != tag || next->key != current_key) {
@@ -188,8 +188,10 @@ public:
 
     /// The frame the pipeline cache last handed this pipeline out (evicts long unused ones).
     void MarkUsed(u64 frame) noexcept {
-        last_use_frame = frame;
-        used = true;
+        if (last_use_frame != frame || !used) {
+            last_use_frame = frame;
+            used = true;
+        }
     }
 
     [[nodiscard]] u64 LastUse() const noexcept {
@@ -210,7 +212,14 @@ public:
     }
 
     [[nodiscard]] bool IsBuilt() const noexcept {
-        return build->IsBuilt();
+        if (is_built_cached) [[likely]] {
+            return true;
+        }
+        if (build->IsBuilt()) {
+            is_built_cached = true;
+            return true;
+        }
+        return false;
     }
 
     template <typename Spec>
@@ -235,6 +244,7 @@ private:
     void Validate();
 
     const GraphicsPipelineCacheKey key;
+    const u64 self_tag{TransitionTag(key)};
     Tegra::Engines::Maxwell3D* maxwell3d;
     Tegra::MemoryManager* gpu_memory;
     const Device& device;
@@ -252,6 +262,7 @@ private:
     std::vector<u64> transition_tags;
     u64 last_use_frame{};
     bool used{};
+    mutable bool is_built_cached{};
 
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
 
@@ -262,6 +273,8 @@ private:
     size_t num_image_elements{};
     std::vector<SampledImage> sampled_images;
     u32 num_textures{};
+    boost::container::small_vector<u8, 96> texture_is_storage_ptr;
+    bool has_storage_ptr_textures{};
     bool fragment_has_color0_output{};
     u32 zero_texture_handles{};
     bool writes_storage{};

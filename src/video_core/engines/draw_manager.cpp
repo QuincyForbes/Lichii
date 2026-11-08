@@ -113,7 +113,11 @@ void Maxwell3D::DrawManager::DrawDeferred(Maxwell3D& maxwell3d, bool loop_contin
     // The first draw of a batch also covers the loop's first instance; a batch that continues a
     // loop split by a register write draws only the instances after the ones already drawn.
     const bool continued = draw_state.drawn_instances != 0;
+    const bool was_indexed = draw_state.draw_indexed;
     DrawEnd(maxwell3d, draw_state.instance_count + (continued ? 0 : 1), true);
+    if (loop_continues) {
+        draw_state.draw_indexed = was_indexed;
+    }
     draw_state.drawn_instances =
         loop_continues ? draw_state.drawn_instances + draw_state.instance_count : 0;
     draw_state.instance_count = 0;

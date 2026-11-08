@@ -1063,6 +1063,9 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     }
 
     flags[Dirty::DepthBiasGlobal] = true;
+    if (!is_clear) {
+        NoteRenderTargetsPrepared();
+    }
 }
 
 template <class P>
@@ -3796,6 +3799,7 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
 
 template <class P>
 void TextureCache<P>::RegisterImage(ImageId image_id) {
+    ++bindings_epoch;
     ImageBase& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");

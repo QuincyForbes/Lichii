@@ -2304,7 +2304,9 @@ void RasterizerVulkan::TiledCacheBarrier() {
 }
 
 void RasterizerVulkan::FlushCommands() {
-    if (draw_counter == 0 && !pending_native_work) {
+    if ((draw_counter == 0 && !pending_native_work) || !scheduler.HasPendingCommands()) {
+        draw_counter = 0;
+        pending_native_work = false;
         return;
     }
     draw_counter = 0;
@@ -3237,6 +3239,9 @@ void RasterizerVulkan::FlushWork() {
         }();
         legacy_budget = forced_draws != 0 ? forced_draws : (device.IsMoltenVK() ? 128U : 4096U);
     }
+    if (native && !android) {
+        pending_native_work = true;
+    }
     switch (SubmissionPolicy::Advance(draw_counter, native, android, budget, legacy_budget)) {
     case SubmissionPolicy::Action::None:
         break;
@@ -3247,9 +3252,6 @@ void RasterizerVulkan::FlushWork() {
         scheduler.Flush();
         pending_native_work = false;
         break;
-    }
-    if (native && !android) {
-        pending_native_work = true;
     }
 }
 
@@ -4297,6 +4299,11 @@ size_t RasterizerVulkan::VertexInputKeyHash::operator()(const VertexInputKey& ke
 u32 RasterizerVulkan::UpdateVertexRepackLayout(bool dynamic_input) {
     const auto& regs = maxwell3d->regs;
     if (VertexInputCacheEnabled()) {
+        if (repack_key_valid && repack_key_dynamic == dynamic_input &&
+            !maxwell3d->dirty.flags[Dirty::VertexInput] &&
+            !maxwell3d->dirty.flags[VideoCommon::Dirty::VertexBuffers]) {
+            return 0;
+        }
         static_assert(Maxwell::NumVertexAttributes == 32 && Maxwell::NumVertexArrays == 32);
         std::array<u32, 64> key;
         for (size_t index = 0; index < 32; ++index) {

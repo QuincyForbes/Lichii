@@ -120,6 +120,7 @@ public:
 
     /// The frame tick of the last LRU touch (BufferCache::TouchBuffer, EDEN_NX2_EXP18 & 4).
     u64 lru_touched_tick = ~u64{0};
+    u64 cpu_dirty_gen = 0;
 
     size_t SizeBytes() const {
         return size_bytes;

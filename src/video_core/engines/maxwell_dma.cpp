@@ -105,14 +105,15 @@ void MaxwellDMA::FrontNoteLaunch(VideoCommon::GpuSplit& split, u32 launch) {
     if (semaphore_type != 0) {
         const GPUVAddr semaphore = address(offsetof(Regs, semaphore));
         split.NoteWriterRange(memory_manager, semaphore, 16, Kind::Copy);
-        // EXP13: a one- or four-word release writes the payload (ReleaseSemaphore).
-        if ((semaphore_type == 1 || semaphore_type == 2) &&
-            VideoCommon::QmdPrediction::Enabled()) {
+        if (semaphore_type == 1 || semaphore_type == 2) {
             if (const auto device = memory_manager.GpuToCpuAddress(semaphore)) {
-                VideoCommon::QmdPrediction::Predict(
-                    VideoCommon::QmdPrediction::Writer::Dma, *device,
-                    reg(offsetof(Regs, semaphore) + 2 * sizeof(u32)), split.SentPosition(), 0,
-                    false);
+                const u32 payload = reg(offsetof(Regs, semaphore) + 2 * sizeof(u32));
+                split.NoteRelease(*device, semaphore, payload);
+                if (VideoCommon::QmdPrediction::Enabled()) {
+                    VideoCommon::QmdPrediction::Predict(VideoCommon::QmdPrediction::Writer::Dma,
+                                                        *device, payload, split.SentPosition(), 0,
+                                                        false);
+                }
             }
         }
     }

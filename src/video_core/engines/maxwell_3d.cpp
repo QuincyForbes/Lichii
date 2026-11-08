@@ -74,7 +74,7 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
         memory_write_mask[i] = true;
     }
     fast_maxwell3d = VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Method) && !record_write_history &&
-                     !g_trace_first_method_writes && !VideoCommon::Nx2Profile::Enabled();
+                     !g_trace_first_method_writes;
     const char* skip_same = std::getenv("EDEN_NX2_SKIP_SAME");
     skip_same_value_writes = skip_same == nullptr || skip_same[0] != '0';
     perf_verify = VideoCommon::Nx2Perf::Verify();
@@ -669,7 +669,25 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
     for (u32 i = 0; i < count; ++i) {
         ProcessDirtyRegisters(methods[i], ProcessShadowRam(methods[i], arguments[i]));
     }
-    memory_manager.WriteWordsCached(address + offset, values.data(), count);
+    const GPUVAddr destination = address + offset;
+    static const bool cb_direct = [] {
+        const char* value = std::getenv("EDEN_NX2_CB_DIRECT");
+        return value == nullptr || value[0] != '0';
+    }();
+    u8* const pointer =
+        cb_direct &&
+                (destination + bytes <= Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) ||
+                 destination >= Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed))
+            ? memory_manager.GetPointer(destination)
+            : nullptr;
+    if (pointer != nullptr) [[likely]] {
+        std::memcpy(pointer, values.data(), bytes);
+        for (u32 i = 0; i < count; ++i) {
+            memory_manager.AccumulateInvalidation(destination + u64{i} * sizeof(u32), sizeof(u32));
+        }
+    } else {
+        memory_manager.WriteWordsCached(destination, values.data(), count);
+    }
     regs.const_buffer.offset += static_cast<u32>(bytes);
 }
 
@@ -1001,7 +1019,23 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     const size_t write_size = std::min(copy_size, room / sizeof(u32) * sizeof(u32));
     if (write_size != 0) {
         const GPUVAddr address{buffer_address + regs.const_buffer.offset};
-        memory_manager.WriteBlockCached(address, start_base, write_size);
+        static const bool cb_direct = [] {
+            const char* value = std::getenv("EDEN_NX2_CB_DIRECT");
+            return value == nullptr || value[0] != '0';
+        }();
+        u8* const pointer =
+            cb_direct &&
+                    write_size <= Core::DEVICE_PAGESIZE - (address & Core::DEVICE_PAGEMASK) &&
+                    (address + write_size <= Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) ||
+                     address >= Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed))
+                ? memory_manager.GetPointer(address)
+                : nullptr;
+        if (pointer != nullptr) [[likely]] {
+            std::memcpy(pointer, start_base, write_size);
+            memory_manager.AccumulateInvalidation(address, write_size);
+        } else {
+            memory_manager.WriteBlockCached(address, start_base, write_size);
+        }
     }
     if (write_size != copy_size) {
         static std::atomic<bool> warned{};
@@ -1080,6 +1114,7 @@ struct Maxwell3D::FrontState {
     bool upload_known{};
     /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
     bool instance_loop{};
+    bool loop_count_sent{};
     u32 pending_instances{};
     /// EDEN_NX2_EXP2, read in Front(): same-value index_buffer.first writes are not sent.
     int same_experiment{};
@@ -1703,7 +1738,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                     fs.oot_macros ? OotMacros::Find(OotMacros::HashMacro(engine.native_code, start))
                                   : nullptr;
                 fs.oot_macro[slot] = found != nullptr ? found->id : OotMacros::Id::None;
-                if (fs.oot_dump) {
+                if (fs.oot_dump || (fs.oot_macros && found == nullptr)) {
                     OotMacros::DumpCode(method, start, engine.native_code);
                 }
             }
@@ -1762,6 +1797,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     }
     if (fs.draw_pending) {
         fs.draw_pending = false;
+        fs.loop_count_sent = false;
         split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
                     VideoCommon::GpuSplit::Effect::Gpu);
     }
@@ -1862,6 +1898,7 @@ void Maxwell3D::FrontTrackInstanceLoop(FrontState& fs, u32 method, u32 value) {
         // Instance id, bits 27:26: First leaves an instance loop, Subsequent enters one.
         if (((value >> 26) & 3) == 0) {
             fs.instance_loop = false;
+            fs.loop_count_sent = false;
         } else if (((value >> 26) & 3) == 1) {
             fs.instance_loop = true;
         }
@@ -1870,8 +1907,12 @@ void Maxwell3D::FrontTrackInstanceLoop(FrontState& fs, u32 method, u32 value) {
     case MAXWELL3D_REG_INDEX(inline_index_2x16.even):
     case MAXWELL3D_REG_INDEX(inline_index_4x8.index0):
         fs.instance_loop = false; // DrawMode::InlineIndex: draw.end draws
+        fs.loop_count_sent = false;
         break;
     default:
+        if (!DrawManager::IsInstanceLoopMethod(method)) {
+            fs.loop_count_sent = false;
+        }
         break;
     }
 }
@@ -1880,6 +1921,9 @@ bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool 
     const bool was_loop = fs.instance_loop;
     FrontTrackInstanceLoop(fs, method, value);
     if (!fs.skip_same || !shadow_kept || fs.regs[method] != value) {
+        if (method == MAXWELL3D_REG_INDEX(index_buffer.count) && fs.instance_loop) {
+            fs.loop_count_sent = true;
+        }
         return false;
     }
     switch (method) {
@@ -1891,7 +1935,8 @@ bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool 
         }
         return false;
     case MAXWELL3D_REG_INDEX(index_buffer.count):
-        if (was_loop && fs.instance_loop && !fs.other_index_draw) {
+        if (was_loop && fs.instance_loop && !fs.other_index_draw &&
+            std::exchange(fs.loop_count_sent, true)) {
             fs.draw_pending = true;
             return true;
         }
@@ -1986,6 +2031,11 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
 
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
                              u32 method, u32 count) {
+    if (fs.pending_instances != 0) [[unlikely]] {
+        const u32 more = std::exchange(fs.pending_instances, 0);
+        split.Defer([this, more] { draw_manager.draw_state.instance_count += more; },
+                    VideoCommon::GpuSplit::Effect::Gpu);
+    }
     // The words may be written by methods still queued for the back (indirect draw arguments
     // from a culling dispatch, constant buffer and inline uploads, reports), and the caches that
     // may hold newer ones belong to it. Draws write memory the 3D engine reads only after a

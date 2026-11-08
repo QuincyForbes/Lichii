@@ -23,6 +23,10 @@ void InnerFence::Queue() {
     if (is_stubbed) {
         return;
     }
+    if (!scheduler.HasPendingCommands() && scheduler.CurrentTick() > 1) {
+        wait_tick = scheduler.CurrentTick() - 1;
+        return;
+    }
     // Get the current tick so we can wait for it
     wait_tick = scheduler.CurrentTick();
     if (!scheduler.DeferFlush()) {

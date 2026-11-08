@@ -191,6 +191,7 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
             flush_modified();
         }
         if (entry_type == EntryType::Mapped) {
+            has_big_pages = true;
             const DAddr current_dev_addr = dev_addr + offset;
             const auto index = PageEntryIndex(current_gpu_addr, true);
             const u32 sub_value = static_cast<u32>(current_dev_addr >> cpu_page_bits);
@@ -263,7 +264,7 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
         return std::nullopt;
     }
     DAddr dev_addr;
-    if (GetEntry(gpu_addr, true) != EntryType::Mapped) [[unlikely]] {
+    if (!has_big_pages || GetEntry(gpu_addr, true) != EntryType::Mapped) [[likely]] {
         if (GetEntry(gpu_addr, false) != EntryType::Mapped)
             return std::nullopt;
         dev_addr = (DAddr(page_table[PageEntryIndex(gpu_addr, false)]) << cpu_page_bits) +
@@ -304,7 +305,12 @@ T MemoryManager::Read(GPUVAddr addr) const {
         }
     }
 
-    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
+    constexpr u64 host_page_mask = (u64{1} << cpu_page_bits) - 1;
+    const u8* const page_pointer =
+        (HandlePointerCacheEnabled() && (addr & host_page_mask) + sizeof(T) <= host_page_mask + 1)
+            ? CachedPagePointer(addr)
+            : GetPointer(addr);
+    if (page_pointer) {
         // NOTE: Avoid adding any extra logic to this fast-path block
         T value;
         std::memcpy(&value, page_pointer, sizeof(T));
@@ -563,7 +569,7 @@ void MemoryManager::ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, co
     // in title 1). Anything else, unmapped or sparse pages included, takes the full path.
     constexpr std::size_t SmallPage = 0x1000;
     if (size <= SmallPage && (gpu_src_addr & (SmallPage - 1)) + size <= SmallPage) {
-        if (const u8* const pointer = GetPointer(gpu_src_addr)) {
+        if (const u8* const pointer = GetPointerForDescriptor(gpu_src_addr)) {
             std::memcpy(dest_buffer, pointer, size);
             return;
         }
@@ -584,6 +590,15 @@ void MemoryManager::ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_
 }
 
 void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) {
+    constexpr std::size_t SmallPage = 0x1000;
+    if (unsafe && size <= SmallPage && (gpu_dest_addr & (SmallPage - 1)) + size <= SmallPage &&
+        (gpu_dest_addr + size <= Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) ||
+         gpu_dest_addr >= Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed))) {
+        if (u8* const pointer = const_cast<u8*>(GetPointerForDescriptor(gpu_dest_addr))) {
+            std::memcpy(pointer, src_buffer, size);
+            return;
+        }
+    }
     // Give Switch 2 sparse pages the write lands on their memory first (otherwise it is dropped).
     Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {

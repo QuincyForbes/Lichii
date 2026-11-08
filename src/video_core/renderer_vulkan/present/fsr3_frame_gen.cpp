@@ -32,12 +32,15 @@ VkImageMemoryBarrier MakeBarrier(VkImage image, VkAccessFlags src_access,
     };
 }
 
-void BarrierComputeWriteToRead(vk::CommandBuffer cmdbuf, VkImage image) {
-    const auto barrier = MakeBarrier(image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                                     VK_IMAGE_LAYOUT_GENERAL,
-                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+void BarrierComputeWriteToRead(vk::CommandBuffer cmdbuf, VkImage) {
+    static constexpr VkMemoryBarrier barrier{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+    };
     cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, barrier);
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, barrier, {}, {});
 }
 
 // ΓöÇΓöÇ Batched dual-copy ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -89,8 +92,7 @@ void CopyImageToTwo(vk::CommandBuffer cmdbuf, VkImage source,
                            0, {}, {}, after);
 }
 
-// Single-image copy (for first-frame init)
-[[maybe_unused]] void CopyImageToImage(vk::CommandBuffer cmdbuf, VkImage source, VkImage destination,
+void CopyImageToImage(vk::CommandBuffer cmdbuf, VkImage source, VkImage destination,
                       VkExtent2D extent) {
     const VkImageCopy region{
         .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
@@ -105,7 +107,7 @@ void CopyImageToTwo(vk::CommandBuffer cmdbuf, VkImage source,
                     VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
         MakeBarrier(destination, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
     };
     cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -122,6 +124,45 @@ void CopyImageToTwo(vk::CommandBuffer cmdbuf, VkImage source,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
     };
     cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           0, {}, {}, after);
+}
+
+void CopyFrameAndPrepareMotion(vk::CommandBuffer cmdbuf, VkImage source, VkImage destination,
+                               VkImage motion, VkExtent2D extent) {
+    const VkImageCopy region{
+        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .srcOffset = {0, 0, 0},
+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .dstOffset = {0, 0, 0},
+        .extent = {extent.width, extent.height, 1},
+    };
+
+    const std::array before{
+        MakeBarrier(source, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+        MakeBarrier(destination, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+    };
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, {}, {}, before);
+
+    cmdbuf.CopyImage(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+
+    const std::array after{
+        MakeBarrier(source, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
+        MakeBarrier(destination, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
+        MakeBarrier(motion, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL),
+    };
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                            0, {}, {}, after);
@@ -163,12 +204,10 @@ Fsr3FrameGen::~Fsr3FrameGen() = default;
 void Fsr3FrameGen::CreateResources(const Device& device) {
     m_linear_sampler = CreateBilinearSampler(device);
 
-    m_history_image = CreateWrappedImage(m_allocator, m_extent, m_format);
-    m_history_view = CreateWrappedImageView(device, m_history_image, m_format);
-
-    // Current-frame copy for interpolation shader
-    m_current_image = CreateWrappedImage(m_allocator, m_extent, m_format);
-    m_current_view = CreateWrappedImageView(device, m_current_image, m_format);
+    for (size_t i = 0; i < NUM_PARITIES; ++i) {
+        m_frame_images[i] = CreateWrappedImage(m_allocator, m_extent, m_format);
+        m_frame_views[i] = CreateWrappedImageView(device, m_frame_images[i], m_format);
+    }
 
     // Half-resolution motion vector image
     m_motion_image = CreateWrappedImage(m_allocator, m_flow_extent, VK_FORMAT_R16G16_SFLOAT);
@@ -176,13 +215,15 @@ void Fsr3FrameGen::CreateResources(const Device& device) {
 
     // Descriptor pool ΓÇö sized for flow (3 bindings) + interp (4 bindings) ├ù 2 sets
     const std::array pool_sizes{
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                             static_cast<u32>(2 * NUM_PARITIES + 3 * NUM_PARITIES * INTERP_CACHE_SIZE)},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                             static_cast<u32>(NUM_PARITIES + NUM_PARITIES * INTERP_CACHE_SIZE)},
     };
     m_desc_pool = device.GetLogical().CreateDescriptorPool(VkDescriptorPoolCreateInfo{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-        .maxSets = 4,
+        .maxSets = static_cast<u32>(NUM_PARITIES + NUM_PARITIES * INTERP_CACHE_SIZE),
         .poolSizeCount = static_cast<u32>(pool_sizes.size()),
         .pPoolSizes = pool_sizes.data(),
     });
@@ -272,26 +313,83 @@ void Fsr3FrameGen::CreatePipelines(const Device& device) {
     });
 
     // Allocate descriptor sets
-    m_flow_desc_sets = CreateWrappedDescriptorSets(m_desc_pool, {*m_flow_desc_layout});
-    m_interp_desc_sets = CreateWrappedDescriptorSets(m_desc_pool, {*m_interp_desc_layout});
+    std::array<VkDescriptorSetLayout, NUM_PARITIES> flow_layouts;
+    flow_layouts.fill(*m_flow_desc_layout);
+    m_flow_desc_sets = CreateWrappedDescriptorSets(m_desc_pool, flow_layouts);
+
+    std::array<VkDescriptorSetLayout, NUM_PARITIES * INTERP_CACHE_SIZE> interp_layouts;
+    interp_layouts.fill(*m_interp_desc_layout);
+    m_interp_desc_sets = CreateWrappedDescriptorSets(m_desc_pool, interp_layouts);
+
+    const VkSampler sampler = *m_linear_sampler;
+    const VkDescriptorImageInfo motion_sample_info{
+        .sampler = sampler,
+        .imageView = *m_motion_view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    const VkDescriptorImageInfo motion_store_info{
+        .sampler = VK_NULL_HANDLE,
+        .imageView = *m_motion_view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+
+    for (size_t parity = 0; parity < NUM_PARITIES; ++parity) {
+        const VkDescriptorImageInfo cur_info{
+            .sampler = sampler,
+            .imageView = *m_frame_views[parity],
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        };
+        const VkDescriptorImageInfo hist_info{
+            .sampler = sampler,
+            .imageView = *m_frame_views[parity ^ 1],
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        };
+        const VkDescriptorSet flow_set = m_flow_desc_sets[parity];
+        const std::array<VkWriteDescriptorSet, 3> flow_writes{{
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, flow_set, 0, 0, 1,
+             VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &cur_info, nullptr, nullptr},
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, flow_set, 1, 0, 1,
+             VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &hist_info, nullptr, nullptr},
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, flow_set, 2, 0, 1,
+             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &motion_store_info, nullptr, nullptr},
+        }};
+        device.GetLogical().UpdateDescriptorSets(flow_writes, {});
+
+        for (size_t slot = 0; slot < INTERP_CACHE_SIZE; ++slot) {
+            const VkDescriptorSet interp_set =
+                m_interp_desc_sets[parity * INTERP_CACHE_SIZE + slot];
+            const std::array<VkWriteDescriptorSet, 3> interp_writes{{
+                {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, interp_set, 0, 0, 1,
+                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &cur_info, nullptr, nullptr},
+                {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, interp_set, 1, 0, 1,
+                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &hist_info, nullptr, nullptr},
+                {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, interp_set, 2, 0, 1,
+                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &motion_sample_info, nullptr, nullptr},
+            }};
+            device.GetLogical().UpdateDescriptorSets(interp_writes, {});
+        }
+    }
 }
 
-void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage current_frame,
-                           VkImageView current_view, u64 frame_count, bool dispatch_flow) {
+void Fsr3FrameGen::Process([[maybe_unused]] const Device& device, Scheduler& scheduler,
+                           VkImage current_frame, [[maybe_unused]] VkImageView current_view,
+                           u64 frame_count, bool dispatch_flow) {
     if (!m_has_history) {
         // First frame: populate history and current-frame copy via batched dual-copy
         scheduler.Record([this, current_frame](vk::CommandBuffer cmdbuf) {
-            CopyImageToTwo(cmdbuf, current_frame, *m_history_image, *m_current_image, m_extent);
+            CopyImageToTwo(cmdbuf, current_frame, *m_frame_images[0], *m_frame_images[1], m_extent);
         });
         m_has_history = true;
+        m_parity = 0;
         m_last_frame_count = frame_count;
         return;
     }
 
     if (!dispatch_flow) {
-        scheduler.Record([this, current_frame](vk::CommandBuffer cmdbuf) {
-            CopyImageToImage(cmdbuf, *m_current_image, *m_history_image, m_extent);
-            CopyImageToImage(cmdbuf, current_frame, *m_current_image, m_extent);
+        m_parity ^= 1U;
+        const VkImage cur_image = *m_frame_images[m_parity];
+        scheduler.Record([this, current_frame, cur_image](vk::CommandBuffer cmdbuf) {
+            CopyImageToImage(cmdbuf, current_frame, cur_image, m_extent);
         });
         m_last_frame_count = frame_count;
         m_flow_valid = false;
@@ -305,29 +403,10 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
     m_last_frame_count = frame_count;
 
     // ΓöÇΓöÇ Descriptor caching ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-    if (current_view != m_cached_flow_current_view) {
-        std::vector<VkDescriptorImageInfo> image_infos;
-        image_infos.reserve(4);
-        std::vector<VkWriteDescriptorSet> updates{
-            CreateWriteDescriptorSet(image_infos, *m_linear_sampler, current_view, m_flow_desc_sets[0], 0),
-            CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_history_view, m_flow_desc_sets[0], 1),
-        };
-
-        const VkDescriptorImageInfo motion_store_info{
-            .imageView = *m_motion_view,
-            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-        };
-        updates.push_back(VkWriteDescriptorSet{
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = m_flow_desc_sets[0],
-            .dstBinding = 2,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .pImageInfo = &motion_store_info,
-        });
-        device.GetLogical().UpdateDescriptorSets(updates, {});
-        m_cached_flow_current_view = current_view;
-    }
+    m_parity ^= 1U;
+    const u32 parity = m_parity;
+    const VkImage cur_image = *m_frame_images[parity];
+    const VkDescriptorSet flow_set = m_flow_desc_sets[parity];
 
     // Dispatch Optical Flow at half resolution
     const u32 flow_w = m_flow_extent.width;
@@ -341,19 +420,13 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
         .block_size = 2.0f,
     };
 
-    scheduler.Record([this, constants, current_frame, flow_w, flow_h](vk::CommandBuffer cmdbuf) {
-        // The last real frame becomes the history and this one the current copy, before the flow
-        // reads them: Generate() interpolates between the two. Copying the new frame into both
-        // after the flow made every generated frame the newest frame blended with itself.
-        CopyImageToImage(cmdbuf, *m_current_image, *m_history_image, m_extent);
-        CopyImageToImage(cmdbuf, current_frame, *m_current_image, m_extent);
-
-        // Transition motion image to GENERAL for storage write
-        TransitionImageLayout(cmdbuf, *m_motion_image, VK_IMAGE_LAYOUT_GENERAL);
+    scheduler.Record([this, constants, current_frame, cur_image, flow_set, flow_w,
+                      flow_h](vk::CommandBuffer cmdbuf) {
+        CopyFrameAndPrepareMotion(cmdbuf, current_frame, cur_image, *m_motion_image, m_extent);
 
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_flow_pipeline);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_flow_pipe_layout, 0,
-                                  m_flow_desc_sets[0], {});
+                                  flow_set, {});
         cmdbuf.PushConstants(*m_flow_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
         cmdbuf.Dispatch((flow_w + 15) / 16, (flow_h + 15) / 16, 1);
 
@@ -372,30 +445,41 @@ void Fsr3FrameGen::Generate(const Device& device, Scheduler& scheduler,
     }
 
     // ΓöÇΓöÇ Descriptor caching for interpolation ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-    if (destination_storage_view != m_cached_interp_dest_view) {
-        std::vector<VkDescriptorImageInfo> image_infos;
-        image_infos.reserve(4);
-        std::vector<VkWriteDescriptorSet> updates{
-            CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_current_view, m_interp_desc_sets[0], 0),
-            CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_history_view, m_interp_desc_sets[0], 1),
-            CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_motion_view, m_interp_desc_sets[0], 2),
-        };
+    const u32 parity = m_parity;
+    auto& cache = m_cached_interp_dest_views[parity];
+    u32 slot = INTERP_CACHE_SIZE;
+    for (u32 i = 0; i < INTERP_CACHE_SIZE; ++i) {
+        if (cache[i] == destination_storage_view) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == INTERP_CACHE_SIZE) {
+        slot = m_interp_next_slot[parity];
+        m_interp_next_slot[parity] = (slot + 1) % INTERP_CACHE_SIZE;
+        cache[slot] = destination_storage_view;
 
+        const VkDescriptorSet dst_set = m_interp_desc_sets[parity * INTERP_CACHE_SIZE + slot];
         const VkDescriptorImageInfo dest_info{
+            .sampler = VK_NULL_HANDLE,
             .imageView = destination_storage_view,
             .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
         };
-        updates.push_back(VkWriteDescriptorSet{
+        const VkWriteDescriptorSet write{
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = m_interp_desc_sets[0],
+            .pNext = nullptr,
+            .dstSet = dst_set,
             .dstBinding = 3,
+            .dstArrayElement = 0,
             .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             .pImageInfo = &dest_info,
-        });
-        device.GetLogical().UpdateDescriptorSets(updates, {});
-        m_cached_interp_dest_view = destination_storage_view;
+            .pBufferInfo = nullptr,
+            .pTexelBufferView = nullptr,
+        };
+        device.GetLogical().UpdateDescriptorSets(std::span{&write, 1}, {});
     }
+    const VkDescriptorSet interp_set = m_interp_desc_sets[parity * INTERP_CACHE_SIZE + slot];
 
     // Interpolation dispatches at full resolution
     const u32 out_w = m_extent.width;
@@ -409,10 +493,10 @@ void Fsr3FrameGen::Generate(const Device& device, Scheduler& scheduler,
         .flow_scale = flow_scale,
     };
 
-    scheduler.Record([this, constants, out_w, out_h](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, constants, interp_set, out_w, out_h](vk::CommandBuffer cmdbuf) {
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_interp_pipeline);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_interp_pipe_layout, 0,
-                                  m_interp_desc_sets[0], {});
+                                  interp_set, {});
         cmdbuf.PushConstants(*m_interp_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
         cmdbuf.Dispatch((out_w + 15) / 16, (out_h + 15) / 16, 1);
     });

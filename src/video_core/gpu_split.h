@@ -522,19 +522,22 @@ public:
             return false;
         }
         const u64 to_scan = pending_write_count - from;
-        if (to_scan > pending_writes.size()) {
-            return true;
-        }
+        const u64 limit = (std::min<u64>)(to_scan, pending_writes.size());
         const u64 end = begin + size;
-        for (u64 scanned = 0; scanned < to_scan; ++scanned) {
+        bool reached = to_scan <= pending_writes.size();
+        for (u64 scanned = 0; scanned < limit; ++scanned) {
             const PendingWrite& write =
                 pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
             if (write.position <= since) {
+                reached = true;
                 break;
             }
             if (write.begin < end && begin < write.end) {
                 return true;
             }
+        }
+        if (!reached) {
+            return true;
         }
         if (checked_writes != nullptr) {
             *checked_writes = pending_write_count;
@@ -742,7 +745,8 @@ private:
     void Commit(size_t words, Effect effect) {
         write_position += words;
         writes.Entry(effect, write_position);
-        if (write_position - published_local >= publish_every) {
+        if (write_position - published_local >= publish_every ||
+            back_waiting.load(std::memory_order_relaxed)) {
             Publish();
         }
     }
@@ -859,7 +863,7 @@ private:
         u64 device;
         u32 payload;
     };
-    std::array<QueuedRelease, 64> queued_releases{};
+    std::array<QueuedRelease, 1024> queued_releases{};
     /// Drops consumed ranged writes; returns the position a memory read of [begin, end) waits
     /// for and the method behind it.
     u64 MemoryWriterTarget(u64 done, GPUVAddr begin, GPUVAddr end, u32& target_method);

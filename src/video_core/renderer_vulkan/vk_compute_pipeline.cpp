@@ -217,6 +217,15 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     std::copy_n(info.constant_buffer_used_sizes.begin(), uniform_buffer_sizes.size(),
                 uniform_buffer_sizes.begin());
     num_descriptor_entries = NumDescriptorEntries(info);
+    const bool null_pointer_handles{VideoCore::Nx2Debug::Experiment(21) != 0};
+    for (const auto& desc : info.texture_descriptors) {
+        for (u32 index = 0; index < desc.count; ++index) {
+            const bool is_ptr = null_pointer_handles &&
+                                VideoCommon::HandleIsStoragePointer(info, desc, index);
+            texture_is_storage_ptr.push_back(is_ptr ? 1 : 0);
+            has_storage_ptr_textures |= is_ptr;
+        }
+    }
 
     DescriptorLayoutBuilder builder{device};
     builder.Add(info, VK_SHADER_STAGE_COMPUTE_BIT);
@@ -442,14 +451,13 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     for (const auto& desc : info.image_buffer_descriptors) {
         add_image(desc, false);
     }
-    // EDEN_NX2_EXP21 (default 1; 0 = off): no texture for a handle that is a buffer address.
-    const bool null_pointer_handles{VideoCore::Nx2Debug::Experiment(21) != 0};
+    size_t tex_idx = 0;
     for (const auto& desc : info.texture_descriptors) {
         for (u32 index = 0; index < desc.count; ++index) {
-            const auto handle{null_pointer_handles &&
-                                      VideoCommon::HandleIsStoragePointer(info, desc, index)
+            const auto handle{has_storage_ptr_textures && texture_is_storage_ptr[tex_idx] != 0
                                   ? VideoCommon::NULL_TEXTURE_HANDLE
                                   : read_handle(desc, index)};
+            ++tex_idx;
             views.push_back({handle.first});
 
             VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);

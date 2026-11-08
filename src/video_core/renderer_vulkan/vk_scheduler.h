@@ -188,6 +188,7 @@ public:
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
+        has_pending_commands = true;
         if (chunk->Record(command)) {
             return;
         }
@@ -202,6 +203,11 @@ public:
             [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
                 command(cmdbuf);
             });
+    }
+
+    [[nodiscard]] bool HasPendingCommands() const noexcept {
+        return has_pending_commands || state.renderpass != VK_NULL_HANDLE ||
+               deferred_clear.framebuffer != nullptr;
     }
 
     /// Whether the recording thread submitted `tick` within 20 ms.
@@ -523,6 +529,7 @@ private:
     std::condition_variable_any event_cv;
     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
     bool lazy_queued{};    ///< A lazily queued chunk may wait for a sleeping worker (recording thread)
+    bool has_pending_commands{};
     std::jthread worker_thread;
 
     std::chrono::steady_clock::duration frame_interval{};

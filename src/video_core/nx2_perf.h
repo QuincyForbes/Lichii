@@ -54,65 +54,62 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "write_intersections", "sorted_page_batches", "async_pipelines", "unswizzle_workers",
 };
 
+inline const bool g_enabled = [] {
+    const char* value = std::getenv("EDEN_NX2_PERF_OPT");
+    return value == nullptr || value[0] != '0';
+}();
+
 inline bool Enabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_PERF_OPT");
-        return value == nullptr || value[0] != '0';
-    }();
-    return enabled;
+    return g_enabled;
 }
+
+inline const unsigned g_off = [] {
+    const auto bit = [](Opt opt) { return 1U << static_cast<unsigned>(opt); };
+    const auto names = [](const char* variable) {
+        unsigned bits = 0;
+        std::string_view list = std::getenv(variable) ? std::getenv(variable) : "";
+        while (!list.empty()) {
+            const size_t comma = list.find(',');
+            const std::string_view name = list.substr(0, comma);
+            bool known = false;
+            for (size_t i = 0; i < opt_names.size(); ++i) {
+                if (name == opt_names[i]) {
+                    bits |= 1U << i;
+                    known = true;
+                }
+            }
+            if (!known && !name.empty()) {
+                LOG_WARNING(HW_GPU, "Nx2Perf: unknown name {} in {}", name, variable);
+            }
+            list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+        }
+        return bits;
+    };
+    const unsigned default_off = bit(Opt::FenceFlush) | bit(Opt::FragmentBarrier);
+    unsigned mask = (default_off & ~names("EDEN_NX2_PERF_ON")) | names("EDEN_NX2_PERF_OFF");
+    mask |= bit(Opt::SplitOverlap);
+    if (const char* value = std::getenv("EDEN_NX2_PERF_FRAMES_AHEAD"); value && value[0] == '0') {
+        mask |= bit(Opt::FramesAhead);
+    }
+    std::string state;
+    for (size_t i = 0; i < opt_names.size(); ++i) {
+        state += fmt::format(" {}={}", opt_names[i], g_enabled && (mask >> i & 1) == 0 ? "on" : "off");
+    }
+    LOG_INFO(HW_GPU, "Nx2Perf:{}", state);
+    return mask;
+}();
 
 inline bool On(Opt opt) {
-    static const unsigned off = [] {
-        const auto bit = [](Opt opt) { return 1U << static_cast<unsigned>(opt); };
-        const auto names = [](const char* variable) {
-            unsigned bits = 0;
-            std::string_view list = std::getenv(variable) ? std::getenv(variable) : "";
-            while (!list.empty()) {
-                const size_t comma = list.find(',');
-                const std::string_view name = list.substr(0, comma);
-                bool known = false;
-                for (size_t i = 0; i < opt_names.size(); ++i) {
-                    if (name == opt_names[i]) {
-                        bits |= 1U << i;
-                        known = true;
-                    }
-                }
-                if (!known && !name.empty()) {
-                    LOG_WARNING(HW_GPU, "Nx2Perf: unknown name {} in {}", name, variable);
-                }
-                list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
-            }
-            return bits;
-        };
-        // FramesAhead is on: with Ocarina's CPU readbacks preflushed it is worth ~1 fps (48.3 ->
-        // 49.5 on the Kokiri porch) and it waits for this frame too whenever the GPU falls behind.
-        const unsigned default_off = bit(Opt::CleanWords) |
-                                     bit(Opt::IndexRebind) | bit(Opt::SubmitBudget) |
-                                     bit(Opt::FenceFlush) | bit(Opt::FragmentBarrier) |
-                                     bit(Opt::FrontSleep) |
-                                     bit(Opt::Bounds);
-        unsigned mask = (default_off & ~names("EDEN_NX2_PERF_ON")) | names("EDEN_NX2_PERF_OFF");
-        mask |= bit(Opt::SplitOverlap);
-        if (const char* value = std::getenv("EDEN_NX2_PERF_FRAMES_AHEAD"); value && value[0] == '0') {
-            mask |= bit(Opt::FramesAhead);
-        }
-        std::string state;
-        for (size_t i = 0; i < opt_names.size(); ++i) {
-            state += fmt::format(" {}={}", opt_names[i], Enabled() && (mask >> i & 1) == 0 ? "on" : "off");
-        }
-        LOG_INFO(HW_GPU, "Nx2Perf:{}", state);
-        return mask;
-    }();
-    return Enabled() && (off >> static_cast<unsigned>(opt) & 1) == 0;
+    return g_enabled && (g_off >> static_cast<unsigned>(opt) & 1) == 0;
 }
 
+inline const bool g_verify = [] {
+    const char* value = std::getenv("EDEN_NX2_PERF_VERIFY");
+    return value != nullptr && value[0] == '1';
+}();
+
 inline bool Verify() {
-    static const bool verify = [] {
-        const char* value = std::getenv("EDEN_NX2_PERF_VERIFY");
-        return value != nullptr && value[0] == '1';
-    }();
-    return verify;
+    return g_verify;
 }
 
 /// The frame period the game asks for (nx2:vi2 present word 12 at the speed limit), 0 while

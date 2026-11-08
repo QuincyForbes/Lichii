@@ -109,6 +109,8 @@ private:
     u32 num_descriptor_entries{};
     boost::container::small_vector<VideoCommon::ImageViewId, 8> written_images;
     std::vector<SampledImage> sampled_images;
+    boost::container::small_vector<u8, 64> texture_is_storage_ptr;
+    bool has_storage_ptr_textures{};
 
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
 

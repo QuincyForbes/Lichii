@@ -139,12 +139,14 @@ inline void LoadExperiments() {
         g_experiments[21].store(1, std::memory_order_relaxed);
         // EXP2 = 1: skip same-value index_buffer.first writes on the split front.
         g_experiments[2].store(1, std::memory_order_relaxed);
-        // EXP3 = 1: skip FenceRelease drain when FencesQuiet(true) holds.
-        g_experiments[3].store(1, std::memory_order_relaxed);
+        // EXP3 = 2: skip FenceRelease drain when FencesQuiet(false) holds.
+        g_experiments[3].store(2, std::memory_order_relaxed);
         // EXP5 = 1: background pipeline prebuild threads run at idle priority on efficiency cores.
         g_experiments[5].store(1, std::memory_order_relaxed);
-        // EXP12 = 1: readable acquire fence releases wait only for untracked writers first.
-        g_experiments[12].store(1, std::memory_order_relaxed);
+        // EXP6 = 2: yield instead of 1 ms sleep when waiting on suspended channels.
+        g_experiments[6].store(2, std::memory_order_relaxed);
+        // EXP12 = 2: readable acquire fence releases wait only for untracked writers without a second full drain.
+        g_experiments[12].store(2, std::memory_order_relaxed);
         // EXP17 = 1: streamed uniform copies reused across stages by guest range (#641 wave 5).
         g_experiments[17].store(1, std::memory_order_relaxed);
         // EXP18 = 7: UBO rebind memo + storage FindBuffer memo + once-per-frame LRU touch (#641).

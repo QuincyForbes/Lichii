@@ -358,11 +358,13 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         return true;
     case 0xae: case 0xaf: case 0xb0: {
         const GPUVAddr qmd_address = GPUVAddr{native_registers[0xad]} << 8;
-        VideoCommon::TraceNativeQuery(9, memory_manager.GetID(), qmd_address,
-            memory_manager.GpuToCpuAddress(qmd_address).value_or(0), method, argument, 0);
+        static const bool qmd_diagnostics = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
+        if (qmd_diagnostics) [[unlikely]] {
+            VideoCommon::TraceNativeQuery(9, memory_manager.GetID(), qmd_address,
+                memory_manager.GpuToCpuAddress(qmd_address).value_or(0), method, argument, 0);
+        }
         if (method == 0xae || (method == 0xaf && !(argument & 2)) ||
             (method == 0xb0 && ((argument & 15) == 0 || (argument & 15) == 1))) return true;
-        static const bool qmd_diagnostics = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
         if ((argument & 15) == 12 && qmd_diagnostics) {
             static u32 captured{};
             if (captured++ == 0 && memory_manager.IsFullyMappedRange(qmd_address, 256)) {
@@ -393,13 +395,15 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                              fmt::join(std::span{descriptor}.subspan(28, 4), ","),
                              fmt::join(std::span{descriptor}.subspan(52, 4), ","));
                 }
-                for (u32 slot = 0; slot < 2; ++slot) {
-                    const u32 flags = descriptor[25 + slot * 4];
-                    if (!(flags & (1U << 23))) continue;
-                    const GPUVAddr destination = (GPUVAddr{flags & 0xff} << 32) | descriptor[24 + slot * 4];
-                    VideoCommon::TraceNativeQuery(7 + slot, memory_manager.GetID(), destination,
-                        memory_manager.GpuToCpuAddress(destination).value_or(0),
-                        descriptor[4], descriptor[26 + slot * 4], flags);
+                if (qmd_diagnostics) [[unlikely]] {
+                    for (u32 slot = 0; slot < 2; ++slot) {
+                        const u32 flags = descriptor[25 + slot * 4];
+                        if (!(flags & (1U << 23))) continue;
+                        const GPUVAddr destination = (GPUVAddr{flags & 0xff} << 32) | descriptor[24 + slot * 4];
+                        VideoCommon::TraceNativeQuery(7 + slot, memory_manager.GetID(), destination,
+                            memory_manager.GpuToCpuAddress(destination).value_or(0),
+                            descriptor[4], descriptor[26 + slot * 4], flags);
+                    }
                 }
                 return true;
             },
@@ -425,7 +429,8 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
                                                           memory_manager.Read<u32>(address), payload);
                         memory_manager.Write<u32>(address, value);
-                        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                        const auto device = memory_manager.GpuToCpuAddress(address);
+                        if (device) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
                         }
                         static const u64 watch = [] {
@@ -435,8 +440,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         if (watch != 0 && (address & ~u64{0xf}) == watch) {
                             LOG_INFO(HW_GPU, "Semaphore watch: QMD release reduction {:#x} -> {:#x}", address, value);
                         }
-                        VideoCommon::TraceNativeQuery(1, memory_manager.GetID(), address,
-                            memory_manager.GpuToCpuAddress(address).value_or(0), 0, value, 1U << 26);
+                        if (qmd_diagnostics) [[unlikely]] {
+                            VideoCommon::TraceNativeQuery(1, memory_manager.GetID(), address,
+                                device.value_or(0), 0, value, 1U << 26);
+                        }
                     });
                 } else if (four_words) {
                     rasterizer->Query(address, VideoCommon::QueryType::Payload,
@@ -525,11 +532,13 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
 
     switch (method) {
     case KEPLER_COMPUTE_REG_INDEX(exec_upload): {
-        UploadInfo info{.upload_address = upload_address,
-                        .exec_address = upload_state.ExecTargetAddress(),
-                        .copy_size = upload_state.GetUploadSize(),
-                        .was_dirty = upload_dirty};
-        uploads.push_back(info);
+        if (!native_mode) {
+            UploadInfo info{.upload_address = upload_address,
+                            .exec_address = upload_state.ExecTargetAddress(),
+                            .copy_size = upload_state.GetUploadSize(),
+                            .was_dirty = upload_dirty};
+            uploads.push_back(info);
+        }
         upload_state.ProcessExec(regs.exec_upload.linear != 0);
         break;
     }
@@ -1548,24 +1557,18 @@ void KeplerCompute::FrontNoteWriter(VideoCommon::GpuSplit& split, FrontState& fs
     case 0xaf:
         if ((argument & 2) != 0) {
             split.NoteDispatchWriter();
-            if (VideoCommon::QmdPrediction::Enabled()) {
-                FrontPredictQmd(split, fs, method, argument);
-            }
+            FrontPredictQmd(split, fs, method, argument);
         }
         return;
     case 0xb0:
         if ((argument & 15) > 1) {
             split.NoteDispatchWriter();
-            if (VideoCommon::QmdPrediction::Enabled()) {
-                FrontPredictQmd(split, fs, method, argument);
-            }
+            FrontPredictQmd(split, fs, method, argument);
         }
         return;
     case 0x107:
         split.NoteDispatchWriter();
-        if (VideoCommon::QmdPrediction::Enabled()) {
-            FrontPredictQmd(split, fs, method, argument);
-        }
+        FrontPredictQmd(split, fs, method, argument);
         return;
     case 0x6c3: {
         const GPUVAddr address =
@@ -1627,8 +1630,13 @@ void KeplerCompute::FrontPredictQmd(VideoCommon::GpuSplit& split, const FrontSta
             }
             const GPUVAddr destination = (GPUVAddr{flags & 0xff} << 32) | qmd[base];
             if (const auto device = memory_manager.GpuToCpuAddress(destination)) {
-                Prediction::Predict(Prediction::Writer::Qmd, *device, qmd[base + 2], position,
-                                    qmd_address, stale);
+                if (!stale) {
+                    split.NoteRelease(*device, destination, qmd[base + 2]);
+                }
+                if (Prediction::Enabled()) {
+                    Prediction::Predict(Prediction::Writer::Qmd, *device, qmd[base + 2], position,
+                                        qmd_address, stale);
+                }
             } else {
                 Prediction::NoteUnmappedRelease();
             }

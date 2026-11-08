@@ -833,11 +833,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             trace_submissions[trace_gpu_count] = trace_work;
             ++trace_gpu_count;
             trace_gpu_recording = false;
+            trace_work = {};
         } else if (trace_gpu_sampling) {
             ++trace_gpu_skipped;
-        }
-        if (trace_query_pool) {
-            trace_work = {};
         }
         cmdbuf.End();
 
@@ -878,6 +876,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     });
     chunk->MarkSubmit();
     DispatchWork();
+    has_pending_commands = false;
     return signal_value;
 }
 

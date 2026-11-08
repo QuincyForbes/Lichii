@@ -43,6 +43,9 @@ public:
     }
 
 private:
+    static constexpr size_t NUM_PARITIES = 2;
+    static constexpr size_t INTERP_CACHE_SIZE = 8;
+
     void CreateResources(const Device& device);
     void CreateShaders(const Device& device);
     void CreatePipelines(const Device& device);
@@ -68,16 +71,12 @@ private:
     vk::DescriptorSets m_flow_desc_sets;
     vk::DescriptorSets m_interp_desc_sets;
 
-    // History and motion vector images
-    vk::Image m_history_image;
-    vk::ImageView m_history_view;
+    std::array<vk::Image, NUM_PARITIES> m_frame_images;
+    std::array<vk::ImageView, NUM_PARITIES> m_frame_views;
+    u32 m_parity{};
 
     vk::Image m_motion_image;
     vk::ImageView m_motion_view;
-
-    // Store the last current-frame view for descriptor caching
-    vk::Image m_current_image;
-    vk::ImageView m_current_view;
 
     bool m_initialized{};
     bool m_has_history{};
@@ -86,9 +85,8 @@ private:
     u64 m_last_frame_count{};
     bool m_flow_valid{};
 
-    // Descriptor caching: only update when views change
-    VkImageView m_cached_flow_current_view{VK_NULL_HANDLE};
-    VkImageView m_cached_interp_dest_view{VK_NULL_HANDLE};
+    std::array<std::array<VkImageView, INTERP_CACHE_SIZE>, NUM_PARITIES> m_cached_interp_dest_views{};
+    std::array<u32, NUM_PARITIES> m_interp_next_slot{};
 };
 
 } // namespace Vulkan

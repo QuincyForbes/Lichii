@@ -39,10 +39,12 @@ enum class Id : u8 {
     E02,
     E04,
     E08,
+    E0A,
     E10,
     E1C,
     E1E,
     E20,
+    E26,
     E28,
     E2A,
     E2C,
@@ -51,6 +53,7 @@ enum class Id : u8 {
     E3E,
     E52,
     E5C,
+    E62,
     E68,
     E8C,
     E92,
@@ -663,6 +666,157 @@ bool ED6(C& c) {
     return true;
 }
 
+// 0xe0a (start 0x32): clears `Read(0x206 + (((p0 >> 6) & 15) << 4))` layers:
+// 674 = p0 + i * 0x400 for i in 0..layers-1.
+template <typename C>
+bool E0A(C& c) {
+    if (c.Count() < 1) {
+        return false;
+    }
+    const u32 p0 = c.Param(0);
+    const u32 layers = c.Read(0x206 + (((p0 >> 6) & 15) << 4));
+    if (layers > MaxInstances) {
+        return false;
+    }
+    for (u32 i = 0; i < layers; ++i) {
+        c.Emit(0x674, p0 + i * 0x400);
+    }
+    return true;
+}
+
+// 0xe26 (start 0x88): switches pipeline mode dram[0x52d] = p0 (0: VTG, 1: task+mesh, 2: mesh)
+// and rebinds cached programs, transform feedback, and constant buffer banks 0x904/0x914.
+template <typename C>
+bool E26(C& c) {
+    if (c.Count() < 1) {
+        return false;
+    }
+    u32* const dram = c.Dram();
+    const u32 p0 = c.Param(0);
+    if (p0 == dram[0x52d]) {
+        return true;
+    }
+    const u32 cb_size = dram[0x543];
+    dram[0x52d] = p0;
+    const auto emit_stage = [&](u32 base, u32 disable_bits) {
+        if (dram[base] == 0) {
+            c.Emit(0x800 | disable_bits, disable_bits);
+            return;
+        }
+        const u32 p2 = dram[base + 1], p3 = dram[base + 2], p4 = dram[base + 3];
+        const u32 stage = ((p4 >> 24) & 7) << 4;
+        c.Emit(0x805 | stage, p2 >> 24);
+        c.Emit(0x806 | stage, (p2 & 0xffffff) << 8);
+        c.Emit(0x807 | stage, (p4 >> 9) & 0x7f);
+        c.Emit(0x8e0, 0x10000);
+        c.Emit(0x8e1, p3 >> 24);
+        c.Emit(0x8e2, (p3 & 0xffffff) << 8);
+        c.Emit(0x904 | (((p4 >> 28) & 7) << 3), 0x11);
+        c.Emit(0x803 | stage, p4 & 0x1ff);
+        c.Emit(0x800 | stage, 1 | stage);
+    };
+    const auto emit_cb_bank = [&](u32 bind_method, u32 cb_addr, u32 cache_offset) {
+        c.Emit(0x8e0, cb_size);
+        c.Emit(0x8e1, cb_addr >> 24);
+        c.Emit(0x8e2, (cb_addr & 0xffffff) << 8);
+        c.Emit(bind_method, 0x21);
+        for (u32 i = 0; i < 14; ++i) {
+            const u32 low = dram[0x480 + cache_offset + i * 2];
+            const u32 high = dram[0x481 + cache_offset + i * 2];
+            const u32 size = (high >> 12) & 0xfffff;
+            const u32 slot_bits = (3 + i) << 4;
+            if (size != 0) {
+                c.Emit(0x8e0, size);
+                c.Emit(0x8e1, high & 0xff);
+                c.Emit(0x8e2, low);
+                c.Emit(bind_method, slot_bits | 1);
+            } else {
+                c.Emit(bind_method, slot_bits);
+            }
+        }
+    };
+    u32 cb0 = 0, cb1 = 0, off0 = 0, off1 = 0, prog_10 = 0, prog_30 = 0, prog_40 = 0;
+    if (p0 == 0) {
+        c.Emit(0x453, 0);
+        dram[0x52c] = 0x3f;
+        dram[0x528] = 0;
+        dram[0x52a] = 2;
+        dram[0x529] = 15;
+        dram[0x52b] = 15;
+        cb0 = dram[0x53c];
+        cb1 = dram[0x53e];
+        off0 = 0;
+        off1 = 0x40;
+        emit_stage(0x500, 0x00);
+        emit_stage(0x508, 0x20);
+        if ((dram[0x52e] & 1) == 0) {
+            c.Emit(0x82, 0);
+        } else {
+            c.Emit(0x82, 1);
+            for (u32 i = 0; i < 8; ++i) {
+                c.Emit(0x490 + i, dram[0x52f + i]);
+            }
+        }
+        prog_10 = 0x504;
+        prog_30 = 0x50c;
+        prog_40 = 0x510;
+    } else {
+        c.Emit(0x453, 1);
+        if (p0 == 2) {
+            dram[0x52c] = 0x320;
+            dram[0x528] = 15;
+            dram[0x52a] = 15;
+            dram[0x529] = 15;
+            dram[0x52b] = 0;
+            cb0 = dram[0x542];
+            off0 = 0x60;
+            c.Emit(0x830, 0x30);
+            prog_10 = 0x520;
+        } else {
+            dram[0x52c] = 0x2e0;
+            dram[0x528] = 15;
+            dram[0x52a] = 15;
+            dram[0x529] = 0;
+            dram[0x52b] = 2;
+            cb0 = dram[0x541];
+            cb1 = dram[0x542];
+            off0 = 0x20;
+            off1 = 0x60;
+            prog_10 = 0x518;
+            prog_30 = 0x51c;
+        }
+        prog_40 = 0x524;
+        c.Emit(0x800, 0);
+        c.Emit(0x820, 0x20);
+        c.Emit(0x82, 1);
+        for (u32 i = 0; i < 8; ++i) {
+            c.Emit(0x490 + i, 0);
+        }
+    }
+    emit_stage(prog_10, 0x10);
+    emit_stage(prog_40, 0x40);
+    emit_cb_bank(0x904, cb0, off0);
+    if (p0 != 2) {
+        emit_stage(prog_30, 0x30);
+        emit_cb_bank(0x914, cb1, off1);
+    }
+    return true;
+}
+
+// 0xe62 (start 0x24b): one non-instanced array draw (points).
+//   586 = 0, 35d = p1, 35e = p0, 585 = 0
+template <typename C>
+bool E62(C& c) {
+    if (c.Count() < 2) {
+        return false;
+    }
+    c.Emit(0x586, 0);
+    c.Emit(0x35d, c.Param(1));
+    c.Emit(0x35e, c.Param(0));
+    c.Emit(0x585, 0);
+    return true;
+}
+
 } // namespace Detail
 
 /// Runs replacement `id` (Find) for the call in `c`. False: run the call through the JIT.
@@ -675,6 +829,8 @@ bool Run(Id id, C& c) {
         return Detail::E04(c);
     case Id::E08:
         return Detail::E08(c);
+    case Id::E0A:
+        return Detail::E0A(c);
     case Id::E10:
         return Detail::E10(c);
     case Id::E1C:
@@ -683,6 +839,8 @@ bool Run(Id id, C& c) {
         return Detail::E1E(c);
     case Id::E20:
         return Detail::E20(c);
+    case Id::E26:
+        return Detail::E26(c);
     case Id::E28:
         return Detail::E28(c);
     case Id::E2A:
@@ -699,6 +857,8 @@ bool Run(Id id, C& c) {
         return Detail::E52(c);
     case Id::E5C:
         return Detail::E5C(c);
+    case Id::E62:
+        return Detail::E62(c);
     case Id::E68:
         return Detail::E68(c);
     case Id::E8C:

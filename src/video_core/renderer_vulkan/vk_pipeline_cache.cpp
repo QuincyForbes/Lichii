@@ -22,6 +22,9 @@
 #include <bit>
 #include <cstring>
 #include <numeric>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include "common/cityhash.h"
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
@@ -427,12 +430,35 @@ size_t GraphicsPipelineCacheKey::Hash() const noexcept {
 }
 
 bool GraphicsPipelineCacheKey::operator==(const GraphicsPipelineCacheKey& rhs) const noexcept {
+#if defined(_M_X64) || defined(__x86_64__)
+    const auto* a = reinterpret_cast<const __m256i*>(this);
+    const auto* b = reinterpret_cast<const __m256i*>(&rhs);
+    const __m256i d0 = _mm256_xor_si256(_mm256_loadu_si256(a + 0), _mm256_loadu_si256(b + 0));
+    const __m256i d1 = _mm256_xor_si256(_mm256_loadu_si256(a + 1), _mm256_loadu_si256(b + 1));
+    const __m256i d2 = _mm256_xor_si256(_mm256_loadu_si256(a + 2), _mm256_loadu_si256(b + 2));
+    const __m256i d3 = _mm256_xor_si256(_mm256_loadu_si256(a + 3), _mm256_loadu_si256(b + 3));
+    __m256i diff = _mm256_or_si256(_mm256_or_si256(d0, d1), _mm256_or_si256(d2, d3));
+    const size_t size = Size();
+    if (size == 160) [[likely]] {
+        diff = _mm256_or_si256(diff, _mm256_xor_si256(_mm256_loadu_si256(a + 4), _mm256_loadu_si256(b + 4)));
+        return _mm256_testz_si256(diff, diff) != 0;
+    }
+    if (size == 128) {
+        return _mm256_testz_si256(diff, diff) != 0;
+    }
+    if (_mm256_testz_si256(diff, diff) == 0) {
+        return false;
+    }
+    return std::memcmp(reinterpret_cast<const char*>(this) + 128,
+                       reinterpret_cast<const char*>(&rhs) + 128, size - 128) == 0;
+#else
     if (unique_hashes != rhs.unique_hashes) {
         return false;
     }
     return std::memcmp(reinterpret_cast<const char*>(this) + sizeof(unique_hashes),
                        reinterpret_cast<const char*>(&rhs) + sizeof(unique_hashes),
                        state.Size()) == 0;
+#endif
 }
 
 namespace {
@@ -1124,10 +1150,6 @@ void PipelineCache::BuildCleanWatch(bool patch) {
             ranges.push_back({static_cast<u32>(offset / sizeof(u32)), 1});
         }
     }
-    // Dirty::ViewportSwizzles:
-    for (const auto& viewport : regs.viewport_transform) {
-        watch(viewport.swizzle);
-    }
     // DynamicState::Refresh (no extended dynamic state):
     if (!features.has_extended_dynamic_state) {
         watch(regs.gl_front_face);
@@ -1160,7 +1182,9 @@ void PipelineCache::BuildCleanWatch(bool patch) {
             watch(regs.color_mask);
             watch(regs.blend_per_target);
         }
-        watch(regs.iterated_blend); // No dirty flag
+        if (Settings::values.use_squashed_iterated_blend) {
+            watch(regs.iterated_blend.enable);
+        }
     }
     // DynamicState::Refresh3:
     if (!features.has_dynamic_state3_logic_op_enable) {
@@ -1299,8 +1323,8 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
         clean.hashes == graphics_key.unique_hashes &&
         clean.topology == maxwell3d->draw_manager.draw_state.topology &&
         clean.engine_state == maxwell3d->engine_state &&
-        (!patch || FixedPipelineState::DualSourceBlend(maxwell3d->regs) ==
-                       (graphics_key.state.attachment0_dual_source_blend != 0)) &&
+        (!patch_blending || FixedPipelineState::DualSourceBlend(maxwell3d->regs) ==
+                                (graphics_key.state.attachment0_dual_source_blend != 0)) &&
         CleanInputsUnchanged()) {
         ++clean.hits;
     } else {
@@ -1333,15 +1357,31 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
         // Every other Refresh input is unchanged, so the snapshot stands. As RefreshGraphicsKey
         // under the raised flags; VertexInput stays raised for the command buffer update.
         ++clean.patches;
-        clean.pipeline = nullptr;
+        bool key_changed = false;
         if (patch_vertex_input) {
             vertex_attribute_types = FixedPipelineState::DynamicAttributeTypes(maxwell3d->regs);
-            graphics_key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
+            const u64 new_types = VideoCommon::KeyedAttributeTypes(
                 vertex_attribute_types, graphics_key.unique_hashes, vertex_attribute_masks);
+            if (graphics_key.state.attribute_types != new_types) {
+                graphics_key.state.attribute_types = new_types;
+                key_changed = true;
+            }
         }
         if (patch_blending) {
+            const auto old_attachments = graphics_key.state.attachments;
+            const u32 old_raw2 = graphics_key.state.raw2;
             graphics_key.state.RefreshBlending(*maxwell3d);
+            if (graphics_key.state.raw2 != old_raw2 ||
+                std::memcmp(graphics_key.state.attachments.data(), old_attachments.data(),
+                            sizeof(old_attachments)) != 0) {
+                key_changed = true;
+            }
         }
+        if (!key_changed) {
+            current_pipeline->MarkUsed(frame_count);
+            return BuiltPipeline(current_pipeline);
+        }
+        clean.pipeline = nullptr;
     } else {
         TakeCleanSnapshot();
         RefreshGraphicsKey();

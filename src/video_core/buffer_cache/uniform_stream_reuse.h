@@ -59,7 +59,7 @@ template <class Ref>
 class UniformStreamReuse {
 public:
     static constexpr u32 MaxBytes = 4096; // BufferCache's DEFAULT_SKIP_CACHE_SIZE
-    static constexpr size_t NumStages = 5;
+    static constexpr size_t NumStages = 6; // the five graphics stages and compute
     static constexpr size_t NumSlots = 18; // Maxwell constant buffers per stage
     /// One private copy per slot, then the copies keyed by guest range (range reuse): NumSets
     /// sets of NumWays.

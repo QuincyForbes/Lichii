@@ -540,8 +540,9 @@ std::optional<u32> GpuSplit::QueuedReleasePayload(u64 device, GPUVAddr address, 
     }
     // Any write sent after the release (an unranged one, or a ranged one to the word) may change
     // the word before the acquire runs.
-    u32 method{};
-    if (MemoryWriterTarget(done, address, address + sizeof(u32), method) > release.position) {
+    if (last_unranged_position > release.position ||
+        NotedWriteSince(release.position, device, sizeof(u32)) ||
+        WritersMayWriteSince(release.position, device, sizeof(u32))) {
         if (miss) *miss = 3;
         return std::nullopt;
     }
@@ -914,12 +915,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
                     ++count;
                 }
                 maxwell3d->ConsumeSink(*system);
-                if (count == 1) {
-                    maxwell3d->CallMethod(*system, method, argument, true);
-                } else {
-                    maxwell3d->CallConstBufferWords(*system, methods.data(), arguments.data(),
-                                                    count);
-                }
+                maxwell3d->CallConstBufferWords(*system, methods.data(), arguments.data(), count);
                 return count;
             }
             if ((head & Direct) != 0) {

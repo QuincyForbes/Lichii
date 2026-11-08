@@ -378,6 +378,7 @@ GraphicsPipeline::GraphicsPipeline(
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
+    const bool null_pointer_handles{VideoCore::Nx2Debug::Experiment(21) != 0};
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         const Shader::Info* const info{infos[stage]};
         if (!info) {
@@ -392,6 +393,14 @@ GraphicsPipeline::GraphicsPipeline(
         num_image_elements += Shader::NumDescriptors(info->texture_descriptors);
         num_image_elements += Shader::NumDescriptors(info->image_descriptors);
         num_descriptor_entries += NumDescriptorEntries(*info);
+        for (const auto& desc : info->texture_descriptors) {
+            for (u32 index = 0; index < desc.count; ++index) {
+                const bool is_ptr = null_pointer_handles &&
+                                    VideoCommon::HandleIsStoragePointer(*info, desc, index);
+                texture_is_storage_ptr.push_back(is_ptr ? 1 : 0);
+                has_storage_ptr_textures |= is_ptr;
+            }
+        }
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
     const auto any_written = [](const auto& descriptors) {
@@ -520,6 +529,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
+    size_t tex_idx = 0;
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
         buffer_cache.UnbindGraphicsStorageBuffers(stage);
@@ -609,14 +619,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 add_image(desc, false);
             }
         }
-        // EDEN_NX2_EXP21 (default 1; 0 = off): no texture for a handle that is a buffer address.
-        const bool null_pointer_handles{VideoCore::Nx2Debug::Experiment(21) != 0};
         for (const auto& desc : info.texture_descriptors) {
             for (u32 index = 0; index < desc.count; ++index) {
-                const auto handle{null_pointer_handles &&
-                                          VideoCommon::HandleIsStoragePointer(info, desc, index)
+                const auto handle{has_storage_ptr_textures && texture_is_storage_ptr[tex_idx] != 0
                                       ? VideoCommon::NULL_TEXTURE_HANDLE
                                       : read_handle(desc, index)};
+                ++tex_idx;
                 // EDEN_NX2_HANDLE_TRACE=<shader hash>: each new handle of that shader's textures.
                 static const u64 trace_hash{[] {
                     const char* const value{std::getenv("EDEN_NX2_HANDLE_TRACE")};

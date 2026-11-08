@@ -710,9 +710,24 @@ struct Memory::Impl {
         }
         std::scoped_lock lk{read_trap_mutex};
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
+        u64 run_begin = 0;
+        u64 run_pages = 0;
         for (auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
              it != armed_read_traps.end() && *it < page_end; ++it) {
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
+            if (run_pages > 0 && *it == run_begin + run_pages) {
+                ++run_pages;
+            } else {
+                if (run_pages > 0) {
+                    host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
+                                         Common::MemoryPermission{});
+                }
+                run_begin = *it;
+                run_pages = 1;
+            }
+        }
+        if (run_pages > 0) {
+            host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
+                                 Common::MemoryPermission{});
         }
     }
 
