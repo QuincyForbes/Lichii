@@ -126,21 +126,26 @@ jobs:
 
       - name: Check the native app is linked
         run: |
-          set -euo pipefail
+          set -uo pipefail
           bin=build/bin/Lichii.app/Lichii
-          {
-            echo '## Native app'
-            echo '```'
-            nm -gU "$bin" | grep -E ' _lichii_(ui_main|emu_launch|settings_count)$' || echo 'native app symbols missing'
-            otool -L "$bin" | grep -E 'SwiftUI|libswiftCore' || true
-            grep -cE 'Swift|swiftc' build.log | sed 's/^/swift build lines: /' || true
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          nm -gU "$bin" | grep -q ' _lichii_ui_main$'
+          # Annotations are readable on the run page without signing in; job summaries are not.
+          note() { printf '::notice title=%s::%s\n' "$1" "$(printf '%s' "$2" | head -c 3500 | sed ':a;N;$!ba;s/%/%25/g;s/\n/%0A/g')"; }
+          note "Linked libraries" "$(otool -L "$bin" | grep -E 'SwiftUI|swift|UIKit' || echo none)"
+          note "Swift objects" "$(grep -E 'lichii_ios_app|\.swift' build.log | tail -20 || echo none)"
+          note "Cache" "$(grep -E 'LICHII_IOS_UI|Swift' build/CMakeCache.txt | head -20 || echo none)"
+          strings -a "$bin" | grep -q 'Recently Played' && otool -L "$bin" | grep -q SwiftUI
 
       - name: Summarize build errors
         if: failure()
         run: |
+          for log in build.log configure.log; do
+            [ -f "$log" ] || continue
+            grep -E 'error:|CMake Error|FAILED:|Undefined symbols|ld: ' -A 3 "$log" | head -c 30000 | split -b 3500 - "ann-$log-" || true
+          done
+          for part in ann-*; do
+            [ -f "$part" ] || continue
+            printf '::error title=%s::%s\n' "$part" "$(sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g' "$part")"
+          done
           {
             echo '## Build errors'
             echo '```'
