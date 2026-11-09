@@ -16,3 +16,4 @@ target_compile_options(lichii_ios_bridge PRIVATE
 create_target_directory_groups(lichii_ios_bridge)
 
 add_subdirectory(App)
+add_subdirectory(Controls)
