@@ -192,6 +192,13 @@ add_executable(update_checker_tests
 target_link_libraries(update_checker_tests PRIVATE common Catch2::Catch2WithMain)
 add_test(NAME update_checker_tests COMMAND update_checker_tests)
 
+add_executable(ios_controls_tests
+    ios_frontend/controls_router.cpp
+    ../ios_frontend/controls_router.cpp)
+target_include_directories(ios_controls_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(ios_controls_tests PRIVATE Catch2::Catch2WithMain)
+add_test(NAME ios_controls_tests COMMAND ios_controls_tests)
+
 # needed for vma
 if (NOT MSVC)
     target_compile_options(tests PRIVATE
