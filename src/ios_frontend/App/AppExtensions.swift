@@ -39,24 +39,29 @@ enum AppExtensions {
     /// Links shown at the top of the global settings (keys, firmware, controllers, logs, ...).
     static var settingsLinks: [SettingsLink] {
         ContentEntries.settingsLinks + [
-            // ios-controls: SettingsLink(id: "controls", title: "Controllers", systemImage: "gamecontroller", view: { AnyView(ControlsView()) }),
+            SettingsLink(id: "controls", title: "Controls", systemImage: "gamecontroller", view: { AnyView(ControlsView()) }),
         ]
     }
 
     /// Per-game screens (updates, DLC, mods, cheats, controller layout, ...).
     static var gameActions: [GameAction] {
-        ContentEntries.gameActions
+        ContentEntries.gameActions + [
+            GameAction(id: "layout", title: "Controller Layout", systemImage: "hand.tap",
+                       view: { AnyView(LayoutEditorScreen(gameId: $0.programIdHex, gameName: $0.title)) }),
+        ]
     }
 
     /// Replaces the basic in-game menu (ios-controls). Gets the game window's view controller.
-    static var presentInGameMenu: ((UIViewController) -> Void)? { nil }
+    static var presentInGameMenu: ((UIViewController) -> Void)? { { _ in MainActor.assumeIsolated { ControlsCenter.shared.openMenu() } } }
 
     /// Called with the render window each time a game boots (HUD, touch controls, ...).
-    static var gameWindowReady: [(UIWindow) -> Void] { [] }
+    static var gameWindowReady: [(UIWindow) -> Void] { [{ window in MainActor.assumeIsolated { ControlsCenter.shared.gameWindowReady(window) } }] }
 
     /// Called once after the library window is up (onboarding, ...).
-    static var appStarted: [() -> Void] { ContentEntries.appStarted }
+    static var appStarted: [() -> Void] {
+        ContentEntries.appStarted + [{ MainActor.assumeIsolated { ControlsCenter.shared.appStarted() } }]
+    }
 
     /// Every LichiiEvent the bridge posts.
-    static var eventHandlers: [(Int32) -> Void] { [] }
+    static var eventHandlers: [(Int32) -> Void] { [{ event in MainActor.assumeIsolated { ControlsCenter.shared.handle(event: event) } }] }
 }

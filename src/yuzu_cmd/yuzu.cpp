@@ -91,6 +91,7 @@
 #include "common/fs/fs.h"
 #include "ios_frontend/bridge_host.h"
 #include "ios_frontend/lichii_bridge_content_host.h"
+#include "ios_frontend/controls_host.h"
 #endif
 
 // Code-signing status: dynarmic's code pages are only executable while the process is being
@@ -464,6 +465,14 @@ static void IosApplyControllers(SdlState* state) {
 #endif
 }
 
+static bool IosNativeApp([[maybe_unused]] SdlState* state) {
+#ifdef LICHII_IOS_UI
+    return state->ios_config != nullptr;
+#else
+    return false;
+#endif
+}
+
 static void IosInstallTouchControls(SdlState* state) {
     g_ios_input = &state->input_subsystem;
     int count = 0;
@@ -510,6 +519,7 @@ static SDL_AppResult IosStartApp(SdlState* state, Core::LaunchParams lp) {
         .input = &state->input_subsystem,
         .save_config = [state] { state->ios_config->SaveAllValues(); },
     });
+    LichiiControls::Attach(state->system, state->input_subsystem);
     IosFrontend::SetJitPoolBytes(kIosJitPoolBytes);
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
     IOS_MARK("showing the app");
@@ -905,6 +915,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // adds a Bluetooth LE scan for Steam Controllers that ran every few seconds for the whole
     // session (battery, and Bluetooth prompts).
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "0");
+#ifdef LICHII_IOS_UI
+    // The app reads GameController devices itself (controls bridge), so SDL leaves them alone.
+    SDL_SetHint(SDL_HINT_JOYSTICK_MFI, "0");
+#endif
     // Per-draw GPU and service info logging costs frame time on the phone; keep warnings.
     Settings::values.log_filter.SetValue(
         "*:Info HW.GPU:Warning Render.Vulkan:Warning Service:Warning Service.NVDRV:Error "
@@ -1190,7 +1204,10 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
     // don't do anything, SDL3 already exists for us :D
     state->system.RegisterExitCallback([] {});
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-    IosInstallTouchControls(state);
+    // The app brings its own on-screen controller.
+    if (!ios_app) {
+        IosInstallTouchControls(state);
+    }
 #endif
 #ifdef LICHII_IOS_UI
     if (ios_app) {
@@ -1454,7 +1471,8 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     }
 #endif
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-    if (state->ios_controllers_dirty && state->emu_window) {
+    // The app maps controllers itself (controls bridge).
+    if (state->ios_controllers_dirty && state->emu_window && !IosNativeApp(state)) {
         state->ios_controllers_dirty = false;
         IosApplyControllers(state);
     }

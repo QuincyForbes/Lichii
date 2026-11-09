@@ -2,7 +2,7 @@ name: iOS
 
 on:
   push:
-    branches: [ios, ios-frontend, ios-content]
+    branches: [ios, ios-frontend, ios-content, ios-controls, ios-platform, ios-merge]
     paths-ignore: ['**.md']
   workflow_dispatch:
   # release-binaries.yml calls this to put the IPA into its release; it names the artifact and the
