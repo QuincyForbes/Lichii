@@ -192,6 +192,11 @@ u64 RunningProgramId() {
     return g_program_id;
 }
 
+std::string RunningGamePath() {
+    std::scoped_lock lock{g_mutex};
+    return g_game_path;
+}
+
 void ApplyGameConfig(u64 program_id) {
     if (program_id == 0 || !Common::FS::Exists(GameConfigPath(program_id))) {
         return;

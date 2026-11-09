@@ -337,6 +337,8 @@ static void OnStatusMessageReceived(const Network::StatusMessageEntry& msg) {
         std::cout << std::endl << "* " << message << std::endl << std::endl;
 }
 
+static std::atomic_bool restart_requested{false};
+
 struct SdlState {
     Core::System system{};
     // Must outlive emu_window, which keeps a pointer to it.
@@ -564,6 +566,16 @@ static std::optional<SDL_AppResult> IosAppIterate(SdlState* state) {
         state->pending_launch.reset();
         IosFrontend::SetState(LICHII_EMU_IDLE);
     }
+    // The game asked to run another program: boot the same file again with the restart handoff,
+    // in this process (the pool is already prepared).
+    if (restart_requested.exchange(false) && state->system.IsPoweredOn()) {
+        Core::LaunchParams lp = state->ios_launch_template;
+        lp.filepath = IosFrontend::RunningGamePath();
+        IosStopGame(state);
+        setenv("EDEN_CLI_RESTART_HANDOFF", "1", 1);
+        state->pending_launch = std::move(lp);
+        IosFrontend::SetState(LICHII_EMU_BOOTING);
+    }
     if (!state->pending_launch && !state->system.IsPoweredOn()) {
         if (auto path = IosFrontend::TakeLaunchRequest()) {
             Core::LaunchParams lp = state->ios_launch_template;
@@ -582,7 +594,9 @@ static std::optional<SDL_AppResult> IosAppIterate(SdlState* state) {
             Core::LaunchParams lp = std::move(*state->pending_launch);
             state->pending_launch.reset();
             state->ios_load_result = Core::SystemResultStatus::Success;
-            if (SDL_AppInitRest(state, std::move(lp)) != SDL_APP_CONTINUE) {
+            const SDL_AppResult result = SDL_AppInitRest(state, std::move(lp));
+            unsetenv("EDEN_CLI_RESTART_HANDOFF");
+            if (result != SDL_APP_CONTINUE) {
                 IosBootFailed(state);
             }
         } else if (jit == State::Failed) {
@@ -605,7 +619,6 @@ static std::optional<SDL_AppResult> IosAppIterate(SdlState* state) {
 #endif
 
 constexpr int kRestartExitCode = 75;
-static std::atomic_bool restart_requested{false};
 
 // ExecuteProgram state for the restarted process: what the Qt frontend keeps in-process when it
 // reboots a game. Only read when the launcher sets EDEN_CLI_RESTART_HANDOFF, so a leftover file

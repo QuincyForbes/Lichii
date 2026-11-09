@@ -47,6 +47,7 @@ LichiiEmuState GetState();
 void SetRunningGame(std::string path, u64 program_id, void* ui_window);
 void ClearRunningGame();
 u64 RunningProgramId();
+std::string RunningGamePath();
 
 /// Loads <program id>.ini over the global values before a boot; RestoreGlobal undoes it.
 void ApplyGameConfig(u64 program_id);
