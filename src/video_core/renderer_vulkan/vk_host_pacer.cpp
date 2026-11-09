@@ -16,7 +16,6 @@
 #include <windows.h>
 #include <dwmapi.h>
 #include "common/string_util.h"
-#pragma comment(lib, "dwmapi.lib")
 #endif
 
 namespace Vulkan {

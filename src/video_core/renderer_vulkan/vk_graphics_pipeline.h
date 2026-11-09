@@ -75,6 +75,9 @@ class RescalingPushConstant;
 class RenderAreaPushConstant;
 class Scheduler;
 
+/// Ends the draw-reuse probe's frame; the rasterizer calls it once per frame.
+void NoteDrawReuseProbeFrame();
+
 class GraphicsPipeline {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
 

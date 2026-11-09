@@ -179,13 +179,15 @@ elseif (MANAGARM)
 endif()
 
 if (YUZU_USE_BUNDLED_FFMPEG)
-    # Windows (MSVC) and Linux x86_64 get the same FFmpeg with libdav1d, for Switch 2 titles' AV1
-    # movies; crueter-ci's packages, used elsewhere, have no AV1 decoder.
+    # Windows (MSVC and MinGW) and Linux x86_64 get the same FFmpeg with libdav1d, for Switch 2
+    # titles' AV1 movies; crueter-ci's packages, used elsewhere, have no AV1 decoder.
     if (IOS AND LICHII_FFMPEG_DIR)
         add_subdirectory("${LICHII_FFMPEG_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/lichii-ffmpeg")
         set(FFmpeg_SOURCE_DIR "${LICHII_FFMPEG_DIR}")
     elseif ((MSVC OR LINUX) AND CPMUTIL_AMD64)
         AddJsonPackage(ffmpeg-ci-av1)
+    elseif (MINGW AND CPMUTIL_AMD64)
+        AddJsonPackage(ffmpeg-ci-av1-mingw)
     else()
         AddJsonPackage(ffmpeg-ci)
     endif()
@@ -259,8 +261,10 @@ else()
 
     # `configure` parameters builds only exactly what yuzu needs from FFmpeg
     # `--disable-vdpau` is needed to avoid linking issues
-    set(FFmpeg_CC ${CMAKE_C_COMPILER_LAUNCHER}  ${CMAKE_C_COMPILER})
-    set(FFmpeg_CXX ${CMAKE_CXX_COMPILER_LAUNCHER}  ${CMAKE_CXX_COMPILER})
+    # One argument each ("ccache cc"): as a list, the launcher became --cc and the compiler a
+    # stray option configure rejects.
+    string(JOIN " " FFmpeg_CC ${CMAKE_C_COMPILER_LAUNCHER} ${CMAKE_C_COMPILER})
+    string(JOIN " " FFmpeg_CXX ${CMAKE_CXX_COMPILER_LAUNCHER} ${CMAKE_CXX_COMPILER})
     # FFmpeg links through the compiler driver; Apple's raw ld rejects the -Wl, flags it gets.
     if (APPLE)
         set(FFmpeg_LD ${CMAKE_C_COMPILER})
