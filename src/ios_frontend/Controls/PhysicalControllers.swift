@@ -252,16 +252,10 @@ final class PhysicalControllers: ObservableObject {
         guard motionManager.isDeviceMotionAvailable else { return }
         motionManager.deviceMotionUpdateInterval = 1.0 / 60.0
         deviceMotionTime = 0
-        motionManager.startDeviceMotionUpdates(to: motionOperations, withHandler: Self.deviceMotionHandler)
+        motionManager.startDeviceMotionUpdates(to: motionOperations, withHandler: deviceMotionHandler)
     }
 
-    private nonisolated static let deviceMotionHandler: CMDeviceMotionHandler = { data, _ in
-        if let data {
-            submitDeviceMotion(data)
-        }
-    }
-
-    private nonisolated static func submitDeviceMotion(_ m: CMDeviceMotion) {
+    fileprivate nonisolated static func submitDeviceMotion(_ m: CMDeviceMotion) {
         let accel = SIMD3<Double>(-(m.gravity.x + m.userAcceleration.x),
                                   -(m.gravity.y + m.userAcceleration.y),
                                   -(m.gravity.z + m.userAcceleration.z))
@@ -405,6 +399,13 @@ final class PhysicalControllers: ObservableObject {
         if let player = profile.player {
             lichii_pad_set_player(pad.slot, player)
         }
+    }
+}
+
+/// CoreMotion calls this on its operation queue.
+private let deviceMotionHandler: CMDeviceMotionHandler = { data, _ in
+    if let data {
+        PhysicalControllers.submitDeviceMotion(data)
     }
 }
 

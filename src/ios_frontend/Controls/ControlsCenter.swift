@@ -106,7 +106,6 @@ final class ControlsCenter: ObservableObject {
         PhysicalControllers.shared.updateDeviceMotion()
         overlay?.detach()
         ExternalDisplay.shared.gameEnded()
-        OrientationManager.shared.restoreLibrary()
         gameWindow = nil
     }
 
@@ -227,7 +226,7 @@ final class ControlsCenter: ObservableObject {
 
     func takeScreenshot() {
         let box = Unmanaged.passRetained(ScreenshotBox())
-        let requested = lichii_emu_screenshot(0, { context, pixels, width, height, flipY in
+        let requested = lichii_emu_screenshot(1080, { context, pixels, width, height, flipY in
             let box = Unmanaged<ScreenshotBox>.fromOpaque(context!).takeRetainedValue()
             let image = pixels.flatMap { ScreenshotBox.image(bgra: $0, width: Int(width), height: Int(height), flipY: flipY) }
             DispatchQueue.main.async {

@@ -80,7 +80,8 @@ private struct MenuButton: UIViewRepresentable {
         button.setImage(UIImage(systemName: "gearshape.circle.fill", withConfiguration: config), for: .normal)
         button.tintColor = .white
         button.alpha = 0.45
-        button.addAction(UIAction { _ in context.coordinator.action() }, for: .touchUpInside)
+        let coordinator = context.coordinator
+        button.addAction(UIAction { _ in coordinator.action() }, for: .touchUpInside)
         return button
     }
 

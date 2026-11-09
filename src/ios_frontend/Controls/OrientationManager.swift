@@ -62,11 +62,6 @@ final class OrientationManager: ObservableObject {
         window.windowScene?.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { _ in }
     }
 
-    /// The library may take any orientation again.
-    func restoreLibrary() {
-        lichii_controls_set_orientations(0)
-    }
-
     private var currentInterfaceOrientation: UIInterfaceOrientation {
         ControlsCenter.shared.gameWindow?.windowScene?.interfaceOrientation ?? .landscapeRight
     }
