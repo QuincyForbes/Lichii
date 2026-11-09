@@ -129,11 +129,11 @@ jobs:
           set -uo pipefail
           bin=build/bin/Lichii.app/Lichii
           # Annotations are readable on the run page without signing in; job summaries are not.
-          note() { printf '::notice title=%s::%s\n' "$1" "$(printf '%s' "$2" | head -c 3500 | sed ':a;N;$!ba;s/%/%25/g;s/\n/%0A/g')"; }
+          note() { printf '::notice title=%s::%s\n' "$1" "$(printf '%s\n' "$2" | head -c 3500 | awk 'BEGIN{ORS="%0A"}{gsub(/%/,"%25");gsub(/\r/,"");print}')"; }
           note "Linked libraries" "$(otool -L "$bin" | grep -E 'SwiftUI|swift|UIKit' || echo none)"
-          note "Swift objects" "$(grep -E 'lichii_ios_app|\.swift' build.log | tail -20 || echo none)"
-          note "Cache" "$(grep -E 'LICHII_IOS_UI|Swift' build/CMakeCache.txt | head -20 || echo none)"
-          strings -a "$bin" | grep -q 'Recently Played' && otool -L "$bin" | grep -q SwiftUI
+          note "Native app symbols" "$(nm "$bin" 2>/dev/null | grep -E 'lichii_(ui_main|emu_launch)' || echo none)"
+          note "Cache" "$(grep -E 'LICHII_IOS_UI|CMAKE_Swift_COMPILER' build/CMakeCache.txt || echo none)"
+          otool -L "$bin" | grep -q libswiftCore && otool -L "$bin" | grep -q SwiftUI
 
       - name: Summarize build errors
         if: failure()
@@ -144,7 +144,7 @@ jobs:
           done
           for part in ann-*; do
             [ -f "$part" ] || continue
-            printf '::error title=%s::%s\n' "$part" "$(sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g' "$part")"
+            printf '::error title=%s::%s\n' "$part" "$(awk 'BEGIN{ORS="%0A"}{gsub(/%/,"%25");gsub(/\r/,"");print}' "$part")"
           done
           {
             echo '## Build errors'

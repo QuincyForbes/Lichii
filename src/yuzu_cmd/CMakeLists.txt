@@ -95,7 +95,10 @@ if (IOS)
         # Linked by clang++: the Swift runtime and overlays come from the SDK and the toolchain.
         execute_process(COMMAND xcrun --sdk iphoneos --show-sdk-path
                         OUTPUT_VARIABLE LICHII_IOS_SDK OUTPUT_STRIP_TRAILING_WHITESPACE)
-        get_filename_component(LICHII_SWIFT_BIN "${CMAKE_Swift_COMPILER}" DIRECTORY)
+        # CMAKE_Swift_COMPILER may be the /usr/bin shim; the runtime libraries sit next to the real one.
+        execute_process(COMMAND xcrun --sdk iphoneos -f swiftc
+                        OUTPUT_VARIABLE LICHII_SWIFTC OUTPUT_STRIP_TRAILING_WHITESPACE)
+        get_filename_component(LICHII_SWIFT_BIN "${LICHII_SWIFTC}" DIRECTORY)
         set_target_properties(yuzu-cmd PROPERTIES LINKER_LANGUAGE CXX)
         target_link_options(yuzu-cmd PRIVATE
             "-L${LICHII_IOS_SDK}/usr/lib/swift"

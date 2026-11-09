@@ -56,8 +56,9 @@ final class GameLibrary: ObservableObject {
                     found.append(game)
                 }
             }
+            let result = found
             await MainActor.run {
-                self.games = found
+                self.games = result
                 self.isScanning = false
             }
         }
@@ -178,9 +179,10 @@ final class GameLibrary: ObservableObject {
                     failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
                 }
             }
+            let message = failures.isEmpty ? nil : failures.joined(separator: "\n")
             await MainActor.run {
                 self.importing = []
-                self.importError = failures.isEmpty ? nil : failures.joined(separator: "\n")
+                self.importError = message
                 self.reload()
             }
         }
