@@ -208,7 +208,8 @@ void ApplyAudioSession() {
     AVAudioSession* session = [AVAudioSession sharedInstance];
     NSError* error = nil;
     const AVAudioSessionCategoryOptions options =
-        g_audio_mix.load() ? AVAudioSessionCategoryOptionMixWithOthers : 0;
+        g_audio_mix.load() ? AVAudioSessionCategoryOptionMixWithOthers
+                           : static_cast<AVAudioSessionCategoryOptions>(0);
     [session setCategory:AVAudioSessionCategoryPlayback
                     mode:AVAudioSessionModeDefault
                  options:options
@@ -234,34 +235,34 @@ void InstallObservers() {
         [center addObserverForName:name object:nil queue:main usingBlock:block];
     };
     observe(UIApplicationWillResignActiveNotification,
-            ^(NSNotification*) { Emit(LICHII_PLATFORM_EVENT_WILL_RESIGN_ACTIVE); });
-    observe(UIApplicationDidEnterBackgroundNotification, ^(NSNotification*) {
+            ^(NSNotification* note) { Emit(LICHII_PLATFORM_EVENT_WILL_RESIGN_ACTIVE); });
+    observe(UIApplicationDidEnterBackgroundNotification, ^(NSNotification* note) {
       LOG_INFO(Frontend, "iOS: in the background, writing caches");
       lichii_platform_flush_caches();
       Emit(LICHII_PLATFORM_EVENT_DID_ENTER_BACKGROUND);
     });
     observe(UIApplicationWillEnterForegroundNotification,
-            ^(NSNotification*) { Emit(LICHII_PLATFORM_EVENT_WILL_ENTER_FOREGROUND); });
+            ^(NSNotification* note) { Emit(LICHII_PLATFORM_EVENT_WILL_ENTER_FOREGROUND); });
     observe(UIApplicationDidBecomeActiveNotification,
-            ^(NSNotification*) { Emit(LICHII_PLATFORM_EVENT_DID_BECOME_ACTIVE); });
-    observe(UIApplicationDidReceiveMemoryWarningNotification, ^(NSNotification*) {
+            ^(NSNotification* note) { Emit(LICHII_PLATFORM_EVENT_DID_BECOME_ACTIVE); });
+    observe(UIApplicationDidReceiveMemoryWarningNotification, ^(NSNotification* note) {
       LOG_WARNING(Frontend, "iOS: memory warning ({} MiB left, footprint {} MiB)",
                   lichii_platform_available_memory_mib(), lichii_platform_footprint_mib());
       Common::PlatformEvents::SignalMemoryPressure();
       Emit(LICHII_PLATFORM_EVENT_MEMORY_WARNING);
     });
-    observe(UIApplicationWillTerminateNotification, ^(NSNotification*) {
+    observe(UIApplicationWillTerminateNotification, ^(NSNotification* note) {
       WriteCachesNow();
       Emit(LICHII_PLATFORM_EVENT_WILL_TERMINATE);
     });
-    observe(NSProcessInfoThermalStateDidChangeNotification, ^(NSNotification*) {
+    observe(NSProcessInfoThermalStateDidChangeNotification, ^(NSNotification* note) {
       LichiiThermalAdvice advice{};
       lichii_platform_thermal_advice(&advice);
       LOG_INFO(Frontend, "iOS: thermal state {}{}{}", advice.thermal_state,
                advice.message[0] != '\0' ? ": " : "", advice.message);
       Emit(LICHII_PLATFORM_EVENT_THERMAL_STATE);
     });
-    observe(NSProcessInfoPowerStateDidChangeNotification, ^(NSNotification*) {
+    observe(NSProcessInfoPowerStateDidChangeNotification, ^(NSNotification* note) {
       LOG_INFO(Frontend, "iOS: Low Power Mode {}", lichii_platform_low_power_mode() != 0);
       Emit(LICHII_PLATFORM_EVENT_LOW_POWER_MODE);
     });
@@ -278,7 +279,7 @@ void InstallObservers() {
           Emit(LICHII_PLATFORM_EVENT_AUDIO_INTERRUPTION_ENDED);
       }
     });
-    observe(AVAudioSessionMediaServicesWereResetNotification, ^(NSNotification*) {
+    observe(AVAudioSessionMediaServicesWereResetNotification, ^(NSNotification* note) {
       LOG_WARNING(Frontend, "iOS: media services were reset, configuring the audio session again");
       ApplyAudioSession();
       Emit(LICHII_PLATFORM_EVENT_AUDIO_SERVICES_RESET);
