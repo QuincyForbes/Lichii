@@ -168,9 +168,16 @@ inline void LoadExperiments() {
     static_cast<void>(loaded);
 }
 
+/// Set once LoadExperiments has run: Experiment is called on several switches per draw, and
+/// a function static's guard costs a thread-local read on MSVC.
+inline std::atomic<bool> g_experiments_loaded{false};
+
 /// The value of experiment switch `n` (EDEN_NX2_EXP<n>), 0 unless set.
 [[nodiscard]] inline int Experiment(int n) {
-    LoadExperiments();
+    if (!g_experiments_loaded.load(std::memory_order_acquire)) [[unlikely]] {
+        LoadExperiments();
+        g_experiments_loaded.store(true, std::memory_order_release);
+    }
     return g_experiments[n].load(std::memory_order_relaxed);
 }
 
