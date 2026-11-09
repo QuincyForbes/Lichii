@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
@@ -22,6 +23,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/polyfill_thread.h"
 #include "common/thread_worker.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/value.h"
@@ -342,6 +344,8 @@ private:
     std::chrono::steady_clock::time_point background_start{};
     /// Last: destroyed (its threads joined) before the state above.
     std::unique_ptr<Common::ThreadWorker> background_workers;
+    /// Sets background_stop when emulation is asked to stop (the loading stop token).
+    std::unique_ptr<std::stop_callback<std::function<void()>>> background_stop_callback;
 
     /// EDEN_NX2_ASYNC_TRANSLATE=1/2: graphics pipelines translated off the GPU thread. Null with
     /// the switch off. Reset first in the destructor (its threads build with the members above).
