@@ -1889,14 +1889,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 }
                 bool build = !background_stop.load(std::memory_order_relaxed);
                 if (build) {
-                    std::scoped_lock lock{background_mutex};
+                    std::scoped_lock claimed_lock{background_mutex};
                     build = !background_claimed.contains(key);
                 }
                 std::unique_ptr<GraphicsPipeline> pipeline;
                 if (build) {
                     pipeline = CreateCachedGraphicsPipeline(key, records_, nullptr);
                 }
-                std::unique_lock lock{background_mutex};
+                std::unique_lock ready_lock{background_mutex};
                 if (pipeline && !background_claimed.contains(key)) {
                     background_ready.emplace(key, std::move(pipeline));
                 }
@@ -1911,7 +1911,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                     background_claimed.clear();
                     background_active.store(false, std::memory_order_release);
                 }
-                lock.unlock();
+                ready_lock.unlock();
                 // A pipeline dropped here was never bound, so no GPU work can still use it.
                 pipeline.reset();
             });
@@ -2442,13 +2442,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                                          hashes[stage + 1], stage, job->reference_spirv[stage]);
                 }
             }
-            auto pools = std::move(job->pools);
+            auto job_pools = std::move(job->pools);
             job.reset();
-            pools->ReleaseContents();
+            job_pools->ReleaseContents();
             {
                 std::scoped_lock lock{spare_pools_mutex};
                 if (spare_pools.size() < 4) {
-                    spare_pools.push_back(std::move(pools));
+                    spare_pools.push_back(std::move(job_pools));
                 }
             }
             AddRuntimeSpirvTime(1, begin);
