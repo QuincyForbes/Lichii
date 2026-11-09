@@ -2516,8 +2516,56 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     }
 }
 
+namespace {
+/// Guest writes of cached memory collected without the caches' mutexes (EDEN_NX2_EXP35) and those
+/// that took them, logged every 5 s with EDEN_NX2_GPU_PROFILE.
+struct GuestWriteCounters {
+    std::atomic<u64> collected{};
+    std::atomic<u64> locked{};
+    std::atomic<s64> last_log{};
+};
+GuestWriteCounters g_guest_writes;
+
+void CountGuestWrite(std::atomic<u64>& counter) {
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        return;
+    }
+    const u64 count = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((count & 1023) != 0) {
+        return;
+    }
+    auto& c = g_guest_writes;
+    const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 last = c.last_log.load(std::memory_order_relaxed);
+    if (now - last < 5000 || !c.last_log.compare_exchange_strong(last, now)) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "Guest writes of cached memory (5 s): {} collected unasked, {} locked",
+             c.collected.exchange(0), c.locked.exchange(0));
+}
+} // Anonymous namespace
+
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
+    // EDEN_NX2_EXP35 (live; from Fritchii v5.5, a34e72fec1/e423d1bd17): collect the write for the
+    // next InvalidateGPUCache without either cache's mutex, which the split's back holds through
+    // each draw (guest cores spent 16% of their busy time spinning on them at Castle Town).
+    // 1 = pages no GPU write ever marked, 2 = every page. A GPU-modified range's write is
+    // collected anyway; a clean one's WriteMemory becomes the same marks when the collected writes
+    // are applied (fences, cache invalidations, every flush), and downloads keep its bytes
+    // (DownloadLanding). Not pages of shader code or images (applied at once, as before): image
+    // downloads don't look at collected writes, and an image rendered to before they are applied
+    // would be uploaded again from the older guest bytes.
+    if (const int collect = VideoCore::Nx2Debug::Experiment(35);
+        collect != 0 && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+        (collect == 2 || !Tegra::Nx2MayBeGpuWritten(addr, size)) &&
+        !pipeline_cache.page_filter.Any(addr, size) && !texture_cache.page_filter.Any(addr, size)) {
+        CountGuestWrite(g_guest_writes.collected);
+        return true;
+    }
+    CountGuestWrite(g_guest_writes.locked);
     static const bool fast_path = [] {
         const char* value = std::getenv("EDEN_NX2_WRITE_FASTPATH");
         return value == nullptr || value[0] != '0';
@@ -2561,8 +2609,35 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.ClaimCpuWrites(ranges);
     }
-    for (const auto& [addr, size] : ranges) {
-        OnCacheInvalidation(addr, size);
+    // Each lock once for the batch, and the texture and shader caches only where they ever held
+    // something (page_filter): with EDEN_NX2_EXP35 most guest writes of cached memory come here.
+    const auto any = [&](const VideoCommon::PageFilter& filter) {
+        return std::ranges::any_of(ranges, [&](const std::pair<DAddr, u64>& range) {
+            return range.first != 0 && filter.Any(range.first, range.second);
+        });
+    };
+    if (any(texture_cache.page_filter)) {
+        std::scoped_lock lock{texture_cache.mutex};
+        for (const auto& [addr, size] : ranges) {
+            if (addr != 0 && size != 0) {
+                texture_cache.WriteMemory(addr, size);
+            }
+        }
+    }
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        for (const auto& [addr, size] : ranges) {
+            if (addr != 0 && size != 0) {
+                buffer_cache.WriteMemory(addr, size);
+            }
+        }
+    }
+    if (any(pipeline_cache.page_filter)) {
+        for (const auto& [addr, size] : ranges) {
+            if (addr != 0 && size != 0) {
+                pipeline_cache.InvalidateRegion(addr, size);
+            }
+        }
     }
 }
 

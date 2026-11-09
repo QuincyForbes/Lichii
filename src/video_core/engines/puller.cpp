@@ -123,9 +123,61 @@ bool MetByQueuedRelease(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
 // EDEN_NX2_ACQUIRE_PRECHECK=2: also while work is queued and on GPU-written pages. The word only
 // grows (GEQUAL semaphores count up), so guest memory, if older than a queued release or a cache,
 // holds a lower value: one that meets the acquire already, meets it then too. Only a write that
-// lowers the word (a reset) could make this wrong. Ocarina drained ~2,200 acquires a second that
-// were met at once.
-bool GequalMetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value) {
+// lowers the word (a reset) could make this wrong (QueuedWriteRefusesMet). Ocarina drained ~2,200
+// acquires a second that were met at once. `readable_word`: what SemaphoreReadableNow read, when
+// it read the word current.
+bool GequalMetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value,
+                           std::optional<u32> readable_word = std::nullopt);
+
+// EDEN_NX2_EXP34 (live; from Fritchii v5.5, f33124b812 and b2e1d011b5): where level 2 would answer
+// a GEQUAL acquire met from guest memory alone, send it the normal way when that may be over a
+// write still queued for the back. NVN2 resets its counters (a plain release of a low value) at
+// scene and pass boundaries; a queued reset leaves the old, higher word in guest memory and the
+// channel runs before the producer the reset preceded. 1 = refuse when the front knows any queued
+// write to the word: the newest plain release recorded for it (QueuedReleaseTo: puller WriteLong,
+// SEM_EXECUTE, 3D and compute 0x6c3 payload releases) with any payload, a noted queued write over
+// it (puller semaphores, 3D reports, uploads), a noted compute or copy writer range, or with
+// EXP13 a queued QMD prediction record; also when SemaphoreReadableNow read the word current and
+// below the value. 2 = only when that queued release writes less than the word read. 0 = off.
+// A strict tightening: a refused answer takes the path level 2 takes for a word below the value
+// (drain, or the readable fence release). Blind spots: with EXP13=0 the front can't tell which
+// word a queued QMD completion release writes, and queued_releases keeps one release per slot.
+// Front thread only, as the GpuSplit tables it reads.
+bool QueuedWriteRefusesMet(u64 device, u32 word, u32 value, std::optional<u32> readable_word) {
+    const int mode = VideoCore::Nx2Debug::Experiment(34);
+    if (mode == 0) {
+        return false;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    const u64 done = split.ConsumedNow();
+    const std::optional<u32> release = split.QueuedReleaseTo(device, done);
+    bool refuse = release && *release < word;
+    if (mode == 1 && !refuse) {
+        refuse = release.has_value() || (readable_word && *readable_word < value) ||
+                 split.HasQueuedWritesTo(device, sizeof(u32)) ||
+                 split.NotedWriterRangeSince(done, device, sizeof(u32)) ||
+                 (VideoCommon::QmdPrediction::Enabled() &&
+                  VideoCommon::QmdPrediction::QueuedPayloads(device, done).count != 0);
+    }
+    if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
+        static u64 asked = 0;
+        static u64 refused = 0;
+        static auto last_report = std::chrono::steady_clock::now();
+        ++asked;
+        refused += refuse ? 1 : 0;
+        if (const auto now = std::chrono::steady_clock::now();
+            now - last_report >= std::chrono::seconds{5}) {
+            last_report = now;
+            LOG_INFO(HW_GPU, "Acquire precheck (level 2, EXP34={}): {} met, {} sent the normal way",
+                     mode, asked - refused, refused);
+            asked = refused = 0;
+        }
+    }
+    return refuse;
+}
+
+bool GequalMetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value,
+                           std::optional<u32> readable_word) {
     static const int level = [] {
         const char* setting = std::getenv("EDEN_NX2_ACQUIRE_PRECHECK");
         return setting == nullptr ? 2 : setting[0] == '2' ? 2 : setting[0] != '0' ? 1 : 0;
@@ -140,7 +192,12 @@ bool GequalMetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value) {
         return false;
     }
     const auto device = memory.GpuToCpuAddress(address);
-    if (!device || (level == 1 && Nx2IsGpuWritten(*device)) || memory.Read<u32>(address) < value) {
+    if (!device || (level == 1 && Nx2IsGpuWritten(*device))) {
+        return false;
+    }
+    const u32 word = memory.Read<u32>(address);
+    if (word < value ||
+        (level == 2 && QueuedWriteRefusesMet(*device, word, value, readable_word))) {
         return false;
     }
     split.NoteSync();
@@ -600,11 +657,13 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquirePollsFast, 1);
         return true;
     }
+    std::optional<u32> readable_word;
     if (u32 word{}; SemaphoreReadableNow(dma_pusher, pending_acquire->address, word)) {
         if (pending_acquire->Matches(word)) {
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquirePollsFast, 1);
             return true;
         }
+        readable_word = word;
         // An unmet word is answered without a drain for at most 16 polls or 1 ms since the back
         // was last drained for this acquire. A release the back holds as deferred work lands only
         // when the back runs, so a channel polled without ever draining again waited forever
@@ -621,7 +680,8 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     }
     if (static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
             GpuSemaphoreOperation::AcquireGequal &&
-        GequalMetWithoutDrain(dma_pusher, pending_acquire->address, pending_acquire->value)) {
+        GequalMetWithoutDrain(dma_pusher, pending_acquire->address, pending_acquire->value,
+                              readable_word)) {
         return true;
     }
     if (static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
@@ -848,7 +908,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         if (op == GpuSemaphoreOperation::AcquireGequal &&
-            GequalMetWithoutDrain(dma_pusher, acquire.address, acquire.value)) {
+            GequalMetWithoutDrain(dma_pusher, acquire.address, acquire.value,
+                                  readable ? std::optional<u32>{word} : std::nullopt)) {
             return;
         }
         if (op == GpuSemaphoreOperation::AcquireEqual &&
