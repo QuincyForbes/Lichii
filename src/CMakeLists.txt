@@ -320,4 +320,9 @@ if (ANDROID)
     target_include_directories(yuzu-android PRIVATE android/app/src/main)
 endif()
 
+option(LICHII_BRIDGE_CONTENT "Build the iOS content bridge on other platforms (compile checks)" OFF)
+if (IOS OR LICHII_BRIDGE_CONTENT)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/ios_frontend/lichii_bridge_content.cmake)
+endif()
+
 include(GenerateDepHashes)

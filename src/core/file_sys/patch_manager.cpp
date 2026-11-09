@@ -907,15 +907,28 @@ std::vector<Core::Memory::CheatEntry> PatchManager::CreateCheatList(const BuildI
     auto patch_dirs = load_dir->GetSubdirectories();
     std::sort(patch_dirs.begin(), patch_dirs.end(), [](auto const& l, auto const& r) { return l->GetName() < r->GetName(); });
 
+    // Single cheats are switched off with "cheat:<folder or file>/<cheat name>" entries.
+    const auto apply_disabled_cheats = [&disabled](auto begin, auto end, const std::string& source) {
+        for (auto it = begin; it != end; ++it) {
+            const std::string name{it->definition.readable_name.data()};
+            if (!name.empty() && std::find(disabled.cbegin(), disabled.cend(),
+                                           fmt::format("cheat:{}/{}", source, name)) != disabled.cend()) {
+                it->enabled = false;
+            }
+        }
+    };
+
     // <mod dir> / <folder> / cheats / <build id>.txt
     std::vector<Core::Memory::CheatEntry> out;
     for (const auto& subdir : patch_dirs) {
         if (std::find(disabled.cbegin(), disabled.cend(), subdir->GetName()) == disabled.cend()) {
             if (auto cheats_dir = FindSubdirectoryCaseless(subdir, "cheats"); cheats_dir != nullptr) {
+                const auto first = out.size();
                 if (auto const res = ReadCheatFileFromFolder(title_id, build_id_, cheats_dir, true))
                     std::copy(res->begin(), res->end(), std::back_inserter(out));
                 if (auto const res = ReadCheatFileFromFolder(title_id, build_id_, cheats_dir, false))
                     std::copy(res->begin(), res->end(), std::back_inserter(out));
+                apply_disabled_cheats(out.begin() + static_cast<std::ptrdiff_t>(first), out.end(), subdir->GetName());
             }
         }
     }
@@ -928,7 +941,9 @@ std::vector<Core::Memory::CheatEntry> PatchManager::CreateCheatList(const BuildI
             if (f->Read(data.data(), data.size()) == data.size()) {
                 const Core::Memory::TextCheatParser parser;
                 auto const res = parser.Parse(std::string_view(reinterpret_cast<const char*>(data.data()), data.size()));
+                const auto first = out.size();
                 std::copy(res.begin(), res.end(), std::back_inserter(out));
+                apply_disabled_cheats(out.begin() + static_cast<std::ptrdiff_t>(first), out.end(), name);
             } else {
                 LOG_INFO(Common_Filesystem, "Failed to read cheats file for title_id={:016X}", title_id);
             }
