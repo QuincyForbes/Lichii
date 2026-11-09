@@ -459,7 +459,10 @@ jobs:
       - name: Stop sccache on Windows
         if: always() && matrix.platform == 'windows-x86_64' && steps.compiler-cache.outcome == 'success'
         shell: pwsh
-        run: sccache --stop-server
+        # The server may already have exited after the long LTO link; that must not fail the job.
+        run: |
+          sccache --stop-server
+          exit 0
 
       - name: Save compiler objects
         if: always() && steps.compiler-cache.outcome == 'success'
