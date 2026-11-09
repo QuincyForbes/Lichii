@@ -21,6 +21,7 @@
 
 #include "common/alignment.h"
 #include "common/memory_detect.h"
+#include "common/platform_events.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
@@ -680,7 +681,21 @@ void TextureCache<P>::TickFrame() {
         out_of_memory = failed != seen_failed_images;
         seen_failed_images = failed;
     }
-    RunGarbageCollector(out_of_memory);
+    // The OS warned of low memory or the process neared its limit (iOS): over the next frames
+    // collect as if out of device memory, since CPU and GPU share it.
+    Common::PlatformEvents::PollMemoryPressure();
+    if (const u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
+        pressure != seen_host_pressure) {
+        seen_host_pressure = pressure;
+        host_pressure_frames = 30;
+        LOG_WARNING(HW_GPU, "Host memory pressure: collecting textures ({} MiB in use)",
+                    total_used_memory >> 20);
+    }
+    const bool host_pressure = host_pressure_frames != 0;
+    if (host_pressure) {
+        --host_pressure_frames;
+    }
+    RunGarbageCollector(out_of_memory || host_pressure);
     if (out_of_memory) {
         // Textures left out for lack of memory are made again on their next read, once a frame
         // while images keep failing.

@@ -190,6 +190,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 native_expected_memory{};
     u64 budget_check_frames{};
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
+    u32 seen_host_pressure{};     ///< Common::PlatformEvents memory pressure already answered
+    u32 host_pressure_frames{};   ///< Frames left collecting as if out of memory after it
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image

@@ -17,6 +17,7 @@
 #include <vector>
 #include <fmt/ranges.h>
 
+#include "common/platform_events.h"
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
@@ -149,6 +150,17 @@ void BufferCache<P>::TickFrame() {
     const bool skip_preferred = hits * 256 < shots * 251;
     channel_state->uniform_buffer_skip_cache_size = skip_preferred ? DEFAULT_SKIP_CACHE_SIZE : 0;
 
+    // Host memory pressure (iOS): collect unused buffers for a while, without downloading
+    // GPU-written ones.
+    if (const u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
+        pressure != seen_host_pressure) {
+        seen_host_pressure = pressure;
+        host_pressure_frames = 30;
+    }
+    const bool host_pressure = host_pressure_frames != 0;
+    if (host_pressure) {
+        --host_pressure_frames;
+    }
     if (gpu_memory != nullptr && gpu_memory->UsesNativeTiling()) {
         // Switch 2 titles fill the device with textures (their collector watches the budget);
         // title 1's buffers were ~200 MiB of an 8 GB GPU's ~6.8 GB in use, yet this collector
@@ -156,14 +168,21 @@ void BufferCache<P>::TickFrame() {
         // downloading the GPU-written ones, ~5% of the GPU thread) that were recreated later.
         // Collect when the buffers themselves are large. At 1 GiB it held geometry of scenes
         // long gone: title 1's title screen grew to ~0.9 GB of buffers in ten minutes.
-        if (buffer_bytes >= 512_MiB) {
-            RunGarbageCollector(buffer_bytes >= 1_GiB);
+        // EDEN_NX2_BC_COLLECT_MIB moves the threshold (aggressive at twice it); iOS sets it from
+        // the process budget, since buffers share memory with everything else there.
+        static const u64 collect_bytes = [] {
+            const char* value = std::getenv("EDEN_NX2_BC_COLLECT_MIB");
+            const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+            return mib != 0 ? mib << 20 : u64{512_MiB};
+        }();
+        if (buffer_bytes >= collect_bytes || host_pressure) {
+            RunGarbageCollector(buffer_bytes >= collect_bytes * 2);
         }
     } else {
         if (runtime.CanReportMemoryUsage()) {
             total_used_memory = runtime.GetDeviceMemoryUsage();
         }
-        if (total_used_memory >= minimum_memory) {
+        if (total_used_memory >= minimum_memory || host_pressure) {
             RunGarbageCollector(total_used_memory >= critical_memory);
         }
     }
