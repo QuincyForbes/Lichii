@@ -277,20 +277,22 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     // ~45 a frame (a shadow map sized by the camera moves every target behind it), far more than
     // the age-based pass below frees.
     if (const u64 bad_overlap_age = (std::max)(u64{4}, min_age); frame_tick > bad_overlap_age) {
+        const bool low_vram = out_of_memory || total_used_memory > minimum_memory;
         size_t visits = 512;
         lru_cache.ForEachItemBelow(frame_tick - bad_overlap_age, [&](ImageId image_id) {
-            if (visits-- == 0) {
-                return true;
-            }
             auto& image = slot_images[image_id];
             if (False(image.flags & ImageFlagBits::BadOverlap) ||
                 True(image.flags & ImageFlagBits::IsDecoding)) {
                 return false;
             }
+            if (visits-- == 0) {
+                return true;
+            }
             const bool superseded = std::ranges::any_of(
                 image.overlapping_images, [&](ImageId overlap_id) {
                     const auto& overlap = slot_images[overlap_id];
-                    return True(overlap.flags & ImageFlagBits::GpuModified) &&
+                    return (low_vram || overlap.gpu_addr != image.gpu_addr) &&
+                           True(overlap.flags & ImageFlagBits::GpuModified) &&
                            overlap.modification_tick > image.modification_tick;
                 });
             if (!superseded) {
@@ -305,6 +307,9 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             DeleteImage(image_id, image.scale_tick > frame_tick + 5);
             return false;
         });
+    }
+    if (!out_of_memory && total_used_memory <= minimum_memory) {
+        return;
     }
     Configure(false);
     static const u64 old_age = [] {
@@ -675,9 +680,7 @@ void TextureCache<P>::TickFrame() {
         out_of_memory = failed != seen_failed_images;
         seen_failed_images = failed;
     }
-    if (out_of_memory || total_used_memory > minimum_memory) {
-        RunGarbageCollector(out_of_memory);
-    }
+    RunGarbageCollector(out_of_memory);
     if (out_of_memory) {
         // Textures left out for lack of memory are made again on their next read, once a frame
         // while images keep failing.
@@ -1485,7 +1488,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
                     ((regs.depth_test_enable != 0 && regs.depth_write_enabled != 0) ||
                      (regs.stencil_enable != 0 && regs.stencil_front_mask != 0)));
     const auto prepare_clear_targets = [&] {
-        if (rt_prepared.serial != render_targets_serial || rt_prepared.frame_tick != frame_tick) {
+        if (rt_prepared.serial != render_targets_serial) {
             rt_prepared.modified_mask = 0;
         }
         if (regs.clear_surface.RT < NUM_RT && color_modified(regs.clear_surface.RT)) {
@@ -1507,8 +1510,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     };
     const auto prepare_draw_targets = [&] {
         const u32 prev_mod_mask =
-            (rt_prepared.valid && rt_prepared.serial == render_targets_serial &&
-             rt_prepared.frame_tick == frame_tick)
+            (rt_prepared.valid && rt_prepared.serial == render_targets_serial)
                 ? rt_prepared.modified_mask
                 : 0u;
         u32 new_mod_mask = prev_mod_mask;
@@ -1677,14 +1679,7 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         return NULL_IMAGE_VIEW_ID;
     }
     if (table.IsPrepared(index, frame_tick)) [[likely]] {
-        const auto id = table.bound_ids[index];
-        if (id != NULL_IMAGE_VIEW_ID) {
-            const ImageViewBase& view = slot_image_views[id];
-            if (!view.IsBuffer()) {
-                CheckCrossFrameUse(slot_images[view.image_id], false, false);
-            }
-        }
-        return id;
+        return table.bound_ids[index];
     }
     if (!table.IsVerified(index, frame_tick)) {
         auto const [descriptor, is_new] = table.Read(*gpu_memory, index, frame_tick);
@@ -5054,16 +5049,16 @@ void TextureCache<P>::NoteRelocationGuard(ImageBase& image, RelocationGuard reas
         return;
     }
     shape.guard |= reason;
-    LOG_INFO(HW_GPU,
-             "Render target relocation guard (EXP43): format {} {}x{} now never relocates: {} "
-             "(image at {:#x}, written in frame {}, frame {})",
-             static_cast<u32>(image.info.format), image.info.size.width, image.info.size.height,
-             reason == GuardSampled  ? "sampled in a later frame"
-             : reason == GuardLoaded ? "rendered to without a clear in a later frame"
-                                     : "read by the CPU",
-             image.gpu_addr,
-             image.last_write_frame == ~u64{0} ? s64{-1} : static_cast<s64>(image.last_write_frame),
-             frame_tick);
+    LOG_DEBUG(HW_GPU,
+              "Render target relocation guard (EXP43): format {} {}x{} now never relocates: {} "
+              "(image at {:#x}, written in frame {}, frame {})",
+              static_cast<u32>(image.info.format), image.info.size.width, image.info.size.height,
+              reason == GuardSampled  ? "sampled in a later frame"
+              : reason == GuardLoaded ? "rendered to without a clear in a later frame"
+                                      : "read by the CPU",
+              image.gpu_addr,
+              image.last_write_frame == ~u64{0} ? s64{-1} : static_cast<s64>(image.last_write_frame),
+              frame_tick);
 }
 
 template <class P>

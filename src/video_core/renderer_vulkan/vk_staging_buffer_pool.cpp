@@ -190,113 +190,54 @@ void StagingBufferPool::TickFrame() {
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
-    // Fast path: if the requested size fits in the currently validated chunk,
-    // allocate directly via lock-free bump without scanning or semaphore queries.
-    size_t cur = current_chunk.offset.load(std::memory_order_relaxed);
-    const size_t limit = current_chunk.limit.load(std::memory_order_relaxed);
-    while (cur + size <= limit) {
-        const size_t next = Common::AlignUp(cur + size, MAX_ALIGNMENT);
-        if (current_chunk.offset.compare_exchange_weak(cur, next, std::memory_order_relaxed)) {
-            iterator = next;
-            return StagingBufferRef{
-                .buffer = *stream_buffer,
-                .device_address = stream_buffer_address,
-                .offset = static_cast<VkDeviceSize>(cur),
-                .mapped_span = stream_pointer.subspan(cur, size),
-                .usage = MemoryUsage::Upload,
-                .log2_level = 0,
-                .index = 0,
-            };
-        }
+    if (AreRegionsActive(Region(free_iterator) + 1,
+                         (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
+        // Avoid waiting for the previous usages to be free
+        return GetStagingBuffer(size, MemoryUsage::Upload);
     }
-
-    // Slow path: crossing chunk boundary or blocked on unsignaled GPU tick.
-    u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
-    const u64 blocked = current_chunk.blocked_tick.load(std::memory_order_relaxed);
-    if (blocked != 0) {
-        if (gpu_tick < blocked) {
-            scheduler.GetMasterSemaphore().Refresh();
-            gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
-            if (gpu_tick < blocked) {
-                // Still waiting for previous GPU usage to complete; avoid scanning past known-unsignaled chunks
-                return GetStagingBuffer(size, MemoryUsage::Upload);
-            }
-        }
-        current_chunk.blocked_tick.store(0, std::memory_order_relaxed);
-    }
-
-    size_t cur_offset = current_chunk.offset.load(std::memory_order_relaxed);
     const u64 current_tick = scheduler.CurrentTick();
+    std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + Region(iterator),
+              current_tick);
+    used_iterator = iterator;
+    free_iterator = (std::max)(free_iterator, iterator + size);
 
-    if (cur_offset + size >= stream_buffer_size) {
-        // Wrap around to the beginning of the stream buffer
+    if (iterator + size >= stream_buffer_size) {
         std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + NUM_SYNCS,
                   current_tick);
         used_iterator = 0;
-        cur_offset = 0;
+        iterator = 0;
         free_iterator = size;
 
-        const size_t wrap_end_region = (std::min)(Region(size) + 1, NUM_SYNCS);
-        if (AreRegionsActive(0, wrap_end_region)) {
-            return GetStagingBuffer(size, MemoryUsage::Upload);
-        }
-        current_chunk.offset.store(0, std::memory_order_relaxed);
-        current_chunk.limit.store(region_size, std::memory_order_relaxed);
-    }
-
-    const size_t req_region_end = (std::min)(Region(cur_offset + size) + 1, NUM_SYNCS);
-    const size_t check_region_begin = Region(free_iterator) + 1;
-    if (check_region_begin < req_region_end) {
-        if (AreRegionsActive(check_region_begin, req_region_end)) {
+        if (AreRegionsActive(0, Region(size) + 1)) {
+            // Avoid waiting for the previous usages to be free
             return GetStagingBuffer(size, MemoryUsage::Upload);
         }
     }
-
-    const size_t alloc_offset = cur_offset;
-    const size_t next_offset = Common::AlignUp(cur_offset + size, MAX_ALIGNMENT);
-    const size_t end_committed_region = Region(next_offset);
-    const size_t used_region = Region(used_iterator);
-    if (end_committed_region > used_region) {
-        std::fill(sync_ticks.begin() + used_region, sync_ticks.begin() + end_committed_region,
-                  current_tick);
-        used_iterator = end_committed_region * region_size;
-    }
-    free_iterator = (std::max)(free_iterator, cur_offset + size);
-
-    current_chunk.offset.store(next_offset, std::memory_order_relaxed);
-    iterator = next_offset;
-
-    // Fast-path limit expands to the boundary of the region where next_offset currently resides
-    const size_t new_limit = (std::min)((Region(next_offset) + 1) * region_size, stream_buffer_size);
-    current_chunk.limit.store(new_limit, std::memory_order_relaxed);
-
+    const size_t offset = iterator;
+    iterator = Common::AlignUp(iterator + size, MAX_ALIGNMENT);
     return StagingBufferRef{
         .buffer = *stream_buffer,
         .device_address = stream_buffer_address,
-        .offset = static_cast<VkDeviceSize>(alloc_offset),
-        .mapped_span = stream_pointer.subspan(alloc_offset, size),
-        .usage = MemoryUsage::Upload,
-        .log2_level = 0,
-        .index = 0,
+        .offset = static_cast<VkDeviceSize>(offset),
+        .mapped_span = stream_pointer.subspan(offset, size),
+        .usage{},
+        .log2_level{},
+        .index{},
     };
 }
 
 bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end) const {
-    if (region_begin >= region_end) {
+    u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+    const auto has_active = [&](u64 tick) {
+        return std::any_of(sync_ticks.begin() + region_begin, sync_ticks.begin() + region_end,
+                           [tick](u64 sync_tick) { return tick < sync_tick; });
+    };
+    if (!has_active(gpu_tick)) {
         return false;
     }
-    u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
-    for (size_t r = region_begin; r < region_end; ++r) {
-        if (gpu_tick < sync_ticks[r]) {
-            scheduler.GetMasterSemaphore().Refresh();
-            gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
-            if (gpu_tick < sync_ticks[r]) {
-                current_chunk.blocked_tick.store(sync_ticks[r], std::memory_order_relaxed);
-                return true;
-            }
-        }
-    }
-    return false;
+    scheduler.GetMasterSemaphore().Refresh();
+    gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+    return has_active(gpu_tick);
 }
 
 StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage usage,

@@ -379,7 +379,7 @@ public:
 [[nodiscard]] inline bool BindMemoEnabled() noexcept {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_BINDMEMO");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] != '0';
     }();
     return enabled;
 }

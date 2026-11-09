@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <span>
 #include <vector>
@@ -58,11 +59,19 @@ public:
             return;
         }
         if (prepared_frame_tick != frame_tick) {
-            const size_t words = (std::min)(epoch_prepared.size(), size_t{current_limit} / 64 + 1);
-            std::fill_n(epoch_prepared.begin(), words, u64{0});
+            for (const u32 w : active_prepared_words) {
+                if (w < epoch_prepared.size()) {
+                    epoch_prepared[w] = 0;
+                }
+            }
+            active_prepared_words.clear();
             prepared_frame_tick = frame_tick;
         }
-        epoch_prepared[index / 64] |= 1ULL << (index % 64);
+        const u32 word_idx = index / 64;
+        if (epoch_prepared[word_idx] == 0) {
+            active_prepared_words.push_back(word_idx);
+        }
+        epoch_prepared[word_idx] |= 1ULL << (index % 64);
     }
 
     void InvalidatePrepared() noexcept {
@@ -78,12 +87,20 @@ public:
             invalidated = false;
             verified_frame_tick = frame_tick;
         } else if (frame_tick != ~0ULL && verified_frame_tick != frame_tick) {
-            const size_t words = (std::min)(frame_verified.size(), size_t{current_limit} / 64 + 1);
-            std::fill_n(frame_verified.begin(), words, u64{0});
+            for (const u32 w : active_verified_words) {
+                if (w < frame_verified.size()) {
+                    frame_verified[w] = 0;
+                }
+            }
+            active_verified_words.clear();
             verified_frame_tick = frame_tick;
         }
+        const u32 word_idx = index / 64;
         if (frame_tick != ~0ULL) {
-            frame_verified[index / 64] |= 1ULL << (index % 64);
+            if (frame_verified[word_idx] == 0) {
+                active_verified_words.push_back(word_idx);
+            }
+            frame_verified[word_idx] |= 1ULL << (index % 64);
         }
         const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
         std::pair<T, bool> result;
@@ -104,10 +121,13 @@ public:
         } else {
             gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));
         }
-        if ((read_descriptors[index / 64] & (1ULL << (index % 64))) != 0) {
+        if ((read_descriptors[word_idx] & (1ULL << (index % 64))) != 0) {
             result.second = result.first != descriptors[index];
         } else {
-            read_descriptors[index / 64] |= 1ULL << (index % 64);
+            if (read_descriptors[word_idx] == 0) {
+                active_read_words.push_back(word_idx);
+            }
+            read_descriptors[word_idx] |= 1ULL << (index % 64);
             result.second = true;
         }
         if (result.second) {
@@ -136,6 +156,9 @@ public:
     std::vector<u64> read_descriptors;
     std::vector<u64> frame_verified;
     std::vector<u64> epoch_prepared;
+    std::vector<u32> active_read_words;
+    std::vector<u32> active_verified_words;
+    std::vector<u32> active_prepared_words;
     std::vector<T> descriptors;
     std::vector<Id> bound_ids;
     GPUVAddr current_gpu_addr{};
@@ -146,15 +169,26 @@ public:
 
 private:
     void ClearReadDescriptors() noexcept {
-        // Reserved capacity is not addressable. A later limit increase clears its new range.
-        const size_t words = (std::min)(read_descriptors.size(), size_t{current_limit} / 64 + 1);
-        std::fill_n(read_descriptors.begin(), words, u64{0});
-        std::fill_n(frame_verified.begin(), (std::min)(frame_verified.size(), words), u64{0});
-        std::fill_n(epoch_prepared.begin(), (std::min)(epoch_prepared.size(), words), u64{0});
+        for (const u32 w : active_read_words) {
+            if (w < read_descriptors.size()) {
+                read_descriptors[w] = 0;
+            }
+        }
+        for (const u32 w : active_verified_words) {
+            if (w < frame_verified.size()) {
+                frame_verified[w] = 0;
+            }
+        }
+        for (const u32 w : active_prepared_words) {
+            if (w < epoch_prepared.size()) {
+                epoch_prepared[w] = 0;
+            }
+        }
+        active_read_words.clear();
+        active_verified_words.clear();
+        active_prepared_words.clear();
         verified_frame_tick = ~0ULL;
         prepared_frame_tick = ~0ULL;
-        const size_t ids = (std::min)(bound_ids.size(), size_t{current_limit} + 1);
-        std::fill_n(bound_ids.begin(), ids, Id{0});
     }
 };
 

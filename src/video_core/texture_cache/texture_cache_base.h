@@ -696,7 +696,7 @@ private:
     void DropOverlapLinks(ImageId image_id);
     void NoteRelocationGuard(ImageBase& image, RelocationGuard reason);
     void CheckCrossFrameUse(ImageBase& image, bool is_modification, bool invalidate) {
-        if (image.last_write_frame == frame_tick || image.last_write_frame == ~u64{0} ||
+        if (image.last_write_frame == ~u64{0} || frame_tick <= image.last_write_frame + 1 ||
             invalidate) {
             return;
         }

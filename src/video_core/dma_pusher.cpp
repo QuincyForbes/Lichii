@@ -893,6 +893,13 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
 }
 
 bool DmaPusher::DrawFromGpuArguments(const CommandListHeader& header) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("EDEN_NX2_GPU_ARG_DRAW");
+        return env != nullptr && env[0] != '0';
+    }();
+    if (!enabled) {
+        return false;
+    }
     // The entry before this one opened the macro's start method with exactly as many words as
     // this entry holds, and the GPU wrote them (the culling dispatch that sets task counts).
     // Every word sent to a macro method is its next parameter, whatever the header's mode (the

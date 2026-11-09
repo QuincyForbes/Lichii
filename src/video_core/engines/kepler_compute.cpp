@@ -524,10 +524,6 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
         }
         if (ProcessNativeMethod(system, method, method_argument, is_last_call)) return;
     }
-    if (native_mode && method != KEPLER_COMPUTE_REG_INDEX(exec_upload) &&
-        method != KEPLER_COMPUTE_REG_INDEX(data_upload)) {
-        upload_state.HoldWrites(false);
-    }
     if (method >= Regs::NUM_REGS) {
         LOG_ERROR(HW_GPU, "Compute register out of range: {:#x}", method);
         return;
@@ -543,14 +539,6 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
                             .copy_size = upload_state.GetUploadSize(),
                             .was_dirty = upload_dirty};
             uploads.push_back(info);
-        } else {
-            static const bool merge_i2m = [] {
-                const char* value = std::getenv("EDEN_NX2_COMPUTE_I2M_MERGE");
-                return value == nullptr || value[0] != '0';
-            }();
-            if (merge_i2m) {
-                upload_state.HoldWrites(true);
-            }
         }
         upload_state.ProcessExec(regs.exec_upload.linear != 0);
         break;

@@ -2249,36 +2249,6 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     const u32 words = std::min<u32>(count, 0x1000);
     const size_t read_bytes = size_t{words} * sizeof(u32);
     static const bool full_drain = std::getenv("EDEN_NX2_MACRO_DMA_DRAIN") != nullptr;
-
-    const GPUVAddr line_base = source & ~GPUVAddr{63};
-    const u32 offset_in_line = static_cast<u32>((source - line_base) / sizeof(u32));
-    const bool fits_in_line =
-        words != 0 && (offset_in_line + words <= FrontState::DmaMicroCache::LineWords);
-    const bool can_use_dma_cache =
-        SuperMacroEnabled() && fits_in_line && !full_drain && !Tegra::Nx2CmdPageDiag::g_enabled &&
-        !VideoCommon::QueryDma::TraceEnabled() && !VideoCommon::Nx2Perf::Verify();
-
-    const auto copy_from_dma_cache = [&] {
-        if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
-            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
-        }
-        if (method == 0x158) {
-            fs.parameters.insert(fs.parameters.end(),
-                                 fs.dma_cache.words.begin() + offset_in_line,
-                                 fs.dma_cache.words.begin() + offset_in_line + words);
-        } else if (ram < native_data_ram.size()) {
-            const size_t copy_words = (std::min<size_t>)(words, native_data_ram.size() - ram);
-            std::memcpy(native_data_ram.data() + ram,
-                        fs.dma_cache.words.data() + offset_in_line,
-                        copy_words * sizeof(u32));
-        }
-    };
-
-    if (can_use_dma_cache && fs.dma_cache.valid && fs.dma_cache.line_addr == line_base) {
-        copy_from_dma_cache();
-        return;
-    }
-
     const auto flush_if_dirty = [&] {
         if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
             split.Run(
@@ -2292,19 +2262,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     // itself (9,600 waits a second in Ocarina's forest).
     if (!full_drain && !Tegra::Nx2CmdPageDiag::g_enabled &&
         !VideoCommon::QueryDma::TraceEnabled()) {
-        if (can_use_dma_cache &&
-            split.ForwardRead(memory_manager.GetID() + 1, line_base,
-                              FrontState::DmaMicroCache::LineWords, fs.dma_cache.words.data())) {
-            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadsForwarded, 1);
-            fs.dma_cache.line_addr = line_base;
-            fs.dma_cache.valid = true;
-            copy_from_dma_cache();
-            return;
-        }
         thread_local std::vector<u32> forwarded;
         forwarded.resize(words);
         if (split.ForwardRead(memory_manager.GetID() + 1, source, words, forwarded.data())) {
-            fs.dma_cache.Invalidate();
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadsForwarded, 1);
             for (u32 i = 0; i < words; ++i) {
                 if (method == 0x158) {
@@ -2422,50 +2382,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             }
             // A report's value is up to 8 bytes, listed by its first 4: look 12 bytes back. A
             // listed report may not be in guest memory yet: take the drained path.
-            const u64 check_device = can_use_dma_cache ? (*device & ~u64{63}) : *device;
-            const size_t check_bytes =
-                can_use_dma_cache ? FrontState::DmaMicroCache::LineBytes : read_bytes;
-            if (!hit || (!rasterizer->HasCachedReports(check_device - 12, u64{check_bytes} + 12) &&
-                         Tegra::Nx2AsyncReportsSettled(check_device, check_bytes))) {
-                if (can_use_dma_cache && snapshot_mode != 10) {
-                    if (hit) {
-                        ++hits;
-                    } else {
-                        ++misses;
-                        const GPUVAddr flush_begin = line_base & ~GPUVAddr{0xfff};
-                        const GPUVAddr flush_end =
-                            (line_base + FrontState::DmaMicroCache::LineBytes + 0xfff) &
-                            ~GPUVAddr{0xfff};
-                        const size_t flush_bytes = static_cast<size_t>(flush_end - flush_begin);
-                        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
-                        if (memory_manager.IsMemoryDirty(flush_begin, flush_bytes,
-                                                         VideoCommon::CacheType::BufferCache)) {
-                            split.Run(
-                                [memory = &memory_manager, flush_begin, flush_bytes] {
-                                    memory->FlushRegion(flush_begin, flush_bytes,
-                                                        VideoCommon::CacheType::BufferCache);
-                                },
-                                VideoCommon::DrainSite::MacroDmaFlush);
-                        }
-                        flush_queries(line_base, FrontState::DmaMicroCache::LineBytes);
-                        if (fs.dma_snapshots.size() > 8192) {
-                            fs.dma_snapshots.clear();
-                        }
-                        for (u64 page = first_page; page <= last_page; ++page) {
-                            fs.dma_snapshots[page] = {split.SentPosition(),
-                                                      split.WriterRangeCount(),
-                                                      split.DispatchWriteCount(),
-                                                      split.PendingWriteCount(),
-                                                      {}};
-                        }
-                    }
-                    memory_manager.ReadWordsUnsafe(line_base, fs.dma_cache.words.data(),
-                                                   FrontState::DmaMicroCache::LineWords);
-                    fs.dma_cache.line_addr = line_base;
-                    fs.dma_cache.valid = true;
-                    copy_from_dma_cache();
-                    return;
-                }
+            if (!hit || (!rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12) &&
+                         Tegra::Nx2AsyncReportsSettled(*device, read_bytes))) {
                 thread_local std::vector<u32> snap_words;
                 snap_words.resize(words);
                 if (hit) {
@@ -2584,31 +2502,6 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         }
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
-    if (can_use_dma_cache) {
-        constexpr size_t line_bytes = FrontState::DmaMicroCache::LineBytes;
-        split.WaitForMemoryWriters(VideoCommon::DrainSite::MacroDmaRead, line_base,
-                                   line_base + line_bytes);
-        const bool flush_buffers =
-            memory_manager.IsMemoryDirty(line_base, line_bytes, VideoCommon::CacheType::BufferCache);
-        split.Run(
-            [this, line_base, flush_buffers] {
-                if (flush_buffers) {
-                    memory_manager.FlushRegion(line_base, FrontState::DmaMicroCache::LineBytes,
-                                               VideoCommon::CacheType::BufferCache);
-                }
-                VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, line_base,
-                                                    FrontState::DmaMicroCache::LineBytes);
-            },
-            VideoCommon::DrainSite::MacroDmaFlush);
-        memory_manager.ReadWordsUnsafe(line_base, fs.dma_cache.words.data(),
-                                       FrontState::DmaMicroCache::LineWords);
-        fs.dma_cache.line_addr = line_base;
-        fs.dma_cache.valid = true;
-        copy_from_dma_cache();
-        return;
-    }
-
-    fs.dma_cache.Invalidate();
     if (full_drain) {
         split.Drain(VideoCommon::DrainSite::MacroDmaRead);
     } else {

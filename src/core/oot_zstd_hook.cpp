@@ -665,7 +665,12 @@ bool CodeMatches(std::span<const u8> image, u64 offset, std::span<const u32> cod
 
 void PatchModule(u64 program_id, std::span<const u8> build_id, std::string_view name,
                  std::span<u8> image, u64 load_base) {
-    if (program_id != ProgramId || name != "main") {
+    // Disabled by default when svc_nx2_zstd (0xF0..0xF2) is active; enable with EDEN_NX2_OOT_STREAM_ZSTD=1.
+    static const bool enabled = [] {
+        const char* env = std::getenv("EDEN_NX2_OOT_STREAM_ZSTD");
+        return env != nullptr && env[0] != '0';
+    }();
+    if (!enabled || program_id != ProgramId || name != "main") {
         return;
     }
     if (Common::HexToString(build_id.first(20)) != MainBuildId) {
