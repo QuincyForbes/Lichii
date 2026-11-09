@@ -526,8 +526,10 @@ private:
     std::mutex execution_mutex;
     std::mutex reserve_mutex;
     std::mutex queue_mutex;
-    std::condition_variable_any event_cv;
+    std::condition_variable work_cv;
+    std::condition_variable wait_cv;
     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
+    bool waiter_waiting{}; ///< WaitWorker is waiting for work_queue to drain (guarded by queue_mutex)
     bool lazy_queued{};    ///< A lazily queued chunk may wait for a sleeping worker (recording thread)
     bool has_pending_commands{};
     std::jthread worker_thread;

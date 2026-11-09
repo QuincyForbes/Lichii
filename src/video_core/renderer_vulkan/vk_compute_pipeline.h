@@ -96,6 +96,10 @@ public:
         return build_task_done.load(std::memory_order::acquire);
     }
 
+    [[nodiscard]] bool IsBuilt() const noexcept {
+        return is_built.load(std::memory_order::acquire);
+    }
+
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();

@@ -145,6 +145,10 @@ inline std::optional<GPUVAddr> MatchDrawCount(u32 value) {
 
 /// Back, at each dispatch: logs the counts every 5 s.
 inline void LogCounts() {
+    static u64 ticks{};
+    if ((++ticks & 0xfff) != 0) [[likely]] {
+        return;
+    }
     static auto last = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     if (now - last < std::chrono::seconds{5}) {

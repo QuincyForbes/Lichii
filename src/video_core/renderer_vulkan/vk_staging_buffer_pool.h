@@ -79,6 +79,7 @@ private:
         std::vector<StagingBuffer> entries;
         size_t delete_index = 0;
         size_t iterate_index = 0;
+        u64 known_busy_gpu_tick = ~u64{0};
     };
 
     static constexpr size_t NUM_LEVELS = sizeof(size_t) * CHAR_BIT;

@@ -166,6 +166,14 @@ void GpuSplit::Stop() {
     dispatch_records = false;
     back_dispatch_records = false;
     dispatch_write_count.store(0, std::memory_order_relaxed);
+    last_unbounded_dispatch_position.store(0, std::memory_order_relaxed);
+    dispatches_bounded.store(0, std::memory_order_relaxed);
+    for (auto& count : dispatches_unbounded) {
+        count.store(0, std::memory_order_relaxed);
+    }
+    for (auto& word : dispatch_written_pages) {
+        word.store(0, std::memory_order_relaxed);
+    }
     back_entry_position = 0;
     async_writes.clear();
     last_sync_position = 0;
@@ -230,14 +238,19 @@ void GpuSplit::Publish() {
     if (published_local == write_position) {
         return;
     }
+    const u64 previous_published = published_local;
     published_local = write_position;
-    publish_every = std::min<size_t>(publish_every * 2, PublishEvery);
+    consumed_cache = consumed.load(std::memory_order_relaxed);
+    publish_every = consumed_cache == previous_published
+                        ? 8
+                        : std::min<size_t>(publish_every * 2, PublishEvery);
     published.store(write_position, std::memory_order_seq_cst);
     if (back_waiting.load(std::memory_order_seq_cst)) {
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
     }
-    if ((macro_sink || compute_sink || ring_pairs) && (++publishes & 1023) == 0) [[unlikely]] {
+    if (Nx2Profile::Enabled() && (macro_sink || compute_sink || ring_pairs) &&
+        (++publishes & 0xfff) == 0) [[unlikely]] {
         ReportBatched();
     }
 }
@@ -269,8 +282,10 @@ void GpuSplit::ReportBatched() {
 void GpuSplit::Drain(DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
+        publish_every = 8;
         return;
     }
+    wait_target.store(write_position, std::memory_order_seq_cst);
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     Common::Nx2Timeline::Span timeline_span{drain_site_names[static_cast<size_t>(site)]};
@@ -278,6 +293,7 @@ void GpuSplit::Drain(DrainSite site) {
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
+            wait_target.store(~u64{0}, std::memory_order_relaxed);
             publish_every = 8;
             Nx2Profile::AddDrain(site, start);
             return;
@@ -631,6 +647,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
             wait_target.store(~u64{0}, std::memory_order_relaxed);
+            publish_every = 8;
             Nx2Profile::AddDrain(site, start);
             return true;
         }
@@ -639,7 +656,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
 }
 
 void GpuSplit::Backoff(u32 spins, u64 target) {
-    if (spins < 16384) {
+    if (spins < 512) {
         Pause();
         return;
     }
@@ -650,8 +667,11 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
     // A long wait sleeps until the back stores a new position (port of #161's front_wake): the
     // back checks front_waiting after each store, the front checks the position after setting it.
     front_waiting.store(true, std::memory_order_seq_cst);
-    const u32 seen = front_wake.load(std::memory_order_seq_cst);
-    if (consumed.load(std::memory_order_seq_cst) < target) {
+    while (back_running.load(std::memory_order_acquire)) {
+        const u32 seen = front_wake.load(std::memory_order_seq_cst);
+        if (consumed.load(std::memory_order_seq_cst) >= target) {
+            break;
+        }
         front_wake.wait(seen, std::memory_order_seq_cst);
     }
     front_waiting.store(false, std::memory_order_relaxed);
@@ -817,6 +837,11 @@ GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, 
     if (last_unrecorded_dispatch_position > since) {
         return DispatchCheck::Unbounded;
     }
+    if (last_unbounded_dispatch_position.load(std::memory_order_acquire) <= since &&
+        !MayBeDispatchWritten(begin, size) &&
+        (wait || dispatches_bounded.load(std::memory_order_relaxed) != 0)) {
+        return DispatchCheck::Miss;
+    }
     if (consumed_cache < last_dispatch_position) {
         consumed_cache = consumed.load(std::memory_order_acquire);
     }
@@ -826,6 +851,11 @@ GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, 
         }
         WaitFor(last_dispatch_position, DrainSite::DispatchWait);
         waited = true;
+        if (last_unbounded_dispatch_position.load(std::memory_order_acquire) <= since &&
+            !MayBeDispatchWritten(begin, size)) {
+            checked = dispatch_write_count.load(std::memory_order_acquire);
+            return DispatchCheck::Miss;
+        }
     }
     // The back recorded every dispatch sent since before storing a position past it (acquired
     // by WaitFor or above). Records start at the entry that ran them: since and later is after
@@ -872,6 +902,19 @@ GpuSplit::DispatchStats GpuSplit::GetDispatchStats() const {
 }
 
 void GpuSplit::AppendDispatchWrite(u64 begin, u64 end) {
+    if (end > begin && !(begin == 0 && end == ~u64{0})) {
+        const u64 last = (std::min<u64>)((end - 1) >> 12, dispatch_written_pages.size() * 64 - 1);
+        for (u64 page = begin >> 12; page <= last;) {
+            const u64 first_bit = page % 64;
+            const u64 bits = (std::min<u64>)(64 - first_bit, last - page + 1);
+            const u64 mask = (bits == 64 ? ~u64{0} : (u64{1} << bits) - 1) << first_bit;
+            auto& word = dispatch_written_pages[page / 64];
+            if ((word.load(std::memory_order_relaxed) & mask) != mask) {
+                word.fetch_or(mask, std::memory_order_relaxed);
+            }
+            page += bits;
+        }
+    }
     const u64 count = dispatch_write_count.load(std::memory_order_relaxed);
     DispatchWrite& write = dispatch_writes[count % DispatchWriteSlots];
     write.position.store(back_entry_position, std::memory_order_relaxed);
@@ -881,6 +924,7 @@ void GpuSplit::AppendDispatchWrite(u64 begin, u64 end) {
 }
 
 void GpuSplit::RecordDispatchUnbounded(DispatchUnbounded reason) {
+    last_unbounded_dispatch_position.store(back_entry_position, std::memory_order_release);
     AppendDispatchWrite(0, ~u64{0});
     if (!dispatch_unbounded) {
         dispatch_unbounded = true;
@@ -1070,7 +1114,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             // The front usually sends more within microseconds: spin briefly before sleeping.
-            for (u32 spins = 0; spins < 8192 && available == read_position &&
+            for (u32 spins = 0; spins < 512 && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
                  ++spins) {
                 Pause();
@@ -1114,18 +1158,22 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 idle_hook(idle_argument);
             }
             // Hand ring space back now and then while working through a long batch, and at once
-            // when the front waits for this position (WaitForWriters).
-            if ((read_position - last_store >= 4096 ||
-                 read_position >= wait_target.load(std::memory_order_relaxed)) &&
-                read_position != available) {
-                consumed.store(read_position, std::memory_order_seq_cst);
-                last_store = read_position;
-                NotifyFront();
+            // when the front first crosses the position it waits for (WaitFor / Drain).
+            if (read_position != available) {
+                const u64 target = wait_target.load(std::memory_order_relaxed);
+                if (last_store < target && read_position >= target) {
+                    consumed.store(read_position, std::memory_order_seq_cst);
+                    last_store = read_position;
+                    NotifyFront(read_position);
+                } else if (read_position - last_store >= 4096) {
+                    consumed.store(read_position, std::memory_order_release);
+                    last_store = read_position;
+                }
             }
         }
         CheckFencesQuiet(read_position);
         consumed.store(read_position, std::memory_order_seq_cst);
-        NotifyFront();
+        NotifyFront(read_position);
     }
     back_running.store(false, std::memory_order_seq_cst);
     front_wake.fetch_add(1, std::memory_order_seq_cst);

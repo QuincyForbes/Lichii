@@ -160,6 +160,10 @@ bool SpinBeforeWait(KernelCore& kernel, KThread* cur_thread, uint64_t addr, bool
         }
         return *reinterpret_cast<const volatile s32*>(pointer);
     };
+    if (!still_waits(load_word())) {
+        credit = static_cast<u8>((std::min)(credit + 2, 16));
+        return !cur_thread->IsTerminationRequested();
+    }
     const PhysicalCore& core = kernel.CurrentPhysicalCore();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds{spin_us};
     for (u32 spin = 1;; ++spin) {
@@ -171,7 +175,7 @@ bool SpinBeforeWait(KernelCore& kernel, KThread* cur_thread, uint64_t addr, bool
             // A terminating thread takes the normal path, which reports the termination first.
             return !cur_thread->IsTerminationRequested();
         }
-        if ((spin & 31) == 0) {
+        if ((spin & 63) == 0) {
             // Something else must run on this core: stop watching.
             if (core.IsInterrupted()) {
                 return false;

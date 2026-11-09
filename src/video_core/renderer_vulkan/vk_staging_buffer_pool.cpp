@@ -37,8 +37,7 @@ constexpr VkDeviceSize MAX_ALIGNMENT = 256;
 #if defined(__FreeBSD__)
 constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
 #else
-// 128 MiB on Windows too: 256 MiB sat mostly unused in device memory on Switch 2 titles.
-constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
+constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 256_MiB;
 #endif
 
 // Unused space after the end of the stream buffer. Constant buffers are bound from it and the
@@ -129,7 +128,8 @@ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool
 }
 
 void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
-    auto& entries = GetCache(ref.usage)[ref.log2_level].entries;
+    auto& cache_level = GetCache(ref.usage)[ref.log2_level];
+    auto& entries = cache_level.entries;
     const auto is_this_one = [&ref](const StagingBuffer& entry) {
         return entry.index == ref.index;
     };
@@ -138,6 +138,7 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
     ASSERT(it->deferred);
     it->tick = scheduler.CurrentTick();
     it->deferred = false;
+    cache_level.known_busy_gpu_tick = ~u64{0};
 }
 
 void StagingBufferPool::TickFrame() {
@@ -186,9 +187,17 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
 }
 
 bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end) const {
-    const u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
-    return std::any_of(sync_ticks.begin() + region_begin, sync_ticks.begin() + region_end,
-                       [gpu_tick](u64 sync_tick) { return gpu_tick < sync_tick; });
+    u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+    const auto has_active = [&](u64 tick) {
+        return std::any_of(sync_ticks.begin() + region_begin, sync_ticks.begin() + region_end,
+                           [tick](u64 sync_tick) { return tick < sync_tick; });
+    };
+    if (!has_active(gpu_tick)) {
+        return false;
+    }
+    scheduler.GetMasterSemaphore().Refresh();
+    gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+    return has_active(gpu_tick);
 };
 
 StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage usage,
@@ -203,16 +212,43 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
                                                                         MemoryUsage usage,
                                                                         bool deferred) {
     StagingBuffers& cache_level = GetCache(usage)[Common::Log2Ceil(size)];
-
-    const auto is_free = [this](const StagingBuffer& entry) {
-        return !entry.deferred && scheduler.IsFree(entry.tick);
-    };
     auto& entries = cache_level.entries;
-    const auto hint_it = entries.begin() + cache_level.iterate_index;
-    auto it = std::find_if(entries.begin() + cache_level.iterate_index, entries.end(), is_free);
+    if (entries.empty()) {
+        return std::nullopt;
+    }
+    auto& semaphore = scheduler.GetMasterSemaphore();
+    u64 gpu_tick = semaphore.KnownGpuTick();
+    if (gpu_tick == cache_level.known_busy_gpu_tick) {
+        semaphore.Refresh();
+        gpu_tick = semaphore.KnownGpuTick();
+        if (gpu_tick == cache_level.known_busy_gpu_tick) {
+            return std::nullopt;
+        }
+    }
+    const auto find_with_tick = [&](u64 tick) {
+        const auto is_free = [tick](const StagingBuffer& entry) {
+            return !entry.deferred && entry.tick <= tick;
+        };
+        const auto hint_it = entries.begin() + cache_level.iterate_index;
+        auto it = std::find_if(hint_it, entries.end(), is_free);
+        if (it == entries.end()) {
+            it = std::find_if(entries.begin(), hint_it, is_free);
+            if (it == hint_it) {
+                return entries.end();
+            }
+        }
+        return it;
+    };
+    auto it = find_with_tick(gpu_tick);
     if (it == entries.end()) {
-        it = std::find_if(entries.begin(), hint_it, is_free);
-        if (it == hint_it) {
+        semaphore.Refresh();
+        const u64 refreshed_tick = semaphore.KnownGpuTick();
+        if (refreshed_tick != gpu_tick) {
+            gpu_tick = refreshed_tick;
+            it = find_with_tick(gpu_tick);
+        }
+        if (it == entries.end()) {
+            cache_level.known_busy_gpu_tick = gpu_tick;
             return std::nullopt;
         }
     }

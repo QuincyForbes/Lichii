@@ -278,7 +278,11 @@ void Scheduler::WaitWorker() {
     // Ensure the queue is drained.
     {
         std::unique_lock ql{queue_mutex};
-        event_cv.wait(ql, [this] { return work_queue.empty(); });
+        if (!work_queue.empty()) {
+            waiter_waiting = true;
+            wait_cv.wait(ql, [this] { return work_queue.empty(); });
+            waiter_waiting = false;
+        }
     }
 
     // Now wait for execution to finish.
@@ -314,7 +318,7 @@ void Scheduler::DispatchWork(bool lazy) {
         lazy_queued = worker_waiting && !wake && !work_queue.empty();
     }
     if (wake) {
-        event_cv.notify_all();
+        work_cv.notify_one();
     }
     if (has_work) {
         AcquireNewChunk();
@@ -539,58 +543,59 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
 
-    const auto TryPopQueue{[this](auto& work) -> bool {
-        if (work_queue.empty()) {
-            return false;
-        }
-
-        work = std::move(work_queue.front());
-        work_queue.pop();
-        event_cv.notify_all();
-        return true;
+    std::stop_callback stop_cb{stop_token, [this] {
+        std::scoped_lock lk{queue_mutex};
+        work_cv.notify_all();
     }};
 
-    while (!stop_token.stop_requested()) {
-        std::unique_ptr<CommandChunk> work;
+    std::vector<std::unique_ptr<CommandChunk>> batch;
+    batch.reserve(16);
 
+    while (!stop_token.stop_requested()) {
+        batch.clear();
+        bool notify_waiter = false;
         {
             std::unique_lock lk{queue_mutex};
-
-            // Wait for work.
-            event_cv.wait(lk, stop_token, [&] {
-                worker_waiting = !TryPopQueue(work);
-                return !worker_waiting;
-            });
-            worker_waiting = false;
-
-            // If we've been asked to stop, we're done.
-            if (stop_token.stop_requested()) {
+            if (work_queue.empty()) {
+                worker_waiting = true;
+                work_cv.wait(lk, [&] {
+                    return !work_queue.empty() || stop_token.stop_requested();
+                });
+                worker_waiting = false;
+            }
+            if (stop_token.stop_requested() && work_queue.empty()) {
                 return;
             }
+            while (!work_queue.empty()) {
+                batch.push_back(std::move(work_queue.front()));
+                work_queue.pop();
+            }
+            notify_waiter = waiter_waiting;
 
             // Exchange lock ownership so that we take the execution lock before
             // the queue lock goes out of scope. This allows us to force execution
-            // to complete in the next step.
+            // to complete in WaitWorker().
             void(std::exchange(lk, std::unique_lock{execution_mutex}));
+            if (notify_waiter) {
+                wait_cv.notify_all();
+            }
 
-            // Perform the work, tracking whether the chunk was a submission
-            // before executing.
-            const bool has_submit = work->HasSubmit();
-            Common::Nx2Timeline::Span timeline_span{has_submit ? "record commands + submit"
-                                                               : "record commands"};
-            work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
-
-            // If the chunk was a submission, reallocate the command buffer.
-            if (has_submit) {
-                AllocateWorkerCommandBuffer();
+            for (auto& work : batch) {
+                const bool has_submit = work->HasSubmit();
+                Common::Nx2Timeline::Span timeline_span{has_submit ? "record commands + submit"
+                                                                   : "record commands"};
+                work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
+                if (has_submit) {
+                    AllocateWorkerCommandBuffer();
+                }
             }
         }
 
         {
             std::scoped_lock rl{reserve_mutex};
-
-            // Recycle the chunk back to the reserve.
-            chunk_reserve.emplace_back(std::move(work));
+            for (auto& work : batch) {
+                chunk_reserve.emplace_back(std::move(work));
+            }
         }
     }
 }
@@ -857,9 +862,13 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             on_submit();
         }
 
-        std::scoped_lock lock{submit_mutex};
-        switch (const VkResult result = master_semaphore->SubmitQueue(
-                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+        VkResult result;
+        {
+            std::scoped_lock lock{submit_mutex};
+            result = master_semaphore->SubmitQueue(cmdbuf, upload_cmdbuf, signal_semaphore,
+                                                   wait_semaphore, signal_value);
+        }
+        switch (result) {
         case VK_SUCCESS:
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&

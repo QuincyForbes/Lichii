@@ -158,7 +158,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
 
     DEBUG_ASSERT(block.GetCondition() == IR::Cond::AL);
     typedef void (EmitX64::*EmitHandlerFn)(EmitContext& context, IR::Inst* inst);
-    constexpr EmitHandlerFn opcode_handlers[] = {
+    static constexpr EmitHandlerFn opcode_handlers[] = {
 #define OPCODE(name, type, ...) &EmitX64::Emit##name,
 #define A32OPC(name, type, ...)
 #define A64OPC(name, type, ...)
@@ -168,7 +168,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
 #undef A64OPC
     };
     typedef void (A64EmitX64::*A64EmitHandlerFn)(A64EmitContext& context, IR::Inst* inst);
-    constexpr A64EmitHandlerFn a64_handlers[] = {
+    static constexpr A64EmitHandlerFn a64_handlers[] = {
 #define OPCODE(...)
 #define A32OPC(...)
 #define A64OPC(name, type, ...) &A64EmitX64::EmitA64##name,

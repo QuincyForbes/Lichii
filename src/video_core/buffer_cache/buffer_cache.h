@@ -294,12 +294,7 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     area->start_address = device_addr_start_aligned;
     area->end_address = device_addr_end_aligned;
     if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
-        // A preflushed region's data reaches guest memory when its fence pops (PopAsyncBuffers
-        // clears gpu_modified_ranges then). A read before that saw stale words: Ocarina of Time's
-        // whole screen flashed white near the sword boulder with EDEN_NX2_PREFLUSH=1 (232 flash
-        // watch reports a session, 3 without preflush). Such a read flushes on demand instead.
-        area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
-                                               device_addr_end_aligned - device_addr_start_aligned);
+        area->preemtive = true;
         return area;
     }
     area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
@@ -527,7 +522,8 @@ void BufferCache<P>::ClearDownload(DAddr device_addr, u64 size) {
 }
 
 template <class P>
-bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
+bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount,
+                             bool inline_grid_copy) {
     const std::optional<DAddr> cpu_src_address = gpu_memory->GpuToCpuAddress(src_address);
     const std::optional<DAddr> cpu_dest_address = gpu_memory->GpuToCpuAddress(dest_address);
     if (!cpu_src_address || !cpu_dest_address) {
@@ -566,7 +562,9 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         const DAddr diff = base_address - *cpu_src_address;
         const DAddr new_base_address = *cpu_dest_address + diff;
         tmp_intervals.push_back({new_base_address, size});
-        QueueFenceDownload(new_base_address, size);
+        if (!inline_grid_copy) {
+            QueueFenceDownload(new_base_address, size);
+        }
     };
     gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
     // This subtraction in this order is important for overlapping copies.
@@ -574,17 +572,19 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     const bool has_new_downloads = tmp_intervals.size() != 0;
     for (const auto& pair : tmp_intervals) {
         gpu_modified_ranges.Add(pair.first, pair.second);
-        gpu_modified_serial.fetch_add(1, std::memory_order_relaxed);
-        if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
-            Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
-            Nx2NoteListWrite(buffer_b, pair.first, pair.second);
+        if (!inline_grid_copy) {
+            gpu_modified_serial.fetch_add(1, std::memory_order_relaxed);
+            if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+                Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
+                Nx2NoteListWrite(buffer_b, pair.first, pair.second);
+            }
         }
     }
     const auto& copy = copies[0];
     src_buffer.MarkUsage(copy.src_offset, copy.size);
     dest_buffer.MarkUsage(copy.dst_offset, copy.size);
     runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
-    if (has_new_downloads) {
+    if (has_new_downloads && !inline_grid_copy) {
         memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount);
         const bool should_sync = Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         if (should_sync) {
@@ -592,9 +592,11 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         }
     }
 
-    Tegra::Memory::DeviceGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
-        tmp(device_memory, *cpu_src_address, amount, &tmp_buffer);
-    tmp.SetAddressAndSize(*cpu_dest_address, amount);
+    if (!inline_grid_copy) {
+        Tegra::Memory::DeviceGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
+            tmp(device_memory, *cpu_src_address, amount, &tmp_buffer);
+        tmp.SetAddressAndSize(*cpu_dest_address, amount);
+    }
     return true;
 }
 
@@ -994,11 +996,11 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
             const auto& qmd = launch_desc;
             const std::array<u32, 3> block{qmd.block_dim_x.Value(), qmd.block_dim_y.Value(),
                                            qmd.block_dim_z.Value()};
-            std::optional<std::array<u32, 3>> grid;
-            if (!kepler_compute->GetIndirectComputeAddress()) {
-                grid = std::array<u32, 3>{qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
-                                          qmd.grid_dim_z.Value()};
-            }
+            const std::array<u32, 3> grid =
+                kepler_compute->GetIndirectComputeAddress()
+                    ? std::array<u32, 3>{64U, 1U, 1U}
+                    : std::array<u32, 3>{qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
+                                         qmd.grid_dim_z.Value()};
             if (const auto extent = Shader::ResolveStorageWriteExtent(write_extent, block, grid)) {
                 // The extent counts from the pointer, the binding from the pointer aligned down.
                 const GPUVAddr pointer = gpu_memory->Read<u64>(ssbo_addr);
@@ -1259,6 +1261,10 @@ void BufferCache<P>::PopAsyncBuffers() {
 
 template <class P>
 bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
+    if (size <= 64_KiB && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+        !Tegra::Nx2MayBeGpuWritten(addr, size)) {
+        return false;
+    }
     // One lookup instead of visiting every range inside (~4% of the GPU thread for title 1's
     // inline uploads once GPU-written ranges are no longer cleared by downloads).
     return gpu_modified_ranges.Intersects(addr, size);
@@ -1758,6 +1764,9 @@ void BufferCache<P>::ResolveMultiRangeStorage(Binding& binding, bool is_written,
         if (is_written && !runtime.PrefersSparseSources()) {
             return;
         }
+        if (gpu_memory->MaxContinuousRange(binding.gpu_addr, binding.size) >= binding.size) {
+            return;
+        }
         const VirtualSegments* found =
             virtual_ranges.Query(*gpu_memory, binding.gpu_addr, binding.size);
         if (!found || found->size() < 2) {
@@ -1847,6 +1856,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
                                   (native_bank_memo.size() - 1)];
     if (!verify && memo.device_addr == device_addr && memo.size == size &&
         memo.checked_frame == frame_tick && !memo.needs_per_bind &&
+        (!memo.has_hot || memo.write_serial == cb_write_serial) &&
         !Core::g_collected_write_pages.Any(first_page, end - first_page) &&
         !Core::g_buffer_write_pages.Any(first_page, end - first_page)) [[likely]] {
         stats.pages_skipped += (end - first_page) >> Core::DEVICE_PAGEBITS;
@@ -1861,6 +1871,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     // Most banks have no CPU-modified page: ask per page only when one has.
     const bool any_cpu_dirty = memory_tracker.IsRegionCpuModified(first_page, end - first_page);
     bool needs_per_bind = false;
+    bool has_hot = false;
     for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
         const u8* const guest = device_memory.template GetPointer<u8>(page);
         if (guest == nullptr) {
@@ -1875,6 +1886,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             ++stats.pages_new;
             std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
             snapshot.checked_frame = frame_tick;
+            snapshot.checked_write_serial = cb_write_serial;
             snapshot.recheck = collected || written;
             needs_per_bind |= snapshot.recheck;
             memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
@@ -1886,22 +1898,23 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         needs_per_bind |= snapshot.recheck;
         const bool is_hot = snapshot.changed_frame != ~u64{0} &&
                             frame_tick - snapshot.changed_frame < HotFrames;
-        needs_per_bind |= is_hot;
+        has_hot |= is_hot;
         NativeBankReason reason = BankNone;
-        if (collected) {
-            reason = BankCollected;
-        } else if (written) {
-            reason = BankWritten;
-        } else if (recheck) {
-            reason = BankRecheck;
-        } else if (any_cpu_dirty &&
-                   memory_tracker.IsRegionCpuModified(page, Core::DEVICE_PAGESIZE)) {
+        if (any_cpu_dirty &&
+            memory_tracker.IsRegionCpuModified(page, Core::DEVICE_PAGESIZE)) {
             if (!verify) {
                 ++stats.pages_skipped;
                 continue;
             }
             reason = BankCpuDirty;
-        } else if (is_hot) {
+        } else if (collected) {
+            reason = BankCollected;
+        } else if (written) {
+            reason = BankWritten;
+        } else if (recheck) {
+            reason = BankRecheck;
+        } else if (is_hot && (snapshot.checked_frame != frame_tick ||
+                              snapshot.checked_write_serial != cb_write_serial)) {
             // Changed lately: likely per-draw data, rewritten by paths none of the flags see
             // (EXP9=2 found ~1 such change in 15 s without this rule).
             reason = BankHot;
@@ -1910,6 +1923,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             reason = BankFrame;
         }
         snapshot.checked_frame = frame_tick;
+        snapshot.checked_write_serial = cb_write_serial;
         if (reason == BankNone && !verify) {
             ++stats.pages_skipped;
             continue;
@@ -1946,7 +1960,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         ++stats.changed[reason];
         if (reason == BankHot || reason == BankFrame || reason == BankNone) {
             snapshot.changed_frame = frame_tick;
-            needs_per_bind = true;
+            has_hot = true;
         }
         std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
         memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
@@ -1955,7 +1969,12 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     memo.device_addr = device_addr;
     memo.size = size;
     memo.checked_frame = frame_tick;
+    memo.write_serial = cb_write_serial;
     memo.needs_per_bind = needs_per_bind;
+    memo.has_hot = has_hot;
+    if (!Nx2Profile::Enabled() || (stats.binds & 0xfff) != 0) [[likely]] {
+        return;
+    }
     const auto now = std::chrono::steady_clock::now();
     if (now - stats.last_log < std::chrono::seconds{5}) {
         return;
@@ -3329,12 +3348,11 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
                         it != native_indirect_page_snapshots.end()) {
                         Core::g_collected_write_pages.Take(page);
                         Core::g_buffer_write_pages.Take(page);
-                        if (it->second.checked_frame != frame_tick) {
-                            if (const u8* const guest = device_memory.template GetPointer<u8>(page)) {
-                                std::memcpy(it->second.words.data(), guest, Core::DEVICE_PAGESIZE);
-                            }
-                            it->second.checked_frame = frame_tick;
+                        if (const u8* const guest = device_memory.template GetPointer<u8>(page)) {
+                            std::memcpy(it->second.words.data(), guest, Core::DEVICE_PAGESIZE);
                         }
+                        it->second.checked_frame = frame_tick;
+                        it->second.checked_write_serial = cb_write_serial;
                         it->second.recheck = false;
                     }
                 }

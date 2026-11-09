@@ -250,30 +250,45 @@ std::shared_ptr<DictEntry> GetDict(Core::Memory::Memory& memory, const GuestDDic
     return fresh;
 }
 
-// Only zstd1 and skippable frames, each complete: anything else (legacy formats the host library
-// would accept, truncated input, trailing bytes) goes to the game's decoder.
-bool OnlyStandardFrames(const u8* src, size_t size) {
+// Validates that the input consists only of complete zstd1 and skippable frames, and computes the
+// upper bound on decompressed size in the same pass (avoiding a second full block-header walk in
+// ZSTD_decompressBound). Returns ZSTD_CONTENTSIZE_ERROR if any frame is legacy, truncated or bad.
+unsigned long long StandardFramesBound(const u8* src, size_t size) {
     if (size == 0) {
-        return false;
+        return ZSTD_CONTENTSIZE_ERROR;
     }
+    unsigned long long total_bound = 0;
     while (size != 0) {
         if (size < 4) {
-            return false;
+            return ZSTD_CONTENTSIZE_ERROR;
         }
         u32 magic;
         std::memcpy(&magic, src, sizeof(magic));
-        if (magic != ZSTD_MAGICNUMBER &&
-            (magic & ZSTD_MAGIC_SKIPPABLE_MASK) != ZSTD_MAGIC_SKIPPABLE_START) {
-            return false;
+        const bool is_zstd = magic == ZSTD_MAGICNUMBER;
+        if (!is_zstd && (magic & ZSTD_MAGIC_SKIPPABLE_MASK) != ZSTD_MAGIC_SKIPPABLE_START) {
+            return ZSTD_CONTENTSIZE_ERROR;
         }
         const size_t frame_size = ZSTD_findFrameCompressedSize(src, size);
         if (ZSTD_isError(frame_size) || frame_size == 0 || frame_size > size) {
-            return false;
+            return ZSTD_CONTENTSIZE_ERROR;
+        }
+        if (is_zstd) {
+            unsigned long long frame_bound = ZSTD_getFrameContentSize(src, frame_size);
+            if (frame_bound == ZSTD_CONTENTSIZE_ERROR) {
+                return ZSTD_CONTENTSIZE_ERROR;
+            }
+            if (frame_bound == ZSTD_CONTENTSIZE_UNKNOWN) {
+                frame_bound = ZSTD_decompressBound(src, frame_size);
+                if (frame_bound == ZSTD_CONTENTSIZE_ERROR) {
+                    return ZSTD_CONTENTSIZE_ERROR;
+                }
+            }
+            total_bound += frame_bound;
         }
         src += frame_size;
         size -= frame_size;
     }
-    return true;
+    return total_bound;
 }
 
 // Decompresses on the host. Returns nullptr on success (args[0] then holds the decompressed size,
@@ -320,13 +335,10 @@ const char* HostDecompress(Core::Memory::Memory& memory, std::span<uint64_t, 8> 
     if (!memory.ReadBlock(src, input.data(), src_size)) {
         return "source unreadable";
     }
-    if (!OnlyStandardFrames(input.data(), src_size)) {
-        return "not only complete zstd1/skippable frames";
-    }
     // Same result for any capacity >= the output, and a capacity below it fails either way.
-    const unsigned long long bound = ZSTD_decompressBound(input.data(), src_size);
+    const unsigned long long bound = StandardFramesBound(input.data(), src_size);
     if (bound == ZSTD_CONTENTSIZE_ERROR) {
-        return "no decompression bound";
+        return "not only complete zstd1/skippable frames";
     }
     const u64 out_capacity = std::min<u64>(capacity, bound);
     if (out_capacity > kMaxSize) {

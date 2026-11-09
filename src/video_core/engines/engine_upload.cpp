@@ -11,6 +11,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_indirect_grid.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/decoders.h"
 
@@ -41,6 +42,10 @@ void State::ProcessData(const u32 data, const bool is_last_call) {
         return;
     }
     if (native_partial && is_linear && regs.line_count == 1) {
+        if (Tegra::Nx2IndirectGrid::LooksLikePlaceholder(data) && (data & 3) < 2 &&
+            write_offset < copy_size) {
+            return;
+        }
         const u32 count = write_offset - flushed_offset;
         if (count) {
             rasterizer->AccelerateInlineToMemory(regs.dest.Address() + flushed_offset, count,

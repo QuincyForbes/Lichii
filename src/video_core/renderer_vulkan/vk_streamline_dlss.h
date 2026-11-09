@@ -82,6 +82,7 @@ private:
     vk::ImageView output_view;
     vk::Sampler point_sampler;
     std::atomic<bool> failed{};
+    bool warned_out_of_vram{};
 };
 
 } // namespace Vulkan

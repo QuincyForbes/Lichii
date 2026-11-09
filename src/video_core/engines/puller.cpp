@@ -87,17 +87,25 @@ bool MetByQueuedRelease(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     if (!split.Active()) {
         return false;
     }
-    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+    auto& memory = dma_pusher.memory_manager;
+    const auto device = memory.GpuToCpuAddress(acquire.address);
     if (!device) {
         return false;
     }
     u32 miss = 0;
     const auto payload = split.QueuedReleasePayload(*device, acquire.address, &miss);
+    if (!payload && miss == 2 && !VideoCore::Nx2Debug::DelayedFences() &&
+        !memory.OverlapsNativeSyncpointShim(acquire.address, sizeof(u32)) &&
+        acquire.Matches(memory.Read<u32>(acquire.address))) {
+        split.NoteSync();
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquiresQueued, 1);
+        return true;
+    }
     if (miss_out) {
         *miss_out = payload ? 4 : miss;
     }
     if (!payload || !acquire.Matches(*payload)) {
-        if (VideoCommon::Nx2Profile::Enabled()) {
+        if (miss_out && VideoCommon::Nx2Profile::Enabled()) {
             using Counter = VideoCommon::Nx2Profile::Counter;
             VideoCommon::Nx2Profile::Add(miss == 1   ? Counter::AcquireNoRelease
                                          : miss == 2 ? Counter::AcquireReleaseRan

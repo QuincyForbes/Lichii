@@ -1670,7 +1670,8 @@ void RasterizerVulkan::DispatchCompute() {
         }
         return;
     }
-    std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+    std::scoped_lock buffer_lock{buffer_cache.mutex};
+    std::scoped_lock texture_lock{texture_cache.mutex};
     std::optional<ByteAddressedShadow> byte_addressed_shadow;
     buffer_cache.Nx2CollectListCopies(true);
     SCOPE_EXIT {
@@ -1681,8 +1682,8 @@ void RasterizerVulkan::DispatchCompute() {
     };
     const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
 #ifdef EGLANTINE_STREAMLINE
-    const bool can_replace = OcarinaDlssEnabled() && pipeline->CanReplaceOcarinaUpscale() &&
-                             !indirect_address && !frame_dump.Capturing();
+    const bool can_replace = pipeline->CanReplaceOcarinaUpscale() && !indirect_address &&
+                             OcarinaDlssEnabled() && !frame_dump.Capturing();
 #else
     constexpr bool can_replace = false;
 #endif
@@ -3005,7 +3006,7 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
             std::scoped_lock lock{buffer_cache.mutex};
             for (const auto& [source, destination, count] : grids) {
                 Tegra::Nx2IndirectGrid::Get().copied.fetch_add(1, std::memory_order_relaxed);
-                if (!buffer_cache.DMACopy(source, destination, count * sizeof(u32))) {
+                if (!buffer_cache.DMACopy(source, destination, count * sizeof(u32), true)) {
                     static std::atomic<u32> logged{};
                     if (logged.fetch_add(1) < 8) {
                         LOG_WARNING(Render_Vulkan,

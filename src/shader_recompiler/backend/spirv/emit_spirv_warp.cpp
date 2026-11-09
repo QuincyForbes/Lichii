@@ -240,6 +240,20 @@ Id EmitSubgroupGeMask(EmitContext& ctx) {
 
 Id EmitShuffleIndex(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
                     Id segmentation_mask) {
+    const IR::Value lane{inst->Arg(1).Resolve()};
+    const IR::Value clamp_arg{inst->Arg(2).Resolve()};
+    const IR::Value segment{inst->Arg(3).Resolve()};
+    if (clamp_arg.IsImmediate() && (clamp_arg.U32() & 31U) == 31U &&
+        segment.IsImmediate() && (segment.U32() & 31U) == 0U) {
+        SetInBoundsFlag(inst, ctx.true_value);
+        if (!StageSupportsSubgroups(ctx)) {
+            return value;
+        }
+        if (lane.IsImmediate()) {
+            return BroadcastLane(ctx, value, lane.U32() & 31U);
+        }
+        return ShuffleAbsolute(ctx, value, HostThreadId(ctx, GuestLane(ctx, index)));
+    }
     const Id not_seg_mask{ctx.OpNot(ctx.U32[1], segmentation_mask)};
     const Id thread_id{EmitLaneId(ctx)};
     const Id min_thread_id{ComputeMinThreadId(ctx, thread_id, segmentation_mask)};
@@ -253,8 +267,6 @@ Id EmitShuffleIndex(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id cla
     if (!StageSupportsSubgroups(ctx)) {
         return value;
     }
-    const IR::Value lane{inst->Arg(1).Resolve()};
-    const IR::Value segment{inst->Arg(3).Resolve()};
     if (lane.IsImmediate() && segment.IsImmediate() && segment.U32() == 0) {
         return ctx.OpSelect(ctx.U32[1], in_range, BroadcastLane(ctx, value, lane.U32() & 31),
                             value);
@@ -305,7 +317,15 @@ Id EmitShuffleButterfly(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id
         SetInBoundsFlag(inst, ctx.false_value);
         return value;
     }
-    const Id mask{GuestLane(ctx, index)};
+    const IR::Value lane{inst->Arg(1).Resolve()};
+    const IR::Value clamp_arg{inst->Arg(2).Resolve()};
+    const IR::Value segment{inst->Arg(3).Resolve()};
+    const Id mask{lane.IsImmediate() ? ctx.Const(lane.U32() & 31U) : GuestLane(ctx, index)};
+    if (clamp_arg.IsImmediate() && (clamp_arg.U32() & 31U) == 31U &&
+        segment.IsImmediate() && (segment.U32() & 31U) == 0U) {
+        SetInBoundsFlag(inst, ctx.true_value);
+        return ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, mask);
+    }
     const Id thread_id{EmitLaneId(ctx)};
     const Id max_thread_id{GetMaxThreadId(ctx, thread_id, clamp, segmentation_mask)};
     const Id src_thread_id{ctx.OpBitwiseXor(ctx.U32[1], thread_id, mask)};

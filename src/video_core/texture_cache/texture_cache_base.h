@@ -504,6 +504,7 @@ private:
 
     /// Synchronize image aliases, copying data if needed
     void SynchronizeAliases(ImageId image_id);
+    [[nodiscard]] bool IsActiveRenderTarget(ImageId image_id) const noexcept;
 
     /// Prepare an image view to be used
     void PrepareImageView(ImageViewId image_view_id, bool is_modification, bool invalidate);
@@ -565,6 +566,7 @@ private:
         u64 modification_tick = 0;
         u64 frame_tick = 0;
         u64 bindings_epoch = 0;
+        u32 modified_mask = 0;
         std::array<ImageViewId, NUM_RT + 1> views{};
     } rt_prepared;
     u32 rt_active_mask = 0;

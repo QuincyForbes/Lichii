@@ -43,6 +43,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/pipeline_cache_policy.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
@@ -1311,27 +1312,33 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
         BuildCleanWatch(patch);
     }
     const auto& flags = maxwell3d->dirty.flags;
+    const auto draw_topology = maxwell3d->draw_manager.draw_state.topology;
     const bool blending_dirty =
-        !dynamic_features.has_extended_dynamic_state_3_blend && flags[Dirty::Blending];
+        flags[Dirty::Blending] && (patch || !dynamic_features.has_extended_dynamic_state_3_blend);
     const bool vertex_input_dirty = flags[Dirty::VertexInput];
+    const bool viewport_swizzles_dirty = flags[Dirty::ViewportSwizzles];
+    const bool hashes_changed = clean.hashes != graphics_key.unique_hashes;
+    const bool topology_changed = clean.topology != draw_topology;
+    const bool engine_state_changed = clean.engine_state != maxwell3d->engine_state;
     const bool patch_blending = patch && blending_dirty;
     const bool patch_vertex_input =
         patch && vertex_input_dirty && dynamic_features.has_dynamic_vertex_input;
+    const bool patch_viewport_swizzles = patch && viewport_swizzles_dirty;
+    const bool patch_hashes = patch && hashes_changed;
+    const bool patch_topology = patch && topology_changed;
+    const bool patch_engine_state = patch && engine_state_changed;
     if (clean.pipeline != nullptr && clean.pipeline == current_pipeline &&
         clean.maxwell3d == maxwell3d && (!vertex_input_dirty || patch_vertex_input) &&
-        !flags[Dirty::ViewportSwizzles] && (!blending_dirty || patch_blending) &&
-        clean.hashes == graphics_key.unique_hashes &&
-        clean.topology == maxwell3d->draw_manager.draw_state.topology &&
-        clean.engine_state == maxwell3d->engine_state &&
-        (!patch_blending || FixedPipelineState::DualSourceBlend(maxwell3d->regs) ==
-                                (graphics_key.state.attachment0_dual_source_blend != 0)) &&
+        (!viewport_swizzles_dirty || patch_viewport_swizzles) &&
+        (!blending_dirty || patch_blending) && (!hashes_changed || patch_hashes) &&
+        (!topology_changed || patch_topology) && (!engine_state_changed || patch_engine_state) &&
         CleanInputsUnchanged()) {
         ++clean.hits;
     } else {
         ++clean.misses;
         clean.pipeline = nullptr;
     }
-    if (((clean.hits + clean.misses) & 0xfff) == 0) {
+    if (VideoCommon::Nx2Profile::Enabled() && ((clean.hits + clean.misses) & 0xfff) == 0) [[unlikely]] {
         const auto now = std::chrono::steady_clock::now();
         if (clean.last_log == std::chrono::steady_clock::time_point{}) {
             clean.last_log = now;
@@ -1350,7 +1357,8 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
         }
     }
     if (clean.pipeline != nullptr) {
-        if (!patch_blending && !patch_vertex_input) {
+        if (!patch_blending && !patch_vertex_input && !patch_viewport_swizzles && !patch_hashes &&
+            !patch_topology && !patch_engine_state) {
             current_pipeline->MarkUsed(frame_count);
             return BuiltPipeline(current_pipeline);
         }
@@ -1358,6 +1366,10 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
         // under the raised flags; VertexInput stays raised for the command buffer update.
         ++clean.patches;
         bool key_changed = false;
+        if (patch_hashes) {
+            clean.hashes = graphics_key.unique_hashes;
+            key_changed = true;
+        }
         if (patch_vertex_input) {
             vertex_attribute_types = FixedPipelineState::DynamicAttributeTypes(maxwell3d->regs);
             const u64 new_types = VideoCommon::KeyedAttributeTypes(
@@ -1366,15 +1378,51 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
                 graphics_key.state.attribute_types = new_types;
                 key_changed = true;
             }
+        } else if (patch_hashes && dynamic_features.has_dynamic_vertex_input) {
+            graphics_key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
+                vertex_attribute_types, graphics_key.unique_hashes, vertex_attribute_masks);
+        }
+        if (patch_viewport_swizzles) {
+            const auto old_swizzles = graphics_key.state.viewport_swizzles;
+            graphics_key.state.RefreshViewportSwizzles(*maxwell3d);
+            if (graphics_key.state.viewport_swizzles != old_swizzles) {
+                key_changed = true;
+            }
+        }
+        if (patch_topology) {
+            clean.topology = draw_topology;
+            const u32 old_raw1 = graphics_key.state.raw1;
+            const u32 old_dyn_raw1 = graphics_key.state.dynamic_state.raw1;
+            graphics_key.state.RefreshTopology(maxwell3d->regs, draw_topology, dynamic_features);
+            if (graphics_key.state.raw1 != old_raw1 ||
+                graphics_key.state.dynamic_state.raw1 != old_dyn_raw1) {
+                key_changed = true;
+            }
+        }
+        if (patch_engine_state) {
+            clean.engine_state = maxwell3d->engine_state;
+            const u32 old_raw2 = graphics_key.state.raw2;
+            graphics_key.state.app_stage.Assign(maxwell3d->engine_state);
+            if (graphics_key.state.raw2 != old_raw2) {
+                key_changed = true;
+            }
         }
         if (patch_blending) {
-            const auto old_attachments = graphics_key.state.attachments;
-            const u32 old_raw2 = graphics_key.state.raw2;
-            graphics_key.state.RefreshBlending(*maxwell3d);
-            if (graphics_key.state.raw2 != old_raw2 ||
-                std::memcmp(graphics_key.state.attachments.data(), old_attachments.data(),
-                            sizeof(old_attachments)) != 0) {
+            const u32 old_raw1 = graphics_key.state.raw1;
+            graphics_key.state.attachment0_dual_source_blend.Assign(
+                FixedPipelineState::DualSourceBlend(maxwell3d->regs) ? 1 : 0);
+            if (graphics_key.state.raw1 != old_raw1) {
                 key_changed = true;
+            }
+            if (!dynamic_features.has_extended_dynamic_state_3_blend) {
+                const auto old_attachments = graphics_key.state.attachments;
+                const u32 old_raw2 = graphics_key.state.raw2;
+                graphics_key.state.RefreshBlending(*maxwell3d);
+                if (graphics_key.state.raw2 != old_raw2 ||
+                    std::memcmp(graphics_key.state.attachments.data(), old_attachments.data(),
+                                sizeof(old_attachments)) != 0) {
+                    key_changed = true;
+                }
             }
         }
         if (!key_changed) {
@@ -1544,25 +1592,44 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     auto& entry{pair->second};
     if (is_new) {
         entry = CreateComputePipeline(key, shader);
-    } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
-               StaleNullPointerSlot(entry)) {
-        // The translation dropped accesses through a pointer that was null back then. Which slots
-        // the game fills depends on the area, so the new one keeps binding every pointer this one
-        // binds, null now or not: a null pointer binds nothing.
-        auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
-        if (rebuilt.pipeline) {
+    } else {
+        if (entry.pending_rebuild && entry.pending_rebuild->IsBuilt()) {
             if (entry.pipeline) {
                 retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
                                                        std::move(entry.pipeline));
             }
-            rebuilt.rebuilds = entry.rebuilds + 1;
-            entry = std::move(rebuilt);
-        } else {
-            // Keep the working translation when the new one cannot be built (for example a
-            // narrow access that now stays global across two buffers), and stop retrying.
-            LOG_WARNING(Render_Vulkan, "Keeping compute shader {:016x}: rebuild failed: {}",
-                        key.unique_hash, rebuilt.failure);
-            entry.rebuilds = MaxComputeRebuilds;
+            entry.pipeline = std::move(entry.pending_rebuild);
+            entry.null_pointer_slots = std::move(entry.pending_null_pointer_slots);
+            entry.mapped_pointers = std::move(entry.pending_mapped_pointers);
+            ++entry.rebuilds;
+        }
+        if (!entry.pending_rebuild && !entry.null_pointer_slots.empty() &&
+            entry.rebuilds < MaxComputeRebuilds && StaleNullPointerSlot(entry)) {
+            // The translation dropped accesses through a pointer that was null back then. Which
+            // slots the game fills depends on the area, so the new one keeps binding every pointer
+            // this one binds, null now or not: a null pointer binds nothing. Built on a worker
+            // while dispatches keep using the current pipeline (#995).
+            auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
+            if (rebuilt.pipeline) {
+                if (rebuilt.pipeline->IsBuilt()) {
+                    if (entry.pipeline) {
+                        retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                               std::move(entry.pipeline));
+                    }
+                    rebuilt.rebuilds = entry.rebuilds + 1;
+                    entry = std::move(rebuilt);
+                } else {
+                    entry.pending_rebuild = std::move(rebuilt.pipeline);
+                    entry.pending_null_pointer_slots = std::move(rebuilt.null_pointer_slots);
+                    entry.pending_mapped_pointers = std::move(rebuilt.mapped_pointers);
+                }
+            } else {
+                // Keep the working translation when the new one cannot be built (for example a
+                // narrow access that now stays global across two buffers), and stop retrying.
+                LOG_WARNING(Render_Vulkan, "Keeping compute shader {:016x}: rebuild failed: {}",
+                            key.unique_hash, rebuilt.failure);
+                entry.rebuilds = MaxComputeRebuilds;
+            }
         }
     }
     return entry.Get(kepler_compute->IsNativeMode(),

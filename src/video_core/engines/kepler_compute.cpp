@@ -1578,16 +1578,24 @@ void KeplerCompute::FrontNoteWriter(VideoCommon::GpuSplit& split, FrontState& fs
             FrontPredictQmd(split, fs, method, argument);
         }
         return;
-    case 0xb0:
-        if ((argument & 15) > 1) {
+    case 0xb0: {
+        const u32 action = argument & 15;
+        if (action == 2 || action == 3 || action == 7) {
             split.NoteDispatchWriter();
             FrontPredictQmd(split, fs, method, argument);
         }
         return;
-    case 0x107:
-        split.NoteDispatchWriter();
+    }
+    case 0x107: {
+        const GPUVAddr address =
+            ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
+        split.NoteWriterRange(memory_manager, address, 256, Kind::Upload);
+        if ((fs.registers[0xa7] & (1U << 24)) || !(fs.registers[0xcc] & (1U << 12))) {
+            split.NoteDispatchWriter();
+        }
         FrontPredictQmd(split, fs, method, argument);
         return;
+    }
     case 0x6c3: {
         const GPUVAddr address =
             (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
@@ -1724,9 +1732,6 @@ void KeplerCompute::FrontPredictQmd(VideoCommon::GpuSplit& split, const FrontSta
         }
         std::copy_n(fs.registers.begin() + 0xc8, qmd.size(), qmd.begin());
         fs.inline_qmds[(qmd_address >> 8) % fs.inline_qmds.size()] = {qmd_address, position, qmd};
-        if (!((fs.registers[0xa7] & (1U << 24)) || !(fs.registers[0xcc] & (1U << 12)))) {
-            return;
-        }
         action = 3;
     } else {
         qmd_address = GPUVAddr{fs.registers[0xad]} << 8;
@@ -1740,12 +1745,18 @@ void KeplerCompute::FrontPredictQmd(VideoCommon::GpuSplit& split, const FrontSta
             Prediction::NoteSignal(Prediction::Signal::Waiting);
         }
     }
+    if (method != 0x107 && action != 7 && ((qmd[4] >> 14) & 0xffff) != 0) {
+        return;
+    }
     predict(qmd_address, qmd, stale);
     for (u32 depth = 0; depth < 4 && (qmd[16] & 1); ++depth) {
         const u32 dependent_action = (qmd[16] >> 1) & 7;
         const GPUVAddr dependent = GPUVAddr{qmd[15]} << 8;
         if ((dependent_action != 4 && dependent_action != 3 && dependent_action != 1) ||
             !read(dependent, qmd, stale)) {
+            break;
+        }
+        if (((qmd[4] >> 14) & 0xffff) > 1) {
             break;
         }
         if (pred_enabled) {

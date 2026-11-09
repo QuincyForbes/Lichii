@@ -402,6 +402,14 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             [&] {
                 api_result = api.evaluate_feature(sl::kFeatureDLSS, *frame, inputs, std::size(inputs),
                                                   reinterpret_cast<sl::CommandBuffer*>(*cmdbuf));
+                if (api_result == sl::Result::eWarnOutOfVRAM) {
+                    if (!warned_out_of_vram) {
+                        warned_out_of_vram = true;
+                        LOG_WARNING(Render_Vulkan,
+                                    "NVIDIA DLSS reported eWarnOutOfVRAM; keeping DLSS active");
+                    }
+                    return true;
+                }
                 return api_result == sl::Result::eOk;
             },
             [&] {

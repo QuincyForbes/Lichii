@@ -92,7 +92,7 @@ void KSpinLock::LockContendedNx2() {
     // Holders keep the lock for a few microseconds; sleeping costs the waiter the host's wake-up
     // latency and the holder a wake syscall. Spin for a bounded time first.
     const auto budget = std::chrono::microseconds{Nx2Wait::SpinMicroseconds()};
-    const auto deadline = std::chrono::steady_clock::now() + budget;
+    std::chrono::steady_clock::time_point deadline{};
     for (u32 spin = 1;; ++spin) {
         Pause();
         if (m_state.load(std::memory_order_relaxed) == 0) {
@@ -102,8 +102,13 @@ void KSpinLock::LockContendedNx2() {
                 return;
             }
         }
-        if ((spin & 31) == 0 && std::chrono::steady_clock::now() >= deadline) {
-            break;
+        if ((spin & 63) == 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (spin == 64) {
+                deadline = now + budget;
+            } else if (now >= deadline) {
+                break;
+            }
         }
     }
     while (m_state.exchange(2, std::memory_order_acquire) != 0) {

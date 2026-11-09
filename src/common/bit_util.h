@@ -37,6 +37,9 @@ template<typename T>
 template<typename T>
     requires std::is_integral_v<T>
 [[nodiscard]] constexpr T Log2Ceil(const T value) {
+    if (value <= T(1)) {
+        return T(0);
+    }
     const T log2_f = Log2Floor<T>(value);
     return T(log2_f + T((value ^ (T(1ULL) << log2_f)) != T(0ULL)));
 }

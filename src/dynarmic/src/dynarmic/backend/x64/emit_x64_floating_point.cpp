@@ -1056,8 +1056,8 @@ void EmitX64::EmitFPRecipStepFused64(EmitContext& ctx, IR::Inst* inst) {
 /// 8-15   exact (!= 0)
 template<typename FPT>
 static u64 EmitFPRoundThunk(u64 input, FP::FPSR& fpsr, FP::FPCR fpcr, u32 extra_args) {
-    auto const exact = ((extra_args >> 16) & 0xff) != 0;
-    auto const rounding_mode = FP::RoundingMode((extra_args >> 8) & 0xff);
+    auto const exact = ((extra_args >> 8) & 0xff) != 0;
+    auto const rounding_mode = FP::RoundingMode(extra_args & 0xff);
     return FP::FPRoundInt<FPT>(FPT(input), fpcr, rounding_mode, exact, fpsr);
 }
 
@@ -1065,10 +1065,13 @@ static void EmitFPRound(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, siz
     auto const rounding_mode = FP::RoundingMode(inst->GetArg(1).GetU8());
     bool const exact = inst->GetArg(2).GetU1();
     auto const round_imm = ConvertRoundingModeToX64Immediate(rounding_mode);
-    if (fsize != 16 && code.HasHostFeature(HostFeature::SSE41) && round_imm && !exact) {
+    if (fsize != 16 && code.HasHostFeature(HostFeature::SSE41) && round_imm &&
+        (!exact || ctx.HasOptimization(OptimizationFlag::Unsafe_ReducedErrorFP) ||
+         ctx.HasOptimization(OptimizationFlag::Unsafe_IgnoreStandardFPCRValue))) {
+        const int imm = *round_imm | (exact ? 0 : 0b1000);
         fsize == 64
-            ? FPTwoOp<64>(code, ctx, inst, [&](Xbyak::Xmm result) { code.roundsd(result, result, *round_imm); })
-            : FPTwoOp<32>(code, ctx, inst, [&](Xbyak::Xmm result) { code.roundss(result, result, *round_imm); });
+            ? FPTwoOp<64>(code, ctx, inst, [&](Xbyak::Xmm result) { code.roundsd(result, result, imm); })
+            : FPTwoOp<32>(code, ctx, inst, [&](Xbyak::Xmm result) { code.roundss(result, result, imm); });
     } else {
         auto args = ctx.reg_alloc.GetArgumentInfo(inst);
         // See EmitFPRoundThunk
@@ -2028,6 +2031,8 @@ void EmitX64::EmitFPFixedU64ToDouble(EmitContext& ctx, IR::Inst* inst) {
 
     if (code.HasHostFeature(HostFeature::AVX512F)) {
         code.vcvtusi2sd(result, result, from);
+    } else if (ctx.HasOptimization(OptimizationFlag::Unsafe_ReducedErrorFP)) {
+        code.cvtsi2sd(result, from);
     } else {
         const Xbyak::Xmm tmp = ctx.reg_alloc.ScratchXmm(code);
 

@@ -109,6 +109,9 @@ struct ShaderPools {
 
 struct ComputePipelineCacheEntry {
     std::unique_ptr<ComputePipeline> pipeline;
+    std::unique_ptr<ComputePipeline> pending_rebuild;
+    std::vector<std::pair<u32, u32>> pending_null_pointer_slots;
+    std::vector<u64> pending_mapped_pointers;
     std::string failure;
     /// Constant buffer slots that were null pointers at translation (see NullStoragePointerSlots)
     std::vector<std::pair<u32, u32>> null_pointer_slots;

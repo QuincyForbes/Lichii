@@ -48,6 +48,14 @@ inline bool LazyPayloadSync() {
     return enabled;
 }
 
+inline bool OotOcclusionOff(u64 program_id) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_OCCLUSION_OFF");
+        return value == nullptr || value[0] == '\0' || value[0] != '0';
+    }();
+    return enabled && program_id == 0x0400486024DEC000ULL;
+}
+
 struct SyncValuesStruct {
     VAddr address;
     u64 value;
@@ -198,9 +206,11 @@ public:
         } else {
             inflight = false;
         }
-        std::vector<SyncValuesStruct> sync_values;
+        auto& sync_values = sync_values_stash;
+        sync_values.clear();
         sync_values.reserve(pending_sync.size());
-        std::vector<VAddr> seen;
+        auto& seen = seen_stash;
+        seen.clear();
         seen.reserve(pending_sync.size());
         for (auto it = pending_sync.rbegin(); it != pending_sync.rend(); ++it) {
             if (std::find(seen.begin(), seen.end(), it->address) != seen.end()) {
@@ -255,6 +265,8 @@ private:
 
     RuntimeType& runtime;
     std::deque<PendingSync> pending_sync;
+    std::vector<SyncValuesStruct> sync_values_stash;
+    std::vector<VAddr> seen_stash;
     std::vector<GuestWrittenRange> lazy_ranges;
     std::vector<std::pair<size_t, VAddr>> superseded;
     bool inflight{};
@@ -358,6 +370,9 @@ QueryCacheBase<Traits>::~QueryCacheBase() = default;
 
 template <typename Traits>
 void QueryCacheBase<Traits>::CounterEnable(QueryType counter_type, bool is_enabled) {
+    if (counter_type == QueryType::ZPassPixelCount64 && OotOcclusionOff(program_id)) {
+        return;
+    }
     size_t index = static_cast<size_t>(counter_type);
     StreamerInterface* streamer = impl->streamers[index];
     if (!streamer) [[unlikely]] {
@@ -373,6 +388,9 @@ void QueryCacheBase<Traits>::CounterEnable(QueryType counter_type, bool is_enabl
 
 template <typename Traits>
 void QueryCacheBase<Traits>::CounterClose(QueryType counter_type) {
+    if (counter_type == QueryType::ZPassPixelCount64 && OotOcclusionOff(program_id)) {
+        return;
+    }
     size_t index = static_cast<size_t>(counter_type);
     StreamerInterface* streamer = impl->streamers[index];
     if (!streamer) [[unlikely]] {
@@ -384,6 +402,9 @@ void QueryCacheBase<Traits>::CounterClose(QueryType counter_type) {
 
 template <typename Traits>
 void QueryCacheBase<Traits>::CounterReset(QueryType counter_type) {
+    if (counter_type == QueryType::ZPassPixelCount64 && OotOcclusionOff(program_id)) {
+        return;
+    }
     size_t index = static_cast<size_t>(counter_type);
     StreamerInterface* streamer = impl->streamers[index];
     if (!streamer) [[unlikely]] {
@@ -416,7 +437,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                  gpu_memory->GpuToCpuAddress(addr).value_or(0));
     }
     size_t streamer_id = static_cast<size_t>(counter_type);
-    auto* streamer = impl->streamers[streamer_id];
+    auto* streamer = (counter_type == QueryType::ZPassPixelCount64 && OotOcclusionOff(program_id))
+                         ? nullptr
+                         : impl->streamers[streamer_id];
     if (streamer == nullptr) [[unlikely]] {
         counter_type = QueryType::Payload;
         payload = 1U;
@@ -451,9 +474,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
     bool is_synced = (Settings::IsGPUFenceBehaviorDefault() ? !VideoCore::Nx2Debug::AccuratePart(1) : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
-    std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
-                                     pointer, pointer_timestamp, cpu_addr, addr,
-                                     asid = gpu_memory->GetID(), counter_type] {
+    auto callback = [this, is_synced, streamer, query_base = query, query_location,
+                     pointer, pointer_timestamp, cpu_addr, addr,
+                     asid = gpu_memory->GetID(), counter_type] {
         struct Settle {
             DAddr address;
             ~Settle() {
@@ -512,7 +535,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         if (!is_synced) [[likely]] {
             impl->pending_unregister.push_back(query_location);
         }
-    });
+    };
     const bool lazy_payload = counter_type == QueryType::Payload && LazyPayloadSync();
     const auto guest_holds_value = [pointer, has_timestamp, payload] {
         if (pointer == nullptr) {
@@ -534,7 +557,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         if (lazy_fence) {
             streamer->MarkInFlight(new_query_id);
         }
-        impl->rasterizer.SignalFence(std::move(operation));
+        if (is_synced) {
+            impl->rasterizer.SignalFence(std::function<void()>{std::ref(callback)});
+        } else {
+            impl->rasterizer.SignalFence(std::function<void()>{std::move(callback)});
+        }
         if (lazy_fence && streamer->FinishInFlight(new_query_id, guest_holds_value())) {
             NotifyWFI();
         }
@@ -566,7 +593,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         }
         Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(cpu_addr)].fetch_add(
             1, std::memory_order_release);
-        impl->rasterizer.SyncOperation(std::move(operation));
+        impl->rasterizer.SyncOperation(std::function<void()>{std::move(callback)});
     }
     if (is_synced) {
         streamer->Free(new_query_id);

@@ -397,6 +397,31 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const auto& qmd{kepler_compute.launch_description};
     const auto& cbufs{qmd.const_buffer_config};
     const bool via_header_index{qmd.linked_tsc != 0};
+    struct CbufPage {
+        GPUVAddr page = ~GPUVAddr{0};
+        const u8* host = nullptr;
+    };
+    std::array<CbufPage, 4> cbuf_pages{};
+    size_t next_cbuf_page = 0;
+    const auto read_cbuf_word = [&](GPUVAddr addr) -> u32 {
+        if ((addr & 3) == 0) [[likely]] {
+            const GPUVAddr page = addr >> 12;
+            for (const auto& entry : cbuf_pages) {
+                if (entry.page == page) {
+                    u32 value;
+                    std::memcpy(&value, entry.host + (addr & 0xfff), sizeof(u32));
+                    return value;
+                }
+            }
+            if (const u8* const host = gpu_memory.GetPointerForDescriptor(addr & ~GPUVAddr{0xfff})) {
+                cbuf_pages[next_cbuf_page++ & 3] = {page, host};
+                u32 value;
+                std::memcpy(&value, host + (addr & 0xfff), sizeof(u32));
+                return value;
+            }
+        }
+        return gpu_memory.ReadHandleWord(addr);
+    };
     const auto read_handle{[&](const auto& desc, u32 index) {
         if (desc.handle_program != ~0U) {
             // Read by the shader from a storage buffer: computed for this dispatch.
@@ -428,12 +453,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                 const u32 secondary_offset{desc.secondary_cbuf_offset};
                 const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].Address() +
                                              secondary_offset};
-                const u32 lhs_raw{gpu_memory.ReadHandleWord(addr) << desc.shift_left};
-                const u32 rhs_raw{gpu_memory.ReadHandleWord(separate_addr) << desc.secondary_shift_left};
+                const u32 lhs_raw{read_cbuf_word(addr) << desc.shift_left};
+                const u32 rhs_raw{read_cbuf_word(separate_addr) << desc.secondary_shift_left};
                 return TexturePair(lhs_raw | rhs_raw, via_header_index);
             }
         }
-        return TexturePair(gpu_memory.ReadHandleWord(addr), via_header_index);
+        return TexturePair(read_cbuf_word(addr), via_header_index);
     }};
     const auto add_image{[&](const auto& desc, bool blacklist) {
         for (u32 index = 0; index < desc.count; ++index) {

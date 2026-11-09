@@ -220,11 +220,7 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
         }
     }
     if (maxwell3d.dirty.flags[Dirty::ViewportSwizzles]) {
-        maxwell3d.dirty.flags[Dirty::ViewportSwizzles] = false;
-        const auto& transform = regs.viewport_transform;
-        std::ranges::transform(transform, viewport_swizzles.begin(), [](const auto& viewport) {
-            return static_cast<u16>(viewport.swizzle.raw);
-        });
+        RefreshViewportSwizzles(maxwell3d);
     }
     dynamic_state.raw1 = 0;
     dynamic_state.raw2 = 0;
@@ -274,6 +270,26 @@ void FixedPipelineState::RefreshBlending(Tegra::Engines::Maxwell3D& maxwell3d) {
             attachment.mask_b.Assign(1);
             attachment.mask_a.Assign(1);
         }
+    }
+}
+
+void FixedPipelineState::RefreshViewportSwizzles(Tegra::Engines::Maxwell3D& maxwell3d) {
+    maxwell3d.dirty.flags[Dirty::ViewportSwizzles] = false;
+    const auto& transform = maxwell3d.regs.viewport_transform;
+    std::ranges::transform(transform, viewport_swizzles.begin(), [](const auto& viewport) {
+        return static_cast<u16>(viewport.swizzle.raw);
+    });
+}
+
+void FixedPipelineState::RefreshTopology(const Maxwell& regs, Maxwell::PrimitiveTopology topology_,
+                                         const DynamicFeatures& features) noexcept {
+    const bool can_collapse_topology_class =
+        features.has_extended_dynamic_state && features.has_extended_dynamic_state_2;
+    topology.Assign(can_collapse_topology_class
+                        ? TOPOLOGY_CLASS_REPRESENTATIVE_LUT[static_cast<size_t>(topology_)]
+                        : topology_);
+    if (!features.has_extended_dynamic_state_2) {
+        dynamic_state.Refresh2(regs, topology_, false);
     }
 }
 

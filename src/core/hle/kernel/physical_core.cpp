@@ -298,17 +298,20 @@ void PhysicalCore::Idle(KernelCore& kernel) {
             return value == nullptr || value[0] != '0';
         }();
         const auto deadline = std::chrono::steady_clock::now() + spin;
-        while (!m_is_interrupted.load(std::memory_order_acquire) &&
-               std::chrono::steady_clock::now() < deadline) {
+        for (u32 iter = 1; !m_is_interrupted.load(std::memory_order_acquire); ++iter) {
 #if defined(_M_X64) || defined(__x86_64__)
             if (idle_pause) {
-                for (int i = 0; i < 8; ++i) {
-                    _mm_pause();
+                _mm_pause();
+                if ((iter & 63) == 0 && std::chrono::steady_clock::now() >= deadline) {
+                    break;
                 }
                 continue;
             }
 #endif
             std::this_thread::yield();
+            if (std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
         }
     }
     if (CoreLockEnabled()) {

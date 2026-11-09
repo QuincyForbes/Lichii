@@ -426,6 +426,25 @@ public:
     /// for the back to run the newest of those dispatches first (`waited` then set).
     DispatchCheck DispatchesMayWriteSince(u64 since, u64 begin, u64 size, bool wait, u64& checked,
                                           bool& waited);
+    /// Whether any bounded dispatch has ever written to device bytes [begin, begin + size).
+    [[nodiscard]] bool MayBeDispatchWritten(u64 begin, u64 size) const noexcept {
+        if (size == 0) {
+            return false;
+        }
+        const u64 first = begin >> 12;
+        const u64 last = (begin + size - 1) >> 12;
+        if (last < first || last >= dispatch_written_pages.size() * 64) {
+            return true;
+        }
+        for (u64 page = first; page <= last; ++page) {
+            if ((dispatch_written_pages[page / 64].load(std::memory_order_relaxed) >>
+                 (page % 64)) &
+                1) {
+                return true;
+            }
+        }
+        return false;
+    }
     /// The writes the back recorded so far.
     [[nodiscard]] u64 DispatchWriteCount() const {
         return dispatch_write_count.load(std::memory_order_acquire);
@@ -799,7 +818,7 @@ private:
     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
     static constexpr size_t RingMask = RingWords - 1;
     static constexpr u32 MaxMultiWords = 8192;
-    static constexpr size_t PublishEvery = 256;
+    static constexpr size_t PublishEvery = 64;
 
     template <typename Func>
     static void CallThunk(const u64* payload) {
@@ -820,8 +839,11 @@ private:
     void Commit(size_t words, Effect effect) {
         write_position += words;
         writes.Entry(effect, write_position);
-        if (write_position - published_local >= publish_every ||
-            back_waiting.load(std::memory_order_relaxed)) {
+        const size_t pending = write_position - published_local;
+        if (pending >= publish_every ||
+            back_waiting.load(std::memory_order_relaxed) ||
+            (pending >= 8 &&
+             consumed.load(std::memory_order_relaxed) == published_local)) {
             Publish();
         }
     }
@@ -836,9 +858,10 @@ private:
 
     /// One step of a front wait for the back to consume `target`.
     void Backoff(u32 spins, u64 target);
-    /// After the back stored `consumed`: wakes a front sleeping in Backoff.
-    void NotifyFront() {
-        if (front_waiting.load(std::memory_order_seq_cst)) {
+    /// After the back stored `consumed`: wakes a front sleeping in Backoff once past wait_target.
+    void NotifyFront(u64 position) {
+        if (front_waiting.load(std::memory_order_seq_cst) &&
+            position >= wait_target.load(std::memory_order_relaxed)) {
             front_wake.fetch_add(1, std::memory_order_seq_cst);
             front_wake.notify_one();
         }
@@ -908,7 +931,9 @@ private:
     static constexpr u64 DispatchWriteSlots = 8192;
     static constexpr u64 MaxDispatchScan = 2048;
     std::array<DispatchWrite, DispatchWriteSlots> dispatch_writes{};
+    std::array<std::atomic<u64>, (u64{1} << (36 - 12)) / 64> dispatch_written_pages{};
     alignas(64) std::atomic<u64> dispatch_write_count{};
+    std::atomic<u64> last_unbounded_dispatch_position{};
     std::atomic<u64> dispatches_bounded{};
     std::array<std::atomic<u64>, static_cast<size_t>(DispatchUnbounded::Count)>
         dispatches_unbounded{};

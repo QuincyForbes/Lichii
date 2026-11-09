@@ -365,7 +365,8 @@ public:
     void PopAsyncFlushes();
     void PopAsyncBuffers();
 
-    bool DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount);
+    bool DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount,
+                 bool inline_grid_copy = false);
 
     bool DMAClear(GPUVAddr src_address, u64 amount, u32 value);
 
@@ -493,6 +494,7 @@ public:
         u64 checked_frame = ~u64{0};
         /// frame_tick when the page was last seen changed: such pages are compared on every bind.
         u64 changed_frame = ~u64{0};
+        u64 checked_write_serial = 0;
         bool recheck = false;
     };
     std::unordered_map<DAddr, NativeBankPage> native_indirect_page_snapshots;
@@ -500,7 +502,9 @@ public:
         DAddr device_addr = ~DAddr{0};
         u32 size = 0;
         u64 checked_frame = ~u64{0};
+        u64 write_serial = 0;
         bool needs_per_bind = false;
+        bool has_hot = false;
     };
     std::array<NativeBankMemoEntry, 64> native_bank_memo{};
     /// Counts graphics draws (UpdateGraphicsBuffers) for EDEN_NX2_EXP4 & 2.
@@ -518,7 +522,7 @@ public:
     /// EDEN_NX2_EXP9 != 0: why bank pages were compared and which of them had changed, by the
     /// first reason that applies (NativeBankReason), logged every 5 s.
     /// EDEN_NX2_EXP9: a page that changed within this many frames is compared on every bind.
-    static constexpr u64 HotFrames = 120;
+    static constexpr u64 HotFrames = 2;
     enum NativeBankReason : size_t {
         BankCollected, ///< Collected CPU writes (Core::g_collected_write_pages)
         BankWritten,   ///< Writes the buffer cache saw (Core::g_buffer_write_pages)
@@ -916,8 +920,9 @@ private:
         if (!exact) {
             if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
                 uncommitted_gpu_modified_ranges.Add(device_addr, size);
+            } else {
+                ArmReadTraps(device_addr, size);
             }
-            ArmReadTraps(device_addr, size);
             return;
         }
         const DAddr end = device_addr + size;
@@ -930,7 +935,9 @@ private:
                 queued += upper - lower;
             }
         });
-        ArmReadTraps(device_addr, size);
+        if (queued < size) {
+            ArmReadTraps(device_addr, size);
+        }
         if (Nx2DownloadTrace::g_enabled && queued != 0) [[unlikely]] {
             Nx2DownloadTrace::Queued(device_addr, size, queued);
         }

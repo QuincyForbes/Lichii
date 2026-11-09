@@ -180,7 +180,8 @@ void DefineGenericOutput(EmitContext& ctx, size_t index, std::optional<u32> invo
         if (xfb_varying) {
             ctx.Decorate(id, spv::Decoration::XfbBuffer, xfb_varying->buffer);
             ctx.Decorate(id, spv::Decoration::XfbStride, xfb_varying->stride);
-            ctx.Decorate(id, spv::Decoration::Offset, xfb_varying->offset);
+            ctx.Decorate(id, spv::Decoration::Offset,
+                         xfb_varying->offset + static_cast<u32>(element) * 4U);
             if (ctx.stage == Stage::Geometry && xfb_varying->stream != 0) {
                 ctx.Decorate(id, spv::Decoration::Stream, xfb_varying->stream);
             }
@@ -456,6 +457,17 @@ Id DescType(EmitContext& ctx, Id sampled_type, Id pointer_type, u32 count) {
     } else {
         return pointer_type;
     }
+}
+
+// EDEN_NX2_LEAN_SSBO=0 turns it off: the global memory helpers are kept as calls and route
+// with one switch. Inlined at each of their calls, a program with ~30 candidate buffers took
+// NVIDIA's compiler 2.4 s (Ocarina's foliage compute programs; 0.6 s this way, same accesses).
+bool LeanGlobalMemory() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_LEAN_SSBO");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
 }
 } // Anonymous namespace
 
@@ -981,8 +993,10 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     // 57.9/57.8 inlined), and a shader is built once before the driver's cache has it.
     static const spv::FunctionControlMask function_control = [] {
         const char* value = std::getenv("EDEN_NX2_SPIRV_INLINE_GLOBALS");
-        return value != nullptr && value[0] == '0' ? spv::FunctionControlMask::DontInline
-                                                   : spv::FunctionControlMask::MaskNone;
+        return value != nullptr && value[0] == '0'
+                   ? spv::FunctionControlMask::DontInline
+                   : (LeanGlobalMemory() ? spv::FunctionControlMask::DontInline
+                                         : spv::FunctionControlMask::MaskNone);
     }();
     const Id zero{u32_zero_value};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
@@ -990,10 +1004,22 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         AddLabel();
         const size_t num_buffers{info.storage_buffers_descriptors.size()};
         const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
+        std::vector<std::pair<u64, Id>> cbuf_cache;
+        const auto load_cbuf_words{[&](u32 cbuf_index, u32 cbuf_offset) {
+            const u64 key{(u64{cbuf_index} << 32) | cbuf_offset};
+            for (const auto& [cached_key, cached_words] : cbuf_cache) {
+                if (cached_key == key) {
+                    return cached_words;
+                }
+            }
+            const Id words{
+                EmitGetCbufU32x2(*this, IR::Value{cbuf_index}, IR::Value{cbuf_offset})};
+            cbuf_cache.emplace_back(key, words);
+            return words;
+        }};
         const auto base_address{[&](size_t index) {
             const auto& ssbo{info.storage_buffers_descriptors[index]};
-            const Id words{EmitGetCbufU32x2(*this, IR::Value{ssbo.cbuf_index},
-                                           IR::Value{ssbo.cbuf_offset})};
+            const Id words{load_cbuf_words(ssbo.cbuf_index, ssbo.cbuf_offset)};
             if (ssbo.indirect_offset == ~0U) {
                 return OpBitwiseAnd(U64, OpBitcast(U64, words), Constant(U64, ssbo_align_mask));
             }
@@ -1048,6 +1074,30 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                                              OpULessThan(U1, distance, best_distance))};
                 best_distance = OpSelect(U64, better, distance, best_distance);
                 best_index = OpSelect(U32[1], better, Const(static_cast<u32>(index)), best_index);
+            }
+            if (LeanGlobalMemory()) {
+                const Id ssbo_offset{OpUConvert(U32[1], best_distance)};
+                const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
+                std::vector<Sirit::Literal> literals;
+                std::vector<Id> labels;
+                literals.reserve(num_buffers);
+                labels.reserve(num_buffers);
+                for (size_t index = 0; index < num_buffers; ++index) {
+                    literals.push_back(static_cast<u32>(index));
+                    labels.push_back(OpLabel());
+                }
+                const Id default_label{OpLabel()};
+                OpSelectionMerge(default_label, spv::SelectionControlMask::MaskNone);
+                OpSwitch(best_index, default_label, literals, labels);
+                for (size_t index = 0; index < num_buffers; ++index) {
+                    AddLabel(labels[index]);
+                    const Id ssbo_id{ssbos[index].*ssbo_member};
+                    callback(OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index), ssbo_id,
+                             ssbo_index);
+                    OpBranch(default_label);
+                }
+                AddLabel(default_label);
+                return;
             }
             for (size_t index = 0; index < num_buffers; ++index) {
                 access(index, bases[index],

@@ -267,6 +267,13 @@ struct FixedPipelineState {
     /// attachments. Clears the flag.
     void RefreshBlending(Tegra::Engines::Maxwell3D& maxwell3d);
 
+    /// The part of Refresh a raised Dirty::ViewportSwizzles redoes. Clears the flag.
+    void RefreshViewportSwizzles(Tegra::Engines::Maxwell3D& maxwell3d);
+
+    /// The part of Refresh a draw topology change redoes.
+    void RefreshTopology(const Maxwell& regs, Maxwell::PrimitiveTopology topology_,
+                         const DynamicFeatures& features) noexcept;
+
     /// attribute_types as Refresh computes it with dynamic vertex input.
     [[nodiscard]] static u64 DynamicAttributeTypes(const Maxwell& regs) noexcept;
 

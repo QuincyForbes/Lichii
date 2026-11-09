@@ -262,6 +262,26 @@ constexpr std::array OOT_POLL_BACKOFF_RECORDS{
     BuiltinPatchRecord{0x17088, OOT_POLL_BACKOFF_CAVE, OOT_POLL_PADDING_ORIGINAL},
 };
 
+bool OotTexturePoolEnabled() {
+    static const bool enabled = OotEnvSwitch("EDEN_NX2_OOT_TEXTURE_POOL", true);
+    return enabled;
+}
+
+// Doubles Ocarina of Time's internal graphics texture pool size so entering the Castle Town guard
+// house / pot room does not exhaust the pool and spin forever on a zero-format descriptor (#976).
+constexpr std::array<u8, 4> OOT_TEXTURE_POOL_CALL_ORIGINAL{0xE8, 0x27, 0x01, 0xA9}; // stp x8, x9, [sp, #0x10]
+constexpr std::array<u8, 4> OOT_TEXTURE_POOL_CALL_BRANCH{0xD5, 0x6F, 0xC0, 0x94};   // bl 0x3c462c0
+constexpr std::array<u8, 12> OOT_TEXTURE_POOL_CAVE_ORIGINAL{};
+constexpr std::array<u8, 12> OOT_TEXTURE_POOL_CAVE{
+    0x08, 0xF9, 0x7F, 0xD3, // lsl x8, x8, #1
+    0xE8, 0x27, 0x01, 0xA9, // stp x8, x9, [sp, #0x10]
+    0xC0, 0x03, 0x5F, 0xD6, // ret
+};
+constexpr std::array OOT_TEXTURE_POOL_RECORDS{
+    BuiltinPatchRecord{0xC2A36C, OOT_TEXTURE_POOL_CALL_BRANCH, OOT_TEXTURE_POOL_CALL_ORIGINAL},
+    BuiltinPatchRecord{0x3C462C0, OOT_TEXTURE_POOL_CAVE, OOT_TEXTURE_POOL_CAVE_ORIGINAL},
+};
+
 constexpr std::array BUILTIN_PATCHES{
     // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
     // instead of following the GPU-time controller down to its 480p floor.
@@ -320,6 +340,14 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = OOT_POLL_BACKOFF_RECORDS,
         .env_enabled = OotPollBackoffEnabled,
+    },
+    BuiltinPatch{
+        .name = "Texture Pool x2 (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = OOT_TEXTURE_POOL_RECORDS,
+        .env_enabled = OotTexturePoolEnabled,
     },
 };
 

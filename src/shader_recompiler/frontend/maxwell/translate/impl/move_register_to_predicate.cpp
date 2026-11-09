@@ -39,6 +39,24 @@ void R2P(TranslatorVisitor& v, u64 insn, const IR::U32& mask) {
     const bool pr_mode{r2p.mode == Mode::PR};
     const u32 num_items{pr_mode ? 7U : 4U};
     const u32 offset_base{static_cast<u32>(r2p.byte_selector) * 8};
+    if (mask.IsImmediate()) {
+        const u32 imm_mask{mask.U32()};
+        for (u32 index = 0; index < num_items; ++index) {
+            if (((imm_mask >> index) & 1) == 0) {
+                continue;
+            }
+            const IR::U32 offset{v.ir.Imm32(offset_base + index)};
+            const IR::U1 src_zero{
+                v.ir.GetZeroFromOp(v.ir.BitFieldExtract(src, offset, count, false))};
+            const IR::U1 src_bit{v.ir.LogicalNot(src_zero)};
+            if (pr_mode) {
+                v.ir.SetPred(IR::Pred{index}, src_bit);
+            } else {
+                SetFlag(v.ir, v.ir.Imm1(false), src_bit, index);
+            }
+        }
+        return;
+    }
     for (u32 index = 0; index < num_items; ++index) {
         const IR::U32 offset{v.ir.Imm32(offset_base + index)};
         const IR::U1 src_zero{v.ir.GetZeroFromOp(v.ir.BitFieldExtract(src, offset, count, false))};

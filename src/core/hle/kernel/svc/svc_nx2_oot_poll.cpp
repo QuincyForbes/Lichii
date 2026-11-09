@@ -137,19 +137,26 @@ bool ExitPending(Core::Memory::Memory& memory, u64 main_base) {
 
 WalkView ReadWalk(Core::Memory::Memory& memory, const ThreadContext& ctx) {
     WalkView view{};
-    const u64 main_base = ctx.pc - kSvcReturnOffset;
-    if (!Valid(memory, main_base + kRescanBranchOffset, 4) ||
-        memory.Read32(main_base + kRescanBranchOffset) != kRescanBranch ||
-        !Valid(memory, main_base + kSvcOffset, 4) ||
-        memory.Read32(main_base + kSvcOffset) != kSvcInstruction) {
+    // Only reached through `tbz w8, #0` with w8 = [sp+0x110]; anything else is not this frame.
+    if ((ctx.r[8] & 1) != 0) {
         return view;
+    }
+    const u64 main_base = ctx.pc - kSvcReturnOffset;
+    static std::atomic<u64> verified_main_base{};
+    if (verified_main_base.load(std::memory_order_relaxed) != main_base) {
+        if (!Valid(memory, main_base + kRescanBranchOffset, 4) ||
+            memory.Read32(main_base + kRescanBranchOffset) != kRescanBranch ||
+            !Valid(memory, main_base + kSvcOffset, 4) ||
+            memory.Read32(main_base + kSvcOffset) != kSvcInstruction) {
+            return view;
+        }
+        verified_main_base.store(main_base, std::memory_order_relaxed);
     }
     const u64 manager = ctx.r[19];
     const u64 sp = ctx.sp;
     if (!Valid(memory, manager, kCountOffset + 4) || !Valid(memory, sp + kIssuedOffset, 0x24)) {
         return view;
     }
-    // Only reached through `tbz w8, #0` with w8 = [sp+0x110]; anything else is not this frame.
     if ((memory.Read32(sp + kAllDoneOffset) & 1) != 0) {
         return view;
     }
@@ -270,6 +277,10 @@ bool CallNx2OotPollBackoff(Core::System& system, u32 imm) {
                 }
                 ++g_stats.slept;
                 g_stats.sleep_ns += sleep_ns;
+            } else {
+                slot.resume_ns = now;
+                slot.head = view.head;
+                slot.count = view.count;
             }
         }
         ++g_stats.outcomes[static_cast<size_t>(view.outcome)];
@@ -297,10 +308,7 @@ bool CallNx2OotPollBackoff(Core::System& system, u32 imm) {
 
     if (sleep_ns > 0) {
         SleepThread(system, sleep_ns);
-    }
-
-    // The next walk starts now: remember when, and the ring it starts from.
-    if (view.outcome != Outcome::Frame) {
+        // The next walk starts now: remember when, and the ring it starts from.
         const u32 head = memory.Read32(view.manager + kHeadOffset);
         const u32 count = memory.Read32(view.manager + kCountOffset);
         const s64 resume = NowNs();

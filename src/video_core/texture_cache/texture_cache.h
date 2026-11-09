@@ -1014,15 +1014,50 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
                     ((regs.depth_test_enable != 0 && regs.depth_write_enabled != 0) ||
                      (regs.stencil_enable != 0 && regs.stencil_front_mask != 0)));
     const auto prepare_clear_targets = [&] {
+        if (rt_prepared.serial != render_targets_serial || rt_prepared.frame_tick != frame_tick) {
+            rt_prepared.modified_mask = 0;
+        }
         if (regs.clear_surface.RT < NUM_RT && color_modified(regs.clear_surface.RT)) {
-            const ImageViewId color_buffer_id =
-                render_targets.color_buffer_ids[regs.clear_surface.RT];
+            const size_t rt = regs.clear_surface.RT;
+            const ImageViewId color_buffer_id = render_targets.color_buffer_ids[rt];
             PrepareImageView(color_buffer_id, true, IsFullClear(color_buffer_id));
+            if (color_buffer_id) {
+                rt_prepared.modified_mask |= 1u << rt;
+            }
         }
         if (depth_modified) {
             const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
             PrepareImageView(depth_buffer_id, true, IsFullClear(depth_buffer_id));
+            if (depth_buffer_id) {
+                rt_prepared.modified_mask |= 1u << NUM_RT;
+            }
         }
+        NoteRenderTargetsPrepared();
+    };
+    const auto prepare_draw_targets = [&] {
+        const u32 prev_mod_mask =
+            (rt_prepared.valid && rt_prepared.serial == render_targets_serial &&
+             rt_prepared.frame_tick == frame_tick)
+                ? rt_prepared.modified_mask
+                : 0u;
+        u32 new_mod_mask = prev_mod_mask;
+        for (size_t index = 0; index < NUM_RT; ++index) {
+            ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
+            const bool mod = color_modified(index);
+            const u32 bit = 1u << index;
+            PrepareImageView(color_buffer_id, mod && (prev_mod_mask & bit) == 0, false);
+            if (mod && color_buffer_id) {
+                new_mod_mask |= bit;
+            }
+        }
+        const u32 depth_bit = 1u << NUM_RT;
+        PrepareImageView(render_targets.depth_buffer_id,
+                         depth_modified && (prev_mod_mask & depth_bit) == 0, false);
+        if (depth_modified && render_targets.depth_buffer_id) {
+            new_mod_mask |= depth_bit;
+        }
+        rt_prepared.modified_mask = new_mod_mask;
+        NoteRenderTargetsPrepared();
     };
     if (!flags[Dirty::RenderTargets]) {
         if (is_clear) {
@@ -1032,15 +1067,9 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         if (RenderTargetsStillPrepared()) {
             return;
         }
-        for (size_t index = 0; index < NUM_RT; ++index) {
-            ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
-            PrepareImageView(color_buffer_id, color_modified(index), false);
-        }
-        PrepareImageView(render_targets.depth_buffer_id, depth_modified, false);
-        NoteRenderTargetsPrepared();
+        prepare_draw_targets();
         return;
     }
-    rt_prepared.valid = false;
 
     const VideoCommon::RenderTargets previous_render_targets = render_targets;
     const bool rescaled = RescaleRenderTargets();
@@ -1051,16 +1080,6 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     }
 
     const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
-    if (is_clear) {
-        prepare_clear_targets();
-    } else {
-        for (size_t index = 0; index < NUM_RT; ++index) {
-            ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
-            PrepareImageView(color_buffer_id, color_modified(index), false);
-        }
-        PrepareImageView(depth_buffer_id, depth_modified, false);
-    }
-
     rt_active_mask = 0;
     rt_image_id = {};
     for (size_t i = 0; i < rt_image_id.size(); ++i) {
@@ -1093,11 +1112,15 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
 
     if (render_targets != previous_render_targets) {
         ++render_targets_serial;
+        rt_prepared.valid = false;
+        rt_prepared.modified_mask = 0;
     }
 
     flags[Dirty::DepthBiasGlobal] = true;
-    if (!is_clear) {
-        NoteRenderTargetsPrepared();
+    if (is_clear) {
+        prepare_clear_targets();
+    } else if (!RenderTargetsStillPrepared()) {
+        prepare_draw_targets();
     }
 }
 
@@ -1109,7 +1132,7 @@ bool TextureCache<P>::RenderTargetsStillPrepared() const {
     }();
     const auto& prepared = rt_prepared;
     if (!enabled || !prepared.valid || prepared.serial != render_targets_serial ||
-        prepared.frame_tick != frame_tick || prepared.bindings_epoch != bindings_epoch) {
+        prepared.frame_tick != frame_tick) {
         return false;
     }
     const auto& regs = maxwell3d->regs;
@@ -1133,7 +1156,8 @@ bool TextureCache<P>::RenderTargetsStillPrepared() const {
                              ? (index < regs.rt_control.count && regs.color_mask[index].raw != 0)
                              : depth_mod;
         const ImageBase& image = slot_images[image_view.image_id];
-        if ((mod && False(image.flags & ImageFlagBits::GpuModified)) ||
+        if ((mod && ((prepared.modified_mask & (1u << index)) == 0 ||
+                     False(image.flags & ImageFlagBits::GpuModified))) ||
             True(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::SparseTiles |
                                 ImageFlagBits::SparseLayers | ImageFlagBits::UnwrittenSparse))) {
             return false;
@@ -4215,22 +4239,43 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
 }
 
 template <class P>
+bool TextureCache<P>::IsActiveRenderTarget(ImageId image_id) const noexcept {
+    if (rt_active_mask == 0 || !image_id) {
+        return false;
+    }
+    if ((rt_active_mask & (1u << NUM_RT)) != 0 && image_id == rt_depth_image_id) {
+        return true;
+    }
+    for (size_t i = 0; i < NUM_RT; ++i) {
+        if ((rt_active_mask & (1u << i)) != 0 && image_id == rt_image_id[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class P>
 void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     Image& image = slot_images[image_id];
     bool any_rescaled = True(image.flags & ImageFlagBits::Rescaled);
     bool any_modified = True(image.flags & ImageFlagBits::GpuModified);
     u64 most_recent_tick = image.modification_tick;
+    const bool rt_settled = !maxwell3d->dirty.flags[VideoCommon::Dirty::RenderTargets];
     for (const AliasedImage& aliased : image.aliased_images) {
         ImageBase& aliased_image = slot_images[aliased.id];
         if (image.modification_tick < aliased_image.modification_tick) {
             most_recent_tick = (std::max)(most_recent_tick, aliased_image.modification_tick);
+            if (rt_settled && IsActiveRenderTarget(aliased.id)) {
+                continue;
+            }
             aliased_images.push_back(&aliased);
             any_rescaled |= True(aliased_image.flags & ImageFlagBits::Rescaled);
             any_modified |= True(aliased_image.flags & ImageFlagBits::GpuModified);
         }
     }
     if (aliased_images.empty()) {
+        image.modification_tick = most_recent_tick;
         return;
     }
     const bool can_rescale = ImageCanRescale(image);

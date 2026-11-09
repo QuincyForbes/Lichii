@@ -139,9 +139,13 @@ public:
 
     bool CanReportMemoryUsage() const;
 
-    u32 GetUniformBufferAlignment() const;
+    u32 GetUniformBufferAlignment() const noexcept {
+        return uniform_buffer_alignment;
+    }
 
-    u32 GetStorageBufferAlignment() const;
+    u32 GetStorageBufferAlignment() const noexcept {
+        return storage_buffer_alignment;
+    }
 
     /// Largest range a storage buffer binding may have
     u64 GetMaxStorageBufferRange() const;
@@ -325,6 +329,8 @@ private:
 
     bool limit_dynamic_storage_buffers = false;
     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();
+    u32 uniform_buffer_alignment = 1;
+    u32 storage_buffer_alignment = 1;
 
     /// The index buffer BindIndexBuffer recorded last, at scheduler recording epoch bound_index_epoch.
     VkBuffer bound_index_buffer = VK_NULL_HANDLE;
@@ -332,6 +338,16 @@ private:
     VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
     u64 bound_index_epoch = 0;
     bool bound_index_valid = false;
+
+    struct BoundVertexSlot {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        VkDeviceSize size = 0;
+        VkDeviceSize stride = 0;
+        u64 epoch = 0;
+        bool valid = false;
+    };
+    std::array<BoundVertexSlot, VideoCommon::NUM_VERTEX_BUFFERS> bound_vertex_slots{};
 };
 
 struct BufferCacheParams {
