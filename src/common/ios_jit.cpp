@@ -127,16 +127,14 @@ bool PublishPool(std::uint8_t* rx, std::uint8_t* rw, std::size_t bytes) {
     return true;
 }
 
-// TXM: ask the attached universal script for the region, alias it writable, detach.
+// TXM: ask the attached universal script for the region, alias it writable, detach. Returns false,
+// leaving the state Waiting, when no script answered the request (JIT was enabled without one) so
+// the caller asks again later; true once the request was answered, failed or not.
 bool AcquireThroughDebugger(std::size_t bytes) {
     g_state = State::Acquiring;
-    InstallTrapGuard();
-    LOG_INFO(Common, "iOS JIT: debugger attached, requesting {} MiB from the universal script",
-             bytes >> 20);
     auto* rx = static_cast<std::uint8_t*>(Jit26PrepareRegion(nullptr, bytes));
     if (rx == nullptr) {
-        SetFailed("the attached debugger did not provide executable memory. In StikDebug the "
-                  "script for this app must be universal.js (or let this app request JIT itself).");
+        g_state = State::Waiting;
         return false;
     }
     vm_address_t alias = 0;
@@ -147,22 +145,22 @@ bool AcquireThroughDebugger(std::size_t bytes) {
     if (kr != KERN_SUCCESS) {
         Jit26Detach();
         SetFailed(std::string("vm_remap of the JIT pool failed: ") + mach_error_string(kr));
-        return false;
+        return true;
     }
     kr = vm_protect(mach_task_self(), alias, bytes, FALSE, VM_PROT_READ | VM_PROT_WRITE);
     if (kr != KERN_SUCCESS) {
         Jit26Detach();
         SetFailed(std::string("vm_protect(RW) of the JIT alias failed: ") + mach_error_string(kr));
-        return false;
+        return true;
     }
     auto* rw = reinterpret_cast<std::uint8_t*>(alias);
     LOG_INFO(Common, "iOS JIT: debugger-provided pool rx={} rw={} ({} MiB)", fmt::ptr(rx),
              fmt::ptr(rw), bytes >> 20);
-    const bool ok = PublishPool(rx, rw, bytes);
+    PublishPool(rx, rw, bytes);
     // Done with the debugger; StikDebug returns to its UI (and to this app when it was asked
     // through its URL scheme).
     Jit26Detach();
-    return ok;
+    return true;
 }
 
 // Pre-TXM: a debugged process may map RWX directly.
@@ -183,25 +181,32 @@ void AcquireThread(std::size_t bytes, bool txm) {
     using namespace std::chrono_literals;
     LOG_INFO(Common, "iOS JIT: waiting for a debugger (TXM: {}, debugged: {}, traced: {})", txm,
              Debugged(), DebuggerAttached());
-    std::chrono::steady_clock::time_point debugged_since{};
+    InstallTrapGuard();
+    std::chrono::steady_clock::time_point unanswered_since{};
     while (true) {
         if (txm) {
-            if (DebuggerAttached()) {
-                AcquireThroughDebugger(bytes);
-                return;
-            }
-            // Debugged without a debugger attached: somebody enabled "JIT" the pre-TXM way (plain
-            // attach/detach). Give the script a few seconds to show up, then explain.
-            if (Debugged()) {
-                const auto now = std::chrono::steady_clock::now();
-                if (debugged_since == std::chrono::steady_clock::time_point{}) {
-                    debugged_since = now;
-                } else if (now - debugged_since > 5s) {
-                    SetFailed("JIT was enabled without the universal script, which iOS 26+ needs. "
-                              "Close this app, open StikDebug and enable JIT for it from this "
-                              "app's own request.");
+            // StikDebug's protocol: once the process is debugged, call into the script. Its
+            // debugserver need not show as P_TRACED, so CS_DEBUGGED is the signal. A call nobody
+            // answers (JIT enabled from StikDebug's app list without the script: a plain
+            // attach/detach) returns null through the trap guard; keep asking, the frontend
+            // requests the script through StikDebug's URL scheme meanwhile.
+            if (Debugged() || DebuggerAttached()) {
+                if (AcquireThroughDebugger(bytes)) {
                     return;
                 }
+                const auto now = std::chrono::steady_clock::now();
+                if (unanswered_since == std::chrono::steady_clock::time_point{}) {
+                    unanswered_since = now;
+                    LOG_WARNING(Common, "iOS JIT: debugged, but no universal script answered; "
+                                        "waiting for StikDebug to attach with it");
+                } else if (now - unanswered_since > 3min) {
+                    SetFailed("JIT was enabled without the universal script, which iOS 26+ needs. "
+                              "Close this app and launch it again; when StikDebug opens, let it "
+                              "enable JIT from this app's request (script universal.js).");
+                    return;
+                }
+                std::this_thread::sleep_for(1s);
+                continue;
             }
         } else if (Debugged()) {
             AcquireRwx(bytes);

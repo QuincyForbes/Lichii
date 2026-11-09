@@ -1125,12 +1125,15 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
         }
         // Hand off to StikDebug once (after the first frame, so there is something to come back
         // to): it attaches to this PID, runs universal.js, serves the pool request and returns.
+        // With TXM also when the process is already debugged: JIT enabled from StikDebug's app
+        // list attaches without the script, and only this request brings it.
+        const bool txm = IosSupport::HasTxm();
         if (!state->jit_url_opened && state->wait_window && state->jit_have_stikdebug &&
-            jit == State::Waiting && !IosJitEnabled()) {
+            jit == State::Waiting && (txm || !IosJitEnabled())) {
             state->jit_url_opened = true;
             std::string url = "stikdebug://enable-jit?bundle-id=" + IosBundleIdentifier() +
                               "&pid=" + std::to_string(getpid());
-            if (IosSupport::HasTxm()) {
+            if (txm) {
                 url += "&script-name=universal.js";
             }
             state->jit_bg_task = IosSupport::BeginBackgroundTask("lichii-jit");
@@ -1149,7 +1152,12 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
             std::vector<std::string> lines;
             switch (jit) {
             case State::Waiting:
-                if (state->jit_have_stikdebug) {
+                if (txm && IosJitEnabled()) {
+                    lines = {"JIT is on, but without its script.", "",
+                             "Let StikDebug enable JIT from this",
+                             "app's request (script universal.js);",
+                             "this screen continues by itself."};
+                } else if (state->jit_have_stikdebug) {
                     lines = {"Requesting JIT from StikDebug...", "",
                              "Tap \"Enable JIT\" in StikDebug if it asks;",
                              "this screen continues by itself."};
