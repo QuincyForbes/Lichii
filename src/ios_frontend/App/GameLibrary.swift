@@ -29,26 +29,89 @@ final class GameLibrary: ObservableObject {
     @Published var importing: [String] = []
     @Published var importError: String?
 
+    /// Folders outside the app that are scanned in place (security-scoped bookmarks).
+    @Published private(set) var linkedFolders: [URL] = []
+
     private let playedKey = "lastPlayed"
+    private let foldersKey = "linkedFolders"
+    private var accessedFolders: Set<URL> = []
 
     init() {
         if let stored = UserDefaults.standard.dictionary(forKey: playedKey) as? [String: Date] {
             lastPlayed = stored
         }
+        resolveFolders()
     }
 
     func reload() {
         guard !isScanning else { return }
         isScanning = true
-        let documents = Bridge.documentsDir
+        let roots = [Bridge.documentsDir] + linkedFolders
         try? FileManager.default.createDirectory(at: Bridge.gamesDir, withIntermediateDirectories: true)
         Task.detached(priority: .userInitiated) {
-            let found = Bridge.scanGames(in: documents)
+            var found: [Game] = []
+            var seen = Set<String>()
+            for root in roots {
+                for game in Bridge.scanGames(in: root) where seen.insert(game.path).inserted {
+                    found.append(game)
+                }
+            }
             await MainActor.run {
                 self.games = found
                 self.isScanning = false
             }
         }
+    }
+
+    /// Games in a linked folder stay where they are; access lasts for the app session, so a game
+    /// from there can boot and stream its files.
+    func linkFolder(_ url: URL) {
+        guard url.startAccessingSecurityScopedResource() else {
+            importError = "Lichii was not allowed to read \(url.lastPathComponent)."
+            return
+        }
+        accessedFolders.insert(url)
+        guard let bookmark = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil,
+                                                   relativeTo: nil) else {
+            importError = "Could not remember \(url.lastPathComponent)."
+            return
+        }
+        var bookmarks = UserDefaults.standard.array(forKey: foldersKey) as? [Data] ?? []
+        bookmarks.append(bookmark)
+        UserDefaults.standard.set(bookmarks, forKey: foldersKey)
+        if !linkedFolders.contains(url) {
+            linkedFolders.append(url)
+        }
+        reload()
+    }
+
+    func unlinkFolder(_ url: URL) {
+        let bookmarks = (UserDefaults.standard.array(forKey: foldersKey) as? [Data] ?? []).filter { data in
+            var stale = false
+            let resolved = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil,
+                                    bookmarkDataIsStale: &stale)
+            return resolved?.standardizedFileURL != url.standardizedFileURL
+        }
+        UserDefaults.standard.set(bookmarks, forKey: foldersKey)
+        if accessedFolders.remove(url) != nil {
+            url.stopAccessingSecurityScopedResource()
+        }
+        linkedFolders.removeAll { $0 == url }
+        reload()
+    }
+
+    private func resolveFolders() {
+        var refreshed: [Data] = []
+        for data in UserDefaults.standard.array(forKey: foldersKey) as? [Data] ?? [] {
+            var stale = false
+            guard let url = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil,
+                                     bookmarkDataIsStale: &stale),
+                  url.startAccessingSecurityScopedResource() else { continue }
+            accessedFolders.insert(url)
+            linkedFolders.append(url)
+            refreshed.append(stale ? (try? url.bookmarkData()) ?? data : data)
+        }
+        UserDefaults.standard.set(refreshed, forKey: foldersKey)
     }
 
     func markPlayed(_ game: Game) {

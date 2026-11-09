@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct LibraryView: View {
     @EnvironmentObject private var app: AppController
@@ -10,6 +11,7 @@ struct LibraryView: View {
     @AppStorage("librarySort") private var sort: LibrarySort = .title
     @State private var query = ""
     @State private var showImporter = false
+    @State private var showFolderPicker = false
     @State private var infoGame: Game?
     @State private var settingsGame: Game?
     @State private var actionSheet: (GameAction, Game)?
@@ -70,8 +72,28 @@ struct LibraryView: View {
                 } label: {
                     Image(systemName: "line.3.horizontal.decrease.circle")
                 }
-                Button {
-                    showImporter = true
+                Menu {
+                    Button {
+                        showImporter = true
+                    } label: {
+                        Label("Import Files", systemImage: "square.and.arrow.down")
+                    }
+                    Button {
+                        showFolderPicker = true
+                    } label: {
+                        Label("Link a Folder", systemImage: "folder.badge.plus")
+                    }
+                    if !library.linkedFolders.isEmpty {
+                        Section("Linked Folders") {
+                            ForEach(library.linkedFolders, id: \.self) { folder in
+                                Button(role: .destructive) {
+                                    library.unlinkFolder(folder)
+                                } label: {
+                                    Label("Unlink \(folder.lastPathComponent)", systemImage: "folder.badge.minus")
+                                }
+                            }
+                        }
+                    }
                 } label: {
                     Image(systemName: "plus")
                 }
@@ -83,6 +105,14 @@ struct LibraryView: View {
                 library.importItems(urls)
             }
         }
+        .background(
+            EmptyView()
+                .fileImporter(isPresented: $showFolderPicker, allowedContentTypes: [.folder]) { result in
+                    if case .success(let url) = result {
+                        library.linkFolder(url)
+                    }
+                }
+        )
         .alert("Import failed", isPresented: Binding(get: { library.importError != nil },
                                                      set: { if !$0 { library.importError = nil } })) {
             Button("OK", role: .cancel) {}
@@ -100,7 +130,7 @@ struct LibraryView: View {
                 deleteGame = nil
             }
         } message: {
-            Text("The file is removed from this app's Documents folder.")
+            Text("The game's file is deleted from this device.")
         }
         .sheet(item: $infoGame) { game in
             NavigationStack {
