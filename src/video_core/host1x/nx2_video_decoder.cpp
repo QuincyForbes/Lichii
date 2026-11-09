@@ -148,6 +148,7 @@ struct Nx2VideoDecoder::Impl {
     std::unique_ptr<FFmpeg::DecoderContext> context;
     SwsContext* scaler{};
     bool open{};
+    bool ever_open{};
     bool using_hardware{};
     bool received_any{};
     u64 errors_seen{};
@@ -312,6 +313,7 @@ Nx2VideoDecoder::Nx2VideoDecoder(std::string_view mime) : impl{std::make_unique<
                     mime);
         impl->open = impl->Open(false);
     }
+    impl->ever_open = impl->open;
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - start)
                         .count();
@@ -340,6 +342,10 @@ Nx2VideoDecoder::~Nx2VideoDecoder() = default;
 
 bool Nx2VideoDecoder::IsOpen() const {
     return impl->open;
+}
+
+bool Nx2VideoDecoder::Failed() const {
+    return impl->ever_open && (!impl->open || impl->failures >= Impl::kMaxFailures);
 }
 
 bool Nx2VideoDecoder::UsingHardware() const {
