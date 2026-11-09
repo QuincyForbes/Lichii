@@ -3,6 +3,7 @@
 
 #include "common/ios_jit.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
@@ -32,15 +34,16 @@ constexpr int kCsDebugged = 0x10000000;
 constexpr std::size_t kJitPageSize = 0x4000;
 constexpr std::uint32_t kBrkF00d = 0xD43E01A0; // brk #0xf00d
 
-struct Pool {
+struct Region {
     std::uint8_t* rx{};
     std::uint8_t* rw{};
     std::size_t size{};
     std::size_t used{};
 };
-Pool g_pool;
+std::vector<Region> g_pool;
 std::mutex g_pool_mutex;
 std::atomic<bool> g_pool_ready{false};
+std::atomic<std::size_t> g_prepared{0};
 std::atomic<State> g_state{State::Waiting};
 std::mutex g_error_mutex;
 std::string g_error;
@@ -112,54 +115,82 @@ bool SelfTest(std::uint8_t* rw, std::uint8_t* rx) {
     return fn() == 42;
 }
 
-bool PublishPool(std::uint8_t* rx, std::uint8_t* rw, std::size_t bytes) {
-    if (!SelfTest(rw, rx)) {
+bool PublishPool(std::vector<Region> regions) {
+    if (regions.empty() || !SelfTest(regions.front().rw, regions.front().rx)) {
         SetFailed("JIT self-test failed: code written through the alias did not execute");
         return false;
     }
+    std::size_t total = 0;
+    for (const Region& region : regions) {
+        total += region.size;
+    }
     {
         std::scoped_lock lock{g_pool_mutex};
-        g_pool = Pool{rx, rw, bytes, 0};
+        g_pool = std::move(regions);
         g_pool_ready = true;
     }
     g_state = State::Ready;
-    LOG_INFO(Common, "iOS JIT: pool ready ({} MiB), self-test passed", bytes >> 20);
+    LOG_INFO(Common, "iOS JIT: pool ready ({} MiB), self-test passed", total >> 20);
     return true;
 }
 
-// TXM: ask the attached universal script for the region, alias it writable, detach. Returns false,
-// leaving the state Waiting, when no script answered the request (JIT was enabled without one) so
-// the caller asks again later; true once the request was answered, failed or not.
-bool AcquireThroughDebugger(std::size_t bytes) {
-    g_state = State::Acquiring;
-    auto* rx = static_cast<std::uint8_t*>(Jit26PrepareRegion(nullptr, bytes));
-    if (rx == nullptr) {
-        g_state = State::Waiting;
-        return false;
-    }
+// A writable alias of a prepared R-X region.
+std::uint8_t* MapWritableAlias(std::uint8_t* rx, std::size_t bytes, std::string& error) {
     vm_address_t alias = 0;
     vm_prot_t cur = 0, max = 0;
     kern_return_t kr = vm_remap(mach_task_self(), &alias, bytes, 0, VM_FLAGS_ANYWHERE,
                                 mach_task_self(), reinterpret_cast<vm_address_t>(rx), FALSE, &cur,
                                 &max, VM_INHERIT_NONE);
     if (kr != KERN_SUCCESS) {
-        Jit26Detach();
-        SetFailed(std::string("vm_remap of the JIT pool failed: ") + mach_error_string(kr));
-        return true;
+        error = std::string("vm_remap of the JIT pool failed: ") + mach_error_string(kr);
+        return nullptr;
     }
     kr = vm_protect(mach_task_self(), alias, bytes, FALSE, VM_PROT_READ | VM_PROT_WRITE);
     if (kr != KERN_SUCCESS) {
-        Jit26Detach();
-        SetFailed(std::string("vm_protect(RW) of the JIT alias failed: ") + mach_error_string(kr));
-        return true;
+        error = std::string("vm_protect(RW) of the JIT alias failed: ") + mach_error_string(kr);
+        return nullptr;
     }
-    auto* rw = reinterpret_cast<std::uint8_t*>(alias);
-    LOG_INFO(Common, "iOS JIT: debugger-provided pool rx={} rw={} ({} MiB)", fmt::ptr(rx),
-             fmt::ptr(rw), bytes >> 20);
-    PublishPool(rx, rw, bytes);
+    return reinterpret_cast<std::uint8_t*>(alias);
+}
+
+// TXM: ask the attached universal script for the pool one chunk at a time (the script touches
+// every 16 KiB page through the debugger, so one big request showed no progress for minutes),
+// alias each chunk writable, detach. Returns false, leaving the state Waiting, when no script
+// answered the first request (JIT was enabled without one) so the caller asks again later; true
+// once the requests were answered, failed or not.
+bool AcquireThroughDebugger(std::size_t bytes) {
+    g_state = State::Acquiring;
+    g_prepared = 0;
+    std::vector<Region> regions;
+    std::string error;
+    while (g_prepared < bytes) {
+        const std::size_t chunk = (std::min)(ChunkBytes, bytes - g_prepared);
+        auto* rx = static_cast<std::uint8_t*>(Jit26PrepareRegion(nullptr, chunk));
+        if (rx == nullptr) {
+            if (regions.empty()) {
+                g_state = State::Waiting;
+                return false;
+            }
+            error = "the debugger stopped answering after " +
+                    std::to_string(g_prepared.load() >> 20) + " MiB of JIT memory";
+            break;
+        }
+        std::uint8_t* rw = MapWritableAlias(rx, chunk, error);
+        if (rw == nullptr) {
+            break;
+        }
+        regions.push_back(Region{rx, rw, chunk, 0});
+        g_prepared += chunk;
+        LOG_INFO(Common, "iOS JIT: prepared {} of {} MiB", g_prepared.load() >> 20, bytes >> 20);
+    }
     // Done with the debugger; StikDebug returns to its UI (and to this app when it was asked
     // through its URL scheme).
     Jit26Detach();
+    if (!error.empty()) {
+        SetFailed(error);
+        return true;
+    }
+    PublishPool(std::move(regions));
     return true;
 }
 
@@ -174,7 +205,8 @@ bool AcquireRwx(std::size_t bytes) {
     }
     auto* mem = static_cast<std::uint8_t*>(p);
     LOG_INFO(Common, "iOS JIT: RWX pool at {} ({} MiB)", fmt::ptr(mem), bytes >> 20);
-    return PublishPool(mem, mem, bytes);
+    g_prepared = bytes;
+    return PublishPool({Region{mem, mem, bytes, 0}});
 }
 
 void AcquireThread(std::size_t bytes, bool txm) {
@@ -256,6 +288,10 @@ std::string GetError() {
     return g_error;
 }
 
+std::size_t PreparedBytes() {
+    return g_prepared.load();
+}
+
 bool Alloc(std::size_t bytes, void** wmem, void** xmem) {
     std::scoped_lock lock{g_pool_mutex};
     if (!g_pool_ready) {
@@ -263,17 +299,22 @@ bool Alloc(std::size_t bytes, void** wmem, void** xmem) {
         return false;
     }
     bytes = AlignUp(bytes, kJitPageSize);
-    if (g_pool.used + bytes > g_pool.size) {
-        LOG_CRITICAL(Common, "iOS JIT: pool exhausted ({} MiB requested, {} of {} MiB used)",
-                     bytes >> 20, g_pool.used >> 20, g_pool.size >> 20);
-        return false;
+    // First fit: a block never straddles two chunks, which are separate mappings.
+    std::size_t left = 0;
+    for (Region& region : g_pool) {
+        if (region.used + bytes <= region.size) {
+            *wmem = region.rw + region.used;
+            *xmem = region.rx + region.used;
+            region.used += bytes;
+            LOG_INFO(Common, "iOS JIT: handed out {} MiB (x={}, w={})", bytes >> 20,
+                     fmt::ptr(*xmem), fmt::ptr(*wmem));
+            return true;
+        }
+        left += region.size - region.used;
     }
-    *wmem = g_pool.rw + g_pool.used;
-    *xmem = g_pool.rx + g_pool.used;
-    g_pool.used += bytes;
-    LOG_INFO(Common, "iOS JIT: handed out {} MiB (x={}, w={}), {} MiB left", bytes >> 20,
-             fmt::ptr(*xmem), fmt::ptr(*wmem), (g_pool.size - g_pool.used) >> 20);
-    return true;
+    LOG_CRITICAL(Common, "iOS JIT: pool exhausted ({} MiB requested, {} MiB left in {} chunks)",
+                 bytes >> 20, left >> 20, g_pool.size());
+    return false;
 }
 
 } // namespace Common::IosJit

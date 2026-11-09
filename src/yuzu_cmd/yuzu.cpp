@@ -100,9 +100,11 @@ static bool IosJitEnabled() {
     }
     return (flags & kCsDebugged) != 0;
 }
-// dynarmic: 128 MiB of code cache per guest core, six cores, plus spare blocks. Acquired once
-// through StikDebug's universal script (iOS 26+), then the debugger is released.
-static constexpr std::size_t kIosJitPoolBytes = (6 * 128 + 32) * 1024 * 1024;
+// dynarmic: one code cache per guest core (six), plus two chunks for smaller blocks. Acquired once
+// through StikDebug's universal script (iOS 26+), then the debugger is released. The script
+// prepares every page over the debug connection while this app waits in the background, so the
+// pool is kept small (800 MiB took long enough for iOS to kill the app).
+static constexpr std::size_t kIosJitPoolBytes = 8 * Common::IosJit::ChunkBytes;
 static std::string IosBundleIdentifier() {
     std::string out;
     if (CFStringRef id = CFBundleGetIdentifier(CFBundleGetMainBundle())) {
@@ -1169,8 +1171,9 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
                 break;
             case State::Acquiring:
                 lines = {"Preparing JIT memory...", "",
-                         "StikDebug is mapping " + std::to_string(kIosJitPoolBytes >> 20) + " MiB;",
-                         "this takes up to a minute."};
+                         "StikDebug has mapped " +
+                             std::to_string(Common::IosJit::PreparedBytes() >> 20) + " of " +
+                             std::to_string(kIosJitPoolBytes >> 20) + " MiB."};
                 break;
             case State::Failed: {
                 lines = {"JIT unavailable", ""};

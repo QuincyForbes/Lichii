@@ -21,8 +21,15 @@
 // Allocation is one-shot: after the pool is acquired the debugger is detached and no further
 // `brk` may be issued (an unserviced `brk` is a fatal SIGTRAP, guarded here by a SIGTRAP handler
 // that turns it into a null result). Every dynarmic code block is therefore carved out of this
-// single pool, which must exist before the emulated CPU starts.
+// pool, prepared in ChunkBytes chunks before the emulated CPU starts.
 namespace Common::IosJit {
+
+/// dynarmic's code cache per guest core on iOS. The pool is prepared page by page through the
+/// debugger, so it is kept small: a full cache is flushed and translated again.
+inline constexpr std::size_t CodeCacheBytes = 32 * 1024 * 1024;
+/// The pool is prepared in chunks of this size, each a contiguous code block or several small
+/// ones, so progress shows and no block straddles two chunks.
+inline constexpr std::size_t ChunkBytes = CodeCacheBytes;
 
 enum class State {
     Waiting,   ///< no debugger yet
@@ -44,6 +51,8 @@ bool PoolReady();
 void StartAcquire(std::size_t bytes, bool txm);
 State GetState();
 std::string GetError();
+/// Bytes of the pool prepared so far (for progress while Acquiring).
+std::size_t PreparedBytes();
 
 /// Carve a dual-mapped block out of the pool. *wmem is the writable alias, *xmem the executable
 /// view of the same pages. Returns false when the pool is missing or exhausted.

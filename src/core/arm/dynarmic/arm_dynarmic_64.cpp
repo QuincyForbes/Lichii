@@ -9,6 +9,12 @@
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#include "common/ios_jit.h"
+#endif
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -401,7 +407,10 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 #endif
 
     // Code cache size
-#if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // Carved out of the debugger-prepared JIT pool (common/ios_jit.h).
+    config.code_cache_size = std::uint32_t(Common::IosJit::CodeCacheBytes);
+#elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
     config.code_cache_size = std::uint32_t(128_MiB);
 #else
     config.code_cache_size = std::uint32_t(512_MiB);
