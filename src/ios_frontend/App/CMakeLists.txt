@@ -5,6 +5,9 @@
 # swiftc arguments, so the Swift app starts clean.
 set_property(DIRECTORY PROPERTY COMPILE_OPTIONS "")
 set_property(DIRECTORY PROPERTY COMPILE_DEFINITIONS "")
+# src/ is an include directory of the C++ code; on the case-insensitive macOS filesystem its
+# network/network.h hides the SDK's <Network/Network.h>, which Photos and AVFoundation import.
+set_property(DIRECTORY PROPERTY INCLUDE_DIRECTORIES "")
 
 # Other areas add their Swift files here (Controls/, Content/, Platform/ next to this folder's files).
 add_library(lichii_ios_app STATIC

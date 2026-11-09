@@ -225,26 +225,21 @@ final class ControlsCenter: ObservableObject {
     // MARK: - Screenshot
 
     func takeScreenshot() {
-        let box = Unmanaged.passRetained(ScreenshotBox())
-        let requested = lichii_emu_screenshot(1080, { context, pixels, width, height, flipY in
-            let box = Unmanaged<ScreenshotBox>.fromOpaque(context!).takeRetainedValue()
-            let image = pixels.flatMap { ScreenshotBox.image(bgra: $0, width: Int(width), height: Int(height), flipY: flipY) }
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated { ControlsCenter.shared.save(screenshot: image) }
-            }
-            _ = box
-        }, box.toOpaque())
-        if !requested {
-            box.release()
+        if !lichii_emu_screenshot(1080, screenshotDone, nil) {
             show(toast: "Screenshot unavailable right now")
         }
     }
 
-    private func save(screenshot: UIImage?) {
+    fileprivate func save(screenshot: UIImage?) {
         guard let screenshot else {
             show(toast: "Screenshot failed")
             return
         }
+        Self.addToPhotos(screenshot)
+    }
+
+    /// Photos calls back on its own queues.
+    private nonisolated static func addToPhotos(_ screenshot: UIImage) {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
                 DispatchQueue.main.async {
@@ -271,6 +266,14 @@ final class ControlsCenter: ObservableObject {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             if !Task.isCancelled { ControlsCenter.shared.toast = nil }
         }
+    }
+}
+
+/// Runs on a renderer thread, so it is a non-isolated constant rather than a closure in the class.
+private let screenshotDone: LichiiScreenshotFn = { _, pixels, width, height, flipY in
+    let image = pixels.flatMap { ScreenshotBox.image(bgra: $0, width: Int(width), height: Int(height), flipY: flipY) }
+    DispatchQueue.main.async {
+        MainActor.assumeIsolated { ControlsCenter.shared.save(screenshot: image) }
     }
 }
 

@@ -6,6 +6,8 @@
 
 set_property(DIRECTORY PROPERTY COMPILE_OPTIONS "")
 set_property(DIRECTORY PROPERTY COMPILE_DEFINITIONS "")
+# No src/ include path for Swift (see App/CMakeLists.txt).
+set_property(DIRECTORY PROPERTY INCLUDE_DIRECTORIES "")
 
 add_library(lichii_melo_controller STATIC
     MeloController/Buttons/ButtonConfiguration.swift
