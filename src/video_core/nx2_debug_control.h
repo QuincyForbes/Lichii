@@ -118,6 +118,9 @@ inline std::atomic<int> g_host_pace{-1};
 /// GEQUAL acquire level 2 would answer met goes the normal way when the front knows a write to its
 /// word is still queued, or the word read current was below the value; 2 = only when a queued plain
 /// release writes less than the word read; 0 = off. With EDEN_NX2_GPU_PROFILE, a 5 s count line.
+/// EXP35 (live; guest writes of cached memory, RasterizerVulkan::OnCPUWrite): collected for the
+/// next InvalidateGPUCache without the texture and buffer cache mutexes, except on pages of
+/// images or shader code. 1 = pages no GPU write ever marked, 2 = every page (Fritchii v5.5).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 
