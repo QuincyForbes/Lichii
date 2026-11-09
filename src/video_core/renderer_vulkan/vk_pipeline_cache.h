@@ -273,6 +273,13 @@ private:
     void EvictUnusedPipelines();
     u64 frame_count{};
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
+    /// Pipelines the translate queue did not use (discarded, stale, abandoned), handed over on the
+    /// GPU thread: destroyed by TickFrame once the GPU and their queued build are done with them,
+    /// never on a translation thread. Beside evicted_pipelines rather than in it: one whose build
+    /// waits behind the boot prebuild would hold the evictions behind it there, as that deque is
+    /// freed from the front.
+    std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> retired_translations; ///< (tick, pipeline)
+    void RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> pipeline);
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;
