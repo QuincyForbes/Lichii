@@ -210,6 +210,9 @@ public:
     void DumpCurrentEntry(const char* reason);
     void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash);
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
+    /// With the GPU thread split: waits for the queued work that may have written the commands
+    /// at `address`, then whether they are GPU-written (IsGpuWrittenCommands).
+    bool WaitForListWriters(GPUVAddr address, size_t size);
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
     /// EDEN_NX2_LIST_FAST: whether an entry of `size` bytes skips the wait for queued writers.
