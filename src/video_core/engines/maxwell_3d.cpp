@@ -2303,7 +2303,27 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             static u64 misses{};
             static u64 differences{};
             static u64 report_reads{};
+            static u64 misses_undrained{};
             static std::array<u64, 4> miss_reasons{};
+            // Most misses are reads of report slots written since their snapshot
+            // (zortos293/Lichii#1032). On pages no GPU work wrote there is nothing to flush: wait
+            // only for the work that writes the bytes read, then read them unless a report there
+            // is still held by the query cache or not yet written by the host. Writers whose range
+            // nobody notes (NoteUnrangedWriter) still queued drain.
+            const auto miss_without_drain = [&] {
+                if (Tegra::Nx2MayBeGpuWritten(*device, read_bytes) ||
+                    split.LastUnrangedPosition() > split.ConsumedNow()) {
+                    return false;
+                }
+                split.WaitForMemoryWriters(VideoCommon::DrainSite::MacroDmaRead, source,
+                                           source + read_bytes);
+                // A back that ran everything costs the drain nothing: take it, and a snapshot.
+                if (split.ConsumedNow() >= split.SentPosition()) {
+                    return false;
+                }
+                return !rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12) &&
+                       Tegra::Nx2AsyncReportsSettled(*device, read_bytes);
+            };
             // EXP10: compute and copies sent since count only where their writes may reach the
             // pages read: the ranges the fronts noted (GpuSplit::WritersMayWriteSince), the
             // writes the back recorded for the dispatches (DispatchesMayWriteSince, once it ran
@@ -2322,10 +2342,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             const u64 first_page = *device >> 12;
             const u64 last_page = (*device + read_bytes - 1) >> 12;
             bool hit = true;
+            bool new_page = false;
             for (u64 page = first_page; page <= last_page && hit; ++page) {
                 const auto it = fs.dma_snapshots.find(page);
                 if (it == fs.dma_snapshots.end()) {
                     hit = false;
+                    new_page = true;
                     ++miss_reasons[0];
                     break;
                 }
@@ -2407,6 +2429,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                             snap_words = std::move(exact);
                         }
                     }
+                } else if (!new_page && miss_without_drain()) {
+                    // The pages keep their snapshot, as only the writers of the bytes read ran: a
+                    // page read for the first time drains to take one.
+                    ++misses_undrained;
+                    memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
                 } else {
                     ++misses;
                     // The GPU data of the whole pages (a flush of only the bytes read left stale
@@ -2440,10 +2467,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     now - last_log >= std::chrono::seconds{5}) {
                     last_log = now;
                     LOG_INFO(HW_GPU,
-                             "DMA snapshot: {} reads skipped the drain, {} drained, {} differed, "
-                             "{} reads of listed reports (drained path); misses: {} new page, {} "
-                             "compute/copy, {} unranged, {} noted write",
-                             hits, misses, differences, report_reads, miss_reasons[0],
+                             "DMA snapshot: {} reads skipped the drain, {} drained, {} missed "
+                             "without a drain, {} differed, {} reads of listed reports (drained "
+                             "path); misses: {} new page, {} compute/copy, {} unranged, {} noted "
+                             "write",
+                             hits, misses, misses_undrained, differences, report_reads,
+                             miss_reasons[0],
                              miss_reasons[1], miss_reasons[2], miss_reasons[3]);
                     if (ranged_writers) {
                         using Unbounded = VideoCommon::GpuSplit::DispatchUnbounded;
