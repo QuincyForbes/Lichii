@@ -69,6 +69,7 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(OotMovieUpscale, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -449,6 +450,12 @@ struct Values {
     // FSR 3.1 in place of the game's upscale pass (video_core/ocarina_upscale.h).
     SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{linkage, OotAntiAliasing::Game,
                                                          "oot_anti_aliasing", Category::Renderer};
+    // The title screen's and cutscenes' videos (AV1 1080p60): a bilinear copy, or the game's own
+    // upscaler (removes banding, 1080p -> 1440p; tensor operations). Automatic: the game's where
+    // the GPU runs tensor operations natively (RTX), the copy elsewhere (its emulated matrices
+    // cost ~33 ms a frame). EDEN_NX2_OOT_MOVIE_NETWORK=0/1 overrides it for tests.
+    SwitchableSetting<OotMovieUpscale> oot_movie_upscale{linkage, OotMovieUpscale::Bilinear,
+                                                         "oot_movie_upscale", Category::Renderer};
 
     SwitchableSetting<std::string> post_shader_chain{linkage,
                                                      std::string(),

@@ -191,6 +191,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "NVIDIA DLSS is on.\nAMD FSR 3.1: temporal upscaling in place of the game's upscale "
               "pass, on any graphics card; it takes the place of NVIDIA DLSS and MetalFX in this "
               "game.\nTakes effect when the game starts."));
+    INSERT(Settings, oot_movie_upscale, tr("Ocarina of Time movies:"),
+           tr("How the title screen and cutscene videos are scaled up.\nBilinear: a plain, fast "
+              "stretch.\nGame's own upscaler: the game's video upscaler, which removes banding and "
+              "sharpens. Fast on NVIDIA RTX, slow on GPUs that emulate its math.\nAutomatic: the "
+              "game's upscaler where the GPU runs it natively, bilinear elsewhere."));
     INSERT(Settings, patch_frame_rate, tr("Unlock frame rate:"),
            tr("Game enhancement. Applies to every game that ships a frame rate patch (currently "
               "Ocarina of Time: FPS Unlock, Dynamic FPS).\nAuto: each patch's default. On: "
@@ -656,6 +661,12 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(GamePatchMode, Auto, tr("Auto")),
                               PAIR(GamePatchMode, On, tr("On")),
                               PAIR(GamePatchMode, Off, tr("Off")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::OotMovieUpscale>::Index(),
+                          {
+                              PAIR(OotMovieUpscale, Automatic, tr("Automatic")),
+                              PAIR(OotMovieUpscale, Bilinear, tr("Bilinear (fast)")),
+                              PAIR(OotMovieUpscale, Game, tr("Game's own upscaler")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::OotAntiAliasing>::Index(),
                           {

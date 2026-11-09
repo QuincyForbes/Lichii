@@ -31,6 +31,7 @@
 #include "video_core/nx2_qmd_prediction.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/native_upscale.h"
@@ -47,6 +48,40 @@
 #include "video_core/textures/decoders.h"
 
 namespace Tegra::Engines {
+
+namespace {
+/// Settings oot_movie_upscale: whether Ocarina's movies keep the game's own upscaler (the network)
+/// instead of the bilinear copy. Automatic: where tensor operations run natively. Logged once.
+bool OotMovieNetworkChosen() {
+    static const char* const env = std::getenv("EDEN_NX2_OOT_MOVIE_NETWORK");
+    bool chosen = false;
+    const char* why = "setting";
+    if (env != nullptr && (env[0] == '0' || env[0] == '1')) {
+        chosen = env[0] == '1';
+        why = "EDEN_NX2_OOT_MOVIE_NETWORK";
+    } else {
+        switch (Settings::values.oot_movie_upscale.GetValue()) {
+        case Settings::OotMovieUpscale::Game:
+            chosen = true;
+            break;
+        case Settings::OotMovieUpscale::Bilinear:
+            break;
+        case Settings::OotMovieUpscale::Automatic:
+        default:
+            chosen = VideoCommon::Nx2Perf::g_native_tensor_ops.load(std::memory_order_relaxed);
+            why = chosen ? "Automatic: native tensor operations"
+                         : "Automatic: emulated tensor operations";
+            break;
+        }
+    }
+    static std::atomic<int> logged{-1};
+    if (logged.exchange(chosen ? 1 : 0) != (chosen ? 1 : 0)) {
+        LOG_INFO(HW_GPU, "Ocarina movies: {} ({})",
+                 chosen ? "the game's own upscaler" : "bilinear copy", why);
+    }
+    return chosen;
+}
+} // Anonymous namespace
 
 KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
     : memory_manager{memory_manager_}
@@ -702,6 +737,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     // network is left alone: its pair (+0xc0 -> +0xd0) carries the tonemap.
     if (!native_upscale_disabled && !dlss_chain.active &&
         Settings::GetCurrentProgramID() == VideoCommon::OotNetwork::ProgramId &&
+        !OotMovieNetworkChosen() &&
         (launch_description.const_buffer_enable_mask & 1)) {
         const auto& cbuf = launch_description.const_buffer_config[0];
         const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;

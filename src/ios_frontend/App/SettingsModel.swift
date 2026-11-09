@@ -407,6 +407,7 @@ enum SettingLabels {
         "ocarina_dlss_mode": "DLSS Mode in Ocarina of Time",
         "game_dlss_network": "Game's Own DLSS Network",
         "oot_anti_aliasing": "Ocarina of Time Anti-Aliasing",
+        "oot_movie_upscale": "Ocarina of Time Movies",
         "accelerate_astc": "ASTC Decoding",
         "astc_recompression": "ASTC Recompression",
         "output_engine": "Audio Output Engine",
