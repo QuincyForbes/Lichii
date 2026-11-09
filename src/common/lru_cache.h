@@ -55,6 +55,11 @@ public:
         Attach(item_id, item);
     }
 
+    /// The tick the item was inserted or last touched at.
+    [[nodiscard]] TickType Tick(size_t id) const {
+        return item_pool[id].tick;
+    }
+
     void Free(size_t id) {
         const u32 item_id = static_cast<u32>(id);
         auto& item = item_pool[item_id];
