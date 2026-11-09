@@ -299,7 +299,7 @@ void GpuSplit::ReportBatched() {
 
 void GpuSplit::Drain(DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
-    if (consumed_cache == write_position) {
+    if (consumed_cache == write_position && BackQuiet()) {
         publish_every = 8;
         return;
     }
@@ -308,13 +308,23 @@ void GpuSplit::Drain(DrainSite site) {
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     Common::Nx2Timeline::Span timeline_span{drain_site_names[static_cast<size_t>(site)]};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
+    // Everything consumed is not enough: the back submits deferred work from its idle hook
+    // afterwards, and the caller may use the scheduler once this returns (from #494's fix in
+    // upstream 23457ccf7b).
+    bool hook_asked = false;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
-            wait_target.store(~u64{0}, std::memory_order_relaxed);
-            publish_every = 8;
-            Nx2Profile::AddDrain(site, start);
-            return;
+            if (BackQuiet()) {
+                wait_target.store(~u64{0}, std::memory_order_relaxed);
+                publish_every = 8;
+                Nx2Profile::AddDrain(site, start);
+                return;
+            }
+            if (!hook_asked) {
+                RequestIdleHook();
+                hook_asked = true;
+            }
         }
         Backoff(spins, write_position);
     }
@@ -1138,12 +1148,19 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }
-            if (available == read_position && idle_hook != nullptr) {
+            if (available == read_position) {
                 hook_requested.store(false, std::memory_order_seq_cst);
-                ForgetFencesQuiet();
-                idle_hook(idle_argument);
+                // The front may already see everything consumed: Drain() waits for back_quiet
+                // too, so the deferred submit can't overlap whatever the front does next.
+                if (!back_quiet.load(std::memory_order_relaxed)) {
+                    if (idle_hook != nullptr) {
+                        ForgetFencesQuiet();
+                        idle_hook(idle_argument);
+                    }
+                    back_quiet.store(true, std::memory_order_release);
+                }
                 available = published.load(std::memory_order_acquire);
-                if (available == read_position) {
+                if (available == read_position && idle_hook != nullptr) {
                     CheckFencesQuiet(read_position);
                 }
             }
@@ -1163,6 +1180,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         u64 last_store = read_position;
+        // Before any entry runs, so a front that sees these entries consumed also sees this.
+        back_quiet.store(false, std::memory_order_seq_cst);
         // EDEN_NX2_RING_PREFETCH: the ring lines ahead of the entry, up to a line short of what
         // the front published (a line it may still be writing would only bounce between the two
         // cores). The front wrote them moments ago: they sit in its core's caches.
