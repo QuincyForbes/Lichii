@@ -24,7 +24,9 @@
 #include "common/thread.h"
 #include "common/thread_pinning.h"
 #ifdef __APPLE__
+#include <TargetConditionals.h>
 #include <mach/mach.h>
+#include <pthread/qos.h>
 #elif defined(__HAIKU__)
 #include <kernel/OS.h>
 #elif defined(_WIN32)
@@ -647,6 +649,20 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
         return;
     }
     RememberCurrentThreadNice(tid, nice_value);
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+    // iOS schedules by QoS class (P or E cores, timer coalescing); a thread given scheduling
+    // parameters is opted out of QoS for good.
+    const qos_class_t qos = [&] {
+        switch (new_priority) {
+        case ThreadPriority::Low: return QOS_CLASS_UTILITY;
+        case ThreadPriority::Normal: return QOS_CLASS_DEFAULT;
+        case ThreadPriority::High: return QOS_CLASS_USER_INITIATED;
+        case ThreadPriority::VeryHigh:
+        case ThreadPriority::Critical: return QOS_CLASS_USER_INTERACTIVE;
+        default: return QOS_CLASS_DEFAULT;
+        }
+    }();
+    pthread_set_qos_class_self_np(qos, 0);
 #elif defined(__linux__)
     const int nice_value = NiceValueForPriority(new_priority);
     if (setpriority(PRIO_PROCESS, 0, nice_value) != 0) {

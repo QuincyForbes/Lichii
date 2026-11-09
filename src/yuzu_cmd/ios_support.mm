@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Portions adapted from MeloNX (https://git.ryujinx.app/projects/MeloNX @ 6a1c159), Copyright Stossy11 and MeloNX contributors (MIT/GPLv3)
 
 #include "yuzu_cmd/ios_support.h"
 
@@ -8,6 +9,8 @@
 #import <UIKit/UIKit.h>
 
 #include <cstdio>
+#include <dlfcn.h>
+#include <mach/mach.h>
 #include <string>
 #include <sys/utsname.h>
 
@@ -38,7 +41,50 @@ bool ParseModel(const std::string& id, const char* prefix, int& major, int& mino
 
 } // Anonymous namespace
 
+bool HasTxmIoKit() {
+    // The device tree's /chosen/memory-map lists a "TXM" region where the monitor runs. IOKit
+    // has no public headers on iOS, so its functions are looked up at run time.
+    static const bool txm = [] {
+        void* iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+        if (iokit == nullptr) {
+            return false;
+        }
+        using FromPath = mach_port_t (*)(mach_port_t, const char*);
+        using CreateProperty = CFTypeRef (*)(mach_port_t, CFStringRef, CFAllocatorRef, uint32_t);
+        using Release = kern_return_t (*)(mach_port_t);
+        const auto from_path =
+            reinterpret_cast<FromPath>(dlsym(iokit, "IORegistryEntryFromPath"));
+        const auto create_property =
+            reinterpret_cast<CreateProperty>(dlsym(iokit, "IORegistryEntryCreateCFProperty"));
+        const auto release = reinterpret_cast<Release>(dlsym(iokit, "IOObjectRelease"));
+        if (from_path == nullptr || create_property == nullptr || release == nullptr) {
+            return false;
+        }
+        const mach_port_t entry = from_path(MACH_PORT_NULL, "IODeviceTree:/chosen/memory-map");
+        if (entry == MACH_PORT_NULL) {
+            return false;
+        }
+        const CFTypeRef keys =
+            create_property(entry, CFSTR("IORegistryEntryPropertyKeys"), kCFAllocatorDefault, 0);
+        release(entry);
+        if (keys == nullptr) {
+            return false;
+        }
+        bool found = false;
+        if (CFGetTypeID(keys) == CFArrayGetTypeID()) {
+            const auto array = static_cast<CFArrayRef>(keys);
+            found = CFArrayContainsValue(array, CFRangeMake(0, CFArrayGetCount(array)), CFSTR("TXM"));
+        }
+        CFRelease(keys);
+        return found;
+    }();
+    return txm;
+}
+
 bool HasTxm() {
+    if (HasTxmIoKit()) {
+        return true;
+    }
     const int os = MajorVersion();
     if (os < 26) {
         return false;

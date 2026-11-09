@@ -14,10 +14,15 @@ namespace IosSupport {
 /// iOS major version (17, 26, 27, ...).
 int MajorVersion();
 
-/// True when this device runs the Trusted Execution Monitor (iOS 26+ on A15/M-class and newer,
-/// every device on iOS 27+). Mirrors StikDebug's own detection, so the two agree on whether a
-/// JIT script is required.
+/// True when this device runs the Trusted Execution Monitor: the device tree lists a TXM region
+/// (HasTxmIoKit), or else by model and iOS version (iOS 26+ on A15/M-class and newer, every
+/// device on iOS 27+), mirroring StikDebug's own detection so the two agree on whether a JIT
+/// script is required.
 bool HasTxm();
+
+/// True when IODeviceTree:/chosen/memory-map has a "TXM" entry. False when it has none or the
+/// registry cannot be read.
+bool HasTxmIoKit();
 
 /// True when an app handling `scheme://` is installed (the scheme must be listed in
 /// LSApplicationQueriesSchemes).

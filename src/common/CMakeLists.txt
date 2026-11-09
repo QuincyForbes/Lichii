@@ -96,6 +96,8 @@ add_library(
     param_package.cpp
     param_package.h
     parent_of_member.h
+    platform_events.cpp
+    platform_events.h
     point.h
     range_map.h
     range_mutex.h

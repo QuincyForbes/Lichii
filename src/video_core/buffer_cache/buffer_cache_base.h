@@ -1099,6 +1099,8 @@ private:
     u64 buffer_bytes = 0; ///< The buffers' own size (total_used_memory may be the device's)
     u64 minimum_memory = 0;
     u64 critical_memory = 0;
+    u32 seen_host_pressure = 0;   ///< Common::PlatformEvents memory pressure already answered
+    u32 host_pressure_frames = 0; ///< Frames left collecting after it
     BufferId inline_buffer_id;
 #ifdef YUZU_LEGACY
     bool immediately_free = false;

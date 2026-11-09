@@ -26,6 +26,7 @@
 #include <immintrin.h>
 #endif
 #include "common/cityhash.h"
+#include "common/platform_events.h"
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
@@ -722,6 +723,20 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         device.SupportsProvokingVertexLastMode();
     dynamic_features.has_provoking_vertex_tf_preserve =
         device.SupportsTransformFeedbackProvokingVertexPreservation();
+
+    // A suspended app may be killed without notice (iOS): write the driver's cache out when it
+    // leaves the foreground, and the used list at the next draw.
+    background_listener = Common::PlatformEvents::AddBackgroundListener([this] {
+        save_used_requested.store(true, std::memory_order_relaxed);
+        if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
+            return;
+        }
+        serialization_thread.QueueWork([this] {
+            SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
+                                         CACHE_VERSION);
+        });
+        serialization_thread.WaitForRequests();
+    });
 }
 
 namespace {
@@ -1029,6 +1044,7 @@ bool PreloadAllPipelines() {
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
+    Common::PlatformEvents::RemoveBackgroundListener(background_listener);
     StopBackgroundPipelines();
     workers.WaitForRequests();
     serialization_thread.WaitForRequests();
@@ -2032,8 +2048,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     const auto save_interval = VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::PipelineRetention)
                                    ? std::chrono::steady_clock::duration{std::chrono::seconds{15}}
                                    : std::chrono::steady_clock::duration{std::chrono::minutes{2}};
-    if (used_this_session.insert(pipeline.get()).second &&
-        std::chrono::steady_clock::now() - used_pipelines_saved > save_interval) {
+    if ((used_this_session.insert(pipeline.get()).second &&
+         std::chrono::steady_clock::now() - used_pipelines_saved > save_interval) ||
+        save_used_requested.exchange(false, std::memory_order_relaxed)) {
         SaveUsedPipelines();
     }
     if (current_pipeline) {
@@ -2751,8 +2768,8 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
         return;
     }
 
-    LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {}",
-             Common::FS::PathToUTF8String(filename));
+    LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {} ({} KiB)",
+             Common::FS::PathToUTF8String(filename), cache_size >> 10);
 
 } catch (const std::ios_base::failure& e) {
     LOG_ERROR(Common_Filesystem, "{}", e.what());
@@ -2816,8 +2833,8 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
         std::vector<char> cache_data(cache_size);
         file.read(cache_data.data(), cache_size);
 
-        LOG_INFO(Render_Vulkan,
-                 "Loaded Vulkan driver pipeline cache: {}", Common::FS::PathToUTF8String(filename));
+        LOG_INFO(Render_Vulkan, "Loaded Vulkan driver pipeline cache: {} ({} KiB)",
+                 Common::FS::PathToUTF8String(filename), cache_size >> 10);
 
         try {
             return create_pipeline_cache(cache_size, cache_data.data());

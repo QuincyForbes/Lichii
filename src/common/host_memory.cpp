@@ -39,6 +39,7 @@
 #include <mach/memory_object_types.h>
 #include <mach/vm_statistics.h>
 #if TARGET_OS_IPHONE
+#include <dlfcn.h>
 // iOS forbids POSIX shared memory for third-party apps; the guest is backed by an anonymous Mach
 // memory object and every fastmem view is a vm_map of it.
 #define LICHII_IOS_MACH_MEMORY 1
@@ -567,15 +568,37 @@ public:
         // Backing memory initialization
 #ifdef LICHII_IOS_MACH_MEMORY
         {
+            // LICHII_IOS_NO_FOOTPRINT=1 (experiment, unverified): tag the guest memory so it is
+            // left out of the process footprint jetsam compares with the limit (as MeloNX does
+            // for its JIT memory).
+            const char* const no_footprint_env = std::getenv("LICHII_IOS_NO_FOOTPRINT");
+            const bool no_footprint = no_footprint_env != nullptr && no_footprint_env[0] == '1';
+            constexpr int MapMemLedgerTagged = 0x002000;
             memory_object_size_t entry_size = backing_size;
             kern_return_t kr = mach_make_memory_entry_64(
-                mach_task_self(), &entry_size, 0, MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE,
+                mach_task_self(), &entry_size, 0,
+                MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE |
+                    (no_footprint ? MapMemLedgerTagged : 0),
                 &backing_entry, MACH_PORT_NULL);
             if (kr != KERN_SUCCESS || entry_size < backing_size) {
                 LOG_CRITICAL(HW_Memory, "mach_make_memory_entry_64({:#x}) failed: {}", backing_size,
                              mach_error_string(kr));
                 backing_entry = MACH_PORT_NULL;
                 return false;
+            }
+            if (no_footprint) {
+                using OwnershipFn = kern_return_t (*)(mach_port_t, task_t, int, int);
+                constexpr int VmLedgerTagDefault = 1;
+                constexpr int VmLedgerFlagNoFootprint = 1;
+                const auto ownership = reinterpret_cast<OwnershipFn>(
+                    dlsym(RTLD_DEFAULT, "mach_memory_entry_ownership"));
+                const kern_return_t owned =
+                    ownership != nullptr
+                        ? ownership(backing_entry, TASK_NULL, VmLedgerTagDefault,
+                                    VmLedgerFlagNoFootprint)
+                        : KERN_FAILURE;
+                LOG_WARNING(HW_Memory, "Guest memory without footprint (experiment): {}",
+                            owned == KERN_SUCCESS ? "on" : mach_error_string(owned));
             }
             vm_address_t backing_address = 0;
             kr = vm_map(mach_task_self(), &backing_address, backing_size, 0, VM_FLAGS_ANYWHERE,

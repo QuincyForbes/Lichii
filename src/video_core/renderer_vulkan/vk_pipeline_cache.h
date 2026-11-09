@@ -282,6 +282,9 @@ private:
     std::chrono::steady_clock::time_point last_flush{};
     std::atomic<size_t> last_cache_size{};
     std::atomic_bool flush_in_flight{};
+    /// Common::PlatformEvents background listener; it asks for the used list to be saved.
+    std::size_t background_listener{};
+    std::atomic_bool save_used_requested{};
 
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;
