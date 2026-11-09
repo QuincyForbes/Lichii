@@ -924,11 +924,18 @@ bool lichii_jit_request(void) {
     if (IosSupport::HasTxm()) {
         url += "&script-name=universal.js";
     }
+    return lichii_jit_request_url(url.c_str());
+}
+
+bool lichii_jit_request_url(const char* url) {
+    if (url == nullptr) {
+        return false;
+    }
     if (g_jit_background_task == 0) {
         g_jit_background_task = IosSupport::BeginBackgroundTask("lichii-jit");
     }
     LOG_INFO(Frontend, "iOS: opening {}", url);
-    return IosSupport::OpenUrl(url.c_str());
+    return IosSupport::OpenUrl(url);
 }
 
 /* ---------------------------------------------------------------------------------- input */

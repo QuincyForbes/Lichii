@@ -198,6 +198,8 @@ bool lichii_jit_needs_script(void);
 bool lichii_jit_stikdebug_installed(void);
 /// Asks StikDebug to enable JIT for this process (opens its URL scheme).
 bool lichii_jit_request(void);
+/// Opens another JIT provider's URL, keeping the app alive in the background meanwhile.
+bool lichii_jit_request_url(const char* url);
 
 /* ---------------------------------------------------------------------------------------- input */
 

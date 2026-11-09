@@ -2,8 +2,74 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import Combine
+import Darwin
 import LichiiBridge
 import SwiftUI
+import UIKit
+
+/// Apps that can attach a debugger to Lichii. Only StikDebug runs the script iOS 26+ (TXM) needs;
+/// the others work where an attached debugger is enough.
+enum JitProvider: String, CaseIterable, Identifiable {
+    case stikDebug, stikDebugLiveContainer, stosDebug, trollStore
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .stikDebug: return "StikDebug"
+        case .stikDebugLiveContainer: return "StikDebug (LiveContainer)"
+        case .stosDebug: return "StosDebug"
+        case .trollStore: return "TrollStore"
+        }
+    }
+
+    static var current: JitProvider {
+        JitProvider(rawValue: UserDefaults.standard.string(forKey: "jitProvider") ?? "") ?? .stikDebug
+    }
+
+    @MainActor var installed: Bool {
+        switch self {
+        case .stikDebug: return lichii_jit_stikdebug_installed()
+        case .stikDebugLiveContainer: return canOpen("livecontainer://")
+        case .stosDebug: return canOpen("stosdebug://")
+        case .trollStore: return canOpen("apple-magnifier://")
+        }
+    }
+
+    @MainActor @discardableResult
+    func request() -> Bool {
+        let bundle = Bundle.main.bundleIdentifier ?? ""
+        let pid = getpid()
+        switch self {
+        case .stikDebug:
+            return lichii_jit_request()
+        case .stikDebugLiveContainer:
+            // LiveContainer forwards the request to the StikDebug inside it.
+            var inner = "stikdebug://enable-jit?pid=\(pid)"
+            if lichii_jit_needs_script() {
+                inner += "&script-name=universal.js"
+            }
+            let encoded = Data(inner.utf8).base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+            return open("livecontainer://open-web-page?url=\(encoded)")
+        case .stosDebug:
+            return open("stosdebug://enableJIT?bundleId=\(bundle)&appName=Lichii&pid=\(pid)")
+        case .trollStore:
+            return open("apple-magnifier://enable-jit?bundle-id=\(bundle)")
+        }
+    }
+
+    @MainActor private func open(_ url: String) -> Bool {
+        url.withCString { lichii_jit_request_url($0) }
+    }
+
+    @MainActor private func canOpen(_ url: String) -> Bool {
+        guard let url = URL(string: url) else { return false }
+        return UIApplication.shared.canOpenURL(url)
+    }
+}
 
 /// Snapshot of the JIT pool state, refreshed by the views that show it.
 struct JitStatus {
@@ -15,11 +81,11 @@ struct JitStatus {
     var needsScript = false
     var stikDebug = false
 
-    static func read() -> JitStatus {
+    @MainActor static func read() -> JitStatus {
         JitStatus(state: Bridge.jitState, prepared: lichii_jit_prepared_bytes(),
                   total: lichii_jit_pool_bytes(), error: Bridge.jitError,
                   debugged: lichii_jit_debugged(), needsScript: lichii_jit_needs_script(),
-                  stikDebug: lichii_jit_stikdebug_installed())
+                  stikDebug: JitProvider.current.installed)
     }
 
     var progress: Double {
@@ -97,6 +163,7 @@ struct JitView: View {
     @EnvironmentObject private var app: AppController
     @State private var status = JitStatus.read()
     @AppStorage("autoRequestJit") private var autoRequest = true
+    @AppStorage("jitProvider") private var provider: JitProvider = .stikDebug
     private let timer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -107,15 +174,24 @@ struct JitView: View {
                     Button {
                         app.requestJitIfNeeded(automatic: false)
                     } label: {
-                        Label("Enable JIT with StikDebug", systemImage: "bolt")
+                        Label("Enable JIT with \(provider.label)", systemImage: "bolt")
                     }
                     .disabled(!status.stikDebug || status.state == .failed)
+                }
+            }
+            Section {
+                Picker("JIT app", selection: $provider) {
+                    ForEach(JitProvider.allCases) { Text($0.label).tag($0) }
+                }
+            } footer: {
+                if status.needsScript && provider != .stikDebug && provider != .stikDebugLiveContainer {
+                    Text("This device needs StikDebug's universal.js script; other JIT apps cannot prepare Lichii's memory here.")
                 }
             }
             Section("Details") {
                 LabeledContent("Debugger attached once", value: status.debugged ? "Yes" : "No")
                 LabeledContent("Needs StikDebug script", value: status.needsScript ? "Yes (TXM)" : "No")
-                LabeledContent("StikDebug", value: status.stikDebug ? "Installed" : "Not found")
+                LabeledContent(provider.label, value: status.stikDebug ? "Installed" : "Not found")
                 LabeledContent("Pool", value: "\(status.prepared >> 20) / \(status.total >> 20) MiB")
             }
             Section {

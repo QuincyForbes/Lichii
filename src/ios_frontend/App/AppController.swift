@@ -68,13 +68,14 @@ final class AppController: ObservableObject {
 
     /// The JIT pool is prepared while the library is open, so a launch does not wait for it.
     func requestJitIfNeeded(automatic: Bool) {
-        guard Bridge.jitState == .waiting, lichii_jit_stikdebug_installed() else { return }
+        let provider = JitProvider.current
+        guard Bridge.jitState == .waiting, provider.installed else { return }
         if automatic {
             guard UserDefaults.standard.object(forKey: "autoRequestJit") as? Bool ?? true,
                   !jitRequested else { return }
         }
         jitRequested = true
-        _ = lichii_jit_request()
+        provider.request()
     }
 
     func launch(_ game: Game) {

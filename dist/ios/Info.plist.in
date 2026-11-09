@@ -93,6 +93,9 @@
 		<string>stikdebug</string>
 		<string>stikjit</string>
 		<string>sidestore</string>
+		<string>stosdebug</string>
+		<string>livecontainer</string>
+		<string>apple-magnifier</string>
 	</array>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
