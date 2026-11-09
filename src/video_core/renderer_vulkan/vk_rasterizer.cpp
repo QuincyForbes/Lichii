@@ -28,6 +28,7 @@
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
+#include "common/cityhash.h"
 #include "common/dkb_frame_trace.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
@@ -4759,11 +4760,10 @@ void RasterizerVulkan::UpdateStencilTestEnable(Tegra::Engines::Maxwell3D::Regs& 
 }
 
 size_t RasterizerVulkan::VertexInputKeyHash::operator()(const VertexInputKey& key) const noexcept {
-    u64 hash = 0xcbf29ce484222325ULL;
-    for (const u32 word : key) {
-        hash = (hash ^ word) * 0x100000001b3ULL;
-    }
-    return static_cast<size_t>(hash ^ (hash >> 32));
+    // CityHash reads the 516-byte key in independent 64-byte blocks; FNV-1a was one serial
+    // multiply per word, and this runs on most draws whose vertex streams changed.
+    return static_cast<size_t>(
+        Common::CityHash64(reinterpret_cast<const char*>(key.data()), sizeof(key)));
 }
 
 u32 RasterizerVulkan::UpdateVertexRepackLayout(bool dynamic_input) {
