@@ -21,6 +21,16 @@ add_library(lichii_ios_app STATIC
     SettingsModel.swift
     SettingsView.swift
     Theme.swift
+    Content/AddonsView.swift
+    Content/CheatsView.swift
+    Content/ContentBridge.swift
+    Content/ContentEntries.swift
+    Content/GuestDialogs.swift
+    Content/KeysFirmwareView.swift
+    Content/LogsView.swift
+    Content/OnboardingView.swift
+    Content/ProfilesView.swift
+    Content/SavesView.swift
 )
 set_target_properties(lichii_ios_app PROPERTIES
     Swift_MODULE_NAME LichiiApp
