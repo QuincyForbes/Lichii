@@ -35,7 +35,6 @@
 #include "core/file_sys/savedata_factory.h"
 #include "core/file_sys/submission_package.h"
 #include "core/file_sys/vfs/vfs.h"
-#include "core/file_sys/vfs/vfs_real.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/am/am_types.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -44,6 +43,7 @@
 #include "frontend_common/content_manager.h"
 #include "frontend_common/firmware_manager.h"
 #include "frontend_common/mod_manager.h"
+#include "ios_frontend/bridge_host.h"
 #include "ios_frontend/lichii_bridge_content.h"
 #include "ios_frontend/lichii_bridge_content_host.h"
 #include "ios_frontend/lichii_content_zip.h"
@@ -57,11 +57,9 @@ using json = nlohmann::json;
 using Common::FS::EdenPath;
 
 struct State {
-    std::recursive_mutex mutex; // the host may call back (save_config) while we hold it
-    Host host;
-    std::unique_ptr<Core::System> own_system;
-    std::unique_ptr<FileSys::ManualContentProvider> own_provider;
-    std::atomic<u32> pending_applet{static_cast<u32>(Service::AM::AppletId::Application)};
+    std::recursive_mutex mutex;
+    std::mutex applet_mutex;
+    std::string applet_path; // boots as MiiEdit
 };
 
 State& GetState() {
@@ -71,50 +69,25 @@ State& GetState() {
 
 using Lock = std::scoped_lock<std::recursive_mutex>;
 
+// The SDL frontend attaches its System (filesystem and content provider set) before the app UI
+// shows, so it is always there when Swift calls in.
 Core::System& System() {
-    auto& state = GetState();
-    if (state.host.system != nullptr) {
-        return *state.host.system;
-    }
-    if (!state.own_system) {
-        LOG_INFO(Frontend, "Content bridge: creating a private System until the host attaches");
-        state.own_system = std::make_unique<Core::System>();
-        state.own_provider = std::make_unique<FileSys::ManualContentProvider>();
-        auto& system = *state.own_system;
-        system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
-        system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
-        system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
-                                       state.own_provider.get());
-        system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
-    }
-    return *state.own_system;
+    return IosFrontend::System();
 }
 
+// Only the integrity check reads it; the app registers no loose game files.
 FileSys::ManualContentProvider& ManualProvider() {
-    auto& state = GetState();
-    System();
-    if (state.host.system != nullptr) {
-        if (state.host.manual_provider == nullptr) {
-            static FileSys::ManualContentProvider empty;
-            return empty;
-        }
-        return *state.host.manual_provider;
-    }
-    return *state.own_provider;
+    static FileSys::ManualContentProvider empty;
+    return empty;
 }
 
 bool IsRunning() {
-    const auto& host = GetState().host;
-    return host.is_running && host.is_running();
+    const auto state = IosFrontend::GetState();
+    return state != LICHII_EMU_IDLE && state != LICHII_EMU_FAILED;
 }
 
 void SaveConfig() {
-    const auto& host = GetState().host;
-    if (host.save_config) {
-        host.save_config();
-    } else {
-        LOG_WARNING(Frontend, "Content bridge: no host to save the config");
-    }
+    IosFrontend::SaveGlobalConfig();
 }
 
 void RefreshFactories() {
@@ -604,21 +577,25 @@ Service::Account::ProfileUsername ToUsername(std::string_view name) {
     return out;
 }
 
-} // Anonymous namespace
-
-void SetHost(Host host) {
-    auto& state = GetState();
-    Lock lock{state.mutex};
-    state.host = std::move(host);
-    if (state.host.system != nullptr && state.own_system) {
-        state.own_system.reset();
-        state.own_provider.reset();
+std::string MiiEditPath() {
+    const auto bis_system = System().GetFileSystemController().GetSystemNANDContents();
+    if (bis_system == nullptr) {
+        return {};
     }
+    const auto nca = bis_system->GetEntry(static_cast<u64>(Service::AM::AppletProgramId::MiiEdit),
+                                          FileSys::ContentRecordType::Program);
+    return nca != nullptr ? nca->GetFullPath() : std::string{};
 }
 
-u32 TakePendingAppletId() {
-    return GetState().pending_applet.exchange(
-        static_cast<u32>(Service::AM::AppletId::Application));
+} // Anonymous namespace
+
+u32 TakePendingAppletId(const std::string& path) {
+    auto& state = GetState();
+    std::scoped_lock lock{state.applet_mutex};
+    const bool mii_edit = !state.applet_path.empty() && state.applet_path == path;
+    state.applet_path.clear();
+    return static_cast<u32>(mii_edit ? Service::AM::AppletId::MiiEdit
+                                     : Service::AM::AppletId::Application);
 }
 
 } // namespace LichiiContent
@@ -1568,20 +1545,20 @@ bool lichii_content_set_profile_avatar(const char* uuid_text, const char* jpeg_p
 
 char* lichii_content_mii_edit_path(void) {
     Lock lock{GetState().mutex};
-    const auto bis_system = System().GetFileSystemController().GetSystemNANDContents();
-    if (bis_system == nullptr) {
-        return nullptr;
-    }
-    const auto nca = bis_system->GetEntry(
-        static_cast<u64>(Service::AM::AppletProgramId::MiiEdit), FileSys::ContentRecordType::Program);
-    if (nca == nullptr) {
-        return nullptr;
-    }
-    return Dup(nca->GetFullPath());
+    const auto path = MiiEditPath();
+    return path.empty() ? nullptr : Dup(path);
 }
 
-void lichii_content_prepare_applet(int applet_id) {
-    GetState().pending_applet.store(static_cast<u32>(applet_id));
+char* lichii_content_prepare_mii_edit(void) {
+    Lock lock{GetState().mutex};
+    const auto path = MiiEditPath();
+    if (path.empty()) {
+        return nullptr;
+    }
+    auto& state = GetState();
+    std::scoped_lock applet_lock{state.applet_mutex};
+    state.applet_path = path;
+    return Dup(path);
 }
 
 } // extern "C"

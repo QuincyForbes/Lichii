@@ -212,14 +212,12 @@ bool lichii_content_set_profile_avatar(const char* uuid, const char* jpeg_path);
 // ---- System applets ------------------------------------------------------------------------
 
 /// Path of the Mii Maker (MiiEdit, 0x0100000000001009) program NCA in the installed firmware,
-/// or NULL. Boot it like a game after lichii_content_prepare_applet(LICHII_APPLET_MII_EDIT).
+/// or NULL.
 char* lichii_content_mii_edit_path(void);
 
-enum { LICHII_APPLET_APPLICATION = 0x01, LICHII_APPLET_MII_EDIT = 0x12 };
-
-/// Sets the applet the next boot starts as (Service::AM::AppletId); the core bridge reads it
-/// when it builds the launch parameters. Booting a game resets it to Application.
-void lichii_content_prepare_applet(int applet_id);
+/// Same path, and the next boot of exactly that path starts as the MiiEdit applet instead of an
+/// application. Pass the result to lichii_emu_launch.
+char* lichii_content_prepare_mii_edit(void);
 
 // ---- Guest dialogs -------------------------------------------------------------------------
 

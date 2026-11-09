@@ -90,6 +90,7 @@
 #ifdef LICHII_IOS_UI
 #include "common/fs/fs.h"
 #include "ios_frontend/bridge_host.h"
+#include "ios_frontend/lichii_bridge_content_host.h"
 #endif
 
 // Code-signing status: dynarmic's code pages are only executable while the process is being
@@ -1105,6 +1106,13 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
         LOG_INFO(Frontend, "Restarted by the game: program index {}, {} user channel entries",
                  handoff->program_index, state->system.GetUserChannel().size());
     }
+#ifdef LICHII_IOS_UI
+    if (ios_app) {
+        LichiiContent::InstallFrontendApplets(state->system);
+        load_parameters.applet_id =
+            static_cast<Service::AM::AppletId>(LichiiContent::TakePendingAppletId(lp.filepath));
+    }
+#endif
     IOS_MARK("system.Load");
     const Core::SystemResultStatus load_result = state->system.Load(*state->emu_window, lp.filepath, load_parameters);
     IOS_MARK("system.Load returned");
