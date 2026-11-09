@@ -772,12 +772,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                     RetireTranslatedPipeline(std::move(pipeline));
                 });
             LOG_INFO(Render_Vulkan,
-                     "EDEN_NX2_ASYNC_TRANSLATE={}: new pipelines of draws that may be skipped are "
-                     "translated on {} threads{}",
-                     VideoCommon::AsyncTranslateMode(), threads,
-                     VideoCommon::AsyncTranslateMode() == 2
-                         ? ", and on the GPU thread too to compare (verify mode)"
-                         : "");
+                     "EDEN_NX2_ASYNC_TRANSLATE=1: new pipelines of draws that may be skipped are "
+                     "translated on {} threads",
+                     threads);
         } else {
             LOG_WARNING(Render_Vulkan, "EDEN_NX2_ASYNC_TRANSLATE needs asynchronous shaders; "
                                        "translating on the GPU thread");
