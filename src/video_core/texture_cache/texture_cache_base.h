@@ -862,6 +862,7 @@ private:
         u64 frame_tick = 0;
         u64 bindings_epoch = 0;
         u32 modified_mask = 0;
+        u64 modified_render_frame = 0; ///< modified_mask holds for this RenderFrame() only
         std::array<ImageViewId, NUM_RT + 1> views{};
     } rt_prepared;
     u32 rt_active_mask = 0;

@@ -1754,10 +1754,12 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         NoteRenderTargetsPrepared();
     };
     const auto prepare_draw_targets = [&] {
-        const u32 prev_mod_mask =
-            (rt_prepared.valid && rt_prepared.serial == render_targets_serial)
-                ? rt_prepared.modified_mask
-                : 0u;
+        // Targets kept across frames are marked modified again once a render frame, so their
+        // last_write_frame follows the clock (relocation's same-frame rule, cross-frame guards).
+        const u64 render_frame = RenderFrame();
+        const bool kept = rt_prepared.valid && rt_prepared.serial == render_targets_serial &&
+                          rt_prepared.modified_render_frame == render_frame;
+        const u32 prev_mod_mask = kept ? rt_prepared.modified_mask : 0u;
         u32 new_mod_mask = prev_mod_mask;
         for (size_t index = 0; index < NUM_RT; ++index) {
             ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
@@ -1775,6 +1777,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
             new_mod_mask |= depth_bit;
         }
         rt_prepared.modified_mask = new_mod_mask;
+        rt_prepared.modified_render_frame = render_frame;
         NoteRenderTargetsPrepared();
     };
     if (!flags[Dirty::RenderTargets]) {
