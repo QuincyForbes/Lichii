@@ -175,6 +175,12 @@ namespace Vulkan {
         /// CreateImage's fallbacks; the image is left null when the result is an error.
         VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, vk::Image &image) const;
 
+        /// 8-64 MiB images in a 128 MiB-block VMA pool (instead of VMA dedicated allocations).
+        bool CreateImageInMediumPool(const VkImageCreateInfo& ci,
+                                     const VmaAllocationCreateInfo& alloc_ci, VkImage& handle,
+                                     VmaAllocation& allocation,
+                                     VmaAllocationInfo& alloc_info) const;
+
         const Device &device;                              ///< Device handle.
         VmaAllocator allocator;                           ///< VMA allocator.
         const VkPhysicalDeviceMemoryProperties properties; ///< Physical device memory properties.

@@ -22,6 +22,8 @@
 #include "common/settings.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+#include <vulkan/vulkan_beta.h>
+
 VK_DEFINE_HANDLE(VmaAllocator)
 VK_DEFINE_HANDLE(VmaPool)
 
@@ -74,6 +76,7 @@ VK_DEFINE_HANDLE(VmaPool)
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
     FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
+    FEATURE(EXT, ShaderAtomicFloat, SHADER_ATOMIC_FLOAT, shader_atomic_float)                      \
     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
     FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \
@@ -278,8 +281,11 @@ public:
     enum class SeparatePool : u32 {
         SparsePages,
         DeviceBuffers,
+        MediumImages,
+        Count,
     };
     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+    static constexpr VkDeviceSize MediumImagePoolBlockSize = 128ULL << 20;
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).
     VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
@@ -992,6 +998,12 @@ FN_MAX_LIMIT_LIST
                features.provoking_vertex.transformFeedbackPreservesProvokingVertex;
     }
 
+    /// Returns true if storage buffers support native 32-bit float atomic adds.
+    bool IsFloat32AtomicAddSupported() const {
+        return extensions.shader_atomic_float &&
+               features.shader_atomic_float.shaderBufferFloat32AtomicAdd;
+    }
+
     /// Returns true if the device supports VK_KHR_shader_atomic_int64.
     bool IsExtShaderAtomicInt64Supported() const {
         return extensions.shader_atomic_int64;
@@ -1117,6 +1129,11 @@ FN_MAX_LIMIT_LIST
 
     u32 GetMaxVertexInputBindings() const {
         return properties.properties.limits.maxVertexInputBindings;
+    }
+
+    VkExtent2D GetMaxFramebufferExtent() const {
+        return {properties.properties.limits.maxFramebufferWidth,
+                properties.properties.limits.maxFramebufferHeight};
     }
 
     u32 GetMaxViewports() const {
@@ -1279,7 +1296,9 @@ private:
     VkInstance instance;         ///< Vulkan instance.
     VmaAllocator allocator{};    ///< VMA allocator.
     mutable std::mutex separate_pools_mutex;
-    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};
+    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>,
+                       static_cast<size_t>(SeparatePool::Count)>
+        separate_pools{};
     vk::DeviceDispatch dld;      ///< Device function pointers.
     vk::PhysicalDevice physical; ///< Physical device.
     vk::Device logical;          ///< Logical device.
@@ -1347,6 +1366,8 @@ private:
     Properties properties{};
 
     VkPhysicalDeviceFeatures2 features2{};
+    /// Enabled as the driver reports them (VK_KHR_portability_subset devices only).
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR portability_subset_features{};
     VkPhysicalDeviceProperties2 properties2{};
 
     // Misc features

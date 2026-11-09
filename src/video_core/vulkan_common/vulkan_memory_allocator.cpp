@@ -248,6 +248,12 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     // unbacked sparse fallback below.
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > (u64{1} << 28);
+    if (!huge && !dedicated &&
+        CreateImageInMediumPool(ci, alloc_ci, handle, allocation, alloc_info)) {
+        image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
+                          device.GetDispatchLoader());
+        return VK_SUCCESS;
+    }
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
@@ -389,6 +395,47 @@ void MemoryAllocator::FreeSparseMemory(VmaAllocation allocation) const {
     if (allocation != VK_NULL_HANDLE) {
         vmaFreeMemory(allocator, allocation);
     }
+}
+
+bool MemoryAllocator::CreateImageInMediumPool(const VkImageCreateInfo& ci,
+                                              const VmaAllocationCreateInfo& alloc_ci,
+                                              VkImage& handle, VmaAllocation& allocation,
+                                              VmaAllocationInfo& alloc_info) const {
+    if (ci.tiling != VK_IMAGE_TILING_OPTIMAL || ci.imageType != VK_IMAGE_TYPE_2D) {
+        return false;
+    }
+    // Quick texel-based precheck (~2M to ~64M texels) so tiny textures don't call vkCreateImage
+    // twice, and only 8-64 MiB requirements go into the 128 MiB-block pool.
+    const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
+    if (texels < (1ULL << 19) || texels > (1ULL << 26)) {
+        return false;
+    }
+    VkImage temp{};
+    const auto& dld = device.GetDispatchLoader();
+    const VkDevice logical = *device.GetLogical();
+    if (dld.vkCreateImage(logical, &ci, nullptr, &temp) != VK_SUCCESS) {
+        return false;
+    }
+    VkMemoryRequirements req{};
+    dld.vkGetImageMemoryRequirements(logical, temp, &req);
+    dld.vkDestroyImage(logical, temp, nullptr);
+    if (req.size <= (8ULL << 20) || req.size > Device::MediumImagePoolBlockSize / 2) {
+        return false;
+    }
+    u32 memory_type{};
+    if (vmaFindMemoryTypeIndex(allocator, req.memoryTypeBits, &alloc_ci, &memory_type) !=
+        VK_SUCCESS) {
+        return false;
+    }
+    const VmaPool pool = device.GetSeparatePool(Device::SeparatePool::MediumImages, memory_type);
+    if (pool == VK_NULL_HANDLE) {
+        return false;
+    }
+    VmaAllocationCreateInfo pool_ci = alloc_ci;
+    pool_ci.pool = pool;
+    pool_ci.memoryTypeBits = 0;
+    return vmaCreateImage(allocator, &ci, &pool_ci, &handle, &allocation, &alloc_info) ==
+           VK_SUCCESS;
 }
 
 bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, MemoryUsage usage,

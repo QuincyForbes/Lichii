@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <climits>
 #include <vector>
 
@@ -38,10 +39,20 @@ public:
     ~StagingBufferPool();
 
     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
+    StagingBufferRef RequestUploadBuffer(size_t size) {
+        return Request(size, MemoryUsage::Upload);
+    }
+    StagingBufferRef GetUploadBuffer(size_t size) {
+        return Request(size, MemoryUsage::Upload);
+    }
     void FreeDeferred(StagingBufferRef& ref);
 
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
         return *stream_buffer;
+    }
+
+    [[nodiscard]] bool IsRebarEnabled() const noexcept {
+        return use_rebar;
     }
 
     void TickFrame();
@@ -85,6 +96,12 @@ private:
     static constexpr size_t NUM_LEVELS = sizeof(size_t) * CHAR_BIT;
     using StagingBuffersCache = std::array<StagingBuffers, NUM_LEVELS>;
 
+    struct ChunkPointer {
+        std::atomic<size_t> offset{0};
+        std::atomic<size_t> limit{0};
+        mutable std::atomic<u64> blocked_tick{0};
+    };
+
     StagingBufferRef GetStreamBuffer(size_t size);
 
     bool AreRegionsActive(size_t region_begin, size_t region_end) const;
@@ -119,6 +136,9 @@ private:
     size_t used_iterator = 0;
     size_t free_iterator = 0;
     std::array<u64, NUM_SYNCS> sync_ticks{};
+
+    mutable ChunkPointer current_chunk{};
+    bool use_rebar = false;
 
     StagingBuffersCache device_local_cache;
     StagingBuffersCache upload_cache;

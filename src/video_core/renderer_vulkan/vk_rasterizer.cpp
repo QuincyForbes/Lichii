@@ -1020,6 +1020,20 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                      regs.blend.enable[0], seen.size());
         }
     }
+    if (!gpu_count && maxwell3d->regs.transform_feedback_enabled == 0 &&
+        (MakeDrawParams(maxwell3d->draw_manager.draw_state, instance_count, is_indexed)
+                 .num_vertices == 0 ||
+         (instance_count == 0 && [this] {
+             const GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
+             return pipeline != nullptr && !pipeline->IsMeshPipeline();
+         }()))) {
+        if (Common::DkbFrameTrace::Enabled()) {
+            ++trace_draws;
+            ++trace_zero_direct;
+        }
+        gpu.TickWork();
+        return;
+    }
     PrepareDraw(is_indexed, [this, is_indexed, instance_count, gpu_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
@@ -1091,6 +1105,41 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 is_indexed ? "vkCmdDrawIndexed" : "vkCmdDraw", params, VK_SUCCESS);
         }
     });
+}
+
+bool RasterizerVulkan::DrawMeshTasksFromGpu(DAddr count_addr) {
+    if (!device.IsExtMeshShaderSupported() || !maxwell3d->regs.IsMeshEnabled()) {
+        return false;
+    }
+    std::optional<u32> slot;
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        slot = buffer_cache.Nx2MeshCountSlot(count_addr);
+    }
+    if (!slot) {
+        return false;
+    }
+    bool drawn = false;
+    PrepareDraw(
+        false,
+        [this, &drawn, offset = VkDeviceSize{*slot} * BufferCacheRuntime::Nx2MeshMirrorSlotSize] {
+            // Only a native task/mesh pipeline takes the count as is; anything else needs it on
+            // the CPU (the caller reads it and draws again).
+            if (!mesh_draw) {
+                return;
+            }
+            scheduler.Record([this, mirror = buffer_cache_runtime.Nx2MeshMirror(),
+                              offset](vk::CommandBuffer cmdbuf) {
+                if (scheduler.GraphicsPipelineMissing()) {
+                    return;
+                }
+                cmdbuf.DrawMeshTasksIndirectEXT(mirror, offset, 1,
+                                                BufferCacheRuntime::Nx2MeshMirrorSlotSize);
+            });
+            drawn = true;
+        },
+        true);
+    return drawn;
 }
 
 void RasterizerVulkan::DrawIndirect() {
@@ -1992,6 +2041,18 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     }
 }
 
+namespace {
+/// EDEN_NX2_TEXTURE_READ_FILTER: the texture cache only flushes or reports GPU-modified images, so
+/// queries over pages no image was ever GPU-modified on skip its lock (gpu_modified_filter).
+bool TextureReadFilter() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_TEXTURE_READ_FILTER");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // Anonymous namespace
+
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     if ((True(which & VideoCommon::CacheType::BufferCache)) && MayBeGpuModified(addr, size)) {
         std::scoped_lock lock{buffer_cache.mutex};
@@ -2003,6 +2064,9 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
         return false;
     }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
+        if (TextureReadFilter() && !texture_cache.MayHaveGpuModifiedImages(addr, size)) {
+            return false;
+        }
         std::scoped_lock lock{texture_cache.mutex};
         return texture_cache.IsRegionGpuModified(addr, size);
     }
@@ -2039,7 +2103,10 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         const char* value = std::getenv("EDEN_NX2_READ_FASTPATH");
         return value == nullptr || value[0] != '0';
     }();
-    const bool skip_textures = fast_path && !texture_cache.page_filter.Any(addr, size);
+    // Nor where no image was ever GPU-modified (EDEN_NX2_TEXTURE_READ_FILTER).
+    const bool skip_textures =
+        fast_path && (!texture_cache.page_filter.Any(addr, size) ||
+                      (TextureReadFilter() && !texture_cache.MayHaveGpuModifiedImages(addr, size)));
     const bool skip_buffers = fast_path && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
                               !device_memory.MayHaveArmedReadTraps(addr, size) &&
                               !Tegra::Nx2MayBeGpuWritten(addr, size);
@@ -2301,6 +2368,13 @@ void RasterizerVulkan::WaitForIdle() {
         VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT |
         VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    if (!device.IsGeometryShaderSupported()) {
+        flags &= ~VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+    }
+    if (!device.IsTessellationSupported()) {
+        flags &= ~(VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
+                   VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT);
+    }
     if (device.IsExtTransformFeedbackSupported()) {
         flags |= VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT;
     }
@@ -3438,11 +3512,15 @@ void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* draw_pipeline) {
     auto& flags = maxwell3d->dirty.flags;
     const auto topology = maxwell3d->draw_manager.draw_state.topology;
     const bool topology_changed = state_tracker.ChangePrimitiveTopology(topology);
+    const bool color_output_changed =
+        device.IsExtExtendedDynamicState3BlendingSupported() &&
+        (draw_pipeline ? draw_pipeline->ColorOutputMask() : ~0U) != last_color_output_mask;
     if (DynamicStateCacheEnabled()) {
         if (!dyn_state_mask_built) [[unlikely]] {
             BuildDynamicStateMask();
         }
-        if (!topology_changed && !dyn_state_never_skip && !(flags & dyn_state_mask).any()) {
+        if (!topology_changed && !color_output_changed && !dyn_state_never_skip &&
+            !(flags & dyn_state_mask).any()) {
             return;
         }
     }
@@ -3513,7 +3591,7 @@ void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* draw_pipeline) {
     }
 
     if (device.IsExtExtendedDynamicState3BlendingSupported()) {
-        UpdateBlending(regs);
+        UpdateBlending(regs, draw_pipeline);
     } else if (device.IsExtColorWriteEnableSupported()) {
         UpdateColorWriteEnable(regs);
     }
@@ -4226,12 +4304,18 @@ void RasterizerVulkan::UpdateLogicOp(Tegra::Engines::Maxwell3D::Regs& regs) {
     scheduler.Record([op](vk::CommandBuffer cmdbuf) { cmdbuf.SetLogicOpEXT(op); });
 }
 
-void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs) {
-    if (!state_tracker.TouchBlending()) {
+void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs,
+                                      const GraphicsPipeline* pipeline) {
+    // The write mask also excludes components the fragment shader doesn't output, so it has to be
+    // recorded again whenever the bound pipeline outputs a different set of components.
+    const u32 color_output_mask = pipeline ? pipeline->ColorOutputMask() : ~0U;
+    const bool color_output_changed = color_output_mask != last_color_output_mask;
+    if (!state_tracker.TouchBlending() && !color_output_changed) {
         return;
     }
 
-    if (state_tracker.TouchColorMask()) {
+    if (state_tracker.TouchColorMask() || color_output_changed) {
+        last_color_output_mask = color_output_mask;
         std::array<VkColorComponentFlags, Maxwell::NumRenderTargets> setup_masks{};
         for (size_t index = 0; index < Maxwell::NumRenderTargets; index++) {
             const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : index];
@@ -4248,6 +4332,7 @@ void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs) {
             if (mask.A) {
                 current |= VK_COLOR_COMPONENT_A_BIT;
             }
+            current &= (color_output_mask >> (index * 4)) & 0xF;
         }
         scheduler.Record([setup_masks](vk::CommandBuffer cmdbuf) {
             cmdbuf.SetColorWriteMaskEXT(0, setup_masks);

@@ -113,6 +113,9 @@ constexpr std::array B10G11R11_UFLOAT_PACK32{
 
 } // namespace Alternatives
 
+// VK_ENABLE_BETA_EXTENSIONS is not defined, so vulkan_core.h leaves this value out.
+constexpr auto PORTABILITY_SUBSET_FEATURES_STYPE = static_cast<VkStructureType>(1000163000);
+
 template <typename T>
 void SetNext(void**& next, T& data) {
     *next = &data;
@@ -892,7 +895,8 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = kind == SeparatePool::MediumImages ? MediumImagePoolBlockSize
+                                                            : SeparatePoolBlockSize,
             .minBlockCount = 0,
             .maxBlockCount = 0,
             .priority = 0.f,
@@ -1173,6 +1177,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
     FOR_EACH_VK_FEATURE_EXT(FEATURE_EXTENSION);
     FOR_EACH_VK_EXTENSION(EXTENSION);
 
+    // The spec requires enabling VK_KHR_portability_subset on devices that expose it.
+    if (supported_extensions.contains(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
+        loaded_extensions.insert(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    }
+
     extensions.depth_stencil_resolve =
         extensions.depth_stencil_resolve &&
         (instance_version >= VK_API_VERSION_1_2 || extensions.create_renderpass2);
@@ -1284,6 +1293,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
 
 #undef EXT_FEATURE
 #undef FEATURE
+
+    // The features the driver reports are enabled through the same chain at device creation.
+    if (loaded_extensions.contains(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
+        portability_subset_features.sType = PORTABILITY_SUBSET_FEATURES_STYPE;
+        SetNext(next, portability_subset_features);
+    }
 
     // Perform the feature test.
     physical.GetFeatures2(features2);
@@ -1597,6 +1612,26 @@ void Device::RemoveUnsuitableExtensions() {
 
     RemoveExtensionFeatureIfUnsuitable(extensions.robustness_2, features.robustness2,
                                        robustness2_extension_name);
+
+    // VK_EXT_shader_atomic_float: only 32-bit float adds on storage buffers are used, enabled on
+    // NVIDIA and AMD drivers; elsewhere a compare-exchange loop adds.
+    {
+        const VkDriverId atomic_driver = properties.driver.driverID;
+        const bool allow_fatomic = atomic_driver == VK_DRIVER_ID_NVIDIA_PROPRIETARY ||
+                                   atomic_driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                                   atomic_driver == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+                                   atomic_driver == VK_DRIVER_ID_MESA_RADV;
+        const VkBool32 buffer_add =
+            allow_fatomic ? features.shader_atomic_float.shaderBufferFloat32AtomicAdd : VK_FALSE;
+        void* const next_feature = features.shader_atomic_float.pNext;
+        features.shader_atomic_float = {};
+        features.shader_atomic_float.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+        features.shader_atomic_float.pNext = next_feature;
+        features.shader_atomic_float.shaderBufferFloat32AtomicAdd = buffer_add;
+        RemoveExtensionFeatureIfUnsuitable(buffer_add == VK_TRUE, features.shader_atomic_float,
+                                           VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+    }
 
     // Image robustness
     extensions.robust_image_access = features.robust_image_access.robustImageAccess;

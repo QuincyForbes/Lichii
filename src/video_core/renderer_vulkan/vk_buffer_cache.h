@@ -139,6 +139,9 @@ public:
 
     bool CanReportMemoryUsage() const;
 
+    /// Bytes each cached buffer allocates past its size.
+    u64 GetBufferAllocationTail() const;
+
     u32 GetUniformBufferAlignment() const noexcept {
         return uniform_buffer_alignment;
     }
@@ -167,6 +170,12 @@ public:
     void PostCopyBarrier();
 
     void ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t size, u32 value);
+
+    /// Switch 2: mesh task indirect commands {count, 1, 1} for the counts GPU-written command
+    /// lists feed (BufferCache::Nx2MeshCountSlot). Created on first use.
+    static constexpr u32 Nx2MeshMirrorSlots = 4096;
+    static constexpr u32 Nx2MeshMirrorSlotSize = 3 * sizeof(u32);
+    VkBuffer Nx2MeshMirror();
 
     void BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format, u32 num_indices,
                          u32 base_vertex, VkBuffer buffer, u32 offset, u32 size);
@@ -318,6 +327,7 @@ private:
     std::shared_ptr<QuadStripIndexBuffer> quad_strip_index_buffer;
 
     vk::Buffer null_buffer;
+    vk::Buffer nx2_mesh_mirror;
 
     std::unique_ptr<Uint8Pass> uint8_pass;
     std::unique_ptr<VertexRepackPass> vertex_repack_pass;

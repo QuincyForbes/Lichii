@@ -16,6 +16,7 @@
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc/svc_nx2_oot_poll.h"
 #include "core/hle/kernel/svc/svc_nx2_zstd.h"
+#include "core/oot_zstd_hook.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/service/kernel_helpers.h"
 
@@ -2503,6 +2504,10 @@ static void Call64(Core::System& system, u32 imm, std::span<uint64_t, 8> args) {
     }
 }
 void Call(Core::System& system, u32 imm) {
+    if (imm == Core::OotZstd::SvcNumber) {
+        Core::OotZstd::Handle(system);
+        return;
+    }
     auto& kernel = system.Kernel();
     auto& process = GetCurrentProcess(kernel);
     std::array<uint64_t, 8> args;

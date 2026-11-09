@@ -81,14 +81,23 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                              (op == 0x83b && instruction.Bits(91, 1));
     }
     const auto address_of = [](u32 index) { return 0x50U + index * 8 + ((index + 1) / 3) * 8; };
+    std::optional<std::pair<u32, std::string_view>> deferred_uniform_fail;
     const auto fail = [&](u32 index, std::string_view reason) {
         result.instructions.clear();
         result.source_instruction_offsets.clear();
+        if (deferred_uniform_fail) {
+            result.error_offset = deferred_uniform_fail->first * sizeof(Instruction);
+            result.error = deferred_uniform_fail->second;
+            return result;
+        }
         result.error_offset = index * sizeof(Instruction);
         result.error = reason;
         return result;
     };
     const auto finish = [&](u32 index) {
+        if (deferred_uniform_fail) {
+            return fail(deferred_uniform_fail->first, deferred_uniform_fail->second);
+        }
         for (const auto& relocation : relocations) {
             if (relocation.target > index) return fail(index, "native branch or call leaves captured program");
             const u32 target = relocation.output_target != ~0U ? relocation.output_target :
@@ -338,7 +347,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             if (reg < 28) return 218 + reg;
             if (reg == 63) return 255;
             if (reg < 63 && reg - 28 < high_uniforms) return high_uniform_base + (reg - 28);
-            if (reg < 63) result.high_uniform_registers = (std::max)(result.high_uniform_registers, (reg - 26) & ~1U);
+            if (reg < 63) {
+                result.high_uniform_registers =
+                    (std::max)(result.high_uniform_registers, (reg - 26) & ~1U);
+                if (!deferred_uniform_fail) {
+                    deferred_uniform_fail.emplace(index, "native uniform register");
+                }
+                return 216 + (reg & 1);
+            }
             return ~0U;
         };
         bool rewritten_uniform = false;
@@ -1414,13 +1430,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (signed_order && !maximum && !minimum) || native_predicate != 7)
                 return fail(index, "native warp sum mode");
             emit(0x50d8000000070000ULL | 250 | (u64{7} << 39) | (u64{7} << 45) | (u64{1} << 48));
+            u32 redux_source = source;
+            if (signed_order) {
+                emit(0x0400000000070000ULL | 253 | (u64{source} << 8) |
+                     (u64{0x80000000U} << 20) | (u64{2} << 53));
+                redux_source = 253;
+            }
             mov_imm(target, minimum ? ~0U : 0U);
             for (u32 lane = 0; lane < 32; ++lane) {
-                emit(0xef10000000070000ULL | 251 | (u64{source} << 8) | (u64{lane} << 20) |
+                emit(0xef10000000070000ULL | 251 | (u64{redux_source} << 8) | (u64{lane} << 20) |
                     (u64{1} << 28) | (u64{1} << 29) | (u64{31} << 34) | (u64{7} << 48));
-                if (signed_order)
-                    emit(0x0400000000070000ULL | 251 | (u64{251} << 8) |
-                         (u64{0x80000000U} << 20) | (u64{2} << 53));
                 emit(0x3828000000070000ULL | 252 | (u64{250} << 8) | (u64{lane} << 20));
                 emit(0x0400000000070000ULL | 252 | (u64{252} << 8) | (u64{1} << 20));
                 emit(0x5c10000000070000ULL | 252 | (u64{255} << 8) | (u64{252} << 20) | (u64{1} << 48));

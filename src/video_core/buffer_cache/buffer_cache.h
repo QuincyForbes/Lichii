@@ -1627,7 +1627,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         return;
     }
     // Classic cached path
-    const bool native_bank = not_gpu_modified &&
+    constexpr u64 ocarina_of_time = 0x0400486024DEC000ULL;
+    const bool bank_recheck = program_id != ocarina_of_time || Nx2Perf::Verify();
+    const bool native_bank = bank_recheck && not_gpu_modified &&
                              (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
                              size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling();
     if (const int tracked_mode = native_bank ? VideoCore::Nx2Debug::Experiment(9) : 0;
@@ -2298,23 +2300,58 @@ void BufferCache<P>::UpdateIndexBuffer() {
     const GPUVAddr gpu_addr_begin = index_buffer_ref.StartAddress();
     const GPUVAddr gpu_addr_end = index_buffer_ref.EndAddress();
     const u32 draw_size = (index_buffer_ref.count + index_buffer_ref.first) * u32(index_buffer_ref.FormatSizeInBytes());
-    if (ReuseGeometry(index_memo, gpu_addr_begin, gpu_addr_end, draw_size)) {
-        channel_state->index_buffer = index_memo.binding;
+    IndexBufferMemo& memo = index_buffer_memo;
+    const u64 map_serial = gpu_memory->MapSerial();
+    const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
+    const u32 size = (std::min)(address_size, draw_size);
+    const bool memo_hit = memo.channel == channel_state && memo.memory == gpu_memory &&
+                          memo.begin == gpu_addr_begin && memo.end == gpu_addr_end &&
+                          memo.map_serial == map_serial && memo.deletions == binding_epoch &&
+                          size != 0 && size <= memo.found_size &&
+                          !Settings::IsGPUFenceBehaviorAccurate();
+    if (memo_hit && !Nx2Perf::Verify()) {
+        channel_state->index_buffer = Binding{
+            .device_addr = memo.device_addr,
+            .size = size,
+            .buffer_id = memo.buffer_id,
+        };
         return;
     }
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
-    const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
-    const u32 size = (std::min)(address_size, draw_size);
     if (size == 0 || !device_addr) {
         channel_state->index_buffer = NULL_BINDING;
         return;
     }
+    const BufferId buffer_id = FindBuffer(*device_addr, size, false);
     channel_state->index_buffer = Binding{
         .device_addr = *device_addr,
         .size = size,
-        .buffer_id = FindBuffer(*device_addr, size, false),
+        .buffer_id = buffer_id,
     };
-    StoreGeometry(index_memo, gpu_addr_begin, gpu_addr_end, draw_size, channel_state->index_buffer);
+    if (memo_hit) {
+        if (memo.device_addr != *device_addr || memo.buffer_id != buffer_id) {
+            static std::atomic<u32> reports{};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(HW_GPU,
+                          "Nx2Perf index buffer memo mismatch: {:#x}+{:#x} kept {:#x} buffer {}, "
+                          "found {:#x} buffer {}",
+                          gpu_addr_begin, size, memo.device_addr, memo.buffer_id.index,
+                          *device_addr, buffer_id.index);
+            }
+        }
+        return;
+    }
+    memo = IndexBufferMemo{
+        .channel = channel_state,
+        .memory = gpu_memory,
+        .begin = gpu_addr_begin,
+        .end = gpu_addr_end,
+        .map_serial = map_serial,
+        .deletions = binding_epoch,
+        .device_addr = *device_addr,
+        .found_size = size,
+        .buffer_id = buffer_id,
+    };
 }
 
 template <class P>
@@ -2674,6 +2711,23 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
     });
 }
 
+namespace Detail {
+/// Whether one range of `set` covers [addr, addr + size) (interval sets join touching ranges).
+template <typename Set, typename Addr>
+[[nodiscard]] bool RangeCovered(const Set& set, Addr addr, u64 size) {
+    if (size == 0) {
+        return false;
+    }
+    u32 pieces = 0;
+    bool covered = false;
+    set.ForEachInRange(addr, size, [&](Addr lower, Addr upper) {
+        ++pieces;
+        covered = lower == addr && upper == addr + size;
+    });
+    return pieces == 1 && covered;
+}
+} // namespace Detail
+
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
     if (VideoCommon::GpuSplit::RecordingDispatch()) [[unlikely]] {
@@ -2693,8 +2747,16 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     }
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
-    gpu_modified_ranges.Add(device_addr, size);
-    gpu_modified_serial.fetch_add(1, std::memory_order_relaxed);
+    static const bool mark_guards = [] {
+        const char* const value = std::getenv("EDEN_NX2_BUFCACHE_MARK");
+        return value == nullptr || value[0] != '0';
+    }();
+    // Dispatches and draws write the same bindings again and again: an interval set add that
+    // changes nothing still erases and reinserts nodes (EDEN_NX2_BUFCACHE_MARK).
+    if (!mark_guards || !Detail::RangeCovered(gpu_modified_ranges, device_addr, size)) {
+        gpu_modified_ranges.Add(device_addr, size);
+        gpu_modified_serial.fetch_add(1, std::memory_order_relaxed);
+    }
     QueueFenceDownload(device_addr, size);
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
         Tegra::Nx2MarkGpuWritten(device_addr, size);
@@ -2747,6 +2809,66 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
 }
 
 template <class P>
+std::optional<u32> BufferCache<P>::Nx2MeshCountSlot(DAddr count_addr) {
+    if constexpr (IS_OPENGL) {
+        return std::nullopt;
+    } else {
+        constexpr DAddr page_size = DAddr{1} << Tegra::Nx2WrittenPageBits;
+        std::scoped_lock lock{nx2_list_mutex};
+        const auto [it, inserted] = nx2_mesh_slots.try_emplace(count_addr);
+        if (inserted) {
+            if (nx2_mesh_slots.size() > Runtime::Nx2MeshMirrorSlots) {
+                nx2_mesh_slots.erase(it);
+            } else {
+                it->second.index = static_cast<u32>(nx2_mesh_slots.size() - 1);
+            }
+            return std::nullopt;
+        }
+        const auto page = nx2_list_pages.find(count_addr & ~(page_size - 1));
+        if (!it->second.initialized || page == nx2_list_pages.end() ||
+            page->second.writes != it->second.mirrored_writes) {
+            return std::nullopt;
+        }
+        return it->second.index;
+    }
+}
+
+template <class P>
+void BufferCache<P>::Nx2MirrorMeshCounts(Buffer& buffer, DAddr begin, DAddr end, u64 writes) {
+    if constexpr (!IS_OPENGL) {
+        // Called with nx2_list_mutex held, right after the page's copy (outside a render pass).
+        if (nx2_mesh_slots.empty()) {
+            return;
+        }
+        constexpr u32 slot_size = Runtime::Nx2MeshMirrorSlotSize;
+        boost::container::small_vector<BufferCopy, 8> copies;
+        std::optional<decltype(runtime.Nx2MeshMirror())> mirror;
+        for (auto& [count_addr, slot] : nx2_mesh_slots) {
+            if (count_addr < begin || count_addr + sizeof(u32) > end) {
+                continue;
+            }
+            if (!mirror) {
+                mirror = runtime.Nx2MeshMirror();
+            }
+            if (!slot.initialized) {
+                runtime.ClearBuffer(*mirror, slot.index * slot_size + sizeof(u32),
+                                    2 * sizeof(u32), 1);
+                slot.initialized = true;
+            }
+            copies.push_back(BufferCopy{
+                .src_offset = buffer.Offset(count_addr),
+                .dst_offset = slot.index * slot_size,
+                .size = sizeof(u32),
+            });
+            slot.mirrored_writes = writes;
+        }
+        if (!copies.empty()) {
+            runtime.CopyBuffer(*mirror, buffer, copies, true);
+        }
+    }
+}
+
+template <class P>
 bool BufferCache<P>::Nx2CopyListPages(u64 tick, u64 writer) {
     if constexpr (IS_OPENGL) {
         return false;
@@ -2790,6 +2912,7 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick, u64 writer) {
             entry.copy_writer = writer;
             entry.copy_begin = static_cast<u32>(begin - page);
             entry.copy_end = static_cast<u32>(end - page);
+            Nx2MirrorMeshCounts(buffer, begin, end, entry.writes);
         }
         nx2_list_copy_requests.clear();
         std::erase_if(nx2_retired_list_copies, [this](auto& retired) {
@@ -3117,13 +3240,14 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
     }
     Buffer& buffer = slot_buffers[buffer_id];
     const auto size = buffer.SizeBytes();
+    const u64 allocated = Common::AlignUp(size + runtime.GetBufferAllocationTail(), 1024);
     if (insert) {
-        buffer_bytes += Common::AlignUp(size, 1024);
-        total_used_memory += Common::AlignUp(size, 1024);
+        buffer_bytes += allocated;
+        total_used_memory += allocated;
         buffer.setLRUID(lru_cache.Insert(buffer_id, frame_tick));
     } else {
-        buffer_bytes -= Common::AlignUp(size, 1024);
-        total_used_memory -= Common::AlignUp(size, 1024);
+        buffer_bytes -= allocated;
+        total_used_memory -= allocated;
         lru_cache.Free(buffer.getLRUID());
     }
     const DAddr device_addr_begin = buffer.CpuAddr();
@@ -3621,6 +3745,37 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     replace(channel_state->compute_uniform_buffers);
     replace(channel_state->compute_storage_buffers);
 
+    // Ocarina uses several GPU channels. A deleted slot must not survive in another channel's
+    // bindings and later resolve to an unrelated buffer that reuses the same id.
+    for (const size_t other_id : this->active_channel_ids) {
+        auto& other = this->channel_storage[other_id];
+        if (&other == channel_state) {
+            continue;
+        }
+        auto& other_flags = other.maxwell3d.dirty.flags;
+        if (other.index_buffer.buffer_id == buffer_id) {
+            other.index_buffer.buffer_id = BufferId{};
+            other_flags[Dirty::IndexBuffer] = true;
+        }
+        for (u32 index = 0; index < other.vertex_buffers.size(); ++index) {
+            if (other.vertex_buffers[index].buffer_id == buffer_id) {
+                other.vertex_buffers[index].buffer_id = BufferId{};
+                other_flags[Dirty::VertexBuffers] = true;
+                other_flags[Dirty::VertexBuffer0 + index] = true;
+            }
+        }
+        std::ranges::for_each(other.uniform_buffers, replace);
+        std::ranges::for_each(other.storage_buffers, replace);
+        replace(other.transform_feedback_buffers);
+        replace(other.compute_uniform_buffers);
+        replace(other.compute_storage_buffers);
+        if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
+            other.dirty_uniform_buffers.fill(~u32{0});
+            other.uniform_buffer_binding_sizes.fill({});
+        }
+        other.has_deleted_buffers = true;
+    }
+
     // Adapted from the pre-refresh branch: merged buffers invalidate segment references too.
     InvalidateMultiRangeSegments(std::span{graphics_segments}, buffer_id);
     InvalidateMultiRangeSegments(std::span{compute_segments}, buffer_id);
@@ -3720,11 +3875,13 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         (raw_next_qword >> 32) == 0 ? static_cast<u64>(static_cast<u32>(raw_next_qword)) : 0ULL;
     // Every draw rebinds each storage buffer: the layout lookup (a mutex), the range walk and
     // two page walks cost Ocarina's GPU thread ~6%. Answers hold until the page table changes.
+    const u32 alignment = runtime.GetStorageBufferAlignment();
     struct CachedBinding {
         size_t owner; ///< MemoryManager id + 1, 0 when empty
         GPUVAddr gpu_addr;
         u64 next_qword;
         u64 serial;
+        u32 alignment;
         u32 flags;
         Binding binding;
     };
@@ -3738,16 +3895,67 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     for (size_t way = 0; way < Ways; ++way) {
         const CachedBinding& cached = set[way];
         if (cached.owner == owner && cached.gpu_addr == gpu_addr &&
-            cached.next_qword == next_qword && cached.flags == flags && cached.serial == serial) {
+            cached.next_qword == next_qword && cached.serial == serial &&
+            cached.alignment == alignment && cached.flags == flags) {
             const Binding hit = cached.binding;
             std::rotate(set.begin(), set.begin() + way, set.begin() + way + 1);
             return hit;
         }
     }
+    // Per-object pointers into one pool miss the cache above on every new object. A pool is
+    // a pointer's kind range and device run: later pointers inside it read their layout size,
+    // contiguous size and device address from it while the mappings stay (EDEN_NX2_BUFCACHE_POOLS).
+    struct Pool {
+        size_t owner{};
+        u64 serial{};
+        GPUVAddr begin{};
+        GPUVAddr kind_end{};  ///< [begin, kind_end) lies in one kind map entry, not INVALID
+        GPUVAddr run_end{};   ///< [begin, run_end) is one device run
+        bool run_end_exact{}; ///< false: the run goes on past run_end (only 64 MiB were asked)
+        DAddr device_begin{};
+    };
+    static const bool pool_ranges = [] {
+        const char* const value = std::getenv("EDEN_NX2_BUFCACHE_POOLS");
+        return value == nullptr || value[0] != '0';
+    }();
+    thread_local std::array<Pool, 8> pools{};
+    thread_local u32 pool_cursor{};
+    const Pool* pool = nullptr;
+    if (pool_ranges) {
+        for (const Pool& entry : pools) {
+            if (entry.owner == owner && entry.serial == serial && entry.begin <= gpu_addr &&
+                gpu_addr < entry.kind_end && gpu_addr < entry.run_end) {
+                pool = &entry;
+                break;
+            }
+        }
+        if (pool == nullptr) {
+            constexpr u64 run_query = 64_MiB;
+            const size_t layout = gpu_memory->GetMemoryLayoutSize(gpu_addr);
+            const size_t run = layout != 0 ? gpu_memory->MaxContinuousRange(gpu_addr, run_query) : 0;
+            const std::optional<DAddr> device = run != 0 ? gpu_memory->GpuToCpuAddress(gpu_addr)
+                                                         : std::nullopt;
+            if (device) {
+                Pool& entry = pools[pool_cursor++ % pools.size()];
+                entry = Pool{
+                    .owner = owner,
+                    .serial = serial,
+                    .begin = gpu_addr,
+                    .kind_end = gpu_addr + layout,
+                    .run_end = gpu_addr + run,
+                    .run_end_exact = run < run_query,
+                    .device_begin = *device,
+                };
+                pool = &entry;
+            }
+        }
+    }
     const Binding binding = [&]() -> Binding {
         u32 size = [&]() {
             const u32 memory_layout_size = static_cast<u32>((std::min)(
-                u64{gpu_memory->GetMemoryLayoutSize(gpu_addr)}, u64{(std::numeric_limits<u32>::max)()}));
+                pool != nullptr ? u64{pool->kind_end - gpu_addr}
+                                : u64{gpu_memory->GetMemoryLayoutSize(gpu_addr)},
+                u64{(std::numeric_limits<u32>::max)()}));
             // A pointer read from a table in memory is the base of an object pool, read anywhere in
             // it: bound to the end of its mapping, as far as a storage buffer may reach (at most
             // 1 GiB). Ocarina of Time's grass instances lie 12-18 MiB past theirs (an 8 MiB cap
@@ -3777,21 +3985,34 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         if ((native_pointer || table_pointer) && size != 0) {
             // Stop where the mapping or its device range does: the binding is one device range, and
             // a written one isn't split into separate ranges without sparse sources.
-            size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
+            if (pool != nullptr && (pool->run_end_exact || gpu_addr + size <= pool->run_end)) {
+                size = static_cast<u32>((std::min<u64>)(size, pool->run_end - gpu_addr));
+            } else {
+                size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
+            }
         }
 
         // Alignment only applies to the offset of the buffer
-        const u32 alignment = runtime.GetStorageBufferAlignment();
         const GPUVAddr aligned_gpu_addr = Common::AlignDown(gpu_addr, alignment);
         const u32 aligned_size = static_cast<u32>(gpu_addr - aligned_gpu_addr) + size;
 
-        const std::optional<DAddr> aligned_device_addr =
-            gpu_memory->GpuToCpuAddress(aligned_gpu_addr);
+        // Inside a run, device addresses follow GPU addresses (above the device space, the
+        // translation reports nothing: leave those to it).
+        const auto translate = [&](GPUVAddr address) -> std::optional<DAddr> {
+            if (pool != nullptr && address >= pool->begin) {
+                const DAddr device = pool->device_begin + (address - pool->begin);
+                if ((device >> Tegra::MaxwellDeviceMemoryManager::AS_BITS) == 0) {
+                    return device;
+                }
+            }
+            return gpu_memory->GpuToCpuAddress(address);
+        };
+        const std::optional<DAddr> aligned_device_addr = translate(aligned_gpu_addr);
         if (!aligned_device_addr || size == 0) {
             LOG_DEBUG(HW_GPU, "Failed to find storage buffer for cbuf index {}", cbuf_index);
             return NULL_BINDING;
         }
-        const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+        const std::optional<DAddr> device_addr = translate(gpu_addr);
         ASSERT_MSG(device_addr, "Unaligned storage buffer address not found for cbuf index {}",
                    cbuf_index);
         // The end address used for size calculation does not need to be aligned
@@ -3809,7 +4030,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         };
     }();
     std::rotate(set.begin(), set.end() - 1, set.end());
-    set[0] = {owner, gpu_addr, next_qword, serial, flags, binding};
+    set[0] = {owner, gpu_addr, next_qword, serial, alignment, flags, binding};
     return binding;
 }
 

@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -15,6 +17,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "common/logging.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -45,6 +48,33 @@ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 256_MiB;
 // against the end of the buffer ("argument c3[0] ... has space for 26624 bytes, but argument has a
 // length(65536)"). The tail is never handed out, so every binding has the full 64 KiB behind it.
 constexpr VkDeviceSize STREAM_BUFFER_TAIL = 64_KiB;
+
+VkDeviceSize GetReBarHeapSize(const Device& device) {
+    VkDeviceSize rebar_size = 0;
+    const auto memory_props = device.GetPhysical().GetMemoryProperties().memoryProperties;
+    constexpr VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (size_t i = 0; i < memory_props.memoryTypeCount; ++i) {
+        const auto& type = memory_props.memoryTypes[i];
+        if ((type.propertyFlags & required) == required) {
+            rebar_size = (std::max)(rebar_size, memory_props.memoryHeaps[type.heapIndex].size);
+        }
+    }
+    return rebar_size;
+}
+
+bool CheckReBarSupport(const Device& device) {
+    return GetReBarHeapSize(device) >= 1_GiB;
+}
+
+bool IsRebarUploadEnabled(const Device& device) {
+    const char* env = std::getenv("EDEN_NX2_REBAR_UPLOAD");
+    if (env != nullptr) {
+        return std::strcmp(env, "0") != 0;
+    }
+    return CheckReBarSupport(device);
+}
 
 size_t GetStreamBufferSize(const Device& device) {
     if (!device.HasDebuggingToolAttached()) {
@@ -90,6 +120,12 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
       stream_buffer_size{GetStreamBufferSize(device)}, region_size{stream_buffer_size /
                                                                    StagingBufferPool::NUM_SYNCS} {
+    use_rebar = IsRebarUploadEnabled(device);
+    const VkDeviceSize rebar_heap = GetReBarHeapSize(device);
+    LOG_INFO(Render_Vulkan,
+             "PCIe ReBAR upload staging: {} (device-local host-visible coherent heap: {} MiB)",
+             use_rebar ? "enabled" : "disabled", rebar_heap / 1_MiB);
+
     VkBufferCreateInfo stream_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
@@ -116,6 +152,10 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     }
     stream_pointer = stream_buffer.Mapped();
     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
+
+    current_chunk.offset.store(0, std::memory_order_relaxed);
+    current_chunk.limit.store(0, std::memory_order_relaxed);
+    current_chunk.blocked_tick.store(0, std::memory_order_relaxed);
 }
 
 StagingBufferPool::~StagingBufferPool() = default;
@@ -150,55 +190,114 @@ void StagingBufferPool::TickFrame() {
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
-    if (AreRegionsActive(Region(free_iterator) + 1,
-                         (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
-        // Avoid waiting for the previous usages to be free
-        return GetStagingBuffer(size, MemoryUsage::Upload);
+    // Fast path: if the requested size fits in the currently validated chunk,
+    // allocate directly via lock-free bump without scanning or semaphore queries.
+    size_t cur = current_chunk.offset.load(std::memory_order_relaxed);
+    const size_t limit = current_chunk.limit.load(std::memory_order_relaxed);
+    while (cur + size <= limit) {
+        const size_t next = Common::AlignUp(cur + size, MAX_ALIGNMENT);
+        if (current_chunk.offset.compare_exchange_weak(cur, next, std::memory_order_relaxed)) {
+            iterator = next;
+            return StagingBufferRef{
+                .buffer = *stream_buffer,
+                .device_address = stream_buffer_address,
+                .offset = static_cast<VkDeviceSize>(cur),
+                .mapped_span = stream_pointer.subspan(cur, size),
+                .usage = MemoryUsage::Upload,
+                .log2_level = 0,
+                .index = 0,
+            };
+        }
     }
-    const u64 current_tick = scheduler.CurrentTick();
-    std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + Region(iterator),
-              current_tick);
-    used_iterator = iterator;
-    free_iterator = (std::max)(free_iterator, iterator + size);
 
-    if (iterator + size >= stream_buffer_size) {
+    // Slow path: crossing chunk boundary or blocked on unsignaled GPU tick.
+    u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+    const u64 blocked = current_chunk.blocked_tick.load(std::memory_order_relaxed);
+    if (blocked != 0) {
+        if (gpu_tick < blocked) {
+            scheduler.GetMasterSemaphore().Refresh();
+            gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+            if (gpu_tick < blocked) {
+                // Still waiting for previous GPU usage to complete; avoid scanning past known-unsignaled chunks
+                return GetStagingBuffer(size, MemoryUsage::Upload);
+            }
+        }
+        current_chunk.blocked_tick.store(0, std::memory_order_relaxed);
+    }
+
+    size_t cur_offset = current_chunk.offset.load(std::memory_order_relaxed);
+    const u64 current_tick = scheduler.CurrentTick();
+
+    if (cur_offset + size >= stream_buffer_size) {
+        // Wrap around to the beginning of the stream buffer
         std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + NUM_SYNCS,
                   current_tick);
         used_iterator = 0;
-        iterator = 0;
+        cur_offset = 0;
         free_iterator = size;
 
-        if (AreRegionsActive(0, Region(size) + 1)) {
-            // Avoid waiting for the previous usages to be free
+        const size_t wrap_end_region = (std::min)(Region(size) + 1, NUM_SYNCS);
+        if (AreRegionsActive(0, wrap_end_region)) {
+            return GetStagingBuffer(size, MemoryUsage::Upload);
+        }
+        current_chunk.offset.store(0, std::memory_order_relaxed);
+        current_chunk.limit.store(region_size, std::memory_order_relaxed);
+    }
+
+    const size_t req_region_end = (std::min)(Region(cur_offset + size) + 1, NUM_SYNCS);
+    const size_t check_region_begin = Region(free_iterator) + 1;
+    if (check_region_begin < req_region_end) {
+        if (AreRegionsActive(check_region_begin, req_region_end)) {
             return GetStagingBuffer(size, MemoryUsage::Upload);
         }
     }
-    const size_t offset = iterator;
-    iterator = Common::AlignUp(iterator + size, MAX_ALIGNMENT);
+
+    const size_t alloc_offset = cur_offset;
+    const size_t next_offset = Common::AlignUp(cur_offset + size, MAX_ALIGNMENT);
+    const size_t end_committed_region = Region(next_offset);
+    const size_t used_region = Region(used_iterator);
+    if (end_committed_region > used_region) {
+        std::fill(sync_ticks.begin() + used_region, sync_ticks.begin() + end_committed_region,
+                  current_tick);
+        used_iterator = end_committed_region * region_size;
+    }
+    free_iterator = (std::max)(free_iterator, cur_offset + size);
+
+    current_chunk.offset.store(next_offset, std::memory_order_relaxed);
+    iterator = next_offset;
+
+    // Fast-path limit expands to the boundary of the region where next_offset currently resides
+    const size_t new_limit = (std::min)((Region(next_offset) + 1) * region_size, stream_buffer_size);
+    current_chunk.limit.store(new_limit, std::memory_order_relaxed);
+
     return StagingBufferRef{
         .buffer = *stream_buffer,
         .device_address = stream_buffer_address,
-        .offset = static_cast<VkDeviceSize>(offset),
-        .mapped_span = stream_pointer.subspan(offset, size),
-        .usage{},
-        .log2_level{},
-        .index{},
+        .offset = static_cast<VkDeviceSize>(alloc_offset),
+        .mapped_span = stream_pointer.subspan(alloc_offset, size),
+        .usage = MemoryUsage::Upload,
+        .log2_level = 0,
+        .index = 0,
     };
 }
 
 bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end) const {
-    u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
-    const auto has_active = [&](u64 tick) {
-        return std::any_of(sync_ticks.begin() + region_begin, sync_ticks.begin() + region_end,
-                           [tick](u64 sync_tick) { return tick < sync_tick; });
-    };
-    if (!has_active(gpu_tick)) {
+    if (region_begin >= region_end) {
         return false;
     }
-    scheduler.GetMasterSemaphore().Refresh();
-    gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
-    return has_active(gpu_tick);
-};
+    u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+    for (size_t r = region_begin; r < region_end; ++r) {
+        if (gpu_tick < sync_ticks[r]) {
+            scheduler.GetMasterSemaphore().Refresh();
+            gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+            if (gpu_tick < sync_ticks[r]) {
+                current_chunk.blocked_tick.store(sync_ticks[r], std::memory_order_relaxed);
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage usage,
                                                      bool deferred) {
@@ -224,6 +323,9 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
         if (gpu_tick == cache_level.known_busy_gpu_tick) {
             return std::nullopt;
         }
+    }
+    if (cache_level.iterate_index >= entries.size()) {
+        cache_level.iterate_index = 0;
     }
     const auto find_with_tick = [&](u64 tick) {
         const auto is_free = [tick](const StagingBuffer& entry) {
@@ -252,7 +354,8 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
             return std::nullopt;
         }
     }
-    cache_level.iterate_index = std::distance(entries.begin(), it) + 1;
+    cache_level.iterate_index =
+        (static_cast<size_t>(std::distance(entries.begin(), it)) + 1) % entries.size();
     it->tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick();
     ASSERT(!it->deferred);
     it->deferred = deferred;
@@ -285,7 +388,11 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
     if (device.IsBufferDeviceAddressSupported()) {
         buffer_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
-    vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+    const MemoryUsage alloc_usage =
+        (use_rebar && usage == MemoryUsage::Upload && (1ULL << log2_size) <= 1_MiB)
+            ? MemoryUsage::Stream
+            : usage;
+    vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, alloc_usage);
     if (device.HasDebuggingToolAttached()) {
         ++buffer_index;
         buffer.SetObjectNameEXT(fmt::format("Staging Buffer {}", buffer_index).c_str());
@@ -297,7 +404,8 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         device.IsBufferDeviceAddressSupported()
             ? device.GetLogical().GetBufferDeviceAddress(*buffer)
             : VkDeviceAddress{};
-    StagingBuffer& entry = GetCache(usage)[log2_size].entries.emplace_back(StagingBuffer{
+    auto& staging = GetCache(usage)[log2_size];
+    StagingBuffer& entry = staging.entries.emplace_back(StagingBuffer{
         .buffer = std::move(buffer),
         .device_address = buffer_address,
         .mapped_span = mapped_span,
@@ -307,6 +415,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         .tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick(),
         .deferred = deferred,
     });
+    staging.iterate_index = 0;
     return entry.Ref();
 }
 
@@ -347,7 +456,7 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
             return scheduler.IsFree(entry.tick) && ++idle > KeepPerLevel;
         });
         staging.delete_index = 0;
-        if (staging.iterate_index > entries.size()) {
+        if (staging.iterate_index >= entries.size()) {
             staging.iterate_index = 0;
         }
         return;
@@ -367,7 +476,7 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     if (staging.delete_index >= new_size) {
         staging.delete_index = 0;
     }
-    if (staging.iterate_index > new_size) {
+    if (staging.iterate_index >= new_size) {
         staging.iterate_index = 0;
     }
 }

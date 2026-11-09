@@ -153,6 +153,10 @@ inline void LoadExperiments() {
         g_experiments[18].store(7, std::memory_order_relaxed);
         // EXP19 = 2: live pipeline lookup without Refresh, with #641 patches for blend/vertex input.
         g_experiments[19].store(2, std::memory_order_relaxed);
+        // EXP42 = 1 and EXP43 = 3: pooled VkImages for deleted render targets, and drifted
+        // per-frame render targets relocated in place.
+        g_experiments[42].store(1, std::memory_order_relaxed);
+        g_experiments[43].store(3, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {

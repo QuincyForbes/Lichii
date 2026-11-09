@@ -22,12 +22,12 @@ public:
         if (size == 0) {
             return;
         }
+        // Pages past the filter need no bits: Any answers "maybe" for every range reaching them.
         const u64 first = address >> PageBits;
-        const u64 last = (address + size - 1) >> PageBits;
-        if (last >= NumWords * 64) {
-            overflow.store(true, std::memory_order_relaxed);
+        if (first >= NumWords * 64) {
             return;
         }
+        const u64 last = (std::min)((address + size - 1) >> PageBits, NumWords * 64 - 1);
         for (u64 page = first; page <= last;) {
             const u64 bit = page % 64;
             const u64 count = (std::min<u64>)(64 - bit, last - page + 1);
@@ -47,7 +47,7 @@ public:
         }
         const u64 first = address >> PageBits;
         const u64 last = (address + size - 1) >> PageBits;
-        if (last >= NumWords * 64 || overflow.load(std::memory_order_relaxed)) {
+        if (last >= NumWords * 64 || last < first) {
             return true;
         }
         for (u64 page = first; page <= last;) {
@@ -66,7 +66,6 @@ private:
     static constexpr u64 PageBits = 12;
     static constexpr u64 NumWords = (u64{1} << (36 - PageBits)) / 64; // 2 MiB of bits
     std::unique_ptr<std::atomic<u64>[]> words;
-    std::atomic<bool> overflow{};
 };
 
 } // namespace VideoCommon

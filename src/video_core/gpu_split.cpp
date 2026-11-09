@@ -49,6 +49,24 @@ void Pause() {
 
 [[maybe_unused]] std::atomic<u32> g_back_thread_id{};
 
+// EDEN_NX2_RING_PREFETCH=0: the back reads each ring line only when it gets to it.
+const bool g_ring_prefetch = [] {
+    const char* value = std::getenv("EDEN_NX2_RING_PREFETCH");
+    return value == nullptr || value[0] != '0';
+}();
+/// How far ahead of the entry it runs the back prefetches ring words (16 lines).
+constexpr u64 RingPrefetchWords = 128;
+
+void PrefetchRingLine(const u64* address) {
+#if defined(__clang__) || defined(__GNUC__)
+    __builtin_prefetch(address, 0, 3);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_prefetch(reinterpret_cast<const char*>(address), _MM_HINT_T0);
+#else
+    (void)address;
+#endif
+}
+
 } // Anonymous namespace
 
 void GpuSplit::CheckOwner(const char* where) {
@@ -1145,8 +1163,21 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         u64 last_store = read_position;
+        // EDEN_NX2_RING_PREFETCH: the ring lines ahead of the entry, up to a line short of what
+        // the front published (a line it may still be writing would only bounce between the two
+        // cores). The front wrote them moments ago: they sit in its core's caches.
+        u64 prefetched = read_position;
         while (read_position != available) {
             const size_t index = read_position & RingMask;
+            if (g_ring_prefetch) {
+                const u64 ahead = (std::min)(read_position + RingPrefetchWords,
+                                             available > 8 ? available - 8 : u64{0});
+                prefetched = (std::max)(prefetched, read_position);
+                while (prefetched + 8 <= ahead) {
+                    prefetched += 8;
+                    PrefetchRingLine(&ring[prefetched & RingMask]);
+                }
+            }
             back_entry_position = read_position;
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));

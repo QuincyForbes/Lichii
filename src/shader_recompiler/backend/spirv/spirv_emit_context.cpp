@@ -1206,20 +1206,65 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         OpFunctionEnd();
         return func_id;
     }};
+    std::array<bool, 6> used_rw{};
+    for (const IR::Block* const block : program.blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            switch (inst.GetOpcode()) {
+            case IR::Opcode::LoadGlobalU8:
+            case IR::Opcode::LoadGlobalS8:
+            case IR::Opcode::LoadGlobalU16:
+            case IR::Opcode::LoadGlobalS16:
+            case IR::Opcode::LoadGlobal32:
+                used_rw[0] = true;
+                break;
+            case IR::Opcode::WriteGlobalU8:
+            case IR::Opcode::WriteGlobalS8:
+            case IR::Opcode::WriteGlobalU16:
+            case IR::Opcode::WriteGlobalS16:
+            case IR::Opcode::WriteGlobal32:
+                used_rw[1] = true;
+                break;
+            case IR::Opcode::LoadGlobal64:
+                used_rw[2] = true;
+                break;
+            case IR::Opcode::WriteGlobal64:
+                used_rw[3] = true;
+                break;
+            case IR::Opcode::LoadGlobal128:
+                used_rw[4] = true;
+                break;
+            case IR::Opcode::WriteGlobal128:
+                used_rw[5] = true;
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    if (!profile.support_descriptor_aliasing) {
+        used_rw[0] = used_rw[0] || used_rw[2] || used_rw[4];
+        used_rw[1] = used_rw[1] || used_rw[3] || used_rw[5];
+    }
     const auto define{
-        [&](DefPtr ssbo_member, const StorageTypeDefinition& type_def, Id type, size_t size) {
+        [&](DefPtr ssbo_member, const StorageTypeDefinition& type_def, Id type, size_t size,
+            bool need_load, bool need_write) {
             const Id element_type{type_def.element};
             const u32 shift{static_cast<u32>(std::countr_zero(size))};
-            const Id load_func{define_load(ssbo_member, element_type, type, shift)};
-            const Id write_func{define_write(ssbo_member, element_type, type, shift)};
+            const Id load_func{need_load ? define_load(ssbo_member, element_type, type, shift)
+                                         : Id{}};
+            const Id write_func{need_write ? define_write(ssbo_member, element_type, type, shift)
+                                           : Id{}};
             return std::make_pair(load_func, write_func);
         }};
     std::tie(load_global_func_u32, write_global_func_u32) =
-        define(&StorageDefinitions::U32, storage_types.U32, U32[1], sizeof(u32));
+        define(&StorageDefinitions::U32, storage_types.U32, U32[1], sizeof(u32),
+               used_rw[0], used_rw[1]);
     std::tie(load_global_func_u32x2, write_global_func_u32x2) =
-        define(&StorageDefinitions::U32x2, storage_types.U32x2, U32[2], sizeof(u32[2]));
+        define(&StorageDefinitions::U32x2, storage_types.U32x2, U32[2], sizeof(u32[2]),
+               used_rw[2], used_rw[3]);
     std::tie(load_global_func_u32x4, write_global_func_u32x4) =
-        define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]));
+        define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]),
+               used_rw[4], used_rw[5]);
 
     if (!std::ranges::any_of(info.storage_buffers_descriptors, [&](const auto& descriptor) {
             return info.native_global_bounds || UsesNvnStorageDescriptor(info, descriptor);
@@ -1846,8 +1891,13 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         layer = DefineInput(*this, U32[1], false, spv::BuiltIn::Layer);
         Decorate(layer, spv::Decoration::Flat);
     }
+    const bool noperspective_as_smooth{
+        stage == Stage::Fragment && runtime_info.scaled_noperspective_inputs &&
+        std::ranges::any_of(info.interpolation, [](Interpolation mode) {
+            return mode == Interpolation::NoPerspective;
+        })};
     if (loads.AnyComponent(IR::Attribute::PositionX) ||
-        info.passthrough.AnyComponent(IR::Attribute::PositionX)) {
+        info.passthrough.AnyComponent(IR::Attribute::PositionX) || noperspective_as_smooth) {
         const bool is_fragment{stage == Stage::Fragment};
         if (!is_fragment && profile.has_broken_spirv_position_input) {
             need_input_position_indirect = true;
@@ -1957,7 +2007,12 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             case Interpolation::Smooth:
                 break;
             case Interpolation::NoPerspective:
-                Decorate(id, spv::Decoration::NoPerspective);
+                // The previous stage may write it times Position.w (noperspective_outputs).
+                if (!runtime_info.scaled_noperspective_inputs) {
+                    Decorate(id, spv::Decoration::NoPerspective);
+                } else {
+                    noperspective_as_smooth_inputs[index] = true;
+                }
                 break;
             case Interpolation::Flat:
                 Decorate(id, spv::Decoration::Flat);

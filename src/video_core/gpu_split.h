@@ -288,6 +288,17 @@ public:
 
     /// Makes what was sent visible to the back.
     void Publish();
+    /// EDEN_NX2_PUBLISH_WAITS: before the front yields or sleeps, sends the held-back work and
+    /// publishes, so the back doesn't idle on work the front already decoded.
+    void PublishBeforeWait() {
+        static const bool publish_waits = [] {
+            const char* value = std::getenv("EDEN_NX2_PUBLISH_WAITS");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (publish_waits) {
+            Publish();
+        }
+    }
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
 
