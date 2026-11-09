@@ -1467,6 +1467,14 @@ extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
             state->ios_paused_for_background = true;
         }
         break;
+#ifdef LICHII_IOS_UI
+    case SDL_EVENT_DROP_FILE:
+        // SDL reports URLs and files opened with the app this way.
+        if (state->ios_config && event->drop.data != nullptr) {
+            IosFrontend::OpenUrl(event->drop.data);
+        }
+        break;
+#endif
     case SDL_EVENT_LOW_MEMORY:
         LOG_WARNING(Frontend, "iOS: low memory warning ({} MiB left to this process)",
                     os_proc_available_memory() >> 20);

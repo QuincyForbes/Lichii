@@ -207,7 +207,7 @@ private struct GameRow: View {
 
 private struct RecentRow: View {
     let games: [Game]
-    let open: (Game) -> Void
+    let open: @MainActor (Game) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {

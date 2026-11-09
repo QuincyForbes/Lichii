@@ -167,7 +167,11 @@ typedef enum LichiiEvent {
     LICHII_EVENT_GAME_WINDOW_READY,  ///< the render window exists: overlays can be attached
     LICHII_EVENT_MENU_REQUESTED,     ///< a controller or overlay asked for the in-game menu
     LICHII_EVENT_CONTROLLERS_CHANGED,
+    LICHII_EVENT_OPEN_URL, ///< a URL or file was opened with the app: lichii_take_open_url
 } LichiiEvent;
+
+/// The URL (lichii://game?id=<title id>) or file path opened with the app, or "" when none.
+char* lichii_take_open_url(void);
 
 typedef void (*LichiiEventFn)(int32_t event);
 /// Events arrive on the main thread.

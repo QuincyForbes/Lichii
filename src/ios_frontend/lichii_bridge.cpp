@@ -63,6 +63,7 @@ std::string g_error;
 std::string g_game_path;
 u64 g_program_id{};
 void* g_game_window{};
+std::string g_open_url;
 
 // Loader and patch manager calls share the system's filesystem objects.
 std::mutex g_loader_mutex;
@@ -225,6 +226,14 @@ void PostEvent(LichiiEvent event) {
                              handler(static_cast<int32_t>(reinterpret_cast<intptr_t>(context)));
                          }
                      });
+}
+
+void OpenUrl(std::string url) {
+    {
+        std::scoped_lock lock{g_mutex};
+        g_open_url = std::move(url);
+    }
+    PostEvent(LICHII_EVENT_OPEN_URL);
 }
 
 void SetJitPoolBytes(u64 bytes) {
@@ -850,6 +859,11 @@ void lichii_set_event_handler(LichiiEventFn handler) {
 
 void lichii_post_event(int32_t event) {
     PostEvent(static_cast<LichiiEvent>(event));
+}
+
+char* lichii_take_open_url(void) {
+    std::scoped_lock lock{g_mutex};
+    return Dup(std::exchange(g_open_url, std::string{}));
 }
 
 /* ------------------------------------------------------------------------------------ JIT */

@@ -56,6 +56,8 @@ void RestoreGlobal();
 u64 ReadProgramId(const std::string& path);
 
 void PostEvent(LichiiEvent event);
+/// A URL or file the system opened with the app (SDL_EVENT_DROP_FILE).
+void OpenUrl(std::string url);
 
 /// Pool size the frontend asked the JIT for.
 void SetJitPoolBytes(u64 bytes);

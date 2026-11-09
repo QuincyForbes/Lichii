@@ -106,10 +106,30 @@ final class AppController: ObservableObject {
             gameWindowReady()
         case Int32(LICHII_EVENT_MENU_REQUESTED.rawValue):
             presentInGameMenu()
+        case Int32(LICHII_EVENT_OPEN_URL.rawValue):
+            open(Bridge.string(lichii_take_open_url()))
         default:
             break
         }
         AppExtensions.eventHandlers.forEach { $0(event) }
+    }
+
+    /// lichii://game?id=<title id> launches a game from the library; a file opened with the app is
+    /// imported.
+    private func open(_ text: String) {
+        guard !text.isEmpty else { return }
+        if let url = URL(string: text), url.scheme == "lichii" {
+            let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first { $0.name == "id" }?.value?.uppercased()
+            if url.host == "game", let id, let game = library.games.first(where: { $0.programIdHex == id }) {
+                launch(game)
+            }
+            return
+        }
+        let file = text.hasPrefix("file://") ? URL(string: text) : URL(fileURLWithPath: text)
+        if let file {
+            library.importItems([file])
+        }
     }
 
     private func stateChanged() {

@@ -103,6 +103,9 @@ final class GameLibrary: ObservableObject {
                     if scoped { url.stopAccessingSecurityScopedResource() }
                 }
                 let target = destination.appendingPathComponent(url.lastPathComponent)
+                if target.standardizedFileURL.path == url.standardizedFileURL.path {
+                    continue
+                }
                 do {
                     if manager.fileExists(atPath: target.path) {
                         try manager.removeItem(at: target)
