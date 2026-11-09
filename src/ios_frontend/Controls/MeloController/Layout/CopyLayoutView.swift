@@ -123,6 +123,7 @@ struct EditableButtonView: View {
                     ButtonView(controller: controller, button: button, layout: $layout, gameId: gameId)
                         .scaleEffect(layout.buttons[button.id]?.scale ?? 1.0)
                         .offset(layout.buttons[button.id]?.offset ?? .zero)
+                        .opacity(layout.buttons[button.id]?.opacity ?? 1.0)
                 }
             }
         }

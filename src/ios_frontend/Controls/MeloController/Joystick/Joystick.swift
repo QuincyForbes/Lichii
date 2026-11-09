@@ -209,7 +209,9 @@ final class JoystickView: UIView {
             )
 
             if !didHitEdge {
-                edgeImpact.impactOccurred(intensity: 0.55)
+                if UserDefaults.standard.object(forKey: "On-ScreenControllerHaptics") as? Bool ?? true {
+                    edgeImpact.impactOccurred(intensity: 0.55)
+                }
                 didHitEdge = true
             }
         } else {

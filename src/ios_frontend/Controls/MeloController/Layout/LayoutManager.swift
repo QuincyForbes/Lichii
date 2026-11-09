@@ -35,9 +35,12 @@ public class LayoutExporter {
                                    conformingTo: .data)
 }
 
-class LayoutManager {
-    static let shared = LayoutManager()
+public class LayoutManager {
+    public static let shared = LayoutManager()
     private init() {}
+
+    /// Lichii: portrait layouts are stored next to the landscape ones as <game>.portrait.json.
+    public var portrait = false
 
     private var baseURL: URL {
         let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -45,7 +48,8 @@ class LayoutManager {
     }
 
     private func fileURL(for gameId: String?) -> URL {
-        let fileName = gameId?.isEmpty == false ? "\(gameId!).json" : "default.json"
+        let base = gameId?.isEmpty == false ? gameId! : "default"
+        let fileName = portrait ? "\(base).portrait.json" : "\(base).json"
         return baseURL.appendingPathComponent(fileName)
     }
 
@@ -53,12 +57,12 @@ class LayoutManager {
         try? FileManager.default.createDirectory(at: baseURL, withIntermediateDirectories: true)
     }
 
-    func save(_ layout: LayoutConfig, for gameId: String? = nil) {
+    public func save(_ layout: LayoutConfig, for gameId: String? = nil) {
         ensureDirectoryExists()
         try? JSONEncoder().encode(layout).write(to: fileURL(for: gameId))
     }
 
-    func load(for gameId: String? = nil) -> LayoutConfig {
+    public func load(for gameId: String? = nil) -> LayoutConfig {
         let url = fileURL(for: gameId)
         guard let data = try? Data(contentsOf: url),
               let config = try? JSONDecoder().decode(LayoutConfig.self, from: data) else {
@@ -79,23 +83,23 @@ class LayoutManager {
         return legacyConfig
     }
 
-    func reset(for gameId: String? = nil) {
+    public func reset(for gameId: String? = nil) {
         try? FileManager.default.removeItem(at: fileURL(for: gameId))
     }
 
-    func resetAll() {
+    public func resetAll() {
         try? FileManager.default.removeItem(at: baseURL)
     }
 
-    func hasCustomLayout(for gameId: String) -> Bool {
+    public func hasCustomLayout(for gameId: String) -> Bool {
         FileManager.default.fileExists(atPath: fileURL(for: gameId).path)
     }
 
-    func copyLayout(from sourceGameId: String?, to targetGameId: String?) {
+    public func copyLayout(from sourceGameId: String?, to targetGameId: String?) {
         save(load(for: sourceGameId), for: targetGameId)
     }
 
-    func getAllGameLayouts() -> [String] {
+    public func getAllGameLayouts() -> [String] {
         ensureDirectoryExists()
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: baseURL,
@@ -103,12 +107,13 @@ class LayoutManager {
         ) else { return [] }
         return files.compactMap { url in
             let filename = url.lastPathComponent
-            guard filename.hasSuffix(".json"), filename != "default.json" else { return nil }
+            guard filename.hasSuffix(".json"), !filename.hasSuffix(".portrait.json"),
+                  filename != "default.json" else { return nil }
             return String(filename.dropLast(5))
         }
     }
 
-    func exportLayout(for gameId: String? = nil) throws -> Data {
+    public func exportLayout(for gameId: String? = nil) throws -> Data {
         let layout = load(for: gameId)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -118,13 +123,13 @@ class LayoutManager {
         return data
     }
 
-    func exportFileName(for gameId: String? = nil) -> String {
+    public func exportFileName(for gameId: String? = nil) -> String {
         let base = gameId?.isEmpty == false ? gameId! : "default"
         return "\(base).\(LayoutExporter.fileType)"
     }
 
     @discardableResult
-    func importLayout(from data: Data, for gameId: String? = nil) throws -> LayoutConfig {
+    public func importLayout(from data: Data, for gameId: String? = nil) throws -> LayoutConfig {
         do {
             let layout = try JSONDecoder().decode(LayoutConfig.self, from: data)
             save(layout, for: gameId)

@@ -66,4 +66,7 @@ public extension VirtualControllerButton {
     static let dPadRight = Self("dPadRight", systemName: "arrowtriangle.right.circle.fill")
     static let leftTrigger = Self("leftTrigger", systemName: "zl.rectangle.roundedtop.fill", trigger: true)
     static let rightTrigger = Self("rightTrigger", systemName: "zr.rectangle.roundedtop.fill", trigger: true)
+    // Lichii
+    static let home = Self("home", systemName: "house.circle.fill", small: true)
+    static let capture = Self("capture", systemName: "camera.circle.fill", small: true)
 }

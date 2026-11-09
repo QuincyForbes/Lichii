@@ -50,6 +50,7 @@ public struct ControllerView: View {
     var controller: any Controller
     @StateObject var controllerHandler = ControllerHandler()
     @AppStorage("On-ScreenControllerScale") private var controllerScale: Double = 1.0
+    @AppStorage("On-ScreenControllerOpacity") private var controllerOpacity: Double = 1.0
     @AppStorage("stickButton") private var stickButton = false
     @State private var hideDpad = false
     @State private var hideABXY = false
@@ -103,14 +104,19 @@ public struct ControllerView: View {
         controller: any Controller,
         isEditing: Bool,
         gameId: String? = nil,
-        gameName: String? = nil
+        gameName: String? = nil,
+        onEditingChanged: ((Bool) -> Void)? = nil
     ) {
         self.isEditingInput = isEditing
         self._isEditing = State(initialValue: isEditing)
         self.gameId = gameId
         self.gameName = gameName
         self.controller = controller
+        self.onEditingChanged = onEditingChanged
     }
+
+    /// Lichii: tells the host when the editor's Done button ends edit mode.
+    private var onEditingChanged: ((Bool) -> Void)?
 
 
     @State private var layout: LayoutConfig = LayoutConfig()
@@ -130,10 +136,24 @@ public struct ControllerView: View {
                 }
             }
             .padding()
+            .opacity(isEditing ? 1 : controllerOpacity)
             .onChange(of: verticalSizeClass) { _ in controllerHandler.updateOrientation() }
+            .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
+                controllerHandler.updateOrientation()
+            }
+            .onChange(of: controllerHandler.isPortrait) { portrait in
+                // Lichii: portrait and landscape keep separate layouts.
+                if isEditing {
+                    LayoutManager.shared.save(layout, for: gameId)
+                }
+                LayoutManager.shared.portrait = portrait
+                loadLayout()
+            }
             .onChange(of: isEditingInput) { isEditing = $0 }
+            .onChange(of: isEditing) { onEditingChanged?($0) }
             .onAppear {
                 controllerHandler.updateOrientation()
+                LayoutManager.shared.portrait = controllerHandler.isPortrait
                 loadLayout()
             }
 
@@ -182,12 +202,6 @@ public struct ControllerView: View {
 
     private func loadLayout() {
         layout = LayoutManager.shared.load(for: gameId)
-
-        let legacyLayout = LayoutManager.shared.loadLegacy(for: gameId)
-        if !legacyLayout.isEmpty && layout.buttons.isEmpty {
-            layout.buttons = legacyLayout
-            LayoutManager.shared.save(layout, for: gameId)
-        }
     }
 
     private var portraitLayout: some View {
@@ -231,20 +245,20 @@ public struct ControllerView: View {
                     HStack(spacing: 60) {
                         HStack {
                             editableButton(.leftStick).padding()
-                            editableButton(.back)
+                            minusGroup
                         }
                         HStack {
-                            editableButton(.start)
+                            plusGroup
                             editableButton(.rightStick).padding()
                         }
                     }
                 } else {
                     HStack(spacing: 60) {
                         HStack {
-                            editableButton(.back)
+                            minusGroup
                         }
                         HStack {
-                            editableButton(.start)
+                            plusGroup
                         }
                     }
                 }
@@ -306,17 +320,17 @@ public struct ControllerView: View {
                     .padding(.top, 30)
 
                     HStack(spacing: 50) {
-                        editableButton(.back)
+                        minusGroup
                         Spacer()
-                        editableButton(.start)
+                        plusGroup
                     }
                 }
                 .padding(.bottom, 20)
             } else {
                 HStack(spacing: 50) {
-                    editableButton(.back)
+                    minusGroup
                     Spacer()
-                    editableButton(.start)
+                    plusGroup
                 }
                 .padding(.bottom, 20)
             }
@@ -324,6 +338,21 @@ public struct ControllerView: View {
     }
 
     // MARK: - Button Groups
+
+    // Lichii: Capture next to -, Home next to +.
+    private var minusGroup: some View {
+        HStack(spacing: 14) {
+            editableButton(.back)
+            editableButton(.capture)
+        }
+    }
+
+    private var plusGroup: some View {
+        HStack(spacing: 14) {
+            editableButton(.home)
+            editableButton(.start)
+        }
+    }
 
     private var shoulderButtonsLeft: some View {
         HStack(spacing: 20) {

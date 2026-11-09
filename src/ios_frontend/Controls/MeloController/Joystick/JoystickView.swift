@@ -79,6 +79,8 @@ struct EditableJoystickView: View {
                 .frame(width: 160, height: 160)
                 .scaleEffect((layout.joysticks[id]?.scale ?? 1.0) * controllerScale)
                 .offset(layout.joysticks[id]?.offset ?? .zero)
+                .opacity((layout.joysticks[id]?.hidden ?? false) ? 0 : (layout.joysticks[id]?.opacity ?? 1.0))
+                .allowsHitTesting(!(layout.joysticks[id]?.hidden ?? false))
         }
     }
 }

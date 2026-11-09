@@ -26,6 +26,8 @@ class JoystickDPadUIHandler: ObservableObject {
 struct LayoutEditorView: View {
     @AppStorage("On-ScreenControllerScale") private var controllerScale: Double = 1.0
     @AppStorage("buttonSlide") private var buttonSlide = true
+    @AppStorage("On-ScreenControllerOpacity") private var controllerOpacity: Double = 1.0
+    @AppStorage("On-ScreenControllerHaptics") private var controllerHaptics = true
     @StateObject var joystickDpad = JoystickDPadUIHandler()
 
     @Binding var hideDpad: Bool
@@ -192,6 +194,15 @@ struct LayoutEditorView: View {
                 subtitle: "Slide a finger straight from one button to the next.",
                 isOn: $buttonSlide
             )
+
+            EditorSliderRow(
+                title: "Controller Opacity",
+                value: Binding(get: { CGFloat(controllerOpacity) }, set: { controllerOpacity = Double($0) }),
+                range: 0.1...1.0,
+                format: "%.1f"
+            )
+
+            EditorToggleRow(title: "Haptic Feedback", isOn: $controllerHaptics)
         }
     }
 
@@ -214,6 +225,16 @@ struct LayoutEditorView: View {
                     get: { layout.buttons[buttonId]?.scale ?? 1.0 },
                     set: { layout.buttons[buttonId, default: ButtonLayout()].scale = $0 }
                 )
+            )
+
+            EditorSliderRow(
+                title: "Opacity",
+                value: Binding(
+                    get: { CGFloat(layout.buttons[buttonId]?.opacity ?? 1.0) },
+                    set: { layout.buttons[buttonId, default: ButtonLayout()].opacity = Double($0) }
+                ),
+                range: 0.1...1.0,
+                format: "%.1f"
             )
 
             EditorToggleRow(
@@ -264,6 +285,16 @@ struct LayoutEditorView: View {
                     get: { layout.joysticks[joystickId]?.scale ?? 1.0 },
                     set: { layout.joysticks[joystickId, default: JoystickLayout()].scale = $0 }
                 )
+            )
+
+            EditorSliderRow(
+                title: "Opacity",
+                value: Binding(
+                    get: { CGFloat(layout.joysticks[joystickId]?.opacity ?? 1.0) },
+                    set: { layout.joysticks[joystickId, default: JoystickLayout()].opacity = Double($0) }
+                ),
+                range: 0.1...1.0,
+                format: "%.1f"
             )
 
             EditorToggleRow(
@@ -406,6 +437,7 @@ struct EditorSliderRow: View {
     @Binding var value: CGFloat
     var range: ClosedRange<CGFloat> = 0.5...2.0
     var step: CGFloat = 0.1
+    var format: String = "%.1f×"
 
     private func nudge(_ amount: CGFloat) {
         let next = (value + amount).rounded(toNearest: step)
@@ -420,7 +452,7 @@ struct EditorSliderRow: View {
                     .font(.caption.weight(.medium))
                     .foregroundColor(.secondary)
                 Spacer()
-                Text(String(format: "%.1f×", value))
+                Text(String(format: format, value))
                     .font(.caption.weight(.semibold).monospacedDigit())
                     .foregroundColor(.secondary)
             }
