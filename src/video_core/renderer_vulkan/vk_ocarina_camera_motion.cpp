@@ -106,8 +106,12 @@ constexpr std::array TEMPLATES{
                                     sizeof(DescriptorUpdateEntry), sizeof(DescriptorUpdateEntry)},
 };
 constexpr DescriptorBankInfo BANK{.textures = 1, .images = 1, .score = 2};
+struct CameraMotionParameters {
+    Matrix clip_to_previous_clip;
+    std::array<f32, 2> jitter; ///< the scene's viewport offset this frame (render pixels)
+};
 constexpr std::array PUSH_CONSTANTS{
-    VkPushConstantRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Matrix)},
+    VkPushConstantRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CameraMotionParameters)},
 };
 constexpr VkImageSubresourceRange MOTION_RANGE{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
@@ -116,7 +120,8 @@ struct ActorTransforms {
     std::array<f32, 16> previous;
     std::array<f32, 4> current_origin;
     std::array<f32, 4> previous_origin;
-    std::array<f32, 4> extent;
+    std::array<f32, 2> extent;
+    std::array<f32, 2> jitter; ///< the scene's viewport offset this frame (render pixels)
 };
 
 vk::Buffer UploadActorData(MemoryAllocator& allocator, std::span<const std::byte> data,
@@ -137,7 +142,8 @@ public:
     ActorOverlay(const Device& device, MemoryAllocator& allocator, const OcarinaActorMesh& mesh,
                  const ActorTransforms& transforms, VkImageView depth_view, VkSampler sampler,
                  VkImageView motion_view, VkExtent2D extent_)
-        : extent{extent_}, index_count{static_cast<u32>(mesh.indices.size())},
+        : extent{extent_}, jitter{transforms.jitter},
+          index_count{static_cast<u32>(mesh.indices.size())},
           vertex_bytes{mesh.vertices.size()}, vertex_address{mesh.vertex_address},
           index_address{mesh.index_address}, base_vertex{mesh.base_vertex},
           bound_depth_view{depth_view}, bound_sampler{sampler},
@@ -251,6 +257,7 @@ public:
         upload(current, std::as_bytes(mesh.current_bones));
         upload(previous, std::as_bytes(mesh.previous_bones));
         upload(uniform, std::as_bytes(std::span{&transforms, 1}));
+        jitter = transforms.jitter;
         if (depth_view != bound_depth_view || sampler != bound_sampler) {
             const VkDescriptorImageInfo depth{sampler, depth_view, VK_IMAGE_LAYOUT_GENERAL};
             const VkWriteDescriptorSet write{
@@ -273,6 +280,12 @@ public:
         }, VK_SUBPASS_CONTENTS_INLINE);
         cmd.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
         cmd.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *layout, 0, sets[0], {});
+        // Offset like the game's jittered draws, so the replay rasterizes the same samples and its
+        // depth matches the scene depth.
+        const VkViewport viewport{jitter[0], static_cast<f32>(extent.height) + jitter[1],
+                                  static_cast<f32>(extent.width), -static_cast<f32>(extent.height),
+                                  0, 1};
+        cmd.SetViewport(0, viewport);
         // Depth matches in the captured replay leveled off at this tolerance.
         constexpr u32 depth_tolerance = 16;
         cmd.PushConstants(*layout, VK_SHADER_STAGE_FRAGMENT_BIT, depth_tolerance);
@@ -316,12 +329,15 @@ private:
             .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
             .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
         };
-        const VkViewport viewport{0, static_cast<f32>(extent.height), static_cast<f32>(extent.width),
-                                  -static_cast<f32>(extent.height), 0, 1};
         const VkRect2D scissor{{0, 0}, extent};
         const VkPipelineViewportStateCreateInfo viewport_state{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-            .viewportCount = 1, .pViewports = &viewport, .scissorCount = 1, .pScissors = &scissor,
+            .viewportCount = 1, .pViewports = nullptr, .scissorCount = 1, .pScissors = &scissor,
+        };
+        const VkDynamicState dynamic_viewport = VK_DYNAMIC_STATE_VIEWPORT; // Draw: + jitter
+        const VkPipelineDynamicStateCreateInfo dynamic{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            .dynamicStateCount = 1, .pDynamicStates = &dynamic_viewport,
         };
         const VkPipelineRasterizationStateCreateInfo raster{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
@@ -344,12 +360,13 @@ private:
             .stageCount = static_cast<u32>(stages.size()), .pStages = stages.data(),
             .pVertexInputState = &vertex_input, .pInputAssemblyState = &assembly,
             .pViewportState = &viewport_state, .pRasterizationState = &raster,
-            .pMultisampleState = &samples, .pColorBlendState = &blend,
+            .pMultisampleState = &samples, .pColorBlendState = &blend, .pDynamicState = &dynamic,
             .layout = *layout, .renderPass = *render_pass, .basePipelineIndex = -1,
         });
     }
 
     VkExtent2D extent;
+    std::array<f32, 2> jitter; ///< ActorTransforms::jitter of the last upload
     u32 index_count;
     size_t vertex_bytes;
     GPUVAddr vertex_address{};
@@ -374,10 +391,10 @@ public:
                       OCARINA_CAMERA_MOTION_COMP_SPV) {}
 
     /// Fill camera motion from depth, then overwrite visible actor pixels with skinned motion.
-    void Record(Scheduler& scheduler, const void* descriptors, const Matrix& transform,
-                VkImage motion, VkExtent2D size,
+    void Record(Scheduler& scheduler, const void* descriptors,
+                const CameraMotionParameters& parameters, VkImage motion, VkExtent2D size,
                 const ActorOverlay* overlay) {
-        scheduler.Record([this, descriptors, transform, motion, size, overlay]
+        scheduler.Record([this, descriptors, parameters, motion, size, overlay]
                          (vk::CommandBuffer cmdbuf) {
             const VkMemoryBarrier read_depth{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -402,7 +419,7 @@ public:
             device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptors);
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
-            cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, transform);
+            cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, parameters);
             cmdbuf.Dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
             const VkMemoryBarrier to_overlay{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -911,7 +928,8 @@ VkImageView OcarinaUpscaler::CompositedView() const {
 bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView target, VkExtent2D extent,
                             VkExtent2D output_extent, VkExtent2D target_extent,
                             const Matrix& current, const Matrix& previous,
-                            const OcarinaActorMesh& mesh, VkImage depth_image, u64 frame) {
+                            const OcarinaActorMesh& mesh, VkImage depth_image, u64 frame,
+                            std::array<f32, 2> jitter) {
     auto& state = *impl;
     if (state.last_frame == frame || state.Failed()) {
         return false;
@@ -939,7 +957,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
     const VkSampler sampler = state.PointSampler();
     const ActorTransforms actor_transforms{
         current, previous, mesh.current_origin, mesh.previous_origin,
-        {static_cast<f32>(extent.width), static_cast<f32>(extent.height), 0, 0},
+        {static_cast<f32>(extent.width), static_cast<f32>(extent.height)}, jitter,
     };
     // Without Link's pose (dialogue, cutscenes, first person) the motion comes from the camera alone.
     const ActorOverlay* active_overlay = nullptr;
@@ -958,7 +976,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
     state.queue.AddSampledImage(depth, sampler);
     state.queue.AddImage(*resources.motion_view);
     resources.tick = state.scheduler.CurrentTick();
-    state.motion_pass.Record(state.scheduler, state.queue.UpdateData(), *transform,
+    state.motion_pass.Record(state.scheduler, state.queue.UpdateData(), {*transform, jitter},
                              *resources.motion, extent, active_overlay);
     state.queue.Acquire(state.scheduler, 2);
     state.queue.AddSampledImage(color, sampler);
@@ -1001,7 +1019,9 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
                                COLOR_RANGE, VK_IMAGE_ASPECT_COLOR_BIT},
             .render_size = extent,
             .upscale_size = output_extent,
-            .jitter = {0.0f, 0.0f},
+            // EDEN_NX2_DLSS_JITTER: the scene's offset this frame (1), or with y flipped (2).
+            .jitter = {jitter[0],
+                       VideoCommon::OcarinaDlssJitterMode() == 2 ? -jitter[1] : jitter[1]},
             .motion_vector_scale = {1.0f, 1.0f},
             .reset = reset,
             .depth_inverted = false,
@@ -1027,7 +1047,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
             .motion_vectors = *resources.motion_view,
             .render_size = extent,
             .upscale_size = output_extent,
-            .jitter = {0.0f, 0.0f},
+            .jitter = jitter,
             .motion_vector_scale = {1.0f, 1.0f},
             .frame_time_ms = elapsed,
             .reset = reset || elapsed > 250.0f,
@@ -1040,9 +1060,11 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
         state.last_evaluation = now;
         static const bool trace = std::getenv("EDEN_NX2_DLSS_CONTRACT_TRACE") != nullptr;
         if (trace || frame % 120 == 0 || reset) {
-            LOG_INFO(Render_Vulkan, "Ocarina FSR 3.1 evaluated frame={} {}x{} -> {}x{} reset={} effects={}",
+            LOG_INFO(Render_Vulkan,
+                     "Ocarina FSR 3.1 evaluated frame={} {}x{} -> {}x{} reset={} effects={} "
+                     "jitter=({:.3f},{:.3f})",
                      frame, extent.width, extent.height, output_extent.width, output_extent.height,
-                     reset || elapsed > 250.0f, bias_view != VK_NULL_HANDLE);
+                     reset || elapsed > 250.0f, bias_view != VK_NULL_HANDLE, jitter[0], jitter[1]);
         }
     }
     // A resize can submit the inputs before recording evaluation, so keep the later tick.

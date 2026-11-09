@@ -38,7 +38,10 @@ and should remain private. No shaders are skipped or game files changed by this 
 
 The Legend of Zelda: Ocarina of Time (`0400486024DEC000`) has no DLSS of its own. Its
 end-of-frame upscale pass is replaced with NVIDIA DLSS when the setting is on and Streamline
-has DLSS for the device. FSR is not used for this game, and no environment override is needed.
+has DLSS for the device. The "Ocarina of Time anti-aliasing" choice "AMD FSR 3.1" (off by
+default, any GPU with the needed Vulkan features) replaces the same pass with FSR 3.1 instead
+and wins over the DLSS setting; it also replaces the passes `c033c3ddc9f0897b` (full size) and
+`ef542df87cacfe9e` (3/4 scale), which DLSS leaves to the game.
 
 - Max Resolution add-on off: the 3/4-scale pass (`e40f5efb5480e692`) is replaced and DLSS
   writes the game's output size (1080p to 1440p docked, 810p to 1080p handheld).
@@ -51,6 +54,17 @@ has DLSS for the device. FSR is not used for this game, and no environment overr
   through this and the previous frame's camera (vertex constant buffer 3). Link's recognized
   skinned draw is replayed with both poses where his depth matches. Without his pose the frame
   keeps the camera motion. The input is tonemapped, so DLSS runs in LDR without auto exposure.
+- Jitter (FSR only; `EDEN_NX2_OOT_JITTER=0` turns it off): the game has no sub-pixel sample
+  sequence, so the host adds one. While FSR replaced the previous frame's upscale, every draw
+  that depth-tests against the scene depth at the scene size has its viewport offset by a
+  Halton (2,3) sub-pixel amount (AMD's phase count, 8 x (output / render width)^2: 18 for
+  1440p -> 4K, 8 for native anti-aliasing), and FSR gets the same offset as the frame's jitter.
+  Shadow maps, half-size passes, full-screen passes and frames the game upscales itself are not
+  offset. Camera motion is reconstructed at each depth sample's unjittered position, and the
+  replay of Link's draw is offset by the same amount, so the motion vectors carry no jitter.
+  DLSS and MetalFX get no jitter unless `EDEN_NX2_DLSS_JITTER=1` (or `2`, vertical sign
+  flipped) asks for it; that switch is an experiment and not measured.
+- No texture LOD bias is added for FSR (AMD recommends log2(render / output) - 1).
 - FXAA and SMAA are skipped on frames DLSS drew.
 - Any unexpected input, a busy frame slot, a rescaled image (resolution scale other than 1x) or
   a failed evaluation leaves the game's pass to run. The log names the reason as

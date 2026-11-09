@@ -48,6 +48,15 @@ TEST_CASE("OoT anti-aliasing choice picks the upscaler; DLSS keeps its setting",
     CHECK(static_cast<u32>(OotAntiAliasing::Fsr3) == 2);
 }
 
+TEST_CASE("OoT jitter uses AMD's phase count for the upscale ratio", "[video_core][ocarina]") {
+    using VideoCommon::OcarinaJitterPhases;
+    CHECK(OcarinaJitterPhases(2560, 3840) == 18);
+    CHECK(OcarinaJitterPhases(2560, 2560) == 8);
+    CHECK(OcarinaJitterPhases(1920, 3840) == 32);
+    CHECK(OcarinaJitterPhases(0, 3840) == 8);
+    CHECK_FALSE(VideoCommon::OcarinaJitterEnabled(VideoCommon::OcarinaUpscaleBackend::Native));
+}
+
 TEST_CASE("FSR temporal sharpness uses the existing stops slider", "[video_core][fsr][ocarina]") {
     CHECK(FSR::RcasSharpnessFromStops(0.0f) == 1.0f);
     CHECK(FSR::RcasSharpnessFromStops(0.81f) == 0.595f);
