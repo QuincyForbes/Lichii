@@ -344,6 +344,7 @@ struct System::Impl {
         // Setting changes may require a full system reinitialization (e.g., disabling multicore).
         ReinitializeIfNecessary(system);
         kernel.Initialize();
+        kernel_initialized = true;
     }
 
     SystemResultStatus SetupForApplicationProcess(System& system, Frontend::EmuWindow& emu_window) {
@@ -405,6 +406,15 @@ struct System::Impl {
         Common::g_wall_clock.SetGuestCNTFRQ(cntfrq);
         LOG_INFO(Core, "Guest counter frequency: {} Hz", cntfrq);
 
+        // A session whose teardown never finished (its emulation thread was terminated) still
+        // owns the kernel's objects. Initializing over it replaced the guest RAM they live in, and
+        // the kernel then walked the freed objects (macOS crash in KernelCore::Initialize).
+        if (kernel_initialized) {
+            LOG_CRITICAL(Core, "The previous session was not shut down; restart Lichii to load "
+                               "another game");
+            return SystemResultStatus::ErrorUnknown;
+        }
+
         InitializeKernel(system);
 
         if (params.applet_type == Service::AM::AppletType::Application) {
@@ -425,6 +435,7 @@ struct System::Impl {
 
         if (!app_loader) {
             LOG_CRITICAL(Core, "Failed to obtain loader for {}!", filepath);
+            ShutdownMainProcess();
             return SystemResultStatus::ErrorGetLoader;
         }
 
@@ -542,6 +553,7 @@ struct System::Impl {
         cpu_manager.Shutdown();
         debugger.reset();
         kernel.Shutdown();
+        kernel_initialized = false;
         stop_event = {};
         Network::RestartSocketOperations();
 
@@ -645,6 +657,8 @@ struct System::Impl {
     bool exit_locked : 1 = false;
     bool exit_requested : 1 = false;
     bool nvdec_active : 1 = false;
+    /// Set by InitializeKernel, cleared once ShutdownMainProcess has shut the kernel down.
+    bool kernel_initialized = false;
     /// EDEN_NX2_DEBUG_SERVER; the last member, so it stops before anything it reads goes away.
     std::unique_ptr<Nx2Debug::Service> debug_service;
 
