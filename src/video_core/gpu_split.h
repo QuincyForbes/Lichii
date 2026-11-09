@@ -507,11 +507,67 @@ public:
     [[nodiscard]] u64 PendingWriteCount() const noexcept {
         return pending_write_count;
     }
-    /// The noted-write part of MayBeWrittenSince: a NoteMemoryWrite sent after `since` overlaps
-    /// [begin, begin + size), or more were noted since than are remembered.
+    /// Unconsumed PendingWrite sub-ranges on one 4 KiB page so snapshot.pending_writes
+    /// always advances to pending_write_count without pinning at same-page writes.
+    struct PagePendingWrites {
+        struct Entry {
+            u64 position;
+            u16 begin;
+            u16 end;
+        };
+        static constexpr size_t MaxEntries = 16;
+        std::array<Entry, MaxEntries> entries{};
+        u32 count{};
+
+        void Add(u64 position, u16 begin, u16 end) noexcept {
+            if (count > 0) {
+                Entry& last = entries[count - 1];
+                if (last.begin <= end && begin <= last.end) {
+                    last.begin = (std::min)(last.begin, begin);
+                    last.end = (std::max)(last.end, end);
+                    last.position = (std::max)(last.position, position);
+                    return;
+                }
+            }
+            if (count < MaxEntries) {
+                entries[count++] = Entry{position, begin, end};
+            } else {
+                Entry& last = entries[MaxEntries - 1];
+                last.begin = (std::min)(last.begin, begin);
+                last.end = (std::max)(last.end, end);
+                last.position = (std::max)(last.position, position);
+            }
+        }
+    };
+
+    /// The noted-write part of MayBeWrittenSince: a NoteMemoryWrite sent after `since` (and not
+    /// yet consumed by the back) overlaps [begin, begin + size), or more were noted since than
+    /// are remembered.
     [[nodiscard]] bool NotedWriteSince(u64 since, u64 begin, u64 size,
-                                       u64* checked_writes = nullptr) const {
-        if (last_memory_writer_position <= since) {
+                                       u64* checked_writes = nullptr,
+                                       PagePendingWrites* page_writes = nullptr) const {
+        const u64 cutoff = (std::max)(since, consumed.load(std::memory_order_acquire));
+        const u64 end = begin + size;
+        const u64 page_begin = begin & ~u64{0xfff};
+        const u64 page_end = (end + 0xfff) & ~u64{0xfff};
+        const u16 rel_begin = static_cast<u16>(begin - page_begin);
+        const u16 rel_end = static_cast<u16>((std::min)(end, page_end) - page_begin);
+        bool overlapped = false;
+        if (page_writes != nullptr && page_writes->count != 0) {
+            u32 dst = 0;
+            for (u32 i = 0; i < page_writes->count; ++i) {
+                const auto& entry = page_writes->entries[i];
+                if (entry.position <= cutoff) {
+                    continue;
+                }
+                if (entry.begin < rel_end && rel_begin < entry.end) {
+                    overlapped = true;
+                }
+                page_writes->entries[dst++] = entry;
+            }
+            page_writes->count = dst;
+        }
+        if (last_memory_writer_position <= cutoff) {
             if (checked_writes != nullptr) {
                 *checked_writes = pending_write_count;
             }
@@ -519,27 +575,35 @@ public:
         }
         const u64 from = checked_writes != nullptr ? *checked_writes : 0;
         if (pending_write_count <= from) {
-            return false;
+            return overlapped;
         }
         const u64 to_scan = pending_write_count - from;
         const u64 limit = (std::min<u64>)(to_scan, pending_writes.size());
-        const u64 end = begin + size;
-        const u64 page_begin = begin & ~u64{0xfff};
-        const u64 page_end = (end + 0xfff) & ~u64{0xfff};
         u64 next_checked = pending_write_count;
         bool reached = to_scan <= pending_writes.size();
         for (u64 scanned = 0; scanned < limit; ++scanned) {
             const u64 index = pending_write_count - 1 - scanned;
             const PendingWrite& write = pending_writes[index % pending_writes.size()];
-            if (write.position <= since) {
+            if (write.position <= cutoff) {
                 reached = true;
                 break;
             }
             if (write.begin < end && begin < write.end) {
-                return true;
+                if (page_writes == nullptr) {
+                    return true;
+                }
+                overlapped = true;
             }
             if (write.begin < page_end && page_begin < write.end) {
-                next_checked = index;
+                if (page_writes != nullptr) {
+                    const u16 w_begin =
+                        static_cast<u16>((std::max)(write.begin, page_begin) - page_begin);
+                    const u16 w_end =
+                        static_cast<u16>((std::min)(write.end, page_end) - page_begin);
+                    page_writes->Add(write.position, w_begin, w_end);
+                } else {
+                    next_checked = index;
+                }
             }
         }
         if (!reached) {
@@ -548,7 +612,7 @@ public:
         if (checked_writes != nullptr) {
             *checked_writes = next_checked;
         }
-        return false;
+        return overlapped;
     }
     /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
     /// report, a semaphore release). size ~0 means an unknown range.
@@ -658,7 +722,12 @@ public:
     u32 QueuedWriterKind(GPUVAddr begin, GPUVAddr end, u32& method);
     /// A semaphore release that writes `payload` at device address `device` (from GPU address
     /// `address`) was just sent (a puller release, a 3D payload report).
-    void NoteRelease(u64 device, GPUVAddr address, u32 payload);
+    void NoteRelease(u64 device, GPUVAddr address, u32 payload, u64 qmd = 0);
+    /// Front: the word at `device` (`address`) after queued releases and known writes, or from
+    /// guest memory when nothing unpredicted since `ConsumedNow()` may write it.
+    std::optional<u32> CurrentReleaseWord(const Tegra::MemoryManager& memory, u64 device,
+                                          GPUVAddr address, u64 qmd = 0,
+                                          bool* same_qmd = nullptr);
     /// For a semaphore acquire of `device`: the payload a release still queued for the back writes
     /// there, if nothing sent after it may write the word. The back runs the acquire's channel
     /// after that release, so an acquire it meets needs no drain. EDEN_NX2_ACQUIRE_QUEUED=0 off.
@@ -867,6 +936,7 @@ private:
     struct QueuedRelease {
         u64 position;
         u64 device;
+        u64 qmd;
         u32 payload;
     };
     std::array<QueuedRelease, 1024> queued_releases{};

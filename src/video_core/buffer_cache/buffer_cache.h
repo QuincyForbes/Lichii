@@ -187,6 +187,7 @@ template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
     Nx2NoteListHostWrite(device_addr, size);
     Core::g_buffer_write_pages.Mark(device_addr, size);
+    NoteUniformWrite(device_addr, size);
     // The written range lies within its pages: when they hold no GPU-written data, both lookups
     // below find nothing, so one lookup answers them.
     if (Nx2Perf::On(Nx2Perf::Opt::WriteIntersections) && keep_page_gpu_data) {
@@ -540,6 +541,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
 
     ClearDownload(*cpu_dest_address, amount);
     MarkVertexBuffersStale(*cpu_dest_address, amount);
+    NoteUniformWrite(*cpu_dest_address, amount);
 
     BufferId buffer_a;
     BufferId buffer_b;
@@ -1043,6 +1045,7 @@ template <class P>
 void BufferCache<P>::FlushCachedWrites() {
     memory_tracker.FlushCachedWrites();
     ++cpu_dirty_epoch;
+    ++cb_write_serial;
 }
 
 template <class P>
@@ -1204,6 +1207,7 @@ template <class P>
 void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
                                            DAddr device_addr, const u8* data, u64 size) {
     Core::g_buffer_write_pages.Mark(device_addr, size);
+    NoteUniformWrite(device_addr, size);
     if (!cpu_written.Intersects(device_addr, size)) {
         device_memory.WriteBlockUnsafe(device_addr, data, size);
         return;
@@ -1604,7 +1608,10 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             if (VideoCommon::UniformStreamReuseEnabled()) {
                 streamed = VideoCommon::BindSmallUniformReusing(
                     runtime, device_memory, stage, index, binding_index, device_addr, size,
-                    VideoCore::Nx2Debug::Experiment(17) != 0);
+                    VideoCore::Nx2Debug::Experiment(17) != 0, cb_write_serial,
+                    UboPageGen(device_addr, size), [this, device_addr, size](u64& gen) {
+                        return UboRangeClean(device_addr, size, gen);
+                    });
             }
         }
         if (!streamed) {
@@ -2108,7 +2115,11 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
                     if (compute_bindcache && VideoCommon::UniformStreamReuseEnabled() &&
                         VideoCommon::BindSmallUniformReusing(
                             runtime, device_memory, 5, index, binding_index, binding.device_addr,
-                            size, VideoCore::Nx2Debug::Experiment(17) != 0)) {
+                            size, VideoCore::Nx2Debug::Experiment(17) != 0, cb_write_serial,
+                            UboPageGen(binding.device_addr, size),
+                            [this, addr = binding.device_addr, size](u64& gen) {
+                                return UboRangeClean(addr, size, gen);
+                            })) {
                         return;
                     }
                 }
@@ -3082,7 +3093,9 @@ void BufferCache<P>::Unregister(BufferId buffer_id) {
 template <class P>
 template <bool insert>
 void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
-    ++binding_epoch;
+    if constexpr (!insert) {
+        ++binding_epoch;
+    }
     Buffer& buffer = slot_buffers[buffer_id];
     const auto size = buffer.SizeBytes();
     if (insert) {
@@ -3365,6 +3378,7 @@ template <class P>
 void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                                 std::span<const u8> inlined_buffer) {
     Core::g_buffer_write_pages.Mark(dest_address, copy_size);
+    NoteUniformWrite(dest_address, copy_size);
     ClearDownload(dest_address, copy_size);
     gpu_modified_ranges.Subtract(dest_address, copy_size);
     MarkVertexBuffersStale(dest_address, copy_size);
@@ -3683,7 +3697,9 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     // The size word after a plain pointer is part of the answer; pool and native pointers ignore
     // it.
     const bool reads_size_word = !(table_pointer && !is_written) && !native_pointer;
-    const u64 next_qword = reads_size_word ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
+    const u64 raw_next_qword = reads_size_word ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
+    const u64 next_qword =
+        (raw_next_qword >> 32) == 0 ? static_cast<u64>(static_cast<u32>(raw_next_qword)) : 0ULL;
     // Every draw rebinds each storage buffer: the layout lookup (a mutex), the range walk and
     // two page walks cost Ocarina's GPU thread ~6%. Answers hold until the page table changes.
     struct CachedBinding {

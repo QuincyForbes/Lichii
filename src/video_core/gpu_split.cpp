@@ -172,6 +172,7 @@ void GpuSplit::Stop() {
     last_memory_write_position = 0;
     previous_memory_write_position = 0;
     ranged_writes.clear();
+    queued_releases = {};
     last_function_position = 0;
     writes.Reset();
     note_memory = nullptr;
@@ -517,7 +518,7 @@ u32 GpuSplit::QueuedWriterKind(GPUVAddr begin, GPUVAddr end, u32& method) {
                                                   : 4;
 }
 
-void GpuSplit::NoteRelease(u64 device, GPUVAddr address, u32 payload) {
+void GpuSplit::NoteRelease(u64 device, GPUVAddr address, u32 payload, u64 qmd) {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_ACQUIRE_QUEUED");
         return value == nullptr || value[0] != '0';
@@ -525,7 +526,37 @@ void GpuSplit::NoteRelease(u64 device, GPUVAddr address, u32 payload) {
     if (!enabled) {
         return;
     }
-    queued_releases[(device >> 2) % queued_releases.size()] = {write_position, device, payload};
+    queued_releases[(device >> 2) % queued_releases.size()] = {write_position, device, qmd,
+                                                               payload};
+}
+
+std::optional<u32> GpuSplit::CurrentReleaseWord(const Tegra::MemoryManager& memory, u64 device,
+                                                GPUVAddr address, u64 qmd, bool* same_qmd) {
+    if (VideoCore::Nx2Debug::DelayedFences()) {
+        return std::nullopt;
+    }
+    const QueuedRelease& release = queued_releases[(device >> 2) % queued_releases.size()];
+    u32 miss = 0;
+    if (const auto payload = QueuedReleasePayload(device, address, &miss)) {
+        if (same_qmd != nullptr && qmd != 0 && release.qmd == qmd) {
+            *same_qmd = true;
+        }
+        return payload;
+    }
+    if (miss == 3 || Tegra::Nx2IsGpuWritten(device)) {
+        return std::nullopt;
+    }
+    const u64 done = consumed.load(std::memory_order_acquire);
+    if (HasAsyncWrite(device, sizeof(u32)) > done || last_unranged_position > done ||
+        WritersMayWriteSince(done, device, sizeof(u32))) {
+        return std::nullopt;
+    }
+    u32 word = memory.Read<u32>(address);
+    if (NotedWriteSince(done, device, sizeof(u32)) &&
+        !OverlayQueuedWrites(done, device, &word, 1)) {
+        return std::nullopt;
+    }
+    return word;
 }
 
 std::optional<u32> GpuSplit::QueuedReleasePayload(u64 device, GPUVAddr address, u32* miss) {

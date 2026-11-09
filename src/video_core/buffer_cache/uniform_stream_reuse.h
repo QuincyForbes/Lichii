@@ -11,6 +11,9 @@
 #include <memory>
 #include <span>
 #include <type_traits>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 #include "common/common_types.h"
 #include "video_core/nx2_profile.h"
@@ -74,6 +77,8 @@ public:
         Ref ref{};
         u64 tick{};
         u64 address{}; ///< the guest range copied (a lookup hint: hits compare the bytes)
+        u64 verified_serial{};
+        u64 page_gen{};
         u32 size{};    ///< 0: nothing copied
         u32 serial{};
     };
@@ -91,6 +96,8 @@ public:
             copy.size = 0;
             copy.tick = 0;
             copy.address = 0;
+            copy.verified_serial = 0;
+            copy.page_gen = 0;
             NextSerial(copy);
         }
         for (auto& stage : slots) {
@@ -142,10 +149,67 @@ inline void ResetUniformStreamReuse() noexcept {
 /// from zortos293/Lichii#641), a copy of the same guest range made by any stage or slot. Every
 /// reuse compares the guest bytes with the copy's. Returns false (nothing bound) when the buffer
 /// does not qualify, so the caller binds it the classic way.
-template <class Runtime, class DeviceMemory>
+[[nodiscard]] inline bool UniformBytesEqual(const u8* copy_bytes, const u8* guest,
+                                            u32 size) noexcept {
+    if (size >= sizeof(u64)) {
+        u64 a0, b0, a1, b1;
+        std::memcpy(&a0, copy_bytes, sizeof(u64));
+        std::memcpy(&b0, guest, sizeof(u64));
+        if (a0 != b0) {
+            return false;
+        }
+        std::memcpy(&a1, copy_bytes + size - sizeof(u64), sizeof(u64));
+        std::memcpy(&b1, guest + size - sizeof(u64), sizeof(u64));
+        if (a1 != b1) {
+            return false;
+        }
+    }
+#if defined(_M_X64) || defined(__x86_64__)
+    size_t off = 0;
+    for (; off + 128 <= size; off += 128) {
+        const __m256i d0 = _mm256_xor_si256(
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(copy_bytes + off)),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(guest + off)));
+        const __m256i d1 = _mm256_xor_si256(
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(copy_bytes + off + 32)),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(guest + off + 32)));
+        const __m256i d2 = _mm256_xor_si256(
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(copy_bytes + off + 64)),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(guest + off + 64)));
+        const __m256i d3 = _mm256_xor_si256(
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(copy_bytes + off + 96)),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(guest + off + 96)));
+        const __m256i acc = _mm256_or_si256(_mm256_or_si256(d0, d1), _mm256_or_si256(d2, d3));
+        if (!_mm256_testz_si256(acc, acc)) {
+            return false;
+        }
+    }
+    for (; off + 32 <= size; off += 32) {
+        const __m256i d = _mm256_xor_si256(
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(copy_bytes + off)),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(guest + off)));
+        if (!_mm256_testz_si256(d, d)) {
+            return false;
+        }
+    }
+    return size == off || std::memcmp(copy_bytes + off, guest + off, size - off) == 0;
+#else
+    return std::memcmp(copy_bytes, guest, size) == 0;
+#endif
+}
+
+struct NoUboRangeClean {
+    [[nodiscard]] constexpr bool operator()(u64&) const noexcept {
+        return false;
+    }
+};
+
+template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeClean>
 [[nodiscard]] bool BindSmallUniformReusing(Runtime& runtime, DeviceMemory& device_memory,
                                            size_t stage, u32 index, u32 binding_index,
-                                           u64 device_addr, u32 size, bool range_reuse = false) {
+                                           u64 device_addr, u32 size, bool range_reuse = false,
+                                           u64 write_serial = 0, u64 page_gen = 0,
+                                           RangeCleanPred&& range_clean = {}) {
     using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
     if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
         index >= Reuse::NumSlots) {
@@ -153,6 +217,59 @@ template <class Runtime, class DeviceMemory>
     }
     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
     typename Reuse::Slot& slot = reuse.slots[stage][index];
+    const u64 tick = runtime.CurrentTick();
+    const auto rebind = [&](size_t copy_index) {
+        const typename Reuse::Copy& copy = reuse.copies[copy_index];
+        runtime.RebindStreamUniform(copy.ref, size);
+        slot = typename Reuse::Slot{static_cast<u32>(copy_index), copy.serial};
+        return true;
+    };
+    const auto is_verified_clean = [&](typename Reuse::Copy& copy) {
+        if (write_serial == 0 || copy.verified_serial == 0) {
+            return false;
+        }
+        if (copy.verified_serial == write_serial) [[likely]] {
+            return true;
+        }
+        if (range_clean(copy.page_gen)) [[likely]] {
+            copy.verified_serial = write_serial;
+            return true;
+        }
+        return false;
+    };
+    constexpr size_t NO_COPY = ~size_t{0};
+    size_t slot_copy = NO_COPY;
+    if (slot.serial != 0 && reuse.copies[slot.copy].serial == slot.serial) {
+        slot_copy = slot.copy;
+        typename Reuse::Copy& copy = reuse.copies[slot_copy];
+        if (copy.tick == tick && copy.address == device_addr && copy.size == size &&
+            is_verified_clean(copy)) [[likely]] {
+            if constexpr (requires { device_memory.GetSpan(device_addr, size); }) {
+                if (UniformInPlaceCompareEnabled()) {
+                    Nx2Profile::Add(Nx2Profile::Counter::UboInPlaceSame, 1);
+                }
+            }
+            return rebind(slot_copy);
+        }
+    }
+    if (range_reuse && write_serial != 0) {
+        const size_t set = Reuse::Set(device_addr, size);
+        const size_t base = Reuse::NumPrivate + set * Reuse::NumWays;
+        for (size_t way = 0; way < Reuse::NumWays; ++way) {
+            const size_t copy_index = base + way;
+            typename Reuse::Copy& copy = reuse.copies[copy_index];
+            if (copy_index != slot_copy && copy.address == device_addr && copy.size == size &&
+                copy.tick == tick && is_verified_clean(copy)) {
+                reuse.mru[set] = static_cast<u8>(way);
+                if constexpr (requires { device_memory.GetSpan(device_addr, size); }) {
+                    if (UniformInPlaceCompareEnabled()) {
+                        Nx2Profile::Add(Nx2Profile::Counter::UboInPlaceSame, 1);
+                    }
+                }
+                return rebind(copy_index);
+            }
+        }
+    }
     // The bytes are compared in guest memory with EDEN_NX2_UBO_INPLACE, else in a scratch copy.
     // The stream allocation is filled from the copy's bytes, never from guest memory, so a later
     // reuse finds exactly the bytes that were uploaded. Test memories have no GetSpan.
@@ -167,22 +284,21 @@ template <class Runtime, class DeviceMemory>
         device_memory.ReadBlockUnsafe(device_addr, reuse.scratch.data(), size);
         guest = reuse.scratch.data();
     }
-    const u64 tick = runtime.CurrentTick();
     const auto same_bytes = [&](size_t copy_index) {
-        return reuse.copies[copy_index].size == size &&
-               std::memcmp(reuse.Bytes(copy_index), guest, size) == 0;
-    };
-    const auto rebind = [&](size_t copy_index) {
-        const typename Reuse::Copy& copy = reuse.copies[copy_index];
-        runtime.RebindStreamUniform(copy.ref, size);
-        slot = typename Reuse::Slot{static_cast<u32>(copy_index), copy.serial};
+        typename Reuse::Copy& copy = reuse.copies[copy_index];
+        if (copy.size != size || !UniformBytesEqual(reuse.Bytes(copy_index), guest, size)) {
+            return false;
+        }
+        if (copy.address == device_addr) {
+            copy.verified_serial = write_serial;
+            copy.page_gen = page_gen;
+        }
         return true;
     };
-    constexpr size_t NO_COPY = ~size_t{0};
-    size_t slot_copy = NO_COPY;
     bool slot_same = false;
-    if (slot.serial != 0 && reuse.copies[slot.copy].serial == slot.serial) {
-        slot_copy = slot.copy;
+    if (slot_copy != NO_COPY &&
+        (reuse.copies[slot_copy].tick == tick || range_reuse) &&
+        (write_serial == 0 || reuse.copies[slot_copy].address == device_addr)) {
         slot_same = same_bytes(slot_copy);
     }
     if (in_place) {
@@ -236,6 +352,8 @@ template <class Runtime, class DeviceMemory>
         std::memcpy(reuse.Bytes(target), guest, size);
         fresh.size = size;
         fresh.address = device_addr;
+        fresh.verified_serial = write_serial;
+        fresh.page_gen = page_gen;
         Reuse::NextSerial(fresh);
     }
     typename Reuse::Copy& copy = reuse.copies[target];

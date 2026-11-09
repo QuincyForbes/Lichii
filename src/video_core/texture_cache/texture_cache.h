@@ -1002,7 +1002,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     const auto& regs = maxwell3d->regs;
     const auto color_modified = [&](size_t index) {
         if (!is_clear) {
-            return true;
+            return index < regs.rt_control.count && regs.color_mask[index].raw != 0;
         }
         return index == regs.clear_surface.RT &&
                (regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
@@ -1012,19 +1012,31 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         is_clear ? (regs.clear_surface.Z != 0 || regs.clear_surface.S != 0)
                  : (regs.zeta_enable != 0 &&
                     ((regs.depth_test_enable != 0 && regs.depth_write_enabled != 0) ||
-                     regs.stencil_enable != 0));
+                     (regs.stencil_enable != 0 && regs.stencil_front_mask != 0)));
+    const auto prepare_clear_targets = [&] {
+        if (regs.clear_surface.RT < NUM_RT && color_modified(regs.clear_surface.RT)) {
+            const ImageViewId color_buffer_id =
+                render_targets.color_buffer_ids[regs.clear_surface.RT];
+            PrepareImageView(color_buffer_id, true, IsFullClear(color_buffer_id));
+        }
+        if (depth_modified) {
+            const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
+            PrepareImageView(depth_buffer_id, true, IsFullClear(depth_buffer_id));
+        }
+    };
     if (!flags[Dirty::RenderTargets]) {
-        if (!is_clear && RenderTargetsStillPrepared()) {
+        if (is_clear) {
+            prepare_clear_targets();
+            return;
+        }
+        if (RenderTargetsStillPrepared()) {
             return;
         }
         for (size_t index = 0; index < NUM_RT; ++index) {
             ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
-            const bool mod = color_modified(index);
-            PrepareImageView(color_buffer_id, mod, is_clear && mod && IsFullClear(color_buffer_id));
+            PrepareImageView(color_buffer_id, color_modified(index), false);
         }
-        const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
-        PrepareImageView(depth_buffer_id, depth_modified,
-                         is_clear && depth_modified && IsFullClear(depth_buffer_id));
+        PrepareImageView(render_targets.depth_buffer_id, depth_modified, false);
         NoteRenderTargetsPrepared();
         return;
     }
@@ -1038,15 +1050,16 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         is_rescaling = rescaled;
     }
 
-    for (size_t index = 0; index < NUM_RT; ++index) {
-        ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
-        const bool mod = color_modified(index);
-        PrepareImageView(color_buffer_id, mod, is_clear && mod && IsFullClear(color_buffer_id));
-    }
     const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
-
-    PrepareImageView(depth_buffer_id, depth_modified,
-                     is_clear && depth_modified && IsFullClear(depth_buffer_id));
+    if (is_clear) {
+        prepare_clear_targets();
+    } else {
+        for (size_t index = 0; index < NUM_RT; ++index) {
+            ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
+            PrepareImageView(color_buffer_id, color_modified(index), false);
+        }
+        PrepareImageView(depth_buffer_id, depth_modified, false);
+    }
 
     rt_active_mask = 0;
     rt_image_id = {};
@@ -1083,7 +1096,9 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     }
 
     flags[Dirty::DepthBiasGlobal] = true;
-    NoteRenderTargetsPrepared();
+    if (!is_clear) {
+        NoteRenderTargetsPrepared();
+    }
 }
 
 template <class P>
@@ -1097,6 +1112,10 @@ bool TextureCache<P>::RenderTargetsStillPrepared() const {
         prepared.frame_tick != frame_tick || prepared.bindings_epoch != bindings_epoch) {
         return false;
     }
+    const auto& regs = maxwell3d->regs;
+    const bool depth_mod = regs.zeta_enable != 0 &&
+                           ((regs.depth_test_enable != 0 && regs.depth_write_enabled != 0) ||
+                            (regs.stencil_enable != 0 && regs.stencil_front_mask != 0));
     for (size_t index = 0; index <= NUM_RT; ++index) {
         const ImageViewId id =
             index < NUM_RT ? render_targets.color_buffer_ids[index] : render_targets.depth_buffer_id;
@@ -1110,8 +1129,11 @@ bool TextureCache<P>::RenderTargetsStillPrepared() const {
         if (image_view.IsBuffer()) {
             continue;
         }
+        const bool mod = index < NUM_RT
+                             ? (index < regs.rt_control.count && regs.color_mask[index].raw != 0)
+                             : depth_mod;
         const ImageBase& image = slot_images[image_view.image_id];
-        if (False(image.flags & ImageFlagBits::GpuModified) ||
+        if ((mod && False(image.flags & ImageFlagBits::GpuModified)) ||
             True(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::SparseTiles |
                                 ImageFlagBits::SparseLayers | ImageFlagBits::UnwrittenSparse))) {
             return false;
@@ -1159,7 +1181,7 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         LOG_TRACE(HW_GPU, "Invalid image view index={}", index);
         return NULL_IMAGE_VIEW_ID;
     }
-    if (table.IsPrepared(index, bindings_epoch)) [[likely]] {
+    if (table.IsPrepared(index, frame_tick)) [[likely]] {
         return table.bound_ids[index];
     }
     if (!table.IsVerified(index, frame_tick)) {
@@ -1202,13 +1224,14 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         if (!view.IsBuffer()) {
             const ImageBase& image = slot_images[view.image_id];
             if (!image.aliased_images.empty() ||
-                True(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::SparseTiles |
-                                    ImageFlagBits::SparseLayers | ImageFlagBits::UnwrittenSparse))) {
+                True(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::Sparse |
+                                    ImageFlagBits::SparseTiles | ImageFlagBits::SparseLayers |
+                                    ImageFlagBits::UnwrittenSparse))) {
                 return id;
             }
         }
     }
-    table.MarkPrepared(index, bindings_epoch);
+    table.MarkPrepared(index, frame_tick);
     return id;
 }
 
@@ -1232,11 +1255,12 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
 template <class P>
 void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
     ClearStale(cpu_addr, size);
-    ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
-        ++bindings_epoch;
+    bool invalidate_prepared = false;
+    ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size, &invalidate_prepared](ImageId image_id, Image& image) {
         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
             // Written at last: a backed image replaces it where it is used next.
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
+            ++bindings_epoch;
             return;
         }
         if (True(image.flags & ImageFlagBits::SparseTiles)) {
@@ -1245,16 +1269,26 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
         }
         if (UploadsByLayer(image)) {
             MarkLayersWritten(image, cpu_addr, size);
+            ++bindings_epoch;
+            invalidate_prepared |= !image.image_view_ids.empty();
             return;
         }
         if (True(image.flags & ImageFlagBits::CpuModified)) {
             return;
         }
+        ++bindings_epoch;
         image.flags |= ImageFlagBits::CpuModified;
+        invalidate_prepared |= !image.image_view_ids.empty();
         if (True(image.flags & ImageFlagBits::Tracked)) {
             UntrackImage(image, image_id);
         }
     });
+    if (invalidate_prepared) {
+        for (size_t c : active_channel_ids) {
+            channel_storage[c].graphics_image_table.InvalidatePrepared();
+            channel_storage[c].compute_image_table.InvalidatePrepared();
+        }
+    }
 }
 
 template <class P>
@@ -1375,6 +1409,13 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
     boost::container::small_vector<ImageId, 16> deleted_images;
     ForEachImageInRegionGPU(as_id, gpu_addr, size,
                             [&](ImageId id, Image&) { deleted_images.push_back(id); });
+    if (deleted_images.empty()) {
+        return;
+    }
+    for (size_t c : active_channel_ids) {
+        channel_storage[c].graphics_image_table.InvalidatePrepared();
+        channel_storage[c].compute_image_table.InvalidatePrepared();
+    }
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
         ++bindings_epoch;
@@ -3287,6 +3328,12 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         join_alias_indices.emplace(aliased_id, alias_index);
         new_image.flags |= ImageFlagBits::Alias;
+    }
+    if (True(new_image.flags & ImageFlagBits::Alias)) {
+        for (size_t c : active_channel_ids) {
+            channel_storage[c].graphics_image_table.InvalidatePrepared();
+            channel_storage[c].compute_image_table.InvalidatePrepared();
+        }
     }
     for (const ImageId aliased_id : join_bad_overlap_ids) {
         ImageBase& aliased = slot_images[aliased_id];

@@ -48,21 +48,25 @@ public:
                (frame_verified[index / 64] & (1ULL << (index % 64))) != 0;
     }
 
-    [[nodiscard]] bool IsPrepared(u32 index, u64 epoch) const noexcept {
-        return !invalidated && prepared_epoch == epoch &&
+    [[nodiscard]] bool IsPrepared(u32 index, u64 frame_tick) const noexcept {
+        return !invalidated && prepared_frame_tick == frame_tick &&
                (epoch_prepared[index / 64] & (1ULL << (index % 64))) != 0;
     }
 
-    void MarkPrepared(u32 index, u64 epoch) noexcept {
+    void MarkPrepared(u32 index, u64 frame_tick) noexcept {
         if (invalidated) {
             return;
         }
-        if (prepared_epoch != epoch) {
+        if (prepared_frame_tick != frame_tick) {
             const size_t words = (std::min)(epoch_prepared.size(), size_t{current_limit} / 64 + 1);
             std::fill_n(epoch_prepared.begin(), words, u64{0});
-            prepared_epoch = epoch;
+            prepared_frame_tick = frame_tick;
         }
         epoch_prepared[index / 64] |= 1ULL << (index % 64);
+    }
+
+    void InvalidatePrepared() noexcept {
+        prepared_frame_tick = ~0ULL;
     }
 
     template <class MemoryManager>
@@ -136,7 +140,7 @@ public:
     std::vector<Id> bound_ids;
     GPUVAddr current_gpu_addr{};
     u64 verified_frame_tick{~0ULL};
-    u64 prepared_epoch{};
+    u64 prepared_frame_tick{~0ULL};
     u32 current_limit{};
     bool invalidated{}; ///< read_descriptors is to be cleared before the next read
 
@@ -148,7 +152,7 @@ private:
         std::fill_n(frame_verified.begin(), (std::min)(frame_verified.size(), words), u64{0});
         std::fill_n(epoch_prepared.begin(), (std::min)(epoch_prepared.size(), words), u64{0});
         verified_frame_tick = ~0ULL;
-        prepared_epoch = 0;
+        prepared_frame_tick = ~0ULL;
         const size_t ids = (std::min)(bound_ids.size(), size_t{current_limit} + 1);
         std::fill_n(bound_ids.begin(), ids, Id{0});
     }

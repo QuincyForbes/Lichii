@@ -1174,6 +1174,7 @@ struct Maxwell3D::FrontState {
         u64 writer_ranges;
         u64 dispatch_writes;
         u64 pending_writes;
+        VideoCommon::GpuSplit::PagePendingWrites page_writes{};
     };
     std::unordered_map<u64, DmaSnapshot> dma_snapshots;
     bool oot_macros{true};
@@ -2172,7 +2173,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     reason = writer_since                             ? 1
                              : split.LastUnrangedPosition() > since ? 2
                              : split.NotedWriteSince(since, read_begin, read_size,
-                                                     &snapshot.pending_writes)
+                                                     &snapshot.pending_writes,
+                                                     &snapshot.page_writes)
                                  ? 3
                                  : 4;
                 } else if (split.WritersMayWriteSince(since, page << 12, 0x1000,
@@ -2184,7 +2186,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 } else if (split.LastUnrangedPosition() > since) {
                     reason = 2;
                 } else if (split.NotedWriteSince(since, read_begin, read_size,
-                                                 &snapshot.pending_writes)) {
+                                                 &snapshot.pending_writes,
+                                                 &snapshot.page_writes)) {
                     reason = 3;
                 } else {
                     // Last: the only check that may wait.
@@ -2210,7 +2213,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             }
             // A report's value is up to 8 bytes, listed by its first 4: look 12 bytes back. A
             // listed report may not be in guest memory yet: take the drained path.
-            if (!hit || !rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12)) {
+            if (!hit || (!rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12) &&
+                         Tegra::Nx2AsyncReportsSettled(*device, read_bytes))) {
                 thread_local std::vector<u32> snap_words;
                 snap_words.resize(words);
                 if (hit) {
@@ -2258,7 +2262,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     for (u64 page = first_page; page <= last_page; ++page) {
                         fs.dma_snapshots[page] = {split.SentPosition(), split.WriterRangeCount(),
                                                   split.DispatchWriteCount(),
-                                                  split.PendingWriteCount()};
+                                                  split.PendingWriteCount(), {}};
                     }
                     memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
                 }

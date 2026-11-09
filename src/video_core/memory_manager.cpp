@@ -369,27 +369,33 @@ const u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) const {
     return memory.GetPointer<u8>(*address);
 }
 
-bool MemoryManager::HandlePointerCacheEnabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_HANDLE_PTR_CACHE");
-        return value == nullptr || value[0] != '0';
-    }();
-    return enabled;
-}
-
 namespace {
+const bool g_handle_ptr_cache_enabled = [] {
+    const char* value = std::getenv("EDEN_NX2_HANDLE_PTR_CACHE");
+    return value == nullptr || value[0] != '0';
+}();
+
 /// One thread's host pointers of the device pages it read last through one manager. Per thread,
 /// as DeviceMemoryManager's translations: a cache shared by threads could be emptied by one
 /// between another's lookup and its use.
 struct HostPageCache {
-    size_t owner{};             ///< MemoryManager::GetID (unique, never reused like `this`)
-    u64 map_generation{};       ///< MemoryManager::map_serial when the pointers were made
-    u64 device_generation{};    ///< DeviceMemoryManager::TranslationGeneration likewise
-    std::array<u64, 16> pages{}; ///< GPU page (4 KiB) + 1 per slot; 0: empty
-    std::array<const u8*, 16> hosts{};
+    static constexpr size_t Size = 4096;
+    struct Entry {
+        u64 tag{};
+        const u8* host{};
+    };
+    size_t owner{};          ///< MemoryManager::GetID (unique, never reused like `this`)
+    u64 map_generation{};    ///< MemoryManager::map_serial when the pointers were made
+    u64 device_generation{}; ///< DeviceMemoryManager::TranslationGeneration likewise
+    u32 epoch{1};            ///< High bits of Entry::tag; bumped on generation change
+    std::array<Entry, Size> entries{};
 };
 thread_local HostPageCache t_host_pages;
 } // Anonymous namespace
+
+bool MemoryManager::HandlePointerCacheEnabled() {
+    return g_handle_ptr_cache_enabled;
+}
 
 const u8* MemoryManager::CachedPagePointer(GPUVAddr addr) const {
     namespace Profile = VideoCommon::Nx2Profile;
@@ -397,16 +403,24 @@ const u8* MemoryManager::CachedPagePointer(GPUVAddr addr) const {
     const u64 map_gen = map_serial.load(std::memory_order_acquire);
     const u64 device_gen = memory.TranslationGeneration();
     if (cache.owner != unique_identifier || cache.map_generation != map_gen ||
-        cache.device_generation != device_gen) {
-        cache = HostPageCache{
-            .owner = unique_identifier, .map_generation = map_gen, .device_generation = device_gen};
+        cache.device_generation != device_gen) [[unlikely]] {
+        cache.owner = unique_identifier;
+        cache.map_generation = map_gen;
+        cache.device_generation = device_gen;
+        if (++cache.epoch == 0) [[unlikely]] {
+            cache.epoch = 1;
+            cache.entries.fill({});
+        }
     }
     constexpr u64 host_page_mask = (u64{1} << cpu_page_bits) - 1;
     const u64 page = addr >> cpu_page_bits;
-    const size_t slot = static_cast<size_t>(page) & (cache.pages.size() - 1);
-    if (cache.pages[slot] == page + 1) {
+    const u64 tag = (u64{cache.epoch} << 36) | (page & ((u64{1} << 36) - 1));
+    const size_t slot =
+        static_cast<size_t>(page ^ (page >> 7) ^ (page >> 15)) & (HostPageCache::Size - 1);
+    HostPageCache::Entry& entry = cache.entries[slot];
+    if (entry.tag == tag) [[likely]] {
         Profile::Add(Profile::Counter::PtrCacheHits, 1);
-        return cache.hosts[slot] + (addr & host_page_mask);
+        return entry.host + (addr & host_page_mask);
     }
     Profile::Add(Profile::Counter::PtrCacheMisses, 1);
     // Device pages are 4 KiB: the host memory of one is contiguous, its neighbour's may not be.
@@ -414,8 +428,8 @@ const u8* MemoryManager::CachedPagePointer(GPUVAddr addr) const {
     if (host == nullptr) {
         return nullptr;
     }
-    cache.pages[slot] = page + 1;
-    cache.hosts[slot] = host;
+    entry.tag = tag;
+    entry.host = host;
     return host + (addr & host_page_mask);
 }
 

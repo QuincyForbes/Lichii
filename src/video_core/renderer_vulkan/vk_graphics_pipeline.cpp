@@ -347,6 +347,21 @@ ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
 }
 
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
+
+const bool g_align_storage_handles = [] {
+    const char* const value = std::getenv("EDEN_NX2_HANDLE_ALIGN");
+    return value == nullptr || *value != '0';
+}();
+
+const u64 g_handle_trace_hash = [] {
+    const char* const value = std::getenv("EDEN_NX2_HANDLE_TRACE");
+    return value ? std::strtoull(value, nullptr, 16) : u64{0};
+}();
+
+const bool g_record_sampled = [] {
+    const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
+    return value && *value != '\0' && *value != '0';
+}();
 } // Anonymous namespace
 
 void NoteDrawReuseProbeFrame() {
@@ -530,6 +545,37 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
     size_t tex_idx = 0;
+    constexpr size_t LocalPageSlots = 4;
+    std::array<u64, LocalPageSlots> local_pages{~0ULL, ~0ULL, ~0ULL, ~0ULL};
+    std::array<const u8*, LocalPageSlots> local_hosts{};
+    const auto read_cbuf_word{[&](GPUVAddr addr) LAMBDA_FORCEINLINE -> u32 {
+        constexpr u64 page_mask = Core::Memory::YUZU_PAGEMASK;
+        const u64 page_offset = addr & page_mask;
+        if (page_offset <= Core::Memory::YUZU_PAGESIZE - sizeof(u32)) [[likely]] {
+            const u64 page = addr >> Core::Memory::YUZU_PAGEBITS;
+            const size_t slot = static_cast<size_t>(page ^ (page >> 4)) & (LocalPageSlots - 1);
+            const u8* host = local_hosts[slot];
+            if (local_pages[slot] != page) {
+                host = gpu_memory->GetPointerForDescriptor(addr & ~page_mask);
+                local_pages[slot] = host ? page : ~0ULL;
+                local_hosts[slot] = host;
+            }
+            if (host) [[likely]] {
+                u32 value;
+                std::memcpy(&value, host + page_offset, sizeof(u32));
+                return value;
+            }
+        }
+        return gpu_memory->ReadHandleWord(addr);
+    }};
+    struct HandleWordReader {
+        decltype(read_cbuf_word)& read_word;
+        u32 ReadHandleWord(GPUVAddr addr) const LAMBDA_FORCEINLINE {
+            return read_word(addr);
+        }
+    } const handle_reader{read_cbuf_word};
+    const u64 storage_alignment{device.GetStorageBufferAlignment()};
+    const u64 active_storage_alignment{g_align_storage_handles ? storage_alignment : 1};
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
         buffer_cache.UnbindGraphicsStorageBuffers(stage);
@@ -544,47 +590,20 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
-        u64 last_cbuf_page{~0ULL};
-        const u8* last_cbuf_host{nullptr};
-        const auto read_cbuf_word{[&](GPUVAddr addr) LAMBDA_FORCEINLINE -> u32 {
-            constexpr u64 page_mask = Core::Memory::YUZU_PAGEMASK;
-            const u64 page_offset = addr & page_mask;
-            if (page_offset <= Core::Memory::YUZU_PAGESIZE - sizeof(u32)) [[likely]] {
-                const u64 page = addr >> Core::Memory::YUZU_PAGEBITS;
-                if (page != last_cbuf_page) {
-                    last_cbuf_host = gpu_memory->GetPointerForDescriptor(addr & ~page_mask);
-                    last_cbuf_page = last_cbuf_host ? page : ~0ULL;
-                }
-                if (last_cbuf_host) [[likely]] {
-                    u32 value;
-                    std::memcpy(&value, last_cbuf_host + page_offset, sizeof(u32));
-                    return value;
-                }
-            }
-            return gpu_memory->ReadHandleWord(addr);
-        }};
-        const auto read_handle{[&](const auto& desc, u32 index) {
+        const auto read_handle{[&](const auto& desc, u32 index) LAMBDA_FORCEINLINE {
             if (desc.handle_program != ~0U) {
                 // Read by the shader from a storage buffer: computed for this draw.
-                const auto evaluate{[&](u64 storage_alignment) {
+                const auto evaluate{[&](u64 align) LAMBDA_FORCEINLINE {
                     return VideoCommon::EvaluateTextureHandle(
-                        info, desc.handle_program, *gpu_memory,
-                        [&](u32 cbuf) -> GPUVAddr {
+                        info, desc.handle_program, handle_reader,
+                        [&](u32 cbuf) LAMBDA_FORCEINLINE -> GPUVAddr {
                             return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
                                                                               : GPUVAddr{};
                         },
-                        storage_alignment);
+                        align);
                 }};
-                // The program's storage offsets are relative to the buffer address aligned down
-                // to the host storage alignment (StorageOffset). EDEN_NX2_HANDLE_ALIGN=0 reads
-                // the words at the unaligned address instead (A/B).
-                static const bool align_storage{[] {
-                    const char* const value{std::getenv("EDEN_NX2_HANDLE_ALIGN")};
-                    return value == nullptr || *value != '0';
-                }()};
-                const u64 storage_alignment{device.GetStorageBufferAlignment()};
-                const u32 raw{evaluate(align_storage ? storage_alignment : 1)};
-                if (raw == 0) {
+                const u32 raw{evaluate(active_storage_alignment)};
+                if (raw == 0) [[unlikely]] {
                     ++zero_texture_handles;
                     static std::set<std::pair<u64, u32>> logged;
                     const std::pair key_program{key.unique_hashes[stage + 1], desc.handle_program};
@@ -645,11 +664,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                       : read_handle(desc, index)};
                 ++tex_idx;
                 // EDEN_NX2_HANDLE_TRACE=<shader hash>: each new handle of that shader's textures.
-                static const u64 trace_hash{[] {
-                    const char* const value{std::getenv("EDEN_NX2_HANDLE_TRACE")};
-                    return value ? std::strtoull(value, nullptr, 16) : u64{0};
-                }()};
-                if (trace_hash != 0 && key.unique_hashes[stage + 1] == trace_hash) {
+                if (g_handle_trace_hash != 0 &&
+                    key.unique_hashes[stage + 1] == g_handle_trace_hash) [[unlikely]] {
                     static std::set<std::tuple<size_t, u32, u32>> traced;
                     const size_t slot = static_cast<size_t>(&desc - info.texture_descriptors.data());
                     if (traced.size() < 512 && traced.emplace(slot, index, handle.first).second) {
@@ -664,7 +680,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                  "Handle trace {:016x} stage {} texture {}[{}]: cbuf {} offset {:#x} "
                                  "shift {} secondary {} ({} {:#x} shift {}) size_shift {} program {}:{} "
                                  "-> tic {} tsc {} (c{}[{:#x}] = {:#x})",
-                                 trace_hash, stage, slot, index, desc.cbuf_index, desc.cbuf_offset,
+                                 g_handle_trace_hash, stage, slot, index, desc.cbuf_index, desc.cbuf_offset,
                                  desc.shift_left, desc.has_secondary, desc.secondary_cbuf_index,
                                  desc.secondary_cbuf_offset, desc.secondary_shift_left,
                                  desc.size_shift, desc.handle_program, program, handle.first,
@@ -711,11 +727,6 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     ASSERT(samplers.size() == num_textures);
     mark();
     {
-        Profile::Scope scope{Profile::Zone::RenderTargets};
-        texture_cache.UpdateRenderTargets(false);
-    }
-    mark();
-    {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
@@ -742,11 +753,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         no_cbufs = DrawReuseProbe::Bytes(no_cbufs, &regs.rt, sizeof(regs.rt));
         DrawReuseProbe::Get().Note(this, full, textures, no_cbufs);
     }
-    static const bool record_sampled = [] {
-        const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
-        return value && *value != '\0' && *value != '0';
-    }();
-    if (record_sampled) {
+    if (g_record_sampled) [[unlikely]] {
         sampled_images.clear();
         size_t view_index{};
         size_t sampler_index{};
@@ -911,9 +918,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     mark();
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
-        if constexpr (Spec::has_images) {
-            texture_cache.UpdateRenderTargets(false);
-        }
+        texture_cache.UpdateRenderTargets(false);
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
         if (scheduler.HasFragmentBarrier() &&

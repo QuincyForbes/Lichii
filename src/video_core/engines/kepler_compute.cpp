@@ -629,8 +629,10 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
             const auto [slot, source] = *match;
             // y and z: the entry's words too, or the constant 1 the macro used instead (the
             // entry's then hold 1 as well: its sizes are counts of 1D work).
-            const bool y_ok = y == Tegra::Nx2IndirectGrid::Placeholder(slot, 1) || y == 1;
-            const bool z_ok = z == Tegra::Nx2IndirectGrid::Placeholder(slot, 2) || z == 1;
+            const bool y_ok =
+                y == (Tegra::Nx2IndirectGrid::Placeholder(slot, 1) & 0xffff) || y == 1;
+            const bool z_ok =
+                z == (Tegra::Nx2IndirectGrid::Placeholder(slot, 2) & 0xffff) || z == 1;
             static const bool read_back = [] {
                 const char* value = std::getenv("EDEN_NX2_INDIRECT_GRID");
                 return value != nullptr && value[0] == '2';
@@ -1368,6 +1370,12 @@ struct KeplerCompute::FrontState {
     GPUVAddr upload_address{};
     u64 upload_size{};
     bool upload_known{};
+    struct InlineQmd {
+        GPUVAddr address{};
+        u64 position{};
+        NativeQmdScheduler::Descriptor qmd{};
+    };
+    mutable std::array<InlineQmd, 128> inline_qmds{};
 };
 
 namespace {
@@ -1513,15 +1521,25 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
 
 void KeplerCompute::FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState& fs,
                                      u32 control) const {
-    // ProcessNativeReportSemaphore: a release (operation 0) without reduction writes the payload.
-    if ((control & 3) != 0 || ((control >> 3) & 1) != 0) {
+    const u32 operation = control & 3;
+    if (operation != 0 && operation != 2) {
         return;
     }
     const GPUVAddr address =
         (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
-    if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-        split.NoteRelease(*device, address, fs.registers[0x6c2]);
+    const auto device = memory_manager.GpuToCpuAddress(address);
+    if (!device) {
+        return;
     }
+    u32 payload = fs.registers[0x6c2];
+    if (((control >> 3) & 1) != 0) {
+        const auto current = split.CurrentReleaseWord(memory_manager, *device, address);
+        if (!current) {
+            return;
+        }
+        payload = ReduceSemaphore((control >> 9) & 7, false, *current, payload);
+    }
+    split.NoteRelease(*device, address, payload);
 }
 
 VideoCommon::SplitWriteTracker::Effect KeplerCompute::FrontEffect(u32 method) const {
@@ -1623,26 +1641,48 @@ void KeplerCompute::FrontPredictQmd(VideoCommon::GpuSplit& split, const FrontSta
     const auto predict = [&](GPUVAddr qmd_address, const Descriptor& qmd, bool stale) {
         for (const u32 base : {24U, 28U, 52U}) {
             const u32 flags = qmd[base + 1];
-            if (!(flags & (1U << 23))) {
-                continue;
-            }
-            if (flags & (1U << 26)) {
-                if (pred_enabled) {
-                    Prediction::NoteReduction();
-                }
+            if (!(flags & (1U << 23)) || !NativeQmdScheduler::IsDecodableRelease(flags)) {
                 continue;
             }
             const GPUVAddr destination = (GPUVAddr{flags & 0xff} << 32) | qmd[base];
-            if (const auto device = memory_manager.GpuToCpuAddress(destination)) {
-                if (!stale) {
-                    split.NoteRelease(*device, destination, qmd[base + 2]);
-                }
+            const auto device = memory_manager.GpuToCpuAddress(destination);
+            if (!device) {
                 if (pred_enabled) {
-                    Prediction::Predict(Prediction::Writer::Qmd, *device, qmd[base + 2], position,
-                                        qmd_address, stale);
+                    Prediction::NoteUnmappedRelease();
                 }
-            } else if (pred_enabled) {
-                Prediction::NoteUnmappedRelease();
+                continue;
+            }
+            const u32 raw_payload = qmd[base + 2];
+            u32 payload = raw_payload;
+            const bool reduction = (flags & (1U << 26)) != 0;
+            if (reduction) {
+                if (pred_enabled) {
+                    Prediction::NoteReduction();
+                }
+                if (stale) {
+                    continue;
+                }
+                bool same_qmd = false;
+                const auto current = split.CurrentReleaseWord(
+                    memory_manager, *device, destination, qmd_address, &same_qmd);
+                if (!current) {
+                    continue;
+                }
+                payload = same_qmd ? *current
+                                   : ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
+                                                     *current, raw_payload);
+            } else if ((flags & (1U << 19)) != 0 && !stale) {
+                if (const auto current =
+                        split.CurrentReleaseWord(memory_manager, *device, destination)) {
+                    payload = (std::max)(*current, raw_payload);
+                }
+            }
+            if (!stale) {
+                split.NoteRelease(*device, destination, payload, qmd_address);
+            }
+            if (pred_enabled && !reduction) {
+                Prediction::Predict(Prediction::Writer::Qmd, *device, raw_payload, position,
+                                    qmd_address, stale);
             }
         }
     };
@@ -1653,11 +1693,23 @@ void KeplerCompute::FrontPredictQmd(VideoCommon::GpuSplit& split, const FrontSta
             }
             return false;
         }
-        memory_manager.ReadBlockUnsafe(qmd_address, qmd.data(), sizeof(qmd));
         const auto device = memory_manager.GpuToCpuAddress(qmd_address);
+        if (const auto& cached = fs.inline_qmds[(qmd_address >> 8) % fs.inline_qmds.size()];
+            cached.address == qmd_address && cached.position > done) {
+            qmd = cached.qmd;
+            stale = !device || split.LastUnrangedPosition() > cached.position ||
+                    split.WritersMayWriteSince(cached.position, *device, sizeof(qmd)) ||
+                    (split.NotedWriteSince(cached.position, *device, sizeof(qmd)) &&
+                     !split.OverlayQueuedWrites(cached.position, *device, qmd.data(),
+                                                static_cast<u32>(qmd.size())));
+            return true;
+        }
+        memory_manager.ReadBlockUnsafe(qmd_address, qmd.data(), sizeof(qmd));
         stale = !device || split.LastUnrangedPosition() > done ||
                 split.WritersMayWriteSince(done, *device, sizeof(qmd)) ||
-                split.NotedWriteSince(done, *device, sizeof(qmd));
+                (split.NotedWriteSince(done, *device, sizeof(qmd)) &&
+                 !split.OverlayQueuedWrites(done, *device, qmd.data(),
+                                            static_cast<u32>(qmd.size())));
         return true;
     };
     Descriptor qmd{};
@@ -1667,11 +1719,14 @@ void KeplerCompute::FrontPredictQmd(VideoCommon::GpuSplit& split, const FrontSta
     if (method == 0x107) {
         // An inline QMD: the back writes the registers' copy to memory, then schedules it.
         qmd_address = ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
-        if (!memory_manager.IsFullyMappedRange(qmd_address, sizeof(qmd)) ||
-            !((fs.registers[0xa7] & (1U << 24)) || !(fs.registers[0xcc] & (1U << 12)))) {
+        if (!memory_manager.IsFullyMappedRange(qmd_address, sizeof(qmd))) {
             return;
         }
         std::copy_n(fs.registers.begin() + 0xc8, qmd.size(), qmd.begin());
+        fs.inline_qmds[(qmd_address >> 8) % fs.inline_qmds.size()] = {qmd_address, position, qmd};
+        if (!((fs.registers[0xa7] & (1U << 24)) || !(fs.registers[0xcc] & (1U << 12)))) {
+            return;
+        }
         action = 3;
     } else {
         qmd_address = GPUVAddr{fs.registers[0xad]} << 8;
@@ -1686,13 +1741,13 @@ void KeplerCompute::FrontPredictQmd(VideoCommon::GpuSplit& split, const FrontSta
         }
     }
     predict(qmd_address, qmd, stale);
-    if (!(qmd[16] & 1)) {
-        return;
-    }
-    const u32 dependent_action = (qmd[16] >> 1) & 7;
-    const GPUVAddr dependent = GPUVAddr{qmd[15]} << 8;
-    if ((dependent_action == 4 || dependent_action == 3 || dependent_action == 1) &&
-        read(dependent, qmd, stale)) {
+    for (u32 depth = 0; depth < 4 && (qmd[16] & 1); ++depth) {
+        const u32 dependent_action = (qmd[16] >> 1) & 7;
+        const GPUVAddr dependent = GPUVAddr{qmd[15]} << 8;
+        if ((dependent_action != 4 && dependent_action != 3 && dependent_action != 1) ||
+            !read(dependent, qmd, stale)) {
+            break;
+        }
         if (pred_enabled) {
             Prediction::NoteSignal(Prediction::Signal::Chained);
         }

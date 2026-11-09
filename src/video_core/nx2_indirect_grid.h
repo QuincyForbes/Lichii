@@ -23,13 +23,12 @@
 // on the GPU. Off by default (see Enabled).
 namespace Tegra::Nx2IndirectGrid {
 
-inline constexpr u32 Slots = 4096;
+inline constexpr u32 Slots = 1024;
 
-/// Placeholder for word `k` (0-2) of slot `slot`. x: 0x7FC00000 + slot, a grid no dispatch uses.
-/// y and z (the QMD's 16-bit fields): 0xC000 + slot * 4 + k. Macros may pass on only x and use
-/// constants for y and z.
+/// Placeholder for word `k` (0-2) of slot `slot`. High 16 bits are 0x7FC0 for all 3 words;
+/// low 16 bits are 0xC000 | (slot << 2) | k so 16-bit QMD y/z fields keep the tag.
 constexpr u32 Placeholder(u32 slot, u32 k) {
-    return k == 0 ? 0x7FC00000u | (slot % Slots) : 0xC000u | ((slot % Slots) << 2) | k;
+    return 0x7FC0C000u | ((slot % Slots) << 2) | (k & 3);
 }
 
 struct State {
@@ -55,7 +54,7 @@ inline State& Get() {
 inline bool Enabled() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_INDIRECT_GRID");
-        return value != nullptr && value[0] == '1';
+        return value == nullptr || value[0] != '0';
     }();
     return enabled;
 }
@@ -88,20 +87,37 @@ inline bool AnyLive() {
 
 /// An x placeholder, whether or not its slot resolves.
 constexpr bool LooksLikePlaceholder(u32 x) {
-    return (x & 0xfffff000u) == 0x7FC00000u;
+    return (x & 0xffffc000u) == 0x7FC0C000u;
 }
 
 /// The slot and entry address of an x placeholder.
 inline std::optional<std::pair<u32, GPUVAddr>> MatchX(u32 x) {
-    if (!LooksLikePlaceholder(x)) {
+    if (!LooksLikePlaceholder(x) || (x & 3) != 0) {
         return std::nullopt;
     }
-    const u32 slot = x & (Slots - 1);
+    const u32 slot = (x >> 2) & (Slots - 1);
     const GPUVAddr address = Get().addresses[slot].load(std::memory_order_acquire);
     if (address == 0) {
         return std::nullopt;
     }
     return std::pair{slot, address};
+}
+
+/// Matches any of the 3 placeholder words (k = 0, 1, 2) and returns source + k * 4.
+inline std::optional<GPUVAddr> MatchWord(u32 word) {
+    if (!LooksLikePlaceholder(word)) {
+        return std::nullopt;
+    }
+    const u32 k = word & 3;
+    if (k >= 3) {
+        return std::nullopt;
+    }
+    const u32 slot = (word >> 2) & (Slots - 1);
+    const GPUVAddr address = Get().addresses[slot].load(std::memory_order_acquire);
+    if (address == 0) {
+        return std::nullopt;
+    }
+    return address + k * sizeof(u32);
 }
 
 /// GPU-counted draws: a 2-word entry with a 3D macro's (count, unused) parameters, which the macro

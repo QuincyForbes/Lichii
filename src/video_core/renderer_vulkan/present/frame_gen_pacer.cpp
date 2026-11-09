@@ -69,7 +69,8 @@ FrameGenPlan FrameGenPacer::Plan(size_t capacity) {
         return {};
     }
 
-    const f32 target_rate = static_cast<f32>(Settings::values.frame_gen_target_rate.GetValue());
+    const u32 raw_target_rate = Settings::values.frame_gen_target_rate.GetValue();
+    const f32 target_rate = raw_target_rate <= 60 ? 0.0f : static_cast<f32>(raw_target_rate);
 
     if (smoothed_interval > 0.0f) {
         f32 burst_threshold = BURST_CADENCE_RATIO / smoothed_interval;

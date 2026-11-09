@@ -758,6 +758,80 @@ private:
 
     void NoteCpuDirty(DAddr device_addr, u64 size);
 
+    struct UboPageWrite {
+        u32 gen{};
+        u16 begin{};
+        u16 end{};
+    };
+    static constexpr size_t UBO_PAGE_SLOTS = 4096;
+    std::array<UboPageWrite, UBO_PAGE_SLOTS> ubo_page_writes{};
+    u64 cb_write_serial = 1;
+
+    void NoteUniformWrite(DAddr device_addr, u64 size) noexcept {
+        if (size == 0) {
+            return;
+        }
+        ++cb_write_serial;
+        const DAddr end_addr = device_addr + size;
+        const u64 first_page = device_addr >> Core::DEVICE_PAGEBITS;
+        const u64 last_page = (end_addr - 1) >> Core::DEVICE_PAGEBITS;
+        if (last_page - first_page >= UBO_PAGE_SLOTS) {
+            for (UboPageWrite& entry : ubo_page_writes) {
+                ++entry.gen;
+                entry.begin = 0;
+                entry.end = static_cast<u16>(Core::DEVICE_PAGESIZE);
+            }
+            return;
+        }
+        for (u64 page = first_page; page <= last_page; ++page) {
+            const DAddr page_base = page << Core::DEVICE_PAGEBITS;
+            const u16 w_begin = static_cast<u16>((std::max)(device_addr, page_base) - page_base);
+            const u16 w_end = static_cast<u16>(
+                (std::min<DAddr>)(end_addr, page_base + Core::DEVICE_PAGESIZE) - page_base);
+            UboPageWrite& entry = ubo_page_writes[page & (UBO_PAGE_SLOTS - 1)];
+            ++entry.gen;
+            entry.begin = w_begin;
+            entry.end = w_end;
+        }
+    }
+
+    [[nodiscard]] u64 UboPageGen(DAddr device_addr, u32 size) const noexcept {
+        const size_t p0 = (device_addr >> Core::DEVICE_PAGEBITS) & (UBO_PAGE_SLOTS - 1);
+        const size_t p1 = ((device_addr + (size != 0 ? size - 1 : 0)) >> Core::DEVICE_PAGEBITS) &
+                          (UBO_PAGE_SLOTS - 1);
+        return u64{ubo_page_writes[p0].gen} | (u64{ubo_page_writes[p1].gen} << 32);
+    }
+
+    [[nodiscard]] bool UboRangeClean(DAddr device_addr, u32 size, u64& page_gen) const noexcept {
+        const u64 cur_gen = UboPageGen(device_addr, size);
+        if (page_gen == cur_gen) [[likely]] {
+            return true;
+        }
+        const DAddr end_addr = device_addr + size;
+        const auto page_clean = [&](u64 page, u32 old_gen) noexcept {
+            const UboPageWrite& entry = ubo_page_writes[page & (UBO_PAGE_SLOTS - 1)];
+            if (entry.gen == old_gen) {
+                return true;
+            }
+            if (entry.gen != old_gen + 1) {
+                return false;
+            }
+            const DAddr page_base = page << Core::DEVICE_PAGEBITS;
+            const u16 b_begin = static_cast<u16>((std::max)(device_addr, page_base) - page_base);
+            const u16 b_end = static_cast<u16>(
+                (std::min<DAddr>)(end_addr, page_base + Core::DEVICE_PAGESIZE) - page_base);
+            return b_end <= entry.begin || b_begin >= entry.end;
+        };
+        const u64 first_page = device_addr >> Core::DEVICE_PAGEBITS;
+        const u64 last_page = (end_addr - 1) >> Core::DEVICE_PAGEBITS;
+        if (page_clean(first_page, static_cast<u32>(page_gen)) &&
+            (last_page == first_page || page_clean(last_page, static_cast<u32>(page_gen >> 32)))) {
+            page_gen = cur_gen;
+            return true;
+        }
+        return false;
+    }
+
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 
     Common::SlotVector<Buffer> slot_buffers;

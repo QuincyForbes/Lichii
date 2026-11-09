@@ -5013,7 +5013,7 @@ void MainWindow::UpdateGPUAccuracyButton() {
 void MainWindow::UpdateOotFpsButton() {
     const bool fps30 = Settings::values.oot_30fps.GetValue();
     oot_fps_button->setChecked(fps30);
-    oot_fps_button->setText(fps30 ? tr("30 FPS") : tr("120 FPS"));
+    oot_fps_button->setText(fps30 ? tr("30 FPS") : tr("60 FPS"));
 }
 
 void MainWindow::OnToggleOotFrameRate() {

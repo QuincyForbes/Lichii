@@ -1413,10 +1413,15 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     gpu_memory->FlushCaching();
 
     auto& regs = maxwell3d->regs;
-    const bool use_color = regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
-                           regs.clear_surface.A;
-    const bool use_depth = regs.clear_surface.Z;
-    const bool use_stencil = regs.clear_surface.S;
+    const u32 color_attachment = regs.clear_surface.RT;
+    const bool use_color =
+        (regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
+         regs.clear_surface.A) &&
+        color_attachment < regs.rt_control.count &&
+        regs.rt[color_attachment].Address() != 0 &&
+        regs.rt[color_attachment].format != Tegra::RenderTargetFormat::NONE;
+    const bool use_depth = regs.clear_surface.Z && regs.zeta_enable && regs.zeta.Address() != 0;
+    const bool use_stencil = regs.clear_surface.S && regs.zeta_enable && regs.zeta.Address() != 0;
     if (!use_color && !use_depth && !use_stencil) {
         return;
     }
@@ -1424,6 +1429,17 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     std::scoped_lock lock{texture_cache.mutex};
     texture_cache.UpdateRenderTargets(true);
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
+    const bool clear_color = use_color && framebuffer->HasAspectColorBit(color_attachment);
+    VkImageAspectFlags aspect_flags = 0;
+    if (use_depth && framebuffer->HasAspectDepthBit()) {
+        aspect_flags |= VK_IMAGE_ASPECT_DEPTH_BIT;
+    }
+    if (use_stencil && framebuffer->HasAspectStencilBit()) {
+        aspect_flags |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    }
+    if (!clear_color && aspect_flags == 0) {
+        return;
+    }
     if (frame_dump.Capturing() || flash_watch.WatchesPasses()) {
         FrameDumpPass(framebuffer);
     }
@@ -1541,10 +1557,8 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     // would begin it outside the pass and end it inside the next draw's pass.
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                               !can_defer_clear && regs.zpass_pixel_count_enable);
-    UpdateViewportsState(regs);
 
-    const u32 color_attachment = regs.clear_surface.RT;
-    if (use_color && framebuffer->HasAspectColorBit(color_attachment)) {
+    if (clear_color) {
         const auto format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[color_attachment].format);
         bool is_integer = IsPixelFormatInteger(format);
         bool is_signed = IsPixelFormatSignedInteger(format);
@@ -1583,16 +1597,6 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         }
     }
 
-    if (!use_depth && !use_stencil) {
-        return;
-    }
-    VkImageAspectFlags aspect_flags = 0;
-    if (use_depth && framebuffer->HasAspectDepthBit()) {
-        aspect_flags |= VK_IMAGE_ASPECT_DEPTH_BIT;
-    }
-    if (use_stencil && framebuffer->HasAspectStencilBit()) {
-        aspect_flags |= VK_IMAGE_ASPECT_STENCIL_BIT;
-    }
     if (aspect_flags == 0) {
         return;
     }
@@ -1771,20 +1775,28 @@ void RasterizerVulkan::DispatchCompute() {
     if (indirect_address) {
         // DispatchIndirect
         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
-        const auto post_op = VideoCommon::ObtainBufferOperation::DiscardWrite;
+        const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
+        buffer->MarkUsage(offset, 12);
         scheduler.RequestOutsideRenderPassOperationContext();
         record_read_barrier();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
-        scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),
+        scheduler.Record([this, pipeline, byte_addressed_shadow,
+                          indirect_buffer = buffer->Handle(),
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
             if (!pipeline->IsBound()) {
                 return;
             }
+            if (byte_addressed_shadow) {
+                TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, false);
+            }
             scheduler.TraceGpuWork(cmdbuf, pipeline->ShaderHash(), 0, {}, [&] {
                 cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
             });
+            if (byte_addressed_shadow) {
+                TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
+            }
         });
         compute_since_count_barrier = true;
         SubmitNx2ListCopies(pipeline->ShaderHash());
@@ -2973,15 +2985,18 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
             return value;
         };
         for (size_t i = 0; i < words; ++i) {
-            const auto match = Tegra::Nx2IndirectGrid::MatchX(word(i));
-            if (!match) {
+            const auto source = Tegra::Nx2IndirectGrid::MatchWord(word(i));
+            if (!source) {
                 continue;
             }
-            const auto [slot, source] = *match;
-            const bool all = i + 3 <= words &&
-                             word(i + 1) == Tegra::Nx2IndirectGrid::Placeholder(slot, 1) &&
-                             word(i + 2) == Tegra::Nx2IndirectGrid::Placeholder(slot, 2);
-            grids.emplace_back(source, address + i * sizeof(u32), all ? 3U : 1U);
+            u32 count = 1;
+            while (i + count < words && count < 3 &&
+                   Tegra::Nx2IndirectGrid::MatchWord(word(i + count)) ==
+                       *source + count * sizeof(u32)) {
+                ++count;
+            }
+            grids.emplace_back(*source, address + i * sizeof(u32), count);
+            i += count - 1;
         }
         if (!grids.empty()) {
             AccelerateInlineToMemoryImpl(address, copy_size, memory);

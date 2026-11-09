@@ -120,7 +120,7 @@ bool MetByQueuedRelease(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
 bool GequalMetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value) {
     static const int level = [] {
         const char* setting = std::getenv("EDEN_NX2_ACQUIRE_PRECHECK");
-        return setting == nullptr ? 0 : setting[0] == '2' ? 2 : setting[0] != '0' ? 1 : 0;
+        return setting == nullptr ? 2 : setting[0] == '2' ? 2 : setting[0] != '0' ? 1 : 0;
     }();
     auto& split = VideoCommon::GpuSplit::Get();
     if (level == 0 || !split.Active()) {
@@ -237,7 +237,7 @@ private:
 bool EqualMetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value) {
     static const bool enabled = [] {
         const char* setting = std::getenv("EDEN_NX2_ACQUIRE_EQUAL");
-        return setting != nullptr && setting[0] == '1';
+        return setting == nullptr || setting[0] != '0';
     }();
     auto& split = VideoCommon::GpuSplit::Get();
     if (!enabled || !split.Active()) {
@@ -614,6 +614,11 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
             GpuSemaphoreOperation::AcquireGequal &&
         GequalMetWithoutDrain(dma_pusher, pending_acquire->address, pending_acquire->value)) {
+        return true;
+    }
+    if (static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
+            GpuSemaphoreOperation::AcquireEqual &&
+        EqualMetWithoutDrain(dma_pusher, pending_acquire->address, pending_acquire->value)) {
         return true;
     }
     // EDEN_NX2_ACQUIRE_LEARN: resume when a release met the waiter (GPU releases notify
