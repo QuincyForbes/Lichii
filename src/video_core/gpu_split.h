@@ -786,6 +786,40 @@ public:
         }
         return (std::min)(target, write_position);
     }
+    /// EDEN_NX2_ACQUIRE_PRECHECK=2's queued write check (puller.cpp, EXP34): the payload of the
+    /// newest release recorded for the u32 at `device` (NoteRelease) while the back has not run it
+    /// (its ring position is past `done`), whatever was sent after it (unlike
+    /// QueuedReleasePayload). queued_releases keeps one release per slot: a newer release to
+    /// another word in the same slot hides it. (From Fritchii v5.5, 0b213954bd.)
+    [[nodiscard]] std::optional<u32> QueuedReleaseTo(u64 device, u64 done) const {
+        const QueuedRelease& release = queued_releases[(device >> 2) % queued_releases.size()];
+        if (release.device != device || release.position == 0 || release.position <= done) {
+            return std::nullopt;
+        }
+        return release.payload;
+    }
+    /// Whether a compute or copy writer range noted after position `since` overlaps device bytes
+    /// [begin, begin + size), not counting unbounded writers (WritersMayWriteSince counts them).
+    /// More ranges than are remembered or scanned count as overlapping.
+    [[nodiscard]] bool NotedWriterRangeSince(u64 since, u64 begin, u64 size) const {
+        const u64 end = begin + size;
+        const u64 oldest =
+            writer_range_count - (std::min<u64>)(writer_range_count, writer_ranges.size());
+        u64 scanned = 0;
+        for (u64 index = writer_range_count; index > oldest; --index, ++scanned) {
+            if (scanned == MaxWriterScan) {
+                return true;
+            }
+            const WriterRange& range = writer_ranges[(index - 1) % writer_ranges.size()];
+            if (range.position <= since) {
+                return false;
+            }
+            if (range.begin < end && begin < range.end) {
+                return true;
+            }
+        }
+        return oldest != 0;
+    }
     /// The entry just sent also writes [address, address + size) of `memory`, noted by device
     /// page (other mappings may alias it, and the caches keep state per page).
     void NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);

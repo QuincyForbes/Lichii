@@ -114,6 +114,10 @@ inline std::atomic<int> g_host_pace{-1};
 /// EXP19 (graphics pipeline lookup without Refresh, PipelineCache::CurrentGraphicsPipelineClean):
 /// 1 = as EDEN_NX2_PIPELINE_CLEAN=1, 2 = also #641's patches (blend registers left to the
 /// dual-source bit and Dirty::Blending, attribute types redone alone under Dirty::VertexInput).
+/// EXP34 (live; EDEN_NX2_ACQUIRE_PRECHECK=2, puller.cpp QueuedWriteRefusesMet): 1 (default) = a
+/// GEQUAL acquire level 2 would answer met goes the normal way when the front knows a write to its
+/// word is still queued, or the word read current was below the value; 2 = only when a queued plain
+/// release writes less than the word read; 0 = off. With EDEN_NX2_GPU_PROFILE, a 5 s count line.
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 
@@ -157,6 +161,10 @@ inline void LoadExperiments() {
         // per-frame render targets relocated in place.
         g_experiments[42].store(1, std::memory_order_relaxed);
         g_experiments[43].store(3, std::memory_order_relaxed);
+        // EXP34 = 1: ACQUIRE_PRECHECK=2 answers no GEQUAL acquire met over a write to its word
+        // queued for the back (a reset there let a channel run before its producer). A strict
+        // tightening: only met answers become the normal path (puller.cpp QueuedWriteRefusesMet).
+        g_experiments[34].store(1, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {
