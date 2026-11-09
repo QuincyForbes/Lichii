@@ -5,6 +5,17 @@
 import LichiiBridge
 import UIKit
 
+/// Called on an emulator thread; the dialog is shown on the main thread.
+private let guestDialogHandler: LichiiDialogHandler = { _, id, json in
+    guard let json else { return }
+    let data = Data(String(cString: json).utf8)
+    DispatchQueue.main.async {
+        MainActor.assumeIsolated {
+            GuestDialogs.handle(id: id, data: data)
+        }
+    }
+}
+
 /// The game's dialogs (software keyboard, errors, user picker, controller applet) as
 /// UIAlertControllers over whichever window is on screen.
 @MainActor
@@ -35,18 +46,10 @@ enum GuestDialogs {
     private static var observers: [UInt64: NSObjectProtocol] = [:]
 
     static func register() {
-        lichii_content_set_dialog_handler({ _, id, json in
-            guard let json else { return }
-            let data = Data(String(cString: json).utf8)
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated {
-                    GuestDialogs.handle(id: id, data: data)
-                }
-            }
-        }, nil)
+        lichii_content_set_dialog_handler(guestDialogHandler, nil)
     }
 
-    private static func handle(id: UInt64, data: Data) {
+    fileprivate static func handle(id: UInt64, data: Data) {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         guard let request = try? decoder.decode(Request.self, from: data) else {

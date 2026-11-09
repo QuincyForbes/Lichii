@@ -34,14 +34,16 @@ enum ContentBridge {
         let handler: @Sendable (Double) -> Bool
         init(_ handler: @escaping @Sendable (Double) -> Bool) { self.handler = handler }
 
+        private static let trampoline: LichiiContentProgress = { user, done, total in
+            guard let user else { return false }
+            let progress = Unmanaged<Progress>.fromOpaque(user).takeUnretainedValue()
+            return progress.handler(total == 0 ? 0 : Double(done) / Double(total))
+        }
+
         func call<T>(_ body: (LichiiContentProgress, UnsafeMutableRawPointer) -> T) -> T {
             let context = Unmanaged.passUnretained(self).toOpaque()
             return withExtendedLifetime(self) {
-                body({ user, done, total in
-                    guard let user else { return false }
-                    let progress = Unmanaged<Progress>.fromOpaque(user).takeUnretainedValue()
-                    return progress.handler(total == 0 ? 0 : Double(done) / Double(total))
-                }, context)
+                body(Progress.trampoline, context)
             }
         }
     }
