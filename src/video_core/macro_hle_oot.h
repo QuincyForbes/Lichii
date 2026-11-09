@@ -448,9 +448,11 @@ bool E52(C& c) {
     if (instances != 0) {
         DrawLoop(c, c.Param(0), c.Param(1), instances);
     }
-    c.Emit(0x446, 0);
-    c.Emit(0x50d, 0);
-    c.Emit(0x50e, 0);
+    if ((c.Param(4) | c.Param(5)) != 0) {
+        c.Emit(0x446, 0);
+        c.Emit(0x50d, 0);
+        c.Emit(0x50e, 0);
+    }
     return true;
 }
 
@@ -613,12 +615,14 @@ bool EA0(C& c) {
     if (instances != 0) {
         DrawLoop(c, c.Param(0), c.Param(1), instances);
     }
-    c.Emit(0x446, 0);
-    c.Emit(0x50d, 0);
-    c.Emit(0x50e, 0);
-    c.Emit(0x8e3, 0x640);
-    c.Emit(0x8e4, 0);
-    c.Emit(0x8e5, 0);
+    if ((base_vertex | base_instance) != 0) {
+        c.Emit(0x446, 0);
+        c.Emit(0x50d, 0);
+        c.Emit(0x50e, 0);
+        c.Emit(0x8e3, 0x640);
+        c.Emit(0x8e4, 0);
+        c.Emit(0x8e5, 0);
+    }
     return true;
 }
 

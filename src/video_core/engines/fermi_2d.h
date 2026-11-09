@@ -23,6 +23,10 @@ namespace VideoCore {
 class RasterizerInterface;
 }
 
+namespace VideoCommon {
+class GpuSplit;
+}
+
 namespace Tegra::Engines {
 
 namespace Blitter {
@@ -51,6 +55,9 @@ public:
 
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
+
+    void FrontMethod(VideoCommon::GpuSplit& split, u32 method, const u32* words, u32 count,
+                     bool non_incrementing);
 
     enum class Origin : u32 {
         Center = 0,
@@ -311,6 +318,7 @@ private:
     VideoCore::RasterizerInterface* rasterizer = nullptr;
     std::unique_ptr<Blitter::SoftwareBlitEngine> sw_blitter;
     MemoryManager& memory_manager;
+    Regs front_regs{};
 
     /// Performs the copy from the source surface to the destination surface as configured in the
     /// registers.

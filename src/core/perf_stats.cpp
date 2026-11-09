@@ -83,8 +83,11 @@ void PerfStats::EndSystemFrame() {
     previous_frame_end = frame_end;
 }
 
-void PerfStats::EndGameFrame() {
+void PerfStats::EndGameFrame(u32 generated_count) {
     game_frames.fetch_add(1, std::memory_order_relaxed);
+    if (generated_count > 0) {
+        generated_frames.fetch_add(generated_count, std::memory_order_relaxed);
+    }
 }
 
 double PerfStats::GetMeanFrametime() const {
@@ -109,11 +112,22 @@ PerfStatsResults PerfStats::GetAndResetStats(microseconds current_system_time_us
     const auto system_us_per_second = (current_system_time_us - reset_point_system_us) / interval;
     const auto current_frames = static_cast<double>(game_frames.load(std::memory_order_relaxed));
     const auto current_fps = current_frames / interval;
+    const auto current_gen_frames =
+        static_cast<double>(generated_frames.load(std::memory_order_relaxed));
+    const auto current_gen_fps = current_gen_frames / interval;
+    const double avg_game_fps = (current_fps + previous_fps) / 2.0;
+    const double avg_gen_fps = (current_gen_fps + previous_generated_fps) / 2.0;
+    const double sys_frametime =
+        system_frames > 0
+            ? duration_cast<DoubleSecs>(accumulated_frametime).count() /
+                  static_cast<double>(system_frames)
+            : (avg_game_fps > 0.0 ? 1.0 / avg_game_fps : 0.0);
     const PerfStatsResults results{
         .system_fps = static_cast<double>(system_frames) / interval,
-        .average_game_fps = (current_fps + previous_fps) / 2.0,
-        .frametime = duration_cast<DoubleSecs>(accumulated_frametime).count() /
-                     static_cast<double>(system_frames),
+        .average_game_fps = avg_game_fps,
+        .generated_fps = avg_gen_fps,
+        .total_fps = avg_game_fps + avg_gen_fps,
+        .frametime = sys_frametime,
         .emulation_speed = system_us_per_second.count() / 1'000'000.0,
     };
 
@@ -123,7 +137,9 @@ PerfStatsResults PerfStats::GetAndResetStats(microseconds current_system_time_us
     accumulated_frametime = Clock::duration::zero();
     system_frames = 0;
     game_frames.store(0, std::memory_order_relaxed);
+    generated_frames.store(0, std::memory_order_relaxed);
     previous_fps = current_fps;
+    previous_generated_fps = current_gen_fps;
 
     return results;
 }

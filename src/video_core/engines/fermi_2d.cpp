@@ -11,6 +11,7 @@
 #include "common/logging.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/sw_blitter/blitter.h"
+#include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/surface.h"
@@ -28,6 +29,8 @@ Fermi2D::Fermi2D(MemoryManager& memory_manager_) : memory_manager{memory_manager
     // Nvidia's OpenGL driver seems to assume these values
     regs.src.depth = 1;
     regs.dst.depth = 1;
+    front_regs.src.depth = 1;
+    front_regs.dst.depth = 1;
 
     execution_mask.reset();
     execution_mask[FERMI2D_REG_INDEX(pixels_from_memory.src_y0) + 1] = true;
@@ -51,6 +54,39 @@ void Fermi2D::CallMethod(Core::System& system, u32 method, u32 method_argument, 
 void Fermi2D::CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) {
     for (u32 i = 0; i < amount; ++i) {
         CallMethod(system, method, base_start[i], methods_pending - i <= 1);
+    }
+}
+
+void Fermi2D::FrontMethod(VideoCommon::GpuSplit& split, u32 method, const u32* words, u32 count,
+                          bool non_incrementing) {
+    for (u32 i = 0; i < count; ++i) {
+        const u32 m = non_incrementing ? method : method + i;
+        if (m < Regs::NUM_REGS) {
+            front_regs.reg_array[m] = words[i];
+        }
+        if (m == FERMI2D_REG_INDEX(pixels_from_memory.src_y0) + 1) {
+            split.NoteMemoryWriter();
+            const Surface& dst = front_regs.dst;
+            const auto dst_pixel_format =
+                VideoCore::Surface::TryPixelFormatFromRenderTargetFormat(dst.format);
+            const auto device = memory_manager.GpuToCpuAddress(dst.Address());
+            if (!dst_pixel_format || !device) {
+                split.NoteMemoryWrite(0, ~u64{0}, "2D blit unmapped");
+                continue;
+            }
+            const u32 bpp = BytesPerBlock(*dst_pixel_format);
+            const u64 size =
+                dst.linear == MemoryLayout::BlockLinear
+                    ? CalculateSize(true, bpp, dst.width, dst.height, (std::max)(dst.depth, 1U),
+                                    dst.block_height, dst.block_depth)
+                    : u64{dst.pitch} * dst.height;
+            if (size == 0 || size > (u64{256} << 20) ||
+                memory_manager.GpuToCpuAddress(dst.Address() + size - 1) != *device + size - 1) {
+                split.NoteMemoryWrite(0, ~u64{0}, "2D blit discontiguous");
+            } else {
+                split.NoteMemoryWrite(*device, size, "2D blit");
+            }
+        }
     }
 }
 

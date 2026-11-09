@@ -49,6 +49,9 @@ static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
         // Choose Mailbox or Immediate if unlocked and those modes are supported
         const auto mode = Settings::values.vsync_mode.GetValue();
         if (Settings::values.frame_gen.GetValue()) {
+            if (mode == Settings::VSyncMode::Mailbox && has_mailbox) {
+                return Settings::VSyncMode::Mailbox;
+            }
             return mode == Settings::VSyncMode::FifoRelaxed ? mode : Settings::VSyncMode::Fifo;
         }
         if (Settings::values.use_speed_limit.GetValue() &&

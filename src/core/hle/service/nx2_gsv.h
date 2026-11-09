@@ -1935,11 +1935,17 @@ private:
         // Ocarina of Time's 30 FPS mode (lower-end PCs): two vblanks a frame. Its frame step
         // follows the time measured (Dynamic FPS by Dark), so it keeps full speed.
         constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
-        if (process != nullptr && process->GetProgramId() == OcarinaOfTimeId &&
-            Settings::values.oot_30fps.GetValue()) {
+        const bool is_oot = process != nullptr && process->GetProgramId() == OcarinaOfTimeId;
+        if (is_oot && Settings::values.oot_30fps.GetValue()) {
             swap_interval = (std::max)(swap_interval, 2U);
         }
-        const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
+        const u32 default_refresh_rate =
+            (is_oot && !Settings::values.oot_30fps.GetValue()) ? 120U : 60U;
+        const u32 refresh_rate = (is_oot && !Settings::values.oot_30fps.GetValue())
+                                     ? 120U
+                                     : ((timing & 0xffff) >= 30 && (timing & 0xffff) <= 240
+                                            ? timing & 0xffff
+                                            : default_refresh_rate);
         if (trace) {
             m_frame_trace.interval = swap_interval;
             m_frame_trace.refresh = refresh_rate;
@@ -2532,7 +2538,7 @@ private:
             // frame that misses a 60 Hz tick idles until the next one.
             static const std::chrono::nanoseconds VblankInterval{[] {
                 const char* text = std::getenv("EDEN_NX2_VSYNC_HZ");
-                const long long hz = text ? (std::max)(std::strtoll(text, nullptr, 10), 1LL) : 60LL;
+                const long long hz = text ? (std::max)(std::strtoll(text, nullptr, 10), 1LL) : 120LL;
                 return 1'000'000'000LL / hz;
             }()};
             m_vsync_timer = Core::Timing::CreateEvent(

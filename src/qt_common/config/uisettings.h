@@ -225,7 +225,7 @@ struct Values {
     QMap<u64, QDir> ryujinx_link_paths;
 
     // perf overlay
-    Setting<bool> show_perf_overlay{linkage, false, "show_perf_overlay", Category::UiGameList};
+    Setting<bool> show_perf_overlay{linkage, true, "show_perf_overlay", Category::UiGameList};
 
     // Size & File Types Column
     Setting<bool> show_size{linkage, true, "show_size", Category::UiGameList};

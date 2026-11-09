@@ -3210,7 +3210,9 @@ public:
     void CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) override;
 
     /// Write multiple values to the register identified by method.
-    void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
+    void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) final;
+
+    void ApplyPairs(Core::System& system, const u64* pairs, u32 count) final;
 
     /// GpuSplit's back (fast_maxwell3d): CallMethod for each of up to 64 single writes to the
     /// constant buffer data registers, uploaded in one memory write within a device page.
@@ -3293,11 +3295,11 @@ private:
 
     u32 ProcessShadowRam(u32 method, u32 argument);
 
+    void SetDirtyFlags(u32 method) noexcept;
+
     void ProcessDirtyRegisters(u32 method, u32 argument);
 
-    void ConsumeSinkImpl(Core::System& system) override;
-
-    void ApplyPairs(Core::System& system, const u64* pairs, u32 count) override;
+    void ConsumeSinkImpl(Core::System& system) final;
 
     void ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call);
 

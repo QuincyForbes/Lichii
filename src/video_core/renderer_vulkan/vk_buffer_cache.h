@@ -61,7 +61,7 @@ public:
 
     void MarkUsage(u64 offset, u64 size) noexcept;
 
-    void ResetUsageTracking() noexcept {
+    void ResetUsageTracking() const noexcept {
         tracker.Reset();
     }
 
@@ -89,7 +89,7 @@ private:
     Scheduler* scheduler{};
     vk::Buffer buffer;
     std::vector<BufferView> views;
-    VideoCommon::UsageTracker tracker;
+    mutable VideoCommon::UsageTracker tracker;
     VkDeviceAddress device_address{};
     u64 last_usage_tick{};
     bool is_null{};

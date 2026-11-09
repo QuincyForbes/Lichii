@@ -17,6 +17,10 @@ struct PerfStatsResults {
     double system_fps;
     /// Average game FPS (GPU frame renders) in Hz
     double average_game_fps;
+    /// Average generated FPS (FrameGen interpolated frames) in Hz
+    double generated_fps;
+    /// Total displayed FPS (real game frames + generated frames) in Hz
+    double total_fps;
     /// Walltime per system frame, in seconds, excluding any waits
     double frametime;
     /// Ratio of walltime / emulated time elapsed
@@ -36,7 +40,7 @@ public:
 
     void BeginSystemFrame();
     void EndSystemFrame();
-    void EndGameFrame();
+    void EndGameFrame(u32 generated_count = 0);
 
     PerfStatsResults GetAndResetStats(std::chrono::microseconds current_system_time_us);
 
@@ -73,6 +77,8 @@ private:
     u32 system_frames = 0;
     /// Cumulative number of game frames (GSP frame submissions) since last reset
     std::atomic<u32> game_frames = 0;
+    /// Cumulative number of generated frames (FrameGen) since last reset
+    std::atomic<u32> generated_frames = 0;
 
     /// Point when the previous system frame ended
     Clock::time_point previous_frame_end = reset_point;
@@ -82,6 +88,8 @@ private:
     Clock::duration previous_frame_length = Clock::duration::zero();
     /// Previously computed fps
     double previous_fps = 0;
+    /// Previously computed generated fps
+    double previous_generated_fps = 0;
 };
 
 class SpeedLimiter {

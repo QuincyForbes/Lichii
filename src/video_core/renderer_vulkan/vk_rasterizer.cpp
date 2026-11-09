@@ -1530,7 +1530,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         clear_rect.rect.extent.height >= render_area.height;
     const bool can_defer_clear = ENABLE_DEFERRED_CLEAR && (!regs.clear_control.use_scissor || clear_covers_render_area) &&
                                  clear_layers.covers_all_layers &&
-                                 !scheduler.IsRenderPassActive() &&
+                                 !scheduler.RenderPassMatches(framebuffer) &&
                                  (!use_color || color_full_channels) && ds_deferrable;
     if (!can_defer_clear) {
         scheduler.RequestRenderpass(framebuffer);
@@ -2271,9 +2271,9 @@ void RasterizerVulkan::WaitForIdle() {
         const char* value = std::getenv("EDEN_NX2_WFI_DEFER");
         return value == nullptr || value[0] != '0';
     }();
-    if (wfi_defer && scheduler.IsRenderPassActive() && !scheduler.RenderPassHasStores() &&
-        nx2_dispatch_serial == nx2_wfi_dispatch_serial &&
+    if (wfi_defer && scheduler.IsRenderPassActive() &&
         maxwell3d->regs.transform_feedback_enabled == 0) {
+        nx2_wfi_dispatch_serial = nx2_dispatch_serial;
         scheduler.DeferFragmentBarrier();
         fence_manager.SignalOrdering();
         return;
@@ -3210,10 +3210,7 @@ void RasterizerVulkan::FlushWork() {
     static constexpr bool android = false;
 #endif // __ANDROID__
     const bool native = gpu_memory->UsesNativeTiling();
-    // The 128-draw native budget is tuned for MoltenVK; desktop Vulkan takes the legacy 4096 (#161).
-    const u32 default_native_budget =
-        (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::SubmitBudget) && !device.IsMoltenVK()) ? 4096U
-                                                                : SubmissionPolicy::DefaultNativeBudget;
+    const u32 default_native_budget = SubmissionPolicy::DefaultNativeBudget;
     u32 budget = default_native_budget;
     if (native && !android) {
         static const std::optional<u32> configured_budget = []() -> std::optional<u32> {
@@ -3249,8 +3246,12 @@ void RasterizerVulkan::FlushWork() {
         scheduler.DispatchWork(true);
         break;
     case SubmissionPolicy::Action::Flush:
-        scheduler.Flush();
-        pending_native_work = false;
+        if (!scheduler.IsRenderPassActive() || draw_counter >= 512U) {
+            scheduler.Flush();
+            pending_native_work = false;
+        } else {
+            scheduler.DispatchWork(true);
+        }
         break;
     }
 }

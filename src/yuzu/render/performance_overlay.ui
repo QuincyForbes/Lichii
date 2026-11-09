@@ -6,18 +6,50 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>225</width>
-    <height>250</height>
+    <width>285</width>
+    <height>310</height>
    </rect>
   </property>
   <property name="windowTitle">
-   <string>Form</string>
+   <string>Performance Overlay</string>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
+   <property name="spacing">
+    <number>4</number>
+   </property>
+   <property name="leftMargin">
+    <number>10</number>
+   </property>
+   <property name="topMargin">
+    <number>8</number>
+   </property>
+   <property name="rightMargin">
+    <number>10</number>
+   </property>
+   <property name="bottomMargin">
+    <number>8</number>
+   </property>
    <item>
-    <layout class="QHBoxLayout" name="ft_label_layout">
+    <layout class="QHBoxLayout" name="total_fps_layout">
      <item>
-      <widget class="QLabel" name="label_3">
+      <widget class="QLabel" name="label_total">
+       <property name="font">
+        <font>
+         <family>Sans Serif</family>
+         <pointsize>11</pointsize>
+         <bold>true</bold>
+        </font>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">color: #4ade80;</string>
+       </property>
+       <property name="text">
+        <string>Displayed FPS</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="total_fps">
        <property name="font">
         <font>
          <family>Sans Serif</family>
@@ -25,70 +57,14 @@
          <bold>true</bold>
         </font>
        </property>
+       <property name="alignment">
+        <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+       </property>
        <property name="styleSheet">
-        <string notr="true">color: #0000ff;</string>
+        <string notr="true">color: #4ade80;</string>
        </property>
        <property name="text">
-        <string>Frametime</string>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QLabel" name="frametime">
-       <property name="font">
-        <font>
-         <family>Sans Serif</family>
-         <pointsize>12</pointsize>
-        </font>
-       </property>
-       <property name="text">
-        <string>0 ms</string>
-       </property>
-      </widget>
-     </item>
-    </layout>
-   </item>
-   <item>
-    <layout class="QHBoxLayout" name="ft_layout">
-     <item>
-      <widget class="QLabel" name="ft_min">
-       <property name="font">
-        <font>
-         <family>Sans Serif</family>
-         <pointsize>10</pointsize>
-         <bold>false</bold>
-        </font>
-       </property>
-       <property name="text">
-        <string>Min: 0</string>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QLabel" name="ft_max">
-       <property name="font">
-        <font>
-         <family>Sans Serif</family>
-         <pointsize>10</pointsize>
-         <bold>false</bold>
-        </font>
-       </property>
-       <property name="text">
-        <string>Max: 0</string>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QLabel" name="ft_avg">
-       <property name="font">
-        <font>
-         <family>Sans Serif</family>
-         <pointsize>10</pointsize>
-         <bold>false</bold>
-        </font>
-       </property>
-       <property name="text">
-        <string>Avg: 0</string>
+        <string>0.0 FPS</string>
        </property>
       </widget>
      </item>
@@ -101,15 +77,15 @@
        <property name="font">
         <font>
          <family>Sans Serif</family>
-         <pointsize>12</pointsize>
+         <pointsize>10</pointsize>
          <bold>true</bold>
         </font>
        </property>
        <property name="styleSheet">
-        <string notr="true">color: #ff0000;</string>
+        <string notr="true">color: #38bdf8;</string>
        </property>
        <property name="text">
-        <string>FPS</string>
+        <string>Actual (Game)</string>
        </property>
       </widget>
      </item>
@@ -118,11 +94,59 @@
        <property name="font">
         <font>
          <family>Sans Serif</family>
-         <pointsize>12</pointsize>
+         <pointsize>10</pointsize>
+         <bold>true</bold>
         </font>
        </property>
+       <property name="alignment">
+        <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">color: #e2e8f0;</string>
+       </property>
        <property name="text">
-        <string>0 fps</string>
+        <string>0.0 FPS</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="gen_fps_layout">
+     <item>
+      <widget class="QLabel" name="label_gen">
+       <property name="font">
+        <font>
+         <family>Sans Serif</family>
+         <pointsize>10</pointsize>
+         <bold>true</bold>
+        </font>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">color: #c084fc;</string>
+       </property>
+       <property name="text">
+        <string>Generated (FG)</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="fps_gen">
+       <property name="font">
+        <font>
+         <family>Sans Serif</family>
+         <pointsize>10</pointsize>
+         <bold>true</bold>
+        </font>
+       </property>
+       <property name="alignment">
+        <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">color: #e9d5ff;</string>
+       </property>
+       <property name="text">
+        <string>+0.0 FPS (Off)</string>
        </property>
       </widget>
      </item>
@@ -135,9 +159,12 @@
        <property name="font">
         <font>
          <family>Sans Serif</family>
-         <pointsize>10</pointsize>
+         <pointsize>9</pointsize>
          <bold>false</bold>
         </font>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">color: #94a3b8;</string>
        </property>
        <property name="text">
         <string>Min: 0</string>
@@ -145,16 +172,19 @@
       </widget>
      </item>
      <item>
-      <widget class="QLabel" name="fps_max">
+      <widget class="QLabel" name="fps_low1">
        <property name="font">
         <font>
          <family>Sans Serif</family>
-         <pointsize>10</pointsize>
+         <pointsize>9</pointsize>
          <bold>false</bold>
         </font>
        </property>
+       <property name="styleSheet">
+        <string notr="true">color: #cbd5e1;</string>
+       </property>
        <property name="text">
-        <string>Max: 0</string>
+        <string>1%L: 0</string>
        </property>
       </widget>
      </item>
@@ -163,16 +193,149 @@
        <property name="font">
         <font>
          <family>Sans Serif</family>
-         <pointsize>10</pointsize>
+         <pointsize>9</pointsize>
          <bold>false</bold>
         </font>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">color: #94a3b8;</string>
        </property>
        <property name="text">
         <string>Avg: 0</string>
        </property>
       </widget>
      </item>
+     <item>
+      <widget class="QLabel" name="fps_max">
+       <property name="font">
+        <font>
+         <family>Sans Serif</family>
+         <pointsize>9</pointsize>
+         <bold>false</bold>
+        </font>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">color: #94a3b8;</string>
+       </property>
+       <property name="text">
+        <string>Max: 0</string>
+       </property>
+      </widget>
+     </item>
     </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="ft_label_layout">
+     <item>
+      <widget class="QLabel" name="label_3">
+       <property name="font">
+        <font>
+         <family>Sans Serif</family>
+         <pointsize>10</pointsize>
+         <bold>true</bold>
+        </font>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">color: #fbbf24;</string>
+       </property>
+       <property name="text">
+        <string>Frametime</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="frametime">
+       <property name="font">
+        <font>
+         <family>Sans Serif</family>
+         <pointsize>10</pointsize>
+         <bold>true</bold>
+        </font>
+       </property>
+       <property name="alignment">
+        <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">color: #e2e8f0;</string>
+       </property>
+       <property name="text">
+        <string>0.00 ms</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="ft_layout">
+     <item>
+      <widget class="QLabel" name="ft_min">
+       <property name="font">
+        <font>
+         <family>Sans Serif</family>
+         <pointsize>9</pointsize>
+         <bold>false</bold>
+        </font>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">color: #94a3b8;</string>
+       </property>
+       <property name="text">
+        <string>Min: 0</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="ft_avg">
+       <property name="font">
+        <font>
+         <family>Sans Serif</family>
+         <pointsize>9</pointsize>
+         <bold>false</bold>
+        </font>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">color: #94a3b8;</string>
+       </property>
+       <property name="text">
+        <string>Avg: 0</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="ft_max">
+       <property name="font">
+        <font>
+         <family>Sans Serif</family>
+         <pointsize>9</pointsize>
+         <bold>false</bold>
+        </font>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">color: #94a3b8;</string>
+       </property>
+       <property name="text">
+        <string>Max: 0</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QLabel" name="status_info">
+     <property name="font">
+      <font>
+       <family>Sans Serif</family>
+       <pointsize>9</pointsize>
+       <bold>false</bold>
+      </font>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">color: #a5b4fc;</string>
+     </property>
+     <property name="text">
+      <string>Speed: 100% | Scale: 1x</string>
+     </property>
+    </widget>
    </item>
   </layout>
  </widget>

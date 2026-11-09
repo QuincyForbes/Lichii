@@ -342,6 +342,17 @@ u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
     return argument;
 }
 
+inline void Maxwell3D::SetDirtyFlags(u32 method) noexcept {
+    const u8 f0 = dirty.tables[0][method];
+    const u8 f1 = dirty.tables[1][method];
+    if (f0 != 0) {
+        dirty.flags[f0] = true;
+    }
+    if (f1 != 0) {
+        dirty.flags[f1] = true;
+    }
+}
+
 void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     const auto control = shadow_state.shadow_ram_control;
     // Sunk methods are state writes only (not in execution_mask): skip unchanged values, as
@@ -376,6 +387,19 @@ void Maxwell3D::ApplyPairs(Core::System& system, const u64* pairs, u32 count) {
                        control == Regs::ShadowRamControl::TrackWithFilter;
     const bool replay = control == Regs::ShadowRamControl::Replay;
     const bool skip_same = SkipSameValueWrites();
+    if (track && skip_same && !draw_manager.HasDeferredDraw()) [[likely]] {
+        for (u32 i = 0; i < count; ++i) {
+            const u64 pair = pairs[i];
+            const u32 method = static_cast<u32>(pair & 0xffff);
+            const u32 value = static_cast<u32>(pair >> 32);
+            shadow_state.reg_array[method] = value;
+            if (regs.reg_array[method] != value) {
+                regs.reg_array[method] = value;
+                SetDirtyFlags(method);
+            }
+        }
+        return;
+    }
     for (u32 i = 0; i < count; ++i) {
         const u32 method = static_cast<u32>(pairs[i] & 0xffff);
         u32 value = static_cast<u32>(pairs[i] >> 32);
@@ -398,8 +422,7 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
         draw_manager.DrawDeferred(*this, true);
     }
     regs.reg_array[method] = argument;
-    for (auto const& table : dirty.tables)
-        dirty.flags[table[method]] = true;
+    SetDirtyFlags(method);
 }
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
@@ -666,8 +689,17 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         return;
     }
     // As CallMethodFast for each word: the first may issue a deferred draw, before any upload.
+    if (draw_manager.HasDeferredDraw()) [[unlikely]] {
+        draw_manager.DrawDeferred(*this, true);
+    }
+    const bool track = shadow_state.shadow_ram_control == Regs::ShadowRamControl::Track ||
+                       shadow_state.shadow_ram_control == Regs::ShadowRamControl::TrackWithFilter;
     for (u32 i = 0; i < count; ++i) {
-        ProcessDirtyRegisters(methods[i], ProcessShadowRam(methods[i], arguments[i]));
+        const u32 m = methods[i];
+        if (track) {
+            shadow_state.reg_array[m] = arguments[i];
+        }
+        regs.reg_array[m] = values[i];
     }
     const GPUVAddr destination = address + offset;
     static const bool cb_direct = [] {
@@ -2130,12 +2162,16 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 // Compute/copy sent since, unranged writer sent since, noted write.
                 auto& snapshot = it->second;
                 const u64 since = snapshot.position;
+                const u64 page_begin = page << 12;
+                const u64 read_begin = (std::max<u64>)(*device, page_begin);
+                const u64 read_end = (std::min<u64>)(*device + read_bytes, page_begin + 0x1000);
+                const u64 read_size = read_end - read_begin;
                 const bool writer_since = split.LastWriterPosition() > since;
                 u32 reason = 4;
                 if (!ranged_writers) {
                     reason = writer_since                             ? 1
                              : split.LastUnrangedPosition() > since ? 2
-                             : split.NotedWriteSince(since, page << 12, 0x1000,
+                             : split.NotedWriteSince(since, read_begin, read_size,
                                                      &snapshot.pending_writes)
                                  ? 3
                                  : 4;
@@ -2147,7 +2183,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                                                    : writer_overlaps);
                 } else if (split.LastUnrangedPosition() > since) {
                     reason = 2;
-                } else if (split.NotedWriteSince(since, page << 12, 0x1000,
+                } else if (split.NotedWriteSince(since, read_begin, read_size,
                                                  &snapshot.pending_writes)) {
                     reason = 3;
                 } else {

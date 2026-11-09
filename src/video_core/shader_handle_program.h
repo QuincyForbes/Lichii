@@ -36,11 +36,15 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_mem
                    if (cbuf == 0) {
                        return 0U;
                    }
-                   GPUVAddr base{gpu_memory.template Read<u64>(cbuf + descriptor.cbuf_offset)};
+                   const auto read_u64 = [&](GPUVAddr addr) -> u64 {
+                       return u64{gpu_memory.ReadHandleWord(addr)} |
+                              (u64{gpu_memory.ReadHandleWord(addr + sizeof(u32))} << 32);
+                   };
+                   GPUVAddr base{read_u64(cbuf + descriptor.cbuf_offset)};
                    if (base != 0 && descriptor.indirect_offset != ~0U) {
                        // The table entry is read at its exact address. Only the buffer address
                        // it holds is aligned down, as the shader does.
-                       base = gpu_memory.template Read<u64>(base + descriptor.indirect_offset);
+                       base = read_u64(base + descriptor.indirect_offset);
                    }
                    base &= storage_mask;
                    return base != 0 ? gpu_memory.ReadHandleWord(base + offset) : 0U;

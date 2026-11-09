@@ -130,8 +130,12 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
 }
 
 void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
+    const u64 current_tick = scheduler->CurrentTick();
+    if (last_usage_tick != current_tick) {
+        tracker.Reset();
+    }
     tracker.Track(offset, size);
-    last_usage_tick = scheduler->CurrentTick();
+    last_usage_tick = current_tick;
 }
 
 VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat format) {
@@ -592,6 +596,10 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
                                           std::span<const VideoCommon::BufferCopy> copies) {
     if (Settings::values.disable_buffer_reorder) {
         return false;
+    }
+    if (buffer.LastUsageTick() != scheduler.CurrentTick()) {
+        buffer.ResetUsageTracking();
+        return true;
     }
     const bool can_use_upload_cmdbuf =
         std::ranges::all_of(copies, [&](const VideoCommon::BufferCopy& copy) {

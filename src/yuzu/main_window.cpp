@@ -4971,13 +4971,29 @@ void MainWindow::UpdateStatusBar() {
         emu_speed_label->setText(tr("Speed: %1%").arg(results.emulation_speed * 100.0, 0, 'f', 0));
     }
 
-    QString fpsText = tr("Game: %1 FPS").arg(std::round(results.average_game_fps), 0, 'f', 0);
+    QString fpsText;
+    if (results.generated_fps > 0.5 && results.average_game_fps > 0.5) {
+        const double mult = results.total_fps / results.average_game_fps;
+        fpsText = tr("Game: %1 FPS | Gen: +%2 FPS | Total: %3 FPS (%4x)")
+                      .arg(results.average_game_fps, 0, 'f', 1)
+                      .arg(results.generated_fps, 0, 'f', 1)
+                      .arg(results.total_fps, 0, 'f', 1)
+                      .arg(mult, 0, 'f', 1);
+    } else {
+        fpsText = tr("Game: %1 FPS").arg(results.average_game_fps, 0, 'f', 1);
+    }
     if (!m_fpsSuffix.isEmpty())
         fpsText = fpsText % QStringLiteral(" (%1)").arg(m_fpsSuffix);
 
     game_fps_label->setText(fpsText);
 
-    emu_frametime_label->setText(tr("Frame: %1 ms").arg(results.frametime * 1000.0, 0, 'f', 2));
+    if (results.generated_fps > 0.5 && results.total_fps > 0.5) {
+        emu_frametime_label->setText(tr("Frame: %1 ms (%2 ms out)")
+                                         .arg(results.frametime * 1000.0, 0, 'f', 2)
+                                         .arg(1000.0 / results.total_fps, 0, 'f', 2));
+    } else {
+        emu_frametime_label->setText(tr("Frame: %1 ms").arg(results.frametime * 1000.0, 0, 'f', 2));
+    }
 
     res_scale_label->setVisible(true);
     emu_speed_label->setVisible(!Settings::values.use_multi_core.GetValue());
@@ -4997,7 +5013,7 @@ void MainWindow::UpdateGPUAccuracyButton() {
 void MainWindow::UpdateOotFpsButton() {
     const bool fps30 = Settings::values.oot_30fps.GetValue();
     oot_fps_button->setChecked(fps30);
-    oot_fps_button->setText(fps30 ? tr("30 FPS") : tr("60 FPS"));
+    oot_fps_button->setText(fps30 ? tr("30 FPS") : tr("120 FPS"));
 }
 
 void MainWindow::OnToggleOotFrameRate() {

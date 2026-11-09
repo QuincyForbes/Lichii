@@ -43,12 +43,43 @@ public:
             (std::min)(bound_ids.size(), size_t{current_limit} + 1));
     }
 
+    [[nodiscard]] bool IsVerified(u32 index, u64 frame_tick) const noexcept {
+        return !invalidated && verified_frame_tick == frame_tick &&
+               (frame_verified[index / 64] & (1ULL << (index % 64))) != 0;
+    }
+
+    [[nodiscard]] bool IsPrepared(u32 index, u64 epoch) const noexcept {
+        return !invalidated && prepared_epoch == epoch &&
+               (epoch_prepared[index / 64] & (1ULL << (index % 64))) != 0;
+    }
+
+    void MarkPrepared(u32 index, u64 epoch) noexcept {
+        if (invalidated) {
+            return;
+        }
+        if (prepared_epoch != epoch) {
+            const size_t words = (std::min)(epoch_prepared.size(), size_t{current_limit} / 64 + 1);
+            std::fill_n(epoch_prepared.begin(), words, u64{0});
+            prepared_epoch = epoch;
+        }
+        epoch_prepared[index / 64] |= 1ULL << (index % 64);
+    }
+
     template <class MemoryManager>
-    [[nodiscard]] std::pair<T, bool> Read(const MemoryManager& gpu_memory, u32 index) noexcept {
+    [[nodiscard]] std::pair<T, bool> Read(const MemoryManager& gpu_memory, u32 index,
+                                          u64 frame_tick = ~0ULL) noexcept {
         DEBUG_ASSERT(index <= current_limit);
         if (invalidated) {
             ClearReadDescriptors();
             invalidated = false;
+            verified_frame_tick = frame_tick;
+        } else if (frame_tick != ~0ULL && verified_frame_tick != frame_tick) {
+            const size_t words = (std::min)(frame_verified.size(), size_t{current_limit} / 64 + 1);
+            std::fill_n(frame_verified.begin(), words, u64{0});
+            verified_frame_tick = frame_tick;
+        }
+        if (frame_tick != ~0ULL) {
+            frame_verified[index / 64] |= 1ULL << (index % 64);
         }
         const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
         std::pair<T, bool> result;
@@ -87,7 +118,10 @@ public:
         // Mario Brothership reallocates a lot of times, so use aggressive pre-alloc sizes
         // std::vector<T> by default uses quadratic growth, but that isn't even enough to satisfy brothership
         const size_t num_descriptors = ((limit + 0x80000) & (~0x7ffff)) + 1;
-        read_descriptors.resize(Common::DivCeil(num_descriptors, 64U));
+        const size_t num_words = Common::DivCeil(num_descriptors, 64U);
+        read_descriptors.resize(num_words);
+        frame_verified.resize(num_words);
+        epoch_prepared.resize(num_words);
         ClearReadDescriptors();
         invalidated = false;
         //
@@ -96,9 +130,13 @@ public:
     }
 
     std::vector<u64> read_descriptors;
+    std::vector<u64> frame_verified;
+    std::vector<u64> epoch_prepared;
     std::vector<T> descriptors;
     std::vector<Id> bound_ids;
     GPUVAddr current_gpu_addr{};
+    u64 verified_frame_tick{~0ULL};
+    u64 prepared_epoch{};
     u32 current_limit{};
     bool invalidated{}; ///< read_descriptors is to be cleared before the next read
 
@@ -107,6 +145,10 @@ private:
         // Reserved capacity is not addressable. A later limit increase clears its new range.
         const size_t words = (std::min)(read_descriptors.size(), size_t{current_limit} / 64 + 1);
         std::fill_n(read_descriptors.begin(), words, u64{0});
+        std::fill_n(frame_verified.begin(), (std::min)(frame_verified.size(), words), u64{0});
+        std::fill_n(epoch_prepared.begin(), (std::min)(epoch_prepared.size(), words), u64{0});
+        verified_frame_tick = ~0ULL;
+        prepared_epoch = 0;
         const size_t ids = (std::min)(bound_ids.size(), size_t{current_limit} + 1);
         std::fill_n(bound_ids.begin(), ids, Id{0});
     }

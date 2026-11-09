@@ -206,10 +206,10 @@ struct GPU::Impl {
                                 present_ns.load(std::memory_order_relaxed));
     }
 
-    void RendererFrameEndNotify() {
+    void RendererFrameEndNotify(u32 generated_frames) {
         present_ns.store(static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count()),
                          std::memory_order_relaxed);
-        system.GetPerfStats().EndGameFrame();
+        system.GetPerfStats().EndGameFrame(generated_frames);
     }
 
     /// Performs any additional setup necessary in order to begin GPU emulation.
@@ -589,8 +589,8 @@ bool GPU::UseNvdec() const {
     return impl->use_nvdec;
 }
 
-void GPU::RendererFrameEndNotify() {
-    impl->RendererFrameEndNotify();
+void GPU::RendererFrameEndNotify(u32 generated_frames) {
+    impl->RendererFrameEndNotify(generated_frames);
 }
 
 void GPU::Start() {

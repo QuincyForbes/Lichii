@@ -230,7 +230,7 @@ public:
 
     [[nodiscard]] bool UseNvdec() const;
 
-    void RendererFrameEndNotify();
+    void RendererFrameEndNotify(u32 generated_frames = 0);
 
     void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers,
                           std::vector<Service::Nvidia::NvFence>&& fences);

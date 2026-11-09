@@ -496,6 +496,13 @@ public:
         bool recheck = false;
     };
     std::unordered_map<DAddr, NativeBankPage> native_indirect_page_snapshots;
+    struct NativeBankMemoEntry {
+        DAddr device_addr = ~DAddr{0};
+        u32 size = 0;
+        u64 checked_frame = ~u64{0};
+        bool needs_per_bind = false;
+    };
+    std::array<NativeBankMemoEntry, 64> native_bank_memo{};
     /// Counts graphics draws (UpdateGraphicsBuffers) for EDEN_NX2_EXP4 & 2.
     u64 native_bank_draw = 0;
     /// EDEN_NX2_EXP4 != 0: bank check cost, logged every 5 s.

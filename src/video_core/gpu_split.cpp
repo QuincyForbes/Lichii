@@ -155,6 +155,7 @@ void GpuSplit::Stop() {
     ForgetFencesQuiet();
     last_writer_position = 0;
     last_memory_writer_position = 0;
+    last_unranged_position = 0;
     pending_write_count = 0;
     writer_range_count = 0;
     last_unbounded_writer_position = 0;
@@ -956,6 +957,18 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const u32 amount = static_cast<u32>(head >> 32);
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
         auto* const engine = back_engine;
+        if (engine->fast_maxwell3d) {
+            auto* const maxwell3d = static_cast<Tegra::Engines::Maxwell3D*>(engine);
+            if (!maxwell3d->method_sink.empty()) [[unlikely]] {
+                maxwell3d->ConsumeSink(*system);
+            }
+            if ((head & HasSegment) != 0) {
+                maxwell3d->current_dma_segment = entry[2];
+            }
+            maxwell3d->CallMultiMethod(*system, method, reinterpret_cast<const u32*>(entry + data),
+                                       amount, static_cast<u32>(entry[1]));
+            return data + (amount + 1) / 2;
+        }
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
         if ((head & HasSegment) != 0) {
@@ -975,6 +988,14 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         // as for any other write, to keep the order.
         const u32 count = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
+        if (engine->fast_maxwell3d) {
+            auto* const maxwell3d = static_cast<Tegra::Engines::Maxwell3D*>(engine);
+            if (!maxwell3d->method_sink.empty()) [[unlikely]] {
+                maxwell3d->ConsumeSink(*system);
+            }
+            maxwell3d->ApplyPairs(*system, entry + 1, count);
+            return 1 + size_t{count};
+        }
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
         engine->ApplyPairs(*system, entry + 1, count);

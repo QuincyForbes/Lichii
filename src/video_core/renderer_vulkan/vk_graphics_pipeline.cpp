@@ -544,6 +544,25 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+        u64 last_cbuf_page{~0ULL};
+        const u8* last_cbuf_host{nullptr};
+        const auto read_cbuf_word{[&](GPUVAddr addr) LAMBDA_FORCEINLINE -> u32 {
+            constexpr u64 page_mask = Core::Memory::YUZU_PAGEMASK;
+            const u64 page_offset = addr & page_mask;
+            if (page_offset <= Core::Memory::YUZU_PAGESIZE - sizeof(u32)) [[likely]] {
+                const u64 page = addr >> Core::Memory::YUZU_PAGEBITS;
+                if (page != last_cbuf_page) {
+                    last_cbuf_host = gpu_memory->GetPointerForDescriptor(addr & ~page_mask);
+                    last_cbuf_page = last_cbuf_host ? page : ~0ULL;
+                }
+                if (last_cbuf_host) [[likely]] {
+                    u32 value;
+                    std::memcpy(&value, last_cbuf_host + page_offset, sizeof(u32));
+                    return value;
+                }
+            }
+            return gpu_memory->ReadHandleWord(addr);
+        }};
         const auto read_handle{[&](const auto& desc, u32 index) {
             if (desc.handle_program != ~0U) {
                 // Read by the shader from a storage buffer: computed for this draw.
@@ -590,14 +609,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     const u32 second_offset{desc.secondary_cbuf_offset};
                     const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
                                                  second_offset};
-                    const u32 lhs_raw{gpu_memory->ReadHandleWord(addr) << desc.shift_left};
-                    const u32 rhs_raw{gpu_memory->ReadHandleWord(separate_addr)
+                    const u32 lhs_raw{read_cbuf_word(addr) << desc.shift_left};
+                    const u32 rhs_raw{read_cbuf_word(separate_addr)
                                       << desc.secondary_shift_left};
                     const u32 raw{lhs_raw | rhs_raw};
                     return TexturePair(raw, via_header_index);
                 }
             }
-            return TexturePair(gpu_memory->ReadHandleWord(addr), via_header_index);
+            return TexturePair(read_cbuf_word(addr), via_header_index);
         }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
@@ -690,6 +709,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     ASSERT(views.size() == num_image_elements);
     ASSERT(samplers.size() == num_textures);
+    mark();
+    {
+        Profile::Scope scope{Profile::Zone::RenderTargets};
+        texture_cache.UpdateRenderTargets(false);
+    }
     mark();
     {
         Profile::Scope scope{Profile::Zone::FillImageViews};
@@ -887,7 +911,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     mark();
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
-        texture_cache.UpdateRenderTargets(false);
+        if constexpr (Spec::has_images) {
+            texture_cache.UpdateRenderTargets(false);
+        }
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
         if (scheduler.HasFragmentBarrier() &&

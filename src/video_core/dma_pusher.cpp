@@ -29,6 +29,7 @@
 #include "video_core/dma_pusher.h"
 #include "video_core/command_fetch_order.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/kepler_memory.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -681,17 +682,11 @@ void DmaPusher::CallMethod(u32 argument) {
                                     engine_type == Engines::EngineTypes::Fermi2D
                                 ? VideoCommon::GpuSplit::Effect::Gpu
                                 : VideoCommon::GpuSplit::Effect::Unknown;
-        const bool memory_writer = split.Active() &&
-                                   engine_type == Engines::EngineTypes::Fermi2D &&
-                                   dma_state.method < subchannel->execution_mask.size() &&
-                                   subchannel->execution_mask[dma_state.method];
         // Whether the engine's front noted what the work sent writes (GpuSplit::NoteWriter).
         bool classified = false;
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter(classified);
-            } else if (memory_writer) {
-                split.NoteUnrangedWriter();
             }
         };
         if (split.Active()) {
@@ -716,6 +711,9 @@ void DmaPusher::CallMethod(u32 argument) {
                 classified = true;
             } else if (engine_type == Engines::EngineTypes::KeplerMemory) {
                 static_cast<Engines::KeplerMemory*>(subchannel)->FrontMethod(
+                    split, dma_state.method, &argument, 1, false);
+            } else if (engine_type == Engines::EngineTypes::Fermi2D) {
+                static_cast<Engines::Fermi2D*>(subchannel)->FrontMethod(
                     split, dma_state.method, &argument, 1, false);
             }
             return;
@@ -764,24 +762,11 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                                     engine_type == Engines::EngineTypes::Fermi2D
                                 ? VideoCommon::GpuSplit::Effect::Gpu
                                 : VideoCommon::GpuSplit::Effect::Unknown;
-        bool memory_writer = false;
-        if (split.Active() && engine_type == Engines::EngineTypes::Fermi2D) {
-            const u32 count = dma_state.non_incrementing ? 1 : num_methods;
-            for (u32 i = 0; i < count; ++i) {
-                const u32 m = dma_state.method + i;
-                if (m < subchannel->execution_mask.size() && subchannel->execution_mask[m]) {
-                    memory_writer = true;
-                    break;
-                }
-            }
-        }
         // Whether the engine's front noted what the work sent writes (GpuSplit::NoteWriter).
         bool classified = false;
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter(classified);
-            } else if (memory_writer) {
-                split.NoteUnrangedWriter();
             }
         };
         if (split.Active()) {
@@ -806,6 +791,9 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                 classified = true;
             } else if (engine_type == Engines::EngineTypes::KeplerMemory) {
                 static_cast<Engines::KeplerMemory*>(subchannel)->FrontMethod(
+                    split, dma_state.method, base_start, num_methods, dma_state.non_incrementing);
+            } else if (engine_type == Engines::EngineTypes::Fermi2D) {
+                static_cast<Engines::Fermi2D*>(subchannel)->FrontMethod(
                     split, dma_state.method, base_start, num_methods, dma_state.non_incrementing);
             }
             return;

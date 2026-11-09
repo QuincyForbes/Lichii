@@ -44,7 +44,8 @@ private:
     Ui::PerformanceOverlay* ui;
 
     // colors
-    QColor m_background{127, 127, 127, 190};
+    QColor m_background{15, 23, 42, 225};
+    QColor m_border{56, 189, 248, 100};
 
     QPoint m_offset{25, 75};
 
@@ -56,13 +57,16 @@ private:
     const size_t NUM_FPS_SAMPLES = 120;
     qreal m_xPos = 0;
     std::deque<double> m_fpsSamples;
+    std::deque<double> m_totalFpsSamples;
     std::deque<QPointF> m_fpsPoints;
+    std::deque<QPointF> m_totalFpsPoints;
 
     // drag
     QPoint m_drag_start_pos;
 
     // fps chart
     QLineSeries* m_fpsSeries = nullptr;
+    QLineSeries* m_totalFpsSeries = nullptr;
     QChart* m_fpsChart = nullptr;
     QChartView* m_fpsChartView = nullptr;
     QValueAxis* m_fpsX = nullptr;

@@ -524,10 +524,13 @@ public:
         const u64 to_scan = pending_write_count - from;
         const u64 limit = (std::min<u64>)(to_scan, pending_writes.size());
         const u64 end = begin + size;
+        const u64 page_begin = begin & ~u64{0xfff};
+        const u64 page_end = (end + 0xfff) & ~u64{0xfff};
+        u64 next_checked = pending_write_count;
         bool reached = to_scan <= pending_writes.size();
         for (u64 scanned = 0; scanned < limit; ++scanned) {
-            const PendingWrite& write =
-                pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+            const u64 index = pending_write_count - 1 - scanned;
+            const PendingWrite& write = pending_writes[index % pending_writes.size()];
             if (write.position <= since) {
                 reached = true;
                 break;
@@ -535,12 +538,15 @@ public:
             if (write.begin < end && begin < write.end) {
                 return true;
             }
+            if (write.begin < page_end && page_begin < write.end) {
+                next_checked = index;
+            }
         }
         if (!reached) {
             return true;
         }
         if (checked_writes != nullptr) {
-            *checked_writes = pending_write_count;
+            *checked_writes = next_checked;
         }
         return false;
     }

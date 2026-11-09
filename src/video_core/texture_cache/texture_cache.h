@@ -727,7 +727,10 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
         return;
     }
     const auto& regs = maxwell3d->regs;
-    const bool writes_depth_stencil = regs.depth_write_enabled != 0 || regs.stencil_enable != 0;
+    const bool writes_depth_stencil =
+        regs.zeta_enable != 0 &&
+        ((regs.depth_test_enable != 0 && regs.depth_write_enabled != 0) ||
+         (regs.stencil_enable != 0 && regs.stencil_front_mask != 0));
     const auto barrier = [&] {
         if (feedback_depth_dirty) {
             runtime.BarrierFeedbackLoop();
@@ -748,7 +751,7 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
         return;
     }
     if (render_targets_serial != last_feedback_loop_serial) {
-        feedback_depth_dirty = true;
+        feedback_depth_dirty = false;
     }
 
     if (rt_active_mask == 0) {
@@ -836,7 +839,10 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
         LOG_TRACE(HW_GPU, "Invalid sampler index={}", index);
         return NULL_SAMPLER_ID;
     }
-    auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
+    if (table.IsVerified(index, frame_tick)) [[likely]] {
+        return table.bound_ids[index];
+    }
+    auto const [descriptor, is_new] = table.Read(*gpu_memory, index, frame_tick);
     if (is_new) {
         auto const id = FindSampler(descriptor, compute);
         table.bound_ids[index] = id;
@@ -993,21 +999,33 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     } clearing_scope{clearing_render_targets};
     clearing_render_targets = is_clear;
     auto& flags = maxwell3d->dirty.flags;
+    const auto& regs = maxwell3d->regs;
+    const auto color_modified = [&](size_t index) {
+        if (!is_clear) {
+            return true;
+        }
+        return index == regs.clear_surface.RT &&
+               (regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
+                regs.clear_surface.A);
+    };
+    const bool depth_modified =
+        is_clear ? (regs.clear_surface.Z != 0 || regs.clear_surface.S != 0)
+                 : (regs.zeta_enable != 0 &&
+                    ((regs.depth_test_enable != 0 && regs.depth_write_enabled != 0) ||
+                     regs.stencil_enable != 0));
     if (!flags[Dirty::RenderTargets]) {
         if (!is_clear && RenderTargetsStillPrepared()) {
             return;
         }
         for (size_t index = 0; index < NUM_RT; ++index) {
             ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
-            PrepareImageView(color_buffer_id, true, is_clear && IsFullClear(color_buffer_id));
+            const bool mod = color_modified(index);
+            PrepareImageView(color_buffer_id, mod, is_clear && mod && IsFullClear(color_buffer_id));
         }
         const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
-        PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
-        if (is_clear) {
-            rt_prepared.valid = false;
-        } else {
-            NoteRenderTargetsPrepared();
-        }
+        PrepareImageView(depth_buffer_id, depth_modified,
+                         is_clear && depth_modified && IsFullClear(depth_buffer_id));
+        NoteRenderTargetsPrepared();
         return;
     }
     rt_prepared.valid = false;
@@ -1022,11 +1040,13 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
 
     for (size_t index = 0; index < NUM_RT; ++index) {
         ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
-        PrepareImageView(color_buffer_id, true, is_clear && IsFullClear(color_buffer_id));
+        const bool mod = color_modified(index);
+        PrepareImageView(color_buffer_id, mod, is_clear && mod && IsFullClear(color_buffer_id));
     }
     const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
 
-    PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
+    PrepareImageView(depth_buffer_id, depth_modified,
+                     is_clear && depth_modified && IsFullClear(depth_buffer_id));
 
     rt_active_mask = 0;
     rt_image_id = {};
@@ -1063,9 +1083,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     }
 
     flags[Dirty::DepthBiasGlobal] = true;
-    if (!is_clear) {
-        NoteRenderTargetsPrepared();
-    }
+    NoteRenderTargetsPrepared();
 }
 
 template <class P>
@@ -1076,8 +1094,7 @@ bool TextureCache<P>::RenderTargetsStillPrepared() const {
     }();
     const auto& prepared = rt_prepared;
     if (!enabled || !prepared.valid || prepared.serial != render_targets_serial ||
-        prepared.modification_tick != modification_tick || prepared.frame_tick != frame_tick ||
-        prepared.bindings_epoch != bindings_epoch) {
+        prepared.frame_tick != frame_tick || prepared.bindings_epoch != bindings_epoch) {
         return false;
     }
     for (size_t index = 0; index <= NUM_RT; ++index) {
@@ -1096,9 +1113,13 @@ bool TextureCache<P>::RenderTargetsStillPrepared() const {
         const ImageBase& image = slot_images[image_view.image_id];
         if (False(image.flags & ImageFlagBits::GpuModified) ||
             True(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::SparseTiles |
-                                ImageFlagBits::SparseLayers | ImageFlagBits::UnwrittenSparse)) ||
-            !image.aliased_images.empty()) {
+                                ImageFlagBits::SparseLayers | ImageFlagBits::UnwrittenSparse))) {
             return false;
+        }
+        for (const AliasedImage& aliased : image.aliased_images) {
+            if (slot_images[aliased.id].modification_tick > image.modification_tick) {
+                return false;
+            }
         }
     }
     return true;
@@ -1138,42 +1159,56 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         LOG_TRACE(HW_GPU, "Invalid image view index={}", index);
         return NULL_IMAGE_VIEW_ID;
     }
-    auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
-    if (is_new) {
-        if (IsValidEntry(*gpu_memory, descriptor)) {
-            const auto [pair, is_new_tc] = channel_state->image_views.try_emplace(descriptor);
-            if (is_new_tc) {
-                const auto failed_images = [&]() -> u32 {
-                    if constexpr (requires { runtime.FailedImages(); }) {
-                        return runtime.FailedImages();
-                    } else {
-                        return 0;
+    if (table.IsPrepared(index, bindings_epoch)) [[likely]] {
+        return table.bound_ids[index];
+    }
+    if (!table.IsVerified(index, frame_tick)) {
+        auto const [descriptor, is_new] = table.Read(*gpu_memory, index, frame_tick);
+        if (is_new) {
+            if (IsValidEntry(*gpu_memory, descriptor)) {
+                const auto [pair, is_new_tc] = channel_state->image_views.try_emplace(descriptor);
+                if (is_new_tc) {
+                    const auto failed_images = [&]() -> u32 {
+                        if constexpr (requires { runtime.FailedImages(); }) {
+                            return runtime.FailedImages();
+                        } else {
+                            return 0;
+                        }
+                    };
+                    const u32 failed_before = failed_images();
+                    pair->second = CreateImageView(descriptor);
+                    if (pair->second == NULL_IMAGE_VIEW_ID && failed_images() != failed_before) {
+                        // No memory for its image: TickFrame invalidates the table after collecting,
+                        // and the descriptor's next read makes the image again.
+                        channel_state->image_views.erase(pair);
+                        table.bound_ids[index] = NULL_IMAGE_VIEW_ID;
+                        return NULL_IMAGE_VIEW_ID;
                     }
-                };
-                const u32 failed_before = failed_images();
-                pair->second = CreateImageView(descriptor);
-                if (pair->second == NULL_IMAGE_VIEW_ID && failed_images() != failed_before) {
-                    // No memory for its image: TickFrame invalidates the table after collecting,
-                    // and the descriptor's next read makes the image again.
-                    channel_state->image_views.erase(pair);
-                    table.bound_ids[index] = NULL_IMAGE_VIEW_ID;
-                    return NULL_IMAGE_VIEW_ID;
+                    if (pair->second != NULL_IMAGE_VIEW_ID) {
+                        image_view_descriptors[pair->second].emplace_back(current_channel_id,
+                                                                          descriptor);
+                    }
                 }
-                if (pair->second != NULL_IMAGE_VIEW_ID) {
-                    image_view_descriptors[pair->second].emplace_back(current_channel_id,
-                                                                      descriptor);
-                }
+                table.bound_ids[index] = pair->second;
+            } else {
+                table.bound_ids[index] = NULL_IMAGE_VIEW_ID;
             }
-            PrepareImageView(pair->second, false, false);
-            table.bound_ids[index] = pair->second;
-            return pair->second;
         }
-        table.bound_ids[index] = NULL_IMAGE_VIEW_ID;
-        return NULL_IMAGE_VIEW_ID;
     }
     const auto id = table.bound_ids[index];
-    if (id != NULL_IMAGE_VIEW_ID)
+    if (id != NULL_IMAGE_VIEW_ID) {
         PrepareImageView(id, false, false);
+        const ImageViewBase& view = slot_image_views[id];
+        if (!view.IsBuffer()) {
+            const ImageBase& image = slot_images[view.image_id];
+            if (!image.aliased_images.empty() ||
+                True(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::SparseTiles |
+                                    ImageFlagBits::SparseLayers | ImageFlagBits::UnwrittenSparse))) {
+                return id;
+            }
+        }
+    }
+    table.MarkPrepared(index, bindings_epoch);
     return id;
 }
 

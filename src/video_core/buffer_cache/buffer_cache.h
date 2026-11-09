@@ -1830,10 +1830,20 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     // 2: every page as with 0, counting the changed pages the rules of 1 and 3 would have skipped.
     static_assert(Core::DevicePageFlags::AddressBits >=
                   Tegra::MaxwellDeviceTraits::device_virtual_bits);
-    u64 mapped_size = 0;
-    while (mapped_size < size &&
-           device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
-        mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
+    const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+    const DAddr end = device_addr + size;
+    const bool verify = mode == 2;
+    const bool frame_check = mode != 3;
+    auto& stats = native_bank_tracked_stats;
+    ++stats.binds;
+    auto& memo = native_bank_memo[((device_addr >> 12) ^ (device_addr >> 18)) &
+                                  (native_bank_memo.size() - 1)];
+    if (!verify && memo.device_addr == device_addr && memo.size == size &&
+        memo.checked_frame == frame_tick && !memo.needs_per_bind &&
+        !Core::g_collected_write_pages.Any(first_page, end - first_page) &&
+        !Core::g_buffer_write_pages.Any(first_page, end - first_page)) [[likely]] {
+        stats.pages_skipped += (end - first_page) >> Core::DEVICE_PAGEBITS;
+        return;
     }
     if (native_indirect_page_snapshots.size() >= 16384) {
         const auto oldest = std::ranges::min_element(
@@ -1841,18 +1851,13 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             [](const auto& entry) { return entry.second.checked_frame; });
         native_indirect_page_snapshots.erase(oldest);
     }
-    const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
-    const DAddr end = device_addr + (std::min<u64>)(mapped_size, size);
-    const bool verify = mode == 2;
-    const bool frame_check = mode != 3;
     // Most banks have no CPU-modified page: ask per page only when one has.
     const bool any_cpu_dirty = memory_tracker.IsRegionCpuModified(first_page, end - first_page);
-    auto& stats = native_bank_tracked_stats;
-    ++stats.binds;
+    bool needs_per_bind = false;
     for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
         const u8* const guest = device_memory.template GetPointer<u8>(page);
         if (guest == nullptr) {
-            continue;
+            break;
         }
         // Take the flags before reading the page: a write flagged later is compared next bind.
         const bool collected = Core::g_collected_write_pages.Take(page);
@@ -1864,12 +1869,17 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
             snapshot.checked_frame = frame_tick;
             snapshot.recheck = collected || written;
+            needs_per_bind |= snapshot.recheck;
             memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
             NoteCpuDirty(page, Core::DEVICE_PAGESIZE);
             continue;
         }
         // A flagged write's bytes may land after this compare: compare again at the next bind.
         const bool recheck = std::exchange(snapshot.recheck, collected || written);
+        needs_per_bind |= snapshot.recheck;
+        const bool is_hot = snapshot.changed_frame != ~u64{0} &&
+                            frame_tick - snapshot.changed_frame < HotFrames;
+        needs_per_bind |= is_hot;
         NativeBankReason reason = BankNone;
         if (collected) {
             reason = BankCollected;
@@ -1884,17 +1894,16 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
                 continue;
             }
             reason = BankCpuDirty;
-        } else if (snapshot.changed_frame != ~u64{0} &&
-                   frame_tick - snapshot.changed_frame < HotFrames) {
+        } else if (is_hot) {
             // Changed lately: likely per-draw data, rewritten by paths none of the flags see
             // (EXP9=2 found ~1 such change in 15 s without this rule).
             reason = BankHot;
-        } else if (frame_check && snapshot.checked_frame != frame_tick) {
+        } else if (frame_check && snapshot.checked_frame != frame_tick &&
+                   ((frame_tick ^ (page >> Core::DEVICE_PAGEBITS)) & 15ULL) == 0) {
             reason = BankFrame;
         }
-        if (reason != BankNone) {
-            snapshot.checked_frame = frame_tick;
-        } else if (!verify) {
+        snapshot.checked_frame = frame_tick;
+        if (reason == BankNone && !verify) {
             ++stats.pages_skipped;
             continue;
         }
@@ -1930,11 +1939,16 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         ++stats.changed[reason];
         if (reason == BankHot || reason == BankFrame || reason == BankNone) {
             snapshot.changed_frame = frame_tick;
+            needs_per_bind = true;
         }
         std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
         memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
         NoteCpuDirty(page, Core::DEVICE_PAGESIZE);
     }
+    memo.device_addr = device_addr;
+    memo.size = size;
+    memo.checked_frame = frame_tick;
+    memo.needs_per_bind = needs_per_bind;
     const auto now = std::chrono::steady_clock::now();
     if (now - stats.last_log < std::chrono::seconds{5}) {
         return;
