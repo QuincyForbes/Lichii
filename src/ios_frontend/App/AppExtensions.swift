@@ -33,23 +33,19 @@ enum AppExtensions {
     /// Tabs after Library, Settings and JIT.
     static var tabs: [AppTab] {
         [
-            // ios-content: AppTab(id: "content", title: "Content", systemImage: "shippingbox", view: { AnyView(ContentHubView()) }),
         ]
     }
 
     /// Links shown at the top of the global settings (keys, firmware, controllers, logs, ...).
     static var settingsLinks: [SettingsLink] {
-        [
-            // ios-content: SettingsLink(id: "keys", title: "Keys & Firmware", systemImage: "key", view: { AnyView(KeysView()) }),
+        ContentEntries.settingsLinks + [
             // ios-controls: SettingsLink(id: "controls", title: "Controllers", systemImage: "gamecontroller", view: { AnyView(ControlsView()) }),
         ]
     }
 
     /// Per-game screens (updates, DLC, mods, cheats, controller layout, ...).
     static var gameActions: [GameAction] {
-        [
-            // ios-content: GameAction(id: "addons", title: "Updates & DLC", systemImage: "square.stack.3d.up", view: { AnyView(AddonsView(game: $0)) }),
-        ]
+        ContentEntries.gameActions
     }
 
     /// Replaces the basic in-game menu (ios-controls). Gets the game window's view controller.
@@ -59,7 +55,7 @@ enum AppExtensions {
     static var gameWindowReady: [(UIWindow) -> Void] { [] }
 
     /// Called once after the library window is up (onboarding, ...).
-    static var appStarted: [() -> Void] { [] }
+    static var appStarted: [() -> Void] { ContentEntries.appStarted }
 
     /// Every LichiiEvent the bridge posts.
     static var eventHandlers: [(Int32) -> Void] { [] }
