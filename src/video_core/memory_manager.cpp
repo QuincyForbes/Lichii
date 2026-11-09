@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -748,9 +749,11 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
         u64 serial;
         size_t result;
     };
-    thread_local std::array<Entry, 1024> cache{};
+    // 4096 entries: Ocarina of Time binds more buffers than 1024 hold (allocated on first use,
+    // ~160 KiB on the threads that bind buffers, not in every thread's static TLS).
+    thread_local std::vector<Entry> cache(4096);
     const u64 serial = map_serial.load(std::memory_order_acquire);
-    Entry& entry = cache[(gpu_addr * 0x9E3779B97F4A7C15ULL) >> 54];
+    Entry& entry = cache[(gpu_addr * 0x9E3779B97F4A7C15ULL) >> 52];
     if (entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr &&
         entry.serial == serial && size <= entry.size) {
         return (std::min)(entry.result, size);
