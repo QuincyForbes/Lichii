@@ -114,6 +114,8 @@ private:
     std::optional<TurboMode> turbo_mode;
 
     Frame applet_frame;
+    Frame screenshot_frame{};
+    VkFormat screenshot_format = VK_FORMAT_UNDEFINED;
 };
 
 } // namespace Vulkan

@@ -28,9 +28,20 @@
 #include <sys/random.h>
 #elif defined(__APPLE__)
 #include <sys/types.h>
+#include <TargetConditionals.h>
+#if !TARGET_OS_IPHONE
 #include <sys/random.h>
+#endif
 #include <mach/vm_map.h>
 #include <mach/mach.h>
+#include <mach/mach_init.h>
+#include <mach/memory_object_types.h>
+#include <mach/vm_statistics.h>
+#if TARGET_OS_IPHONE
+// iOS forbids POSIX shared memory for third-party apps; the guest is backed by an anonymous Mach
+// memory object and every fastmem view is a vm_map of it.
+#define LICHII_IOS_MACH_MEMORY 1
+#endif
 #elif defined(__FreeBSD__)
 #include <sys/shm.h>
 #elif defined(__OPENORBIS__)
@@ -63,6 +74,7 @@
 #include "common/div_ceil.h"
 #include "common/free_region_manager.h"
 #include "common/host_memory.h"
+#include <fmt/format.h>
 #include "common/logging.h"
 
 #if defined(__ANDROID__) && __ANDROID_API__ < 30
@@ -545,6 +557,41 @@ public:
 #endif
         host_page_size = static_cast<size_t>(page_size);
         // Backing memory initialization
+#ifdef LICHII_IOS_MACH_MEMORY
+        {
+            memory_object_size_t entry_size = backing_size;
+            kern_return_t kr = mach_make_memory_entry_64(
+                mach_task_self(), &entry_size, 0, MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE,
+                &backing_entry, MACH_PORT_NULL);
+            if (kr != KERN_SUCCESS || entry_size < backing_size) {
+                LOG_CRITICAL(HW_Memory, "mach_make_memory_entry_64({:#x}) failed: {}", backing_size,
+                             mach_error_string(kr));
+                backing_entry = MACH_PORT_NULL;
+                return false;
+            }
+            vm_address_t backing_address = 0;
+            kr = vm_map(mach_task_self(), &backing_address, backing_size, 0, VM_FLAGS_ANYWHERE,
+                        backing_entry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                        VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+            if (kr != KERN_SUCCESS) {
+                LOG_CRITICAL(HW_Memory, "vm_map of the {:#x} byte backing object failed: {}",
+                             backing_size, mach_error_string(kr));
+                return false;
+            }
+            backing_base = reinterpret_cast<u8*>(backing_address);
+            vm_address_t virtual_address = 0;
+            kr = vm_allocate(mach_task_self(), &virtual_address, virtual_size, VM_FLAGS_ANYWHERE);
+            if (kr != KERN_SUCCESS) {
+                LOG_CRITICAL(HW_Memory,
+                             "vm_allocate of the {:#x} byte guest address space failed: {} (is the "
+                             "extended-virtual-addressing entitlement present?)",
+                             virtual_size, mach_error_string(kr));
+                return false;
+            }
+            vm_protect(mach_task_self(), virtual_address, virtual_size, FALSE, VM_PROT_NONE);
+            virtual_base = virtual_map_base = reinterpret_cast<u8*>(virtual_address);
+        }
+#else
 #if defined(__sun__) || defined(__HAIKU__) || defined(__NetBSD__) || defined(__DragonFly__)
         fd = shm_open_anon(O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
 #elif defined(__OpenBSD__)
@@ -611,10 +658,11 @@ public:
 #if defined(__linux__)
         madvise(virtual_base, virtual_size, MADV_HUGEPAGE);
 #endif
+#endif
         free_manager.SetAddressSpace(virtual_base, virtual_size);
 
         if (host_page_size != PageAlignment) {
-            if (fd < 0 || virtual_size % host_page_size != 0) {
+            if ((fd < 0 && !HasBackingObject()) || virtual_size % host_page_size != 0) {
                 LOG_WARNING(Common_Memory, "Can't emulate {:#x} byte pages with host page size {:#x}",
                             PageAlignment, host_page_size);
                 return false;
@@ -681,9 +729,14 @@ public:
         if (True(perms & MemoryPermission::Execute))
             prot_flags |= PROT_EXEC;
 #endif
+#ifdef LICHII_IOS_MACH_MEMORY
+        ASSERT_MSG(MapBackingView(virtual_base + virtual_offset, length, host_offset, prot_flags),
+                   "vm_map failed for {:#x} bytes at offset {:#x}", length, virtual_offset);
+#else
         int flags = (fd >= 0 ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED;
         void* ret = mmap(virtual_base + virtual_offset, length, prot_flags, flags, fd, host_offset);
         ASSERT_MSG(ret != MAP_FAILED, "mmap: {} {}", strerror(errno), fd);
+#endif
     }
 
     void Unmap(size_t virtual_offset, size_t length) {
@@ -707,8 +760,13 @@ public:
         auto [merged_pointer, merged_size] =
             free_manager.FreeBlock(virtual_base + virtual_offset, length);
 
+#ifdef LICHII_IOS_MACH_MEMORY
+        ASSERT_MSG(ReserveRange(merged_pointer, merged_size), "vm_allocate failed for {:#x} bytes",
+                   merged_size);
+#else
         void* ret = mmap(merged_pointer, merged_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
         ASSERT_MSG(ret != MAP_FAILED, "mmap: {}", strerror(errno));
+#endif
     }
 
     void Protect(size_t virtual_offset, size_t length, bool read, bool write, bool execute) {
@@ -778,7 +836,59 @@ private:
             int ret = close(fd);
             ASSERT_MSG(ret == 0, "close failed: {}", strerror(errno));
         }
+#ifdef LICHII_IOS_MACH_MEMORY
+        if (backing_entry != MACH_PORT_NULL) {
+            mach_port_deallocate(mach_task_self(), backing_entry);
+            backing_entry = MACH_PORT_NULL;
+        }
+#endif
     }
+
+    bool HasBackingObject() const {
+#ifdef LICHII_IOS_MACH_MEMORY
+        return backing_entry != MACH_PORT_NULL;
+#else
+        return false;
+#endif
+    }
+
+#ifdef LICHII_IOS_MACH_MEMORY
+    static vm_prot_t ToVmProt(int prot) {
+        vm_prot_t out = VM_PROT_NONE;
+        if (prot & PROT_READ) {
+            out |= VM_PROT_READ;
+        }
+        if (prot & PROT_WRITE) {
+            out |= VM_PROT_WRITE;
+        }
+        return out;
+    }
+
+    bool MapBackingView(void* address, size_t size, size_t host_offset, int prot) {
+        vm_address_t target = reinterpret_cast<vm_address_t>(address);
+        const kern_return_t kr = vm_map(mach_task_self(), &target, size, 0,
+                                        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, backing_entry,
+                                        host_offset, FALSE, ToVmProt(prot),
+                                        VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+        if (kr != KERN_SUCCESS) {
+            LOG_CRITICAL(HW_Memory, "vm_map({}, {:#x}, offset {:#x}) failed: {}", fmt::ptr(address), size,
+                         host_offset, mach_error_string(kr));
+        }
+        return kr == KERN_SUCCESS;
+    }
+
+    bool ReserveRange(void* address, size_t size) {
+        vm_address_t target = reinterpret_cast<vm_address_t>(address);
+        kern_return_t kr = vm_allocate(mach_task_self(), &target, size, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE);
+        if (kr != KERN_SUCCESS) {
+            LOG_CRITICAL(HW_Memory, "vm_allocate({}, {:#x}) failed: {}", fmt::ptr(address), size,
+                         mach_error_string(kr));
+            return false;
+        }
+        kr = vm_protect(mach_task_self(), target, size, FALSE, VM_PROT_NONE);
+        return kr == KERN_SUCCESS;
+    }
+#endif
 
     void AdjustMap(size_t* virtual_offset, size_t* length) {
         if (virtual_base != nullptr) {
@@ -867,12 +977,21 @@ private:
             const size_t size = run_end - run_begin;
             if (!page.mapped) {
                 if (remap) {
+#ifdef LICHII_IOS_MACH_MEMORY
+                    ASSERT_MSG(ReserveRange(address, size), "vm_allocate failed for {:#x} bytes", size);
+#else
                     void* ret = mmap(address, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
                     ASSERT_MSG(ret != MAP_FAILED, "mmap: {}", strerror(errno));
+#endif
                 }
             } else if (remap) {
+#ifdef LICHII_IOS_MACH_MEMORY
+                ASSERT_MSG(MapBackingView(address, size, page.host_offset, page.prot),
+                           "vm_map failed for {:#x} bytes", size);
+#else
                 void* ret = mmap(address, size, page.prot, MAP_SHARED | MAP_FIXED, fd, off_t(page.host_offset));
                 ASSERT_MSG(ret != MAP_FAILED, "mmap: {}", strerror(errno));
+#endif
             } else {
                 int ret = mprotect(address, size, page.prot);
                 ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
@@ -895,6 +1014,9 @@ private:
     }
 
     int fd{-1}; // memfd file descriptor, -1 is the error value of memfd_create
+#ifdef LICHII_IOS_MACH_MEMORY
+    mach_port_t backing_entry{MACH_PORT_NULL};
+#endif
     FreeRegionManager free_manager{};
     size_t host_page_size{PageAlignment};
     u32* page_states{};

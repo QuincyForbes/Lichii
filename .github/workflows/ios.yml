@@ -1,0 +1,167 @@
+name: iOS
+
+on:
+  push:
+    branches: [ios]
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: iOS arm64 (unsigned IPA)
+    runs-on: macos-26
+    timeout-minutes: 180
+    env:
+      CPM_SOURCE_CACHE: ${{ github.workspace }}/.cache/cpm
+      CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
+      CCACHE_MAXSIZE: 2G
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install tools
+        env:
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew install ninja ccache nasm glslang meson pkgconf
+          xcodebuild -version
+          cmake --version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/cpm
+            .cache/ccache
+          key: ios-deps-${{ hashFiles('cpmfile.json', '.github/workflows/ios.yml') }}-${{ github.sha }}
+          restore-keys: |
+            ios-deps-${{ hashFiles('cpmfile.json', '.github/workflows/ios.yml') }}-
+            ios-deps-
+
+      - name: Cache FFmpeg (AV1 + VideoToolbox)
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-ios
+          key: ffmpeg-ios-${{ hashFiles('.ci/ios/build-ffmpeg.sh', '.ci/ios/ffmpeg-CMakeLists.txt') }}
+
+      - name: Build FFmpeg (AV1 + VideoToolbox)
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          chmod +x .ci/ios/build-ffmpeg.sh
+          OUT="$PWD/ffmpeg-ios" .ci/ios/build-ffmpeg.sh
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DLICHII_FFMPEG_DIR="$PWD/ffmpeg-ios" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DCMAKE_C_FLAGS=-miphoneos-version-min=17.0 \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DBOOST_CONTEXT_ARCHITECTURE=arm64 \
+            -DBOOST_CONTEXT_ABI=aapcs \
+            -DBOOST_CONTEXT_BINARY_FORMAT=mach-o \
+            -DBOOST_CONTEXT_ASSEMBLER=gas \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCPMUTIL_FORCE_BUNDLED=ON \
+            -DENABLE_QT=OFF \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DENABLE_WEB_SERVICE=OFF \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DENABLE_LIBUSB=OFF \
+            -DENABLE_CUBEB=OFF \
+            -DENABLE_LSFG=OFF \
+            -DENABLE_RESHADE=OFF \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DENABLE_WERROR=OFF \
+            -DYUZU_TESTS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DDYNARMIC_TESTS=OFF \
+            -DYUZU_USE_BUNDLED_FFMPEG=ON \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DYUZU_USE_BUNDLED_SIRIT=ON \
+            -DYUZU_USE_BUNDLED_OPENSSL=OFF \
+            -DOPENSSL_TARGET_PLATFORM=ios64-xcrun \
+            -DYUZU_USE_BUNDLED_MOLTENVK=ON \
+            -DLICHII_BUILD_TAG=ios-${{ github.run_number }} \
+            -DLICHII_BUILD_PLATFORM=ios-arm64
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cmake --build build --target yuzu-cmd --parallel -- -k 0
+          ccache -s
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          app=build/bin/Lichii.app
+          test -x "$app/Lichii"
+          test -f "$app/Frameworks/MoltenVK.framework/MoltenVK"
+          ls -la "$app" "$app/Frameworks"
+          cp dist/ios/Lichii.entitlements Lichii.entitlements
+          # Ad-hoc signature carrying the entitlements: SideStore/AltStore keep an app's existing
+          # entitlements when re-signing, so JIT + memory limits survive the sideload.
+          codesign --force --sign - --entitlements dist/ios/Lichii.entitlements "$app/Frameworks/MoltenVK.framework/MoltenVK"
+          codesign --force --sign - --entitlements dist/ios/Lichii.entitlements "$app"
+          codesign -d --entitlements - "$app" 2>&1 | head -40
+          rm -rf Payload && mkdir Payload
+          cp -R "$app" Payload/
+          codesign -dv Payload/Lichii.app 2>&1 | head -5
+          /usr/bin/zip -qry Lichii.ipa Payload
+          ls -la Lichii.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lichii-iOS-unsigned-${{ github.run_number }}
+          path: |
+            Lichii.ipa
+            Lichii.entitlements
+          if-no-files-found: error
+
+      - name: Upload configure log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-logs-${{ github.run_number }}
+          path: |
+            build/CMakeFiles/CMakeConfigureLog.yaml
+            build/CMakeCache.txt
+          if-no-files-found: ignore
+
+      - name: Publish rolling release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=ios-latest
+          notes="Unsigned iOS build of Lichii (yuzu-cmd SDL3 frontend) from ${GITHUB_SHA}. Sign with Lichii.entitlements (JIT, increased memory limit, extended virtual addressing) and install with SideStore or your own profile."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" Lichii.ipa Lichii.entitlements --clobber
+            gh release edit "$tag" --notes "$notes" --prerelease
+          else
+            gh release create "$tag" Lichii.ipa Lichii.entitlements --title "iOS (latest)" --notes "$notes" --prerelease
+          fi

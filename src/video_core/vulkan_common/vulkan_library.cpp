@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#include <cstdlib>
+#endif
 #include <string>
 
 #ifdef _WIN32
@@ -128,10 +132,28 @@ std::shared_ptr<Common::DynamicLibrary> OpenLibrary(
 #else
     auto library = std::make_shared<Common::DynamicLibrary>();
 #ifdef __APPLE__
+    static const bool mvk_tuning = [] {
+        const char* const env = std::getenv("EDEN_NX2_MVK_TUNING");
+        if (env != nullptr && env[0] == '0') {
+            return false;
+        }
+        setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
+        setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+        return true;
+    }();
+    (void)mvk_tuning;
+#if TARGET_OS_IPHONE
+    // iOS: MoltenVK.framework is embedded in the flat app bundle (no Contents/ directory).
+    const auto libvulkan_filename =
+        Common::FS::GetBundleDirectory() / "Frameworks/MoltenVK.framework/MoltenVK";
+    const auto libmoltenvk_filename =
+        Common::FS::GetBundleDirectory() / "Frameworks/libMoltenVK.dylib";
+#else
     const auto libvulkan_filename =
         Common::FS::GetBundleDirectory() / "Contents/Frameworks/libvulkan.1.dylib";
     const auto libmoltenvk_filename =
         Common::FS::GetBundleDirectory() / "Contents/Frameworks/libMoltenVK.dylib";
+#endif
     const char* library_paths[] = {std::getenv("LIBVULKAN_PATH"), libvulkan_filename.c_str(),
                                    libmoltenvk_filename.c_str()};
     // Check if a path to a specific Vulkan library has been specified.

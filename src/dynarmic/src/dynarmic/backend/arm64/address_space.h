@@ -25,6 +25,8 @@
 
 namespace Dynarmic::Backend::Arm64 {
 
+struct StackLayout;
+
 class AddressSpace {
 public:
     explicit AddressSpace(std::size_t code_cache_size);
@@ -41,6 +43,7 @@ public:
     CodePtr ReverseGetEntryPoint(CodePtr host_pc);
 
     CodePtr GetOrEmit(IR::LocationDescriptor descriptor);
+    CodePtr GetOrEmitFromDispatcher(IR::LocationDescriptor descriptor, StackLayout& stack);
 
     void InvalidateBasicBlocks(const ::Common::unordered_set<IR::LocationDescriptor>& descriptors);
 
@@ -62,7 +65,7 @@ protected:
     }
 
     std::size_t GetRemainingSize();
-    EmittedBlockInfo Emit(IR::Block ir_block);
+    CodePtr Emit(IR::Block ir_block);
     void Link(EmittedBlockInfo& block);
     void LinkBlockLinks(const CodePtr entry_point, const CodePtr target_ptr, const std::vector<BlockRelocation>& block_relocations_list);
     void RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr);
@@ -71,6 +74,7 @@ protected:
 
     IR::Block ir_block;
     const std::size_t code_cache_size;
+    u64 cache_generation = 0;
     oaknut::CodeBlock mem;
     oaknut::CodeGenerator code;
 

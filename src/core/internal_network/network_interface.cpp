@@ -17,6 +17,18 @@
 #include <cerrno>
 #include <ifaddrs.h>
 #include <net/if.h>
+#elif defined(__APPLE__)
+#include <TargetConditionals.h>
+#include <cerrno>
+#include <cstring>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#if TARGET_OS_OSX
+#include <CoreFoundation/CoreFoundation.h>
+#include <SystemConfiguration/SCNetworkConfiguration.h>
+#endif
 #elif defined(__FreeBSD__)
 #include <sys/types.h>
 #include <sys/time.h>
@@ -104,7 +116,7 @@ std::vector<Network::NetworkInterface> GetAvailableNetworkInterfaces() {
 #else
 
 std::vector<Network::NetworkInterface> GetAvailableNetworkInterfaces() {
-#if defined(__ANDROID__) || defined(__linux__)
+#if defined(__ANDROID__) || defined(__linux__) || defined(__APPLE__)
     struct ifaddrs* ifaddr = nullptr;
     if (getifaddrs(&ifaddr) != 0) {
         LOG_ERROR(Network, "getifaddrs: {}", std::strerror(errno));
@@ -119,7 +131,7 @@ std::vector<Network::NetworkInterface> GetAvailableNetworkInterfaces() {
         u32 flags;
     };
     std::vector<RoutingEntry> routes{};
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__APPLE__)
     // Even through Linux based, we can't reliably obtain routing information from there :(
 #else
     if (std::ifstream file("/proc/net/route"); file.is_open()) {
@@ -135,6 +147,35 @@ std::vector<Network::NetworkInterface> GetAvailableNetworkInterfaces() {
         LOG_WARNING(Network, "\"/proc/net/route\" not found - using gateway 0");
     }
 #endif
+#if defined(__APPLE__) && TARGET_OS_OSX
+    std::vector<std::string> wifi_names;
+    if (const CFArrayRef interfaces = SCNetworkInterfaceCopyAll()) {
+        const CFIndex count = CFArrayGetCount(interfaces);
+        for (CFIndex i = 0; i < count; ++i) {
+            const auto iface = static_cast<SCNetworkInterfaceRef>(CFArrayGetValueAtIndex(interfaces, i));
+            const CFStringRef type = SCNetworkInterfaceGetInterfaceType(iface);
+            const CFStringRef bsd_name = SCNetworkInterfaceGetBSDName(iface);
+            if (type && bsd_name &&
+                CFEqual(type, kSCNetworkInterfaceTypeIEEE80211)) {
+                char buf[128]{};
+                if (CFStringGetCString(bsd_name, buf, sizeof(buf), kCFStringEncodingUTF8)) {
+                    wifi_names.emplace_back(buf);
+                }
+            }
+        }
+        CFRelease(interfaces);
+    }
+#endif
+    const auto to_in_addr = [](const struct sockaddr* addr) -> in_addr {
+        struct sockaddr_in sin{};
+#ifdef __APPLE__
+        const size_t len = (std::min<size_t>)(addr->sa_len, sizeof(sin));
+#else
+        const size_t len = sizeof(sin);
+#endif
+        std::memcpy(&sin, addr, len);
+        return sin.sin_addr;
+    };
     std::vector<Network::NetworkInterface> ifaces;
     for (auto ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == nullptr || ifa->ifa_netmask == nullptr /* Have a netmask and address */
@@ -149,11 +190,18 @@ std::vector<Network::NetworkInterface> GetAvailableNetworkInterfaces() {
         });
         in_addr gw; // Solaris defines s_addr as a macro, can't use special C++ shenanigans here
         gw.s_addr = it != routes.end() ? it->gateway : 0;
+        HostAdapterKind kind = HostAdapterKind::Ethernet;
+#if defined(__APPLE__) && TARGET_OS_OSX
+        if (std::ranges::find(wifi_names, ifa->ifa_name) != wifi_names.end()) {
+            kind = HostAdapterKind::Wifi;
+        }
+#endif
         ifaces.emplace_back(Network::NetworkInterface{
             .name = ifa->ifa_name,
-            .ip_address = std::bit_cast<struct sockaddr_in>(*ifa->ifa_addr).sin_addr,
-            .subnet_mask = std::bit_cast<struct sockaddr_in>(*ifa->ifa_netmask).sin_addr,
-            .gateway = gw
+            .ip_address = to_in_addr(ifa->ifa_addr),
+            .subnet_mask = to_in_addr(ifa->ifa_netmask),
+            .gateway = gw,
+            .kind = kind,
         });
     }
     freeifaddrs(ifaddr);

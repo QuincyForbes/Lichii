@@ -150,6 +150,9 @@ public:
             num_descriptors > device->MaxPushDescriptors()) {
             return false;
         }
+        if (device->IsMoltenVK() && exceeds_metal_slots) {
+            return false;
+        }
         return !device->IsExtDescriptorBufferSupported() ||
                device->DescriptorBufferProperties().bufferlessPushDescriptors;
     }
@@ -270,6 +273,19 @@ public:
         is_compute |= (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
         uses_mesh |= (stage & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) != 0;
 
+        // MoltenVK cannot put push descriptors into Metal argument buffers, so each one takes a
+        // direct Metal slot (31 buffers, 16 samplers, 128/31 textures per stage) alongside the
+        // push constants, vertex buffers and MoltenVK's auxiliary buffers. Over that, use a
+        // descriptor set, which MoltenVK puts into an argument buffer.
+        const u32 buffers = Shader::NumDescriptors(info.constant_buffer_descriptors) +
+                            Shader::NumDescriptors(info.storage_buffers_descriptors);
+        const u32 samplers = Shader::NumDescriptors(info.texture_descriptors);
+        const u32 textures = samplers + Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                             Shader::NumDescriptors(info.image_buffer_descriptors) +
+                             Shader::NumDescriptors(info.image_descriptors);
+        const u32 max_buffers = (stage & VK_SHADER_STAGE_VERTEX_BIT) != 0 ? 10U : 24U;
+        exceeds_metal_slots |= buffers > max_buffers || samplers > 16 || textures > 31;
+
         Add(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage, info.constant_buffer_descriptors);
         Add(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage, info.storage_buffers_descriptors);
         Add(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, stage, info.texture_buffer_descriptors);
@@ -307,6 +323,7 @@ private:
     const Device* device{};
     bool is_compute{};
     bool uses_mesh{};
+    bool exceeds_metal_slots{};
     boost::container::small_vector<VkDescriptorSetLayoutBinding, 32> bindings;
     boost::container::small_vector<VkDescriptorUpdateTemplateEntry, 32> entries;
     u32 binding{};

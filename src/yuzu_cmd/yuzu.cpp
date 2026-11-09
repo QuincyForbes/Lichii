@@ -67,6 +67,89 @@
 #include <sys/resource.h>
 #endif
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
+#include <vector>
+#include <os/log.h>
+#include "common/ios_jit.h"
+#include "yuzu_cmd/ios_support.h"
+#include "hid_core/frontend/emulated_controller.h"
+#include "hid_core/hid_core.h"
+#include "hid_core/hid_types.h"
+#include "input_common/drivers/virtual_gamepad.h"
+#include <os/proc.h>
+#include <sys/sysctl.h>
+#include <unistd.h>
+#include <CoreFoundation/CoreFoundation.h>
+
+// Code-signing status: dynarmic's code pages are only executable while the process is being
+// debugged (that is what StikDebug/SideStore "JIT" means on iOS 17+).
+extern "C" int csops(pid_t pid, unsigned int ops, void* useraddr, size_t usersize);
+static constexpr unsigned int kCsOpsStatus = 0;
+static constexpr int kCsDebugged = 0x10000000;
+static bool IosJitEnabled() {
+    int flags = 0;
+    if (csops(getpid(), kCsOpsStatus, &flags, sizeof(flags)) != 0) {
+        return false;
+    }
+    return (flags & kCsDebugged) != 0;
+}
+// dynarmic: 128 MiB of code cache per guest core, six cores, plus spare blocks. Acquired once
+// through StikDebug's universal script (iOS 26+), then the debugger is released.
+static constexpr std::size_t kIosJitPoolBytes = (6 * 128 + 32) * 1024 * 1024;
+static std::string IosBundleIdentifier() {
+    std::string out;
+    if (CFStringRef id = CFBundleGetIdentifier(CFBundleGetMainBundle())) {
+        char buf[256];
+        if (CFStringGetCString(id, buf, sizeof(buf), kCFStringEncodingUTF8)) {
+            out = buf;
+        }
+    }
+    return out;
+}
+
+// Startup breadcrumbs for a device without a debugger: os_log (visible in the device syslog) and
+// Documents/lichii-startup.txt. stdout/stderr are also redirected into Documents/console.txt so the
+// console log backend and any printf survive an early exit.
+static std::string IosDocumentsDir() {
+    const char* home = std::getenv("HOME");
+    return std::string(home ? home : ".") + "/Documents";
+}
+static void IosMark(const char* what) {
+    os_log(OS_LOG_DEFAULT, "[lichii] %{public}s", what);
+    static FILE* marks = nullptr;
+    if (marks == nullptr) {
+        marks = std::fopen((IosDocumentsDir() + "/lichii-startup.txt").c_str(), "a");
+    }
+    if (marks != nullptr) {
+        std::fprintf(marks, "%s\n", what);
+        std::fflush(marks);
+    }
+}
+static void IosCaptureConsole() {
+    const std::string path = IosDocumentsDir() + "/console.txt";
+    std::freopen(path.c_str(), "a", stdout);
+    std::freopen(path.c_str(), "a", stderr);
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+}
+namespace {
+struct IosStaticInitMark {
+    IosStaticInitMark() {
+        IosMark("yuzu.cpp static init");
+    }
+} ios_static_init_mark;
+} // namespace
+#define IOS_MARK(what) IosMark(what)
+#else
+#define IOS_MARK(what) ((void)0)
+#endif
+
 #ifdef _WIN32
 // windows.h needs to be included before shellapi.h
 #include <windows.h>
@@ -253,7 +336,103 @@ struct SdlState {
     InputCommon::InputSubsystem input_subsystem{};
     std::unique_ptr<EmuWindow_SDL3> emu_window;
     bool network_initialized{};
+    // iOS: launch parameters parked until the JIT (debugged) state is on; finished in SDL_AppIterate.
+    std::optional<Core::LaunchParams> pending_launch;
+    Uint64 jit_wait_start{};
+    Uint64 jit_failed_at{};
+    bool jit_have_stikdebug{};
+    bool jit_url_opened{};
+    std::uint64_t jit_bg_task{};
+    bool ios_controllers_dirty{};
+    bool ios_paused_for_background{};
+    // Plain SDL window shown while waiting for the JIT so the screen is not just black.
+    SDL_Window* wait_window{};
+    SDL_Renderer* wait_renderer{};
 };
+
+static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp);
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+// Touch overlay -> virtual gamepad. Player 1 (port 0) and Handheld (port 8) both listen to it,
+// so the game sees the input whichever controller style it reads.
+static InputCommon::InputSubsystem* g_ios_input = nullptr;
+static constexpr std::size_t kIosVirtualPorts[] = {0, 8};
+
+static void IosTouchButton(int button, bool pressed) {
+    if (g_ios_input == nullptr) {
+        return;
+    }
+    if (auto* pad = g_ios_input->GetVirtualGamepad()) {
+        for (const std::size_t port : kIosVirtualPorts) {
+            pad->SetButtonState(port, button, pressed);
+        }
+    }
+}
+
+static void IosTouchStick(int stick, float x, float y) {
+    if (g_ios_input == nullptr) {
+        return;
+    }
+    if (auto* pad = g_ios_input->GetVirtualGamepad()) {
+        for (const std::size_t port : kIosVirtualPorts) {
+            pad->SetStickPosition(port, stick, x, y);
+        }
+    }
+}
+
+// Maps the first physical controller (SDL: MFi, Xbox, DualSense, Switch Pro, Backbone, ...)
+// onto Player 1 and Handheld with its default layout, and shows the touch overlay only when no
+// controller is connected.
+static void IosApplyControllers(SdlState* state) {
+    auto& input = state->input_subsystem;
+    std::optional<Common::ParamPackage> pad;
+    for (const auto& device : input.GetInputDevices()) {
+        if (device.Get("engine", "") == "sdl") {
+            pad = device;
+            break;
+        }
+    }
+    if (pad) {
+        const auto buttons = input.GetButtonMappingForDevice(*pad);
+        const auto analogs = input.GetAnalogMappingForDevice(*pad);
+        for (const auto id : {Core::HID::NpadIdType::Player1, Core::HID::NpadIdType::Handheld}) {
+            auto* controller = state->system.HIDCore().GetEmulatedController(id);
+            if (controller == nullptr) {
+                continue;
+            }
+            for (const auto& [index, param] : buttons) {
+                controller->SetButtonParam(static_cast<std::size_t>(index), param);
+            }
+            for (const auto& [index, param] : analogs) {
+                controller->SetStickParam(static_cast<std::size_t>(index), param);
+            }
+        }
+        LOG_INFO(Frontend, "iOS: controller \"{}\" mapped to player 1, touch controls hidden",
+                 pad->Get("display", "gamepad"));
+    } else {
+        LOG_INFO(Frontend, "iOS: no controller connected, touch controls shown");
+    }
+    IosSupport::SetTouchControlsVisible(!pad.has_value());
+}
+
+static void IosInstallTouchControls(SdlState* state) {
+    g_ios_input = &state->input_subsystem;
+    int count = 0;
+    SDL_Window** windows = SDL_GetWindows(&count);
+    void* ui_window = nullptr;
+    if (windows != nullptr && count > 0) {
+        ui_window = SDL_GetPointerProperty(SDL_GetWindowProperties(windows[0]),
+                                           SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, nullptr);
+    }
+    SDL_free(windows);
+    if (ui_window == nullptr) {
+        LOG_ERROR(Frontend, "iOS: no UIWindow for the touch controls");
+        return;
+    }
+    IosSupport::InstallTouchControls(ui_window, &IosTouchButton, &IosTouchStick);
+    IosApplyControllers(state);
+}
+#endif
 
 constexpr int kRestartExitCode = 75;
 static std::atomic_bool restart_requested{false};
@@ -485,7 +664,12 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
     // input; 240 Hz is plenty for input and the key script.
     SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "240");
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    IosCaptureConsole();
+    IOS_MARK("SDL_AppInit enter");
+#endif
     SdlState* state = new SdlState();
+    IOS_MARK("SdlState constructed (Core::System + input)");
     *appstate = state;
 
 #ifdef _WIN32
@@ -507,6 +691,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
     Common::Log::Start();
+    IOS_MARK("logging started");
 
     int option_index = 0;
 #ifdef _WIN32
@@ -524,6 +709,27 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     LocalFree(argv_w);
 #endif
     SdlConfig config{lp.config_path};
+    IOS_MARK("config loaded");
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // Audio: playback session with a 20 ms hardware buffer and a larger SDL device buffer; the
+    // default small buffer underran whenever a frame took longer than usual (audible skips).
+    IosSupport::ConfigureAudioSession();
+    SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "1024");
+    // Controllers come through Apple's GameController framework. SDL's HIDAPI layer on iOS only
+    // adds a Bluetooth LE scan for Steam Controllers that ran every few seconds for the whole
+    // session (battery, and Bluetooth prompts).
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "0");
+    // Per-draw GPU and service info logging costs frame time on the phone; keep warnings.
+    Settings::values.log_filter.SetValue(
+        "*:Info HW.GPU:Warning Render.Vulkan:Warning Service:Warning Service.NVDRV:Error "
+        "Service.AM:Error Debug:Error");
+    {
+        Common::Log::Filter filter;
+        filter.ParseFilterString(Settings::values.log_filter.GetValue());
+        Common::Log::SetGlobalFilter(filter);
+    }
+#endif
 
     Core::ApplyLaunchParams(lp);
 
@@ -545,6 +751,105 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         return EditNup(lp) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
     }
 
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // The JIT must be on before the first guest instruction runs, or the kernel kills the process
+    // with CODESIGNING "Invalid Page". Waiting here would block the main thread and trip the 10 s
+    // scene-update watchdog, so park the launch and let SDL_AppIterate finish it.
+    // dynarmic needs executable memory before the first guest instruction. On iOS 26+ (TXM)
+    // only a debugger running StikDebug's universal script can provide it, so the launch is
+    // parked while a background thread acquires the code pool; SDL_AppIterate shows progress,
+    // asks StikDebug through its URL scheme and finishes the launch once the pool is ready
+    // (blocking here would trip the 10 s scene-update watchdog).
+    const bool txm = IosSupport::HasTxm();
+    state->jit_have_stikdebug = IosSupport::CanOpenScheme("stikdebug");
+    LOG_INFO(Frontend, "iOS {}: TXM {}, debugged {}, traced {}, StikDebug {}",
+             IosSupport::MajorVersion(), txm, IosJitEnabled(), Common::IosJit::DebuggerAttached(),
+             state->jit_have_stikdebug ? "installed" : "not installed");
+    IOS_MARK(IosJitEnabled() ? "JIT enabled at launch, acquiring pool" : "JIT not enabled, waiting");
+    Common::IosJit::StartAcquire(kIosJitPoolBytes, txm);
+    state->pending_launch = std::move(lp);
+    state->jit_wait_start = SDL_GetTicks();
+    return SDL_APP_CONTINUE;
+#else
+    return SDL_AppInitRest(state, std::move(lp));
+#endif
+}
+
+static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // Movies: software decoding (dav1d for AV1). The VideoToolbox AV1 hwaccel failed every
+    // frame on iOS 27 and the game died as soon as the New Game movie started.
+    Settings::values.nvdec_emulation.SetValue(Settings::NvdecEmulation::Cpu);
+    // Speed: a phone is a handheld (the game renders at its handheld resolution, not 4K docked),
+    // and shaders build in the background instead of stalling frames (and audio) while they
+    // compile.
+    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
+    Settings::values.use_asynchronous_shaders.SetValue(true);
+    // Memory: CPU and GPU share the app's ~6.6 GB budget (about 5.3 GB free at launch). The
+    // texture cache was allowed 5 GB before collecting (desktop tuning for Switch 2 titles), so a
+    // busy scene got the app killed by iOS without a crash report. Collect much earlier here.
+    {
+        const std::size_t avail_mib = os_proc_available_memory() >> 20;
+        const std::size_t critical = std::clamp<std::size_t>(avail_mib / 4, 1024, 2048);
+        const std::size_t expected = critical - 512;
+        setenv("EDEN_NX2_TC_CRITICAL_MIB", std::to_string(critical).c_str(), 0);
+        setenv("EDEN_NX2_TC_EXPECTED_MIB", std::to_string(expected).c_str(), 0);
+        LOG_INFO(Frontend, "iOS: texture cache limits {} / {} MiB", expected, critical);
+    }
+    // iOS has no command line: run the first game in the app's Documents folder, which the user
+    // fills through the Files app (UIFileSharingEnabled in Info.plist).
+    if (lp.filepath.empty()) {
+        lp.fullscreen = true;
+        // The per-process memory budget decides whether a Switch 2 title fits on this device.
+        {
+            u64 physical = 0;
+            size_t physical_size = sizeof(physical);
+            sysctlbyname("hw.memsize", &physical, &physical_size, nullptr, 0);
+            LOG_INFO(Frontend, "iOS: physical memory {} MiB, available to this process {} MiB",
+                     physical >> 20, static_cast<u64>(os_proc_available_memory()) >> 20);
+        }
+        const char* home = std::getenv("HOME");
+        const std::filesystem::path documents = std::filesystem::path(home ? home : ".") / "Documents";
+        std::error_code ec;
+        std::filesystem::create_directories(documents, ec);
+        std::vector<std::filesystem::path> candidates;
+        // Documents and one level of subfolders (Files app copies and USB pushes both land there).
+        for (auto it = std::filesystem::recursive_directory_iterator(documents, ec);
+             it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec) {
+                break;
+            }
+            const auto& entry = *it;
+            if (entry.is_directory(ec)) {
+                if (it.depth() >= 1 || entry.path().filename() == "eden") {
+                    it.disable_recursion_pending();
+                }
+                continue;
+            }
+            if (!entry.is_regular_file(ec)) {
+                continue;
+            }
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (ext == ".nup" || ext == ".nsp" || ext == ".xci" || ext == ".nca" || ext == ".nso" ||
+                ext == ".nro") {
+                candidates.push_back(entry.path());
+            }
+        }
+        std::sort(candidates.begin(), candidates.end());
+        if (!candidates.empty()) {
+            lp.filepath = candidates.front().string();
+            LOG_INFO(Frontend, "iOS: launching {}", lp.filepath);
+        } else {
+            LOG_CRITICAL(Frontend, "iOS: no game found in {}", documents.string());
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Lichii",
+                                     "No game found. Copy a .nup, .nsp or .xci into this app's folder "
+                                     "(Files app > On My iPhone > Lichii), then launch again.",
+                                     nullptr);
+        }
+    }
+#endif
     if (lp.filepath.empty()) {
         LOG_CRITICAL(Frontend, "Failed to load ROM: No ROM specified");
         return SDL_APP_FAILURE;
@@ -556,7 +861,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         return SDL_APP_FAILURE;
     }
 
+    IOS_MARK("system.Initialize");
     state->system.Initialize();
+    IOS_MARK("system initialized");
 
 
     // Apply the command line arguments
@@ -612,7 +919,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         LOG_INFO(Frontend, "Restarted by the game: program index {}, {} user channel entries",
                  handoff->program_index, state->system.GetUserChannel().size());
     }
+    IOS_MARK("system.Load");
     const Core::SystemResultStatus load_result = state->system.Load(*state->emu_window, lp.filepath, load_parameters);
+    IOS_MARK("system.Load returned");
     switch (load_result) {
     case Core::SystemResultStatus::Success:
         if (restarted) {
@@ -658,6 +967,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     }
 
     // Core is loaded, start the GPU (makes the GPU contexts current to this thread)
+    IOS_MARK("GPU start");
     state->system.GPU().Start();
     state->system.GetCpuManager().OnGpuReady();
 
@@ -669,6 +979,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 
     // don't do anything, SDL3 already exists for us :D
     state->system.RegisterExitCallback([] {});
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    IosInstallTouchControls(state);
+#endif
 
     // A game executing a program (e.g. restarting after a settings change) writes its launch state
     // to the restart handoff and quits with kRestartExitCode; the launcher boots the same file again
@@ -718,6 +1031,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         state->system.Run();
     });
 
+    IOS_MARK("system.Run");
     void(state->system.Run());
     if (state->system.DebuggerEnabled())
         state->system.InitializeDebugger();
@@ -780,6 +1094,132 @@ static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem) {
 
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    if (state->pending_launch) {
+        using Common::IosJit::State;
+        const State jit = Common::IosJit::GetState();
+        if (jit == State::Ready) {
+            LOG_INFO(Frontend, "iOS: JIT pool ready after {} ms", SDL_GetTicks() - state->jit_wait_start);
+            IOS_MARK("JIT pool ready");
+            IosSupport::EndBackgroundTask(state->jit_bg_task);
+            state->jit_bg_task = 0;
+            if (state->wait_renderer) {
+                SDL_DestroyRenderer(state->wait_renderer);
+                state->wait_renderer = nullptr;
+            }
+            if (state->wait_window) {
+                SDL_DestroyWindow(state->wait_window);
+                state->wait_window = nullptr;
+            }
+            Core::LaunchParams lp = std::move(*state->pending_launch);
+            state->pending_launch.reset();
+            return SDL_AppInitRest(state, std::move(lp));
+        }
+        if (!state->wait_window) {
+            state->wait_window = SDL_CreateWindow("Lichii", 0, 0, SDL_WINDOW_FULLSCREEN | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+            if (state->wait_window) {
+                state->wait_renderer = SDL_CreateRenderer(state->wait_window, nullptr);
+            }
+        }
+        // Hand off to StikDebug once (after the first frame, so there is something to come back
+        // to): it attaches to this PID, runs universal.js, serves the pool request and returns.
+        if (!state->jit_url_opened && state->wait_window && state->jit_have_stikdebug &&
+            jit == State::Waiting && !IosJitEnabled()) {
+            state->jit_url_opened = true;
+            std::string url = "stikdebug://enable-jit?bundle-id=" + IosBundleIdentifier() +
+                              "&pid=" + std::to_string(getpid());
+            if (IosSupport::HasTxm()) {
+                url += "&script-name=universal.js";
+            }
+            state->jit_bg_task = IosSupport::BeginBackgroundTask("lichii-jit");
+            IOS_MARK("asking StikDebug for JIT");
+            LOG_INFO(Frontend, "iOS: opening {}", url);
+            IosSupport::OpenUrl(url.c_str());
+        }
+        if (jit == State::Failed && state->jit_failed_at == 0) {
+            state->jit_failed_at = SDL_GetTicks();
+            IOS_MARK("JIT pool failed");
+            IosSupport::EndBackgroundTask(state->jit_bg_task);
+            state->jit_bg_task = 0;
+        }
+        if (state->wait_renderer) {
+            const Uint64 waited = (SDL_GetTicks() - state->jit_wait_start) / 1000;
+            std::vector<std::string> lines;
+            switch (jit) {
+            case State::Waiting:
+                if (state->jit_have_stikdebug) {
+                    lines = {"Requesting JIT from StikDebug...", "",
+                             "Tap \"Enable JIT\" in StikDebug if it asks;",
+                             "this screen continues by itself."};
+                } else {
+                    lines = {"Waiting for JIT...", "",
+                             "Install StikDebug 3.2 or newer, then",
+                             "enable JIT for this app (universal.js)."};
+                }
+                break;
+            case State::Acquiring:
+                lines = {"Preparing JIT memory...", "",
+                         "StikDebug is mapping " + std::to_string(kIosJitPoolBytes >> 20) + " MiB;",
+                         "this takes up to a minute."};
+                break;
+            case State::Failed: {
+                lines = {"JIT unavailable", ""};
+                std::string err = Common::IosJit::GetError();
+                while (!err.empty()) {
+                    std::size_t cut = std::min<std::size_t>(err.size(), 44);
+                    if (cut < err.size()) {
+                        const auto sp = err.rfind(' ', cut);
+                        if (sp != std::string::npos && sp > 20) {
+                            cut = sp;
+                        }
+                    }
+                    lines.push_back(err.substr(0, cut));
+                    err.erase(0, cut);
+                    while (!err.empty() && err.front() == ' ') {
+                        err.erase(0, 1);
+                    }
+                }
+                lines.push_back("");
+                lines.push_back("Closing in a moment; launch again.");
+                break;
+            }
+            case State::Ready:
+                break;
+            }
+            SDL_SetRenderDrawColor(state->wait_renderer, 12, 12, 16, 255);
+            SDL_RenderClear(state->wait_renderer);
+            SDL_SetRenderScale(state->wait_renderer, 3.0f, 3.0f);
+            SDL_SetRenderDrawColor(state->wait_renderer, 235, 235, 235, 255);
+            float y = 40.0f;
+            for (const auto& line : lines) {
+                SDL_RenderDebugText(state->wait_renderer, 16, y, line.c_str());
+                y += 10.0f;
+            }
+            const std::string elapsed = "waited " + std::to_string(waited) + " s";
+            SDL_RenderDebugText(state->wait_renderer, 16, y + 10.0f, elapsed.c_str());
+            SDL_SetRenderScale(state->wait_renderer, 1.0f, 1.0f);
+            SDL_RenderPresent(state->wait_renderer);
+        }
+        // No message boxes here: SDL's UIKit alert spins the run loop, which re-enters this
+        // callback and recursed until the stack overflowed.
+        if (jit == State::Failed && SDL_GetTicks() - state->jit_failed_at > 20 * 1000) {
+            LOG_CRITICAL(Frontend, "iOS: exiting, JIT pool failed: {}", Common::IosJit::GetError());
+            return SDL_APP_FAILURE;
+        }
+        if (SDL_GetTicks() - state->jit_wait_start > 10 * 60 * 1000) {
+            LOG_CRITICAL(Frontend, "iOS: JIT still not available after 10 minutes, exiting");
+            return SDL_APP_FAILURE;
+        }
+        SDL_Delay(20);
+        return SDL_APP_CONTINUE;
+    }
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    if (state->ios_controllers_dirty && state->emu_window) {
+        state->ios_controllers_dirty = false;
+        IosApplyControllers(state);
+    }
+#endif
     RunKeyScript(state->input_subsystem);
     if (state->emu_window) {
         state->emu_window->ApplyPendingTitle();
@@ -791,6 +1231,43 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
 }
 extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     SdlState *state = (SdlState *)appstate;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    switch (event->type) {
+    case SDL_EVENT_GAMEPAD_ADDED:
+    case SDL_EVENT_GAMEPAD_REMOVED:
+    case SDL_EVENT_JOYSTICK_ADDED:
+    case SDL_EVENT_JOYSTICK_REMOVED:
+        // The input driver handles the device in its event watch; remap on the next frame.
+        state->ios_controllers_dirty = true;
+        break;
+    case SDL_EVENT_WILL_ENTER_BACKGROUND:
+        // iOS forbids GPU work in the background (Metal fails the command buffers and the
+        // Vulkan scheduler aborted on the lost device): stop emulating until we are back.
+        if (state->system.IsPoweredOn() && !state->pending_launch) {
+            LOG_INFO(Frontend, "iOS: entering background, pausing");
+            void(state->system.Pause());
+            state->ios_paused_for_background = true;
+        }
+        break;
+    case SDL_EVENT_LOW_MEMORY:
+        LOG_WARNING(Frontend, "iOS: low memory warning ({} MiB left to this process)",
+                    os_proc_available_memory() >> 20);
+        break;
+    case SDL_EVENT_TERMINATING:
+        LOG_INFO(Frontend, "iOS: terminating");
+        Common::Log::Stop();
+        break;
+    case SDL_EVENT_DID_ENTER_FOREGROUND:
+        if (state->ios_paused_for_background) {
+            LOG_INFO(Frontend, "iOS: back in the foreground, resuming");
+            state->ios_paused_for_background = false;
+            void(state->system.Run());
+        }
+        break;
+    default:
+        break;
+    }
+#endif
     if (state->emu_window)
         state->emu_window->OnEvent(*event);
     return SDL_APP_CONTINUE;

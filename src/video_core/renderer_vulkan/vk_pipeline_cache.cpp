@@ -1786,11 +1786,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }
         }
 
+        // Keys asking for a last-vertex mode the device lacks are loaded as they are: draws look
+        // them up with the same bit, and the pipeline falls back to the first vertex when built.
         const bool key_requests_provoking_last = key.state.provoking_vertex_last != 0;
-        if (key_requests_provoking_last && !dynamic_features.has_provoking_vertex_last_mode) {
-            return;
-        }
-
         const bool key_uses_transform_feedback = key.state.xfb_enabled != 0;
         if (key_uses_transform_feedback && key_requests_provoking_last &&
             !dynamic_features.has_provoking_vertex_tf_preserve) {

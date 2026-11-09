@@ -442,7 +442,27 @@ if (APPLE)
     endif()
 
     # TODO: kosmickrisp?
-    if (NOT MOLTENVK_LIBRARY OR YUZU_USE_BUNDLED_MOLTENVK)
+    if (IOS)
+        # Official MoltenVK 1.4.2 for iOS (emits thread_scope_simdgroup instead of 1.4.1's
+        # thread_scope_subgroup, which the iOS Metal compiler rejects).
+        set(moltenvk_ios_dir "${CMAKE_BINARY_DIR}/externals/moltenvk-ios-1.4.2")
+        set(moltenvk_ios_fw "${moltenvk_ios_dir}/MoltenVK/MoltenVK/dynamic/MoltenVK.xcframework/ios-arm64/MoltenVK.framework")
+        if (NOT EXISTS "${moltenvk_ios_fw}/MoltenVK")
+            message(STATUS "Downloading MoltenVK for iOS")
+            file(DOWNLOAD
+                "https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-ios.tar"
+                "${moltenvk_ios_dir}/MoltenVK-ios.tar"
+                EXPECTED_HASH SHA512=eb98821ee08cf3e3429a93fb85f5aaeaa2de3ee2eb02a06fd1f8b09f9b31958f0d6b0d07162e1f44f19a2c846ba26bbbdb090fab6c97cc7ce7b7887e8c1d1086
+                STATUS moltenvk_ios_status)
+            list(GET moltenvk_ios_status 0 moltenvk_ios_error)
+            if (moltenvk_ios_error)
+                message(FATAL_ERROR "MoltenVK iOS download failed: ${moltenvk_ios_status}")
+            endif()
+            file(ARCHIVE_EXTRACT INPUT "${moltenvk_ios_dir}/MoltenVK-ios.tar" DESTINATION "${moltenvk_ios_dir}")
+        endif()
+        set(MOLTENVK_FRAMEWORK_DIR "${moltenvk_ios_fw}" CACHE PATH "" FORCE)
+        set(MOLTENVK_LIBRARY "${moltenvk_ios_fw}/MoltenVK" CACHE STRING "" FORCE)
+    elseif (NOT MOLTENVK_LIBRARY OR YUZU_USE_BUNDLED_MOLTENVK)
         AddJsonPackage(moltenvk)
 
         set(MOLTENVK_LIBRARY "${moltenvk_SOURCE_DIR}/MoltenVK/dylib/macOS/libMoltenVK.dylib" CACHE STRING "" FORCE)

@@ -34,8 +34,8 @@ static MemoryInfo Detect() {
     mem_info.TotalPhysicalMemory = memorystatus.ullTotalPhys;
     mem_info.TotalSwapMemory = memorystatus.ullTotalPageFile - mem_info.TotalPhysicalMemory;
 #elif defined(__APPLE__)
-    u64 ramsize;
-    struct xsw_usage vmusage;
+    u64 ramsize{};
+    struct xsw_usage vmusage{};
     std::size_t sizeof_ramsize = sizeof(ramsize);
     std::size_t sizeof_vmusage = sizeof(vmusage);
     // hw and vm are defined in sysctl.h

@@ -102,6 +102,8 @@ jobs:
             pgo: true
           - platform: macos-arm64
             runner: macos-15
+          - platform: macos-x86_64
+            runner: macos-15-intel
 
     steps:
       - name: Check out source
@@ -126,7 +128,7 @@ jobs:
 
       # The packages docs/Deps.md lists for macOS, plus ccache.
       - name: Install macOS dependencies
-        if: startsWith(matrix.platform, 'macos')
+        if: matrix.platform == 'macos-arm64'
         shell: bash
         env:
           HOMEBREW_NO_INSTALL_CLEANUP: 1
@@ -135,6 +137,28 @@ jobs:
           brew install autoconf automake boost ffmpeg fmt glslang hidapi libtool libusb lz4 ninja \
             nlohmann-json openssl pkg-config qt@6 sdl3 speexdsp zlib zstd cmake catch2 molten-vk \
             vulkan-loader spirv-tools vulkan-utility-libraries ccache
+
+      # Homebrew has no Intel bottles any more, so building qt@6 and friends there takes hours; take
+      # Qt from jurplel/install-qt-action and build the rest from CPM.
+      - name: Install macOS Intel build tools
+        if: matrix.platform == 'macos-x86_64'
+        shell: bash
+        env:
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew install autoconf automake libtool nasm glslang ninja pkg-config ccache
+
+      - name: Install Qt on macOS Intel
+        if: matrix.platform == 'macos-x86_64'
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.12.0"
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtcharts
+          cache: true
 
       - name: Install Qt on Linux x86_64
         if: startsWith(matrix.platform, 'linux') && runner.arch != 'ARM64'
@@ -320,7 +344,7 @@ jobs:
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
       - name: Configure macOS
-        if: startsWith(matrix.platform, 'macos')
+        if: matrix.platform == 'macos-arm64'
         shell: bash
         run: |
           set -euo pipefail
@@ -336,6 +360,28 @@ jobs:
             "-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+            -DENABLE_UPDATE_CHECKER=ON \
+            -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
+            -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DUSE_CCACHE=ON
+
+      - name: Configure macOS Intel
+        if: matrix.platform == 'macos-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_TESTS=OFF \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR" \
+            -DCPMUTIL_FORCE_BUNDLED=ON \
+            -DYUZU_USE_EXTERNAL_FFMPEG=ON \
             -DENABLE_UPDATE_CHECKER=ON \
             -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
@@ -526,7 +572,8 @@ jobs:
           test -x "$app/Contents/MacOS/lichii"
           test -x build/release/bin/eden-cli
           cp build/release/bin/eden-cli "$app/Contents/MacOS/eden-cli"
-          "$(brew --prefix qt@6)/bin/macdeployqt" "$app" \
+          qt_bin="${QT_ROOT_DIR:-$(brew --prefix qt@6)}/bin"
+          "$qt_bin/macdeployqt" "$app" \
             -executable="$app/Contents/MacOS/eden-cli" -libpath="$(brew --prefix)/lib" \
             -always-overwrite -verbose=1
           # Qt's virtual keyboard input plugin pulls in the QML stack, which the emulator doesn't use.

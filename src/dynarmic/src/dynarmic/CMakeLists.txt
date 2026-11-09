@@ -325,6 +325,8 @@ endif()
 
 if (WIN32)
     target_sources(dynarmic PRIVATE backend/exception_handler_windows.cpp)
+elseif (IOS)
+    target_sources(dynarmic PRIVATE backend/exception_handler_posix.cpp)
 elseif (APPLE)
     find_path(MACH_EXC_DEFS_DIR "mach/mach_exc.defs")
     if (NOT MACH_EXC_DEFS_DIR)

@@ -62,8 +62,13 @@ size_t BytesPerIndex(VkIndexType index_type) {
     }
 }
 
+constexpr VkDeviceSize MOLTENVK_BUFFER_TAIL = 65536;
+
 vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allocator, u64 size,
                         VkDeviceSize sparse_alignment) {
+    if (device.IsMoltenVK()) {
+        size += MOLTENVK_BUFFER_TAIL;
+    }
     VkBufferUsageFlags flags =
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
         VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
@@ -127,6 +132,20 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
     if (device->IsBufferDeviceAddressSupported()) {
         device_address = device->GetLogical().GetBufferDeviceAddress(*buffer);
     }
+    if (device->IsMoltenVK()) {
+        scheduler->RequestOutsideRenderPassOperationContext();
+        scheduler->Record([handle = *buffer, offset = SizeBytes()](vk::CommandBuffer cmdbuf) {
+            static constexpr VkMemoryBarrier ZERO_FILL_BARRIER{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT,
+            };
+            cmdbuf.FillBuffer(handle, offset, MOLTENVK_BUFFER_TAIL, 0);
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, ZERO_FILL_BARRIER);
+        });
+    }
 }
 
 void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
@@ -164,7 +183,7 @@ VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat 
             .buffer = *buffer,
             .format = MaxwellToVK::SurfaceFormat(*device, FormatType::Buffer, false, format).format,
             .offset = offset,
-            .range = size,
+            .range = is_null ? VK_WHOLE_SIZE : size,
         }),
     });
     return *views.back().handle;
@@ -999,9 +1018,12 @@ vk::Buffer BufferCacheRuntime::CreateNullBuffer() {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .size = 4,
+        .size = device.IsMoltenVK() ? MOLTENVK_BUFFER_TAIL : 4,
         .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+                 VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
@@ -1019,7 +1041,17 @@ vk::Buffer BufferCacheRuntime::CreateNullBuffer() {
 
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([buffer = *ret](vk::CommandBuffer cmdbuf) {
+        static constexpr VkMemoryBarrier ZERO_FILL_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                             VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT |
+                             VK_ACCESS_SHADER_READ_BIT,
+        };
         cmdbuf.FillBuffer(buffer, 0, VK_WHOLE_SIZE, 0);
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
+                               0, ZERO_FILL_BARRIER);
     });
 
     return ret;

@@ -301,10 +301,13 @@ public:
         u32 levels;
         u32 layers;
         u32 unused_frames;
+        u64 last_use{};
     };
+    void RecycleFinishedTranscodes();
     std::deque<PendingTranscode> pending_transcodes;
     /// Decode images the GPU is done with, for the next texture of the same shape.
     std::vector<PendingTranscode> free_transcodes;
+    u64 transcode_use_counter{};
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;
@@ -787,6 +790,8 @@ private:
     vk::ImageView stencil_view;
     vk::ImageView color_view;
     vk::Image null_image;
+    vk::Image null_image_3d;
+    vk::Image null_image_cube;
     VkImage image_handle = VK_NULL_HANDLE;
     VkImageView render_target = VK_NULL_HANDLE;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;

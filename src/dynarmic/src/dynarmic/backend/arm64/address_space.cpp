@@ -28,7 +28,7 @@ AddressSpace::AddressSpace(std::size_t code_cache_size)
     : ir_block{IR::LocationDescriptor{0}}
     , code_cache_size(code_cache_size)
     , mem(code_cache_size)
-    , code(mem.ptr(), mem.ptr())
+    , code(mem.wptr(), mem.ptr())
     , fastmem_manager(exception_handler)
 {
     ASSERT(code_cache_size <= 128 * 1024 * 1024 && "code_cache_size > 128 MiB not currently supported");
@@ -71,8 +71,18 @@ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
         return block_entry;
     }
     GenerateIR(ir_block, descriptor);
-    const EmittedBlockInfo block_info = Emit(std::move(ir_block));
-    return block_info.entry_point;
+    return Emit(std::move(ir_block));
+}
+
+CodePtr AddressSpace::GetOrEmitFromDispatcher(IR::LocationDescriptor descriptor, StackLayout& stack) {
+    const u64 generation = cache_generation;
+    const CodePtr entry_point = GetOrEmit(descriptor);
+    if (generation != cache_generation) {
+        for (RSBEntry& entry : stack.rsb) {
+            entry.code_ptr = std::bit_cast<u64>(prelude_info.return_to_dispatcher);
+        }
+    }
+    return entry_point;
 }
 
 void AddressSpace::InvalidateBasicBlocks(const ::Common::unordered_set<IR::LocationDescriptor>& descriptors) {
@@ -100,13 +110,14 @@ void AddressSpace::ClearCache() {
     block_infos.clear();
     block_references.clear();
     code.set_offset(prelude_info.end_of_prelude);
+    ++cache_generation;
 }
 
 std::size_t AddressSpace::GetRemainingSize() {
     return code_cache_size - static_cast<std::size_t>(code.offset());
 }
 
-EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
+CodePtr AddressSpace::Emit(IR::Block block) {
     if (GetRemainingSize() < 1024 * 1024) {
         ClearCache();
     }
@@ -114,20 +125,23 @@ EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
     UnprotectCodeMemory();
 
     EmittedBlockInfo block_info = EmitArm64(code, std::move(block), GetEmitConfig(), fastmem_manager);
+    const CodePtr entry_point = block_info.entry_point;
 
-    ASSERT(block_entries.insert({block.Location(), block_info.entry_point}).second);
-    ASSERT(reverse_block_entries.insert({block_info.entry_point, block.Location()}).second);
-    ASSERT(block_infos.insert({block_info.entry_point, block_info}).second);
+    ASSERT(block_entries.insert({block.Location(), entry_point}).second);
+    ASSERT(reverse_block_entries.insert({entry_point, block.Location()}).second);
+    const auto [info_iter, inserted] = block_infos.emplace(entry_point, std::move(block_info));
+    ASSERT(inserted);
+    EmittedBlockInfo& stored_info = info_iter->second;
 
-    Link(block_info);
-    RelinkForDescriptor(block.Location(), block_info.entry_point);
+    Link(stored_info);
+    RelinkForDescriptor(block.Location(), entry_point);
 
-    mem.invalidate(reinterpret_cast<u32*>(block_info.entry_point), block_info.size);
+    mem.invalidate(reinterpret_cast<u32*>(entry_point), stored_info.size);
     ProtectCodeMemory();
 
-    RegisterNewBasicBlock(block, block_info);
+    RegisterNewBasicBlock(block, stored_info);
 
-    return block_info;
+    return entry_point;
 }
 
 void AddressSpace::Link(EmittedBlockInfo& block_info) {
@@ -135,7 +149,7 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
     using namespace oaknut::util;
 
     for (auto [ptr_offset, target] : block_info.relocations) {
-        CodeGenerator c{mem.ptr(), mem.ptr()};
+        CodeGenerator c{mem.wptr(), mem.ptr()};
         c.set_xptr(reinterpret_cast<u32*>(block_info.entry_point + ptr_offset));
 
         switch (target) {
@@ -270,7 +284,7 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
         }
     }
 
-    for (auto [target_descriptor, list] : block_info.block_relocations) {
+    for (const auto& [target_descriptor, list] : block_info.block_relocations) {
         block_references[target_descriptor].insert(block_info.entry_point);
         LinkBlockLinks(block_info.entry_point, Get(target_descriptor), list);
     }
@@ -281,7 +295,7 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
     using namespace oaknut::util;
 
     for (auto [ptr_offset, type] : block_relocations_list) {
-        CodeGenerator c{mem.ptr(), mem.ptr()};
+        CodeGenerator c{mem.wptr(), mem.ptr()};
         c.set_xptr(reinterpret_cast<u32*>(entry_point + ptr_offset));
 
         switch (type) {

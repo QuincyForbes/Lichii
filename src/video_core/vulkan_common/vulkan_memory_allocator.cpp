@@ -446,7 +446,25 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VkMemoryPropertyFlags property_flags{};
 
     if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
-        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
+        VkResult result =
+            vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            static u32 logged{};
+            if (logged++ < 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "Buffer of {} bytes (usage {}) is over the memory budget; "
+                            "allocating it anyway",
+                            ci.size, static_cast<u32>(usage));
+            }
+            if (device.IsIntegrated() || usage == MemoryUsage::DeviceLocal ||
+                usage == MemoryUsage::Stream) {
+                pressure_events.fetch_add(1, std::memory_order_relaxed);
+            }
+            VmaAllocationCreateInfo relaxed = alloc_ci;
+            relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateBuffer(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        }
+        vk::Check(result);
     }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 

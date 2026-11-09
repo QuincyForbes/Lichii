@@ -172,12 +172,16 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
     return usage;
 }
 
+// False when the driver could not build the GPU ASTC decoder (Apple's shader compiler crashes on
+// it for AMD GPUs under MoltenVK). Every ASTC image then decodes on the CPU.
+std::atomic_bool gpu_astc_decoder_available{true};
+
 // An ASTC 2D array whose RGBA8 decode exceeds 1 GiB (title 1's 8192x8192x68 terrain textures).
 // These stay on the GPU decoder as RGBA8 with trimmed levels (TrimmedHostInfo) even when other
 // ASTC images are re-compressed to BC1/BC3 on the CPU: re-compressing them would not fit either.
 [[nodiscard]] bool IsHugeAstcArray(const Device& device, const ImageInfo& info) {
     if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
-        info.type != ImageType::e2D || info.size.depth != 1) {
+        !gpu_astc_decoder_available || info.type != ImageType::e2D || info.size.depth != 1) {
         return false;
     }
     u64 bytes = 0;
@@ -369,8 +373,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 // decode, so streamed textures are ready the frame they are first used instead of seconds later.
 [[nodiscard]] bool WillUseGpuBcnTranscode(const Device& device, const ImageInfo& info) {
     if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
-        IsHugeAstcArray(device, info) || IsUnevenMipRgba8Astc(device, info) ||
-        info.type != ImageType::e2D || info.size.depth != 1) {
+        !gpu_astc_decoder_available || IsHugeAstcArray(device, info) ||
+        IsUnevenMipRgba8Astc(device, info) || info.type != ImageType::e2D || info.size.depth != 1) {
         return false;
     }
     return Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu &&
@@ -378,7 +382,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 }
 
 [[nodiscard]] bool WillUseAcceleratedAstcDecode(const Device& device, const ImageInfo& info) {
-    if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported()) {
+    if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
+        !gpu_astc_decoder_available) {
         return false;
     }
     if (IsHugeAstcArray(device, info) || IsUnevenMipRgba8Astc(device, info)) {
@@ -1276,13 +1281,24 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
     // Before anything below reads astc_recompression (passes, view formats).
     UseBc3ForSwitch2OnSmallCards(device);
     // Huge ASTC arrays always decode on the GPU (IsHugeAstcArray), whatever the decode setting.
+    gpu_astc_decoder_available = true;
     if (Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu ||
         !device.IsOptimalAstcSupported()) {
-        astc_decoder_pass.emplace(device, scheduler, descriptor_pool, staging_buffer_pool,
-                                  compute_pass_descriptor_queue, memory_allocator);
-        if (Settings::GetAstcRecompression() != Settings::AstcRecompression::Uncompressed) {
-            bc_encoder_pass.emplace(device, scheduler, descriptor_pool,
-                                    compute_pass_descriptor_queue);
+        try {
+            astc_decoder_pass.emplace(device, scheduler, descriptor_pool, staging_buffer_pool,
+                                      compute_pass_descriptor_queue, memory_allocator);
+            if (Settings::GetAstcRecompression() != Settings::AstcRecompression::Uncompressed) {
+                bc_encoder_pass.emplace(device, scheduler, descriptor_pool,
+                                        compute_pass_descriptor_queue);
+            }
+        } catch (const vk::Exception& exception) {
+            LOG_WARNING(Render_Vulkan,
+                        "The driver could not build the GPU ASTC decoder ({}): ASTC textures "
+                        "decode on the CPU",
+                        exception.what());
+            astc_decoder_pass.reset();
+            bc_encoder_pass.reset();
+            gpu_astc_decoder_available = false;
         }
     }
     if (!device.IsKhrImageFormatListSupported()) {
@@ -2889,14 +2905,15 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
     }
 }
 
-void TextureCacheRuntime::TickFrame() {
-    while (!pending_byte_addressed_shadows.empty() &&
-           scheduler.IsFree(pending_byte_addressed_shadows.front().tick)) {
-        pending_byte_addressed_shadows.pop_front();
+void TextureCacheRuntime::RecycleFinishedTranscodes() {
+    if (pending_transcodes.empty() || !scheduler.IsFree(pending_transcodes.front().tick)) {
+        return;
     }
-    static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
-    // Finished decode images wait for the next texture of their shape, up to this much memory.
     static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
+    static const bool evict_lru = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_POOL_V2");
+        return value == nullptr || value[0] != '0';
+    }();
     const auto decode_bytes = [](const PendingTranscode& t) {
         u64 bytes{};
         for (u32 level = 0; level < t.levels; ++level) {
@@ -2911,6 +2928,12 @@ void TextureCacheRuntime::TickFrame() {
     while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
         PendingTranscode& done = pending_transcodes.front();
         const u64 bytes = decode_bytes(done);
+        while (evict_lru && free_bytes + bytes > MaxFreeTranscodeBytes && !free_transcodes.empty()) {
+            const auto oldest = std::ranges::min_element(
+                free_transcodes, {}, [](const PendingTranscode& t) { return t.last_use; });
+            free_bytes -= decode_bytes(*oldest);
+            free_transcodes.erase(oldest);
+        }
         if (free_bytes + bytes <= MaxFreeTranscodeBytes) {
             done.unused_frames = 0;
             free_bytes += bytes;
@@ -2918,6 +2941,15 @@ void TextureCacheRuntime::TickFrame() {
         }
         pending_transcodes.pop_front();
     }
+}
+
+void TextureCacheRuntime::TickFrame() {
+    while (!pending_byte_addressed_shadows.empty() &&
+           scheduler.IsFree(pending_byte_addressed_shadows.front().tick)) {
+        pending_byte_addressed_shadows.pop_front();
+    }
+    static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
+    RecycleFinishedTranscodes();
     std::erase_if(free_transcodes, [](PendingTranscode& t) {
         return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
     });
@@ -2984,6 +3016,9 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
             if (WillUseAcceleratedAstcDecode(runtime->device, info) ||
                 WillUseGpuBcnTranscode(runtime->device, info)) {
                 flags |= VideoCommon::ImageFlagBits::AcceleratedUpload;
+            } else if (!gpu_astc_decoder_available) {
+                // Without the GPU decoder, decode off the GPU thread as CpuAsynchronous does.
+                flags |= VideoCommon::ImageFlagBits::AsynchronousDecode;
             }
             if (IsUnevenMipRgba8Astc(runtime->device, info)) {
                 static std::atomic<u32> uneven_images{0};
@@ -3121,19 +3156,10 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
             CopyBufferToImage(cmdbuf, src_buffer, temp_vk_image, vk_aspect_mask, false, vk_copies);
         });
 
-        const auto [samples_x, samples_y] = VideoCommon::SamplesLog2(info.num_samples);
         boost::container::small_vector<VideoCommon::ImageCopy, 16> image_copies;
         image_copies.reserve(copies.size());
         for (const auto& copy : copies) {
-            VideoCommon::ImageCopy image_copy{};
-            image_copy.src_offset = {0, 0, 0};
-            image_copy.dst_offset = {copy.image_offset.x >> samples_x,
-                                     copy.image_offset.y >> samples_y, copy.image_offset.z};
-            image_copy.src_subresource = copy.image_subresource;
-            image_copy.dst_subresource = copy.image_subresource;
-            image_copy.extent = {copy.image_extent.width >> samples_x,
-                                 copy.image_extent.height >> samples_y, copy.image_extent.depth};
-            image_copies.push_back(image_copy);
+            image_copies.push_back(VideoCommon::MsaaUploadCopy(copy, info.num_samples));
         }
 
         if (msaa_upload_is_depth) {
@@ -4403,6 +4429,43 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::NullImageV
     for (u32 i = 0; i < Shader::NUM_TEXTURE_TYPES; i++) {
         image_views[i] = MakeView(VK_FORMAT_A8B8G8R8_UNORM_PACK32, VK_IMAGE_ASPECT_COLOR_BIT);
     }
+
+    // MakeView builds a 2D view when the backing image is not 3D or 6+ layers; Metal rejects a 2D
+    // texture bound to a 3D or cube sampler, so give those slots a backing image of their own type.
+    ImageInfo info_3d = info;
+    info_3d.type = ImageType::e3D;
+    null_image_3d = MakeImage(*device, runtime.memory_allocator, info_3d, {});
+
+    ImageInfo info_cube = info;
+    info_cube.type = ImageType::e2D;
+    info_cube.resources.layers = 6;
+    null_image_cube = MakeImage(*device, runtime.memory_allocator, info_cube, {});
+
+    const auto make_typed_null_view = [&](VkImage img, VkImageViewType view_type, u32 layers) {
+        return device->GetLogical().CreateImageView({
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .image = img,
+            .viewType = view_type,
+            .format = VK_FORMAT_A8B8G8R8_UNORM_PACK32,
+            .components = {},
+            .subresourceRange =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = layers,
+                },
+        });
+    };
+    image_views[static_cast<size_t>(Shader::TextureType::Color3D)] =
+        make_typed_null_view(*null_image_3d, VK_IMAGE_VIEW_TYPE_3D, 1);
+    image_views[static_cast<size_t>(Shader::TextureType::ColorCube)] =
+        make_typed_null_view(*null_image_cube, VK_IMAGE_VIEW_TYPE_CUBE, 6);
+    image_views[static_cast<size_t>(Shader::TextureType::ColorArrayCube)] =
+        make_typed_null_view(*null_image_cube, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 6);
 }
 
 ImageView::~ImageView() = default;
@@ -5006,14 +5069,44 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // The BC encoder declares layout(rgba8). Identical byte layout is not enough:
     // its storage image view must have the matching R8G8B8A8_UNORM format.
     constexpr VkFormat DecodeFormat = VK_FORMAT_R8G8B8A8_UNORM;
-    // A decode image of the same shape the GPU is done with: title 1's title screen decodes
-    // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
-    // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
-    const auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
-        return t.width == width && t.height == height && t.levels == levels && t.layers == layers;
-    });
+    static const bool bucket_scratch = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_SCRATCH_BUCKET");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const bool recycle_on_lookup = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_POOL_V2");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const bool allow_larger = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_POOL_FIT");
+        return value == nullptr || value[0] != '0';
+    }();
+    constexpr u32 ScratchAlignment = 64;
+    const u32 scratch_width = bucket_scratch ? Common::AlignUp(width, ScratchAlignment) : width;
+    const u32 scratch_height = bucket_scratch ? Common::AlignUp(height, ScratchAlignment) : height;
+    if (recycle_on_lookup) {
+        RecycleFinishedTranscodes();
+    }
+    const auto fits = [&](const PendingTranscode& t) {
+        if (t.levels != levels || t.layers != layers) {
+            return false;
+        }
+        if (t.width == scratch_width && t.height == scratch_height) {
+            return true;
+        }
+        return allow_larger && t.width >= scratch_width && t.height >= scratch_height &&
+               t.width <= scratch_width * 2 && t.height <= scratch_height * 2;
+    };
+    const auto reusable = std::ranges::min_element(
+        free_transcodes, [&](const PendingTranscode& a, const PendingTranscode& b) {
+            const bool fits_a = fits(a), fits_b = fits(b);
+            if (fits_a != fits_b) {
+                return fits_a;
+            }
+            return u64{a.width} * a.height < u64{b.width} * b.height;
+        });
     PendingTranscode pending;
-    if (reusable != free_transcodes.end()) {
+    if (reusable != free_transcodes.end() && fits(*reusable)) {
         pending = std::move(*reusable);
         free_transcodes.erase(reusable);
     } else {
@@ -5023,7 +5116,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .flags = 0,
             .imageType = VK_IMAGE_TYPE_2D,
             .format = DecodeFormat,
-            .extent = {width, height, 1},
+            .extent = {scratch_width, scratch_height, 1},
             .mipLevels = levels,
             .arrayLayers = layers,
             .samples = VK_SAMPLE_COUNT_1_BIT,
@@ -5056,17 +5149,22 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .tick = 0,
             .image = std::move(decode),
             .views = {},
-            .width = width,
-            .height = height,
+            .width = scratch_width,
+            .height = scratch_height,
             .levels = levels,
             .layers = layers,
             .unused_frames = 0,
+            .last_use = 0,
         };
         for (u32 level = 0; level < levels; ++level) {
             pending.views.push_back(
                 MakeStorageView(device.GetLogical(), level, *pending.image, DecodeFormat));
         }
     }
+    static const bool one_submit = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_ONE_SUBMIT");
+        return value == nullptr || value[0] != '0';
+    }();
     astc_decoder_pass->AssembleInto(
         info, 0, image.guest_size_bytes,
         ASTCDecoderPass::Target{
@@ -5074,7 +5172,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
             .initialized = false,
             .level_view = [&pending](s32 level) { return *pending.views[level]; },
-            .wait = true,
+            .wait = !one_submit,
         },
         map, swizzles);
 
@@ -5123,6 +5221,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     });
     image.UploadMemory(output.buffer, output.offset, copies);
     pending.tick = scheduler.CurrentTick();
+    pending.last_use = ++transcode_use_counter;
     pending_transcodes.push_back(std::move(pending));
 }
 
