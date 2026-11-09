@@ -36,26 +36,35 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
     { runtime.CurrentTick() } -> std::convertible_to<u64>;
 };
 
-/// EDEN_NX2_UBOREUSE=0 turns the reuse off (every small uniform buffer is copied, as before).
-[[nodiscard]] inline bool UniformStreamReuseEnabled() noexcept {
-    static const bool enabled = [] {
-        const char* const value = std::getenv("EDEN_NX2_UBOREUSE");
-        return value == nullptr || value[0] != '0';
-    }();
-    return enabled;
+[[nodiscard]] inline bool UniformSwitchOn(const char* name) noexcept {
+    const char* const value = std::getenv(name);
+    return value == nullptr || value[0] != '0';
 }
 
-/// EDEN_NX2_UBO_INPLACE=1 (default off): BindSmallUniformReusing compares a buffer whose device
-/// pages are one host run (always so within one 4 KiB page) with its slot's bytes straight in
-/// guest memory, instead of copying it into a scratch buffer first. Unchanged bytes are then not
-/// copied at all; changed ones are copied once into the slot and the stream copy is made from the
-/// slot, so the two never differ (as the scratch snapshot guaranteed before).
+/// Plain flags, not function statics: they are checked for every uniform buffer of every draw,
+/// and MSVC reads a thread-local to check a static's initialization (zortos293/Lichii#1059).
+inline bool g_uniform_stream_reuse = UniformSwitchOn("EDEN_NX2_UBOREUSE");
+inline bool g_uniform_in_place_compare = UniformSwitchOn("EDEN_NX2_UBO_INPLACE");
+
+/// Called by VideoCore::CreateGPU: static initialization runs before the frontend loads
+/// nx2_switches.txt, so a switch set only there takes effect from that point on.
+inline void ReadUniformStreamReuseSwitches() noexcept {
+    g_uniform_stream_reuse = UniformSwitchOn("EDEN_NX2_UBOREUSE");
+    g_uniform_in_place_compare = UniformSwitchOn("EDEN_NX2_UBO_INPLACE");
+}
+
+/// EDEN_NX2_UBOREUSE=0 turns the reuse off (every small uniform buffer is copied, as before).
+[[nodiscard]] inline bool UniformStreamReuseEnabled() noexcept {
+    return g_uniform_stream_reuse;
+}
+
+/// EDEN_NX2_UBO_INPLACE=0 (default on) turns this off: BindSmallUniformReusing compares a buffer
+/// whose device pages are one host run (always so within one 4 KiB page) with its slot's bytes
+/// straight in guest memory, instead of copying it into a scratch buffer first. Unchanged bytes
+/// are then not copied at all; changed ones are copied once into the slot and the stream copy is
+/// made from the slot, so the two never differ (as the scratch snapshot guaranteed before).
 [[nodiscard]] inline bool UniformInPlaceCompareEnabled() noexcept {
-    static const bool enabled = [] {
-        const char* const value = std::getenv("EDEN_NX2_UBO_INPLACE");
-        return value == nullptr || value[0] != '0';
-    }();
-    return enabled;
+    return g_uniform_in_place_compare;
 }
 
 template <class Ref>
