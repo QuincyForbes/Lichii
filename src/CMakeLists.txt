@@ -287,6 +287,10 @@ if (YUZU_TESTS)
     add_subdirectory(tests)
 endif()
 
+if (IOS)
+    include(ios_frontend/platform.cmake)
+endif()
+
 if (IOS AND YUZU_CMD)
     # Native SwiftUI app around the SDL frontend; OFF keeps the plain SDL launcher.
     option(LICHII_IOS_UI "Build the native iOS app (SwiftUI)" ON)

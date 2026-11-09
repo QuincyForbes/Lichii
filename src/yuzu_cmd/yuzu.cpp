@@ -78,6 +78,7 @@
 #include <vector>
 #include <os/log.h>
 #include "common/ios_jit.h"
+#include "ios_frontend/lichii_bridge_platform.h"
 #include "yuzu_cmd/ios_support.h"
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
@@ -483,14 +484,18 @@ static void IosInstallTouchControls(SdlState* state) {
 // Defaults the SDL launcher forced on every boot, applied once so the app's settings can change
 // them afterwards.
 static void IosApplyFirstRunDefaults(SdlState* state) {
+    // Per-device defaults (resolution, frame generation...) once per device profile version.
+    bool changed = lichii_platform_apply_device_defaults(LICHII_DEFAULTS_FIRST_LAUNCH) != 0;
     const auto marker = Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "ios-defaults-v1";
-    if (Common::FS::Exists(marker)) {
-        return;
+    if (!Common::FS::Exists(marker)) {
+        Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
+        Settings::values.use_asynchronous_shaders.SetValue(true);
+        std::ofstream{marker} << "1\n";
+        changed = true;
     }
-    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
-    Settings::values.use_asynchronous_shaders.SetValue(true);
-    state->ios_config->SaveAllValues();
-    std::ofstream{marker} << "1\n";
+    if (changed) {
+        state->ios_config->SaveAllValues();
+    }
 }
 
 static SDL_AppResult IosStartApp(SdlState* state, Core::LaunchParams lp) {
@@ -882,9 +887,11 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     SdlConfig config{lp.config_path};
     IOS_MARK("config loaded");
 #if defined(__APPLE__) && TARGET_OS_IPHONE
+    // Device facts, cache budgets, MoltenVK options and lifecycle observers (before Vulkan loads).
+    lichii_platform_init();
     // Audio: playback session with a 20 ms hardware buffer and a larger SDL device buffer; the
     // default small buffer underran whenever a frame took longer than usual (audible skips).
-    IosSupport::ConfigureAudioSession();
+    lichii_platform_configure_audio(0, 20.0);
     SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "1024");
     // Controllers come through Apple's GameController framework. SDL's HIDAPI layer on iOS only
@@ -968,18 +975,12 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
     if (!ios_app) {
         Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
         Settings::values.use_asynchronous_shaders.SetValue(true);
+        // Resolution and the rest follow the device's defaults where the configuration keeps the
+        // built-in value.
+        lichii_platform_apply_device_defaults(LICHII_DEFAULTS_UNCHANGED);
     }
-    // Memory: CPU and GPU share the app's ~6.6 GB budget (about 5.3 GB free at launch). The
-    // texture cache was allowed 5 GB before collecting (desktop tuning for Switch 2 titles), so a
-    // busy scene got the app killed by iOS without a crash report. Collect much earlier here.
-    {
-        const std::size_t avail_mib = os_proc_available_memory() >> 20;
-        const std::size_t critical = std::clamp<std::size_t>(avail_mib / 4, 1024, 2048);
-        const std::size_t expected = critical - 512;
-        setenv("EDEN_NX2_TC_CRITICAL_MIB", std::to_string(critical).c_str(), 0);
-        setenv("EDEN_NX2_TC_EXPECTED_MIB", std::to_string(expected).c_str(), 0);
-        LOG_INFO(Frontend, "iOS: texture cache limits {} / {} MiB", expected, critical);
-    }
+    // Memory: CPU and GPU share the app's ~6.6 GB budget (about 5.3 GB free at launch); the cache
+    // budgets come from it (lichii_platform_init).
     // iOS has no command line: run the first game in the app's Documents folder, which the user
     // fills through the Files app (UIFileSharingEnabled in Info.plist).
     if (lp.filepath.empty()) {
@@ -1163,7 +1164,12 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
     if (Settings::values.use_disk_shader_cache.GetValue()) {
         state->system.Renderer().ReadRasterizer()->LoadDiskResources(
             state->system.GetApplicationProcessProgramID(), std::stop_token{},
-            [](VideoCore::LoadCallbackStage, size_t value, size_t total) {});
+            []([[maybe_unused]] VideoCore::LoadCallbackStage stage,
+               [[maybe_unused]] size_t value, [[maybe_unused]] size_t total) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+                lichii_platform_note_shader_progress(static_cast<int>(stage), value, total);
+#endif
+            });
     }
 
     // don't do anything, SDL3 already exists for us :D
@@ -1230,6 +1236,9 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
 
     IOS_MARK("system.Run");
     void(state->system.Run());
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    lichii_platform_set_playing(1);
+#endif
     if (state->system.DebuggerEnabled())
         state->system.InitializeDebugger();
 #ifdef LICHII_IOS_UI

@@ -64,6 +64,15 @@
 	<true/>
 	<key>GCSupportsControllerUserInteraction</key>
 	<true/>
+	<!-- 120 Hz on ProMotion iPhones (otherwise capped at 60) and iOS 18 Game Mode. -->
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.games</string>
+	<key>LSSupportsGameMode</key>
+	<true/>
+	<key>GCSupportsGameMode</key>
+	<true/>
 	<key>GCSupportedGameControllers</key>
 	<array>
 		<dict>

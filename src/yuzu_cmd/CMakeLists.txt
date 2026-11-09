@@ -75,6 +75,7 @@ if (IOS)
     enable_language(OBJCXX)
     target_sources(yuzu-cmd PRIVATE ios_support.mm ios_support.h)
     set_source_files_properties(ios_support.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(yuzu-cmd PRIVATE lichii_platform)
     set_target_properties(yuzu-cmd PROPERTIES
         OUTPUT_NAME "Lichii"
         MACOSX_BUNDLE TRUE
