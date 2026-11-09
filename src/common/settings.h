@@ -441,7 +441,8 @@ struct Values {
                                                   true,
                                                   true};
     // The Legend of Zelda: Ocarina of Time's own anti-aliasing network and its sharpening output
-    // pass, or the tonemapped image as the game renders it (video_core/oot_network.h).
+    // pass, or the tonemapped image as the game renders it (video_core/oot_network.h), or AMD
+    // FSR 3.1 in place of the game's upscale pass (video_core/ocarina_upscale.h).
     SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{linkage, OotAntiAliasing::Game,
                                                          "oot_anti_aliasing", Category::Renderer};
 

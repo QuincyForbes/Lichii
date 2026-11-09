@@ -46,8 +46,9 @@ NVIDIA DLSS takes precedence: while Ocarina DLSS is enabled ("Use NVIDIA DLSS in
 game's DLSS" on, with DLSS available from Streamline), `RasterizerVulkan::OotNetworkBypass` returns
 null and No sharpening does nothing, because DLSS replaces the same output pass
 (docs/native-dlss-replacement.md). The log says
-`Ocarina of Time: No sharpening is off while NVIDIA DLSS is on` once. Once DLSS turns itself off
-for the session or its evaluation fails, No sharpening takes over from the next frame.
+`Ocarina of Time: No sharpening is off while temporal upscaling is on` once. Once DLSS turns itself
+off for the session or its evaluation fails, No sharpening takes over from the next frame. The same
+holds for Apple MetalFX temporal and for AMD FSR 3.1 forced with `EDEN_NX2_DLSS_REPLACEMENT=fsr`.
 
 The game's constants (shader hashes, program keys, the cb0 offset) are in
 `src/video_core/oot_network.h`.

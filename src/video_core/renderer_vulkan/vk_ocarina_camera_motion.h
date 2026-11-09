@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/ocarina_upscale.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -18,6 +19,7 @@ class DescriptorPool;
 class Device;
 class MemoryAllocator;
 class Scheduler;
+class StagingBufferPool;
 
 struct OcarinaActorMesh {
     std::span<const u8> vertices;
@@ -31,15 +33,17 @@ struct OcarinaActorMesh {
     std::span<const f32> previous_bones;
 };
 
-#ifdef LICHII_OCARINA_LIVE_UPSCALE
-class OcarinaLiveDlss {
+/// Replaces the game's upscale pass with AMD FSR 3.1, or with the build's live upscaler (NVIDIA
+/// DLSS, Apple MetalFX temporal) for the Dlss backend.
+class OcarinaUpscaler {
 public:
-    OcarinaLiveDlss(const Device& device, Scheduler& scheduler, DescriptorPool& pool,
-                    ComputePassDescriptorQueue& queue, MemoryAllocator& allocator);
-    ~OcarinaLiveDlss();
+    OcarinaUpscaler(const Device& device, Scheduler& scheduler, DescriptorPool& pool,
+                    ComputePassDescriptorQueue& queue, MemoryAllocator& allocator,
+                    StagingBufferPool& staging, VideoCommon::OcarinaUpscaleBackend backend);
+    ~OcarinaUpscaler();
 
     [[nodiscard]] bool EvaluationFailed() const;
-    /// Save the 1440p DLSS copy before the game adds its HUD.
+    /// Save the 1440p upscaled copy before the game adds its HUD.
     void SaveSceneReference(VkImageView color);
     /// Composite the HUD from the guest image over the matching 4K scene.
     void Composite4k(VkImageView native_composite, u64 frame);
@@ -47,12 +51,12 @@ public:
     /// motion vectors of their own.
     void SaveEffectsBase(VkImageView scene, VkExtent2D extent, u64 frame);
     /// Mark the pixels those glows and particles changed since SaveEffectsBase, so Record can
-    /// tell DLSS to use this frame's colour there.
+    /// tell the upscaler to use this frame's colour there.
     void MarkEffects(VkImageView scene, u64 frame);
     VkImage CompositedImage() const;
     VkImageView CompositedView() const;
 
-    /// Queue motion, DLSS evaluation and guest writeback for one frame. A false return leaves
+    /// Queue motion, the evaluation and guest writeback for one frame. A false return leaves
     /// the guest dispatch in charge. The scheduler checks EvaluationFailed before skipping it.
     bool Record(VkImageView color, VkImageView depth, VkImageView target, VkExtent2D extent,
                 VkExtent2D output_extent, VkExtent2D target_extent, const std::array<f32, 16>& current,
@@ -63,6 +67,5 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl;
 };
-#endif
 
 } // namespace Vulkan

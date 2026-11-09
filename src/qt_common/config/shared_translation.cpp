@@ -182,7 +182,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("The Legend of Zelda: Ocarina of Time only.\nGame: the game's own anti-aliasing "
               "network, which sharpens heavily.\nNo sharpening: the image as the game renders it, "
               "without the network (faster; pairs well with a higher resolution). Has no effect while "
-              "NVIDIA DLSS is on.\nTakes effect when the game starts."));
+              "NVIDIA DLSS is on.\nAMD FSR 3.1: temporal upscaling in place of the game's upscale "
+              "pass, on any graphics card; it takes the place of NVIDIA DLSS and MetalFX in this "
+              "game.\nTakes effect when the game starts."));
     INSERT(Settings, patch_frame_rate, tr("Unlock frame rate:"),
            tr("Game enhancement. Applies to every game that ships a frame rate patch (currently "
               "Ocarina of Time: FPS Unlock, Dynamic FPS).\nAuto: each patch's default. On: "
@@ -646,6 +648,7 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                           {
                               PAIR(OotAntiAliasing, Game, tr("Game")),
                               PAIR(OotAntiAliasing, NoSharpening, tr("No sharpening")),
+                              PAIR(OotAntiAliasing, Fsr3, tr("AMD FSR 3.1")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AspectRatio>::Index(),
                           {
