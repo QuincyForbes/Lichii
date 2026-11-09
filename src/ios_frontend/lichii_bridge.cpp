@@ -66,7 +66,7 @@ void* g_game_window{};
 std::string g_open_url;
 
 // Loader and patch manager calls share the system's filesystem objects.
-std::mutex g_loader_mutex;
+std::recursive_mutex g_loader_mutex;
 
 char* Dup(std::string_view text) {
     char* out = static_cast<char*>(std::malloc(text.size() + 1));
@@ -119,6 +119,12 @@ std::filesystem::path GameConfigPath(u64 program_id) {
            fmt::format("{:016X}.ini", program_id);
 }
 
+// Only CPU video decoding works on iOS (the frontend forces the global value); a game's own
+// config must not turn GPU decoding back on.
+void KeepIosOverrides() {
+    Settings::values.nvdec_emulation.SetGlobal(true);
+}
+
 } // Anonymous namespace
 
 void Attach(const Host& host) {
@@ -137,6 +143,10 @@ void SaveGlobalConfig() {
     if (g_host.save_config) {
         g_host.save_config();
     }
+}
+
+std::recursive_mutex& LoaderMutex() {
+    return g_loader_mutex;
 }
 
 std::optional<std::string> TakeLaunchRequest() {
@@ -203,6 +213,7 @@ void ApplyGameConfig(u64 program_id) {
     }
     LOG_INFO(Frontend, "iOS: applying per-game settings for {:016X}", program_id);
     GameConfig config{program_id};
+    KeepIosOverrides();
 }
 
 void RestoreGlobal() {
@@ -726,6 +737,7 @@ void lichii_settings_end_game(void) {
     g_game_config.reset();
     Settings::SetConfiguringGlobal(true);
     if (RunningProgramId() == g_game_scope && System().IsPoweredOn()) {
+        KeepIosOverrides();
         System().ApplySettings();
     } else {
         Settings::RestoreGlobalState(false);
@@ -757,6 +769,29 @@ void lichii_settings_save(void) {
     if (System().IsPoweredOn()) {
         System().ApplySettings();
     }
+}
+
+char* lichii_settings_get_effective(const char* key) {
+    const auto* setting = FindSetting(key);
+    return Dup(setting ? setting->ToString() : std::string{});
+}
+
+bool lichii_settings_set_effective(const char* key, const char* value) {
+    const auto* setting = FindSetting(key);
+    if (setting == nullptr || value == nullptr || InGameScope()) {
+        return false;
+    }
+    const u64 running = RunningProgramId();
+    if (running != 0 && !setting->UsingGlobal() && lichii_settings_begin_game(running)) {
+        const bool ok = lichii_settings_set(key, value);
+        lichii_settings_end_game();
+        return ok;
+    }
+    if (!lichii_settings_set(key, value)) {
+        return false;
+    }
+    lichii_settings_save();
+    return true;
 }
 
 /* ------------------------------------------------------------------------------ emulation */

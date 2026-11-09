@@ -67,7 +67,14 @@ State& GetState() {
     return state;
 }
 
-using Lock = std::scoped_lock<std::recursive_mutex>;
+// Installs change the content the library scan reads: both hold the bridge's loader lock.
+class Lock {
+public:
+    explicit Lock(std::recursive_mutex& mutex) : lock{IosFrontend::LoaderMutex(), mutex} {}
+
+private:
+    std::scoped_lock<std::recursive_mutex, std::recursive_mutex> lock;
+};
 
 // The SDL frontend attaches its System (filesystem and content provider set) before the app UI
 // shows, so it is always there when Swift calls in.

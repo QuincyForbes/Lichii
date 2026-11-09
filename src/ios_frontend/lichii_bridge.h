@@ -121,6 +121,13 @@ void lichii_settings_set_use_global(const char* key, bool use_global);
 /// Writes the global config. Applies the values to a running game as well.
 void lichii_settings_save(void);
 
+/// Outside a per-game scope: the value in effect now (the running game's own value where its
+/// per-game config overrides the setting, else the global one).
+char* lichii_settings_get_effective(const char* key);
+/// Changes the value in effect and saves it where it lives: the running game's per-game config
+/// when that overrides the setting, else the global config. Applies it to a running game.
+bool lichii_settings_set_effective(const char* key, const char* value);
+
 /* ------------------------------------------------------------------------------------ emulation */
 
 typedef enum LichiiEmuState {

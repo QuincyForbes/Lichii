@@ -1508,8 +1508,9 @@ extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
         break;
     case SDL_EVENT_WILL_ENTER_BACKGROUND:
         // iOS forbids GPU work in the background (Metal fails the command buffers and the
-        // Vulkan scheduler aborted on the lost device): stop emulating until we are back.
-        if (state->system.IsPoweredOn() && !state->pending_launch) {
+        // Vulkan scheduler aborted on the lost device): stop emulating until we are back. The
+        // native app pauses and resumes from its platform event handler instead.
+        if (state->system.IsPoweredOn() && !state->pending_launch && !IosNativeApp(state)) {
             LOG_INFO(Frontend, "iOS: entering background, pausing");
             void(state->system.Pause());
             state->ios_paused_for_background = true;
@@ -1533,13 +1534,6 @@ extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
         break;
     case SDL_EVENT_DID_ENTER_FOREGROUND:
         if (state->ios_paused_for_background) {
-#ifdef LICHII_IOS_UI
-            // Paused from the in-game menu: stays paused.
-            if (IosFrontend::GetState() == LICHII_EMU_PAUSED) {
-                state->ios_paused_for_background = false;
-                break;
-            }
-#endif
             LOG_INFO(Frontend, "iOS: back in the foreground, resuming");
             state->ios_paused_for_background = false;
             void(state->system.Run());

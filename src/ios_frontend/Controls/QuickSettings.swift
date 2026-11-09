@@ -3,7 +3,8 @@
 
 import LichiiBridge
 
-/// The settings the in-game menu changes, through the settings bridge.
+/// The settings the in-game menu changes, through the settings bridge: the value in effect, which
+/// is the running game's own where its per-game config overrides the setting.
 @MainActor
 enum QuickSettings {
     struct Choice: Identifiable, Hashable {
@@ -13,7 +14,7 @@ enum QuickSettings {
     }
 
     static func string(_ key: String) -> String {
-        Bridge.string(key.withCString { lichii_settings_get($0) })
+        Bridge.string(key.withCString { lichii_settings_get_effective($0) })
     }
 
     static func bool(_ key: String) -> Bool {
@@ -24,10 +25,10 @@ enum QuickSettings {
         Int(string(key)) ?? 0
     }
 
-    /// Sets and saves; a running game picks up runtime-modifiable values at once.
+    /// Sets and saves to the per-game or the global config, wherever the value comes from; a
+    /// running game picks up runtime-modifiable values at once.
     static func set(_ key: String, _ value: String) {
-        _ = key.withCString { k in value.withCString { v in lichii_settings_set(k, v) } }
-        lichii_settings_save()
+        _ = key.withCString { k in value.withCString { v in lichii_settings_set_effective(k, v) } }
     }
 
     static func set(_ key: String, _ value: Bool) {

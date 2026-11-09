@@ -7,6 +7,7 @@
 // polls the requests the app makes; the bridge files (lichii_bridge*.cpp) use them.
 
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -36,6 +37,9 @@ void Attach(const Host& host);
 Core::System& System();
 InputCommon::InputSubsystem& Input();
 void SaveGlobalConfig();
+/// Held while game files are read or content is installed: both use the system's filesystem
+/// objects (library scans, installs).
+std::recursive_mutex& LoaderMutex();
 
 /// Frontend side: requests made through the C API, taken once.
 std::optional<std::string> TakeLaunchRequest();
