@@ -42,11 +42,14 @@
 	<array>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
+		<string>UIInterfaceOrientationPortrait</string>
 	</array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
 	</array>
 	<key>UIRequiresFullScreen</key>
 	<true/>
@@ -88,6 +91,10 @@
 			</array>
 		</dict>
 	</array>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Screenshots taken from the in-game menu are saved to Photos.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>Games with motion controls read the device's motion sensors.</string>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
 		<string>stikdebug</string>
