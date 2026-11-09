@@ -133,15 +133,25 @@ bool lichii_pad_get_menu_chord(void);
 uint32_t lichii_controls_take_actions(void);
 
 typedef struct LichiiRumble {
-    float left_low;
+    float left_low; ///< amplitude 0..1
     float left_high;
     float right_low;
     float right_high;
+    float left_low_hz; ///< frequency of the matching amplitude
+    float left_high_hz;
+    float right_low_hz;
+    float right_high_hz;
 } LichiiRumble;
 
-/// Rumble amplitudes (0..1) the game last asked for on `player` (Handheld included for player
-/// 0). False when no game runs.
+/// Rumble the game last asked for on `player` (Handheld included for player 0), scaled by the
+/// player's vibration strength; all zero when vibration is off. False when no game runs.
 bool lichii_controls_rumble(int32_t player, LichiiRumble* out);
+
+/* -------------------------------------------------------------------------------- orientation */
+
+/// Orientations the game's render window accepts, as a UIInterfaceOrientationMask value (0 lets
+/// SDL decide). The app's Info.plist must list them too. Main thread.
+void lichii_controls_set_orientations(uint32_t mask);
 
 /* ------------------------------------------------------------------------------ process stats */
 

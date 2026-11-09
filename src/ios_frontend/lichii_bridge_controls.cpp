@@ -7,7 +7,13 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <string>
 #include <thread>
+
+#if __has_include(<SDL3/SDL_hints.h>)
+#include <SDL3/SDL_hints.h>
+#define LICHII_HAVE_SDL_HINTS 1
+#endif
 
 #include "common/settings.h"
 #include "core/core.h"
@@ -261,10 +267,16 @@ bool lichii_controls_rumble(int32_t player, LichiiRumble* out) {
         }
         const auto left = controller->GetActualVibrationValue(Core::HID::DeviceIndex::Left);
         const auto right = controller->GetActualVibrationValue(Core::HID::DeviceIndex::Right);
-        out->left_low = (std::max)(out->left_low, left.low_amplitude);
-        out->left_high = (std::max)(out->left_high, left.high_amplitude);
-        out->right_low = (std::max)(out->right_low, right.low_amplitude);
-        out->right_high = (std::max)(out->right_high, right.high_amplitude);
+        const auto take = [](float& amplitude, float& hz, float new_amplitude, float new_hz) {
+            if (new_amplitude > amplitude) {
+                amplitude = new_amplitude;
+                hz = new_hz;
+            }
+        };
+        take(out->left_low, out->left_low_hz, left.low_amplitude, left.low_frequency);
+        take(out->left_high, out->left_high_hz, left.high_amplitude, left.high_frequency);
+        take(out->right_low, out->right_low_hz, right.low_amplitude, right.low_frequency);
+        take(out->right_high, out->right_high_hz, right.high_amplitude, right.high_frequency);
     };
     merge(hid.GetEmulatedControllerByIndex(static_cast<std::size_t>(player)));
     if (player == 0) {
@@ -284,6 +296,26 @@ bool lichii_controls_rumble(int32_t player, LichiiRumble* out) {
         }
     }
     return true;
+}
+
+void lichii_controls_set_orientations(uint32_t mask) {
+#if LICHII_HAVE_SDL_HINTS
+    // UIInterfaceOrientationMask bits.
+    std::string names;
+    const auto add = [&](uint32_t bit, const char* name) {
+        if (mask & bit) {
+            names += names.empty() ? "" : " ";
+            names += name;
+        }
+    };
+    add(1u << 1, "Portrait");
+    add(1u << 2, "PortraitUpsideDown");
+    add(1u << 3, "LandscapeRight");
+    add(1u << 4, "LandscapeLeft");
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, names.empty() ? nullptr : names.c_str());
+#else
+    (void)mask;
+#endif
 }
 
 bool lichii_controls_system_stats(LichiiSystemStats* out) {
