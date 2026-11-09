@@ -5,13 +5,23 @@ on:
     branches: [ios]
     paths-ignore: ['**.md']
   workflow_dispatch:
+  # release-binaries.yml calls this to put the IPA into its release; it names the artifact and the
+  # build tag, and publishes the release itself.
+  workflow_call:
+    inputs:
+      artifact_name:
+        type: string
+        required: true
+      build_tag:
+        type: string
+        required: true
 
 permissions:
   contents: write
 
 concurrency:
-  group: ios-${{ github.ref }}
-  cancel-in-progress: true
+  group: ios-${{ github.ref }}-${{ inputs.artifact_name || 'rolling' }}
+  cancel-in-progress: ${{ !inputs.artifact_name }}
 
 jobs:
   build:
@@ -104,8 +114,9 @@ jobs:
             -DYUZU_USE_BUNDLED_OPENSSL=OFF \
             -DOPENSSL_TARGET_PLATFORM=ios64-xcrun \
             -DYUZU_USE_BUNDLED_MOLTENVK=ON \
-            -DLICHII_BUILD_TAG=ios-${{ github.run_number }} \
-            -DLICHII_BUILD_PLATFORM=ios-arm64
+            -DLICHII_BUILD_TAG=${{ inputs.build_tag || format('ios-{0}', github.run_number) }} \
+            -DLICHII_BUILD_PLATFORM=ios-arm64 \
+            -DLICHII_UPDATE_REPO=${{ github.repository }}
 
       - name: Build
         run: |
@@ -135,7 +146,7 @@ jobs:
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Lichii-iOS-unsigned-${{ github.run_number }}
+          name: ${{ inputs.artifact_name || format('Lichii-iOS-unsigned-{0}', github.run_number) }}
           path: |
             Lichii.ipa
             Lichii.entitlements
@@ -152,7 +163,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Publish rolling release
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && !inputs.artifact_name
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

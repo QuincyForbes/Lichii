@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - nx2-experimental
+      - oot-custom
     # A binary only changes when build inputs change; docs-only pushes skip the build.
     paths:
       - "src/**"
@@ -24,6 +25,8 @@ on:
       - ".patch/**"
       - "cpmfile.json"
       - ".github/workflows/release-binaries.yml"
+      - ".github/workflows/ios.yml"
+      - ".ci/ios/**"
 
 permissions:
   contents: read
@@ -306,6 +309,7 @@ jobs:
             -DENABLE_UPDATE_CHECKER=ON
             -DLICHII_BUILD_TAG=build-${{ github.run_number }}
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }}
+            -DLICHII_UPDATE_REPO=${{ github.repository }}
             -DUSE_DISCORD_PRESENCE=OFF
             -DUSE_CCACHE=ON
           )
@@ -339,9 +343,13 @@ jobs:
           -DENABLE_UPDATE_CHECKER=ON
           -DLICHII_BUILD_TAG=build-${{ github.run_number }}
           -DLICHII_BUILD_PLATFORM=${{ matrix.platform }}
+          -DLICHII_UPDATE_REPO=${{ github.repository }}
           -DUSE_DISCORD_PRESENCE=OFF
           -DCMAKE_C_COMPILER_LAUNCHER=sccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          -DENABLE_LTO=ON
+          -DCMAKE_C_FLAGS=/arch:AVX2
+          -DCMAKE_CXX_FLAGS=/arch:AVX2
 
       - name: Configure macOS
         if: matrix.platform == 'macos-arm64'
@@ -363,6 +371,7 @@ jobs:
             -DENABLE_UPDATE_CHECKER=ON \
             -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
+            -DLICHII_UPDATE_REPO=${{ github.repository }} \
             -DUSE_DISCORD_PRESENCE=OFF \
             -DUSE_CCACHE=ON
 
@@ -385,6 +394,7 @@ jobs:
             -DENABLE_UPDATE_CHECKER=ON \
             -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
+            -DLICHII_UPDATE_REPO=${{ github.repository }} \
             -DUSE_DISCORD_PRESENCE=OFF \
             -DUSE_CCACHE=ON
 
@@ -412,6 +422,7 @@ jobs:
             -DENABLE_UPDATE_CHECKER=ON \
             -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
+            -DLICHII_UPDATE_REPO=${{ github.repository }} \
             -DUSE_DISCORD_PRESENCE=OFF \
             -DUSE_CCACHE=ON \
             -DCMAKE_C_COMPILER=clang \
@@ -666,13 +677,23 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  # Publishes every binary as a GitHub pre-release once every platform built: on pushes to
-  # nx2-experimental, and on manual runs unless "Publish the binaries as a GitHub release" is
-  # unticked.
+  ios:
+    name: ios-arm64 IPA
+    needs: prepare-release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/ios.yml
+    with:
+      artifact_name: lichii-ios-arm64-${{ github.sha }}
+      build_tag: build-${{ github.run_number }}
+
+  # Publishes every binary as a GitHub pre-release: on pushes to nx2-experimental and oot-custom,
+  # and on manual runs unless "Publish the binaries as a GitHub release" is unticked. A failed
+  # Linux leg does not hold the release back; the Windows, macOS and iOS packages must all exist.
   release:
     name: Publish release
-    needs: build
-    if: github.event_name == 'push' || inputs.publish_release
+    needs: [build, ios]
+    if: ${{ !cancelled() && (github.event_name == 'push' || inputs.publish_release) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -698,6 +719,9 @@ jobs:
               for file in "$artifact"*.AppImage "$artifact"*.tar.gz; do
                 cp "$file" "dist/$(strip_sha "$(basename "$file")")"
               done
+            elif compgen -G "$artifact*.ipa" > /dev/null; then
+              cp "$artifact"Lichii.ipa dist/lichii-ios-arm64.ipa
+              cp "$artifact"Lichii.entitlements dist/lichii-ios-arm64.entitlements
             elif compgen -G "$artifact*.zip" > /dev/null; then
               for file in "$artifact"*.zip "$artifact"*.dmg; do
                 [[ -e "$file" ]] && cp "$file" "dist/$(strip_sha "$(basename "$file")")"
@@ -707,6 +731,10 @@ jobs:
             fi
           done
           ls -la dist
+          for required in lichii-windows-x86_64.zip lichii-windows-x86_64-pgo.zip \
+            lichii-macos-arm64.dmg lichii-macos-x86_64.dmg lichii-ios-arm64.ipa; do
+            test -s "dist/$required" || { echo "Missing release file $required"; exit 1; }
+          done
 
       - name: Create release
         shell: bash
@@ -740,14 +768,21 @@ jobs:
 
           | Build Type | Standard | PGO (Recommended) | Notes |
           | --- | --- | --- | --- |
-          | amd64 / x86_64 (MSVC) | [MSVC zip](${base}/lichii-windows-x86_64.zip) | | Use if you run into graphical issues on other builds |
+          | amd64 / x86_64 (MSVC) | [MSVC zip](${base}/lichii-windows-x86_64.zip) | | LTO, needs an AVX2 CPU (Haswell / Zen or newer) |
           | amd64 / x86_64 (MinGW) | | [PGO zip](${base}/lichii-windows-x86_64-pgo.zip) | Built with MinGW clang; bundles its own DLLs, no Visual C++ redistributable needed |
 
           ## macOS
 
           | Build Type | Standard | PGO (Recommended) | Notes |
           | --- | --- | --- | --- |
-          | arm64 (Apple Silicon) | [zip](${base}/lichii-macos-arm64.zip) | | macOS 15 or newer. Not notarized: right-click and choose Open the first time, or run \`xattr -dr com.apple.quarantine lichii.app\`. \`eden-cli\` is inside the app, in \`Contents/MacOS\` |
+          | arm64 (Apple Silicon) | [dmg](${base}/lichii-macos-arm64.dmg) · [zip](${base}/lichii-macos-arm64.zip) | | macOS 15 or newer. Not notarized: right-click and choose Open the first time, or run \`xattr -dr com.apple.quarantine lichii.app\`. \`eden-cli\` is inside the app, in \`Contents/MacOS\` |
+          | x86_64 (Intel) | [dmg](${base}/lichii-macos-x86_64.dmg) · [zip](${base}/lichii-macos-x86_64.zip) | | Same notes as Apple Silicon |
+
+          ## iOS
+
+          | Build Type | Package | Notes |
+          | --- | --- | --- |
+          | arm64 | [IPA](${base}/lichii-ios-arm64.ipa) · [entitlements](${base}/lichii-ios-arm64.entitlements) | Unsigned. Sign with the entitlements (JIT, increased memory limit, extended virtual addressing) and install with SideStore or your own profile; JIT must be enabled to run games |
 
           The PGO builds are the same programs compiled with profile-guided optimization (clang plus Eglantine's profile); prefer them when your CPU supports it.
           EOF
