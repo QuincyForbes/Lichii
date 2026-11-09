@@ -124,6 +124,20 @@ jobs:
           cmake --build build --target yuzu-cmd --parallel -- -k 0 2>&1 | tee build.log
           ccache -s
 
+      - name: Check the native app is linked
+        run: |
+          set -euo pipefail
+          bin=build/bin/Lichii.app/Lichii
+          {
+            echo '## Native app'
+            echo '```'
+            nm -gU "$bin" | grep -E ' _lichii_(ui_main|emu_launch|settings_count)$' || echo 'native app symbols missing'
+            otool -L "$bin" | grep -E 'SwiftUI|libswiftCore' || true
+            grep -cE 'Swift|swiftc' build.log | sed 's/^/swift build lines: /' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          nm -gU "$bin" | grep -q ' _lichii_ui_main$'
+
       - name: Summarize build errors
         if: failure()
         run: |
