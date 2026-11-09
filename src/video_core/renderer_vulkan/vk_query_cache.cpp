@@ -226,7 +226,8 @@ public:
         // logged every 5 s while they happen.
         const int limit_setting = VideoCore::Nx2Debug::Experiment(16);
         const size_t limit =
-            limit_setting > 0 ? static_cast<size_t>(limit_setting) : SamplesQueryBank::BANK_SIZE;
+            limit_setting > 0 ? static_cast<size_t>(limit_setting)
+                              : 4 * SamplesQueryBank::BANK_SIZE; // gameplay reaches 346 (#718)
         if (current_query && current_query->size_slots > limit) {
             static u64 resets{};
             static auto since = std::chrono::steady_clock::now();
