@@ -101,7 +101,6 @@ jobs:
             -DENABLE_UPDATE_CHECKER=OFF \
             -DENABLE_LIBUSB=OFF \
             -DENABLE_CUBEB=OFF \
-            -DENABLE_LSFG=OFF \
             -DENABLE_RESHADE=OFF \
             -DUSE_DISCORD_PRESENCE=OFF \
             -DENABLE_WERROR=OFF \

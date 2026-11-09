@@ -784,7 +784,7 @@ jobs:
 
           | Build Type | Package | Notes |
           | --- | --- | --- |
-          | arm64 | [IPA](${base}/lichii-ios-arm64.ipa) · [entitlements](${base}/lichii-ios-arm64.entitlements) | Unsigned. Sign with the entitlements (JIT, increased memory limit, extended virtual addressing) and install with SideStore or your own profile; JIT must be enabled to run games |
+          | arm64 | [IPA](${base}/lichii-ios-arm64.ipa) · [entitlements](${base}/lichii-ios-arm64.entitlements) | Unsigned. Sign with the entitlements (JIT, increased memory limit, extended virtual addressing) and install with SideStore or your own profile; JIT must be enabled to run games. On-screen controls show until a controller connects. Upscaling filter and FSR 3 frame generation are set in \`Documents/eden/config/sdl2-config.ini\` (\`scaling_filter\`, \`frame_gen\`, \`frame_gen_type\`); NX2 switches go in \`Documents/eden/nx2_switches.txt\` |
 
           The PGO builds are the same programs compiled with profile-guided optimization (clang plus Eglantine's profile); prefer them when your CPU supports it.
           EOF

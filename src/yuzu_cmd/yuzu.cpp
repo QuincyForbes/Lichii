@@ -49,6 +49,7 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
+#include "frontend_common/nx2_switches.h"
 #include "input_common/drivers/keyboard.h"
 #include "input_common/main.h"
 #include "network/network.h"
@@ -668,6 +669,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     IosCaptureConsole();
     IOS_MARK("SDL_AppInit enter");
 #endif
+    FrontendCommon::LoadNx2Switches(argc > 0 ? argv[0] : nullptr);
     SdlState* state = new SdlState();
     IOS_MARK("SdlState constructed (Core::System + input)");
     *appstate = state;

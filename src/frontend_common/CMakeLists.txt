@@ -11,6 +11,7 @@ add_library(frontend_common STATIC
     firmware_manager.h
     firmware_manager.cpp
     data_manager.h data_manager.cpp
+    nx2_switches.h nx2_switches.cpp
     play_time_manager.cpp
     play_time_manager.h
     settings_generator.h settings_generator.cpp
