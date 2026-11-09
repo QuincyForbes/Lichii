@@ -163,16 +163,6 @@ jobs:
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-          # Annotations are readable without signing in: the first error lines, 8 per annotation.
-          if [ -f build.log ]; then
-            grep -E 'error:|FAILED:|Undefined symbols|ld: ' build.log | grep -v '^FAILED: \[code=' | head -80 \
-              | split -l 8 - err_chunk_ || true
-            for f in err_chunk_*; do
-              [ -f "$f" ] || continue
-              msg=$(sed -e 's/%/%25/g' "$f" | awk '{printf "%s%%0A", $0}')
-              echo "::error title=build errors ($f)::$msg"
-            done
-          fi
 
       - name: Package IPA
         run: |
