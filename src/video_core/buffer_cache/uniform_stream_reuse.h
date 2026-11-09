@@ -164,7 +164,7 @@ inline void ResetUniformStreamReuse() noexcept {
             return false;
         }
     }
-#if defined(_M_X64) || defined(__x86_64__)
+#ifdef __AVX2__
     size_t off = 0;
     for (; off + 128 <= size; off += 128) {
         const __m256i d0 = _mm256_xor_si256(

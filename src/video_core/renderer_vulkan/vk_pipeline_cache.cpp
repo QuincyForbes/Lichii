@@ -431,7 +431,7 @@ size_t GraphicsPipelineCacheKey::Hash() const noexcept {
 }
 
 bool GraphicsPipelineCacheKey::operator==(const GraphicsPipelineCacheKey& rhs) const noexcept {
-#if defined(_M_X64) || defined(__x86_64__)
+#ifdef __AVX2__
     const auto* a = reinterpret_cast<const __m256i*>(this);
     const auto* b = reinterpret_cast<const __m256i*>(&rhs);
     const __m256i d0 = _mm256_xor_si256(_mm256_loadu_si256(a + 0), _mm256_loadu_si256(b + 0));
@@ -866,7 +866,7 @@ void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
                          : VideoCommon::PipelineMergeLog{};
     bool log_changed = false;
     std::optional<VideoCommon::PipelineKeySet> own_keys;
-    using Status = VideoCommon::PipelineCacheMergeResult::Status;
+    using MergeStatus = VideoCommon::PipelineCacheMergeResult::MergeStatus;
     for (const Candidate& candidate : candidates) {
         const auto stamp = VideoCommon::StampPipelineCacheFile(candidate.cache);
         if (!stamp) {
@@ -894,7 +894,7 @@ void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
                 candidate.cache, own_cache, PipelineCacheMagic, *version, CACHE_VERSION,
                 ReadPipelineRecordKey, own_keys);
             switch (result.status) {
-            case Status::Merged:
+            case MergeStatus::Merged:
                 LOG_INFO(Render_Vulkan,
                          "Merged {} new pipelines ({} records) from {} (cache version {}); {} "
                          "were already cached",
@@ -902,25 +902,25 @@ void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
                          result.known_pipelines);
                 cache_merged = true;
                 break;
-            case Status::Missing:
+            case MergeStatus::Missing:
                 continue;
-            case Status::WrongHeader:
+            case MergeStatus::WrongHeader:
                 LOG_WARNING(Render_Vulkan,
                             "Skipped pipeline cache {}: it is not a cache version {} file", path,
                             *version);
                 break;
-            case Status::BadSource:
+            case MergeStatus::BadSource:
                 LOG_WARNING(Render_Vulkan,
                             "Skipped pipeline cache {} (cache version {}): {}; nothing was "
                             "merged, it is tried again when it changes",
                             path, *version, result.detail);
                 break;
-            case Status::BadDestination:
+            case MergeStatus::BadDestination:
                 LOG_WARNING(Render_Vulkan, "Not merging pipeline cache {} into {}: {}", path,
                             Common::FS::PathToUTF8String(own_cache), result.detail);
                 return;
-            case Status::NoSpace:
-            case Status::WriteFailed:
+            case MergeStatus::NoSpace:
+            case MergeStatus::WriteFailed:
                 LOG_WARNING(Render_Vulkan,
                             "Not merging pipeline cache {}: {}; the cache is unchanged", path,
                             result.detail);

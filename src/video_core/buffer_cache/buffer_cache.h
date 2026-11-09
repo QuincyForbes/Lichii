@@ -1960,7 +1960,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         ++stats.compared[reason];
         const u8* const snap = snapshot.words.data();
         bool same = true;
-#if defined(_M_X64) || defined(__x86_64__)
+#ifdef __AVX2__
         for (size_t off = 0; off < Core::DEVICE_PAGESIZE; off += 128) {
             const __m256i d0 = _mm256_xor_si256(
                 _mm256_load_si256(reinterpret_cast<const __m256i*>(snap + off)),

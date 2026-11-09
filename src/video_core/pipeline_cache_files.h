@@ -109,7 +109,7 @@ using PipelineRecordKeyReader =
 using PipelineKeySet = std::unordered_set<std::string>;
 
 struct PipelineCacheMergeResult {
-    enum class Status {
+    enum class MergeStatus {
         Merged,         ///< `added_records` appended (possibly none)
         Missing,        ///< No source file
         WrongHeader,    ///< The source is not a cache of the expected magic and version
@@ -118,7 +118,7 @@ struct PipelineCacheMergeResult {
         NoSpace,        ///< Not enough free disk space for the merged copy
         WriteFailed,    ///< Writing or renaming the merged copy failed; the destination is unchanged
     };
-    Status status{};
+    MergeStatus status{};
     size_t added_pipelines{};
     size_t added_records{};
     size_t known_pipelines{}; ///< Source pipelines the destination already had

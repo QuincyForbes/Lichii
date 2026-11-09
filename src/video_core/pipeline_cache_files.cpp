@@ -118,15 +118,15 @@ PipelineCacheMergeResult MergePipelineCache(const std::filesystem::path& source,
                                             u32 destination_version,
                                             const PipelineRecordKeyReader& read_key,
                                             std::optional<PipelineKeySet>& known_keys) {
-    using Status = PipelineCacheMergeResult::Status;
+    using MergeStatus = PipelineCacheMergeResult::MergeStatus;
     PipelineCacheMergeResult result;
     std::error_code error;
     if (!std::filesystem::is_regular_file(source, error)) {
-        result.status = Status::Missing;
+        result.status = MergeStatus::Missing;
         return result;
     }
     if (!PipelineCacheHeaderMatches(source, magic, source_version)) {
-        result.status = Status::WrongHeader;
+        result.status = MergeStatus::WrongHeader;
         return result;
     }
     const bool has_destination = std::filesystem::exists(destination, error);
@@ -135,7 +135,7 @@ PipelineCacheMergeResult MergePipelineCache(const std::filesystem::path& source,
         destination_size = std::filesystem::file_size(destination, error);
     }
     if (error) {
-        result.status = Status::BadDestination;
+        result.status = MergeStatus::BadDestination;
         result.detail = error.message();
         return result;
     }
@@ -147,7 +147,7 @@ PipelineCacheMergeResult MergePipelineCache(const std::filesystem::path& source,
                           destination, magic, destination_version, read_key,
                           [&](std::string&& key, RecordRange) { keys.insert(std::move(key)); },
                           result.detail)) {
-            result.status = Status::BadDestination;
+            result.status = MergeStatus::BadDestination;
             return result;
         }
         known_keys = std::move(keys);
@@ -174,13 +174,13 @@ PipelineCacheMergeResult MergePipelineCache(const std::filesystem::path& source,
                 }
             },
             result.detail)) {
-        result.status = Status::BadSource;
+        result.status = MergeStatus::BadSource;
         result.added_records = 0;
         return result;
     }
     result.added_pipelines = added.size();
     result.known_pipelines = known.size();
-    result.status = Status::Merged;
+    result.status = MergeStatus::Merged;
     if (ranges.empty()) {
         return result;
     }
@@ -190,7 +190,7 @@ PipelineCacheMergeResult MergePipelineCache(const std::filesystem::path& source,
     constexpr u64 SpareBytes = u64{64} << 20;
     const auto space = std::filesystem::space(destination.parent_path(), error);
     if (!error && space.available < merged_size + SpareBytes) {
-        result.status = Status::NoSpace;
+        result.status = MergeStatus::NoSpace;
         result.detail = fmt::format("{} MiB needed, {} MiB free", (merged_size + SpareBytes) >> 20,
                                     space.available >> 20);
         return result;
@@ -200,7 +200,7 @@ PipelineCacheMergeResult MergePipelineCache(const std::filesystem::path& source,
     temporary += ".merging";
     const auto fail = [&](std::string detail) {
         std::filesystem::remove(temporary, error);
-        result.status = Status::WriteFailed;
+        result.status = MergeStatus::WriteFailed;
         result.detail = std::move(detail);
         return result;
     };
@@ -237,7 +237,7 @@ PipelineCacheMergeResult MergePipelineCache(const std::filesystem::path& source,
         return fail("the merged copy has the wrong size");
     }
     if (!ReplaceWith(temporary, destination)) {
-        result.status = Status::WriteFailed;
+        result.status = MergeStatus::WriteFailed;
         result.detail = "replacing the cache with the merged copy failed";
         return result;
     }
