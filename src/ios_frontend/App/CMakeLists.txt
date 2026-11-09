@@ -34,6 +34,8 @@ add_library(lichii_ios_app STATIC
     Content/OnboardingView.swift
     Content/ProfilesView.swift
     Content/SavesView.swift
+    Platform/PlatformCenter.swift
+    Platform/PlatformViews.swift
 )
 set_target_properties(lichii_ios_app PROPERTIES
     Swift_MODULE_NAME LichiiApp

@@ -17,6 +17,8 @@ final class ControlsCenter: ObservableObject {
     @Published private(set) var menuOpen = false
     @Published var editingLayout = false
     @Published private(set) var touchControlsVisible = true
+    /// The user asked the game to stay paused after the menu closes.
+    @Published private(set) var manuallyPaused = false
     @Published var toast: String?
     @Published var showHUD = UserDefaults.standard.bool(forKey: "showPerformanceHUD") {
         didSet { UserDefaults.standard.set(showHUD, forKey: "showPerformanceHUD") }
@@ -40,6 +42,10 @@ final class ControlsCenter: ObservableObject {
     private var toastTask: Task<Void, Never>?
 
     var currentGame: Game? { AppController.shared.currentGame }
+
+    /// Paused by the user (menu open, layout editor, or kept paused): the platform layer does not
+    /// resume the game when the app becomes active again.
+    var userPaused: Bool { manuallyPaused || menuOpen || editingLayout }
 
     // MARK: - App hooks
 
@@ -99,6 +105,7 @@ final class ControlsCenter: ObservableObject {
         gameRunning = false
         menuOpen = false
         editingLayout = false
+        manuallyPaused = false
         ticker?.invalidate()
         ticker = nil
         lichii_controls_release_touch()
@@ -132,20 +139,22 @@ final class ControlsCenter: ObservableObject {
         guard menuOpen else { return }
         menuOpen = false
         overlay?.interactive = editingLayout
-        if resume && resumeAfterMenu {
+        if resume && resumeAfterMenu && !manuallyPaused {
             lichii_emu_resume()
         }
         resumeAfterMenu = false
     }
 
-    func togglePause() {
-        if Bridge.emuState == .paused {
-            lichii_emu_resume()
-            resumeAfterMenu = false
-        } else {
-            lichii_emu_pause()
-        }
-        objectWillChange.send()
+    /// Closes the menu and runs the game, also when it was kept paused or paused by the system.
+    func resumeGame() {
+        manuallyPaused = false
+        closeMenu(resume: false)
+        lichii_emu_resume()
+    }
+
+    /// Whether the game stays paused once the menu closes.
+    func toggleKeepPaused() {
+        manuallyPaused.toggle()
     }
 
     func quitToLibrary() {
@@ -154,7 +163,10 @@ final class ControlsCenter: ObservableObject {
     }
 
     func editLayout() {
+        // The game stays paused while editing and resumes when the editor closes.
+        let resume = resumeAfterMenu
         closeMenu(resume: false)
+        resumeAfterMenu = resume
         editingLayout = true
         overlay?.interactive = true
         touchControlsVisible = true
@@ -165,10 +177,10 @@ final class ControlsCenter: ObservableObject {
         editingLayout = false
         overlay?.interactive = menuOpen
         updateTouchVisibility()
-        if resumeAfterMenu {
+        if resumeAfterMenu && !manuallyPaused {
             lichii_emu_resume()
-            resumeAfterMenu = false
         }
+        resumeAfterMenu = false
     }
 
     // MARK: - Ticker

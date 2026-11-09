@@ -53,6 +53,9 @@ struct SettingsView: View {
                             }
                         }
                     }
+                    if query.isEmpty {
+                        ShaderCacheSettingsSection()
+                    }
                 }
                 ForEach(SettingsCatalog.sections(perGame: game != nil, query: query)) { section in
                     Section(section.title) {
@@ -117,8 +120,7 @@ private struct StatusHeader: View {
         Section {
             LabeledContent("Version", value: Bridge.buildVersion)
             LabeledContent("JIT", value: jitText)
-            LabeledContent("Device", value: "\(UIDevice.current.model), iOS \(UIDevice.current.systemVersion)")
-            LabeledContent("Memory", value: UInt64(ProcessInfo.processInfo.physicalMemory).byteCount)
+            DeviceInfoRows()
         }
     }
 

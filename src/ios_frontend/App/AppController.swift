@@ -96,6 +96,7 @@ final class AppController: ObservableObject {
     }
 
     func stop() {
+        lichii_platform_flush_caches()
         lichii_emu_stop()
     }
 
@@ -165,7 +166,10 @@ final class AppController: ObservableObject {
         window?.isHidden = true
         guard let pointer = lichii_emu_window() else { return }
         let gameWindow = Unmanaged<UIWindow>.fromOpaque(pointer).takeUnretainedValue()
-        EmulationOverlay.install(in: gameWindow)
+        // The full in-game menu brings its own menu button.
+        if AppExtensions.presentInGameMenu == nil {
+            EmulationOverlay.install(in: gameWindow)
+        }
         AppExtensions.gameWindowReady.forEach { $0(gameWindow) }
     }
 

@@ -51,6 +51,7 @@ struct LaunchView: View {
             VStack(spacing: 12) {
                 ProgressView().controlSize(.large).tint(.white)
                 Text("Starting...").foregroundStyle(.secondary)
+                ShaderProgressView()
             }
         default:
             VStack(spacing: 14) {

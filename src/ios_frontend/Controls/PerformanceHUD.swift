@@ -89,6 +89,7 @@ enum HUDPosition: String, CaseIterable, Identifiable {
 
 struct PerformanceHUD: View {
     @ObservedObject private var monitor = HUDMonitor.shared
+    @ObservedObject private var platform = PlatformCenter.shared
     @AppStorage("hudDetailed") private var detailed = true
     @AppStorage("hudFrameTime") private var showFrameTime = true
     @AppStorage("hudMemory") private var showMemory = true
@@ -112,6 +113,10 @@ struct PerformanceHUD: View {
                 if showThermal {
                     Text("Thermal: \(thermalName)")
                         .foregroundStyle(thermalColor)
+                    if !platform.thermalBadge.isEmpty {
+                        Text(platform.thermalBadge)
+                            .foregroundStyle(thermalColor)
+                    }
                 }
                 if showBattery, monitor.battery >= 0 {
                     Text(String(format: "Battery %.0f%%%@", monitor.battery * 100, monitor.charging ? " ⚡︎" : ""))

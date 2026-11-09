@@ -38,17 +38,19 @@ enum AppExtensions {
 
     /// Links shown at the top of the global settings (keys, firmware, controllers, logs, ...).
     static var settingsLinks: [SettingsLink] {
-        ContentEntries.settingsLinks + [
+        let links = ContentEntries.settingsLinks
+        func content(_ id: String) -> [SettingsLink] { links.filter { $0.id == id } }
+        return content("keys") + [
             SettingsLink(id: "controls", title: "Controls", systemImage: "gamecontroller", view: { AnyView(ControlsView()) }),
-        ]
+        ] + content("logs") + content("users") + PlatformEntries.settingsLinks + content("setup")
     }
 
-    /// Per-game screens (updates, DLC, mods, cheats, controller layout, ...).
+    /// Per-game screens after Game Settings (controller layout, updates, DLC, mods, cheats, saves, ...).
     static var gameActions: [GameAction] {
-        ContentEntries.gameActions + [
+        [
             GameAction(id: "layout", title: "Controller Layout", systemImage: "hand.tap",
                        view: { AnyView(LayoutEditorScreen(gameId: $0.programIdHex, gameName: $0.title)) }),
-        ]
+        ] + ContentEntries.gameActions + PlatformEntries.gameActions
     }
 
     /// Replaces the basic in-game menu (ios-controls). Gets the game window's view controller.
@@ -59,9 +61,15 @@ enum AppExtensions {
 
     /// Called once after the library window is up (onboarding, ...).
     static var appStarted: [() -> Void] {
-        ContentEntries.appStarted + [{ MainActor.assumeIsolated { ControlsCenter.shared.appStarted() } }]
+        [{ MainActor.assumeIsolated { PlatformCenter.shared.start() } }] + ContentEntries.appStarted +
+            [{ MainActor.assumeIsolated { ControlsCenter.shared.appStarted() } }]
     }
 
     /// Every LichiiEvent the bridge posts.
-    static var eventHandlers: [(Int32) -> Void] { [{ event in MainActor.assumeIsolated { ControlsCenter.shared.handle(event: event) } }] }
+    static var eventHandlers: [(Int32) -> Void] {
+        [
+            { event in MainActor.assumeIsolated { PlatformCenter.shared.handle(appEvent: event) } },
+            { event in MainActor.assumeIsolated { ControlsCenter.shared.handle(event: event) } },
+        ]
+    }
 }

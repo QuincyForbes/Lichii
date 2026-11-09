@@ -42,6 +42,23 @@ struct ControlsOverlayView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
 
+            if !center.editingLayout && !center.menuOpen {
+                VStack(spacing: 6) {
+                    if center.manuallyPaused {
+                        Label("Paused", systemImage: "pause.fill")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.black.opacity(0.6), in: Capsule())
+                    }
+                    ThermalBanner(compact: true)
+                }
+                .padding(.bottom, 10)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .allowsHitTesting(false)
+            }
+
             if let toast = center.toast {
                 Text(toast)
                     .font(.footnote.weight(.semibold))

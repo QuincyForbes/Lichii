@@ -69,10 +69,11 @@ struct InGameMenuView: View {
                 Text(Bridge.emuState == .paused ? "Paused" : "Running")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                ThermalBanner(compact: true)
             }
             Spacer()
             Button {
-                center.closeMenu()
+                center.resumeGame()
             } label: {
                 Label("Resume", systemImage: "play.fill")
                     .font(.subheadline.weight(.semibold))
@@ -83,6 +84,10 @@ struct InGameMenuView: View {
 
     private var actions: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 132), spacing: 10)], spacing: 10) {
+            MenuTile(title: center.manuallyPaused ? "Run on Close" : "Keep Paused",
+                     systemImage: center.manuallyPaused ? "play.circle" : "pause.circle") {
+                center.toggleKeepPaused()
+            }
             MenuTile(title: "Screenshot", systemImage: "camera") {
                 center.closeMenu()
                 center.takeScreenshot()
