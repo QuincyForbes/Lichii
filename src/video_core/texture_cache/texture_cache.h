@@ -903,8 +903,6 @@ void TextureCache<P>::TickRenderClock() {
                      frame_tick,
                      Tegra::Nx2RenderClockSyncpt() >= 0
                          ? fmt::format("syncpoint {}", Tegra::Nx2RenderClockSyncpt())
-                     : Tegra::Nx2RenderClockWordSource()
-                         ? std::string{"the present poll's learned word"}
                          : std::string{"the flip's frame fence"});
         }
     }
