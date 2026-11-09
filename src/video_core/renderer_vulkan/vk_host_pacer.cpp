@@ -9,6 +9,13 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/vk_host_pacer.h"
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include "common/platform_events.h"
+#endif
+#endif
+
 #ifdef _WIN32
 #include <cwchar>
 #include <string_view>
@@ -172,6 +179,11 @@ std::optional<DisplayRefresh> DisplayRefreshQuery::Query([[maybe_unused]] void* 
     if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) &&
         mode.dmDisplayFrequency > 1) {
         return DisplayRefresh{1e9 / mode.dmDisplayFrequency, "primary, display settings"};
+    }
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+    // The frontend reports UIScreen.maximumFramesPerSecond (120 on ProMotion devices).
+    if (const u32 fps = Common::PlatformEvents::DisplayMaxFps(); fps != 0) {
+        return DisplayRefresh{1e9 / fps, "UIScreen"};
     }
 #endif
     return std::nullopt;

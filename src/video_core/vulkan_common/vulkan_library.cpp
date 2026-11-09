@@ -139,6 +139,17 @@ std::shared_ptr<Common::DynamicLibrary> OpenLibrary(
         }
         setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
         setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+#if TARGET_OS_IPHONE
+        // iOS (see docs/ios-platform.md): a command buffer failing while the app leaves the
+        // foreground must not lose the device; the MSL kept for pipeline cache export is
+        // compressed (thousands of shaders); fewer Metal command buffers in flight; no info logs
+        // and no performance tracking.
+        setenv("MVK_CONFIG_RESUME_LOST_DEVICE", "1", 0);
+        setenv("MVK_CONFIG_SHADER_COMPRESSION_ALGORITHM", "1", 0);
+        setenv("MVK_CONFIG_MAX_ACTIVE_METAL_COMMAND_BUFFERS_PER_QUEUE", "32", 0);
+        setenv("MVK_CONFIG_LOG_LEVEL", "2", 0);
+        setenv("MVK_CONFIG_PERFORMANCE_TRACKING", "0", 0);
+#endif
         return true;
     }();
     (void)mvk_tuning;
