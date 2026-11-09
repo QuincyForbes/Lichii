@@ -150,7 +150,7 @@ jobs:
           HOMEBREW_NO_INSTALL_CLEANUP: 1
           HOMEBREW_NO_AUTO_UPDATE: 1
         run: |
-          brew install autoconf automake libtool nasm glslang ninja pkg-config ccache
+          brew install autoconf automake libtool nasm glslang ninja pkg-config ccache dav1d
           # Homebrew names it glibtoolize; the bundled libusb build looks for libtoolize.
           echo "$(brew --prefix libtool)/libexec/gnubin" >> "$GITHUB_PATH"
 

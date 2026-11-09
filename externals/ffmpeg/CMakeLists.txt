@@ -154,6 +154,15 @@ elseif (UNIX AND NOT DEFINED FFmpeg_IS_CROSS_COMPILING AND NOT ANDROID)
         list(APPEND FFmpeg_HWACCEL_FLAGS --disable-vdpau)
         message(WARNING "ffmpeg: libvdpau-dev not found, disabling Video Decode and Presentation API for Unix (VDPAU)...")
     endif()
+    # Switch 2 titles' movies are AV1 (Ocarina of Time's cutscenes); FFmpeg's own av1 decoder
+    # only works through a hardware accelerator, so libdav1d decodes them where there is none.
+    pkg_check_modules(DAV1D dav1d)
+    if (DAV1D_FOUND)
+        list(APPEND FFmpeg_HWACCEL_FLAGS --enable-libdav1d --enable-decoder=libdav1d)
+        list(APPEND FFmpeg_HWACCEL_LIBRARIES ${DAV1D_LINK_LIBRARIES})
+        list(APPEND FFmpeg_HWACCEL_INCLUDE_DIRS ${DAV1D_INCLUDE_DIRS})
+        message(STATUS "ffmpeg: libdav1d ${DAV1D_VERSION} found")
+    endif()
 endif()
 
 if (OPENORBIS)
