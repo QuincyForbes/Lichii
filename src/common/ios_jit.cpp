@@ -317,6 +317,14 @@ bool Alloc(std::size_t bytes, void** wmem, void** xmem) {
     return false;
 }
 
+void Reset() {
+    std::scoped_lock lock{g_pool_mutex};
+    for (Region& region : g_pool) {
+        region.used = 0;
+    }
+    LOG_INFO(Common, "iOS JIT: pool reset ({} chunks free)", g_pool.size());
+}
+
 } // namespace Common::IosJit
 
 extern "C" int lichii_ios_jit_alloc(std::size_t bytes, void** wmem, void** xmem) {

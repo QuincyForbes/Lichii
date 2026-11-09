@@ -1,0 +1,4 @@
+module LichiiBridge {
+    header "lichii_bridge.h"
+    export *
+}

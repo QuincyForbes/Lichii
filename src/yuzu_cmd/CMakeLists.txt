@@ -89,6 +89,19 @@ if (IOS)
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${MOLTENVK_FRAMEWORK_DIR}" "$<TARGET_BUNDLE_DIR:yuzu-cmd>/Frameworks/MoltenVK.framework"
         COMMAND ${CMAKE_COMMAND} -E copy "${PROJECT_SOURCE_DIR}/dist/ios/Lichii.entitlements" "$<TARGET_BUNDLE_DIR:yuzu-cmd>/../Lichii.entitlements"
         COMMENT "Embedding MoltenVK.framework into Lichii.app")
+    if (LICHII_IOS_UI)
+        target_compile_definitions(yuzu-cmd PRIVATE LICHII_IOS_UI)
+        target_link_libraries(yuzu-cmd PRIVATE lichii_ios_app lichii_ios_bridge)
+        # Linked by clang++: the Swift runtime and overlays come from the SDK and the toolchain.
+        execute_process(COMMAND xcrun --sdk iphoneos --show-sdk-path
+                        OUTPUT_VARIABLE LICHII_IOS_SDK OUTPUT_STRIP_TRAILING_WHITESPACE)
+        get_filename_component(LICHII_SWIFT_BIN "${CMAKE_Swift_COMPILER}" DIRECTORY)
+        set_target_properties(yuzu-cmd PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(yuzu-cmd PRIVATE
+            "-L${LICHII_IOS_SDK}/usr/lib/swift"
+            "-L${LICHII_SWIFT_BIN}/../lib/swift/iphoneos"
+            "-Wl,-rpath,/usr/lib/swift")
+    endif()
 endif()
 
 # needed for vma

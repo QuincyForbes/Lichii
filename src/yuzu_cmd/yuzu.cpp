@@ -87,6 +87,10 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 #include <CoreFoundation/CoreFoundation.h>
+#ifdef LICHII_IOS_UI
+#include "common/fs/fs.h"
+#include "ios_frontend/bridge_host.h"
+#endif
 
 // Code-signing status: dynarmic's code pages are only executable while the process is being
 // debugged (that is what StikDebug/SideStore "JIT" means on iOS 17+).
@@ -351,9 +355,45 @@ struct SdlState {
     // Plain SDL window shown while waiting for the JIT so the screen is not just black.
     SDL_Window* wait_window{};
     SDL_Renderer* wait_renderer{};
+    bool system_initialized{};
+    bool content_initialized{};
+#ifdef LICHII_IOS_UI
+    // Set while the native app drives launches; the global config stays open to save edits.
+    std::unique_ptr<SdlConfig> ios_config;
+    Core::LaunchParams ios_launch_template;
+    Core::SystemResultStatus ios_load_result{Core::SystemResultStatus::Success};
+#endif
 };
 
 static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp);
+
+// The app keeps one system for several games: these run once per process.
+static bool InitializeSystem(SdlState* state) {
+    if (state->system_initialized) {
+        return true;
+    }
+    state->network_initialized = Network::Init();
+    if (!state->network_initialized) {
+        LOG_CRITICAL(Network, "Failed to initialize room networking");
+        return false;
+    }
+
+    IOS_MARK("system.Initialize");
+    state->system.Initialize();
+    IOS_MARK("system initialized");
+    state->system_initialized = true;
+    return true;
+}
+
+static void InitializeContent(SdlState* state) {
+    if (state->content_initialized) {
+        return;
+    }
+    state->system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
+    state->system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
+    state->system.GetFileSystemController().CreateFactories(*state->system.GetFilesystem());
+    state->content_initialized = true;
+}
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
 // Touch overlay -> virtual gamepad. Player 1 (port 0) and Handheld (port 8) both listen to it,
@@ -416,6 +456,9 @@ static void IosApplyControllers(SdlState* state) {
         LOG_INFO(Frontend, "iOS: no controller connected, touch controls shown");
     }
     IosSupport::SetTouchControlsVisible(!pad.has_value());
+#ifdef LICHII_IOS_UI
+    IosFrontend::PostEvent(LICHII_EVENT_CONTROLLERS_CHANGED);
+#endif
 }
 
 static void IosInstallTouchControls(SdlState* state) {
@@ -435,6 +478,130 @@ static void IosInstallTouchControls(SdlState* state) {
     IosSupport::InstallTouchControls(ui_window, &IosTouchButton, &IosTouchStick);
     IosApplyControllers(state);
 }
+
+#ifdef LICHII_IOS_UI
+// Defaults the SDL launcher forced on every boot, applied once so the app's settings can change
+// them afterwards.
+static void IosApplyFirstRunDefaults(SdlState* state) {
+    const auto marker = Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "ios-defaults-v1";
+    if (Common::FS::Exists(marker)) {
+        return;
+    }
+    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
+    Settings::values.use_asynchronous_shaders.SetValue(true);
+    state->ios_config->SaveAllValues();
+    std::ofstream{marker} << "1\n";
+}
+
+static SDL_AppResult IosStartApp(SdlState* state, Core::LaunchParams lp) {
+    state->ios_config = std::make_unique<SdlConfig>(lp.config_path);
+    IosApplyFirstRunDefaults(state);
+    if (!InitializeSystem(state)) {
+        return SDL_APP_FAILURE;
+    }
+    InitializeContent(state);
+    lp.fullscreen = true;
+    state->ios_launch_template = std::move(lp);
+    IosFrontend::Attach({
+        .system = &state->system,
+        .input = &state->input_subsystem,
+        .save_config = [state] { state->ios_config->SaveAllValues(); },
+    });
+    IosFrontend::SetJitPoolBytes(kIosJitPoolBytes);
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    IOS_MARK("showing the app");
+    lichii_ui_main();
+    return SDL_APP_CONTINUE;
+}
+
+static void* IosGameWindow(SdlState* state) {
+    if (!state->emu_window || state->emu_window->GetSdlWindow() == nullptr) {
+        return nullptr;
+    }
+    return SDL_GetPointerProperty(SDL_GetWindowProperties(state->emu_window->GetSdlWindow()),
+                                  SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, nullptr);
+}
+
+static void IosStopGame(SdlState* state) {
+    LOG_INFO(Frontend, "iOS: stopping the game");
+    IosSupport::SetTouchControlsVisible(false);
+    if (state->system.IsPoweredOn()) {
+        void(state->system.Pause());
+        state->system.ShutdownMainProcess();
+    }
+    if (state->emu_window) {
+        SDL_HideWindow(state->emu_window->GetSdlWindow());
+    }
+    // Every dynarmic instance went with the process, so the prepared pool can be handed out again.
+    Common::IosJit::Reset();
+    IosFrontend::RestoreGlobal();
+    IosFrontend::ClearRunningGame();
+    IosFrontend::SetState(LICHII_EMU_IDLE);
+}
+
+static void IosBootFailed(SdlState* state) {
+    std::string error = "The game could not be started. The log has the details.";
+    if (state->ios_load_result != Core::SystemResultStatus::Success) {
+        const u16 loader_id = u16(Core::SystemResultStatus::ErrorLoader);
+        const u16 code = u16(state->ios_load_result);
+        if (code > loader_id) {
+            error = fmt::format("Loader error {:04X}-{:04X}: {}", loader_id, code - loader_id,
+                                Loader::ResultStatus(code - loader_id));
+        } else if (state->ios_load_result == Core::SystemResultStatus::ErrorVideoCore) {
+            error = "The renderer (Vulkan/MoltenVK) failed to start.";
+        } else if (state->ios_load_result == Core::SystemResultStatus::ErrorGetLoader) {
+            error = "This file is not a supported game format.";
+        }
+    }
+    IosStopGame(state);
+    IosFrontend::SetState(LICHII_EMU_FAILED, std::move(error));
+}
+
+// Launches, stops and JIT waits requested by the app. Returns a result when this frame is done.
+static std::optional<SDL_AppResult> IosAppIterate(SdlState* state) {
+    using Common::IosJit::State;
+    if (IosFrontend::TakeCancelRequest() && state->pending_launch) {
+        state->pending_launch.reset();
+        IosFrontend::SetState(LICHII_EMU_IDLE);
+    }
+    if (!state->pending_launch && !state->system.IsPoweredOn()) {
+        if (auto path = IosFrontend::TakeLaunchRequest()) {
+            Core::LaunchParams lp = state->ios_launch_template;
+            lp.filepath = std::move(*path);
+            state->pending_launch = std::move(lp);
+            state->jit_wait_start = SDL_GetTicks();
+            IosFrontend::SetState(LICHII_EMU_WAITING_FOR_JIT);
+        }
+    }
+    if (state->pending_launch) {
+        const State jit = Common::IosJit::GetState();
+        if (jit == State::Ready) {
+            LOG_INFO(Frontend, "iOS: JIT pool ready, booting {}", state->pending_launch->filepath);
+            IosFrontend::EndJitBackgroundTask();
+            IosFrontend::SetState(LICHII_EMU_BOOTING);
+            Core::LaunchParams lp = std::move(*state->pending_launch);
+            state->pending_launch.reset();
+            state->ios_load_result = Core::SystemResultStatus::Success;
+            if (SDL_AppInitRest(state, std::move(lp)) != SDL_APP_CONTINUE) {
+                IosBootFailed(state);
+            }
+        } else if (jit == State::Failed) {
+            IosFrontend::EndJitBackgroundTask();
+            state->pending_launch.reset();
+            IosFrontend::SetState(LICHII_EMU_FAILED,
+                                  "JIT unavailable: " + Common::IosJit::GetError());
+        }
+        return SDL_APP_CONTINUE;
+    }
+    if (IosFrontend::TakeStopRequest()) {
+        IosStopGame(state);
+    }
+    if (!state->system.IsPoweredOn()) {
+        return SDL_APP_CONTINUE;
+    }
+    return std::nullopt;
+}
+#endif
 #endif
 
 constexpr int kRestartExitCode = 75;
@@ -771,6 +938,12 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
              state->jit_have_stikdebug ? "installed" : "not installed");
     IOS_MARK(IosJitEnabled() ? "JIT enabled at launch, acquiring pool" : "JIT not enabled, waiting");
     Common::IosJit::StartAcquire(kIosJitPoolBytes, txm);
+#ifdef LICHII_IOS_UI
+    // The pool is acquired while the library is open; a game launches from the app.
+    if (lp.filepath.empty()) {
+        return IosStartApp(state, std::move(lp));
+    }
+#endif
     state->pending_launch = std::move(lp);
     state->jit_wait_start = SDL_GetTicks();
     return SDL_APP_CONTINUE;
@@ -784,11 +957,18 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
     // Movies: software decoding (dav1d for AV1). The VideoToolbox AV1 hwaccel failed every
     // frame on iOS 27 and the game died as soon as the New Game movie started.
     Settings::values.nvdec_emulation.SetValue(Settings::NvdecEmulation::Cpu);
+#ifdef LICHII_IOS_UI
+    const bool ios_app = state->ios_config != nullptr;
+#else
+    constexpr bool ios_app = false;
+#endif
     // Speed: a phone is a handheld (the game renders at its handheld resolution, not 4K docked),
     // and shaders build in the background instead of stalling frames (and audio) while they
-    // compile.
-    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
-    Settings::values.use_asynchronous_shaders.SetValue(true);
+    // compile. The app applies these once as defaults instead.
+    if (!ios_app) {
+        Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
+        Settings::values.use_asynchronous_shaders.SetValue(true);
+    }
     // Memory: CPU and GPU share the app's ~6.6 GB budget (about 5.3 GB free at launch). The
     // texture cache was allowed 5 GB before collecting (desktop tuning for Switch 2 titles), so a
     // busy scene got the app killed by iOS without a crash report. Collect much earlier here.
@@ -859,37 +1039,41 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
         return SDL_APP_FAILURE;
     }
 
-    state->network_initialized = Network::Init();
-    if (!state->network_initialized) {
-        LOG_CRITICAL(Network, "Failed to initialize room networking");
+    if (!InitializeSystem(state)) {
         return SDL_APP_FAILURE;
     }
 
-    IOS_MARK("system.Initialize");
-    state->system.Initialize();
-    IOS_MARK("system initialized");
-
+#ifdef LICHII_IOS_UI
+    if (ios_app) {
+        IosFrontend::ApplyGameConfig(IosFrontend::ReadProgramId(lp.filepath));
+    }
+#endif
 
     // Apply the command line arguments
     state->system.ApplySettings();
 
-    switch (Settings::values.renderer_backend.GetValue()) {
+    // A second game in the same app session renders into the window of the first.
+    if (state->emu_window) {
+        SDL_ShowWindow(state->emu_window->GetSdlWindow());
+    } else {
+        switch (Settings::values.renderer_backend.GetValue()) {
 #ifdef HAS_OPENGL
-    case Settings::RendererBackend::OpenGL_GLSL:
-    case Settings::RendererBackend::OpenGL_GLASM:
-    case Settings::RendererBackend::OpenGL_SPIRV:
-        state->emu_window = std::make_unique<EmuWindow_SDL3_GL>(&state->input_subsystem, state->system, lp.fullscreen);
-        break;
+        case Settings::RendererBackend::OpenGL_GLSL:
+        case Settings::RendererBackend::OpenGL_GLASM:
+        case Settings::RendererBackend::OpenGL_SPIRV:
+            state->emu_window = std::make_unique<EmuWindow_SDL3_GL>(&state->input_subsystem, state->system, lp.fullscreen);
+            break;
 #endif
-    case Settings::RendererBackend::Vulkan:
-        state->emu_window = std::make_unique<EmuWindow_SDL3_VK>(&state->input_subsystem, state->system, lp.fullscreen);
-        break;
-    case Settings::RendererBackend::Null:
-        state->emu_window = std::make_unique<EmuWindow_SDL3_Null>(&state->input_subsystem, state->system, lp.fullscreen);
-        break;
-    default:
-        LOG_CRITICAL(Frontend, "Invalid renderer backend");
-        return SDL_APP_FAILURE;
+        case Settings::RendererBackend::Vulkan:
+            state->emu_window = std::make_unique<EmuWindow_SDL3_VK>(&state->input_subsystem, state->system, lp.fullscreen);
+            break;
+        case Settings::RendererBackend::Null:
+            state->emu_window = std::make_unique<EmuWindow_SDL3_Null>(&state->input_subsystem, state->system, lp.fullscreen);
+            break;
+        default:
+            LOG_CRITICAL(Frontend, "Invalid renderer backend");
+            return SDL_APP_FAILURE;
+        }
     }
 
 #ifdef _WIN32
@@ -897,9 +1081,7 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
     state->system.CoreTiming().SetTimerResolutionNs(Common::Windows::GetCurrentTimerResolution());
 #endif
 
-    state->system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
-    state->system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
-    state->system.GetFileSystemController().CreateFactories(*state->system.GetFilesystem());
+    InitializeContent(state);
     state->system.GetUserChannel().clear();
 
     Service::AM::FrontendAppletParameters load_parameters{
@@ -926,6 +1108,9 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
     IOS_MARK("system.Load");
     const Core::SystemResultStatus load_result = state->system.Load(*state->emu_window, lp.filepath, load_parameters);
     IOS_MARK("system.Load returned");
+#ifdef LICHII_IOS_UI
+    state->ios_load_result = load_result;
+#endif
     switch (load_result) {
     case Core::SystemResultStatus::Success:
         if (restarted) {
@@ -986,6 +1171,14 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
     IosInstallTouchControls(state);
 #endif
+#ifdef LICHII_IOS_UI
+    if (ios_app) {
+        // A game that exits by itself returns to the library.
+        state->system.RegisterExitCallback([] { lichii_emu_stop(); });
+        IosFrontend::SetRunningGame(lp.filepath, state->system.GetApplicationProcessProgramID(),
+                                    IosGameWindow(state));
+    }
+#endif
 
     // A game executing a program (e.g. restarting after a settings change) writes its launch state
     // to the restart handoff and quits with kRestartExitCode; the launcher boots the same file again
@@ -1039,6 +1232,11 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
     void(state->system.Run());
     if (state->system.DebuggerEnabled())
         state->system.InitializeDebugger();
+#ifdef LICHII_IOS_UI
+    if (ios_app) {
+        IosFrontend::SetState(LICHII_EMU_RUNNING);
+    }
+#endif
     return SDL_APP_CONTINUE;
 }
 // EDEN_NX2_KEY_SCRIPT="seconds:code,seconds:-code,..." (or "@<file>"): press (code) or release (-code) keyboard
@@ -1098,6 +1296,13 @@ static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem) {
 
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
+#ifdef LICHII_IOS_UI
+    if (state->ios_config) {
+        if (const auto result = IosAppIterate(state)) {
+            return *result;
+        }
+    }
+#endif
 #if defined(__APPLE__) && TARGET_OS_IPHONE
     if (state->pending_launch) {
         using Common::IosJit::State;
@@ -1272,6 +1477,13 @@ extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
         break;
     case SDL_EVENT_DID_ENTER_FOREGROUND:
         if (state->ios_paused_for_background) {
+#ifdef LICHII_IOS_UI
+            // Paused from the in-game menu: stays paused.
+            if (IosFrontend::GetState() == LICHII_EMU_PAUSED) {
+                state->ios_paused_for_background = false;
+                break;
+            }
+#endif
             LOG_INFO(Frontend, "iOS: back in the foreground, resuming");
             state->ios_paused_for_background = false;
             void(state->system.Run());

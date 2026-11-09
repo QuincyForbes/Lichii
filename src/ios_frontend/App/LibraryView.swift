@@ -1,0 +1,320 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import SwiftUI
+
+struct LibraryView: View {
+    @EnvironmentObject private var app: AppController
+    @EnvironmentObject private var library: GameLibrary
+    @AppStorage("libraryGrid") private var grid = true
+    @AppStorage("librarySort") private var sort: LibrarySort = .title
+    @State private var query = ""
+    @State private var showImporter = false
+    @State private var infoGame: Game?
+    @State private var settingsGame: Game?
+    @State private var actionSheet: (GameAction, Game)?
+    @State private var deleteGame: Game?
+
+    var body: some View {
+        let games = library.sorted(sort, matching: query)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                if !library.importing.isEmpty {
+                    ImportProgressBanner(names: library.importing)
+                }
+                if query.isEmpty, !library.recentlyPlayed.isEmpty {
+                    RecentRow(games: library.recentlyPlayed, open: app.launch)
+                }
+                if games.isEmpty {
+                    EmptyLibraryView(scanning: library.isScanning, importAction: { showImporter = true })
+                } else if grid {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 132), spacing: 16)], spacing: 18) {
+                        ForEach(games) { game in
+                            GameCard(game: game)
+                                .onTapGesture { app.launch(game) }
+                                .contextMenu { menu(for: game) }
+                        }
+                    }
+                } else {
+                    LazyVStack(spacing: 0) {
+                        ForEach(games) { game in
+                            GameRow(game: game, lastPlayed: library.playedDate(game))
+                                .contentShape(Rectangle())
+                                .onTapGesture { app.launch(game) }
+                                .contextMenu { menu(for: game) }
+                            Divider().padding(.leading, 76)
+                        }
+                    }
+                }
+            }
+            .padding()
+        }
+        .navigationTitle("Library")
+        .searchable(text: $query, prompt: "Search games")
+        .refreshable { library.reload() }
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Menu {
+                    Picker("Sort", selection: $sort) {
+                        ForEach(LibrarySort.allCases) { Text($0.label).tag($0) }
+                    }
+                    Picker("Layout", selection: $grid) {
+                        Label("Grid", systemImage: "square.grid.2x2").tag(true)
+                        Label("List", systemImage: "list.bullet").tag(false)
+                    }
+                    Button {
+                        library.reload()
+                    } label: {
+                        Label("Rescan", systemImage: "arrow.clockwise")
+                    }
+                } label: {
+                    Image(systemName: "line.3.horizontal.decrease.circle")
+                }
+                Button {
+                    showImporter = true
+                } label: {
+                    Image(systemName: "plus")
+                }
+            }
+        }
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: ImportTypes.games,
+                      allowsMultipleSelection: true) { result in
+            if case .success(let urls) = result {
+                library.importItems(urls)
+            }
+        }
+        .alert("Import failed", isPresented: Binding(get: { library.importError != nil },
+                                                     set: { if !$0 { library.importError = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(library.importError ?? "")
+        }
+        .confirmationDialog("Delete \(deleteGame?.title ?? "")?",
+                            isPresented: Binding(get: { deleteGame != nil },
+                                                 set: { if !$0 { deleteGame = nil } }),
+                            titleVisibility: .visible) {
+            Button("Delete", role: .destructive) {
+                if let game = deleteGame {
+                    library.delete(game)
+                }
+                deleteGame = nil
+            }
+        } message: {
+            Text("The file is removed from this app's Documents folder.")
+        }
+        .sheet(item: $infoGame) { game in
+            NavigationStack {
+                GameInfoView(game: game, lastPlayed: library.playedDate(game))
+            }
+        }
+        .sheet(item: $settingsGame) { game in
+            NavigationStack {
+                SettingsView(scope: .game(game))
+            }
+        }
+        .sheet(isPresented: Binding(get: { actionSheet != nil }, set: { if !$0 { actionSheet = nil } })) {
+            if let entry = actionSheet {
+                NavigationStack {
+                    entry.0.view(entry.1)
+                }
+            }
+        }
+        .onAppear {
+            if library.games.isEmpty { library.reload() }
+        }
+    }
+
+    @ViewBuilder
+    private func menu(for game: Game) -> some View {
+        Button {
+            app.launch(game)
+        } label: {
+            Label("Play", systemImage: "play.fill")
+        }
+        Button {
+            infoGame = game
+        } label: {
+            Label("Game Info", systemImage: "info.circle")
+        }
+        Button {
+            settingsGame = game
+        } label: {
+            Label("Game Settings", systemImage: "slider.horizontal.3")
+        }
+        ForEach(AppExtensions.gameActions) { action in
+            Button {
+                actionSheet = (action, game)
+            } label: {
+                Label(action.title, systemImage: action.systemImage)
+            }
+        }
+        Divider()
+        Button(role: .destructive) {
+            deleteGame = game
+        } label: {
+            Label("Delete", systemImage: "trash")
+        }
+    }
+}
+
+private struct GameCard: View {
+    let game: Game
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            GameIcon(game: game, size: 132)
+                .shadow(color: .black.opacity(0.25), radius: 6, y: 3)
+            Text(game.title)
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(2)
+            Text(game.developer.isEmpty ? game.kind.label : game.developer)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .frame(width: 132, alignment: .leading)
+    }
+}
+
+private struct GameRow: View {
+    let game: Game
+    let lastPlayed: Date?
+
+    var body: some View {
+        HStack(spacing: 14) {
+            GameIcon(game: game, size: 60)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(game.title).font(.headline).lineLimit(1)
+                Text([game.developer, game.version.isEmpty ? "" : "v\(game.version)", game.kind.label]
+                    .filter { !$0.isEmpty }.joined(separator: " · "))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let lastPlayed {
+                    Text("Played \(lastPlayed.formatted(.relative(presentation: .named)))")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            Spacer()
+            Text(game.fileSize.byteCount)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 8)
+    }
+}
+
+private struct RecentRow: View {
+    let games: [Game]
+    let open: (Game) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Recently Played").font(.title3.bold())
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 14) {
+                    ForEach(games) { game in
+                        Button {
+                            open(game)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                GameIcon(game: game, size: 96)
+                                Text(game.title)
+                                    .font(.caption.weight(.medium))
+                                    .lineLimit(1)
+                                    .frame(width: 96, alignment: .leading)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct EmptyLibraryView: View {
+    let scanning: Bool
+    let importAction: () -> Void
+
+    var body: some View {
+        VStack(spacing: 14) {
+            if scanning {
+                ProgressView("Looking for games...")
+            } else {
+                Image(systemName: "gamecontroller")
+                    .font(.system(size: 48))
+                    .foregroundStyle(.secondary)
+                Text("No games yet").font(.title3.bold())
+                Text("Import .nsp, .xci, .nup, .nca or .nro files, or copy them into Lichii's folder with the Files app.")
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
+                Button("Import Games", action: importAction)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 60)
+    }
+}
+
+struct GameInfoView: View {
+    @EnvironmentObject private var app: AppController
+    @Environment(\.dismiss) private var dismiss
+    let game: Game
+    let lastPlayed: Date?
+
+    var body: some View {
+        List {
+            Section {
+                HStack(spacing: 16) {
+                    GameIcon(game: game, size: 96)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(game.title).font(.title3.bold())
+                        if !game.developer.isEmpty {
+                            Text(game.developer).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Button {
+                    dismiss()
+                    app.launch(game)
+                } label: {
+                    Label("Play", systemImage: "play.fill")
+                }
+            }
+            Section("Details") {
+                LabeledContent("Title ID", value: game.programIdHex)
+                LabeledContent("Version", value: game.version.isEmpty ? "-" : game.version)
+                LabeledContent("Format", value: game.kind.label)
+                LabeledContent("Size", value: game.fileSize.byteCount)
+                if let lastPlayed {
+                    LabeledContent("Last played", value: lastPlayed.formatted(date: .abbreviated, time: .shortened))
+                }
+                LabeledContent("File", value: game.containerURL.lastPathComponent)
+            }
+            Section {
+                NavigationLink {
+                    SettingsView(scope: .game(game))
+                } label: {
+                    Label("Game Settings", systemImage: "slider.horizontal.3")
+                }
+                ForEach(AppExtensions.gameActions) { action in
+                    NavigationLink {
+                        action.view(game)
+                    } label: {
+                        Label(action.title, systemImage: action.systemImage)
+                    }
+                }
+            }
+        }
+        .navigationTitle("Game Info")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Done") { dismiss() }
+            }
+        }
+    }
+}

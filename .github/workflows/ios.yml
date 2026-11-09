@@ -2,7 +2,7 @@ name: iOS
 
 on:
   push:
-    branches: [ios]
+    branches: [ios, ios-frontend]
     paths-ignore: ['**.md']
   workflow_dispatch:
   # release-binaries.yml calls this to put the IPA into its release; it names the artifact and the
@@ -77,6 +77,7 @@ jobs:
         run: |
           set -euo pipefail
           cmake -S . -B build -G Ninja \
+            -DCMAKE_Swift_COMPILER_TARGET=arm64-apple-ios17.0 \
             -DLICHII_FFMPEG_DIR="$PWD/ffmpeg-ios" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=iOS \
@@ -115,13 +116,34 @@ jobs:
             -DYUZU_USE_BUNDLED_MOLTENVK=ON \
             -DLICHII_BUILD_TAG=${{ inputs.build_tag || format('ios-{0}', github.run_number) }} \
             -DLICHII_BUILD_PLATFORM=ios-arm64 \
-            -DLICHII_UPDATE_REPO=${{ github.repository }}
+            -DLICHII_UPDATE_REPO=${{ github.repository }} 2>&1 | tee configure.log
 
       - name: Build
         run: |
           set -euo pipefail
-          cmake --build build --target yuzu-cmd --parallel -- -k 0
+          cmake --build build --target yuzu-cmd --parallel -- -k 0 2>&1 | tee build.log
           ccache -s
+
+      - name: Summarize build errors
+        if: failure()
+        run: |
+          {
+            echo '## Build errors'
+            echo '```'
+            grep -E 'error:|error [A-Z]+[0-9]+|FAILED:|undefined symbol|Undefined symbols|ld: ' build.log | head -300 || true
+            echo '```'
+            echo '## Last 200 lines'
+            echo '```'
+            tail -200 build.log || true
+            echo '```'
+            if [ ! -f build.log ] && [ -f configure.log ]; then
+              echo '## Configure output (tail)'
+              echo '```'
+              grep -E 'CMake Error|error:' -A 6 configure.log | head -120 || true
+              tail -80 configure.log
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Package IPA
         run: |
@@ -162,7 +184,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Publish rolling release
-        if: github.event_name == 'push' && !inputs.artifact_name
+        if: github.event_name == 'push' && !inputs.artifact_name && github.ref == 'refs/heads/ios'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

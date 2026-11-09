@@ -58,6 +58,10 @@ std::size_t PreparedBytes();
 /// view of the same pages. Returns false when the pool is missing or exhausted.
 bool Alloc(std::size_t bytes, void** wmem, void** xmem);
 
+/// Hands the whole pool out again. Only after every code block is gone (the emulated process was
+/// shut down), so a second game in the same app session reuses the prepared pages.
+void Reset();
+
 } // namespace Common::IosJit
 
 extern "C" {

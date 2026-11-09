@@ -55,6 +55,10 @@ public:
     // Sets the window icon from yuzu.bmp
     void SetWindowIcon();
 
+    SDL_Window* GetSdlWindow() const {
+        return render_window;
+    }
+
 protected:
     /// Called by WaitEvent when a key is pressed or released.
     void OnKeyEvent(int key, u8 state);
