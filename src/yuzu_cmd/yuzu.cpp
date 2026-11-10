@@ -1386,8 +1386,8 @@ static SDL_AppResult LoadGame(SdlState* state, Core::LaunchParams& lp,
 }
 
 // Main thread: callbacks, then the guest starts (`run`), or waits paused for the app.
-static void StartGame(SdlState* state, const Core::LaunchParams& lp, [[maybe_unused]] bool ios_app,
-                      bool run) {
+static void StartGame(SdlState* state, [[maybe_unused]] const Core::LaunchParams& lp,
+                      [[maybe_unused]] bool ios_app, bool run) {
     // don't do anything, SDL3 already exists for us :D
     state->system.RegisterExitCallback([] {});
 #if defined(__APPLE__) && TARGET_OS_IPHONE
