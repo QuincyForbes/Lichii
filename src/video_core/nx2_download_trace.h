@@ -15,8 +15,9 @@
 
 // EDEN_NX2_DOWNLOAD_TRACE: what the buffer cache copies back to guest memory at fences. Every
 // 10 s it logs the GPU writes that queued the most bytes for download (by written range), the
-// 64 KiB regions copied back the most, and the first 2000 guest CPU reads of GPU-written ranges
-// (a Preflushable mark sends later GPU writes over the range to a download at every fence).
+// 64 KiB regions copied back the most, how many CPU reads of preflushed ranges came before their
+// download had landed, and the first 2000 guest CPU reads of GPU-written ranges (a Preflushable
+// mark sends later GPU writes over the range to a download at every fence).
 namespace VideoCommon::Nx2DownloadTrace {
 
 inline const bool g_enabled = std::getenv("EDEN_NX2_DOWNLOAD_TRACE") != nullptr;
@@ -31,6 +32,8 @@ struct State {
     std::unordered_map<u64, Totals> regions; ///< 64 KiB region copied back
     std::chrono::steady_clock::time_point last{std::chrono::steady_clock::now()};
     u64 marks{};
+    u64 early_reads{};  ///< Reads of preflushed ranges before their download landed
+    u64 landed_reads{}; ///< And after it
 };
 
 inline State& Get() {
@@ -69,8 +72,14 @@ inline void MaybeReport() {
     state.last = now;
     LogTop("queued by GPU write", state.writes, true);
     LogTop("copied back by region", state.regions, false);
+    LOG_INFO(HW_GPU,
+             "Download trace, CPU reads of preflushed ranges in 10 s: {} before their download "
+             "landed (flushed on demand), {} after",
+             state.early_reads, state.landed_reads);
     state.writes.clear();
     state.regions.clear();
+    state.early_reads = 0;
+    state.landed_reads = 0;
 }
 
 /// A GPU write over [address, address + size) queued `queued` bytes for the next fence.
@@ -86,6 +95,11 @@ inline void Copied(u64 address, u64 size) {
     totals.bytes += size;
     ++totals.count;
     MaybeReport();
+}
+
+/// A guest CPU read of a Preflushable range: `early` while a GPU write's download is in flight.
+inline void PreflushedRead(bool early) {
+    ++(early ? Get().early_reads : Get().landed_reads);
 }
 
 /// A guest CPU read of GPU-written [address, address + size): marked Preflushable, or flushed.
