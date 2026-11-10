@@ -79,6 +79,7 @@ struct SettingSection: Identifiable {
     let id: String
     let title: String
     let items: [SettingItem]
+    var footer: String? = nil
 }
 
 /// Whether a setting does anything in this build on this device.
@@ -140,7 +141,7 @@ enum SettingsGroup: String, CaseIterable, Identifiable {
 
     var categories: [String] {
         switch self {
-        case .graphics: return ["Renderer", "RendererAdvanced"]
+        case .graphics: return ["Renderer", "RendererAdvanced", SettingsCatalog.enhancementsCategory]
         case .audio: return ["Audio", "SystemAudio"]
         case .system: return ["Core", "Cpu", "System", "Controls", "LibraryApplet", "DataStorage", "Overlay"]
         case .advanced: return Array(SettingsCatalog.advancedCategories).sorted()
@@ -152,6 +153,7 @@ enum SettingsGroup: String, CaseIterable, Identifiable {
         switch (self, category) {
         case (.graphics, "Renderer"): return "Image"
         case (.graphics, "RendererAdvanced"): return "Performance"
+        case (.graphics, SettingsCatalog.enhancementsCategory): return "Game Enhancements"
         default: return SettingsCatalog.categoryTitles[category] ?? category
         }
     }
@@ -284,7 +286,21 @@ enum SettingsCatalog {
     /// but an everyday switch on a phone.
     static let categoryOverrides: [String: String] = [
         "use_asynchronous_shaders": "RendererAdvanced",
+        "patch_frame_rate": enhancementsCategory,
+        "patch_resolution": enhancementsCategory,
+        "patch_performance": enhancementsCategory,
+        "patch_image": enhancementsCategory,
     ]
+
+    /// Built-in game patches by kind (Settings > Graphics > Game Enhancements).
+    static let enhancementsCategory = "GameEnhancements"
+
+    /// Explains the Game Enhancements rows, listing the games that ship such patches.
+    static func enhancementsFooter() -> String {
+        let games = ContentBridge.builtinPatchGames()
+        let list = games.isEmpty ? "none yet" : games.joined(separator: ", ")
+        return "Built-in patches by kind. Each applies to every game that ships such a patch, currently: \(list). Auto keeps each patch's default for this device. A game's own choice in its Updates, DLC & Mods sheet overrides these. Changes apply the next time a game starts."
+    }
 
     static func displayCategory(of item: SettingItem) -> String {
         categoryOverrides[item.key] ?? item.category
@@ -315,7 +331,8 @@ enum SettingsCatalog {
             let sorted = items.enumerated().sorted { a, b in
                 (rank[a.element.key] ?? Int.max, a.offset) < (rank[b.element.key] ?? Int.max, b.offset)
             }.map(\.element)
-            return SettingSection(id: category, title: group.sectionTitle(category), items: sorted)
+            return SettingSection(id: category, title: group.sectionTitle(category), items: sorted,
+                                  footer: category == enhancementsCategory ? enhancementsFooter() : nil)
         }
     }
 
@@ -395,6 +412,10 @@ enum SettingLabels {
         "use_vulkan_driver_pipeline_cache": "Driver Pipeline Cache",
         "nvidia_dlss": "NVIDIA DLSS",
         "metalfx_temporal": "MetalFX Upscaling (replaces the game's)",
+        "patch_frame_rate": "Unlock Frame Rate",
+        "patch_resolution": "Max Resolution",
+        "patch_performance": "Performance Patches",
+        "patch_image": "Disable Game Anti-Aliasing",
         "device_name": "Console Name",
         "log_filter": "Log Filter",
     ]
