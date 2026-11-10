@@ -42,6 +42,7 @@
 #include "input_common/drivers/virtual_gamepad.h"
 #include "input_common/main.h"
 #include "ios_frontend/bridge_host.h"
+#include "ios_frontend/lichii_bridge_platform.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 #include "yuzu_cmd/ios_support.h"
@@ -120,9 +121,14 @@ std::filesystem::path GameConfigPath(u64 program_id) {
 }
 
 // Only CPU video decoding works on iOS (the frontend forces the global value); a game's own
-// config must not turn GPU decoding back on.
+// config must not turn GPU decoding back on. Nor may frame generation come from a desktop
+// per-game config (Ocarina's carry frame_gen=true) on a GPU without the headroom for it.
 void KeepIosOverrides() {
     Settings::values.nvdec_emulation.SetGlobal(true);
+    LichiiDeviceDefaults defaults{};
+    if (lichii_platform_device_defaults(&defaults) != 0 && defaults.frame_gen_capable == 0) {
+        Settings::values.frame_gen.SetGlobal(true);
+    }
 }
 
 // On the JIT acquiring thread. The background task that kept the app alive while StikDebug worked

@@ -23,6 +23,7 @@
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
+#include "common/platform_events.h"
 #include "common/settings.h"
 #include "shader_recompiler/byte_addressed_image.h"
 #include "shader_recompiler/exception.h"
@@ -3025,10 +3026,15 @@ void TextureCacheRuntime::TickFrame() {
         // switch is off or device memory ran short (an image did not fit or could not be made).
         const u32 pressure = memory_allocator.MemoryPressureEvents();
         const u32 failed = memory_allocator.FailedImages();
-        const bool short_of_memory =
-            pressure != image_pool_seen_pressure || failed != image_pool_seen_failed;
+        // Host memory pressure is only signalled on iOS (shared memory: the OS low-memory warning
+        // or the process nearing its limit).
+        const u32 host_pressure = Common::PlatformEvents::MemoryPressureGeneration();
+        const bool short_of_memory = pressure != image_pool_seen_pressure ||
+                                     failed != image_pool_seen_failed ||
+                                     host_pressure != image_pool_seen_host_pressure;
         image_pool_seen_pressure = pressure;
         image_pool_seen_failed = failed;
+        image_pool_seen_host_pressure = host_pressure;
         const int pool_switch = VideoCore::Nx2Debug::Experiment(42);
         if (pool_switch == 0 || short_of_memory) {
             TrimImagePool(0);
