@@ -1317,8 +1317,9 @@ endif()
 if (ENABLE_LTO AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
     # Fibers can migrate between host threads; keep kernel TLS lookups outside LTO callers.
     set_source_files_properties(hle/kernel/kernel.cpp PROPERTIES COMPILE_OPTIONS -fno-lto)
-elseif (MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_FLAGS_RELEASE MATCHES "-flto")
-    # The same for clang-cl builds that pass -flto=thin in their flags (the PGO release build), for
+elseif (MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
+        "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELEASE}" MATCHES "-flto")
+    # The same for clang-cl builds that pass -flto=thin in their flags (the release builds), for
     # the whole kernel: with a newer Ocarina profile, ThinLTO dropped k_thread.cpp's and
     # k_scheduler.cpp's definitions (KThread::Run, ~KThread, GetCurrentThread, ... undefined at the
     # link, though the archive index lists them). The kernel isn't hot for Ocarina.
