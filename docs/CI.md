@@ -80,12 +80,24 @@ Both the scheme-preparation job and the publishing job check out CI helper scrip
 | ------------------- | ---------------------------- | ---------------------- |
 | Linux x86_64        | AppImage and `.tar.gz`       | AppImage and `.tar.gz` |
 | Linux aarch64       | AppImage and `.tar.gz`       | AppImage and `.tar.gz` |
-| Windows x86_64      | MSVC `.zip`                  | MinGW/clang `.zip`     |
+| Windows x86_64      | clang-cl + ThinLTO + PGO `.zip` | MinGW/clang `.zip`  |
 | macOS Apple Silicon | App bundle `.zip` and `.dmg` | Not built              |
 
-The existing build steps use the repository's current CMake targets (`yuzu` and `yuzu-cmd`) and package the produced `eglantine` and `eden-cli` binaries. Linux AppImages require glibc 2.39 or newer. Linux tarballs use system Qt and other shared libraries. Windows archives contain the deployed runtime dependencies. macOS artifacts are ad-hoc signed, not notarized; Gatekeeper may require the user to approve the app on first launch.
+The existing build steps use the repository's current CMake targets (`yuzu` and `yuzu-cmd`) and package the produced `eglantine` and `eden-cli` binaries. Linux AppImages require glibc 2.39 or newer. Linux tarballs use system Qt and other shared libraries. The standard Windows build uses clang-cl from a pinned LLVM release (`tools/windows/install-llvm.ps1`) in Release mode with ThinLTO, x86-64-v3 (AVX2) and `-fprofile-use=lichii-windows.profdata`, against the MSVC headers, runtime and SDK; `tools/windows/build-clang.ps1` builds the same locally. MSVC still builds the project for development. Windows archives contain the deployed runtime dependencies. macOS artifacts are ad-hoc signed, not notarized; Gatekeeper may require the user to approve the app on first launch.
 
 Build artifacts are retained for seven days. Published GitHub Release assets remain available until a release is deleted. Daily releases are pruned to approximately the seven most recent; branch releases are rolling and are cleaned up when no longer needed.
+
+## Windows PGO profile
+
+`lichii-windows.profdata` is an LLVM indexed IR profile from clang-cl, so its function names use the MSVC ABI; Linux's `eglantine.profdata` uses Itanium names and clang-cl cannot use it. It comes from Ocarina of Time in Kokiri Forest (save load, standing, camera pans). Code that run never reached gets no profile data, so other games gain less.
+
+A profile older than the source only produces warnings: functions whose code changed since training lose their profile data and are compiled as without a profile. Retrain when those warnings cover code that matters (the build log lists them as `hash mismatch`), or when the LLVM version changes; clang-cl reads only the indexed format its own LLVM writes.
+
+To retrain:
+
+1. Build an instrumented binary without LTO: `tools/windows/build-clang.ps1 -NoLto -ExtraFlags '-fprofile-generate=<dir>'` (a path without spaces; lld-link needs `<llvm>\lib\clang\<major>\lib\windows` in `LIB` for the profile runtime).
+2. Run `lichii.exe` with `LLVM_PROFILE_FILE=<dir>/lichii-%p.profraw`, play the scenes the profile should cover, and exit normally: counters are written only at exit, so a killed process leaves no profile.
+3. Merge with that LLVM: `llvm-profdata merge -o lichii-windows.profdata <dir>/*.profraw`, and replace the file in the repository root.
 
 ## Release naming
 
