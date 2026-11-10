@@ -2154,8 +2154,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
         precache_capture_bytes += capture_bytes;
         precache_graphics.push_back(
-            {hash, [this, key = key, records_ = std::move(records)]() mutable {
-                 return CreateCachedGraphicsPipeline(key, records_, nullptr) != nullptr;
+            {hash, [this, key_ = key, records_ = std::move(records)]() mutable {
+                 return CreateCachedGraphicsPipeline(key_, records_, nullptr) != nullptr;
              }});
     }
     if (background_count != 0 && !stop_loading.stop_requested()) {
