@@ -72,7 +72,7 @@ struct AddonsView: View {
                 Button {
                     importer = tab
                 } label: {
-                    Image(systemName: "plus")
+                    Label(tab == .mods ? "Add Mods" : "Install Packages", systemImage: "plus")
                 }
                 .disabled(busy)
             }
@@ -247,35 +247,37 @@ struct AddonsView: View {
             }
             return flag.isCancelled
         }
+        KeepAwake.set(true, for: "addons")
         ContentBridge.run({
-            urls.map { url in
-                (url.lastPathComponent,
-                 withSecurityScope(url) { ContentBridge.installPackage(url, for: current, progress: box) })
+            // A coordinated read, so packages in iCloud Drive or another file provider are
+            // downloaded first.
+            urls.map { url -> String in
+                let (result, error) = coordinatedRead(url) { readable in
+                    ContentBridge.installPackage(readable, for: current, progress: box)
+                }
+                return "\(url.lastPathComponent): \(result.map(ContentBridge.describe) ?? error ?? "")"
             }
-        }) { results in
+        }) { lines in
             busy = false
             progress = nil
+            KeepAwake.set(false, for: "addons")
             reload()
-            let lines = results.map { "\($0.0): \(ContentBridge.describe($0.1))" }
             alert = ContentAlert(title: "Install", message: lines.joined(separator: "\n"))
         }
     }
 
     private func installMods(_ urls: [URL]) {
         busy = true
+        KeepAwake.set(true, for: "addons")
         let current = game
         ContentBridge.run({
-            urls.map { url -> (String, LichiiModResult, Int32) in
+            urls.map { url -> String in
+                let name = url.lastPathComponent
                 var count: Int32 = 0
-                let result = withSecurityScope(url) {
-                    url.path.withCString { lichii_content_install_mod(current.programId, $0, nil, &count) }
+                let (read, error) = coordinatedRead(url) { readable in
+                    readable.path.withCString { lichii_content_install_mod(current.programId, $0, nil, &count) }
                 }
-                return (url.lastPathComponent, result, count)
-            }
-        }) { results in
-            busy = false
-            reload()
-            let lines = results.map { name, result, count -> String in
+                guard let result = read else { return "\(name): \(error ?? "not found")" }
                 switch result {
                 case LICHII_MOD_OK: return "\(name): \(count) mod\(count == 1 ? "" : "s") installed"
                 case LICHII_MOD_NO_MOD: return "\(name): no exefs, romfs or cheats folder inside"
@@ -284,6 +286,10 @@ struct AddonsView: View {
                 default: return "\(name): copying failed"
                 }
             }
+        }) { lines in
+            busy = false
+            KeepAwake.set(false, for: "addons")
+            reload()
             alert = ContentAlert(title: "Mods", message: lines.joined(separator: "\n"))
         }
     }
