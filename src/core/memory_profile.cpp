@@ -134,14 +134,25 @@ std::string ProfileGuest(System& system) {
     const bool known = resident.size() == num_pages;
     Tally other{};
     std::vector<std::pair<size_t, size_t>> brought_in;
+    // Per 2 MiB of backing: the application's zero pages, and whether anything there holds data.
+    // A backing made of separate host objects could only give back the ones without data.
+    constexpr size_t ChunkPages = (size_t{2} << 20) / PageSize;
+    struct Chunk {
+        u32 zero;
+        u32 resident_zero;
+        bool data;
+    };
+    std::vector<Chunk> chunks((num_pages + ChunkPages - 1) / ChunkPages);
     for (size_t index = 0; index < num_pages; ++index) {
         const bool is_resident = known && resident[index];
+        Chunk& chunk = chunks[index / ChunkPages];
         if (owner[index] == Unmapped) {
             // Kernel, services and pages the game gave back: only what is resident.
             if (is_resident) {
                 ++other.pages;
-                (IsZeroPage(backing + index * PageSize) ? other.resident_zero
-                                                        : other.resident_data) += PageSize;
+                const bool zero = IsZeroPage(backing + index * PageSize);
+                (zero ? other.resident_zero : other.resident_data) += PageSize;
+                chunk.data = chunk.data || !zero;
             }
             continue;
         }
@@ -150,6 +161,10 @@ std::string ProfileGuest(System& system) {
         const bool zero = IsZeroPage(backing + index * PageSize);
         if (!zero) {
             CountData(tally, backing + index * PageSize);
+            chunk.data = true;
+        } else {
+            ++chunk.zero;
+            chunk.resident_zero += is_resident ? 1 : 0;
         }
         if (is_resident) {
             (zero ? tally.resident_zero : tally.resident_data) += PageSize;
@@ -191,6 +206,29 @@ std::string ProfileGuest(System& system) {
             MiB(tally.resident_data + tally.paged_data), MiB(tally.resident_data),
             MiB(tally.paged_data), MiB(tally.sparse), MiB(tally.fill), MiB(tally.resident_zero));
     }
+    std::string chunk_text;
+    for (const size_t size : {size_t{1}, size_t{8}, size_t{32}}) {
+        u64 zero = 0;
+        u64 resident_zero = 0;
+        for (size_t first = 0; first < chunks.size(); first += size) {
+            const size_t end = (std::min)(first + size, chunks.size());
+            bool data = false;
+            u64 chunk_zero = 0;
+            u64 chunk_resident_zero = 0;
+            for (size_t i = first; i < end; ++i) {
+                data = data || chunks[i].data;
+                chunk_zero += chunks[i].zero;
+                chunk_resident_zero += chunks[i].resident_zero;
+            }
+            if (!data) {
+                zero += chunk_zero;
+                resident_zero += chunk_resident_zero;
+            }
+        }
+        chunk_text += fmt::format("{}{} MiB chunks {} MiB (resident {})", chunk_text.empty() ? "" : ", ",
+                                  size * 2, MiB(zero * PageSize), MiB(resident_zero * PageSize));
+    }
+    text += fmt::format("\n  application zero pages in backing chunks without data: {}", chunk_text);
     auto& manager = system.Kernel().MemoryManager();
     using Pool = Kernel::KMemoryManager::Pool;
     const auto used = [&manager](Pool pool) {
