@@ -34,7 +34,8 @@ struct SettingItem: Identifiable, Hashable {
     init(_ info: LichiiSettingInfo) {
         let key = Bridge.constant(info.key)
         self.key = key
-        category = Bridge.constant(info.category)
+        let names = SettingsCatalog.categoryNames
+        category = Int(info.category_id) < names.count ? names[Int(info.category_id)] : Bridge.constant(info.category)
         kind = SettingKind(rawValue: info.kind) ?? .string
         switchable = info.switchable
         runtimeModifiable = info.runtime_modifiable
@@ -120,6 +121,16 @@ enum SettingsCatalog {
         return lichii_settings_info(index, &info) ? SettingItem(info) : nil
     }
 
+    /// Settings::Category in declaration order (common/settings_common.h). The ini group name
+    /// (info.category) folds the debug, hack and unsafe groups into their parents.
+    static let categoryNames = [
+        "Android", "Audio", "Core", "Cpu", "CpuDebug", "CpuUnsafe", "Overlay", "Renderer",
+        "RendererAdvanced", "RendererHacks", "RendererExtensions", "RendererDebug", "System",
+        "SystemAudio", "DataStorage", "Debugging", "DebuggingGraphics", "GpuDriver", "Miscellaneous",
+        "Network", "WebService", "AddOns", "Controls", "Ui", "UiAudio", "UiGeneral", "UiLayout",
+        "UiGameList", "Screenshots", "Shortcuts", "Multiplayer", "Services", "Paths", "LibraryApplet",
+    ]
+
     /// Shown first, in this order.
     static let essentials = [
         "resolution_setup", "scaling_filter", "fsr_sharpening_slider", "anti_aliasing",
@@ -130,8 +141,8 @@ enum SettingsCatalog {
 
     /// INI groups that only matter to desktop frontends or have no effect on iOS.
     static let hiddenCategories: Set<String> = [
-        "Android", "UI", "UiGeneral", "UiLayout", "UiGameList", "UiAudio", "Shortcuts", "Multiplayer",
-        "WebService", "Paths", "Screenshots", "Network", "Services", "GpuDriver",
+        "Android", "Ui", "UiGeneral", "UiLayout", "UiGameList", "UiAudio", "Shortcuts", "Multiplayer",
+        "WebService", "Paths", "Screenshots", "Network", "Services", "GpuDriver", "AddOns",
     ]
 
     /// Desktop input, debugger and bookkeeping keys with no use in the iOS app.
