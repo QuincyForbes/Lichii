@@ -324,6 +324,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 
 constexpr int default_mouse_hide_timeout = 2500;
 constexpr int default_input_update_timeout = 1;
+constexpr int idle_input_update_timeout = 16;
 constexpr int EmuThreadStopTimeoutMs = 10'000;
 // A teardown that keeps making progress (Common::ShutdownProgress) is waited for this long at
 // most before its thread is terminated.
@@ -494,8 +495,13 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     connect(&mouse_hide_timer, &QTimer::timeout, this, &MainWindow::HideMouseCursor);
     connect(ui->menubar, &QMenuBar::hovered, this, &MainWindow::ShowMouseCursor);
 
-    update_input_timer.setInterval(default_input_update_timeout);
+    // 1 ms only while a game runs: on the game list it woke the UI thread 1000 times a second.
+    update_input_timer.setInterval(idle_input_update_timeout);
     connect(&update_input_timer, &QTimer::timeout, this, &MainWindow::UpdateInputDrivers);
+    connect(this, &MainWindow::EmulationStarting, this,
+            [this] { update_input_timer.setInterval(default_input_update_timeout); });
+    connect(this, &MainWindow::EmulationStopping, this,
+            [this] { update_input_timer.setInterval(idle_input_update_timeout); });
     update_input_timer.start();
 
     if (has_broken_vulkan) {
