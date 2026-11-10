@@ -173,7 +173,9 @@ namespace Vulkan {
         }
 
         /// CreateImage's fallbacks; the image is left null when the result is an error.
-        VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, vk::Image &image) const;
+        /// may_fail: the caller handles VK_ERROR_OUT_OF_DEVICE_MEMORY (see UsesUnbackedFallback).
+        VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
+                               vk::Image &image) const;
 
         /// 8-64 MiB images in a 128 MiB-block VMA pool (instead of VMA dedicated allocations).
         bool CreateImageInMediumPool(const VkImageCreateInfo& ci,
