@@ -78,6 +78,8 @@ void PerfStats::EndSystemFrame() {
     }
     accumulated_frametime += frame_time;
     system_frames += 1;
+    total_frametime += frame_time;
+    total_system_frames += 1;
 
     previous_frame_length = frame_end - previous_frame_end;
     previous_frame_end = frame_end;
@@ -85,9 +87,23 @@ void PerfStats::EndSystemFrame() {
 
 void PerfStats::EndGameFrame(u32 generated_count) {
     game_frames.fetch_add(1, std::memory_order_relaxed);
+    total_game_frames.fetch_add(1, std::memory_order_relaxed);
     if (generated_count > 0) {
         generated_frames.fetch_add(generated_count, std::memory_order_relaxed);
+        total_generated_frames.fetch_add(generated_count, std::memory_order_relaxed);
     }
+}
+
+PerfCounters PerfStats::GetCounters(microseconds current_system_time_us) const {
+    std::scoped_lock lock{object_mutex};
+    return PerfCounters{
+        .time = Clock::now(),
+        .system_time_us = current_system_time_us,
+        .game_frames = total_game_frames.load(std::memory_order_relaxed),
+        .generated_frames = total_generated_frames.load(std::memory_order_relaxed),
+        .system_frames = total_system_frames,
+        .system_frametime = total_frametime,
+    };
 }
 
 double PerfStats::GetMeanFrametime() const {

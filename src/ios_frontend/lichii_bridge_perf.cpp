@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <chrono>
 #include <cmath>
+#include <mutex>
+#include <optional>
 
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/perf_stats.h"
 #include "ios_frontend/bridge_host.h"
 #include "ios_frontend/lichii_bridge_perf.h"
@@ -16,6 +20,55 @@ namespace {
 
 double Finite(double value) {
     return std::isfinite(value) ? value : 0.0;
+}
+
+struct Rates {
+    double real_fps;
+    double generated_fps;
+    double frametime_ms;
+    double speed;
+};
+
+// Rates from the difference to the previous reading of the never-reset counters. The SDL window's
+// title timer resets the shared counters (GetAndResetPerfStats) every 2 s, which made every other
+// reader's interval arbitrary.
+Rates ReadRates(Core::System& system, bool paused) {
+    using namespace std::chrono;
+    constexpr auto MinInterval = milliseconds{250};
+    static std::mutex mutex;
+    static const Core::PerfStats* stats{};
+    static std::optional<Core::PerfCounters> last;
+    static Rates rates{};
+
+    auto& perf = system.GetPerfStats();
+    const auto now = perf.GetCounters(system.CoreTiming().GetGlobalTimeUs());
+    std::scoped_lock lock{mutex};
+    // A new game has new counters; time spent paused is not part of the rate.
+    if (paused || stats != &perf || !last || now.game_frames < last->game_frames ||
+        now.system_frames < last->system_frames) {
+        stats = &perf;
+        last = now;
+        if (!paused) {
+            rates = {};
+        }
+        return rates;
+    }
+    if (now.time - last->time < MinInterval) {
+        return rates;
+    }
+    const double seconds = duration<double>(now.time - last->time).count();
+    const u64 system_frames = now.system_frames - last->system_frames;
+    rates.real_fps = static_cast<double>(now.game_frames - last->game_frames) / seconds;
+    rates.generated_fps =
+        static_cast<double>(now.generated_frames - last->generated_frames) / seconds;
+    rates.frametime_ms =
+        system_frames > 0
+            ? duration<double, std::milli>(now.system_frametime - last->system_frametime).count() /
+                  static_cast<double>(system_frames)
+            : (rates.real_fps > 0.0 ? 1000.0 / rates.real_fps : 0.0);
+    rates.speed = duration<double>(now.system_time_us - last->system_time_us).count() / seconds;
+    last = now;
+    return rates;
 }
 
 } // namespace
@@ -30,16 +83,15 @@ bool lichii_perf_snapshot(LichiiPerfSnapshot* out) {
         return false;
     }
 
-    const auto results = system.GetAndResetPerfStats();
     *out = {};
-    out->real_fps = Finite(results.average_game_fps);
-    out->generated_fps = Finite(results.generated_fps);
-    const double total = Finite(results.total_fps);
-    out->displayed_fps = total > 0.0 ? total : out->real_fps + out->generated_fps;
-    out->frametime_ms = Finite(results.frametime) * 1000.0;
-    out->speed = Finite(results.emulation_speed);
-
     out->paused = state == LICHII_EMU_PAUSED;
+    const Rates rates = ReadRates(system, out->paused);
+    out->real_fps = Finite(rates.real_fps);
+    out->generated_fps = Finite(rates.generated_fps);
+    out->displayed_fps = out->real_fps + out->generated_fps;
+    out->frametime_ms = Finite(rates.frametime_ms);
+    out->speed = Finite(rates.speed);
+
     out->frame_gen_enabled = Settings::values.frame_gen.GetValue();
     out->game_dlss_network = Settings::values.game_dlss_network.GetValue();
     out->nvidia_dlss = Settings::values.nvidia_dlss.GetValue();

@@ -27,7 +27,11 @@ final class TouchController: ObservableObject, Controller {
             Task { @MainActor in ControlsCenter.shared.openMenu() }
             return
         }
-        guard let id = Self.buttons[button.id] else { return }
+        guard let id = Self.buttons[button.id] else {
+            ControllerDiagnostics.once("unmapped-\(button.id)", "on-screen button \(button.id) has no Switch button")
+            return
+        }
+        ControllerDiagnostics.once("bridge-press", "first bridge call, \(button.id) -> button \(id) player \(player + 1)")
         lichii_controls_touch_button(player, id, true)
     }
 
@@ -38,6 +42,9 @@ final class TouchController: ObservableObject, Controller {
 
     /// Melo-Controller reports y down; the bridge takes y up.
     func joystickMoved(position: CGPoint, right: Bool) {
+        if position != .zero {
+            ControllerDiagnostics.once("bridge-stick", "first bridge stick call, \(right ? "right" : "left") stick")
+        }
         lichii_controls_touch_stick(player, right ? 1 : 0, Float(position.x), Float(-position.y))
     }
 }

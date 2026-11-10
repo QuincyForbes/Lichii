@@ -27,6 +27,18 @@ struct PerfStatsResults {
     double emulation_speed;
 };
 
+/// Totals since the game started. Unlike GetAndResetStats, reading them changes nothing, so any
+/// number of readers can take rates from the difference of two readings.
+struct PerfCounters {
+    std::chrono::steady_clock::time_point time;
+    std::chrono::microseconds system_time_us;
+    u64 game_frames;
+    u64 generated_frames;
+    u64 system_frames;
+    /// Walltime of those system frames, excluding any waits
+    std::chrono::steady_clock::duration system_frametime;
+};
+
 /**
  * Class to manage and query performance/timing statistics. All public functions of this class are
  * thread-safe unless stated otherwise.
@@ -43,6 +55,8 @@ public:
     void EndGameFrame(u32 generated_count = 0);
 
     PerfStatsResults GetAndResetStats(std::chrono::microseconds current_system_time_us);
+
+    PerfCounters GetCounters(std::chrono::microseconds current_system_time_us) const;
 
     /**
      * Returns the arithmetic mean of all frametime values stored in the performance history.
@@ -79,6 +93,12 @@ private:
     std::atomic<u32> game_frames = 0;
     /// Cumulative number of generated frames (FrameGen) since last reset
     std::atomic<u32> generated_frames = 0;
+
+    /// Totals for GetCounters, never reset
+    std::atomic<u64> total_game_frames = 0;
+    std::atomic<u64> total_generated_frames = 0;
+    u64 total_system_frames = 0;
+    Clock::duration total_frametime = Clock::duration::zero();
 
     /// Point when the previous system frame ended
     Clock::time_point previous_frame_end = reset_point;

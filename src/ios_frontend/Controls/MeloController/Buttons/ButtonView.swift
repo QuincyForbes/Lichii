@@ -167,6 +167,9 @@ public struct ButtonView: View {
     }
 
     private func handleButtonPress() {
+        // Lichii
+        ControllerDiagnostics.once("button-press",
+                                   "first button press, \(button.id), toggle \(istoggle || toggleState), held \(isPressed)")
         if istoggle || toggleState {
             toggleState.toggle()
             isPressed = toggleState

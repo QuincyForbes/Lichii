@@ -108,7 +108,10 @@ final class ControllerTouchRouter {
     }
 }
 
-final class ControllerTouchView: UIView {
+// Lichii: ControllerTouchTarget and the first-touch log.
+final class ControllerTouchView: UIView, ControllerTouchTarget {
+    var touchPriority: Int { 1 }
+
     var onPress: (() -> Void)?
     var onRelease: (() -> Void)?
 
@@ -179,6 +182,8 @@ final class ControllerTouchView: UIView {
     // MARK: Touches
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        ControllerDiagnostics.once("button-touch",
+                                   "first button touch, view \(frame.size) in window \(window != nil), press handler \(onPress != nil)")
         for touch in touches {
             ControllerTouchRouter.shared.touchBegan(touch, on: self)
         }
