@@ -85,6 +85,8 @@ ProcessMemory QueryProcessMemory() {
         memory.footprint_peak = info.ledger_phys_footprint_peak;
         memory.compressed = info.compressed;
         memory.reusable = info.reusable;
+        memory.internal = info.internal;
+        memory.purgeable_nonvolatile = static_cast<u64>(info.ledger_purgeable_nonvolatile);
     }
 #endif
     return memory;

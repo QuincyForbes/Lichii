@@ -127,9 +127,15 @@ private struct SettingSectionsList: View {
 
     var body: some View {
         ForEach(sections) { section in
-            Section(section.title) {
+            Section {
                 ForEach(section.items) { item in
                     SettingRow(item: item, perGame: perGame)
+                }
+            } header: {
+                Text(section.title)
+            } footer: {
+                if let footer = section.footer {
+                    Text(footer)
                 }
             }
         }

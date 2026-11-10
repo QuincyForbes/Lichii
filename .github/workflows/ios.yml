@@ -3,6 +3,12 @@ name: iOS
 on:
   # Run by hand for an IPA-only build and the ios-latest release.
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner image (macos-15-intel when GitHub's arm64 Macs are out of capacity)
+        type: choice
+        options: [macos-26, macos-15-intel, macos-15]
+        default: macos-26
   # release-binaries.yml calls this to put the IPA into its release; it names the artifact and the
   # build tag, and publishes the release itself.
   workflow_call:
@@ -13,6 +19,9 @@ on:
       build_tag:
         type: string
         required: true
+      runner:
+        type: string
+        default: macos-26
 
 permissions:
   contents: write
@@ -24,7 +33,7 @@ concurrency:
 jobs:
   build:
     name: iOS arm64 (unsigned IPA)
-    runs-on: macos-26
+    runs-on: ${{ inputs.runner || 'macos-26' }}
     timeout-minutes: 180
     env:
       CPM_SOURCE_CACHE: ${{ github.workspace }}/.cache/cpm
@@ -42,6 +51,10 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: 1
         run: |
           brew install ninja ccache nasm glslang meson pkgconf
+          # The iOS 26 SDK (MetalFX frame interpolation) needs Xcode 26; older images default to
+          # Xcode 16, so take the newest Xcode 26 they carry.
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$xcode" ]; then sudo xcode-select -s "$xcode/Contents/Developer"; fi
           xcodebuild -version
           cmake --version
           xcrun --sdk iphoneos --show-sdk-path

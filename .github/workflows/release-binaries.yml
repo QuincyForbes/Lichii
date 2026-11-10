@@ -58,15 +58,24 @@ jobs:
         run: |
           set -euo pipefail
           tag="build-${GITHUB_RUN_NUMBER}"
-          if tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null); then
-            if [ "$tag_sha" != "$GITHUB_SHA" ]; then
-              echo "Release tag $tag points to $tag_sha instead of $GITHUB_SHA"
-              exit 1
+          # The API sometimes answers with an empty body ("unexpected end of JSON input"), so the
+          # tag is looked up again and created again a few times before the run gives up.
+          for attempt in 1 2 3 4 5; do
+            if tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null) && [ -n "$tag_sha" ]; then
+              if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+                echo "Release tag $tag points to $tag_sha instead of $GITHUB_SHA"
+                exit 1
+              fi
+              exit 0
             fi
-          else
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f "ref=refs/tags/$tag" -f "sha=$GITHUB_SHA"
-          fi
+            if gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/$tag" -f "sha=$GITHUB_SHA"; then
+              exit 0
+            fi
+            sleep $((attempt * 10))
+          done
+          echo "Could not create release tag $tag"
+          exit 1
 
   build:
     name: ${{ matrix.platform }} binary
@@ -719,10 +728,15 @@ jobs:
     with:
       artifact_name: lichii-ios-arm64-${{ github.sha }}
       build_tag: build-${{ github.run_number }}
+      # The repository variable IOS_RUNNER moves the IPA build (macos-15-intel while GitHub's
+      # arm64 Macs are out of capacity) without a commit.
+      runner: ${{ vars.IOS_RUNNER || 'macos-26' }}
 
   # Publishes every binary as a GitHub pre-release: on pushes to main,
   # and on manual runs unless "Publish the binaries as a GitHub release" is unticked. A failed
-  # Linux leg does not hold the release back; the Windows, macOS and iOS packages must all exist.
+  # Linux leg does not hold the release back, and neither does the Apple Silicon Mac package (its
+  # job is cancelled when GitHub has no arm64 Mac runner; the notes then say it is missing). The
+  # Windows, Intel Mac and iOS packages must all exist.
   release:
     name: Publish release
     needs: [build, ios]
@@ -765,7 +779,7 @@ jobs:
           done
           ls -la dist
           for required in lichii-windows-x86_64.zip lichii-windows-x86_64-pgo.zip \
-            lichii-macos-arm64.dmg lichii-macos-x86_64.dmg lichii-ios-arm64.ipa; do
+            lichii-macos-x86_64.dmg lichii-ios-arm64.ipa; do
             test -s "dist/$required" || { echo "Missing release file $required"; exit 1; }
           done
 
@@ -782,6 +796,10 @@ jobs:
           fi
           tag="build-${GITHUB_RUN_NUMBER}"
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+          mac_arm64="[dmg](${base}/lichii-macos-arm64.dmg) · [zip](${base}/lichii-macos-arm64.zip)"
+          if [ ! -s dist/lichii-macos-arm64.dmg ]; then
+            mac_arm64="Not in this build (GitHub had no Apple Silicon runner); take it from an earlier build"
+          fi
 
           cat > notes.md <<EOF
           Automatic build of \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}.
@@ -808,7 +826,7 @@ jobs:
 
           | Build Type | Standard | PGO (Recommended) | Notes |
           | --- | --- | --- | --- |
-          | arm64 (Apple Silicon) | [dmg](${base}/lichii-macos-arm64.dmg) · [zip](${base}/lichii-macos-arm64.zip) | | macOS 15 or newer. Not notarized: on first launch macOS blocks it; open System Settings > Privacy & Security and click Open Anyway, or run \`xattr -dr com.apple.quarantine lichii.app\`. \`eden-cli\` is inside the app, in \`Contents/MacOS\` |
+          | arm64 (Apple Silicon) | ${mac_arm64} | | macOS 15 or newer. Not notarized: on first launch macOS blocks it; open System Settings > Privacy & Security and click Open Anyway, or run \`xattr -dr com.apple.quarantine lichii.app\`. \`eden-cli\` is inside the app, in \`Contents/MacOS\` |
           | x86_64 (Intel) | [dmg](${base}/lichii-macos-x86_64.dmg) · [zip](${base}/lichii-macos-x86_64.zip) | | Same notes as Apple Silicon |
 
           ## iOS

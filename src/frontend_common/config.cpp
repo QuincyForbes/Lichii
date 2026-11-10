@@ -142,7 +142,13 @@ void Config::SetUpIni() {
             WriteStringSetting(setting.GetLabel(), value);
             WriteBooleanSetting(setting.GetLabel() + "\\default", false);
         };
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        // FSR 3's optical flow and accumulation cost a phone GPU too much for a present filter.
+        seed(Settings::values.scaling_filter,
+             ToString(u32(Settings::ScalingFilter::MetalFxSpatial)));
+#else
         seed(Settings::values.scaling_filter, ToString(u32(Settings::ScalingFilter::Fsr3)));
+#endif
         seed(Settings::values.gpu_accuracy, ToString(u32(Settings::GpuAccuracy::Low)));
         seed(Settings::values.nvdec_emulation, ToString(u32(Settings::NvdecEmulation::Gpu)));
         seed(Settings::values.async_presentation, ToString(true));

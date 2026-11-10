@@ -32,7 +32,16 @@ class ConfigurePerGameAddons : public QWidget {
     Q_OBJECT
 
 public:
-    enum PatchData { NUMERIC_VERSION = Qt::UserRole, PATCH_LOCATION };
+    // BUILTIN_CHOICE: the FileSys::BuiltinPatchChoice the row will save; BUILTIN_FOLLOW_STATE: whether
+    // the patch is on when it follows the global setting; BUILTIN_CHECK: the check state last
+    // set by this dialog (to tell a user's click from the dialog's own update).
+    enum PatchData {
+        NUMERIC_VERSION = Qt::UserRole,
+        PATCH_LOCATION,
+        BUILTIN_CHOICE,
+        BUILTIN_FOLLOW_STATE,
+        BUILTIN_CHECK,
+    };
 
     explicit ConfigurePerGameAddons(Core::System& system_, QWidget* parent = nullptr);
     ~ConfigurePerGameAddons() override;

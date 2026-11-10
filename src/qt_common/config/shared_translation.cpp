@@ -183,6 +183,33 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "network, which sharpens heavily.\nNo sharpening: the image as the game renders it, "
               "without the network (faster; pairs well with a higher resolution). Has no effect while "
               "NVIDIA DLSS is on.\nTakes effect when the game starts."));
+    INSERT(Settings, patch_frame_rate, tr("Unlock frame rate:"),
+           tr("Game enhancement. Applies to every game that ships a frame rate patch (currently "
+              "Ocarina of Time: FPS Unlock, Dynamic FPS).\nAuto: each patch's default. On: "
+              "game logic follows real time, so the game keeps its speed above 30 or 60 fps. "
+              "Off: the game's own fixed frame rate.\nA game's Add-Ons choice overrides this. "
+              "Takes effect when the game starts."));
+    INSERT(Settings, patch_resolution, tr("Max resolution:"),
+           tr("Game enhancement. Applies to every game that ships a resolution patch (currently "
+              "Ocarina of Time).\nAuto: on, except on iOS. On: the game renders at full scale "
+              "instead of lowering its resolution when the GPU is busy (sharper, more GPU work). "
+              "Off: the game's own dynamic resolution (down to 480p).\nA game's Add-Ons choice "
+              "overrides this. Takes effect when the game starts."));
+    INSERT(Settings, patch_performance, tr("Performance patches:"),
+           tr("Game enhancement. Applies to every game that ships performance patches (currently "
+              "Ocarina of Time: Occlusion Off, Native zstd, Fast lookup strcmp, Resource poll "
+              "backoff, Texture Pool x2).\nAuto: each patch's default. On: all of them; they "
+              "trade a little GPU work (Occlusion Off) or host-side code for less CPU time and "
+              "fewer stalls. Off: the game's own code.\nA game's Add-Ons choice overrides this. "
+              "Takes effect when the game starts."));
+    INSERT(Settings, patch_image, tr("Disable game anti-aliasing:"),
+           tr("Game enhancement. Applies to every game that ships a patch removing its own "
+              "anti-aliasing (currently Ocarina of Time: No NDSR anti-aliasing).\nAuto: on "
+              "Apple devices, which lack the cooperative matrices the network needs, off "
+              "elsewhere. On: the game skips its anti-aliasing and sharpening network (faster, "
+              "softer image). Off: the game's own anti-aliasing.\nNot applied while MetalFX "
+              "Temporal is on. A game's Add-Ons choice overrides this. Takes effect when the "
+              "game starts."));
     INSERT(Settings, post_shader_chain, QString(), QString());
     INSERT(Settings, post_shader_preset, QString(), QString());
     INSERT(Settings, post_shader_enabled, tr("Enable post-processing effects"),
@@ -608,6 +635,12 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(DlssPreset, K, tr("K (recommended)")),
                               PAIR(DlssPreset, L, tr("L")),
                               PAIR(DlssPreset, M, tr("M")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::GamePatchMode>::Index(),
+                          {
+                              PAIR(GamePatchMode, Auto, tr("Auto")),
+                              PAIR(GamePatchMode, On, tr("On")),
+                              PAIR(GamePatchMode, Off, tr("Off")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::OotAntiAliasing>::Index(),
                           {

@@ -977,7 +977,7 @@ char* lichii_content_list_addons_json(uint64_t program_id, const char* game_path
             }
             break;
         }
-        out.push_back({
+        json entry{
             {"name", patch.name},
             {"toggle_key", ToggleKey(patch)},
             {"version", patch.version},
@@ -988,9 +988,42 @@ char* lichii_content_list_addons_json(uint64_t program_id, const char* game_path
             {"numeric_version", patch.numeric_version},
             {"location", patch.location},
             {"removable", removable},
-        });
+        };
+        if (patch.builtin) {
+            const auto& info = *patch.builtin;
+            const char* choice = info.choice == FileSys::BuiltinPatchChoice::On    ? "on"
+                                 : info.choice == FileSys::BuiltinPatchChoice::Off ? "off"
+                                                                                   : "global";
+            entry["builtin"] = {
+                {"kind", FileSys::BuiltinPatchKindName(info.kind)},
+                {"game", info.game},
+                {"description", info.description},
+                {"effect", info.effect},
+                {"choice", choice},
+                {"source", FileSys::BuiltinPatchSourceName(info.source)},
+                {"resolved_enabled", info.resolved_enabled},
+                {"included_in", info.included_in},
+            };
+        }
+        out.push_back(std::move(entry));
     }
     return DupJson(out);
+}
+
+char* lichii_content_builtin_patch_games_json(void) {
+    return DupJson(json(FileSys::BuiltinPatchGames()));
+}
+
+bool lichii_content_set_builtin_patch_choice(uint64_t program_id, const char* name, int choice) {
+    if (name == nullptr || name[0] == '\0' || choice < 0 || choice > 2) {
+        return false;
+    }
+    Lock lock{GetState().mutex};
+    FileSys::ApplyBuiltinPatchChoice(DisabledAddons(program_id), name,
+                                     static_cast<FileSys::BuiltinPatchChoice>(choice));
+    InvalidateGameListCache(program_id);
+    SaveConfig();
+    return true;
 }
 
 char* lichii_content_list_dlc_json(uint64_t program_id) {
