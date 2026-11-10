@@ -22,6 +22,9 @@
 #ifndef _WIN32
 #include <unistd.h>
 #endif
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
 #include "common/common_types.h"
 #include "common/logging.h"
@@ -115,8 +118,8 @@ inline bool StartLab() {
     if (DrawListDir().empty()) {
         status = "EDEN_NX2_LAB needs EDEN_NX2_DIAG_DIR";
     } else {
-#ifdef _WIN32
-        status = "EDEN_NX2_LAB is not supported on Windows, run tools/nx2/shader_lab.py yourself";
+#if defined(_WIN32) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+        status = "EDEN_NX2_LAB is not supported here, run tools/nx2/shader_lab.py yourself";
 #else
         const auto script = std::filesystem::path{Env("EDEN_NX2_LAB_SCRIPT") ? Env("EDEN_NX2_LAB_SCRIPT")
                                                                               : "tools/nx2/shader_lab.py"};
