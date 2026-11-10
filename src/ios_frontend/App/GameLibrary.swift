@@ -170,7 +170,11 @@ final class GameLibrary: ObservableObject {
             var stale = false
             guard let url = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil,
                                      bookmarkDataIsStale: &stale),
-                  url.startAccessingSecurityScopedResource() else { continue }
+                  url.startAccessingSecurityScopedResource() else {
+                // A folder that is offline right now (a drive, a cloud volume) stays linked.
+                refreshed.append(data)
+                continue
+            }
             accessedFolders.insert(url)
             linkedFolders.append(url)
             refreshed.append(stale ? (try? url.bookmarkData()) ?? data : data)

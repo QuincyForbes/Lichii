@@ -74,6 +74,11 @@ std::optional<std::filesystem::path> GetCurrentUserPlayTimePath() {
         return false;
     }
 
+    if (!Common::FS::CreateParentDirs(filename.value())) {
+        LOG_ERROR(Frontend, "Failed to create the play time directory");
+        return false;
+    }
+
     Common::FS::IOFile file{filename.value(), Common::FS::FileAccessMode::Write,
                             Common::FS::FileType::BinaryFile};
     if (!file.IsOpen()) {

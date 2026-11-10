@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <pthread.h>
 #include <signal.h>
 
 #include <algorithm>
@@ -143,7 +144,12 @@ void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
             return;
         }
     }
-    LOG_ERROR(Core, "Unhandled {} at {:#018x}\n", sig == SIGSEGV ? "SIGSEGV" : "SIGBUS", CTX_PC);
+    char thread_name[64]{};
+#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
+    pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
+#endif
+    LOG_ERROR(Core, "Unhandled {} at {:#018x} (fault address {}, thread \"{}\")\n",
+              sig == SIGSEGV ? "SIGSEGV" : "SIGBUS", CTX_PC, fmt::ptr(info->si_addr), thread_name);
 
     struct sigaction* retry_sa = sig == SIGSEGV ? &sig_handler->old_sa_segv : &sig_handler->old_sa_bus;
     if (retry_sa->sa_flags & SA_SIGINFO) {

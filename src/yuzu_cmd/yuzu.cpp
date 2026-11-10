@@ -618,15 +618,20 @@ static void IosStopGame(SdlState* state) {
     IosSupport::SetTouchControlsVisible(false);
     if (state->system.IsPoweredOn()) {
         void(state->system.Pause());
+        LOG_INFO(Frontend, "iOS: game paused, shutting down the main process");
         state->system.ShutdownMainProcess();
+        LOG_INFO(Frontend, "iOS: main process shut down");
     }
     IosEndBootSession(state);
+    LOG_INFO(Frontend, "iOS: boot thread ended");
     if (state->emu_window) {
         SDL_HideWindow(state->emu_window->GetSdlWindow());
     }
+    LOG_INFO(Frontend, "iOS: game window hidden");
     // Every dynarmic instance went with the process, so the prepared pool can be handed out again.
     Common::IosJit::Reset();
     IosFrontend::RestoreGlobal();
+    LOG_INFO(Frontend, "iOS: game stopped");
     IosFrontend::ClearRunningGame();
     IosFrontend::SetState(LICHII_EMU_IDLE);
 }

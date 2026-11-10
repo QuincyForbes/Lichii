@@ -8,6 +8,8 @@
 #include <cctype>
 #include <iostream>
 #include <sstream>
+#include <string>
+#include <string_view>
 #include "common/container/unordered_map.h"
 
 #include "common/assert.h"
@@ -311,8 +313,41 @@ std::string GetLegacyPathString(EmuPath legacy_path) {
     return PathToUTF8String(GetLegacyPath(legacy_path));
 }
 
-void SetEdenPath(EdenPath eden_path, const fs::path& new_path) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+// iOS gives the app a new container UUID on every reinstall, so an absolute path stored by an
+// earlier install points into a container that is gone. Moves it into the current container.
+static fs::path RebaseToCurrentContainer(const fs::path& path) {
+    constexpr std::string_view marker = "/Containers/Data/Application/";
+    const char* home = std::getenv("HOME");
+    if (home == nullptr || !path.is_absolute()) {
+        return path;
+    }
+    const std::string text = path.generic_string();
+    const auto at = text.find(marker);
+    if (at == std::string::npos) {
+        return path;
+    }
+    const auto uuid_end = text.find('/', at + marker.size());
+    if (uuid_end == std::string::npos) {
+        return path;
+    }
+    fs::path rebased = fs::path{home} / text.substr(uuid_end + 1);
+    return rebased == path ? path : rebased;
+}
+#endif
+
+void SetEdenPath(EdenPath eden_path, const fs::path& stored_path) {
     auto& instance = PathManagerImpl::GetInstance();
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    const fs::path new_path = RebaseToCurrentContainer(stored_path);
+    if (new_path != stored_path) {
+        LOG_INFO(Common_Filesystem, "Stored path {} belongs to another app container, using {}",
+                 PathToUTF8String(stored_path), PathToUTF8String(new_path));
+        void(FS::CreateDirs(new_path));
+    }
+#else
+    const fs::path& new_path = stored_path;
+#endif
     if (FS::IsDir(new_path)) {
         instance.SetEdenPathImpl(eden_path, new_path);
     } else {

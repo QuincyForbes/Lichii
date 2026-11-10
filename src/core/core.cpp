@@ -524,6 +524,7 @@ struct System::Impl {
     }
 
     void ShutdownMainProcess() {
+        LOG_INFO(Core, "Shutdown: begin");
         debug_service.reset();
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
@@ -542,10 +543,12 @@ struct System::Impl {
         Network::CancelPendingSocketOperations();
         kernel.SuspendEmulation(true);
         kernel.CloseServices();
+        LOG_INFO(Core, "Shutdown: services closed");
         // Each step done tells the frontend the teardown still moves (see
         // Common::ShutdownProgress); the GPU's (pipeline caches) reports its own steps.
         Common::NoteShutdownProgress();
         kernel.ShutdownCores();
+        LOG_INFO(Core, "Shutdown: cores shut down");
         Common::NoteShutdownProgress();
         services.reset();
         service_manager.reset();
@@ -553,16 +556,21 @@ struct System::Impl {
         cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
+        LOG_INFO(Core, "Shutdown: services and loader released");
         Common::NoteShutdownProgress();
         audio_core.reset();
+        LOG_INFO(Core, "Shutdown: audio released");
         Common::NoteShutdownProgress();
         gpu_core.reset();
+        LOG_INFO(Core, "Shutdown: GPU released");
         Common::NoteShutdownProgress();
         host1x_core.reset();
         perf_stats.reset();
         cpu_manager.Shutdown();
+        LOG_INFO(Core, "Shutdown: CPU threads joined");
         debugger.reset();
         kernel.Shutdown();
+        LOG_INFO(Core, "Shutdown: kernel released");
         kernel_initialized = false;
         stop_event = {};
         Network::RestartSocketOperations();
@@ -580,6 +588,7 @@ struct System::Impl {
         // InitializeKernel creates it again, sized for the next game.
         if (Settings::CurrentProgramIsSwitch2()) {
             device_memory.reset();
+            LOG_INFO(Core, "Shutdown: guest RAM released");
         }
 
         LOG_DEBUG(Core, "Shutdown OK");
