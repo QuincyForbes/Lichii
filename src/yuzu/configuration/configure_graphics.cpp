@@ -277,6 +277,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 
         if (setting->Id() == Settings::values.frame_gen_type.Id()) {
             frame_gen_type_combobox = widget->combobox;
+        } else if (setting->Id() == Settings::values.scaling_filter.Id()) {
+            scaling_filter_combobox = widget->combobox;
         } else if (setting->Id() == Settings::values.frame_gen_target_rate.Id() &&
                    widget->spinbox != nullptr) {
             widget->spinbox->setSpecialValueText(tr("Off (use the multiplier)"));
@@ -421,6 +423,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     nvidia_dlss_widget = held(Settings::values.nvidia_dlss);
     nvidia_dlss_preset_widget = held(Settings::values.nvidia_dlss_preset);
     frame_gen_widget = held(Settings::values.frame_gen);
+    metalfx_temporal_widget = held(Settings::values.metalfx_temporal);
 
 #ifdef HAS_LSFG
     // Where LSFG's Lossless.dll comes from, under the type combobox.
@@ -701,6 +704,40 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     }
 #endif
     ConfigurationShared::SetUnavailable(frame_gen_widget, frame_gen_reason);
+
+    QString metalfx_reason;
+#ifndef LICHII_METALFX
+    metalfx_reason = tr("Apple only (MetalFX).");
+#else
+    if (!vulkan) {
+        metalfx_reason = tr("Needs the Vulkan renderer.");
+    }
+#endif
+    ConfigurationShared::SetUnavailable(metalfx_temporal_widget, metalfx_reason);
+    // The MetalFX entries of the two lists stay selectable while they are the current value.
+    const auto gate_item = [&](QComboBox* combobox, u32 enumeration, u32 value) {
+        auto* model = combobox != nullptr
+                          ? qobject_cast<QStandardItemModel*>(combobox->model())
+                          : nullptr;
+        if (model == nullptr) {
+            return;
+        }
+        const auto& items = combobox_translations.at(enumeration);
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (items[i].first != value) {
+                continue;
+            }
+            if (QStandardItem* item = model->item(static_cast<int>(i))) {
+                item->setEnabled(metalfx_reason.isEmpty() ||
+                                 combobox->currentIndex() == static_cast<int>(i));
+                item->setToolTip(metalfx_reason);
+            }
+        }
+    };
+    gate_item(scaling_filter_combobox, Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
+              static_cast<u32>(Settings::ScalingFilter::MetalFxSpatial));
+    gate_item(frame_gen_type_combobox, Settings::EnumMetadata<Settings::FrameGenType>::Index(),
+              static_cast<u32>(Settings::FrameGenType::MetalFx));
 }
 
 void ConfigureGraphics::UpdateLosslessStatus() {

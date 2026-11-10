@@ -163,6 +163,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, nvidia_dlss_preset, tr("DLSS preset:"),
            tr("The DLSS model. K is the tested default; L and M are NVIDIA's newer models, J the "
               "older one. Default lets NVIDIA choose per quality mode."));
+    INSERT(Settings, metalfx_temporal, tr("Use MetalFX in place of a game's upscaler (Apple)"),
+           tr("Apple MetalFX temporal upscaling in place of a Switch 2 game's DLSS and of "
+              "Ocarina of Time's own upscaler, instead of AMD FSR 3.1 and the game's.\nNeeds "
+              "macOS 13 or iOS 16 on an Apple GPU."));
     INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS in place of a game's DLSS (experimental)"),
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
               "instead of AMD FSR 3.1.\nNeeds NVIDIA's Streamline loader, and NVIDIA DLSS unless "
@@ -241,7 +245,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, frame_gen_type, tr("Frame Generation Type"),
            tr("Optical Flow Interpolation (built-in): Lichii's own frame generation, needs "
               "nothing else.\nLossless Scaling (LSFG): uses the shaders of Lossless.dll from your "
-              "own copy of Lossless Scaling (Steam); without the file no frames are generated."));
+              "own copy of Lossless Scaling (Steam); without the file no frames are generated."
+              "\nMetalFX Frame Interpolation (Apple, macOS 26 or iOS 26): Apple's interpolation on "
+              "the same optical flow, 2x only (3x and 4x use the built-in interpolation)."));
     INSERT(Settings, frame_gen_multiplier, tr("Frame Generation Multiplier"),
            tr("How many frames are shown per real frame: 2x adds one generated frame, 3x two, "
               "4x three.\nIgnored while Target Frame Rate is set."));
@@ -559,6 +565,7 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                           {
                               PAIR(FrameGenType, Lsfg, tr("Lossless Scaling (LSFG)")),
                               PAIR(FrameGenType, Fsr3, tr("Optical Flow Interpolation (built-in)")),
+                              PAIR(FrameGenType, MetalFx, tr("MetalFX Frame Interpolation (Apple)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
                           {
@@ -578,6 +585,7 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(ScalingFilter, Sgsr, tr("Snapdragon Game Super Resolution")),
                               PAIR(ScalingFilter, SgsrEdge, tr("Snapdragon Game Super Resolution EdgeDir")),
                               PAIR(ScalingFilter, Fsr3, tr("AMD FidelityFX Super Resolution 1, softer sharpening")),
+                              PAIR(ScalingFilter, MetalFxSpatial, tr("MetalFX Spatial (Apple)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AntiAliasing>::Index(),
                           {
