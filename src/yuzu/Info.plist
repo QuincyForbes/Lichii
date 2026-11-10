@@ -15,27 +15,29 @@ SPDX-License-Identifier: GPL-2.0-or-later
     <key>CFBundleExecutable</key>
     <string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string>
     <key>CFBundleGetInfoString</key>
-    <string></string>
+    <string>${MACOSX_BUNDLE_INFO_STRING}</string>
     <key>CFBundleIconFile</key>
     <string>lichii.icns</string>
     <key>CFBundleIconName</key>
     <string>lichii</string>
     <key>CFBundleIdentifier</key>
-    <string>com.yuzu-emu.yuzu</string> <!-- May be required by 3rd party ext -->
+    <string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleLongVersionString</key>
-    <string></string>
+    <string>${MACOSX_BUNDLE_LONG_VERSION_STRING}</string>
     <key>CFBundleName</key>
-    <string>lichii</string>
+    <string>${MACOSX_BUNDLE_BUNDLE_NAME}</string>
+    <key>CFBundleDisplayName</key>
+    <string>Lichii</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string></string>
+    <string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
     <key>CFBundleSignature</key>
     <string>????</string>
     <key>CFBundleVersion</key>
-    <string></string>
+    <string>${MACOSX_BUNDLE_BUNDLE_VERSION}</string>
     <key>CSResourcesFileMapped</key>
     <true/>
     <key>CFBundleDocumentTypes</key>
@@ -56,13 +58,25 @@ SPDX-License-Identifier: GPL-2.0-or-later
             <key>LSHandlerRank</key>
             <string>Default</string>
         </dict>
+        <dict>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>nup</string>
+            </array>
+            <key>CFBundleTypeName</key>
+            <string>Nintendo Switch 2 Game</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>io.github.zortos293.lichii.nup</string>
+            </array>
+        </dict>
     </array>
 
     <!-- LS -->
-    <key>LSApplicationCategoryType</key>
-    <string>public.app-category.games</string>
-    <key>LSRequiresCarbon</key>
-    <true/>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.games</string>
 
@@ -76,13 +90,32 @@ SPDX-License-Identifier: GPL-2.0-or-later
         <string>LaunchGameIntent</string>
     </array>
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright 2025 Eden Emulator Project GPL-3.0-or-later</string>
+    <string>Lichii, GPL-3.0-or-later. Based on Eden and yuzu.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Games can use the microphone as an audio input device.</string>
 
     <!-- UI -->
     <key>UIDesignRequiresCompatibility</key>
     <true/> <!-- https://bugreports.qt.io/browse/QTBUG-138942 -->
     <key>UTExportedTypeDeclarations</key>
     <array>
+        <dict>
+            <key>UTTypeDescription</key>
+            <string>Nintendo Switch 2 Game</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+            <string>public.data</string>
+            </array>
+            <key>UTTypeIdentifier</key>
+            <string>io.github.zortos293.lichii.nup</string>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+            <key>public.filename-extension</key>
+            <array>
+                <string>nup</string>
+            </array>
+            </dict>
+        </dict>
         <dict>
             <key>UTTypeDescription</key>
             <string>Extensible Application Markup Language</string>
