@@ -300,7 +300,7 @@ private:
     u32 UpdateVertexRepackLayout(bool dynamic_input);
 
     void FrameDumpPass(const Framebuffer* framebuffer);
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     bool OcarinaDlssEnabled() const;
     void TrackOcarinaCamera();
     void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect);
@@ -346,7 +346,7 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     std::optional<u64> oot_camera_sample_frame;
     struct OcarinaMotionTrace {
         const Tegra::MemoryManager* camera_channel{};
