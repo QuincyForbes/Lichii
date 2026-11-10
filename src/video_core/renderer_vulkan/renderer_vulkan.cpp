@@ -23,6 +23,7 @@
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
 #include "video_core/present.h"
+#include "video_core/render_probe.h"
 #include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #ifdef HAS_RESHADE
@@ -234,6 +235,16 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
                                render_window.GetFramebufferLayout(),
                                present_manager.SwapchainImageCount(),
                                swapchain.GetImageViewFormat());
+
+    if (!framebuffers.empty()) {
+        const auto& guest = framebuffers.front();
+        const bool cropped = !guest.crop_rect.IsEmpty();
+        const auto& layout = render_window.GetFramebufferLayout();
+        VideoCore::Probe::StoreFrameExtents(
+            cropped ? static_cast<u32>(guest.crop_rect.GetWidth()) : guest.width,
+            cropped ? static_cast<u32>(guest.crop_rect.GetHeight()) : guest.height, layout.width,
+            layout.height);
+    }
 
     size_t generated_frames = 0;
 #ifdef HAS_LSFG
