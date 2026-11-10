@@ -95,7 +95,7 @@ TEST_CASE("Uniform stream reuse preserves data through mutation and session rese
     bind(4, 17, 0, 4096);
     const auto before = runtime.allocations.size();
     for (auto [stage, slot, size] :
-         {std::array<u32, 3>{5, 0, 64}, {0, 18, 64}, {0, 0, 0}, {0, 0, 4097}}) {
+         {std::array<u32, 3>{6, 0, 64}, {0, 18, 64}, {0, 0, 0}, {0, 0, 4097}}) {
         Check(!BindSmallUniformReusing(runtime, memory, stage, slot, slot, 0, size),
               "invalid uniform range did not use the fallback");
     }

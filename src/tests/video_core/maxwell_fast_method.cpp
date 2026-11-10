@@ -129,8 +129,14 @@ struct Fixture {
         for (auto* engine : {&slow, &fast}) {
             engine->BindRasterizer(&rasterizer);
             VideoCommon::Dirty::SetupDirtyFlags(engine->dirty.tables);
-            // Give every register a flag so that a missed or extra write shows.
+            // Give every register a flag so that a missed or extra write shows. The constant
+            // buffer data words keep none: their batched path stores them without a flag lookup.
             for (u32 method = 0; method < Maxwell3D::Regs::NUM_REGS; ++method) {
+                if (method >= CbData && method < CbData + 16) {
+                    REQUIRE(engine->dirty.tables[0][method] == 0);
+                    REQUIRE(engine->dirty.tables[1][method] == 0);
+                    continue;
+                }
                 if (engine->dirty.tables[1][method] == 0) {
                     engine->dirty.tables[1][method] =
                         static_cast<u8>(VideoCommon::Dirty::LastCommonEntry + method % 61);
@@ -516,6 +522,9 @@ TEST_CASE("GpuSplit dispatches count where the back recorded their writes",
     Access::RunDispatch(split, entry, 0x80000, 0x100);
     Access::Consume(split, Access::End(split));
     REQUIRE(split.DispatchesMayWriteSince(since, 0x40000, 0x1000, false, checked, waited) ==
+            Check::Miss);
+    // On the page it wrote the records are compared, and remembered as checked.
+    REQUIRE(split.DispatchesMayWriteSince(since, 0x80800, 0x100, false, checked, waited) ==
             Check::Miss);
     REQUIRE(checked == split.DispatchWriteCount());
     u64 fresh = 0;
