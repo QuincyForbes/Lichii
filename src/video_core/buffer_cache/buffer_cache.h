@@ -319,16 +319,28 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     area->start_address = device_addr_start_aligned;
     area->end_address = device_addr_end_aligned;
     if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
-        area->preemtive = true;
+        // A preflushed region's data reaches guest memory when its fence pops (PopAsyncBuffers
+        // clears gpu_modified_ranges then), while fast GPU fences tell the guest at once that the
+        // GPU is done. A read in between saw the previous words: Ocarina of Time meters the frame
+        // on the GPU and its CPU derives the exposure from that, which then jumped between
+        // values and washed the picture out. Such a read flushes on demand instead.
+        area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
+                                               device_addr_end_aligned - device_addr_start_aligned);
+        if (Nx2DownloadTrace::g_enabled) [[unlikely]] {
+            Nx2DownloadTrace::PreflushedRead(!area->preemtive);
+        }
+        // The core consumed this trap, or keeps the area: the next GPU write must arm again.
+        read_trapped_ranges.Subtract(device_addr_start_aligned,
+                                     device_addr_end_aligned - device_addr_start_aligned);
         return area;
     }
     area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
                                            device_addr_end_aligned - device_addr_start_aligned);
     // A preflushable mark persists and downloads later GPU writes at every fence. Native titles
-    // instead keep read traps and flush on demand; EDEN_NX2_PREFLUSH=1 restores preflushing.
-    // Not Ocarina of Time either: preflushing its CPU's ~170 reads a second of GPU-written pages
-    // was worth ~3 fps, but a third of loads into Castle Town then rendered overexposed and
-    // tinted (stale or wrong exposure data), against none with the traps.
+    // keep read traps and flush on demand unless EDEN_NX2_PREFLUSH=1, which nx2_switches.cpp sets
+    // by default: preflushing Ocarina of Time's ~170 CPU reads a second of GPU-written pages was
+    // worth ~3 fps. A third of its loads into Castle Town then rendered overexposed and tinted
+    // (stale exposure data), which the on-demand flush above is for.
     static const std::optional<bool> forced_preflush = []() -> std::optional<bool> {
         const char* value = std::getenv("EDEN_NX2_PREFLUSH");
         if (value != nullptr) {
