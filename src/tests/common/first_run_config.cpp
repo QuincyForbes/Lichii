@@ -91,13 +91,15 @@ void CheckFreshProfile() {
     CHECK(values.use_asynchronous_shaders.GetValue());
 }
 
+// The plain defaults. Only the scaling filter differs from the first-run profile: the other seeded
+// values became the defaults too.
 void CheckLegacyProfile() {
     const auto& values = Settings::values;
     CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::ScaleForce);
-    CHECK(values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::High);
-    CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Cpu);
-    CHECK_FALSE(values.async_presentation.GetValue());
-    CHECK_FALSE(values.use_asynchronous_shaders.GetValue());
+    CHECK(values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::Low);
+    CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);
+    CHECK(values.async_presentation.GetValue());
+    CHECK(values.use_asynchronous_shaders.GetValue());
 }
 
 void CheckUnchangedProfile() {
@@ -110,8 +112,8 @@ void CheckUnchangedProfile() {
     CHECK(values.slow_speed_limit.GetValue() == 50);
     CHECK(values.turbo_speed_limit.GetValue() == 200);
     CHECK_FALSE(values.sync_core_speed.GetValue());
-    CHECK(values.memory_layout_mode.GetValue() == Settings::MemoryLayout::Memory_4Gb);
-    CHECK(values.vsync_mode.GetValue() == Settings::VSyncMode::Fifo);
+    CHECK(values.memory_layout_mode.GetValue() == Settings::MemoryLayout::Memory_8Gb);
+    CHECK(values.vsync_mode.GetValue() == Settings::VSyncMode::Mailbox);
     CHECK(values.fsr_sharpening_slider.GetValue() == 25);
     CHECK(values.dma_accuracy.GetValue() == Settings::DmaAccuracy::Default);
     CHECK(values.gpu_fence_behavior.GetValue() == Settings::GpuFenceBehavior::Default);
@@ -169,9 +171,11 @@ TEST_CASE("Absent global config receives the first-run profile and persists it",
                                std::istreambuf_iterator<char>{}};
     REQUIRE(saved.LoadData(contents) >= 0);
     file.close();
-    for (const char* key : {"scaling_filter", "gpu_accuracy", "nvdec_emulation",
-                            "async_presentation", "use_asynchronous_shaders"}) {
-        CHECK_FALSE(saved.GetBoolValue("Renderer", (std::string{key} + "\\default").c_str(), true));
+    CHECK_FALSE(saved.GetBoolValue("Renderer", "scaling_filter\\default", true));
+    // Seeded with their defaults, so they are saved as defaults.
+    for (const char* key : {"gpu_accuracy", "nvdec_emulation", "async_presentation",
+                            "use_asynchronous_shaders"}) {
+        CHECK(saved.GetBoolValue("Renderer", (std::string{key} + "\\default").c_str(), false));
     }
     const auto filename = config->GetConfigFilePath();
     config.reset();
@@ -214,7 +218,7 @@ TEST_CASE("Existing default markers and missing keys keep their historical value
         contents = "[System]\nfast_gpu_time\\default=true\n";
     }
     SECTION("Stored values without default markers") {
-        contents = "[Renderer]\nasync_presentation=true\nuse_asynchronous_shaders=true\n";
+        contents = "[Renderer]\nasync_presentation=false\nuse_asynchronous_shaders=false\n";
     }
     SECTION("Malformed existing config") {
         contents = "[incomplete section\nnot a setting\n";
@@ -224,10 +228,10 @@ TEST_CASE("Existing default markers and missing keys keep their historical value
             fmt::format("[Renderer]\nscaling_filter={}\nscaling_filter\\default=true\n"
                         "gpu_accuracy={}\ngpu_accuracy\\default=true\n"
                         "nvdec_emulation={}\nnvdec_emulation\\default=true\n"
-                        "async_presentation=true\nasync_presentation\\default=true\n"
-                        "use_asynchronous_shaders=true\nuse_asynchronous_shaders\\default=true\n",
-                        u32(Settings::ScalingFilter::Fsr3), u32(Settings::GpuAccuracy::Low),
-                        u32(Settings::NvdecEmulation::Gpu));
+                        "async_presentation=false\nasync_presentation\\default=true\n"
+                        "use_asynchronous_shaders=false\nuse_asynchronous_shaders\\default=true\n",
+                        u32(Settings::ScalingFilter::Fsr3), u32(Settings::GpuAccuracy::High),
+                        u32(Settings::NvdecEmulation::Cpu));
     }
     directory.Write("qt-config.ini", contents);
     for (int i = 0; i < 3; ++i) {
@@ -266,7 +270,7 @@ TEST_CASE("Per-game overrides and use-global flags survive the new global profil
             "nvdec_emulation={}\nnvdec_emulation\\default=false\nnvdec_emulation\\use_global=true\n"
             "async_presentation=false\nasync_presentation\\default=false\n"
             "async_presentation\\use_global=false\n",
-            u32(Settings::ScalingFilter::Bilinear), u32(Settings::GpuAccuracy::Low),
+            u32(Settings::ScalingFilter::Bilinear), u32(Settings::GpuAccuracy::High),
             u32(Settings::NvdecEmulation::Off)));
     for (int i = 0; i < 3; ++i) {
         FileConfig game{std::string{"game"}, Config::ConfigType::PerGameConfig};
@@ -274,7 +278,7 @@ TEST_CASE("Per-game overrides and use-global flags survive the new global profil
         CHECK(Settings::values.scaling_filter.GetValue() == Settings::ScalingFilter::Bilinear);
         CHECK(Settings::values.scaling_filter.GetValue(true) == Settings::ScalingFilter::Fsr3);
         CHECK_FALSE(Settings::values.gpu_accuracy.UsingGlobal());
-        CHECK(Settings::values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::High);
+        CHECK(Settings::values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::Low);
         CHECK(Settings::values.gpu_accuracy.GetValue(true) == Settings::GpuAccuracy::Low);
         CHECK(Settings::values.nvdec_emulation.UsingGlobal());
         CHECK(Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);

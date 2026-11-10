@@ -18,7 +18,10 @@ void SetOtherBuildValues(Settings::Values& values) {
     values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
     values.memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_4Gb);
     values.nvdec_emulation.SetValue(Settings::NvdecEmulation::Cpu);
-    values.scaling_filter.SetValue(Settings::ScalingFilter::Fsr3);
+    values.resolution_setup.SetValue(Settings::ResolutionSetup::Res2X);
+    values.cpu_accuracy.SetValue(Settings::CpuAccuracy::Accurate);
+    values.use_disk_shader_cache.SetValue(false);
+    values.use_vulkan_driver_pipeline_cache.SetValue(false);
 }
 
 void CheckFriztiValues(const Settings::Values& values) {
@@ -31,7 +34,10 @@ void CheckFriztiValues(const Settings::Values& values) {
     CHECK(values.use_docked_mode.GetValue() == Settings::ConsoleMode::Docked);
     CHECK(values.memory_layout_mode.GetValue() == Settings::MemoryLayout::Memory_8Gb);
     CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);
-    CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::ScaleForce);
+    CHECK(values.resolution_setup.GetValue() == Settings::ResolutionSetup::Res1X);
+    CHECK(values.cpu_accuracy.GetValue() == Settings::CpuAccuracy::Auto);
+    CHECK(values.use_disk_shader_cache.GetValue());
+    CHECK(values.use_vulkan_driver_pipeline_cache.GetValue());
 }
 } // namespace
 
@@ -62,16 +68,16 @@ TEST_CASE("Between revisions only another build's changes are undone", "[frizti_
     record.revision = Frizti::Revision;
     record.global = Frizti::GlobalValues(tuned);
 
-    // Another build then saved FIFO and FSR.
+    // Another build then saved FIFO and 2x.
     values->vsync_mode.SetValue(Settings::VSyncMode::Fifo);
-    values->scaling_filter.SetValue(Settings::ScalingFilter::Fsr3);
+    values->resolution_setup.SetValue(Settings::ResolutionSetup::Res2X);
     const auto changes = Frizti::ReconcileGlobal(tuned, record, false);
     REQUIRE(changes.size() == 2);
     CHECK(values->gpu_accuracy.GetValue() == Settings::GpuAccuracy::High);
     CHECK(values->vsync_mode.GetValue() == Settings::VSyncMode::Mailbox);
-    CHECK(values->scaling_filter.GetValue() == Settings::ScalingFilter::ScaleForce);
+    CHECK(values->resolution_setup.GetValue() == Settings::ResolutionSetup::Res1X);
     CHECK(Frizti::FormatChanges(changes) ==
-          "use_vsync: Fifo -> Mailbox, scaling_filter: Fsr3 -> ScaleForce");
+          "use_vsync: Fifo -> Mailbox, resolution_setup: Res2X -> Res1X");
 }
 
 TEST_CASE("Ocarina's per-game overrides go back to global", "[frizti_settings]") {
