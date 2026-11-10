@@ -12,12 +12,17 @@
 
 #include <fmt/ranges.h>
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
 #include "common/logging.h"
+#include "common/platform_events.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -39,6 +44,10 @@ constexpr VkDeviceSize MAX_ALIGNMENT = 256;
 // - GT 1030 on ^NIX will OOM with 256mib
 #if defined(__FreeBSD__)
 constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+// iOS counts all of it in the footprint once the ring has gone round; uploads past a region (4 MiB)
+// take pooled staging buffers instead.
+constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 64_MiB;
 #else
 constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 256_MiB;
 #endif
@@ -184,9 +193,39 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
 void StagingBufferPool::TickFrame() {
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
 
+    // Host memory pressure (iOS): every idle buffer goes now rather than a level every frame.
+    if (const u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
+        pressure != seen_host_pressure) {
+        seen_host_pressure = pressure;
+        const u64 before = CachedBytes();
+        for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
+            for (StagingBuffers& staging : *cache) {
+                std::erase_if(staging.entries, [this](const StagingBuffer& entry) {
+                    return scheduler.IsFree(entry.tick);
+                });
+                staging.delete_index = 0;
+                staging.iterate_index = 0;
+            }
+        }
+        LOG_INFO(Render_Vulkan, "Host memory pressure: staging buffers {} -> {} MiB", before >> 20,
+                 CachedBytes() >> 20);
+    }
+
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
     ReleaseCache(MemoryUsage::Download);
+}
+
+u64 StagingBufferPool::CachedBytes() const {
+    u64 bytes = 0;
+    for (const StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
+        for (const StagingBuffers& staging : *cache) {
+            for (const StagingBuffer& entry : staging.entries) {
+                bytes += u64{1} << entry.log2_level;
+            }
+        }
+    }
+    return bytes;
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
