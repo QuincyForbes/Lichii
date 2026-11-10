@@ -23,24 +23,40 @@ struct InGameMenuView: View {
     private let resolutions = QuickSettings.choices("resolution_setup")
 
     var body: some View {
-        ZStack {
-            Color.black.opacity(0.45)
-                .ignoresSafeArea()
-                .onTapGesture { center.closeMenu() }
+        GeometryReader { proxy in
+            ZStack {
+                Color.black.opacity(0.45)
+                    .ignoresSafeArea()
+                    .onTapGesture { center.closeMenu() }
+                    .accessibilityHidden(true)
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
+                // The header (Resume) and Quit stay in view; only the middle scrolls, so the
+                // panel fits an iPhone in landscape.
+                VStack(spacing: 0) {
                     header
-                    actions
-                    quickSettings
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 12)
+                    Divider()
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 14) {
+                            actions
+                            quickSettings
+                        }
+                        .padding(18)
+                    }
+                    Divider()
                     quit
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 12)
                 }
-                .padding(18)
+                .frame(maxWidth: 480)
+                .frame(height: min(560, max(200, proxy.size.height - 16)))
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .padding(.horizontal, 20)
+                .accessibilityElement(children: .contain)
+                .accessibilityAction(.escape) { center.closeMenu() }
             }
-            .frame(maxWidth: 480, maxHeight: 560)
-            .fixedSize(horizontal: false, vertical: true)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-            .padding(20)
+            .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .sheet(isPresented: $showControllers) {
             NavigationStack {
@@ -66,6 +82,7 @@ struct InGameMenuView: View {
                 Text(center.currentGame?.title ?? "Lichii")
                     .font(.headline)
                     .lineLimit(1)
+                    .accessibilityAddTraits(.isHeader)
                 Text(Bridge.emuState == .paused ? "Paused" : "Running")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -79,6 +96,7 @@ struct InGameMenuView: View {
                     .font(.subheadline.weight(.semibold))
             }
             .buttonStyle(.borderedProminent)
+            .accessibilityHint("Closes the menu and continues the game")
         }
     }
 
@@ -190,7 +208,9 @@ private struct MenuTile: View {
             }
             .frame(maxWidth: .infinity, minHeight: 62)
             .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(title)
     }
 }

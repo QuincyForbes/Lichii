@@ -71,8 +71,8 @@ enum JitProvider: String, CaseIterable, Identifiable {
     }
 }
 
-/// Snapshot of the JIT pool state, refreshed by the views that show it.
-struct JitStatus {
+/// Snapshot of the JIT pool state (AppController.jit keeps the current one).
+struct JitStatus: Equatable {
     var state: JitState = .waiting
     var prepared: UInt64 = 0
     var total: UInt64 = 0
@@ -82,10 +82,15 @@ struct JitStatus {
     var stikDebug = false
 
     @MainActor static func read() -> JitStatus {
+        read(installed: JitProvider.current.installed)
+    }
+
+    /// Without asking iOS whether the JIT app is installed (canOpenURL is an IPC).
+    @MainActor static func read(installed: Bool) -> JitStatus {
         JitStatus(state: Bridge.jitState, prepared: lichii_jit_prepared_bytes(),
                   total: lichii_jit_pool_bytes(), error: Bridge.jitError,
                   debugged: lichii_jit_debugged(), needsScript: lichii_jit_needs_script(),
-                  stikDebug: JitProvider.current.installed)
+                  stikDebug: installed)
     }
 
     var progress: Double {
@@ -161,10 +166,10 @@ struct JitStatusCard: View {
 
 struct JitView: View {
     @EnvironmentObject private var app: AppController
-    @State private var status = JitStatus.read()
     @AppStorage("autoRequestJit") private var autoRequest = true
     @AppStorage("jitProvider") private var provider: JitProvider = .stikDebug
-    private let timer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+
+    private var status: JitStatus { app.jit }
 
     var body: some View {
         List {
@@ -201,6 +206,6 @@ struct JitView: View {
             }
         }
         .navigationTitle("JIT")
-        .onReceive(timer) { _ in status = JitStatus.read() }
+        .onChange(of: provider) { _ in app.refreshJit(checkProvider: true) }
     }
 }

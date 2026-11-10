@@ -6,8 +6,9 @@ import SwiftUI
 import UIKit
 
 /// The platform layer (lichii_bridge_platform.h) in the app: pauses the game while the app is
-/// inactive, keeps the screen awake while playing, follows the thermal state and the shader cache
-/// loading progress, and reads the device facts.
+/// inactive or its audio is interrupted and brings it back paused, keeps the screen awake while
+/// playing, follows the thermal state and the shader cache loading progress, notices a game that
+/// ended without a clean stop, and reads the device facts.
 @MainActor
 final class PlatformCenter: ObservableObject {
     static let shared = PlatformCenter()
@@ -16,9 +17,13 @@ final class PlatformCenter: ObservableObject {
     @Published private(set) var lowPowerMode = false
     /// Thermal advice for a banner, empty when there is nothing to say.
     @Published private(set) var thermalMessage = ""
+    /// The thermal badge over the game shows for a few seconds after it changes.
+    @Published private(set) var thermalBadgeVisible = false
     @Published private(set) var shaderStage = Int32(LICHII_SHADER_IDLE.rawValue)
     @Published private(set) var shaderDone: UInt64 = 0
     @Published private(set) var shaderTotal: UInt64 = 0
+    /// The previous game session ended without a clean stop (crash, or iOS closed Lichii).
+    @Published var uncleanExit: GameSession?
 
     @Published var mixWithOtherAudio = UserDefaults.standard.bool(forKey: "mixWithOtherAudio") {
         didSet {
@@ -27,11 +32,13 @@ final class PlatformCenter: ObservableObject {
         }
     }
 
-    /// Set when this layer paused the game for the app going inactive; it resumes the game when
-    /// the app is active again unless the user paused it.
+    /// Set when this layer paused the game (app inactive, audio interrupted); the game comes back
+    /// paused with the menu open, and runs again when the user closes it.
     private var pausedForLifecycle = false
+    private var badgeTask: Task<Void, Never>?
 
     func start() {
+        uncleanExit = GameSession.takeUncleanExit()
         lichii_platform_init()
         lichii_platform_set_event_handler(platformEvent, nil)
         lichii_platform_set_shader_progress_handler(shaderProgress, nil)
@@ -43,16 +50,25 @@ final class PlatformCenter: ObservableObject {
 
     /// Every LichiiEvent of the app bridge.
     func handle(appEvent event: Int32) {
+        if event == Int32(LICHII_EVENT_GAME_WINDOW_READY.rawValue) {
+            GameSession.begin(AppController.shared.currentGame)
+            flashThermalBadge()
+            return
+        }
         guard event == Int32(LICHII_EVENT_STATE_CHANGED.rawValue) else { return }
         switch Bridge.emuState {
         case .waitingForJit:
             lichii_platform_reset_shader_progress()
         case .running:
             lichii_platform_set_playing(1)
+        case .paused:
+            // The screen may lock while the game waits.
+            lichii_platform_set_playing(0)
         case .idle, .failed:
             pausedForLifecycle = false
             lichii_platform_set_playing(0)
-        case .booting, .paused:
+            GameSession.end()
+        case .booting:
             break
         }
     }
@@ -60,21 +76,41 @@ final class PlatformCenter: ObservableObject {
     fileprivate func handle(platformEvent event: Int32) {
         switch event {
         case Int32(LICHII_PLATFORM_EVENT_WILL_RESIGN_ACTIVE.rawValue),
-             Int32(LICHII_PLATFORM_EVENT_DID_ENTER_BACKGROUND.rawValue):
+             Int32(LICHII_PLATFORM_EVENT_AUDIO_INTERRUPTION_BEGAN.rawValue):
             pauseForLifecycle()
+        case Int32(LICHII_PLATFORM_EVENT_DID_ENTER_BACKGROUND.rawValue):
+            pauseForLifecycle()
+            GameSession.update { $0.background = true }
+        case Int32(LICHII_PLATFORM_EVENT_WILL_ENTER_FOREGROUND.rawValue):
+            GameSession.update { $0.background = false }
         case Int32(LICHII_PLATFORM_EVENT_DID_BECOME_ACTIVE.rawValue):
-            resumeAfterLifecycle()
+            returnAfterInterruption()
+        case Int32(LICHII_PLATFORM_EVENT_AUDIO_INTERRUPTION_ENDED.rawValue):
+            // A call banner or Siri over the active app; otherwise DID_BECOME_ACTIVE follows.
+            if UIApplication.shared.applicationState == .active {
+                returnAfterInterruption()
+            }
         case Int32(LICHII_PLATFORM_EVENT_THERMAL_STATE.rawValue),
              Int32(LICHII_PLATFORM_EVENT_LOW_POWER_MODE.rawValue):
-            let before = thermalState
+            let before = (thermalState, lowPowerMode, thermalBadge)
             refreshThermal()
-            if thermalState > before, !thermalMessage.isEmpty, ControlsCenter.shared.gameRunning {
-                ControlsCenter.shared.show(toast: thermalMessage)
+            if ControlsCenter.shared.gameRunning {
+                if thermalState > before.0, thermalState >= 2 {
+                    ControlsCenter.shared.show(toast: thermalMessage)
+                } else if lowPowerMode, !before.1 {
+                    ControlsCenter.shared.show(toast: "Low Power Mode is on: the CPU and GPU run slower.")
+                }
+            }
+            if thermalBadge != before.2 {
+                flashThermalBadge()
             }
         case Int32(LICHII_PLATFORM_EVENT_MEMORY_WARNING.rawValue):
+            GameSession.update { $0.memoryWarning = true }
             if ControlsCenter.shared.gameRunning {
                 ControlsCenter.shared.show(toast: "Memory is low: caches trimmed")
             }
+        case Int32(LICHII_PLATFORM_EVENT_WILL_TERMINATE.rawValue):
+            GameSession.end()
         default:
             break
         }
@@ -86,11 +122,13 @@ final class PlatformCenter: ObservableObject {
         pausedForLifecycle = true
     }
 
-    private func resumeAfterLifecycle() {
+    /// After a call, the app switcher, Control Center or Siri the game waits paused under the
+    /// in-game menu; closing the menu runs it again.
+    private func returnAfterInterruption() {
         guard pausedForLifecycle else { return }
         pausedForLifecycle = false
         guard Bridge.emuState == .paused, !ControlsCenter.shared.userPaused else { return }
-        lichii_emu_resume()
+        ControlsCenter.shared.openMenu(resumeOnClose: true)
     }
 
     private func refreshThermal() {
@@ -101,12 +139,23 @@ final class PlatformCenter: ObservableObject {
         thermalMessage = Self.text(advice.message)
     }
 
-    /// A short form of the thermal advice for the game overlay and the HUD.
+    /// A short form of the thermal state for the in-game menu and the HUD.
     var thermalBadge: String {
         switch thermalState {
         case 3...: return "Very hot"
-        case 2: return "Hot · 30 fps advised"
+        case 2: return "Hot"
         default: return lowPowerMode ? "Low Power Mode" : ""
+        }
+    }
+
+    /// Shows the badge over the game for five seconds.
+    func flashThermalBadge() {
+        badgeTask?.cancel()
+        thermalBadgeVisible = thermalState >= 2
+        guard thermalBadgeVisible else { return }
+        badgeTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            if !Task.isCancelled { PlatformCenter.shared.thermalBadgeVisible = false }
         }
     }
 
@@ -159,12 +208,62 @@ final class PlatformCenter: ObservableObject {
     }
 }
 
+/// A game that is up, kept in UserDefaults until it stops cleanly. Still there at the next launch
+/// means the app ended with it (a crash, or iOS closed Lichii, usually for memory).
+struct GameSession: Codable, Identifiable {
+    var title: String
+    var programId: UInt64
+    var resolution: String
+    var started: Date
+    var background = false
+    var memoryWarning = false
+
+    var id: Date { started }
+
+    private static let key = "runningGameSession"
+
+    @MainActor static func begin(_ game: Game?) {
+        let session = GameSession(title: game?.title ?? "The game", programId: lichii_emu_program_id(),
+                                  resolution: QuickSettings.string("resolution_setup"), started: Date())
+        save(session)
+    }
+
+    static func end() {
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+
+    static func update(_ change: (inout GameSession) -> Void) {
+        guard var session = load() else { return }
+        change(&session)
+        save(session)
+    }
+
+    /// The session the last run left behind. One that ended in the background is dropped: the
+    /// user left the game, and iOS (or the app switcher) closing a suspended app is expected.
+    static func takeUncleanExit() -> GameSession? {
+        defer { end() }
+        guard let session = load(), !session.background else { return nil }
+        return session
+    }
+
+    private static func load() -> GameSession? {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(GameSession.self, from: data)
+    }
+
+    private static func save(_ session: GameSession) {
+        if let data = try? JSONEncoder().encode(session) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+}
+
 /// Called on the main thread.
 private let platformEvent: LichiiPlatformEventFn = { event, _ in
     MainActor.assumeIsolated { PlatformCenter.shared.handle(platformEvent: event) }
 }
 
-/// Called on the thread loading the disk shader cache.
+/// Called on the thread loading the disk shader cache, at most ten times a second.
 private let shaderProgress: LichiiShaderProgressFn = { stage, done, total, _ in
     DispatchQueue.main.async {
         MainActor.assumeIsolated { PlatformCenter.shared.shaderProgressChanged(stage, done, total) }

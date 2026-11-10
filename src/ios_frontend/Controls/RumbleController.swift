@@ -9,27 +9,35 @@ import LichiiBridge
 
 /// Plays the game's rumble on a controller's haptic engines (one per handle when it has two) or
 /// on the device: a low and a high continuous player per engine whose intensity and sharpness
-/// follow the HD rumble amplitudes and frequencies.
+/// follow the HD rumble amplitudes and frequencies. The engines start with the first rumble and
+/// stop after two seconds without any, so a game that never rumbles keeps them off.
 final class RumbleController {
     private final class HapticChannel {
         private let engine: CHHapticEngine
         private let eventDuration: TimeInterval
         private var lowPlayer: CHHapticPatternPlayer?
         private var highPlayer: CHHapticPatternPlayer?
+        private var running = false
 
         init?(engine: CHHapticEngine?, eventDuration: TimeInterval) {
             guard let engine else { return nil }
             self.engine = engine
             self.eventDuration = eventDuration
+        }
+
+        private func start() {
             do {
                 try engine.start()
                 try createPlayers()
+                running = true
             } catch {
-                return nil
+                lowPlayer = nil
+                highPlayer = nil
             }
         }
 
         func restart() {
+            guard running else { return }
             do {
                 try lowPlayer?.stop(atTime: CHHapticTimeImmediate)
                 try highPlayer?.stop(atTime: CHHapticTimeImmediate)
@@ -42,12 +50,20 @@ final class RumbleController {
         }
 
         func stop() {
+            guard running else { return }
+            running = false
             try? lowPlayer?.stop(atTime: CHHapticTimeImmediate)
             try? highPlayer?.stop(atTime: CHHapticTimeImmediate)
+            lowPlayer = nil
+            highPlayer = nil
             engine.stop()
         }
 
         func update(low: Float, lowHz: Float, high: Float, highHz: Float, multiplier: Float) {
+            if !running {
+                guard low > 0 || high > 0 else { return }
+                start()
+            }
             do {
                 try send(low: low, lowHz: lowHz, high: high, highHz: highHz, multiplier: multiplier)
             } catch {
@@ -113,6 +129,8 @@ final class RumbleController {
     private let eventDuration: TimeInterval = 20
     private var restartTimer: Timer?
     private var last = LichiiRumble()
+    private var lastActive: TimeInterval = 0
+    private var enginesOn = false
 
     /// The controller's engines (both handles when it has them), or nil when it has no haptics.
     init?(controller: GCController, multiplier: Float = 2.5) {
@@ -168,9 +186,18 @@ final class RumbleController {
 
     func stop() {
         update(LichiiRumble())
+        stopEngines()
     }
 
     func update(_ value: LichiiRumble) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let silent = value.left_low <= 0 && value.left_high <= 0 && value.right_low <= 0 && value.right_high <= 0
+        if !silent {
+            lastActive = now
+            enginesOn = true
+        } else if enginesOn, now - lastActive > 2 {
+            stopEngines()
+        }
         guard !Self.same(value, last) else { return }
         last = value
         queue.async { [self] in
@@ -187,6 +214,16 @@ final class RumbleController {
                     highHz: Self.weighted(value.left_high_hz, value.left_high, value.right_high_hz, value.right_high, 320),
                     multiplier: multiplier)
             }
+        }
+    }
+
+    private func stopEngines() {
+        guard enginesOn else { return }
+        enginesOn = false
+        queue.async { [self] in
+            leftChannel?.stop()
+            rightChannel?.stop()
+            fallbackChannel?.stop()
         }
     }
 

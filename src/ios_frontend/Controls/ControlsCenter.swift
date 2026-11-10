@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import LichiiBridge
+import Melo_Controller
 import Photos
 import SwiftUI
 import UIKit
@@ -56,15 +57,25 @@ final class ControlsCenter: ObservableObject {
         NotificationCenter.default.addObserver(forName: UIDevice.orientationDidChangeNotification,
                                                object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { DeviceOrientation.update() }
+            // The interface finishes rotating after the device reports the new orientation.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                MainActor.assumeIsolated { DeviceOrientation.update() }
+            }
         }
         NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification,
                                                object: nil, queue: .main) { _ in
             MainActor.assumeIsolated {
-                lichii_controls_release_touch()
+                ControlsCenter.shared.releaseTouch()
                 PhysicalControllers.shared.stopRumble()
             }
         }
         DeviceOrientation.update()
+    }
+
+    /// Releases everything the on-screen controller holds; toggled buttons show released again.
+    func releaseTouch() {
+        lichii_controls_release_touch()
+        NotificationCenter.default.post(name: .lichiiTouchReleased, object: nil)
     }
 
     func gameWindowReady(_ window: UIWindow) {
@@ -86,6 +97,10 @@ final class ControlsCenter: ObservableObject {
         PhysicalControllers.shared.updateDeviceMotion()
         updateTouchVisibility()
         startTicker()
+        // Loaded while the app was inactive: the game waits paused under the menu.
+        if Bridge.emuState == .paused {
+            openMenu(resumeOnClose: true)
+        }
     }
 
     func handle(event: Int32) {
@@ -93,6 +108,8 @@ final class ControlsCenter: ObservableObject {
         case Int32(LICHII_EVENT_STATE_CHANGED.rawValue):
             if !Bridge.emuState.inGame, Bridge.emuState != .booting, gameRunning {
                 gameEnded()
+            } else if gameRunning {
+                updateIdleWork()
             }
         case Int32(LICHII_EVENT_CONTROLLERS_CHANGED.rawValue):
             updateTouchVisibility()
@@ -108,7 +125,7 @@ final class ControlsCenter: ObservableObject {
         manuallyPaused = false
         ticker?.invalidate()
         ticker = nil
-        lichii_controls_release_touch()
+        releaseTouch()
         PhysicalControllers.shared.stopRumble()
         PhysicalControllers.shared.updateDeviceMotion()
         overlay?.detach()
@@ -124,15 +141,19 @@ final class ControlsCenter: ObservableObject {
 
     // MARK: - Menu
 
-    func openMenu() {
+    /// `resumeOnClose`: the game was paused for it (an interruption, a controller that went away)
+    /// and runs again when the menu closes.
+    func openMenu(resumeOnClose: Bool = false) {
         guard gameRunning, !menuOpen else { return }
-        lichii_controls_release_touch()
-        resumeAfterMenu = Bridge.emuState == .running
-        if resumeAfterMenu {
+        releaseTouch()
+        let running = Bridge.emuState == .running
+        resumeAfterMenu = running || resumeOnClose
+        if running {
             lichii_emu_pause()
         }
         menuOpen = true
         overlay?.interactive = true
+        UIAccessibility.post(notification: .screenChanged, argument: nil)
     }
 
     func closeMenu(resume: Bool = true) {
@@ -188,9 +209,21 @@ final class ControlsCenter: ObservableObject {
     private func startTicker() {
         ticker?.invalidate()
         let link = CADisplayLink(target: TickTarget.shared, selector: #selector(TickTarget.tick))
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
         link.add(to: .main, forMode: .common)
         ticker = link
+        updateIdleWork()
+    }
+
+    /// While the game is paused only the controller actions (the menu chord) are polled, slowly;
+    /// rumble and the phone's motion sensors stop.
+    private func updateIdleWork() {
+        let running = Bridge.emuState == .running
+        ticker?.preferredFrameRateRange = running ? CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+                                                  : CAFrameRateRange(minimum: 10, maximum: 15, preferred: 15)
+        if !running {
+            PhysicalControllers.shared.stopRumble()
+        }
+        PhysicalControllers.shared.updateDeviceMotion()
     }
 
     fileprivate func tick() {
@@ -200,8 +233,6 @@ final class ControlsCenter: ObservableObject {
         }
         if Bridge.emuState == .running {
             PhysicalControllers.shared.pollRumble()
-        } else {
-            PhysicalControllers.shared.stopRumble()
         }
     }
 
@@ -229,9 +260,26 @@ final class ControlsCenter: ObservableObject {
         let controller = PhysicalControllers.shared.playerOneHasController
         let visible = editingLayout || (showTouchControls && !(hideTouchWithController && controller))
         if !visible {
-            lichii_controls_release_touch()
+            releaseTouch()
         }
         touchControlsVisible = visible
+    }
+
+    // MARK: - Controllers
+
+    func controllerConnected(_ name: String, player: Int32) {
+        guard gameRunning else { return }
+        show(toast: player >= 0 ? "\(name) connected · Player \(player + 1)" : "\(name) connected")
+    }
+
+    /// A controller that drove a player went away: the game pauses under the menu until the user
+    /// closes it (reconnect, or carry on with the on-screen controller).
+    func controllerDisconnected(_ name: String, drovePlayer: Bool) {
+        guard gameRunning else { return }
+        if drovePlayer, Bridge.emuState == .running, !editingLayout {
+            openMenu(resumeOnClose: true)
+        }
+        show(toast: "\(name) disconnected")
     }
 
     // MARK: - Screenshot
@@ -273,9 +321,12 @@ final class ControlsCenter: ObservableObject {
 
     func show(toast text: String) {
         toast = text
+        UIAccessibility.post(notification: .announcement, argument: text)
         toastTask?.cancel()
+        // Longer toasts (thermal advice) stay longer.
+        let seconds = text.count > 60 ? 5.0 : 2.5
         toastTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             if !Task.isCancelled { ControlsCenter.shared.toast = nil }
         }
     }

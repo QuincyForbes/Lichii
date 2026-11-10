@@ -56,17 +56,22 @@ struct DeviceInfoRows: View {
     }
 }
 
-/// The thermal advice as a banner (library) or a small badge (over the game).
+/// The thermal advice as a banner (library) or a small badge (in-game menu). `transient` (over
+/// the game): only for a few seconds after the device gets hot, and not for Low Power Mode, which
+/// gets a toast instead.
 struct ThermalBanner: View {
     @ObservedObject private var platform = PlatformCenter.shared
     let compact: Bool
+    let transient: Bool
 
-    init(compact: Bool = false) {
+    init(compact: Bool = false, transient: Bool = false) {
         self.compact = compact
+        self.transient = transient
     }
 
     var body: some View {
-        let text = compact ? platform.thermalBadge : platform.thermalMessage
+        let hidden = transient && (!platform.thermalBadgeVisible || platform.thermalState < 2)
+        let text = hidden ? "" : compact ? platform.thermalBadge : platform.thermalMessage
         if !text.isEmpty {
             Label(text, systemImage: platform.thermalState >= 2 ? "thermometer.sun.fill" : "battery.25")
                 .font(compact ? Font.caption2.weight(.semibold) : Font.footnote)
@@ -77,6 +82,7 @@ struct ThermalBanner: View {
                 .background(tint.opacity(compact ? 0.75 : 0.18),
                             in: RoundedRectangle(cornerRadius: compact ? 12 : Theme.cornerRadius, style: .continuous))
                 .allowsHitTesting(false)
+                .accessibilityElement(children: .combine)
         }
     }
 
@@ -139,6 +145,71 @@ struct ShaderProgressView: View {
             }
         default:
             EmptyView()
+        }
+    }
+}
+
+/// Shown at launch when the previous game session ended without a clean stop.
+struct UncleanExitView: View {
+    @Environment(\.dismiss) private var dismiss
+    let session: GameSession
+    @State private var loweredTo: String?
+
+    /// The log of the previous run (the logger renames it at start).
+    private var logFiles: [URL] {
+        let current = Bridge.logFile
+        let previous = URL(fileURLWithPath: current.path + ".old.txt")
+        let startup = Bridge.documentsDir.appendingPathComponent("lichii-startup.old.txt")
+        return [previous, startup].filter { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    private var lowerResolution: QuickSettings.Choice? {
+        let choices = QuickSettings.choices("resolution_setup")
+        let current = QuickSettings.string("resolution_setup")
+        guard let index = choices.firstIndex(where: { $0.value == current }), index > 0 else { return nil }
+        return choices[index - 1]
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Label("\(session.title) closed unexpectedly", systemImage: "exclamationmark.triangle.fill")
+                        .font(.headline)
+                        .foregroundStyle(.orange)
+                    Text(session.memoryWarning
+                         ? "iOS warned that memory was running low just before, so it most likely closed Lichii to free memory. A lower resolution uses less."
+                         : "Lichii stopped while the game was running: a crash, or iOS closed it, often for memory. The log of that run helps find out which.")
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Section {
+                    if !logFiles.isEmpty {
+                        ShareLink(items: logFiles) {
+                            Label("Share the Log", systemImage: "square.and.arrow.up")
+                        }
+                    }
+                    if let loweredTo {
+                        Label("Resolution set to \(loweredTo)", systemImage: "checkmark")
+                    } else if let lower = lowerResolution {
+                        Button {
+                            QuickSettings.set("resolution_setup", lower.value)
+                            loweredTo = lower.name
+                        } label: {
+                            Label("Lower the Resolution to \(lower.name)",
+                                  systemImage: "arrow.down.right.and.arrow.up.left")
+                        }
+                    }
+                } footer: {
+                    Text("The resolution applies to every game without its own setting.")
+                }
+            }
+            .navigationTitle("Last Session")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
         }
     }
 }
