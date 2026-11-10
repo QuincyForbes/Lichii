@@ -9,6 +9,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/backend/spirv/ssbo_align_gate.h"
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -216,6 +217,9 @@ Id EmitLoadStorage32(EmitContext& ctx, const IR::Value& binding, const IR::Value
 static bool VectorViewIsExact(EmitContext& ctx, const IR::Value& offset, u32 size) {
     if (!ctx.profile.support_descriptor_aliasing) {
         return false;
+    }
+    if (!SsboAlignFixEnabled()) {
+        return true;
     }
     if (offset.IsImmediate()) {
         return offset.U32() % size == 0;

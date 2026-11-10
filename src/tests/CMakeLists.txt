@@ -132,6 +132,7 @@ add_executable(tests
     core/nx2_video_input_queue.cpp
     core/ldn.cpp
     core/internal_network/socket_proxy.cpp
+    core/nx2_movie_pacing.cpp
     core/priority_queue.cpp
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
@@ -139,6 +140,7 @@ add_executable(tests
     video_core/memory_manager_runs.cpp
     video_core/nx2_perf_draw_binds.cpp
     video_core/nx2_perf_texture_writes.cpp
+    video_core/ampere_depth_compare.cpp
     video_core/h264_packet.cpp
     video_core/nx2_gpu_mapping.cpp
     video_core/vertex_repack.cpp
