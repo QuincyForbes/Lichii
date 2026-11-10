@@ -569,6 +569,9 @@ void ConfigurePerGame::LoadConfiguration() {
         }
     }
     initial_nup_title = ui->display_name->text().trimmed().toStdString();
+    if (!initial_nup_title.empty()) {
+        setWindowTitle(tr("Properties - %1").arg(ui->display_name->text().trimmed()));
+    }
     nup_icon_modified = false;
     pending_nup_icon.clear();
 

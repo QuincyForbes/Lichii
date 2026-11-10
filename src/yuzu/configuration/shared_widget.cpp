@@ -77,6 +77,9 @@ QPushButton* Widget::CreateRestoreGlobalButton(bool using_global, QWidget* paren
     QIcon* icon = new QIcon(style->standardIcon(QStyle::SP_LineEditClearButton));
     QPushButton* restore_button = new QPushButton(*icon, QString(), parent);
     restore_button->setObjectName(QStringLiteral("RestoreButton%1").arg(restore_button_count));
+    restore_button->setToolTip(
+        tr("Use the global setting (Configure) instead of this game's own value"));
+    restore_button->setAccessibleName(tr("Use global setting"));
     restore_button->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
 
     // Workaround for dark theme causing min-width to be much larger than 0
@@ -766,13 +769,22 @@ Widget::Widget(Settings::BasicSetting* setting_, const TranslationMap& translati
     });
 
     bool enable = runtime_lock || setting.RuntimeModifiable();
-    if (setting.Switchable() && Settings::IsConfiguringGlobal() && !runtime_lock) {
-        enable &= setting.UsingGlobal();
+    QString reason;
+    if (!enable) {
+        reason = tr("Stop the game to change this.");
+    }
+    if (setting.Switchable() && Settings::IsConfiguringGlobal() && !runtime_lock &&
+        !setting.UsingGlobal()) {
+        enable = false;
+        reason = tr("The running game's Properties override this setting: change it there "
+                    "(right-click the game > Properties).");
     }
 
     this->setEnabled(enable);
 
-    this->setToolTip(tooltip);
+    this->setToolTip(reason.isEmpty()     ? tooltip
+                     : tooltip.isEmpty() ? reason
+                                         : tooltip + QStringLiteral("\n\n") + reason);
 }
 
 Builder::Builder(QWidget* parent_, bool runtime_lock_)
