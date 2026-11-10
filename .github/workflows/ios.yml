@@ -203,13 +203,17 @@ jobs:
           if-no-files-found: ignore
 
       - name: Publish rolling release
-        if: github.event_name == 'push' && !inputs.artifact_name && github.ref == 'refs/heads/ios'
+        # A manual run publishes too: it builds only the IPA, without the desktop release.
+        if: >-
+          !inputs.artifact_name &&
+          (github.event_name == 'workflow_dispatch' ||
+           (github.event_name == 'push' && github.ref == 'refs/heads/ios'))
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag=ios-latest
-          notes="Unsigned iOS build of Lichii (yuzu-cmd SDL3 frontend) from ${GITHUB_SHA}. Sign with Lichii.entitlements (JIT, increased memory limit, extended virtual addressing) and install with SideStore or your own profile."
+          notes="Unsigned iOS build of Lichii from ${GITHUB_REF_NAME} ${GITHUB_SHA}. Sign with Lichii.entitlements (JIT, increased memory limit, extended virtual addressing) and install with SideStore or your own profile. With SideStore, enable Extended Virtual Addressing and Increased Memory Limit for Lichii's App ID at developer.apple.com first, or games can't start."
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" Lichii.ipa Lichii.entitlements --clobber
             gh release edit "$tag" --notes "$notes" --prerelease
