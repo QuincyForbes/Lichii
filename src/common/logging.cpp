@@ -349,7 +349,10 @@ struct DebuggerBackend final : public Backend {
     explicit DebuggerBackend() noexcept = default;
     ~DebuggerBackend() noexcept override = default;
     void Write(const Entry& entry) noexcept override {
-        ::OutputDebugStringW(UTF8ToUTF16W(FormatLogMessage(entry)).c_str());
+        // Without a debugger the call raises an exception internally for nothing.
+        if (::IsDebuggerPresent()) {
+            ::OutputDebugStringW(UTF8ToUTF16W(FormatLogMessage(entry)).c_str());
+        }
     }
     void Flush() noexcept override {}
 };
@@ -413,6 +416,11 @@ struct Impl {
 #endif
     std::chrono::steady_clock::time_point time_origin{std::chrono::steady_clock::now()};
 };
+
+void PublishLowestLevel(const Filter& filter) {
+    const auto lowest = std::min_element(filter.class_levels.begin(), filter.class_levels.end());
+    g_lowest_enabled_level.store(u8(*lowest), std::memory_order_relaxed);
+}
 } // Anonymous namespace
 
 void Filter::ParseFilterString(std::string_view filter_view) {
@@ -441,6 +449,7 @@ void Initialize() {
     } else {
         logging_instance.emplace();
         logging_instance->filter.ParseFilterString(Settings::values.log_filter.GetValue());
+        PublishLowestLevel(logging_instance->filter);
 #ifndef __OPENORBIS__
         using namespace Common::FS;
         const auto& log_dir = GetEdenPath(EdenPath::LogDir);
@@ -459,8 +468,10 @@ void Stop() {
 }
 
 void SetGlobalFilter(const Filter& filter) {
-    if (logging_instance)
+    if (logging_instance) {
         logging_instance->filter = filter;
+        PublishLowestLevel(filter);
+    }
 }
 
 void SetColorConsoleBackendEnabled(bool enabled) {
