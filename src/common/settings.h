@@ -1027,7 +1027,19 @@ struct Values {
     Setting<std::string> eden_token{linkage, "",
                                     "eden_token", Category::WebService};
 
-    // Add-Ons
+    // Built-in game patches by kind (core/file_sys/patch_manager.h). Auto keeps the platform's
+    // default for each patch; a game's own add-on choice overrides these.
+    Setting<GamePatchMode> patch_frame_rate{linkage, GamePatchMode::Auto, "patch_frame_rate",
+                                            Category::Renderer};
+    Setting<GamePatchMode> patch_resolution{linkage, GamePatchMode::Auto, "patch_resolution",
+                                            Category::Renderer};
+    Setting<GamePatchMode> patch_performance{linkage, GamePatchMode::Auto, "patch_performance",
+                                             Category::Renderer};
+    Setting<GamePatchMode> patch_image{linkage, GamePatchMode::Auto, "patch_image",
+                                       Category::Renderer};
+
+    // Add-Ons. An entry is a disabled add-on's name, or "enabled:<name>" for a built-in patch the
+    // game turns on against the global setting.
     std::map<u64, std::vector<std::string>> disabled_addons;
 
     // Per-game overrides

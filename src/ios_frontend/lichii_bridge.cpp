@@ -522,6 +522,7 @@ const std::map<u32, std::vector<EnumChoice>>& EnumTable() {
         AddEnum<AntiAliasing>(t);
         AddEnum<OotAntiAliasing>(t);
         AddEnum<DlssPreset>(t);
+        AddEnum<GamePatchMode>(t);
         AddEnum<AspectRatio>(t);
         AddEnum<ConsoleMode>(t);
         AddEnum<AppletMode>(t);

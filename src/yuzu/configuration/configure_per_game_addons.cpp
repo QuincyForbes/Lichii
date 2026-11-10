@@ -34,6 +34,28 @@
 #include "yuzu/configuration/configure_input.h"
 #include "yuzu/configuration/configure_per_game_addons.h"
 
+namespace {
+
+QString BuiltinVersionText(const QString& kind, FileSys::BuiltinPatchChoice choice,
+                           FileSys::BuiltinPatchSource source, const QString& included_in) {
+    if (!included_in.isEmpty()) {
+        return QObject::tr("%1 · included in %2").arg(kind, included_in);
+    }
+    using Choice = FileSys::BuiltinPatchChoice;
+    if (choice != Choice::FollowGlobal) {
+        return QObject::tr("%1 · set for this game").arg(kind);
+    }
+    return source == FileSys::BuiltinPatchSource::Global
+               ? QObject::tr("%1 · follows the global setting").arg(kind)
+               : QObject::tr("%1 · follows the default").arg(kind);
+}
+
+QString StripBuiltinSuffix(QString name) {
+    return name.remove(QStringLiteral(" (built-in)"));
+}
+
+} // Anonymous namespace
+
 ConfigurePerGameAddons::ConfigurePerGameAddons(Core::System& system_, QWidget* parent)
     : QWidget(parent), ui{std::make_unique<Ui::ConfigurePerGameAddons>()}, system{system_} {
     ui->setupUi(this);
@@ -87,6 +109,22 @@ ConfigurePerGameAddons::ConfigurePerGameAddons(Core::System& system_, QWidget* p
 ConfigurePerGameAddons::~ConfigurePerGameAddons() = default;
 
 void ConfigurePerGameAddons::OnItemChanged(QStandardItem* item) {
+    if (item->column() == 0 && item->data(BUILTIN_CHOICE).isValid() &&
+        item->data(BUILTIN_CHECK).toInt() != static_cast<int>(item->checkState())) {
+        // A click on a built-in patch is this game's own choice.
+        const QSignalBlocker blocker{item_model};
+        item->setData(static_cast<int>(item->checkState()), BUILTIN_CHECK);
+        item->setData(static_cast<int>(item->checkState() == Qt::Checked
+                                           ? FileSys::BuiltinPatchChoice::On
+                                           : FileSys::BuiltinPatchChoice::Off),
+                      BUILTIN_CHOICE);
+        if (auto* version = item_model->item(item->row(), 1)) {
+            version->setText(BuiltinVersionText(
+                version->text().section(QStringLiteral(" · "), 0, 0),
+                FileSys::BuiltinPatchChoice::On, FileSys::BuiltinPatchSource::Game, {}));
+        }
+        return;
+    }
     if (update_items.size() > 1 && item->checkState() == Qt::Checked) {
         auto it = std::find(update_items.begin(), update_items.end(), item);
         if (it != update_items.end()) {
@@ -106,7 +144,15 @@ void ConfigurePerGameAddons::OnItemChanged(QStandardItem* item) {
 void ConfigurePerGameAddons::ApplyConfiguration() {
     std::vector<std::string> disabled_addons;
 
+    std::vector<std::pair<std::string, FileSys::BuiltinPatchChoice>> builtin_choices;
+
     for (const auto& item : list_items) {
+        if (item.front()->data(BUILTIN_CHOICE).isValid()) {
+            builtin_choices.emplace_back(item.front()->text().toStdString(),
+                                         static_cast<FileSys::BuiltinPatchChoice>(
+                                             item.front()->data(BUILTIN_CHOICE).toInt()));
+            continue;
+        }
         const auto disabled = item.front()->checkState() == Qt::Unchecked;
         if (disabled) {
             QVariant userData = item.front()->data(Qt::UserRole);
@@ -118,6 +164,10 @@ void ConfigurePerGameAddons::ApplyConfiguration() {
                 disabled_addons.push_back(item.front()->text().toStdString());
             }
         }
+    }
+
+    for (const auto& [name, choice] : builtin_choices) {
+        FileSys::ApplyBuiltinPatchChoice(disabled_addons, name, choice);
     }
 
     auto current = Settings::values.disabled_addons[title_id];
@@ -268,6 +318,32 @@ void ConfigurePerGameAddons::showContextMenu(const QPoint& pos) {
 
     QMenu menu(this);
 
+    const bool all_builtin = std::ranges::all_of(selected, [](const QModelIndex& index) {
+        return index.data(BUILTIN_CHOICE).isValid();
+    });
+    if (all_builtin) {
+        QAction* follow = menu.addAction(tr("&Follow the global setting"));
+        connect(follow, &QAction::triggered, this, [this, selected]() {
+            const QSignalBlocker blocker{item_model};
+            for (const QModelIndex& index : selected) {
+                auto* item = item_model->itemFromIndex(index.sibling(index.row(), 0));
+                const bool on = item->data(BUILTIN_FOLLOW_STATE).toBool();
+                item->setCheckState(on ? Qt::Checked : Qt::Unchecked);
+                item->setData(static_cast<int>(item->checkState()), BUILTIN_CHECK);
+                item->setData(static_cast<int>(FileSys::BuiltinPatchChoice::FollowGlobal),
+                              BUILTIN_CHOICE);
+                if (auto* version = item_model->item(item->row(), 1)) {
+                    version->setText(BuiltinVersionText(
+                        version->text().section(QStringLiteral(" · "), 0, 0),
+                        FileSys::BuiltinPatchChoice::FollowGlobal,
+                        FileSys::BuiltinPatchSource::Global, {}));
+                }
+            }
+            UISettings::values.is_game_list_reload_pending.exchange(true);
+        });
+        menu.addSeparator();
+    }
+
     QAction* remove = menu.addAction(tr("&Delete"));
     connect(remove, &QAction::triggered, this,
             [this, selected]() { AddonDeleteRequested(selected); });
@@ -349,6 +425,35 @@ void ConfigurePerGameAddons::LoadConfiguration() {
 
         bool should_enable = !patch_disabled;
 
+        QString version_text = QString::fromStdString(patch.version);
+        QString tooltip;
+        if (patch.builtin) {
+            const auto& info = *patch.builtin;
+            const auto included_in = StripBuiltinSuffix(QString::fromStdString(info.included_in));
+            should_enable = patch.enabled;
+            first_item->setData(static_cast<int>(info.choice), BUILTIN_CHOICE);
+            first_item->setData(FileSys::BuiltinPatchEnabledWhenFollowing(patch.name),
+                                BUILTIN_FOLLOW_STATE);
+            first_item->setData(should_enable ? static_cast<int>(Qt::Checked)
+                                              : static_cast<int>(Qt::Unchecked),
+                                BUILTIN_CHECK);
+            version_text = BuiltinVersionText(
+                QString::fromUtf8(FileSys::BuiltinPatchKindName(info.kind)), info.choice,
+                info.source, included_in);
+            tooltip = tr("%1\n\n%2\n\n%3")
+                          .arg(QString::fromStdString(info.description),
+                               QString::fromStdString(info.effect),
+                               included_in.isEmpty()
+                                   ? tr("Right-click to follow the global setting (Configure > "
+                                        "Graphics).")
+                                   : tr("Included in %1, which is on; this one does nothing "
+                                        "while it is.")
+                                         .arg(included_in));
+            if (!included_in.isEmpty()) {
+                first_item->setEnabled(false);
+            }
+        }
+
         if (patch.type == FileSys::PatchType::Update) {
             if (should_enable) {
                 if (has_enabled_update) {
@@ -362,8 +467,13 @@ void ConfigurePerGameAddons::LoadConfiguration() {
 
         first_item->setCheckState(should_enable ? Qt::Checked : Qt::Unchecked);
 
-        list_items.push_back(QList<QStandardItem*>{
-            first_item, new QStandardItem{QString::fromStdString(patch.version)}});
+        auto* const version_item = new QStandardItem{version_text};
+        if (!tooltip.isEmpty()) {
+            first_item->setToolTip(tooltip);
+            version_item->setToolTip(tooltip);
+            version_item->setEnabled(first_item->isEnabled());
+        }
+        list_items.push_back(QList<QStandardItem*>{first_item, version_item});
         item_model->appendRow(list_items.back());
     }
 

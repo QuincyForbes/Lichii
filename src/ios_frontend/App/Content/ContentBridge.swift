@@ -135,10 +135,38 @@ enum ContentBridge {
         let numericVersion: UInt32
         let location: String
         let removable: Bool
+        let builtin: BuiltinPatch?
 
         var isUpdate: Bool { type == "update" }
         var isDLC: Bool { type == "dlc" }
         var isMod: Bool { type == "mod" || type == "builtin" || type == "cheat" }
+    }
+
+    /// What a built-in patch does and what decided whether it applies.
+    struct BuiltinPatch: Decodable, Hashable {
+        let kind: String
+        let game: String
+        let description: String
+        let effect: String
+        /// "global" (follows the global setting of its kind), "on" or "off" (this game's choice).
+        let choice: String
+        /// What decided: "game", "global" or "default".
+        let source: String
+        let resolvedEnabled: Bool
+        /// An enabled built-in patch that contains this one; empty when none.
+        let includedIn: String
+
+        var followsGlobal: Bool { choice == "global" }
+    }
+
+    /// 0 follows the global setting, 1 forces the patch on, 2 forces it off.
+    static func setBuiltinChoice(_ game: Game, name: String, choice: Int32) {
+        _ = name.withCString { lichii_content_set_builtin_patch_choice(game.programId, $0, choice) }
+    }
+
+    /// The games that ship built-in patches.
+    static func builtinPatchGames() -> [String] {
+        decode([String].self, lichii_content_builtin_patch_games_json()) ?? []
     }
 
     struct DLC: Decodable, Identifiable, Hashable {
