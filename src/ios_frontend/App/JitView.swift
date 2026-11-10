@@ -209,17 +209,18 @@ struct JitView: View {
                 }
             }
             Section {
-                DisclosureGroup("Details") {
-                    LabeledContent("Debugger attached once", value: status.debugged ? "Yes" : "No")
-                    LabeledContent("Needs StikDebug script", value: status.needsScript ? "Yes (TXM)" : "No")
+                // Diagnostics, collapsed: for bug reports.
+                DisclosureGroup("Diagnostics") {
                     LabeledContent(provider.label, value: status.providerInstalled ? "Installed" : "Not found")
-                    LabeledContent("Pool", value: "\(status.prepared >> 20) / \(status.total >> 20) MiB")
+                    LabeledContent("Debugger attached", value: status.debugged ? "Yes" : "No")
+                    LabeledContent("Needs StikDebug's script", value: status.needsScript ? "Yes (TXM device)" : "No")
+                    LabeledContent("JIT memory prepared", value: "\(status.prepared >> 20) of \(status.total >> 20) MiB")
                 }
             }
             Section {
-                Toggle("Ask \(provider.label) at launch", isOn: $autoRequest)
+                Toggle("Enable JIT Automatically", isOn: $autoRequest)
             } footer: {
-                Text("Lichii prepares its JIT memory while you browse the library, so games start without waiting.")
+                Text("When Lichii opens without JIT, it switches to \(provider.label) once to enable it and comes back, so games start without waiting. Turn this off to enable JIT only with the button above or when you start a game.")
             }
         }
         .navigationTitle("JIT")

@@ -114,6 +114,49 @@ struct SettingsPlatform {
     }
 }
 
+/// The pages of the global settings, each a list of setting categories in section order.
+enum SettingsGroup: String, CaseIterable, Identifiable {
+    case graphics, audio, system, advanced
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .graphics: return "Graphics"
+        case .audio: return "Audio"
+        case .system: return "System"
+        case .advanced: return "Advanced"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .graphics: return "display"
+        case .audio: return "speaker.wave.2"
+        case .system: return "cpu"
+        case .advanced: return "wrench.and.screwdriver"
+        }
+    }
+
+    var categories: [String] {
+        switch self {
+        case .graphics: return ["Renderer", "RendererAdvanced"]
+        case .audio: return ["Audio", "SystemAudio"]
+        case .system: return ["Core", "Cpu", "System", "Controls", "LibraryApplet", "DataStorage", "Overlay"]
+        case .advanced: return Array(SettingsCatalog.advancedCategories).sorted()
+        }
+    }
+
+    /// Section titles within a page.
+    func sectionTitle(_ category: String) -> String {
+        switch (self, category) {
+        case (.graphics, "Renderer"): return "Image"
+        case (.graphics, "RendererAdvanced"): return "Performance"
+        default: return SettingsCatalog.categoryTitles[category] ?? category
+        }
+    }
+}
+
 enum SettingsCatalog {
     /// Every setting, read once (the list never changes while the app runs).
     @MainActor static let all: [SettingItem] = (0..<lichii_settings_count()).compactMap { index in
@@ -234,12 +277,51 @@ enum SettingsCatalog {
         "Overlay": "Overlay", "GpuDriver": "GPU Driver", "AddOns": "Add-ons",
     ]
 
-    /// The main page (`advanced` false) or the Advanced page; a search covers both.
+    /// Settings shown with another group than their own: shader building is a hack in the core
+    /// but an everyday switch on a phone.
+    static let categoryOverrides: [String: String] = [
+        "use_asynchronous_shaders": "RendererAdvanced",
+    ]
+
+    static func displayCategory(of item: SettingItem) -> String {
+        categoryOverrides[item.key] ?? item.category
+    }
+
+    /// One page of the global settings. A search covers every page.
+    @MainActor
+    static func sections(group: SettingsGroup, query: String) -> [SettingSection] {
+        let rank = Dictionary(essentials.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        let visible = all.filter { item in
+            availability(of: item) != .hidden &&
+                (query.isEmpty ? group.categories.contains(displayCategory(of: item))
+                    : item.label.localizedCaseInsensitiveContains(query) ||
+                        item.key.localizedCaseInsensitiveContains(query))
+        }
+        var grouped: [String: [SettingItem]] = [:]
+        var order: [String] = query.isEmpty ? group.categories : []
+        for item in visible {
+            let category = displayCategory(of: item)
+            if !order.contains(category) {
+                order.append(category)
+            }
+            grouped[category, default: []].append(item)
+        }
+        return order.compactMap { category in
+            guard let items = grouped[category], !items.isEmpty else { return nil }
+            // The everyday settings first, then the core's order (a stable sort).
+            let sorted = items.enumerated().sorted { a, b in
+                (rank[a.element.key] ?? Int.max, a.offset) < (rank[b.element.key] ?? Int.max, b.offset)
+            }.map(\.element)
+            return SettingSection(id: category, title: group.sectionTitle(category), items: sorted)
+        }
+    }
+
+    /// The per-game page (`advanced` false) or its advanced part; a search covers both.
     @MainActor
     static func sections(perGame: Bool, query: String, advanced: Bool = false) -> [SettingSection] {
         let visible = all.filter { item in
             availability(of: item) != .hidden && (!perGame || item.switchable) &&
-                (query.isEmpty ? advancedCategories.contains(item.category) == advanced
+                (query.isEmpty ? advancedCategories.contains(displayCategory(of: item)) == advanced
                     : item.label.localizedCaseInsensitiveContains(query) ||
                         item.key.localizedCaseInsensitiveContains(query))
         }
@@ -253,10 +335,11 @@ enum SettingsCatalog {
         var order: [String] = []
         var grouped: [String: [SettingItem]] = [:]
         for item in visible where !essentialKeys.contains(item.key) {
-            if grouped[item.category] == nil {
-                order.append(item.category)
+            let category = displayCategory(of: item)
+            if grouped[category] == nil {
+                order.append(category)
             }
-            grouped[item.category, default: []].append(item)
+            grouped[category, default: []].append(item)
         }
         for category in order {
             sections.append(SettingSection(id: category, title: categoryTitles[category] ?? category,

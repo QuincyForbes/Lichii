@@ -45,6 +45,13 @@ enum AppExtensions {
         ] + content("logs") + content("users") + PlatformEntries.settingsLinks + content("setup")
     }
 
+    /// Sections added to the end of Settings > Graphics (app-side options such as the performance
+    /// overlay). Each returns a `Section`.
+    static var graphicsSettingsSections: [() -> AnyView] {
+        [
+        ]
+    }
+
     /// Per-game screens after Game Settings (controller layout, updates, DLC, mods, cheats, saves, ...).
     static var gameActions: [GameAction] {
         [

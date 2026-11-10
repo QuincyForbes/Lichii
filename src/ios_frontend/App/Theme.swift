@@ -38,13 +38,35 @@ enum IconCache {
     }
 }
 
-/// A game's icon, or a placeholder with its initials.
+/// A game's icon, or a placeholder with its initials. `fills`: a square as wide as the space
+/// offered instead of `size`.
 struct GameIcon: View {
     let game: Game
     var size: CGFloat = 120
+    var fills = false
     @State private var loaded: UIImage?
 
     var body: some View {
+        Group {
+            if !fills {
+                icon(size)
+            } else {
+                Color.clear
+                    .aspectRatio(1, contentMode: .fit)
+                    .overlay {
+                        GeometryReader { proxy in
+                            icon(proxy.size.width)
+                        }
+                    }
+            }
+        }
+        .accessibilityHidden(true)
+        .task(id: game) {
+            loaded = await IconCache.load(game)
+        }
+    }
+
+    private func icon(_ side: CGFloat) -> some View {
         Group {
             if let image = loaded ?? IconCache.cached(game) {
                 Image(uiImage: image)
@@ -56,17 +78,13 @@ struct GameIcon: View {
                     LinearGradient(colors: [Theme.accent.opacity(0.85), .indigo],
                                    startPoint: .topLeading, endPoint: .bottomTrailing)
                     Text(initials)
-                        .font(.system(size: size * 0.3, weight: .bold, design: .rounded))
+                        .font(.system(size: side * 0.3, weight: .bold, design: .rounded))
                         .foregroundStyle(.white)
                 }
             }
         }
-        .frame(width: size, height: size)
-        .clipShape(RoundedRectangle(cornerRadius: size * 0.12, style: .continuous))
-        .accessibilityHidden(true)
-        .task(id: game) {
-            loaded = await IconCache.load(game)
-        }
+        .frame(width: side, height: side)
+        .clipShape(RoundedRectangle(cornerRadius: side * 0.12, style: .continuous))
     }
 
     private var initials: String {
