@@ -1200,12 +1200,16 @@ namespace {
 std::atomic<u64> g_zero_filled_bytes{};
 
 [[maybe_unused]] bool IsZeroPage(const u8* page) {
+    // A cache line at a time: most pages that are not zero say so in their first line.
     const auto* words = reinterpret_cast<const u64*>(page);
-    u64 bits = 0;
-    for (size_t i = 0; i < PageAlignment / sizeof(u64); ++i) {
-        bits |= words[i];
+    for (size_t i = 0; i < PageAlignment / sizeof(u64); i += 8) {
+        const u64 bits = words[i] | words[i + 1] | words[i + 2] | words[i + 3] | words[i + 4] |
+                         words[i + 5] | words[i + 6] | words[i + 7];
+        if (bits != 0) {
+            return false;
+        }
     }
-    return bits == 0;
+    return true;
 }
 } // namespace
 
@@ -1213,12 +1217,19 @@ u64 HostMemory::ZeroFilledBytes() noexcept {
     return g_zero_filled_bytes.load(std::memory_order_relaxed);
 }
 
-std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
+std::pair<size_t, size_t> HostMemory::TrimZeroPages(
+    [[maybe_unused]] ZeroTrimState* state,
+    [[maybe_unused]] const std::function<bool()>& pause) const {
 #ifdef _WIN32
     if (backing_base == nullptr) {
         return {0, 0};
     }
-    std::vector<ULONG_PTR> entries(size_t{1} << 22);
+    ZeroTrimState local;
+    ZeroTrimState& s = state != nullptr ? *state : local;
+    auto& entries = s.entries;
+    if (entries.size() < (size_t{1} << 20)) {
+        entries.resize(size_t{1} << 20);
+    }
     for (int attempt = 0;; ++attempt) {
         if (K32QueryWorkingSet(GetCurrentProcess(), entries.data(),
                                static_cast<DWORD>(entries.size() * sizeof(ULONG_PTR)))) {
@@ -1227,14 +1238,16 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
         if (GetLastError() != ERROR_BAD_LENGTH || attempt == 3) {
             return {0, 0};
         }
-        entries.assign((std::max)(entries.size() * 2, size_t{entries[0]} + (size_t{1} << 18)), 0);
+        entries.resize((std::max)(entries.size() * 2, size_t{entries[0]} + (size_t{1} << 18)));
     }
     const size_t count = (std::min)(size_t{entries[0]}, entries.size() - 1);
     const auto backing_begin = reinterpret_cast<uintptr_t>(backing_base);
     const auto view_begin = reinterpret_cast<uintptr_t>(impl ? impl->virtual_base : nullptr);
     const size_t view_size = impl ? impl->virtual_size : 0;
-    std::vector<uintptr_t> backing_pages;
-    std::vector<uintptr_t> view_pages;
+    auto& backing_pages = s.backing_pages;
+    auto& view_pages = s.view_pages;
+    backing_pages.clear();
+    view_pages.clear();
     for (size_t i = 1; i <= count; ++i) {
         const uintptr_t page = entries[i] & ~uintptr_t{PageAlignment - 1};
         if (page - backing_begin < backing_size) {
@@ -1244,34 +1257,24 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
         }
     }
     std::sort(backing_pages.begin(), backing_pages.end());
+    std::sort(view_pages.begin(), view_pages.end());
+
     // Pages are only ever read through the backing, which stays mapped and writable: a view page
     // can be unmapped or protected by a guest thread meanwhile. Trimming keeps the contents, so a
     // write that lands after the check costs a soft fault and nothing else.
-    std::vector<uintptr_t> trim;
+    const bool confirm = state != nullptr;
+    auto& trim = s.trim;
+    auto& zero_now = s.zero_now;
+    trim.clear();
+    zero_now.clear();
     size_t zero_bytes = 0;
-    for (const uintptr_t page : backing_pages) {
-        if (IsZeroPage(reinterpret_cast<const u8*>(page))) {
+    const auto zero = [&](uintptr_t page) {
+        zero_now.push_back(page);
+        if (!confirm || std::binary_search(s.zero_before.begin(), s.zero_before.end(), page)) {
             trim.push_back(page);
             zero_bytes += PageAlignment;
         }
-    }
-    for (const uintptr_t page : view_pages) {
-        const auto offset = impl->BackingOffset(page - view_begin);
-        if (!offset || *offset >= backing_size) {
-            continue;
-        }
-        const uintptr_t backing_page = backing_begin + *offset;
-        if (IsZeroPage(reinterpret_cast<const u8*>(backing_page))) {
-            trim.push_back(page);
-            zero_bytes += PageAlignment;
-        }
-        // Reading it put the backing page in the working set: take it out again.
-        if (!std::binary_search(backing_pages.begin(), backing_pages.end(), backing_page)) {
-            trim.push_back(backing_page);
-        }
-    }
-    std::sort(trim.begin(), trim.end());
-    trim.erase(std::unique(trim.begin(), trim.end()), trim.end());
+    };
     // A run can span two views, which VirtualUnlock refuses as a whole: then page by page.
     const auto unlock = [](uintptr_t begin, uintptr_t end) {
         if (VirtualUnlock(reinterpret_cast<void*>(begin), end - begin) ||
@@ -1282,14 +1285,55 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
             VirtualUnlock(reinterpret_cast<void*>(page), PageAlignment);
         }
     };
-    for (size_t i = 0; i < trim.size();) {
-        size_t j = i + 1;
-        while (j < trim.size() && trim[j] == trim[j - 1] + PageAlignment) {
-            ++j;
+    // Each slice reads at most 4 MiB and unlocks what it found, then the caller may sleep: one
+    // pass over a 9 GB working set held a core and the working-set lock for up to 4.7 s.
+    constexpr size_t SlicePages = 1024;
+    const auto end_slice = [&] {
+        std::sort(trim.begin(), trim.end());
+        trim.erase(std::unique(trim.begin(), trim.end()), trim.end());
+        for (size_t i = 0; i < trim.size();) {
+            size_t j = i + 1;
+            while (j < trim.size() && trim[j] == trim[j - 1] + PageAlignment) {
+                ++j;
+            }
+            unlock(trim[i], trim[j - 1] + PageAlignment);
+            i = j;
         }
-        unlock(trim[i], trim[j - 1] + PageAlignment);
-        i = j;
+        trim.clear();
+        return !pause || pause();
+    };
+    bool finished = true;
+    for (size_t i = 0; i < backing_pages.size() && finished; ++i) {
+        const uintptr_t page = backing_pages[i];
+        if (IsZeroPage(reinterpret_cast<const u8*>(page))) {
+            zero(page);
+        }
+        if ((i + 1) % SlicePages == 0) {
+            finished = end_slice();
+        }
     }
+    for (size_t i = 0; i < view_pages.size() && finished; ++i) {
+        const uintptr_t page = view_pages[i];
+        const auto offset = impl->BackingOffset(page - view_begin);
+        if (offset && *offset < backing_size) {
+            const uintptr_t backing_page = backing_begin + *offset;
+            if (IsZeroPage(reinterpret_cast<const u8*>(backing_page))) {
+                zero(page);
+            }
+            // Reading it put the backing page in the working set: take it out again.
+            if (!std::binary_search(backing_pages.begin(), backing_pages.end(), backing_page)) {
+                trim.push_back(backing_page);
+            }
+        }
+        if ((i + 1) % SlicePages == 0) {
+            finished = end_slice();
+        }
+    }
+    if (finished) {
+        end_slice();
+    }
+    std::sort(zero_now.begin(), zero_now.end());
+    s.zero_before.swap(zero_now);
     return {(backing_pages.size() + view_pages.size()) * PageAlignment, zero_bytes};
 #else
     return {0, 0};
