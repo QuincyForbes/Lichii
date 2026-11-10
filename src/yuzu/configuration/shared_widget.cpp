@@ -777,7 +777,7 @@ Widget::Widget(Settings::BasicSetting* setting_, const TranslationMap& translati
         !setting.UsingGlobal()) {
         enable = false;
         reason = tr("The running game's Properties override this setting: change it there "
-                    "(right-click the game > Properties).");
+                    "(right-click the game > Configure Game).");
     }
 
     this->setEnabled(enable);
