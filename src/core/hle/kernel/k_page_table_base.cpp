@@ -308,11 +308,38 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
         (alias_region_size + heap_region_size + stack_region_size + kernel_map_region_size);
     R_UNLESS(alloc_size >= needed_size, ResultOutOfMemory);
 
-    const size_t remaining_size = alloc_size - needed_size;
+    size_t remaining_size = alloc_size - needed_size;
+
+    // iOS grants a fastmem arena smaller than the address space; guest accesses above it take the
+    // page table path. Keep the regions inside it when they fit, else put the hot ones first:
+    // heap, then stack, alias and kernel map. (NCE sizes its arena and layout itself.)
+    const u64 fastmem_end = [&]() -> u64 {
+#ifdef HAS_NCE
+        return 0;
+#else
+        const auto& fastmem = m_system.DeviceMemory().buffer;
+        return fastmem.VirtualBasePointer() != nullptr && Settings::IsFastmemEnabled()
+                   ? fastmem.VirtualSize()
+                   : 0;
+#endif
+    }();
+    const bool fastmem_short = fastmem_end != 0 && fastmem_end < GetInteger(end) &&
+                               GetInteger(alloc_start) < fastmem_end;
+    const bool hot_first = fastmem_short &&
+                           GetInteger(alloc_start) + needed_size > fastmem_end &&
+                           remaining_size >= 3 * RegionAlignment;
+    if (fastmem_short && !hot_first) {
+        remaining_size = (std::min)(
+            remaining_size, static_cast<size_t>(fastmem_end - GetInteger(alloc_start) - needed_size));
+    }
 
     // Determine random placements for each region.
     size_t alias_rnd = 0, heap_rnd = 0, stack_rnd = 0, kmap_rnd = 0;
-    if (enable_aslr) {
+    if (hot_first) {
+        stack_rnd = RegionAlignment;
+        alias_rnd = 2 * RegionAlignment;
+        kmap_rnd = 3 * RegionAlignment;
+    } else if (enable_aslr) {
         alias_rnd = KSystemControl::GenerateRandomRange(0, remaining_size / RegionAlignment) * RegionAlignment;
         heap_rnd = KSystemControl::GenerateRandomRange(0, remaining_size / RegionAlignment) * RegionAlignment;
         stack_rnd = KSystemControl::GenerateRandomRange(0, remaining_size / RegionAlignment) * RegionAlignment;
@@ -433,6 +460,19 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
     ASSERT(alias_last < kmap_start || kmap_last < alias_start);
     ASSERT(heap_last < stack_start || stack_last < heap_start);
     ASSERT(heap_last < kmap_start || kmap_last < heap_start);
+
+    LOG_INFO(Kernel,
+             "Address space: {}-bit, code {:#x}-{:#x}, heap {:#x}-{:#x}, alias {:#x}-{:#x}, stack "
+             "{:#x}-{:#x}, kernel map {:#x}-{:#x}, ASLR {}{}",
+             m_address_space_width, GetInteger(process_code_start), GetInteger(process_code_end),
+             GetInteger(m_heap_region_start), GetInteger(m_heap_region_end),
+             GetInteger(m_alias_region_start), GetInteger(m_alias_region_end),
+             GetInteger(m_stack_region_start), GetInteger(m_stack_region_end),
+             GetInteger(m_kernel_map_region_start), GetInteger(m_kernel_map_region_end),
+             enable_aslr ? 1 : 0,
+             !fastmem_short ? ""
+             : hot_first    ? ", fastmem arena too small: hot regions first"
+                            : ", kept inside the fastmem arena");
 
     // Initialize our implementation.
     m_impl.Resize(m_address_space_width, PageBits);

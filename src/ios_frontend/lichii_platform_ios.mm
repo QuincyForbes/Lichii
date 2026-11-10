@@ -108,6 +108,17 @@ bool CanReserve(std::size_t bytes) {
     return true;
 }
 
+// Largest single reservation in GiB (the guest's fastmem arena needs one).
+uint64_t LargestReservationGib() {
+    uint64_t low = 0;
+    uint64_t high = 1024;
+    while (high - low > 1) {
+        const uint64_t mid = (low + high) / 2;
+        (CanReserve(std::size_t{mid} << 30) ? low : high) = mid;
+    }
+    return low;
+}
+
 uint64_t FootprintBytes() {
     task_vm_info_data_t info{};
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
@@ -178,6 +189,7 @@ void GatherDeviceInfo() {
         EntitlementValue("com.apple.developer.kernel.extended-virtual-addressing");
     info.va_reserve_4g = CanReserve(std::size_t{4} << 30) ? 1 : 0;
     info.va_reserve_16g = CanReserve(std::size_t{16} << 30) ? 1 : 0;
+    info.va_reserve_max_gib = LargestReservationGib();
     info.txm_from_device_tree = IosSupport::HasTxmIoKit() ? 1 : 0;
     info.txm = IosSupport::HasTxm() ? 1 : 0;
     info.max_fps = static_cast<int>(UIScreen.mainScreen.maximumFramesPerSecond);
@@ -311,9 +323,10 @@ void lichii_platform_init(void) {
                      g_info.max_fps);
             LOG_INFO(Frontend,
                      "iOS platform: increased memory limit {}, extended virtual addressing {}, "
-                     "reserve 4 GiB {} / 16 GiB {}, TXM {} ({})",
+                     "reserve 4 GiB {} / 16 GiB {} / largest {} GiB, TXM {} ({})",
                      g_info.increased_memory_limit, g_info.extended_virtual_addressing,
-                     g_info.va_reserve_4g, g_info.va_reserve_16g, g_info.txm,
+                     g_info.va_reserve_4g, g_info.va_reserve_16g, g_info.va_reserve_max_gib,
+                     g_info.txm,
                      g_info.txm_from_device_tree ? "device tree" : "model table");
             if (g_info.increased_memory_limit == 0) {
                 LOG_WARNING(Frontend, "iOS: the increased-memory-limit entitlement is missing; "

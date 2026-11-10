@@ -45,6 +45,7 @@ typedef struct LichiiDeviceInfo {
     int extended_virtual_addressing; ///< Same for extended-virtual-addressing
     int va_reserve_4g;          ///< A 4 GiB PROT_NONE reservation succeeded
     int va_reserve_16g;         ///< A 16 GiB one succeeded (the guest needs large reservations)
+    uint64_t va_reserve_max_gib; ///< Largest single PROT_NONE reservation at launch, in GiB
     int txm;                    ///< Trusted Execution Monitor (JIT needs StikDebug's script)
     int txm_from_device_tree;   ///< ... known from the device tree rather than the model table
     int low_power_mode;
