@@ -121,6 +121,15 @@ inline std::atomic<int> g_host_pace{-1};
 /// EXP35 (live; guest writes of cached memory, RasterizerVulkan::OnCPUWrite): collected for the
 /// next InvalidateGPUCache without the texture and buffer cache mutexes, except on pages of
 /// images or shader code. 1 = pages no GPU write ever marked, 2 = every page (Fritchii v5.5).
+/// EXP42 (live; VkImage pool, vk_texture_cache.cpp): 1 = deleted render targets' VkImages are kept
+/// for the next image of the same create info (512 MiB, 180 frames); 2 = dedicated-allocation
+/// targets too, up to 1.5 GiB.
+/// EXP56 (live) = 1: a cleared depth target larger than its colour targets is not uploaded from
+/// guest memory first (TextureCache::JoinImages). EXP57 (live) = 1: the collector's high-priority
+/// pass waits for the GPU (the download of a GPU-written image) once a frame at most, unless an
+/// allocation failed.
+/// EXP58 (live; TextureCache::SweepColdImages): 1 = guarded render targets that a newer target of
+/// another shape superseded are deleted once 60 frames old; 2 = those the CPU read once too.
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 

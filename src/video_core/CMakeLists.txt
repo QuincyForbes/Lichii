@@ -27,6 +27,7 @@ add_library(video_core STATIC
     capture.h
     cdma_pusher.cpp
     cdma_pusher.h
+    churn_counters.h
     compatible_formats.cpp
     compatible_formats.h
     control/channel_state.cpp
@@ -270,6 +271,7 @@ add_library(video_core STATIC
     vulkan_common/vulkan_overlay_filter.h
     vulkan_common/vulkan_memory_allocator.cpp
     vulkan_common/vulkan_memory_allocator.h
+    vulkan_common/unbacked_fallback.h
     vulkan_common/vulkan_surface.cpp
     vulkan_common/vulkan_surface.h
     vulkan_common/vulkan_wrapper.cpp
@@ -300,6 +302,7 @@ add_library(video_core STATIC
     texture_cache/formatter.h
     texture_cache/format_lookup_table.cpp
     texture_cache/format_lookup_table.h
+    texture_cache/host_memory_limit.h
     texture_cache/image_base.cpp
     texture_cache/image_base.h
     texture_cache/image_info.cpp
