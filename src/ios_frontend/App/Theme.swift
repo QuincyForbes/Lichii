@@ -9,14 +9,44 @@ enum Theme {
     static let cornerRadius: CGFloat = 14
 }
 
+/// Decoded game icons. Decoding runs off the main thread, once per icon.
+enum IconCache {
+    private static let cache = NSCache<NSString, UIImage>()
+
+    private static func key(_ game: Game) -> NSString {
+        "\(game.path)#\(game.icon?.count ?? 0)" as NSString
+    }
+
+    static func cached(_ game: Game) -> UIImage? {
+        cache.object(forKey: key(game))
+    }
+
+    static func load(_ game: Game) async -> UIImage? {
+        if let image = cached(game) {
+            return image
+        }
+        guard let data = game.icon else { return nil }
+        let image: UIImage? = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: UIImage(data: data)?.preparingForDisplay())
+            }
+        }
+        if let image {
+            cache.setObject(image, forKey: key(game))
+        }
+        return image
+    }
+}
+
 /// A game's icon, or a placeholder with its initials.
 struct GameIcon: View {
     let game: Game
     var size: CGFloat = 120
+    @State private var loaded: UIImage?
 
     var body: some View {
         Group {
-            if let data = game.icon, let image = UIImage(data: data) {
+            if let image = loaded ?? IconCache.cached(game) {
                 Image(uiImage: image)
                     .resizable()
                     .interpolation(.high)
@@ -33,6 +63,10 @@ struct GameIcon: View {
         }
         .frame(width: size, height: size)
         .clipShape(RoundedRectangle(cornerRadius: size * 0.12, style: .continuous))
+        .accessibilityHidden(true)
+        .task(id: game) {
+            loaded = await IconCache.load(game)
+        }
     }
 
     private var initials: String {
