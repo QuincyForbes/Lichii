@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -25,17 +25,18 @@ constexpr size_t VirtualReserveSize = 1ULL << 39;
 DeviceMemory::DeviceMemory()
     : buffer{Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize(),
              VirtualReserveSize} {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     zero_trim_thread = std::jthread{[this](std::stop_token stop) { TrimZeroPages(stop); }};
 #endif
 }
 
 DeviceMemory::~DeviceMemory() = default;
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 // Windows can't punch holes in the guest memory section, so pages holding only zeros (games clear
 // their heaps while booting: Ocarina leaves ~7 GB) stay resident until they leave the working set.
-// A pass comes every 5 s while they keep turning up, backing off to once a minute.
+// A pass comes every 5 s while they keep turning up, backing off to once a minute. Apple counts
+// them in the footprint iOS kills the app over, compressed or not.
 void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     using namespace std::chrono_literals;
     Common::SetCurrentThreadName("ZeroTrim");

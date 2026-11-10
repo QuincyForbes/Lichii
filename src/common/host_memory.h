@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <utility>
+#include <vector>
 #include "common/common_funcs.h"
 #include "common/common_types.h"
 
@@ -64,11 +65,17 @@ public:
     void HintCold(size_t physical_offset, size_t length,
                   std::optional<size_t> virtual_offset) const;
     /// Windows: resident pages of guest memory (backing and its views) that hold only zeros leave
-    /// the working set, like HintCold. Returns {resident bytes looked at, bytes trimmed}.
+    /// the working set, like HintCold. Apple: resident and compressed zero pages of the backing
+    /// leave the footprint (MADV_FREE_REUSABLE). Returns {resident bytes looked at, bytes trimmed}.
     std::pair<size_t, size_t> TrimZeroPages() const;
 
     /// Bytes ClearBackingRegion has filled with zeros (memset) since start.
     static u64 ZeroFilledBytes() noexcept;
+    /// Apple, as of the last TrimZeroPages: guest memory resident or compressed, guest memory the
+    /// kernel has handed out, and zero bytes trimmed so far.
+    static u64 ScannedResidentBytes() noexcept;
+    static u64 ScannedHandedOutBytes() noexcept;
+    static u64 TrimmedZeroBytes() noexcept;
 
     /// Pages the kernel hands out (cleared or not).
     void MarkUsed(size_t physical_offset, size_t length);
@@ -124,6 +131,9 @@ private:
     static constexpr u8 GranuleReleased = 1 << 2; ///< Apple: given back with MADV_FREE_REUSABLE
     std::unique_ptr<std::atomic<u8>[]> granules;
     size_t num_granules{};
+#ifdef __APPLE__
+    mutable std::vector<bool> trimmed_pages; ///< Host pages TrimZeroPages made reusable
+#endif
     // Windows requires it for kernels whom lack proper support for some functions!
     bool fallback_buffer{false};
 };
