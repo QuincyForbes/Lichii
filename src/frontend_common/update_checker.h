@@ -53,7 +53,7 @@ struct FritchiiVersion {
     std::string ToString() const;
 };
 
-// "4" or "3.5", as in dist/frizti_version.txt.
+// "4" or "3.5", as in Fritchii release tags.
 std::optional<FritchiiVersion> ParseFritchiiVersion(std::string_view text);
 
 // The build version "Fritchii v4" (or the older "Frizti v3.5"); nullopt for other builds.

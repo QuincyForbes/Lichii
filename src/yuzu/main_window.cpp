@@ -4762,7 +4762,7 @@ void MainWindow::OnEmulatorUpdateAvailable() {
         QString text;
         switch (result.failure) {
         case UpdateChecker::Failure::RateLimited:
-            text = tr("Could not check for updates: GitHub rate limit reached. Fritchii will try "
+            text = tr("Could not check for updates: GitHub rate limit reached. Lichii will try "
                       "again at the next start.");
             break;
         case UpdateChecker::Failure::Http:
@@ -4829,7 +4829,7 @@ void MainWindow::ShowRestartNote() {
         QTimer::singleShot(1000, this, &MainWindow::ShowRestartNote);
         return;
     }
-    QMessageBox::information(this, tr("Fritchii"), restart_note);
+    QMessageBox::information(this, tr("Lichii"), restart_note);
 }
 
 void MainWindow::ShowUpdate(const UpdateChecker::CheckResult& result) {

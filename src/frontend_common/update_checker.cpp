@@ -50,43 +50,6 @@ std::optional<u32> ParseNumber(std::string_view text) {
     return number;
 }
 
-CheckResult CheckFritchii([[maybe_unused]] const FritchiiVersion& current) {
-#ifndef _WIN32
-    // Fritchii only publishes Windows packages.
-    return {};
-#else
-    auto source = DefaultSource();
-    if (const char* override_url = std::getenv("EDEN_UPDATE_URL");
-        override_url != nullptr && *override_url != '\0') {
-        const auto parsed = ParseSourceOverride(override_url);
-        if (!parsed) {
-            LOG_ERROR(Frontend,
-                      "Ignoring EDEN_UPDATE_URL {}: it must be https, or http on a loopback host",
-                      override_url);
-            return {.failure = Failure::Network};
-        }
-        LOG_WARNING(Frontend, "Checking for updates at {} (EDEN_UPDATE_URL, for testing only)",
-                    override_url);
-        source = *parsed;
-    }
-
-    const auto response = Common::Net::Fetch(source.origin, source.api_path);
-    if (!response.body) {
-        LOG_WARNING(Frontend, "Update check failed with status {}", response.status);
-        return {.failure = ClassifyFailure(response.status), .status = response.status};
-    }
-    const auto releases = Common::Net::Release::ListFromJson(
-        std::string_view{*response.body}, source.origin, std::string{ReleaseRepo});
-    auto update = SelectFritchiiUpdate(releases, current, source);
-    if (!update) {
-        return {};
-    }
-    auto asset = SelectFritchiiAsset(*update, source);
-    LOG_INFO(Frontend, "Received update {} ({})", update->title, update->tag);
-    return {.update = std::move(update), .asset = std::move(asset)};
-#endif
-}
-
 } // namespace
 
 Failure ClassifyFailure(int status) {
@@ -117,9 +80,9 @@ std::optional<Common::Net::Release> SelectUpdate(std::span<const Common::Net::Re
 }
 
 CheckResult Check() {
-    if (const auto running = RunningVersion()) {
-        return CheckFritchii(*running);
-    }
+    // Only published build-N packages of this fork (LICHII_UPDATE_REPO) are compared, against newer
+    // build-N releases of the same repository. Dev and custom builds have no number and are never
+    // offered another fork's release.
     if (!ParseBuildNumber(Common::g_build_release_tag) ||
         std::string_view{Common::g_build_release_platform}.empty()) {
         return {};
