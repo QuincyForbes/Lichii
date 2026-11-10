@@ -88,6 +88,15 @@ public:
     /// One flag per 4 KiB page of the backing: resident through the backing or a view (Windows
     /// working set), or resident or compressed (mincore elsewhere). Empty where unknown.
     std::vector<bool> ResidentPages() const;
+    /// Starts measuring which guest pages get used. The host forgets which ones are in use:
+    /// Windows takes every page of the process out of the working set (each soft-faults back at
+    /// its next use), Apple clears the backing's reference bits. Contents stay. Until EndTouched,
+    /// zero trimming and HintCold do nothing. False where there is no way to measure.
+    bool ResetTouched() const;
+    void EndTouched() const;
+    /// One flag per 4 KiB page of the backing: read or written, through the backing or a view,
+    /// since ResetTouched. Empty when nothing is being measured.
+    std::vector<bool> TouchedPages() const;
     [[nodiscard]] size_t BackingSize() const noexcept {
         return backing_size;
     }

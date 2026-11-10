@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <mutex>
+#include <optional>
 #include <vector>
 
 #include <fmt/format.h>
@@ -79,16 +81,22 @@ constexpr u64 MiB(u64 bytes) {
     return bytes >> 20;
 }
 
-std::string ProfileGuest(System& system) {
+std::mutex touch_mutex;
+std::optional<std::chrono::steady_clock::time_point> touch_start;
+
+using Tallies = std::array<Tally, 2 * GpuShared>;
+
+/// The application's backing pages by memory state, plus GpuShared where the GPU maps them.
+/// Reads no guest memory.
+bool ClassifyBacking(System& system, std::vector<u8>& owner, Tallies& tallies) {
     Kernel::KProcess* const process = system.ApplicationProcess();
     auto& buffer = system.DeviceMemory().buffer;
-    u8* const backing = buffer.BackingBasePointer();
+    const u8* const backing = buffer.BackingBasePointer();
     if (process == nullptr || backing == nullptr) {
-        return "no application process";
+        return false;
     }
     const size_t num_pages = buffer.BackingSize() / PageSize;
-    std::vector<u8> owner(num_pages, Unmapped);
-    std::array<Tally, 2 * GpuShared> tallies{};
+    owner.assign(num_pages, Unmapped);
     auto& page_table = process->GetPageTable();
     auto& memory = process->GetMemory();
     const auto& device_memory = system.Host1x().MemoryManager();
@@ -129,6 +137,25 @@ std::string ProfileGuest(System& system) {
         }
         address = next;
     }
+    return true;
+}
+
+std::string CategoryName(size_t category) {
+    return fmt::format("{}{}", StateNames[category % GpuShared],
+                       category >= GpuShared ? " (GPU)" : "");
+}
+
+std::string ProfileGuest(System& system) {
+    std::vector<u8> owner;
+    Tallies tallies{};
+    if (!ClassifyBacking(system, owner, tallies)) {
+        return "no application process";
+    }
+    Kernel::KProcess* const process = system.ApplicationProcess();
+    auto& buffer = system.DeviceMemory().buffer;
+    u8* const backing = buffer.BackingBasePointer();
+    const size_t num_pages = owner.size();
+    auto& page_table = process->GetPageTable();
 
     const std::vector<bool> resident = buffer.ResidentPages();
     const bool known = resident.size() == num_pages;
@@ -203,10 +230,9 @@ std::string ProfileGuest(System& system) {
         total.sparse += tally.sparse;
         total.fill += tally.fill;
         text += fmt::format(
-            "\n  {}{}: mapped {} MiB, backing {} MiB, data {} MiB (resident {}, paged out {}, "
+            "\n  {}: mapped {} MiB, backing {} MiB, data {} MiB (resident {}, paged out {}, "
             "sparse {}, fill {}), resident zero {} MiB",
-            StateNames[category % GpuShared], category >= GpuShared ? " (GPU)" : "",
-            MiB(tally.mapped), MiB(tally.pages * PageSize),
+            CategoryName(category), MiB(tally.mapped), MiB(tally.pages * PageSize),
             MiB(tally.resident_data + tally.paged_data), MiB(tally.resident_data),
             MiB(tally.paged_data), MiB(tally.sparse), MiB(tally.fill), MiB(tally.resident_zero));
     }
@@ -448,6 +474,94 @@ std::string ProfileMemory(System& system) {
                         .count();
     LOG_INFO(Core, "Memory profile ({} ms): {}", ms, text);
     return text;
+}
+
+TouchedMemory ProfileTouched(System& system, bool reset, bool end) {
+    std::scoped_lock lock{touch_mutex};
+    auto& buffer = system.DeviceMemory().buffer;
+    TouchedMemory result;
+    if (touch_start) {
+        const std::vector<bool> touched = buffer.TouchedPages();
+        std::vector<u8> owner;
+        Tallies tallies{};
+        if (touched.empty() || !ClassifyBacking(system, owner, tallies) ||
+            touched.size() != owner.size()) {
+            result.text = "touched pages unknown";
+        } else {
+            std::array<u64, 2 * GpuShared> pages{};
+            std::array<u64, 2 * GpuShared> used{};
+            // With 16 KiB host pages (iOS) a use of one 4 KiB page keeps its three neighbours.
+            std::array<u64, 2 * GpuShared> used_coarse{};
+            constexpr size_t CoarsePages = 4;
+            u64 outside = 0;
+            bool coarse = false;
+            for (size_t index = 0; index < owner.size(); ++index) {
+                if (index % CoarsePages == 0) {
+                    coarse = false;
+                    const size_t last = (std::min)(index + CoarsePages, owner.size());
+                    for (size_t page = index; page < last; ++page) {
+                        coarse = coarse || touched[page];
+                    }
+                }
+                if (owner[index] == Unmapped) {
+                    outside += touched[index] ? 1 : 0;
+                    continue;
+                }
+                ++pages[owner[index]];
+                used[owner[index]] += touched[index] ? 1 : 0;
+                used_coarse[owner[index]] += coarse ? 1 : 0;
+            }
+            result.seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - *touch_start)
+                    .count();
+            u64 all_pages = 0;
+            u64 all_used = 0;
+            u64 all_coarse = 0;
+            std::string classes;
+            for (size_t category = 0; category < pages.size(); ++category) {
+                if (pages[category] == 0) {
+                    continue;
+                }
+                all_pages += pages[category];
+                all_used += used[category];
+                all_coarse += used_coarse[category];
+                result.classes.push_back({CategoryName(category), pages[category] * PageSize,
+                                          used[category] * PageSize,
+                                          used_coarse[category] * PageSize});
+                classes += fmt::format(
+                    "; {}: {:.1f} ({:.1f}) of {} MiB", CategoryName(category),
+                    static_cast<double>(used[category] * PageSize) / (1 << 20),
+                    static_cast<double>(used_coarse[category] * PageSize) / (1 << 20),
+                    MiB(pages[category] * PageSize));
+            }
+            result.outside = outside * PageSize;
+            result.known = true;
+            result.text = fmt::format(
+                "guest memory used in {:.1f} s, per 4 KiB page (per 16 KiB): {:.1f} ({:.1f}) of {} "
+                "MiB of the application's backing{}; outside the application {:.1f} MiB",
+                result.seconds, static_cast<double>(all_used * PageSize) / (1 << 20),
+                static_cast<double>(all_coarse * PageSize) / (1 << 20), MiB(all_pages * PageSize),
+                classes, static_cast<double>(outside * PageSize) / (1 << 20));
+        }
+        LOG_INFO(Core, "Memory touched: {}", result.text);
+    } else if (!reset) {
+        result.text = "nothing is being measured: call with reset first";
+    }
+    if (end || reset) {
+        buffer.EndTouched();
+        touch_start.reset();
+    }
+    if (reset) {
+        if (buffer.ResetTouched()) {
+            touch_start = std::chrono::steady_clock::now();
+        } else {
+            buffer.EndTouched();
+            result.text += result.text.empty() ? "" : "; ";
+            result.text += "this host can't tell which pages are used";
+        }
+    }
+    result.measuring = touch_start.has_value();
+    return result;
 }
 
 } // namespace Core

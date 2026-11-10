@@ -86,6 +86,19 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "memory_touched",
+        "description": "How much guest memory the game uses over time, per memory state and GPU "
+                       "mapping. 'reset' starts a measurement (Windows: the whole process "
+                       "soft-faults once more, about a second; Apple: reference bits are "
+                       "cleared); a call without it reports bytes used since, and can be "
+                       "repeated; 'end' stops. Zero trimming and cold hints pause meanwhile. "
+                       "Reads no guest memory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"reset": {"type": "boolean"}, "end": {"type": "boolean"}},
+        },
+    },
+    {
         "name": "capture_frame",
         "description": "EDEN_NX2_FRAME_DUMP for the next frame, now: every pass colour target, "
                        "dispatch storage image and the present source as PNG and .raw.zst, plus "

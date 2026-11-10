@@ -1642,9 +1642,15 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 #endif
 }
 
+namespace {
+/// ResetTouched is measuring: nothing of ours may take pages out of the working set or read them.
+std::atomic<bool> g_touch_window{};
+} // namespace
+
 void HostMemory::HintCold(size_t physical_offset, size_t length,
                           std::optional<size_t> virtual_offset) const {
-    if (length == 0 || backing_base == nullptr) {
+    if (length == 0 || backing_base == nullptr ||
+        g_touch_window.load(std::memory_order_relaxed)) {
         return;
     }
     const auto hint = [length](u8* address) {
@@ -1759,6 +1765,55 @@ std::vector<bool> HostMemory::ResidentPages() const {
     return resident;
 }
 
+bool HostMemory::ResetTouched() const {
+    if (backing_base == nullptr) {
+        return false;
+    }
+#ifdef _WIN32
+    g_touch_window.store(true, std::memory_order_relaxed);
+    // Not VirtualUnlock per range: this is the documented call, and it keeps the contents too.
+    return K32EmptyWorkingSet(GetCurrentProcess()) != 0;
+#elif defined(__APPLE__) && defined(MINCORE_REFERENCED)
+    g_touch_window.store(true, std::memory_order_relaxed);
+    // Deactivates the pages and clears their reference bits (per physical page, so a use
+    // through any view sets it again); nothing is discarded.
+    return madvise(backing_base, backing_size, MADV_DONTNEED) == 0;
+#else
+    return false;
+#endif
+}
+
+void HostMemory::EndTouched() const {
+    g_touch_window.store(false, std::memory_order_relaxed);
+}
+
+std::vector<bool> HostMemory::TouchedPages() const {
+    if (backing_base == nullptr || !g_touch_window.load(std::memory_order_relaxed)) {
+        return {};
+    }
+#if defined(__APPLE__) && defined(MINCORE_REFERENCED)
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t num_pages = backing_size / page_size;
+    std::vector<char> residency(num_pages);
+    if (mincore(backing_base, num_pages * page_size, residency.data()) != 0) {
+        return {};
+    }
+    std::vector<bool> touched(backing_size / PageAlignment);
+    const size_t per_page = page_size / PageAlignment;
+    for (size_t index = 0; index < num_pages; ++index) {
+        if ((residency[index] & MINCORE_REFERENCED) != 0) {
+            for (size_t i = 0; i < per_page; ++i) {
+                touched[index * per_page + i] = true;
+            }
+        }
+    }
+    return touched;
+#else
+    // Windows: the pages that came back into the working set.
+    return ResidentPages();
+#endif
+}
+
 u64 HostMemory::ZeroFilledBytes() noexcept {
     return g_zero_filled_bytes.load(std::memory_order_relaxed);
 }
@@ -1778,6 +1833,9 @@ u64 HostMemory::ScannedHandedOutBytes() noexcept {
 std::pair<size_t, size_t> HostMemory::TrimZeroPages(
     [[maybe_unused]] ZeroTrimState* state,
     [[maybe_unused]] const std::function<bool()>& pause) const {
+    if (g_touch_window.load(std::memory_order_relaxed)) {
+        return {0, 0};
+    }
 #ifdef _WIN32
     if (backing_base == nullptr) {
         return {0, 0};
