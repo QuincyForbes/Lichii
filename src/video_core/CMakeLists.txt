@@ -581,7 +581,6 @@ endif()
 # MoltenVK's. Objective-C++, built only for Apple; MetalFX is weakly linked and every class is
 # checked with @available, so older OS versions still start.
 if (APPLE)
-    enable_language(OBJCXX)
     set(METALFX_SOURCES
         renderer_vulkan/present/metalfx_context.mm
         renderer_vulkan/present/metalfx_frame_gen.mm
@@ -595,10 +594,14 @@ if (APPLE)
         renderer_vulkan/present/metalfx_spatial.h
         renderer_vulkan/present/metalfx_temporal.h
     )
-    # -fexperimental-library: libc++'s jthread/stop_token, which the shared headers use; the
-    # top-level C/C++ flags don't reach Objective-C++ on macOS.
+    # Built as C++ with clang's Objective-C++ mode, so they take the same flags as the rest of
+    # video_core (the OBJCXX language missed -fexperimental-library, and enabling it here left its
+    # rule variables unset for the macOS x86_64 generator).
     set_source_files_properties(${METALFX_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "-fobjc-arc;-fexperimental-library")
+        LANGUAGE CXX
+        COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc"
+        SKIP_PRECOMPILE_HEADERS ON
+        SKIP_UNITY_BUILD_INCLUSION ON)
     target_link_libraries(video_core PRIVATE "-framework Metal" "-weak_framework MetalFX")
     target_compile_definitions(video_core PUBLIC LICHII_METALFX)
 endif()

@@ -25,10 +25,16 @@
 
 #include <fmt/format.h>
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
+#include "common/host_memory.h"
+#include "common/platform_events.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
@@ -3433,6 +3439,66 @@ void RasterizerVulkan::TickFrame() {
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.TickFrame();
     }
+    TickMemoryReport();
+}
+
+void RasterizerVulkan::TickMemoryReport() {
+    // After host memory pressure the caches collect for 30 frames: then malloc hands what they
+    // freed back to the OS.
+    if (const u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
+        pressure != memory_report_pressure) {
+        memory_report_pressure = pressure;
+        malloc_relief_frames = 31;
+    }
+    if (malloc_relief_frames != 0 && --malloc_relief_frames == 0) {
+        const u64 released = Common::PlatformEvents::RelieveMallocPressure();
+        LOG_INFO(Render_Vulkan, "Host memory pressure: malloc released {} MiB", released >> 20);
+    }
+    // Where the footprint goes, at the first frame and every 30 s. On by default on iOS;
+    // EDEN_NX2_MEMORY_REPORT=1 elsewhere, =0 turns it off.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_MEMORY_REPORT");
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        return value == nullptr || value[0] != '0';
+#else
+        return value != nullptr && value[0] != '0';
+#endif
+    }();
+    const auto now = std::chrono::steady_clock::now();
+    if (!enabled || now < memory_report_next) {
+        return;
+    }
+    memory_report_next = now + std::chrono::seconds{30};
+    const auto process = Common::PlatformEvents::QueryProcessMemory();
+    std::pair<size_t, u64> images;
+    std::array<u64, 3> collector;
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        images = texture_cache.ImageMemory();
+        collector = texture_cache.CollectorMemory();
+    }
+    u64 buffer_bytes;
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_bytes = buffer_cache.BufferBytes();
+    }
+    const auto [graphics_pipelines, compute_pipelines] = pipeline_cache.PipelineCounts();
+    LOG_INFO(Render_Vulkan,
+             "Memory: footprint {} MiB (peak {}, compressed {}, reusable {}), {} MiB left | guest "
+             "RAM handed out {} MiB, resident {} MiB, zero pages trimmed {} MiB (last scan) | "
+             "Vulkan {} | textures {} images {} MiB (collector {} / {} / {} MiB) | buffers {} MiB "
+             "| staging stream {} MiB + pooled {} MiB | pipelines {} graphics, {} compute | ASTC "
+             "{}, BCn {}",
+             process.footprint >> 20, process.footprint_peak >> 20, process.compressed >> 20,
+             process.reusable >> 20, Common::PlatformEvents::AvailableProcessMemory() >> 20,
+             Common::HostMemory::ScannedHandedOutBytes() >> 20,
+             Common::HostMemory::ScannedResidentBytes() >> 20,
+             Common::HostMemory::TrimmedZeroBytes() >> 20, device.MemoryHeapReport(),
+             images.first, images.second >> 20, collector[0] >> 20, collector[1] >> 20,
+             collector[2] >> 20, buffer_bytes >> 20, staging_pool.StreamBufferSize() >> 20,
+             staging_pool.CachedBytes() >> 20, graphics_pipelines, compute_pipelines,
+             device.IsOptimalAstcSupported() ? "native" : "decoded",
+             device.IsOptimalBcnSupported() ? "native" : "decoded");
 }
 
 bool RasterizerVulkan::AccelerateConditionalRendering() {

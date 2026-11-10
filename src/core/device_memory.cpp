@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -9,6 +9,7 @@
 #include <mutex>
 
 #include "common/logging.h"
+#include "common/platform_events.h"
 #include "common/thread.h"
 #endif
 
@@ -26,26 +27,29 @@ constexpr size_t VirtualReserveSize = 1ULL << 39;
 DeviceMemory::DeviceMemory()
     : buffer{Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize(),
              VirtualReserveSize} {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     zero_trim_thread = std::jthread{[this](std::stop_token stop) { TrimZeroPages(stop); }};
 #endif
 }
 
 DeviceMemory::~DeviceMemory() = default;
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 // Windows can't punch holes in the guest memory section, so pages holding only zeros (games clear
 // their heaps while booting: Ocarina leaves ~7 GB) stay resident until they leave the working set.
-// A pass comes every 5 s while they keep turning up, backing off to once a minute. It works in
-// slices of a few MiB with a short sleep after each, on the efficiency cores, and only trims pages
-// that were already zero on the pass before: whole passes at once took 1.4-4.7 s and lined up with
-// the 0.6-0.7 s hitches of a game's first minute. EDEN_NX2_ZERO_TRIM=0 turns it off.
+// A pass comes every 5 s while they keep turning up, backing off to once a minute. Apple counts
+// them in the footprint iOS kills the app over, compressed or not.
+// Passes work in slices of a few MiB with a short sleep after each, on the efficiency cores:
+// whole passes at once took 1.4-4.7 s on Windows and lined up with the 0.6-0.7 s hitches of a
+// game's first minute. On Windows a page leaves only once two passes found it zero. Under host
+// memory pressure (iOS) a pass starts at once and runs without the sleeps.
+// EDEN_NX2_TRIM_ZERO=0 turns it off.
 void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     using namespace std::chrono_literals;
     Common::SetCurrentThreadName("ZeroTrim");
-    if (const char* value = std::getenv("EDEN_NX2_ZERO_TRIM");
+    if (const char* value = std::getenv("EDEN_NX2_TRIM_ZERO");
         value != nullptr && value[0] == '0') {
-        LOG_INFO(HW_Memory, "Zero page trimming is off (EDEN_NX2_ZERO_TRIM=0)");
+        LOG_INFO(HW_Memory, "Zero page trimming is off (EDEN_NX2_TRIM_ZERO=0)");
         return;
     }
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
@@ -60,19 +64,35 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     };
     Common::HostMemory::ZeroTrimState state;
     std::chrono::seconds interval = 5s;
-    while (sleep(interval)) {
+    u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
+    while (true) {
+        // Host memory pressure (iOS) starts a pass at once.
+        bool urgent = false;
+        for (std::chrono::seconds waited = 0s; waited < interval; waited += 1s) {
+            if (!sleep(1s)) {
+                return;
+            }
+            if (const u32 now = Common::PlatformEvents::MemoryPressureGeneration();
+                now != pressure) {
+                pressure = now;
+                urgent = true;
+                break;
+            }
+        }
         const auto start = std::chrono::steady_clock::now();
-        const auto [resident, trimmed] =
-            buffer.TrimZeroPages(&state, [&] { return sleep(2ms); });
+        const auto [resident, trimmed] = buffer.TrimZeroPages(&state, [&] {
+            return urgent ? !stop.stop_requested() : sleep(2ms);
+        });
         if (stop.stop_requested()) {
             return;
         }
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - start)
                             .count();
-        // Pages found zero for the first time are trimmed by the next pass if they stay zero.
-        const size_t zero = state.zero_before.size() * 0x1000;
-        if (trimmed < Busy && zero - trimmed < Busy) {
+        // Windows: pages found zero for the first time go on the next pass if they stay zero.
+        const size_t pending = state.zero_before.size() * 0x1000 - (std::min)(
+            trimmed, state.zero_before.size() * 0x1000);
+        if (trimmed < Busy && pending < Busy) {
             interval = (std::min)(interval * 2, std::chrono::seconds{60});
             continue;
         }
