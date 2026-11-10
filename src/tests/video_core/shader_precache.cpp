@@ -186,11 +186,11 @@ TEST_CASE("ShaderPrecache: a program naming no texture bank reads bank 0", "[vid
 
 TEST_CASE("ShaderPrecache: programs that cannot be lowered are refused", "[video_core]") {
     ShaderWarm::LoweredCode lowered;
-    REQUIRE(ShaderWarm::LowerProgram({}, lowered).has_value());
+    REQUIRE(ShaderWarm::LowerProgram({}, false, lowered).has_value());
     const std::array<u8, 15> partial{};
-    REQUIRE(ShaderWarm::LowerProgram(partial, lowered).has_value());
+    REQUIRE(ShaderWarm::LowerProgram(partial, false, lowered).has_value());
     // One instruction with no exit: not a complete program.
     const std::array<u8, 16> no_exit{};
-    REQUIRE(ShaderWarm::LowerProgram(no_exit, lowered).has_value());
+    REQUIRE(ShaderWarm::LowerProgram(no_exit, false, lowered).has_value());
     REQUIRE(lowered.code.empty());
 }

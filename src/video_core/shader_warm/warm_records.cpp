@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
+#include <unordered_set>
 
 #include "common/cityhash.h"
 #include "shader_recompiler/frontend/ampere/instruction.h"
@@ -54,16 +56,53 @@ void PutEnvHeader(std::vector<u8>& out, u64 code_size, u64 cbuf_count, u32 local
     Put<u32>(out, stage);
 }
 
+struct PairHash {
+    u128 a{};
+    u128 b{};
+    bool operator==(const PairHash&) const = default;
+};
+
+struct PairHasher {
+    size_t operator()(const PairHash& h) const noexcept {
+        return static_cast<size_t>(h.a[0] ^ (h.b[0] * 0x9E3779B97F4A7C15ULL));
+    }
+};
+
+struct U128Hasher {
+    size_t operator()(const u128& h) const noexcept {
+        return static_cast<size_t>(h[0]);
+    }
+};
+
+u128 Hash128(std::span<const u8> bytes) {
+    return Common::CityHash128(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+size_t TailSize(u32 stage) {
+    if (stage == 5) {
+        return 16;
+    }
+    return 80 + (stage == 3 ? 32 : 0) + (stage == 7 || stage == 8 ? 92 : 0);
+}
+
 } // Anonymous namespace
 
-std::optional<std::string> LowerProgram(std::span<const u8> program, LoweredCode& out) {
+std::optional<std::string> LowerProgram(std::span<const u8> program, bool graphics,
+                                        LoweredCode& out) {
     using Shader::Ampere::Instruction;
-    if (program.empty() || program.size() % sizeof(Instruction) ||
-        program.size() / sizeof(Instruction) > 65536) {
+    const size_t header_size = graphics ? 128 : 0;
+    if (program.size() <= header_size || (program.size() - header_size) % sizeof(Instruction) ||
+        (program.size() - header_size) / sizeof(Instruction) > 65536) {
         return "Native input must contain 1..65536 complete 16-byte instructions";
     }
-    std::vector<Instruction> native(program.size() / sizeof(Instruction));
-    std::memcpy(native.data(), program.data(), native.size() * sizeof(Instruction));
+    if (graphics) {
+        const u32 type = (Get<u32>(program, 0) >> 10) & 15;
+        if (type < 1 || type > 5) {
+            return "Invalid native graphics header stage";
+        }
+    }
+    std::vector<Instruction> native((program.size() - header_size) / sizeof(Instruction));
+    std::memcpy(native.data(), program.data() + header_size, native.size() * sizeof(Instruction));
     Shader::Ampere::ProgramCaptureState capture;
     bool complete = false;
     for (u32 index = 0; index < native.size(); ++index) {
@@ -96,6 +135,9 @@ std::optional<std::string> LowerProgram(std::span<const u8> program, LoweredCode
         return "Cannot encode the lowering as an override record";
     }
     std::vector<u64> words(10, 0);
+    if (graphics) {
+        std::memcpy(words.data(), program.data(), 80);
+    }
     words.reserve(10 + lowered.instructions.size() * 5 / 4 + 4 + offsets.size());
     for (const u64 instruction : lowered.instructions) {
         if (words.size() % 4 == 0) {
@@ -159,6 +201,172 @@ std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& c
     std::memcpy(key.data(), key_bytes.data(), key.size());
     PutBytes(out, key_bytes);
     return out;
+}
+
+std::vector<u8> GraphicsEnv(u32 stage, const LoweredCode& lowered, std::span<const u8> program) {
+    const auto sph = program.first(80);
+    const u32 bound = lowered.texture_buffer != ~0U ? lowered.texture_buffer
+                                                     : (stage == 0 ? 0U : 2U);
+    // Constant buffer bank 1 = the last 256 bytes of the program allocation.
+    const auto bank1 = program.last(std::min<size_t>(256, program.size()));
+    const size_t cbuf_count = (bank1.size() & ~size_t{3}) / 4;
+    const u32 w1 = Get<u32>(sph, 4), w2 = Get<u32>(sph, 8), w3 = Get<u32>(sph, 12);
+    const u64 local_memory =
+        ((u64{w1} & 0xFFFFFF) | ((u64{w2} & 0xFFFFFF) << 24)) + (u64{w3} & 0xFFFFFF);
+    std::vector<u8> out;
+    out.reserve(EnvHeaderSize + lowered.code.size() + cbuf_count * 12 + 80);
+    PutEnvHeader(out, lowered.code.size(), cbuf_count, static_cast<u32>(local_memory), bound, 0,
+                 stage);
+    PutBytes(out, lowered.code);
+    for (size_t i = 0; i < cbuf_count; ++i) {
+        Put<u64>(out, (u64{1} << 32) | (i * 4));
+        Put<u32>(out, Get<u32>(bank1, i * 4));
+    }
+    PutBytes(out, sph);
+    return out;
+}
+
+GraphicsKey GraphicsEntryKey(u32 stage, const GraphicsKey& template_key, u64 stage_hash,
+                             u64 attribute_types) {
+    GraphicsKey key = template_key;
+    const size_t slot = stage == 0 ? 1 : 5;
+    std::memcpy(key.data() + slot * 8, &stage_hash, sizeof(stage_hash));
+    if (stage == 0) {
+        std::memcpy(key.data() + AttributeTypesOffset, &attribute_types, sizeof(u64));
+    }
+    return key;
+}
+
+RuntimeStats ReadRuntimeStats(const std::vector<std::filesystem::path>& caches) {
+    struct Occurrence {
+        u32 stage;
+        u64 hash;
+        const u8* key;
+    };
+    std::vector<std::vector<u8>> files;
+    std::vector<Occurrence> occurrences;
+    std::unordered_set<PairHash, PairHasher> seen;
+    for (const auto& path : caches) {
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            continue;
+        }
+        const auto size = static_cast<size_t>(file.tellg());
+        file.seekg(0);
+        std::vector<u8> data(size);
+        if (!file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size))) {
+            continue;
+        }
+        if (size < 12 || std::memcmp(data.data(), "yuzucach", 8) != 0 ||
+            !IsReadableRuntimeCacheVersion(Get<u32>(data, 8))) {
+            continue;
+        }
+        const std::span<const u8> bytes{data};
+        size_t cur = 12;
+        struct Env {
+            u32 stage;
+            size_t begin;
+            size_t end;
+        };
+        std::vector<Env> envs;
+        while (cur + 4 <= size) {
+            const u32 count = Get<u32>(bytes, cur);
+            cur += 4;
+            envs.clear();
+            bool truncated = count == 0;
+            for (u32 i = 0; i < count && !truncated; ++i) {
+                if (cur + EnvHeaderSize > size) {
+                    truncated = true;
+                    break;
+                }
+                std::array<u64, 6> counts;
+                std::memcpy(counts.data(), data.data() + cur, sizeof(counts));
+                const u32 stage = Get<u32>(bytes, cur + 48 + 6 * 4);
+                const u64 body = counts[0] + counts[1] * 8 + counts[2] * 8 + counts[3] * 12 +
+                                 counts[4] * 9 + counts[5] * 12 + TailSize(stage);
+                if (body > size - cur - EnvHeaderSize) {
+                    truncated = true;
+                    break;
+                }
+                const size_t begin = cur;
+                cur += EnvHeaderSize + static_cast<size_t>(body);
+                envs.push_back({stage, begin, cur});
+            }
+            if (truncated) {
+                break;
+            }
+            const size_t key_size = envs[0].stage == ComputeStage ? 24 : GraphicsKeySize;
+            if (key_size > size - cur) {
+                break;
+            }
+            const u8* const key = data.data() + cur;
+            cur += key_size;
+            if (envs[0].stage == ComputeStage) {
+                continue;
+            }
+            std::array<u64, 6> hashes;
+            std::memcpy(hashes.data(), key, sizeof(hashes));
+            size_t env_index = 0;
+            for (size_t slot = 0; slot < 6 && env_index < envs.size(); ++slot) {
+                if (hashes[slot] == 0) {
+                    continue;
+                }
+                const Env& env = envs[env_index++];
+                if (env.stage != 0 && env.stage != 4) {
+                    continue;
+                }
+                const PairHash id{Hash128(bytes.subspan(env.begin, env.end - env.begin)),
+                                  Hash128({key, key_size})};
+                if (seen.insert(id).second) {
+                    occurrences.push_back({env.stage, hashes[slot], key});
+                }
+            }
+        }
+        files.push_back(std::move(data));
+    }
+
+    RuntimeStats stats;
+    stats.occurrences = occurrences.size();
+    for (size_t index = 0; index < 2; ++index) {
+        const u32 stage = index == 0 ? 0 : 4;
+        struct Count {
+            size_t count;
+            size_t first;
+        };
+        std::unordered_map<u128, Count, U128Hasher> counts;
+        GraphicsKey normalized;
+        for (size_t i = 0; i < occurrences.size(); ++i) {
+            if (occurrences[i].stage != stage) {
+                continue;
+            }
+            std::memcpy(normalized.data(), occurrences[i].key, normalized.size());
+            std::fill(normalized.begin() + 56, normalized.begin() + 64, u8{0});
+            ++counts.try_emplace(Hash128(normalized), Count{0, i}).first->second.count;
+        }
+        // Counter.most_common: highest count, the first seen among equals.
+        const Count* best = nullptr;
+        for (const auto& [hash, count] : counts) {
+            if (best == nullptr || count.count > best->count ||
+                (count.count == best->count && count.first < best->first)) {
+                best = &count;
+            }
+        }
+        if (best != nullptr) {
+            GraphicsKey key;
+            std::memcpy(key.data(), occurrences[best->first].key, key.size());
+            std::fill(key.begin() + 56, key.begin() + 64, u8{0});
+            std::fill(key.begin(), key.begin() + 48, u8{0});
+            stats.templates[index] = key;
+        }
+    }
+    for (const auto& occurrence : occurrences) {
+        if (occurrence.stage == 0) {
+            u64 attributes;
+            std::memcpy(&attributes, occurrence.key + AttributeTypesOffset, sizeof(attributes));
+            stats.vertex_attributes[occurrence.hash].push_back(attributes);
+        }
+    }
+    return stats;
 }
 
 } // namespace VideoCommon::ShaderWarm

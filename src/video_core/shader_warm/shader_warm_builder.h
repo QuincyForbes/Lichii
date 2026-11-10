@@ -10,6 +10,7 @@
 #include <stop_token>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "common/common_types.h"
 #include "common/settings_enums.h"
@@ -24,6 +25,13 @@ namespace VideoCommon::ShaderWarm {
 /// (<shader dir>/<title id>/warm-compute.bin). It holds the compute programs found in the game
 /// files, in pipeline cache format with no recorded reads.
 std::filesystem::path ComputeWarmPath(u64 title_id);
+/// The title's vertex and fragment programs (<shader dir>/<title id>/warm-graphics.bin), one
+/// single-stage entry each with a guessed draw state. Used with graphics pipeline libraries only.
+std::filesystem::path GraphicsWarmPath(u64 title_id);
+/// EDEN_NX2_GRAPHICS_PRECACHE=1: the graphics file is built with the precache file and, with
+/// graphics pipeline libraries (EDEN_NX2_GPL=1), built on the loading screen after it. Off by
+/// default: Ocarina's file is 1.5 GB and takes six minutes to build on a 24-thread CPU.
+bool GraphicsPrecacheRequested();
 
 /// "Already precached" marker of a precache file (same folder, extension .done), written by the
 /// emulator after the precache ran to the end. A matching marker skips the precache at boot.
@@ -127,6 +135,8 @@ struct Result {
     std::string error;           ///< Empty when ok
     size_t archives{};           ///< Shader archives found in the game files
     size_t compute_programs{};   ///< Entries written to the precache file
+    size_t vertex_programs{};    ///< Vertex entries written to the graphics file
+    size_t fragment_programs{};  ///< Fragment entries written to the graphics file
     size_t skipped{};            ///< Programs that failed to extract or convert
 };
 
@@ -141,6 +151,11 @@ Result BuildWarmFiles(Core::System& system, const std::filesystem::path& game_pa
 struct BuildOptions {
     /// Folder for warm-compute.bin; empty: <shader dir>/<title id>.
     std::filesystem::path output_dir;
+    /// Pipeline caches used for the draw state guesses. Unset: the title's own pipeline cache
+    /// when it exists, else the built-in defaults. Set but empty: always the built-in defaults.
+    std::optional<std::vector<std::filesystem::path>> runtime_caches;
+    /// Whether warm-graphics.bin is built too. Unset: GraphicsPrecacheRequested().
+    std::optional<bool> graphics;
     /// Conversion threads, 0: a quarter of the CPU threads, 2 to 6.
     size_t threads{};
 };

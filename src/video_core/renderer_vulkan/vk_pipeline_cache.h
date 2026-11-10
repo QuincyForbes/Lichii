@@ -288,10 +288,17 @@ private:
     /// missing reads guessed) are built, then thrown away. They only fill the driver's shader
     /// cache, so a later build of the same pipeline finds the driver's work done. Reports progress
     /// through `callback` and returns when it is done, skipped from the loading screen or the load
-    /// is stopped.
-    void PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
+    /// is stopped. False when it was skipped or stopped.
+    bool PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
                          std::unordered_set<u64> precached, std::stop_token stop_loading,
                          const VideoCore::DiskResourceLoadCallback& callback);
+
+    /// EDEN_NX2_GRAPHICS_PRECACHE with graphics pipeline libraries (EDEN_NX2_GPL): builds each
+    /// vertex and fragment program of the title's graphics precache file as a single-stage library
+    /// and drops it, so the driver's shader cache holds it and a later pipeline with that stage
+    /// costs a link.
+    void PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop_loading,
+                                   const VideoCore::DiskResourceLoadCallback& callback);
 
     const Device& device;
     Scheduler& scheduler;

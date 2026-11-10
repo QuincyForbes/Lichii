@@ -1103,8 +1103,9 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
         }
     }
     fmt::print("{{\"ok\": {}, \"error\": \"{}\", \"archives\": {}, \"compute\": {}, "
-               "\"skipped\": {}, \"seconds\": {:.1f}}}\n",
-               result.ok, error, result.archives, result.compute_programs, result.skipped,
+               "\"vertex\": {}, \"fragment\": {}, \"skipped\": {}, \"seconds\": {:.1f}}}\n",
+               result.ok, error, result.archives, result.compute_programs, result.vertex_programs,
+               result.fragment_programs, result.skipped,
                std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
     std::fflush(stdout);
     return result.ok;
