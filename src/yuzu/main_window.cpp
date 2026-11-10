@@ -2035,8 +2035,33 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
         return false;
 
     /** Exec */
-    const Core::SystemResultStatus result{
-        QtCommon::system->Load(*render_window, filename.toStdString(), params)};
+    const std::string rom_path = filename.toStdString();
+    Core::SystemResultStatus result{};
+#ifdef _WIN32
+    if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan) {
+        // On a worker, like the loose RomFS preparation: the NSO load, the Vulkan instance and
+        // devices and audio froze the window for ~1.4 s. Vulkan on Windows only: an OpenGL
+        // context, and surfaces on some other platforms, belong to the thread that made them.
+        QProgressDialog progress(tr("Loading game..."), QString{}, 0, 0, this);
+        progress.setWindowModality(Qt::ApplicationModal);
+        progress.setWindowFlag(Qt::WindowCloseButtonHint, false);
+        progress.setCancelButton(nullptr);
+        progress.setMinimumDuration(0);
+        QFutureWatcher<Core::SystemResultStatus> watcher;
+        QEventLoop loop;
+        connect(&watcher, &QFutureWatcher<Core::SystemResultStatus>::finished, &loop,
+                &QEventLoop::quit);
+        watcher.setFuture(QtConcurrent::run([this, &rom_path, &params] {
+            return QtCommon::system->Load(*render_window, rom_path, params);
+        }));
+        progress.show();
+        loop.exec();
+        result = watcher.result();
+    } else
+#endif
+    {
+        result = QtCommon::system->Load(*render_window, rom_path, params);
+    }
 
     if (result != Core::SystemResultStatus::Success) {
         switch (result) {
