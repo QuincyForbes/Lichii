@@ -312,6 +312,8 @@ private struct RecentRow: View {
                             }
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel(game.title)
+                        .accessibilityHint("Starts the game")
                     }
                 }
             }

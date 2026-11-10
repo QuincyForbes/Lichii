@@ -124,8 +124,16 @@ final class AppController: ObservableObject {
         if let url = URL(string: text), url.scheme == "lichii" {
             let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
                 .queryItems?.first { $0.name == "id" }?.value?.uppercased()
-            if url.host == "game", let id, let game = library.games.first(where: { $0.programIdHex == id }) {
-                launch(game)
+            guard url.host == "game", let id else { return }
+            // On a cold start the first scan is still running.
+            library.reload { [weak self] in
+                guard let self else { return }
+                if let game = library.games.first(where: { $0.programIdHex == id }) {
+                    launch(game)
+                } else {
+                    library.notice = LibraryNotice(title: "Game not found",
+                                                   message: "No game with the title ID \(id) is in the library.")
+                }
             }
             return
         }

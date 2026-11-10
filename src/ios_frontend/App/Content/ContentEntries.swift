@@ -35,6 +35,7 @@ enum ContentEntries {
         [
             { GuestDialogs.register() },
             { Onboarding.presentIfNeeded() },
+            { DispatchQueue.global(qos: .utility).async { ContentBridge.removeTemporaryFiles() } },
         ]
     }
 }

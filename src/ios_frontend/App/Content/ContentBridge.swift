@@ -239,9 +239,24 @@ enum ContentBridge {
 
     static var profiles: [Profile] { decode([Profile].self, lichii_content_list_profiles_json()) ?? [] }
 
+    private static var exportsDir: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("exports", isDirectory: true)
+    }
+
+    /// Exports of earlier sessions and import staging folders left by an interrupted install.
+    static func removeTemporaryFiles() {
+        let manager = FileManager.default
+        try? manager.removeItem(at: exportsDir)
+        let temporary = manager.temporaryDirectory
+        for name in (try? manager.contentsOfDirectory(atPath: temporary.path)) ?? []
+            where name.hasPrefix("lichii-import-") {
+            try? manager.removeItem(at: temporary.appendingPathComponent(name))
+        }
+    }
+
     /// A temporary file for exports handed to the share sheet.
     static func exportURL(_ name: String) -> URL {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("exports", isDirectory: true)
+        let dir = exportsDir
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent(name)
         try? FileManager.default.removeItem(at: url)
