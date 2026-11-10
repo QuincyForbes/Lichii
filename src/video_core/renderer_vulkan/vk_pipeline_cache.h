@@ -141,6 +141,11 @@ public:
 
     void TickFrame();
 
+    /// Graphics and compute pipelines in the cache.
+    [[nodiscard]] std::pair<size_t, size_t> PipelineCounts() const noexcept {
+        return {graphics_cache.size(), compute_cache.size()};
+    }
+
     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
 
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,

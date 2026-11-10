@@ -6,7 +6,7 @@
 
 #pragma once
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 #include <thread>
 #endif
 
@@ -71,7 +71,7 @@ public:
 
     Common::HostMemory buffer;
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 private:
     void TrimZeroPages(std::stop_token stop);
 

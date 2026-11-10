@@ -1198,6 +1198,9 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
 
 namespace {
 std::atomic<u64> g_zero_filled_bytes{};
+[[maybe_unused]] std::atomic<u64> g_scanned_resident_bytes{};
+[[maybe_unused]] std::atomic<u64> g_trimmed_zero_bytes{};
+[[maybe_unused]] std::atomic<u64> g_scanned_handed_out_bytes{};
 
 [[maybe_unused]] bool IsZeroPage(const u8* page) {
     const auto* words = reinterpret_cast<const u64*>(page);
@@ -1211,6 +1214,18 @@ std::atomic<u64> g_zero_filled_bytes{};
 
 u64 HostMemory::ZeroFilledBytes() noexcept {
     return g_zero_filled_bytes.load(std::memory_order_relaxed);
+}
+
+u64 HostMemory::ScannedResidentBytes() noexcept {
+    return g_scanned_resident_bytes.load(std::memory_order_relaxed);
+}
+
+u64 HostMemory::TrimmedZeroBytes() noexcept {
+    return g_trimmed_zero_bytes.load(std::memory_order_relaxed);
+}
+
+u64 HostMemory::ScannedHandedOutBytes() noexcept {
+    return g_scanned_handed_out_bytes.load(std::memory_order_relaxed);
 }
 
 std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
@@ -1291,6 +1306,99 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
         i = j;
     }
     return {(backing_pages.size() + view_pages.size()) * PageAlignment, zero_bytes};
+#elif defined(__APPLE__)
+    // Apple counts every resident or compressed page of the guest memory object once, whichever
+    // view touched it, and iOS kills the app when that footprint passes its limit. Zero pages
+    // there are made reusable: they leave the footprint, read back as zeros if the OS takes them
+    // and are counted again once written. EDEN_NX2_TRIM_ZERO=0 turns it off.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_TRIM_ZERO");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled || backing_base == nullptr) {
+        return {0, 0};
+    }
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t num_pages = backing_size / page_size;
+    std::vector<char> residency(num_pages);
+    if (mincore(reinterpret_cast<char*>(backing_base), num_pages * page_size,
+                residency.data()) != 0) {
+        return {0, 0};
+    }
+    if (trimmed_pages.size() != num_pages) {
+        trimmed_pages.assign(num_pages, false);
+    }
+    int counted = MINCORE_INCORE;
+#ifdef MINCORE_PAGED_OUT
+    counted |= MINCORE_PAGED_OUT;
+#endif
+    const auto is_zero = [page_size](const u8* page) {
+        const auto* words = reinterpret_cast<const u64*>(page);
+        u64 bits = 0;
+        for (size_t i = 0; i < page_size / sizeof(u64); ++i) {
+            bits |= words[i];
+        }
+        return bits == 0;
+    };
+    size_t resident = 0;
+    size_t trimmed = 0;
+    // A guest write between the check and madvise is the one thing a reclaim could lose: each run
+    // is checked again right after, and a page that changed is written to (unchanged) and reused.
+    const auto trim = [&](size_t first, size_t end) {
+        u8* const begin = backing_base + first * page_size;
+        if (madvise(begin, (end - first) * page_size, MADV_FREE_REUSABLE) != 0) {
+            return;
+        }
+        for (size_t index = first; index < end; ++index) {
+            u8* const page = backing_base + index * page_size;
+            if (!is_zero(page)) {
+                // A compare-exchange of a word with itself stores it (an idempotent RMW can be
+                // compiled to a load), so the page counts as written again.
+                auto* const word = reinterpret_cast<u64*>(page);
+                u64 value = __atomic_load_n(word, __ATOMIC_RELAXED);
+                while (!__atomic_compare_exchange_n(word, &value, value, false, __ATOMIC_RELAXED,
+                                                    __ATOMIC_RELAXED)) {
+                }
+                madvise(page, page_size, MADV_FREE_REUSE);
+                trimmed_pages[index] = false;
+                continue;
+            }
+            if (!trimmed_pages[index]) {
+                trimmed_pages[index] = true;
+                trimmed += page_size;
+            }
+        }
+    };
+    size_t run_begin = num_pages;
+    for (size_t index = 0; index < num_pages; ++index) {
+        bool zero = false;
+        if ((residency[index] & counted) != 0) {
+            resident += page_size;
+            zero = is_zero(backing_base + index * page_size);
+            if (!zero) {
+                trimmed_pages[index] = false;
+            }
+        }
+        if (zero && run_begin == num_pages) {
+            run_begin = index;
+        } else if (!zero && run_begin != num_pages) {
+            trim(run_begin, index);
+            run_begin = num_pages;
+        }
+    }
+    if (run_begin != num_pages) {
+        trim(run_begin, num_pages);
+    }
+    u64 handed_out = 0;
+    for (size_t index = 0; index < num_granules; ++index) {
+        if ((granules[index].load(std::memory_order_relaxed) & GranuleUsed) != 0) {
+            handed_out += u64{1} << GranuleShift;
+        }
+    }
+    g_scanned_handed_out_bytes.store(handed_out, std::memory_order_relaxed);
+    g_scanned_resident_bytes.store(resident, std::memory_order_relaxed);
+    g_trimmed_zero_bytes.fetch_add(trimmed, std::memory_order_relaxed);
+    return {resident, trimmed};
 #else
     return {0, 0};
 #endif

@@ -25,6 +25,17 @@ void SetMemoryLowWater(u64 bytes);
 /// Checks the low-water mark at most every 250 ms. Called once per frame by the caches.
 void PollMemoryPressure();
 
+struct ProcessMemory {
+    u64 footprint;      ///< What jetsam compares with the limit (phys_footprint)
+    u64 footprint_peak;
+    u64 compressed;
+    u64 reusable;       ///< Marked reusable (MADV_FREE_REUSABLE), outside the footprint
+};
+/// Apple: the process footprint and parts of it; zeros elsewhere.
+ProcessMemory QueryProcessMemory();
+/// Apple: hands the memory malloc holds free back to the OS. Returns the bytes released.
+u64 RelieveMallocPressure();
+
 /// Work to finish before the app is suspended (write caches out). Listeners run on the thread
 /// calling NotifyEnteringBackground; they must not wait for the emulated CPU or the GPU thread.
 std::size_t AddBackgroundListener(std::function<void()> listener);

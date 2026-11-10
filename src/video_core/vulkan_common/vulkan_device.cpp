@@ -1922,6 +1922,28 @@ u64 Device::GetDeviceMemoryUsage() const {
     return result;
 }
 
+std::string Device::MemoryHeapReport() const {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    physical.GetMemoryProperties(&budget);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+    if (allocator != nullptr) {
+        vmaGetHeapBudgets(allocator, heap_budgets.data());
+    }
+    std::string report;
+    for (const size_t heap : valid_heap_memory) {
+        const VmaStatistics& statistics = heap_budgets[heap].statistics;
+        report += fmt::format("{}heap {}: {} MiB in use of {} MiB (blocks {} MiB, allocations {} MiB)",
+                              report.empty() ? "" : ", ", heap,
+                              AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]) >> 20,
+                              (extensions.memory_budget ? budget.heapBudget[heap]
+                                                        : heap_budgets[heap].budget) >>
+                                  20,
+                              statistics.blockBytes >> 20, statistics.allocationBytes >> 20);
+    }
+    return report;
+}
+
 u64 Device::GetDeviceMemorySlack() const {
     if (allocator == nullptr) {
         return 0;
