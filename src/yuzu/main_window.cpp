@@ -482,7 +482,26 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     if (Settings::values.use_dev_keys.GetValue()) {
         Core::Crypto::KeyManager::Instance().ReloadKeys();
     }
-    game_list->PopulateAsync(UISettings::values.game_dirs);
+    // Parsed before the scan: a game on the command line only needs the game directories'
+    // updates and DLC registered, not the list (BootGame waited ~200 ms for that scan to stop).
+    // The list fills when the game exits.
+    std::optional<Core::LaunchParams> launch_params;
+    if (QStringList args = QApplication::arguments(); args.size() >= 2) {
+        QList<QByteArray> qba{};
+        for (auto const& e : args)
+            qba.push_back(e.toUtf8());
+        std::vector<char*> args_cstr{};
+        for (auto& e : qba)
+            args_cstr.push_back(e.data());
+
+        launch_params = Core::ParseLaunchParams(*QtCommon::system, int(args_cstr.size()),
+                                                args_cstr.data(), nullptr);
+    }
+    if (launch_params && !launch_params->filepath.empty()) {
+        game_list->FillContentProvider(UISettings::values.game_dirs);
+    } else {
+        game_list->PopulateAsync(UISettings::values.game_dirs);
+    }
 
     // Set up game list mode checkboxes.
     SetGameListMode(UISettings::values.game_list_mode.GetValue());
@@ -546,15 +565,8 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     // to prevent the UI from blowing up.
     UpdateUITheme();
 
-    if (QStringList args = QApplication::arguments(); args.size() >= 2) {
-        QList<QByteArray> qba{};
-        for (auto const& e : args)
-            qba.push_back(e.toUtf8());
-        std::vector<char*> args_cstr{};
-        for (auto& e : qba)
-            args_cstr.push_back(e.data());
-
-        auto const lp = Core::ParseLaunchParams(*QtCommon::system, args_cstr.size(), args_cstr.data(), nullptr);
+    if (launch_params) {
+        auto const& lp = *launch_params;
 
         // Override fullscreen setting if gamepath or argument is provided
         if (!lp.filepath.empty() || lp.fullscreen) {

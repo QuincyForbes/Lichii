@@ -73,6 +73,15 @@ void GameListModel::PopulateAsync(QVector<UISettings::GameDir>& game_dirs) {
     QThreadPool::globalInstance()->start(current_worker.get());
 }
 
+void GameListModel::FillContentProvider(QVector<UISettings::GameDir>& game_dirs) {
+    if (!scan_enabled || system.IsPoweredOn()) {
+        return;
+    }
+    StopWorker();
+    GameListWorker worker{vfs, provider, game_dirs, play_time_manager, system};
+    worker.FillContentProvider();
+}
+
 void GameListModel::WorkerEvent() {
     if (current_worker) {
         current_worker->ProcessEvents(this);
