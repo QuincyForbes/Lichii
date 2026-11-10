@@ -29,7 +29,6 @@ private:
     void UpdateGameStatus(std::string_view game_url, bool use_default);
 
     std::string game_title{};
-    std::string game_version{};
     Core::System& system;
 };
 
