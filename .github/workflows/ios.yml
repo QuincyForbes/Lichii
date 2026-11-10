@@ -1,9 +1,7 @@
 name: iOS
 
 on:
-  push:
-    branches: [ios, ios-frontend, ios-content, ios-controls, ios-platform, ios-merge]
-    paths-ignore: ['**.md']
+  # Run by hand for an IPA-only build and the ios-latest release.
   workflow_dispatch:
   # release-binaries.yml calls this to put the IPA into its release; it names the artifact and the
   # build tag, and publishes the release itself.
@@ -203,11 +201,8 @@ jobs:
           if-no-files-found: ignore
 
       - name: Publish rolling release
-        # A manual run publishes too: it builds only the IPA, without the desktop release.
-        if: >-
-          !inputs.artifact_name &&
-          (github.event_name == 'workflow_dispatch' ||
-           (github.event_name == 'push' && github.ref == 'refs/heads/ios'))
+        # Not when release-binaries.yml calls it (it names an artifact and publishes itself).
+        if: github.event_name == 'workflow_dispatch' && !inputs.artifact_name
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

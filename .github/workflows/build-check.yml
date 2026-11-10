@@ -1,10 +1,9 @@
 name: build-check
 
 on:
+  # Pushes to main build in release-binaries.yml.
   pull_request:
-    branches: [nx2]
-  push:
-    branches: [nx2]
+    branches: [main]
   workflow_dispatch:
 
 permissions:

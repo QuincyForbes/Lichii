@@ -9,8 +9,7 @@ on:
         default: true
   push:
     branches:
-      - nx2-experimental
-      - oot-custom
+      - main
     # A binary only changes when build inputs change; docs-only pushes skip the build.
     paths:
       - "src/**"
@@ -721,7 +720,7 @@ jobs:
       artifact_name: lichii-ios-arm64-${{ github.sha }}
       build_tag: build-${{ github.run_number }}
 
-  # Publishes every binary as a GitHub pre-release: on pushes to nx2-experimental and oot-custom,
+  # Publishes every binary as a GitHub pre-release: on pushes to main,
   # and on manual runs unless "Publish the binaries as a GitHub release" is unticked. A failed
   # Linux leg does not hold the release back; the Windows, macOS and iOS packages must all exist.
   release:
