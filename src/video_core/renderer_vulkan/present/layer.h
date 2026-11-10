@@ -16,6 +16,9 @@
 #include "video_core/renderer_vulkan/present/fsr3.h"
 #include "video_core/renderer_vulkan/present/sgsr.h"
 #include "video_core/renderer_vulkan/present/fxaa.h"
+#ifdef LICHII_METALFX
+#include "video_core/renderer_vulkan/present/metalfx_spatial.h"
+#endif
 #ifdef HAS_RESHADE
 #include "video_core/renderer_vulkan/present/post_process.h"
 #endif
@@ -101,7 +104,13 @@ private:
 
     Settings::AntiAliasing anti_alias_setting{};
     std::variant<std::monostate, FXAA, SMAA> anti_alias{};
-    std::variant<std::monostate, SGSR, FSR, FSR3> sr_filter{};
+    std::variant<std::monostate, SGSR, FSR, FSR3
+#ifdef LICHII_METALFX
+                 ,
+                 MetalFxSpatial
+#endif
+                 >
+        sr_filter{};
 #ifdef HAS_RESHADE
     std::optional<PostProcessChain> post_process{};
     u64 post_process_generation{};

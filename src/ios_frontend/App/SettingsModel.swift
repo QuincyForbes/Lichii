@@ -177,7 +177,7 @@ enum SettingsCatalog {
     /// Shown first, in this order.
     static let essentials = [
         "resolution_setup", "scaling_filter", "fsr_sharpening_slider", "anti_aliasing",
-        "frame_gen", "frame_gen_type", "frame_gen_multiplier", "use_vsync", "frame_pacing_mode",
+        "metalfx_temporal", "frame_gen", "frame_gen_type", "frame_gen_multiplier", "use_vsync", "frame_pacing_mode",
         "use_speed_limit", "speed_limit", "use_docked_mode", "gpu_accuracy", "cpu_accuracy",
         "use_asynchronous_shaders", "use_disk_shader_cache", "aspect_ratio", "volume", "audio_muted",
     ]
@@ -258,6 +258,9 @@ enum SettingsCatalog {
             let canonical = item.choices.first { $0.value == value }?.canonical
             if canonical == "Lsfg", !SettingsPlatform.current.losslessInstalled {
                 return "LSFG needs Lossless.dll from Lossless Scaling in Lichii's eden/lossless folder (Files app). AMD FSR 3 needs nothing."
+            }
+            if canonical == "MetalFx" {
+                return "MetalFX makes the 2x frame on iOS 26. Before iOS 26, and at 3x or 4x, AMD FSR 3 does."
             }
             return nil
         case "game_dlss_network":
@@ -391,6 +394,7 @@ enum SettingLabels {
         "force_max_clock": "Force Maximum GPU Clocks",
         "use_vulkan_driver_pipeline_cache": "Driver Pipeline Cache",
         "nvidia_dlss": "NVIDIA DLSS",
+        "metalfx_temporal": "MetalFX Upscaling (replaces the game's)",
         "device_name": "Console Name",
         "log_filter": "Log Filter",
     ]
@@ -426,8 +430,11 @@ enum SettingLabels {
             "NearestNeighbor": "Nearest Neighbor", "Fsr": "AMD FSR 1", "Fsr3": "AMD FSR 3",
             "ScaleForce": "ScaleForce", "ZeroTangent": "Zero Tangent", "BSpline": "B-Spline",
             "Mmpx": "MMPX", "Sgsr": "Snapdragon GSR", "SgsrEdge": "Snapdragon GSR (Edge)",
+            "MetalFxSpatial": "MetalFX Spatial",
         ],
-        "frame_gen_type": ["Lsfg": "Lossless Scaling (LSFG)", "Fsr3": "AMD FSR 3"],
+        "frame_gen_type": [
+            "Lsfg": "Lossless Scaling (LSFG)", "Fsr3": "AMD FSR 3", "MetalFx": "MetalFX (iOS 26, 2x)",
+        ],
         "aspect_ratio": [
             "R16_9": "16:9", "R4_3": "4:3", "R21_9": "21:9", "R16_10": "16:10", "Stretch": "Stretch",
         ],

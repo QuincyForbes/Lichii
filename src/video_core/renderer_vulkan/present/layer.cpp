@@ -80,6 +80,15 @@ Layer::Layer(const Device& device, MemoryAllocator& memory_allocator_, Scheduler
         sr_filter.emplace<SGSR>(device, memory_allocator, image_count, output_size, true);
     } else if (filters.get_scaling_filter() == Settings::ScalingFilter::Fsr3) {
         sr_filter.emplace<FSR3>(device, memory_allocator, image_count, output_size);
+    } else if (filters.get_scaling_filter() == Settings::ScalingFilter::MetalFxSpatial) {
+#ifdef LICHII_METALFX
+        if (MetalFxSpatial::IsSupported(device)) {
+            sr_filter.emplace<MetalFxSpatial>(device, memory_allocator, scheduler, output_size);
+            return;
+        }
+#endif
+        // FSR 1 where MetalFX can't run (other platforms, older OS versions).
+        sr_filter.emplace<FSR>(device, memory_allocator, image_count, output_size);
     }
 }
 
@@ -162,6 +171,15 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
                                            source_image_view, render_extent, crop_rect);
             crop_rect = {0, 0, 1, 1};
         }
+#ifdef LICHII_METALFX
+        else if (auto* metalfx = std::get_if<MetalFxSpatial>(&sr_filter)) {
+            if (const auto upscaled =
+                    metalfx->Draw(scheduler, source_image, render_extent, crop_rect)) {
+                source_image_view = *upscaled;
+                crop_rect = {0, 0, 1, 1};
+            }
+        }
+#endif
     }
 
     SetMatrixData(device, *out_push_constants, layout);

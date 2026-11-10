@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <optional>
 
 #include "common/common_types.h"
@@ -10,6 +11,9 @@
 #include "video_core/renderer_vulkan/present/lsfg_chain.h"
 #include "video_core/renderer_vulkan/present/lsfg_shaders.h"
 #include "video_core/renderer_vulkan/present/fsr3_frame_gen.h"
+#ifdef LICHII_METALFX
+#include "video_core/renderer_vulkan/present/metalfx_frame_gen.h"
+#endif
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 
 namespace Vulkan {
@@ -31,9 +35,17 @@ public:
 
     void GenerateInto(const Device& device, Frame* destination, size_t generation);
 
+    /// The smoothed time between real frames in seconds, or 0 while it is unknown.
+    [[nodiscard]] f32 FrameInterval() const {
+        return frame_interval;
+    }
+
 private:
     void Rebuild(const Device& device, VkExtent2D extent, VkFormat format, f32 flow_scale);
     void DumpDebugImages(u64 count);
+#ifdef LICHII_METALFX
+    bool GenerateWithMetalFx(const Device& device, Frame* destination);
+#endif
 
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
@@ -41,6 +53,13 @@ private:
     std::optional<LsfgShaders> shaders;
     std::optional<LsfgChain> chain;
     std::optional<Fsr3FrameGen> fsr3_chain;
+#ifdef LICHII_METALFX
+    std::optional<MetalFxFrameGen> metalfx;
+    u64 metalfx_count{};
+    bool metalfx_unsupported{};
+#endif
+    std::chrono::steady_clock::time_point last_process{};
+    f32 frame_interval{};
     FrameGenPacer pacer;
     FrameGenPlan plan{};
     VkExtent2D peak_guest_extent{};

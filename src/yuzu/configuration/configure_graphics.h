@@ -122,4 +122,6 @@ private:
     QWidget* frame_gen_widget{};
     QComboBox* frame_gen_type_combobox{};
     QLabel* lossless_status_label{};
+    QWidget* metalfx_temporal_widget{};
+    QComboBox* scaling_filter_combobox{};
 };

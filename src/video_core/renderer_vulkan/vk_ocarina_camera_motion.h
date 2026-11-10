@@ -31,7 +31,7 @@ struct OcarinaActorMesh {
     std::span<const f32> previous_bones;
 };
 
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
 class OcarinaLiveDlss {
 public:
     OcarinaLiveDlss(const Device& device, Scheduler& scheduler, DescriptorPool& pool,
