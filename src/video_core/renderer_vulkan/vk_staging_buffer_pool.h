@@ -57,6 +57,13 @@ public:
 
     void TickFrame();
 
+    /// Bytes held by the pooled staging buffers (the stream buffer not included).
+    [[nodiscard]] u64 CachedBytes() const;
+
+    [[nodiscard]] VkDeviceSize StreamBufferSize() const noexcept {
+        return stream_buffer_size;
+    }
+
 private:
     struct StreamBufferCommit {
         size_t upper_bound;
@@ -139,6 +146,7 @@ private:
 
     mutable ChunkPointer current_chunk{};
     bool use_rebar = false;
+    u32 seen_host_pressure{};
 
     StagingBuffersCache device_local_cache;
     StagingBuffersCache upload_cache;

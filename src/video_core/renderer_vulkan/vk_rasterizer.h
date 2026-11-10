@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -300,7 +301,7 @@ private:
     u32 UpdateVertexRepackLayout(bool dynamic_input);
 
     void FrameDumpPass(const Framebuffer* framebuffer);
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     bool OcarinaDlssEnabled() const;
     void TrackOcarinaCamera();
     void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect);
@@ -346,7 +347,7 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     std::optional<u64> oot_camera_sample_frame;
     struct OcarinaMotionTrace {
         const Tegra::MemoryManager* camera_channel{};
@@ -497,6 +498,11 @@ private:
     Common::DkbFrameTrace::RateLimit trace_cpu_rate;
     std::optional<Common::DkbCpuTrace::Snapshot> trace_cpu_snapshot;
     u64 trace_cpu_frame{};
+    /// Memory report (iOS, EDEN_NX2_MEMORY_REPORT) and malloc relief after host memory pressure.
+    void TickMemoryReport();
+    std::chrono::steady_clock::time_point memory_report_next{};
+    u32 memory_report_pressure{};
+    u32 malloc_relief_frames{};
     bool trace_sample_frame{true};
     u64 trace_frame{};
     u64 trace_window_frames{};

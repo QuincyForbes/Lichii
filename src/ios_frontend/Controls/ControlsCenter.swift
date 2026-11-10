@@ -247,7 +247,7 @@ final class ControlsCenter: ObservableObject {
             takeScreenshot()
         }
         if has(LICHII_ACTION_TOGGLE_HUD) {
-            showHUD.toggle()
+            OverlayPreset.toggle()
         }
         if has(LICHII_ACTION_TOGGLE_SPEED_LIMIT) {
             let enabled = QuickSettings.bool("use_speed_limit")
@@ -398,6 +398,7 @@ final class OverlayController: NSObject {
     func attach(to window: UIWindow) {
         guard let parent = window.rootViewController else { return }
         detach()
+        WindowBoundsFollower.install(in: window)
         parent.addChild(host)
         container.frame = parent.view.bounds
         container.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -421,11 +422,58 @@ final class PassthroughView: UIView {
     var interactive = false
     weak var hostView: UIView?
 
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        // The container follows the root view; the root view follows the window.
+        if let window {
+            WindowBoundsFollower.fit(window)
+        }
+        if let parent = superview, frame != parent.bounds {
+            frame = parent.bounds
+        }
+    }
+
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let hit = super.hitTest(point, with: event)
         if interactive {
             return hit
         }
         return hit === self || hit === hostView ? nil : hit
+    }
+}
+
+/// Keeps the window's root view (SDL's Metal view, which also carries the overlay) at the window's
+/// bounds. SDL sets that view's frame itself when it shows a fullscreen window, from the window it
+/// sees then, swapped to landscape for a landscape-only window. The game window is shown hidden
+/// while the game loads (the library, in portrait, keeps the scene), so it got a 874 x 402 frame in
+/// a 402 x 874 window, and the rotation's autoresizing then made it 1346 x -70: a black picture,
+/// and the controls and menu off screen. Sits behind the root view and re-fits it whenever the
+/// window's size changes.
+final class WindowBoundsFollower: UIView {
+    static func install(in window: UIWindow) {
+        if let follower = window.subviews.first(where: { $0 is WindowBoundsFollower }) {
+            follower.frame = window.bounds
+        } else {
+            let follower = WindowBoundsFollower(frame: window.bounds)
+            follower.isUserInteractionEnabled = false
+            follower.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            window.insertSubview(follower, at: 0)
+        }
+        fit(window)
+    }
+
+    static func fit(_ window: UIWindow) {
+        if let root = window.rootViewController?.view, root.frame != window.bounds {
+            root.frame = window.bounds
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard let window else { return }
+        if frame != window.bounds {
+            frame = window.bounds
+        }
+        Self.fit(window)
     }
 }

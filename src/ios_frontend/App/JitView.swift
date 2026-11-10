@@ -79,7 +79,11 @@ struct JitStatus: Equatable {
     var error = ""
     var debugged = false
     var needsScript = false
-    var stikDebug = false
+    /// The chosen JIT app (JitProvider.current) is installed.
+    var providerInstalled = false
+    var provider = JitProvider.stikDebug
+
+    var stikDebug: Bool { providerInstalled }
 
     @MainActor static func read() -> JitStatus {
         read(installed: JitProvider.current.installed)
@@ -90,7 +94,7 @@ struct JitStatus: Equatable {
         JitStatus(state: Bridge.jitState, prepared: lichii_jit_prepared_bytes(),
                   total: lichii_jit_pool_bytes(), error: Bridge.jitError,
                   debugged: lichii_jit_debugged(), needsScript: lichii_jit_needs_script(),
-                  stikDebug: installed)
+                  providerInstalled: installed, provider: JitProvider.current)
     }
 
     var progress: Double {
@@ -113,16 +117,20 @@ struct JitStatus: Equatable {
             if needsScript && debugged {
                 return "JIT was enabled without its script. Enable it again from Lichii's request so StikDebug runs universal.js."
             }
-            if stikDebug {
-                return "Lichii asks StikDebug to enable JIT. Tap Enable JIT in StikDebug if it asks; Lichii continues by itself."
+            if providerInstalled {
+                return "Lichii asks \(provider.label) to enable JIT. Confirm in \(provider.label) if it asks; Lichii continues by itself."
             }
-            return "Install StikDebug 3.2 or newer and enable JIT for Lichii (script universal.js on iOS 26 and newer)."
+            if provider == .stikDebug || provider == .stikDebugLiveContainer {
+                return "Install StikDebug 3.2 or newer (SideStore or AltStore), import your pairing file in it, then enable JIT for Lichii (script universal.js on iOS 26 and newer)."
+            }
+            return "\(provider.label) isn't installed. Install it or pick another JIT app below."
         case .acquiring:
-            return "StikDebug has mapped \(prepared >> 20) of \(total >> 20) MiB."
+            return "\(prepared >> 20) of \(total >> 20) MiB prepared."
         case .ready:
             return "Games start right away."
         case .failed:
-            return error.isEmpty ? "Close Lichii and launch it again." : error
+            let restart = "Swipe Lichii away in the app switcher and open it again."
+            return error.isEmpty ? restart : "\(error)\n\(restart)"
         }
     }
 
@@ -175,13 +183,20 @@ struct JitView: View {
         List {
             Section {
                 JitStatusCard(status: status)
-                if status.state == .waiting || status.state == .failed {
+                if status.state == .waiting {
                     Button {
                         app.requestJitIfNeeded(automatic: false)
                     } label: {
                         Label("Enable JIT with \(provider.label)", systemImage: "bolt")
                     }
-                    .disabled(!status.stikDebug || status.state == .failed)
+                    .disabled(!status.providerInstalled)
+                }
+                if status.state == .failed {
+                    NavigationLink {
+                        LogsView()
+                    } label: {
+                        Label("Share the Log", systemImage: "doc.text.magnifyingglass")
+                    }
                 }
             }
             Section {
@@ -193,16 +208,19 @@ struct JitView: View {
                     Text("This device needs StikDebug's universal.js script; other JIT apps cannot prepare Lichii's memory here.")
                 }
             }
-            Section("Details") {
-                LabeledContent("Debugger attached once", value: status.debugged ? "Yes" : "No")
-                LabeledContent("Needs StikDebug script", value: status.needsScript ? "Yes (TXM)" : "No")
-                LabeledContent(provider.label, value: status.stikDebug ? "Installed" : "Not found")
-                LabeledContent("Pool", value: "\(status.prepared >> 20) / \(status.total >> 20) MiB")
+            Section {
+                // Diagnostics, collapsed: for bug reports.
+                DisclosureGroup("Diagnostics") {
+                    LabeledContent(provider.label, value: status.providerInstalled ? "Installed" : "Not found")
+                    LabeledContent("Debugger attached", value: status.debugged ? "Yes" : "No")
+                    LabeledContent("Needs StikDebug's script", value: status.needsScript ? "Yes (TXM device)" : "No")
+                    LabeledContent("JIT memory prepared", value: "\(status.prepared >> 20) of \(status.total >> 20) MiB")
+                }
             }
             Section {
-                Toggle("Ask StikDebug at launch", isOn: $autoRequest)
+                Toggle("Enable JIT Automatically", isOn: $autoRequest)
             } footer: {
-                Text("Lichii prepares its JIT memory while you browse the library, so games start without waiting.")
+                Text("When Lichii opens without JIT, it switches to \(provider.label) once to enable it and comes back, so games start without waiting. Turn this off to enable JIT only with the button above or when you start a game.")
             }
         }
         .navigationTitle("JIT")

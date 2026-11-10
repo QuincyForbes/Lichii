@@ -84,7 +84,9 @@ bool OotOcclusionOffEnabled() {
 
 bool OotNoNdsrEnabled() {
     static const bool enabled = OotEnvSwitch("EDEN_NX2_OOT_NO_NDSR", false);
-    return enabled;
+    // MetalFX temporal upscaling (Apple) replaces the output pass this removes, and skips its
+    // dispatch itself.
+    return enabled && !Settings::values.metalfx_temporal.GetValue();
 }
 
 bool OotNativeZstdEnabled() {

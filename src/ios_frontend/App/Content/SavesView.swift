@@ -93,8 +93,13 @@ struct SavesView: View {
     }
 
     private func reload() {
-        info = ContentBridge.saveInfo(game)
-        profile = ContentBridge.profiles.first(where: \.current)?.name ?? ""
+        let current = game
+        ContentBridge.run({
+            (ContentBridge.saveInfo(current), ContentBridge.profiles.first(where: \.current)?.name ?? "")
+        }) { result in
+            info = result.0
+            profile = result.1
+        }
     }
 
     private func exportSave() {
@@ -124,15 +129,18 @@ struct SavesView: View {
         busy = true
         let current = game
         ContentBridge.run({ () -> (Bool, String) in
-            withSecurityScope(url) {
+            // A coordinated read, so an archive in iCloud Drive or another file provider is
+            // downloaded first.
+            let (result, error) = coordinatedRead(url) { readable -> (Bool, String) in
                 var raw: UnsafeMutablePointer<CChar>?
                 let ok = current.path.withCString { game in
-                    url.path.withCString { zip in
+                    readable.path.withCString { zip in
                         lichii_content_import_save(current.programId, game, zip, &raw)
                     }
                 }
                 return (ok, ContentBridge.string(raw) ?? "")
             }
+            return result ?? (false, error ?? "")
         }) { ok, message in
             busy = false
             reload()

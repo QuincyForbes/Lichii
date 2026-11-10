@@ -5,12 +5,17 @@ import LichiiBridge
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Keys and firmware state shared by the settings screen and onboarding.
+/// Keys and firmware state shared by the settings screen and onboarding. One instance, so an
+/// install keeps its progress and result when the screen that started it closes.
 @MainActor
 final class SystemFilesModel: ObservableObject {
+    static let shared = SystemFilesModel()
+
     @Published private(set) var keys: ContentBridge.KeyStatus?
     @Published private(set) var firmware: ContentBridge.FirmwareStatus?
-    @Published private(set) var busy = false
+    @Published private(set) var busy = false {
+        didSet { KeepAwake.set(busy, for: "systemFiles") }
+    }
     @Published var progress: Double?
     @Published var alert: ContentAlert?
     @Published private(set) var miiEditAvailable = false
@@ -149,7 +154,7 @@ enum ContentTypes {
 }
 
 struct KeysFirmwareView: View {
-    @StateObject private var model = SystemFilesModel()
+    @ObservedObject private var model = SystemFilesModel.shared
     @State private var importer: Importer?
     @State private var confirmRemoveKeys = false
     @State private var confirmRemoveFirmware = false
@@ -163,7 +168,8 @@ struct KeysFirmwareView: View {
         List {
             Section {
                 StatusRow(title: "prod.keys", ok: model.keys?.prodKeys == true,
-                          detail: model.keys.map { "\($0.masterKeys) master keys" + ($0.headerKey ? ", header key" : "") })
+                          detail: model.keys.map { "\($0.masterKeys) master keys" + ($0.headerKey ? ", header key" : "") },
+                          optional: true)
                 StatusRow(title: "title.keys", ok: model.keys?.titleKeys == true,
                           detail: model.keys.map { "\($0.titleKeyCount) title keys" }, optional: true)
                 Button {
@@ -175,7 +181,7 @@ struct KeysFirmwareView: View {
             } header: {
                 Text("Keys")
             } footer: {
-                Text("Select prod.keys and title.keys dumped from your own Switch (Lockpick). They are copied to Documents/eden/keys.")
+                Text("Only needed for Switch 1 games and firmware; Switch 2 games (.nup) run without keys. Select prod.keys and title.keys dumped from your own Switch (Lockpick). They are copied to Documents/eden/keys.")
             }
 
             Section {
@@ -260,19 +266,35 @@ struct StatusRow: View {
     let ok: Bool
     var detail: String?
     var optional = false
+    /// Not done yet but on its way (JIT waiting for its app), rather than missing.
+    var pending = false
 
     var body: some View {
         HStack {
-            Image(systemName: ok ? "checkmark.circle.fill" : (optional ? "minus.circle" : "xmark.circle.fill"))
-                .foregroundStyle(ok ? .green : (optional ? .secondary : .red))
+            Image(systemName: symbol)
+                .foregroundStyle(color)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                 if let detail, ok {
                     Text(detail).font(.caption).foregroundStyle(.secondary)
                 } else if !ok {
-                    Text(optional ? "Optional" : "Missing").font(.caption).foregroundStyle(.secondary)
+                    Text(pending ? "Waiting" : optional ? "Optional" : "Missing")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
         }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var symbol: String {
+        if ok { return "checkmark.circle.fill" }
+        if pending { return "clock.fill" }
+        return optional ? "minus.circle" : "xmark.circle.fill"
+    }
+
+    private var color: Color {
+        if ok { return .green }
+        if pending { return .orange }
+        return optional ? .secondary : .red
     }
 }

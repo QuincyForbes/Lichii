@@ -205,6 +205,7 @@ Frame* PresentManager::GetRenderFrame() {
     // Wait for the presentation to be finished so all frame resources are free
     frame->present_done.Wait();
     frame->present_done.Reset();
+    frame->present_spacing = {};
 
     return frame;
 }
@@ -379,7 +380,15 @@ void PresentManager::PresentThread(std::stop_token token) {
             // lock in WaitPresent is guaranteed to occur after here.
             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
             last_present_id = 0;
+            // After a generated frame: let it keep the screen for its share of the real frame
+            // interval. Sent back to back, a 120 Hz display shows it for one refresh only.
+            for (auto now = std::chrono::steady_clock::now();
+                 now < next_present && !token.stop_requested();
+                 now = std::chrono::steady_clock::now()) {
+                std::this_thread::sleep_for(next_present - now);
+            }
             CopyToSwapchain(frame);
+            next_present = std::chrono::steady_clock::now() + frame->present_spacing;
             {
                 static std::chrono::steady_clock::time_point previous{};
                 const auto now = std::chrono::steady_clock::now();

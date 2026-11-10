@@ -11,6 +11,8 @@ enum SettingKind: Int32 {
 struct SettingChoice: Hashable {
     let name: String
     let value: String
+    /// The enum's own name ("Lsfg"), before SettingLabels.
+    let canonical: String
 }
 
 /// One setting as the bridge describes it.
@@ -32,7 +34,8 @@ struct SettingItem: Identifiable, Hashable {
     init(_ info: LichiiSettingInfo) {
         let key = Bridge.constant(info.key)
         self.key = key
-        category = Bridge.constant(info.category)
+        let names = SettingsCatalog.categoryNames
+        category = Int(info.category_id) < names.count ? names[Int(info.category_id)] : Bridge.constant(info.category)
         kind = SettingKind(rawValue: info.kind) ?? .string
         switchable = info.switchable
         runtimeModifiable = info.runtime_modifiable
@@ -44,7 +47,8 @@ struct SettingItem: Identifiable, Hashable {
             key.withCString { pointer in
                 let name = Bridge.constant(lichii_settings_enum_name(pointer, index))
                 return SettingChoice(name: SettingLabels.choice(name, for: key),
-                                     value: String(lichii_settings_enum_value(pointer, index)))
+                                     value: String(lichii_settings_enum_value(pointer, index)),
+                                     canonical: name)
             }
         }
     }
@@ -77,6 +81,82 @@ struct SettingSection: Identifiable {
     let items: [SettingItem]
 }
 
+/// Whether a setting does anything in this build on this device.
+enum SettingAvailability: Equatable {
+    case available
+    /// Greyed out, with the reason.
+    case unavailable(String)
+    /// Desktop or debug only: not listed.
+    case hidden
+}
+
+/// Build and device facts the settings gate on.
+@MainActor
+struct SettingsPlatform {
+    let frameGenBuilt: Bool
+    let postShadersBuilt: Bool
+    /// Apple GPU family 9 (A17 Pro) or an M-series chip; true when the platform layer can't tell.
+    let frameGenCapable: Bool
+
+    /// Read once the platform layer is up (lichii_platform_init), so after the app has started.
+    static let current = SettingsPlatform()
+
+    private init() {
+        frameGenBuilt = lichii_settings_frame_gen_built()
+        postShadersBuilt = lichii_settings_post_shaders_built()
+        frameGenCapable = PlatformCenter.deviceDefaults.map { $0.frame_gen_capable != 0 } ?? true
+    }
+
+    /// Lossless Scaling's library, which LSFG frame generation loads; the user copies it in.
+    var losslessInstalled: Bool {
+        FileManager.default.fileExists(atPath: Bridge.userDir
+            .appendingPathComponent("lossless/Lossless.dll").path)
+    }
+}
+
+/// The pages of the global settings, each a list of setting categories in section order.
+enum SettingsGroup: String, CaseIterable, Identifiable {
+    case graphics, audio, system, advanced
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .graphics: return "Graphics"
+        case .audio: return "Audio"
+        case .system: return "System"
+        case .advanced: return "Advanced"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .graphics: return "display"
+        case .audio: return "speaker.wave.2"
+        case .system: return "cpu"
+        case .advanced: return "wrench.and.screwdriver"
+        }
+    }
+
+    var categories: [String] {
+        switch self {
+        case .graphics: return ["Renderer", "RendererAdvanced"]
+        case .audio: return ["Audio", "SystemAudio"]
+        case .system: return ["Core", "Cpu", "System", "Controls", "LibraryApplet", "DataStorage", "Overlay"]
+        case .advanced: return Array(SettingsCatalog.advancedCategories).sorted()
+        }
+    }
+
+    /// Section titles within a page.
+    func sectionTitle(_ category: String) -> String {
+        switch (self, category) {
+        case (.graphics, "Renderer"): return "Image"
+        case (.graphics, "RendererAdvanced"): return "Performance"
+        default: return SettingsCatalog.categoryTitles[category] ?? category
+        }
+    }
+}
+
 enum SettingsCatalog {
     /// Every setting, read once (the list never changes while the app runs).
     @MainActor static let all: [SettingItem] = (0..<lichii_settings_count()).compactMap { index in
@@ -84,19 +164,111 @@ enum SettingsCatalog {
         return lichii_settings_info(index, &info) ? SettingItem(info) : nil
     }
 
+    /// Settings::Category in declaration order (common/settings_common.h). The ini group name
+    /// (info.category) folds the debug, hack and unsafe groups into their parents.
+    static let categoryNames = [
+        "Android", "Audio", "Core", "Cpu", "CpuDebug", "CpuUnsafe", "Overlay", "Renderer",
+        "RendererAdvanced", "RendererHacks", "RendererExtensions", "RendererDebug", "System",
+        "SystemAudio", "DataStorage", "Debugging", "DebuggingGraphics", "GpuDriver", "Miscellaneous",
+        "Network", "WebService", "AddOns", "Controls", "Ui", "UiAudio", "UiGeneral", "UiLayout",
+        "UiGameList", "Screenshots", "Shortcuts", "Multiplayer", "Services", "Paths", "LibraryApplet",
+    ]
+
     /// Shown first, in this order.
     static let essentials = [
         "resolution_setup", "scaling_filter", "fsr_sharpening_slider", "anti_aliasing",
-        "frame_gen", "frame_gen_type", "frame_gen_multiplier", "use_vsync", "frame_pacing_mode",
+        "metalfx_temporal", "frame_gen", "frame_gen_type", "frame_gen_multiplier", "use_vsync", "frame_pacing_mode",
         "use_speed_limit", "speed_limit", "use_docked_mode", "gpu_accuracy", "cpu_accuracy",
         "use_asynchronous_shaders", "use_disk_shader_cache", "aspect_ratio", "volume", "audio_muted",
     ]
 
-    /// INI groups that only matter to desktop frontends.
+    /// INI groups that only matter to desktop frontends or have no effect on iOS.
     static let hiddenCategories: Set<String> = [
-        "Android", "UI", "UiGeneral", "UiLayout", "UiGameList", "UiAudio", "Shortcuts", "Multiplayer",
-        "WebService", "Paths", "Screenshots",
+        "Android", "Ui", "UiGeneral", "UiLayout", "UiGameList", "UiAudio", "Shortcuts", "Multiplayer",
+        "WebService", "Paths", "Screenshots", "Network", "Services", "GpuDriver", "AddOns",
     ]
+
+    /// Desktop input, debugger and bookkeeping keys with no use in the iOS app.
+    static let hiddenKeys: Set<String> = [
+        "vulkan_device", "fullscreen_mode", "output_device", "input_device", "dump_audio_commands",
+        "frame_gen_dump_flow", "oot_fps_asked", "frizti_settings_revision", "current_user",
+        "current_speed_mode", "first_launch", "censor_username", "program_args", "gamecard_inserted",
+        "gamecard_current_game", "gamecard_path", "nsight_aftermath", "renderdoc_hotkey", "use_gdbstub",
+        "gdbstub_port", "perform_vulkan_check", "gpu_log_level", "gpu_log_vulkan_calls",
+        "gpu_log_shader_dumps", "gpu_log_memory_tracking", "gpu_log_driver_debug",
+        "gpu_log_ring_buffer_size", "disable_wgi_xinput", "enable_raw_input", "controller_navigation",
+        "enable_joycon_driver", "enable_procon_driver", "udp_input_servers", "enable_udp_controller",
+        "pause_tas_on_load", "tas_enable", "tas_loop", "tas_show_recording_dialog", "mouse_panning",
+        "mouse_panning_sensitivity", "mouse_enabled", "mouse_panning_x_sensitivity",
+        "mouse_panning_y_sensitivity", "mouse_panning_deadzone_counterweight",
+        "mouse_panning_decay_strength", "mouse_panning_min_decay", "emulate_analog_keyboard",
+        "keyboard_enabled", "debug_pad_enabled", "touch_device", "touch_from_button_map",
+        "enable_ir_sensor", "ir_sensor_device",
+    ]
+
+    /// Settings that do nothing in the iOS app, shown greyed out with the reason.
+    static let unavailableReasons: [String: String] = [
+        "nvidia_dlss": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.",
+        "nvidia_dlss_preset": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.",
+        "backend": "iOS has one graphics API: Vulkan through MoltenVK.",
+        "cpu_backend": "iOS runs games with the Dynarmic JIT only.",
+        "nvdec_emulation": "Lichii decodes game videos on the CPU on iOS and sets this at every boot.",
+        "force_max_clock": "Only works with AMD, NVIDIA, Intel and Qualcomm drivers.",
+        "enable_compute_pipelines": "Only matters for some Intel drivers on Windows.",
+        "disable_macro_jit": "The macro JIT exists only on x86-64 PCs.",
+        "accelerate_astc": "Apple GPUs read ASTC textures directly; this is for GPUs without ASTC.",
+        "astc_recompression": "Apple GPUs read ASTC textures directly; this is for GPUs without ASTC.",
+        "output_engine": "Lichii plays audio through SDL on iOS.",
+    ]
+
+    /// Kept off the main page: debug switches and hacks that can stop games from starting.
+    static let advancedCategories: Set<String> = [
+        "RendererHacks", "RendererExtensions", "RendererDebug", "CpuDebug", "CpuUnsafe", "Debugging",
+        "DebuggingGraphics", "Miscellaneous",
+    ]
+
+    @MainActor
+    static func availability(of item: SettingItem) -> SettingAvailability {
+        if hiddenCategories.contains(item.category) || hiddenKeys.contains(item.key) {
+            return .hidden
+        }
+        if let reason = unavailableReasons[item.key] {
+            return .unavailable(reason)
+        }
+        let platform = SettingsPlatform.current
+        if item.key.hasPrefix("frame_gen") {
+            if !platform.frameGenBuilt {
+                return .unavailable("Frame generation isn't part of this build.")
+            }
+            if !platform.frameGenCapable {
+                return .unavailable("Frame generation needs an A17 Pro, M-series or newer chip.")
+            }
+        }
+        if item.key.hasPrefix("post_shader"), !platform.postShadersBuilt {
+            return .unavailable("ReShade post-processing isn't part of the iOS app.")
+        }
+        return .available
+    }
+
+    /// A hint under a usable setting, depending on its value.
+    @MainActor
+    static func note(for item: SettingItem, value: String) -> String? {
+        switch item.key {
+        case "frame_gen_type":
+            let canonical = item.choices.first { $0.value == value }?.canonical
+            if canonical == "Lsfg", !SettingsPlatform.current.losslessInstalled {
+                return "LSFG needs Lossless.dll from Lossless Scaling in Lichii's eden/lossless folder (Files app). AMD FSR 3 needs nothing."
+            }
+            if canonical == "MetalFx" {
+                return "MetalFX makes the 2x frame on iOS 26. Before iOS 26, and at 3x or 4x, AMD FSR 3 does."
+            }
+            return nil
+        case "game_dlss_network":
+            return "Used only at 1x resolution."
+        default:
+            return nil
+        }
+    }
 
     static let categoryTitles: [String: String] = [
         "Renderer": "Graphics", "RendererAdvanced": "Graphics (Advanced)", "RendererHacks": "Graphics Hacks",
@@ -108,12 +280,53 @@ enum SettingsCatalog {
         "Overlay": "Overlay", "GpuDriver": "GPU Driver", "AddOns": "Add-ons",
     ]
 
+    /// Settings shown with another group than their own: shader building is a hack in the core
+    /// but an everyday switch on a phone.
+    static let categoryOverrides: [String: String] = [
+        "use_asynchronous_shaders": "RendererAdvanced",
+    ]
+
+    static func displayCategory(of item: SettingItem) -> String {
+        categoryOverrides[item.key] ?? item.category
+    }
+
+    /// One page of the global settings. A search covers every page.
     @MainActor
-    static func sections(perGame: Bool, query: String) -> [SettingSection] {
+    static func sections(group: SettingsGroup, query: String) -> [SettingSection] {
+        let rank = Dictionary(essentials.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
         let visible = all.filter { item in
-            !hiddenCategories.contains(item.category) && (!perGame || item.switchable) &&
-                (query.isEmpty || item.label.localizedCaseInsensitiveContains(query) ||
-                    item.key.localizedCaseInsensitiveContains(query))
+            availability(of: item) != .hidden &&
+                (query.isEmpty ? group.categories.contains(displayCategory(of: item))
+                    : item.label.localizedCaseInsensitiveContains(query) ||
+                        item.key.localizedCaseInsensitiveContains(query))
+        }
+        var grouped: [String: [SettingItem]] = [:]
+        var order: [String] = query.isEmpty ? group.categories : []
+        for item in visible {
+            let category = displayCategory(of: item)
+            if !order.contains(category) {
+                order.append(category)
+            }
+            grouped[category, default: []].append(item)
+        }
+        return order.compactMap { category in
+            guard let items = grouped[category], !items.isEmpty else { return nil }
+            // The everyday settings first, then the core's order (a stable sort).
+            let sorted = items.enumerated().sorted { a, b in
+                (rank[a.element.key] ?? Int.max, a.offset) < (rank[b.element.key] ?? Int.max, b.offset)
+            }.map(\.element)
+            return SettingSection(id: category, title: group.sectionTitle(category), items: sorted)
+        }
+    }
+
+    /// The per-game page (`advanced` false) or its advanced part; a search covers both.
+    @MainActor
+    static func sections(perGame: Bool, query: String, advanced: Bool = false) -> [SettingSection] {
+        let visible = all.filter { item in
+            availability(of: item) != .hidden && (!perGame || item.switchable) &&
+                (query.isEmpty ? advancedCategories.contains(displayCategory(of: item)) == advanced
+                    : item.label.localizedCaseInsensitiveContains(query) ||
+                        item.key.localizedCaseInsensitiveContains(query))
         }
         var sections: [SettingSection] = []
         let byKey = Dictionary(visible.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
@@ -125,10 +338,11 @@ enum SettingsCatalog {
         var order: [String] = []
         var grouped: [String: [SettingItem]] = [:]
         for item in visible where !essentialKeys.contains(item.key) {
-            if grouped[item.category] == nil {
-                order.append(item.category)
+            let category = displayCategory(of: item)
+            if grouped[category] == nil {
+                order.append(category)
             }
-            grouped[item.category, default: []].append(item)
+            grouped[category, default: []].append(item)
         }
         for category in order {
             sections.append(SettingSection(id: category, title: categoryTitles[category] ?? category,
@@ -169,9 +383,18 @@ enum SettingLabels {
         "language_index": "Language",
         "region_index": "Region",
         "time_zone_index": "Time Zone",
-        "renderer_backend": "Graphics API",
+        "backend": "Graphics API",
+        "cpu_backend": "CPU Backend",
+        "nvidia_dlss_preset": "DLSS Preset",
+        "game_dlss_network": "Game's Own DLSS Network",
+        "oot_anti_aliasing": "Ocarina of Time Anti-Aliasing",
+        "accelerate_astc": "ASTC Decoding",
+        "astc_recompression": "ASTC Recompression",
+        "output_engine": "Audio Output Engine",
+        "force_max_clock": "Force Maximum GPU Clocks",
         "use_vulkan_driver_pipeline_cache": "Driver Pipeline Cache",
-        "nvidia_dlss": "DLSS",
+        "nvidia_dlss": "NVIDIA DLSS",
+        "metalfx_temporal": "MetalFX Upscaling (replaces the game's)",
         "device_name": "Console Name",
         "log_filter": "Log Filter",
     ]
@@ -207,8 +430,11 @@ enum SettingLabels {
             "NearestNeighbor": "Nearest Neighbor", "Fsr": "AMD FSR 1", "Fsr3": "AMD FSR 3",
             "ScaleForce": "ScaleForce", "ZeroTangent": "Zero Tangent", "BSpline": "B-Spline",
             "Mmpx": "MMPX", "Sgsr": "Snapdragon GSR", "SgsrEdge": "Snapdragon GSR (Edge)",
+            "MetalFxSpatial": "MetalFX Spatial",
         ],
-        "frame_gen_type": ["Lsfg": "Lossless Scaling (LSFG)", "Fsr3": "AMD FSR 3"],
+        "frame_gen_type": [
+            "Lsfg": "Lossless Scaling (LSFG)", "Fsr3": "AMD FSR 3", "MetalFx": "MetalFX (iOS 26, 2x)",
+        ],
         "aspect_ratio": [
             "R16_9": "16:9", "R4_3": "4:3", "R21_9": "21:9", "R16_10": "16:10", "Stretch": "Stretch",
         ],

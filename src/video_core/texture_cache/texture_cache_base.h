@@ -292,6 +292,14 @@ public:
     /// Notify the cache that a new frame has been queued
     void TickFrame();
 
+    /// Images in the cache and their (scaled) size in bytes.
+    [[nodiscard]] std::pair<size_t, u64> ImageMemory();
+
+    /// Device memory the collector counts as in use, and its expected and critical thresholds.
+    [[nodiscard]] std::array<u64, 3> CollectorMemory() const noexcept {
+        return {total_used_memory, expected_memory, critical_memory};
+    }
+
     /// Return a constant reference to the given image view id
     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
 

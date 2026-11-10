@@ -25,10 +25,16 @@
 
 #include <fmt/format.h>
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
+#include "common/host_memory.h"
+#include "common/platform_events.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
@@ -51,6 +57,9 @@
 #include "video_core/renderer_vulkan/framebuffer_clear_layers.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
+#ifdef LICHII_METALFX
+#include "video_core/renderer_vulkan/present/metalfx_temporal.h"
+#endif
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #include "video_core/vulkan_common/streamline.h"
@@ -850,7 +859,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         return;
     }
 
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     TrackOcarinaCamera();
     TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect);
 #endif
@@ -938,7 +947,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             });
     }
     submitted = true;
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     const auto& hashes = pipeline->ShaderHashes();
     if (oot_4k_scene_frame == render_trace_frame) {
         constexpr u64 final_vertex = 0x16aff33d999f993fULL;
@@ -1554,7 +1563,7 @@ void RasterizerVulkan::DrawIndirect() {
 }
 
 VideoCommon::OotNetwork::BypassState* RasterizerVulkan::OotNetworkBypass() {
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     // NVIDIA DLSS replaces the same output pass and takes precedence until its evaluation fails.
     if (OcarinaDlssEnabled() && !(oot_live_dlss && oot_live_dlss->EvaluationFailed())) {
         static bool logged = false;
@@ -2069,7 +2078,7 @@ void RasterizerVulkan::DispatchCompute() {
         }
     };
     const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     const bool can_replace = pipeline->CanReplaceOcarinaUpscale() && !indirect_address &&
                              OcarinaDlssEnabled() && !frame_dump.Capturing();
     const bool marking_effects = oot_effects_frame == render_trace_frame && OcarinaDlssEnabled() &&
@@ -2201,7 +2210,7 @@ void RasterizerVulkan::DispatchCompute() {
     }
     scheduler.RequestOutsideRenderPassOperationContext();
     record_read_barrier();
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     if (marking_effects) {
         const auto written = pipeline->WrittenImages();
         if (std::ranges::any_of(written, [this](VideoCommon::ImageViewId id) {
@@ -2222,11 +2231,11 @@ void RasterizerVulkan::DispatchCompute() {
     scheduler.TraceComputePipeline(pipeline->ShaderHash());
 #endif
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind)
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
                       , replacement
 #endif
                      ](vk::CommandBuffer cmdbuf) {
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
         if (replacement && !replacement->EvaluationFailed()) {
             return;
         }
@@ -2256,7 +2265,7 @@ void RasterizerVulkan::DispatchCompute() {
     compute_since_count_barrier = true;
     SubmitNx2ListCopies(pipeline->ShaderHash());
 
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     if (!can_replace) {
         TryOcarinaDlss(*pipeline, false);
     }
@@ -2931,11 +2940,18 @@ void RasterizerVulkan::TracePendingCpuWrites(bool compute, std::span<const u64> 
     });
 }
 
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
 bool RasterizerVulkan::OcarinaDlssEnabled() const {
     constexpr u64 ocarina_program = 0x0400486024DEC000ULL;
+#ifdef EGLANTINE_STREAMLINE
     return program_id == ocarina_program && !oot_live_failed &&
            Settings::values.nvidia_dlss.GetValue() && Streamline::IsDlssAvailable();
+#else
+    // Apple: MetalFX temporal upscaling in place of the game's upscaler.
+    static const bool supported = MetalFxTemporalUpscaler::IsSupported(device);
+    return program_id == ocarina_program && !oot_live_failed &&
+           Settings::values.metalfx_temporal.GetValue() && supported;
+#endif
 }
 
 /// Capture the two camera matrices from a draw targeting the scene color and depth. Terrain and
@@ -3236,7 +3252,14 @@ bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool repl
                 device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator);
         }
         const VkExtent2D target_extent{target.size.width, target.size.height};
-        const VkExtent2D output_extent = upscale_4k ? VkExtent2D{3840, 2160} : target_extent;
+#ifdef EGLANTINE_STREAMLINE
+        const bool present_4k = upscale_4k;
+#else
+        // A 3840x2160 image only to be scaled down to a phone or laptop screen: MetalFX writes the
+        // game's 1440p target instead.
+        constexpr bool present_4k = false;
+#endif
+        const VkExtent2D output_extent = present_4k ? VkExtent2D{3840, 2160} : target_extent;
         const bool recorded = oot_live_dlss->Record(color_view, depth.DepthView(), target_view,
                                                    extent, output_extent, target_extent, oot_motion.current,
                                                    oot_motion.previous, mesh, depth.ImageHandle(),
@@ -3244,7 +3267,7 @@ bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool repl
         if (!recorded) {
             return fail("DLSS declined the frame");
         }
-        if (upscale_4k) {
+        if (present_4k) {
             oot_live_dlss->SaveSceneReference(scene_reference);
             oot_4k_scene_frame = render_trace_frame;
             oot_4k_guest_present = VK_NULL_HANDLE;
@@ -3416,6 +3439,66 @@ void RasterizerVulkan::TickFrame() {
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.TickFrame();
     }
+    TickMemoryReport();
+}
+
+void RasterizerVulkan::TickMemoryReport() {
+    // After host memory pressure the caches collect for 30 frames: then malloc hands what they
+    // freed back to the OS.
+    if (const u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
+        pressure != memory_report_pressure) {
+        memory_report_pressure = pressure;
+        malloc_relief_frames = 31;
+    }
+    if (malloc_relief_frames != 0 && --malloc_relief_frames == 0) {
+        const u64 released = Common::PlatformEvents::RelieveMallocPressure();
+        LOG_INFO(Render_Vulkan, "Host memory pressure: malloc released {} MiB", released >> 20);
+    }
+    // Where the footprint goes, at the first frame and every 30 s. On by default on iOS;
+    // EDEN_NX2_MEMORY_REPORT=1 elsewhere, =0 turns it off.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_MEMORY_REPORT");
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        return value == nullptr || value[0] != '0';
+#else
+        return value != nullptr && value[0] != '0';
+#endif
+    }();
+    const auto now = std::chrono::steady_clock::now();
+    if (!enabled || now < memory_report_next) {
+        return;
+    }
+    memory_report_next = now + std::chrono::seconds{30};
+    const auto process = Common::PlatformEvents::QueryProcessMemory();
+    std::pair<size_t, u64> images;
+    std::array<u64, 3> collector;
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        images = texture_cache.ImageMemory();
+        collector = texture_cache.CollectorMemory();
+    }
+    u64 buffer_bytes;
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_bytes = buffer_cache.BufferBytes();
+    }
+    const auto [graphics_pipelines, compute_pipelines] = pipeline_cache.PipelineCounts();
+    LOG_INFO(Render_Vulkan,
+             "Memory: footprint {} MiB (peak {}, compressed {}, reusable {}), {} MiB left | guest "
+             "RAM handed out {} MiB, resident {} MiB, zero pages trimmed {} MiB (last scan) | "
+             "Vulkan {} | textures {} images {} MiB (collector {} / {} / {} MiB) | buffers {} MiB "
+             "| staging stream {} MiB + pooled {} MiB | pipelines {} graphics, {} compute | ASTC "
+             "{}, BCn {}",
+             process.footprint >> 20, process.footprint_peak >> 20, process.compressed >> 20,
+             process.reusable >> 20, Common::PlatformEvents::AvailableProcessMemory() >> 20,
+             Common::HostMemory::ScannedHandedOutBytes() >> 20,
+             Common::HostMemory::ScannedResidentBytes() >> 20,
+             Common::HostMemory::TrimmedZeroBytes() >> 20, device.MemoryHeapReport(),
+             images.first, images.second >> 20, collector[0] >> 20, collector[1] >> 20,
+             collector[2] >> 20, buffer_bytes >> 20, staging_pool.StreamBufferSize() >> 20,
+             staging_pool.CachedBytes() >> 20, graphics_pipelines, compute_pipelines,
+             device.IsOptimalAstcSupported() ? "native" : "decoded",
+             device.IsOptimalBcnSupported() ? "native" : "decoded");
 }
 
 bool RasterizerVulkan::AccelerateConditionalRendering() {
@@ -3688,7 +3771,7 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     info.height = image_view->size.height;
     info.scaled_width = scaled ? resolution.ScaleUp(info.width) : info.width;
     info.scaled_height = scaled ? resolution.ScaleUp(info.height) : info.height;
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     info.anti_aliased = oot_live_dlss && oot_dlss_frame == render_trace_frame &&
                         !oot_live_dlss->EvaluationFailed();
     if (oot_live_dlss && oot_4k_scene_frame == render_trace_frame && info.image &&

@@ -31,6 +31,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/render_probe.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/samples_helper.h"
@@ -494,6 +495,17 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
 }
 
 template <class P>
+std::pair<size_t, u64> TextureCache<P>::ImageMemory() {
+    size_t images = 0;
+    u64 bytes = 0;
+    for (const auto [image_id, image] : slot_images) {
+        bytes += GetScaledImageSizeBytes(*image);
+        ++images;
+    }
+    return {images, bytes};
+}
+
+template <class P>
 void TextureCache<P>::TickFrame() {
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
@@ -606,6 +618,8 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, runtime.PooledImageBytes());
         }
     }
+    VideoCore::Probe::texture_cache_bytes.store(total_used_memory, std::memory_order_relaxed);
+    VideoCore::Probe::texture_cache_expected.store(expected_memory, std::memory_order_relaxed);
     // Every 600 frames: device memory in use against the collector's thresholds.
     // Skip expensive heap allocation, map construction, and sorting unless debug logging is explicitly enabled.
     static const bool log_tc = std::getenv("EDEN_NX2_TC_LOG") != nullptr;

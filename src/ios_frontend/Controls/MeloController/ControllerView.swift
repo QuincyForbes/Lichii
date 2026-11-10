@@ -149,6 +149,14 @@ public struct ControllerView: View {
                 LayoutManager.shared.portrait = portrait
                 loadLayout()
             }
+            // Lichii: the layout follows the space the controller has, not the key window.
+            .background(
+                GeometryReader { geometry in
+                    Color.clear
+                        .onAppear { controllerHandler.update(size: geometry.size) }
+                        .onChange(of: geometry.size) { controllerHandler.update(size: $0) }
+                }
+            )
             .onChange(of: isEditingInput) { isEditing = $0 }
             .onChange(of: isEditing) { onEditingChanged?($0) }
             .onAppear {

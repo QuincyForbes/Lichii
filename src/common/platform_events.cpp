@@ -9,6 +9,8 @@
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
+#include <mach/mach.h>
+#include <malloc/malloc.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h>
 #endif
@@ -70,6 +72,30 @@ void PollMemoryPressure() {
         // Give the collectors a second before the next look.
         g_next_poll_ns.store(now + 1'000'000'000LL, std::memory_order_relaxed);
     }
+}
+
+ProcessMemory QueryProcessMemory() {
+    ProcessMemory memory{};
+#ifdef __APPLE__
+    task_vm_info_data_t info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) ==
+        KERN_SUCCESS) {
+        memory.footprint = info.phys_footprint;
+        memory.footprint_peak = info.ledger_phys_footprint_peak;
+        memory.compressed = info.compressed;
+        memory.reusable = info.reusable;
+    }
+#endif
+    return memory;
+}
+
+u64 RelieveMallocPressure() {
+#ifdef __APPLE__
+    return static_cast<u64>(malloc_zone_pressure_relief(nullptr, 0));
+#else
+    return 0;
+#endif
 }
 
 std::size_t AddBackgroundListener(std::function<void()> listener) {

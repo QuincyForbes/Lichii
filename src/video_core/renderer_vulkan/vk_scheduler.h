@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -80,6 +81,12 @@ public:
     /// Waits for the worker thread to finish executing everything. After this function returns it's
     /// safe to touch worker resources.
     void WaitWorker();
+
+    /// The next submission without a wait semaphore of its own waits for this binary semaphore
+    /// (MetalFX work submitted outside the scheduler, see present/metalfx_context.h).
+    void WaitOnNextSubmit(VkSemaphore semaphore) noexcept {
+        next_wait_semaphore.store(semaphore, std::memory_order_release);
+    }
 
     void MarkFrameEnd(u64 frame);
     void TraceGraphicsPipeline(const std::array<u64, 6>& hashes);
@@ -513,6 +520,7 @@ private:
 
     std::unique_ptr<CommandChunk> chunk;
     std::function<void()> on_submit;
+    std::atomic<VkSemaphore> next_wait_semaphore{};
 
     State state;
     u64 recording_epoch = 0;

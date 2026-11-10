@@ -242,6 +242,11 @@ public:
 
     void TickFrame();
 
+    /// The buffers' own size in bytes.
+    [[nodiscard]] u64 BufferBytes() const noexcept {
+        return buffer_bytes;
+    }
+
     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
                                std::span<const MultiRangeSegment> pool,
                                u64 write_mark_limit = ~u64{0});

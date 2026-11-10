@@ -128,6 +128,11 @@ char* lichii_settings_get_effective(const char* key);
 /// when that overrides the setting, else the global config. Applies it to a running game.
 bool lichii_settings_set_effective(const char* key, const char* value);
 
+/// Optional parts of the renderer this build has: frame generation (LSFG and FSR 3 frame
+/// generation) and ReShade post-processing.
+bool lichii_settings_frame_gen_built(void);
+bool lichii_settings_post_shaders_built(void);
+
 /* ------------------------------------------------------------------------------------ emulation */
 
 typedef enum LichiiEmuState {

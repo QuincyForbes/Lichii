@@ -812,6 +812,22 @@ bool lichii_settings_set_effective(const char* key, const char* value) {
     return true;
 }
 
+bool lichii_settings_frame_gen_built(void) {
+#ifdef HAS_LSFG
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool lichii_settings_post_shaders_built(void) {
+#ifdef HAS_RESHADE
+    return true;
+#else
+    return false;
+#endif
+}
+
 /* ------------------------------------------------------------------------------ emulation */
 
 bool lichii_emu_launch(const char* path) {

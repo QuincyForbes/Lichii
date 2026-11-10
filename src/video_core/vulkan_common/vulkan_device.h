@@ -657,6 +657,11 @@ FN_MAX_LIMIT_LIST
         return extensions.swapchain_mutable_format;
     }
 
+    /// Returns true if VK_EXT_metal_objects is enabled (MoltenVK: MetalFX reads its Metal objects).
+    bool IsExtMetalObjectsEnabled() const {
+        return extensions.metal_objects;
+    }
+
     /// Returns true if VK_KHR_shader_float_controls is enabled.
     bool IsKhrShaderFloatControlsSupported() const {
         return extensions.shader_float_controls;
@@ -1101,6 +1106,9 @@ FN_MAX_LIMIT_LIST
     /// yet the driver does: with the heap at its budget it is not available to new images.
     u64 GetDeviceMemorySlack() const;
 
+    /// Each used heap's usage, budget and allocator block and allocation bytes, for the log.
+    std::string MemoryHeapReport() const;
+
     u32 GetSetsPerPool() const {
         return sets_per_pool;
     }
@@ -1321,6 +1329,7 @@ private:
         FOR_EACH_VK_FEATURE_1_4(FEATURE);
         FOR_EACH_VK_FEATURE_EXT(FEATURE);
         FOR_EACH_VK_EXTENSION(EXTENSION);
+        bool metal_objects{}; ///< VK_EXT_metal_objects (Apple only)
 
 #undef EXTENSION
 #undef FEATURE

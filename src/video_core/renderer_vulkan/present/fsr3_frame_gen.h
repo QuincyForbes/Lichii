@@ -42,6 +42,24 @@ public:
         return m_initialized && m_has_history;
     }
 
+    /// Whether the last Process left two frames and the flow between them (Generate can run).
+    [[nodiscard]] bool HasFlow() const {
+        return m_has_history && m_flow_valid;
+    }
+    [[nodiscard]] VkImage CurrentFrame() const {
+        return *m_frame_images[m_parity];
+    }
+    [[nodiscard]] VkImage PreviousFrame() const {
+        return *m_frame_images[m_parity ^ 1];
+    }
+    /// R16G16F at FlowExtent: per current pixel, the offset in flow texels to the previous frame.
+    [[nodiscard]] VkImage MotionImage() const {
+        return *m_motion_image;
+    }
+    [[nodiscard]] VkExtent2D FlowExtent() const {
+        return m_flow_extent;
+    }
+
 private:
     static constexpr size_t NUM_PARITIES = 2;
     static constexpr size_t INTERP_CACHE_SIZE = 8;

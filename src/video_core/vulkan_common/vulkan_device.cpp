@@ -1177,6 +1177,14 @@ bool Device::GetSuitability(bool requires_swapchain) {
     FOR_EACH_VK_FEATURE_EXT(FEATURE_EXTENSION);
     FOR_EACH_VK_EXTENSION(EXTENSION);
 
+#ifdef VK_EXT_METAL_OBJECTS_EXTENSION_NAME
+    // MetalFX (present/metalfx_*.mm) works on the Metal textures and events behind Vulkan objects.
+    if (supported_extensions.contains(VK_EXT_METAL_OBJECTS_EXTENSION_NAME)) {
+        loaded_extensions.insert(VK_EXT_METAL_OBJECTS_EXTENSION_NAME);
+        extensions.metal_objects = true;
+    }
+#endif
+
     // The spec requires enabling VK_KHR_portability_subset on devices that expose it.
     if (supported_extensions.contains(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
         loaded_extensions.insert(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
@@ -1912,6 +1920,28 @@ u64 Device::GetDeviceMemoryUsage() const {
         result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
     }
     return result;
+}
+
+std::string Device::MemoryHeapReport() const {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    physical.GetMemoryProperties(&budget);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+    if (allocator != nullptr) {
+        vmaGetHeapBudgets(allocator, heap_budgets.data());
+    }
+    std::string report;
+    for (const size_t heap : valid_heap_memory) {
+        const VmaStatistics& statistics = heap_budgets[heap].statistics;
+        report += fmt::format("{}heap {}: {} MiB in use of {} MiB (blocks {} MiB, allocations {} MiB)",
+                              report.empty() ? "" : ", ", heap,
+                              AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]) >> 20,
+                              (extensions.memory_budget ? budget.heapBudget[heap]
+                                                        : heap_budgets[heap].budget) >>
+                                  20,
+                              statistics.blockBytes >> 20, statistics.allocationBytes >> 20);
+    }
+    return report;
 }
 
 u64 Device::GetDeviceMemorySlack() const {
