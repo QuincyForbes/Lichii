@@ -370,6 +370,12 @@ struct System::Impl {
     }
 
     SystemResultStatus SetupForApplicationProcess(System& system, Frontend::EmuWindow& emu_window) {
+        // ShutdownMainProcess leaves the flag set, and a frontend that keeps one System for every
+        // game (the iOS app) never cleared it: the second game's vsync thread returned on its
+        // first signal (nothing was presented) and its audio renderer rendered nothing.
+        if (is_shutting_down.exchange(false)) {
+            LOG_INFO(Core, "Boot: the shutdown flag of the previous game was still set, cleared");
+        }
         host1x_core.emplace(system);
         VideoCore::CreateGPU(gpu_core, emu_window, system);
         if (!gpu_core)
@@ -559,6 +565,7 @@ struct System::Impl {
         core_timing.SyncPause(false);
         Network::CancelPendingSocketOperations();
         kernel.SuspendEmulation(true);
+        LOG_INFO(Core, "Shutdown: guest threads suspended");
         kernel.CloseServices();
         LOG_INFO(Core, "Shutdown: services closed");
         // Each step done tells the frontend the teardown still moves (see
@@ -583,6 +590,7 @@ struct System::Impl {
         Common::NoteShutdownProgress();
         host1x_core.reset();
         perf_stats.reset();
+        LOG_INFO(Core, "Shutdown: host1x released");
         cpu_manager.Shutdown();
         LOG_INFO(Core, "Shutdown: CPU threads joined");
         debugger.reset();
