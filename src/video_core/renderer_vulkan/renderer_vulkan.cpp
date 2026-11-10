@@ -243,8 +243,18 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
                       GuestExtent(framebuffers));
 
     generated_frames = frame_gen.GeneratedFrameCount();
+#ifdef __APPLE__
+    // ProMotion (120 Hz) with FIFO: each generated frame gets an equal share of the real frame
+    // interval (zortos293/Lichii#783, Apple only here).
+    const auto spacing = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<f32>(std::min(frame_gen.FrameInterval(), 0.1f) /
+                                   static_cast<f32>(generated_frames + 1)));
+#endif
     for (size_t generation = 0; generation < generated_frames; ++generation) {
         Frame* generated = present_manager.GetRenderFrame();
+#ifdef __APPLE__
+        generated->present_spacing = spacing;
+#endif
         blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
         frame_gen.GenerateInto(device, generated, generation);
         generated->render_tick = scheduler.Flush(*generated->render_ready);
