@@ -39,6 +39,7 @@
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/nx2.h"
+#include "video_core/churn_counters.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/render_trace.h"
 #include "video_core/textures/decoders.h"
@@ -866,6 +867,27 @@ void TextureCache<P>::TickFrame() {
     }
     TickRenderClock();
     TickRelocationTombstones();
+    // What the caches made and destroyed (counted always, logged on request).
+    static const bool churn_log = [] {
+        const char* value = std::getenv("EDEN_NX2_CHURN_LOG");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (churn_log && frame_tick % 600 == 0) {
+        const auto churn = Churn::Take();
+        LOG_INFO(HW_GPU,
+                 "Churn (600 frames): images created {}, deleted {}, relocated {}, pooled {}; "
+                 "image views created {}, destroyed {}; buffers created {}, deleted {}, joined {} "
+                 "({} KiB copied); staging buffers allocated {} ({} MiB); device memory "
+                 "allocations {}, frees {}; descriptor pools created {}; {} images now",
+                 churn[Churn::ImagesCreated], churn[Churn::ImagesDeleted],
+                 churn[Churn::ImagesRelocated], churn[Churn::ImagesPooled],
+                 churn[Churn::ImageViewsCreated], churn[Churn::ImageViewsDestroyed],
+                 churn[Churn::BuffersCreated], churn[Churn::BuffersDeleted],
+                 churn[Churn::BuffersJoined], churn[Churn::BufferJoinBytes] >> 10,
+                 churn[Churn::StagingBuffers], churn[Churn::StagingBytes] >> 20,
+                 churn[Churn::DeviceAllocations], churn[Churn::DeviceFrees],
+                 churn[Churn::DescriptorPools], slot_images.size());
+    }
 
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
         for (auto& buffer : async_buffers_death_ring) {
@@ -3584,6 +3606,7 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     ++bindings_epoch;
     if (info.type == ImageType::Buffer) {
         const ImageViewInfo view_info(config, 0);
+        Churn::Add(Churn::ImageViewsCreated);
         return slot_image_views.insert(runtime, info, view_info, config.Address());
     }
     const u32 layer_offset = config.BaseLayer() * info.layer_stride;
@@ -3751,6 +3774,7 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     for (const ImageViewId image_view_id : image_view_ids) {
         sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
         slot_image_views.erase(image_view_id);
+        Churn::Add(Churn::ImageViewsDestroyed);
     }
     image.image_view_ids.clear();
     image.image_view_infos.clear();
@@ -4299,6 +4323,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 }
                 if (relocate) {
                     ++relocation_relocated;
+                    Churn::Add(Churn::ImagesRelocated);
                     if (mode == 4) {
                         AddRelocationTombstone(slot_images[old_id], gpu_addr);
                     }
@@ -4344,6 +4369,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+    if constexpr (requires(const Image& image) { image.FromPool(); }) {
+        Churn::Add(Churn::ImagesPooled, slot_images[new_image_id].FromPool() ? 1 : 0);
+    }
     if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
         if (slot_images[new_image_id].OutOfMemory()) {
             // Left out of the cache: lookups see no image (a null view) and make it again once
@@ -4377,6 +4405,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             shape.second = gpu_addr;
         }
         ++images_created;
+        Churn::Add(Churn::ImagesCreated);
     }
 
     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
@@ -5118,6 +5147,7 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
                  info.range.extent.layers);
     }
     const ImageViewId image_view_id = slot_image_views.insert(runtime, info, image_id, image, slot_images);
+    Churn::Add(Churn::ImageViewsCreated);
     image.InsertView(info, image_view_id);
     ++bindings_epoch;
     return image_view_id;
@@ -5296,6 +5326,7 @@ template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
+    Churn::Add(Churn::ImagesDeleted);
     ++bindings_epoch;
     BumpBindingSerial(image_id);
     MarkStale(image);
@@ -5365,6 +5396,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
             sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
         }
         slot_image_views.erase(image_view_id);
+        Churn::Add(Churn::ImageViewsDestroyed);
     }
     const bool retained = RetainPendingImageDownloads(image_id, slot_images[image_id],
                                                        uncommitted_downloads, committed_downloads);
