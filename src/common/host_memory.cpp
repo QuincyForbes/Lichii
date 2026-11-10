@@ -1021,14 +1021,19 @@ private:
     }
 
     bool ReserveRange(void* address, size_t size) {
+        // One call that maps the range without access. vm_allocate followed by vm_protect left it
+        // readable and writable zero-filled memory in between: a guest thread whose 4 KiB page
+        // shares a 16 KiB host page with the range (UpdateHostPages reserves whole host pages)
+        // read zeros or lost a write there instead of faulting into the page table path.
         vm_address_t target = reinterpret_cast<vm_address_t>(address);
-        kern_return_t kr = vm_allocate(mach_task_self(), &target, size, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE);
+        const kern_return_t kr = vm_map(mach_task_self(), &target, size, 0,
+                                        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, MACH_PORT_NULL, 0,
+                                        FALSE, VM_PROT_NONE, VM_PROT_READ | VM_PROT_WRITE,
+                                        VM_INHERIT_NONE);
         if (kr != KERN_SUCCESS) {
-            LOG_CRITICAL(HW_Memory, "vm_allocate({}, {:#x}) failed: {}", fmt::ptr(address), size,
-                         mach_error_string(kr));
-            return false;
+            LOG_CRITICAL(HW_Memory, "vm_map({}, {:#x}) of a reserved range failed: {}",
+                         fmt::ptr(address), size, mach_error_string(kr));
         }
-        kr = vm_protect(mach_task_self(), target, size, FALSE, VM_PROT_NONE);
         return kr == KERN_SUCCESS;
     }
 #endif
