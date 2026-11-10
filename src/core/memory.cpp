@@ -1168,11 +1168,27 @@ struct Memory::Impl {
         static constexpr u64 MaxAddressBits = 39;
         static constexpr u64 NumPages = 1ULL << (MaxAddressBits - YUZU_PAGEBITS);
         static constexpr u64 NumWords = NumPages / 64;
-        std::unique_ptr<std::atomic<u64>[]> words{
-            std::make_unique<std::atomic<u64>[]>(NumWords)};
+        // 16 MiB, zeroed, made at the first armed trap: every service process has a Memory too,
+        // and ~60 zeroed bitmaps were ~1 GB of resident host memory.
+        std::atomic<std::atomic<u64>*> words{};
+        std::unique_ptr<std::atomic<u64>[]> storage;
+
+        std::atomic<u64>* Words() noexcept {
+            std::atomic<u64>* current = words.load(std::memory_order_acquire);
+            if (current != nullptr) {
+                return current;
+            }
+            auto fresh = std::make_unique<std::atomic<u64>[]>(NumWords);
+            if (words.compare_exchange_strong(current, fresh.get(), std::memory_order_acq_rel)) {
+                storage = std::move(fresh);
+                return storage.get();
+            }
+            return current;
+        }
 
         bool Any(u64 vaddr, u64 size) const noexcept {
-            if (size == 0) {
+            const std::atomic<u64>* const bits = words.load(std::memory_order_acquire);
+            if (size == 0 || bits == nullptr) {
                 return false;
             }
             const u64 first = vaddr >> YUZU_PAGEBITS;
@@ -1184,7 +1200,7 @@ struct Memory::Impl {
                 const u64 bit = page & 63;
                 const u64 count = (std::min<u64>)(64 - bit, last - page + 1);
                 const u64 mask = (count == 64 ? ~u64{0} : (u64{1} << count) - 1) << bit;
-                if (words[page >> 6].load(std::memory_order_acquire) & mask) {
+                if (bits[page >> 6].load(std::memory_order_acquire) & mask) {
                     return true;
                 }
                 page += count;
@@ -1197,7 +1213,7 @@ struct Memory::Impl {
                 return false;
             }
             const u64 mask = 1ULL << (page & 63);
-            auto& word = words[page >> 6];
+            auto& word = Words()[page >> 6];
             if (word.load(std::memory_order_relaxed) & mask) {
                 return false;
             }
@@ -1205,10 +1221,11 @@ struct Memory::Impl {
         }
 
         void Clear(u64 page) noexcept {
-            if (page >= NumPages) [[unlikely]] {
+            std::atomic<u64>* const bits = words.load(std::memory_order_acquire);
+            if (page >= NumPages || bits == nullptr) [[unlikely]] {
                 return;
             }
-            words[page >> 6].fetch_and(~(1ULL << (page & 63)), std::memory_order_release);
+            bits[page >> 6].fetch_and(~(1ULL << (page & 63)), std::memory_order_release);
         }
     };
 
