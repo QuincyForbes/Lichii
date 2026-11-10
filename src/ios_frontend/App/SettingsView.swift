@@ -152,6 +152,8 @@ struct SettingRow: View {
             control
                 .disabled(perGame && useGlobal)
                 .opacity(perGame && useGlobal ? 0.55 : 1)
+                .disabled(SettingLabels.unavailable[item.key] != nil)
+                .help(SettingLabels.unavailable[item.key] ?? "")
             if perGame {
                 Button {
                     useGlobal.toggle()

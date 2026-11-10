@@ -16,6 +16,7 @@ struct InGameMenuView: View {
     @State private var resolution = QuickSettings.string("resolution_setup")
     @State private var frameGen = QuickSettings.bool("frame_gen")
     @State private var frameGenMultiplier = max(2, QuickSettings.int("frame_gen_multiplier"))
+    @State private var frameGenMetalFx = QuickSettings.string("frame_gen_type") == "MetalFx"
     @State private var speedLimit = QuickSettings.bool("use_speed_limit")
     @State private var speedPercent = QuickSettings.int("speed_limit")
     @State private var pendingRestart = false
@@ -131,6 +132,9 @@ struct InGameMenuView: View {
             if frameGen {
                 Stepper("Multiplier: \(frameGenMultiplier)x", value: $frameGenMultiplier, in: 2...4)
                     .onChange(of: frameGenMultiplier) { value in change("frame_gen_multiplier", String(value)) }
+                // Apple's interpolation (iOS 26) makes the 2x frame; 3x and 4x stay built-in.
+                Toggle("MetalFX Interpolation", isOn: $frameGenMetalFx)
+                    .onChange(of: frameGenMetalFx) { value in change("frame_gen_type", value ? "MetalFx" : "Fsr3") }
             }
 
             Toggle("Limit Speed", isOn: $speedLimit)
