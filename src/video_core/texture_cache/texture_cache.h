@@ -494,6 +494,17 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
 }
 
 template <class P>
+std::pair<size_t, u64> TextureCache<P>::ImageMemory() {
+    size_t images = 0;
+    u64 bytes = 0;
+    for (const auto [image_id, image] : slot_images) {
+        bytes += GetScaledImageSizeBytes(*image);
+        ++images;
+    }
+    return {images, bytes};
+}
+
+template <class P>
 void TextureCache<P>::TickFrame() {
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
