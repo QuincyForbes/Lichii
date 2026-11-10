@@ -3,11 +3,13 @@
 
 #include <algorithm>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/present/frame_gen.h"
 #include "video_core/renderer_vulkan/present/util.h"
@@ -22,6 +24,11 @@ namespace {
 constexpr size_t COLOR_CHANNELS = 4;
 constexpr u64 LSFG_REQUIRED_FRAMES = 2;
 constexpr u32 LSFG_RECURRENCE_FRAMES = 2;
+
+/// FSR 3 and MetalFX frame generation both run on the built-in optical flow; LSFG has its own.
+[[nodiscard]] bool UsesOpticalFlow() {
+    return Settings::values.frame_gen_type.GetValue() != Settings::FrameGenType::Lsfg;
+}
 
 [[nodiscard]] f32 ManualFlowScale() {
     return static_cast<f32>(Settings::values.frame_gen_flow_scale.GetValue()) / 100.0f;
@@ -212,22 +219,40 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         return;
     }
 
-    if (!shaders->IsValid() && Settings::values.frame_gen_type.GetValue() != Settings::FrameGenType::Fsr3) {
+    if (!shaders->IsValid() && !UsesOpticalFlow()) {
         unavailable = true;
         return;
     }
 
     if (!frame->storage_view) {
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            LOG_WARNING(Render_Vulkan, "Frame generation is off: the swapchain format ({}) can't "
+                                       "be a storage image on this device",
+                        static_cast<int>(format));
+        }
         warm_streak = 0;
         return;
     }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (last_process != std::chrono::steady_clock::time_point{}) {
+        const f32 interval = std::chrono::duration<f32>(now - last_process).count();
+        // A load or a pause would take seconds to forget: start again after one.
+        frame_interval = interval > 0.25f || frame_interval == 0.0f
+                             ? std::min(interval, 0.1f)
+                             : frame_interval + (interval - frame_interval) * 0.25f;
+    }
+    last_process = now;
 
     peak_guest_extent.width = (std::max)(peak_guest_extent.width, guest_extent.width);
     peak_guest_extent.height = (std::max)(peak_guest_extent.height, guest_extent.height);
 
     const VkExtent2D extent{.width = frame->width, .height = frame->height};
     const f32 flow_scale = ConfiguredFlowScale(peak_guest_extent, extent);
-    if ((!chain && !fsr3_chain) || built_extent.width != extent.width || built_extent.height != extent.height ||
+    // A type changed from the quick settings has to build the other chain.
+    if ((!chain && !fsr3_chain) || fsr3_chain.has_value() != UsesOpticalFlow() ||
+        built_extent.width != extent.width || built_extent.height != extent.height ||
         built_format != format || built_flow_scale != flow_scale) {
         Rebuild(device, extent, format, flow_scale);
     }
@@ -240,9 +265,7 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     warm_streak = warm ? warm_streak + 1 : 0;
     generated = warm && warm_streak >= LSFG_RECURRENCE_FRAMES && plan.generations > 0;
 
-    const bool use_fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
-
-    if (use_fsr3 && fsr3_chain) {
+    if (fsr3_chain) {
         scheduler.RequestOutsideRenderPassOperationContext();
         fsr3_chain->Process(device, scheduler, *frame->image, *frame->storage_view, count,
                             generated);
@@ -280,9 +303,15 @@ size_t FrameGen::GeneratedFrameCount() const {
 }
 
 void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t generation) {
-    const bool use_fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
-
-    if (use_fsr3 && fsr3_chain) {
+#ifdef LICHII_METALFX
+    // MetalFX makes only the frame halfway between two: 3x and 4x stay with FSR 3.
+    if (fsr3_chain && last_generations == 1 &&
+        Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::MetalFx &&
+        GenerateWithMetalFx(device, destination)) {
+        return;
+    }
+#endif
+    if (fsr3_chain) {
         const f32 blend = static_cast<f32>(generation + 1) / static_cast<f32>(last_generations + 1);
         const f32 flow_scale = ConfiguredFlowScale(peak_guest_extent, built_extent);
 
@@ -311,7 +340,7 @@ void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format,
 
     built_flow_scale = flow_scale;
 
-    if (Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3) {
+    if (UsesOpticalFlow()) {
         fsr3_chain.emplace(device, memory_allocator, extent, format);
     } else {
         chain.emplace(device, memory_allocator, *shaders, extent, format, built_flow_scale);
@@ -321,7 +350,38 @@ void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format,
     frame_count = 0;
     warm_streak = 0;
     generated = false;
+#ifdef LICHII_METALFX
+    metalfx_count = 0;
+#endif
 }
+
+#ifdef LICHII_METALFX
+bool FrameGen::GenerateWithMetalFx(const Device& device, Frame* destination) {
+    if (metalfx_unsupported || !fsr3_chain->HasFlow()) {
+        return false;
+    }
+    if (!metalfx) {
+        if (!MetalFxFrameGen::IsSupported(device)) {
+            LOG_WARNING(Render_Vulkan, "MetalFX frame interpolation needs iOS 26 or macOS 26 and "
+                                       "an Apple GPU that has it; using FSR 3 frame generation");
+            metalfx_unsupported = true;
+            return false;
+        }
+        metalfx.emplace(device, scheduler);
+    }
+    // The interpolator keeps the last pair: a skipped frame or a rebuilt chain starts it again.
+    const bool reset = last_count != metalfx_count + 1;
+    metalfx_count = last_count;
+    const f32 delta_time = frame_interval > 0.0f ? frame_interval : 1.0f / 30.0f;
+    if (!metalfx->Generate(fsr3_chain->PreviousFrame(), fsr3_chain->CurrentFrame(), built_extent,
+                           fsr3_chain->MotionImage(), fsr3_chain->FlowExtent(),
+                           *destination->image, delta_time, reset)) {
+        metalfx_unsupported = true;
+        return false;
+    }
+    return true;
+}
+#endif
 
 void FrameGen::DumpDebugImages(u64 count) {
     const std::filesystem::path directory =

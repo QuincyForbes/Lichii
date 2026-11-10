@@ -38,6 +38,11 @@ public:
         return gpu_tick.load(std::memory_order_acquire);
     }
 
+    /// The timeline semaphore, or null where fences stand in for it.
+    [[nodiscard]] VkSemaphore Handle() const noexcept {
+        return semaphore ? *semaphore : VK_NULL_HANDLE;
+    }
+
     /// Returns true when a tick has been hit by the GPU.
     [[nodiscard]] bool IsFree(u64 tick) const noexcept {
         return KnownGpuTick() >= tick;

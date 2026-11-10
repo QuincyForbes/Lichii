@@ -577,4 +577,33 @@ if (ENABLE_NVIDIA_DLSS)
     message(STATUS "NVIDIA DLSS through Streamline: ${STREAMLINE_INCLUDE_DIR}")
 endif()
 
+# Apple MetalFX (spatial and temporal upscaling, frame interpolation) on the Metal objects behind
+# MoltenVK's. Objective-C++, built only for Apple; MetalFX is weakly linked and every class is
+# checked with @available, so older OS versions still start.
+if (APPLE)
+    enable_language(OBJCXX)
+    set(METALFX_SOURCES
+        renderer_vulkan/present/metalfx_context.mm
+        renderer_vulkan/present/metalfx_frame_gen.mm
+        renderer_vulkan/present/metalfx_spatial.mm
+        renderer_vulkan/present/metalfx_temporal.mm
+    )
+    target_sources(video_core PRIVATE
+        ${METALFX_SOURCES}
+        renderer_vulkan/present/metalfx_context.h
+        renderer_vulkan/present/metalfx_frame_gen.h
+        renderer_vulkan/present/metalfx_spatial.h
+        renderer_vulkan/present/metalfx_temporal.h
+    )
+    set_source_files_properties(${METALFX_SOURCES} PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(video_core PRIVATE "-framework Metal" "-weak_framework MetalFX")
+    target_compile_definitions(video_core PUBLIC LICHII_METALFX)
+endif()
+
+# Ocarina of Time's upscaler replaced live by NVIDIA DLSS or Apple MetalFX temporal upscaling
+# (vk_ocarina_camera_motion.cpp).
+if (ENABLE_NVIDIA_DLSS OR APPLE)
+    target_compile_definitions(video_core PUBLIC LICHII_OCARINA_LIVE_UPSCALE)
+endif()
+
 create_target_directory_groups(video_core)

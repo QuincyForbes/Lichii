@@ -25,6 +25,9 @@
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #endif
+#ifdef LICHII_METALFX
+#include "video_core/renderer_vulkan/present/metalfx_temporal.h"
+#endif
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image_view_base.h"
@@ -310,6 +313,16 @@ public:
                          std::array<f32, 2> motion_scale, bool reset);
     std::unique_ptr<StreamlineDlssUpscaler> dlss_upscaler;
     bool dlss_unsupported{};
+#endif
+#ifdef LICHII_METALFX
+    /// Apple MetalFX temporal upscaling in place of the game's DLSS, before FSR 3.1, when the
+    /// setting is on. Returns false to fall back to FSR 3.1.
+    bool UpscaleWithMetalFx(Framebuffer* dst_framebuffer, ImageView& input_color,
+                            ImageView& motion_vectors, ImageView& depth,
+                            std::array<u32, 2> render_size, std::array<f32, 2> jitter,
+                            std::array<f32, 2> motion_scale, bool reset);
+    std::unique_ptr<MetalFxTemporalUpscaler> metalfx_upscaler;
+    bool metalfx_unsupported{};
 #endif
 
     /// TemporalUpscale's history: its previous result (images[current]) and the image the next

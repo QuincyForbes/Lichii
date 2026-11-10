@@ -73,7 +73,7 @@ final class AppController: ObservableObject {
         return UIWindow(frame: UIScreen.main.bounds)
     }
 
-    /// Reads the JIT state again; `checkProvider` also asks iOS whether the JIT app is installed.
+    /// Reads the JIT state again; checkProvider also asks iOS whether the JIT app is installed.
     func refreshJit(checkProvider: Bool = false) {
         let status = JitStatus.read(installed: checkProvider ? JitProvider.current.installed : jit.stikDebug)
         if status != jit {
@@ -81,13 +81,14 @@ final class AppController: ObservableObject {
         }
     }
 
-    /// The JIT pool is prepared while the library is open, so a launch does not wait for it.
+    /// The JIT pool is prepared while the library is open, so a launch does not wait for it. The
+    /// automatic request waits until onboarding has explained it.
     func requestJitIfNeeded(automatic: Bool) {
         let provider = JitProvider.current
         guard Bridge.jitState == .waiting, provider.installed else { return }
         if automatic {
             guard UserDefaults.standard.object(forKey: "autoRequestJit") as? Bool ?? true,
-                  !jitRequested else { return }
+                  Onboarding.completed, !jitRequested else { return }
         }
         jitRequested = true
         provider.request()
@@ -144,8 +145,16 @@ final class AppController: ObservableObject {
         if let url = URL(string: text), url.scheme == "lichii" {
             let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
                 .queryItems?.first { $0.name == "id" }?.value?.uppercased()
-            if url.host == "game", let id, let game = library.games.first(where: { $0.programIdHex == id }) {
-                launch(game)
+            guard url.host == "game", let id else { return }
+            // On a cold start the first scan is still running.
+            library.reload { [weak self] in
+                guard let self else { return }
+                if let game = library.games.first(where: { $0.programIdHex == id }) {
+                    launch(game)
+                } else {
+                    library.notice = LibraryNotice(title: "Game not found",
+                                                   message: "No game with the title ID \(id) is in the library.")
+                }
             }
             return
         }

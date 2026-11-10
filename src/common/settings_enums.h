@@ -147,7 +147,7 @@ ENUM(ConfirmStop, Ask_Always, Ask_Based_On_Game, Ask_Never);
 ENUM(FullscreenMode, Borderless, Exclusive);
 ENUM(NvdecEmulation, Off, Cpu, Gpu);
 ENUM(ResolutionSetup, Res1_4X, Res1_2X, Res3_4X, Res1X, Res5_4X, Res3_2X, Res2X, Res3X, Res4X, Res5X, Res6X, Res7X, Res8X);
-ENUM(ScalingFilter, NearestNeighbor, Bilinear, Bicubic, Gaussian, Lanczos, ScaleForce, Fsr, Area, ZeroTangent, BSpline, Mitchell, Spline1, Mmpx, Sgsr, SgsrEdge, Fsr3);
+ENUM(ScalingFilter, NearestNeighbor, Bilinear, Bicubic, Gaussian, Lanczos, ScaleForce, Fsr, Area, ZeroTangent, BSpline, Mitchell, Spline1, Mmpx, Sgsr, SgsrEdge, Fsr3, MetalFxSpatial);
 ENUM(AntiAliasing, None, Fxaa, Smaa);
 ENUM(OotAntiAliasing, Game, NoSharpening);
 ENUM(DlssPreset, Default, J, K, L, M);
@@ -164,7 +164,7 @@ ENUM(ExtendedDynamicState, Disabled, EDS1, EDS2, EDS3);
 ENUM(GpuLogLevel, Off, Errors, Standard, Verbose, All)
 ENUM(GameListMode, TreeView, GridView, CarouselView);
 ENUM(SpeedMode, Standard, Turbo, Slow);
-ENUM(FrameGenType, Lsfg, Fsr3);
+ENUM(FrameGenType, Lsfg, Fsr3, MetalFx);
 
 template <typename Type>
 inline std::string_view CanonicalizeEnum(Type id) {

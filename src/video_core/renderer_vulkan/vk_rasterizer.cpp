@@ -51,6 +51,9 @@
 #include "video_core/renderer_vulkan/framebuffer_clear_layers.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
+#ifdef LICHII_METALFX
+#include "video_core/renderer_vulkan/present/metalfx_temporal.h"
+#endif
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #include "video_core/vulkan_common/streamline.h"
@@ -850,7 +853,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         return;
     }
 
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     TrackOcarinaCamera();
     TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect);
 #endif
@@ -938,7 +941,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             });
     }
     submitted = true;
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     const auto& hashes = pipeline->ShaderHashes();
     if (oot_4k_scene_frame == render_trace_frame) {
         constexpr u64 final_vertex = 0x16aff33d999f993fULL;
@@ -1554,7 +1557,7 @@ void RasterizerVulkan::DrawIndirect() {
 }
 
 VideoCommon::OotNetwork::BypassState* RasterizerVulkan::OotNetworkBypass() {
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     // NVIDIA DLSS replaces the same output pass and takes precedence until its evaluation fails.
     if (OcarinaDlssEnabled() && !(oot_live_dlss && oot_live_dlss->EvaluationFailed())) {
         static bool logged = false;
@@ -2069,7 +2072,7 @@ void RasterizerVulkan::DispatchCompute() {
         }
     };
     const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     const bool can_replace = pipeline->CanReplaceOcarinaUpscale() && !indirect_address &&
                              OcarinaDlssEnabled() && !frame_dump.Capturing();
     const bool marking_effects = oot_effects_frame == render_trace_frame && OcarinaDlssEnabled() &&
@@ -2201,7 +2204,7 @@ void RasterizerVulkan::DispatchCompute() {
     }
     scheduler.RequestOutsideRenderPassOperationContext();
     record_read_barrier();
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     if (marking_effects) {
         const auto written = pipeline->WrittenImages();
         if (std::ranges::any_of(written, [this](VideoCommon::ImageViewId id) {
@@ -2222,11 +2225,11 @@ void RasterizerVulkan::DispatchCompute() {
     scheduler.TraceComputePipeline(pipeline->ShaderHash());
 #endif
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind)
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
                       , replacement
 #endif
                      ](vk::CommandBuffer cmdbuf) {
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
         if (replacement && !replacement->EvaluationFailed()) {
             return;
         }
@@ -2256,7 +2259,7 @@ void RasterizerVulkan::DispatchCompute() {
     compute_since_count_barrier = true;
     SubmitNx2ListCopies(pipeline->ShaderHash());
 
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     if (!can_replace) {
         TryOcarinaDlss(*pipeline, false);
     }
@@ -2931,11 +2934,18 @@ void RasterizerVulkan::TracePendingCpuWrites(bool compute, std::span<const u64> 
     });
 }
 
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
 bool RasterizerVulkan::OcarinaDlssEnabled() const {
     constexpr u64 ocarina_program = 0x0400486024DEC000ULL;
+#ifdef EGLANTINE_STREAMLINE
     return program_id == ocarina_program && !oot_live_failed &&
            Settings::values.nvidia_dlss.GetValue() && Streamline::IsDlssAvailable();
+#else
+    // Apple: MetalFX temporal upscaling in place of the game's upscaler.
+    static const bool supported = MetalFxTemporalUpscaler::IsSupported(device);
+    return program_id == ocarina_program && !oot_live_failed &&
+           Settings::values.metalfx_temporal.GetValue() && supported;
+#endif
 }
 
 /// Capture the two camera matrices from a draw targeting the scene color and depth. Terrain and
@@ -3236,7 +3246,14 @@ bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool repl
                 device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator);
         }
         const VkExtent2D target_extent{target.size.width, target.size.height};
-        const VkExtent2D output_extent = upscale_4k ? VkExtent2D{3840, 2160} : target_extent;
+#ifdef EGLANTINE_STREAMLINE
+        const bool present_4k = upscale_4k;
+#else
+        // A 3840x2160 image only to be scaled down to a phone or laptop screen: MetalFX writes the
+        // game's 1440p target instead.
+        constexpr bool present_4k = false;
+#endif
+        const VkExtent2D output_extent = present_4k ? VkExtent2D{3840, 2160} : target_extent;
         const bool recorded = oot_live_dlss->Record(color_view, depth.DepthView(), target_view,
                                                    extent, output_extent, target_extent, oot_motion.current,
                                                    oot_motion.previous, mesh, depth.ImageHandle(),
@@ -3244,7 +3261,7 @@ bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool repl
         if (!recorded) {
             return fail("DLSS declined the frame");
         }
-        if (upscale_4k) {
+        if (present_4k) {
             oot_live_dlss->SaveSceneReference(scene_reference);
             oot_4k_scene_frame = render_trace_frame;
             oot_4k_guest_present = VK_NULL_HANDLE;
@@ -3688,7 +3705,7 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     info.height = image_view->size.height;
     info.scaled_width = scaled ? resolution.ScaleUp(info.width) : info.width;
     info.scaled_height = scaled ? resolution.ScaleUp(info.height) : info.height;
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
     info.anti_aliased = oot_live_dlss && oot_dlss_frame == render_trace_frame &&
                         !oot_live_dlss->EvaluationFailed();
     if (oot_live_dlss && oot_4k_scene_frame == render_trace_frame && info.image &&
