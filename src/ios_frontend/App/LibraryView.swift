@@ -19,33 +19,46 @@ struct LibraryView: View {
 
     var body: some View {
         let games = library.sorted(sort, matching: query)
+        let recent = query.isEmpty ? library.recentlyPlayed : []
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 MemoryEntitlementBanner()
                 ThermalBanner()
-                if !library.importing.isEmpty {
-                    ImportProgressBanner(names: library.importing)
+                if let progress = library.importProgress {
+                    ImportProgressBanner(progress: progress)
                 }
-                if query.isEmpty, !library.recentlyPlayed.isEmpty {
-                    RecentRow(games: library.recentlyPlayed, open: app.launch)
+                if !recent.isEmpty {
+                    RecentRow(games: recent, open: app.launch)
                 }
-                if games.isEmpty {
+                if games.isEmpty && !query.isEmpty && !library.games.isEmpty {
+                    ContentUnavailableView.search(text: query)
+                } else if games.isEmpty {
                     EmptyLibraryView(scanning: library.isScanning, importAction: { showImporter = true })
                 } else if grid {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 132), spacing: 16)], spacing: 18) {
                         ForEach(games) { game in
-                            GameCard(game: game)
-                                .onTapGesture { app.launch(game) }
-                                .contextMenu { menu(for: game) }
+                            Button {
+                                app.launch(game)
+                            } label: {
+                                GameCard(game: game)
+                            }
+                            .buttonStyle(.plain)
+                            .gameAccessibility(game) { infoGame = game }
+                            .contextMenu { menu(for: game) }
                         }
                     }
                 } else {
                     LazyVStack(spacing: 0) {
                         ForEach(games) { game in
-                            GameRow(game: game, lastPlayed: library.playedDate(game))
-                                .contentShape(Rectangle())
-                                .onTapGesture { app.launch(game) }
-                                .contextMenu { menu(for: game) }
+                            Button {
+                                app.launch(game)
+                            } label: {
+                                GameRow(game: game, lastPlayed: library.playedDate(game))
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .gameAccessibility(game) { infoGame = game }
+                            .contextMenu { menu(for: game) }
                             Divider().padding(.leading, 76)
                         }
                     }
@@ -55,7 +68,7 @@ struct LibraryView: View {
         }
         .navigationTitle("Library")
         .searchable(text: $query, prompt: "Search games")
-        .refreshable { library.reload() }
+        .refreshable { await library.refresh() }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Menu {
@@ -71,8 +84,16 @@ struct LibraryView: View {
                     } label: {
                         Label("Rescan", systemImage: "arrow.clockwise")
                     }
+                    if !library.hiddenPaths.isEmpty {
+                        Button {
+                            library.showHiddenGames()
+                        } label: {
+                            Label("Show \(library.hiddenPaths.count) Removed Game\(library.hiddenPaths.count == 1 ? "" : "s")",
+                                  systemImage: "eye")
+                        }
+                    }
                 } label: {
-                    Image(systemName: "line.3.horizontal.decrease.circle")
+                    Label("Sort and View", systemImage: "line.3.horizontal.decrease.circle")
                 }
                 Menu {
                     Button {
@@ -97,7 +118,7 @@ struct LibraryView: View {
                         }
                     }
                 } label: {
-                    Image(systemName: "plus")
+                    Label("Add Games", systemImage: "plus")
                 }
             }
         }
@@ -115,24 +136,32 @@ struct LibraryView: View {
                     }
                 }
         )
-        .alert("Import failed", isPresented: Binding(get: { library.importError != nil },
-                                                     set: { if !$0 { library.importError = nil } })) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(library.importError ?? "")
-        }
-        .confirmationDialog("Delete \(deleteGame?.title ?? "")?",
-                            isPresented: Binding(get: { deleteGame != nil },
-                                                 set: { if !$0 { deleteGame = nil } }),
-                            titleVisibility: .visible) {
-            Button("Delete", role: .destructive) {
-                if let game = deleteGame {
-                    library.delete(game)
+        .alert(library.notice?.title ?? "", isPresented: Binding(get: { library.notice != nil },
+                                                                  set: { if !$0 { library.notice = nil } }),
+               presenting: library.notice) { notice in
+            if !notice.removable.isEmpty {
+                Button("Remove \(notice.removable.count == 1 ? "File" : "Files")", role: .destructive) {
+                    library.removeImported(notice.removable)
                 }
-                deleteGame = nil
+                Button("Keep", role: .cancel) {}
+            } else {
+                Button("OK", role: .cancel) {}
             }
-        } message: {
-            Text("The game's file is deleted from this device.")
+        } message: { notice in
+            Text(notice.message)
+        }
+        .confirmationDialog(deleteTitle, isPresented: Binding(get: { deleteGame != nil },
+                                                              set: { if !$0 { deleteGame = nil } }),
+                            titleVisibility: .visible, presenting: deleteGame) { game in
+            if library.isLinked(game) {
+                Button("Remove from Library", role: .destructive) { library.hide(game) }
+            } else {
+                Button("Delete", role: .destructive) { library.delete(game) }
+            }
+        } message: { game in
+            Text(library.isLinked(game)
+                 ? "The game stays in its linked folder in Files; Lichii stops listing it. Show Removed Games in the sort menu brings it back."
+                 : "The game's file is deleted from this device.")
         }
         .sheet(item: $infoGame) { game in
             NavigationStack {
@@ -156,36 +185,60 @@ struct LibraryView: View {
         }
     }
 
+    private var deleteTitle: String {
+        guard let game = deleteGame else { return "" }
+        return library.isLinked(game) ? "Remove \(game.title) from the library?" : "Delete \(game.title)?"
+    }
+
     @ViewBuilder
     private func menu(for game: Game) -> some View {
-        Button {
-            app.launch(game)
-        } label: {
-            Label("Play", systemImage: "play.fill")
-        }
-        Button {
-            infoGame = game
-        } label: {
-            Label("Game Info", systemImage: "info.circle")
-        }
-        Button {
-            settingsGame = game
-        } label: {
-            Label("Game Settings", systemImage: "slider.horizontal.3")
-        }
-        ForEach(AppExtensions.gameActions) { action in
+        Section {
             Button {
-                actionSheet = (action, game)
+                app.launch(game)
             } label: {
-                Label(action.title, systemImage: action.systemImage)
+                Label("Play", systemImage: "play.fill")
+            }
+            Button {
+                infoGame = game
+            } label: {
+                Label("Game Info", systemImage: "info.circle")
+            }
+            Button {
+                settingsGame = game
+            } label: {
+                Label("Game Settings", systemImage: "slider.horizontal.3")
             }
         }
-        Divider()
-        Button(role: .destructive) {
-            deleteGame = game
-        } label: {
-            Label("Delete", systemImage: "trash")
+        Section {
+            ForEach(AppExtensions.gameActions) { action in
+                Button {
+                    actionSheet = (action, game)
+                } label: {
+                    Label(action.title, systemImage: action.systemImage)
+                }
+            }
         }
+        Section {
+            Button(role: .destructive) {
+                deleteGame = game
+            } label: {
+                if library.isLinked(game) {
+                    Label("Remove from Library", systemImage: "minus.circle")
+                } else {
+                    Label("Delete", systemImage: "trash")
+                }
+            }
+        }
+    }
+}
+
+private extension View {
+    /// One VoiceOver element per game that starts it, with Game Info as an extra action.
+    func gameAccessibility(_ game: Game, info: @escaping () -> Void) -> some View {
+        accessibilityElement(children: .combine)
+            .accessibilityLabel(game.title)
+            .accessibilityHint("Starts the game")
+            .accessibilityAction(named: "Game Info", info)
     }
 }
 

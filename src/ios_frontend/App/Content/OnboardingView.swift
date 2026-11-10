@@ -193,9 +193,9 @@ struct OnboardingView: View {
     private var games: some View {
         VStack(spacing: 16) {
             PageHeader(systemImage: "square.grid.2x2.fill", title: "Games",
-                       text: "Import your dumps (.nup for Switch 2; .nsp, .xci, .nsz, .xcz for Switch 1). They are copied into the app, or drop them into Documents/Games with the Files app or Finder.")
-            if !library.importing.isEmpty {
-                ImportProgressBanner(names: library.importing)
+                       text: "Import your dumps (.nup for Switch 2; .nsp, .xci, .nsz, .xcz for Switch 1). They are copied into the app, or drop them into Documents/Games with the Files app or Finder. To play large files where they are without a copy, use Link a Folder in the Library's + menu.")
+            if let progress = library.importProgress {
+                ImportProgressBanner(progress: progress)
             }
             ActionButton(title: "Import Games", busy: false) {
                 importer = .games

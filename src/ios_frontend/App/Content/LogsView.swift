@@ -54,8 +54,8 @@ struct LogsView: View {
             }
         }
         .navigationTitle("Logs")
-        .onAppear { logs = ContentBridge.logs }
-        .refreshable { logs = ContentBridge.logs }
+        .onAppear { ContentBridge.run({ ContentBridge.logs }) { logs = $0 } }
+        .refreshable { ContentBridge.run({ ContentBridge.logs }) { logs = $0 } }
         .sheet(item: $share) { item in
             ShareSheet(items: [item.url])
         }
@@ -85,9 +85,42 @@ struct LogsView: View {
     }
 }
 
+/// One line of a log with its level, worked out once when the file is read.
+private struct LogLine {
+    enum Level { case error, warning, debug, info }
+
+    let text: String
+    let level: Level
+
+    init(_ text: String) {
+        self.text = text
+        if text.contains("<Critical>") || text.contains("<Error>") {
+            level = .error
+        } else if text.contains("<Warning>") {
+            level = .warning
+        } else if text.contains("<Debug>") || text.contains("<Trace>") {
+            level = .debug
+        } else {
+            level = .info
+        }
+    }
+
+    var isIssue: Bool { level == .error || level == .warning }
+
+    var color: Color {
+        switch level {
+        case .error: return .red
+        case .warning: return .orange
+        case .debug: return .secondary
+        case .info: return .primary
+        }
+    }
+}
+
 struct LogViewer: View {
     let log: ContentBridge.LogFile
-    @State private var lines: [String] = []
+    @State private var lines: [LogLine] = []
+    @State private var shown: [LogLine] = []
     @State private var query = ""
     @State private var share: ShareItem?
     @State private var loading = true
@@ -97,14 +130,13 @@ struct LogViewer: View {
     private static let maxBytes: UInt64 = 2 << 20
 
     var body: some View {
-        let shown = filtered
         ScrollViewReader { proxy in
             ScrollView([.vertical, .horizontal]) {
                 LazyVStack(alignment: .leading, spacing: 1) {
-                    ForEach(Array(shown.enumerated()), id: \.offset) { index, line in
-                        Text(line)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(color(for: line))
+                    ForEach(shown.indices, id: \.self) { index in
+                        Text(shown[index].text)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(shown[index].color)
                             .textSelection(.enabled)
                             .fixedSize()
                             .id(index)
@@ -135,18 +167,18 @@ struct LogViewer: View {
                             Label("Reload", systemImage: "arrow.clockwise")
                         }
                     } label: {
-                        Image(systemName: "ellipsis.circle")
+                        Label("Options", systemImage: "ellipsis.circle")
                     }
                     Button {
                         share = ShareItem(url: URL(fileURLWithPath: log.path))
                     } label: {
-                        Image(systemName: "square.and.arrow.up")
+                        Label("Share", systemImage: "square.and.arrow.up")
                     }
                 }
             }
             .onChange(of: loading) { _, isLoading in
                 if !isLoading {
-                    proxy.scrollTo(max(0, filtered.count - 1), anchor: .bottom)
+                    proxy.scrollTo(max(0, shown.count - 1), anchor: .bottom)
                 }
             }
         }
@@ -154,26 +186,37 @@ struct LogViewer: View {
         .navigationTitle(log.name)
         .navigationBarTitleDisplayMode(.inline)
         .onAppear(perform: load)
+        .task(id: FilterKey(query: query, issuesOnly: issuesOnly, count: lines.count)) {
+            // Typing waits for a pause; the filter runs off the main thread.
+            if !query.isEmpty {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard !Task.isCancelled else { return }
+            }
+            shown = await Self.filter(lines, query: query, issuesOnly: issuesOnly)
+        }
         .sheet(item: $share) { item in
             ShareSheet(items: [item.url])
         }
     }
 
-    private var filtered: [String] {
-        lines.filter { line in
-            (!issuesOnly || isIssue(line)) && (query.isEmpty || line.localizedCaseInsensitiveContains(query))
+    private struct FilterKey: Equatable {
+        let query: String
+        let issuesOnly: Bool
+        let count: Int
+    }
+
+    private static func filter(_ lines: [LogLine], query: String, issuesOnly: Bool) async -> [LogLine] {
+        if query.isEmpty && !issuesOnly {
+            return lines
         }
-    }
-
-    private func isIssue(_ line: String) -> Bool {
-        line.contains("<Warning>") || line.contains("<Error>") || line.contains("<Critical>")
-    }
-
-    private func color(for line: String) -> Color {
-        if line.contains("<Critical>") || line.contains("<Error>") { return .red }
-        if line.contains("<Warning>") { return .orange }
-        if line.contains("<Debug>") || line.contains("<Trace>") { return .secondary }
-        return .primary
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: lines.filter { line in
+                    (!issuesOnly || line.isIssue) &&
+                        (query.isEmpty || line.text.localizedCaseInsensitiveContains(query))
+                })
+            }
+        }
     }
 
     private func load() {
@@ -181,14 +224,15 @@ struct LogViewer: View {
         let path = log.path
         let isDump = !path.hasSuffix(".txt") && !path.hasSuffix(".old")
         let maxBytes = Self.maxBytes
-        ContentBridge.run({ () -> [String] in
+        ContentBridge.run({ () -> [LogLine] in
             if isDump {
-                return ["Binary file: use Share to send it."]
+                return [LogLine("Binary file: use Share to send it.")]
             }
             let text = path.withCString { ContentBridge.string(lichii_content_read_log($0, maxBytes)) } ?? ""
-            return text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            return text.split(separator: "\n", omittingEmptySubsequences: false).map { LogLine(String($0)) }
         }) { result in
             lines = result
+            shown = result
             loading = false
         }
     }
