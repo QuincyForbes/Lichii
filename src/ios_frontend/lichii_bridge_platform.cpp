@@ -121,8 +121,8 @@ LichiiDeviceDefaults ComputeDefaults(const LichiiDeviceInfo& info) {
     out.docked = 0;
     if (info.increased_memory_limit == 0) {
         CopyString(out.note, sizeof(out.note),
-                   "The increased memory limit entitlement is missing: sign the app with "
-                   "Lichii.entitlements, or games will be closed by iOS.");
+                   "The increased memory limit entitlement is missing: enable it for Lichii's "
+                   "App ID at developer.apple.com and reinstall, or games will be closed by iOS.");
     }
 
     // Budgets from what this process may allocate (CPU and GPU share it): the texture cache

@@ -21,6 +21,7 @@ struct LibraryView: View {
         let games = library.sorted(sort, matching: query)
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                MemoryEntitlementBanner()
                 ThermalBanner()
                 if !library.importing.isEmpty {
                     ImportProgressBanner(names: library.importing)

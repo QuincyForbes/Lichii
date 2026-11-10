@@ -39,6 +39,7 @@ struct DeviceInfoRows: View {
             LabeledContent("GPU", value: PlatformCenter.text(info.gpu_name))
             LabeledContent("Memory", value: "\(mib(info.physical_memory_mib)), \(mib(info.available_memory_mib)) free for Lichii")
             LabeledContent("Increased Memory Limit", value: flag(info.increased_memory_limit))
+            LabeledContent("Extended Virtual Addressing", value: flag(info.extended_virtual_addressing))
             if let defaults = PlatformCenter.deviceDefaults {
                 LabeledContent("Device Tier", value: PlatformCenter.text(defaults.tier_name))
                 let note = PlatformCenter.text(defaults.note)
@@ -84,6 +85,35 @@ struct ThermalBanner: View {
         case 3...: return .red
         case 2: return .orange
         default: return .yellow
+        }
+    }
+}
+
+/// Library banner when the signature lacks the memory entitlements: games can't start without
+/// them. SideStore only keeps them when the App ID has both capabilities.
+struct MemoryEntitlementBanner: View {
+    private let missing: [String] = {
+        guard let info = PlatformCenter.deviceInfo else { return [] }
+        var names: [String] = []
+        if info.extended_virtual_addressing == 0 { names.append("Extended Virtual Addressing") }
+        if info.increased_memory_limit == 0 { names.append("Increased Memory Limit") }
+        return names
+    }()
+
+    var body: some View {
+        if !missing.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Games can't start: memory entitlements missing", systemImage: "memorychip")
+                    .font(.footnote.weight(.semibold))
+                Text("The installed app is not signed with \(missing.joined(separator: " and ")). At developer.apple.com, open Certificates, Identifiers & Profiles > Identifiers, select Lichii's App ID, enable Extended Virtual Addressing and Increased Memory Limit, save, then delete Lichii and install it again with SideStore.")
+                    .font(.footnote)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.red.opacity(0.15),
+                        in: RoundedRectangle(cornerRadius: Theme.cornerRadius, style: .continuous))
+            .accessibilityElement(children: .combine)
         }
     }
 }

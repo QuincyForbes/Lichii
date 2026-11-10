@@ -332,7 +332,7 @@ struct System::Impl {
         debugger.emplace(system, port);
     }
 
-    void InitializeKernel(System& system) {
+    bool InitializeKernel(System& system) {
         LOG_DEBUG(Core, "initialized OK");
 
         // ShutdownMainProcess releases it after a Switch 2 game; create it before the check below
@@ -343,8 +343,16 @@ struct System::Impl {
 
         // Setting changes may require a full system reinitialization (e.g., disabling multicore).
         ReinitializeIfNecessary(system);
+
+        // The host refused the guest RAM (iOS without the memory entitlements): the kernel would
+        // crash on its first access.
+        if (device_memory->buffer.BackingBasePointer() == nullptr) {
+            LOG_CRITICAL(Core, "The guest memory could not be allocated");
+            return false;
+        }
         kernel.Initialize();
         kernel_initialized = true;
+        return true;
     }
 
     SystemResultStatus SetupForApplicationProcess(System& system, Frontend::EmuWindow& emu_window) {
@@ -415,7 +423,9 @@ struct System::Impl {
             return SystemResultStatus::ErrorUnknown;
         }
 
-        InitializeKernel(system);
+        if (!InitializeKernel(system)) {
+            return SystemResultStatus::ErrorUnknown;
+        }
 
         if (params.applet_type == Service::AM::AppletType::Application) {
             current_application_filepath = filepath;
@@ -795,6 +805,11 @@ Core::DeviceMemory& System::DeviceMemory() {
 
 const Core::DeviceMemory& System::DeviceMemory() const {
     return *impl->device_memory;
+}
+
+bool System::GuestMemoryFailed() const {
+    return impl->device_memory.has_value() &&
+           impl->device_memory->buffer.BackingBasePointer() == nullptr;
 }
 
 const Kernel::KProcess* System::ApplicationProcess() const {

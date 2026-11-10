@@ -288,6 +288,9 @@ public:
     /// Gets the manager for the guest device memory
     [[nodiscard]] const Core::DeviceMemory& DeviceMemory() const;
 
+    /// Whether the host refused the guest device memory when it was last created
+    [[nodiscard]] bool GuestMemoryFailed() const;
+
     /// Provides a pointer to the application process
     [[nodiscard]] Kernel::KProcess* ApplicationProcess();
 

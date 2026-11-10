@@ -749,6 +749,7 @@ public:
         auto* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
         if (ptr == MAP_FAILED) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate fallback buffer with size {:#x}, {}", size, strerror(errno));
+            return nullptr;
         }
         return ptr;
     }
@@ -1123,7 +1124,7 @@ HostMemory::~HostMemory() {
         VirtualFree(backing_base, backing_size, MEM_RELEASE);
     }
 #else
-    if (fallback_buffer) {
+    if (fallback_buffer && backing_base != nullptr) {
         munmap(backing_base, backing_size);
     }
 #endif

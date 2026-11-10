@@ -557,9 +557,19 @@ static void IosStopGame(SdlState* state) {
     IosFrontend::SetState(LICHII_EMU_IDLE);
 }
 
+// iOS refused the guest RAM: the signature lacks the memory entitlements SideStore only keeps
+// when the App ID has those capabilities.
+static constexpr const char* kIosNoGuestMemory =
+    "iOS did not give Lichii enough memory for the game: the installed app is missing the "
+    "Extended Virtual Addressing and Increased Memory Limit entitlements. Enable both "
+    "capabilities for Lichii's App ID at developer.apple.com (Identifiers), then reinstall "
+    "Lichii with SideStore.";
+
 static void IosBootFailed(SdlState* state) {
     std::string error = "The game could not be started. The log has the details.";
-    if (state->ios_load_result != Core::SystemResultStatus::Success) {
+    if (state->system.GuestMemoryFailed()) {
+        error = kIosNoGuestMemory;
+    } else if (state->ios_load_result != Core::SystemResultStatus::Success) {
         const u16 loader_id = u16(Core::SystemResultStatus::ErrorLoader);
         const u16 code = u16(state->ios_load_result);
         if (code > loader_id) {
@@ -594,6 +604,10 @@ static std::optional<SDL_AppResult> IosAppIterate(SdlState* state) {
     }
     if (!state->pending_launch && !state->system.IsPoweredOn()) {
         if (auto path = IosFrontend::TakeLaunchRequest()) {
+            if (state->system.GuestMemoryFailed()) {
+                IosFrontend::SetState(LICHII_EMU_FAILED, kIosNoGuestMemory);
+                return SDL_APP_CONTINUE;
+            }
             Core::LaunchParams lp = state->ios_launch_template;
             lp.filepath = std::move(*path);
             state->pending_launch = std::move(lp);
