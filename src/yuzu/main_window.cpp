@@ -4211,14 +4211,15 @@ void MainWindow::OnVerifyInstalledContents() {
     QtCommon::Content::VerifyInstalledContents();
 }
 
+// InstallFirmware already says when keys are missing; prompting again here showed a second dialog.
 void MainWindow::OnInstallFirmware() {
     QtCommon::Content::InstallFirmware();
-    OnCheckFirmwareDecryption();
+    OnCheckFirmwareDecryption(false);
 }
 
 void MainWindow::OnInstallFirmwareFromZIP() {
     QtCommon::Content::InstallFirmwareZip();
-    OnCheckFirmwareDecryption();
+    OnCheckFirmwareDecryption(false);
 }
 
 // TODO(crueter): QtCommon this: game list populate can be a signal?
@@ -4230,7 +4231,8 @@ void MainWindow::OnInstallDecryptionKeys() {
     QtCommon::Content::InstallKeys();
 
     game_list->PopulateAsync(UISettings::values.game_dirs);
-    OnCheckFirmwareDecryption();
+    // Not prompting again: cancelling the file picker would otherwise ask to install keys again.
+    OnCheckFirmwareDecryption(false);
 }
 
 void MainWindow::OnAbout() {
@@ -5177,8 +5179,9 @@ void MainWindow::OnCheckFirmwareDecryption(bool prompt) {
         LOG_WARNING(Frontend, "Decryption keys are missing: NCA, NSP and XCI games need them");
     } else if (!ContentManager::AreKeysPresent()) {
         const auto res = QtCommon::Frontend::Warning(
-            tr("Derivation Components Missing"),
-            tr("Decryption keys are missing. Install them now?"),
+            tr("Decryption keys missing"),
+            tr("NCA, NSP and XCI games and firmware need your prod.keys. Install them now?\n\n"
+               "Switch 2 .nup games don't need keys or firmware."),
             QtCommon::Frontend::StandardButton::Yes | QtCommon::Frontend::StandardButton::No);
 
         if (res == QtCommon::Frontend::StandardButton::Yes)
@@ -5248,17 +5251,24 @@ void MainWindow::SetFirmwareVersion() {
     const auto firmware_data = pair.first;
     const auto result = pair.second;
 
+    ui->menu_Tools->setToolTipsVisible(true);
     if (result.IsError() || !CheckFirmwarePresence()) {
         LOG_INFO(Frontend, "Installed firmware: No firmware available");
+        const QString reason =
+            tr("Needs Switch firmware (Tools > Install Firmware). Switch 2 .nup games don't.");
         ui->menu_Applets->setEnabled(false);
+        ui->menu_Applets->menuAction()->setToolTip(reason);
         ui->menu_Create_Shortcuts->setEnabled(false);
+        ui->menu_Create_Shortcuts->menuAction()->setToolTip(reason);
         firmware_label->setVisible(false);
         return;
     }
 
     firmware_label->setVisible(true);
     ui->menu_Applets->setEnabled(true);
+    ui->menu_Applets->menuAction()->setToolTip(QString{});
     ui->menu_Create_Shortcuts->setEnabled(true);
+    ui->menu_Create_Shortcuts->menuAction()->setToolTip(QString{});
 
     const std::string display_version(firmware_data.display_version.data());
     const std::string display_title(firmware_data.display_title.data());
