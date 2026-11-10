@@ -15,10 +15,12 @@ namespace Vulkan {
 
 namespace {
 
+// CPU waits until the shared-event path is proven on a device (the first iPhone run with MetalFX
+// Temporal never presented a frame); EDEN_NX2_METALFX_SYNC=event opts back in.
 bool ForceCpuSync() {
     static const bool force = [] {
         const char* const value = std::getenv("EDEN_NX2_METALFX_SYNC");
-        return value != nullptr && std::string_view{value} == "cpu";
+        return value == nullptr || std::string_view{value} != "event";
     }();
     return force;
 }

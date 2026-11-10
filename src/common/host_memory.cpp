@@ -664,15 +664,30 @@ public:
                 return false;
             }
             backing_base = reinterpret_cast<u8*>(backing_address);
+            // Even with extended-virtual-addressing iOS hands out far less than the 512 GiB a 39-bit
+            // guest spans, so take the largest power of two it grants: guest addresses above it
+            // take dynarmic's page table path.
+            constexpr size_t MinGuestSpace = size_t{1} << 32;
             vm_address_t virtual_address = 0;
-            kr = vm_allocate(mach_task_self(), &virtual_address, virtual_size, VM_FLAGS_ANYWHERE);
-            if (kr != KERN_SUCCESS) {
-                LOG_CRITICAL(HW_Memory,
-                             "vm_allocate of the {:#x} byte guest address space failed: {} (is the "
-                             "extended-virtual-addressing entitlement present?)",
-                             virtual_size, mach_error_string(kr));
-                return false;
+            size_t guest_space = virtual_size - HugePageSize;
+            while (true) {
+                kr = vm_allocate(mach_task_self(), &virtual_address, guest_space + HugePageSize,
+                                 VM_FLAGS_ANYWHERE);
+                if (kr == KERN_SUCCESS) {
+                    break;
+                }
+                LOG_INFO(HW_Memory, "fastmem: reserving {} GiB of guest address space failed: {}",
+                         guest_space >> 30, mach_error_string(kr));
+                if (guest_space / 2 < MinGuestSpace) {
+                    LOG_CRITICAL(HW_Memory,
+                                 "vm_allocate of the guest address space failed down to {} GiB (is "
+                                 "the extended-virtual-addressing entitlement present?)",
+                                 guest_space >> 30);
+                    return false;
+                }
+                guest_space /= 2;
             }
+            virtual_size = guest_space + HugePageSize;
             vm_protect(mach_task_self(), virtual_address, virtual_size, FALSE, VM_PROT_NONE);
             virtual_base = virtual_map_base = reinterpret_cast<u8*>(virtual_address);
         }
@@ -895,7 +910,7 @@ public:
     }
 
     const size_t backing_size; ///< Size of the backing memory in bytes
-    const size_t virtual_size; ///< Size of the virtual address placeholder in bytes
+    size_t virtual_size; ///< Size of the virtual address placeholder in bytes (iOS: as granted)
 
     u8* backing_base{reinterpret_cast<u8*>(MAP_FAILED)};
     u8* virtual_base{reinterpret_cast<u8*>(MAP_FAILED)};
@@ -1133,6 +1148,12 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
             virtual_base = reinterpret_cast<u8*>(Common::AlignUp(uintptr_t(virtual_base), HugePageSize));
             virtual_base_offset = virtual_base - impl->virtual_base;
         }
+        // iOS may grant less than asked; mappings above it are left to the page table.
+        virtual_size = (std::min)(virtual_size, impl->virtual_size - HugePageSize);
+        LOG_INFO(HW_Memory,
+                 "fastmem: reserved {} GiB guest address space (requested {} GiB), covering guest "
+                 "{:#x}-{:#x}",
+                 virtual_size >> 30, virtual_size_ >> 30, 0, virtual_size - 1);
     } else {
         LOG_WARNING(HW_Memory, "Platform can support fastmem, but can't create it");
         fallback_buffer = true;
@@ -1164,8 +1185,8 @@ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, M
     ASSERT(virtual_offset % PageAlignment == 0);
     ASSERT(host_offset % PageAlignment == 0);
     ASSERT(length % PageAlignment == 0);
-    ASSERT(virtual_offset + length <= virtual_size);
     ASSERT(host_offset + length <= backing_size);
+    length = ClipToVirtualSize(virtual_offset, length);
     if (length == 0 || !virtual_base || !impl) {
         return;
     }
@@ -1177,7 +1198,7 @@ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap)
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
     ASSERT(virtual_offset % PageAlignment == 0);
     ASSERT(length % PageAlignment == 0);
-    ASSERT(virtual_offset + length <= virtual_size);
+    length = ClipToVirtualSize(virtual_offset, length);
     if (length == 0 || !virtual_base || !impl) {
         return;
     }
@@ -1189,7 +1210,7 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
     ASSERT(virtual_offset % PageAlignment == 0);
     ASSERT(length % PageAlignment == 0);
-    ASSERT(virtual_offset + length <= virtual_size);
+    length = ClipToVirtualSize(virtual_offset, length);
     if (length == 0 || !virtual_base || !impl) {
         return;
     }

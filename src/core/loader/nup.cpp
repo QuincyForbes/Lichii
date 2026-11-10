@@ -134,6 +134,9 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
     const auto& program = nup->GetPackages()[*program_index];
     base_title_id = program.title_id;
 
+    // Title metadata lives on the base package (SPEC section 5.1), which is still present when
+    // its ExeFS is empty and the program boots from the update. Take each field from the base
+    // when it has one and fall back to the program package otherwise.
     NupContainer::PackageInfo meta;
     meta.title_id = program.title_id;
     meta.title_name = program.title_name;
@@ -156,6 +159,7 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
         if (!base.publisher.empty()) {
             meta.publisher = base.publisher;
         }
+        // The default and localized icons are one set, so they come from the same package.
         if (!base.icon.empty() || !base.localized_icons.empty()) {
             meta.icon = base.icon;
             meta.localized_icons = base.localized_icons;

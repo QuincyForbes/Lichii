@@ -24,8 +24,9 @@ class Scheduler;
 /// Work goes to a command queue of its own. It waits on the GPU for the scheduler's timeline
 /// semaphore (exported as an MTLSharedEvent) to reach the tick of everything recorded before it,
 /// and signals a timeline semaphore of its own; a submission with no commands turns that into a
-/// binary semaphore the scheduler's next submission waits for. Without shared events (or with
-/// EDEN_NX2_METALFX_SYNC=cpu) it waits on the CPU instead: Finish, then waitUntilCompleted.
+/// binary semaphore the scheduler's next submission waits for. That path is opt-in
+/// (EDEN_NX2_METALFX_SYNC=event); by default, and without shared events, it waits on the CPU:
+/// Finish, then waitUntilCompleted.
 class MetalFxContext {
 public:
     explicit MetalFxContext(const Device& device, Scheduler& scheduler);

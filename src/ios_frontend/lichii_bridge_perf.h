@@ -44,9 +44,9 @@ typedef struct LichiiPerfSnapshot {
     int32_t shaders_building;
 } LichiiPerfSnapshot;
 
-/// Main thread. Reads the frame statistics since the previous call (so one caller, about twice a
-/// second) and relaxed atomics for the rest: no locks the emulation threads wait on. False while
-/// no game runs.
+/// Main thread. Frame rates since the previous call (calls less than 250 ms apart repeat the last
+/// rates), from counters nothing else resets, and relaxed atomics for the rest. False while no
+/// game runs.
 bool lichii_perf_snapshot(LichiiPerfSnapshot* out);
 
 #ifdef __cplusplus

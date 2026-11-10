@@ -8,6 +8,30 @@
 //
 
 import SwiftUI
+import UIKit
+
+/// Lichii: the UIKit views that take the on-screen controller's touches (buttons and sticks). The
+/// host hands touches to them itself instead of relying on SwiftUI's hit testing.
+@MainActor
+public protocol ControllerTouchTarget: UIView {
+    /// A button wins over a stick under it.
+    var touchPriority: Int { get }
+}
+
+/// Lichii: one log line per kind of event and game, so a device log shows how far a touch got.
+public enum ControllerDiagnostics {
+    public static var sink: ((String) -> Void)?
+    private static var logged: Set<String> = []
+
+    public static func once(_ key: String, _ message: @autoclosure () -> String) {
+        guard let sink, logged.insert(key).inserted else { return }
+        sink(message())
+    }
+
+    public static func reset() {
+        logged.removeAll()
+    }
+}
 
 public protocol Controller: ObservableObject {
     func buttonPressed(_ button: VirtualControllerButton)

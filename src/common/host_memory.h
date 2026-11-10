@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <optional>
@@ -104,6 +105,7 @@ public:
         return virtual_base;
     }
 
+    /// Guest address space the fastmem arena covers. iOS may grant less than was asked for.
     [[nodiscard]] size_t VirtualSize() const noexcept {
         return virtual_size;
     }
@@ -113,6 +115,12 @@ public:
     }
 
 private:
+    /// The part of [virtual_offset, virtual_offset + length) inside the arena starts at
+    /// virtual_offset; returns its length.
+    size_t ClipToVirtualSize(size_t virtual_offset, size_t length) const noexcept {
+        return virtual_offset >= virtual_size ? 0 : (std::min)(length, virtual_size - virtual_offset);
+    }
+
     size_t backing_size{};
     size_t virtual_size{};
 

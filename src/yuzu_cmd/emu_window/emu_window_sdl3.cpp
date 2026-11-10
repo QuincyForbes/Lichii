@@ -233,8 +233,12 @@ void EmuWindow_SDL3::OnEvent(SDL_Event& event) {
     switch (event.type) {
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        return OnResize();
     case SDL_EVENT_WINDOW_MAXIMIZED:
     case SDL_EVENT_WINDOW_RESTORED:
+        // UIKit minimizes every window when the app resigns active and restores it when it is
+        // active again, without an expose: the renderer would stop presenting for good.
+        is_shown = true;
         return OnResize();
     case SDL_EVENT_WINDOW_MINIMIZED:
         is_shown = false;

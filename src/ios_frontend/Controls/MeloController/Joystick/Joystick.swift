@@ -12,7 +12,10 @@ import UIKit
 import SwiftUI
 
 // i am never doing uikit again
-final class JoystickView: UIView {
+// Lichii: ControllerTouchTarget and the first-touch log.
+final class JoystickView: UIView, ControllerTouchTarget {
+    var touchPriority: Int { 0 }
+
     var right: Bool = true
     var background: Bool = false {
         didSet { if activeTouch == nil { backgroundView.alpha = background ? 1 : 0 } }
@@ -147,6 +150,8 @@ final class JoystickView: UIView {
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard activeTouch == nil, let touch = touches.first else { return }
+        ControllerDiagnostics.once("stick-touch",
+                                   "first stick touch, \(right ? "right" : "left") stick, view \(frame.size), defers taps \(deferTaps)")
         activeTouch = touch
         let location = touch.location(in: self)
         if deferTaps, hypot(location.x - bounds.midX, location.y - bounds.midY) < bounds.width * 0.45 {

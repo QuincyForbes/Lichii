@@ -8,6 +8,9 @@
 	<!-- Switch 2 titles are given a 12 GB memory layout; lift the per-process limit. -->
 	<key>com.apple.developer.kernel.increased-memory-limit</key>
 	<true/>
+	<!-- About 512 MB more on top of the increased limit (6.1 -> 6.6 GB on a 12 GB iPhone). -->
+	<key>com.apple.developer.kernel.increased-debugging-memory-limit</key>
+	<true/>
 	<!-- The guest address space is reserved as one large mapping. -->
 	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
 	<true/>

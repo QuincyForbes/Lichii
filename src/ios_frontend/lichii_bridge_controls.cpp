@@ -181,6 +181,12 @@ void lichii_controls_motion(int32_t player, uint64_t delta_us, float gyro_x, flo
     SendMotion(player, delta_us, gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z);
 }
 
+void lichii_controls_log(const char* message) {
+    if (message != nullptr) {
+        LOG_INFO(Frontend, "Controls: {}", message);
+    }
+}
+
 int32_t lichii_pad_connect(int32_t kind) {
     return GetRouter().Connect(kind);
 }
