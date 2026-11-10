@@ -143,6 +143,9 @@ std::string ProfileGuest(System& system) {
         bool data;
     };
     std::vector<Chunk> chunks((num_pages + ChunkPages - 1) / ChunkPages);
+    // Where the resident pages outside the application are, per 64 MiB of backing.
+    constexpr size_t WindowPages = (size_t{64} << 20) / PageSize;
+    std::vector<u32> other_windows((num_pages + WindowPages - 1) / WindowPages);
     for (size_t index = 0; index < num_pages; ++index) {
         const bool is_resident = known && resident[index];
         Chunk& chunk = chunks[index / ChunkPages];
@@ -150,6 +153,7 @@ std::string ProfileGuest(System& system) {
             // Kernel, services and pages the game gave back: only what is resident.
             if (is_resident) {
                 ++other.pages;
+                ++other_windows[index / WindowPages];
                 const bool zero = IsZeroPage(backing + index * PageSize);
                 (zero ? other.resident_zero : other.resident_data) += PageSize;
                 chunk.data = chunk.data || !zero;
@@ -229,6 +233,26 @@ std::string ProfileGuest(System& system) {
                                   size * 2, MiB(zero * PageSize), MiB(resident_zero * PageSize));
     }
     text += fmt::format("\n  application zero pages in backing chunks without data: {}", chunk_text);
+    // Runs of 64 MiB windows that each hold 8 MiB or more.
+    std::string other_text;
+    constexpr u32 WindowFloor = (u32{8} << 20) / PageSize;
+    for (size_t first = 0; first < other_windows.size();) {
+        if (other_windows[first] < WindowFloor) {
+            ++first;
+            continue;
+        }
+        size_t end = first;
+        u64 pages = 0;
+        for (; end < other_windows.size() && other_windows[end] >= WindowFloor; ++end) {
+            pages += other_windows[end];
+        }
+        other_text += fmt::format("{}{}-{} MiB: {} MiB", other_text.empty() ? "" : ", ", first * 64,
+                                  end * 64, MiB(pages * PageSize));
+        first = end;
+    }
+    if (!other_text.empty()) {
+        text += fmt::format("\n  resident outside the application, by backing offset: {}", other_text);
+    }
     auto& manager = system.Kernel().MemoryManager();
     using Pool = Kernel::KMemoryManager::Pool;
     const auto used = [&manager](Pool pool) {
