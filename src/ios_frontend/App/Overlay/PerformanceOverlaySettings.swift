@@ -3,14 +3,14 @@
 
 import SwiftUI
 
-/// Settings > Performance Overlay.
-struct PerformanceOverlaySettingsView: View {
+/// Settings > Graphics > Performance Overlay (AppExtensions.graphicsSettingsSections).
+struct PerformanceOverlaySettingsSection: View {
     @AppStorage("overlayPreset") private var presetName = ""
     @AppStorage("hudPosition") private var positionName = HUDPosition.topRight.rawValue
     @AppStorage("overlayVoiceOver") private var voiceOver = false
 
     var body: some View {
-        Form {
+        Group {
             Section {
                 Picker("Performance Overlay", selection: Binding(
                     get: { OverlayPreset.resolve(presetName) },
@@ -21,6 +21,8 @@ struct PerformanceOverlaySettingsView: View {
                 Picker("Position", selection: $positionName) {
                     ForEach(HUDPosition.allCases) { Text($0.title).tag($0.rawValue) }
                 }
+            } header: {
+                Text("Performance Overlay")
             } footer: {
                 Text("Shown over the game, with the same numbers as the desktop overlay. The in-game menu changes it too.")
             }
@@ -42,7 +44,14 @@ struct PerformanceOverlaySettingsView: View {
                 Text("The overlay is hidden from VoiceOver by default. The in-game menu reads a summary instead.")
             }
         }
-        .navigationTitle("Performance Overlay")
+    }
+}
+
+/// The same sections as a screen of their own (Controls links to it).
+struct PerformanceOverlaySettingsView: View {
+    var body: some View {
+        Form { PerformanceOverlaySettingsSection() }
+            .navigationTitle("Performance Overlay")
     }
 }
 

@@ -42,7 +42,6 @@ enum AppExtensions {
         func content(_ id: String) -> [SettingsLink] { links.filter { $0.id == id } }
         return content("keys") + [
             SettingsLink(id: "controls", title: "Controls", systemImage: "gamecontroller", view: { AnyView(ControlsView()) }),
-            SettingsLink(id: "overlay", title: "Performance Overlay", systemImage: "speedometer", view: { AnyView(PerformanceOverlaySettingsView()) }),
         ] + content("logs") + content("users") + PlatformEntries.settingsLinks + content("setup")
     }
 
@@ -50,6 +49,7 @@ enum AppExtensions {
     /// overlay). Each returns a `Section`.
     static var graphicsSettingsSections: [() -> AnyView] {
         [
+            { AnyView(PerformanceOverlaySettingsSection()) },
         ]
     }
 
