@@ -538,7 +538,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         renderer_status_button->setDisabled(true);
         renderer_status_button->setChecked(false);
     } else {
-        VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
+        // Read when a configuration dialog first needs them: one more Vulkan instance and a test
+        // surface on the UI thread at every start otherwise.
+        vk_records_pending = true;
     }
 
     // On macOS, SDL video would pump AppKit events alongside Qt and disrupt native menus.
@@ -3803,6 +3805,9 @@ void MainWindow::OnConfigure() {
     const bool old_force_x11 = UISettings::values.gui_force_x11.GetValue();
 #endif
 
+    if (std::exchange(vk_records_pending, false)) {
+        VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
+    }
     Settings::SetConfiguringGlobal(true);
     ConfigureDialog configure_dialog(this, hotkey_registry, input_subsystem.get(),
                                      vk_device_records, *QtCommon::system,
@@ -4093,6 +4098,9 @@ void MainWindow::OnConfigurePerGame() {
 }
 
 void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_name) {
+    if (std::exchange(vk_records_pending, false)) {
+        VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
+    }
     Settings::SetConfiguringGlobal(false);
     ConfigurePerGame dialog(this, title_id, file_name, vk_device_records, *QtCommon::system);
     dialog.LoadFromFile(Core::GetGameFileFromPath(QtCommon::vfs, file_name));

@@ -545,6 +545,7 @@ private:
     GameListPlaceholder* game_list_placeholder = nullptr;
 
     std::vector<VkDeviceInfo::Record> vk_device_records;
+    bool vk_records_pending{}; ///< vk_device_records not read yet
 
     // Status bar elements
     QLabel* message_label = nullptr;
