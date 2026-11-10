@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -210,6 +211,40 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{}; ///< Collect what only the debug statistics lines use
+    /// EDEN_NX2_RT_EVICT_PRESSURE: fresh render targets to check, with their allocation tick and
+    /// how often they were found still in use.
+    struct TransientTarget {
+        ImageId id;
+        u64 allocation_tick;
+        u64 check_tick;
+        u32 survived;
+    };
+    std::deque<TransientTarget> transient_targets;
+    u64 transient_evictions{};
+    u64 logged_transient_evictions{};
+    /// Image made by the latest JoinImages call; FindRenderTargetView uses it to tell a target it
+    /// just created from one that already existed (and may hold CPU writes not uploaded yet).
+    ImageId last_created_image{};
+    /// EDEN_NX2_RT_EVICT_PRESSURE=<frames> (0 = off, the default; zortos293/Lichii#1023 uses 8):
+    /// how long a fresh render target may go unused before it is deleted while the cache is over
+    /// its expected size. A value that isn't a plain number of frames keeps the default.
+    [[nodiscard]] static u64 RtEvictPressureFrames() {
+        static const u64 frames = [] {
+            constexpr u64 default_frames = 0;
+            const char* value = std::getenv("EDEN_NX2_RT_EVICT_PRESSURE");
+            if (value == nullptr || *value < '0' || *value > '9') {
+                return default_frames;
+            }
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long long parsed = std::strtoull(value, &end, 10);
+            if (errno != 0 || *end != '\0') {
+                return default_frames;
+            }
+            return static_cast<u64>(parsed);
+        }();
+        return frames;
+    }
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
@@ -779,6 +814,10 @@ private:
     /// clear in a later frame. JoinImages puts the chain members it sees on the watch list.
     void WatchColdImage(ImageId image_id);
     void SweepColdImages();
+
+    /// Deletes fresh render targets that went unused while the cache is over its expected size
+    /// (EDEN_NX2_RT_EVICT_PRESSURE).
+    void EvictTransientTargets();
     std::vector<std::pair<ImageId, u64>> cold_watch; ///< Image, frame_tick it was put on
     ::Common::unordered_set<ImageId> cold_watch_set;
     u64 cold_deleted{};       ///< Since the last report
