@@ -5,9 +5,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
+#include <cstddef>
 #include <cstdlib>
+#include <iterator>
+#include <optional>
+#include <string>
+#include <vector>
+#include <fmt/format.h>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
@@ -48,6 +55,194 @@ u32 Nx2DispatchBits() {
     return bits >= 8 && bits <= 24 ? u32(bits) : 0;
 }
 
+constexpr u32 NoRegister = 32;
+
+/// An A64 load or store with an immediate offset.
+struct GuestAccess {
+    u32 base; ///< 31 = sp
+    s64 offset;
+    std::array<u32, 3> written; ///< X registers it writes: Rt, Rt2 or the base, the base
+    bool wide_load;             ///< Loads whole X registers (a pointer, possibly)
+};
+
+std::optional<GuestAccess> DecodeGuestAccess(u32 inst) {
+    const u32 rt = inst & 31;
+    const u32 rn = (inst >> 5) & 31;
+    const bool vector = (inst & 0x04000000) != 0;
+    const u32 size = inst >> 30;
+    const u32 opc = (inst >> 22) & 3;
+    const bool load = vector ? (opc & 1) != 0 : opc != 0;
+    const u32 loaded = load && !vector ? rt : NoRegister;
+    if ((inst & 0x3B000000) == 0x39000000) {
+        // Unsigned scaled offset; prfm reads nothing.
+        if (!vector && size == 3 && opc == 2) {
+            return std::nullopt;
+        }
+        const u32 scale = vector ? (((opc & 2) << 1) | size) : size;
+        return GuestAccess{rn, static_cast<s64>((inst >> 10) & 0xFFF) << scale,
+                           {loaded, NoRegister, NoRegister}, !vector && size == 3 && opc == 1};
+    }
+    if ((inst & 0x3B200000) == 0x38000000) {
+        // Unscaled, post-indexed (the offset applies afterwards) and pre-indexed
+        const u32 mode = (inst >> 10) & 3;
+        const s64 imm9 = static_cast<s32>(inst << 11) >> 23;
+        return GuestAccess{rn, mode == 1 ? 0 : imm9,
+                           {loaded, NoRegister, mode == 1 || mode == 3 ? rn : NoRegister},
+                           !vector && size == 3 && opc == 1};
+    }
+    if ((inst & 0x3A000000) == 0x28000000) {
+        // Pairs
+        const u32 mode = (inst >> 23) & 3;
+        const bool pair_load = (inst & 0x00400000) != 0 && !vector;
+        const u32 scale = vector ? 2 + size : 2 + (size >> 1);
+        const s64 imm7 = static_cast<s64>(static_cast<s32>(inst << 10) >> 25) * (s64{1} << scale);
+        return GuestAccess{rn, mode == 1 ? 0 : imm7,
+                           {pair_load ? rt : NoRegister, pair_load ? (inst >> 10) & 31 : NoRegister,
+                            mode == 1 || mode == 3 ? rn : NoRegister},
+                           pair_load && size == 2};
+    }
+    return std::nullopt;
+}
+
+bool IsGuestCall(u32 inst) {
+    return (inst & 0xFC000000) == 0x94000000 || (inst & 0xFFFFFC1F) == 0xD63F0000; // bl, blr
+}
+
+bool EndsGuestBlock(u32 inst) {
+    return (inst & 0x7C000000) == 0x14000000 || // b, bl
+           (inst & 0xFF000010) == 0x54000000 || // b.cond
+           (inst & 0x7C000000) == 0x34000000 || // cbz, cbnz, tbz, tbnz
+           (inst & 0xFE000000) == 0xD6000000 || // br, blr, ret
+           (inst & 0xFF000000) == 0xD4000000;   // svc, brk
+}
+
+/// The first unmapped reads of a session, for a game that then runs on zeros: the block's code,
+/// the registers and, when the bad address came from a pointer loaded shortly before, the memory
+/// that pointer was read from. A page of zeros there says the memory lost its contents; other data
+/// around a null says the game stored it. Reads straight-line code only, so it is a best effort.
+void LogUnmappedReadContext(Core::Memory::Memory& memory, const Dynarmic::A64::Jit& jit, u64 vaddr) {
+    const u64 pc = jit.GetPC();
+    const u64 sp = jit.GetSP();
+    const auto regs = jit.GetRegisters();
+    const auto reg = [&](u32 index) { return index == 31 ? sp : regs[index]; };
+    const auto read_code = [&](u64 address) -> std::optional<u32> {
+        u32 inst{};
+        if (!memory.IsValidVirtualAddressRange(address, sizeof(inst)) ||
+            !memory.ReadBlock(address, &inst, sizeof(inst))) {
+            return std::nullopt;
+        }
+        return inst;
+    };
+    std::string text;
+    for (size_t i = 0; i < regs.size(); ++i) {
+        fmt::format_to(std::back_inserter(text), " x{}={:#x}", i, regs[i]);
+    }
+    // The JIT stores the pc at the start of a block and a register when the block last sets it.
+    LOG_ERROR(Core_ARM, "Unmapped read context: block at {:#x}, registers as last stored:{}", pc, text);
+    text.clear();
+    for (u64 address = pc - 0x40; address < pc + 0x80; address += 4) {
+        const auto inst = read_code(address);
+        fmt::format_to(std::back_inserter(text), " {}", inst ? fmt::format("{:08x}", *inst) : "--------");
+    }
+    LOG_ERROR(Core_ARM, "Unmapped read context: code from {:#x}:{}", pc - 0x40, text);
+
+    // The instruction: the first load of the block that addresses vaddr (or, for a read near
+    // null, has it as its offset: the base register's stored value may be an older one).
+    std::optional<u64> fault_pc;
+    GuestAccess fault{};
+    for (u64 address = pc; address < pc + 64 * 4; address += 4) {
+        const auto inst = read_code(address);
+        if (!inst) {
+            break;
+        }
+        if (const auto access = DecodeGuestAccess(*inst);
+            access && (reg(access->base) + static_cast<u64>(access->offset) == vaddr ||
+                       (vaddr < 0x10000 && static_cast<u64>(access->offset) == vaddr))) {
+            fault_pc = address;
+            fault = *access;
+            break;
+        }
+        if (EndsGuestBlock(*inst)) {
+            break;
+        }
+    }
+    if (!fault_pc) {
+        LOG_ERROR(Core_ARM, "Unmapped read context: no load in the block addresses {:#x}", vaddr);
+        return;
+    }
+    LOG_ERROR(Core_ARM, "Unmapped read context: the load at {:#x} reads [x{} + {:#x}], x{} = {:#x}",
+              *fault_pc, fault.base, fault.offset, fault.base, reg(fault.base));
+
+    // Where the base register got its value.
+    u32 tracked = fault.base;
+    for (u64 address = *fault_pc - 4; tracked != 31 && address >= *fault_pc - 48 * 4; address -= 4) {
+        const auto inst = read_code(address);
+        if (!inst) {
+            break;
+        }
+        if (IsGuestCall(*inst) && tracked <= 18) {
+            LOG_ERROR(Core_ARM,
+                      "Unmapped read context: x{} was left by the call at {:#x} (x0 = its return value)",
+                      tracked, address);
+            return;
+        }
+        if ((*inst & 0xFC000000) == 0x14000000 || (*inst & 0xFFFFFC1F) == 0xD61F0000 ||
+            (*inst & 0xFFFFFC1F) == 0xD65F0000) {
+            // b, br, ret: the code after it is reached by a jump.
+            break;
+        }
+        if ((*inst & 0xFFE0FFE0) == 0xAA0003E0 && (*inst & 31) == tracked) {
+            tracked = (*inst >> 16) & 31; // mov
+            continue;
+        }
+        if (const auto access = DecodeGuestAccess(*inst)) {
+            const auto slot = std::find(access->written.begin(), access->written.end(), tracked);
+            if (slot == access->written.end()) {
+                continue;
+            }
+            const auto index = static_cast<u64>(slot - access->written.begin());
+            if (!access->wide_load || index == 2 || access->base == tracked) {
+                LOG_ERROR(Core_ARM, "Unmapped read context: x{} was written by {:08x} at {:#x}", tracked,
+                          *inst, address);
+                return;
+            }
+            const u64 source = reg(access->base) + static_cast<u64>(access->offset) + index * 8;
+            const u64 begin = (source & ~u64{7}) - 32;
+            text.clear();
+            std::array<u64, 8> words{};
+            if (memory.IsValidVirtualAddressRange(begin, sizeof(words)) &&
+                memory.ReadBlock(begin, words.data(), sizeof(words))) {
+                for (const u64 word : words) {
+                    fmt::format_to(std::back_inserter(text), " {:016x}", word);
+                }
+            } else {
+                text = " unmapped";
+            }
+            std::vector<u8> page(Core::Memory::YUZU_PAGESIZE);
+            const u64 page_begin = source & ~u64{Core::Memory::YUZU_PAGEMASK};
+            std::ptrdiff_t non_zero = -1;
+            if (memory.IsValidVirtualAddressRange(page_begin, page.size()) &&
+                memory.ReadBlock(page_begin, page.data(), page.size())) {
+                non_zero = std::count_if(page.begin(), page.end(), [](u8 byte) { return byte != 0; });
+            }
+            LOG_ERROR(Core_ARM,
+                      "Unmapped read context: x{} was loaded at {:#x} from [x{} + {:#x}] = {:#x} (if "
+                      "x{} is unchanged); memory from {:#x}:{}; non-zero bytes in its 4 KiB page: {}",
+                      tracked, address, access->base, access->offset, source, access->base, begin, text,
+                      non_zero);
+            return;
+        }
+        // Data processing (immediate or register) with this destination
+        if (((*inst & 0x1C000000) == 0x10000000 || (*inst & 0x0E000000) == 0x0A000000) &&
+            (*inst & 31) == tracked) {
+            LOG_ERROR(Core_ARM, "Unmapped read context: x{} was computed by {:08x} at {:#x}", tracked,
+                      *inst, address);
+            return;
+        }
+    }
+    LOG_ERROR(Core_ARM, "Unmapped read context: nothing in the code before sets x{}", tracked);
+}
+
 } // Anonymous namespace
 
 DynarmicCallbacks64::DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess* process)
@@ -70,9 +265,14 @@ u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {
     if (auto& unmapped = Core::Memory::UnmappedReadFlag(); unmapped != 0) {
         unmapped = 0;
         static std::atomic<u32> logged{};
-        if (logged.fetch_add(1) < 32) {
+        const u32 count = logged.fetch_add(1);
+        if (count < 32) {
             LOG_ERROR(Core_ARM, "Unmapped read {:#x} ({} bytes) at pc {:#x} lr {:#x} sp {:#x}", vaddr, size,
                       m_parent.m_jit->GetPC(), m_parent.m_jit->GetRegister(30), m_parent.m_jit->GetSP());
+        }
+        if (count < 2) {
+            LogUnmappedReadContext(m_memory, *m_parent.m_jit, vaddr);
+            unmapped = 0;
         }
     }
     return value;
