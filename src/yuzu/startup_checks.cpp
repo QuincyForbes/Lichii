@@ -20,7 +20,16 @@
 #include <unistd.h>
 #endif
 
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+
 #include <fmt/core.h>
+#include "common/common_types.h"
+#include "common/fs/file.h"
+#include "common/fs/fs.h"
+#include "common/fs/path_util.h"
+#include "common/string_util.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
 #include "video_core/vulkan_common/vulkan_library.h"
 #include "yuzu/startup_checks.h"
@@ -38,6 +47,123 @@ void CheckVulkan() {
     }
 }
 
+#ifdef _WIN32
+namespace {
+
+void AddFileStamp(std::string& out, const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    out += Common::UTF16ToUTF8(path);
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
+        out += fmt::format("|{}|{}|{}|{};", data.nFileSizeHigh, data.nFileSizeLow,
+                           data.ftLastWriteTime.dwHighDateTime,
+                           data.ftLastWriteTime.dwLowDateTime);
+    } else {
+        out += "|missing;";
+    }
+}
+
+/// The loader's driver and layer lists: the value names are manifest paths, stamped like files.
+void AddManifests(std::string& out, HKEY root, const wchar_t* subkey) {
+    HKEY key{};
+    if (RegOpenKeyExW(root, subkey, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return;
+    }
+    out += Common::UTF16ToUTF8(subkey);
+    out += ':';
+    for (DWORD index = 0;; ++index) {
+        wchar_t name[1024];
+        DWORD name_length = static_cast<DWORD>(std::size(name));
+        DWORD enabled = 0;
+        DWORD size = sizeof(enabled);
+        const LONG result = RegEnumValueW(key, index, name, &name_length, nullptr, nullptr,
+                                          reinterpret_cast<BYTE*>(&enabled), &size);
+        if (result == ERROR_NO_MORE_ITEMS) {
+            break;
+        }
+        if (result == ERROR_SUCCESS) {
+            AddFileStamp(out, std::wstring{name, name_length});
+            out += std::to_string(enabled);
+        }
+    }
+    RegCloseKey(key);
+}
+
+/// What a crash of the Vulkan check depends on: this executable, the Vulkan loader, the display
+/// drivers' versions, the drivers and layers registered with the loader and the loader's
+/// environment. The check runs again whenever one of them changes.
+std::string VulkanCheckFingerprint() {
+    std::string out;
+    wchar_t path[MAX_PATH];
+    if (const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        length != 0 && length < MAX_PATH) {
+        AddFileStamp(out, path);
+    }
+    if (const UINT length = GetSystemDirectoryW(path, MAX_PATH);
+        length != 0 && length < MAX_PATH) {
+        AddFileStamp(out, std::wstring{path, length} + L"\\vulkan-1.dll");
+    }
+
+    constexpr const wchar_t* display_class =
+        L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    HKEY adapters{};
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, display_class, 0, KEY_READ, &adapters) ==
+        ERROR_SUCCESS) {
+        for (DWORD index = 0;; ++index) {
+            wchar_t name[256];
+            DWORD name_length = static_cast<DWORD>(std::size(name));
+            const LONG result = RegEnumKeyExW(adapters, index, name, &name_length, nullptr,
+                                              nullptr, nullptr, nullptr);
+            if (result == ERROR_NO_MORE_ITEMS) {
+                break;
+            }
+            if (result != ERROR_SUCCESS) {
+                continue;
+            }
+            for (const wchar_t* value_name :
+                 {L"DriverVersion", L"DriverDate", L"VulkanDriverName"}) {
+                wchar_t value[1024];
+                DWORD size = sizeof(value);
+                if (RegGetValueW(adapters, name, value_name, RRF_RT_REG_SZ | RRF_RT_REG_MULTI_SZ,
+                                 nullptr, value, &size) == ERROR_SUCCESS) {
+                    out += Common::UTF16ToUTF8(std::wstring_view{value, size / sizeof(wchar_t)});
+                    out += ';';
+                }
+            }
+        }
+        RegCloseKey(adapters);
+    }
+
+    for (const HKEY root : {HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER}) {
+        for (const wchar_t* subkey : {L"SOFTWARE\\Khronos\\Vulkan\\Drivers",
+                                      L"SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers",
+                                      L"SOFTWARE\\Khronos\\Vulkan\\ExplicitLayers"}) {
+            AddManifests(out, root, subkey);
+        }
+    }
+    for (const char* variable :
+         {"VK_ICD_FILENAMES", "VK_DRIVER_FILES", "VK_ADD_DRIVER_FILES", "VK_LAYER_PATH",
+          "VK_ADD_LAYER_PATH", "VK_IMPLICIT_LAYER_PATH", "VK_ADD_IMPLICIT_LAYER_PATH",
+          "VK_INSTANCE_LAYERS", "VK_LOADER_LAYERS_ENABLE", "VK_LOADER_LAYERS_DISABLE",
+          "VK_LOADER_DRIVERS_SELECT", "VK_LOADER_DRIVERS_DISABLE"}) {
+        if (const char* value = std::getenv(variable)) {
+            out += fmt::format("{}={};", variable, value);
+        }
+    }
+
+    // FNV-1a: the file keeps a hash, not the paths.
+    u64 hash = 0xcbf29ce484222325ULL;
+    for (const char c : out) {
+        hash = (hash ^ static_cast<u8>(c)) * 0x100000001b3ULL;
+    }
+    return fmt::format("vulkan-check-ok {:016x}", hash);
+}
+
+std::filesystem::path VulkanCheckCachePath() {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "vulkan_check.txt";
+}
+
+} // Anonymous namespace
+#endif
 bool CheckEnvVars(bool* is_child) {
 #ifdef _WIN32
     // Check environment variable to see if we are the child
@@ -81,6 +207,15 @@ bool StartupChecks(const char* arg0, bool* has_broken_vulkan, bool perform_vulka
         return false;
     }
 
+    // The child is spawned only when something the check depends on changed since it last
+    // passed: it cost 0.3-0.8 s before the window on every start.
+    const std::string fingerprint = perform_vulkan_check ? VulkanCheckFingerprint() : std::string{};
+    if (perform_vulkan_check &&
+        Common::FS::ReadStringFromFile(VulkanCheckCachePath(), Common::FS::FileType::TextFile) ==
+            fingerprint) {
+        perform_vulkan_check = false;
+    }
+
     if (perform_vulkan_check) {
         // Spawn child process that performs Vulkan check
         PROCESS_INFORMATION process_info;
@@ -100,6 +235,13 @@ bool StartupChecks(const char* arg0, bool* has_broken_vulkan, bool perform_vulka
 
         // Vulkan is broken if the child crashed (return value is not zero)
         *has_broken_vulkan = (exit_code != 0);
+        const auto cache_path = VulkanCheckCachePath();
+        if (*has_broken_vulkan) {
+            Common::FS::RemoveFile(cache_path);
+        } else if (Common::FS::CreateParentDirs(cache_path)) {
+            void(Common::FS::WriteStringToFile(cache_path, Common::FS::FileType::TextFile,
+                                               fingerprint));
+        }
 
         if (CloseHandle(process_info.hProcess) == 0) {
             fmt::print(stderr, "CloseHandle failed with error {}\n", GetLastError());

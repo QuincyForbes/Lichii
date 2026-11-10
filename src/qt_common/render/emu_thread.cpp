@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <qdebug.h>
+#include "common/scope_exit.h"
+#ifdef _WIN32
+#include "common/windows/timer_resolution.h"
+#endif
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "emu_thread.h"
 #include "qt_common/qt_common.h"
@@ -16,6 +21,14 @@ EmuThread::~EmuThread() = default;
 
 void EmuThread::run() {
     Common::SetCurrentThreadName("EmuControlThread");
+#ifdef _WIN32
+    // The 0.5 ms system timer only while a game runs.
+    QtCommon::system->CoreTiming().SetTimerResolutionNs(
+        Common::Windows::SetCurrentTimerResolutionToMaximum());
+    SCOPE_EXIT {
+        Common::Windows::ReleaseTimerResolution();
+    };
+#endif
 
     auto& gpu = QtCommon::system->GPU();
     auto stop_token = m_stop_source.get_token();

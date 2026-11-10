@@ -344,6 +344,8 @@ void lichii_platform_init(void) {
                      g_info.va_reserve_4g, g_info.va_reserve_16g, g_info.va_reserve_max_gib,
                      g_info.txm,
                      g_info.txm_from_device_tree ? "device tree" : "model table");
+            LOG_INFO(Frontend, "iOS platform: increased debugging memory limit {}",
+                     EntitlementValue("com.apple.developer.kernel.increased-debugging-memory-limit"));
             if (g_info.increased_memory_limit == 0) {
                 LOG_WARNING(Frontend, "iOS: the increased-memory-limit entitlement is missing; "
                                       "games will likely be closed by iOS");

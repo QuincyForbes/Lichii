@@ -32,6 +32,9 @@ std::chrono::nanoseconds SetCurrentTimerResolution(std::chrono::nanoseconds time
  */
 std::chrono::nanoseconds SetCurrentTimerResolutionToMaximum();
 
+/// Withdraws this process's request from SetCurrentTimerResolution(ToMaximum).
+void ReleaseTimerResolution();
+
 /// Sleep for one tick of the current timer resolution.
 void SleepForOneTick();
 

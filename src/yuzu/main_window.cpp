@@ -324,6 +324,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 
 constexpr int default_mouse_hide_timeout = 2500;
 constexpr int default_input_update_timeout = 1;
+constexpr int idle_input_update_timeout = 16;
 constexpr int EmuThreadStopTimeoutMs = 10'000;
 // A teardown that keeps making progress (Common::ShutdownProgress) is waited for this long at
 // most before its thread is terminated.
@@ -481,7 +482,26 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     if (Settings::values.use_dev_keys.GetValue()) {
         Core::Crypto::KeyManager::Instance().ReloadKeys();
     }
-    game_list->PopulateAsync(UISettings::values.game_dirs);
+    // Parsed before the scan: a game on the command line only needs the game directories'
+    // updates and DLC registered, not the list (BootGame waited ~200 ms for that scan to stop).
+    // The list fills when the game exits.
+    std::optional<Core::LaunchParams> launch_params;
+    if (QStringList args = QApplication::arguments(); args.size() >= 2) {
+        QList<QByteArray> qba{};
+        for (auto const& e : args)
+            qba.push_back(e.toUtf8());
+        std::vector<char*> args_cstr{};
+        for (auto& e : qba)
+            args_cstr.push_back(e.data());
+
+        launch_params = Core::ParseLaunchParams(*QtCommon::system, int(args_cstr.size()),
+                                                args_cstr.data(), nullptr);
+    }
+    if (launch_params && !launch_params->filepath.empty()) {
+        game_list->FillContentProvider(UISettings::values.game_dirs);
+    } else {
+        game_list->PopulateAsync(UISettings::values.game_dirs);
+    }
 
     // Set up game list mode checkboxes.
     SetGameListMode(UISettings::values.game_list_mode.GetValue());
@@ -494,8 +514,13 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     connect(&mouse_hide_timer, &QTimer::timeout, this, &MainWindow::HideMouseCursor);
     connect(ui->menubar, &QMenuBar::hovered, this, &MainWindow::ShowMouseCursor);
 
-    update_input_timer.setInterval(default_input_update_timeout);
+    // 1 ms only while a game runs: on the game list it woke the UI thread 1000 times a second.
+    update_input_timer.setInterval(idle_input_update_timeout);
     connect(&update_input_timer, &QTimer::timeout, this, &MainWindow::UpdateInputDrivers);
+    connect(this, &MainWindow::EmulationStarting, this,
+            [this] { update_input_timer.setInterval(default_input_update_timeout); });
+    connect(this, &MainWindow::EmulationStopping, this,
+            [this] { update_input_timer.setInterval(idle_input_update_timeout); });
     update_input_timer.start();
 
     if (has_broken_vulkan) {
@@ -513,7 +538,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         renderer_status_button->setDisabled(true);
         renderer_status_button->setChecked(false);
     } else {
-        VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
+        // Read when a configuration dialog first needs them: one more Vulkan instance and a test
+        // surface on the UI thread at every start otherwise.
+        vk_records_pending = true;
     }
 
     // On macOS, SDL video would pump AppKit events alongside Qt and disrupt native menus.
@@ -540,15 +567,8 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     // to prevent the UI from blowing up.
     UpdateUITheme();
 
-    if (QStringList args = QApplication::arguments(); args.size() >= 2) {
-        QList<QByteArray> qba{};
-        for (auto const& e : args)
-            qba.push_back(e.toUtf8());
-        std::vector<char*> args_cstr{};
-        for (auto& e : qba)
-            args_cstr.push_back(e.data());
-
-        auto const lp = Core::ParseLaunchParams(*QtCommon::system, args_cstr.size(), args_cstr.data(), nullptr);
+    if (launch_params) {
+        auto const& lp = *launch_params;
 
         // Override fullscreen setting if gamepath or argument is provided
         if (!lp.filepath.empty() || lp.fullscreen) {
@@ -2015,8 +2035,33 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
         return false;
 
     /** Exec */
-    const Core::SystemResultStatus result{
-        QtCommon::system->Load(*render_window, filename.toStdString(), params)};
+    const std::string rom_path = filename.toStdString();
+    Core::SystemResultStatus result{};
+#ifdef _WIN32
+    if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan) {
+        // On a worker, like the loose RomFS preparation: the NSO load, the Vulkan instance and
+        // devices and audio froze the window for ~1.4 s. Vulkan on Windows only: an OpenGL
+        // context, and surfaces on some other platforms, belong to the thread that made them.
+        QProgressDialog progress(tr("Loading game..."), QString{}, 0, 0, this);
+        progress.setWindowModality(Qt::ApplicationModal);
+        progress.setWindowFlag(Qt::WindowCloseButtonHint, false);
+        progress.setCancelButton(nullptr);
+        progress.setMinimumDuration(0);
+        QFutureWatcher<Core::SystemResultStatus> watcher;
+        QEventLoop loop;
+        connect(&watcher, &QFutureWatcher<Core::SystemResultStatus>::finished, &loop,
+                &QEventLoop::quit);
+        watcher.setFuture(QtConcurrent::run([this, &rom_path, &params] {
+            return QtCommon::system->Load(*render_window, rom_path, params);
+        }));
+        progress.show();
+        loop.exec();
+        result = watcher.result();
+    } else
+#endif
+    {
+        result = QtCommon::system->Load(*render_window, rom_path, params);
+    }
 
     if (result != Core::SystemResultStatus::Success) {
         switch (result) {
@@ -3785,6 +3830,9 @@ void MainWindow::OnConfigure() {
     const bool old_force_x11 = UISettings::values.gui_force_x11.GetValue();
 #endif
 
+    if (std::exchange(vk_records_pending, false)) {
+        VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
+    }
     Settings::SetConfiguringGlobal(true);
     ConfigureDialog configure_dialog(this, hotkey_registry, input_subsystem.get(),
                                      vk_device_records, *QtCommon::system,
@@ -4075,6 +4123,9 @@ void MainWindow::OnConfigurePerGame() {
 }
 
 void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_name) {
+    if (std::exchange(vk_records_pending, false)) {
+        VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
+    }
     Settings::SetConfiguringGlobal(false);
     ConfigurePerGame dialog(this, title_id, file_name, vk_device_records, *QtCommon::system);
     dialog.LoadFromFile(Core::GetGameFileFromPath(QtCommon::vfs, file_name));

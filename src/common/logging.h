@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -92,8 +93,15 @@ void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, u
 /// Returns true if a message of this class and level would pass the global filter.
 [[nodiscard]] bool IsLevelEnabled(Class log_class, Level log_level);
 
+/// The lowest level any class passes in the global filter. Messages below it (LOG_DEBUG at the
+/// default *:Info) return before the call.
+inline std::atomic<u8> g_lowest_enabled_level{0};
+
 template <typename... Args>
 void FmtLogMessage(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, fmt::format_string<Args...> format, const Args&... args) {
+    if (u8(log_level) < g_lowest_enabled_level.load(std::memory_order_relaxed)) {
+        return;
+    }
     FmtLogMessageImpl(log_class, log_level, filename, line_num, function, format.get(), fmt::make_format_args(args...));
 }
 

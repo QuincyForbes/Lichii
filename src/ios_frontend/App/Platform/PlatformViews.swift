@@ -290,12 +290,22 @@ struct ShaderCacheSettingsSection: View {
 struct ExperimentsView: View {
     @ObservedObject private var platform = PlatformCenter.shared
     @State private var noFootprint = lichii_platform_experiment("no_footprint") != 0
+    @State private var untaggedGuest = lichii_platform_experiment("untagged_guest") != 0
+    @State private var noZeroTrim = lichii_platform_experiment("no_zero_trim") != 0
     @State private var confirmReset = false
     @State private var resetDone = false
 
     var body: some View {
         List {
             Section {
+                Toggle("Count Guest Memory per Mapping", isOn: $untaggedGuest)
+                    .onChange(of: untaggedGuest) { value in
+                        lichii_platform_set_experiment("untagged_guest", value ? 1 : 0)
+                    }
+                Toggle("Zero Page Trimming Off", isOn: $noZeroTrim)
+                    .onChange(of: noZeroTrim) { value in
+                        lichii_platform_set_experiment("no_zero_trim", value ? 1 : 0)
+                    }
                 Toggle("Untracked Guest Memory", isOn: $noFootprint)
                     .onChange(of: noFootprint) { value in
                         lichii_platform_set_experiment("no_footprint", value ? 1 : 0)
@@ -303,7 +313,7 @@ struct ExperimentsView: View {
             } header: {
                 Text("Memory")
             } footer: {
-                Text("Asks iOS to leave the guest memory out of the app's memory footprint. Current iOS versions refuse this for apps without a private Apple entitlement (the log then shows \"no access\"), so it has no effect; it does no harm either. Applies the next time Lichii starts.")
+                Text("Guest memory normally counts once toward the limit iOS closes Lichii at. Per mapping is the old accounting: pages both the game and the emulator touch count twice, and all-zero pages are trimmed. Untracked asks iOS to leave guest memory out entirely; current iOS versions refuse that for apps without a private Apple entitlement (the log shows \"no access\"), so it has no effect. All apply the next time Lichii starts.")
             }
 
             Section {

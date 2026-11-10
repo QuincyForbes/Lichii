@@ -3449,13 +3449,16 @@ void RasterizerVulkan::TickMemoryReport() {
         pressure != memory_report_pressure) {
         memory_report_pressure = pressure;
         malloc_relief_frames = 31;
+        // And where the footprint went, now.
+        memory_report_next = {};
     }
     if (malloc_relief_frames != 0 && --malloc_relief_frames == 0) {
         const u64 released = Common::PlatformEvents::RelieveMallocPressure();
         LOG_INFO(Render_Vulkan, "Host memory pressure: malloc released {} MiB", released >> 20);
     }
-    // Where the footprint goes, at the first frame and every 30 s (5 s with under 1 GiB left to
-    // the process). On by default on iOS; EDEN_NX2_MEMORY_REPORT=1 elsewhere, =0 turns it off.
+    // Where the footprint goes, at the first frame, on memory pressure and every 30 s (5 s with
+    // under 1 GiB left to the process). On by default on iOS; EDEN_NX2_MEMORY_REPORT=1
+    // elsewhere, =0 turns it off.
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_MEMORY_REPORT");
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -3486,13 +3489,14 @@ void RasterizerVulkan::TickMemoryReport() {
     }
     const auto [graphics_pipelines, compute_pipelines] = pipeline_cache.PipelineCounts();
     LOG_INFO(Render_Vulkan,
-             "Memory: footprint {} MiB (peak {}, compressed {}, reusable {}), {} MiB left | guest "
-             "RAM handed out {} MiB, resident {} MiB, zero pages trimmed {} MiB (last scan) | "
-             "Vulkan {} | textures {} images {} MiB (collector {} / {} / {} MiB) | buffers {} MiB "
-             "| staging stream {} MiB + pooled {} MiB | pipelines {} graphics, {} compute | ASTC "
-             "{}, BCn {}",
-             process.footprint >> 20, process.footprint_peak >> 20, process.compressed >> 20,
-             process.reusable >> 20, available >> 20,
+             "Memory: footprint {} MiB (peak {}, internal {}, compressed {}, reusable {}, "
+             "purgeable {}), {} MiB left | guest RAM handed out {} MiB, resident {} MiB, zero "
+             "pages trimmed {} MiB (last scan) | Vulkan {} | textures {} images {} MiB (collector "
+             "{} / {} / {} MiB) | buffers {} MiB | staging stream {} MiB + pooled {} MiB | "
+             "pipelines {} graphics, {} compute | ASTC {}, BCn {}",
+             process.footprint >> 20, process.footprint_peak >> 20, process.internal >> 20,
+             process.compressed >> 20, process.reusable >> 20,
+             process.purgeable_nonvolatile >> 20, available >> 20,
              Common::HostMemory::ScannedHandedOutBytes() >> 20,
              Common::HostMemory::ScannedResidentBytes() >> 20,
              Common::HostMemory::TrimmedZeroBytes() >> 20, device.MemoryHeapReport(),
