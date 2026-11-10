@@ -306,10 +306,19 @@ struct LayoutEditorView: View {
             )
 
             EditorToggleRow(
+                title: "Floating Stick",
+                subtitle: "The stick centres where your thumb lands, so a small push walks instead of runs.",
+                isOn: Binding(
+                    get: { layout.joysticks[joystickId]?.floating ?? JoystickLayout.defaultFloating(right: joystickId == "rightJoystick") },
+                    set: { layout.joysticks[joystickId, default: JoystickLayout()].floating = $0 }
+                )
+            )
+
+            EditorToggleRow(
                 title: "Hide Buttons Underneath",
                 subtitle: "Fades the overlapping D-Pad or ABXY buttons while the stick is in use.",
                 isOn: Binding(
-                    get: { layout.joysticks[joystickId]?.hide ?? true },
+                    get: { layout.joysticks[joystickId]?.hide ?? false },
                     set: { layout.joysticks[joystickId, default: JoystickLayout()].hide = $0 }
                 )
             )
@@ -427,8 +436,11 @@ struct EditorChip: View {
                 }
             }
             .foregroundColor(tint ?? .primary)
+            .frame(minWidth: 30, minHeight: 30)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(title)
     }
 }
 
@@ -459,10 +471,14 @@ struct EditorSliderRow: View {
 
             HStack(spacing: 12) {
                 EditorStepperButton(icon: "minus") { nudge(-step) }
+                    .accessibilityLabel("Decrease \(title)")
 
                 Slider(value: $value, in: range, step: step)
+                    .accessibilityLabel(title)
+                    .accessibilityValue(String(format: format, value))
 
                 EditorStepperButton(icon: "plus") { nudge(step) }
+                    .accessibilityLabel("Increase \(title)")
             }
         }
     }
@@ -478,6 +494,8 @@ struct EditorStepperButton: View {
                 .font(.system(size: 12, weight: .bold))
                 .foregroundColor(.secondary)
                 .frame(width: 22, height: 26)
+                .frame(width: 36, height: 36)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -534,6 +552,7 @@ struct EditorSelectionRing: ViewModifier {
                 .opacity(isSelected ? 1 : 0)
                 .animation(.easeOut(duration: 0.16), value: isSelected)
             }
+            .accessibilityAddTraits(isSelected ? AccessibilityTraits.isSelected : AccessibilityTraits())
     }
 }
 

@@ -15,3 +15,9 @@ public protocol Controller: ObservableObject {
 
     func joystickMoved(position: CGPoint, right: Bool)
 }
+
+public extension Notification.Name {
+    /// Lichii: the app released every on-screen input (menu opened, app inactive, controls
+    /// hidden); toggled buttons show released again.
+    static let lichiiTouchReleased = Notification.Name("LichiiTouchReleased")
+}

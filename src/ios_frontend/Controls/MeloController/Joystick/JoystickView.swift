@@ -43,6 +43,14 @@ struct EditableJoystickView: View {
         .frame(width: 160, height: 160)
     }
 
+    /// Lichii: the right stick still sits under ABXY (neither was moved in the editor).
+    private var overFaceButtons: Bool {
+        guard iscool, (layout.joysticks[id]?.offset ?? .zero) == .zero else { return false }
+        return [VirtualControllerButton.A, .B, .X, .Y].allSatisfy {
+            (layout.buttons[$0.id]?.offset ?? .zero) == .zero && !(layout.buttons[$0.id]?.hidden ?? false)
+        }
+    }
+
     var body: some View {
         if isEditing {
             editorPlaceholder
@@ -75,7 +83,10 @@ struct EditableJoystickView: View {
                         }
                 )
         } else {
-            JoystickViewRepresentable(controller: controller, right: iscool, showBackground: $showBackground)
+            JoystickViewRepresentable(controller: controller, right: iscool, showBackground: $showBackground,
+                                      floating: layout.joysticks[id]?.floating ?? JoystickLayout.defaultFloating(right: iscool),
+                                      deferTaps: overFaceButtons,
+                                      hidesButtons: layout.joysticks[id]?.hide ?? false)
                 .frame(width: 160, height: 160)
                 .scaleEffect((layout.joysticks[id]?.scale ?? 1.0) * controllerScale)
                 .offset(layout.joysticks[id]?.offset ?? .zero)
