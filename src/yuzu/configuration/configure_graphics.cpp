@@ -4,18 +4,26 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <filesystem>
 #include <functional>
 #include <vector>
 #include <QBoxLayout>
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
+#include <QDesktopServices>
+#include <QDir>
+#include <QFileDialog>
 #include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QPixmap>
 #include <QPushButton>
 #include <QSlider>
+#include <QSpinBox>
+#include <QStandardItemModel>
+#include <QUrl>
 #include <QStringLiteral>
 #include <QtCore/qobjectdefs.h>
 #include <qabstractbutton.h>
@@ -37,6 +45,10 @@
 #include "yuzu/configuration/configure_graphics.h"
 #include "yuzu/configuration/nvidia_dlss_panel.h"
 #include "yuzu/configuration/shared_widget.h"
+
+#ifdef HAS_LSFG
+#include "video_core/frame_gen/lossless_dll.h"
+#endif
 
 #ifdef HAS_RESHADE
 #include "yuzu/configuration/configure_post_processing.h"
@@ -87,11 +99,13 @@ ConfigureGraphics::ConfigureGraphics(
     connect(api_combobox, qOverload<int>(&QComboBox::activated), this, [this] {
         UpdateAPILayout();
         PopulateVSyncModeSelection(false);
+        UpdateFeatureAvailability();
     });
     connect(vulkan_device_combobox, qOverload<int>(&QComboBox::activated), this,
             [this](int device) {
                 UpdateDeviceSelection(device);
                 PopulateVSyncModeSelection(false);
+                UpdateFeatureAvailability();
             });
     connect(ui->bg_button, &QPushButton::clicked, this, [this] {
         const QColor new_bg_color = QColorDialog::getColor(bg_color);
@@ -130,6 +144,8 @@ ConfigureGraphics::ConfigureGraphics(
     if (Settings::IsConfiguringGlobal()) {
         ui->bg_widget->setEnabled(Settings::values.bg_red.UsingGlobal());
     }
+
+    UpdateFeatureAvailability();
 }
 
 void ConfigureGraphics::PopulateVSyncModeSelection(bool use_setting) {
@@ -220,6 +236,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     std::map<u32, QWidget*> hold_graphics;
     std::vector<QWidget*> hold_api;
     QCheckBox* frame_gen_checkbox = nullptr;
+    QCheckBox* flow_scale_auto_checkbox = nullptr;
 
     for (const auto setting : Settings::values.linkage.by_category[Settings::Category::Renderer]) {
 #ifndef HAS_RESHADE
@@ -227,14 +244,6 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             continue;
         }
 #endif
-#ifndef EGLANTINE_STREAMLINE
-        // Only builds with NVIDIA Streamline (Windows) can use it.
-        if (setting->Id() == Settings::values.nvidia_dlss.Id() ||
-            setting->Id() == Settings::values.nvidia_dlss_preset.Id()) {
-            continue;
-        }
-#endif
-
         ConfigurationShared::Widget* widget = [&]() {
             if (setting->Id() == Settings::values.fsr_sharpening_slider.Id()) {
                 // FSR needs a reversed slider and a 0.5 multiplier
@@ -245,6 +254,14 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                 return builder.BuildWidget(setting, apply_funcs,
                                            ConfigurationShared::RequestType::Slider, true, 1.0f,
                                            nullptr, tr(" Hz", "Frame rate limit (e.g. 120 Hz)"));
+            } else if (setting->Id() == Settings::values.frame_gen_multiplier.Id()) {
+                return builder.BuildWidget(setting, apply_funcs, nullptr,
+                                           ConfigurationShared::RequestType::Default,
+                                           tr("x", "Frame generation multiplier (e.g. 2x)"));
+            } else if (setting->Id() == Settings::values.frame_gen_target_rate.Id()) {
+                return builder.BuildWidget(setting, apply_funcs, nullptr,
+                                           ConfigurationShared::RequestType::Default,
+                                           tr(" fps", "Frame generation target (e.g. 120 fps)"));
             } else {
                 return builder.BuildWidget(setting, apply_funcs);
             }
@@ -256,6 +273,15 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         if (!widget->Valid()) {
             widget->deleteLater();
             continue;
+        }
+
+        if (setting->Id() == Settings::values.frame_gen_type.Id()) {
+            frame_gen_type_combobox = widget->combobox;
+        } else if (setting->Id() == Settings::values.frame_gen_target_rate.Id() &&
+                   widget->spinbox != nullptr) {
+            widget->spinbox->setSpecialValueText(tr("Off (use the multiplier)"));
+        } else if (setting->Id() == Settings::values.frame_gen_flow_scale_auto.Id()) {
+            flow_scale_auto_checkbox = widget->checkbox;
         }
 
         if (setting->Id() == Settings::values.renderer_backend.Id()) {
@@ -375,6 +401,104 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             }
         }
     }
+
+    // The manual flow scale is only read while Auto Flow Scale is off.
+    if (const auto it = hold_graphics.find(Settings::values.frame_gen_flow_scale.Id());
+        flow_scale_auto_checkbox != nullptr && it != hold_graphics.end()) {
+        QWidget* flow_scale = it->second;
+        const auto update = [flow_scale](bool automatic) {
+            ConfigurationShared::SetUnavailable(
+                flow_scale, automatic ? tr("Turn Auto Flow Scale off to set this.") : QString());
+        };
+        update(flow_scale_auto_checkbox->isChecked());
+        connect(flow_scale_auto_checkbox, &QCheckBox::toggled, flow_scale, update);
+    }
+
+    const auto held = [&hold_graphics](const Settings::BasicSetting& setting) -> QWidget* {
+        const auto it = hold_graphics.find(setting.Id());
+        return it != hold_graphics.end() ? it->second : nullptr;
+    };
+    nvidia_dlss_widget = held(Settings::values.nvidia_dlss);
+    nvidia_dlss_preset_widget = held(Settings::values.nvidia_dlss_preset);
+    frame_gen_widget = held(Settings::values.frame_gen);
+
+#ifdef HAS_LSFG
+    // Where LSFG's Lossless.dll comes from, under the type combobox.
+    if (QWidget* type_widget = held(Settings::values.frame_gen_type);
+        type_widget != nullptr && frame_gen_type_combobox != nullptr) {
+        QWidget* row = new QWidget(type_widget);
+        QHBoxLayout* row_layout = new QHBoxLayout(row);
+        row_layout->setContentsMargins(0, 0, 0, 0);
+        lossless_status_label = new QLabel(row);
+        lossless_status_label->setWordWrap(true);
+        lossless_status_label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        QPushButton* choose = new QPushButton(tr("Choose Lossless.dll..."), row);
+        QPushButton* open_folder = new QPushButton(tr("Open Folder"), row);
+        row_layout->addWidget(lossless_status_label);
+        row_layout->addWidget(choose);
+        row_layout->addWidget(open_folder);
+
+        QWidget* group = new QWidget(this);
+        QVBoxLayout* group_layout = new QVBoxLayout(group);
+        group_layout->setContentsMargins(0, 0, 0, 0);
+        group_layout->setSpacing(2);
+        graphics_layout.replaceWidget(type_widget, group);
+        group_layout->addWidget(type_widget);
+        group_layout->addWidget(row);
+        type_widget->setVisible(true);
+        if (frame_gen_checkbox != nullptr) {
+            group->setVisible(frame_gen_checkbox->isChecked());
+            disconnect(frame_gen_checkbox, &QCheckBox::toggled, type_widget, &QWidget::setVisible);
+            connect(frame_gen_checkbox, &QCheckBox::toggled, group, &QWidget::setVisible);
+        }
+
+        const auto show_row = [this, row] {
+            const auto& types = combobox_translations.at(
+                Settings::EnumMetadata<Settings::FrameGenType>::Index());
+            const int index = frame_gen_type_combobox->currentIndex();
+            row->setVisible(index >= 0 && size_t(index) < types.size() &&
+                            static_cast<Settings::FrameGenType>(types[index].first) ==
+                                Settings::FrameGenType::Lsfg);
+        };
+        show_row();
+        connect(frame_gen_type_combobox, qOverload<int>(&QComboBox::currentIndexChanged), row,
+                show_row);
+        connect(choose, &QPushButton::clicked, this, [this] {
+            const QString file = QFileDialog::getOpenFileName(
+                this, tr("Choose Lossless.dll"), QString(), QStringLiteral("Lossless.dll"));
+            if (file.isEmpty()) {
+                return;
+            }
+            const std::filesystem::path source{file.toStdU16String()};
+            if (VideoCore::FrameGen::ValidateLosslessDll(source) !=
+                VideoCore::FrameGen::LosslessStatus::Ok) {
+                QMessageBox::warning(this, tr("Lossless.dll"),
+                                     tr("This file is not a Lossless.dll with the frame "
+                                        "generation shaders Lichii needs."));
+                return;
+            }
+            const auto destination = VideoCore::FrameGen::GetLosslessDllPath();
+            std::error_code ec;
+            std::filesystem::create_directories(destination.parent_path(), ec);
+            std::filesystem::copy_file(source, destination,
+                                       std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) {
+                QMessageBox::warning(this, tr("Lossless.dll"),
+                                     tr("Could not copy the file: %1")
+                                         .arg(QString::fromStdString(ec.message())));
+            }
+            UpdateLosslessStatus();
+        });
+        connect(open_folder, &QPushButton::clicked, this, [] {
+            const auto folder = VideoCore::FrameGen::GetLosslessDllPath().parent_path();
+            std::error_code ec;
+            std::filesystem::create_directories(folder, ec);
+            QDesktopServices::openUrl(QUrl::fromLocalFile(
+                QString::fromStdU16String(folder.u16string())));
+        });
+    }
+    UpdateLosslessStatus();
+#endif
 
     for (auto widget : hold_api) {
         api_grid_layout->addWidget(widget);
@@ -537,6 +661,85 @@ void ConfigureGraphics::RetrieveVulkanDevices() {
             expose_compute_option();
         }
     }
+}
+
+void ConfigureGraphics::UpdateFeatureAvailability() {
+    [[maybe_unused]] const bool vulkan =
+        GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan;
+    const int device = vulkan_device_combobox != nullptr ? vulkan_device_combobox->currentIndex()
+                                                         : -1;
+    [[maybe_unused]] const VkDeviceInfo::Record* record =
+        device >= 0 && size_t(device) < records.size() ? &records[device] : nullptr;
+
+    QString dlss_reason;
+#if defined(__APPLE__)
+    dlss_reason = tr("Not available on macOS: NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.");
+#elif !defined(EGLANTINE_STREAMLINE)
+#ifdef _WIN32
+    dlss_reason = tr("Not included in this build (built without NVIDIA Streamline).");
+#else
+    dlss_reason = tr("Windows only: NVIDIA DLSS runs through NVIDIA Streamline, which is Windows "
+                     "only.");
+#endif
+#else
+    if (!vulkan) {
+        dlss_reason = tr("Needs the Vulkan renderer.");
+    } else if (record != nullptr && !record->dlss_capable) {
+        dlss_reason = tr("Requires an NVIDIA RTX GPU with NVIDIA's driver (selected: %1).")
+                          .arg(QString::fromStdString(record->name));
+    }
+#endif
+    ConfigurationShared::SetUnavailable(nvidia_dlss_widget, dlss_reason);
+    ConfigurationShared::SetUnavailable(nvidia_dlss_preset_widget, dlss_reason);
+
+    QString frame_gen_reason;
+#ifndef HAS_LSFG
+    frame_gen_reason = tr("Frame generation is not included in this build.");
+#else
+    if (!vulkan) {
+        frame_gen_reason = tr("Needs the Vulkan renderer.");
+    }
+#endif
+    ConfigurationShared::SetUnavailable(frame_gen_widget, frame_gen_reason);
+}
+
+void ConfigureGraphics::UpdateLosslessStatus() {
+#ifdef HAS_LSFG
+    using VideoCore::FrameGen::LosslessStatus;
+    const auto status = VideoCore::FrameGen::GetInstalledLosslessStatus();
+    const QString where = QDir::toNativeSeparators(
+        QString::fromStdU16String(VideoCore::FrameGen::GetLosslessDllPath().u16string()));
+    QString problem;
+    if (status == LosslessStatus::NotInstalled) {
+        problem = tr("Lossless.dll not found in %1. Copy it from your own Lossless Scaling "
+                     "install (Steam\\steamapps\\common\\Lossless Scaling) or choose it here.")
+                      .arg(where);
+    } else if (status != LosslessStatus::Ok) {
+        problem = tr("%1 can't be used: it lacks the frame generation shaders (another Lossless "
+                     "Scaling version?).")
+                      .arg(where);
+    }
+    if (lossless_status_label != nullptr) {
+        lossless_status_label->setText(problem.isEmpty() ? tr("Lossless.dll found.") : problem);
+    }
+    if (frame_gen_type_combobox == nullptr) {
+        return;
+    }
+    // Without the file LSFG generates nothing; the item stays selectable if it is already chosen.
+    auto* model = qobject_cast<QStandardItemModel*>(frame_gen_type_combobox->model());
+    const auto& types =
+        combobox_translations.at(Settings::EnumMetadata<Settings::FrameGenType>::Index());
+    for (size_t i = 0; model != nullptr && i < types.size(); ++i) {
+        if (static_cast<Settings::FrameGenType>(types[i].first) != Settings::FrameGenType::Lsfg) {
+            continue;
+        }
+        if (QStandardItem* item = model->item(static_cast<int>(i))) {
+            item->setEnabled(problem.isEmpty() ||
+                             frame_gen_type_combobox->currentIndex() == static_cast<int>(i));
+            item->setToolTip(problem);
+        }
+    }
+#endif
 }
 
 Settings::RendererBackend ConfigureGraphics::GetCurrentGraphicsBackend() const {

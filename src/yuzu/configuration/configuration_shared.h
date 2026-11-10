@@ -24,4 +24,9 @@ public:
     virtual void SetConfiguration() = 0;
 };
 
+/// Greys out a setting this platform, GPU or build can't use and puts the reason first in its
+/// tooltip; an empty reason restores the state and tooltip it had before the first call. The value
+/// itself is left alone.
+void SetUnavailable(QWidget* widget, const QString& reason);
+
 } // namespace ConfigurationShared

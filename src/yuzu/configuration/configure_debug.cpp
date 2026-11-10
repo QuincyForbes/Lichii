@@ -79,8 +79,22 @@ void ConfigureDebug::SetConfiguration() {
     ui->enable_graphics_debugging->setChecked(Settings::values.renderer_debug.GetValue());
     ui->enable_shader_feedback->setEnabled(runtime_lock);
     ui->enable_shader_feedback->setChecked(Settings::values.renderer_shader_feedback.GetValue());
+#ifdef HAS_NSIGHT_AFTERMATH
     ui->enable_nsight_aftermath->setEnabled(runtime_lock);
+#else
+    ui->enable_nsight_aftermath->setEnabled(false);
+    ui->enable_nsight_aftermath->setToolTip(
+        tr("Not included in this build (needs ENABLE_NSIGHT_AFTERMATH and the NVIDIA Nsight "
+           "Aftermath SDK)."));
+#endif
     ui->enable_nsight_aftermath->setChecked(Settings::values.enable_nsight_aftermath.GetValue());
+#ifdef HAS_LSFG
+    ui->frame_gen_dump_flow->setEnabled(runtime_lock);
+#else
+    ui->frame_gen_dump_flow->setEnabled(false);
+    ui->frame_gen_dump_flow->setToolTip(tr("Frame generation is not included in this build."));
+#endif
+    ui->frame_gen_dump_flow->setChecked(Settings::values.frame_gen_dump_flow.GetValue());
     ui->dump_guest_shaders->setEnabled(runtime_lock);
     ui->dump_guest_shaders->setChecked(Settings::values.dump_guest_shaders.GetValue());
     ui->dump_macros->setEnabled(runtime_lock);
@@ -129,6 +143,7 @@ void ConfigureDebug::ApplyConfiguration() {
     Settings::values.disable_buffer_reorder = ui->disable_buffer_reorder->isChecked();
     Settings::values.renderer_shader_feedback = ui->enable_shader_feedback->isChecked();
     Settings::values.enable_nsight_aftermath = ui->enable_nsight_aftermath->isChecked();
+    Settings::values.frame_gen_dump_flow = ui->frame_gen_dump_flow->isChecked();
     Settings::values.dump_guest_shaders = ui->dump_guest_shaders->isChecked();
     Settings::values.dump_macros = ui->dump_macros->isChecked();
     Settings::values.disable_shader_loop_safety_checks =

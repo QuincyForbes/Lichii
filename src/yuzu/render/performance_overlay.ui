@@ -44,7 +44,7 @@
         <string notr="true">color: #4ade80;</string>
        </property>
        <property name="text">
-        <string>Displayed FPS</string>
+        <string>Displayed (Real + Generated)</string>
        </property>
       </widget>
      </item>
@@ -85,7 +85,7 @@
         <string notr="true">color: #38bdf8;</string>
        </property>
        <property name="text">
-        <string>Actual (Game)</string>
+        <string>Real (game)</string>
        </property>
       </widget>
      </item>
@@ -126,7 +126,7 @@
         <string notr="true">color: #c084fc;</string>
        </property>
        <property name="text">
-        <string>Generated (FG)</string>
+        <string>Generated</string>
        </property>
       </widget>
      </item>
@@ -184,7 +184,7 @@
         <string notr="true">color: #cbd5e1;</string>
        </property>
        <property name="text">
-        <string>1%L: 0</string>
+        <string>10% low: 0</string>
        </property>
       </widget>
      </item>

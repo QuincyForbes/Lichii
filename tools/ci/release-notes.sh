@@ -90,7 +90,7 @@ EOF2
   m_dmg=$(link dmg eglantine-macos-arm64.dmg)
   if [[ -n "$m_zip$m_dmg" ]]; then
     printf '## macOS\n\n| Build Type | Standard | PGO (Recommended) | Notes |\n| --- | --- | --- | --- |\n'
-    row 'arm64 (Apple Silicon)' "$(join "$m_zip" "$m_dmg")" '' "macOS ${macos_ver} or newer. Not notarized: right-click and choose Open the first time, or run `xattr -dr com.apple.quarantine eglantine.app`. `eden-cli` is inside the app, in `Contents/MacOS`."
+    row 'arm64 (Apple Silicon)' "$(join "$m_zip" "$m_dmg")" '' "macOS ${macos_ver} or newer. Not notarized: on first launch macOS blocks it; open System Settings > Privacy & Security and click Open Anyway, or run `xattr -dr com.apple.quarantine eglantine.app`. `eden-cli` is inside the app, in `Contents/MacOS`."
     printf '\n'
   fi
 
