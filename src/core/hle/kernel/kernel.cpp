@@ -166,12 +166,17 @@ struct KernelCore::Impl {
             // finalize can't unmap the next game's memory, and clear the arena.
             const u32 references = application_process->GetReferenceCount();
             application_process->GetPageTable().GetImpl().fastmem_arena = nullptr;
-            application_process->Close(system.Kernel());
-            application_process = nullptr;
             if (references > 1) {
-                LOG_WARNING(Kernel, "Application process still had {} references at shutdown",
+                // Its JITs would outlive it too: their code blocks stay registered with the fault
+                // handler while the iOS JIT pool they sit in is handed to the next game. The CPU
+                // threads are joined by now, so nothing runs in them.
+                application_process->ReleaseArmInterfaces();
+                LOG_WARNING(Kernel,
+                            "Shutdown: application process still had {} references, JITs released",
                             references);
             }
+            application_process->Close(system.Kernel());
+            application_process = nullptr;
             auto& arena = system.DeviceMemory().buffer;
             arena.Unmap(0, arena.VirtualSize(), false);
         }
@@ -1308,6 +1313,7 @@ void KernelCore::SuspendEmulation(bool suspended) {
 
 void KernelCore::ShutdownCores() {
     impl->TerminateAllProcesses();
+    LOG_INFO(Kernel, "Shutdown: processes terminated");
     KScopedSchedulerLock lk{*this};
     for (auto* thread : impl->shutdown_threads)
         void(thread->Run(*this));

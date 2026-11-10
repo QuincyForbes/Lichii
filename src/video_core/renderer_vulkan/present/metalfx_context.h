@@ -8,7 +8,9 @@
 #import <Metal/Metal.h>
 
 #include <array>
+#include <atomic>
 #include <functional>
+#include <memory>
 
 #include "common/common_types.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -43,12 +45,18 @@ public:
         return mtl_device;
     }
 
+    /// Whether Run orders the work with shared events on the GPU instead of waiting on the CPU.
+    [[nodiscard]] bool UsesSharedEvents() const noexcept {
+        return metal_event != nil;
+    }
+
     /// The Metal texture behind a Vulkan image, or nil.
     [[nodiscard]] id<MTLTexture> Texture(VkImage image) const;
 
     /// Encodes work that runs after every Vulkan command recorded so far and before every one
     /// recorded after this returns. encode returns false to drop the command buffer. Returns
-    /// whether the work was committed.
+    /// whether the work was committed (with CPU waits: whether it completed), and false once a
+    /// command buffer of the shared-event path has failed after Run returned. Logs the reason.
     bool Run(const std::function<bool(id<MTLCommandBuffer>)>& encode);
 
 private:
@@ -67,6 +75,8 @@ private:
     std::array<vk::Semaphore, 2> bridge_semaphores;
     size_t bridge_index{};
     u64 metal_value{};
+    /// Set by the completion handler of a command buffer that failed after Run returned.
+    std::shared_ptr<std::atomic<bool>> async_failure = std::make_shared<std::atomic<bool>>(false);
 };
 
 /// Whether the texture can be used where MetalFX asks for these usage options.

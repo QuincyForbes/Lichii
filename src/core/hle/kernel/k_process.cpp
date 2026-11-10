@@ -176,13 +176,17 @@ void KProcess::Finalize(KernelCore& kernel) {
     }
 
     // Clear expensive resources, as the destructor is not called for guest objects.
+    this->ReleaseArmInterfaces();
+
+    // Perform inherited finalization.
+    KSynchronizationObject::Finalize(kernel);
+}
+
+void KProcess::ReleaseArmInterfaces() {
     for (auto& interface : m_arm_interfaces) {
         interface.reset();
     }
     m_exclusive_monitor.reset();
-
-    // Perform inherited finalization.
-    KSynchronizationObject::Finalize(kernel);
 }
 
 Result KProcess::Initialize(KernelCore& kernel, const Svc::CreateProcessParameter& params, KResourceLimit* res_limit, bool is_real) {

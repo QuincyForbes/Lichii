@@ -10,6 +10,7 @@
 #include <signal.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstring>
 #include <functional>
@@ -27,6 +28,16 @@
 #include "common/common_types.h"
 #include "dynarmic/backend/exception_handler.h"
 #include "dynarmic/common/context.h"
+#if defined(__APPLE__) && defined(ARCHITECTURE_arm64)
+#    include <iterator>
+#    include <string>
+#    include <TargetConditionals.h>
+#    include <dlfcn.h>
+#    include <mach/mach.h>
+#    if TARGET_OS_IPHONE
+#        include "common/ios_jit.h"
+#    endif
+#endif
 #if defined(ARCHITECTURE_x86_64)
 #    include "dynarmic/backend/x64/block_of_code.h"
 #elif defined(ARCHITECTURE_arm64)
@@ -121,6 +132,51 @@ void SigHandler::RegisterHandler() {
     }
 }
 
+#if defined(__APPLE__) && defined(ARCHITECTURE_arm64)
+// Image and offset of a host address, or its place in the iOS JIT pool.
+std::string DescribeHostAddress(u64 address) {
+#    if TARGET_OS_IPHONE
+    if (const auto location = ::Common::IosJit::Locate(reinterpret_cast<const void*>(address))) {
+        return fmt::format("JIT pool chunk {} +{:#x} ({} view, {})", location->chunk, location->offset,
+                           location->writable_view ? "writable" : "executable",
+                           location->handed_out ? "handed out" : "not handed out");
+    }
+#    endif
+    Dl_info image{};
+    if (dladdr(reinterpret_cast<const void*>(address), &image) != 0 && image.dli_fname != nullptr) {
+        const char* const slash = std::strrchr(image.dli_fname, '/');
+        return fmt::format("{} +{:#x}", slash != nullptr ? slash + 1 : image.dli_fname,
+                           address - reinterpret_cast<u64>(image.dli_fbase));
+    }
+    return "no image";
+}
+
+// What an unhandled fault's one-line report can't tell: which code the thread was in. The frame
+// records ({caller's fp, return address}) are read through the kernel, so a bad one ends the walk
+// instead of faulting again.
+void LogCrashContext(u64 pc, u64 lr, u64 fp) {
+    LOG_ERROR(Core, "Crash context: pc in {}; lr {:#018x} in {}", DescribeHostAddress(pc), lr,
+              DescribeHostAddress(lr));
+    std::string frames;
+    for (int depth = 0; depth < 24 && fp != 0 && fp % 8 == 0; ++depth) {
+        u64 record[2]{};
+        vm_size_t bytes_read = 0;
+        if (vm_read_overwrite(mach_task_self(), static_cast<vm_address_t>(fp), sizeof(record),
+                              reinterpret_cast<vm_address_t>(&record[0]), &bytes_read) != KERN_SUCCESS ||
+            bytes_read != sizeof(record)) {
+            break;
+        }
+        fmt::format_to(std::back_inserter(frames), "{}{:#x} {}", depth != 0 ? " < " : "", record[1],
+                       DescribeHostAddress(record[1]));
+        if (record[0] <= fp) {
+            break;
+        }
+        fp = record[0];
+    }
+    LOG_ERROR(Core, "Crash backtrace: {}", frames.empty() ? "no frame records" : frames);
+}
+#endif
+
 void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
     DEBUG_ASSERT(sig == SIGSEGV || sig == SIGBUS);
     CTX_DECLARE(raw_context);
@@ -150,6 +206,13 @@ void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
 #endif
     LOG_ERROR(Core, "Unhandled {} at {:#018x} (fault address {}, thread \"{}\")\n",
               sig == SIGSEGV ? "SIGSEGV" : "SIGBUS", CTX_PC, fmt::ptr(info->si_addr), thread_name);
+#if defined(__APPLE__) && defined(ARCHITECTURE_arm64)
+    // Once: a fault inside this report lands here again.
+    static std::atomic_flag context_logged = ATOMIC_FLAG_INIT;
+    if (!context_logged.test_and_set()) {
+        LogCrashContext(CTX_PC, CTX_LR, mctx->__ss.__fp);
+    }
+#endif
 
     struct sigaction* retry_sa = sig == SIGSEGV ? &sig_handler->old_sa_segv : &sig_handler->old_sa_bus;
     if (retry_sa->sa_flags & SA_SIGINFO) {

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
 #include <string>
 
 // iOS JIT substrate.
@@ -65,6 +66,16 @@ bool Alloc(std::size_t bytes, void** wmem, void** xmem);
 /// Hands the whole pool out again. Only after every code block is gone (the emulated process was
 /// shut down), so a second game in the same app session reuses the prepared pages.
 void Reset();
+
+struct PoolLocation {
+    std::size_t chunk;
+    std::size_t offset;
+    bool writable_view; ///< In the writable alias, which is never executable
+    bool handed_out;    ///< Below the chunk's allocation mark
+};
+/// Where `address` lies in the pool, for crash logs. Takes no lock (the chunk list does not change
+/// once the pool is ready), so a signal handler may call it.
+std::optional<PoolLocation> Locate(const void* address);
 
 } // namespace Common::IosJit
 
