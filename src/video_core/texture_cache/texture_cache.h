@@ -776,6 +776,9 @@ void TextureCache<P>::TickFrame() {
 
     runtime.TickFrame();
     ++frame_tick;
+    if (rescale_trace && frame_tick % 300 == 0) {
+        LogRescaleTrace();
+    }
     ++bindings_epoch;
     ++frame_epoch_bumps;
     if (relocation_seen && frame_tick % 600 == 0) {
@@ -1085,8 +1088,13 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
                         continue;
                     }
                     auto& image = slot_images[image_view.image_id];
-                    has_blacklisted |= ScaleDown(image);
+                    const bool was_scaled = ScaleDown(image);
+                    has_blacklisted |= was_scaled;
                     image.scale_rating = 0;
+                    if (rescale_trace) {
+                        NoteRescaleTrace(image, was_scaled ? "storage (scaled down now)"
+                                                           : "storage");
+                    }
                 }
             }
         }
@@ -1759,6 +1767,9 @@ bool TextureCache<P>::RescaleRenderTargets() {
     const auto set_rating = [this, scale_rating](ImageId image_id) {
         if (image_id != CORRUPT_ID) {
             Image& image = slot_images[image_id];
+            if (rescale_trace) {
+                NoteRescaleTrace(image, "target");
+            }
             image.scale_rating = scale_rating;
             if (image.scale_tick <= frame_tick) {
                 image.scale_tick = frame_tick + 1;
@@ -3489,6 +3500,41 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     image.flags &= ~ImageFlagBits::CheckingRescalable;
     image.flags |= ImageFlagBits::IsRescalable;
     return true;
+}
+
+template <class P>
+void TextureCache<P>::NoteRescaleTrace(ImageBase& image, std::string_view role) {
+    const auto& info = image.info;
+    std::string_view state = "native, waiting";
+    if (True(image.flags & ImageFlagBits::Rescaled)) {
+        state = "scaled";
+    } else if (!info.rescaleable) {
+        state = "native: not rescaleable";
+    } else if (Settings::values.resolution_info.downscale && !info.downscaleable) {
+        state = "native: too small to downscale";
+    } else if (!ImageCanRescale(image)) {
+        state = "native: an alias can't rescale";
+    }
+    ++rescale_trace_counts[fmt::format("{} {}x{} format {} levels {} layers {}: {}", role,
+                                       info.size.width, info.size.height,
+                                       static_cast<u32>(info.format), info.resources.levels,
+                                       info.resources.layers, state)];
+}
+
+template <class P>
+void TextureCache<P>::LogRescaleTrace() {
+    std::vector<std::pair<u64, std::string>> sorted;
+    for (auto& [key, count] : rescale_trace_counts) {
+        sorted.emplace_back(count, key);
+    }
+    rescale_trace_counts.clear();
+    std::ranges::sort(sorted, std::greater{});
+    const auto& info = Settings::values.resolution_info;
+    LOG_INFO(HW_GPU, "Rescale trace (scale {}/{}): {} shapes", info.up_scale, 1u << info.down_shift,
+             sorted.size());
+    for (size_t i = 0; i < std::min<size_t>(sorted.size(), 30); ++i) {
+        LOG_INFO(HW_GPU, "  {:6} {}", sorted[i].first, sorted[i].second);
+    }
 }
 
 template <class P>

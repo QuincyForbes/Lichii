@@ -367,10 +367,11 @@ struct Values {
                                                   true,
                                                   true};
 
-    // Phones: no extra GPU passes on top of the game's own anti-aliasing.
+    // Phones: one cheap spatial pass, since even 1x is stretched to a larger screen (FSR 1 where
+    // MetalFX can't run).
     SwitchableSetting<ScalingFilter> scaling_filter{linkage,
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-                                                    ScalingFilter::Bilinear,
+                                                    ScalingFilter::MetalFxSpatial,
 #else
                                                     ScalingFilter::ScaleForce,
 #endif
