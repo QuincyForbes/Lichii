@@ -1144,12 +1144,14 @@ void PlacePrebuildThread(bool quiet) {
 }
 
 // Preload every cached pipeline at boot across all worker threads unless EDEN_NX2_PRELOAD_ALL_PIPELINES=0.
-bool PreloadAllPipelines() {
-    static const bool all = [] {
+// Off by default on MoltenVK, as upstream: each one goes through SPIR-V -> MSL -> Metal and none
+// is ever evicted there, so Ocarina's ~23,000 took minutes and more memory than an iPhone has.
+bool PreloadAllPipelines(const Device& device) {
+    static const int all = [] {
         const char* value = std::getenv("EDEN_NX2_PRELOAD_ALL_PIPELINES");
-        return value == nullptr || value[0] != '0';
+        return value == nullptr ? -1 : (value[0] != '0' ? 1 : 0);
     }();
-    return all;
+    return all < 0 ? !device.IsMoltenVK() : all != 0;
 }
 
 /// Destroys the pipelines of `pipelines` (a map or a deque of pairs holding unique_ptrs), telling
@@ -1992,7 +1994,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto queue_graphics{[&](const GraphicsPipelineCacheKey& key, GraphicsRecords records) {
         const u64 hash = key.Hash();
         disk_pipelines.insert(hash);
-        if (!PreloadAllPipelines() &&
+        if (!PreloadAllPipelines(device) &&
             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
                                     : !used_pipelines.contains(hash))) {
             ++skipped_pipelines;
@@ -2038,7 +2040,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     compute_envs.clear();
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
-    if (PreloadAllPipelines() && queued_graphics > 10000) {
+    if (PreloadAllPipelines(device) && queued_graphics > 10000) {
         LOG_WARNING(Render_Vulkan,
                     "EDEN_NX2_PRELOAD_ALL_PIPELINES: building and keeping all {} cached graphics "
                     "pipelines holds ~{} GB of driver memory all session",
@@ -2334,7 +2336,9 @@ void PipelineCache::TickFrame() {
         retired_compute_pipelines.pop_front();
     }
     constexpr u64 EvictCheckFrames = 600;
-    if (frame_count % EvictCheckFrames == 0) {
+    if (frame_count % EvictCheckFrames == 0 ||
+        (device.IsMoltenVK() &&
+         Common::PlatformEvents::MemoryPressureGeneration() != evict_pressure_generation)) {
         EvictUnusedPipelines();
     }
 }
@@ -2347,21 +2351,28 @@ void PipelineCache::RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> p
 
 void PipelineCache::EvictUnusedPipelines() {
     // Building a pipeline again on MoltenVK means a Metal compile mid-game, far dearer than the
-    // 2-3 ms below, so none are evicted there.
+    // 2-3 ms below, so none are evicted there unless the OS reports memory pressure: then every
+    // one unused for ~10 s goes, ahead of a jetsam kill.
+    bool under_pressure = false;
     if (device.IsMoltenVK()) {
-        return;
+        const u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
+        if (pressure == evict_pressure_generation) {
+            return;
+        }
+        evict_pressure_generation = pressure;
+        under_pressure = true;
     }
     // EDEN_NX2_PRELOAD_ALL_PIPELINES asked for every cached pipeline built: evicting the ones not
     // used yet threw the preload away after 9000 frames (Ocarina: 22,510 of 24,285, then rebuilt
     // one by one in new places).
-    if (PreloadAllPipelines()) {
+    if (!under_pressure && PreloadAllPipelines(device)) {
         return;
     }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
-    constexpr u64 EvictAfterFrames = 9000;
-    if (frame_count <= EvictAfterFrames) {
+    const u64 evict_after_frames = under_pressure ? 600 : 9000;
+    if (frame_count <= evict_after_frames) {
         return;
     }
     // Only while the cache is large: each one evicted is translated again on the GPU thread when
@@ -2370,16 +2381,16 @@ void PipelineCache::EvictUnusedPipelines() {
     // pipelines are ~3.6 GB of driver memory at most. EDEN_NX2_PIPELINE_EVICT_ABOVE sets it.
     // Past it only the excess goes, least recently used first (from zortos293/Lichii#408), so
     // crossing it doesn't drop every stale pipeline at once.
-    const size_t evict_above = EvictAbovePipelines();
+    const size_t evict_above = under_pressure ? 0 : EvictAbovePipelines();
     if (graphics_cache.size() <= evict_above) {
         return;
     }
-    const u64 cutoff = frame_count - EvictAfterFrames;
+    const u64 cutoff = frame_count - evict_after_frames;
     // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a budget
     // (from zortos293/Lichii#550): evicting it throws the prebuild away, and the game translates it
     // again on the GPU thread when it reaches that content. Past the budget (~0.9 GB of driver
     // memory) they go like the rest, so a large cache can't hold their memory all session.
-    constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
+    const size_t max_unused_prebuilt = under_pressure ? 0 : 2000;
     size_t kept_prebuilt = 0;
     std::vector<std::pair<u64, GraphicsPipelineCacheKey>> candidates;
     for (const auto& [key, pipeline] : graphics_cache) {
@@ -2387,7 +2398,7 @@ void PipelineCache::EvictUnusedPipelines() {
             pipeline->LastUse() >= cutoff) {
             continue;
         }
-        if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
+        if (!pipeline->WasUsed() && kept_prebuilt < max_unused_prebuilt) {
             ++kept_prebuilt;
             continue;
         }
@@ -2415,7 +2426,7 @@ void PipelineCache::EvictUnusedPipelines() {
         }
     }
     LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
-             EvictAfterFrames, graphics_cache.size());
+             evict_after_frames, graphics_cache.size());
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::TakeBackgroundPipeline(
