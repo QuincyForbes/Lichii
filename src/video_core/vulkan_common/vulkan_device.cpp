@@ -1177,6 +1177,14 @@ bool Device::GetSuitability(bool requires_swapchain) {
     FOR_EACH_VK_FEATURE_EXT(FEATURE_EXTENSION);
     FOR_EACH_VK_EXTENSION(EXTENSION);
 
+#ifdef VK_EXT_METAL_OBJECTS_EXTENSION_NAME
+    // MetalFX (present/metalfx_*.mm) works on the Metal textures and events behind Vulkan objects.
+    if (supported_extensions.contains(VK_EXT_METAL_OBJECTS_EXTENSION_NAME)) {
+        loaded_extensions.insert(VK_EXT_METAL_OBJECTS_EXTENSION_NAME);
+        extensions.metal_objects = true;
+    }
+#endif
+
     // The spec requires enabling VK_KHR_portability_subset on devices that expose it.
     if (supported_extensions.contains(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
         loaded_extensions.insert(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
