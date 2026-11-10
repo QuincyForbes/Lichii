@@ -79,13 +79,19 @@ struct JitStatus {
     var error = ""
     var debugged = false
     var needsScript = false
-    var stikDebug = false
+    /// The chosen JIT app (JitProvider.current) is installed.
+    var providerInstalled = false
+    var provider = JitProvider.stikDebug
 
-    @MainActor static func read() -> JitStatus {
-        JitStatus(state: Bridge.jitState, prepared: lichii_jit_prepared_bytes(),
-                  total: lichii_jit_pool_bytes(), error: Bridge.jitError,
-                  debugged: lichii_jit_debugged(), needsScript: lichii_jit_needs_script(),
-                  stikDebug: JitProvider.current.installed)
+    var stikDebug: Bool { providerInstalled }
+
+    /// `providerInstalled` skips the canOpenURL check when the caller already knows it.
+    @MainActor static func read(providerInstalled: Bool? = nil) -> JitStatus {
+        let provider = JitProvider.current
+        return JitStatus(state: Bridge.jitState, prepared: lichii_jit_prepared_bytes(),
+                         total: lichii_jit_pool_bytes(), error: Bridge.jitError,
+                         debugged: lichii_jit_debugged(), needsScript: lichii_jit_needs_script(),
+                         providerInstalled: providerInstalled ?? provider.installed, provider: provider)
     }
 
     var progress: Double {
@@ -108,16 +114,20 @@ struct JitStatus {
             if needsScript && debugged {
                 return "JIT was enabled without its script. Enable it again from Lichii's request so StikDebug runs universal.js."
             }
-            if stikDebug {
-                return "Lichii asks StikDebug to enable JIT. Tap Enable JIT in StikDebug if it asks; Lichii continues by itself."
+            if providerInstalled {
+                return "Lichii asks \(provider.label) to enable JIT. Confirm in \(provider.label) if it asks; Lichii continues by itself."
             }
-            return "Install StikDebug 3.2 or newer and enable JIT for Lichii (script universal.js on iOS 26 and newer)."
+            if provider == .stikDebug || provider == .stikDebugLiveContainer {
+                return "Install StikDebug 3.2 or newer (SideStore or AltStore), import your pairing file in it, then enable JIT for Lichii (script universal.js on iOS 26 and newer)."
+            }
+            return "\(provider.label) isn't installed. Install it or pick another JIT app below."
         case .acquiring:
-            return "StikDebug has mapped \(prepared >> 20) of \(total >> 20) MiB."
+            return "\(prepared >> 20) of \(total >> 20) MiB prepared."
         case .ready:
             return "Games start right away."
         case .failed:
-            return error.isEmpty ? "Close Lichii and launch it again." : error
+            let restart = "Swipe Lichii away in the app switcher and open it again."
+            return error.isEmpty ? restart : "\(error)\n\(restart)"
         }
     }
 
@@ -164,19 +174,26 @@ struct JitView: View {
     @State private var status = JitStatus.read()
     @AppStorage("autoRequestJit") private var autoRequest = true
     @AppStorage("jitProvider") private var provider: JitProvider = .stikDebug
-    private let timer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+    @State private var providerInstalled: Bool?
 
     var body: some View {
         List {
             Section {
                 JitStatusCard(status: status)
-                if status.state == .waiting || status.state == .failed {
+                if status.state == .waiting {
                     Button {
                         app.requestJitIfNeeded(automatic: false)
                     } label: {
                         Label("Enable JIT with \(provider.label)", systemImage: "bolt")
                     }
-                    .disabled(!status.stikDebug || status.state == .failed)
+                    .disabled(!status.providerInstalled)
+                }
+                if status.state == .failed {
+                    NavigationLink {
+                        LogsView()
+                    } label: {
+                        Label("Share the Log", systemImage: "doc.text.magnifyingglass")
+                    }
                 }
             }
             Section {
@@ -188,19 +205,32 @@ struct JitView: View {
                     Text("This device needs StikDebug's universal.js script; other JIT apps cannot prepare Lichii's memory here.")
                 }
             }
-            Section("Details") {
-                LabeledContent("Debugger attached once", value: status.debugged ? "Yes" : "No")
-                LabeledContent("Needs StikDebug script", value: status.needsScript ? "Yes (TXM)" : "No")
-                LabeledContent(provider.label, value: status.stikDebug ? "Installed" : "Not found")
-                LabeledContent("Pool", value: "\(status.prepared >> 20) / \(status.total >> 20) MiB")
+            Section {
+                DisclosureGroup("Details") {
+                    LabeledContent("Debugger attached once", value: status.debugged ? "Yes" : "No")
+                    LabeledContent("Needs StikDebug script", value: status.needsScript ? "Yes (TXM)" : "No")
+                    LabeledContent(provider.label, value: status.providerInstalled ? "Installed" : "Not found")
+                    LabeledContent("Pool", value: "\(status.prepared >> 20) / \(status.total >> 20) MiB")
+                }
             }
             Section {
-                Toggle("Ask StikDebug at launch", isOn: $autoRequest)
+                Toggle("Ask \(provider.label) at launch", isOn: $autoRequest)
             } footer: {
                 Text("Lichii prepares its JIT memory while you browse the library, so games start without waiting.")
             }
         }
         .navigationTitle("JIT")
-        .onReceive(timer) { _ in status = JitStatus.read() }
+        // Polls only while the tab is on screen; the task is cancelled when it disappears.
+        .task(id: provider) {
+            providerInstalled = provider.installed
+            while !Task.isCancelled {
+                status = JitStatus.read(providerInstalled: providerInstalled)
+                try? await Task.sleep(nanoseconds: status.state == .ready ? 2_000_000_000 : 500_000_000)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            // The JIT app may have been installed or removed meanwhile.
+            providerInstalled = provider.installed
+        }
     }
 }

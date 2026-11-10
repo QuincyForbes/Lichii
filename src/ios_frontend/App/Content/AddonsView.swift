@@ -7,7 +7,6 @@ import SwiftUI
 /// Per-game updates, DLC and mods (with the built-in patches) in one screen.
 struct AddonsView: View {
     let game: Game
-    var initialTab: AddonsTab = .updates
 
     enum AddonsTab: String, CaseIterable, Identifiable {
         case updates = "Updates", dlc = "DLC", mods = "Mods"
@@ -15,7 +14,12 @@ struct AddonsView: View {
     }
 
     @Environment(\.dismiss) private var dismiss
-    @State private var tab: AddonsTab = .updates
+    @State private var tab: AddonsTab
+
+    init(game: Game, initialTab: AddonsTab = .updates) {
+        self.game = game
+        _tab = State(initialValue: initialTab)
+    }
     @State private var addons: [ContentBridge.Addon] = []
     @State private var dlc: [ContentBridge.DLC] = []
     @State private var importer: AddonsTab?
@@ -73,10 +77,7 @@ struct AddonsView: View {
                 .disabled(busy)
             }
         }
-        .onAppear {
-            tab = initialTab
-            reload()
-        }
+        .onAppear(perform: reload)
         .refreshable { reload() }
         .fileImporter(isPresented: Binding(get: { importer != nil }, set: { if !$0 { importer = nil } }),
                       allowedContentTypes: importer == .mods ? ContentTypes.mods : ContentTypes.packages,

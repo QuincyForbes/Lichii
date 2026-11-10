@@ -66,13 +66,14 @@ final class AppController: ObservableObject {
         return UIWindow(frame: UIScreen.main.bounds)
     }
 
-    /// The JIT pool is prepared while the library is open, so a launch does not wait for it.
+    /// The JIT pool is prepared while the library is open, so a launch does not wait for it. The
+    /// automatic request waits until onboarding has explained it.
     func requestJitIfNeeded(automatic: Bool) {
         let provider = JitProvider.current
         guard Bridge.jitState == .waiting, provider.installed else { return }
         if automatic {
             guard UserDefaults.standard.object(forKey: "autoRequestJit") as? Bool ?? true,
-                  !jitRequested else { return }
+                  Onboarding.completed, !jitRequested else { return }
         }
         jitRequested = true
         provider.request()

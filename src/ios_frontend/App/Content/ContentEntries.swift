@@ -21,10 +21,9 @@ enum ContentEntries {
 
     static var gameActions: [GameAction] {
         [
-            GameAction(id: "updates", title: "Updates & DLC", systemImage: "square.stack.3d.up",
-                       view: { AnyView(AddonsView(game: $0, initialTab: .updates)) }),
-            GameAction(id: "mods", title: "Mods", systemImage: "puzzlepiece.extension",
-                       view: { AnyView(AddonsView(game: $0, initialTab: .mods)) }),
+            // One screen with Updates, DLC and Mods tabs.
+            GameAction(id: "addons", title: "Updates, DLC & Mods", systemImage: "square.stack.3d.up",
+                       view: { AnyView(AddonsView(game: $0)) }),
             GameAction(id: "cheats", title: "Cheats", systemImage: "wand.and.rays",
                        view: { AnyView(CheatsView(game: $0)) }),
             GameAction(id: "saves", title: "Save Data", systemImage: "externaldrive",
@@ -42,7 +41,8 @@ enum ContentEntries {
 
 /// Setup status at a glance, and the onboarding again.
 struct SetupAssistantView: View {
-    @StateObject private var files = SystemFilesModel()
+    @ObservedObject private var files = SystemFilesModel.shared
+    @State private var jitState = Bridge.jitState
 
     var body: some View {
         List {
@@ -51,7 +51,8 @@ struct SetupAssistantView: View {
                 StatusRow(title: "Firmware", ok: files.firmwareReady,
                           detail: files.firmware.flatMap { $0.version.isEmpty ? nil : "Version \($0.version)" },
                           optional: true)
-                StatusRow(title: "JIT", ok: Bridge.jitState == .ready, detail: "Ready")
+                StatusRow(title: "JIT", ok: jitState == .ready, detail: "Ready",
+                          pending: jitState == .waiting || jitState == .acquiring)
             }
             Section {
                 Button {
@@ -63,5 +64,11 @@ struct SetupAssistantView: View {
         }
         .navigationTitle("Setup Assistant")
         .onAppear { files.refresh() }
+        .task {
+            while !Task.isCancelled && jitState != .ready {
+                jitState = Bridge.jitState
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
     }
 }
