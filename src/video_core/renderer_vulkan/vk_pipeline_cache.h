@@ -146,6 +146,15 @@ public:
         return {graphics_cache.size(), compute_cache.size()};
     }
 
+    /// Size of the driver's VkPipelineCache data, 0 without one.
+    [[nodiscard]] size_t DriverPipelineCacheBytes() const noexcept {
+        size_t size = 0;
+        if (!vulkan_pipeline_cache || vulkan_pipeline_cache.Read(&size, nullptr) != VK_SUCCESS) {
+            return 0;
+        }
+        return size;
+    }
+
     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
 
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,

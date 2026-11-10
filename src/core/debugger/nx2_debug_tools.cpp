@@ -30,10 +30,12 @@
 #include "core/frontend/framebuffer_layout.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
+#include "core/memory_profile.h"
 #include "hid_core/hid_core.h"
 #include "video_core/gpu.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/render_probe.h"
 #include "video_core/renderer_base.h"
 
 namespace Core::Nx2Debug {
@@ -235,6 +237,12 @@ json Status(ToolState& state, const json& params) {
         {"log_filter", state.log_filter},
         {"rejected", HexList(VideoCore::Nx2Debug::RejectedHashes())},
     };
+}
+
+json MemoryProfile(ToolState& state, const json&) {
+    // The renderer logs its own "Memory:" line at its next frame.
+    VideoCore::Probe::memory_report_requests.fetch_add(1, std::memory_order_relaxed);
+    return {{"report", Core::ProfileMemory(state.system)}};
 }
 
 json Screenshot(ToolState& state, const json& params) {
@@ -914,6 +922,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"status", handler(Status)},
         {"screenshot", handler(Screenshot)},
         {"log_tail", handler(LogTail)},
+        {"memory_profile", handler(MemoryProfile)},
         {"log_filter", handler(LogFilter)},
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},

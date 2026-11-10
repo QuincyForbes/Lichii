@@ -16,6 +16,11 @@
 #endif
 #endif
 
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 #include "common/logging.h"
 #include "common/platform_events.h"
 
@@ -85,6 +90,13 @@ ProcessMemory QueryProcessMemory() {
         memory.footprint_peak = info.ledger_phys_footprint_peak;
         memory.compressed = info.compressed;
         memory.reusable = info.reusable;
+    }
+#elif defined(_WIN32)
+    // The closest Windows has: everything resident, guest memory included.
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+        memory.footprint = counters.WorkingSetSize;
+        memory.footprint_peak = counters.PeakWorkingSetSize;
     }
 #endif
     return memory;

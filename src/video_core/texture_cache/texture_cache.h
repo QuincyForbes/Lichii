@@ -506,6 +506,32 @@ std::pair<size_t, u64> TextureCache<P>::ImageMemory() {
 }
 
 template <class P>
+std::array<u64, 6> TextureCache<P>::ImageMemoryKinds() {
+    std::array<u64, 6> kinds{};
+    for (const auto [image_id, image] : slot_images) {
+        const u64 bytes = ImageMemoryBytes(*image);
+        if (True(image->flags & ImageFlagBits::GpuModified)) {
+            kinds[0] += bytes;
+        } else if (True(image->flags & ImageFlagBits::Converted)) {
+            kinds[1] += bytes;
+        } else if (True(image->flags & ImageFlagBits::Rescaled)) {
+            kinds[2] += bytes;
+        } else {
+            kinds[3] += bytes;
+        }
+    }
+    // Deleted images whose memory is not free yet, and EXP42's pool of deleted images.
+    kinds[4] = gpu_sentenced_bytes;
+    for (const u64 bytes : sentenced_image_bytes) {
+        kinds[4] += bytes;
+    }
+    if constexpr (requires { runtime.PooledImageBytes(); }) {
+        kinds[5] = runtime.PooledImageBytes();
+    }
+    return kinds;
+}
+
+template <class P>
 void TextureCache<P>::TickFrame() {
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.

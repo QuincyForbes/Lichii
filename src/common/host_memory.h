@@ -68,7 +68,14 @@ public:
     /// Windows: resident pages of guest memory (backing and its views) that hold only zeros leave
     /// the working set, like HintCold. Apple: resident and compressed zero pages of the backing
     /// leave the footprint (MADV_FREE_REUSABLE). Returns {resident bytes looked at, bytes trimmed}.
+    /// EDEN_NX2_TRIM_ZERO=0 turns it off.
     std::pair<size_t, size_t> TrimZeroPages() const;
+    /// One flag per 4 KiB page of the backing: resident through the backing or a view (Windows
+    /// working set), or resident or compressed (mincore elsewhere). Empty where unknown.
+    std::vector<bool> ResidentPages() const;
+    [[nodiscard]] size_t BackingSize() const noexcept {
+        return backing_size;
+    }
 
     /// Bytes ClearBackingRegion has filled with zeros (memset) since start.
     static u64 ZeroFilledBytes() noexcept;

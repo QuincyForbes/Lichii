@@ -502,6 +502,7 @@ private:
     void TickMemoryReport();
     std::chrono::steady_clock::time_point memory_report_next{};
     u32 memory_report_pressure{};
+    u32 memory_report_requests{};
     u32 malloc_relief_frames{};
     bool trace_sample_frame{true};
     u64 trace_frame{};

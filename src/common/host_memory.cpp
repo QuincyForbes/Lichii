@@ -1231,7 +1231,80 @@ std::atomic<u64> g_zero_filled_bytes{};
     }
     return bits == 0;
 }
+
+#ifdef _WIN32
+/// Addresses of the pages in this process's working set, entries[0] being the count; empty on
+/// failure.
+std::vector<ULONG_PTR> QueryWorkingSetPages() {
+    std::vector<ULONG_PTR> entries(size_t{1} << 22);
+    for (int attempt = 0;; ++attempt) {
+        if (K32QueryWorkingSet(GetCurrentProcess(), entries.data(),
+                               static_cast<DWORD>(entries.size() * sizeof(ULONG_PTR)))) {
+            break;
+        }
+        if (GetLastError() != ERROR_BAD_LENGTH || attempt == 3) {
+            return {};
+        }
+        entries.assign((std::max)(entries.size() * 2, size_t{entries[0]} + (size_t{1} << 18)), 0);
+    }
+    entries.resize((std::min)(size_t{entries[0]}, entries.size() - 1) + 1);
+    return entries;
+}
+#endif
 } // namespace
+
+std::vector<bool> HostMemory::ResidentPages() const {
+    if (backing_base == nullptr) {
+        return {};
+    }
+    std::vector<bool> resident(backing_size / PageAlignment);
+#ifdef _WIN32
+    const std::vector<ULONG_PTR> entries = QueryWorkingSetPages();
+    if (entries.empty()) {
+        return {};
+    }
+    const auto backing_begin = reinterpret_cast<uintptr_t>(backing_base);
+    const auto view_begin = reinterpret_cast<uintptr_t>(impl ? impl->virtual_base : nullptr);
+    const size_t view_size = impl ? impl->virtual_size : 0;
+    for (size_t i = 1; i < entries.size(); ++i) {
+        const uintptr_t page = entries[i] & ~uintptr_t{PageAlignment - 1};
+        if (page - backing_begin < backing_size) {
+            resident[(page - backing_begin) / PageAlignment] = true;
+        } else if (view_begin != 0 && page - view_begin < view_size) {
+            if (const auto offset = impl->BackingOffset(page - view_begin);
+                offset && *offset < backing_size) {
+                resident[*offset / PageAlignment] = true;
+            }
+        }
+    }
+#elif defined(__APPLE__) || defined(__linux__)
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t num_pages = backing_size / page_size;
+#ifdef __APPLE__
+    std::vector<char> residency(num_pages);
+#else
+    std::vector<unsigned char> residency(num_pages);
+#endif
+    if (mincore(backing_base, num_pages * page_size, residency.data()) != 0) {
+        return {};
+    }
+    int counted = 1;
+#ifdef MINCORE_PAGED_OUT
+    counted |= MINCORE_PAGED_OUT;
+#endif
+    const size_t per_page = page_size / PageAlignment;
+    for (size_t index = 0; index < num_pages; ++index) {
+        if ((residency[index] & counted) != 0) {
+            for (size_t i = 0; i < per_page; ++i) {
+                resident[index * per_page + i] = true;
+            }
+        }
+    }
+#else
+    return {};
+#endif
+    return resident;
+}
 
 u64 HostMemory::ZeroFilledBytes() noexcept {
     return g_zero_filled_bytes.load(std::memory_order_relaxed);
@@ -1251,21 +1324,18 @@ u64 HostMemory::ScannedHandedOutBytes() noexcept {
 
 std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
 #ifdef _WIN32
-    if (backing_base == nullptr) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_TRIM_ZERO");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled || backing_base == nullptr) {
         return {0, 0};
     }
-    std::vector<ULONG_PTR> entries(size_t{1} << 22);
-    for (int attempt = 0;; ++attempt) {
-        if (K32QueryWorkingSet(GetCurrentProcess(), entries.data(),
-                               static_cast<DWORD>(entries.size() * sizeof(ULONG_PTR)))) {
-            break;
-        }
-        if (GetLastError() != ERROR_BAD_LENGTH || attempt == 3) {
-            return {0, 0};
-        }
-        entries.assign((std::max)(entries.size() * 2, size_t{entries[0]} + (size_t{1} << 18)), 0);
+    const std::vector<ULONG_PTR> entries = QueryWorkingSetPages();
+    if (entries.empty()) {
+        return {0, 0};
     }
-    const size_t count = (std::min)(size_t{entries[0]}, entries.size() - 1);
+    const size_t count = entries.size() - 1;
     const auto backing_begin = reinterpret_cast<uintptr_t>(backing_base);
     const auto view_begin = reinterpret_cast<uintptr_t>(impl ? impl->virtual_base : nullptr);
     const size_t view_size = impl ? impl->virtual_size : 0;

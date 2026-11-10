@@ -168,6 +168,16 @@ default. The service turns it on at boot. A call without `after` returns the new
 it with `SetGlobalFilter` (`logging.cpp:449`), the call the Qt settings dialog makes. Lines
 already filtered out were never formatted, so the new filter applies only to later lines.
 
+**`memory_profile`** `{}`. `Core::ProfileMemory` (`src/core/memory_profile.cpp`) walks the
+application's memory blocks with `QueryInfo`, maps each page to its backing page, and counts it
+by memory state, split by whether the GPU (SMMU) maps it. Each backing page counts once, as
+non-zero or all-zero and as resident or not (`HostMemory::ResidentPages`). Pages it had to bring
+in are handed back with `HintCold`. On Windows it first splits the working set into guest, image,
+driver-mapped, private data and JIT code, and lists malloc's busy blocks by size and the private
+allocations with the most resident memory. It also asks the renderer for its `Memory:` and
+`Memory detail:` lines (Vulkan memory types, image bytes by kind). It is logged at Info and
+returned as `report`.
+
 **`capture_frame`** `{sampled?, buffers?, timeout_s?, manifest_lines?, index?}`. It reuses
 `FrameDump`. `FrameDump::Arm` (`vk_frame_dump.cpp:268`) points the next capture at a fresh directory and resets
 the per-capture counters, so `EDEN_NX2_FRAME_DUMP` is not needed. When to capture is decided by

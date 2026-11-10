@@ -46,6 +46,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/native_indirect_reset.h"
+#include "video_core/render_probe.h"
 #include "video_core/render_trace.h"
 #include "video_core/indirect_reset.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -3465,17 +3466,22 @@ void RasterizerVulkan::TickMemoryReport() {
 #endif
     }();
     const auto now = std::chrono::steady_clock::now();
-    if (!enabled || now < memory_report_next) {
+    const u32 requests = VideoCore::Probe::memory_report_requests.load(std::memory_order_relaxed);
+    const bool requested = requests != memory_report_requests;
+    memory_report_requests = requests;
+    if (!requested && (!enabled || now < memory_report_next)) {
         return;
     }
     memory_report_next = now + std::chrono::seconds{30};
     const auto process = Common::PlatformEvents::QueryProcessMemory();
     std::pair<size_t, u64> images;
     std::array<u64, 3> collector;
+    std::array<u64, 6> image_kinds;
     {
         std::scoped_lock lock{texture_cache.mutex};
         images = texture_cache.ImageMemory();
         collector = texture_cache.CollectorMemory();
+        image_kinds = texture_cache.ImageMemoryKinds();
     }
     u64 buffer_bytes;
     {
@@ -3499,6 +3505,17 @@ void RasterizerVulkan::TickMemoryReport() {
              staging_pool.CachedBytes() >> 20, graphics_pipelines, compute_pipelines,
              device.IsOptimalAstcSupported() ? "native" : "decoded",
              device.IsOptimalBcnSupported() ? "native" : "decoded");
+    // Where the Vulkan memory goes, for fitting a game into a limit.
+    if (requested || std::getenv("EDEN_NX2_MEMORY_REPORT") != nullptr) {
+        LOG_INFO(Render_Vulkan,
+                 "Memory detail: images (host bytes) GPU-written {} MiB, converted {} MiB, "
+                 "rescaled {} MiB, other {} MiB, deleted {} MiB, pooled {} MiB | {} | driver "
+                 "pipeline cache {} KiB",
+                 image_kinds[0] >> 20, image_kinds[1] >> 20, image_kinds[2] >> 20,
+                 image_kinds[3] >> 20, image_kinds[4] >> 20, image_kinds[5] >> 20,
+                 device.MemoryTypeReport(),
+                 pipeline_cache.DriverPipelineCacheBytes() >> 10);
+    }
 }
 
 bool RasterizerVulkan::AccelerateConditionalRendering() {
