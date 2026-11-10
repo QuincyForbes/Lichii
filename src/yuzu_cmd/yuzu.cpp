@@ -11,6 +11,7 @@
 #include <vector>
 #include <cstdlib>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <csignal>
 #include <cstring>
@@ -20,7 +21,9 @@
 #include <mutex>
 #include <optional>
 #include <regex>
+#include <stop_token>
 #include <string>
+#include <thread>
 #include "common/settings_enums.h"
 #include "core/launch_params.h"
 #ifdef __EMSCRIPTEN__
@@ -78,6 +81,7 @@
 #include <vector>
 #include <os/log.h>
 #include "common/ios_jit.h"
+#include "common/thread.h"
 #include "ios_frontend/lichii_bridge_platform.h"
 #include "yuzu_cmd/ios_support.h"
 #include "hid_core/frontend/emulated_controller.h"
@@ -124,20 +128,29 @@ static std::string IosBundleIdentifier() {
 }
 
 // Startup breadcrumbs for a device without a debugger: os_log (visible in the device syslog) and
-// Documents/lichii-startup.txt. stdout/stderr are also redirected into Documents/console.txt so the
-// console log backend and any printf survive an early exit.
+// Documents/lichii-startup.txt (the previous launch's in lichii-startup.old.txt), with the
+// milliseconds since the first mark. stdout/stderr are also redirected into Documents/console.txt
+// so the console log backend and any printf survive an early exit.
 static std::string IosDocumentsDir() {
     const char* home = std::getenv("HOME");
     return std::string(home ? home : ".") + "/Documents";
 }
 static void IosMark(const char* what) {
-    os_log(OS_LOG_DEFAULT, "[lichii] %{public}s", what);
+    static std::mutex mutex;
     static FILE* marks = nullptr;
+    static const auto start = std::chrono::steady_clock::now();
+    const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+    os_log(OS_LOG_DEFAULT, "[lichii] +%lld ms %{public}s", ms, what);
+    std::scoped_lock lock{mutex};
     if (marks == nullptr) {
-        marks = std::fopen((IosDocumentsDir() + "/lichii-startup.txt").c_str(), "a");
+        const std::string path = IosDocumentsDir() + "/lichii-startup.txt";
+        std::rename(path.c_str(), (IosDocumentsDir() + "/lichii-startup.old.txt").c_str());
+        marks = std::fopen(path.c_str(), "w");
     }
     if (marks != nullptr) {
-        std::fprintf(marks, "%s\n", what);
+        std::fprintf(marks, "+%lld ms %s\n", ms, what);
         std::fflush(marks);
     }
 }
@@ -342,6 +355,24 @@ static void OnStatusMessageReceived(const Network::StatusMessageEntry& msg) {
 
 static std::atomic_bool restart_requested{false};
 
+#ifdef LICHII_IOS_UI
+// The app loads a game on this thread so the UI stays live (shader progress, Cancel, lifecycle).
+// It then waits until the game is shut down: the kernel keeps a host thread record for it, as for
+// Qt's EmuThread.
+struct IosBootSession {
+    std::thread thread;
+    std::stop_source stop;
+    std::mutex mutex;
+    std::condition_variable exit_cv;
+    bool exit{};
+    std::atomic<bool> loaded{};
+    bool started{};
+    SDL_AppResult result{SDL_APP_CONTINUE};
+    Core::LaunchParams lp;
+    std::uint64_t background_task{};
+};
+#endif
+
 struct SdlState {
     Core::System system{};
     // Must outlive emu_window, which keeps a pointer to it.
@@ -367,10 +398,15 @@ struct SdlState {
     std::unique_ptr<SdlConfig> ios_config;
     Core::LaunchParams ios_launch_template;
     Core::SystemResultStatus ios_load_result{Core::SystemResultStatus::Success};
+    std::unique_ptr<IosBootSession> ios_boot;
 #endif
 };
 
 static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp);
+static bool CreateEmuWindow(SdlState* state, bool fullscreen);
+static SDL_AppResult LoadGame(SdlState* state, Core::LaunchParams& lp, bool ios_app,
+                              std::stop_token stop);
+static void StartGame(SdlState* state, const Core::LaunchParams& lp, bool ios_app, bool run);
 
 // The app keeps one system for several games: these run once per process.
 static bool InitializeSystem(SdlState* state) {
@@ -540,6 +576,24 @@ static void* IosGameWindow(SdlState* state) {
                                   SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, nullptr);
 }
 
+// After the game is shut down: lets the boot thread exit. It only waits on exit_cv by then.
+static void IosEndBootSession(SdlState* state) {
+    if (!state->ios_boot) {
+        return;
+    }
+    IosBootSession& boot = *state->ios_boot;
+    IosSupport::EndBackgroundTask(std::exchange(boot.background_task, 0));
+    {
+        std::scoped_lock lock{boot.mutex};
+        boot.exit = true;
+    }
+    boot.exit_cv.notify_all();
+    if (boot.thread.joinable()) {
+        boot.thread.join();
+    }
+    state->ios_boot.reset();
+}
+
 static void IosStopGame(SdlState* state) {
     LOG_INFO(Frontend, "iOS: stopping the game");
     IosSupport::SetTouchControlsVisible(false);
@@ -547,6 +601,7 @@ static void IosStopGame(SdlState* state) {
         void(state->system.Pause());
         state->system.ShutdownMainProcess();
     }
+    IosEndBootSession(state);
     if (state->emu_window) {
         SDL_HideWindow(state->emu_window->GetSdlWindow());
     }
@@ -585,10 +640,91 @@ static void IosBootFailed(SdlState* state) {
     IosFrontend::SetState(LICHII_EMU_FAILED, std::move(error));
 }
 
+// Main thread: the render window (hidden until the game runs, so the launch screen can show the
+// shader progress), then the load on the boot thread.
+static void IosStartBoot(SdlState* state, Core::LaunchParams lp) {
+    // Movies: software decoding (dav1d for AV1); the VideoToolbox AV1 hwaccel failed every frame.
+    Settings::values.nvdec_emulation.SetValue(Settings::NvdecEmulation::Cpu);
+    state->ios_load_result = Core::SystemResultStatus::Success;
+    if (!CreateEmuWindow(state, lp.fullscreen)) {
+        IosBootFailed(state);
+        return;
+    }
+    SDL_HideWindow(state->emu_window->GetSdlWindow());
+    auto session = std::make_unique<IosBootSession>();
+    session->lp = std::move(lp);
+    // A launch left in the background keeps loading for the time iOS gives a background task.
+    session->background_task = IosSupport::BeginBackgroundTask("lichii-boot");
+    IosBootSession* const boot = session.get();
+    state->ios_boot = std::move(session);
+    boot->thread = std::thread([state, boot] {
+        Common::SetCurrentThreadName("LichiiBoot");
+        boot->result = LoadGame(state, boot->lp, true, boot->stop.get_token());
+        boot->loaded.store(true, std::memory_order_release);
+        std::unique_lock lock{boot->mutex};
+        boot->exit_cv.wait(lock, [boot] { return boot->exit; });
+    });
+}
+
+// Main thread, once the boot thread has loaded the game (or given up).
+static void IosFinishBoot(SdlState* state) {
+    IosBootSession& boot = *state->ios_boot;
+    boot.started = true;
+    IosSupport::EndBackgroundTask(std::exchange(boot.background_task, 0));
+    unsetenv("EDEN_CLI_RESTART_HANDOFF");
+    if (boot.stop.stop_requested()) {
+        LOG_INFO(Frontend, "iOS: launch cancelled");
+        IosStopGame(state);
+        return;
+    }
+    if (boot.result != SDL_APP_CONTINUE) {
+        IosBootFailed(state);
+        return;
+    }
+    IOS_MARK("game loaded");
+    SDL_ShowWindow(state->emu_window->GetSdlWindow());
+    // Loaded while the app was inactive (a call, the app switcher): the game waits paused, as it
+    // would have been paused then; the app shows its menu.
+    StartGame(state, boot.lp, true, IosSupport::IsActive());
+}
+
+// The main callbacks run off a CADisplayLink: slow while nothing happens on the SDL side (library,
+// paused), faster while a launch is pending (JIT, boot) and while the game runs.
+static void IosUpdateCallbackRate() {
+    static int current = 0;
+    int rate = 10;
+    switch (IosFrontend::GetState()) {
+    case LICHII_EMU_WAITING_FOR_JIT:
+    case LICHII_EMU_BOOTING:
+        rate = 30;
+        break;
+    case LICHII_EMU_RUNNING:
+        rate = 60;
+        break;
+    default:
+        break;
+    }
+    if (rate != current) {
+        current = rate;
+        SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, std::to_string(rate).c_str());
+    }
+}
+
 // Launches, stops and JIT waits requested by the app. Returns a result when this frame is done.
 static std::optional<SDL_AppResult> IosAppIterate(SdlState* state) {
     using Common::IosJit::State;
-    if (IosFrontend::TakeCancelRequest() && state->pending_launch) {
+    IosUpdateCallbackRate();
+    const bool cancel = IosFrontend::TakeCancelRequest();
+    if (state->ios_boot && !state->ios_boot->started) {
+        if (cancel) {
+            state->ios_boot->stop.request_stop();
+        }
+        if (state->ios_boot->loaded.load(std::memory_order_acquire)) {
+            IosFinishBoot(state);
+        }
+        return SDL_APP_CONTINUE;
+    }
+    if (cancel && state->pending_launch) {
         state->pending_launch.reset();
         IosFrontend::SetState(LICHII_EMU_IDLE);
     }
@@ -623,12 +759,7 @@ static std::optional<SDL_AppResult> IosAppIterate(SdlState* state) {
             IosFrontend::SetState(LICHII_EMU_BOOTING);
             Core::LaunchParams lp = std::move(*state->pending_launch);
             state->pending_launch.reset();
-            state->ios_load_result = Core::SystemResultStatus::Success;
-            const SDL_AppResult result = SDL_AppInitRest(state, std::move(lp));
-            unsetenv("EDEN_CLI_RESTART_HANDOFF");
-            if (result != SDL_APP_CONTINUE) {
-                IosBootFailed(state);
-            }
+            IosStartBoot(state, std::move(lp));
         } else if (jit == State::Failed) {
             IosFrontend::EndJitBackgroundTask();
             state->pending_launch.reset();
@@ -1086,38 +1217,60 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
         return SDL_APP_FAILURE;
     }
 
-#ifdef LICHII_IOS_UI
-    if (ios_app) {
-        IosFrontend::ApplyGameConfig(IosFrontend::ReadProgramId(lp.filepath));
-    }
-#endif
-
     // Apply the command line arguments
     state->system.ApplySettings();
 
     // A second game in the same app session renders into the window of the first.
     if (state->emu_window) {
         SDL_ShowWindow(state->emu_window->GetSdlWindow());
-    } else {
-        switch (Settings::values.renderer_backend.GetValue()) {
-#ifdef HAS_OPENGL
-        case Settings::RendererBackend::OpenGL_GLSL:
-        case Settings::RendererBackend::OpenGL_GLASM:
-        case Settings::RendererBackend::OpenGL_SPIRV:
-            state->emu_window = std::make_unique<EmuWindow_SDL3_GL>(&state->input_subsystem, state->system, lp.fullscreen);
-            break;
-#endif
-        case Settings::RendererBackend::Vulkan:
-            state->emu_window = std::make_unique<EmuWindow_SDL3_VK>(&state->input_subsystem, state->system, lp.fullscreen);
-            break;
-        case Settings::RendererBackend::Null:
-            state->emu_window = std::make_unique<EmuWindow_SDL3_Null>(&state->input_subsystem, state->system, lp.fullscreen);
-            break;
-        default:
-            LOG_CRITICAL(Frontend, "Invalid renderer backend");
-            return SDL_APP_FAILURE;
-        }
+    } else if (!CreateEmuWindow(state, lp.fullscreen)) {
+        return SDL_APP_FAILURE;
     }
+
+    if (const SDL_AppResult result = LoadGame(state, lp, false, std::stop_token{});
+        result != SDL_APP_CONTINUE) {
+        return result;
+    }
+    StartGame(state, lp, false, true);
+    return SDL_APP_CONTINUE;
+}
+
+// Main thread (SDL creates UIKit windows and Metal views there).
+static bool CreateEmuWindow(SdlState* state, bool fullscreen) {
+    if (state->emu_window) {
+        return true;
+    }
+    switch (Settings::values.renderer_backend.GetValue()) {
+#ifdef HAS_OPENGL
+    case Settings::RendererBackend::OpenGL_GLSL:
+    case Settings::RendererBackend::OpenGL_GLASM:
+    case Settings::RendererBackend::OpenGL_SPIRV:
+        state->emu_window = std::make_unique<EmuWindow_SDL3_GL>(&state->input_subsystem, state->system, fullscreen);
+        break;
+#endif
+    case Settings::RendererBackend::Vulkan:
+        state->emu_window = std::make_unique<EmuWindow_SDL3_VK>(&state->input_subsystem, state->system, fullscreen);
+        break;
+    case Settings::RendererBackend::Null:
+        state->emu_window = std::make_unique<EmuWindow_SDL3_Null>(&state->input_subsystem, state->system, fullscreen);
+        break;
+    default:
+        LOG_CRITICAL(Frontend, "Invalid renderer backend");
+        return false;
+    }
+    return true;
+}
+
+// The game load, the GPU and the disk shader cache. The iOS app runs this on its boot thread
+// (which also applies the game's settings); `stop` ends the shader cache load early.
+static SDL_AppResult LoadGame(SdlState* state, Core::LaunchParams& lp,
+                              [[maybe_unused]] bool ios_app, std::stop_token stop) {
+#ifdef LICHII_IOS_UI
+    if (ios_app) {
+        IosFrontend::ApplyGameConfig(IosFrontend::ReadProgramId(lp.filepath));
+        state->system.ApplySettings();
+    }
+#endif
 
 #ifdef _WIN32
     Common::Windows::SetCurrentTimerResolutionToMaximum();
@@ -1155,6 +1308,9 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
             static_cast<Service::AM::AppletId>(LichiiContent::TakePendingAppletId(lp.filepath));
     }
 #endif
+    if (stop.stop_requested()) {
+        return SDL_APP_CONTINUE;
+    }
     IOS_MARK("system.Load");
     const Core::SystemResultStatus load_result = state->system.Load(*state->emu_window, lp.filepath, load_parameters);
     IOS_MARK("system.Load returned");
@@ -1210,17 +1366,28 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
     state->system.GPU().Start();
     state->system.GetCpuManager().OnGpuReady();
 
-    if (Settings::values.use_disk_shader_cache.GetValue()) {
+    if (Settings::values.use_disk_shader_cache.GetValue() && !stop.stop_requested()) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        lichii_platform_note_shader_progress(LICHII_SHADER_PREPARE, 0, 0);
+#endif
         state->system.Renderer().ReadRasterizer()->LoadDiskResources(
-            state->system.GetApplicationProcessProgramID(), std::stop_token{},
+            state->system.GetApplicationProcessProgramID(), stop,
             []([[maybe_unused]] VideoCore::LoadCallbackStage stage,
                [[maybe_unused]] size_t value, [[maybe_unused]] size_t total) {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
                 lichii_platform_note_shader_progress(static_cast<int>(stage), value, total);
 #endif
             });
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        lichii_platform_note_shader_progress(LICHII_SHADER_COMPLETE, 0, 0);
+#endif
     }
+    return SDL_APP_CONTINUE;
+}
 
+// Main thread: callbacks, then the guest starts (`run`), or waits paused for the app.
+static void StartGame(SdlState* state, [[maybe_unused]] const Core::LaunchParams& lp,
+                      [[maybe_unused]] bool ios_app, bool run) {
     // don't do anything, SDL3 already exists for us :D
     state->system.RegisterExitCallback([] {});
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -1265,7 +1432,7 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
 
     // QLaunch launched applications (should) now reload shader cache.
     static std::mutex shader_cache_reload_mutex;
-    state->system.RegisterApplicationChangedCallback([&state](u64 changed_program_id) {
+    state->system.RegisterApplicationChangedCallback([state](u64 changed_program_id) {
         if (!Settings::values.use_disk_shader_cache.GetValue()) {
             return;
         }
@@ -1286,19 +1453,20 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
         state->system.Run();
     });
 
-    IOS_MARK("system.Run");
-    void(state->system.Run());
+    if (run) {
+        IOS_MARK("system.Run");
+        void(state->system.Run());
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-    lichii_platform_set_playing(1);
+        lichii_platform_set_playing(1);
 #endif
+    }
     if (state->system.DebuggerEnabled())
         state->system.InitializeDebugger();
 #ifdef LICHII_IOS_UI
     if (ios_app) {
-        IosFrontend::SetState(LICHII_EMU_RUNNING);
+        IosFrontend::SetState(run ? LICHII_EMU_RUNNING : LICHII_EMU_PAUSED);
     }
 #endif
-    return SDL_APP_CONTINUE;
 }
 // EDEN_NX2_KEY_SCRIPT="seconds:code,seconds:-code,..." (or "@<file>"): press (code) or release (-code) keyboard
 // keys, by SDL scancode, that many seconds after start. Lets hidden test runs drive menus.
@@ -1566,6 +1734,14 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     if (!state) {
         return;
     }
+#ifdef LICHII_IOS_UI
+    // Still loading a game: the boot thread is left to the process exit with the state it uses.
+    if (state->ios_boot && !state->ios_boot->loaded.load(std::memory_order_acquire)) {
+        state->ios_boot->stop.request_stop();
+        state->ios_boot->thread.detach();
+        return;
+    }
+#endif
     state->system.DetachDebugger();
     // SDL calls this even when SDL_AppInit never powered the system on (no ROM given, --help or
     // --version): the kernel is uninitialised then, and Pause()/ShutdownMainProcess() would
@@ -1574,6 +1750,9 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         void(state->system.Pause());
         state->system.ShutdownMainProcess();
     }
+#ifdef LICHII_IOS_UI
+    IosEndBootSession(state);
+#endif
     const bool network_initialized = state->network_initialized;
     delete state;
     if (network_initialized) {

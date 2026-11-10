@@ -7,6 +7,7 @@
 //  Created by Stossy11 on 26/1/2026.
 //
 
+import Combine
 import SwiftUI
 
 public struct ButtonView: View {
@@ -69,6 +70,19 @@ public struct ButtonView: View {
             }
             .onChange(of: controllerScale) { _ in
                 size = calculateButtonSize()
+            }
+            // Lichii: the app already released the input (menu, inactive app); a toggled button
+            // would otherwise look held and need two taps to press again.
+            .onReceive(NotificationCenter.default.publisher(for: .lichiiTouchReleased)) { _ in
+                toggleState = false
+                isPressed = false
+            }
+            .accessibilityElement()
+            .accessibilityLabel(button.accessibilityName)
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction {
+                handleButtonPress()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { handleButtonRelease() }
             }
             .overlay {
                 if !disabled {

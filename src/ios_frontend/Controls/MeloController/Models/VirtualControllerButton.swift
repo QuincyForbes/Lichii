@@ -46,6 +46,27 @@ public extension VirtualControllerButton {
     var isSmall: Bool {
         Self.registered.contains(where: { $0.id == id && $0.small })
     }
+
+    /// Lichii: the Switch name, for VoiceOver.
+    var accessibilityName: String {
+        switch id {
+        case "back": return "Minus"
+        case "start": return "Plus"
+        case "leftStick": return "Left Stick Press"
+        case "rightStick": return "Right Stick Press"
+        case "leftShoulder": return "L"
+        case "rightShoulder": return "R"
+        case "leftTrigger": return "ZL"
+        case "rightTrigger": return "ZR"
+        case "dPadUp": return "D-Pad Up"
+        case "dPadDown": return "D-Pad Down"
+        case "dPadLeft": return "D-Pad Left"
+        case "dPadRight": return "D-Pad Right"
+        case "home": return "Home"
+        case "capture": return "Capture"
+        default: return id
+        }
+    }
 }
 
 public extension VirtualControllerButton {

@@ -48,6 +48,18 @@ std::atomic<State> g_state{State::Waiting};
 std::mutex g_error_mutex;
 std::string g_error;
 std::atomic<bool> g_thread_started{false};
+std::atomic<StateCallback> g_state_callback{nullptr};
+
+void NotifyState() {
+    if (const StateCallback callback = g_state_callback.load()) {
+        callback();
+    }
+}
+
+void SetState(State state) {
+    g_state = state;
+    NotifyState();
+}
 
 void SetFailed(const std::string& error) {
     {
@@ -55,7 +67,7 @@ void SetFailed(const std::string& error) {
         g_error = error;
     }
     LOG_CRITICAL(Common, "iOS JIT: {}", error);
-    g_state = State::Failed;
+    SetState(State::Failed);
 }
 
 // brk-based "syscalls" serviced by StikDebug's universal.js (x16 = command).
@@ -129,8 +141,8 @@ bool PublishPool(std::vector<Region> regions) {
         g_pool = std::move(regions);
         g_pool_ready = true;
     }
-    g_state = State::Ready;
     LOG_INFO(Common, "iOS JIT: pool ready ({} MiB), self-test passed", total >> 20);
+    SetState(State::Ready);
     return true;
 }
 
@@ -159,8 +171,8 @@ std::uint8_t* MapWritableAlias(std::uint8_t* rx, std::size_t bytes, std::string&
 // answered the first request (JIT was enabled without one) so the caller asks again later; true
 // once the requests were answered, failed or not.
 bool AcquireThroughDebugger(std::size_t bytes) {
-    g_state = State::Acquiring;
     g_prepared = 0;
+    SetState(State::Acquiring);
     std::vector<Region> regions;
     std::string error;
     while (g_prepared < bytes) {
@@ -168,7 +180,7 @@ bool AcquireThroughDebugger(std::size_t bytes) {
         auto* rx = static_cast<std::uint8_t*>(Jit26PrepareRegion(nullptr, chunk));
         if (rx == nullptr) {
             if (regions.empty()) {
-                g_state = State::Waiting;
+                SetState(State::Waiting);
                 return false;
             }
             error = "the debugger stopped answering after " +
@@ -182,6 +194,7 @@ bool AcquireThroughDebugger(std::size_t bytes) {
         regions.push_back(Region{rx, rw, chunk, 0});
         g_prepared += chunk;
         LOG_INFO(Common, "iOS JIT: prepared {} of {} MiB", g_prepared.load() >> 20, bytes >> 20);
+        NotifyState();
     }
     // Done with the debugger; StikDebug returns to its UI (and to this app when it was asked
     // through its URL scheme).
@@ -196,7 +209,7 @@ bool AcquireThroughDebugger(std::size_t bytes) {
 
 // Pre-TXM: a debugged process may map RWX directly.
 bool AcquireRwx(std::size_t bytes) {
-    g_state = State::Acquiring;
+    SetState(State::Acquiring);
     void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (p == MAP_FAILED) {
         SetFailed(std::string("RWX mapping refused (") + strerror(errno) +
@@ -215,6 +228,7 @@ void AcquireThread(std::size_t bytes, bool txm) {
              Debugged(), DebuggerAttached());
     InstallTrapGuard();
     std::chrono::steady_clock::time_point unanswered_since{};
+    const auto started = std::chrono::steady_clock::now();
     while (true) {
         if (txm) {
             // StikDebug's protocol: once the process is debugged, call into the script. Its
@@ -244,7 +258,10 @@ void AcquireThread(std::size_t bytes, bool txm) {
             AcquireRwx(bytes);
             return;
         }
-        std::this_thread::sleep_for(50ms);
+        // Quick at first (StikDebug attaches right after the launch request), then 4 Hz for the
+        // rest of a session without JIT.
+        std::this_thread::sleep_for(std::chrono::steady_clock::now() - started < 15s ? 50ms
+                                                                                    : 250ms);
     }
 }
 
@@ -290,6 +307,10 @@ std::string GetError() {
 
 std::size_t PreparedBytes() {
     return g_prepared.load();
+}
+
+void SetStateCallback(StateCallback callback) {
+    g_state_callback = callback;
 }
 
 bool Alloc(std::size_t bytes, void** wmem, void** xmem) {
