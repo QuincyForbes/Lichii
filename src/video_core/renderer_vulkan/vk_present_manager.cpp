@@ -394,7 +394,6 @@ void PresentManager::PresentThread(std::stop_token token) {
                 std::this_thread::sleep_for(next_present - now);
             }
             CopyToSwapchain(frame);
-            previous_generated = frame->generated;
             next_present = std::chrono::steady_clock::now() + frame->present_spacing;
             {
                 static std::chrono::steady_clock::time_point previous{};
@@ -435,15 +434,7 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
         !Settings::values.frame_gen.GetValue() && Settings::values.use_speed_limit.GetValue() &&
         Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo;
     pacer.Refresh(allowed, refresh_monitor);
-    // Frame generation: a generated frame and the real one after it (or the other way round)
-    // must not reach a mailbox swapchain within one refresh, where the second replaced the first.
-    // Wait for the previous one to be shown, as the pacer does.
-    const bool space_generated =
-        (frame->generated || previous_generated) && Settings::values.frame_gen.GetValue() &&
-        (mode == VK_PRESENT_MODE_MAILBOX_KHR || mode == VK_PRESENT_MODE_IMMEDIATE_KHR) &&
-        pacer.RefreshKnown() && !pacer.Broken();
-    if (const u64 want = pacer.Outstanding();
-        (pacer.Pacing() || space_generated) && want != 0) {
+    if (const u64 want = pacer.Outstanding(); pacer.Pacing() && want != 0) {
         // The next target counts from the refresh the previous frame was shown at.
         Common::Nx2Timeline::Span span{"present: wait until shown"};
         // At most a refresh and a half: a driver whose present wait never signals would hold

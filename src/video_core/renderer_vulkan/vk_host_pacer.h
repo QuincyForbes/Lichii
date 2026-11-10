@@ -90,14 +90,6 @@ public:
     /// Re-reads the switch, and takes the display's refresh period when `monitor` has a new one.
     void Refresh(bool allowed, const DisplayRefreshMonitor& monitor);
 
-    /// Present wait does not signal on this driver (see NoteShownWait).
-    [[nodiscard]] bool Broken() const {
-        return broken;
-    }
-
-    [[nodiscard]] bool RefreshKnown() const {
-        return refresh_known;
-    }
 
     /// When the next frame should be handed to the swapchain; `now` or earlier = at once.
     [[nodiscard]] Clock::time_point Target(Clock::time_point now);
