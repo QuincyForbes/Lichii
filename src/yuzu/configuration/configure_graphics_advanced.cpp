@@ -64,6 +64,29 @@ void ConfigureGraphicsAdvanced::Setup(const ConfigurationShared::Builder& builde
     for (const auto& [id, widget] : normal_hold) {
         normal_layout.addWidget(widget);
     }
+
+    const auto held = [&normal_hold](const Settings::BasicSetting& setting) -> QWidget* {
+        const auto it = normal_hold.find(setting.Id());
+        return it != normal_hold.end() ? it->second : nullptr;
+    };
+    if (Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Vulkan) {
+        const QString reason = tr("Vulkan only: the renderer is set to another API (Graphics tab).");
+        ConfigurationShared::SetUnavailable(held(Settings::values.renderer_force_max_clock), reason);
+        ConfigurationShared::SetUnavailable(held(Settings::values.frame_pacing_mode), reason);
+    }
+    // nx2_gsv.h PaceToVblank only holds the two-vblank interval at a 60 Hz vsync event with the
+    // speed limited.
+    if (const u32 hz = Settings::values.frame_rate_limit.GetValue(); hz != 60) {
+        ConfigurationShared::SetUnavailable(
+            held(Settings::values.oot_30fps),
+            tr("Has no effect while Frame rate limit (Switch 2) is %1 Hz: set it to 60 Hz in the "
+               "Graphics tab first.")
+                .arg(hz));
+    } else if (!Settings::values.use_speed_limit.GetValue()) {
+        ConfigurationShared::SetUnavailable(
+            held(Settings::values.oot_30fps),
+            tr("Has no effect while the speed limit is off (Configure > General)."));
+    }
 }
 
 void ConfigureGraphicsAdvanced::ApplyConfiguration() {

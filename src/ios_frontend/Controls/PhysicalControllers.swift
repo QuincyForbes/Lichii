@@ -126,17 +126,20 @@ final class PhysicalControllers: ObservableObject {
         pads.append(pad)
         lichii_post_event(Int32(LICHII_EVENT_CONTROLLERS_CHANGED.rawValue))
         updateDeviceMotion()
+        ControlsCenter.shared.controllerConnected(pad.name, player: pad.player)
     }
 
     private func disconnect(_ controller: GCController) {
         guard let index = pads.firstIndex(where: { $0.controller === controller }) else { return }
         let pad = pads.remove(at: index)
+        let player = pad.player
         pad.rumble?.stop()
         pad.rumble = nil
         controller.motion?.valueChangedHandler = nil
         lichii_pad_disconnect(pad.slot)
         lichii_post_event(Int32(LICHII_EVENT_CONTROLLERS_CHANGED.rawValue))
         updateDeviceMotion()
+        ControlsCenter.shared.controllerDisconnected(pad.name, drovePlayer: player >= 0)
     }
 
     private static func kind(of controller: GCController) -> Int32 {
@@ -240,10 +243,10 @@ final class PhysicalControllers: ObservableObject {
         }
     }
 
-    /// Device motion for player 1 while no controller with sensors drives it.
+    /// Device motion for player 1 while the game runs and no controller with sensors drives it.
     func updateDeviceMotion() {
         let wanted = deviceMotionEnabled && ControlsCenter.shared.gameRunning &&
-            !pads.contains { $0.player == 0 && $0.hasMotion }
+            Bridge.emuState == .running && !pads.contains { $0.player == 0 && $0.hasMotion }
         if wanted == motionManager.isDeviceMotionActive { return }
         guard wanted else {
             motionManager.stopDeviceMotionUpdates()
@@ -409,7 +412,10 @@ private let deviceMotionHandler: CMDeviceMotionHandler = { data, _ in
     }
 }
 
-/// The device orientation, readable from any thread (CoreMotion delivers on its own queue).
+/// The way the game's picture is turned, as the device orientation the motion remap expects;
+/// readable from any thread (CoreMotion delivers on its own queue). It follows the interface, not
+/// the device: with the rotation locked to landscape, tilting the phone upright while aiming must
+/// not turn the gyro axes.
 enum DeviceOrientation {
     private static let lock = NSLock()
     private static var value: UIDeviceOrientation = .landscapeLeft
@@ -422,8 +428,17 @@ enum DeviceOrientation {
 
     @MainActor
     static func update() {
-        let orientation = UIDevice.current.orientation
-        guard orientation.isValidInterfaceOrientation else { return }
+        let scene = ControlsCenter.shared.gameWindow?.windowScene ??
+            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        let orientation: UIDeviceOrientation
+        // Interface left/right are the device's right/left (the home side).
+        switch scene?.interfaceOrientation {
+        case .landscapeLeft: orientation = .landscapeRight
+        case .landscapeRight: orientation = .landscapeLeft
+        case .portraitUpsideDown: orientation = .portraitUpsideDown
+        case .portrait: orientation = .portrait
+        default: return
+        }
         lock.lock()
         value = orientation
         lock.unlock()

@@ -71,8 +71,8 @@ enum JitProvider: String, CaseIterable, Identifiable {
     }
 }
 
-/// Snapshot of the JIT pool state, refreshed by the views that show it.
-struct JitStatus {
+/// Snapshot of the JIT pool state (AppController.jit keeps the current one).
+struct JitStatus: Equatable {
     var state: JitState = .waiting
     var prepared: UInt64 = 0
     var total: UInt64 = 0
@@ -85,13 +85,16 @@ struct JitStatus {
 
     var stikDebug: Bool { providerInstalled }
 
-    /// `providerInstalled` skips the canOpenURL check when the caller already knows it.
-    @MainActor static func read(providerInstalled: Bool? = nil) -> JitStatus {
-        let provider = JitProvider.current
-        return JitStatus(state: Bridge.jitState, prepared: lichii_jit_prepared_bytes(),
-                         total: lichii_jit_pool_bytes(), error: Bridge.jitError,
-                         debugged: lichii_jit_debugged(), needsScript: lichii_jit_needs_script(),
-                         providerInstalled: providerInstalled ?? provider.installed, provider: provider)
+    @MainActor static func read() -> JitStatus {
+        read(installed: JitProvider.current.installed)
+    }
+
+    /// Without asking iOS whether the JIT app is installed (canOpenURL is an IPC).
+    @MainActor static func read(installed: Bool) -> JitStatus {
+        JitStatus(state: Bridge.jitState, prepared: lichii_jit_prepared_bytes(),
+                  total: lichii_jit_pool_bytes(), error: Bridge.jitError,
+                  debugged: lichii_jit_debugged(), needsScript: lichii_jit_needs_script(),
+                  providerInstalled: installed, provider: JitProvider.current)
     }
 
     var progress: Double {
@@ -171,10 +174,10 @@ struct JitStatusCard: View {
 
 struct JitView: View {
     @EnvironmentObject private var app: AppController
-    @State private var status = JitStatus.read()
     @AppStorage("autoRequestJit") private var autoRequest = true
     @AppStorage("jitProvider") private var provider: JitProvider = .stikDebug
-    @State private var providerInstalled: Bool?
+
+    private var status: JitStatus { app.jit }
 
     var body: some View {
         List {
@@ -220,17 +223,6 @@ struct JitView: View {
             }
         }
         .navigationTitle("JIT")
-        // Polls only while the tab is on screen; the task is cancelled when it disappears.
-        .task(id: provider) {
-            providerInstalled = provider.installed
-            while !Task.isCancelled {
-                status = JitStatus.read(providerInstalled: providerInstalled)
-                try? await Task.sleep(nanoseconds: status.state == .ready ? 2_000_000_000 : 500_000_000)
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
-            // The JIT app may have been installed or removed meanwhile.
-            providerInstalled = provider.installed
-        }
+        .onChange(of: provider) { _ in app.refreshJit(checkProvider: true) }
     }
 }

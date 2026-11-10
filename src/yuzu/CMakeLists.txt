@@ -393,6 +393,20 @@ if (APPLE)
 
     set_target_properties(yuzu PROPERTIES MACOSX_BUNDLE TRUE)
     set_target_properties(yuzu PROPERTIES MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist)
+    # The same id as the Linux desktop file. Not yuzu's: macOS keyed preferences and privacy
+    # permissions to it. User data lives in the eden folders and does not depend on the id.
+    if (LICHII_BUILD_TAG MATCHES "^build-([0-9]+)$")
+        set(_bundle_version "${CMAKE_MATCH_1}")
+    else()
+        set(_bundle_version "0")
+    endif()
+    set_target_properties(yuzu PROPERTIES
+        MACOSX_BUNDLE_GUI_IDENTIFIER "io.github.zortos293.lichii"
+        MACOSX_BUNDLE_BUNDLE_NAME "Lichii"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${_bundle_version}"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${_bundle_version}"
+        MACOSX_BUNDLE_LONG_VERSION_STRING "Lichii ${LICHII_BUILD_TAG}"
+        MACOSX_BUNDLE_INFO_STRING "Lichii ${LICHII_BUILD_TAG}")
 
     set(CMAKE_FIND_LIBRARY_SUFFIXES ".dylib")
     find_library(MOLTENVK_LIBRARY MoltenVK REQUIRED)
@@ -430,6 +444,10 @@ endif()
 
 if (ENABLE_WEB_SERVICE)
     target_compile_definitions(yuzu PRIVATE ENABLE_WEB_SERVICE)
+endif()
+
+if (ENABLE_NSIGHT_AFTERMATH)
+    target_compile_definitions(yuzu PRIVATE HAS_NSIGHT_AFTERMATH)
 endif()
 
 if (YUZU_USE_QT_MULTIMEDIA)

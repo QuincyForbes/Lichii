@@ -54,6 +54,10 @@ std::string GetError();
 /// Bytes of the pool prepared so far (for progress while Acquiring).
 std::size_t PreparedBytes();
 
+/// Called on the acquiring thread whenever the state or the prepared bytes change.
+using StateCallback = void (*)();
+void SetStateCallback(StateCallback callback);
+
 /// Carve a dual-mapped block out of the pool. *wmem is the writable alias, *xmem the executable
 /// view of the same pages. Returns false when the pool is missing or exhausted.
 bool Alloc(std::size_t bytes, void** wmem, void** xmem);

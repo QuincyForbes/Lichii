@@ -808,7 +808,7 @@ jobs:
 
           | Build Type | Standard | PGO (Recommended) | Notes |
           | --- | --- | --- | --- |
-          | arm64 (Apple Silicon) | [dmg](${base}/lichii-macos-arm64.dmg) · [zip](${base}/lichii-macos-arm64.zip) | | macOS 15 or newer. Not notarized: right-click and choose Open the first time, or run \`xattr -dr com.apple.quarantine lichii.app\`. \`eden-cli\` is inside the app, in \`Contents/MacOS\` |
+          | arm64 (Apple Silicon) | [dmg](${base}/lichii-macos-arm64.dmg) · [zip](${base}/lichii-macos-arm64.zip) | | macOS 15 or newer. Not notarized: on first launch macOS blocks it; open System Settings > Privacy & Security and click Open Anyway, or run \`xattr -dr com.apple.quarantine lichii.app\`. \`eden-cli\` is inside the app, in \`Contents/MacOS\` |
           | x86_64 (Intel) | [dmg](${base}/lichii-macos-x86_64.dmg) · [zip](${base}/lichii-macos-x86_64.zip) | | Same notes as Apple Silicon |
 
           ## iOS

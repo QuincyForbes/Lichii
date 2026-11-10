@@ -26,6 +26,7 @@ class QPushButton;
 class QEvent;
 class QObject;
 class QComboBox;
+class QLabel;
 
 namespace Settings {
 enum class NvdecEmulation : u32;
@@ -74,6 +75,11 @@ private:
 
     void RetrieveVulkanDevices();
 
+    /// Greys out the DLSS and frame generation settings the selected renderer, GPU or build can't
+    /// use, with the reason in the tooltip.
+    void UpdateFeatureAvailability();
+    void UpdateLosslessStatus();
+
     /* Turns a Vulkan present mode into a textual string for a UI
      * (and eventually for a human to read) */
     const QString TranslateVSyncMode(VkPresentModeKHR mode,
@@ -110,4 +116,10 @@ private:
     QWidget* api_widget;
     QComboBox* aspect_ratio_combobox;
     QComboBox* resolution_combobox;
+
+    QWidget* nvidia_dlss_widget{};
+    QWidget* nvidia_dlss_preset_widget{};
+    QWidget* frame_gen_widget{};
+    QComboBox* frame_gen_type_combobox{};
+    QLabel* lossless_status_label{};
 };

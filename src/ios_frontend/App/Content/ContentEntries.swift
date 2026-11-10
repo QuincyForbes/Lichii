@@ -43,7 +43,10 @@ enum ContentEntries {
 /// Setup status at a glance, and the onboarding again.
 struct SetupAssistantView: View {
     @ObservedObject private var files = SystemFilesModel.shared
-    @State private var jitState = Bridge.jitState
+    /// Follows LICHII_EVENT_JIT_CHANGED.
+    @ObservedObject private var app = AppController.shared
+
+    private var jitState: JitState { app.jit.state }
 
     var body: some View {
         List {
@@ -65,11 +68,5 @@ struct SetupAssistantView: View {
         }
         .navigationTitle("Setup Assistant")
         .onAppear { files.refresh() }
-        .task {
-            while !Task.isCancelled && jitState != .ready {
-                jitState = Bridge.jitState
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-            }
-        }
     }
 }

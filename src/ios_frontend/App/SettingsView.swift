@@ -190,7 +190,8 @@ private struct AdvancedSettingsView: View {
 
 /// Build, JIT and device summary at the top of the global settings.
 private struct StatusHeader: View {
-    @State private var jitText = StatusHeader.readJit()
+    /// Follows LICHII_EVENT_JIT_CHANGED.
+    @ObservedObject private var app = AppController.shared
 
     var body: some View {
         Section {
@@ -198,12 +199,11 @@ private struct StatusHeader: View {
             LabeledContent("JIT", value: jitText)
             DeviceInfoRows()
         }
-        .onAppear { jitText = Self.readJit() }
     }
 
-    @MainActor private static func readJit() -> String {
-        switch Bridge.jitState {
-        case .waiting: return lichii_jit_debugged() ? "Attached, waiting for the script" : "Not enabled"
+    private var jitText: String {
+        switch app.jit.state {
+        case .waiting: return app.jit.debugged ? "Attached, waiting for the script" : "Not enabled"
         case .acquiring: return "Preparing"
         case .ready: return "Ready"
         case .failed: return "Failed"

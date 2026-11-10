@@ -22,6 +22,26 @@
 #include <QPainter>
 #include <QValueAxis>
 
+#ifdef HAS_LSFG
+#include <filesystem>
+#include "video_core/frame_gen/lossless_dll.h"
+#endif
+
+namespace {
+
+// LSFG without its Lossless.dll never generates a frame.
+bool LosslessMissing() {
+#ifdef HAS_LSFG
+    std::error_code ec;
+    return Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Lsfg &&
+           !std::filesystem::exists(VideoCore::FrameGen::GetLosslessDllPath(), ec);
+#else
+    return false;
+#endif
+}
+
+} // namespace
+
 PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
     : QWidget(parent), m_mainWindow{parent}, ui(new Ui::PerformanceOverlay) {
     ui->setupUi(this);
@@ -124,11 +144,12 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
             ui->fps_gen->setText(tr("+%1 FPS (%2x)").arg(gen_fps, 0, 'f', 1).arg(mult, 0, 'f', 1));
             ui->total_fps->setText(tr("%1 FPS (%2x FG)").arg(total_fps, 0, 'f', 1).arg(mult, 0, 'f', 1));
         } else if (Settings::values.frame_gen.GetValue()) {
-            ui->fps_gen->setText(tr("+0.0 FPS (Warmup)"));
+            ui->fps_gen->setText(LosslessMissing() ? tr("Unavailable (no Lossless.dll, see Graphics)")
+                                                   : tr("+0.0 FPS (Warmup)"));
             ui->total_fps->setText(tr("%1 FPS").arg(fps, 0, 'f', 1));
         } else {
             ui->fps_gen->setText(tr("Off (0 FPS)"));
-            ui->total_fps->setText(tr("%1 FPS (Native)").arg(fps, 0, 'f', 1));
+            ui->total_fps->setText(tr("%1 FPS (Real only)").arg(fps, 0, 'f', 1));
         }
 
         if (fps > FPS_SAMPLE_THRESHOLD) {
@@ -161,16 +182,16 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
             const double min_fps = *min_it;
             const double max_fps = *max_it;
 
-            // Compute 1% low from sorted actual FPS samples
+            // Average of the lowest 10% of the real FPS samples
             std::vector<double> sorted(m_fpsSamples.begin(), m_fpsSamples.end());
             std::sort(sorted.begin(), sorted.end());
             const size_t low_count = std::max<size_t>(1, sorted.size() / 10);
-            const double low1_fps =
+            const double low10_fps =
                 std::accumulate(sorted.begin(), sorted.begin() + low_count, 0.0) /
                 static_cast<double>(low_count);
 
             ui->fps_min->setText(tr("Min: %1").arg(min_fps, 0, 'f', 0));
-            ui->fps_low1->setText(tr("1%L: %1").arg(low1_fps, 0, 'f', 0));
+            ui->fps_low1->setText(tr("10% low: %1").arg(low10_fps, 0, 'f', 0));
             ui->fps_max->setText(tr("Max: %1").arg(max_fps, 0, 'f', 0));
 
             double peak_chart_fps = max_fps;

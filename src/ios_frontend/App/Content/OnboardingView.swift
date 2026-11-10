@@ -50,9 +50,10 @@ struct OnboardingView: View {
     @ObservedObject private var files = SystemFilesModel.shared
     @State private var page: OnboardingPage = .welcome
     @State private var importer: OnboardingPage?
-    @State private var jitStatus = JitStatus()
+    @ObservedObject private var app = AppController.shared
     @State private var forward = true
 
+    private var jitStatus: JitStatus { app.jit }
     private var jitState: JitState { jitStatus.state }
 
     var body: some View {
@@ -82,19 +83,11 @@ struct OnboardingView: View {
             footer
         }
         .onAppear { files.refresh() }
-        .task(id: page) {
-            // The JIT page follows the pool and moves on by itself once JIT is ready.
-            guard page == .jit else { return }
-            jitStatus = JitStatus.read()
-            guard jitStatus.state != .ready else { return }
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                jitStatus = JitStatus.read()
-                if jitStatus.state == .ready {
-                    try? await Task.sleep(nanoseconds: 800_000_000)
-                    if !Task.isCancelled, page == .jit { move(1) }
-                    return
-                }
+        .onChange(of: jitState) { _, state in
+            // The JIT page moves on by itself once JIT is ready (LICHII_EVENT_JIT_CHANGED).
+            guard state == .ready, page == .jit else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                if page == .jit { move(1) }
             }
         }
         .fileImporter(isPresented: Binding(get: { importer != nil }, set: { if !$0 { importer = nil } }),

@@ -154,6 +154,12 @@ bool IsForeground() {
     }
 }
 
+bool IsActive() {
+    @autoreleasepool {
+        return [[UIApplication sharedApplication] applicationState] == UIApplicationStateActive;
+    }
+}
+
 
 // ---------------------------------------------------------------------------------- audio
 

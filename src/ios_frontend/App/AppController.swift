@@ -23,6 +23,11 @@ final class AppController: ObservableObject {
     /// The game being launched or played.
     @Published var currentGame: Game?
     @Published var showLaunch = false
+    /// Follows LICHII_EVENT_JIT_CHANGED; whether the JIT app is installed is checked again when
+    /// Lichii comes to the foreground or the JIT app setting changes.
+    @Published private(set) var jit = JitStatus()
+    /// A boot was cancelled: the launch screen stays up until the game is shut down again (IDLE).
+    @Published private(set) var cancellingBoot = false
 
     let library = GameLibrary()
     private var window: UIWindow?
@@ -44,10 +49,12 @@ final class AppController: ObservableObject {
         window.makeKeyAndVisible()
         self.window = window
 
+        refreshJit(checkProvider: true)
         library.reload()
         NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification,
                                                object: nil, queue: .main) { _ in
             MainActor.assumeIsolated {
+                AppController.shared.refreshJit(checkProvider: true)
                 AppController.shared.requestJitIfNeeded(automatic: true)
             }
         }
@@ -64,6 +71,14 @@ final class AppController: ObservableObject {
             return UIWindow(windowScene: scene)
         }
         return UIWindow(frame: UIScreen.main.bounds)
+    }
+
+    /// Reads the JIT state again; checkProvider also asks iOS whether the JIT app is installed.
+    func refreshJit(checkProvider: Bool = false) {
+        let status = JitStatus.read(installed: checkProvider ? JitProvider.current.installed : jit.stikDebug)
+        if status != jit {
+            jit = status
+        }
     }
 
     /// The JIT pool is prepared while the library is open, so a launch does not wait for it. The
@@ -93,7 +108,11 @@ final class AppController: ObservableObject {
 
     func cancelLaunch() {
         lichii_emu_cancel_launch()
-        showLaunch = false
+        if Bridge.emuState == .booting {
+            cancellingBoot = true
+        } else {
+            showLaunch = false
+        }
     }
 
     func stop() {
@@ -111,6 +130,8 @@ final class AppController: ObservableObject {
             presentInGameMenu()
         case Int32(LICHII_EVENT_OPEN_URL.rawValue):
             open(Bridge.string(lichii_take_open_url()))
+        case Int32(LICHII_EVENT_JIT_CHANGED.rawValue):
+            refreshJit()
         default:
             break
         }
@@ -147,6 +168,9 @@ final class AppController: ObservableObject {
         let state = Bridge.emuState
         let previous = emuState
         emuState = state
+        if state != .booting {
+            cancellingBoot = false
+        }
         switch state {
         case .idle:
             showLibrary()

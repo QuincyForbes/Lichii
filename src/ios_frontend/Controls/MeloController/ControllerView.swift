@@ -214,7 +214,7 @@ public struct ControllerView: View {
                         ZStack {
                             editableJoystick(id: "leftJoystick", showBackground: $hideDpad)
 
-                            if layout.joysticks["leftJoystick"]?.hide ?? true {
+                            if layout.joysticks["leftJoystick"]?.hide ?? false {
                                 dpadView
                                     .opacity(hideDpad ? 0 : 1)
                                     .allowsHitTesting(!hideDpad)
@@ -229,7 +229,7 @@ public struct ControllerView: View {
                         shoulderButtonsRight
                         ZStack {
                             editableJoystick(id: "rightJoystick", iscool: true, showBackground: $hideABXY)
-                            if layout.joysticks["rightJoystick"]?.hide ?? true {
+                            if layout.joysticks["rightJoystick"]?.hide ?? false {
                                 abxyView
                                     .opacity(hideABXY ? 0 : 1)
                                     .allowsHitTesting(!hideABXY)
@@ -275,7 +275,7 @@ public struct ControllerView: View {
                     ZStack {
                         editableJoystick(id: "leftJoystick", showBackground: $hideDpad)
 
-                        if layout.joysticks["leftJoystick"]?.hide ?? true {
+                        if layout.joysticks["leftJoystick"]?.hide ?? false {
                             dpadView
                                 .opacity(hideDpad ? 0 : 1)
                                 .allowsHitTesting(!hideDpad)
@@ -294,7 +294,7 @@ public struct ControllerView: View {
                     shoulderButtonsRight
                     ZStack {
                         editableJoystick(id: "rightJoystick", iscool: true, showBackground: $hideABXY)
-                        if layout.joysticks["rightJoystick"]?.hide ?? true {
+                        if layout.joysticks["rightJoystick"]?.hide ?? false {
                             abxyView
                                 .opacity(hideABXY ? 0 : 1)
                                 .allowsHitTesting(!hideABXY)

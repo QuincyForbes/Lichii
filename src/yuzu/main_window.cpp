@@ -1125,8 +1125,11 @@ void MainWindow::InitializeWidgets() {
         tr("Current emulation speed. Values higher or lower than 100% "
            "indicate emulation is running faster or slower than a Switch."));
     game_fps_label = new QLabel();
-    game_fps_label->setToolTip(tr("How many frames per second the game is currently displaying. "
-                                  "This will vary from game to game and scene to scene."));
+    game_fps_label->setToolTip(
+        tr("Real: frames per second the game itself renders. This varies from game to game "
+           "and scene to scene.\nWith frame generation on, Generated counts the frames added "
+           "between them and Displayed is Real + Generated, the frames handed to the display "
+           "(above the display's refresh rate some are never shown)."));
     emu_frametime_label = new QLabel();
     emu_frametime_label->setToolTip(
         tr("Time taken to emulate a Switch frame, not counting framelimiting or v-sync. For "
@@ -1348,8 +1351,6 @@ void MainWindow::InitializeWidgets() {
     oot_fps_button->setObjectName(QStringLiteral("OotFpsStatusBarButton"));
     oot_fps_button->setCheckable(true);
     oot_fps_button->setFocusPolicy(Qt::NoFocus);
-    oot_fps_button->setToolTip(tr("Ocarina of Time frame rate. Click to switch between 60 FPS and "
-                                  "30 FPS (lower-end PCs); it takes effect at once."));
     connect(oot_fps_button, &QPushButton::clicked, this, &MainWindow::OnToggleOotFrameRate);
     UpdateOotFpsButton();
     statusBar()->insertPermanentWidget(0, oot_fps_button);
@@ -4211,14 +4212,15 @@ void MainWindow::OnVerifyInstalledContents() {
     QtCommon::Content::VerifyInstalledContents();
 }
 
+// InstallFirmware already says when keys are missing; prompting again here showed a second dialog.
 void MainWindow::OnInstallFirmware() {
     QtCommon::Content::InstallFirmware();
-    OnCheckFirmwareDecryption();
+    OnCheckFirmwareDecryption(false);
 }
 
 void MainWindow::OnInstallFirmwareFromZIP() {
     QtCommon::Content::InstallFirmwareZip();
-    OnCheckFirmwareDecryption();
+    OnCheckFirmwareDecryption(false);
 }
 
 // TODO(crueter): QtCommon this: game list populate can be a signal?
@@ -4230,7 +4232,8 @@ void MainWindow::OnInstallDecryptionKeys() {
     QtCommon::Content::InstallKeys();
 
     game_list->PopulateAsync(UISettings::values.game_dirs);
-    OnCheckFirmwareDecryption();
+    // Not prompting again: cancelling the file picker would otherwise ask to install keys again.
+    OnCheckFirmwareDecryption(false);
 }
 
 void MainWindow::OnAbout() {
@@ -4762,7 +4765,7 @@ void MainWindow::OnEmulatorUpdateAvailable() {
         QString text;
         switch (result.failure) {
         case UpdateChecker::Failure::RateLimited:
-            text = tr("Could not check for updates: GitHub rate limit reached. Fritchii will try "
+            text = tr("Could not check for updates: GitHub rate limit reached. Lichii will try "
                       "again at the next start.");
             break;
         case UpdateChecker::Failure::Http:
@@ -4829,7 +4832,7 @@ void MainWindow::ShowRestartNote() {
         QTimer::singleShot(1000, this, &MainWindow::ShowRestartNote);
         return;
     }
-    QMessageBox::information(this, tr("Fritchii"), restart_note);
+    QMessageBox::information(this, tr("Lichii"), restart_note);
 }
 
 void MainWindow::ShowUpdate(const UpdateChecker::CheckResult& result) {
@@ -5003,13 +5006,13 @@ void MainWindow::UpdateStatusBar() {
     QString fpsText;
     if (results.generated_fps > 0.5 && results.average_game_fps > 0.5) {
         const double mult = results.total_fps / results.average_game_fps;
-        fpsText = tr("Game: %1 FPS | Gen: +%2 FPS | Total: %3 FPS (%4x)")
+        fpsText = tr("Real: %1 FPS | Generated: +%2 | Displayed: %3 FPS (%4x)")
                       .arg(results.average_game_fps, 0, 'f', 1)
                       .arg(results.generated_fps, 0, 'f', 1)
                       .arg(results.total_fps, 0, 'f', 1)
                       .arg(mult, 0, 'f', 1);
     } else {
-        fpsText = tr("Game: %1 FPS").arg(results.average_game_fps, 0, 'f', 1);
+        fpsText = tr("Real: %1 FPS").arg(results.average_game_fps, 0, 'f', 1);
     }
     if (!m_fpsSuffix.isEmpty())
         fpsText = fpsText % QStringLiteral(" (%1)").arg(m_fpsSuffix);
@@ -5017,7 +5020,7 @@ void MainWindow::UpdateStatusBar() {
     game_fps_label->setText(fpsText);
 
     if (results.generated_fps > 0.5 && results.total_fps > 0.5) {
-        emu_frametime_label->setText(tr("Frame: %1 ms (%2 ms out)")
+        emu_frametime_label->setText(tr("Frame: %1 ms (%2 ms displayed)")
                                          .arg(results.frametime * 1000.0, 0, 'f', 2)
                                          .arg(1000.0 / results.total_fps, 0, 'f', 2));
     } else {
@@ -5042,7 +5045,35 @@ void MainWindow::UpdateGPUAccuracyButton() {
 void MainWindow::UpdateOotFpsButton() {
     const bool fps30 = Settings::values.oot_30fps.GetValue();
     oot_fps_button->setChecked(fps30);
-    oot_fps_button->setText(fps30 ? tr("30 FPS") : tr("60 FPS"));
+    // The 30 FPS mode only applies while the Switch 2 vsync event runs at 60 Hz and the speed is
+    // limited (nx2_gsv.h PaceToVblank); otherwise show the cap that does apply.
+    const char* forced_hz = std::getenv("EDEN_NX2_VSYNC_HZ");
+    const u32 vsync_hz =
+        forced_hz != nullptr
+            ? static_cast<u32>((std::max)(std::strtoll(forced_hz, nullptr, 10), 1LL))
+            : (std::max<u32>)(Settings::values.frame_rate_limit.GetValue(), 1);
+    const bool unlocked =
+        !Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0;
+    if (unlocked) {
+        oot_fps_button->setEnabled(false);
+        oot_fps_button->setText(tr("FPS UNLOCKED"));
+        oot_fps_button->setToolTip(tr("Ocarina of Time frame rate: the speed limit is off, so the "
+                                      "60 / 30 FPS switch has no effect. Turn the speed limit back "
+                                      "on (Toggle Framerate Limit hotkey or Configure > General)."));
+    } else if (vsync_hz != 60) {
+        oot_fps_button->setEnabled(false);
+        oot_fps_button->setText(tr("%1 FPS").arg(vsync_hz));
+        oot_fps_button->setToolTip(
+            tr("Ocarina of Time frame rate: capped by Frame rate limit (Switch 2) = %1 Hz%2. The "
+               "60 / 30 FPS switch only works at 60 Hz (Configure > Graphics).")
+                .arg(vsync_hz)
+                .arg(forced_hz != nullptr ? tr(" (EDEN_NX2_VSYNC_HZ)") : QString{}));
+    } else {
+        oot_fps_button->setEnabled(true);
+        oot_fps_button->setText(fps30 ? tr("30 FPS") : tr("60 FPS"));
+        oot_fps_button->setToolTip(tr("Ocarina of Time frame rate. Click to switch between 60 FPS "
+                                      "and 30 FPS (lower-end PCs); it takes effect at once."));
+    }
 }
 
 void MainWindow::OnToggleOotFrameRate() {
@@ -5177,8 +5208,9 @@ void MainWindow::OnCheckFirmwareDecryption(bool prompt) {
         LOG_WARNING(Frontend, "Decryption keys are missing: NCA, NSP and XCI games need them");
     } else if (!ContentManager::AreKeysPresent()) {
         const auto res = QtCommon::Frontend::Warning(
-            tr("Derivation Components Missing"),
-            tr("Decryption keys are missing. Install them now?"),
+            tr("Decryption keys missing"),
+            tr("NCA, NSP and XCI games and firmware need your prod.keys. Install them now?\n\n"
+               "Switch 2 .nup games don't need keys or firmware."),
             QtCommon::Frontend::StandardButton::Yes | QtCommon::Frontend::StandardButton::No);
 
         if (res == QtCommon::Frontend::StandardButton::Yes)
@@ -5248,17 +5280,24 @@ void MainWindow::SetFirmwareVersion() {
     const auto firmware_data = pair.first;
     const auto result = pair.second;
 
+    ui->menu_Tools->setToolTipsVisible(true);
     if (result.IsError() || !CheckFirmwarePresence()) {
         LOG_INFO(Frontend, "Installed firmware: No firmware available");
+        const QString reason =
+            tr("Needs Switch firmware (Tools > Install Firmware). Switch 2 .nup games don't.");
         ui->menu_Applets->setEnabled(false);
+        ui->menu_Applets->menuAction()->setToolTip(reason);
         ui->menu_Create_Shortcuts->setEnabled(false);
+        ui->menu_Create_Shortcuts->menuAction()->setToolTip(reason);
         firmware_label->setVisible(false);
         return;
     }
 
     firmware_label->setVisible(true);
     ui->menu_Applets->setEnabled(true);
+    ui->menu_Applets->menuAction()->setToolTip(QString{});
     ui->menu_Create_Shortcuts->setEnabled(true);
+    ui->menu_Create_Shortcuts->menuAction()->setToolTip(QString{});
 
     const std::string display_version(firmware_data.display_version.data());
     const std::string display_title(firmware_data.display_title.data());
@@ -5282,6 +5321,7 @@ void MainWindow::SetFPSSuffix() {
         m_fpsSuffix = limited ? QString{} : tr("Unlocked");
         break;
     }
+    UpdateOotFpsButton();
 }
 
 bool MainWindow::SelectRomFSDumpTarget(const FileSys::ContentProvider& installed, u64 program_id,

@@ -227,10 +227,15 @@ void VerifyGameContents(const std::string& game_path) {
                                      tr("File contents may be corrupt or missing."));
         break;
     case ContentManager::GameVerificationResult::NotImplemented:
-        QtCommon::Frontend::Warning(
-            rootObject, tr("Integrity verification couldn't be performed"),
-            tr("Firmware installation cancelled, firmware may be in a bad state or corrupted. "
-               "File contents could not be checked for validity."));
+        // Also returned when the verification is cancelled.
+        if (progress->wasCanceled()) {
+            QtCommon::Frontend::Information(rootObject, tr("Integrity verification cancelled"),
+                                            tr("Verification cancelled. Nothing was changed."));
+        } else {
+            QtCommon::Frontend::Warning(rootObject,
+                                        tr("Integrity verification couldn't be performed"),
+                                        tr("This file type can't be verified."));
+        }
     }
 }
 
@@ -497,8 +502,10 @@ void ImportDataDir(FrontendCommon::DataManager::DataDir data_dir, const std::str
 bool CheckKeys() {
     if (!ContentManager::AreKeysPresent()) {
         QtCommon::Frontend::Information(
-            tr("Keys not installed"),
-            tr("Install decryption keys and restart Eden before attempting to install firmware."));
+            tr("Decryption keys missing"),
+            tr("Firmware is encrypted, so Lichii needs your prod.keys first: install them with "
+               "Tools > Install Decryption Keys.\n\nSwitch 2 .nup games don't need keys or "
+               "firmware."));
         return false;
     }
 
