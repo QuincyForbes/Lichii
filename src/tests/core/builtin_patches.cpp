@@ -9,6 +9,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
@@ -212,6 +213,62 @@ TEST_CASE("Built-in Max Resolution patch is listed and loaded for Ocarina's main
 
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
     REQUIRE_FALSE(builtin_enabled());
+}
+
+TEST_CASE("Built-in patch kind settings: game choice, then global, then default",
+          "[patch_manager]") {
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+    const auto info = [&] {
+        const auto patches = manager.GetPatches();
+        const auto it = std::ranges::find(patches, MaxResolution, &FileSys::Patch::name);
+        REQUIRE(it != patches.end());
+        REQUIRE(it->builtin);
+        REQUIRE(it->builtin->kind == FileSys::BuiltinPatchKind::Resolution);
+        return std::pair{it->enabled, it->builtin->source};
+    };
+    using Source = FileSys::BuiltinPatchSource;
+
+    SECTION("Auto follows the default") {
+        const auto [enabled, source] = info();
+        REQUIRE(enabled);
+        REQUIRE(source == Source::Default);
+    }
+
+    SECTION("The global setting of the kind decides") {
+        Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Off);
+        auto [enabled, source] = info();
+        REQUIRE_FALSE(enabled);
+        REQUIRE(source == Source::Global);
+        REQUIRE(PatchMain(context, OcarinaBuildId, TbzInstruction) == TbzInstruction);
+
+        Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::On);
+        std::tie(enabled, source) = info();
+        REQUIRE(enabled);
+        REQUIRE(source == Source::Global);
+    }
+
+    SECTION("The game's choice overrides the global setting") {
+        Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Off);
+        FileSys::ApplyBuiltinPatchChoice(Settings::values.disabled_addons[OcarinaTitleId],
+                                         MaxResolution, FileSys::BuiltinPatchChoice::On);
+        const auto [enabled, source] = info();
+        REQUIRE(enabled);
+        REQUIRE(source == Source::Game);
+        REQUIRE(PatchMain(context, OcarinaBuildId, TbzInstruction) == BranchInstruction);
+
+        FileSys::ApplyBuiltinPatchChoice(Settings::values.disabled_addons[OcarinaTitleId],
+                                         MaxResolution, FileSys::BuiltinPatchChoice::FollowGlobal);
+        REQUIRE_FALSE(info().first);
+    }
+
+    SECTION("Other kinds are not affected") {
+        Settings::values.patch_frame_rate.SetValue(Settings::GamePatchMode::Off);
+        REQUIRE(info().first);
+    }
+
+    Settings::values.patch_frame_rate.SetValue(Settings::GamePatchMode::Auto);
+    Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Auto);
 }
 
 namespace {

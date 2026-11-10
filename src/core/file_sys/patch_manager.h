@@ -10,6 +10,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 #include "common/common_types.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/vfs/vfs_types.h"
@@ -39,6 +41,42 @@ enum class PatchSource {
     Packed,
 };
 
+/// What a built-in patch changes; each kind has a global setting (Settings::patch_*).
+enum class BuiltinPatchKind : u8 {
+    FrameRate,
+    Resolution,
+    Performance,
+    Image,
+};
+
+/// A game's own choice for a built-in patch.
+enum class BuiltinPatchChoice : u8 {
+    FollowGlobal,
+    On,
+    Off,
+};
+
+/// Which setting decided whether a built-in patch applies.
+enum class BuiltinPatchSource : u8 {
+    Game,
+    Global,
+    Default,
+};
+
+struct BuiltinPatchInfo {
+    BuiltinPatchKind kind;
+    std::string game;
+    std::string description;
+    /// What turning it on costs and gains.
+    std::string effect;
+    BuiltinPatchChoice choice;
+    BuiltinPatchSource source;
+    /// The resolved choice, before another patch that contains this one is considered.
+    bool resolved_enabled;
+    /// Name of an enabled built-in patch that contains this one (it then does nothing here).
+    std::string included_in;
+};
+
 struct Patch {
     bool enabled;
     std::string name;
@@ -49,7 +87,20 @@ struct Patch {
     PatchSource source;
     std::string location;
     u32 numeric_version{0};
+    std::optional<BuiltinPatchInfo> builtin{};
 };
+
+[[nodiscard]] std::string_view BuiltinPatchKindName(BuiltinPatchKind kind);
+[[nodiscard]] std::string_view BuiltinPatchSourceName(BuiltinPatchSource source);
+/// Games that ship at least one built-in patch, in table order.
+[[nodiscard]] std::vector<std::string> BuiltinPatchGames();
+/// Sets a built-in patch's per-game choice in a disabled add-ons list.
+void ApplyBuiltinPatchChoice(std::vector<std::string>& disabled, std::string_view name,
+                             BuiltinPatchChoice choice);
+/// Whether a built-in patch is on when its game follows the global setting.
+[[nodiscard]] bool BuiltinPatchEnabledWhenFollowing(std::string_view name);
+[[nodiscard]] BuiltinPatchChoice GetBuiltinPatchChoice(const std::vector<std::string>& disabled,
+                                                       std::string_view name);
 
 // A centralized class to manage patches to games.
 class PatchManager {

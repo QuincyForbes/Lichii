@@ -46,6 +46,7 @@
 #include "core/crypto/key_manager.h"
 #include "core/file_sys/common_funcs.h"
 #include "core/file_sys/nup_writer.h"
+#include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/hle/service/am/applet_manager.h"
@@ -541,23 +542,29 @@ static void IosApplyFirstRunDefaults(SdlState* state) {
         std::ofstream{marker} << "1\n";
         changed = true;
     }
-    // Ocarina of Time's Max Resolution built-in turns off the game's GPU-time dynamic resolution,
-    // the safety valve a phone GPU needs. Off once; the Add-Ons list can turn it back on.
+    // Max Resolution (Ocarina of Time) is off by default on iOS now (the patch table's default),
+    // so the per-game "disabled" entry an earlier build wrote once is dropped and the game follows
+    // the global "Max resolution" setting. A build that wrote it and a user who then turned the
+    // patch on keep that choice as a per-game On.
     const auto marker_v2 =
         Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "ios-defaults-v2";
-    if (!Common::FS::Exists(marker_v2)) {
+    const auto marker_v3 =
+        Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "ios-defaults-v3";
+    if (!Common::FS::Exists(marker_v3)) {
         constexpr u64 OcarinaOfTime = 0x0400486024DEC000;
         constexpr std::string_view MaxResolution = "Max Resolution (built-in)";
         auto& disabled = Settings::values.disabled_addons[OcarinaOfTime];
-        if (std::find(disabled.begin(), disabled.end(), MaxResolution) == disabled.end()) {
-            disabled.emplace_back(MaxResolution);
+        const bool was_disabled = std::erase(disabled, std::string{MaxResolution}) != 0;
+        if (!was_disabled && Common::FS::Exists(marker_v2)) {
+            FileSys::ApplyBuiltinPatchChoice(disabled, MaxResolution,
+                                             FileSys::BuiltinPatchChoice::On);
         }
         // The game list caches each game's add-on summary.
         std::error_code ec;
         std::filesystem::remove(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
                                     "game_list" / fmt::format("{:016X}.pv.txt", OcarinaOfTime),
                                 ec);
-        std::ofstream{marker_v2} << "1\n";
+        std::ofstream{marker_v3} << "1\n";
         changed = true;
     }
     if (changed) {
