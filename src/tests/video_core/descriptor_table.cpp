@@ -277,7 +277,8 @@ TEST_CASE("Bound descriptor IDs match the previous tagged lookup across channels
     }
 }
 
-TEST_CASE("Bound descriptor IDs refresh after descriptor capacity changes", "[descriptor_table]") {
+TEST_CASE("Descriptors read as new after capacity changes and invalidation",
+          "[descriptor_table]") {
     struct Memory {
         const u8* GetPointer(GPUVAddr) const {
             return nullptr;
@@ -296,12 +297,14 @@ TEST_CASE("Bound descriptor IDs refresh after descriptor capacity changes", "[de
         REQUIRE(table.bound_ids[limit] == Common::SlotId{limit + 1});
         table.Refresh(0x1000, 0);
         table.Refresh(0x1000, limit);
+        // The table keeps the old bound ID: a descriptor that reads as new tells the caller to
+        // store its ID again.
         REQUIRE(table.Read(memory, limit).second);
-        REQUIRE(table.bound_ids[limit] == Common::SlotId{0});
+        REQUIRE_FALSE(table.Read(memory, limit).second);
         table.bound_ids[limit] = Common::SlotId{limit + 2};
         table.Invalidate();
         REQUIRE(table.Read(memory, limit).second);
-        REQUIRE(table.bound_ids[limit] == Common::SlotId{0});
+        REQUIRE_FALSE(table.Read(memory, limit).second);
     }
 }
 
@@ -334,9 +337,9 @@ TEST_CASE("Descriptor Debug poisoning touches only the current addressable range
     REQUIRE(table.bound_ids.back() == untouched);
     REQUIRE(table.bound_ids.data() == data);
     REQUIRE(table.bound_ids.capacity() == capacity);
+    // The poison stays until the caller stores the ID of the descriptor that read as new.
     REQUIRE(table.Read(memory, 127).second);
     REQUIRE_FALSE(table.invalidated);
-    REQUIRE(table.bound_ids[127] == Id{0});
     REQUIRE(table.bound_ids[128] == untouched);
 
     REQUIRE(table.Synchronize(0x1000, 0));
@@ -347,12 +350,10 @@ TEST_CASE("Descriptor Debug poisoning touches only the current addressable range
     REQUIRE(table.bound_ids[0] == poison);
     REQUIRE(table.bound_ids[1] == untouched);
     REQUIRE(table.Read(memory, 0).second);
-    REQUIRE(table.bound_ids[0] == Id{0});
     REQUIRE(table.bound_ids[1] == untouched);
 
     REQUIRE(table.Synchronize(0x1000, 127));
     REQUIRE(table.LiveBoundIds().size() == 128);
-    REQUIRE(table.bound_ids[1] == Id{0});
     REQUIRE(table.Read(memory, 1).second);
     REQUIRE_FALSE(table.Read(memory, 1).second);
     std::ranges::fill(table.LiveBoundIds(), poison);
@@ -376,7 +377,7 @@ TEST_CASE("Descriptor ID lookup CPU benchmark", "[.][descriptor_lookup_bench]") 
             std::memcpy(output, GetPointer(address), size);
         }
     };
-    struct Result {
+    struct LookupBenchmarkResult {
         double ns_per_lookup;
         u64 checksum;
     };
@@ -426,7 +427,7 @@ TEST_CASE("Descriptor ID lookup CPU benchmark", "[.][descriptor_lookup_bench]") 
         const double ns =
             std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start)
                 .count();
-        return Result{ns / operations, checksum};
+        return LookupBenchmarkResult{ns / operations, checksum};
     };
     for (const u32 size : {128U, 4096U, 16384U}) {
         std::mt19937 random{0x256};
@@ -438,7 +439,7 @@ TEST_CASE("Descriptor ID lookup CPU benchmark", "[.][descriptor_lookup_bench]") 
             std::array<double, 7> before{};
             std::array<double, 7> after{};
             for (size_t trial = 0; trial < before.size(); ++trial) {
-                Result old_result{}, new_result{};
+                LookupBenchmarkResult old_result{}, new_result{};
                 if (trial % 2 == 0) {
                     old_result = measure.template operator()<false>(size, mutate, indices);
                     new_result = measure.template operator()<true>(size, mutate, indices);
