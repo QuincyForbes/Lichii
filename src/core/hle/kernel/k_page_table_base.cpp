@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
+#include <fmt/format.h>
+
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -311,8 +315,14 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
     size_t remaining_size = alloc_size - needed_size;
 
     // iOS grants a fastmem arena smaller than the address space; guest accesses above it take the
-    // page table path. Keep the regions inside it when they fit, else put the hot ones first:
-    // heap, then stack, alias and kernel map. (NCE sizes its arena and layout itself.)
+    // page table path. EDEN_NX2_PACK_LAYOUT=1 keeps the regions inside it when they fit, else puts
+    // the hot ones first: heap, then stack, alias and kernel map. Off by default: Ocarina of Time
+    // jumped to 0 six seconds into boot with the heap packed right after its code, and runs with
+    // the console's layout. (NCE sizes its arena and layout itself.)
+    static const bool pack_layout = [] {
+        const char* const value = std::getenv("EDEN_NX2_PACK_LAYOUT");
+        return value != nullptr && value[0] == '1';
+    }();
     const u64 fastmem_end = [&]() -> u64 {
 #ifdef HAS_NCE
         return 0;
@@ -323,8 +333,9 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
                    : 0;
 #endif
     }();
-    const bool fastmem_short = fastmem_end != 0 && fastmem_end < GetInteger(end) &&
-                               GetInteger(alloc_start) < fastmem_end;
+    const bool arena_short = fastmem_end != 0 && fastmem_end < GetInteger(end);
+    const bool fastmem_short =
+        pack_layout && arena_short && GetInteger(alloc_start) < fastmem_end;
     const bool hot_first = fastmem_short &&
                            GetInteger(alloc_start) + needed_size > fastmem_end &&
                            remaining_size >= 3 * RegionAlignment;
@@ -473,6 +484,22 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
              !fastmem_short ? ""
              : hot_first    ? ", fastmem arena too small: hot regions first"
                             : ", kept inside the fastmem arena");
+    if (arena_short) {
+        // How much of each region the arena covers (fastmem); the rest takes the page table.
+        const auto covered = [&](KProcessAddress first, KProcessAddress last) {
+            const u64 begin = GetInteger(first);
+            const u64 limit = (std::min)(GetInteger(last), fastmem_end);
+            return fmt::format("{} MiB of {}", limit > begin ? (limit - begin) >> 20 : 0,
+                               (GetInteger(last) - begin) >> 20);
+        };
+        LOG_INFO(Kernel,
+                 "Fastmem arena {} GiB covers: code {}, heap {}, alias {}, stack {}, kernel map {}",
+                 fastmem_end >> 30, covered(process_code_start, process_code_end),
+                 covered(m_heap_region_start, m_heap_region_end),
+                 covered(m_alias_region_start, m_alias_region_end),
+                 covered(m_stack_region_start, m_stack_region_end),
+                 covered(m_kernel_map_region_start, m_kernel_map_region_end));
+    }
 
     // Initialize our implementation.
     m_impl.Resize(m_address_space_width, PageBits);

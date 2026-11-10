@@ -154,6 +154,7 @@ private:
     std::condition_variable shown_cv;
     std::vector<ShownReport> shown_reports;
     std::jthread present_wait_thread;
+    DisplayRefreshMonitor refresh_monitor;
 };
 
 } // namespace Vulkan

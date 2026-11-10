@@ -136,6 +136,12 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , blit_supported{CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageViewFormat())}
     , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
     , use_present_thread{Settings::values.async_presentation.GetValue()}
+    , refresh_monitor{[&window = render_window_]() -> void* {
+        // The HWND on Windows.
+        const auto& info = window.GetWindowInfo();
+        return info.type == Core::Frontend::WindowSystemType::Windows ? info.render_surface
+                                                                       : nullptr;
+    }}
 {
     SetImageCount();
 
@@ -427,12 +433,7 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
          mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) &&
         !Settings::values.frame_gen.GetValue() && Settings::values.use_speed_limit.GetValue() &&
         Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo;
-    // The refresh rate of the display the window is on (the HWND on Windows).
-    const auto& window_info = render_window.GetWindowInfo();
-    pacer.Refresh(Clock::now(), allowed,
-                  window_info.type == Core::Frontend::WindowSystemType::Windows
-                      ? window_info.render_surface
-                      : nullptr);
+    pacer.Refresh(allowed, refresh_monitor);
     if (const u64 want = pacer.Outstanding(); pacer.Pacing() && want != 0) {
         // The next target counts from the refresh the previous frame was shown at.
         Common::Nx2Timeline::Span span{"present: wait until shown"};

@@ -40,11 +40,20 @@ void RomFSFactory::SetPackedUpdate(VirtualFile update_raw_file) {
 VirtualFile RomFSFactory::OpenCurrentProcess(u64 current_process_title_id) const {
     const auto type = ContentRecordType::Program;
     if (!updatable) {
-        // sergio: a NUP already carries its update merged, but LayeredFS mods
-        // (user/load/<title>/<mod>/romfs) still apply; no NCA, so no update step.
-        const PatchManager mods{current_process_title_id, filesystem_controller,
-                                content_provider};
-        return mods.PatchRomFS(nullptr, file, type, nullptr);
+        // LOCAL TEST (Zelda): a RomFS with the update already merged (NUP containers) still takes
+        // LayeredFS mods (romfs folders of the title's mods); without, they were never applied.
+        // No update is looked up (no base NCA). Built once.
+        std::scoped_lock lock{layered_mutex};
+        if (!layered_file) {
+            const PatchManager patch_manager{current_process_title_id, filesystem_controller,
+                                             content_provider};
+            layered_file = patch_manager.PatchRomFS(nullptr, file, ContentRecordType::Program,
+                                                    nullptr);
+            if (!layered_file) {
+                layered_file = file;
+            }
+        }
+        return layered_file;
     }
 
     const auto nca = content_provider.GetEntry(current_process_title_id, type);
@@ -69,7 +78,12 @@ VirtualFile RomFSFactory::OpenPatchedRomFSWithProgramIndex(u64 title_id, u8 prog
                                                            ContentRecordType type) const {
     const auto res_title_id = GetBaseTitleIDWithProgramIndex(title_id, program_index);
 
-    return OpenPatchedRomFS(res_title_id, type);
+    auto romfs = OpenPatchedRomFS(res_title_id, type);
+    if (romfs == nullptr && program_index == 0 && !updatable) {
+        // NUP containers and loose dumps aren't in the content provider: use the loader's RomFS.
+        return file;
+    }
+    return romfs;
 }
 
 VirtualFile RomFSFactory::Open(u64 title_id, StorageId storage, ContentRecordType type) const {
