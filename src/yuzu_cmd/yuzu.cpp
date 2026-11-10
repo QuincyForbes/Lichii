@@ -1227,11 +1227,11 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
         return SDL_APP_FAILURE;
     }
 
-    if (const SDL_AppResult result = LoadGame(state, lp, ios_app, std::stop_token{});
+    if (const SDL_AppResult result = LoadGame(state, lp, false, std::stop_token{});
         result != SDL_APP_CONTINUE) {
         return result;
     }
-    StartGame(state, lp, ios_app, true);
+    StartGame(state, lp, false, true);
     return SDL_APP_CONTINUE;
 }
 
