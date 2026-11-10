@@ -247,7 +247,7 @@ final class ControlsCenter: ObservableObject {
             takeScreenshot()
         }
         if has(LICHII_ACTION_TOGGLE_HUD) {
-            showHUD.toggle()
+            OverlayPreset.toggle()
         }
         if has(LICHII_ACTION_TOGGLE_SPEED_LIMIT) {
             let enabled = QuickSettings.bool("use_speed_limit")

@@ -20,13 +20,6 @@ struct ControlsView: View {
     @AppStorage("perGameLayouts") private var perGameLayouts = true
     @AppStorage("menuButtonVisible") private var menuButtonVisible = true
     @AppStorage("menuChord") private var menuChord = true
-    @AppStorage("hudPosition") private var hudPosition = HUDPosition.topRight.rawValue
-    @AppStorage("hudDetailed") private var hudDetailed = true
-    @AppStorage("hudFrameTime") private var hudFrameTime = true
-    @AppStorage("hudCPU") private var hudCPU = true
-    @AppStorage("hudMemory") private var hudMemory = true
-    @AppStorage("hudThermal") private var hudThermal = true
-    @AppStorage("hudBattery") private var hudBattery = false
     @State private var editing = false
     @State private var confirmReset = false
 
@@ -79,19 +72,8 @@ struct ControlsView: View {
                 Text("A three-finger tap on the game also opens the menu. Controller buttons can be mapped to it as well.")
             }
 
-            Section("Performance HUD") {
-                Toggle("Show HUD", isOn: $center.showHUD)
-                Picker("Position", selection: $hudPosition) {
-                    ForEach(HUDPosition.allCases) { Text($0.title).tag($0.rawValue) }
-                }
-                Toggle("Details", isOn: $hudDetailed)
-                if hudDetailed {
-                    Toggle("Frame Time and Speed", isOn: $hudFrameTime)
-                    Toggle("CPU", isOn: $hudCPU)
-                    Toggle("Memory", isOn: $hudMemory)
-                    Toggle("Thermal State", isOn: $hudThermal)
-                    Toggle("Battery", isOn: $hudBattery)
-                }
+            Section {
+                NavigationLink("Performance Overlay") { PerformanceOverlaySettingsView() }
             }
 
             Section {

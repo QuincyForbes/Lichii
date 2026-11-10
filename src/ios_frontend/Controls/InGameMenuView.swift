@@ -40,6 +40,7 @@ struct InGameMenuView: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 14) {
                             actions
+                            PerformanceSummaryRow()
                             quickSettings
                         }
                         .padding(18)
@@ -110,9 +111,7 @@ struct InGameMenuView: View {
                 center.closeMenu()
                 center.takeScreenshot()
             }
-            MenuTile(title: center.showHUD ? "Hide HUD" : "Show HUD", systemImage: "speedometer") {
-                center.showHUD.toggle()
-            }
+            PerformanceOverlayTile()
             MenuTile(title: "Edit Controls", systemImage: "hand.tap") {
                 center.editLayout()
             }

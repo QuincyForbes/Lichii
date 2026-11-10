@@ -10,7 +10,6 @@ import UIKit
 /// the in-game menu.
 struct ControlsOverlayView: View {
     @ObservedObject private var center = ControlsCenter.shared
-    @AppStorage("hudPosition") private var hudPosition = HUDPosition.topRight.rawValue
     @AppStorage("menuButtonVisible") private var menuButtonVisible = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -29,11 +28,8 @@ struct ControlsOverlayView: View {
                 .id("\(gameId ?? "")-\(perGameLayouts)")
             }
 
-            if center.showHUD && !center.editingLayout {
-                PerformanceHUD()
-                    .padding(10)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity,
-                           alignment: (HUDPosition(rawValue: hudPosition) ?? .topRight).alignment)
+            if !center.editingLayout {
+                PerformanceOverlayHost()
             }
 
             if menuButtonVisible && !center.editingLayout && !center.menuOpen {
