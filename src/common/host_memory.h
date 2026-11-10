@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -65,10 +67,24 @@ public:
     /// it needs RAM. The contents stay; using the pages brings them back.
     void HintCold(size_t physical_offset, size_t length,
                   std::optional<size_t> virtual_offset) const;
+    /// What a caller of TrimZeroPages keeps between passes: the buffers (a pass over a 9 GB
+    /// working set needs ~20 MB of them) and the pages the last pass found zero.
+    struct ZeroTrimState {
+        std::vector<uintptr_t> entries;
+        std::vector<uintptr_t> backing_pages;
+        std::vector<uintptr_t> view_pages;
+        std::vector<uintptr_t> trim;
+        std::vector<uintptr_t> zero_now;
+        std::vector<uintptr_t> zero_before; ///< Sorted
+    };
     /// Windows: resident pages of guest memory (backing and its views) that hold only zeros leave
     /// the working set, like HintCold. Apple: resident and compressed zero pages of the backing
     /// leave the footprint (MADV_FREE_REUSABLE). Returns {resident bytes looked at, bytes trimmed}.
-    std::pair<size_t, size_t> TrimZeroPages() const;
+    /// pause runs after each slice of a few MiB; it returns false to end the pass. Windows, with
+    /// state: only pages the previous pass found zero too are trimmed (a page the game clears and
+    /// fills again stays).
+    std::pair<size_t, size_t> TrimZeroPages(ZeroTrimState* state = nullptr,
+                                            const std::function<bool()>& pause = {}) const;
 
     /// Bytes ClearBackingRegion has filled with zeros (memset) since start.
     static u64 ZeroFilledBytes() noexcept;

@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "common/settings.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/present/frame_gen_pacer.h"
 
 namespace Vulkan {
@@ -69,8 +70,17 @@ FrameGenPlan FrameGenPacer::Plan(size_t capacity) {
         return {};
     }
 
-    const u32 raw_target_rate = Settings::values.frame_gen_target_rate.GetValue();
-    const f32 target_rate = raw_target_rate <= 60 ? 0.0f : static_cast<f32>(raw_target_rate);
+    // 0 follows the display's refresh rate, and no target asks for more frames than the display
+    // shows: the extra ones were presented within the same refresh and dropped, and with the
+    // fixed multiplier the real frame rate fell to half the presents the swapchain took (60 at
+    // 120 Hz). Only while the display's rate is unknown does 0 mean the fixed multiplier.
+    f32 target_rate = static_cast<f32>(Settings::values.frame_gen_target_rate.GetValue());
+    if (const long long display_ns =
+            VideoCommon::Nx2Perf::g_display_refresh_ns.load(std::memory_order_relaxed);
+        display_ns > 0) {
+        const f32 display_rate = 1e9f / static_cast<f32>(display_ns);
+        target_rate = target_rate == 0.0f ? display_rate : (std::min)(target_rate, display_rate);
+    }
 
     if (smoothed_interval > 0.0f) {
         f32 burst_threshold = BURST_CADENCE_RATIO / smoothed_interval;
@@ -114,6 +124,13 @@ FrameGenPlan FrameGenPacer::Plan(size_t capacity) {
         output_credit = 0.0f;
         issued_generations = limit;
         return {.generations = limit, .warm = limit > 0};
+    }
+
+    // Real frames already (nearly) fill the target: nothing to generate.
+    if (1.0f / smoothed_interval >= target_rate * TARGET_SATISFIED_RATIO) {
+        output_credit = 0.0f;
+        deficit_since.reset();
+        return {};
     }
 
     UpdateLimit(now, 1.0f / smoothed_interval, target_rate, ceiling);

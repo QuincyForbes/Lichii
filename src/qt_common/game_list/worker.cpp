@@ -528,6 +528,29 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
     }
 }
 
+void GameListWorker::FillContentProvider() {
+    const auto started = std::chrono::steady_clock::now();
+    provider->ClearAllEntries();
+    for (const UISettings::GameDir& game_dir : game_dirs) {
+        if (game_dir.path == std::string("SDMC") || game_dir.path == std::string("UserNAND") ||
+            game_dir.path == std::string("SysNAND")) {
+            continue;
+        }
+        const auto discovery = GameListDiscovery::Discover(
+            std::filesystem::path(Common::FS::ToU8String(game_dir.path)), game_dir.deep_scan,
+            [](const auto& path) {
+                const auto name = Common::FS::PathToUTF8String(path);
+                return HasSupportedFileExtension(name) || IsExtractedNCAMain(name);
+            },
+            [] { return false; });
+        ScanFileSystem(ScanTarget::FillManualContentProvider, discovery.files, nullptr);
+    }
+    LOG_INFO(Frontend, "Game directory content registered: elapsed_ms={}",
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - started).count());
+    processing_completed.Set();
+}
+
 void GameListWorker::run() {
     const auto started = std::chrono::steady_clock::now();
     watch_list.clear();

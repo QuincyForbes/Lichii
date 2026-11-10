@@ -6,6 +6,9 @@
 #include <atomic>
 #include <memory>
 #include <utility>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
 #include "game_settings.h"
 #include "common/cpu_features.h"
@@ -189,7 +192,15 @@ struct System::Impl {
     u64 program_id;
 
     void Initialize(System& system) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        // iOS: before the renderer and the game's files take address space, where the 8 GiB map
+        // is likeliest to fit.
         device_memory.emplace();
+#else
+        // Created when a game loads (InitializeKernel), sized for its memory layout: made here,
+        // it kept 8 GiB (12 for Switch 2) committed while the frontend sat idle.
+        device_memory.reset();
+#endif
 
         is_multicore = Settings::values.use_multi_core.GetValue();
         memory_layout = Settings::values.memory_layout_mode.GetValue();
@@ -217,7 +228,6 @@ struct System::Impl {
 
     void ReinitializeIfNecessary(System& system) {
         const bool must_reinitialize =
-            !device_memory.has_value() ||
             is_multicore != Settings::values.use_multi_core.GetValue() ||
             memory_layout != Settings::values.memory_layout_mode.GetValue();
 
@@ -335,14 +345,13 @@ struct System::Impl {
     bool InitializeKernel(System& system) {
         LOG_DEBUG(Core, "initialized OK");
 
-        // ShutdownMainProcess releases it after a Switch 2 game; create it before the check below
-        // so an empty slot alone does not rerun the full Initialize.
+        // Setting changes may require a full system reinitialization (e.g., disabling multicore).
+        ReinitializeIfNecessary(system);
+
+        // Not made at startup, and ShutdownMainProcess releases it after a Switch 2 game.
         if (!device_memory.has_value()) {
             device_memory.emplace();
         }
-
-        // Setting changes may require a full system reinitialization (e.g., disabling multicore).
-        ReinitializeIfNecessary(system);
 
         // The host refused the guest RAM (iOS without the memory entitlements): the kernel would
         // crash on its first access.
@@ -809,6 +818,9 @@ Kernel::KProcess* System::ApplicationProcess() {
 }
 
 Core::DeviceMemory& System::DeviceMemory() {
+    if (!impl->device_memory.has_value()) {
+        impl->device_memory.emplace();
+    }
     return *impl->device_memory;
 }
 
