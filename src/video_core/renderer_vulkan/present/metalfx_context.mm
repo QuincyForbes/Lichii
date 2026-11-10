@@ -3,7 +3,10 @@
 
 #include <cstdlib>
 #include <mutex>
+#include <string>
 #include <string_view>
+
+#include <fmt/format.h>
 
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/present/metalfx_context.h"
@@ -23,6 +26,18 @@ bool ForceCpuSync() {
         return value == nullptr || std::string_view{value} != "event";
     }();
     return force;
+}
+
+/// Why a command buffer did not complete, for the log.
+std::string FailureText(id<MTLCommandBuffer> buffer) {
+    NSError* const error = buffer.error;
+    if (error == nil) {
+        return fmt::format("status {}, no error", static_cast<int>(buffer.status));
+    }
+    const char* const domain = error.domain.UTF8String;
+    const char* const description = error.localizedDescription.UTF8String;
+    return fmt::format("{} {}: {}", domain ? domain : "?", static_cast<long>(error.code),
+                       description ? description : "?");
 }
 
 } // Anonymous namespace
@@ -170,7 +185,8 @@ id<MTLTexture> MetalFxContext::Texture(VkImage image) const {
 }
 
 bool MetalFxContext::Run(const std::function<bool(id<MTLCommandBuffer>)>& encode) {
-    if (queue == nil) {
+    // The handler of the command buffer that failed has logged why.
+    if (queue == nil || async_failure->load()) {
         return false;
     }
     @autoreleasepool {
@@ -199,16 +215,30 @@ bool MetalFxContext::Run(const std::function<bool(id<MTLCommandBuffer>)>& encode
             [command_buffer commit];
             [command_buffer waitUntilCompleted];
             last_command_buffer = nil;
-            return command_buffer.status == MTLCommandBufferStatusCompleted;
+            if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+                LOG_ERROR(Render_Vulkan, "MetalFX: the command buffer failed ({})",
+                          FailureText(command_buffer));
+                return false;
+            }
+            return true;
         }
         const u64 value = ++metal_value;
         [command_buffer encodeSignalEvent:metal_event value:value];
         // A command buffer that faults may skip its signal, and MoltenVK's queue would wait for it
-        // forever: signal from the CPU instead.
+        // forever: signal from the CPU instead. Its output was not written, so later calls fail and
+        // the callers fall back instead of presenting it.
         id<MTLSharedEvent> event = metal_event;
+        const std::shared_ptr<std::atomic<bool>> failure = async_failure;
         [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
-          if (buffer.status == MTLCommandBufferStatusError && event.signaledValue < value) {
+          if (buffer.status != MTLCommandBufferStatusError) {
+              return;
+          }
+          if (event.signaledValue < value) {
               event.signaledValue = value;
+          }
+          if (!failure->exchange(true)) {
+              LOG_ERROR(Render_Vulkan, "MetalFX: the command buffer failed ({})",
+                        FailureText(buffer));
           }
         }];
         [command_buffer commit];

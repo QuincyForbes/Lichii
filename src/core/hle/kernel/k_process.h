@@ -518,6 +518,10 @@ public:
         return m_arm_interfaces[core_index].get();
     }
 
+    /// Destroys the JITs and the exclusive monitor. Finalize does this; kernel shutdown calls it
+    /// for a process that is still referenced and so is never finalized. No CPU thread may run.
+    void ReleaseArmInterfaces();
+
 public:
     // Attempts to insert a watchpoint into a free slot. Returns false if none are available.
     bool InsertWatchpoint(KernelCore& kernel, KProcessAddress addr, u64 size, DebugWatchpointType type);

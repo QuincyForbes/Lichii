@@ -77,6 +77,15 @@ TOOLS = [
         },
     },
     {
+        "name": "memory_profile",
+        "description": "Where memory goes: guest pages the game mapped by memory state and "
+                       "GPU mapping (non-zero, resident, paged out, all-zero), kernel pools, and on "
+                       "Windows the working set split by kind with malloc's busy blocks. Reads "
+                       "every mapped guest page (a second or two). The renderer logs its "
+                       "'Memory:' and 'Memory detail:' lines at the next frame.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "capture_frame",
         "description": "EDEN_NX2_FRAME_DUMP for the next frame, now: every pass colour target, "
                        "dispatch storage image and the present source as PNG and .raw.zst, plus "

@@ -1021,14 +1021,19 @@ private:
     }
 
     bool ReserveRange(void* address, size_t size) {
+        // One call that maps the range without access. vm_allocate followed by vm_protect left it
+        // readable and writable zero-filled memory in between: a guest thread whose 4 KiB page
+        // shares a 16 KiB host page with the range (UpdateHostPages reserves whole host pages)
+        // read zeros or lost a write there instead of faulting into the page table path.
         vm_address_t target = reinterpret_cast<vm_address_t>(address);
-        kern_return_t kr = vm_allocate(mach_task_self(), &target, size, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE);
+        const kern_return_t kr = vm_map(mach_task_self(), &target, size, 0,
+                                        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, MACH_PORT_NULL, 0,
+                                        FALSE, VM_PROT_NONE, VM_PROT_READ | VM_PROT_WRITE,
+                                        VM_INHERIT_NONE);
         if (kr != KERN_SUCCESS) {
-            LOG_CRITICAL(HW_Memory, "vm_allocate({}, {:#x}) failed: {}", fmt::ptr(address), size,
-                         mach_error_string(kr));
-            return false;
+            LOG_CRITICAL(HW_Memory, "vm_map({}, {:#x}) of a reserved range failed: {}",
+                         fmt::ptr(address), size, mach_error_string(kr));
         }
-        kr = vm_protect(mach_task_self(), target, size, FALSE, VM_PROT_NONE);
         return kr == KERN_SUCCESS;
     }
 #endif
@@ -1305,7 +1310,80 @@ std::atomic<u64> g_zero_filled_bytes{};
     }
     return true;
 }
+
+#ifdef _WIN32
+/// Addresses of the pages in this process's working set, entries[0] being the count; empty on
+/// failure.
+std::vector<ULONG_PTR> QueryWorkingSetPages() {
+    std::vector<ULONG_PTR> entries(size_t{1} << 22);
+    for (int attempt = 0;; ++attempt) {
+        if (K32QueryWorkingSet(GetCurrentProcess(), entries.data(),
+                               static_cast<DWORD>(entries.size() * sizeof(ULONG_PTR)))) {
+            break;
+        }
+        if (GetLastError() != ERROR_BAD_LENGTH || attempt == 3) {
+            return {};
+        }
+        entries.assign((std::max)(entries.size() * 2, size_t{entries[0]} + (size_t{1} << 18)), 0);
+    }
+    entries.resize((std::min)(size_t{entries[0]}, entries.size() - 1) + 1);
+    return entries;
+}
+#endif
 } // namespace
+
+std::vector<bool> HostMemory::ResidentPages() const {
+    if (backing_base == nullptr) {
+        return {};
+    }
+    std::vector<bool> resident(backing_size / PageAlignment);
+#ifdef _WIN32
+    const std::vector<ULONG_PTR> entries = QueryWorkingSetPages();
+    if (entries.empty()) {
+        return {};
+    }
+    const auto backing_begin = reinterpret_cast<uintptr_t>(backing_base);
+    const auto view_begin = reinterpret_cast<uintptr_t>(impl ? impl->virtual_base : nullptr);
+    const size_t view_size = impl ? impl->virtual_size : 0;
+    for (size_t i = 1; i < entries.size(); ++i) {
+        const uintptr_t page = entries[i] & ~uintptr_t{PageAlignment - 1};
+        if (page - backing_begin < backing_size) {
+            resident[(page - backing_begin) / PageAlignment] = true;
+        } else if (view_begin != 0 && page - view_begin < view_size) {
+            if (const auto offset = impl->BackingOffset(page - view_begin);
+                offset && *offset < backing_size) {
+                resident[*offset / PageAlignment] = true;
+            }
+        }
+    }
+#elif defined(__APPLE__) || defined(__linux__)
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t num_pages = backing_size / page_size;
+#ifdef __APPLE__
+    std::vector<char> residency(num_pages);
+#else
+    std::vector<unsigned char> residency(num_pages);
+#endif
+    if (mincore(backing_base, num_pages * page_size, residency.data()) != 0) {
+        return {};
+    }
+    int counted = 1;
+#ifdef MINCORE_PAGED_OUT
+    counted |= MINCORE_PAGED_OUT;
+#endif
+    const size_t per_page = page_size / PageAlignment;
+    for (size_t index = 0; index < num_pages; ++index) {
+        if ((residency[index] & counted) != 0) {
+            for (size_t i = 0; i < per_page; ++i) {
+                resident[index * per_page + i] = true;
+            }
+        }
+    }
+#else
+    return {};
+#endif
+    return resident;
+}
 
 u64 HostMemory::ZeroFilledBytes() noexcept {
     return g_zero_filled_bytes.load(std::memory_order_relaxed);

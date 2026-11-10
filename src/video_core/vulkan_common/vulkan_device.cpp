@@ -1994,6 +1994,32 @@ std::string Device::MemoryHeapReport() const {
     return report;
 }
 
+std::string Device::MemoryTypeReport() const {
+    if (allocator == nullptr) {
+        return "no allocator";
+    }
+    const VkPhysicalDeviceMemoryProperties* memory_properties{};
+    vmaGetMemoryProperties(allocator, &memory_properties);
+    VmaTotalStatistics stats{};
+    vmaCalculateStatistics(allocator, &stats);
+    std::string report;
+    for (u32 type = 0; type < memory_properties->memoryTypeCount; ++type) {
+        const VmaStatistics& statistics = stats.memoryType[type].statistics;
+        if (statistics.blockCount == 0) {
+            continue;
+        }
+        const VkMemoryPropertyFlags flags = memory_properties->memoryTypes[type].propertyFlags;
+        report += fmt::format(
+            "{}type {} ({}{}{}): {} blocks {} MiB, {} allocations {} MiB", report.empty() ? "" : ", ",
+            type, (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? "DL" : "",
+            (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 ? " HV" : "",
+            (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0 ? " HC" : "", statistics.blockCount,
+            statistics.blockBytes >> 20, statistics.allocationCount,
+            statistics.allocationBytes >> 20);
+    }
+    return report;
+}
+
 u64 Device::GetDeviceMemorySlack() const {
     if (allocator == nullptr) {
         return 0;

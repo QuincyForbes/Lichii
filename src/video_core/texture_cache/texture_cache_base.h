@@ -298,6 +298,10 @@ public:
 
     /// Images in the cache and their (scaled) size in bytes.
     [[nodiscard]] std::pair<size_t, u64> ImageMemory();
+    /// Host bytes of the images split: GPU-written (render targets, storage images), converted
+    /// (decoded ASTC/BCn and other host formats), rescaled, the rest; then deleted images whose
+    /// memory is not free yet, and pooled images.
+    [[nodiscard]] std::array<u64, 6> ImageMemoryKinds();
 
     /// Device memory the collector counts as in use, and its expected and critical thresholds.
     [[nodiscard]] std::array<u64, 3> CollectorMemory() const noexcept {

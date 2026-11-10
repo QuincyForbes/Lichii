@@ -105,6 +105,12 @@ public:
         ApplyOpOnPAddr(address, buffer, operation);
     }
 
+    /// Whether the device address space maps the physical page at this raw address.
+    bool IsPhysicalPageMapped(PAddr address) const {
+        const size_t page = address >> page_bits;
+        return page < compressed_device_addr.size() && compressed_device_addr[page] != 0;
+    }
+
     PAddr GetPhysicalRawAddressFromDAddr(DAddr address) const {
         PAddr subbits = PAddr(address & page_mask);
         auto paddr = tracked_entries[(address >> page_bits)].compressed_physical_ptr;

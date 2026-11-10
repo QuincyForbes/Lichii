@@ -1064,6 +1064,7 @@ add_library(core STATIC
     hle/service/nx2_streamplay.h
     hle/service/nx2_stub_interface.h
     hle/service/nx2_gsv.h
+    hle/service/nx2_movie_clock.h
     hle/service/nx2_video_input_queue.h
     hle/service/nx2_image_layout.h
     hle/service/nx2_present_pacer.h
@@ -1197,6 +1198,8 @@ add_library(core STATIC
     memory/dmnt_cheat_types.h
     memory/dmnt_cheat_vm.cpp
     memory/dmnt_cheat_vm.h
+    memory_profile.cpp
+    memory_profile.h
     oot_zstd_hook.cpp
     oot_zstd_hook.h
     perf_stats.cpp

@@ -121,12 +121,15 @@ bool MetalFxReplacesNdsr() {
 }
 
 // The game's dynamic resolution is the safety valve a phone GPU needs.
+// EDEN_NX2_OOT_MAX_RESOLUTION=0 gives a desktop run the phone's default.
 bool MaxResolutionDefault() {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-    return false;
+    constexpr bool platform_default = false;
 #else
-    return true;
+    constexpr bool platform_default = true;
 #endif
+    static const bool enabled = OotEnvSwitch("EDEN_NX2_OOT_MAX_RESOLUTION", platform_default);
+    return enabled;
 }
 
 bool OotNativeZstdEnabled() {

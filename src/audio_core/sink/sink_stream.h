@@ -34,6 +34,18 @@ enum class StreamType {
     Sysmix,
 };
 
+/// Sample frames the host audio device took from the first audio renderer stream, played
+/// (rendered by the game) and starved (the last frame repeated: nothing was queued). The clock
+/// Switch 2 movies are shown by waits for starved audio (EDEN_NX2_VIDEO_PTS_SYNC, on unless 0)
+/// and the movie sync trace (EDEN_NX2_VIDEO_TRACE) compares both with video timestamps. Counted
+/// only when one of them is on.
+struct RenderOutputClock {
+    std::atomic<u64> played{};
+    std::atomic<u64> starved{};
+};
+RenderOutputClock& GetRenderOutputClock();
+bool RenderOutputClockEnabled();
+
 struct SinkBuffer {
     u64 frames;
     u64 frames_played;

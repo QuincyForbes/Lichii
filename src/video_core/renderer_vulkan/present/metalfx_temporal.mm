@@ -4,6 +4,9 @@
 #import <MetalFX/MetalFX.h>
 
 #include <algorithm>
+#include <string>
+
+#include <fmt/format.h>
 
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/present/metalfx_context.h"
@@ -21,7 +24,8 @@ constexpr VkFormat OUTPUT_FORMAT = VK_FORMAT_R16G16B16A16_SFLOAT;
 
 /// The 2D texture of one level and layer of a Vulkan image's Metal texture.
 id<MTLTexture> Plane(id<MTLTexture> texture, const VkImageSubresourceRange& range) {
-    if (texture == nil) {
+    // MetalFX reads single-sampled textures only.
+    if (texture == nil || texture.sampleCount > 1) {
         return nil;
     }
     if (texture.textureType == MTLTextureType2D && range.baseMipLevel == 0 &&
@@ -55,6 +59,63 @@ struct ScalerKey {
                hdr == other.hdr;
     }
 };
+
+std::string FormatText(MTLPixelFormat format) {
+    switch (format) {
+    case MTLPixelFormatInvalid:
+        return "none";
+    case MTLPixelFormatR16Float:
+        return "R16Float";
+    case MTLPixelFormatRG16Float:
+        return "RG16Float";
+    case MTLPixelFormatRGBA8Unorm:
+        return "RGBA8Unorm";
+    case MTLPixelFormatBGRA8Unorm:
+        return "BGRA8Unorm";
+    case MTLPixelFormatRGB10A2Unorm:
+        return "RGB10A2Unorm";
+    case MTLPixelFormatRG11B10Float:
+        return "RG11B10Float";
+    case MTLPixelFormatRGBA16Float:
+        return "RGBA16Float";
+    case MTLPixelFormatDepth32Float:
+        return "Depth32Float";
+    case MTLPixelFormatDepth32Float_Stencil8:
+        return "Depth32Float_Stencil8";
+    default:
+        return fmt::format("format {}", static_cast<u32>(format));
+    }
+}
+
+/// What MetalFX gets to see of a texture, for the log.
+std::string Describe(id<MTLTexture> texture) {
+    if (texture == nil) {
+        return "none";
+    }
+    const MTLStorageMode storage = texture.storageMode;
+    return fmt::format("{} {}x{} samples {} usage {:#x} storage {}",
+                       FormatText(texture.pixelFormat), static_cast<u32>(texture.width),
+                       static_cast<u32>(texture.height), static_cast<u32>(texture.sampleCount),
+                       static_cast<u32>(texture.usage),
+                       storage == MTLStorageModePrivate  ? "private"
+                       : storage == MTLStorageModeShared ? "shared"
+                                                         : "other");
+}
+
+/// The content scales the device's temporal scaler takes, for the log.
+std::string SupportedScaleText(id<MTLDevice> device) {
+    if (@available(iOS 17.0, macOS 14.0, *)) {
+        return fmt::format(
+            "x{:.2f} to x{:.2f}",
+            [MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice:device],
+            [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:device]);
+    }
+    return "unknown";
+}
+
+bool Covers(id<MTLTexture> texture, VkExtent2D extent) {
+    return texture.width >= extent.width && texture.height >= extent.height;
+}
 
 } // Anonymous namespace
 
@@ -105,17 +166,30 @@ bool MetalFxTemporalUpscaler::Impl::Prepare(const ScalerKey& wanted) {
             descriptor.reactiveMaskTextureFormat = wanted.mask;
         }
     }
-    scaler = [descriptor newTemporalScalerWithDevice:device];
+    // An exception MetalFX raises for a descriptor it rejects would end the app.
+    @try {
+        scaler = [descriptor newTemporalScalerWithDevice:device];
+    } @catch (NSException* exception) {
+        const char* const reason = exception.reason.UTF8String;
+        LOG_ERROR(Render_Vulkan, "MetalFX temporal: creating the scaler raised: {}",
+                  reason ? reason : "no reason given");
+        scaler = nil;
+    }
+    const std::string setup = fmt::format(
+        "{}x{} in {}x{} textures -> {}x{} (x{:.3f}, device takes {}), content region {}, "
+        "auto exposure {}, formats colour {} depth {} motion {} output {} mask {}",
+        wanted.render.width, wanted.render.height, static_cast<u32>(wanted.input_width),
+        static_cast<u32>(wanted.input_height), wanted.upscale.width, wanted.upscale.height,
+        static_cast<f32>(wanted.upscale.width) / static_cast<f32>(wanted.render.width),
+        SupportedScaleText(device), content_properties ? "on" : "off", wanted.hdr ? "on" : "off",
+        FormatText(wanted.color), FormatText(wanted.depth), FormatText(wanted.motion),
+        FormatText(wanted.output), FormatText(wanted.mask));
     if (scaler == nil) {
-        LOG_WARNING(Render_Vulkan, "MetalFX temporal: no scaler for {}x{} -> {}x{}",
-                    wanted.render.width, wanted.render.height, wanted.upscale.width,
-                    wanted.upscale.height);
+        LOG_WARNING(Render_Vulkan, "MetalFX temporal: no scaler for {}", setup);
         return false;
     }
     first_evaluation = true;
-    LOG_INFO(Render_Vulkan, "MetalFX temporal: {}x{} -> {}x{}{}", wanted.render.width,
-             wanted.render.height, wanted.upscale.width, wanted.upscale.height,
-             wanted.mask != MTLPixelFormatInvalid ? " with a reactive mask" : "");
+    LOG_INFO(Render_Vulkan, "MetalFX temporal: scaler for {}", setup);
     return true;
 }
 
@@ -203,13 +277,19 @@ bool MetalFxTemporalUpscaler::Upscale(const Inputs& inputs) {
         CreateOutput(inputs.upscale_size);
     }
     Impl& state = *impl;
+    // The caller falls back to its own upscaler and logs that; this says why.
+    const auto decline = [this](const std::string& reason) {
+        LOG_WARNING(Render_Vulkan, "MetalFX temporal: declined, {}", reason);
+        failed = true;
+        return false;
+    };
     @autoreleasepool {
-        id<MTLTexture> color =
-            Plane(state.context.Texture(inputs.color.image), inputs.color.range);
-        id<MTLTexture> depth =
-            Plane(state.context.Texture(inputs.depth.image), inputs.depth.range);
-        id<MTLTexture> motion =
-            Plane(state.context.Texture(inputs.motion_vectors.image), inputs.motion_vectors.range);
+        id<MTLTexture> color_source = state.context.Texture(inputs.color.image);
+        id<MTLTexture> depth_source = state.context.Texture(inputs.depth.image);
+        id<MTLTexture> motion_source = state.context.Texture(inputs.motion_vectors.image);
+        id<MTLTexture> color = Plane(color_source, inputs.color.range);
+        id<MTLTexture> depth = Plane(depth_source, inputs.depth.range);
+        id<MTLTexture> motion = Plane(motion_source, inputs.motion_vectors.range);
         id<MTLTexture> output = state.context.Texture(*output_image);
         id<MTLTexture> mask = nil;
         if (inputs.bias_current_color) {
@@ -219,9 +299,22 @@ bool MetalFxTemporalUpscaler::Upscale(const Inputs& inputs) {
             }
         }
         if (color == nil || depth == nil || motion == nil || output == nil) {
-            LOG_WARNING(Render_Vulkan, "MetalFX temporal: no Metal textures for the inputs");
-            failed = true;
-            return false;
+            return decline(fmt::format("no single-sampled Metal texture for an input: colour {}; "
+                                       "depth {}; motion {}; output {}",
+                                       Describe(color_source), Describe(depth_source),
+                                       Describe(motion_source), Describe(output)));
+        }
+        if (!Covers(color, inputs.render_size) || !Covers(depth, inputs.render_size) ||
+            !Covers(motion, inputs.render_size)) {
+            return decline(fmt::format("an input is smaller than the {}x{} render size: colour "
+                                       "{}; depth {}; motion {}",
+                                       inputs.render_size.width, inputs.render_size.height,
+                                       Describe(color), Describe(depth), Describe(motion)));
+        }
+        // "You are responsible for providing a texture with a private storageMode"
+        // (MTLFXTemporalScaler.outputTexture).
+        if (output.storageMode != MTLStorageModePrivate) {
+            return decline(fmt::format("the output texture is not private: {}", Describe(output)));
         }
         const ScalerKey key{
             .color = color.pixelFormat,
@@ -249,23 +342,32 @@ bool MetalFxTemporalUpscaler::Upscale(const Inputs& inputs) {
                 usable = usable && HasUsage(mask, scaler.reactiveTextureUsage);
             }
         }
+        const auto textures = [&] {
+            return fmt::format(
+                "colour {} (needs usage {:#x}); depth {} (needs {:#x}); motion {} (needs {:#x}); "
+                "output {} (needs {:#x}); mask {}",
+                Describe(color), static_cast<u32>(scaler.colorTextureUsage), Describe(depth),
+                static_cast<u32>(scaler.depthTextureUsage), Describe(motion),
+                static_cast<u32>(scaler.motionTextureUsage), Describe(output),
+                static_cast<u32>(scaler.outputTextureUsage), Describe(mask));
+        };
         if (!usable) {
-            LOG_WARNING(Render_Vulkan, "MetalFX temporal: the inputs lack the texture usage it "
-                                       "needs");
-            failed = true;
-            return false;
+            return decline(fmt::format("a texture lacks the usage MetalFX needs: {}", textures()));
         }
-        const bool reset = inputs.reset || state.first_evaluation;
+        const bool first = state.first_evaluation;
+        const bool reset = inputs.reset || first;
         state.first_evaluation = false;
+        if (first) {
+            LOG_INFO(Render_Vulkan, "MetalFX temporal: textures: {}", textures());
+        }
         const bool ran = state.context.Run([&](id<MTLCommandBuffer> command_buffer) {
             scaler.colorTexture = color;
             scaler.depthTexture = depth;
             scaler.motionTexture = motion;
             scaler.outputTexture = output;
-            if (state.content_properties) {
-                scaler.inputContentWidth = inputs.render_size.width;
-                scaler.inputContentHeight = inputs.render_size.height;
-            }
+            // Every evaluation, as the steps of MTLFXTemporalScaler list them.
+            scaler.inputContentWidth = inputs.render_size.width;
+            scaler.inputContentHeight = inputs.render_size.height;
             scaler.jitterOffsetX = inputs.jitter[0];
             scaler.jitterOffsetY = inputs.jitter[1];
             scaler.motionVectorScaleX = inputs.motion_vector_scale[0];
@@ -278,13 +380,27 @@ bool MetalFxTemporalUpscaler::Upscale(const Inputs& inputs) {
                     scaler.reactiveMaskTexture = mask;
                 }
             }
-            [scaler encodeToCommandBuffer:command_buffer];
+            @try {
+                [scaler encodeToCommandBuffer:command_buffer];
+            } @catch (NSException* exception) {
+                const char* const reason = exception.reason.UTF8String;
+                LOG_ERROR(Render_Vulkan, "MetalFX temporal: encoding raised: {}",
+                          reason ? reason : "no reason given");
+                return false;
+            }
             return true;
         });
         if (!ran) {
-            LOG_WARNING(Render_Vulkan, "MetalFX temporal: the Metal work failed");
-            failed = true;
-            return false;
+            return decline("the Metal work failed or was dropped (see the MetalFX lines above)");
+        }
+        if (first) {
+            LOG_INFO(Render_Vulkan,
+                     "MetalFX temporal: first evaluation {}: jitter ({}, {}), motion scale ({}, "
+                     "{}), depth reversed {}, reset {}",
+                     state.context.UsesSharedEvents() ? "committed (shared event)"
+                                                      : "completed (CPU wait)",
+                     inputs.jitter[0], inputs.jitter[1], inputs.motion_vector_scale[0],
+                     inputs.motion_vector_scale[1], inputs.depth_inverted, reset);
         }
     }
     return true;

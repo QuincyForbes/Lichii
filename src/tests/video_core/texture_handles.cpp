@@ -309,17 +309,9 @@ TEST_CASE("Failed Phi handle subtrees discard their cached values",
 namespace {
 struct HandleTestMemory {
     std::map<GPUVAddr, u32> words;
-    template <typename T>
-    T Read(GPUVAddr address) const {
-        const auto word = [&](GPUVAddr at) -> u64 {
-            const auto it = words.find(at);
-            return it != words.end() ? it->second : 0U;
-        };
-        if constexpr (sizeof(T) == 8) {
-            return static_cast<T>(word(address) | (word(address + 4) << 32));
-        } else {
-            return static_cast<T>(word(address));
-        }
+    u32 ReadHandleWord(GPUVAddr address) const {
+        const auto it = words.find(address);
+        return it != words.end() ? it->second : 0U;
     }
 };
 } // namespace

@@ -346,6 +346,24 @@ void Reset() {
     LOG_INFO(Common, "iOS JIT: pool reset ({} chunks free)", g_pool.size());
 }
 
+std::optional<PoolLocation> Locate(const void* address) {
+    if (!g_pool_ready.load()) {
+        return std::nullopt;
+    }
+    const auto* const byte = static_cast<const std::uint8_t*>(address);
+    for (std::size_t chunk = 0; chunk < g_pool.size(); ++chunk) {
+        const Region& region = g_pool[chunk];
+        for (const bool writable_view : {false, true}) {
+            const std::uint8_t* const base = writable_view ? region.rw : region.rx;
+            if (base != nullptr && byte >= base && byte < base + region.size) {
+                const auto offset = static_cast<std::size_t>(byte - base);
+                return PoolLocation{chunk, offset, writable_view, offset < region.used};
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 } // namespace Common::IosJit
 
 extern "C" int lichii_ios_jit_alloc(std::size_t bytes, void** wmem, void** xmem) {

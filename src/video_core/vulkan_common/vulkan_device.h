@@ -1135,6 +1135,8 @@ FN_MAX_LIMIT_LIST
 
     /// Each used heap's usage, budget and allocator block and allocation bytes, for the log.
     std::string MemoryHeapReport() const;
+    /// VMA blocks and allocations per memory type in use (device local, host visible...).
+    std::string MemoryTypeReport() const;
 
     u32 GetSetsPerPool() const {
         return sets_per_pool;

@@ -1,0 +1,131 @@
+name: tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    # What the test programs are built from: the source paths release-binaries.yml builds on, with
+    # src/tests included.
+    paths:
+      - "src/**"
+      - "CMakeLists.txt"
+      - "CMakeModules/**"
+      - "externals/**"
+      - ".patch/**"
+      - "cpmfile.json"
+      - ".github/workflows/tests.yml"
+
+permissions:
+  contents: read
+
+# A group and caches of its own: a test run never queues behind a release build or makes one wait,
+# and a failing test cannot stop a release. A newer push replaces a running test run.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-gcc:
+    name: Linux unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      # Smaller than the release builds' caches, which share the repository's cache quota.
+      CCACHE_MAXSIZE: 1500M
+      CCACHE_COMPILERCHECK: content
+      TEST_TARGETS: tests update_checker_tests ios_controls_tests config_tests
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # The Linux packages of release-binaries.yml without Qt: no test program links the Qt frontend.
+      - name: Install Linux dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf cmake g++ gcc git glslang-tools libglu1-mesa-dev \
+            libpulse-dev libtool libudev-dev libxkbcommon-x11-0 \
+            mesa-common-dev nasm ninja-build libavfilter-dev libavcodec-dev \
+            libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
+            spirv-tools spirv-headers libusb-1.0-0-dev \
+            libboost-dev libboost-fiber-dev libboost-context-dev \
+            libopus-dev libasound2-dev ccache
+
+      - name: Restore CPM downloads
+        id: cpm-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .cache/cpm
+          key: cpm-tests-linux-x86_64-v1-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'CMakeModules/CPM*.cmake', 'externals/**/CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          restore-keys: |
+            cpm-tests-linux-x86_64-v1-
+            cpm-linux-x86_64-v2-
+
+      - name: Restore compiler objects
+        id: compiler-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .ccache
+          key: objects-tests-linux-x86_64-v1-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            objects-tests-linux-x86_64-v1-${{ github.sha }}-
+            objects-tests-linux-x86_64-v1-
+
+      # The release configuration with the tests on and the Qt frontend off. BUILD_TESTING would
+      # also turn on dynarmic's own tests, which this job does not build.
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build/tests -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_WERROR=ON \
+            -DBUILD_TESTING=ON \
+            -DYUZU_TESTS=ON \
+            -DDYNARMIC_TESTS=OFF \
+            -DENABLE_QT=OFF \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DVulkanHeaders_FORCE_BUNDLED=ON \
+            -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+            -DENABLE_UPDATE_CHECKER=ON \
+            -DLICHII_UPDATE_REPO=${{ github.repository }} \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DUSE_CCACHE=ON
+
+      - name: Save CPM downloads
+        if: steps.cpm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: .cache/cpm
+          key: ${{ steps.cpm-cache.outputs.cache-primary-key }}
+
+      - name: Build tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ccache --zero-stats
+          # Past the first error, so one run shows everything that no longer compiles.
+          cmake --build build/tests --target $TEST_TARGETS --parallel -- -k 0
+          ccache --show-stats
+
+      - name: Save compiler objects
+        if: always() && steps.compiler-cache.outcome == 'success'
+        uses: actions/cache/save@v5
+        with:
+          path: .ccache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir build/tests --output-on-failure --no-tests=error \
+            -R "^(${TEST_TARGETS// /|})\$"

@@ -158,6 +158,15 @@ public:
         return alloc_size / sizeof(T);
     }
 
+    /// Host bytes committed for writing so far.
+    [[nodiscard]] std::size_t CommittedBytes() const noexcept {
+        std::size_t pages = 0;
+        for (const auto& word : committed_pages) {
+            pages += std::popcount(word.load(std::memory_order_relaxed));
+        }
+        return pages * HostPageSize;
+    }
+
 private:
     [[nodiscard]] constexpr bool IsCommittedPage(std::size_t index) const noexcept {
         if (index > alloc_size / sizeof(T)) {

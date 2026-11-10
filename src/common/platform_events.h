@@ -33,7 +33,8 @@ struct ProcessMemory {
     u64 internal;       ///< Anonymous memory mapped by the process, per mapping (pmap ledger)
     u64 purgeable_nonvolatile;
 };
-/// Apple: the process footprint and parts of it; zeros elsewhere.
+/// Apple: the process footprint and parts of it. Windows: the working set and its peak. Zeros
+/// elsewhere.
 ProcessMemory QueryProcessMemory();
 /// Apple: hands the memory malloc holds free back to the OS. Returns the bytes released.
 u64 RelieveMallocPressure();

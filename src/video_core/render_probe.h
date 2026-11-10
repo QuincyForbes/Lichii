@@ -16,6 +16,8 @@ inline std::atomic<u64> frame_extents{};
 /// Device memory the texture cache holds, and the level at which it starts collecting.
 inline std::atomic<u64> texture_cache_bytes{};
 inline std::atomic<u64> texture_cache_expected{};
+/// Bumped to have the renderer log its memory report at the next frame (debug server).
+inline std::atomic<u32> memory_report_requests{};
 
 inline void StoreFrameExtents(u32 guest_width, u32 guest_height, u32 output_width,
                               u32 output_height) {
