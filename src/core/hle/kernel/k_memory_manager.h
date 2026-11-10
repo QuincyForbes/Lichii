@@ -110,7 +110,7 @@ public:
 
             {
                 KScopedLightLock lk(m_pool_locks[static_cast<size_t>(manager.GetPool())]);
-                manager.Close(address, cur_pages);
+                manager.Close(*this, address, cur_pages);
             }
 
             num_pages -= cur_pages;
@@ -291,10 +291,15 @@ private:
             }
         }
 
-        void Close(KPhysicalAddress address, size_t num_pages) {
+        void Close(KMemoryManager& owner, KPhysicalAddress address, size_t num_pages) {
             size_t index = this->GetPageOffset(address);
             const size_t end = index + num_pages;
 
+            const auto free_run = [&](size_t start, size_t count) {
+                const KPhysicalAddress block = m_heap.GetAddress() + start * PageSize;
+                owner.ReleaseFreed(block, count);
+                this->Free(block, count);
+            };
             size_t free_start = 0;
             size_t free_count = 0;
             while (index < end) {
@@ -311,7 +316,7 @@ private:
                     }
                 } else {
                     if (free_count > 0) {
-                        this->Free(m_heap.GetAddress() + free_start * PageSize, free_count);
+                        free_run(free_start, free_count);
                         free_count = 0;
                     }
                 }
@@ -320,7 +325,7 @@ private:
             }
 
             if (free_count > 0) {
-                this->Free(m_heap.GetAddress() + free_start * PageSize, free_count);
+                free_run(free_start, free_count);
             }
         }
 
@@ -338,6 +343,7 @@ private:
 private:
     void MarkUsed(KPhysicalAddress address, size_t num_pages);
     void MarkDirty(KPhysicalAddress address, size_t num_pages);
+    void ReleaseFreed(KPhysicalAddress address, size_t num_pages);
 
     Impl& GetManager(KPhysicalAddress address) {
         return m_managers[m_memory_layout.GetPhysicalLinearRegion(address).GetAttributes()];
