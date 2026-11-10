@@ -3511,6 +3511,15 @@ void RasterizerVulkan::TickMemoryReport() {
              staging_pool.CachedBytes() >> 20, graphics_pipelines, compute_pipelines,
              device.IsOptimalAstcSupported() ? "native" : "decoded",
              device.IsOptimalBcnSupported() ? "native" : "decoded");
+    if (const auto commit = Common::HostMemory::GetCommitStats(); commit.reserved) {
+        // EDEN_NX2_SEC_RESERVE. A fault commit is a page touched before the kernel handed it out.
+        LOG_INFO(Render_Vulkan,
+                 "Guest memory section: {} of {} MiB committed, {} fault commits (first at {} "
+                 "offset {:#x})",
+                 commit.committed_bytes >> 20, commit.section_bytes >> 20, commit.net_commits,
+                 (commit.first_net_offset >> 63) != 0 ? "virtual" : "backing",
+                 commit.first_net_offset & ~(u64{1} << 63));
+    }
     // Where the Vulkan memory goes, for fitting a game into a limit.
     if (requested || std::getenv("EDEN_NX2_MEMORY_REPORT") != nullptr) {
         LOG_INFO(Render_Vulkan,

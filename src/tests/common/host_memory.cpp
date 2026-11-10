@@ -5,7 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <cstring>
+#include <utility>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -306,5 +309,66 @@ TEST_CASE("HostMemory: Trim zero pages keeps contents", "[common]") {
     REQUIRE(all(view + 2 * Page, 0));
     REQUIRE(all(view + 3 * Page, 0));
     REQUIRE(all(backing + 0x400000, 0));
+}
+#endif
+
+#ifdef _WIN32
+TEST_CASE("HostMemory: Reserved section commits on use", "[common]") {
+    _putenv_s("EDEN_NX2_SEC_RESERVE", "1");
+    {
+        HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
+        _putenv_s("EDEN_NX2_SEC_RESERVE", "");
+        REQUIRE(mem.BackingBasePointer() != nullptr);
+        REQUIRE(mem.CommitsOnUse());
+        const auto before = HostMemory::GetCommitStats();
+        REQUIRE(before.reserved);
+
+        // Handed out: its 64 KiB granule is committed, usable through the backing and a view.
+        mem.MarkUsed(0x25000, 0x2000);
+        volatile u8* const backing = mem.BackingBasePointer();
+        backing[0x25000] = 1;
+        backing[0x2ffff] = 2;
+        mem.Map(0x5000, 0x25000, 0x1000, PERMS, HEAP);
+        volatile u8* const view = mem.VirtualBasePointer();
+        REQUIRE(view[0x5000] == 1);
+        auto stats = HostMemory::GetCommitStats();
+        REQUIRE(stats.committed_bytes - before.committed_bytes == 0x10000);
+        REQUIRE(stats.net_commits == before.net_commits);
+
+        // Mapped without being handed out: Map commits it.
+        mem.Map(0x10000, 0x100000, 0x3000, PERMS, HEAP);
+        view[0x12fff] = 3;
+        REQUIRE(backing[0x102fff] == 3);
+        stats = HostMemory::GetCommitStats();
+        REQUIRE(stats.committed_bytes - before.committed_bytes == 0x20000);
+        REQUIRE(stats.net_commits == before.net_commits);
+
+        // Touched without either: the fault handler commits it and counts.
+        backing[0x800000] = 4;
+        REQUIRE(backing[0x800000] == 4);
+        stats = HostMemory::GetCommitStats();
+        REQUIRE(stats.net_commits == before.net_commits + 1);
+        if (before.net_commits == 0) {
+            REQUIRE(stats.first_net_offset == 0x800000);
+        }
+
+        // Everything outside the ranges left to be committed on use.
+        const std::array<std::pair<size_t, size_t>, 1> lazy{{{0x1000000, BACKING_SIZE - 0x1000000}}};
+        mem.CommitAllBut(lazy);
+        stats = HostMemory::GetCommitStats();
+        REQUIRE(stats.committed_bytes - before.committed_bytes == 0x1000000);
+        REQUIRE(stats.net_commits == before.net_commits + 1);
+    }
+    REQUIRE_FALSE(HostMemory::GetCommitStats().reserved);
+}
+
+TEST_CASE("HostMemory: Section committed whole without the switch", "[common]") {
+    HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
+    REQUIRE(mem.BackingBasePointer() != nullptr);
+    REQUIRE_FALSE(mem.CommitsOnUse());
+    REQUIRE_FALSE(HostMemory::GetCommitStats().reserved);
+    const u64 committed = HostMemory::GetCommitStats().committed_bytes;
+    mem.MarkUsed(0x25000, 0x2000);
+    REQUIRE(HostMemory::GetCommitStats().committed_bytes == committed);
 }
 #endif
