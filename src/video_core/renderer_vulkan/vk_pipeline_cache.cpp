@@ -1143,6 +1143,19 @@ void PlacePrebuildThread(bool quiet) {
     }
 }
 
+/// Apple: Metal compiles in MTLCompilerService at the QoS of the thread asking, so a pipeline the
+/// boot waits for is built at user-initiated rather than the workers' utility class.
+struct BootBuildQos {
+#ifdef __APPLE__
+    BootBuildQos() {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+    }
+    ~BootBuildQos() {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    }
+#endif
+};
+
 // Preload every cached pipeline at boot across all worker threads unless EDEN_NX2_PRELOAD_ALL_PIPELINES=0.
 // Off by default on MoltenVK, as upstream: each one goes through SPIR-V -> MSL -> Metal and none
 // is ever evicted there, so Ocarina's ~23,000 took minutes and more memory than an iPhone has.
@@ -1898,6 +1911,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                  std::vector<FileEnvironment> candidates) {
         workers.QueueWork([this, key, envs_ = std::move(candidates), &state,
                            &callback]() mutable {
+            [[maybe_unused]] BootBuildQos qos;
             ShaderPools pools;
             ComputePipelineCacheEntry entry;
             for (auto& env : envs_) {
@@ -2006,6 +2020,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         ++queued_graphics;
 
         workers.QueueWork([this, key, records_ = std::move(records), &state, &callback]() mutable {
+            [[maybe_unused]] BootBuildQos qos;
             auto pipeline{CreateCachedGraphicsPipeline(key, records_, state.statistics.get())};
 
             std::scoped_lock lock{state.mutex};
