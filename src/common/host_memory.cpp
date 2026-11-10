@@ -68,8 +68,10 @@
 #endif // ^^^ POSIX ^^^
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <random>
 
@@ -597,17 +599,14 @@ public:
         // Backing memory initialization
 #ifdef LICHII_IOS_MACH_MEMORY
         {
-            // LICHII_IOS_NO_FOOTPRINT=1 (experiment, unverified): tag the guest memory so it is
-            // left out of the process footprint jetsam compares with the limit (as MeloNX does
-            // for its JIT memory).
+            // The object stays untagged: XNU then charges each mapping of a page (pmap ledgers),
+            // which MADV_FREE_REUSABLE and dropping the backing view's mappings can undo. A tagged
+            // (owned) object is charged per resident page instead and ignores both.
             const char* const no_footprint_env = std::getenv("LICHII_IOS_NO_FOOTPRINT");
             const bool no_footprint = no_footprint_env != nullptr && no_footprint_env[0] == '1';
-            constexpr int MapMemLedgerTagged = 0x002000;
             memory_object_size_t entry_size = backing_size;
             kern_return_t kr = mach_make_memory_entry_64(
-                mach_task_self(), &entry_size, 0,
-                MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE |
-                    (no_footprint ? MapMemLedgerTagged : 0),
+                mach_task_self(), &entry_size, 0, MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE,
                 &backing_entry, MACH_PORT_NULL);
             if (kr != KERN_SUCCESS || entry_size < backing_size) {
                 LOG_CRITICAL(HW_Memory, "mach_make_memory_entry_64({:#x}) failed: {}", backing_size,
@@ -616,6 +615,11 @@ public:
                 return false;
             }
             if (no_footprint) {
+                // LICHII_IOS_NO_FOOTPRINT=1 (experiment): XNU's mach_memory_entry_ownership
+                // refuses VM_LEDGER_FLAG_NO_FOOTPRINT (and the NETWORK tag, which implies it) with
+                // KERN_NO_ACCESS unless the app holds com.apple.private.memory.ownership_transfer
+                // or matching com.apple.developer.memory.transfer-send/-accept, whatever the tag
+                // or owner. A refusal leaves the object untouched.
                 using OwnershipFn = kern_return_t (*)(mach_port_t, task_t, int, int);
                 constexpr int VmLedgerTagDefault = 1;
                 constexpr int VmLedgerFlagNoFootprint = 1;
@@ -623,7 +627,7 @@ public:
                     dlsym(RTLD_DEFAULT, "mach_memory_entry_ownership"));
                 const kern_return_t owned =
                     ownership != nullptr
-                        ? ownership(backing_entry, TASK_NULL, VmLedgerTagDefault,
+                        ? ownership(backing_entry, mach_task_self(), VmLedgerTagDefault,
                                     VmLedgerFlagNoFootprint)
                         : KERN_FAILURE;
                 LOG_WARNING(HW_Memory, "Guest memory without footprint (experiment): {}",
@@ -883,6 +887,22 @@ public:
     void EnableDirectMappedAddress() {
         virtual_base = nullptr;
     }
+
+#ifdef LICHII_IOS_MACH_MEMORY
+    /// Maps [offset, offset + size) of the backing view again. Its pages stay in the memory
+    /// object; only the view's page table entries go, which XNU charges to the footprint once per
+    /// mapping on top of the fastmem view's. The swap is atomic for other threads (the map lock is
+    /// held throughout) and a later access soft-faults the page back.
+    bool DropBackingMappings(size_t offset, size_t size) {
+        if (backing_entry == MACH_PORT_NULL) {
+            return false;
+        }
+        vm_address_t target = reinterpret_cast<vm_address_t>(backing_base + offset);
+        return vm_map(mach_task_self(), &target, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                      backing_entry, offset, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                      VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE) == KERN_SUCCESS;
+    }
+#endif
 
     const size_t backing_size; ///< Size of the backing memory in bytes
     size_t virtual_size; ///< Size of the virtual address placeholder in bytes (iOS: as granted)
@@ -1219,6 +1239,7 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
 
 namespace {
 std::atomic<u64> g_zero_filled_bytes{};
+[[maybe_unused]] std::atomic<u64> g_zero_advised_bytes{};
 [[maybe_unused]] std::atomic<u64> g_scanned_resident_bytes{};
 [[maybe_unused]] std::atomic<u64> g_trimmed_zero_bytes{};
 [[maybe_unused]] std::atomic<u64> g_scanned_handed_out_bytes{};
@@ -1328,10 +1349,11 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
     }
     return {(backing_pages.size() + view_pages.size()) * PageAlignment, zero_bytes};
 #elif defined(__APPLE__)
-    // Apple counts every resident or compressed page of the guest memory object once, whichever
-    // view touched it, and iOS kills the app when that footprint passes its limit. Zero pages
-    // there are made reusable: they leave the footprint, read back as zeros if the OS takes them
-    // and are counted again once written. EDEN_NX2_TRIM_ZERO=0 turns it off.
+    // Apple counts every mapping of a resident or compressed guest page in the footprint, and iOS
+    // kills the app when it passes its limit. Zero pages are made reusable: they leave the
+    // footprint of every mapping (until MADV_FREE_REUSE; writes keep them dirty, so the OS
+    // compresses rather than drops them) and read back as zeros if the OS takes them.
+    // EDEN_NX2_TRIM_ZERO=0 turns it off.
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_TRIM_ZERO");
         return value == nullptr || value[0] != '0';
@@ -1390,25 +1412,49 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
             }
         }
     };
-    size_t run_begin = num_pages;
-    for (size_t index = 0; index < num_pages; ++index) {
-        bool zero = false;
-        if ((residency[index] & counted) != 0) {
-            resident += page_size;
-            zero = is_zero(backing_base + index * page_size);
-            if (!zero) {
-                trimmed_pages[index] = false;
+#ifdef LICHII_IOS_MACH_MEMORY
+    // XNU charges an untagged object's page once per mapping: a page the guest uses through the
+    // fastmem view and the emulator (or this scan) read through the backing counts twice. Each
+    // chunk's backing mappings go once it is scanned, so the scan never holds more than one
+    // chunk of extra footprint. EDEN_NX2_TRIM_UNMAP=0 keeps them.
+    static const bool unmap = [] {
+        const char* value = std::getenv("EDEN_NX2_TRIM_UNMAP");
+        return value == nullptr || value[0] != '0';
+    }();
+#endif
+    constexpr size_t ChunkBytes = size_t{64} << 20;
+    const size_t chunk_pages = (std::max)(size_t{1}, ChunkBytes / page_size);
+    for (size_t chunk = 0; chunk < num_pages; chunk += chunk_pages) {
+        const size_t chunk_end = (std::min)(num_pages, chunk + chunk_pages);
+        bool touched = false;
+        size_t run_begin = chunk_end;
+        for (size_t index = chunk; index < chunk_end; ++index) {
+            bool zero = false;
+            if ((residency[index] & counted) != 0) {
+                touched = true;
+                resident += page_size;
+                zero = is_zero(backing_base + index * page_size);
+                if (!zero) {
+                    trimmed_pages[index] = false;
+                }
+            }
+            if (zero && run_begin == chunk_end) {
+                run_begin = index;
+            } else if (!zero && run_begin != chunk_end) {
+                trim(run_begin, index);
+                run_begin = chunk_end;
             }
         }
-        if (zero && run_begin == num_pages) {
-            run_begin = index;
-        } else if (!zero && run_begin != num_pages) {
-            trim(run_begin, index);
-            run_begin = num_pages;
+        if (run_begin != chunk_end) {
+            trim(run_begin, chunk_end);
         }
-    }
-    if (run_begin != num_pages) {
-        trim(run_begin, num_pages);
+#ifdef LICHII_IOS_MACH_MEMORY
+        if (unmap && touched && impl) {
+            impl->DropBackingMappings(chunk * page_size, (chunk_end - chunk) * page_size);
+        }
+#else
+        static_cast<void>(touched);
+#endif
     }
     u64 handed_out = 0;
     for (size_t index = 0; index < num_granules; ++index) {
@@ -1424,6 +1470,50 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
     return {0, 0};
 #endif
 }
+
+u64 HostMemory::ZeroAdvisedBytes() noexcept {
+    return g_zero_advised_bytes.load(std::memory_order_relaxed);
+}
+
+#ifdef __APPLE__
+#ifndef MADV_ZERO
+#define MADV_ZERO 11
+#endif
+bool HostMemory::ZeroWithoutFaulting(size_t offset, size_t length) {
+    // MADV_ZERO (iOS 17, macOS 14) zeroes resident pages in place and drops compressed ones
+    // without faulting the rest in; a memset gives every page RAM and a second charged mapping
+    // (the backing view's). The cleared whole pages are then made reusable, out of the footprint.
+    static std::atomic<bool> unsupported{};
+    static std::atomic<bool> logged{};
+    static const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    if (unsupported.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const size_t begin = Common::AlignUp(offset, page_size);
+    const size_t end = Common::AlignDown(offset + length, page_size);
+    if (begin >= end) {
+        return false;
+    }
+    if (madvise(backing_base + begin, end - begin, MADV_ZERO) != 0) {
+        const int error = errno;
+        if (error == EINVAL || error == ENOTSUP) {
+            unsupported.store(true, std::memory_order_relaxed);
+            LOG_INFO(Common_Memory, "MADV_ZERO unavailable ({}): guest memory is cleared with memset",
+                     strerror(error));
+        }
+        return false;
+    }
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        LOG_INFO(Common_Memory, "Guest memory is cleared with MADV_ZERO (no pages faulted in)");
+    }
+    std::memset(backing_base + offset, 0, begin - offset);
+    std::memset(backing_base + end, 0, offset + length - end);
+    madvise(backing_base + begin, end - begin, MADV_FREE_REUSABLE);
+    g_zero_filled_bytes.fetch_add(length - (end - begin), std::memory_order_relaxed);
+    g_zero_advised_bytes.fetch_add(end - begin, std::memory_order_relaxed);
+    return true;
+}
+#endif
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
     if (length == 0) {
@@ -1453,15 +1543,17 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
         const size_t clear_end = (std::min)(granule_end, end);
         if ((granules[index].load(std::memory_order_acquire) & GranuleDirty) != 0) {
             const bool whole = offset == granule_begin && clear_end == granule_end;
+            bool cleared = false;
 #ifdef __APPLE__
-            if ((granules[index].fetch_and(static_cast<u8>(~GranuleReleased),
-                                           std::memory_order_acq_rel) &
-                 GranuleReleased) != 0) {
+            const bool released = (granules[index].fetch_and(static_cast<u8>(~GranuleReleased),
+                                                             std::memory_order_acq_rel) &
+                                   GranuleReleased) != 0;
+            cleared = ZeroWithoutFaulting(offset, clear_end - offset);
+            if (!cleared && released) {
                 madvise(backing_base + granule_begin,
                         (std::min)(granule_end, backing_size) - granule_begin, MADV_FREE_REUSE);
             }
 #endif
-            bool cleared = false;
 #ifdef __linux__
             cleared = whole && punch && impl && impl->PunchHole(granule_begin, granule_end - granule_begin);
 #endif

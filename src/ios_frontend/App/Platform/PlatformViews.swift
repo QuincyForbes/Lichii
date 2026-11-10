@@ -303,7 +303,7 @@ struct ExperimentsView: View {
             } header: {
                 Text("Memory")
             } footer: {
-                Text("Tags the guest memory out of the app's memory footprint so iOS may close the app later. Unverified; applies the next time Lichii starts.")
+                Text("Asks iOS to leave the guest memory out of the app's memory footprint. Current iOS versions refuse this for apps without a private Apple entitlement (the log then shows \"no access\"), so it has no effect; it does no harm either. Applies the next time Lichii starts.")
             }
 
             Section {

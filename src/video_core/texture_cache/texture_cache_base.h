@@ -193,6 +193,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
     u32 seen_host_pressure{};     ///< Common::PlatformEvents memory pressure already answered
     u32 host_pressure_frames{};   ///< Frames left collecting as if out of memory after it
+    /// iOS: the most the cache may hold given what is left to the process (TickFrame)
+    u64 host_memory_cap{(std::numeric_limits<u64>::max)()};
+    u64 host_memory_cap_logged{}; ///< Collection threshold last logged for host_memory_cap
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image

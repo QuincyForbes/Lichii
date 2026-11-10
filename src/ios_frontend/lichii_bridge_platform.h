@@ -182,7 +182,8 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 // -------------------------------------------------------------------------------- experiments
 
 /// Opt-in switches, kept in the config dir and applied at the next launch:
-/// "no_footprint": guest memory tagged out of the process footprint (unverified).
+/// "no_footprint": ask for guest memory out of the process footprint (iOS 26 refuses it without
+/// a private entitlement: KERN_NO_ACCESS).
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
 
