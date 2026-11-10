@@ -716,6 +716,37 @@ void TextureCache<P>::TickFrame() {
     if (host_pressure) {
         --host_pressure_frames;
     }
+#ifdef __APPLE__
+    // iOS: textures share the process's memory limit with guest RAM, which grows on its own. The
+    // cache may only use what is left of the limit past a reserve (re-read every 30 frames); with
+    // less left than that, the collector runs aggressively down to two thirds of what it holds.
+    if (frame_tick % 30 == 0) {
+        const u64 available = Common::PlatformEvents::AvailableProcessMemory();
+        host_memory_cap = (std::numeric_limits<u64>::max)();
+        if (available != 0) {
+            // Back to the configured thresholds, then the cap.
+            ApplyThresholdOverrides(false);
+            constexpr u64 Reserve = 768_MiB;
+            const u64 room = available > Reserve ? available - Reserve : 0;
+            host_memory_cap = (std::max)(total_used_memory + room, u64{384_MiB});
+            const u64 effective = (std::min)(critical_memory, host_memory_cap);
+            const u64 change = effective > host_memory_cap_logged ? effective - host_memory_cap_logged
+                                                                  : host_memory_cap_logged - effective;
+            if (change >= 128_MiB) {
+                host_memory_cap_logged = effective;
+                LOG_INFO(HW_GPU,
+                         "Texture cache with {} MiB left to the process: collects from {} MiB "
+                         "({} MiB in use)",
+                         available >> 20, effective >> 20, total_used_memory >> 20);
+            }
+        }
+    }
+    if (host_memory_cap < critical_memory) {
+        critical_memory = host_memory_cap;
+        expected_memory = (std::min)(expected_memory, host_memory_cap - host_memory_cap / 3);
+        minimum_memory = (std::min)(minimum_memory, host_memory_cap / 3);
+    }
+#endif
     RunGarbageCollector(out_of_memory || host_pressure);
     if (out_of_memory) {
         // Textures left out for lack of memory are made again on their next read, once a frame

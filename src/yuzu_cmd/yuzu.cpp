@@ -38,6 +38,7 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/nx2_sampler.h"
+#include "common/platform_events.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/string_util.h"
@@ -1807,6 +1808,7 @@ extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     case SDL_EVENT_LOW_MEMORY:
         LOG_WARNING(Frontend, "iOS: low memory warning ({} MiB left to this process)",
                     os_proc_available_memory() >> 20);
+        Common::PlatformEvents::SignalMemoryPressure();
         break;
     case SDL_EVENT_TERMINATING:
         LOG_INFO(Frontend, "iOS: terminating");
