@@ -69,7 +69,11 @@ GLuint Layer::ConfigureDraw(std::array<GLfloat, 3 * 2>& out_matrix,
 
     glDisablei(GL_SCISSOR_TEST, 0);
 
-    if (filters.get_scaling_filter() == Settings::ScalingFilter::Fsr || filters.get_scaling_filter() == Settings::ScalingFilter::Fsr3) {
+    // MetalFX Spatial is Vulkan on Apple only; elsewhere it falls back to FSR 1, as on Vulkan.
+    const auto scaling_filter = filters.get_scaling_filter();
+    if (scaling_filter == Settings::ScalingFilter::Fsr ||
+        scaling_filter == Settings::ScalingFilter::Fsr3 ||
+        scaling_filter == Settings::ScalingFilter::MetalFxSpatial) {
         if (!fsr || fsr->NeedsRecreation(layout.screen)) {
             fsr.emplace(layout.screen.GetWidth(), layout.screen.GetHeight());
         }
