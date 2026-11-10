@@ -75,6 +75,7 @@
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/nx2_image_layout.h"
+#include "core/hle/service/nx2_movie_clock.h"
 #include "core/hle/service/nx2_video_input_queue.h"
 #include "core/hle/service/nx2_present_pacer.h"
 #include "core/hle/service/nx2_video_ready.h"
@@ -1500,6 +1501,29 @@ inline bool Nx2VideoSyncTraceEnabled() {
     return enabled;
 }
 
+// EDEN_NX2_VIDEO_PTS_SYNC (on unless 0): movies follow their timestamps (PickByClock). 0 is the
+// pacing before it (DropOvertakenFrames), to compare.
+inline bool Nx2VideoPtsSyncEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_VIDEO_PTS_SYNC");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// EDEN_NX2_VIDEO_HOLD (experiment): 1 makes early frames wait for the movie clock in every game,
+// 0 in none. Unset: only in games known to show one movie frame per frame they draw.
+inline std::optional<bool> Nx2VideoHoldOverride() {
+    static const std::optional<bool> hold = [] () -> std::optional<bool> {
+        const char* value = std::getenv("EDEN_NX2_VIDEO_HOLD");
+        if (value == nullptr || value[0] == '\0') {
+            return std::nullopt;
+        }
+        return value[0] != '0';
+    }();
+    return hold;
+}
+
 // EDEN_NX2_VIDEO_RELEASE_WAIT_MS (experiment, default 100): the longest the decode thread waits
 // for the game's GPU reads of an output image it gave back before writing the next frame into
 // it. 0 writes at once: the game can then show a frame early.
@@ -2824,6 +2848,8 @@ private:
         u64 frames{};
         u64 window_frames{};
         u64 empty_polls{};
+        u64 dropped{}; ///< Decoded frames skipped as late (window)
+        u64 held{};    ///< Frames that waited for the movie clock (window)
         double last_late_ms{};
         Timing decode;
         Timing convert;
@@ -2844,6 +2870,11 @@ private:
     static constexpr s64 PauseGap = 1'000'000;   // us
     static constexpr s64 MaxCatchUp = 3'000'000; // us
     static constexpr u32 MaxDroppedInARow = 30;
+    // PickByClock: frames are picked this far ahead of the clock at most (the time the client
+    // takes to acquire a written frame), and an early frame waits this long at most.
+    static constexpr double MaxLead = 50'000.0; // us
+    static constexpr s64 MaxHold = 250'000;     // us
+    enum class ClockPick { Write, DecodeMore, Hold };
 
     void Log(HLERequestContext& ctx, std::string_view what) {
         const auto* w = ctx.CommandBuffer();
@@ -2927,6 +2958,7 @@ private:
             m_width = w[5];
             m_height = w[6];
             m_clock_offset.reset();
+            m_clock.Reset();
             m_stream_start.reset();
         }
         if (!m_worker.joinable()) {
@@ -3112,6 +3144,7 @@ private:
             m_stream_ended = false;
             m_end_queued = false;
             m_clock_offset.reset();
+            m_clock.Reset();
             m_stream_start.reset();
             m_ready->room.store(true, std::memory_order_relaxed);
             // Only Stop: Bananza flushes (8) after its movies end and treats every completed
@@ -3141,6 +3174,7 @@ private:
             }
             CompleteHandedFences();
             m_clock_offset.reset();
+            m_clock.Reset();
             m_stream_start.reset();
         }
         TipcReplyWords(ctx, {});
@@ -3207,10 +3241,106 @@ private:
             m_decoded.pop_front();
             ++m_frames_dropped;
             ++m_dropped_in_a_row;
+            ++m_sync.dropped;
         }
         const Decoded& front = m_decoded.front();
         return m_decoded.size() == 1 && !m_inputs.Empty() && !front.end &&
                m_dropped_in_a_row < MaxDroppedInARow && front.pts + m_frame_interval < *due;
+    }
+
+    s64 PauseEndUs() const {
+        return system.CoreTiming().GetPauseEndTime().count() / 1000;
+    }
+
+    // Tells the movie clock what the host audio device played of the game's audio and how long
+    // it waited for it (m_mutex held).
+    void ClockAudio(s64 now) {
+        const auto us = [](const std::atomic<u64>& frames) {
+            return frames.load(std::memory_order_relaxed) * 1'000'000 / AudioCore::TargetSampleRate;
+        };
+        const auto& audio = AudioCore::Sink::GetRenderOutputClock();
+        m_clock.Audio(now, us(audio.played), us(audio.starved));
+    }
+
+    // EDEN_NX2_VIDEO_PTS_SYNC: the client acquired a frame (213; m_mutex held).
+    void ClockAcquired(const Output& output) {
+        const s64 now = HostTimeUs();
+        const auto host_now = std::chrono::steady_clock::now();
+        ClockAudio(now);
+        if (m_clock.Acquired(now, output.pts, PauseEndUs())) {
+            // Frames written before the clock started waited for the client to start (or to
+            // resume), not for it to draw a frame.
+            m_pickup_since = host_now;
+        } else if (output.ready >= m_pickup_since) {
+            const double us = std::min(
+                std::chrono::duration<double, std::micro>(host_now - output.ready).count(), MaxLead);
+            m_pickup_us = m_pickup_us == 0.0 ? us : m_pickup_us * 0.9 + us * 0.1;
+        }
+    }
+
+    // Whether frames ahead of the movie clock wait for it. Only for clients known to show one
+    // movie frame per frame they draw, whatever its timestamp: a player with a clock of its own
+    // takes frames early on purpose, and one catching up with its audio needs them at once.
+    bool HoldsEarlyFrames() const {
+        if (const auto hold = Nx2VideoHoldOverride()) {
+            return *hold;
+        }
+        constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
+        return system.GetApplicationProcessProgramID() == OcarinaOfTimeId;
+    }
+
+    // EDEN_NX2_VIDEO_PTS_SYNC: an output image is free. Drops the decoded frames the movie clock
+    // has passed and says whether to write the oldest one left now, decode further first, or wait
+    // (m_mutex held, m_decoded not empty). The clock runs from the client's first acquire
+    // (zortos293/Lichii 89fecaa577); frames are picked ahead of it by the time the client takes
+    // to acquire a written frame, and early ones can wait (Fritchii f40398a7cc).
+    ClockPick PickByClock() {
+        const s64 now = HostTimeUs();
+        ClockAudio(now);
+        const auto due = m_clock.Due(now + static_cast<s64>(m_pickup_us), PauseEndUs());
+        if (!due) {
+            m_dropped_in_a_row = 0;
+            m_hold_since.reset();
+            m_wrote_late = false;
+            return ClockPick::Write;
+        }
+        while (true) {
+            const Decoded& front = m_decoded.front();
+            // The end of the stream and a frame without a picture are never skipped or held.
+            const bool whole = front.picture && !front.end;
+            const bool droppable = whole && m_dropped_in_a_row < MaxDroppedInARow;
+            const std::optional<u64> next = droppable && m_decoded.size() >= 2
+                                                ? std::optional<u64>{m_decoded[1].pts}
+                                                : std::nullopt;
+            const bool more_input = droppable && m_decoded.size() == 1 && !m_inputs.Empty();
+            switch (PickMovieFrame(*due, m_frame_interval, front.pts, next, more_input,
+                                   m_wrote_late, whole && HoldsEarlyFrames(),
+                                   m_hold_since.has_value())) {
+            case Nx2MoviePick::Drop:
+                m_decoded.pop_front();
+                ++m_frames_dropped;
+                ++m_dropped_in_a_row;
+                ++m_sync.dropped;
+                continue;
+            case Nx2MoviePick::DecodeMore:
+                return ClockPick::DecodeMore;
+            case Nx2MoviePick::Hold:
+                if (!m_hold_since) {
+                    m_hold_since = now;
+                    ++m_sync.held;
+                } else if (now - *m_hold_since >= MaxHold) {
+                    break;
+                }
+                m_hold_wait = std::chrono::microseconds{std::clamp<s64>(
+                    static_cast<s64>(front.pts - *due - m_frame_interval), 1'000, 20'000)};
+                return ClockPick::Hold;
+            case Nx2MoviePick::Write:
+                break;
+            }
+            m_hold_since.reset();
+            m_wrote_late = front.pts < *due;
+            return ClockPick::Write;
+        }
     }
 
     // Advances the decoder's syncpoint to the last value handed out (m_mutex held).
@@ -3239,7 +3369,11 @@ private:
             if (!m_outputs.empty()) {
                 output = m_outputs.front();
                 m_outputs.pop_front();
-                AnchorClock(output->pts);
+                if (Nx2VideoPtsSyncEnabled()) {
+                    ClockAcquired(*output);
+                } else {
+                    AnchorClock(output->pts);
+                }
                 if (Nx2VideoSyncTraceEnabled()) {
                     TraceAcquired(*output);
                 }
@@ -3290,6 +3424,7 @@ private:
                 m_decoded.clear();
                 m_last_decoded_pts = 0;
                 m_dropped_in_a_row = 0;
+                m_hold_since.reset();
                 if (decoder) {
                     lk.unlock();
                     decoder->Reset();
@@ -3297,7 +3432,27 @@ private:
                 }
                 continue;
             }
-            if (!m_decoded.empty() && !m_free.empty() && !DropOvertakenFrames()) {
+            bool write = !m_decoded.empty() && !m_free.empty();
+            if (write && Nx2VideoPtsSyncEnabled()) {
+                switch (PickByClock()) {
+                case ClockPick::Write:
+                    break;
+                case ClockPick::DecodeMore:
+                    write = false;
+                    break;
+                case ClockPick::Hold:
+                    if (!m_inputs.Empty() && m_decoded.size() < MaxDecodedAhead) {
+                        // Decode ahead while the frame waits.
+                        write = false;
+                        break;
+                    }
+                    m_cv.wait_for(lk, m_hold_wait, [&] { return m_quit || m_flush; });
+                    continue;
+                }
+            } else if (write) {
+                write = !DropOvertakenFrames();
+            }
+            if (write) {
                 m_dropped_in_a_row = 0;
                 Decoded frame = std::move(m_decoded.front());
                 m_decoded.pop_front();
@@ -3716,18 +3871,21 @@ private:
                  "clock {:+.0f} ms | no frame for the game {} times | ms avg/max: decode "
                  "{:.1f}/{:.1f} convert {:.1f}/{:.1f} image wait {:.1f}/{:.1f} write "
                  "{:.1f}/{:.1f} pickup {:.1f}/{:.1f} | queued: input {} decoded {} finished {} "
-                 "free images {} | {} decoder{}",
+                 "free images {} | pts sync {}: dropped {} held {} | {} decoder{}",
                  m_sync_movies, wall_ms / 1000.0, t.frames,
                  static_cast<double>(t.window_frames) / window_s, late_ms, late_ms - t.last_late_ms,
                  audio_ms - pts_ms, starved_ms, guest_ms - wall_ms, t.empty_polls,
                  t.decode.Average(), t.decode.max_ms, t.convert.Average(), t.convert.max_ms,
                  t.fence.Average(), t.fence.max_ms, t.write.Average(), t.write.max_ms,
                  t.pickup.Average(), t.pickup.max_ms, m_inputs.Size(), m_decoded.size(),
-                 m_outputs.size(), m_free.size(), t.hardware ? "GPU" : "CPU", note);
+                 m_outputs.size(), m_free.size(), Nx2VideoPtsSyncEnabled() ? "on" : "off",
+                 t.dropped, t.held, t.hardware ? "GPU" : "CPU", note);
         t.last_late_ms = late_ms;
         t.window0 = now;
         t.window_frames = 0;
         t.empty_polls = 0;
+        t.dropped = 0;
+        t.held = 0;
         t.window_starved0 = starved;
         t.decode = {};
         t.convert = {};
@@ -3791,6 +3949,12 @@ private:
     std::optional<s64> m_clock_offset; ///< Host time minus pts (us) of the frames the client shows
     s64 m_last_acquire{};              ///< Host time (us) of the client's last acquire
     u64 m_last_acquired_pts{};
+    Nx2MovieClock m_clock;             ///< EDEN_NX2_VIDEO_PTS_SYNC
+    double m_pickup_us{};              ///< Written frame to the client's acquire (average)
+    std::chrono::steady_clock::time_point m_pickup_since{};
+    std::optional<s64> m_hold_since;   ///< Host time (us) the front decoded frame started to wait
+    bool m_wrote_late{};               ///< The last frame written was past its time
+    std::chrono::microseconds m_hold_wait{};
     u64 m_frame_interval{16667}; ///< us, from consecutive decoded frames
     u64 m_last_decoded_pts{};
     u32 m_dropped_in_a_row{};
