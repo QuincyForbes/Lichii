@@ -4,7 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdlib>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
@@ -517,6 +519,17 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
+    // iOS grants a fastmem arena smaller than the guest address space: accesses above it are
+    // bounds-checked into the page table path instead of reaching past the arena.
+#ifndef HAS_NCE
+    if (config.fastmem_pointer) {
+        const auto arena_bits =
+            std::uint32_t(std::bit_width(m_system.DeviceMemory().buffer.VirtualSize()) - 1);
+        if (arena_bits < address_space_bits) {
+            config.fastmem_address_space_bits = (std::min)(config.fastmem_address_space_bits, arena_bits);
+        }
+    }
+#endif
 #if defined(ARCHITECTURE_x86_64)
     // x86-64 is TSO: LDAPR/LDAR/LDAXR need no locked RMW (STLR keeps XCHG), and DMB xxLD/xxST
     // order nothing TSO does not already order. Ocarina of Time has ~68k LDAPRB sites (static
