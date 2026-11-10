@@ -141,6 +141,8 @@ typedef enum LichiiEmuState {
 
 /// Queues a game; it boots as soon as the JIT pool is ready. False while another game runs.
 bool lichii_emu_launch(const char* path);
+/// Drops a queued launch, or stops a boot once the game has loaded (the shader cache load ends
+/// early); the state returns to IDLE.
 void lichii_emu_cancel_launch(void);
 void lichii_emu_pause(void);
 void lichii_emu_resume(void);
@@ -175,6 +177,7 @@ typedef enum LichiiEvent {
     LICHII_EVENT_MENU_REQUESTED,     ///< a controller or overlay asked for the in-game menu
     LICHII_EVENT_CONTROLLERS_CHANGED,
     LICHII_EVENT_OPEN_URL, ///< a URL or file was opened with the app: lichii_take_open_url
+    LICHII_EVENT_JIT_CHANGED, ///< the JIT state or the prepared pool size changed
 } LichiiEvent;
 
 /// The URL (lichii://game?id=<title id>) or file path opened with the app, or "" when none.

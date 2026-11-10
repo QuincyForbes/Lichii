@@ -125,10 +125,21 @@ void KeepIosOverrides() {
     Settings::values.nvdec_emulation.SetGlobal(true);
 }
 
+// On the JIT acquiring thread. The background task that kept the app alive while StikDebug worked
+// ends as soon as the pool is ready or failed.
+void JitChanged() {
+    const auto state = Common::IosJit::GetState();
+    if (state == Common::IosJit::State::Ready || state == Common::IosJit::State::Failed) {
+        dispatch_async_f(dispatch_get_main_queue(), nullptr, [](void*) { EndJitBackgroundTask(); });
+    }
+    PostEvent(LICHII_EVENT_JIT_CHANGED);
+}
+
 } // Anonymous namespace
 
 void Attach(const Host& host) {
     g_host = host;
+    Common::IosJit::SetStateCallback(&JitChanged);
 }
 
 Core::System& System() {
@@ -716,7 +727,8 @@ bool lichii_settings_set(const char* key, const char* value) {
 }
 
 bool lichii_settings_begin_game(uint64_t program_id) {
-    if (program_id == 0 || InGameScope()) {
+    // A boot applies the game's config on its own thread.
+    if (program_id == 0 || InGameScope() || g_state.load() == LICHII_EMU_BOOTING) {
         return false;
     }
     const u64 running = RunningProgramId();
@@ -766,7 +778,7 @@ void lichii_settings_set_use_global(const char* key, bool use_global) {
 
 void lichii_settings_save(void) {
     SaveGlobalConfig();
-    if (System().IsPoweredOn()) {
+    if (g_state.load() != LICHII_EMU_BOOTING && System().IsPoweredOn()) {
         System().ApplySettings();
     }
 }
