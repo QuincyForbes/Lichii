@@ -202,7 +202,7 @@ jobs:
 
       - name: Publish rolling release
         # Not when release-binaries.yml calls it (it names an artifact and publishes itself).
-        if: github.event_name == 'workflow_dispatch' && !inputs.artifact_name
+        if: github.event_name == 'workflow_dispatch' && !inputs.artifact_name && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
