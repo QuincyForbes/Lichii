@@ -93,8 +93,6 @@ public:
     /// iOS: the guest memory object is ledger-tagged, so the footprint counts each of its pages
     /// once however many views map it, and zero trimming can't make them reusable.
     [[nodiscard]] bool PagesCountedOnce() const noexcept;
-    /// Apple: bytes ClearBackingRegion has zeroed with MADV_ZERO (no pages faulted in) since start.
-    static u64 ZeroAdvisedBytes() noexcept;
     /// Apple, as of the last TrimZeroPages: guest memory resident or compressed, guest memory the
     /// kernel has handed out, and zero bytes trimmed so far.
     static u64 ScannedResidentBytes() noexcept;
@@ -143,12 +141,6 @@ private:
     size_t ClipToVirtualSize(size_t virtual_offset, size_t length) const noexcept {
         return virtual_offset >= virtual_size ? 0 : (std::min)(length, virtual_size - virtual_offset);
     }
-
-#ifdef __APPLE__
-    /// Zeroes [offset, offset + length) of the backing without giving its pages RAM. False when
-    /// the OS can't (nothing was changed).
-    bool ZeroWithoutFaulting(size_t offset, size_t length);
-#endif
 
 #ifdef __APPLE__
     /// Zeroes [offset, offset + length) of the backing without giving its pages RAM. False when
