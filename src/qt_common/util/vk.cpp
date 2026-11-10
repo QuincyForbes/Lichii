@@ -23,8 +23,9 @@ class QWindow;
 
 namespace VkDeviceInfo {
 Record::Record(std::string_view name_, const std::vector<VkPresentModeKHR>& vsync_modes_,
-               bool has_broken_compute_)
-    : name{name_}, vsync_support{vsync_modes_}, has_broken_compute{has_broken_compute_} {}
+               bool has_broken_compute_, VkDriverId driver_id_, bool dlss_capable_)
+    : name{name_}, vsync_support{vsync_modes_}, has_broken_compute{has_broken_compute_},
+      driver_id{driver_id_}, dlss_capable{dlss_capable_} {}
 
 Record::~Record() = default;
 
@@ -65,6 +66,19 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
         bool has_broken_compute{
             Vulkan::Device::CheckBrokenCompute(driverID, properties.properties.driverVersion)};
 
+        // Tensor cores came with RTX; GTX 16 cards are Turing without them. Ray tracing pipelines
+        // cover RTX parts whose name lacks it.
+        bool dlss_capable = false;
+        if (driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY) {
+            dlss_capable = name.find("RTX") != std::string::npos;
+            for (const auto& extension : physical_device.EnumerateDeviceExtensionProperties()) {
+                if (std::string_view{extension.extensionName} ==
+                    VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) {
+                    dlss_capable = true;
+                }
+            }
+        }
+
         std::string driver_string = Vulkan::vk::GetDriverName(driver_properties);
 
         if (driver_string.empty())
@@ -72,7 +86,8 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
 
         name = fmt::format("{} ({})", name, driver_string);
 
-        records.push_back(VkDeviceInfo::Record(name, present_modes, has_broken_compute));
+        records.push_back(VkDeviceInfo::Record(name, present_modes, has_broken_compute, driverID,
+                                               dlss_capable));
     }
 } catch (const Vulkan::vk::Exception& exception) {
     LOG_ERROR(Frontend, "Failed to enumerate devices with error: {}", exception.what());

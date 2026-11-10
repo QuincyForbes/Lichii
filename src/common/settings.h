@@ -515,8 +515,9 @@ struct Values {
                                                         false,
                                                         &frame_gen};
 
+    // Same ini group as Renderer; shown in the Debug tab.
     SwitchableSetting<bool> frame_gen_dump_flow{linkage, false, "frame_gen_dump_flow",
-                                                Category::Renderer};
+                                                Category::RendererDebug};
 
     SwitchableSetting<bool> use_asynchronous_gpu_emulation{linkage, true, "use_asynchronous_gpu_emulation",
                                                            Category::Renderer};

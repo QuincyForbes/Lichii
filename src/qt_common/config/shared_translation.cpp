@@ -233,13 +233,32 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, bg_green, QString(), QString());
     INSERT(Settings, bg_blue, QString(), QString());
 
-    INSERT(Settings, frame_gen, tr("Enable Frame Generation"), QString());
-    INSERT(Settings, frame_gen_type, tr("Frame Generation Type"), QString());
-    INSERT(Settings, frame_gen_multiplier, tr("Frame Generation Multiplier"), QString());
-    INSERT(Settings, frame_gen_target_rate, tr("Target Frame Rate"), QString());
-    INSERT(Settings, frame_gen_flow_scale_auto, tr("Auto Flow Scale"), QString());
-    INSERT(Settings, frame_gen_flow_scale, tr("Flow Scale"), QString());
-    INSERT(Settings, frame_gen_queue_target, tr("Queue Target"), QString());
+    INSERT(Settings, frame_gen, tr("Enable Frame Generation"),
+           tr("Inserts generated frames between the game's real frames, so motion looks smoother "
+              "on a high refresh rate display. It does not make the game itself run faster and "
+              "adds about one real frame of input latency.\nWorks best when the game already "
+              "reaches a steady 60 FPS. Vulkan only.\nTakes effect when a game starts."));
+    INSERT(Settings, frame_gen_type, tr("Frame Generation Type"),
+           tr("Optical Flow Interpolation (built-in): Lichii's own frame generation, needs "
+              "nothing else.\nLossless Scaling (LSFG): uses the shaders of Lossless.dll from your "
+              "own copy of Lossless Scaling (Steam); without the file no frames are generated."));
+    INSERT(Settings, frame_gen_multiplier, tr("Frame Generation Multiplier"),
+           tr("How many frames are shown per real frame: 2x adds one generated frame, 3x two, "
+              "4x three.\nIgnored while Target Frame Rate is set."));
+    INSERT(Settings, frame_gen_target_rate, tr("Target Frame Rate"),
+           tr("Off: use the multiplier.\nAbove 60: generate as many frames (up to three per real "
+              "frame) as it takes to reach this rate, in place of the multiplier. Set it to your "
+              "display's refresh rate.\nValues from 1 to 60 count as Off."));
+    INSERT(Settings, frame_gen_flow_scale_auto, tr("Auto Flow Scale"),
+           tr("Picks the resolution of the motion estimate from the rendering and window "
+              "resolutions. Turn it off to set Flow Scale yourself."));
+    INSERT(Settings, frame_gen_flow_scale, tr("Flow Scale"),
+           tr("Resolution of the motion estimate relative to the image. Lower is faster but "
+              "blurs fast motion; higher is sharper but costs more GPU time.\nOnly used while Auto "
+              "Flow Scale is off."));
+    INSERT(Settings, frame_gen_queue_target, tr("Queue Target"),
+           tr("Extra frames queued before display. 0 has the lowest latency; 1 or 2 smooth out "
+              "uneven frame times at the cost of one or two frames of latency."));
     INSERT(Settings, frame_gen_dump_flow, tr("Dump Optical Flow"), QString());
 
     // Renderer (Advanced Graphics)
