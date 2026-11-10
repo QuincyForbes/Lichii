@@ -505,6 +505,25 @@ static void IosApplyFirstRunDefaults(SdlState* state) {
         std::ofstream{marker} << "1\n";
         changed = true;
     }
+    // Ocarina of Time's Max Resolution built-in turns off the game's GPU-time dynamic resolution,
+    // the safety valve a phone GPU needs. Off once; the Add-Ons list can turn it back on.
+    const auto marker_v2 =
+        Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "ios-defaults-v2";
+    if (!Common::FS::Exists(marker_v2)) {
+        constexpr u64 OcarinaOfTime = 0x0400486024DEC000;
+        constexpr std::string_view MaxResolution = "Max Resolution (built-in)";
+        auto& disabled = Settings::values.disabled_addons[OcarinaOfTime];
+        if (std::find(disabled.begin(), disabled.end(), MaxResolution) == disabled.end()) {
+            disabled.emplace_back(MaxResolution);
+        }
+        // The game list caches each game's add-on summary.
+        std::error_code ec;
+        std::filesystem::remove(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
+                                    "game_list" / fmt::format("{:016X}.pv.txt", OcarinaOfTime),
+                                ec);
+        std::ofstream{marker_v2} << "1\n";
+        changed = true;
+    }
     if (changed) {
         state->ios_config->SaveAllValues();
     }
