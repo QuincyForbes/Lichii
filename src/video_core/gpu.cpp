@@ -265,6 +265,10 @@ struct GPU::Impl {
 
     /// Push GPU command entries to be processed
     void PushGPUEntries(s32 channel, Tegra::CommandList&& entries) {
+        if (!first_submit_logged.exchange(true, std::memory_order_relaxed)) {
+            LOG_INFO(HW_GPU, "Boot: first GPU command list, channel {}, {} entries", channel,
+                     entries.command_lists.size());
+        }
         gpu_thread.SubmitList(channel, std::move(entries), is_async);
     }
 
@@ -443,6 +447,8 @@ struct GPU::Impl {
     bool sync_requests_dropped{};
 
     const bool is_async;
+    /// Boot milestone: the guest's first command list.
+    std::atomic<bool> first_submit_logged{};
 
     std::unique_ptr<Core::Frontend::GraphicsContext> cpu_context;
 
