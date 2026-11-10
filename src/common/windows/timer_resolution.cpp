@@ -103,6 +103,11 @@ nanoseconds SetCurrentTimerResolutionToMaximum() {
     return SetCurrentTimerResolution(GetMaximumTimerResolution());
 }
 
+void ReleaseTimerResolution() {
+    ULONG CurrentTimerResolution;
+    NtSetTimerResolution(ToHundredNS(GetMaximumTimerResolution()), FALSE, &CurrentTimerResolution);
+}
+
 void SleepForOneTick() {
     LARGE_INTEGER DelayInterval{
         .QuadPart{-1},

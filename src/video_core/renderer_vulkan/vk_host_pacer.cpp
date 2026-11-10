@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 
 #include "common/logging.h"
+#include "common/thread.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/vk_host_pacer.h"
@@ -200,11 +202,46 @@ void HostPacer::NoteQueued(Clock::time_point queued) {
     last_queued = queued;
 }
 
-void HostPacer::Refresh(Clock::time_point now, bool allowed, void* native_window) {
-    if (now >= next_refresh_query) {
-        next_refresh_query = now + std::chrono::seconds{2};
-        if (const auto refresh = refresh_query.Query(native_window);
+DisplayRefreshMonitor::DisplayRefreshMonitor(std::function<void*()> native_window_)
+    : native_window{std::move(native_window_)},
+      thread{[this](std::stop_token token) { Run(token); }} {}
+
+DisplayRefreshMonitor::~DisplayRefreshMonitor() {
+    thread.request_stop();
+    thread.join();
+    VideoCommon::Nx2Perf::g_display_refresh_ns.store(0, std::memory_order_relaxed);
+}
+
+std::optional<DisplayRefresh> DisplayRefreshMonitor::Latest() const {
+    std::scoped_lock lock{mutex};
+    return latest;
+}
+
+void DisplayRefreshMonitor::Run(std::stop_token token) {
+    Common::SetCurrentThreadName("DisplayRefresh");
+    DisplayRefreshQuery query;
+    std::mutex wait_mutex;
+    std::condition_variable_any wake;
+    do {
+        if (auto refresh = query.Query(native_window());
             refresh && refresh->period_ns > 2e6 && refresh->period_ns < 50e6) {
+            VideoCommon::Nx2Perf::g_display_refresh_ns.store(
+                static_cast<long long>(refresh->period_ns), std::memory_order_relaxed);
+            {
+                std::scoped_lock lock{mutex};
+                latest = std::move(refresh);
+            }
+            version.fetch_add(1, std::memory_order_release);
+        }
+        std::unique_lock lock{wait_mutex};
+        wake.wait_for(lock, token, std::chrono::seconds{2}, [] { return false; });
+    } while (!token.stop_requested());
+}
+
+void HostPacer::Refresh(bool allowed, const DisplayRefreshMonitor& monitor) {
+    if (const u64 current = monitor.Version(); current != refresh_version) {
+        refresh_version = current;
+        if (const auto refresh = monitor.Latest()) {
             const double period = refresh->period_ns;
             if (!refresh_known || std::abs(period - refresh_ns) > refresh_ns * 0.01 ||
                 refresh->display != refresh_display) {

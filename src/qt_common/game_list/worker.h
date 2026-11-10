@@ -58,6 +58,10 @@ public:
     /// Requests the worker to stop and blocks until processing has finished.
     void Stop();
 
+    /// Registers the game directories' content (updates, DLC) with the manual content provider
+    /// on the calling thread, without the list's own pass (a boot from the command line).
+    void FillContentProvider();
+
 public:
     /**
      * Synchronously processes any events queued by the worker.
