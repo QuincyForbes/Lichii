@@ -8,6 +8,7 @@
 
 #include <cstdio>
 
+#include <atomic>
 #include <bit>
 
 #include "dynarmic/backend/arm64/a64_address_space.h"
@@ -119,6 +120,13 @@ std::size_t AddressSpace::GetRemainingSize() {
 
 CodePtr AddressSpace::Emit(IR::Block block) {
     if (GetRemainingSize() < 1024 * 1024) {
+#ifdef __APPLE__
+        // The iOS caches are small (debugger-prepared pool): every full flush translates the hot
+        // code again, so count them (iOS: Documents/console.txt).
+        static std::atomic<unsigned> full_flushes{};
+        std::fprintf(stderr, "dynarmic: code cache full (%zu MiB), flushed; %u full flushes so far\n",
+                     code_cache_size >> 20, full_flushes.fetch_add(1, std::memory_order_relaxed) + 1);
+#endif
         ClearCache();
     }
 
