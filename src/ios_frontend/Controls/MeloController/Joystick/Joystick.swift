@@ -21,6 +21,26 @@ final class JoystickView: UIView {
 
     var deadZone: CGFloat = 0.08
 
+    /// Lichii: the stick centres where the thumb lands (relative), instead of measuring from the
+    /// middle of the control (absolute).
+    var floating = false
+    /// Lichii: under the ABXY buttons, a touch that starts in their area presses the face button
+    /// of its quadrant unless it starts dragging, so a tap between two buttons is not lost to
+    /// the camera.
+    var deferTaps = false
+    var onFaceButton: ((FaceQuadrant, Bool) -> Void)?
+
+    enum FaceQuadrant {
+        case top, left, right, bottom
+    }
+
+    private var origin: CGPoint?
+    private var pendingStart: CGPoint?
+    private var pendingHold: DispatchWorkItem?
+    private var heldQuadrant: FaceQuadrant?
+
+    private var stickCenter: CGPoint { origin ?? CGPoint(x: bounds.midX, y: bounds.midY) }
+
     private var dragDiameter: CGFloat { bounds.width > 0 ? bounds.width : 160 }
 
     private var joystickSize: CGFloat { dragDiameter * 0.2 }
@@ -91,6 +111,9 @@ final class JoystickView: UIView {
 
         backgroundView.frame              = boundaryView.frame
         backgroundView.layer.cornerRadius = size / 2
+        if let origin {
+            backgroundView.center = origin
+        }
 
         joystickBackgroundView.bounds = CGRect(
             x: 0, y: 0,
@@ -105,6 +128,7 @@ final class JoystickView: UIView {
             height: joystickSize
         )
         joystickView.layer.cornerRadius = joystickSize / 2
+        joystickView.layer.shadowPath = UIBezierPath(ovalIn: joystickView.bounds).cgPath
 
         if activeTouch == nil && springAnimator == nil {
             placeAtCenter()
@@ -117,41 +141,108 @@ final class JoystickView: UIView {
         super.didMoveToWindow()
 
         if window == nil, activeTouch != nil {
-            endTracking()
+            finishTouch(cancelled: true)
         }
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard activeTouch == nil, let touch = touches.first else { return }
         activeTouch = touch
-        beginTracking(at: touch.location(in: self))
+        let location = touch.location(in: self)
+        if deferTaps, hypot(location.x - bounds.midX, location.y - bounds.midY) < bounds.width * 0.45 {
+            pendingStart = location
+            // Held still: the face button is held as well.
+            let hold = DispatchWorkItem { [weak self] in self?.holdPendingButton() }
+            pendingHold = hold
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: hold)
+            return
+        }
+        beginTracking(at: location)
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = activeTouch, touches.contains(touch) else { return }
-        processOffset(rawOffset(for: touch.location(in: self)))
+        guard let touch = activeTouch, touches.contains(touch), heldQuadrant == nil else { return }
+        let location = touch.location(in: self)
+        if let start = pendingStart {
+            guard hypot(location.x - start.x, location.y - start.y) > 12 else { return }
+            cancelPending()
+            beginTracking(at: start)
+        }
+        processOffset(rawOffset(for: location))
         updateJoystickPosition()
         onPositionChanged?(normalizedPosition())
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = activeTouch, touches.contains(touch) else { return }
-        endTracking()
+        finishTouch(cancelled: false)
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = activeTouch, touches.contains(touch) else { return }
-        endTracking()
+        finishTouch(cancelled: true)
+    }
+
+    private func finishTouch(cancelled: Bool) {
+        if let quadrant = heldQuadrant {
+            heldQuadrant = nil
+            activeTouch = nil
+            onFaceButton?(quadrant, false)
+        } else if let start = pendingStart {
+            cancelPending()
+            activeTouch = nil
+            if !cancelled, let quadrant = quadrant(for: start) {
+                onFaceButton?(quadrant, true)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+                    self?.onFaceButton?(quadrant, false)
+                }
+            }
+        } else {
+            endTracking()
+        }
+    }
+
+    private func cancelPending() {
+        pendingHold?.cancel()
+        pendingHold = nil
+        pendingStart = nil
+    }
+
+    private func holdPendingButton() {
+        guard let start = pendingStart else { return }
+        cancelPending()
+        if let quadrant = quadrant(for: start) {
+            heldQuadrant = quadrant
+            onFaceButton?(quadrant, true)
+        } else {
+            beginTracking(at: start)
+        }
+    }
+
+    /// The face button whose quadrant `point` is in; nil right at the middle.
+    private func quadrant(for point: CGPoint) -> FaceQuadrant? {
+        let dx = point.x - bounds.midX
+        let dy = point.y - bounds.midY
+        guard hypot(dx, dy) > bounds.width * 0.06 else { return nil }
+        if abs(dx) > abs(dy) {
+            return dx > 0 ? .right : .left
+        }
+        return dy < 0 ? .top : .bottom
     }
 
     private func rawOffset(for location: CGPoint) -> CGPoint {
-        CGPoint(x: location.x - bounds.midX, y: location.y - bounds.midY)
+        let center = stickCenter
+        return CGPoint(x: location.x - center.x, y: location.y - center.y)
     }
 
     private func beginTracking(at location: CGPoint) {
-        let rawOffset = rawOffset(for: location)
         springAnimator?.stopAnimation(true)
         springAnimator = nil
+        if floating {
+            origin = location
+            backgroundView.center = location
+        }
+        let rawOffset = rawOffset(for: location)
 
         didHitEdge = false
         edgeImpact.prepare()
@@ -161,10 +252,12 @@ final class JoystickView: UIView {
         updateJoystickPosition()
         onPositionChanged?(normalizedPosition())
 
-        UIView.animate(withDuration: 0.12, delay: 0,
-                       usingSpringWithDamping: 0.6, initialSpringVelocity: 1) {
-            self.joystickView.transform = CGAffineTransform(scaleX: 1.12, y: 1.12)
-            self.joystickBackgroundView.transform = CGAffineTransform(scaleX: 1.08, y: 1.08)
+        if !UIAccessibility.isReduceMotionEnabled {
+            UIView.animate(withDuration: 0.12, delay: 0,
+                           usingSpringWithDamping: 0.6, initialSpringVelocity: 1) {
+                self.joystickView.transform = CGAffineTransform(scaleX: 1.12, y: 1.12)
+                self.joystickBackgroundView.transform = CGAffineTransform(scaleX: 1.08, y: 1.08)
+            }
         }
         onActiveChanged?(true)
     }
@@ -178,6 +271,10 @@ final class JoystickView: UIView {
 
         animateBackground(show: false)
         onPositionChanged?(.zero)
+        if origin != nil {
+            origin = nil
+            backgroundView.center = CGPoint(x: bounds.midX, y: bounds.midY)
+        }
         springReturnToCenter()
         onActiveChanged?(false)
     }
@@ -215,15 +312,17 @@ final class JoystickView: UIView {
                 didHitEdge = true
             }
         } else {
-            offset     = rawOffset
-            didHitEdge = false
+            // Lichii: the edge tap plays once per touch, not each time a circling thumb hits the
+            // rim again.
+            offset = rawOffset
         }
     }
 
     private func updateJoystickPosition() {
+        let base = stickCenter
         let center = CGPoint(
-            x: bounds.midX + offset.x,
-            y: bounds.midY + offset.y
+            x: base.x + offset.x,
+            y: base.y + offset.y
         )
         joystickView.center          = center
         joystickBackgroundView.center = center
@@ -238,6 +337,10 @@ final class JoystickView: UIView {
 
     private func springReturnToCenter() {
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        if UIAccessibility.isReduceMotionEnabled {
+            placeAtCenter()
+            return
+        }
 
         let params = UISpringTimingParameters(
             mass: 0.6,

@@ -60,6 +60,11 @@ final class OrientationManager: ObservableObject {
         lichii_controls_set_orientations(UInt32(mask.rawValue))
         window.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
         window.windowScene?.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { _ in }
+        // The motion axes follow the picture once it has turned.
+        DeviceOrientation.update()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            MainActor.assumeIsolated { DeviceOrientation.update() }
+        }
     }
 
     private var currentInterfaceOrientation: UIInterfaceOrientation {

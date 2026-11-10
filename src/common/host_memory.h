@@ -93,6 +93,10 @@ public:
     /// Pages given back to the kernel: their contents are no longer known to be zero.
     void MarkDirty(size_t physical_offset, size_t length);
 
+    /// Apple: pages the kernel freed (no reference left) give their RAM back to the OS. Contents
+    /// are lost; they stay Dirty, so ClearBackingRegion clears them before reuse.
+    void ReleaseFreed(size_t physical_offset, size_t length);
+
     /// A new kernel on this memory: everything a previous one used may hold data.
     void ForgetContents();
 
@@ -134,6 +138,7 @@ private:
     static constexpr size_t GranuleShift = 16; ///< 64 KiB of backing per state byte
     static constexpr u8 GranuleUsed = 1 << 0;   ///< Handed out at least once
     static constexpr u8 GranuleDirty = 1 << 1;  ///< May hold non-zero data
+    static constexpr u8 GranuleReleased = 1 << 2; ///< Apple: given back with MADV_FREE_REUSABLE
     std::unique_ptr<std::atomic<u8>[]> granules;
     size_t num_granules{};
     // Windows requires it for kernels whom lack proper support for some functions!

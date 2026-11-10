@@ -12,6 +12,10 @@
 #include <optional>
 #include <span>
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include "video_core/texture_cache/texture_cache_base.h"
 
 #include "shader_recompiler/shader_info.h"
@@ -20,6 +24,9 @@
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
+#endif
+#ifdef LICHII_METALFX
+#include "video_core/renderer_vulkan/present/metalfx_temporal.h"
 #endif
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -307,6 +314,16 @@ public:
     std::unique_ptr<StreamlineDlssUpscaler> dlss_upscaler;
     bool dlss_unsupported{};
 #endif
+#ifdef LICHII_METALFX
+    /// Apple MetalFX temporal upscaling in place of the game's DLSS, before FSR 3.1, when the
+    /// setting is on. Returns false to fall back to FSR 3.1.
+    bool UpscaleWithMetalFx(Framebuffer* dst_framebuffer, ImageView& input_color,
+                            ImageView& motion_vectors, ImageView& depth,
+                            std::array<u32, 2> render_size, std::array<f32, 2> jitter,
+                            std::array<f32, 2> motion_scale, bool reset);
+    std::unique_ptr<MetalFxTemporalUpscaler> metalfx_upscaler;
+    bool metalfx_unsupported{};
+#endif
 
     /// TemporalUpscale's history: its previous result (images[current]) and the image the next
     /// result is stored to.
@@ -391,13 +408,19 @@ public:
         u64 bytes;
         u64 frame;
     };
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // Dead render targets count in the process footprint jetsam watches.
+    static constexpr u64 ImagePoolMaxBytes = u64{128} << 20;
+#else
     static constexpr u64 ImagePoolMaxBytes = u64{512} << 20;
+#endif
     static constexpr u64 ImagePoolMaxFrames = 180;
     std::deque<PooledImage> image_pool;
     u64 image_pool_bytes{};
     u64 image_pool_frame{};
     u32 image_pool_seen_pressure{};
     u32 image_pool_seen_failed{};
+    u32 image_pool_seen_host_pressure{};
     /// Since the last report (TickFrame, every 600 frames while the pool is in use).
     u64 image_pool_taken{};
     u64 image_pool_missed{};

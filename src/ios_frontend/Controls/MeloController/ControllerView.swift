@@ -149,6 +149,14 @@ public struct ControllerView: View {
                 LayoutManager.shared.portrait = portrait
                 loadLayout()
             }
+            // Lichii: the layout follows the space the controller has, not the key window.
+            .background(
+                GeometryReader { geometry in
+                    Color.clear
+                        .onAppear { controllerHandler.update(size: geometry.size) }
+                        .onChange(of: geometry.size) { controllerHandler.update(size: $0) }
+                }
+            )
             .onChange(of: isEditingInput) { isEditing = $0 }
             .onChange(of: isEditing) { onEditingChanged?($0) }
             .onAppear {
@@ -214,7 +222,7 @@ public struct ControllerView: View {
                         ZStack {
                             editableJoystick(id: "leftJoystick", showBackground: $hideDpad)
 
-                            if layout.joysticks["leftJoystick"]?.hide ?? true {
+                            if layout.joysticks["leftJoystick"]?.hide ?? false {
                                 dpadView
                                     .opacity(hideDpad ? 0 : 1)
                                     .allowsHitTesting(!hideDpad)
@@ -229,7 +237,7 @@ public struct ControllerView: View {
                         shoulderButtonsRight
                         ZStack {
                             editableJoystick(id: "rightJoystick", iscool: true, showBackground: $hideABXY)
-                            if layout.joysticks["rightJoystick"]?.hide ?? true {
+                            if layout.joysticks["rightJoystick"]?.hide ?? false {
                                 abxyView
                                     .opacity(hideABXY ? 0 : 1)
                                     .allowsHitTesting(!hideABXY)
@@ -275,7 +283,7 @@ public struct ControllerView: View {
                     ZStack {
                         editableJoystick(id: "leftJoystick", showBackground: $hideDpad)
 
-                        if layout.joysticks["leftJoystick"]?.hide ?? true {
+                        if layout.joysticks["leftJoystick"]?.hide ?? false {
                             dpadView
                                 .opacity(hideDpad ? 0 : 1)
                                 .allowsHitTesting(!hideDpad)
@@ -294,7 +302,7 @@ public struct ControllerView: View {
                     shoulderButtonsRight
                     ZStack {
                         editableJoystick(id: "rightJoystick", iscool: true, showBackground: $hideABXY)
-                        if layout.joysticks["rightJoystick"]?.hide ?? true {
+                        if layout.joysticks["rightJoystick"]?.hide ?? false {
                             abxyView
                                 .opacity(hideABXY ? 0 : 1)
                                 .allowsHitTesting(!hideABXY)

@@ -23,6 +23,7 @@
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
+#include "common/platform_events.h"
 #include "common/settings.h"
 #include "shader_recompiler/byte_addressed_image.h"
 #include "shader_recompiler/exception.h"
@@ -1843,6 +1844,11 @@ bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
         return true;
     }
 #endif
+#ifdef LICHII_METALFX
+    if (Settings::values.metalfx_temporal.GetValue() && !metalfx_unsupported) {
+        return true;
+    }
+#endif
     return !fsr3_unsupported;
 }
 
@@ -1888,6 +1894,12 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
 #ifdef EGLANTINE_STREAMLINE
     if (UpscaleWithDlss(dst_framebuffer, input_color, motion_vectors, depth, render_size, jitter,
                         motion_scale, reset)) {
+        return true;
+    }
+#endif
+#ifdef LICHII_METALFX
+    if (UpscaleWithMetalFx(dst_framebuffer, input_color, motion_vectors, depth, render_size,
+                           jitter, motion_scale, reset)) {
         return true;
     }
 #endif
@@ -2070,6 +2082,74 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
         logged = true;
         LOG_INFO(Render_Vulkan, "DLSS replaced by NVIDIA DLSS: {}x{} -> {}x{}", render_size[0],
                  render_size[1], extent.width, extent.height);
+    }
+    return true;
+}
+#endif
+
+#ifdef LICHII_METALFX
+bool TextureCacheRuntime::UpscaleWithMetalFx(Framebuffer* dst_framebuffer, ImageView& input_color,
+                                             ImageView& motion_vectors, ImageView& depth,
+                                             std::array<u32, 2> render_size,
+                                             std::array<f32, 2> jitter,
+                                             std::array<f32, 2> motion_scale, bool reset) {
+    if (!Settings::values.metalfx_temporal.GetValue() || metalfx_unsupported) {
+        return false;
+    }
+    if (!metalfx_upscaler) {
+        try {
+            metalfx_upscaler =
+                std::make_unique<MetalFxTemporalUpscaler>(device, scheduler, memory_allocator);
+        } catch (const vk::Exception& exception) {
+            LOG_WARNING(Render_Vulkan, "MetalFX temporal unavailable ({}); using FSR 3.1",
+                        exception.what());
+            metalfx_unsupported = true;
+            return false;
+        }
+    }
+    const auto image = [&](ImageView& view, VkImageView handle, VkImageAspectFlags aspect) {
+        return MetalFxTemporalUpscaler::Image{
+            .view = handle,
+            .image = view.ImageHandle(),
+            .format = MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, view.format)
+                          .format,
+            .range{
+                .aspectMask = aspect,
+                .baseMipLevel = static_cast<u32>(view.range.base.level),
+                .levelCount = 1,
+                .baseArrayLayer = static_cast<u32>(view.range.base.layer),
+                .layerCount = 1,
+            },
+            .barrier_aspect = ImageAspectMask(view.format),
+        };
+    };
+    const VkExtent2D extent = dst_framebuffer->RenderArea();
+    const bool upscaled = metalfx_upscaler->Upscale({
+        .color = image(input_color, input_color.Handle(Shader::TextureType::Color2D),
+                       VK_IMAGE_ASPECT_COLOR_BIT),
+        .depth = image(depth, depth.DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT),
+        .motion_vectors = image(motion_vectors,
+                                motion_vectors.Handle(Shader::TextureType::Color2D),
+                                VK_IMAGE_ASPECT_COLOR_BIT),
+        .render_size = {render_size[0], render_size[1]},
+        .upscale_size = extent,
+        .jitter = jitter,
+        .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
+                                motion_scale[1] * static_cast<f32>(render_size[1])},
+        .reset = reset,
+    });
+    if (!upscaled) {
+        LOG_WARNING(Render_Vulkan, "MetalFX temporal declined the evaluation; using FSR 3.1");
+        metalfx_unsupported = true;
+        return false;
+    }
+    DrawUpscaledOutput(dst_framebuffer, metalfx_upscaler->OutputView(),
+                       metalfx_upscaler->OutputImage(), metalfx_upscaler->PointSampler());
+    static bool logged{};
+    if (!logged) {
+        logged = true;
+        LOG_INFO(Render_Vulkan, "DLSS replaced by MetalFX temporal: {}x{} -> {}x{}",
+                 render_size[0], render_size[1], extent.width, extent.height);
     }
     return true;
 }
@@ -3025,10 +3105,15 @@ void TextureCacheRuntime::TickFrame() {
         // switch is off or device memory ran short (an image did not fit or could not be made).
         const u32 pressure = memory_allocator.MemoryPressureEvents();
         const u32 failed = memory_allocator.FailedImages();
-        const bool short_of_memory =
-            pressure != image_pool_seen_pressure || failed != image_pool_seen_failed;
+        // Host memory pressure is only signalled on iOS (shared memory: the OS low-memory warning
+        // or the process nearing its limit).
+        const u32 host_pressure = Common::PlatformEvents::MemoryPressureGeneration();
+        const bool short_of_memory = pressure != image_pool_seen_pressure ||
+                                     failed != image_pool_seen_failed ||
+                                     host_pressure != image_pool_seen_host_pressure;
         image_pool_seen_pressure = pressure;
         image_pool_seen_failed = failed;
+        image_pool_seen_host_pressure = host_pressure;
         const int pool_switch = VideoCore::Nx2Debug::Experiment(42);
         if (pool_switch == 0 || short_of_memory) {
             TrimImagePool(0);

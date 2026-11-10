@@ -1,36 +1,41 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import Combine
 import SwiftUI
 
 /// Shown from the moment a game is picked until its render window takes over: JIT wait, boot,
 /// or the reason the launch failed.
 struct LaunchView: View {
     @EnvironmentObject private var app: AppController
-    @State private var jit = JitStatus.read()
-    private let timer = Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+
+    /// iPhone landscape: a smaller icon so everything fits without scrolling.
+    private var compact: Bool { verticalSizeClass == .compact }
 
     var body: some View {
         ZStack {
             LinearGradient(colors: [Color(white: 0.06), Color(white: 0.12)], startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea()
-            VStack(spacing: 22) {
-                if let game = app.currentGame {
-                    GameIcon(game: game, size: 140)
-                        .shadow(color: .black.opacity(0.5), radius: 16, y: 6)
-                    Text(game.title)
-                        .font(.title2.bold())
-                        .foregroundStyle(.white)
-                        .multilineTextAlignment(.center)
+            ScrollView {
+                VStack(spacing: compact ? 14 : 22) {
+                    if let game = app.currentGame {
+                        GameIcon(game: game, size: compact ? 72 : 140)
+                            .shadow(color: .black.opacity(0.5), radius: 16, y: 6)
+                            .accessibilityHidden(true)
+                        Text(game.title)
+                            .font(.title2.bold())
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(.center)
+                    }
+                    content
+                        .frame(maxWidth: 460)
                 }
-                content
-                    .frame(maxWidth: 460)
+                .padding(compact ? 20 : 32)
+                .frame(maxWidth: .infinity)
             }
-            .padding(32)
+            .scrollBounceBehavior(.basedOnSize)
         }
         .preferredColorScheme(.dark)
-        .onReceive(timer) { _ in jit = JitStatus.read() }
     }
 
     @ViewBuilder
@@ -50,17 +55,24 @@ struct LaunchView: View {
         case .booting, .running, .paused:
             VStack(spacing: 12) {
                 ProgressView().controlSize(.large).tint(.white)
-                Text("Starting...").foregroundStyle(.secondary)
-                ShaderProgressView()
+                Text(app.cancellingBoot ? "Cancelling..." : "Starting...").foregroundStyle(.secondary)
+                if !app.cancellingBoot {
+                    ShaderProgressView()
+                    if app.emuState == .booting {
+                        Button("Cancel", role: .cancel) { app.cancelLaunch() }
+                            .buttonStyle(.bordered)
+                    }
+                }
             }
+            .accessibilityElement(children: .contain)
         default:
             VStack(spacing: 14) {
-                JitStatusCard(status: jit)
+                JitStatusCard(status: app.jit)
                     .padding()
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: Theme.cornerRadius))
                 HStack {
-                    if jit.state == .waiting && jit.stikDebug {
-                        Button("Open StikDebug") { app.requestJitIfNeeded(automatic: false) }
+                    if app.jit.state == .waiting && app.jit.stikDebug {
+                        Button("Open \(JitProvider.current.label)") { app.requestJitIfNeeded(automatic: false) }
                             .buttonStyle(.bordered)
                     }
                     Button("Cancel", role: .cancel) { app.cancelLaunch() }

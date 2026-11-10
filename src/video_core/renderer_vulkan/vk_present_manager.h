@@ -45,6 +45,9 @@ struct Frame {
     bool generated{};                                ///< Made by frame generation
     u64 render_tick{};                               ///< Scheduler tick that renders the frame
     std::chrono::steady_clock::time_point queued_at; ///< When it reached the present queue
+    /// Time the present thread leaves before presenting the next frame: a generated frame's
+    /// share of the real frame interval (zortos293/Lichii#783).
+    std::chrono::nanoseconds present_spacing{};
 };
 
 class PresentManager {
@@ -142,6 +145,8 @@ private:
     bool present_wait_enabled{};
     HostPacer pacer;
     u64 last_present_id{};
+    /// The present thread presents no frame before this (Frame::present_spacing).
+    std::chrono::steady_clock::time_point next_present{};
     std::mutex present_wait_mutex; ///< Held while waiting on a swapchain; recreation takes it
     std::mutex wait_queue_mutex;
     std::condition_variable_any wait_queue_cv;

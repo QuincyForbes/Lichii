@@ -34,6 +34,9 @@ add_library(lichii_ios_app STATIC
     Content/OnboardingView.swift
     Content/ProfilesView.swift
     Content/SavesView.swift
+    Overlay/PerformanceOverlayModel.swift
+    Overlay/PerformanceOverlaySettings.swift
+    Overlay/PerformanceOverlayView.swift
     Platform/PlatformCenter.swift
     Platform/PlatformViews.swift
 )

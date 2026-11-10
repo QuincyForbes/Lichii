@@ -657,6 +657,11 @@ FN_MAX_LIMIT_LIST
         return extensions.swapchain_mutable_format;
     }
 
+    /// Returns true if VK_EXT_metal_objects is enabled (MoltenVK: MetalFX reads its Metal objects).
+    bool IsExtMetalObjectsEnabled() const {
+        return extensions.metal_objects;
+    }
+
     /// Returns true if VK_KHR_shader_float_controls is enabled.
     bool IsKhrShaderFloatControlsSupported() const {
         return extensions.shader_float_controls;
@@ -1321,6 +1326,7 @@ private:
         FOR_EACH_VK_FEATURE_1_4(FEATURE);
         FOR_EACH_VK_FEATURE_EXT(FEATURE);
         FOR_EACH_VK_EXTENSION(EXTENSION);
+        bool metal_objects{}; ///< VK_EXT_metal_objects (Apple only)
 
 #undef EXTENSION
 #undef FEATURE

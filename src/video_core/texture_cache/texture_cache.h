@@ -31,6 +31,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/render_probe.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/samples_helper.h"
@@ -481,6 +482,12 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
             *target = std::strtoull(value, nullptr, 10) << 20;
         }
     }
+#ifdef __APPLE__
+    // The iOS memory budget sets these overrides. The minimum taken from the device's (unified,
+    // large) heap above would hold the collector off until long past them.
+    minimum_memory = (std::min)(minimum_memory,
+                                expected_memory - (std::min)(expected_memory, u64{512_MiB}));
+#endif
     if (log) {
         LOG_INFO(HW_GPU, "Texture cache thresholds: expected {} MiB, critical {} MiB, minimum {} MiB",
                  expected_memory >> 20, critical_memory >> 20, minimum_memory >> 20);
@@ -600,6 +607,8 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, runtime.PooledImageBytes());
         }
     }
+    VideoCore::Probe::texture_cache_bytes.store(total_used_memory, std::memory_order_relaxed);
+    VideoCore::Probe::texture_cache_expected.store(expected_memory, std::memory_order_relaxed);
     // Every 600 frames: device memory in use against the collector's thresholds.
     // Skip expensive heap allocation, map construction, and sorting unless debug logging is explicitly enabled.
     static const bool log_tc = std::getenv("EDEN_NX2_TC_LOG") != nullptr;

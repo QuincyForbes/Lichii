@@ -12,6 +12,8 @@ add_library(lichii_ios_bridge STATIC
     lichii_bridge_content.h
     lichii_bridge_content_applets.cpp
     lichii_bridge_content_host.h
+    lichii_bridge_perf.cpp
+    lichii_bridge_perf.h
     lichii_content_zip.cpp
     lichii_content_zip.h
 )

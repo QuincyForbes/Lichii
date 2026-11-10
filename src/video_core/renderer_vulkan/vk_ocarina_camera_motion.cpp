@@ -6,7 +6,7 @@
 #include <cstring>
 #include <optional>
 
-#ifdef EGLANTINE_STREAMLINE
+#ifdef LICHII_OCARINA_LIVE_UPSCALE
 #include "common/logging.h"
 #include "video_core/host_shaders/ocarina_dlss_color_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_output_comp_spv.h"
@@ -15,7 +15,11 @@
 #include "video_core/host_shaders/ocarina_dlss_bias_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_effects_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
+#else
+#include "video_core/renderer_vulkan/present/metalfx_temporal.h"
+#endif
 
 #include "video_core/host_shaders/ocarina_camera_motion_comp_spv.h"
 #include "video_core/host_shaders/ocarina_actor_motion_frag_spv.h"
@@ -29,6 +33,13 @@
 
 namespace Vulkan {
 namespace {
+
+// NVIDIA DLSS on Windows, Apple MetalFX temporal upscaling on Apple (the same interface).
+#ifdef EGLANTINE_STREAMLINE
+using LiveUpscaler = StreamlineDlssUpscaler;
+#else
+using LiveUpscaler = MetalFxTemporalUpscaler;
+#endif
 
 using Matrix = std::array<f32, 16>;
 
@@ -429,7 +440,7 @@ public:
                       code) {}
 
     void Record(Scheduler& scheduler, const void* descriptors, VkImage input,
-                VkExtent2D extent, const StreamlineDlssUpscaler* require_success = nullptr) {
+                VkExtent2D extent, const LiveUpscaler* require_success = nullptr) {
         scheduler.Record([this, descriptors, input, extent, require_success](vk::CommandBuffer cmd) {
             if (require_success && require_success->Failed()) {
                 return;
@@ -453,7 +464,7 @@ public:
         });
     }
     void RecordOutput(Scheduler& scheduler, const void* descriptors,
-                      const StreamlineDlssUpscaler& upscaler, VkExtent2D extent, u64 frame,
+                      const LiveUpscaler& upscaler, VkExtent2D extent, u64 frame,
                       bool reset) {
         scheduler.Record([this, descriptors, &upscaler, extent, frame, reset](vk::CommandBuffer cmd) {
             if (upscaler.Failed()) {
@@ -512,7 +523,7 @@ public:
                       OCARINA_DLSS_4K_COMPOSITE_COMP_SPV) {}
 
     void Record(Scheduler& scheduler, const void* descriptors, VkImage image,
-                const StreamlineDlssUpscaler& upscaler, u64 frame) {
+                const LiveUpscaler& upscaler, u64 frame) {
         scheduler.Record([this, descriptors, image, &upscaler, frame](vk::CommandBuffer cmd) {
             const auto output = ProbeBarrier(image, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                                              VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
@@ -700,7 +711,7 @@ struct OcarinaLiveDlss::Impl {
     ComputePassDescriptorQueue& queue;
     MemoryAllocator& allocator;
     DescriptorPool& pool;
-    StreamlineDlssUpscaler upscaler;
+    LiveUpscaler upscaler;
     CameraMotionPass motion_pass;
     OcarinaColorPass color_pass;
     OcarinaColorPass output_pass;
@@ -899,7 +910,7 @@ bool OcarinaLiveDlss::Record(VkImageView color, VkImageView depth, VkImageView t
     state.queue.AddImage(*resources.color_view);
     state.color_pass.Record(state.scheduler, state.queue.UpdateData(), *resources.color, extent);
 
-    std::optional<StreamlineDlssUpscaler::Image> bias;
+    std::optional<LiveUpscaler::Image> bias;
     if (state.effects && state.effects->marked_frame == frame &&
         state.effects->extent.width == extent.width &&
         state.effects->extent.height == extent.height) {
@@ -913,7 +924,7 @@ bool OcarinaLiveDlss::Record(VkImageView color, VkImageView depth, VkImageView t
         state.queue.AddImage(*effects.bias_view);
         state.effects_bias_pass->Record(state.scheduler, state.queue.UpdateData(), *effects.bias,
                                         extent, has_previous ? 1 : 0);
-        bias = StreamlineDlssUpscaler::Image{*effects.bias_view, *effects.bias, BIAS_FORMAT,
+        bias = LiveUpscaler::Image{*effects.bias_view, *effects.bias, BIAS_FORMAT,
                                              COLOR_RANGE, VK_IMAGE_ASPECT_COLOR_BIT};
     }
 

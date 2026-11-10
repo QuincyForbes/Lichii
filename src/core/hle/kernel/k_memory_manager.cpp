@@ -259,6 +259,11 @@ void KMemoryManager::MarkDirty(KPhysicalAddress address, size_t num_pages) {
                                              num_pages * PageSize);
 }
 
+void KMemoryManager::ReleaseFreed(KPhysicalAddress address, size_t num_pages) {
+    m_system.DeviceMemory().buffer.ReleaseFreed(GetInteger(address) - Core::DramMemoryMap::Base,
+                                                num_pages * PageSize);
+}
+
 Result KMemoryManager::AllocatePageGroupImpl(KPageGroup* out, size_t num_pages, Pool pool,
                                              Direction dir, bool unoptimized, bool random) {
     // Choose a heap based on our page size request.

@@ -16,6 +16,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include "common/common_types.h"
 #include "common/settings_common.h"
 #include "common/settings_enums.h"
@@ -360,8 +364,13 @@ struct Values {
                                                   true,
                                                   true};
 
+    // Phones: no extra GPU passes on top of the game's own anti-aliasing.
     SwitchableSetting<ScalingFilter> scaling_filter{linkage,
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+                                                    ScalingFilter::Bilinear,
+#else
                                                     ScalingFilter::ScaleForce,
+#endif
                                                     "scaling_filter",
                                                     Category::Renderer,
                                                     Specialization::Default,
@@ -405,6 +414,9 @@ struct Values {
     // still overrides it.
     Setting<DlssPreset> nvidia_dlss_preset{linkage, DlssPreset::K, "nvidia_dlss_preset",
                                            Category::Renderer};
+    // Apple only: MetalFX temporal upscaling in place of a game's DLSS and of Ocarina of Time's
+    // upscaler (what NVIDIA DLSS does on Windows). Global only, like nvidia_dlss.
+    Setting<bool> metalfx_temporal{linkage, false, "metalfx_temporal", Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",
@@ -414,7 +426,11 @@ struct Values {
                                                       true};
 
     SwitchableSetting<AntiAliasing> anti_aliasing{linkage,
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+                                                  AntiAliasing::None,
+#else
                                                   AntiAliasing::Fxaa,
+#endif
                                                   "anti_aliasing",
                                                   Category::Renderer,
                                                   Specialization::Default,
@@ -666,8 +682,10 @@ struct Values {
     SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
                                             Category::RendererAdvanced};
 
+    // Apple: unified memory doesn't make the readback free, it is still a fence wait (Ocarina of
+    // Time is tuned without it).
     SwitchableSetting<bool> use_reactive_flushing{linkage,
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__APPLE__)
                                                   false,
 #else
                                                   true,

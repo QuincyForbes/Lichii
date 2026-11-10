@@ -16,6 +16,7 @@ struct InGameMenuView: View {
     @State private var resolution = QuickSettings.string("resolution_setup")
     @State private var frameGen = QuickSettings.bool("frame_gen")
     @State private var frameGenMultiplier = max(2, QuickSettings.int("frame_gen_multiplier"))
+    @State private var frameGenMetalFx = QuickSettings.string("frame_gen_type") == "MetalFx"
     @State private var speedLimit = QuickSettings.bool("use_speed_limit")
     @State private var speedPercent = QuickSettings.int("speed_limit")
     @State private var pendingRestart = false
@@ -23,24 +24,41 @@ struct InGameMenuView: View {
     private let resolutions = QuickSettings.choices("resolution_setup")
 
     var body: some View {
-        ZStack {
-            Color.black.opacity(0.45)
-                .ignoresSafeArea()
-                .onTapGesture { center.closeMenu() }
+        GeometryReader { proxy in
+            ZStack {
+                Color.black.opacity(0.45)
+                    .ignoresSafeArea()
+                    .onTapGesture { center.closeMenu() }
+                    .accessibilityHidden(true)
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
+                // The header (Resume) and Quit stay in view; only the middle scrolls, so the
+                // panel fits an iPhone in landscape.
+                VStack(spacing: 0) {
                     header
-                    actions
-                    quickSettings
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 12)
+                    Divider()
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 14) {
+                            actions
+                            PerformanceSummaryRow()
+                            quickSettings
+                        }
+                        .padding(18)
+                    }
+                    Divider()
                     quit
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 12)
                 }
-                .padding(18)
+                .frame(maxWidth: 480)
+                .frame(height: min(560, max(200, proxy.size.height - 16)))
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .padding(.horizontal, 20)
+                .accessibilityElement(children: .contain)
+                .accessibilityAction(.escape) { center.closeMenu() }
             }
-            .frame(maxWidth: 480, maxHeight: 560)
-            .fixedSize(horizontal: false, vertical: true)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-            .padding(20)
+            .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .sheet(isPresented: $showControllers) {
             NavigationStack {
@@ -66,6 +84,7 @@ struct InGameMenuView: View {
                 Text(center.currentGame?.title ?? "Lichii")
                     .font(.headline)
                     .lineLimit(1)
+                    .accessibilityAddTraits(.isHeader)
                 Text(Bridge.emuState == .paused ? "Paused" : "Running")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -79,6 +98,7 @@ struct InGameMenuView: View {
                     .font(.subheadline.weight(.semibold))
             }
             .buttonStyle(.borderedProminent)
+            .accessibilityHint("Closes the menu and continues the game")
         }
     }
 
@@ -92,9 +112,7 @@ struct InGameMenuView: View {
                 center.closeMenu()
                 center.takeScreenshot()
             }
-            MenuTile(title: center.showHUD ? "Hide HUD" : "Show HUD", systemImage: "speedometer") {
-                center.showHUD.toggle()
-            }
+            PerformanceOverlayTile()
             MenuTile(title: "Edit Controls", systemImage: "hand.tap") {
                 center.editLayout()
             }
@@ -131,6 +149,9 @@ struct InGameMenuView: View {
             if frameGen {
                 Stepper("Multiplier: \(frameGenMultiplier)x", value: $frameGenMultiplier, in: 2...4)
                     .onChange(of: frameGenMultiplier) { value in change("frame_gen_multiplier", String(value)) }
+                // Apple's interpolation (iOS 26) makes the 2x frame; 3x and 4x stay built-in.
+                Toggle("MetalFX Interpolation", isOn: $frameGenMetalFx)
+                    .onChange(of: frameGenMetalFx) { value in change("frame_gen_type", value ? "MetalFx" : "Fsr3") }
             }
 
             Toggle("Limit Speed", isOn: $speedLimit)
@@ -190,7 +211,9 @@ private struct MenuTile: View {
             }
             .frame(maxWidth: .infinity, minHeight: 62)
             .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(title)
     }
 }

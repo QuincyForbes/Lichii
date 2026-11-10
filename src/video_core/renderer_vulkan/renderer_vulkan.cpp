@@ -23,6 +23,7 @@
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
 #include "video_core/present.h"
+#include "video_core/render_probe.h"
 #include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #ifdef HAS_RESHADE
@@ -235,6 +236,16 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
                                present_manager.SwapchainImageCount(),
                                swapchain.GetImageViewFormat());
 
+    if (!framebuffers.empty()) {
+        const auto& guest = framebuffers.front();
+        const bool cropped = !guest.crop_rect.IsEmpty();
+        const auto& layout = render_window.GetFramebufferLayout();
+        VideoCore::Probe::StoreFrameExtents(
+            cropped ? static_cast<u32>(guest.crop_rect.GetWidth()) : guest.width,
+            cropped ? static_cast<u32>(guest.crop_rect.GetHeight()) : guest.height, layout.width,
+            layout.height);
+    }
+
     size_t generated_frames = 0;
 #ifdef HAS_LSFG
     void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames()));
@@ -243,8 +254,18 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
                       GuestExtent(framebuffers));
 
     generated_frames = frame_gen.GeneratedFrameCount();
+#ifdef __APPLE__
+    // ProMotion (120 Hz) with FIFO: each generated frame gets an equal share of the real frame
+    // interval (zortos293/Lichii#783, Apple only here).
+    const auto spacing = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<f32>(std::min(frame_gen.FrameInterval(), 0.1f) /
+                                   static_cast<f32>(generated_frames + 1)));
+#endif
     for (size_t generation = 0; generation < generated_frames; ++generation) {
         Frame* generated = present_manager.GetRenderFrame();
+#ifdef __APPLE__
+        generated->present_spacing = spacing;
+#endif
         blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
         frame_gen.GenerateInto(device, generated, generation);
         generated->render_tick = scheduler.Flush(*generated->render_ready);

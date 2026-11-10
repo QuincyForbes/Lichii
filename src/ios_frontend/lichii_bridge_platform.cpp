@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -77,6 +78,7 @@ bool ValidExperimentName(const char* name) {
 std::atomic<int> g_shader_stage{LICHII_SHADER_IDLE};
 std::atomic<u64> g_shader_done{};
 std::atomic<u64> g_shader_total{};
+std::atomic<s64> g_shader_last_post_ms{};
 std::mutex g_shader_handler_mutex;
 LichiiShaderProgressFn g_shader_handler = nullptr;
 void* g_shader_handler_user = nullptr;
@@ -172,14 +174,15 @@ LichiiThermalAdvice ComputeThermalAdvice(int thermal_state, int low_power_mode) 
         out.lower_resolution = 1;
         out.suggest_pause = 1;
         CopyString(out.message, sizeof(out.message),
-                   "Device is very hot: iOS is throttling hard. Pause for a while or lower the "
-                   "resolution.");
+                   "Device is very hot and iOS is slowing Lichii down hard. Pause for a while, or "
+                   "turn frame generation off and lower the resolution.");
     } else if (thermal_state == 2) {
         out.disable_frame_gen = 1;
         out.max_fps = 30;
         out.lower_resolution = 1;
         CopyString(out.message, sizeof(out.message),
-                   "Device is hot: frame generation off and 30 fps. A lower resolution helps.");
+                   "Device is hot and iOS may slow Lichii down. Turning frame generation off or "
+                   "lowering the resolution helps.");
     } else if (low_power_mode != 0) {
         out.disable_frame_gen = 1;
         CopyString(out.message, sizeof(out.message),
@@ -260,9 +263,23 @@ void lichii_platform_trim_memory(void) {
 }
 
 void lichii_platform_note_shader_progress(int stage, uint64_t done, uint64_t total) {
-    LichiiPlatform::g_shader_stage.store(stage, std::memory_order_relaxed);
+    using namespace std::chrono;
+    const int previous = LichiiPlatform::g_shader_stage.exchange(stage, std::memory_order_relaxed);
     LichiiPlatform::g_shader_done.store(done, std::memory_order_relaxed);
     LichiiPlatform::g_shader_total.store(total, std::memory_order_relaxed);
+    // The handler hops to the main queue: at most ten calls a second, plus stage changes and the
+    // last shader.
+    const s64 now =
+        duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    s64 last = LichiiPlatform::g_shader_last_post_ms.load(std::memory_order_relaxed);
+    if (previous == stage && done < total) {
+        if (now - last < 100 ||
+            !LichiiPlatform::g_shader_last_post_ms.compare_exchange_strong(last, now)) {
+            return;
+        }
+    } else {
+        LichiiPlatform::g_shader_last_post_ms.store(now, std::memory_order_relaxed);
+    }
     std::scoped_lock lock{LichiiPlatform::g_shader_handler_mutex};
     if (LichiiPlatform::g_shader_handler != nullptr) {
         LichiiPlatform::g_shader_handler(stage, done, total, LichiiPlatform::g_shader_handler_user);

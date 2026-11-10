@@ -97,6 +97,12 @@ constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
     // for this process only (from Fritchii v5.5, 4012e5271e).
     {"__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1"},
     {"__GL_SHADER_DISK_CACHE_SIZE", "10737418240"},
+#ifdef __APPLE__
+    // Ocarina's anti-aliasing network needs cooperative matrices, which MoltenVK lacks: emulated,
+    // it costs more GPU time per frame than it saves (an RTX 5090 with them gains 41 -> 50 fps
+    // without it). This game-side patch also drops its heavy dispatch.
+    {"EDEN_NX2_OOT_NO_NDSR", "1"},
+#endif
 };
 
 } // Anonymous namespace

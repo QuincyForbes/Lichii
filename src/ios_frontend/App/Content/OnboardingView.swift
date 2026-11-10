@@ -30,6 +30,7 @@ enum Onboarding {
             UserDefaults.standard.set(version, forKey: key)
             presenter.dismiss(animated: true)
             AppController.shared.library.reload()
+            AppController.shared.requestJitIfNeeded(automatic: true)
         }
         .environmentObject(AppController.shared.library)
         let host = UIHostingController(rootView: view)
@@ -46,11 +47,14 @@ private enum OnboardingPage: Int, CaseIterable {
 struct OnboardingView: View {
     let finish: () -> Void
     @EnvironmentObject private var library: GameLibrary
-    @StateObject private var files = SystemFilesModel()
+    @ObservedObject private var files = SystemFilesModel.shared
     @State private var page: OnboardingPage = .welcome
     @State private var importer: OnboardingPage?
-    @State private var jitState = Bridge.jitState
-    private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    @ObservedObject private var app = AppController.shared
+    @State private var forward = true
+
+    private var jitStatus: JitStatus { app.jit }
+    private var jitState: JitState { jitStatus.state }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -58,6 +62,8 @@ struct OnboardingView: View {
                 .tint(Theme.accent)
                 .padding(.horizontal)
                 .padding(.top, 8)
+                .accessibilityLabel("Setup progress")
+                .accessibilityValue("Step \(page.rawValue + 1) of \(OnboardingPage.allCases.count)")
             ScrollView {
                 VStack(spacing: 16) {
                     switch page {
@@ -72,12 +78,18 @@ struct OnboardingView: View {
                 .padding(24)
                 .frame(maxWidth: .infinity)
                 .id(page)
-                .transition(.backslide)
+                .transition(forward ? .backslide : .backslideReversed)
             }
             footer
         }
         .onAppear { files.refresh() }
-        .onReceive(timer) { _ in jitState = Bridge.jitState }
+        .onChange(of: jitState) { _, state in
+            // The JIT page moves on by itself once JIT is ready (LICHII_EVENT_JIT_CHANGED).
+            guard state == .ready, page == .jit else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                if page == .jit { move(1) }
+            }
+        }
         .fileImporter(isPresented: Binding(get: { importer != nil }, set: { if !$0 { importer = nil } }),
                       allowedContentTypes: allowedTypes,
                       allowsMultipleSelection: importer != .firmware) { result in
@@ -107,8 +119,13 @@ struct OnboardingView: View {
     // MARK: Pages
 
     private var welcome: some View {
-        PageHeader(systemImage: "sparkles", title: "Welcome to Lichii",
-                   text: "A few steps get you playing: JIT through StikDebug and your games. Keys and firmware from your own Switch are optional: Switch 2 games (.nup) run without them.")
+        VStack(spacing: 16) {
+            PageHeader(systemImage: "sparkles", title: "Welcome to Lichii",
+                       text: "A few steps get you playing: JIT through \(JitProvider.current.label) and your games. Keys and firmware from your own Switch are optional: Switch 2 games (.nup) run without them.")
+            Button("Set Up Later", action: finish)
+                .font(.footnote)
+                .frame(minHeight: 44)
+        }
     }
 
     private var keys: some View {
@@ -151,39 +168,27 @@ struct OnboardingView: View {
     private var jit: some View {
         VStack(spacing: 16) {
             PageHeader(systemImage: "bolt.fill", title: "JIT",
-                       text: "iOS only lets an app generate code while a debugger is attached. StikDebug (with its pairing file) does that on the device: open StikDebug, pick Lichii, and come back. On iOS 26 with TXM, StikDebug's script prepares Lichii's memory as well.")
-            StatusRow(title: "JIT", ok: jitState == .ready, detail: "Ready")
-            if jitState != .ready {
-                Text(jitDetail).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
-            }
-            if lichii_jit_stikdebug_installed() {
-                ActionButton(title: "Enable JIT with StikDebug", busy: jitState == .acquiring) {
-                    _ = lichii_jit_request()
+                       text: "iOS only lets an app generate code while a debugger is attached. \(jitStatus.provider.label) does that on the device: tap the button below, confirm in \(jitStatus.provider.label), and come back. On iOS 26 with TXM, StikDebug's script prepares Lichii's memory as well. The JIT app can be changed in the JIT tab.")
+            JitStatusCard(status: jitStatus)
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: Theme.cornerRadius))
+            if jitStatus.state == .waiting && jitStatus.providerInstalled {
+                ActionButton(title: "Enable JIT with \(jitStatus.provider.label)", busy: false) {
+                    AppController.shared.requestJitIfNeeded(automatic: false)
                 }
-            } else {
-                Text("StikDebug is not installed. Install it with SideStore or AltStore, then enable JIT for Lichii from it.")
-                    .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
             }
             Text("You can skip this: games wait for JIT when you start them.")
                 .font(.footnote).foregroundStyle(.secondary)
         }
     }
 
-    private var jitDetail: String {
-        switch jitState {
-        case .waiting: return "Waiting for a debugger."
-        case .acquiring: return "Preparing memory..."
-        case .failed: return Bridge.jitError
-        case .ready: return ""
-        }
-    }
-
     private var games: some View {
         VStack(spacing: 16) {
             PageHeader(systemImage: "square.grid.2x2.fill", title: "Games",
-                       text: "Import your dumps (.nup for Switch 2; .nsp, .xci, .nsz, .xcz for Switch 1). They are copied into the app, or drop them into Documents/Games with the Files app or Finder.")
-            if !library.importing.isEmpty {
-                ImportProgressBanner(names: library.importing)
+                       text: "Import your dumps (.nup for Switch 2; .nsp, .xci, .nsz, .xcz for Switch 1). They are copied into the app, or drop them into Documents/Games with the Files app or Finder. To play large files where they are without a copy, use Link a Folder in the Library's + menu.")
+            if let progress = library.importProgress {
+                ImportProgressBanner(progress: progress)
             }
             ActionButton(title: "Import Games", busy: false) {
                 importer = .games
@@ -201,12 +206,7 @@ struct OnboardingView: View {
                 Button("Back") { move(-1) }
             }
             Spacer()
-            if page != .games && page != .welcome {
-                Button("Skip") { move(1) }
-                    .foregroundStyle(.secondary)
-                    .padding(.trailing, 8)
-            }
-            ContinueButton(text: page == .games ? "Done" : "Continue",
+            ContinueButton(text: page == .games ? "Done" : (stepDone || page == .welcome ? "Continue" : "Skip"),
                            action: { page == .games ? finish() : move(1) },
                            success: stepDone, enabled: .constant(!files.busy), showCheckmark: false)
         }
@@ -225,6 +225,7 @@ struct OnboardingView: View {
 
     private func move(_ delta: Int) {
         guard let next = OnboardingPage(rawValue: page.rawValue + delta) else { return }
+        forward = delta > 0
         withAnimation { page = next }
     }
 }
@@ -322,5 +323,10 @@ struct ContinueButton: View {
 extension AnyTransition {
     static var backslide: AnyTransition {
         .asymmetric(insertion: .move(edge: .trailing), removal: .move(edge: .leading))
+    }
+
+    /// The same slide for going back a page.
+    static var backslideReversed: AnyTransition {
+        .asymmetric(insertion: .move(edge: .leading), removal: .move(edge: .trailing))
     }
 }

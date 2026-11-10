@@ -117,4 +117,15 @@ struct Game: Identifiable, Hashable {
         let url = URL(fileURLWithPath: path)
         return url.lastPathComponent == "00" ? url.deletingLastPathComponent() : url
     }
+
+    // Without the icon bytes, which views compare on every update.
+    static func == (lhs: Game, rhs: Game) -> Bool {
+        lhs.path == rhs.path && lhs.title == rhs.title && lhs.developer == rhs.developer &&
+            lhs.version == rhs.version && lhs.programId == rhs.programId && lhs.fileSize == rhs.fileSize &&
+            lhs.icon?.count == rhs.icon?.count
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(path)
+    }
 }

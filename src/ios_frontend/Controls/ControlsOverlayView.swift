@@ -10,8 +10,8 @@ import UIKit
 /// the in-game menu.
 struct ControlsOverlayView: View {
     @ObservedObject private var center = ControlsCenter.shared
-    @AppStorage("hudPosition") private var hudPosition = HUDPosition.topRight.rawValue
     @AppStorage("menuButtonVisible") private var menuButtonVisible = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var gameId: String? { center.currentGame?.programIdHex }
 
@@ -28,17 +28,14 @@ struct ControlsOverlayView: View {
                 .id("\(gameId ?? "")-\(perGameLayouts)")
             }
 
-            if center.showHUD && !center.editingLayout {
-                PerformanceHUD()
-                    .padding(10)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity,
-                           alignment: (HUDPosition(rawValue: hudPosition) ?? .topRight).alignment)
+            if !center.editingLayout {
+                PerformanceOverlayHost()
             }
 
             if menuButtonVisible && !center.editingLayout && !center.menuOpen {
                 MenuButton { center.openMenu() }
-                    .frame(width: 36, height: 36)
-                    .padding(12)
+                    .frame(width: 44, height: 44)
+                    .padding(8)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
 
@@ -52,32 +49,36 @@ struct ControlsOverlayView: View {
                             .padding(.vertical, 6)
                             .background(Color.black.opacity(0.6), in: Capsule())
                     }
-                    ThermalBanner(compact: true)
+                    ThermalBanner(compact: true, transient: true)
                 }
                 .padding(.bottom, 10)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .allowsHitTesting(false)
             }
 
-            if let toast = center.toast {
-                Text(toast)
-                    .font(.footnote.weight(.semibold))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                    .padding(.top, 16)
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
-            }
-
             if center.menuOpen {
                 InGameMenuView()
                     .transition(.opacity)
             }
+
+            // Above the menu: a controller that went away opens it with a toast.
+            if let toast = center.toast {
+                Text(toast)
+                    .font(.footnote.weight(.semibold))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .padding(.horizontal, 60)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .padding(.top, 16)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                    .transition(.opacity)
+            }
         }
-        .animation(.easeInOut(duration: 0.2), value: center.menuOpen)
-        .animation(.easeInOut(duration: 0.2), value: center.toast)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: center.menuOpen)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: center.toast)
         .ignoresSafeArea(.keyboard)
     }
 
@@ -96,7 +97,9 @@ private struct MenuButton: UIViewRepresentable {
         let config = UIImage.SymbolConfiguration(pointSize: 22, weight: .semibold)
         button.setImage(UIImage(systemName: "gearshape.circle.fill", withConfiguration: config), for: .normal)
         button.tintColor = .white
-        button.alpha = 0.45
+        button.alpha = 0.6
+        button.accessibilityLabel = "Game Menu"
+        button.accessibilityHint = "Pauses the game"
         let coordinator = context.coordinator
         button.addAction(UIAction { _ in coordinator.action() }, for: .touchUpInside)
         return button
