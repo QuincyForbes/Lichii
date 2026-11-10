@@ -15,6 +15,9 @@
 #define LICHII_HAVE_SDL_HINTS 1
 #endif
 
+#include <fmt/format.h>
+
+#include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "hid_core/frontend/emulated_controller.h"
@@ -48,12 +51,51 @@ InputCommon::VirtualGamepad* Gamepad() {
     return attached_input ? attached_input->GetVirtualGamepad() : nullptr;
 }
 
+std::string DescribeController(const Core::HID::EmulatedController* controller) {
+    if (controller == nullptr) {
+        return "missing";
+    }
+    return fmt::format("connected={} style={} buttons={:#x}", controller->IsConnected(),
+                       static_cast<int>(controller->GetNpadStyleIndex()),
+                       static_cast<u64>(controller->GetNpadButtons().raw));
+}
+
+// The first press of each game, after it was sent: whether the emulated controllers took it.
+void LogFirstPress(int player, int button, bool have_gamepad) {
+    static std::atomic<u64> logged_program{~0ULL};
+    std::scoped_lock lock{attach_mutex};
+    if (attached_system == nullptr || !attached_system->IsPoweredOn()) {
+        return;
+    }
+    const u64 program = attached_system->GetApplicationProcessProgramID();
+    if (logged_program.exchange(program) == program) {
+        return;
+    }
+    if (!have_gamepad) {
+        LOG_WARNING(Frontend, "Controls: button {} for player {} dropped: no virtual gamepad",
+                    button, player + 1);
+        return;
+    }
+    auto& hid = attached_system->HIDCore();
+    LOG_INFO(Frontend,
+             "Controls: first press, button {} player {} -> ports {}{}; player {} {}; handheld {}; "
+             "game styles {:#x}",
+             button, player + 1, player, player == 0 ? " and 8" : "", player + 1,
+             DescribeController(hid.GetEmulatedControllerByIndex(static_cast<std::size_t>(player))),
+             DescribeController(hid.GetEmulatedController(Core::HID::NpadIdType::Handheld)),
+             static_cast<u32>(hid.GetSupportedStyleTag().raw));
+}
+
 void SendButton(int player, int button, bool pressed) {
-    if (auto* pad = Gamepad()) {
+    auto* pad = Gamepad();
+    if (pad) {
         pad->SetButtonState(static_cast<std::size_t>(player), button, pressed);
         if (player == 0) {
             pad->SetButtonState(HandheldPort, button, pressed);
         }
+    }
+    if (pressed) {
+        LogFirstPress(player, button, pad != nullptr);
     }
 }
 
