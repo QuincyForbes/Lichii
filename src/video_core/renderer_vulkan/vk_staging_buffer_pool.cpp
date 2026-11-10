@@ -372,7 +372,29 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         (use_rebar && usage == MemoryUsage::Upload && (1ULL << log2_size) <= 1_MiB)
             ? MemoryUsage::Stream
             : usage;
-    vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, alloc_usage);
+    vk::Buffer buffer;
+    try {
+        buffer = memory_allocator.CreateBuffer(buffer_ci, alloc_usage);
+    } catch (const vk::Exception& e) {
+        // Out of memory: free every idle staging buffer and try once more.
+        size_t freed = 0;
+        for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
+            for (StagingBuffers& level : *cache) {
+                const size_t before = level.entries.size();
+                std::erase_if(level.entries, [this](const StagingBuffer& entry) {
+                    return !entry.deferred && scheduler.IsFree(entry.tick);
+                });
+                freed += before - level.entries.size();
+                level.iterate_index = 0;
+                level.delete_index = 0;
+            }
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "Staging buffer of {} MiB could not be made ({}); freed {} idle staging "
+                    "buffers and retrying",
+                    buffer_ci.size >> 20, e.what(), freed);
+        buffer = memory_allocator.CreateBuffer(buffer_ci, alloc_usage);
+    }
     if (device.HasDebuggingToolAttached()) {
         ++buffer_index;
         buffer.SetObjectNameEXT(fmt::format("Staging Buffer {}", buffer_index).c_str());
