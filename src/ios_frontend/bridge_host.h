@@ -69,4 +69,9 @@ void SetJitPoolBytes(u64 bytes);
 /// Ends the background task lichii_jit_request began (the pool is ready or failed).
 void EndJitBackgroundTask();
 
+/// Pauses or runs the game off the calling thread, in request order; waits for it at most 0.5 s.
+void Suspend(bool pause);
+/// Waits for the pauses and resumes requested so far.
+void DrainSuspendQueue();
+
 } // namespace IosFrontend

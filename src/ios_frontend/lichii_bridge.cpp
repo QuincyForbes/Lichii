@@ -4,9 +4,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -275,6 +277,43 @@ void SetJitPoolBytes(u64 bytes) {
 
 void EndJitBackgroundTask() {
     IosSupport::EndBackgroundTask(std::exchange(g_jit_background_task, 0));
+}
+
+namespace {
+
+// Pause and resume run in order on a queue of their own. Pausing waits for every guest core to
+// leave guest code, which never happens while one is stuck in a host wait (a hung GPU): the app's
+// main thread, and with it the menu and the controls, must not stop with it.
+dispatch_queue_t SuspendQueue() {
+    static dispatch_queue_t queue = dispatch_queue_create("lichii.suspend", DISPATCH_QUEUE_SERIAL);
+    return queue;
+}
+
+} // Anonymous namespace
+
+void Suspend(bool pause) {
+    struct Work {
+        bool pause;
+        std::promise<void> done;
+    };
+    auto* const work = new Work{pause, {}};
+    auto done = work->done.get_future();
+    dispatch_async_f(SuspendQueue(), work, [](void* context) {
+        std::unique_ptr<Work> work{static_cast<Work*>(context)};
+        if (System().IsPoweredOn()) {
+            void(work->pause ? System().Pause() : System().Run());
+        }
+        work->done.set_value();
+    });
+    // Usually done at once; the caller only waits briefly for it.
+    if (done.wait_for(std::chrono::milliseconds{500}) == std::future_status::timeout) {
+        LOG_WARNING(Frontend, "iOS: the game did not {} within 0.5 s (a guest or GPU thread is stuck)",
+                    pause ? "pause" : "resume");
+    }
+}
+
+void DrainSuspendQueue() {
+    dispatch_sync_f(SuspendQueue(), nullptr, [](void*) {});
 }
 
 } // namespace IosFrontend
@@ -854,15 +893,15 @@ void lichii_emu_cancel_launch(void) {
 
 void lichii_emu_pause(void) {
     if (g_state.load() == LICHII_EMU_RUNNING && System().IsPoweredOn()) {
-        void(System().Pause());
         SetState(LICHII_EMU_PAUSED);
+        Suspend(true);
     }
 }
 
 void lichii_emu_resume(void) {
     if (g_state.load() == LICHII_EMU_PAUSED && System().IsPoweredOn()) {
-        void(System().Run());
         SetState(LICHII_EMU_RUNNING);
+        Suspend(false);
     }
 }
 

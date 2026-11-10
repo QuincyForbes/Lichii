@@ -13,6 +13,7 @@
 #include "common/thread.h"
 #endif
 
+#include "core/core.h"
 #include "core/device_memory.h"
 #include "hle/kernel/board/nintendo/nx/k_system_control.h"
 
@@ -72,6 +73,15 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             if (!sleep(1s)) {
                 return;
             }
+#ifdef __APPLE__
+            // Not while the game boots: no pass before its first frame, so a reclaim can't race
+            // the heap clears of a game that has never run on this device.
+            if (g_nx2_present_count.load(std::memory_order_relaxed) == 0) {
+                pressure = Common::PlatformEvents::MemoryPressureGeneration();
+                waited = 0s;
+                continue;
+            }
+#endif
             if (const u32 now = Common::PlatformEvents::MemoryPressureGeneration();
                 now != pressure) {
                 pressure = now;
