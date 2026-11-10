@@ -415,7 +415,22 @@ std::string ProfileHost(System& system) {
                                         static_cast<double>(size) / (1 << 20));
         }
     }
-    PROCESS_MEMORY_COUNTERS_EX2 counters{};
+    // PROCESS_MEMORY_COUNTERS_EX2, which MinGW's psapi.h does not declare.
+    struct {
+        DWORD cb;
+        DWORD PageFaultCount;
+        SIZE_T PeakWorkingSetSize;
+        SIZE_T WorkingSetSize;
+        SIZE_T QuotaPeakPagedPoolUsage;
+        SIZE_T QuotaPagedPoolUsage;
+        SIZE_T QuotaPeakNonPagedPoolUsage;
+        SIZE_T QuotaNonPagedPoolUsage;
+        SIZE_T PagefileUsage;
+        SIZE_T PeakPagefileUsage;
+        SIZE_T PrivateUsage;
+        SIZE_T PrivateWorkingSetSize;
+        ULONG64 SharedCommitUsage;
+    } counters{};
     counters.cb = sizeof(counters);
     K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
                             sizeof(counters));
