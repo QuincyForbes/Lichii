@@ -292,11 +292,23 @@ struct ExperimentsView: View {
     @State private var noFootprint = lichii_platform_experiment("no_footprint") != 0
     @State private var untaggedGuest = lichii_platform_experiment("untagged_guest") != 0
     @State private var noZeroTrim = lichii_platform_experiment("no_zero_trim") != 0
+    @State private var chunkedGuest = lichii_platform_experiment("chunked_guest") != 0
     @State private var confirmReset = false
     @State private var resetDone = false
 
     var body: some View {
         List {
+            Section {
+                Toggle("Give Back Zeroed Guest Memory", isOn: $chunkedGuest)
+                    .onChange(of: chunkedGuest) { value in
+                        lichii_platform_set_experiment("chunked_guest", value ? 1 : 0)
+                    }
+            } header: {
+                Text("Memory Savings")
+            } footer: {
+                Text("Untested on a device. Splits guest memory into 2 MiB pieces and returns the ones holding only zeros to iOS (about 0.5 GB in Ocarina of Time). To do that safely Lichii stops all of its threads for about a millisecond at a time, which may show as a stutter. Applies the next time Lichii starts; has no effect with Count Guest Memory per Mapping on.")
+            }
+
             Section {
                 Toggle("Count Guest Memory per Mapping", isOn: $untaggedGuest)
                     .onChange(of: untaggedGuest) { value in

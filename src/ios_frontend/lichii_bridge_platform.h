@@ -185,6 +185,7 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// "no_footprint": ask for guest memory out of the process footprint (iOS 26 refuses it without
 /// a private entitlement: KERN_NO_ACCESS). "untagged_guest": guest memory counted per mapping, as
 /// before ledger tagging, with zero trimming. "no_zero_trim": no zero page trimming.
+/// "chunked_guest": guest memory in purgeable 2 MiB objects, the all-zero ones given back.
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
 
