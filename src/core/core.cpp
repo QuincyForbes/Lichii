@@ -67,6 +67,7 @@
 #include "core/hle/service/sm/sm.h"
 #include "core/internal_network/network.h"
 #include "core/loader/loader.h"
+#include "core/loader/nx.h"
 #include "core/memory.h"
 #include "core/memory/cheat_engine.h"
 #include "core/perf_stats.h"
@@ -76,6 +77,7 @@
 #include "hid_core/hid_core.h"
 #include "network/network.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_diag.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
 
@@ -146,6 +148,9 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
                metadata.IsSwitch2();
     }
     const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
+    if (type == Loader::FileType::NX) {
+        return Loader::AppLoader_NX::ReadPlatform(file, program_id) == 2;
+    }
     if (type == Loader::FileType::XCI || type == Loader::FileType::XCZ) {
         const FileSys::XCI xci{file, program_id, program_index};
         if (xci.GetStatus() != Loader::ResultStatus::Success) {
@@ -526,6 +531,9 @@ struct System::Impl {
             game_info.id = params.program_id;
             game_info.version = title_version;
             room_member->SendGameInfo(game_info);
+        }
+        if (VideoCommon::Nx2Diag::Active()) {
+            VideoCommon::Nx2Diag::Diagnostics::Get().SetTitle(params.program_id);
         }
         debug_service = Nx2Debug::MaybeStartService(system, name, params.program_id);
         Nx2Sampler::StartFromEnvironment();

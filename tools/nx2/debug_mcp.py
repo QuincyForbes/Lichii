@@ -199,6 +199,23 @@ TOOLS = [
         },
     },
     {
+        "name": "write_memory",
+        "description": "For experiments only: writes 1 to 4096 bytes of the game's guest memory "
+                       "and returns what was there before. Refused unless the emulator was "
+                       "started with EDEN_NX2_DEBUG_WRITE=1 (status shows write_memory). Give "
+                       "'hex' (byte pairs in memory order) or 'f32' (floats, little endian). "
+                       "Restore the 'before' bytes when done.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": ["string", "integer"]},
+                "hex": {"type": "string"},
+                "f32": {"type": "array", "items": {"type": "number"}},
+            },
+            "required": ["address"],
+        },
+    },
+    {
         "name": "read_gpu_memory",
         "description": "Reads up to 64 KiB of GPU virtual memory (e.g. query report and semaphore "
                        "buffers the game reads back) at the next frame end, as the GPU sees it, "

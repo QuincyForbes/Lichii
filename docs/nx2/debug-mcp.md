@@ -246,6 +246,12 @@ capture shows in `c5`, and from there the time-of-day or dynamic-resolution stat
 copies every mapped page once, so it keeps one host core busy for up to the budget: run it once,
 not in a loop, while the owner plays.
 
+**`write_memory`** `{address, hex | f32}`, for experiments only. It refuses unless the emulator was
+started with `EDEN_NX2_DEBUG_WRITE=1` (read once by the service at boot; `status` shows
+`write_memory`). It writes 1 to 4096 bytes with `Memory::WriteBlock` from the server thread, logs
+the write and returns the bytes that were there before; write them back when done. The game keeps
+running, so a write can race the guest, and code it changes is not translated again.
+
 **`read_gpu_memory`** `{gpu_address, size, as?, timeout_s?}` reads GPU virtual memory, for
 example query report and semaphore buffers that the game reads back. It runs on the rasterizer
 thread at the next frame end, like a capture, so it fails with "no frame was presented" while

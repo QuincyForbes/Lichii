@@ -19,6 +19,14 @@
 #endif
 #endif
 
+#ifdef __linux__
+#include <algorithm>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#include <string_view>
+#endif
+
 #include "common/memory_detect.h"
 
 namespace Common {
