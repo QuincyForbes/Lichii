@@ -33,6 +33,11 @@ namespace {
 /// Address in constant buffers to the storage buffer descriptor
 struct StorageBufferAddr {
     auto operator<=>(const StorageBufferAddr&) const noexcept = default;
+    // Not defaulted: clang then treats this 12-byte type as trivially equality comparable, and
+    // MSVC's STL std::find picks a vectorized path that has no 12-byte variant (clang-cl error).
+    bool operator==(const StorageBufferAddr& other) const noexcept {
+        return index == other.index && offset == other.offset && indirect == other.indirect;
+    }
 
     u32 index;
     u32 offset;
