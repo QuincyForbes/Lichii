@@ -96,4 +96,17 @@ u64 GetProcessPageFaults() {
 #endif
 }
 
+std::optional<u64> GetSystemCommitRoom() {
+#ifdef _WIN32
+    PERFORMANCE_INFORMATION performance{};
+    performance.cb = sizeof(performance);
+    if (K32GetPerformanceInfo(&performance, sizeof(performance))) {
+        const u64 limit = performance.CommitLimit;
+        const u64 committed = performance.CommitTotal;
+        return (committed < limit ? limit - committed : 0) * performance.PageSize;
+    }
+#endif
+    return std::nullopt;
+}
+
 } // namespace Common

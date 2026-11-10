@@ -193,6 +193,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 native_critical_memory{};
     u64 native_expected_memory{};
     u64 budget_check_frames{};
+    u64 logged_critical_memory{}; ///< The critical threshold of the last thresholds line logged
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
     u32 seen_host_pressure{};     ///< Common::PlatformEvents memory pressure already answered
     u32 host_pressure_frames{};   ///< Frames left collecting as if out of memory after it
