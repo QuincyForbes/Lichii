@@ -13,10 +13,11 @@ struct CheatsView: View {
     @State private var showImporter = false
     @State private var alert: ContentAlert?
     @State private var query = ""
+    @State private var busy = false
 
     var body: some View {
         List {
-            if files.isEmpty {
+            if files.isEmpty && !busy {
                 Section {
                     Text("No cheats for this game yet.").foregroundStyle(.secondary)
                 } footer: {
@@ -31,7 +32,13 @@ struct CheatsView: View {
                             Text(file.file).font(.caption.monospaced()).foregroundStyle(.secondary)
                         }
                     }
-                    ForEach(filtered(file.cheats)) { cheat in
+                    .swipeActions {
+                        if file.source.hasPrefix("cheat_") {
+                            Button("Delete", role: .destructive) { delete(file) }
+                        }
+                    }
+                    // Names can repeat inside one file, so rows are told apart by position.
+                    ForEach(Array(filtered(file.cheats).enumerated()), id: \.offset) { _, cheat in
                         Toggle(isOn: cheatBinding(file, cheat)) {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(cheat.name)
@@ -45,11 +52,6 @@ struct CheatsView: View {
                         Text("No named cheats in this file.").font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                .swipeActions {
-                    if file.source.hasPrefix("cheat_") {
-                        Button("Delete", role: .destructive) { delete(file) }
-                    }
-                }
             }
             if !files.isEmpty {
                 Section {
@@ -57,6 +59,9 @@ struct CheatsView: View {
                     Text("Cheats apply when the game boots. A cheat file only runs for the game build its name (the build id) matches.")
                 }
             }
+        }
+        .overlay {
+            if busy && files.isEmpty { ProgressView() }
         }
         .searchable(text: $query, prompt: "Search cheats")
         .navigationTitle("Cheats")
@@ -69,26 +74,16 @@ struct CheatsView: View {
                 Button {
                     showImporter = true
                 } label: {
-                    Image(systemName: "plus")
+                    Label("Add Cheat Files", systemImage: "plus")
                 }
+                .disabled(busy)
             }
         }
         .onAppear(perform: reload)
         .fileImporter(isPresented: $showImporter, allowedContentTypes: ContentTypes.cheats,
                       allowsMultipleSelection: true) { result in
             guard case .success(let urls) = result else { return }
-            var failed: [String] = []
-            for url in urls {
-                let ok = withSecurityScope(url) {
-                    url.path.withCString { lichii_content_install_cheat_file(game.programId, $0) }
-                }
-                if !ok { failed.append(url.lastPathComponent) }
-            }
-            if !failed.isEmpty {
-                alert = ContentAlert(title: "Cheats",
-                                     message: "No cheats could be read from: \(failed.joined(separator: ", "))")
-            }
-            reload()
+            install(urls)
         }
         .alert(item: $alert) { alert in
             Alert(title: Text(alert.title), message: Text(alert.message))
@@ -101,7 +96,33 @@ struct CheatsView: View {
     }
 
     private func reload() {
-        files = ContentBridge.cheats(game)
+        busy = true
+        let current = game
+        ContentBridge.run({ ContentBridge.cheats(current) }) { result in
+            files = result
+            busy = false
+        }
+    }
+
+    private func install(_ urls: [URL]) {
+        busy = true
+        let programId = game.programId
+        ContentBridge.run({ () -> [String] in
+            // Coordinated reads, so files in iCloud Drive or another file provider are downloaded.
+            urls.compactMap { url -> String? in
+                let (ok, error) = coordinatedRead(url) { readable in
+                    readable.path.withCString { lichii_content_install_cheat_file(programId, $0) }
+                }
+                if ok == true { return nil }
+                return error.map { "\(url.lastPathComponent) (\($0))" } ?? url.lastPathComponent
+            }
+        }) { failed in
+            if !failed.isEmpty {
+                alert = ContentAlert(title: "Cheats",
+                                     message: "No cheats could be read from: \(failed.joined(separator: ", "))")
+            }
+            reload()
+        }
     }
 
     private func sourceBinding(_ file: ContentBridge.CheatFile) -> Binding<Bool> {

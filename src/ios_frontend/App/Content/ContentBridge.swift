@@ -239,9 +239,24 @@ enum ContentBridge {
 
     static var profiles: [Profile] { decode([Profile].self, lichii_content_list_profiles_json()) ?? [] }
 
+    private static var exportsDir: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("exports", isDirectory: true)
+    }
+
+    /// Exports of earlier sessions and import staging folders left by an interrupted install.
+    static func removeTemporaryFiles() {
+        let manager = FileManager.default
+        try? manager.removeItem(at: exportsDir)
+        let temporary = manager.temporaryDirectory
+        for name in (try? manager.contentsOfDirectory(atPath: temporary.path)) ?? []
+            where name.hasPrefix("lichii-import-") {
+            try? manager.removeItem(at: temporary.appendingPathComponent(name))
+        }
+    }
+
     /// A temporary file for exports handed to the share sheet.
     static func exportURL(_ name: String) -> URL {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("exports", isDirectory: true)
+        let dir = exportsDir
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent(name)
         try? FileManager.default.removeItem(at: url)
@@ -271,26 +286,42 @@ func withSecurityScope<T>(_ url: URL, _ body: () -> T) -> T {
     return body()
 }
 
-/// Copies a picked file or folder to `target` through a coordinated read, which downloads an
-/// iCloud Drive or file provider item first; a plain read of such an item finds no data. Returns
-/// the error text, nil on success.
-func coordinatedCopy(_ url: URL, to target: URL) -> String? {
+/// Runs `body` with a readable URL for a picked file or folder, inside a coordinated read: that
+/// downloads an iCloud Drive or file provider item first, where a plain read finds no data. The
+/// URL is only valid during `body`. Returns nil and the error text when the item can't be read.
+func coordinatedRead<T>(_ url: URL, _ body: (URL) -> T) -> (T?, String?) {
     let scoped = url.startAccessingSecurityScopedResource()
     defer { if scoped { url.stopAccessingSecurityScopedResource() } }
     var coordinationError: NSError?
-    var failure: String?
+    var result: T?
     NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { readable in
+        result = body(readable)
+    }
+    if let result {
+        return (result, nil)
+    }
+    return (nil, coordinationError?.localizedDescription ?? "The file could not be read.")
+}
+
+/// Copies a picked file or folder to `target` through a coordinated read (coordinatedRead).
+/// Returns the error text, nil on success.
+func coordinatedCopy(_ url: URL, to target: URL) -> String? {
+    let (failure, error) = coordinatedRead(url) { readable -> String? in
         let manager = FileManager.default
         do {
             if manager.fileExists(atPath: target.path) {
                 try manager.removeItem(at: target)
             }
             try manager.copyItem(at: readable, to: target)
+            return nil
         } catch {
-            failure = error.localizedDescription
+            return error.localizedDescription
         }
     }
-    return coordinationError?.localizedDescription ?? failure
+    if let error {
+        return error
+    }
+    return failure ?? nil
 }
 
 /// A new temporary folder for coordinated copies; the caller removes it.

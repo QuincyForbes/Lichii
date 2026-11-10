@@ -481,6 +481,12 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
             *target = std::strtoull(value, nullptr, 10) << 20;
         }
     }
+#ifdef __APPLE__
+    // The iOS memory budget sets these overrides. The minimum taken from the device's (unified,
+    // large) heap above would hold the collector off until long past them.
+    minimum_memory = (std::min)(minimum_memory,
+                                expected_memory - (std::min)(expected_memory, u64{512_MiB}));
+#endif
     if (log) {
         LOG_INFO(HW_GPU, "Texture cache thresholds: expected {} MiB, critical {} MiB, minimum {} MiB",
                  expected_memory >> 20, critical_memory >> 20, minimum_memory >> 20);

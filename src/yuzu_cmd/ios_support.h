@@ -39,6 +39,10 @@ void EndBackgroundTask(std::uint64_t task);
 /// True while the app is in the foreground (active or inactive but visible).
 bool IsForeground();
 
+/// True while the app is active (not covered by a call, Control Center or the app switcher).
+/// Main thread only.
+bool IsActive();
+
 /// Audio: playback category (plays with the silent switch on) and a 20 ms hardware buffer.
 /// Call before SDL opens the audio device.
 void ConfigureAudioSession();

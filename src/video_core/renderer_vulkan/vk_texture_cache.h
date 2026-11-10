@@ -12,6 +12,10 @@
 #include <optional>
 #include <span>
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include "video_core/texture_cache/texture_cache_base.h"
 
 #include "shader_recompiler/shader_info.h"
@@ -404,13 +408,19 @@ public:
         u64 bytes;
         u64 frame;
     };
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // Dead render targets count in the process footprint jetsam watches.
+    static constexpr u64 ImagePoolMaxBytes = u64{128} << 20;
+#else
     static constexpr u64 ImagePoolMaxBytes = u64{512} << 20;
+#endif
     static constexpr u64 ImagePoolMaxFrames = 180;
     std::deque<PooledImage> image_pool;
     u64 image_pool_bytes{};
     u64 image_pool_frame{};
     u32 image_pool_seen_pressure{};
     u32 image_pool_seen_failed{};
+    u32 image_pool_seen_host_pressure{};
     /// Since the last report (TickFrame, every 600 frames while the pool is in use).
     u64 image_pool_taken{};
     u64 image_pool_missed{};

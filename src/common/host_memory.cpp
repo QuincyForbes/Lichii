@@ -1324,6 +1324,14 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
         const size_t clear_end = (std::min)(granule_end, end);
         if ((granules[index].load(std::memory_order_acquire) & GranuleDirty) != 0) {
             const bool whole = offset == granule_begin && clear_end == granule_end;
+#ifdef __APPLE__
+            if ((granules[index].fetch_and(static_cast<u8>(~GranuleReleased),
+                                           std::memory_order_acq_rel) &
+                 GranuleReleased) != 0) {
+                madvise(backing_base + granule_begin,
+                        (std::min)(granule_end, backing_size) - granule_begin, MADV_FREE_REUSE);
+            }
+#endif
             bool cleared = false;
 #ifdef __linux__
             cleared = whole && punch && impl && impl->PunchHole(granule_begin, granule_end - granule_begin);
@@ -1360,6 +1368,52 @@ void HostMemory::MarkDirty(size_t physical_offset, size_t length) {
     for (size_t index = physical_offset >> GranuleShift; index <= last; ++index) {
         granules[index].fetch_or(GranuleDirty, std::memory_order_release);
     }
+}
+
+void HostMemory::ReleaseFreed(size_t physical_offset, size_t length) {
+#ifdef __APPLE__
+    // Nothing else hands freed guest memory back on Apple: the footprint jetsam watches only grew
+    // to the session's peak. EDEN_NX2_RELEASE_FREED=0 turns it off.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_RELEASE_FREED");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled || length == 0 || backing_base == nullptr) {
+        return;
+    }
+    // Whole granules only: the rest of a partial one may still be in use. They stay Dirty, so the
+    // next allocation clears them whatever the OS left in them.
+    constexpr size_t GranuleSize = size_t{1} << GranuleShift;
+    const size_t first = Common::AlignUp(physical_offset, GranuleSize);
+    const size_t end = (std::min)(Common::AlignDown(physical_offset + length, GranuleSize),
+                                  Common::AlignDown(backing_size, GranuleSize));
+    if (first >= end) {
+        return;
+    }
+    for (size_t offset = first; offset < end; offset += GranuleSize) {
+        granules[offset >> GranuleShift].fetch_or(GranuleReleased, std::memory_order_release);
+    }
+    if (madvise(backing_base + first, end - first, MADV_FREE_REUSABLE) != 0) {
+        return;
+    }
+    static std::atomic<u64> released{};
+    constexpr u64 LogEvery = u64{1} << 30;
+    const u64 before = released.fetch_add(end - first, std::memory_order_relaxed);
+    if (before / LogEvery != (before + (end - first)) / LogEvery) {
+        task_vm_info_data_t info{};
+        mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+        const bool have_info = task_info(mach_task_self(), TASK_VM_INFO,
+                                         reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS;
+        LOG_INFO(Common_Memory,
+                 "Freed guest memory handed back to the OS: {} MiB so far (footprint {} MiB, "
+                 "reusable {} MiB)",
+                 (before + (end - first)) >> 20, have_info ? info.phys_footprint >> 20 : 0,
+                 have_info ? info.reusable >> 20 : 0);
+    }
+#else
+    static_cast<void>(physical_offset);
+    static_cast<void>(length);
+#endif
 }
 
 void HostMemory::ForgetContents() {

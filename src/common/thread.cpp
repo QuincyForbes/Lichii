@@ -649,15 +649,17 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
         return;
     }
     RememberCurrentThreadNice(tid, nice_value);
-#elif defined(__APPLE__) && TARGET_OS_IPHONE
-    // iOS schedules by QoS class (P or E cores, timer coalescing); a thread given scheduling
-    // parameters is opted out of QoS for good.
+#elif defined(__APPLE__)
+    // iOS and macOS schedule by QoS class (P or E cores, timer coalescing); a thread given
+    // scheduling parameters is opted out of QoS for good. Only the threads that bound the frame
+    // (guest cores, GPU threads, Vulkan worker: Critical) are user-interactive: an iPhone has two
+    // P-cores. Timing threads (VeryHigh) do little work and get user-initiated.
     const qos_class_t qos = [&] {
         switch (new_priority) {
         case ThreadPriority::Low: return QOS_CLASS_UTILITY;
         case ThreadPriority::Normal: return QOS_CLASS_DEFAULT;
-        case ThreadPriority::High: return QOS_CLASS_USER_INITIATED;
-        case ThreadPriority::VeryHigh:
+        case ThreadPriority::High:
+        case ThreadPriority::VeryHigh: return QOS_CLASS_USER_INITIATED;
         case ThreadPriority::Critical: return QOS_CLASS_USER_INTERACTIVE;
         default: return QOS_CLASS_DEFAULT;
         }
@@ -821,6 +823,9 @@ void SetCurrentThreadCpuMask(u64 mask) {
 void SetCurrentThreadIdlePriority() {
 #ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+#elif defined(__APPLE__)
+    // Background keeps the thread on the efficiency cores of Apple silicon.
+    pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
 #else
     SetCurrentThreadPriority(ThreadPriority::Low);
 #endif

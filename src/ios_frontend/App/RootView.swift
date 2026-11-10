@@ -5,6 +5,7 @@ import SwiftUI
 
 struct RootView: View {
     @EnvironmentObject private var app: AppController
+    @ObservedObject private var platform = PlatformCenter.shared
 
     var body: some View {
         TabView {
@@ -33,6 +34,9 @@ struct RootView: View {
         .tint(Theme.accent)
         .fullScreenCover(isPresented: $app.showLaunch) {
             LaunchView()
+        }
+        .sheet(item: $platform.uncleanExit) { session in
+            UncleanExitView(session: session)
         }
     }
 }

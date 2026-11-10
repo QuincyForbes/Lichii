@@ -10,6 +10,12 @@
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#if defined(__aarch64__)
+#include <arm_acle.h>
+#endif
+#endif
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -281,7 +287,8 @@ void PhysicalCore::Idle(KernelCore& kernel) {
     }();
     long long spin_us = spin_setting;
     if (spin_us < 0) {
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+        // Phones: two P-cores, and a spinning idle core takes one from the GPU threads.
         spin_us = 0;
 #else
         const KProcess* process = kernel.ApplicationProcess();
@@ -302,6 +309,16 @@ void PhysicalCore::Idle(KernelCore& kernel) {
 #if defined(_M_X64) || defined(__x86_64__)
             if (idle_pause) {
                 _mm_pause();
+                if ((iter & 63) == 0 && std::chrono::steady_clock::now() >= deadline) {
+                    break;
+                }
+                continue;
+            }
+#elif defined(__APPLE__) && defined(__aarch64__)
+            // ISB rather than a sched_yield syscall per iteration (Rust's spin_loop hint on
+            // aarch64; the YIELD instruction does nothing on Apple cores).
+            if (idle_pause) {
+                __isb(0xF);
                 if ((iter & 63) == 0 && std::chrono::steady_clock::now() >= deadline) {
                     break;
                 }
