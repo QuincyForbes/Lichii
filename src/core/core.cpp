@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <utility>
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -413,8 +414,35 @@ struct System::Impl {
 
         // Switch 2 titles size their heap from the total memory and need the 12 GiB layout. Set it
         // as a per-game value, so RestoreGlobalState brings back the configured layout afterwards.
-        if (switch2_program &&
-            Settings::values.memory_layout_mode.GetValue() != Settings::MemoryLayout::Memory_12Gb) {
+        // EDEN_NX2_MEMORY_LAYOUT=<4|6|8|10|12> (GiB) picks the layout instead (memory tests).
+        static const std::optional<Settings::MemoryLayout> forced_layout =
+            []() -> std::optional<Settings::MemoryLayout> {
+            const char* value = std::getenv("EDEN_NX2_MEMORY_LAYOUT");
+            if (value == nullptr) {
+                return std::nullopt;
+            }
+            switch (std::strtoul(value, nullptr, 10)) {
+            case 4:
+                return Settings::MemoryLayout::Memory_4Gb;
+            case 6:
+                return Settings::MemoryLayout::Memory_6Gb;
+            case 8:
+                return Settings::MemoryLayout::Memory_8Gb;
+            case 10:
+                return Settings::MemoryLayout::Memory_10Gb;
+            case 12:
+                return Settings::MemoryLayout::Memory_12Gb;
+            default:
+                return std::nullopt;
+            }
+        }();
+        if (forced_layout) {
+            LOG_INFO(Core, "EDEN_NX2_MEMORY_LAYOUT: using memory layout {}",
+                     Settings::CanonicalizeEnum(*forced_layout));
+            Settings::values.memory_layout_mode.SetGlobal(false);
+            Settings::values.memory_layout_mode.SetValue(*forced_layout);
+        } else if (switch2_program && Settings::values.memory_layout_mode.GetValue() !=
+                                          Settings::MemoryLayout::Memory_12Gb) {
             LOG_INFO(Core, "Switch 2 program: using the 12 GiB memory layout");
             Settings::values.memory_layout_mode.SetGlobal(false);
             Settings::values.memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_12Gb);

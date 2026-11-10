@@ -85,6 +85,12 @@ public:
     /// fills again stays).
     std::pair<size_t, size_t> TrimZeroPages(ZeroTrimState* state = nullptr,
                                             const std::function<bool()>& pause = {}) const;
+    /// One flag per 4 KiB page of the backing: resident through the backing or a view (Windows
+    /// working set), or resident or compressed (mincore elsewhere). Empty where unknown.
+    std::vector<bool> ResidentPages() const;
+    [[nodiscard]] size_t BackingSize() const noexcept {
+        return backing_size;
+    }
 
     /// Bytes ClearBackingRegion has filled with zeros (memset) since start.
     static u64 ZeroFilledBytes() noexcept;

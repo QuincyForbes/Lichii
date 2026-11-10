@@ -1198,6 +1198,8 @@ add_library(core STATIC
     memory/dmnt_cheat_types.h
     memory/dmnt_cheat_vm.cpp
     memory/dmnt_cheat_vm.h
+    memory_profile.cpp
+    memory_profile.h
     oot_zstd_hook.cpp
     oot_zstd_hook.h
     perf_stats.cpp
