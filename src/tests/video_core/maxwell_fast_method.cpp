@@ -375,7 +375,9 @@ TEST_CASE("GpuSplit CB batching respects device remaps within GPU big pages",
     for (auto* engine : {&f.slow, &f.fast}) {
         std::memset(backing, 0, 0x10000);
         std::memset(replacement, 0, 0x1000);
-        VideoCommon::GpuSplit split;
+        // On the heap: a GpuSplit is larger than the stack of a Windows thread.
+        const auto split_storage = std::make_unique<VideoCommon::GpuSplit>();
+        VideoCommon::GpuSplit& split = *split_storage;
         Access::Initialize(split, f.system);
         split.MacroWrite(engine, CbAddressHigh, 0);
         split.MacroWrite(engine, CbAddressLow, 0x100ffc);
@@ -410,7 +412,8 @@ TEST_CASE("GpuSplit compute and copy write ranges count only for reads they over
     // Two GPU pages on device pages that are not adjacent.
     f.memory.Map(0x100000, 0x40000, 0x1000, Tegra::PTEKind::PITCH, false);
     f.memory.Map(0x101000, 0x80000, 0x1000, Tegra::PTEKind::PITCH, false);
-    VideoCommon::GpuSplit split;
+    const auto split_storage = std::make_unique<VideoCommon::GpuSplit>();
+    VideoCommon::GpuSplit& split = *split_storage;
     Access::Initialize(split, f.system, 100);
 
     split.NoteWriterRange(f.memory, 0x100100, 0x100, Kind::Copy);
@@ -461,7 +464,8 @@ TEST_CASE("GpuSplit compute releases to unmapped memory write nothing",
     Fixture f;
     f.memory.BindRasterizer(&f.rasterizer);
     f.memory.Map(0x100000, 0x40000, 0x1000, Tegra::PTEKind::PITCH, false);
-    VideoCommon::GpuSplit split;
+    const auto split_storage = std::make_unique<VideoCommon::GpuSplit>();
+    VideoCommon::GpuSplit& split = *split_storage;
     Access::Initialize(split, f.system, 100);
     const auto notes = [&split](Note note) {
         return split.ReleaseNotes()[static_cast<size_t>(note)];
@@ -497,7 +501,8 @@ TEST_CASE("GpuSplit dispatches count where the back recorded their writes",
     SCOPE_EXIT {
         VideoCore::Nx2Debug::g_experiments[10].store(previous);
     };
-    VideoCommon::GpuSplit split;
+    const auto split_storage = std::make_unique<VideoCommon::GpuSplit>();
+    VideoCommon::GpuSplit& split = *split_storage;
     Access::Initialize(split, f.system, 100);
     bool waited = false;
 
@@ -590,7 +595,8 @@ TEST_CASE("GpuSplit dispatch preserves mapped uploads and macro boundaries",
         CAPTURE(wrap);
         std::vector<Snapshot> expected;
         for (auto* engine : {&f.slow, &f.fast}) {
-            VideoCommon::GpuSplit split;
+            const auto split_storage = std::make_unique<VideoCommon::GpuSplit>();
+            VideoCommon::GpuSplit& split = *split_storage;
             struct ProbeEngine final : Tegra::Engines::EngineInterface {
                 u32 writes{};
                 void CallMethod(Core::System&, u32, u32, bool) override {
@@ -725,7 +731,8 @@ TEST_CASE("GpuSplit CB batching preserves words at the GPU address space end",
     f.memory.Map(0xfffff000, 0x10000, 0x1000, Tegra::PTEKind::PITCH, false);
     for (auto* engine : {&f.slow, &f.fast}) {
         std::memset(backing, 0, 0x1000);
-        VideoCommon::GpuSplit split;
+        const auto split_storage = std::make_unique<VideoCommon::GpuSplit>();
+        VideoCommon::GpuSplit& split = *split_storage;
         Access::Initialize(split, f.system);
         split.MacroWrite(engine, CbAddressHigh, 0);
         split.MacroWrite(engine, CbAddressLow, 0xfffffffcu);
