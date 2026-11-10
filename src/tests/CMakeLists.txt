@@ -6,6 +6,7 @@
 
 add_executable(tests
     video_core/vulkan_overlay_filter.cpp
+    common/addon_config.cpp
     video_core/unswizzle_workers.cpp
     video_core/aftermath_dump.cpp
     video_core/gpu_timestamp.cpp
@@ -16,6 +17,8 @@ add_executable(tests
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp
     audio_core/nx2_sysmix.cpp
+    audio_core/nx2_input_service.cpp
+    audio_core/audio_in.cpp
     audio_core/sysmix_sink.cpp
     audio_core/sysmix_test_context.h
     video_core/ampere_starfox_test10.cpp
@@ -23,10 +26,12 @@ add_executable(tests
     video_core/ampere_yoshi_compute.cpp
     video_core/texture_rect_descriptor.cpp
     audio_core/batch_decoder.cpp
+    audio_core/microphone.cpp
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp
     core/memory_acquire.cpp
     core/builtin_patches.cpp
+    core/builtin_font_glyphs.cpp
     core/system_test_context.h
     video_core/ampere_branch_modifiers.cpp
     video_core/ampere_fast_fusion_logged.cpp
@@ -38,6 +43,10 @@ add_executable(tests
     video_core/storage_write_extent.cpp
     video_core/storage_buffer_control_flow.cpp
     core/nup_validation.cpp
+    core/nx_archive.cpp
+    frontend_common/nx_archive.cpp
+    core/vfs_vector.cpp
+    core/file_sys_parsers.cpp
     input_common/calibration_lifetime.cpp
     input_common/tas_input.cpp
     video_core/ampere_logged_numeric.cpp
@@ -106,13 +115,16 @@ add_executable(tests
     video_core/spirv_nan_safe_min_max.cpp
     video_core/virtual_range_cache.cpp
     common/bit_field.cpp
+    common/bit_util.cpp
     common/cityhash.cpp
     common/container_hash.cpp
     common/event.cpp
     common/fibers.cpp
     common/frizti_settings.cpp
+    common/fs_iterate.cpp
     common/game_presets.cpp
     common/host_memory.cpp
+    common/multi_level_page_table.cpp
     common/page_table.cpp
     common/param_package.cpp
     common/range_map.cpp
@@ -130,6 +142,7 @@ add_executable(tests
     core/nup_metadata.cpp
     core/nx2_image_layout.cpp
     core/nx2_video_input_queue.cpp
+    core/font_merge.cpp
     core/ldn.cpp
     core/internal_network/socket_proxy.cpp
     core/nx2_movie_pacing.cpp
@@ -172,13 +185,16 @@ add_executable(tests
 
 create_target_directory_groups(tests)
 
-target_link_libraries(tests PRIVATE common core audio_core input_common video_core)
+target_link_libraries(tests PRIVATE common core audio_core input_common video_core frontend_common)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 if (TARGET dynarmic::dynarmic)
     target_sources(tests PRIVATE core/window_trace.cpp)
     target_link_libraries(tests PRIVATE dynarmic::dynarmic)
 endif()
+
+target_compile_definitions(tests PRIVATE
+    LICHII_NX_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/core/nx_fixtures")
 
 add_test(NAME tests COMMAND tests)
 
@@ -201,6 +217,18 @@ add_executable(ios_controls_tests
 target_include_directories(ios_controls_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(ios_controls_tests PRIVATE Catch2::Catch2WithMain)
 add_test(NAME ios_controls_tests COMMAND ios_controls_tests)
+
+if (NOT ANDROID)
+    target_sources(tests PRIVATE input_common/joycon_subcommand_response.cpp)
+    target_link_libraries(tests PRIVATE SDL3::SDL3)
+
+    add_executable(config_tests
+        common/first_run_config.cpp
+        ../frontend_common/config.cpp)
+    target_link_libraries(config_tests PRIVATE common SimpleIni::SimpleIni Catch2::Catch2WithMain
+        ${PLATFORM_LIBRARIES})
+    add_test(NAME config_tests COMMAND config_tests)
+endif()
 
 # needed for vma
 if (NOT MSVC)

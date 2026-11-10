@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 #include "common/common_funcs.h"
 #include "common/fs/path_util.h"
+#include "common/hex_util.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/file_sys/patch_manager.h"
@@ -54,15 +55,23 @@ constexpr std::array<std::pair<Common::FS::EdenPath, const char*>, 4> TestDirect
     {Common::FS::EdenPath::DumpDir, "dump"},
 }};
 
-void WriteIps(const std::filesystem::path& path, u32 word) {
-    std::vector<u8> ips{'P', 'A', 'T', 'C', 'H'};
-    ips.push_back(static_cast<u8>(PatchOffset >> 16));
-    ips.push_back(static_cast<u8>(PatchOffset >> 8));
-    ips.push_back(static_cast<u8>(PatchOffset));
+void WriteIps(const std::filesystem::path& path, u32 word, size_t offset = PatchOffset) {
+    const bool ips32 = offset > 0xFFFFFF;
+    std::vector<u8> ips =
+        ips32 ? std::vector<u8>{'I', 'P', 'S', '3', '2'} : std::vector<u8>{'P', 'A', 'T', 'C', 'H'};
+    if (ips32) {
+        ips.push_back(static_cast<u8>(offset >> 24));
+    }
+    ips.push_back(static_cast<u8>(offset >> 16));
+    ips.push_back(static_cast<u8>(offset >> 8));
+    ips.push_back(static_cast<u8>(offset));
     ips.push_back(0);
     ips.push_back(sizeof(word));
     for (size_t i = 0; i < sizeof(word); ++i) {
         ips.push_back(static_cast<u8>(word >> (i * 8)));
+    }
+    if (ips32) {
+        ips.push_back('E');
     }
     ips.insert(ips.end(), {'E', 'O', 'F'});
     std::ofstream file{path, std::ios::binary};
@@ -71,7 +80,8 @@ void WriteIps(const std::filesystem::path& path, u32 word) {
 
 class PatchManagerTestContext {
 public:
-    explicit PatchManagerTestContext(std::optional<u32> user_mod_word = std::nullopt) {
+    explicit PatchManagerTestContext(std::optional<u32> user_mod_word = std::nullopt,
+                                     size_t user_mod_offset = PatchOffset) {
         for (size_t i = 0; i < TestDirectories.size(); ++i) {
             const auto& [path, name] = TestDirectories[i];
             previous[i] = Common::FS::GetEdenPath(path);
@@ -83,7 +93,8 @@ public:
         if (user_mod_word) {
             const auto exefs = title_dir / "UserMod" / "exefs";
             std::filesystem::create_directories(exefs);
-            WriteIps(exefs / fmt::format("{}.ips", OcarinaBuildIdHex), *user_mod_word);
+            WriteIps(exefs / fmt::format("{}.ips", OcarinaBuildIdHex), *user_mod_word,
+                     user_mod_offset);
         }
         system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
         system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
@@ -126,10 +137,10 @@ std::vector<u8> MakeMain(const FileSys::PatchManager::BuildID& build_id, u32 wor
     return nso;
 }
 
-u32 WordAt(const std::vector<u8>& nso) {
-    REQUIRE(nso.size() >= PatchOffset + sizeof(u32));
+u32 WordAt(const std::vector<u8>& nso, size_t offset = PatchOffset) {
+    REQUIRE(nso.size() >= offset + sizeof(u32));
     u32 word;
-    std::memcpy(&word, nso.data() + PatchOffset, sizeof(word));
+    std::memcpy(&word, nso.data() + offset, sizeof(word));
     return word;
 }
 
