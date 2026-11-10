@@ -24,7 +24,7 @@
 #include <filesystem>
 #include <string>
 
-#include <fmt/core.h>
+#include <fmt/format.h>
 #include "common/common_types.h"
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
