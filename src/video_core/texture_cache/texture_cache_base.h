@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <type_traits>
 // TODO: find out which don't require stable iters
 #include <unordered_map>
@@ -193,6 +194,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
     u32 seen_host_pressure{};     ///< Common::PlatformEvents memory pressure already answered
     u32 host_pressure_frames{};   ///< Frames left collecting as if out of memory after it
+    /// iOS: the most the cache may hold given what is left to the process (TickFrame)
+    u64 host_memory_cap{(std::numeric_limits<u64>::max)()};
+    u64 host_memory_cap_logged{}; ///< Collection threshold last logged for host_memory_cap
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image
@@ -835,6 +839,10 @@ private:
                                                       bool mark_as_modified);
 
     bool ImageCanRescale(ImageBase& image);
+    /// EDEN_NX2_RESCALE_TRACE=1: counts, per image shape, whether bound targets and storage
+    /// images run at the resolution scale and why not; logged every 300 frames.
+    void NoteRescaleTrace(ImageBase& image, std::string_view role);
+    void LogRescaleTrace();
     void InvalidateScale(Image& image);
     bool ScaleUp(Image& image);
     bool ScaleDown(Image& image);
@@ -1022,6 +1030,9 @@ private:
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;
+
+    bool rescale_trace = std::getenv("EDEN_NX2_RESCALE_TRACE") != nullptr;
+    std::map<std::string, u64> rescale_trace_counts;
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};

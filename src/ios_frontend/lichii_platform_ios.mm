@@ -296,6 +296,22 @@ void InstallObservers() {
       ApplyAudioSession();
       Emit(LICHII_PLATFORM_EVENT_AUDIO_SERVICES_RESET);
     });
+    // The UIKit warning above arrives on the main queue, after whatever the main thread is busy
+    // with; this one comes on its own queue as soon as the system's memory pressure rises.
+    static dispatch_source_t pressure_source = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+        DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+    if (pressure_source != nullptr) {
+        dispatch_source_set_event_handler(pressure_source, ^{
+          const unsigned long level = dispatch_source_get_data(pressure_source);
+          LOG_WARNING(Frontend, "iOS: system memory pressure {} ({} MiB left, footprint {} MiB)",
+                      (level & DISPATCH_MEMORYPRESSURE_CRITICAL) != 0 ? "critical" : "warning",
+                      lichii_platform_available_memory_mib(), lichii_platform_footprint_mib());
+          Common::PlatformEvents::SignalMemoryPressure();
+        });
+        dispatch_resume(pressure_source);
+    }
 }
 
 } // Anonymous namespace
@@ -328,6 +344,8 @@ void lichii_platform_init(void) {
                      g_info.va_reserve_4g, g_info.va_reserve_16g, g_info.va_reserve_max_gib,
                      g_info.txm,
                      g_info.txm_from_device_tree ? "device tree" : "model table");
+            LOG_INFO(Frontend, "iOS platform: increased debugging memory limit {}",
+                     EntitlementValue("com.apple.developer.kernel.increased-debugging-memory-limit"));
             if (g_info.increased_memory_limit == 0) {
                 LOG_WARNING(Frontend, "iOS: the increased-memory-limit entitlement is missing; "
                                       "games will likely be closed by iOS");

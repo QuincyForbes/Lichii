@@ -37,6 +37,8 @@
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
+#include "common/platform_events.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/string_util.h"
@@ -46,6 +48,7 @@
 #include "core/crypto/key_manager.h"
 #include "core/file_sys/common_funcs.h"
 #include "core/file_sys/nup_writer.h"
+#include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/hle/service/am/applet_manager.h"
@@ -431,6 +434,10 @@ static void InitializeContent(SdlState* state) {
         return;
     }
     state->system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
+    // Holds the updates and DLC an NX archive brings, as the Qt frontend does.
+    static FileSys::ManualContentProvider manual_provider;
+    state->system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
+                                          &manual_provider);
     state->system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
     state->system.GetFileSystemController().CreateFactories(*state->system.GetFilesystem());
     state->content_initialized = true;
@@ -541,23 +548,29 @@ static void IosApplyFirstRunDefaults(SdlState* state) {
         std::ofstream{marker} << "1\n";
         changed = true;
     }
-    // Ocarina of Time's Max Resolution built-in turns off the game's GPU-time dynamic resolution,
-    // the safety valve a phone GPU needs. Off once; the Add-Ons list can turn it back on.
+    // Max Resolution (Ocarina of Time) is off by default on iOS now (the patch table's default),
+    // so the per-game "disabled" entry an earlier build wrote once is dropped and the game follows
+    // the global "Max resolution" setting. A build that wrote it and a user who then turned the
+    // patch on keep that choice as a per-game On.
     const auto marker_v2 =
         Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "ios-defaults-v2";
-    if (!Common::FS::Exists(marker_v2)) {
+    const auto marker_v3 =
+        Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "ios-defaults-v3";
+    if (!Common::FS::Exists(marker_v3)) {
         constexpr u64 OcarinaOfTime = 0x0400486024DEC000;
         constexpr std::string_view MaxResolution = "Max Resolution (built-in)";
         auto& disabled = Settings::values.disabled_addons[OcarinaOfTime];
-        if (std::find(disabled.begin(), disabled.end(), MaxResolution) == disabled.end()) {
-            disabled.emplace_back(MaxResolution);
+        const bool was_disabled = std::erase(disabled, std::string{MaxResolution}) != 0;
+        if (!was_disabled && Common::FS::Exists(marker_v2)) {
+            FileSys::ApplyBuiltinPatchChoice(disabled, MaxResolution,
+                                             FileSys::BuiltinPatchChoice::On);
         }
         // The game list caches each game's add-on summary.
         std::error_code ec;
         std::filesystem::remove(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
                                     "game_list" / fmt::format("{:016X}.pv.txt", OcarinaOfTime),
                                 ec);
-        std::ofstream{marker_v2} << "1\n";
+        std::ofstream{marker_v3} << "1\n";
         changed = true;
     }
     if (changed) {
@@ -619,6 +632,8 @@ static void IosEndBootSession(SdlState* state) {
 static void IosStopGame(SdlState* state) {
     LOG_INFO(Frontend, "iOS: stopping the game");
     IosSupport::SetTouchControlsVisible(false);
+    // A resume the app asked for must not run into the teardown.
+    IosFrontend::DrainSuspendQueue();
     if (state->system.IsPoweredOn()) {
         void(state->system.Pause());
         LOG_INFO(Frontend, "iOS: game paused, shutting down the main process");
@@ -1499,7 +1514,70 @@ static void StartGame(SdlState* state, [[maybe_unused]] const Core::LaunchParams
 // keys, by SDL scancode, that many seconds after start. Lets hidden test runs drive menus.
 double Nx2KeyClockSeconds(); // emu_window_sdl3.cpp
 
-static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem) {
+// EDEN_NX2_DIAG_DIR=<dir>: keys.txt there is read and removed while the game runs, for scripted
+// control (tools/nx2/lab_ctl.py press). One entry per line: "<code>" press, "-<code>" release, or
+// "<code> <milliseconds>" press and release after that long. Codes are SDL scancodes.
+static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::System& system) {
+    static const std::filesystem::path file = [] {
+        const char* dir = std::getenv("EDEN_NX2_DIAG_DIR");
+        return dir && *dir ? std::filesystem::path{dir} / "keys.txt" : std::filesystem::path{};
+    }();
+    if (file.empty()) {
+        return;
+    }
+    static std::vector<std::pair<double, int>> releases;
+    static double last_check = 0.0;
+    const double now = Nx2KeyClockSeconds();
+    std::erase_if(releases, [&](const std::pair<double, int>& release) {
+        if (release.first > now) {
+            return false;
+        }
+        input_subsystem.GetKeyboard()->ReleaseKey(static_cast<std::size_t>(release.second));
+        return true;
+    });
+    if (now - last_check < 0.05) {
+        return;
+    }
+    last_check = now;
+    // Renamed first, so a writer replacing the file is never read halfway.
+    const auto taken = std::filesystem::path{file}.replace_extension(".taken");
+    std::error_code error;
+    std::filesystem::rename(file, taken, error);
+    if (error) {
+        return;
+    }
+    std::ifstream in{taken};
+    std::string line;
+    while (std::getline(in, line)) {
+        // "gpu low|high": sets the GPU accuracy, as the Qt app's Change GPU Mode hotkey.
+        if (line.starts_with("gpu ")) {
+            const bool high = line.substr(4) == "high";
+            Settings::values.gpu_accuracy.SetValue(high ? Settings::GpuAccuracy::High
+                                                        : Settings::GpuAccuracy::Low);
+            system.ApplySettings();
+            LOG_INFO(Frontend, "Live keys: GPU accuracy {}", high ? "high" : "low");
+            continue;
+        }
+        int code = 0, milliseconds = -1;
+        if (std::sscanf(line.c_str(), "%d %d", &code, &milliseconds) < 1 || code == 0) {
+            continue;
+        }
+        LOG_INFO(Frontend, "Live keys: {} {}{}", code < 0 ? "release" : "press", code < 0 ? -code : code,
+                 milliseconds >= 0 ? fmt::format(" for {} ms", milliseconds) : "");
+        if (code < 0) {
+            input_subsystem.GetKeyboard()->ReleaseKey(static_cast<std::size_t>(-code));
+            continue;
+        }
+        input_subsystem.GetKeyboard()->PressKey(static_cast<std::size_t>(code));
+        if (milliseconds >= 0) {
+            releases.emplace_back(now + milliseconds / 1000.0, code);
+        }
+    }
+    in.close();
+    std::filesystem::remove(taken, error);
+}
+
+static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem, Core::System& system) {
     struct KeyEvent {
         double seconds; // when frame is 0
         u64 frame;      // "f<frame>:code": after that many presents
@@ -1548,6 +1626,7 @@ static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem) {
         }
         ++next;
     }
+    RunLiveKeys(input_subsystem, system);
 }
 
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
@@ -1695,7 +1774,7 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
         IosApplyControllers(state);
     }
 #endif
-    RunKeyScript(state->input_subsystem);
+    RunKeyScript(state->input_subsystem, state->system);
     if (state->emu_window) {
         state->emu_window->ApplyPendingTitle();
     }
@@ -1736,6 +1815,7 @@ extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     case SDL_EVENT_LOW_MEMORY:
         LOG_WARNING(Frontend, "iOS: low memory warning ({} MiB left to this process)",
                     os_proc_available_memory() >> 20);
+        Common::PlatformEvents::SignalMemoryPressure();
         break;
     case SDL_EVENT_TERMINATING:
         LOG_INFO(Frontend, "iOS: terminating");

@@ -145,9 +145,10 @@ GRenderWindow::GRenderWindow(MainWindow* parent,
     mouse_constrain_timer.setInterval(default_mouse_constrain_timeout);
     connect(&mouse_constrain_timer, &QTimer::timeout, this, &GRenderWindow::ConstrainMouse);
 
+    // Runs from a game's start (InitializeCamera) until it stops (UpdateMouse), not on the game
+    // list.
     mouse_update_timer.setInterval(default_mouse_update_timeout);
     connect(&mouse_update_timer, &QTimer::timeout, this, &GRenderWindow::UpdateMouse);
-    mouse_update_timer.start();
 }
 
 void GRenderWindow::ExecuteProgram(std::size_t program_index) {
@@ -562,6 +563,9 @@ void GRenderWindow::ConstrainMouse() {
 }
 
 void GRenderWindow::UpdateMouse() {
+    if (QtCommon::emu_thread == nullptr) {
+        mouse_update_timer.stop();
+    }
     input_subsystem->GetMouse()->NotifyChanged(); // required to reset mouse once it's no longer moved
 }
 
@@ -596,6 +600,7 @@ void GRenderWindow::TouchEndEvent() {
 }
 
 void GRenderWindow::InitializeCamera() {
+    mouse_update_timer.start();
 #if YUZU_USE_QT_MULTIMEDIA
     constexpr auto camera_update_ms = std::chrono::milliseconds{50}; // (50ms, 20Hz)
     if (!Settings::values.enable_ir_sensor) {

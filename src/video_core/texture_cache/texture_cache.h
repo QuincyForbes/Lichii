@@ -742,6 +742,37 @@ void TextureCache<P>::TickFrame() {
     if (host_pressure) {
         --host_pressure_frames;
     }
+#ifdef __APPLE__
+    // iOS: textures share the process's memory limit with guest RAM, which grows on its own. The
+    // cache may only use what is left of the limit past a reserve (re-read every 30 frames); with
+    // less left than that, the collector runs aggressively down to two thirds of what it holds.
+    if (frame_tick % 30 == 0) {
+        const u64 available = Common::PlatformEvents::AvailableProcessMemory();
+        host_memory_cap = (std::numeric_limits<u64>::max)();
+        if (available != 0) {
+            // Back to the configured thresholds, then the cap.
+            ApplyThresholdOverrides(false);
+            constexpr u64 Reserve = 768_MiB;
+            const u64 room = available > Reserve ? available - Reserve : 0;
+            host_memory_cap = (std::max)(total_used_memory + room, u64{384_MiB});
+            const u64 effective = (std::min)(critical_memory, host_memory_cap);
+            const u64 change = effective > host_memory_cap_logged ? effective - host_memory_cap_logged
+                                                                  : host_memory_cap_logged - effective;
+            if (change >= 128_MiB) {
+                host_memory_cap_logged = effective;
+                LOG_INFO(HW_GPU,
+                         "Texture cache with {} MiB left to the process: collects from {} MiB "
+                         "({} MiB in use)",
+                         available >> 20, effective >> 20, total_used_memory >> 20);
+            }
+        }
+    }
+    if (host_memory_cap < critical_memory) {
+        critical_memory = host_memory_cap;
+        expected_memory = (std::min)(expected_memory, host_memory_cap - host_memory_cap / 3);
+        minimum_memory = (std::min)(minimum_memory, host_memory_cap / 3);
+    }
+#endif
     RunGarbageCollector(out_of_memory || host_pressure);
     if (out_of_memory) {
         // Textures left out for lack of memory are made again on their next read, once a frame
@@ -771,6 +802,9 @@ void TextureCache<P>::TickFrame() {
 
     runtime.TickFrame();
     ++frame_tick;
+    if (rescale_trace && frame_tick % 300 == 0) {
+        LogRescaleTrace();
+    }
     ++bindings_epoch;
     ++frame_epoch_bumps;
     if (relocation_seen && frame_tick % 600 == 0) {
@@ -1080,8 +1114,13 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
                         continue;
                     }
                     auto& image = slot_images[image_view.image_id];
-                    has_blacklisted |= ScaleDown(image);
+                    const bool was_scaled = ScaleDown(image);
+                    has_blacklisted |= was_scaled;
                     image.scale_rating = 0;
+                    if (rescale_trace) {
+                        NoteRescaleTrace(image, was_scaled ? "storage (scaled down now)"
+                                                           : "storage");
+                    }
                 }
             }
         }
@@ -1754,6 +1793,9 @@ bool TextureCache<P>::RescaleRenderTargets() {
     const auto set_rating = [this, scale_rating](ImageId image_id) {
         if (image_id != CORRUPT_ID) {
             Image& image = slot_images[image_id];
+            if (rescale_trace) {
+                NoteRescaleTrace(image, "target");
+            }
             image.scale_rating = scale_rating;
             if (image.scale_tick <= frame_tick) {
                 image.scale_tick = frame_tick + 1;
@@ -3484,6 +3526,41 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     image.flags &= ~ImageFlagBits::CheckingRescalable;
     image.flags |= ImageFlagBits::IsRescalable;
     return true;
+}
+
+template <class P>
+void TextureCache<P>::NoteRescaleTrace(ImageBase& image, std::string_view role) {
+    const auto& info = image.info;
+    std::string_view state = "native, waiting";
+    if (True(image.flags & ImageFlagBits::Rescaled)) {
+        state = "scaled";
+    } else if (!info.rescaleable) {
+        state = "native: not rescaleable";
+    } else if (Settings::values.resolution_info.downscale && !info.downscaleable) {
+        state = "native: too small to downscale";
+    } else if (!ImageCanRescale(image)) {
+        state = "native: an alias can't rescale";
+    }
+    ++rescale_trace_counts[fmt::format("{} {}x{} format {} levels {} layers {}: {}", role,
+                                       info.size.width, info.size.height,
+                                       static_cast<u32>(info.format), info.resources.levels,
+                                       info.resources.layers, state)];
+}
+
+template <class P>
+void TextureCache<P>::LogRescaleTrace() {
+    std::vector<std::pair<u64, std::string>> sorted;
+    for (auto& [key, count] : rescale_trace_counts) {
+        sorted.emplace_back(count, key);
+    }
+    rescale_trace_counts.clear();
+    std::ranges::sort(sorted, std::greater{});
+    const auto& info = Settings::values.resolution_info;
+    LOG_INFO(HW_GPU, "Rescale trace (scale {}/{}): {} shapes", info.up_scale, 1u << info.down_shift,
+             sorted.size());
+    for (size_t i = 0; i < std::min<size_t>(sorted.size(), 30); ++i) {
+        LOG_INFO(HW_GPU, "  {:6} {}", sorted[i].first, sorted[i].second);
+    }
 }
 
 template <class P>

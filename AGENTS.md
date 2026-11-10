@@ -27,6 +27,7 @@ Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Ea
 | 0400380020056000 | Raiders |
 | 0400D1D02399A000 | The Duskbloods network test |
 | 0400486024DEC000 | The Legend of Zelda: Ocarina of Time |
+| 0400245021D2C000 | Yoshi and the Mysterious Book |
 
 Add ids here when a report identifies a new game.
 
@@ -89,6 +90,7 @@ Use these before guessing. All are off unless the variable is set; pass them as 
 | Split GPU thread races | `EDEN_NX2_SPLIT_CHECK=1` | Reports scheduler use from the wrong thread. |
 | Upscaler and DLSS contracts | `EDEN_NX2_DLSS_CONTRACT_TRACE=1` | Inputs and outputs of replaced upscaler networks. |
 | Service calls | `EDEN_NX2_IPC_TRACE=1` | IPC command trace. |
+| Read stalls (loading hitches, NUP vs other containers) | `EDEN_NX2_FS_READ_TRACE=1` | About once a second while the guest reads, one `Guest storage reads` line (`IStorage`, the RomFS) and one `Guest file reads` line (`IFile`): count, MiB, p50/p99/max latency and reads over 1 ms and 16 ms, plus totals and read time since boot. Times cover the backend read (NUP decompression included), not the Switch 1 SD-card throttle. |
 | Host crash (log just stops) | Windows minidump in `%LOCALAPPDATA%\CrashDumps\lichii.exe.<pid>.dmp` | Read the exception and stack with the `minidump` Python package, then symbolize with `llvm-symbolizer --obj=lichii.exe --inlines --relative-address <offset>` next to the build's `lichii.pdb`. |
 
 ## How work is split
@@ -105,3 +107,11 @@ Use these before guessing. All are off unless the variable is set; pass them as 
 - The build the owner tests runs on the owner's Windows PC (DESKTOP-4UD89UT, Ryzen 9 5900X), built with clang using 12 jobs (`cmake --build <dir> --parallel 12`).
 - On the PC the toolchain is clang-cl (LLVM 22) with the VS 2022 SDK, Qt 6.8.3 in `C:/lx/qt`, Ninja and sccache. Source is `C:/lx/src`, the persistent build dir is `C:/lx/build`, and `C:/lx/configure.sh` holds the configure flags. Build and package a fix with one command: `bash C:/lx/build-fix.sh <branch> <build-name> "<Game> - <fix>" ["ENV=VAL ..."] ["log filter"]`.
 - Every fix gets its own debug build on that PC in `C:\Users\Zortos\.capy\work\lichii-debug\<build>\` and a desktop shortcut `Lichii Debug - <Game> - <fix>` that launches it with the owner's existing user data and keeps the log next to the build, so the owner can run it and send the log back.
+
+## Shader catalogue
+
+`tools/nx2/catalog/<program id>.json` lists, per game, the native programs people have identified (what they draw, how it was found), so the next investigation starts from them. Entries are keyed by native program key (the shader dump and shader lab key, the same in every build); `hash` is the frame dump / `reject_shaders` hash, which changes when that program's lowering changes. `tools/nx2/catalog/README.md` has the format.
+
+- The shader lab (`tools/nx2/shader_lab.py`) saves what you name to your local copy (`EDEN_NX2_CATALOG_DIR`, default `%APPDATA%\eglantine\nx2-catalog` or `~/.local/share/eglantine/nx2-catalog`), which carries over between builds and checkouts. Programs identified another way (debug server rejects, frame dumps): `python3 -I tools/nx2/catalog.py add --title <program id> --key <key> [--hash <hash>] --object "..." --how "..."`.
+- **Every commit uploads the catalogue when yours has more.** Before each commit run `python3 -I tools/nx2/catalog.py status`. If it exits 1 (your local copy has entries the repo copy lacks, or newer ones), run `python3 -I tools/nx2/catalog.py merge` and commit the changed `tools/nx2/catalog/*.json` as its own commit (`tools/nx2: catalogue: <game>: <n> programs`) next to your work, so it goes up with the same push. If the repo copy already has everything, change nothing. `merge` only adds and updates; never delete entries from the repo copy.
+- Names, stages and short notes only: no shader code, textures, dumps or other game data.

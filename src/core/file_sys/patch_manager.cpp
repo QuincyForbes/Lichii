@@ -62,11 +62,38 @@ struct BuiltinPatch {
     std::span<const BuiltinPatchRecord> records;
     size_t state_offset = 0;
     size_t state_size = 0;
-    /// Applied only while this returns true (an env kill switch); null means always.
-    bool (*env_enabled)() = nullptr;
+    /// The platform default (an EDEN_NX2_ switch) when neither the game nor the global setting
+    /// decides; null means on.
+    bool (*default_on)() = nullptr;
+    /// While this returns true the patch does not apply, whatever the settings say.
+    bool (*blocked)() = nullptr;
     // Another built-in this one contains; it is skipped once this one is applied.
     std::string_view replaces{};
+    BuiltinPatchKind kind = BuiltinPatchKind::Performance;
+    std::string_view game{};
+    std::string_view description{};
+    std::string_view effect{};
 };
+
+constexpr std::string_view ENABLED_PREFIX = "enabled:";
+
+bool IsListed(const std::vector<std::string>& list, std::string_view name) {
+    return std::ranges::find(list, name) != list.end();
+}
+
+Settings::GamePatchMode GlobalPatchMode(BuiltinPatchKind kind) {
+    switch (kind) {
+    case BuiltinPatchKind::FrameRate:
+        return Settings::values.patch_frame_rate.GetValue();
+    case BuiltinPatchKind::Resolution:
+        return Settings::values.patch_resolution.GetValue();
+    case BuiltinPatchKind::Performance:
+        return Settings::values.patch_performance.GetValue();
+    case BuiltinPatchKind::Image:
+        return Settings::values.patch_image.GetValue();
+    }
+    return Settings::GamePatchMode::Auto;
+}
 
 // EDEN_NX2_<NAME>: unset or empty gives the default, otherwise on unless it starts with '0'.
 bool OotEnvSwitch(const char* name, bool default_on) {
@@ -84,9 +111,22 @@ bool OotOcclusionOffEnabled() {
 
 bool OotNoNdsrEnabled() {
     static const bool enabled = OotEnvSwitch("EDEN_NX2_OOT_NO_NDSR", false);
-    // MetalFX temporal upscaling (Apple) replaces the output pass this removes, and skips its
-    // dispatch itself.
-    return enabled && !Settings::values.metalfx_temporal.GetValue();
+    return enabled;
+}
+
+// MetalFX temporal upscaling (Apple) replaces the output pass this removes, and skips its
+// dispatch itself.
+bool MetalFxReplacesNdsr() {
+    return Settings::values.metalfx_temporal.GetValue();
+}
+
+// The game's dynamic resolution is the safety valve a phone GPU needs.
+bool MaxResolutionDefault() {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    return false;
+#else
+    return true;
+#endif
 }
 
 bool OotNativeZstdEnabled() {
@@ -306,6 +346,8 @@ constexpr std::array OOT_TEXTURE_POOL_RECORDS{
     BuiltinPatchRecord{0x3C462C0, OOT_TEXTURE_POOL_CAVE, OOT_TEXTURE_POOL_CAVE_ORIGINAL},
 };
 
+constexpr std::string_view OOT_GAME = "The Legend of Zelda: Ocarina of Time";
+
 constexpr std::array BUILTIN_PATCHES{
     // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
     // instead of following the GPU-time controller down to its 480p floor.
@@ -315,6 +357,13 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = MAX_RESOLUTION_RECORDS,
+        .default_on = MaxResolutionDefault,
+        .kind = BuiltinPatchKind::Resolution,
+        .game = OOT_GAME,
+        .description = "Renders the 3D at full scale instead of letting the game lower its "
+                       "resolution toward 480p when the GPU is busy.",
+        .effect = "Sharper image; more GPU work, and the game can no longer drop resolution to "
+                  "hold its frame rate.",
     },
     // Dark's routine with a tail that also lowers the step above 60 fps, so the game keeps real
     // speed at any frame rate limit (Settings frame_rate_limit).
@@ -327,6 +376,12 @@ constexpr std::array BUILTIN_PATCHES{
         .state_offset = 0x4E9FE00,
         .state_size = 16,
         .replaces = "Dynamic FPS by Dark (built-in)",
+        .kind = BuiltinPatchKind::FrameRate,
+        .game = OOT_GAME,
+        .description = "Game logic follows real time at any frame rate limit, so the game keeps "
+                       "its speed above 60 fps and down to 10 fps.",
+        .effect = "Lets 90 or 120 fps and frame generation run at full game speed; no cost "
+                  "beyond rendering the extra frames.",
     },
     BuiltinPatch{
         .name = "Dynamic FPS by Dark (built-in)",
@@ -336,6 +391,11 @@ constexpr std::array BUILTIN_PATCHES{
         .records = DYNAMIC_FPS_RECORDS,
         .state_offset = 0x4E9FE00,
         .state_size = 16,
+        .kind = BuiltinPatchKind::FrameRate,
+        .game = OOT_GAME,
+        .description = "Dark's smoothed time step: the game keeps its speed below 60 fps.",
+        .effect = "Fixes slow-motion at low frame rates; does not keep speed above 60 fps "
+                  "(FPS Unlock does).",
     },
     BuiltinPatch{
         .name = "Occlusion Off (built-in)",
@@ -343,7 +403,13 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = OOT_OCCLUSION_OFF_RECORDS,
-        .env_enabled = OotOcclusionOffEnabled,
+        .default_on = OotOcclusionOffEnabled,
+        .kind = BuiltinPatchKind::Performance,
+        .game = OOT_GAME,
+        .description = "Stops the game issuing per-object occlusion queries and the conditional "
+                       "renders they feed.",
+        .effect = "Fewer query stalls and fewer pop-in problems; hidden objects are drawn, so "
+                  "more GPU work.",
     },
     BuiltinPatch{
         .name = "No NDSR anti-aliasing (built-in)",
@@ -351,7 +417,13 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = OOT_NO_NDSR_RECORDS,
-        .env_enabled = OotNoNdsrEnabled,
+        .default_on = OotNoNdsrEnabled,
+        .blocked = MetalFxReplacesNdsr,
+        .kind = BuiltinPatchKind::Image,
+        .game = OOT_GAME,
+        .description = "Removes the game's own anti-aliasing and sharpening network.",
+        .effect = "Much less GPU time (the network needs cooperative matrices, which Apple GPUs "
+                  "lack); a softer, unsharpened image.",
     },
     BuiltinPatch{
         .name = "Native zstd (built-in)",
@@ -359,7 +431,12 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = OOT_NATIVE_ZSTD_RECORDS,
-        .env_enabled = OotNativeZstdEnabled,
+        .default_on = OotNativeZstdEnabled,
+        .kind = BuiltinPatchKind::Performance,
+        .game = OOT_GAME,
+        .description = "Decompresses the game's data with the host's zstd instead of emulating "
+                       "the game's decompressor.",
+        .effect = "Faster loading and streaming with less CPU use; no visible change.",
     },
     BuiltinPatch{
         .name = "Fast lookup strcmp (built-in)",
@@ -367,7 +444,12 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = OOT_FAST_LOOKUP_RECORDS,
-        .env_enabled = OotFastLookupEnabled,
+        .default_on = OotFastLookupEnabled,
+        .kind = BuiltinPatchKind::Performance,
+        .game = OOT_GAME,
+        .description = "Rewrites the game's name-keyed asset lookup to compare eight bytes at a "
+                       "time.",
+        .effect = "Less CPU use while the game loads assets; same results.",
     },
     BuiltinPatch{
         .name = "Resource poll backoff (built-in)",
@@ -375,7 +457,12 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = OOT_POLL_BACKOFF_RECORDS,
-        .env_enabled = OotPollBackoffEnabled,
+        .default_on = OotPollBackoffEnabled,
+        .kind = BuiltinPatchKind::Performance,
+        .game = OOT_GAME,
+        .description = "Makes the resource request thread sleep instead of rescanning at once "
+                       "when a request is not ready.",
+        .effect = "Frees a CPU core; no change to gameplay.",
     },
     BuiltinPatch{
         .name = "Texture Pool x2 (built-in)",
@@ -383,9 +470,58 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = OOT_TEXTURE_POOL_RECORDS,
-        .env_enabled = OotTexturePoolEnabled,
+        .default_on = OotTexturePoolEnabled,
+        .kind = BuiltinPatchKind::Performance,
+        .game = OOT_GAME,
+        .description = "Doubles the game's internal texture pool, which the Castle Town guard "
+                       "house and pot room could exhaust and hang on.",
+        .effect = "Fixes that hang; uses a little more memory.",
     },
 };
+
+struct BuiltinDecision {
+    bool enabled;
+    BuiltinPatchSource source;
+    BuiltinPatchChoice choice;
+};
+
+BuiltinPatchChoice ChoiceFor(const std::vector<std::string>& disabled, std::string_view name) {
+    if (IsListed(disabled, name)) {
+        return BuiltinPatchChoice::Off;
+    }
+    const std::string prefixed = fmt::format("{}{}", ENABLED_PREFIX, name);
+    return IsListed(disabled, prefixed) ? BuiltinPatchChoice::On : BuiltinPatchChoice::FollowGlobal;
+}
+
+// The game's own choice, then the global setting of the patch's kind, then the platform default.
+BuiltinDecision Decide(const BuiltinPatch& patch, const std::vector<std::string>& disabled) {
+    const auto choice = ChoiceFor(disabled, patch.name);
+    if (choice != BuiltinPatchChoice::FollowGlobal) {
+        return {choice == BuiltinPatchChoice::On, BuiltinPatchSource::Game, choice};
+    }
+    switch (GlobalPatchMode(patch.kind)) {
+    case Settings::GamePatchMode::On:
+        return {true, BuiltinPatchSource::Global, choice};
+    case Settings::GamePatchMode::Off:
+        return {false, BuiltinPatchSource::Global, choice};
+    case Settings::GamePatchMode::Auto:
+        break;
+    }
+    const bool on = patch.default_on == nullptr || patch.default_on();
+    return {on, BuiltinPatchSource::Default, choice};
+}
+
+std::string_view SourceText(BuiltinPatchSource source) {
+    switch (source) {
+    case BuiltinPatchSource::Game:
+        return "this game's Add-Ons choice";
+    case BuiltinPatchSource::Global:
+        return "the global setting for its kind";
+    case BuiltinPatchSource::Default:
+        return "the default";
+    }
+    return {};
+}
 
 enum class TitleVersionFormat : u8 {
     ThreeElements, ///< vX.Y.Z
@@ -537,6 +673,67 @@ std::vector<std::string> PatchManager::GetDisabledAddons() const {
     return disabled;
 }
 
+std::string_view BuiltinPatchKindName(BuiltinPatchKind kind) {
+    switch (kind) {
+    case BuiltinPatchKind::FrameRate:
+        return "Frame rate";
+    case BuiltinPatchKind::Resolution:
+        return "Resolution";
+    case BuiltinPatchKind::Performance:
+        return "Performance";
+    case BuiltinPatchKind::Image:
+        return "Image";
+    }
+    return {};
+}
+
+std::string_view BuiltinPatchSourceName(BuiltinPatchSource source) {
+    switch (source) {
+    case BuiltinPatchSource::Game:
+        return "game";
+    case BuiltinPatchSource::Global:
+        return "global";
+    case BuiltinPatchSource::Default:
+        return "default";
+    }
+    return {};
+}
+
+std::vector<std::string> BuiltinPatchGames() {
+    std::vector<std::string> games;
+    for (const auto& patch : BUILTIN_PATCHES) {
+        if (!IsListed(games, patch.game)) {
+            games.emplace_back(patch.game);
+        }
+    }
+    return games;
+}
+
+void ApplyBuiltinPatchChoice(std::vector<std::string>& disabled, std::string_view name,
+                             BuiltinPatchChoice choice) {
+    const std::string prefixed = fmt::format("{}{}", ENABLED_PREFIX, name);
+    std::erase(disabled, std::string{name});
+    std::erase(disabled, prefixed);
+    if (choice == BuiltinPatchChoice::Off) {
+        disabled.emplace_back(name);
+    } else if (choice == BuiltinPatchChoice::On) {
+        disabled.push_back(prefixed);
+    }
+}
+
+BuiltinPatchChoice GetBuiltinPatchChoice(const std::vector<std::string>& disabled,
+                                         std::string_view name) {
+    return ChoiceFor(disabled, name);
+}
+
+bool BuiltinPatchEnabledWhenFollowing(std::string_view name) {
+    const auto it = std::ranges::find(BUILTIN_PATCHES, name, &BuiltinPatch::name);
+    if (it == BUILTIN_PATCHES.end()) {
+        return false;
+    }
+    return Decide(*it, {}).enabled && (it->blocked == nullptr || !it->blocked());
+}
+
 VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
     LOG_INFO(Loader, "Patching ExeFS for title_id={:016X}", title_id);
 
@@ -674,7 +871,10 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
     const auto load_dir = GetModificationLoadRoot();
     const auto sdmc_load_dir = GetModificationLoadRoot(true);
 
-    std::vector<VirtualDir> patch_dirs = {sdmc_load_dir};
+    std::vector<VirtualDir> patch_dirs;
+    if (sdmc_load_dir != nullptr) {
+        patch_dirs.push_back(sdmc_load_dir);
+    }
     if (load_dir != nullptr) {
         const auto load_patch_dirs = load_dir->GetSubdirectories();
         patch_dirs.insert(patch_dirs.end(), load_patch_dirs.begin(), load_patch_dirs.end());
@@ -808,12 +1008,15 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (patch.title_id != title_id || patch.module != name) {
             continue;
         }
-        if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
-            LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
+        const auto decision = Decide(patch, disabled);
+        if (!decision.enabled) {
+            LOG_INFO(Loader, "    - Skipping \"{}\": off by {}", patch.name,
+                     SourceText(decision.source));
             continue;
         }
-        if (patch.env_enabled != nullptr && !patch.env_enabled()) {
-            LOG_INFO(Loader, "    - Skipping \"{}\": off by its EDEN_NX2_ switch", patch.name);
+        if (patch.blocked != nullptr && patch.blocked()) {
+            LOG_INFO(Loader, "    - Skipping \"{}\": a setting replaces what it changes",
+                     patch.name);
             continue;
         }
         if (std::find(replaced.cbegin(), replaced.cend(), patch.name) != replaced.cend()) {
@@ -901,8 +1104,8 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             std::memcpy(out.data() + sizeof(Loader::NSOHeader) + record.module_offset,
                         record.bytes.data(), record.bytes.size());
         }
-        LOG_INFO(Loader, "    - Applying built-in patch \"{}\" ({} records) to {}", patch.name,
-                 patch.records.size(), name);
+        LOG_INFO(Loader, "    - Applying built-in patch \"{}\" ({} records) to {}: on by {}",
+                 patch.name, patch.records.size(), name, SourceText(decision.source));
         if (!patch.replaces.empty()) {
             replaced.push_back(patch.replaces);
         }
@@ -1007,8 +1210,12 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
     }
 
     const auto disabled = GetDisabledAddons();
-    std::vector<VirtualDir> patch_dirs = load_dir->GetSubdirectories();
-    if (std::find(disabled.cbegin(), disabled.cend(), "SDMC") == disabled.cend()) {
+    std::vector<VirtualDir> patch_dirs;
+    if (load_dir != nullptr) {
+        patch_dirs = load_dir->GetSubdirectories();
+    }
+    if (std::find(disabled.cbegin(), disabled.cend(), "SDMC") == disabled.cend() &&
+        sdmc_load_dir != nullptr) {
         patch_dirs.push_back(sdmc_load_dir);
     }
     std::sort(patch_dirs.begin(), patch_dirs.end(),
@@ -1478,26 +1685,36 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
         if (patch.title_id != title_id) {
             continue;
         }
-        const auto is_disabled = [&](std::string_view name) {
-            return std::find(disabled.begin(), disabled.end(), name) != disabled.end();
-        };
+        const auto builtin_disabled = GetDisabledAddons();
+        const auto decision = Decide(patch, builtin_disabled);
         // Name an enabled built-in that contains this one, so unchecking only this one is not
         // mistaken for turning the change off. Whether it applies is only known in PatchNSO (a
         // user mod can make it skip), hence "when it applies".
         const auto replacing = std::ranges::find_if(BUILTIN_PATCHES, [&](const BuiltinPatch& other) {
             return other.title_id == title_id && other.replaces == patch.name &&
-                   !is_disabled(other.name);
+                   Decide(other, builtin_disabled).enabled &&
+                   (other.blocked == nullptr || !other.blocked());
         });
-        out.push_back({.enabled = !is_disabled(patch.name),
+        const bool included = replacing != BUILTIN_PATCHES.end();
+        out.push_back({.enabled = decision.enabled && !(patch.blocked && patch.blocked()),
                        .name = std::string{patch.name},
-                       .version = replacing != BUILTIN_PATCHES.end()
-                                      ? fmt::format("IPS, replaced by {} when it applies",
-                                                    replacing->name)
-                                      : std::string{"IPS"},
+                       .version = included ? fmt::format("IPS, replaced by {} when it applies",
+                                                         replacing->name)
+                                           : std::string{"IPS"},
                        .type = PatchType::Mod,
                        .program_id = title_id,
                        .title_id = title_id,
-                       .source = PatchSource::Unknown});
+                       .source = PatchSource::Unknown,
+                       .builtin = BuiltinPatchInfo{
+                           .kind = patch.kind,
+                           .game = std::string{patch.game},
+                           .description = std::string{patch.description},
+                           .effect = std::string{patch.effect},
+                           .choice = decision.choice,
+                           .source = decision.source,
+                           .resolved_enabled = decision.enabled,
+                           .included_in = included ? std::string{replacing->name} : std::string{},
+                       }});
     }
 
     // DLC

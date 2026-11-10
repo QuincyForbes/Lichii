@@ -116,6 +116,15 @@ char* lichii_content_list_dlc_json(uint64_t program_id);
 /// Enables/disables an add-on by its toggle_key (Settings::disabled_addons) and saves the config.
 bool lichii_content_set_addon_enabled(uint64_t program_id, const char* toggle_key, bool enabled);
 
+/// A built-in patch's per-game choice: 0 follows the global setting of its kind, 1 on, 2 off.
+/// Saves the config. A "builtin" entry of the add-on list carries "builtin": {"kind","game",
+/// "description","effect","choice":"global|on|off","source":"game|global|default",
+/// "resolved_enabled","included_in"}.
+bool lichii_content_set_builtin_patch_choice(uint64_t program_id, const char* name, int choice);
+
+/// Names of the games that ship built-in patches: ["The Legend of Zelda: Ocarina of Time"].
+char* lichii_content_builtin_patch_games_json(void);
+
 bool lichii_content_remove_update(uint64_t program_id);
 bool lichii_content_remove_dlc(uint64_t dlc_title_id);
 int lichii_content_remove_all_dlc(uint64_t program_id);

@@ -47,6 +47,8 @@ using namespace std::chrono_literals;
 constexpr size_t RING_LINES = 20000;
 /// Bytes one read_memory or read_gpu_memory call returns at most.
 constexpr u64 MAX_READ = 64 * 1024;
+/// Bytes one write_memory call writes at most.
+constexpr size_t MAX_WRITE = 4096;
 /// Presented frames one input or input_sequence call holds at most (10 minutes at 60 fps).
 constexpr u64 MAX_INPUT_FRAMES = 36000;
 constexpr size_t MAX_INPUT_STEPS = 1000;
@@ -92,6 +94,11 @@ struct ToolState {
     std::string title;
     u64 program_id;
     std::filesystem::path dump_directory;
+    /// EDEN_NX2_DEBUG_WRITE=1 at launch: write_memory may change guest memory.
+    bool write_enabled{[] {
+        const char* const value = std::getenv("EDEN_NX2_DEBUG_WRITE");
+        return value != nullptr && std::string_view{value} == "1";
+    }()};
     std::chrono::steady_clock::time_point start{std::chrono::steady_clock::now()};
     /// Names this session's captures apart from earlier ones in the same dump directory.
     s64 session{std::chrono::duration_cast<std::chrono::seconds>(
@@ -234,6 +241,7 @@ json Status(ToolState& state, const json& params) {
         {"uptime_s", std::chrono::duration<double>(std::chrono::steady_clock::now() - state.start)
                          .count()},
         {"dump_dir", state.dump_directory.generic_string()},
+        {"write_memory", state.write_enabled},
         {"log_filter", state.log_filter},
         {"rejected", HexList(VideoCore::Nx2Debug::RejectedHashes())},
     };
@@ -504,6 +512,41 @@ json ReadMemory(ToolState& state, const json& params) {
     }
     json result = {{"address", HexAddress(address)}, {"size", size}};
     result.update(FormatMemory(bytes, as));
+    return result;
+}
+
+/// For experiments only: off unless the emulator was started with EDEN_NX2_DEBUG_WRITE=1.
+json WriteMemory(ToolState& state, const json& params) {
+    if (!state.write_enabled) {
+        throw std::runtime_error{"write_memory is off: start the emulator with "
+                                 "EDEN_NX2_DEBUG_WRITE=1 to allow it"};
+    }
+    const u64 address = AddressParam(params, "address");
+    std::vector<u8> bytes;
+    if (params.contains("f32")) {
+        for (const json& value : params.at("f32")) {
+            const u32 bits = std::bit_cast<u32>(value.get<float>());
+            for (int i = 0; i < 4; ++i) {
+                bytes.push_back(static_cast<u8>(bits >> (i * 8)));
+            }
+        }
+    } else {
+        bytes = ParseHexBytes(params.at("hex").get<std::string>());
+    }
+    if (bytes.empty() || bytes.size() > MAX_WRITE) {
+        throw std::runtime_error{fmt::format("write 1 to {} bytes", MAX_WRITE)};
+    }
+    if (address + bytes.size() < address) {
+        throw std::runtime_error{"address + size wraps around"};
+    }
+    std::vector<u8> before(bytes.size());
+    if (const auto unmapped = ReadGuestMemory(Application(state).GetMemory(), address, before)) {
+        throw std::runtime_error{fmt::format("guest address {:#x} is not mapped", *unmapped)};
+    }
+    Application(state).GetMemory().WriteBlock(address, bytes.data(), bytes.size());
+    LOG_INFO(Debug, "Debug server wrote {} bytes at {:#x}", bytes.size(), address);
+    json result = {{"address", HexAddress(address)}, {"size", bytes.size()}};
+    result["before"] = FormatMemory(before, "hex").at("hex");
     return result;
 }
 
@@ -933,6 +976,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"speed_limit", handler(SpeedLimit)},
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},
+        {"write_memory", handler(WriteMemory)},
         {"read_gpu_memory", handler(ReadGpuMemory)},
         {"input", waiting(Input)},
         {"input_sequence", waiting(InputSequence)},
@@ -1266,8 +1310,9 @@ Service::Service(System& system, std::string title, u64 program_id, const Endpoi
         VideoCore::Nx2Debug::EndSession();
         throw;
     }
-    LOG_INFO(Debug, "Debug server listening on {}:{}, dump dir {}", endpoint.host, server->Port(),
-             state->dump_directory.generic_string());
+    LOG_INFO(Debug, "Debug server listening on {}:{}, dump dir {}{}", endpoint.host, server->Port(),
+             state->dump_directory.generic_string(),
+             state->write_enabled ? ", write_memory on (EDEN_NX2_DEBUG_WRITE)" : "");
 }
 
 Service::~Service() {

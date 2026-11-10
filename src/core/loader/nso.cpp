@@ -109,22 +109,35 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
             nso_file.Read(compressed_data.data(), nso_header.segments_compressed_size[i], nso_header.segments[i].offset);
             if (nso_header.IsSegmentCompressed(i)) {
+                const u32 segment_size = nso_header.segments[i].size;
                 if (nso_header.IsZBICCompressed()) {
                     // ZBIC compression
                     const int r = Common::Compression::DecompressDataZBIC(
-                        std::span<u8>{decompressed_size}.first(nso_header.segments[i].size),
+                        std::span<u8>{decompressed_size}.first(segment_size),
                         std::span<const u8>{compressed_data}.first(nso_header.segments_compressed_size[i])
                     );
-                    ASSERT(r > 0);
+                    // A failed segment would leave the previous segment's bytes in the buffer and
+                    // boot a corrupt image that hangs without presenting; refuse to load instead.
+                    if (r <= 0) {
+                        LOG_ERROR(Loader, "{}: segment {} failed ZBIC decompression",
+                                  nso_file.GetName(), i);
+                        return std::nullopt;
+                    }
+                    if (static_cast<u32>(r) != segment_size) {
+                        LOG_WARNING(Loader, "{}: segment {} decompressed to {:#x} of {:#x} bytes",
+                                    nso_file.GetName(), i, r, segment_size);
+                        std::fill(decompressed_size.begin() + r,
+                                  decompressed_size.begin() + segment_size, u8{0});
+                    }
                 } else {
                     // LZ4 compression
                     int r = Common::Compression::DecompressDataLZ4(
                         decompressed_size.data(),
-                        nso_header.segments[i].size,
+                        segment_size,
                         compressed_data.data(),
                         nso_header.segments_compressed_size[i]
                     );
-                    ASSERT(r == int(nso_header.segments[i].size));
+                    ASSERT(r == int(segment_size));
                 }
 
                 std::memcpy(
@@ -177,6 +190,34 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         pi_header = pm->PatchNSO(pi_header, name);
 
         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
+    }
+
+    // Star Fox output pacing for the tested build. The engine's explicit-rate path
+    // updates its render delta as well; simulation timing and the guest clock stay unchanged.
+    if (name == "main" && process.GetProgramId() == 0x0400E88025B1A000ULL) {
+        constexpr u32 Fps = 60;
+        constexpr size_t Offset = 0xB444ADC;
+        constexpr std::array<u32, 3> Original{0xBD4223E1, 0x1E202028, 0x540000ED};
+        constexpr std::array<u8, 20> BuildId{
+            0xA7, 0x73, 0x0D, 0x0F, 0x74, 0xD1, 0x68, 0xD9, 0x04, 0x22,
+            0x35, 0x4C, 0x83, 0x17, 0xF7, 0x6F, 0xF7, 0x8A, 0xD9, 0x38};
+        const auto& text = nso_header.segments[0];
+        if (std::equal(BuildId.begin(), BuildId.end(), nso_header.build_id.begin()) &&
+            Offset >= text.location && Offset + sizeof(Original) <= u64{text.location} + text.size &&
+            module_start + Offset + sizeof(Original) <= codeset.memory.size() &&
+            std::memcmp(codeset.memory.data() + module_start + Offset, Original.data(),
+                        sizeof(Original)) == 0) {
+            constexpr std::array<u32, 3> replacement{
+                0x52800019U | (Fps << 5), // mov w25, #60
+                0x1E2E1000,              // fmov s0, #1.0
+                0x14000035};             // b main+0xB444BB8 (explicit output-rate path)
+            std::memcpy(codeset.memory.data() + module_start + Offset, replacement.data(),
+                        sizeof(replacement));
+            LOG_INFO(Loader, "Star Fox output interval: {} FPS; guest clock unchanged", Fps);
+        } else {
+            LOG_WARNING(Loader,
+                        "Star Fox output patch skipped: unsupported build or instructions");
+        }
     }
 
     // Mario Kart World selects a 1- or 2-vblank frame mode in its main loop. Force its native

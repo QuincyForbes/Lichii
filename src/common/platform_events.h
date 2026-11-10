@@ -30,6 +30,8 @@ struct ProcessMemory {
     u64 footprint_peak;
     u64 compressed;
     u64 reusable;       ///< Marked reusable (MADV_FREE_REUSABLE), outside the footprint
+    u64 internal;       ///< Anonymous memory mapped by the process, per mapping (pmap ledger)
+    u64 purgeable_nonvolatile;
 };
 /// Apple: the process footprint and parts of it. Windows: the working set and its peak. Zeros
 /// elsewhere.

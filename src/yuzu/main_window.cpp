@@ -324,6 +324,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 
 constexpr int default_mouse_hide_timeout = 2500;
 constexpr int default_input_update_timeout = 1;
+constexpr int idle_input_update_timeout = 16;
 constexpr int EmuThreadStopTimeoutMs = 10'000;
 // A teardown that keeps making progress (Common::ShutdownProgress) is waited for this long at
 // most before its thread is terminated.
@@ -481,7 +482,26 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     if (Settings::values.use_dev_keys.GetValue()) {
         Core::Crypto::KeyManager::Instance().ReloadKeys();
     }
-    game_list->PopulateAsync(UISettings::values.game_dirs);
+    // Parsed before the scan: a game on the command line only needs the game directories'
+    // updates and DLC registered, not the list (BootGame waited ~200 ms for that scan to stop).
+    // The list fills when the game exits.
+    std::optional<Core::LaunchParams> launch_params;
+    if (QStringList args = QApplication::arguments(); args.size() >= 2) {
+        QList<QByteArray> qba{};
+        for (auto const& e : args)
+            qba.push_back(e.toUtf8());
+        std::vector<char*> args_cstr{};
+        for (auto& e : qba)
+            args_cstr.push_back(e.data());
+
+        launch_params = Core::ParseLaunchParams(*QtCommon::system, int(args_cstr.size()),
+                                                args_cstr.data(), nullptr);
+    }
+    if (launch_params && !launch_params->filepath.empty()) {
+        game_list->FillContentProvider(UISettings::values.game_dirs);
+    } else {
+        game_list->PopulateAsync(UISettings::values.game_dirs);
+    }
 
     // Set up game list mode checkboxes.
     SetGameListMode(UISettings::values.game_list_mode.GetValue());
@@ -494,8 +514,13 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     connect(&mouse_hide_timer, &QTimer::timeout, this, &MainWindow::HideMouseCursor);
     connect(ui->menubar, &QMenuBar::hovered, this, &MainWindow::ShowMouseCursor);
 
-    update_input_timer.setInterval(default_input_update_timeout);
+    // 1 ms only while a game runs: on the game list it woke the UI thread 1000 times a second.
+    update_input_timer.setInterval(idle_input_update_timeout);
     connect(&update_input_timer, &QTimer::timeout, this, &MainWindow::UpdateInputDrivers);
+    connect(this, &MainWindow::EmulationStarting, this,
+            [this] { update_input_timer.setInterval(default_input_update_timeout); });
+    connect(this, &MainWindow::EmulationStopping, this,
+            [this] { update_input_timer.setInterval(idle_input_update_timeout); });
     update_input_timer.start();
 
     if (has_broken_vulkan) {
@@ -513,7 +538,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         renderer_status_button->setDisabled(true);
         renderer_status_button->setChecked(false);
     } else {
-        VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
+        // Read when a configuration dialog first needs them: one more Vulkan instance and a test
+        // surface on the UI thread at every start otherwise.
+        vk_records_pending = true;
     }
 
     // On macOS, SDL video would pump AppKit events alongside Qt and disrupt native menus.
@@ -540,15 +567,8 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     // to prevent the UI from blowing up.
     UpdateUITheme();
 
-    if (QStringList args = QApplication::arguments(); args.size() >= 2) {
-        QList<QByteArray> qba{};
-        for (auto const& e : args)
-            qba.push_back(e.toUtf8());
-        std::vector<char*> args_cstr{};
-        for (auto& e : qba)
-            args_cstr.push_back(e.data());
-
-        auto const lp = Core::ParseLaunchParams(*QtCommon::system, args_cstr.size(), args_cstr.data(), nullptr);
+    if (launch_params) {
+        auto const& lp = *launch_params;
 
         // Override fullscreen setting if gamepath or argument is provided
         if (!lp.filepath.empty() || lp.fullscreen) {
@@ -1626,8 +1646,7 @@ void MainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::DumpRomFSRequested, this, &MainWindow::OnGameListDumpRomFS);
     connect(game_list, &GameList::VerifyIntegrityRequested, this,
             &MainWindow::OnGameListVerifyIntegrity);
-    connect(game_list, &GameList::ConvertToNupRequested, this,
-            &MainWindow::OnGameListConvertToNup);
+    connect(game_list, &GameList::ConvertToNupRequested, this, &MainWindow::OnGameListConvertToNup);
     connect(game_list, &GameList::ExtractNupRequested, this, &MainWindow::OnGameListExtractNup);
     connect(game_list, &GameList::EditNupMetadataRequested, this,
             &MainWindow::OnGameListEditNupMetadata);
@@ -1829,11 +1848,8 @@ void MainWindow::UpdateMenuState() {
     const bool is_firmware_available = CheckFirmwarePresence();
 
     const std::array running_actions{
-        ui->action_Stop,
-        ui->action_Restart,
-        ui->action_Configure_Current_Game,
-        ui->action_Load_Amiibo,
-        ui->action_Pause,
+        ui->action_Stop,        ui->action_Restart, ui->action_Configure_Current_Game,
+        ui->action_Load_Amiibo, ui->action_Pause,
     };
 
     const std::array applet_actions{
@@ -2015,8 +2031,33 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
         return false;
 
     /** Exec */
-    const Core::SystemResultStatus result{
-        QtCommon::system->Load(*render_window, filename.toStdString(), params)};
+    const std::string rom_path = filename.toStdString();
+    Core::SystemResultStatus result{};
+#ifdef _WIN32
+    if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan) {
+        // On a worker, like the loose RomFS preparation: the NSO load, the Vulkan instance and
+        // devices and audio froze the window for ~1.4 s. Vulkan on Windows only: an OpenGL
+        // context, and surfaces on some other platforms, belong to the thread that made them.
+        QProgressDialog progress(tr("Loading game..."), QString{}, 0, 0, this);
+        progress.setWindowModality(Qt::ApplicationModal);
+        progress.setWindowFlag(Qt::WindowCloseButtonHint, false);
+        progress.setCancelButton(nullptr);
+        progress.setMinimumDuration(0);
+        QFutureWatcher<Core::SystemResultStatus> watcher;
+        QEventLoop loop;
+        connect(&watcher, &QFutureWatcher<Core::SystemResultStatus>::finished, &loop,
+                &QEventLoop::quit);
+        watcher.setFuture(QtConcurrent::run([this, &rom_path, &params] {
+            return QtCommon::system->Load(*render_window, rom_path, params);
+        }));
+        progress.show();
+        loop.exec();
+        result = watcher.result();
+    } else
+#endif
+    {
+        result = QtCommon::system->Load(*render_window, rom_path, params);
+    }
 
     if (result != Core::SystemResultStatus::Success) {
         switch (result) {
@@ -2026,12 +2067,13 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
                                   tr("The ROM format is not supported."));
             break;
         case Core::SystemResultStatus::ErrorVideoCore:
-            QMessageBox::critical(
-                this, tr("An error occurred initializing the video core."),
-                tr("This is usually caused by outdated GPU drivers. "
-                   "Please see the log for more details. See: "
-                   "<a href='https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/user/HowToAccessLogs.md'>"
-                   "How to access log files</a>."));
+            QMessageBox::critical(this, tr("An error occurred initializing the video core."),
+                                  tr("This is usually caused by outdated GPU drivers. "
+                                     "Please see the log for more details. See: "
+                                     "<a "
+                                     "href='https://git.eden-emu.dev/eden-emu/eden/src/branch/"
+                                     "master/docs/user/HowToAccessLogs.md'>"
+                                     "How to access log files</a>."));
             break;
         default:
             if (result > Core::SystemResultStatus::ErrorLoader) {
@@ -2161,11 +2203,14 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         LOG_INFO(Config, "MKW recommended settings accepted: {}", use_recommended_mkw_settings);
     }
     if (Settings::ApplyMarioKartWorldPreset(Settings::values, title_id,
-                                          use_recommended_mkw_settings)) {
+                                            use_recommended_mkw_settings)) {
         QtCommon::system->ApplySettings();
         Settings::UpdateGPUAccuracy();
         LOG_INFO(Config, "Applied recommended MKW settings after per-game configuration");
     }
+
+
+
     Settings::LogSettings();
 
     if (UISettings::values.select_user_on_boot && !user_flag_cmd_line) {
@@ -2194,7 +2239,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         progress.setMinimumDuration(0);
         QFutureWatcher<FileSys::VirtualFile> watcher;
         QEventLoop loop;
-        connect(&watcher, &QFutureWatcher<FileSys::VirtualFile>::finished, &loop, &QEventLoop::quit);
+        connect(&watcher, &QFutureWatcher<FileSys::VirtualFile>::finished, &loop,
+                &QEventLoop::quit);
         watcher.setFuture(QtConcurrent::run([&loader] {
             FileSys::VirtualFile image;
             loader->ReadRomFS(image);
@@ -2266,10 +2312,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
 
     connect(
         QtCommon::emu_thread.get(), &EmuThread::ShaderCacheReloadFinished, this,
-        [this] {
-            loading_screen->OnLoadComplete();
-        },
-        Qt::QueuedConnection);
+        [this] { loading_screen->OnLoadComplete(); }, Qt::QueuedConnection);
 
     // Update the GUI
     UpdateStatusButtons();
@@ -3551,7 +3594,8 @@ void MainWindow::OnOpenModsPage() {
 }
 
 void MainWindow::OnOpenUserHandbook() {
-    OpenURL(QUrl(QStringLiteral("https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/user/README.md")));
+    OpenURL(QUrl(QStringLiteral(
+        "https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/user/README.md")));
 }
 
 void MainWindow::ToggleFullscreen() {
@@ -3785,6 +3829,9 @@ void MainWindow::OnConfigure() {
     const bool old_force_x11 = UISettings::values.gui_force_x11.GetValue();
 #endif
 
+    if (std::exchange(vk_records_pending, false)) {
+        VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
+    }
     Settings::SetConfiguringGlobal(true);
     ConfigureDialog configure_dialog(this, hotkey_registry, input_subsystem.get(),
                                      vk_device_records, *QtCommon::system,
@@ -4075,6 +4122,9 @@ void MainWindow::OnConfigurePerGame() {
 }
 
 void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_name) {
+    if (std::exchange(vk_records_pending, false)) {
+        VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
+    }
     Settings::SetConfiguringGlobal(false);
     ConfigurePerGame dialog(this, title_id, file_name, vk_device_records, *QtCommon::system);
     dialog.LoadFromFile(Core::GetGameFileFromPath(QtCommon::vfs, file_name));
@@ -4306,9 +4356,10 @@ void MainWindow::OnGameListConvertToNup(const std::string& game_path) {
     const QString convert_title = tr("Convert to NUP");
     const auto archive = FileSys::Nup::DefaultArchivePath(*root);
     if (std::filesystem::exists(archive)) {
-        QMessageBox::information(this, convert_title,
-                                 tr("The target archive already exists:\n%1")
-                                     .arg(QString::fromStdString(Common::FS::PathToUTF8String(archive))));
+        QMessageBox::information(
+            this, convert_title,
+            tr("The target archive already exists:\n%1")
+                .arg(QString::fromStdString(Common::FS::PathToUTF8String(archive))));
         return;
     }
 
@@ -4326,8 +4377,8 @@ void MainWindow::OnGameListConvertToNup(const std::string& game_path) {
         u64 needed{};
         {
             std::error_code ec;
-            for (std::filesystem::recursive_directory_iterator it(*root, ec), end;
-                 !ec && it != end; it.increment(ec)) {
+            for (std::filesystem::recursive_directory_iterator it(*root, ec), end; !ec && it != end;
+                 it.increment(ec)) {
                 if (it->is_regular_file(ec))
                     needed += it->file_size(ec);
             }
@@ -4347,34 +4398,33 @@ void MainWindow::OnGameListConvertToNup(const std::string& game_path) {
     nup_source_path = game_path;
     game_list->SetNupConversionRunning(true);
     nup_cancel = std::make_shared<std::atomic_bool>(false);
-    nup_progress = new NupProgressDialog(tr("Converting to NUP"), progress_title, progress_icon, this);
-    connect(nup_progress, &NupProgressDialog::CancelRequested, this,
-            [this, cancel = nup_cancel] {
-                cancel->store(true);
-                if (nup_progress)
-                    nup_progress->SetCancelling();
-            });
+    nup_progress =
+        new NupProgressDialog(tr("Converting to NUP"), progress_title, progress_icon, this);
+    connect(nup_progress, &NupProgressDialog::CancelRequested, this, [this, cancel = nup_cancel] {
+        cancel->store(true);
+        if (nup_progress)
+            nup_progress->SetCancelling();
+    });
     nup_progress->show();
 
     const auto cancel = nup_cancel;
     auto last_update = std::make_shared<std::chrono::steady_clock::time_point>();
     nup_watcher.setFuture(QtConcurrent::run([this, root = *root, archive, delete_sources, metadata,
-                                                  cancel, last_update] {
+                                             cancel, last_update] {
         std::string error;
-        const auto on_progress = [this, last_update](
-                                     const FileSys::Nup::PackProgress& progress) {
-                const auto now = std::chrono::steady_clock::now();
-                if (now - *last_update < std::chrono::milliseconds(200))
-                    return;
-                *last_update = now;
-                QMetaObject::invokeMethod(
-                    this,
-                    [this, progress] {
-                        if (!nup_progress)
-                            return;
-                        nup_progress->SetProgress(progress);
-                    },
-                    Qt::QueuedConnection);
+        const auto on_progress = [this, last_update](const FileSys::Nup::PackProgress& progress) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - *last_update < std::chrono::milliseconds(200))
+                return;
+            *last_update = now;
+            QMetaObject::invokeMethod(
+                this,
+                [this, progress] {
+                    if (!nup_progress)
+                        return;
+                    nup_progress->SetProgress(progress);
+                },
+                Qt::QueuedConnection);
         };
         const auto result = FileSys::Nup::PackDump(
             root, archive, {.delete_sources = delete_sources, .metadata = metadata}, on_progress,
@@ -4427,10 +4477,10 @@ void MainWindow::OnGameListExtractNup(const std::string& game_path) {
         return std::filesystem::path{std::u8string{utf8.begin(), utf8.end()}};
     };
     const auto archive = to_path(game_path);
-    const auto out_dir = QFileDialog::getSaveFileName(
-        this, tr("Extract NUP"),
-        QString::fromStdString(Common::FS::PathToUTF8String(
-            FileSys::Nup::DefaultExtractPath(archive))));
+    const auto out_dir =
+        QFileDialog::getSaveFileName(this, tr("Extract NUP"),
+                                     QString::fromStdString(Common::FS::PathToUTF8String(
+                                         FileSys::Nup::DefaultExtractPath(archive))));
     if (out_dir.isEmpty()) {
         return;
     }
@@ -4441,14 +4491,12 @@ void MainWindow::OnGameListExtractNup(const std::string& game_path) {
         return;
     }
     const auto probed = FileSys::Nup::ProbeNupMetadata(archive);
-    const QString progress_title =
-        QString::fromStdString(probed.title_name).trimmed().isEmpty()
-            ? tr("Extracting NUP")
-            : QString::fromStdString(probed.title_name);
+    const QString progress_title = QString::fromStdString(probed.title_name).trimmed().isEmpty()
+                                       ? tr("Extracting NUP")
+                                       : QString::fromStdString(probed.title_name);
     QPixmap progress_icon;
     if (!probed.icon.empty()) {
-        progress_icon.loadFromData(probed.icon.data(),
-                                   static_cast<uint>(probed.icon.size()));
+        progress_icon.loadFromData(probed.icon.data(), static_cast<uint>(probed.icon.size()));
     }
 
     nup_running = true;
@@ -4456,21 +4504,19 @@ void MainWindow::OnGameListExtractNup(const std::string& game_path) {
     game_list->SetNupConversionRunning(true);
     nup_cancel = std::make_shared<std::atomic_bool>(false);
     nup_progress = new NupProgressDialog(tr("Extracting NUP"), progress_title, progress_icon, this);
-    connect(nup_progress, &NupProgressDialog::CancelRequested, this,
-            [this, cancel = nup_cancel] {
-                cancel->store(true);
-                if (nup_progress) {
-                    nup_progress->SetCancelling();
-                }
-            });
+    connect(nup_progress, &NupProgressDialog::CancelRequested, this, [this, cancel = nup_cancel] {
+        cancel->store(true);
+        if (nup_progress) {
+            nup_progress->SetCancelling();
+        }
+    });
     nup_progress->show();
 
     const auto cancel = nup_cancel;
     auto last_update = std::make_shared<std::chrono::steady_clock::time_point>();
     nup_watcher.setFuture(QtConcurrent::run([this, archive, out_path, cancel, last_update] {
         std::string error;
-        const auto on_progress = [this,
-                                  last_update](const FileSys::Nup::PackProgress& progress) {
+        const auto on_progress = [this, last_update](const FileSys::Nup::PackProgress& progress) {
             const auto now = std::chrono::steady_clock::now();
             if (now - *last_update < std::chrono::milliseconds(200)) {
                 return;
@@ -4548,23 +4594,21 @@ void MainWindow::OnGameListEditNupMetadata(const std::string& game_path) {
     nup_source_path = game_path;
     game_list->SetNupConversionRunning(true);
     nup_cancel = std::make_shared<std::atomic_bool>(false);
-    nup_progress = new NupProgressDialog(tr("Editing NUP Metadata"), progress_title, progress_icon,
-                                         this);
-    connect(nup_progress, &NupProgressDialog::CancelRequested, this,
-            [this, cancel = nup_cancel] {
-                cancel->store(true);
-                if (nup_progress) {
-                    nup_progress->SetCancelling();
-                }
-            });
+    nup_progress =
+        new NupProgressDialog(tr("Editing NUP Metadata"), progress_title, progress_icon, this);
+    connect(nup_progress, &NupProgressDialog::CancelRequested, this, [this, cancel = nup_cancel] {
+        cancel->store(true);
+        if (nup_progress) {
+            nup_progress->SetCancelling();
+        }
+    });
     nup_progress->show();
 
     const auto cancel = nup_cancel;
     auto last_update = std::make_shared<std::chrono::steady_clock::time_point>();
     nup_watcher.setFuture(QtConcurrent::run([this, archive, edit, cancel, last_update] {
         std::string error;
-        const auto on_progress = [this,
-                                  last_update](const FileSys::Nup::PackProgress& progress) {
+        const auto on_progress = [this, last_update](const FileSys::Nup::PackProgress& progress) {
             const auto now = std::chrono::steady_clock::now();
             if (now - *last_update < std::chrono::milliseconds(200)) {
                 return;
@@ -4608,8 +4652,7 @@ void MainWindow::OnGameListEditNupMetadata(const std::string& game_path) {
                     break;
                 case FileSys::Nup::EditResult::InvalidSource:
                 case FileSys::Nup::EditResult::IoError:
-                    QMessageBox::critical(this, tr("Edit Failed"),
-                                          QString::fromStdString(error));
+                    QMessageBox::critical(this, tr("Edit Failed"), QString::fromStdString(error));
                     break;
                 }
             },
@@ -5541,7 +5584,8 @@ static void AdjustLinkColor() {
 }
 
 void MainWindow::UpdateUITheme() {
-    const QString default_theme = QString::fromUtf8(UISettings::themes[size_t(UISettings::default_theme)].second);
+    const QString default_theme =
+        QString::fromUtf8(UISettings::themes[size_t(UISettings::default_theme)].second);
     QString current_theme = QString::fromStdString(UISettings::values.theme);
 
     if (current_theme.isEmpty())
@@ -5552,7 +5596,8 @@ void MainWindow::UpdateUITheme() {
     AdjustLinkColor();
 #else
     if (current_theme == QStringLiteral("default") || current_theme == QStringLiteral("colorful")) {
-        QIcon::setThemeName(current_theme == QStringLiteral("colorful") ? current_theme : startup_icon_theme);
+        QIcon::setThemeName(current_theme == QStringLiteral("colorful") ? current_theme
+                                                                        : startup_icon_theme);
         QIcon::setThemeSearchPaths(QStringList(default_theme_paths));
         if (isDarkMode()) {
             current_theme = QStringLiteral("default_dark");

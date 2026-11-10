@@ -127,16 +127,17 @@ LichiiDeviceDefaults ComputeDefaults(const LichiiDeviceInfo& info) {
                    "App ID at developer.apple.com and reinstall, or games will be closed by iOS.");
     }
 
-    // Budgets from what this process may allocate (CPU and GPU share it): the texture cache
-    // collects well before the limit, buffers like MeloNX's clamp(RAM / 16, 256, 768 MiB).
+    // Budgets from what this process may allocate (CPU and GPU share it, and guest RAM takes
+    // most of it: 4.9 GB of footprint at Ocarina's title screen with 0.46 GB of textures). The
+    // texture cache also shrinks with what is left at run time (texture_cache.h).
     u64 available = info.launch_available_memory_mib;
     if (available == 0) {
         available = info.physical_memory_mib * 6 / 10;
     }
-    const u64 critical = Clamp<u64>(available / 4, 1024, 2048);
+    const u64 critical = Clamp<u64>(available * 18 / 100, 768, 2048);
     out.texture_cache_critical_mib = static_cast<u32>(critical);
-    out.texture_cache_expected_mib = static_cast<u32>(critical - 512);
-    out.buffer_cache_collect_mib = static_cast<u32>(Clamp<u64>(available / 16, 256, 768));
+    out.texture_cache_expected_mib = static_cast<u32>(critical * 2 / 3);
+    out.buffer_cache_collect_mib = static_cast<u32>(Clamp<u64>(available / 24, 192, 512));
     out.memory_low_water_mib = static_cast<u32>(Clamp<u64>(available / 10, 384, 768));
     return out;
 }
@@ -161,6 +162,14 @@ void ApplyExperiments() {
     if (lichii_platform_experiment("no_footprint")) {
         setenv("LICHII_IOS_NO_FOOTPRINT", "1", 0);
         LOG_WARNING(Frontend, "iOS: experiment no_footprint on");
+    }
+    if (lichii_platform_experiment("untagged_guest")) {
+        setenv("LICHII_IOS_UNTAGGED_GUEST", "1", 0);
+        LOG_WARNING(Frontend, "iOS: experiment untagged_guest on");
+    }
+    if (lichii_platform_experiment("no_zero_trim")) {
+        setenv("EDEN_NX2_TRIM_ZERO", "0", 0);
+        LOG_WARNING(Frontend, "iOS: experiment no_zero_trim on");
     }
 }
 

@@ -7,6 +7,9 @@
 #include <memory>
 #include <optional>
 #include <utility>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
 #include "game_settings.h"
 #include "common/cpu_features.h"
@@ -65,6 +68,7 @@
 #include "core/hle/service/sm/sm.h"
 #include "core/internal_network/network.h"
 #include "core/loader/loader.h"
+#include "core/loader/nx.h"
 #include "core/memory.h"
 #include "core/memory/cheat_engine.h"
 #include "core/perf_stats.h"
@@ -74,6 +78,7 @@
 #include "hid_core/hid_core.h"
 #include "network/network.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_diag.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
 
@@ -144,6 +149,9 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
                metadata.IsSwitch2();
     }
     const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
+    if (type == Loader::FileType::NX) {
+        return Loader::AppLoader_NX::ReadPlatform(file, program_id) == 2;
+    }
     if (type == Loader::FileType::XCI || type == Loader::FileType::XCZ) {
         const FileSys::XCI xci{file, program_id, program_index};
         if (xci.GetStatus() != Loader::ResultStatus::Success) {
@@ -190,7 +198,15 @@ struct System::Impl {
     u64 program_id;
 
     void Initialize(System& system) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        // iOS: before the renderer and the game's files take address space, where the 8 GiB map
+        // is likeliest to fit.
         device_memory.emplace();
+#else
+        // Created when a game loads (InitializeKernel), sized for its memory layout: made here,
+        // it kept 8 GiB (12 for Switch 2) committed while the frontend sat idle.
+        device_memory.reset();
+#endif
 
         is_multicore = Settings::values.use_multi_core.GetValue();
         memory_layout = Settings::values.memory_layout_mode.GetValue();
@@ -218,7 +234,6 @@ struct System::Impl {
 
     void ReinitializeIfNecessary(System& system) {
         const bool must_reinitialize =
-            !device_memory.has_value() ||
             is_multicore != Settings::values.use_multi_core.GetValue() ||
             memory_layout != Settings::values.memory_layout_mode.GetValue();
 
@@ -336,14 +351,13 @@ struct System::Impl {
     bool InitializeKernel(System& system) {
         LOG_DEBUG(Core, "initialized OK");
 
-        // ShutdownMainProcess releases it after a Switch 2 game; create it before the check below
-        // so an empty slot alone does not rerun the full Initialize.
+        // Setting changes may require a full system reinitialization (e.g., disabling multicore).
+        ReinitializeIfNecessary(system);
+
+        // Not made at startup, and ShutdownMainProcess releases it after a Switch 2 game.
         if (!device_memory.has_value()) {
             device_memory.emplace();
         }
-
-        // Setting changes may require a full system reinitialization (e.g., disabling multicore).
-        ReinitializeIfNecessary(system);
 
         // The host refused the guest RAM (iOS without the memory entitlements): the kernel would
         // crash on its first access.
@@ -545,6 +559,9 @@ struct System::Impl {
             game_info.id = params.program_id;
             game_info.version = title_version;
             room_member->SendGameInfo(game_info);
+        }
+        if (VideoCommon::Nx2Diag::Active()) {
+            VideoCommon::Nx2Diag::Diagnostics::Get().SetTitle(params.program_id);
         }
         debug_service = Nx2Debug::MaybeStartService(system, name, params.program_id);
         Nx2Sampler::StartFromEnvironment();
@@ -837,6 +854,9 @@ Kernel::KProcess* System::ApplicationProcess() {
 }
 
 Core::DeviceMemory& System::DeviceMemory() {
+    if (!impl->device_memory.has_value()) {
+        impl->device_memory.emplace();
+    }
     return *impl->device_memory;
 }
 

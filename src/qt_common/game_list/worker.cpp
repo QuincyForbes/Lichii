@@ -31,6 +31,7 @@
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/submission_package.h"
 #include "core/loader/loader.h"
+#include "core/loader/nx.h"
 
 #include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
@@ -273,7 +274,9 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
         });
 
     FileSys::NACP nacp{};
-    if (file_type == Loader::FileType::NUP &&
+    // An NX tree snapshot, like a NUP, is already the updated game: no patch manager update.
+    if ((file_type == Loader::FileType::NUP ||
+         (file_type == Loader::FileType::NX && !loader.IsRomFSUpdatable())) &&
         loader.ReadControlData(nacp) == Loader::ResultStatus::Success) {
         const std::string version_string = nacp.GetVersionString();
         if (!version_string.empty()) {
@@ -434,7 +437,7 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
         if (target == ScanTarget::PopulateGameList &&
             (file_type == Loader::FileType::XCI || file_type == Loader::FileType::XCZ ||
              file_type == Loader::FileType::NSP || file_type == Loader::FileType::NSZ ||
-             file_type == Loader::FileType::NUP) &&
+             file_type == Loader::FileType::NUP || file_type == Loader::FileType::NX) &&
             !Loader::IsBootableGameContainer(file, file_type)) {
             return;
         }
@@ -447,6 +450,9 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                 provider->AddEntry(FileSys::TitleType::Application,
                                    FileSys::GetCRTypeFromNCAType(FileSys::NCA{file}.GetType()),
                                    program_id, file);
+            } else if (file_type == Loader::FileType::NX) {
+                // An archive brings its own updates and add-ons, whatever the setting.
+                static_cast<Loader::AppLoader_NX&>(*loader).RegisterContent(*provider);
             } else if (Settings::values.ext_content_from_game_dirs.GetValue() &&
                        (file_type == Loader::FileType::XCI ||
                         file_type == Loader::FileType::XCZ ||
@@ -471,6 +477,14 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                     if (const QString loose = LooseExeFSName(physical_name); !loose.isEmpty()) {
                         name = loose.toStdString();
                     }
+                }
+                if ((res3 != Loader::ResultStatus::Success || name.empty() || name == " ") &&
+                    (app_loader->GetFileType() == Loader::FileType::NX ||
+                     app_loader->GetFileType() == Loader::FileType::NUP)) {
+                    // A dump without control data has no title: show the file name.
+                    name = QFileInfo(QString::fromStdString(physical_name))
+                               .completeBaseName()
+                               .toStdString();
                 }
 
                 const FileSys::PatchManager patch{id, system.GetFileSystemController(),
@@ -526,6 +540,29 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
         }
         process_candidate(path);
     }
+}
+
+void GameListWorker::FillContentProvider() {
+    const auto started = std::chrono::steady_clock::now();
+    provider->ClearAllEntries();
+    for (const UISettings::GameDir& game_dir : game_dirs) {
+        if (game_dir.path == std::string("SDMC") || game_dir.path == std::string("UserNAND") ||
+            game_dir.path == std::string("SysNAND")) {
+            continue;
+        }
+        const auto discovery = GameListDiscovery::Discover(
+            std::filesystem::path(Common::FS::ToU8String(game_dir.path)), game_dir.deep_scan,
+            [](const auto& path) {
+                const auto name = Common::FS::PathToUTF8String(path);
+                return HasSupportedFileExtension(name) || IsExtractedNCAMain(name);
+            },
+            [] { return false; });
+        ScanFileSystem(ScanTarget::FillManualContentProvider, discovery.files, nullptr);
+    }
+    LOG_INFO(Frontend, "Game directory content registered: elapsed_ms={}",
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - started).count());
+    processing_completed.Set();
 }
 
 void GameListWorker::run() {

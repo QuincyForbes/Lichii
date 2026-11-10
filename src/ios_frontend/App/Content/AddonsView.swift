@@ -200,16 +200,70 @@ struct AddonsView: View {
             if !builtins.isEmpty {
                 Section {
                     ForEach(builtins) { item in
-                        Toggle(item.name.replacingOccurrences(of: " (built-in)", with: ""),
-                               isOn: binding(for: item))
+                        if let info = item.builtin {
+                            builtinRow(item, info)
+                        } else {
+                            Toggle(item.name.replacingOccurrences(of: " (built-in)", with: ""),
+                                   isOn: binding(for: item))
+                        }
                     }
                 } header: {
                     Text("Built-in patches")
                 } footer: {
-                    Text("Patches that ship with Lichii for this game.")
+                    Text("Patches that ship with Lichii for this game. \"Follow global\" uses the Game Enhancements setting for the patch's kind (Settings > Graphics); On or Off here overrides it for this game only. Changes apply on the next boot.")
                 }
             }
         }
+    }
+
+    private func builtinRow(_ item: ContentBridge.Addon, _ info: ContentBridge.BuiltinPatch) -> some View {
+        let included = !info.includedIn.isEmpty
+        let name = item.name.replacingOccurrences(of: " (built-in)", with: "")
+        let state = info.resolvedEnabled ? "On" : "Off"
+        let decided: String
+        switch info.source {
+        case "game": decided = "this game's choice"
+        case "global": decided = "global setting"
+        default: decided = "default"
+        }
+        let choice = Binding<Int32> {
+            switch info.choice {
+            case "on": return 1
+            case "off": return 2
+            default: return 0
+            }
+        } set: { value in
+            ContentBridge.setBuiltinChoice(game, name: item.name, choice: value)
+            reload()
+        }
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(name)
+                Text(info.kind)
+                    .font(.caption2)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(.quaternary, in: Capsule())
+                Spacer()
+                Picker(name, selection: choice) {
+                    Text("Follow global").tag(Int32(0))
+                    Text("On").tag(Int32(1))
+                    Text("Off").tag(Int32(2))
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+            }
+            Text(info.description).font(.caption).foregroundStyle(.secondary)
+            Text(info.effect).font(.caption).foregroundStyle(.secondary)
+            if included {
+                Text("Included in \(info.includedIn.replacingOccurrences(of: " (built-in)", with: ""))")
+                    .font(.caption.weight(.semibold))
+            } else {
+                Text(info.followsGlobal ? "\(state) · follows \(decided)" : "\(state) · overridden for this game")
+                    .font(.caption.weight(.semibold))
+            }
+        }
+        .opacity(included ? 0.5 : 1)
     }
 
     // MARK: Actions
