@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <type_traits>
 // TODO: find out which don't require stable iters
 #include <unordered_map>
@@ -831,6 +832,10 @@ private:
                                                       bool mark_as_modified);
 
     bool ImageCanRescale(ImageBase& image);
+    /// EDEN_NX2_RESCALE_TRACE=1: counts, per image shape, whether bound targets and storage
+    /// images run at the resolution scale and why not; logged every 300 frames.
+    void NoteRescaleTrace(ImageBase& image, std::string_view role);
+    void LogRescaleTrace();
     void InvalidateScale(Image& image);
     bool ScaleUp(Image& image);
     bool ScaleDown(Image& image);
@@ -1018,6 +1023,9 @@ private:
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;
+
+    bool rescale_trace = std::getenv("EDEN_NX2_RESCALE_TRACE") != nullptr;
+    std::map<std::string, u64> rescale_trace_counts;
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};
