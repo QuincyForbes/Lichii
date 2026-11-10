@@ -195,7 +195,7 @@ final class PerformanceOverlayMonitor: ObservableObject {
 
     private func apply(_ snapshot: LichiiPerfSnapshot, to next: inout OverlayReading) {
         next.paused = snapshot.paused
-        // The counters reset on every read, so a paused game reads zero: keep the last numbers.
+        // A paused game reads zero: keep the last numbers.
         if !snapshot.paused {
             next.realFps = Self.round(snapshot.real_fps)
             next.generatedFps = Self.round(snapshot.generated_fps)

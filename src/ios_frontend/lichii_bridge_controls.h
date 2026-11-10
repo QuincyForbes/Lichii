@@ -92,6 +92,8 @@ void lichii_controls_release_touch(void);
 /// Device motion for `player`: gyro in turns per second (rad/s / 2pi), accel in g, Switch axes.
 void lichii_controls_motion(int32_t player, uint64_t delta_us, float gyro_x, float gyro_y,
                             float gyro_z, float accel_x, float accel_y, float accel_z);
+/// Writes "Controls: <message>" to the log at Info (touch delivery diagnostics).
+void lichii_controls_log(const char* message);
 
 /* ---------------------------------------------------------------------- physical controllers */
 

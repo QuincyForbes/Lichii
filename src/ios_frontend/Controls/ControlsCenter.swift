@@ -6,6 +6,7 @@ import Melo_Controller
 import Photos
 import SwiftUI
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 
 /// Runs the controls while a game is up: the overlay on the render window (on-screen controller,
 /// performance HUD, menu button, in-game menu), frontend actions from controllers, rumble, and
@@ -51,6 +52,7 @@ final class ControlsCenter: ObservableObject {
     // MARK: - App hooks
 
     func appStarted() {
+        ControllerDiagnostics.sink = { lichii_controls_log($0) }
         PhysicalControllers.shared.start()
         ExternalDisplay.shared.start()
         UIDevice.current.beginGeneratingDeviceOrientationNotifications()
@@ -83,12 +85,15 @@ final class ControlsCenter: ObservableObject {
         gameRunning = true
         editingLayout = false
         menuOpen = false
+        ControllerDiagnostics.reset()
         let overlay = overlay ?? OverlayController()
         self.overlay = overlay
         attachOverlay(to: ExternalDisplay.shared.controlsWindow ?? window)
         let tap = UITapGestureRecognizer(target: overlay, action: #selector(OverlayController.threeFingerTap))
         tap.numberOfTouchesRequired = 3
         tap.cancelsTouchesInView = false
+        // Releases reach the controls at once instead of after the tap fails.
+        tap.delaysTouchesEnded = false
         window.gestureRecognizers?.filter { ($0 as? UITapGestureRecognizer)?.numberOfTouchesRequired == 3 }
             .forEach(window.removeGestureRecognizer)
         window.addGestureRecognizer(tap)
@@ -404,6 +409,9 @@ final class OverlayController: NSObject {
         container.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         parent.view.addSubview(container)
         host.didMove(toParent: parent)
+        if !(window.gestureRecognizers ?? []).contains(where: { $0 is TouchProbe }) {
+            window.addGestureRecognizer(TouchProbe(container: container))
+        }
     }
 
     func detach() {
@@ -418,9 +426,15 @@ final class OverlayController: NSObject {
     }
 }
 
+/// Takes the on-screen controller's touches itself and hands each to the button or stick under it,
+/// so they never depend on how the hosting view hit-tests the SwiftUI content around them or on
+/// SwiftUI's gesture recognizers on it. Other touches go to the overlay's own controls (menu
+/// button), or fall through to the game.
 final class PassthroughView: UIView {
     var interactive = false
     weak var hostView: UIView?
+    /// Touches handed to a control, by touch.
+    private var owners: [ObjectIdentifier: UIView] = [:]
 
     override func layoutSubviews() {
         super.layoutSubviews()
@@ -434,11 +448,123 @@ final class PassthroughView: UIView {
     }
 
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        if !interactive, let target = control(at: point) {
+            ControllerDiagnostics.once("overlay-control",
+                                       "first touch on a control (\(type(of: target))) at \(Self.text(point)) in \(Self.text(bounds.size))")
+            return self
+        }
         let hit = super.hitTest(point, with: event)
         if interactive {
             return hit
         }
-        return hit === self || hit === hostView ? nil : hit
+        let result = hit === self || hit === hostView ? nil : hit
+        ControllerDiagnostics.once("overlay-pass",
+                                   "first touch on no control at \(Self.text(point)) in \(Self.text(bounds.size)): \(result.map { "\(type(of: $0))" } ?? "to the game"), \(controlCount()) controls")
+        return result
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for touch in touches {
+            guard let target = control(at: touch.location(in: self)) else { continue }
+            owners[ObjectIdentifier(touch)] = target
+            target.touchesBegan([touch], with: event)
+        }
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for touch in touches {
+            owners[ObjectIdentifier(touch)]?.touchesMoved([touch], with: event)
+        }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for touch in touches {
+            owners.removeValue(forKey: ObjectIdentifier(touch))?.touchesEnded([touch], with: event)
+        }
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for touch in touches {
+            owners.removeValue(forKey: ObjectIdentifier(touch))?.touchesCancelled([touch], with: event)
+        }
+    }
+
+    /// The topmost visible button under `point` (in this view), else the topmost stick.
+    func control(at point: CGPoint) -> UIView? {
+        guard let hostView else { return nil }
+        var best: UIView?
+        var bestPriority = Int.min
+        func visit(_ view: UIView) {
+            guard !view.isHidden, view.alpha > 0.01, view.isUserInteractionEnabled else { return }
+            if let target = view as? ControllerTouchTarget {
+                if target.touchPriority > bestPriority, view.point(inside: view.convert(point, from: self), with: nil) {
+                    best = view
+                    bestPriority = target.touchPriority
+                }
+                return
+            }
+            view.subviews.reversed().forEach(visit)
+        }
+        visit(hostView)
+        return best
+    }
+
+    private func controlCount() -> Int {
+        func count(_ view: UIView) -> Int {
+            (view is ControllerTouchTarget ? 1 : 0) + view.subviews.reduce(0) { $0 + count($1) }
+        }
+        return hostView.map(count) ?? 0
+    }
+
+    static func text(_ point: CGPoint) -> String {
+        String(format: "%.0f,%.0f", point.x, point.y)
+    }
+
+    static func text(_ size: CGSize) -> String {
+        String(format: "%.0fx%.0f", size.width, size.height)
+    }
+}
+
+/// Logs the first touch the game window sees: where it landed, which view UIKit hit-tests there
+/// and whether a control is under it. Never recognizes, so it takes nothing from anyone.
+final class TouchProbe: UIGestureRecognizer {
+    private weak var container: PassthroughView?
+
+    init(container: PassthroughView) {
+        self.container = container
+        super.init(target: nil, action: nil)
+        cancelsTouchesInView = false
+        delaysTouchesBegan = false
+        delaysTouchesEnded = false
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        if let touch = touches.first, let window = view as? UIWindow {
+            let point = touch.location(in: window)
+            ControllerDiagnostics.once("window-touch", describe(point, in: window, event: event))
+        }
+        state = .failed
+    }
+
+    private func describe(_ point: CGPoint, in window: UIWindow, event: UIEvent) -> String {
+        var chain: [String] = []
+        var view = window.hitTest(point, with: event)
+        while let current = view, chain.count < 5 {
+            chain.append("\(type(of: current))")
+            view = current.superview
+        }
+        let root = window.rootViewController?.view
+        var text = "first touch in the game window at \(PassthroughView.text(point)), window \(PassthroughView.text(window.bounds.size))"
+        text += ", root \(root.map { "\(type(of: $0)) \(PassthroughView.text($0.frame.size))" } ?? "none")"
+        text += ", hit \(chain.isEmpty ? "nothing" : chain.joined(separator: " < "))"
+        if let container {
+            let local = container.convert(point, from: window)
+            text += ", overlay \(container.window === window ? "attached" : "detached") \(PassthroughView.text(container.bounds.size))"
+            text += " interactive \(container.interactive), control \(container.control(at: local).map { "\(type(of: $0))" } ?? "none")"
+        } else {
+            text += ", no overlay"
+        }
+        return text
     }
 }
 

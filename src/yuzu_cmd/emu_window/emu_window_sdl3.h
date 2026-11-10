@@ -109,8 +109,8 @@ protected:
     /// Is the window still open?
     bool is_open = true;
 
-    /// Is the window being shown?
-    bool is_shown = true;
+    /// Is the window being shown? Read by the renderer thread.
+    std::atomic<bool> is_shown = true;
 
     /// Internal SDL3 render window
     SDL_Window* render_window{};
