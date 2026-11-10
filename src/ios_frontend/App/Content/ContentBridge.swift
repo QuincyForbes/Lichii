@@ -270,3 +270,37 @@ func withSecurityScope<T>(_ url: URL, _ body: () -> T) -> T {
     defer { if scoped { url.stopAccessingSecurityScopedResource() } }
     return body()
 }
+
+/// Copies a picked file or folder to `target` through a coordinated read, which downloads an
+/// iCloud Drive or file provider item first; a plain read of such an item finds no data. Returns
+/// the error text, nil on success.
+func coordinatedCopy(_ url: URL, to target: URL) -> String? {
+    let scoped = url.startAccessingSecurityScopedResource()
+    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+    var coordinationError: NSError?
+    var failure: String?
+    NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { readable in
+        let manager = FileManager.default
+        do {
+            if manager.fileExists(atPath: target.path) {
+                try manager.removeItem(at: target)
+            }
+            try manager.copyItem(at: readable, to: target)
+        } catch {
+            failure = error.localizedDescription
+        }
+    }
+    return coordinationError?.localizedDescription ?? failure
+}
+
+/// A new temporary folder for coordinated copies; the caller removes it.
+func makeStagingDirectory() -> URL? {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lichii-import-\(UUID().uuidString)", isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    } catch {
+        return nil
+    }
+}

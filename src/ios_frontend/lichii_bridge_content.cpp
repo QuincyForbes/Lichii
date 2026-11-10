@@ -240,13 +240,18 @@ std::string_view Trim(std::string_view text) {
 }
 
 // A key file is "name = hex" lines (comments with ';' or '#'). Title keys use a 32 hex digit
-// rights id as the name.
-KeyFileKind ClassifyKeyFile(const fs::path& path, int& entries) {
+// rights id as the name. Lines that are neither are counted in `skipped`, not fatal: dumping tools
+// add their own lines, and the key manager ignores what it doesn't know as well.
+KeyFileKind ClassifyKeyFile(const fs::path& path, int& entries, int& skipped) {
     entries = 0;
+    skipped = 0;
     if (Lower(PathString(path.filename())) == "key_retail.bin") {
         return KeyFileKind::RetailBin;
     }
-    const auto text = ReadTextFile(path, 4u << 20);
+    auto text = ReadTextFile(path, 4u << 20);
+    if (text.starts_with("\xEF\xBB\xBF")) {
+        text.erase(0, 3);
+    }
     int title_entries = 0;
     std::size_t start = 0;
     while (start < text.size()) {
@@ -261,7 +266,8 @@ KeyFileKind ClassifyKeyFile(const fs::path& path, int& entries) {
         }
         const auto eq = line.find('=');
         if (eq == std::string_view::npos) {
-            return KeyFileKind::Invalid;
+            ++skipped;
+            continue;
         }
         const auto name = Trim(line.substr(0, eq));
         const auto value = Trim(line.substr(eq + 1));
@@ -269,7 +275,8 @@ KeyFileKind ClassifyKeyFile(const fs::path& path, int& entries) {
             return std::isalnum(c) != 0 || c == '_';
         });
         if (!name_ok || !IsHex(value)) {
-            return KeyFileKind::Invalid;
+            ++skipped;
+            continue;
         }
         ++entries;
         if (name.size() == 32 && IsHex(name) && value.size() == 32) {
@@ -284,7 +291,9 @@ KeyFileKind ClassifyKeyFile(const fs::path& path, int& entries) {
 
 int CountKeyLines(const fs::path& path) {
     int entries = 0;
-    if (!Common::FS::Exists(path) || ClassifyKeyFile(path, entries) == KeyFileKind::Invalid) {
+    int skipped = 0;
+    if (!Common::FS::Exists(path) ||
+        ClassifyKeyFile(path, entries, skipped) == KeyFileKind::Invalid) {
         return 0;
     }
     return entries;
@@ -656,18 +665,24 @@ LichiiKeyResult lichii_content_install_keys(const char* const* paths, int count,
         const auto path = PathFrom(paths[i]);
         const auto file_name = PathString(path.filename());
         int entries = 0;
+        int skipped = 0;
         if (!Common::FS::IsFile(path)) {
             lines.push_back(fmt::format("{}: not found", file_name));
             continue;
         }
-        switch (ClassifyKeyFile(path, entries)) {
+        const auto skipped_note = [&] {
+            return skipped != 0 ? fmt::format(" ({} unrecognised lines ignored)", skipped)
+                                : std::string{};
+        };
+        switch (ClassifyKeyFile(path, entries, skipped)) {
         case KeyFileKind::Prod:
             copies.emplace_back(path, keys_dir / "prod.keys");
-            lines.push_back(fmt::format("{}: {} keys", file_name, entries));
+            lines.push_back(fmt::format("{}: {} keys{}", file_name, entries, skipped_note()));
             break;
         case KeyFileKind::Title:
             copies.emplace_back(path, keys_dir / "title.keys");
-            lines.push_back(fmt::format("{}: {} title keys", file_name, entries));
+            lines.push_back(
+                fmt::format("{}: {} title keys{}", file_name, entries, skipped_note()));
             break;
         case KeyFileKind::RetailBin:
             copies.emplace_back(path, keys_dir / "key_retail.bin");

@@ -47,9 +47,10 @@ struct SetupAssistantView: View {
     var body: some View {
         List {
             Section {
-                StatusRow(title: "Keys", ok: files.keysReady)
+                StatusRow(title: "Keys", ok: files.keysReady, optional: true)
                 StatusRow(title: "Firmware", ok: files.firmwareReady,
-                          detail: files.firmware.flatMap { $0.version.isEmpty ? nil : "Version \($0.version)" })
+                          detail: files.firmware.flatMap { $0.version.isEmpty ? nil : "Version \($0.version)" },
+                          optional: true)
                 StatusRow(title: "JIT", ok: Bridge.jitState == .ready, detail: "Ready")
             }
             Section {

@@ -108,15 +108,15 @@ struct OnboardingView: View {
 
     private var welcome: some View {
         PageHeader(systemImage: "sparkles", title: "Welcome to Lichii",
-                   text: "A few steps get you playing: your console's keys and firmware, JIT through StikDebug, and your games. Everything comes from your own Switch.")
+                   text: "A few steps get you playing: JIT through StikDebug and your games. Keys and firmware from your own Switch are optional: Switch 2 games (.nup) run without them.")
     }
 
     private var keys: some View {
         VStack(spacing: 16) {
             PageHeader(systemImage: "key.fill", title: "Keys",
-                       text: "Select prod.keys and title.keys dumped from your Switch with Lockpick. They decrypt your games and firmware.")
+                       text: "Optional. Switch 2 games (.nup) don't need keys. Encrypted Switch 1 dumps (.nsp, .xci, .nca) and firmware do: select prod.keys and title.keys dumped from your Switch with Lockpick.")
             StatusRow(title: "prod.keys", ok: files.keys?.prodKeys == true && files.keysReady,
-                      detail: files.keys.map { "\($0.masterKeys) master keys" })
+                      detail: files.keys.map { "\($0.masterKeys) master keys" }, optional: true)
             StatusRow(title: "title.keys", ok: files.keys?.titleKeys == true,
                       detail: files.keys.map { "\($0.titleKeyCount) title keys" }, optional: true)
             ActionButton(title: files.keysReady ? "Import Again" : "Import Keys", busy: files.busy) {
@@ -128,9 +128,10 @@ struct OnboardingView: View {
     private var firmware: some View {
         VStack(spacing: 16) {
             PageHeader(systemImage: "cpu", title: "Firmware",
-                       text: "Pick a firmware .zip or folder dumped from your Switch. Games use it for fonts, system applets and Miis.")
+                       text: "Optional. Lichii has its own replacements for the system data games use; firmware is only needed for system applets such as Mii Maker. Pick a firmware .zip or folder dumped from your Switch.")
             StatusRow(title: "Firmware", ok: files.firmwareReady,
-                      detail: files.firmware.flatMap { $0.version.isEmpty ? nil : "Version \($0.version)" })
+                      detail: files.firmware.flatMap { $0.version.isEmpty ? nil : "Version \($0.version)" },
+                      optional: true)
             if let progress = files.progress {
                 ProgressView(value: progress)
                 Button("Cancel") { files.cancel() }
@@ -180,7 +181,7 @@ struct OnboardingView: View {
     private var games: some View {
         VStack(spacing: 16) {
             PageHeader(systemImage: "square.grid.2x2.fill", title: "Games",
-                       text: "Import your dumps (.nsp, .xci, .nsz, .xcz). They are copied into the app, or drop them into Documents/Games with the Files app or Finder.")
+                       text: "Import your dumps (.nup for Switch 2; .nsp, .xci, .nsz, .xcz for Switch 1). They are copied into the app, or drop them into Documents/Games with the Files app or Finder.")
             if !library.importing.isEmpty {
                 ImportProgressBanner(names: library.importing)
             }

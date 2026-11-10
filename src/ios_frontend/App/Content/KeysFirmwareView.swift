@@ -28,10 +28,26 @@ final class SystemFilesModel: ObservableObject {
 
     func importKeys(_ urls: [URL]) {
         busy = true
-        ContentBridge.run({
-            let scoped = urls.map { ($0, $0.startAccessingSecurityScopedResource()) }
-            defer { scoped.forEach { if $0.1 { $0.0.stopAccessingSecurityScopedResource() } } }
-            return ContentBridge.installKeys(urls)
+        ContentBridge.run({ () -> (LichiiKeyResult, String) in
+            guard let staging = makeStagingDirectory() else {
+                return (LICHII_KEYS_COPY_FAILED, "Could not create a temporary folder.")
+            }
+            defer { try? FileManager.default.removeItem(at: staging) }
+            var staged: [URL] = []
+            var errors: [String] = []
+            for url in urls {
+                let target = staging.appendingPathComponent(url.lastPathComponent)
+                if let error = coordinatedCopy(url, to: target) {
+                    errors.append("\(url.lastPathComponent): \(error)")
+                } else {
+                    staged.append(target)
+                }
+            }
+            if staged.isEmpty {
+                return (LICHII_KEYS_NO_FILES, errors.joined(separator: "\n"))
+            }
+            let (code, message) = ContentBridge.installKeys(staged)
+            return (code, (errors + [message]).joined(separator: "\n"))
         }) { [weak self] result in
             guard let self else { return }
             busy = false
@@ -64,8 +80,16 @@ final class SystemFilesModel: ObservableObject {
             }
             return flag.isCancelled
         }
-        ContentBridge.run({
-            withSecurityScope(url) { ContentBridge.installFirmware(url, progress: progressBox) }
+        ContentBridge.run({ () -> (LichiiFirmwareResult, String) in
+            guard let staging = makeStagingDirectory() else {
+                return (LICHII_FIRMWARE_COPY_FAILED, "Could not create a temporary folder.")
+            }
+            defer { try? FileManager.default.removeItem(at: staging) }
+            let target = staging.appendingPathComponent(url.lastPathComponent)
+            if let error = coordinatedCopy(url, to: target) {
+                return (LICHII_FIRMWARE_COPY_FAILED, "\(url.lastPathComponent): \(error)")
+            }
+            return ContentBridge.installFirmware(target, progress: progressBox)
         }) { [weak self] result in
             guard let self else { return }
             busy = false

@@ -162,21 +162,12 @@ final class GameLibrary: ObservableObject {
             let manager = FileManager.default
             try? manager.createDirectory(at: destination, withIntermediateDirectories: true)
             for url in urls {
-                let scoped = url.startAccessingSecurityScopedResource()
-                defer {
-                    if scoped { url.stopAccessingSecurityScopedResource() }
-                }
                 let target = destination.appendingPathComponent(url.lastPathComponent)
                 if target.standardizedFileURL.path == url.standardizedFileURL.path {
                     continue
                 }
-                do {
-                    if manager.fileExists(atPath: target.path) {
-                        try manager.removeItem(at: target)
-                    }
-                    try manager.copyItem(at: url, to: target)
-                } catch {
-                    failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
+                if let error = coordinatedCopy(url, to: target) {
+                    failures.append("\(url.lastPathComponent): \(error)")
                 }
             }
             let message = failures.isEmpty ? nil : failures.joined(separator: "\n")
