@@ -476,7 +476,7 @@ TEST_CASE("Maxwell saturating conversions emit with native and lowered float64",
           "[shader][maxwell][numeric_backend]") {
     for (u32 backend = 0; backend < 3; ++backend) {
         for (bool float64 : {false, true}) {
-            for (const auto [destination, format] : std::array{
+            for (const auto& [destination, format] : std::array{
                      std::pair{0U, 1U}, std::pair{0U, 2U}, std::pair{0U, 3U}, std::pair{2U, 2U}}) {
                 for (bool sign : {false, true}) {
                     if (destination == 2 && !sign) {
