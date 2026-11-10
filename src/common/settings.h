@@ -405,6 +405,9 @@ struct Values {
     // still overrides it.
     Setting<DlssPreset> nvidia_dlss_preset{linkage, DlssPreset::K, "nvidia_dlss_preset",
                                            Category::Renderer};
+    // Apple only: MetalFX temporal upscaling in place of a game's DLSS and of Ocarina of Time's
+    // upscaler (what NVIDIA DLSS does on Windows). Global only, like nvidia_dlss.
+    Setting<bool> metalfx_temporal{linkage, false, "metalfx_temporal", Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",
