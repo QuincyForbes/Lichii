@@ -8,6 +8,7 @@
 #include <mutex>
 
 #include "common/logging.h"
+#include "common/platform_events.h"
 #include "common/thread.h"
 #endif
 
@@ -45,13 +46,22 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     std::mutex mutex;
     std::condition_variable_any wake;
     std::chrono::seconds interval = 5s;
+    u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
     while (true) {
-        {
-            std::unique_lock lock{mutex};
-            wake.wait_for(lock, stop, interval, [] { return false; });
-        }
-        if (stop.stop_requested()) {
-            return;
+        // Host memory pressure (iOS) starts a pass at once.
+        for (std::chrono::seconds waited = 0s; waited < interval; waited += 1s) {
+            {
+                std::unique_lock lock{mutex};
+                wake.wait_for(lock, stop, 1s, [] { return false; });
+            }
+            if (stop.stop_requested()) {
+                return;
+            }
+            if (const u32 now = Common::PlatformEvents::MemoryPressureGeneration();
+                now != pressure) {
+                pressure = now;
+                break;
+            }
         }
         const auto start = std::chrono::steady_clock::now();
         const auto [resident, trimmed] = buffer.TrimZeroPages();
