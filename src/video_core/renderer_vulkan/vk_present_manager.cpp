@@ -136,6 +136,12 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , blit_supported{CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageViewFormat())}
     , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
     , use_present_thread{Settings::values.async_presentation.GetValue()}
+    , refresh_monitor{[&window = render_window_]() -> void* {
+        // The HWND on Windows.
+        const auto& info = window.GetWindowInfo();
+        return info.type == Core::Frontend::WindowSystemType::Windows ? info.render_surface
+                                                                       : nullptr;
+    }}
 {
     SetImageCount();
 
@@ -380,6 +386,7 @@ void PresentManager::PresentThread(std::stop_token token) {
             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
             last_present_id = 0;
             CopyToSwapchain(frame);
+            previous_generated = frame->generated;
             {
                 static std::chrono::steady_clock::time_point previous{};
                 const auto now = std::chrono::steady_clock::now();
@@ -418,13 +425,16 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
          mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) &&
         !Settings::values.frame_gen.GetValue() && Settings::values.use_speed_limit.GetValue() &&
         Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo;
-    // The refresh rate of the display the window is on (the HWND on Windows).
-    const auto& window_info = render_window.GetWindowInfo();
-    pacer.Refresh(Clock::now(), allowed,
-                  window_info.type == Core::Frontend::WindowSystemType::Windows
-                      ? window_info.render_surface
-                      : nullptr);
-    if (const u64 want = pacer.Outstanding(); pacer.Pacing() && want != 0) {
+    pacer.Refresh(allowed, refresh_monitor);
+    // Frame generation: a generated frame and the real one after it (or the other way round)
+    // must not reach a mailbox swapchain within one refresh, where the second replaced the first.
+    // Wait for the previous one to be shown, as the pacer does.
+    const bool space_generated =
+        (frame->generated || previous_generated) && Settings::values.frame_gen.GetValue() &&
+        (mode == VK_PRESENT_MODE_MAILBOX_KHR || mode == VK_PRESENT_MODE_IMMEDIATE_KHR) &&
+        pacer.RefreshKnown() && !pacer.Broken();
+    if (const u64 want = pacer.Outstanding();
+        (pacer.Pacing() || space_generated) && want != 0) {
         // The next target counts from the refresh the previous frame was shown at.
         Common::Nx2Timeline::Span span{"present: wait until shown"};
         // At most a refresh and a half: a driver whose present wait never signals would hold

@@ -248,9 +248,11 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
         frame_gen.GenerateInto(device, generated, generation);
         generated->render_tick = scheduler.Flush(*generated->render_ready);
+        generated->generated = true;
         present_manager.Present(generated);
     }
 #endif
+    frame->generated = false;
 
     if (trace) {
         scheduler.MarkFrameEnd(++trace_frame);

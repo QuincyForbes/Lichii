@@ -42,6 +42,7 @@ struct Frame {
     vk::Semaphore render_ready;
     vk::Fence present_done;
     bool storage_capable{};
+    bool generated{};                                ///< Made by frame generation
     u64 render_tick{};                               ///< Scheduler tick that renders the frame
     std::chrono::steady_clock::time_point queued_at; ///< When it reached the present queue
 };
@@ -149,6 +150,8 @@ private:
     std::condition_variable shown_cv;
     std::vector<ShownReport> shown_reports;
     std::jthread present_wait_thread;
+    bool previous_generated{}; ///< The last frame presented was a generated one
+    DisplayRefreshMonitor refresh_monitor;
 };
 
 } // namespace Vulkan

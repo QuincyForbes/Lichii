@@ -4,12 +4,16 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <deque>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 
 #include "common/common_types.h"
+#include "common/polyfill_thread.h"
 
 namespace Vulkan {
 
@@ -31,6 +35,32 @@ private:
     u32 nominal_hz{};     ///< Its integer rate when the rate was read
     double rational_ns{}; ///< From the display configuration; 0: unavailable
     std::chrono::steady_clock::time_point stale_at{};
+};
+
+/// Runs DisplayRefreshQuery for the window `native_window` returns (see DisplayRefreshQuery) every
+/// 2 s on a thread of its own, and publishes the result (also to Nx2Perf::g_display_refresh_ns).
+/// The queries cost tens of µs to tens of ms; on the present thread they held the next present.
+class DisplayRefreshMonitor {
+public:
+    explicit DisplayRefreshMonitor(std::function<void*()> native_window);
+    ~DisplayRefreshMonitor();
+
+    /// Bumped by every new reading.
+    [[nodiscard]] u64 Version() const {
+        return version.load(std::memory_order_acquire);
+    }
+
+    /// The latest reading, nullopt until there is one.
+    [[nodiscard]] std::optional<DisplayRefresh> Latest() const;
+
+private:
+    void Run(std::stop_token token);
+
+    std::function<void*()> native_window;
+    mutable std::mutex mutex;
+    std::optional<DisplayRefresh> latest;
+    std::atomic<u64> version{};
+    std::jthread thread;
 };
 
 /// Host frame pacer (EDEN_NX2_HOST_PACE, live switch; 1 = on, the default, 0 = measure only).
@@ -57,9 +87,17 @@ public:
         return pacing;
     }
 
-    /// Re-reads the switch and the refresh period of the display `native_window` is on (see
-    /// DisplayRefreshQuery) now and then.
-    void Refresh(Clock::time_point now, bool allowed, void* native_window);
+    /// Re-reads the switch, and takes the display's refresh period when `monitor` has a new one.
+    void Refresh(bool allowed, const DisplayRefreshMonitor& monitor);
+
+    /// Present wait does not signal on this driver (see NoteShownWait).
+    [[nodiscard]] bool Broken() const {
+        return broken;
+    }
+
+    [[nodiscard]] bool RefreshKnown() const {
+        return refresh_known;
+    }
 
     /// When the next frame should be handed to the swapchain; `now` or earlier = at once.
     [[nodiscard]] Clock::time_point Target(Clock::time_point now);
@@ -103,8 +141,7 @@ private:
     u32 shown_wait_misses{}; ///< In a row
     double refresh_ns{1e9 / 60.0};
     bool refresh_known{};
-    Clock::time_point next_refresh_query{};
-    DisplayRefreshQuery refresh_query;
+    u64 refresh_version{}; ///< DisplayRefreshMonitor::Version of refresh_ns
     std::string refresh_display;
 
     std::optional<Clock::time_point> last_queued;
