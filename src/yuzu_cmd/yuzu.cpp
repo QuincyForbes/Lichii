@@ -568,6 +568,9 @@ static void IosApplyFirstRunDefaults(SdlState* state) {
 static SDL_AppResult IosStartApp(SdlState* state, Core::LaunchParams lp) {
     state->ios_config = std::make_unique<SdlConfig>(lp.config_path);
     IosApplyFirstRunDefaults(state);
+    // The log is shared from the app while it runs, or read after iOS killed it: buffered Info
+    // lines never reached the file (a shared log stopped at its first 4 KiB).
+    Settings::values.log_flush_line.SetValue(true);
     if (!InitializeSystem(state)) {
         return SDL_APP_FAILURE;
     }
