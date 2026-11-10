@@ -595,7 +595,10 @@ if (APPLE)
         renderer_vulkan/present/metalfx_spatial.h
         renderer_vulkan/present/metalfx_temporal.h
     )
-    set_source_files_properties(${METALFX_SOURCES} PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    # -fexperimental-library: libc++'s jthread/stop_token, which the shared headers use; the
+    # top-level C/C++ flags don't reach Objective-C++ on macOS.
+    set_source_files_properties(${METALFX_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-fobjc-arc;-fexperimental-library")
     target_link_libraries(video_core PRIVATE "-framework Metal" "-weak_framework MetalFX")
     target_compile_definitions(video_core PUBLIC LICHII_METALFX)
 endif()
