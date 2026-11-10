@@ -13,6 +13,7 @@
 #include "common/thread.h"
 #endif
 
+#include "core/core.h"
 #include "core/device_memory.h"
 #include "hle/kernel/board/nintendo/nx/k_system_control.h"
 
@@ -65,6 +66,7 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     Common::HostMemory::ZeroTrimState state;
     std::chrono::seconds interval = 5s;
     u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
+    [[maybe_unused]] u32 seconds_since_frame = 0;
     while (true) {
         // Host memory pressure (iOS) starts a pass at once.
         bool urgent = false;
@@ -72,8 +74,26 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             if (!sleep(1s)) {
                 return;
             }
-            if (const u32 now = Common::PlatformEvents::MemoryPressureGeneration();
-                now != pressure) {
+            const u32 now = Common::PlatformEvents::MemoryPressureGeneration();
+#ifdef __APPLE__
+            // Not while the game boots: no pass before its first frame, and for a minute after it
+            // only under host memory pressure, so a reclaim is unlikely to race the heap clears
+            // and loads of the game's start.
+            if (g_nx2_present_count.load(std::memory_order_relaxed) == 0) {
+                seconds_since_frame = 0;
+                pressure = now;
+                waited = 0s;
+                continue;
+            }
+            if (seconds_since_frame < 60) {
+                ++seconds_since_frame;
+                if (now == pressure) {
+                    waited = 0s;
+                    continue;
+                }
+            }
+#endif
+            if (now != pressure) {
                 pressure = now;
                 urgent = true;
                 break;

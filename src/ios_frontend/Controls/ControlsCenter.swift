@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import Combine
 import LichiiBridge
 import Melo_Controller
 import Photos
@@ -383,6 +384,10 @@ private final class ScreenshotBox {
 final class OverlayController: NSObject {
     private let host = UIHostingController(rootView: ControlsOverlayView())
     private let container = PassthroughView()
+    /// The game menu button, a plain UIKit button above the SwiftUI content: no SwiftUI hosting
+    /// or gesture recognizer sits between it and its touches.
+    private let menuButton = UIButton(type: .system)
+    private var observers: Set<AnyCancellable> = []
 
     var interactive: Bool {
         get { container.interactive }
@@ -398,6 +403,42 @@ final class OverlayController: NSObject {
         container.isMultipleTouchEnabled = true
         container.hostView = host.view
         container.addSubview(host.view)
+        setUpMenuButton()
+    }
+
+    private func setUpMenuButton() {
+        let config = UIImage.SymbolConfiguration(pointSize: 22, weight: .semibold)
+        menuButton.setImage(UIImage(systemName: "gearshape.circle.fill", withConfiguration: config), for: .normal)
+        menuButton.tintColor = .white
+        menuButton.alpha = 0.6
+        menuButton.accessibilityLabel = "Game Menu"
+        menuButton.accessibilityHint = "Pauses the game"
+        menuButton.addAction(UIAction { _ in
+            MainActor.assumeIsolated {
+                ControllerDiagnostics.once("menu-button", "menu button tapped, game state \(Bridge.emuState)")
+                ControlsCenter.shared.openMenu()
+            }
+        }, for: .touchUpInside)
+        container.addSubview(menuButton)
+        container.menuButton = menuButton
+
+        let center = ControlsCenter.shared
+        let visibleSetting = NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
+            .map { _ in Self.menuButtonVisible }
+            .prepend(Self.menuButtonVisible)
+            .removeDuplicates()
+        Publishers.CombineLatest3(center.$menuOpen, center.$editingLayout, visibleSetting)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] menuOpen, editing, visible in
+                MainActor.assumeIsolated {
+                    self?.menuButton.isHidden = !visible || menuOpen || editing
+                }
+            }
+            .store(in: &observers)
+    }
+
+    private nonisolated static var menuButtonVisible: Bool {
+        UserDefaults.standard.object(forKey: "menuButtonVisible") as? Bool ?? true
     }
 
     func attach(to window: UIWindow) {
@@ -433,6 +474,7 @@ final class OverlayController: NSObject {
 final class PassthroughView: UIView {
     var interactive = false
     weak var hostView: UIView?
+    weak var menuButton: UIView?
     /// Touches handed to a control, by touch.
     private var owners: [ObjectIdentifier: UIView] = [:]
 
@@ -445,9 +487,23 @@ final class PassthroughView: UIView {
         if let parent = superview, frame != parent.bounds {
             frame = parent.bounds
         }
+        if let menuButton {
+            menuButton.frame = CGRect(x: safeAreaInsets.left + 8, y: safeAreaInsets.top + 8, width: 44, height: 44)
+            bringSubviewToFront(menuButton)
+        }
+    }
+
+    override func safeAreaInsetsDidChange() {
+        super.safeAreaInsetsDidChange()
+        setNeedsLayout()
     }
 
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        // The menu button before anything under it.
+        if !interactive, let menuButton, !menuButton.isHidden, menuButton.frame.insetBy(dx: -6, dy: -6).contains(point) {
+            ControllerDiagnostics.once("overlay-menu", "first touch on the menu button at \(Self.text(point))")
+            return menuButton
+        }
         if !interactive, let target = control(at: point) {
             ControllerDiagnostics.once("overlay-control",
                                        "first touch on a control (\(type(of: target))) at \(Self.text(point)) in \(Self.text(bounds.size))")
@@ -492,10 +548,24 @@ final class PassthroughView: UIView {
     /// The topmost visible button under `point` (in this view), else the topmost stick.
     func control(at point: CGPoint) -> UIView? {
         guard let hostView else { return nil }
+        if let found = control(at: point, in: hostView, requireInteraction: true) {
+            return found
+        }
+        // SwiftUI may turn user interaction off on the views it wraps a UIKit view in; the
+        // controls take their touches from here, so only hidden or transparent ones are skipped.
+        let found = control(at: point, in: hostView, requireInteraction: false)
+        if let found {
+            ControllerDiagnostics.once("overlay-control-noninteractive",
+                                       "control \(type(of: found)) under the touch sits in a view with user interaction off; taken anyway")
+        }
+        return found
+    }
+
+    private func control(at point: CGPoint, in root: UIView, requireInteraction: Bool) -> UIView? {
         var best: UIView?
         var bestPriority = Int.min
         func visit(_ view: UIView) {
-            guard !view.isHidden, view.alpha > 0.01, view.isUserInteractionEnabled else { return }
+            guard !view.isHidden, view.alpha > 0.01, !requireInteraction || view.isUserInteractionEnabled else { return }
             if let target = view as? ControllerTouchTarget {
                 if target.touchPriority > bestPriority, view.point(inside: view.convert(point, from: self), with: nil) {
                     best = view
@@ -505,7 +575,7 @@ final class PassthroughView: UIView {
             }
             view.subviews.reversed().forEach(visit)
         }
-        visit(hostView)
+        visit(root)
         return best
     }
 

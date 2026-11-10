@@ -624,6 +624,8 @@ static void IosEndBootSession(SdlState* state) {
 static void IosStopGame(SdlState* state) {
     LOG_INFO(Frontend, "iOS: stopping the game");
     IosSupport::SetTouchControlsVisible(false);
+    // A resume the app asked for must not run into the teardown.
+    IosFrontend::DrainSuspendQueue();
     if (state->system.IsPoweredOn()) {
         void(state->system.Pause());
         LOG_INFO(Frontend, "iOS: game paused, shutting down the main process");
