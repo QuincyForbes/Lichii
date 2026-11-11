@@ -9,6 +9,7 @@
 #include <functional>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -43,10 +44,12 @@ namespace VideoCommon::GPUThread {
 /// Command to signal to the GPU thread that a command list is ready for processing
 struct SubmitListCommand final {
     explicit SubmitListCommand(s32 channel_, Tegra::CommandList&& entries_)
-        : channel{channel_}, entries{std::move(entries_)} {}
+        : channel{channel_}, entries{std::make_unique<Tegra::CommandList>(std::move(entries_))} {}
 
     s32 channel;
-    Tegra::CommandList entries;
+    /// On the heap: a list is 6 kB of inline storage, which in each of the queue's 4096 slots
+    /// was 25 MiB written within the first seconds.
+    std::unique_ptr<Tegra::CommandList> entries;
 };
 
 /// Command to signal to the GPU thread to flush a region
