@@ -243,7 +243,75 @@ constexpr RequestLayout GetReplyOutLayout(bool is_domain) {
     return is_domain ? GetDomainReplyOutLayout<MethodArguments>() : GetNonDomainReplyOutLayout<MethodArguments>();
 }
 
-using OutTemporaryBuffers = std::array<Common::ScratchBuffer<u8>, 3>;
+struct OutTemporaryBuffers {
+    static constexpr std::size_t MaxBuffers = 8;
+    std::array<Common::ScratchBuffer<u8>, MaxBuffers> scratch{};
+    std::array<bool, MaxBuffers> direct{};
+
+    Common::ScratchBuffer<u8>& operator[](std::size_t index) noexcept {
+        return scratch[index];
+    }
+    const Common::ScratchBuffer<u8>& operator[](std::size_t index) const noexcept {
+        return scratch[index];
+    }
+};
+
+struct ScopedOutScratch {
+    static constexpr std::size_t TrimThresholdBytes = 1024 * 1024;
+    static constexpr u32 TrimAfterIdleCalls = 64;
+
+    struct ThreadState {
+        OutTemporaryBuffers buffers{};
+        u32 idle_calls{};
+        bool in_use{};
+    };
+
+    ScopedOutScratch() noexcept {
+        static thread_local ThreadState t_state{};
+        if (!t_state.in_use) [[likely]] {
+            t_state.in_use = true;
+            t_state.buffers.direct.fill(false);
+            for (auto& buf : t_state.buffers.scratch) {
+                buf.resize_destructive(0);
+            }
+            state = &t_state;
+            active = &t_state.buffers;
+        } else {
+            fallback.emplace();
+            active = &*fallback;
+        }
+    }
+
+    ~ScopedOutScratch() {
+        if (state != nullptr) [[likely]] {
+            bool any_large_capacity = false;
+            bool used_large_this_call = false;
+            for (const auto& buf : state->buffers.scratch) {
+                if (buf.capacity() > TrimThresholdBytes) {
+                    any_large_capacity = true;
+                }
+                if (buf.size() > TrimThresholdBytes) {
+                    used_large_this_call = true;
+                }
+            }
+            if (used_large_this_call) {
+                state->idle_calls = 0;
+            } else if (any_large_capacity && ++state->idle_calls >= TrimAfterIdleCalls) {
+                for (auto& buf : state->buffers.scratch) {
+                    if (buf.capacity() > TrimThresholdBytes) {
+                        buf.release();
+                    }
+                }
+                state->idle_calls = 0;
+            }
+            state->in_use = false;
+        }
+    }
+
+    ThreadState* state{};
+    OutTemporaryBuffers* active{};
+    std::optional<OutTemporaryBuffers> fallback{};
+};
 
 template <typename MethodArguments, typename CallArguments, size_t PrevAlign = 1, size_t DataOffset = 0, size_t HandleIndex = 0, size_t InBufferIndex = 0, size_t OutBufferIndex = 0, bool RawDataFinished = false, size_t ArgIndex = 0>
 void ReadInArgument(bool is_domain, CallArguments& args, const u8* raw_data, HLERequestContext& ctx, OutTemporaryBuffers& temp) {
@@ -341,17 +409,38 @@ void ReadInArgument(bool is_domain, CallArguments& args, const u8* raw_data, HLE
             return ReadInArgument<MethodArguments, CallArguments, PrevAlign, DataOffset, HandleIndex, InBufferIndex, OutBufferIndex + 1, RawDataFinished, ArgIndex + 1>(is_domain, args, raw_data, ctx, temp);
         } else if constexpr (ArgumentTraits<ArgType>::Type == ArgumentType::OutBuffer) {
             using ElementType = typename ArgType::Type;
+            static_assert(OutBufferIndex < OutTemporaryBuffers::MaxBuffers);
 
-            // Set up scratch buffer.
-            auto& buffer = temp[OutBufferIndex];
+            std::span<u8> raw_span{};
+            temp.direct[OutBufferIndex] = false;
             if (ctx.CanWriteBuffer(OutBufferIndex)) {
-                buffer.resize_destructive(ctx.GetWriteBufferSize(OutBufferIndex));
+                const size_t write_size = ctx.GetWriteBufferSize(OutBufferIndex);
+                if (write_size == 0) {
+                    temp.direct[OutBufferIndex] = true;
+                    temp[OutBufferIndex].resize_destructive(0);
+                } else {
+                    if constexpr (ArgType::Attr & BufferAttr_HipcAutoSelect) {
+                        raw_span = ctx.GetWriteBufferSpan(OutBufferIndex);
+                    } else if constexpr (ArgType::Attr & BufferAttr_HipcMapAlias) {
+                        raw_span = ctx.GetWriteBufferSpanB(OutBufferIndex);
+                    } else /* if (ArgType::Attr & BufferAttr_HipcPointer) */ {
+                        raw_span = ctx.GetWriteBufferSpanC(OutBufferIndex);
+                    }
+                    if (raw_span.data() != nullptr &&
+                        (reinterpret_cast<uintptr_t>(raw_span.data()) % alignof(ElementType)) == 0) {
+                        temp.direct[OutBufferIndex] = true;
+                        temp[OutBufferIndex].resize_destructive(0);
+                    } else {
+                        temp[OutBufferIndex].resize_destructive(write_size);
+                        raw_span = std::span<u8>{temp[OutBufferIndex].data(), write_size};
+                    }
+                }
             } else {
-                buffer.resize_destructive(0);
+                temp[OutBufferIndex].resize_destructive(0);
             }
 
-            ElementType* ptr = (ElementType*) buffer.data();
-            size_t size = buffer.size() / sizeof(ElementType);
+            ElementType* ptr = reinterpret_cast<ElementType*>(raw_span.data());
+            size_t size = raw_span.size() / sizeof(ElementType);
 
             std::get<ArgIndex>(args) = std::span(ptr, size);
 
@@ -416,16 +505,27 @@ void WriteOutArgument(bool is_domain, CallArguments& args, u8* raw_data, HLERequ
 
             return WriteOutArgument<MethodArguments, CallArguments, PrevAlign, DataOffset, OutBufferIndex + 1, RawDataFinished, ArgIndex + 1>(is_domain, args, raw_data, ctx, temp);
         } else if constexpr (ArgumentTraits<ArgType>::Type == ArgumentType::OutBuffer) {
-            auto& buffer = temp[OutBufferIndex];
-            const size_t size = buffer.size();
-
-            if (size > 0 && ctx.CanWriteBuffer(OutBufferIndex)) {
+            static_assert(OutBufferIndex < OutTemporaryBuffers::MaxBuffers);
+            if (temp.direct[OutBufferIndex]) {
                 if constexpr (ArgType::Attr & BufferAttr_HipcAutoSelect) {
-                    ctx.WriteBuffer(buffer.data(), size, OutBufferIndex);
+                    ctx.CommitWriteBufferSpan(OutBufferIndex);
                 } else if constexpr (ArgType::Attr & BufferAttr_HipcMapAlias) {
-                    ctx.WriteBufferB(buffer.data(), size, OutBufferIndex);
+                    ctx.CommitWriteBufferSpanB(OutBufferIndex);
                 } else /* if (ArgType::Attr & BufferAttr_HipcPointer) */ {
-                    ctx.WriteBufferC(buffer.data(), size, OutBufferIndex);
+                    ctx.CommitWriteBufferSpanC(OutBufferIndex);
+                }
+            } else {
+                auto& buffer = temp[OutBufferIndex];
+                const size_t size = buffer.size();
+
+                if (size > 0 && ctx.CanWriteBuffer(OutBufferIndex)) {
+                    if constexpr (ArgType::Attr & BufferAttr_HipcAutoSelect) {
+                        ctx.WriteBuffer(buffer.data(), size, OutBufferIndex);
+                    } else if constexpr (ArgType::Attr & BufferAttr_HipcMapAlias) {
+                        ctx.WriteBufferB(buffer.data(), size, OutBufferIndex);
+                    } else /* if (ArgType::Attr & BufferAttr_HipcPointer) */ {
+                        ctx.WriteBufferC(buffer.data(), size, OutBufferIndex);
+                    }
                 }
             }
 
@@ -438,7 +538,8 @@ void WriteOutArgument(bool is_domain, CallArguments& args, u8* raw_data, HLERequ
 
 template <bool Domain, typename T, typename... A>
 void CmifReplyWrapImpl(HLERequestContext& ctx, T& t, Result (T::*f)(A...)) {
-    const auto mgr = ctx.GetManager().get();
+    const auto mgr_holder = ctx.GetManager();
+    auto* const mgr = mgr_holder.get();
     // Verify domain state.
     if constexpr (!Domain) {
         const bool is_domain = mgr ? mgr->IsDomain() : false;
@@ -456,7 +557,8 @@ void CmifReplyWrapImpl(HLERequestContext& ctx, T& t, Result (T::*f)(A...)) {
     static_assert(ConstIfReference<A...>(), "Arguments taken by reference must be const");
     using MethodArguments = std::tuple<std::remove_cvref_t<A>...>;
 
-    OutTemporaryBuffers buffers{};
+    ScopedOutScratch scratch_scope{};
+    OutTemporaryBuffers& buffers = *scratch_scope.active;
     auto call_arguments = std::tuple<typename UnwrapArg<A>::Type...>();
 
     // Read inputs.

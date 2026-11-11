@@ -197,7 +197,8 @@ void HLERequestContext::ParseCommandBuffer(u32_le* src_cmdbuf, bool incoming) {
         // Padding to align to 16 bytes
         rp.AlignWithPadding();
 
-        if (GetManager()->IsDomain() &&
+        const auto mgr = GetManager();
+        if (mgr && mgr->IsDomain() &&
             ((command_header->type == IPC::CommandType::Request ||
               command_header->type == IPC::CommandType::RequestWithContext) ||
              !incoming)) {
@@ -206,9 +207,7 @@ void HLERequestContext::ParseCommandBuffer(u32_le* src_cmdbuf, bool incoming) {
             if (incoming || domain_message_header) {
                 domain_message_header = rp.PopRaw<IPC::DomainMessageHeader>();
             } else {
-                if (GetManager()->IsDomain()) {
-                    LOG_WARNING(IPC, "Domain request has no DomainMessageHeader!");
-                }
+                LOG_WARNING(IPC, "Domain request has no DomainMessageHeader!");
             }
         }
 
@@ -300,12 +299,12 @@ Result HLERequestContext::WriteToOutgoingCommandBuffer() {
     // Write the domain objects to the command buffer, these go after the raw untranslated data.
     // TODO(Subv): This completely ignores C buffers.
 
-    if (GetManager()->IsDomain()) {
+    if (const auto mgr = GetManager(); mgr && mgr->IsDomain()) {
         current_offset = domain_offset - static_cast<u32>(outgoing_domain_objects.size());
         for (auto& object : outgoing_domain_objects) {
             if (object) {
                 cmd_buf[current_offset++] =
-                    static_cast<u32_le>(GetManager()->AppendDomainHandler(std::move(object)));
+                    static_cast<u32_le>(mgr->AppendDomainHandler(std::move(object)));
             } else {
                 cmd_buf[current_offset++] = 0;
             }
@@ -452,6 +451,72 @@ std::size_t HLERequestContext::WriteBufferC(const void* buffer, std::size_t size
 
     memory.WriteBlock(BufferDescriptorC()[buffer_index].Address(), buffer, size);
     return size;
+}
+
+std::span<u8> HLERequestContext::GetWriteBufferSpanB(std::size_t buffer_index) const {
+    if (buffer_index >= BufferDescriptorB().size()) {
+        return {};
+    }
+    const VAddr addr = BufferDescriptorB()[buffer_index].Address();
+    const std::size_t size = BufferDescriptorB()[buffer_index].Size();
+    if (size == 0) {
+        return {};
+    }
+    if (u8* const ptr = memory.GetSpan(addr, size); ptr != nullptr) {
+        void(memory.StoreDataCache(addr, size));
+        return {ptr, size};
+    }
+    return {};
+}
+
+std::span<u8> HLERequestContext::GetWriteBufferSpanC(std::size_t buffer_index) const {
+    if (buffer_index >= BufferDescriptorC().size()) {
+        return {};
+    }
+    const VAddr addr = BufferDescriptorC()[buffer_index].Address();
+    const std::size_t size = BufferDescriptorC()[buffer_index].Size();
+    if (size == 0) {
+        return {};
+    }
+    if (u8* const ptr = memory.GetSpan(addr, size); ptr != nullptr) {
+        void(memory.StoreDataCache(addr, size));
+        return {ptr, size};
+    }
+    return {};
+}
+
+std::span<u8> HLERequestContext::GetWriteBufferSpan(std::size_t buffer_index) const {
+    const bool is_buffer_b = BufferDescriptorB().size() > buffer_index &&
+                             BufferDescriptorB()[buffer_index].Size() != 0;
+    return is_buffer_b ? GetWriteBufferSpanB(buffer_index) : GetWriteBufferSpanC(buffer_index);
+}
+
+void HLERequestContext::CommitWriteBufferSpanB(std::size_t buffer_index) const {
+    if (buffer_index < BufferDescriptorB().size()) {
+        const auto& desc = BufferDescriptorB()[buffer_index];
+        if (desc.Size() > 0) {
+            void(memory.StoreDataCache(desc.Address(), desc.Size()));
+        }
+    }
+}
+
+void HLERequestContext::CommitWriteBufferSpanC(std::size_t buffer_index) const {
+    if (buffer_index < BufferDescriptorC().size()) {
+        const auto& desc = BufferDescriptorC()[buffer_index];
+        if (desc.Size() > 0) {
+            void(memory.StoreDataCache(desc.Address(), desc.Size()));
+        }
+    }
+}
+
+void HLERequestContext::CommitWriteBufferSpan(std::size_t buffer_index) const {
+    const bool is_buffer_b = BufferDescriptorB().size() > buffer_index &&
+                             BufferDescriptorB()[buffer_index].Size() != 0;
+    if (is_buffer_b) {
+        CommitWriteBufferSpanB(buffer_index);
+    } else {
+        CommitWriteBufferSpanC(buffer_index);
+    }
 }
 
 std::size_t HLERequestContext::GetReadBufferSize(std::size_t buffer_index) const {
