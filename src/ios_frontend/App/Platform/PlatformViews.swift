@@ -292,11 +292,28 @@ struct ExperimentsView: View {
     @State private var noFootprint = lichii_platform_experiment("no_footprint") != 0
     @State private var untaggedGuest = lichii_platform_experiment("untagged_guest") != 0
     @State private var noZeroTrim = lichii_platform_experiment("no_zero_trim") != 0
+    @State private var chunkedGuest = lichii_platform_experiment("chunked_guest") != 0
+    @State private var fileGuest = lichii_platform_experiment("file_guest") != 0
     @State private var confirmReset = false
     @State private var resetDone = false
 
     var body: some View {
         List {
+            Section {
+                Toggle("Give Back Zeroed Guest Memory", isOn: $chunkedGuest)
+                    .onChange(of: chunkedGuest) { value in
+                        lichii_platform_set_experiment("chunked_guest", value ? 1 : 0)
+                    }
+                Toggle("Keep Guest Memory in a File", isOn: $fileGuest)
+                    .onChange(of: fileGuest) { value in
+                        lichii_platform_set_experiment("file_guest", value ? 1 : 0)
+                    }
+            } header: {
+                Text("Memory Savings")
+            } footer: {
+                Text("Both are untested on a device and apply the next time Lichii starts.\n\nGive Back Zeroed Guest Memory splits guest memory into 2 MiB pieces and returns the ones holding only zeros to iOS (about 0.5 GB in Ocarina of Time). To do that safely Lichii stops all of its threads for about a millisecond at a time, which may show as a stutter. No effect with Count Guest Memory per Mapping on.\n\nKeep Guest Memory in a File writes guest memory to storage: the game's memory lives in a temporary file that iOS doesn't count toward the limit it closes Lichii at, and iOS writes parts the game isn't using to storage when it needs the memory. Expect stutter while a game loads, and wear on the storage from several gigabytes written per play session. iOS may still close Lichii if storage can't keep up. Needs about 14 GB of free storage (Lichii falls back to normal memory with less); the file is removed when Lichii closes. Overrides the other guest memory switches.")
+            }
+
             Section {
                 Toggle("Count Guest Memory per Mapping", isOn: $untaggedGuest)
                     .onChange(of: untaggedGuest) { value in
