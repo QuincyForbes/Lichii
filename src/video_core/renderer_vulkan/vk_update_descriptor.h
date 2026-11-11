@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <array>
+#include <cstring>
 #include <memory>
 #include <variant>
 #include <vector>
@@ -40,6 +42,7 @@ class UpdateDescriptorQueue final {
     // This should be plenty for the vast majority of cases. Most desktop platforms only
     // provide up to 3 swapchain images.
     static constexpr size_t FRAMES_IN_FLIGHT = 8;
+    static constexpr size_t CHUNK_ENTRIES = 0x1000; // 4,096 entries = 96 KiB per chunk
 
 public:
     static constexpr size_t GUEST_FRAME_PAYLOAD_SIZE = 0x80000;
@@ -130,17 +133,30 @@ public:
     }
 
 private:
-    const Device& device;
-    size_t frame_payload_size;
+    struct Chunk {
+        std::unique_ptr<DescriptorUpdateEntry[]> data;
+        size_t capacity{};
+    };
+
+    struct FrameArena {
+        std::vector<Chunk> chunks;
+        size_t chunk_index{};
+        size_t total_entries{};
+        size_t last_used_chunks{};
+        size_t peak_recent_chunks{};
+        u32 excess_turns{};
+    };
+
+    void AcquireSlow(Scheduler& scheduler, size_t reserve);
+
     const size_t maximum_frame_payload_size;
     const bool supports_descriptor_buffer;
     bool use_descriptor_buffer{false};
     size_t frame_index{0};
     DescriptorUpdateEntry* payload_cursor = nullptr;
-    DescriptorUpdateEntry* payload_start = nullptr;
+    DescriptorUpdateEntry* payload_end = nullptr;
     const DescriptorUpdateEntry* upload_start = nullptr;
-    std::unique_ptr<DescriptorUpdateEntry[]> payload;
-    bool growth_disabled{};
+    std::array<FrameArena, FRAMES_IN_FLIGHT> frames{};
     bool fallback_reported{};
 };
 
