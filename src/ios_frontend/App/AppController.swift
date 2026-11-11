@@ -28,6 +28,9 @@ final class AppController: ObservableObject {
     @Published private(set) var jit = JitStatus()
     /// A boot was cancelled: the launch screen stays up until the game is shut down again (IDLE).
     @Published private(set) var cancellingBoot = false
+    /// False while the library window is hidden behind the game render window, allowing LibraryView
+    /// to unmount off-screen icon cells so decoded UIImages are not pinned during gameplay.
+    @Published private(set) var libraryVisible = true
 
     let library = GameLibrary()
     private var window: UIWindow?
@@ -189,6 +192,7 @@ final class AppController: ObservableObject {
     }
 
     private func showLibrary() {
+        libraryVisible = true
         guard let window, window.isHidden else { return }
         window.isHidden = false
         window.makeKeyAndVisible()
@@ -196,7 +200,9 @@ final class AppController: ObservableObject {
 
     private func gameWindowReady() {
         showLaunch = false
+        libraryVisible = false
         window?.isHidden = true
+        IconCache.evictAll()
         guard let pointer = lichii_emu_window() else { return }
         let gameWindow = Unmanaged<UIWindow>.fromOpaque(pointer).takeUnretainedValue()
         // The full in-game menu brings its own menu button.

@@ -268,7 +268,10 @@ final class ControlsCenter: ObservableObject {
         if !visible {
             releaseTouch()
         }
-        touchControlsVisible = visible
+        if touchControlsVisible != visible {
+            touchControlsVisible = visible
+        }
+        overlay?.invalidateControlTargets()
     }
 
     // MARK: - Controllers
@@ -394,6 +397,10 @@ final class OverlayController: NSObject {
         set { container.interactive = newValue }
     }
 
+    func invalidateControlTargets() {
+        container.invalidateTargets()
+    }
+
     override init() {
         super.init()
         host.view.backgroundColor = .clear
@@ -472,11 +479,64 @@ final class OverlayController: NSObject {
 /// SwiftUI's gesture recognizers on it. Other touches go to the overlay's own controls (menu
 /// button), or fall through to the game.
 final class PassthroughView: UIView {
-    var interactive = false
-    weak var hostView: UIView?
+    var interactive = false {
+        didSet {
+            if interactive != oldValue {
+                invalidateTargets()
+            }
+        }
+    }
+    weak var hostView: UIView? {
+        didSet { invalidateTargets() }
+    }
     weak var menuButton: UIView?
     /// Touches handed to a control, by touch.
     private var owners: [ObjectIdentifier: UIView] = [:]
+
+    private struct WeakControlTarget {
+        weak var view: ControllerTouchTarget?
+        let priority: Int
+    }
+
+    private struct HitCache {
+        let point: CGPoint
+        let time: CFTimeInterval
+        weak var view: UIView?
+    }
+
+    private var cachedTargets: [WeakControlTarget] = []
+    private var targetsDirty = true
+    private var lastBoundsSize: CGSize = .zero
+    private var lastHit: HitCache?
+    private var defaultsObserver: NSObjectProtocol?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        defaultsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.invalidateTargets()
+            }
+        }
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+    }
+
+    deinit {
+        if let defaultsObserver {
+            NotificationCenter.default.removeObserver(defaultsObserver)
+        }
+    }
+
+    func invalidateTargets() {
+        targetsDirty = true
+        lastHit = nil
+    }
 
     override func layoutSubviews() {
         super.layoutSubviews()
@@ -486,6 +546,10 @@ final class PassthroughView: UIView {
         }
         if let parent = superview, frame != parent.bounds {
             frame = parent.bounds
+        }
+        if bounds.size != lastBoundsSize {
+            lastBoundsSize = bounds.size
+            invalidateTargets()
         }
         if let menuButton {
             menuButton.frame = CGRect(x: safeAreaInsets.left + 8, y: safeAreaInsets.top + 8, width: 44, height: 44)
@@ -499,24 +563,25 @@ final class PassthroughView: UIView {
     }
 
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        if interactive {
+            return super.hitTest(point, with: event)
+        }
         // The menu button before anything under it.
-        if !interactive, let menuButton, !menuButton.isHidden, menuButton.frame.insetBy(dx: -6, dy: -6).contains(point) {
+        if let menuButton, !menuButton.isHidden, menuButton.frame.insetBy(dx: -6, dy: -6).contains(point) {
             ControllerDiagnostics.once("overlay-menu", "first touch on the menu button at \(Self.text(point))")
             return menuButton
         }
-        if !interactive, let target = control(at: point) {
+        if !ControlsCenter.shared.touchControlsVisible && !ControlsCenter.shared.editingLayout {
+            return nil
+        }
+        if let target = control(at: point) {
             ControllerDiagnostics.once("overlay-control",
                                        "first touch on a control (\(type(of: target))) at \(Self.text(point)) in \(Self.text(bounds.size))")
             return self
         }
-        let hit = super.hitTest(point, with: event)
-        if interactive {
-            return hit
-        }
-        let result = hit === self || hit === hostView ? nil : hit
         ControllerDiagnostics.once("overlay-pass",
-                                   "first touch on no control at \(Self.text(point)) in \(Self.text(bounds.size)): \(result.map { "\(type(of: $0))" } ?? "to the game"), \(controlCount()) controls")
-        return result
+                                   "first touch on no control at \(Self.text(point)) in \(Self.text(bounds.size)): to the game, \(cachedTargets.count) controls")
+        return nil
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -545,45 +610,102 @@ final class PassthroughView: UIView {
         }
     }
 
+    private func rebuildTargetsIfNeeded(in root: UIView) {
+        if !targetsDirty && !cachedTargets.isEmpty {
+            let hasStale = cachedTargets.contains { $0.view == nil || $0.view?.window == nil }
+            if !hasStale {
+                return
+            }
+        }
+        var collected: [WeakControlTarget] = []
+        collected.reserveCapacity(20)
+        func collect(_ view: UIView) {
+            if let target = view as? ControllerTouchTarget {
+                collected.append(WeakControlTarget(view: target, priority: target.touchPriority))
+                return
+            }
+            let children = view.subviews
+            var idx = children.count
+            while idx > 0 {
+                idx -= 1
+                collect(children[idx])
+            }
+        }
+        collect(root)
+        collected.sort { $0.priority > $1.priority }
+        cachedTargets = collected
+        targetsDirty = false
+    }
+
+    /// Returns nil when `view` or an ancestor up to `root` is hidden/transparent; otherwise whether
+    /// every ancestor has `isUserInteractionEnabled` on.
+    private static func ancestorInteractiveState(of view: UIView, upTo root: UIView) -> Bool? {
+        var interactive = true
+        var current: UIView? = view
+        while let v = current {
+            if v.isHidden || v.alpha <= 0.01 {
+                return nil
+            }
+            if !v.isUserInteractionEnabled {
+                interactive = false
+            }
+            if v === root {
+                return interactive
+            }
+            current = v.superview
+        }
+        return nil
+    }
+
     /// The topmost visible button under `point` (in this view), else the topmost stick.
     func control(at point: CGPoint) -> UIView? {
         guard let hostView else { return nil }
-        if let found = control(at: point, in: hostView, requireInteraction: true) {
-            return found
-        }
-        // SwiftUI may turn user interaction off on the views it wraps a UIKit view in; the
-        // controls take their touches from here, so only hidden or transparent ones are skipped.
-        let found = control(at: point, in: hostView, requireInteraction: false)
-        if let found {
-            ControllerDiagnostics.once("overlay-control-noninteractive",
-                                       "control \(type(of: found)) under the touch sits in a view with user interaction off; taken anyway")
-        }
-        return found
-    }
-
-    private func control(at point: CGPoint, in root: UIView, requireInteraction: Bool) -> UIView? {
-        var best: UIView?
-        var bestPriority = Int.min
-        func visit(_ view: UIView) {
-            guard !view.isHidden, view.alpha > 0.01, !requireInteraction || view.isUserInteractionEnabled else { return }
-            if let target = view as? ControllerTouchTarget {
-                if target.touchPriority > bestPriority, view.point(inside: view.convert(point, from: self), with: nil) {
-                    best = view
-                    bestPriority = target.touchPriority
+        let now = CACurrentMediaTime()
+        if let hit = lastHit,
+           abs(hit.point.x - point.x) < 0.5,
+           abs(hit.point.y - point.y) < 0.5,
+           now - hit.time < 0.05 {
+            if let view = hit.view {
+                if view.window != nil {
+                    return view
                 }
-                return
+            } else {
+                return nil
             }
-            view.subviews.reversed().forEach(visit)
         }
-        visit(root)
-        return best
-    }
 
-    private func controlCount() -> Int {
-        func count(_ view: UIView) -> Int {
-            (view is ControllerTouchTarget ? 1 : 0) + view.subviews.reduce(0) { $0 + count($1) }
+        rebuildTargetsIfNeeded(in: hostView)
+
+        var fallback: UIView?
+        var fallbackPriority = Int.min
+        for entry in cachedTargets {
+            guard let view = entry.view else { continue }
+            if fallback != nil && entry.priority < fallbackPriority {
+                break
+            }
+            guard let ancestorsInteractive = Self.ancestorInteractiveState(of: view, upTo: hostView) else {
+                continue
+            }
+            let local = view.convert(point, from: self)
+            guard view.bounds.contains(local), view.point(inside: local, with: nil) else {
+                continue
+            }
+            if ancestorsInteractive {
+                lastHit = HitCache(point: point, time: now, view: view)
+                return view
+            }
+            if entry.priority > fallbackPriority {
+                fallback = view
+                fallbackPriority = entry.priority
+            }
         }
-        return hostView.map(count) ?? 0
+
+        if let fallback {
+            ControllerDiagnostics.once("overlay-control-noninteractive",
+                                       "control \(type(of: fallback)) under the touch sits in a view with user interaction off; taken anyway")
+        }
+        lastHit = HitCache(point: point, time: now, view: fallback)
+        return fallback
     }
 
     static func text(_ point: CGPoint) -> String {
