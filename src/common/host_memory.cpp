@@ -2594,6 +2594,7 @@ void HostMemory::Commit(size_t physical_offset, size_t length) {
 }
 
 void HostMemory::CommitAllBut(std::span<const std::pair<size_t, size_t>> lazy) {
+#ifdef _WIN32
     if (!commit_on_use) {
         return;
     }
@@ -2611,6 +2612,9 @@ void HostMemory::CommitAllBut(std::span<const std::pair<size_t, size_t>> lazy) {
     }
     LOG_INFO(HW_Memory, "EDEN_NX2_SEC_RESERVE: {} MiB of guest memory committed (the kernel's own)",
              g_committed_bytes.load(std::memory_order_relaxed) >> 20);
+#else
+    static_cast<void>(lazy);
+#endif
 }
 
 HostMemory::CommitStats HostMemory::GetCommitStats() {
