@@ -455,15 +455,16 @@ AtomicT<bitsize> AtomicRmwResult(AtomicT<bitsize> a, AtomicT<bitsize> b, u64 op)
     }
 }
 
-// Slow paths through the memory callbacks (no fastmem, or a fastmem fault): a CAS loop. A failed
-// write that leaves memory unchanged is not a race (unmapped or aborted access): stop there.
+// Slow paths through the memory callbacks (no fastmem, or a fastmem fault): a CAS loop. Every
+// failed write is retried. Memory reading the same value again after a failure does not mean the
+// write went through: another thread may have changed it and changed it back (a lock taken and
+// released), and stopping there reports an operation that never happened.
 template<std::size_t bitsize>
 u64 AtomicRmwFallback(const A64::UserConfig& conf, u64 vaddr, u64 operand, u64 op) {
     using T = AtomicT<bitsize>;
     for (;;) {
         const T old = T(conf.callbacks->MemoryRead(vaddr, bitsize / 8));
-        if (AtomicWriteExclusive<bitsize>(conf.callbacks, vaddr, AtomicRmwResult<bitsize>(old, T(operand), op), old) ||
-            T(conf.callbacks->MemoryRead(vaddr, bitsize / 8)) == old) {
+        if (AtomicWriteExclusive<bitsize>(conf.callbacks, vaddr, AtomicRmwResult<bitsize>(old, T(operand), op), old)) {
             return old;
         }
     }
@@ -474,11 +475,7 @@ u64 AtomicCasFallback(const A64::UserConfig& conf, u64 vaddr, u64 expected, u64 
     using T = AtomicT<bitsize>;
     for (;;) {
         const T old = T(conf.callbacks->MemoryRead(vaddr, bitsize / 8));
-        if (old != T(expected)) {
-            return old;
-        }
-        if (AtomicWriteExclusive<bitsize>(conf.callbacks, vaddr, T(desired), old) ||
-            T(conf.callbacks->MemoryRead(vaddr, bitsize / 8)) == old) {
+        if (old != T(expected) || AtomicWriteExclusive<bitsize>(conf.callbacks, vaddr, T(desired), old)) {
             return old;
         }
     }
@@ -541,7 +538,7 @@ void A64EmitX64::EmitAtomicRmwMemory(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const u8 op = args[3].GetImmediateU8();
     const AtomicFallbackFn fallback = &AtomicRmwFallback<bitsize>;
-    const auto fastmem_marker = ShouldFastmem(ctx, inst);
+    const auto fastmem_marker = conf.atomics_through_callbacks ? std::nullopt : ShouldFastmem(ctx, inst);
     if (conf.jit_counters) {
         code.inc(qword[code.ABI_JIT_PTR + offsetof(A64JitState, nx2_counters) + 3 * sizeof(u64)]);
     }
@@ -702,7 +699,7 @@ template<std::size_t bitsize>
 void A64EmitX64::EmitAtomicCasMemory(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const AtomicFallbackFn fallback = &AtomicCasFallback<bitsize>;
-    const auto fastmem_marker = ShouldFastmem(ctx, inst);
+    const auto fastmem_marker = conf.atomics_through_callbacks ? std::nullopt : ShouldFastmem(ctx, inst);
     if (conf.jit_counters) {
         code.inc(qword[code.ABI_JIT_PTR + offsetof(A64JitState, nx2_counters) + 3 * sizeof(u64)]);
     }
