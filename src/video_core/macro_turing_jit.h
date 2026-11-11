@@ -241,7 +241,7 @@ private:
             case 24: xor_(dst, dst); return;
             case 25: mov(dst, Word(std::int32_t(std::int16_t(d.imm[lane])))); return;
             case 26: mov(dst, Word(std::int32_t(std::int16_t(d.imm[1 - lane])))); return;
-            case 27: mov(dst, (d.imm[0] << 16) | d.imm[1]); return;
+            case 27: mov(dst, (Word{d.imm[0]} << 16) | d.imm[1]); return;
             case 28: mov(dst, r12d); return;
             case 29: mov(dst, r13d); return;
             default: jmp(fail_source, T_NEAR); return;
@@ -456,9 +456,9 @@ private:
             case 4: mov(dst, r13d); return;
             case 5: mov(dst, d.imm[0]); return;
             case 6: mov(dst, d.imm[1]); return;
-            case 8: mov(dst, d.imm[0] >> 12); return;
-            case 9: mov(dst, d.imm[1] >> 12); return;
-            case 10: mov(dst, (d.imm[0] << 16) | d.imm[1]); return;
+            case 8: mov(dst, Word{d.imm[0]} >> 12); return;
+            case 9: mov(dst, Word{d.imm[1]} >> 12); return;
+            case 10: mov(dst, (Word{d.imm[0]} << 16) | d.imm[1]); return;
             default: jmp(fail_output, T_NEAR); return;
             }
         }

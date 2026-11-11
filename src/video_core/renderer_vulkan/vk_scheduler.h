@@ -17,6 +17,7 @@
 #include <utility>
 #include <queue>
 #include <source_location>
+#include <span>
 #include <vector>
 
 #include "common/alignment.h"
@@ -44,6 +45,7 @@ class Device;
 class Framebuffer;
 class GraphicsPipeline;
 class StateTracker;
+class UploadBatch;
 
 struct QueryCacheParams;
 
@@ -188,12 +190,19 @@ public:
         on_submit = std::move(func);
     }
 
+    /// Consecutive in-order staging uploads share barriers until their destinations overlap,
+    /// a source depends on a pending copy, or the batch is full. Call outside a render pass.
+    void RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies);
+
     /// Send work to a separate thread.
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
     void RecordWithUploadBuffer(T&& command) {
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
+        }
+        if (uploads_pending) {
+            FlushUploads();
         }
         has_pending_commands = true;
         if (chunk->Record(command)) {
@@ -213,7 +222,7 @@ public:
     }
 
     [[nodiscard]] bool HasPendingCommands() const noexcept {
-        return has_pending_commands || state.renderpass != VK_NULL_HANDLE ||
+        return has_pending_commands || uploads_pending || state.renderpass != VK_NULL_HANDLE ||
                deferred_clear.framebuffer != nullptr;
     }
 
@@ -420,6 +429,9 @@ private:
         VkRenderPass renderpass{};
         VkFramebuffer framebuffer{};
         VkExtent2D render_area = {0, 0};
+        /// The pass is a deferred clear's variant of the framebuffer's render pass that differs
+        /// from it only in load ops, so later draws on that framebuffer can stay in it.
+        bool clear_variant = false;
         GraphicsPipeline* graphics_pipeline = nullptr;
         bool is_rescaling = false;
         bool rescaling_defined = false;
@@ -471,6 +483,9 @@ private:
     bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;
+    std::unique_ptr<UploadBatch> upload_batch;
+    bool uploads_pending{};
+    void FlushUploads();
 
     vk::QueryPool trace_query_pool;
     static constexpr u32 TraceMaxSubmissions = 512;

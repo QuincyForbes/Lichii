@@ -139,9 +139,10 @@ inline void LoadExperiments() {
         // walking through Hyrule Field, fresh launches: 1% low 30.3 -> 35.1 fps, frames over
         // 25 ms 68 -> 38 of ~1650.
         g_experiments[8].store(15, std::memory_order_relaxed);
-        // EXP9 = 1: native uniform bank pages compared only when they may have changed (verified
-        // with EXP9=2: 0 missed in 120 s walking). Idle 54.5 -> 57.7 fps, walking 56.6 -> 58.9.
-        g_experiments[9].store(1, std::memory_order_relaxed);
+        // EXP9 = 3: native uniform bank pages compared only when they may have changed, without
+        // the once-a-frame compare of every page which never found an unflagged change (from
+        // Fritchii, 29c7b12286: uniform buffers 135.6 -> 97.9 ms/s on GPUBack in Castle Town).
+        g_experiments[9].store(3, std::memory_order_relaxed);
         // EXP10 = 1: macro DMA reads wait only for the dispatches, uploads, copies and releases
         // that may have written them (EDEN_NX2_DMA_SNAPSHOT=10 verify: 0 differed in 2 x 90 s
         // walking). GPU front idle 81 -> 105 ms/s, waits for the back 368 -> 338 ms/s.
@@ -177,6 +178,9 @@ inline void LoadExperiments() {
         // queued for the back (a reset there let a channel run before its producer). A strict
         // tightening: only met answers become the normal path (puller.cpp QueuedWriteRefusesMet).
         g_experiments[34].store(1, std::memory_order_relaxed);
+        // EXP62 = 1: coalesce consecutive in-order stream buffer uploads into one command with
+        // one pair of barriers (zortos293/Lichii#1245; Fritchii 25892ea154).
+        g_experiments[62].store(1, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {

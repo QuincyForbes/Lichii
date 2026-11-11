@@ -132,9 +132,7 @@ public:
             if (delay_fence) {
                 uncommitted_operations.emplace_back(std::move(func));
             }
-            pending_operations.emplace_back(std::move(uncommitted_operations));
-            uncommitted_operations.clear(); // moved-from: make it empty explicitly
-            uncommitted_operations.reserve(64);
+            pending_operations.emplace_back(TakeUncommittedOperations());
         }
         pending_flushes.push_back(committed_flushes);
         if constexpr (can_async_check) {
@@ -293,6 +291,8 @@ protected:
     TQueryCache& query_cache;
 
 private:
+    using OperationList = std::vector<std::function<void()>>;
+
     template <bool force_wait>
     void TryReleasePendingFences() {
         while (!fences.empty()) {
@@ -310,6 +310,11 @@ private:
             pending_operations.pop_front();
             for (auto& operation : operations) {
                 operation();
+            }
+            operations.clear();
+            {
+                std::scoped_lock lock{uncommitted_guard};
+                KeepSpareOperations(operations);
             }
             {
                 std::unique_lock lock(ring_guard);
@@ -398,6 +403,13 @@ private:
                 for (auto& operation : released.operations) {
                     operation();
                 }
+                released.operations.clear();
+            }
+            {
+                std::scoped_lock lock{uncommitted_guard};
+                for (Released& released : batch) {
+                    KeepSpareOperations(released.operations);
+                }
             }
             {
                 std::unique_lock lock(ring_guard);
@@ -448,7 +460,7 @@ private:
             OperationList operations;
             {
                 std::scoped_lock ops_lock{uncommitted_guard};
-                operations.swap(uncommitted_operations);
+                operations = TakeUncommittedOperations();
             }
             lock.unlock();
             query_cache.PopAsyncFlushes();
@@ -457,6 +469,11 @@ private:
             }
             if (delay_fence) {
                 func();
+            }
+            operations.clear();
+            {
+                std::scoped_lock ops_lock{uncommitted_guard};
+                KeepSpareOperations(operations);
             }
             fences_in_flight.fetch_sub(1, std::memory_order_release);
             lock.lock();
@@ -474,9 +491,7 @@ private:
             if (delay_fence) {
                 uncommitted_operations.emplace_back(std::move(func));
             }
-            pending_operations.emplace_back(std::move(uncommitted_operations));
-            uncommitted_operations.clear();
-            uncommitted_operations.reserve(64);
+            pending_operations.emplace_back(TakeUncommittedOperations());
         }
         pending_flushes.push_back(0);
         pending_query_pops.push_back(1);
@@ -486,6 +501,29 @@ private:
         work_epoch.fetch_add(1, std::memory_order_release);
         lock.unlock();
         cv.notify_all();
+    }
+
+    static constexpr size_t MaxSpareOperationLists = 32;
+
+    /// Caller holds uncommitted_guard. Hands the uncommitted list over and puts a spare list in
+    /// its place with its capacity intact (zortos293/Lichii#1161).
+    OperationList TakeUncommittedOperations() {
+        OperationList taken = std::move(uncommitted_operations);
+        if (!spare_operations.empty()) {
+            uncommitted_operations = std::move(spare_operations.back());
+            spare_operations.pop_back();
+        } else {
+            uncommitted_operations = OperationList{};
+            uncommitted_operations.reserve(64);
+        }
+        return taken;
+    }
+
+    /// Caller holds uncommitted_guard. `list` was already cleared outside the lock.
+    void KeepSpareOperations(OperationList& list) {
+        if (spare_operations.size() < MaxSpareOperationLists && list.capacity() != 0) {
+            spare_operations.push_back(std::move(list));
+        }
     }
 
     /// The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
@@ -611,12 +649,9 @@ private:
     }
 
     std::queue<TFence> fences;
-    // LOCAL TEST (Zelda): vectors, not deques. MSVC's deque of std::function holds one element per
-    // block, so every queued operation (one per query report, ~1000 objects a frame in Ocarina's
-    // Kokiri Forest) allocated a block.
-    using OperationList = std::vector<std::function<void()>>;
     OperationList uncommitted_operations;
     std::deque<OperationList> pending_operations;
+    std::vector<OperationList> spare_operations; ///< Guarded by uncommitted_guard
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     std::deque<u32> pending_query_pops;
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)

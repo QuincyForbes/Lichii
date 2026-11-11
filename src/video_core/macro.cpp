@@ -1547,14 +1547,17 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         }
         fifo.assign(parameters.begin(), parameters.end());
         const u64 code_generation = native_code_generation;
+        native_interpreter.Prepare(native_code, code_generation);
         const auto result = native_interpreter.Execute(native_code, method, fifo,
             [&](u32 address) { return address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U; },
             [&](u32 address, u32 value) {
-                if (use_memo) {
+                if (use_memo && !read_memory && !native_interpreter.read_registers &&
+                    !native_interpreter.reread_data_ram) {
                     native_writes.emplace_back(address, value);
                 }
                 return emit(address, value);
-            });
+            },
+            use_memo);
         // Remember the call if its effects depend only on its parameters and the data RAM words
         // it read (and the macro code did not change under it).
         if (use_memo && result.success && !read_memory && !native_interpreter.read_registers &&

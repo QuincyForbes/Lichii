@@ -24,9 +24,12 @@
 #include "common/settings.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/thread.h"
+#include <boost/container/small_vector.hpp>
+
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/renderer_vulkan/upload_batch.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -112,7 +115,8 @@ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
 Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     : device{device_}, state_tracker{state_tracker_},
       master_semaphore{std::make_unique<MasterSemaphore>(device)},
-      command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
+      command_pool{std::make_unique<CommandPool>(*master_semaphore, device)},
+      upload_batch{std::make_unique<UploadBatch>()} {
 
     if (Common::DkbFrameTrace::Enabled()) {
         const auto physical = device.GetPhysical();
@@ -299,6 +303,9 @@ void Scheduler::DispatchWork(bool lazy) {
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
     }
+    if (uploads_pending) {
+        FlushUploads();
+    }
     static const bool lazy_wake = [] {
         const char* value = std::getenv("EDEN_NX2_LAZY_WAKE");
         return value == nullptr || value[0] != '0';
@@ -325,9 +332,39 @@ void Scheduler::DispatchWork(bool lazy) {
     }
 }
 
+void Scheduler::RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies) {
+    if (VideoCommon::GpuSplit::check_owner) {
+        VideoCommon::GpuSplit::CheckOwner("Scheduler::RecordUpload");
+    }
+    for (const VkBufferCopy& copy : copies) {
+        const std::span<const VkBufferCopy> region{&copy, 1};
+        if (uploads_pending && !upload_batch->CanAdd(src, dst, region)) {
+            FlushUploads();
+        }
+        upload_batch->Add(src, dst, region);
+        uploads_pending = true;
+        has_pending_commands = true;
+    }
+}
+
+void Scheduler::FlushUploads() {
+    boost::container::small_vector<VkBufferCopy, 16> copies(upload_batch->copies.begin(),
+                                                            upload_batch->copies.end());
+    boost::container::small_vector<UploadBatch::Group, 8> groups(upload_batch->groups.begin(),
+                                                                 upload_batch->groups.end());
+    upload_batch->copies.clear();
+    upload_batch->groups.clear();
+    uploads_pending = false;
+    Record([copies = std::move(copies), groups = std::move(groups)](vk::CommandBuffer cmdbuf) {
+        UploadBatch::Record(cmdbuf, std::span<const VkBufferCopy>{copies.data(), copies.size()},
+                            std::span<const UploadBatch::Group>{groups.data(), groups.size()});
+    });
+}
+
 bool Scheduler::RenderPassMatches(const Framebuffer* framebuffer) const {
     const VkExtent2D render_area = framebuffer->RenderArea();
-    return state.renderpass != VK_NULL_HANDLE && framebuffer->RenderPass() == state.renderpass &&
+    return state.renderpass != VK_NULL_HANDLE &&
+           (framebuffer->RenderPass() == state.renderpass || state.clear_variant) &&
            framebuffer->Handle() == state.framebuffer &&
            render_area.width == state.render_area.width &&
            render_area.height == state.render_area.height;
@@ -340,7 +377,8 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
-    state.renderpass = framebuffer->RenderPass();
+    state.renderpass = renderpass;
+    state.clear_variant = false;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
 
@@ -418,6 +456,9 @@ void Scheduler::RealizeDeferredClear() {
         dc.color_clear_mask, dc.depth_stencil, color_discard_mask, depth_stencil_discard);
     EndRenderPass();
     BeginRenderPassImpl(dc.framebuffer, renderpass, clear_values.data(), count);
+    // Without discards, the variant only clears instead of loading: its store ops, layouts and
+    // attachments are the framebuffer's own.
+    state.clear_variant = color_discard_mask == 0 && !depth_stencil_discard;
 }
 
 bool Scheduler::DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot,
@@ -469,18 +510,11 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
         return;
     }
     const VkRenderPass renderpass = framebuffer->RenderPass();
-    const VkFramebuffer framebuffer_handle = framebuffer->Handle();
-    const VkExtent2D render_area = framebuffer->RenderArea();
-    // A draw continues the active pass whenever the same framebuffer and area are bound. The
-    // render-pass *variant* (a deferred clear's loadOp=CLEAR form) is only meaningful at begin -
-    // loadOps are applied once, and the base/variant passes are render-pass-compatible (only
-    // loadOp/storeOp differ). Comparing the exact handle here made every draw after a deferred
-    // clear restart the pass and re-LOAD what was just CLEARed (~118 MB of attachment traffic per
-    // world-target turn). The framebuffer handle already fixes the attachment structure and key,
-    // so it is the correct identity to compare.
-    if (state.renderpass && framebuffer_handle == state.framebuffer &&
-        render_area.width == state.render_area.width &&
-        render_area.height == state.render_area.height) {
+    // A deferred clear's non-discarding pass serves the draws after its first one too: ending it
+    // there and beginning the framebuffer's own pass stored the attachments only to load them back
+    // (~9-11 render passes a frame in Ocarina of Time). MSAA tiler discard variants keep their
+    // distinct renderpass identity so storeOp=DONT_CARE is not reused across separate passes.
+    if (RenderPassMatches(framebuffer)) {
         return;
     }
     if (state.renderpass) {
@@ -833,6 +867,9 @@ void Scheduler::TraceGpuSubmission() {
 }
 
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+    if (uploads_pending) {
+        FlushUploads();
+    }
     if (VideoCommon::Nx2Profile::Enabled()) {
         g_profile_submits.fetch_add(1, std::memory_order_relaxed);
         ReportSubmitCounts();
@@ -1011,6 +1048,7 @@ void Scheduler::EndRenderPass()
         });
 
         state.renderpass = VkRenderPass{};
+        state.clear_variant = false;
         num_renderpass_images = 0;
     }
 
