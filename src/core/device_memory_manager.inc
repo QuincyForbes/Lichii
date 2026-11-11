@@ -179,7 +179,10 @@ DeviceMemoryManager<Traits>::DeviceMemoryManager(const DeviceMemory& device_memo
     , tracked_entries(device_as_size >> Memory::YUZU_PAGEBITS)
 {
     impl = std::make_unique<DeviceMemoryManagerAllocator<Traits>>();
-    cached_pages = std::make_unique<CachedPages>();
+    armed_pages.reset(static_cast<std::atomic<u64>*>(
+        std::calloc(armed_page_count / 64, sizeof(std::atomic<u64>))));
+    cached_pages.reset(static_cast<CachedPages*>(std::calloc(1, sizeof(CachedPages))));
+    ASSERT(armed_pages != nullptr && cached_pages != nullptr);
 }
 
 template <typename Traits>

@@ -39,16 +39,10 @@ Result KSecureSystemResource::Initialize(KernelCore& kernel, size_t size, KResou
         Common::AlignUp(KPageTableSlabHeap::CalculateReferenceCountSize(m_resource_size), PageSize);
     R_UNLESS(m_resource_size > rc_size, ResultOutOfMemory);
 
-    // Get resource pointer.
-    KPhysicalAddress resource_paddr =
-        KPageTable::GetHeapPhysicalAddress(kernel, m_resource_address);
-    auto* resource =
-        kernel.System().DeviceMemory().GetPointer<KPageTableManager::RefCount>(resource_paddr);
-
     // Initialize slab heaps.
     m_dynamic_page_manager.Initialize(m_resource_address + rc_size, m_resource_size - rc_size,
                                       PageSize);
-    m_page_table_heap.Initialize(std::addressof(m_dynamic_page_manager), 0, resource);
+    m_page_table_heap.Initialize(std::addressof(m_dynamic_page_manager), 0, nullptr);
     m_memory_block_heap.Initialize(std::addressof(m_dynamic_page_manager), 0);
     m_block_info_heap.Initialize(std::addressof(m_dynamic_page_manager), 0);
 

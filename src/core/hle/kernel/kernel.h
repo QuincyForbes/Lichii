@@ -11,6 +11,7 @@
 #include <list>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include "common/container/unordered_map.h"
 #include <vector>
 
@@ -138,6 +139,36 @@ public:
 
     /// Retrieves the list of processes.
     std::list<KScopedAutoObject<KProcess>> GetProcessList();
+
+    /// Iterates active processes without allocating a std::list. Returning false stops iteration.
+    template <typename Func>
+    void ForEachProcess(Func&& func) {
+        auto wrapper = [](void* ctx, KProcess* process) -> bool {
+            using Fn = std::remove_reference_t<Func>;
+            if constexpr (std::is_convertible_v<std::invoke_result_t<Fn&, KProcess*>, bool>) {
+                return (*static_cast<Fn*>(ctx))(process);
+            } else {
+                (*static_cast<Fn*>(ctx))(process);
+                return true;
+            }
+        };
+        ForEachProcessImpl(std::addressof(func), wrapper, false);
+    }
+
+    /// Iterates real (non-HLE-dummy) processes without allocating a std::list.
+    template <typename Func>
+    void ForEachRealProcess(Func&& func) {
+        auto wrapper = [](void* ctx, KProcess* process) -> bool {
+            using Fn = std::remove_reference_t<Func>;
+            if constexpr (std::is_convertible_v<std::invoke_result_t<Fn&, KProcess*>, bool>) {
+                return (*static_cast<Fn*>(ctx))(process);
+            } else {
+                (*static_cast<Fn*>(ctx))(process);
+                return true;
+            }
+        };
+        ForEachProcessImpl(std::addressof(func), wrapper, true);
+    }
 
     /// Gets the sole instance of the global scheduler
     Kernel::GlobalSchedulerContext& GlobalSchedulerContext();
@@ -324,6 +355,8 @@ private:
 
     /// Provides a const reference to the global handle table.
     const KHandleTable& GlobalHandleTable() const;
+
+    void ForEachProcessImpl(void* ctx, bool (*callback)(void*, KProcess*), bool only_real);
 
     struct Impl;
     std::unique_ptr<Impl> impl;

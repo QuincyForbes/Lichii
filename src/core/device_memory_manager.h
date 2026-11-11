@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -277,14 +278,19 @@ private:
         tracked_entries.GetUnchecked(page_index).cpu_backing_address = address | (asid.id << asid_start_bit);
     }
 
+    struct FreeDeleter {
+        void operator()(void* ptr) const noexcept {
+            std::free(ptr);
+        }
+    };
+
     /// Starts past every earlier manager's: one built where a destroyed one was must not match
     /// the translations a thread kept for that one (Translations compares owner and generation).
     static inline std::atomic<u64> next_generation_base{1};
     /// Bumped by Map and Unmap
     std::atomic<u64> translation_generation{next_generation_base.fetch_add(1ULL << 32)};
     static constexpr u64 armed_page_count = device_as_size >> page_bits;
-    std::unique_ptr<std::atomic<u64>[]> armed_pages{
-        std::make_unique<std::atomic<u64>[]>(armed_page_count / 64)};
+    std::unique_ptr<std::atomic<u64>[], FreeDeleter> armed_pages;
     using CounterType = u8;
     using CounterAtomicType = std::atomic_uint8_t;
     static constexpr size_t subentries = 8 / sizeof(CounterType);
@@ -312,7 +318,7 @@ private:
     static constexpr size_t num_counter_entries =
         (1ULL << (device_virtual_bits - page_bits)) / subentries;
     using CachedPages = std::array<CounterEntry, num_counter_entries>;
-    std::unique_ptr<CachedPages> cached_pages;
+    std::unique_ptr<CachedPages, FreeDeleter> cached_pages;
     Common::RangeMutex counter_guard;
     std::mutex mapping_guard;
 
