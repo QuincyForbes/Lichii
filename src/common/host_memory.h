@@ -122,9 +122,11 @@ public:
         File,       ///< Not at all
     };
     /// Apple, as of the last TrimZeroPages: guest memory resident or compressed and how it is
-    /// counted, guest memory the kernel has handed out, and zero bytes trimmed so far.
+    /// counted, the compressed part of it, guest memory the kernel has handed out, and zero bytes
+    /// trimmed so far.
     static GuestAccounting ScannedAccounting() noexcept;
     static u64 ScannedResidentBytes() noexcept;
+    static u64 ScannedCompressedBytes() noexcept;
     static u64 ScannedHandedOutBytes() noexcept;
     static u64 TrimmedZeroBytes() noexcept;
 

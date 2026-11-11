@@ -1793,6 +1793,7 @@ namespace {
 std::atomic<u64> g_zero_filled_bytes{};
 [[maybe_unused]] std::atomic<u64> g_zero_advised_bytes{};
 [[maybe_unused]] std::atomic<u64> g_scanned_resident_bytes{};
+[[maybe_unused]] std::atomic<u64> g_scanned_compressed_bytes{};
 std::atomic<HostMemory::GuestAccounting> g_scanned_accounting{};
 [[maybe_unused]] std::atomic<u64> g_trimmed_zero_bytes{};
 [[maybe_unused]] std::atomic<u64> g_scanned_handed_out_bytes{};
@@ -1971,6 +1972,10 @@ u64 HostMemory::ScannedResidentBytes() noexcept {
     return g_scanned_resident_bytes.load(std::memory_order_relaxed);
 }
 
+u64 HostMemory::ScannedCompressedBytes() noexcept {
+    return g_scanned_compressed_bytes.load(std::memory_order_relaxed);
+}
+
 u64 HostMemory::TrimmedZeroBytes() noexcept {
     return g_trimmed_zero_bytes.load(std::memory_order_relaxed);
 }
@@ -2137,6 +2142,8 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
         return true;
     };
     size_t resident = 0;
+    // In the compressor: counted like a page in RAM, whatever it compressed to.
+    size_t compressed = 0;
     size_t trimmed = 0;
     // A guest write between the check and madvise is the one thing a reclaim could lose: each run
     // is checked again right after, and a page that changed is written to (unchanged) and reused.
@@ -2193,6 +2200,9 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
         bool zero = false;
         if ((residency[index] & counted) != 0) {
             resident += page_size;
+            if ((residency[index] & MINCORE_INCORE) == 0) {
+                compressed += page_size;
+            }
             if (!scan) {
                 continue;
             }
@@ -2252,6 +2262,7 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
     }
     g_scanned_handed_out_bytes.store(handed_out, std::memory_order_relaxed);
     g_scanned_resident_bytes.store(resident, std::memory_order_relaxed);
+    g_scanned_compressed_bytes.store((std::min)(compressed, resident), std::memory_order_relaxed);
     g_scanned_accounting.store(FileBacked()         ? GuestAccounting::File
                                : PagesCountedOnce() ? GuestAccounting::Once
                                                     : GuestAccounting::PerMapping,

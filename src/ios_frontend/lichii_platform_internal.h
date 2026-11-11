@@ -11,8 +11,9 @@ namespace LichiiPlatform {
 /// The per-device defaults for `info` (pure: the table in lichii_bridge_platform.cpp).
 LichiiDeviceDefaults ComputeDefaults(const LichiiDeviceInfo& info);
 
-/// Exports the cache budgets of `defaults` to the texture/buffer caches (environment, kept when
-/// already set) and the memory low-water mark.
+/// Exports the cache budgets of `defaults` to the texture/buffer caches and the .nup loader
+/// (environment, kept when already set) and the memory low-water mark; removes the temporary
+/// files the loader left when iOS closed a game.
 void ApplyMemoryBudgets(const LichiiDeviceDefaults& defaults);
 
 /// Sets the environment of the enabled experiments (before the guest memory is created).

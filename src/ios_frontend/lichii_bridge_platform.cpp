@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -88,6 +89,34 @@ std::filesystem::path ShaderCachePath(u64 title_id) {
     return title_id == 0 ? dir : dir / fmt::format("{:016x}", title_id);
 }
 
+/// The .nup loader keeps the files it decompressed in host memory (512 MiB by default, which a
+/// phone doesn't have to spare) and writes those over half the cap to a temporary file instead.
+constexpr u32 NupCacheMib = 96;
+
+/// The loader removes its temporary files when the game closes; a game iOS closed leaves them.
+void RemoveLeftoverNupFiles() {
+    const auto dir = Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "nup";
+    std::error_code error;
+    std::vector<std::filesystem::path> leftovers;
+    for (std::filesystem::directory_iterator it{dir, error}, end; !error && it != end;
+         it.increment(error)) {
+        if (it->path().extension() == ".tmp") {
+            leftovers.push_back(it->path());
+        }
+    }
+    u64 bytes = 0;
+    for (const auto& path : leftovers) {
+        const auto size = std::filesystem::file_size(path, error);
+        if (!error && std::filesystem::remove(path, error)) {
+            bytes += size;
+        }
+    }
+    if (!leftovers.empty()) {
+        LOG_INFO(Frontend, "iOS: removed {} temporary .nup files of an earlier run ({} MiB)",
+                 leftovers.size(), bytes >> 20);
+    }
+}
+
 } // Anonymous namespace
 
 LichiiDeviceDefaults ComputeDefaults(const LichiiDeviceInfo& info) {
@@ -149,13 +178,20 @@ void ApplyMemoryBudgets(const LichiiDeviceDefaults& defaults) {
     setenv("EDEN_NX2_TC_EXPECTED_MIB", std::to_string(defaults.texture_cache_expected_mib).c_str(),
            0);
     setenv("EDEN_NX2_BC_COLLECT_MIB", std::to_string(defaults.buffer_cache_collect_mib).c_str(), 0);
+    if (lichii_platform_experiment("nup_in_memory")) {
+        LOG_WARNING(Frontend, "iOS: experiment nup_in_memory on");
+    } else {
+        setenv("EDEN_NUP_CACHE_MIB", std::to_string(NupCacheMib).c_str(), 0);
+    }
     Common::PlatformEvents::SetMemoryLowWater(u64{defaults.memory_low_water_mib} << 20);
+    const char* const nup_cache = std::getenv("EDEN_NUP_CACHE_MIB");
     LOG_INFO(Frontend,
              "iOS: tier {}, texture cache {} / {} MiB, buffer cache collects at {} MiB, caches "
-             "collect below {} MiB left",
+             "collect below {} MiB left, decompressed .nup files {} MiB",
              defaults.tier_name, defaults.texture_cache_expected_mib,
              defaults.texture_cache_critical_mib, defaults.buffer_cache_collect_mib,
-             defaults.memory_low_water_mib);
+             defaults.memory_low_water_mib, nup_cache != nullptr ? nup_cache : "512");
+    RemoveLeftoverNupFiles();
 }
 
 void ApplyExperiments() {
