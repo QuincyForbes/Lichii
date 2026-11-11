@@ -433,12 +433,16 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
         if (file_type == Loader::FileType::Unknown || file_type == Loader::FileType::Error) {
             return;
         }
+        if (target == ScanTarget::FillManualContentProvider &&
+            file_type == Loader::FileType::NUP) {
+            return;
+        }
 
         if (target == ScanTarget::PopulateGameList &&
             (file_type == Loader::FileType::XCI || file_type == Loader::FileType::XCZ ||
              file_type == Loader::FileType::NSP || file_type == Loader::FileType::NSZ ||
              file_type == Loader::FileType::NUP || file_type == Loader::FileType::NX) &&
-            !Loader::IsBootableGameContainer(file, file_type)) {
+            !Loader::IsBootableGameContainer(*loader, file)) {
             return;
         }
 
@@ -533,10 +537,13 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
         if (stop_requested) {
             break;
         }
-        // Loose executables cannot contribute NCA content to the manual provider.
-        if (target == ScanTarget::FillManualContentProvider &&
-            IsExtractedNCAMain(Common::FS::PathToUTF8String(path))) {
-            continue;
+        // Loose executables and NUP containers do not contribute NCA content to the manual provider.
+        if (target == ScanTarget::FillManualContentProvider) {
+            const auto name_utf8 = Common::FS::PathToUTF8String(path);
+            if (IsExtractedNCAMain(name_utf8) ||
+                Loader::GuessFromFilename(name_utf8) == Loader::FileType::NUP) {
+                continue;
+            }
         }
         process_candidate(path);
     }

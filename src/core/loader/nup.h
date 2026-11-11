@@ -38,6 +38,10 @@ public:
         return FileType::NUP;
     }
 
+    bool IsBootable() const {
+        return has_program;
+    }
+
     LoadResult Load(Kernel::KProcess& process, Core::System& system) override;
 
     ResultStatus VerifyIntegrity(std::function<bool(size_t, size_t)> progress_callback) override;

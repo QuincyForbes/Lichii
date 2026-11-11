@@ -31,10 +31,16 @@
 EmuWindow_SDL3::EmuWindow_SDL3(InputCommon::InputSubsystem* input_subsystem_, Core::System& system_)
     : input_subsystem{input_subsystem_}, system{system_} {
     input_subsystem->Initialize();
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD)) {
+#ifdef LICHII_IOS_UI
+    constexpr SDL_InitFlags sdl_flags = SDL_INIT_VIDEO;
+#else
+    constexpr SDL_InitFlags sdl_flags = SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD;
+#endif
+    if (!SDL_Init(sdl_flags)) {
         LOG_CRITICAL(Frontend, "Failed to initialize SDL3: {}, Exiting...", SDL_GetError());
         exit(1);
     }
+#ifndef LICHII_IOS_UI
     titlebar_timer = SDL_AddTimer(2000, [](void *userdata, SDL_TimerID, Uint32) -> Uint32 {
         auto* this_ = (EmuWindow_SDL3*)userdata;
         auto const results = this_->system.GetAndResetPerfStats();
@@ -57,11 +63,16 @@ EmuWindow_SDL3::EmuWindow_SDL3(InputCommon::InputSubsystem* input_subsystem_, Co
         }
         return 100;
     }, this);
+#endif
 }
 
 EmuWindow_SDL3::~EmuWindow_SDL3() {
-    SDL_RemoveTimer(titlebar_timer);
-    SDL_RemoveTimer(mouse_timer);
+    if (titlebar_timer != 0) {
+        SDL_RemoveTimer(titlebar_timer);
+    }
+    if (mouse_timer != 0) {
+        SDL_RemoveTimer(mouse_timer);
+    }
     delete pending_title.exchange(nullptr);
     system.HIDCore().UnloadInputDevices();
     input_subsystem->Shutdown();
@@ -99,24 +110,32 @@ EmuWindow_SDL3::FloatPairNonHFA EmuWindow_SDL3::MouseToTouchPos(s32 touch_x, s32
 }
 
 void EmuWindow_SDL3::OnMouseButton(u32 button, u8 state, s32 x, s32 y) {
+    auto* const mouse = input_subsystem->GetMouse();
+    if (mouse == nullptr) {
+        return;
+    }
     const auto mouse_button = SDLButtonToMouseButton(button);
     if (state != 0) {
         auto const [touch_x, touch_y, _] = MouseToTouchPos(x, y);
-        input_subsystem->GetMouse()->PressButton(x, y, mouse_button);
-        input_subsystem->GetMouse()->PressMouseButton(mouse_button);
-        input_subsystem->GetMouse()->PressTouchButton(touch_x, touch_y, mouse_button);
+        mouse->PressButton(x, y, mouse_button);
+        mouse->PressMouseButton(mouse_button);
+        mouse->PressTouchButton(touch_x, touch_y, mouse_button);
     } else {
-        input_subsystem->GetMouse()->ReleaseButton(mouse_button);
+        mouse->ReleaseButton(mouse_button);
     }
-    input_subsystem->GetMouse()->NotifyChanged();
+    mouse->NotifyChanged();
 }
 
 void EmuWindow_SDL3::OnMouseMotion(s32 x, s32 y) {
+    auto* const mouse = input_subsystem->GetMouse();
+    if (mouse == nullptr) {
+        return;
+    }
     auto const [touch_x, touch_y, _] = MouseToTouchPos(x, y);
-    input_subsystem->GetMouse()->Move(x, y, 0, 0);
-    input_subsystem->GetMouse()->MouseMove(touch_x, touch_y);
-    input_subsystem->GetMouse()->TouchMove(touch_x, touch_y);
-    input_subsystem->GetMouse()->NotifyChanged();
+    mouse->Move(x, y, 0, 0);
+    mouse->MouseMove(touch_x, touch_y);
+    mouse->TouchMove(touch_x, touch_y);
+    mouse->NotifyChanged();
 }
 
 void EmuWindow_SDL3::OnFingerDown(float x, float y, std::size_t id) {

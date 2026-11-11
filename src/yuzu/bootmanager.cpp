@@ -531,6 +531,10 @@ void GRenderWindow::mouseMoveEvent(QMouseEvent* event) {
     }
 
     mouse_constrain_timer.stop();
+    if ((Settings::values.mouse_panning || Settings::values.mouse_enabled) &&
+        QtCommon::emu_thread != nullptr && !mouse_update_timer.isActive()) {
+        mouse_update_timer.start();
+    }
     emit MouseActivity();
 }
 
@@ -563,10 +567,17 @@ void GRenderWindow::ConstrainMouse() {
 }
 
 void GRenderWindow::UpdateMouse() {
-    if (QtCommon::emu_thread == nullptr) {
+    if (QtCommon::emu_thread == nullptr ||
+        (!Settings::values.mouse_panning && !Settings::values.mouse_enabled)) {
         mouse_update_timer.stop();
+        if (auto* const mouse = input_subsystem->GetMouse()) {
+            mouse->NotifyChanged();
+        }
+        return;
     }
-    input_subsystem->GetMouse()->NotifyChanged(); // required to reset mouse once it's no longer moved
+    if (auto* const mouse = input_subsystem->GetMouse()) {
+        mouse->NotifyChanged(); // required to reset mouse once it's no longer moved
+    }
 }
 
 void GRenderWindow::wheelEvent(QWheelEvent* event) {
@@ -600,7 +611,11 @@ void GRenderWindow::TouchEndEvent() {
 }
 
 void GRenderWindow::InitializeCamera() {
-    mouse_update_timer.start();
+    if (Settings::values.mouse_panning || Settings::values.mouse_enabled) {
+        mouse_update_timer.start();
+    } else {
+        mouse_update_timer.stop();
+    }
 #if YUZU_USE_QT_MULTIMEDIA
     constexpr auto camera_update_ms = std::chrono::milliseconds{50}; // (50ms, 20Hz)
     if (!Settings::values.enable_ir_sensor) {
@@ -652,6 +667,7 @@ void GRenderWindow::InitializeCamera() {
 }
 
 void GRenderWindow::FinalizeCamera() {
+    mouse_update_timer.stop();
 #if YUZU_USE_QT_MULTIMEDIA
     if (camera_timer) {
         camera_timer->stop();

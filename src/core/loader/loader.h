@@ -65,6 +65,8 @@ FileType IdentifyFile(FileSys::VirtualFile file);
  */
 bool IsContainerType(FileType type);
 
+class AppLoader;
+
 /**
  * Returns whether a container file is bootable as a game (has Application/Program content).
  *
@@ -74,6 +76,13 @@ bool IsContainerType(FileType type);
  * @param program_index optional program index hint for multi-program containers.
  */
 bool IsBootableGameContainer(FileSys::VirtualFile file, FileType type = FileType::Unknown,
+                             u64 program_id = 0, std::size_t program_index = 0);
+
+/**
+ * Overload that reuses an already-constructed AppLoader when possible (such as NUP containers,
+ * avoiding re-reading and hashing the TOC).
+ */
+bool IsBootableGameContainer(const AppLoader& loader, FileSys::VirtualFile file,
                              u64 program_id = 0, std::size_t program_index = 0);
 
 /**

@@ -198,6 +198,15 @@ bool IsBootableGameContainer(FileSys::VirtualFile file, FileType type, u64 progr
     return HasApplicationProgramContent(OpenContainerAsNsp(file, type, program_id, program_index));
 }
 
+bool IsBootableGameContainer(const AppLoader& loader, FileSys::VirtualFile file, u64 program_id,
+                             std::size_t program_index) {
+    const FileType type = loader.GetFileType();
+    if (type == FileType::NUP) {
+        return static_cast<const AppLoader_NUP&>(loader).IsBootable();
+    }
+    return IsBootableGameContainer(std::move(file), type, program_id, program_index);
+}
+
 FileType GuessFromFilename(const std::string& name) {
     if (name == "main")
         return FileType::DeconstructedRomDirectory;
