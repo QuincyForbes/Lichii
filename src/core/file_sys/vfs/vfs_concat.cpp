@@ -2,27 +2,29 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstring>
 #include <utility>
 
 #include "common/assert.h"
 #include "core/file_sys/vfs/vfs_concat.h"
-#include "core/file_sys/vfs/vfs_static.h"
 
 namespace FileSys {
 
-ConcatenatedVfsFile::ConcatenatedVfsFile(std::string&& name_, ConcatenationMap&& concatenation_map_)
-    : concatenation_map(std::move(concatenation_map_)), name(std::move(name_)) {
+ConcatenatedVfsFile::ConcatenatedVfsFile(std::string&& name_,
+                                         ConcatenationMap&& concatenation_map_, u8 filler_byte_)
+    : concatenation_map(std::move(concatenation_map_)), name(std::move(name_)),
+      filler_byte(filler_byte_) {
     DEBUG_ASSERT(this->VerifyContinuity());
 }
 
 bool ConcatenatedVfsFile::VerifyContinuity() const {
     u64 last_offset = 0;
-    for (auto& entry : concatenation_map) {
-        if (entry.offset != last_offset) {
+    for (const auto& entry : concatenation_map) {
+        if (entry.offset < last_offset) {
             return false;
         }
 
-        last_offset = entry.offset + entry.file->GetSize();
+        last_offset = entry.offset + entry.size;
     }
 
     return true;
@@ -46,10 +48,11 @@ VirtualFile ConcatenatedVfsFile::MakeConcatenatedFile(std::string&& name,
     u64 last_offset = 0;
 
     for (auto& file : files) {
-        const auto size = file->GetSize();
+        const u64 size = file->GetSize();
 
         concatenation_map.emplace_back(ConcatenationEntry{
             .offset = last_offset,
+            .size = size,
             .file = std::move(file),
         });
 
@@ -65,36 +68,26 @@ VirtualFile ConcatenatedVfsFile::MakeConcatenatedFile(
     if (files.empty()) {
         return nullptr;
     }
-    if (files.size() == 1) {
+    if (files.size() == 1 && files.begin()->first == 0) {
         return files.begin()->second;
     }
 
-    // Make the concatenation map from the input.
+    // Make the concatenation map from the input without allocating gap StaticVfsFile objects.
     std::vector<ConcatenationEntry> concatenation_map;
-
     concatenation_map.reserve(files.size());
-    u64 last_offset = 0;
 
-    // Iteration of a multimap is ordered, so offset will be strictly non-decreasing.
     for (auto& [offset, file] : files) {
-        const auto size = file->GetSize();
-
-        if (offset > last_offset) {
-            concatenation_map.emplace_back(ConcatenationEntry{
-                .offset = last_offset,
-                .file = std::make_shared<StaticVfsFile>(filler_byte, offset - last_offset),
-            });
-        }
+        const u64 size = file->GetSize();
 
         concatenation_map.emplace_back(ConcatenationEntry{
             .offset = offset,
+            .size = size,
             .file = std::move(file),
         });
-
-        last_offset = offset + size;
     }
 
-    return VirtualFile(new ConcatenatedVfsFile(std::move(name), std::move(concatenation_map)));
+    return VirtualFile(
+        new ConcatenatedVfsFile(std::move(name), std::move(concatenation_map), filler_byte));
 }
 
 std::string ConcatenatedVfsFile::GetName() const {
@@ -111,7 +104,7 @@ std::size_t ConcatenatedVfsFile::GetSize() const {
     if (concatenation_map.empty()) {
         return 0;
     }
-    return concatenation_map.back().offset + concatenation_map.back().file->GetSize();
+    return concatenation_map.back().offset + concatenation_map.back().size;
 }
 
 bool ConcatenatedVfsFile::Resize(std::size_t new_size) {
@@ -134,43 +127,58 @@ bool ConcatenatedVfsFile::IsReadable() const {
 }
 
 std::size_t ConcatenatedVfsFile::Read(u8* data, std::size_t length, std::size_t offset) const {
-    const ConcatenationEntry key{
-        .offset = offset,
-        .file = nullptr,
-    };
-
-    // Read nothing if the map is empty.
-    if (concatenation_map.empty()) {
+    if (length == 0 || concatenation_map.empty()) {
         return 0;
     }
 
-    // Binary search to find the iterator to the first position we can check.
-    // It must exist, since we are not empty and are comparing unsigned integers.
-    auto it = std::prev(std::upper_bound(concatenation_map.begin(), concatenation_map.end(), key));
-    u64 cur_length = length;
+    const u64 total_size = concatenation_map.back().offset + concatenation_map.back().size;
+    if (offset >= total_size) {
+        return 0;
+    }
+
     u64 cur_offset = offset;
+    u64 cur_length = std::min<u64>(length, total_size - offset);
+
+    const ConcatenationEntry key{
+        .offset = cur_offset,
+        .size = 0,
+        .file = nullptr,
+    };
+
+    auto it = std::upper_bound(concatenation_map.begin(), concatenation_map.end(), key);
+    if (it != concatenation_map.begin()) {
+        const auto prev = std::prev(it);
+        if (cur_offset < prev->offset + prev->size) {
+            it = prev;
+        }
+    }
 
     while (cur_length > 0 && it != concatenation_map.end()) {
-        // Check if we can read the file at this position.
-        const auto& file = it->file;
-        const u64 map_offset = it->offset;
-        const u64 file_size = file->GetSize();
+        if (cur_offset < it->offset) {
+            const u64 gap_size = std::min<u64>(cur_length, it->offset - cur_offset);
+            std::memset(data + (cur_offset - offset), filler_byte, gap_size);
+            cur_offset += gap_size;
+            cur_length -= gap_size;
+            if (cur_length == 0) {
+                break;
+            }
+        }
 
-        if (cur_offset > map_offset + file_size) {
-            // Entirely out of bounds read.
-            break;
+        if (it->size == 0) {
+            ++it;
+            continue;
         }
 
         // Read the file at this position.
-        const u64 file_seek = cur_offset - map_offset;
-        const u64 intended_read_size = std::min<u64>(cur_length, file_size - file_seek);
+        const u64 file_seek = cur_offset - it->offset;
+        const u64 intended_read_size = std::min<u64>(cur_length, it->size - file_seek);
         const u64 actual_read_size =
-            file->Read(data + (cur_offset - offset), intended_read_size, file_seek);
+            it->file->Read(data + (cur_offset - offset), intended_read_size, file_seek);
 
         // Update tracking.
         cur_offset += actual_read_size;
         cur_length -= actual_read_size;
-        it++;
+        ++it;
 
         // If we encountered a short read, we're done.
         if (actual_read_size < intended_read_size) {

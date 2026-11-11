@@ -16,6 +16,7 @@ class ConcatenatedVfsFile : public VfsFile {
 private:
     struct ConcatenationEntry {
         u64 offset;
+        u64 size;
         VirtualFile file;
 
         auto operator<=>(const ConcatenationEntry& other) const {
@@ -25,7 +26,8 @@ private:
     using ConcatenationMap = std::vector<ConcatenationEntry>;
 
     explicit ConcatenatedVfsFile(std::string&& name,
-                                 std::vector<ConcatenationEntry>&& concatenation_map);
+                                 std::vector<ConcatenationEntry>&& concatenation_map,
+                                 u8 filler_byte = 0);
     bool VerifyContinuity() const;
 
 public:
@@ -52,6 +54,7 @@ public:
 private:
     ConcatenationMap concatenation_map;
     std::string name;
+    u8 filler_byte = 0;
 };
 
 } // namespace FileSys
