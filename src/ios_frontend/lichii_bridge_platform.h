@@ -187,6 +187,8 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// "chunked_guest": guest memory in purgeable 2 MiB objects, the all-zero ones given back.
 /// "file_guest": guest memory in a mapped file in tmp, outside the footprint; iOS writes it to
 /// storage when it needs the memory. Wins over the other guest memory switches.
+/// "nup_in_memory": the .nup loader keeps up to 512 MiB of decompressed files in memory, as on a
+/// computer, instead of 96 MiB with the larger files in temporary files.
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
 

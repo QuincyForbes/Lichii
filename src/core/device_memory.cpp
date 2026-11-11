@@ -272,14 +272,15 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             continue;
         }
         LOG_INFO(HW_Memory,
-                 "Guest memory {} MiB resident ({}), {} MiB trimmed over {} ms: footprint {} -> {} "
-                 "MiB (internal {}, compressed {}, reusable {}), {} MiB left; clears so far {} MiB "
-                 "memset, {} MiB without faulting",
+                 "Guest memory {} MiB resident ({}, {} MiB of it compressed), {} MiB trimmed over "
+                 "{} ms: footprint {} -> {} MiB (internal {}, compressed {}, reusable {}), {} MiB "
+                 "left; clears so far {} MiB memset, {} MiB without faulting",
                  resident >> 20,
                  buffer.FileBacked()         ? "in a file, outside the footprint"
                  : buffer.PagesCountedOnce() ? "counted once"
                                              : "counted per mapping",
-                 trimmed >> 20, ms, before.footprint >> 20, after.footprint >> 20,
+                 Common::HostMemory::ScannedCompressedBytes() >> 20, trimmed >> 20, ms,
+                 before.footprint >> 20, after.footprint >> 20,
                  after.internal >> 20, after.compressed >> 20, after.reusable >> 20,
                  available >> 20, Common::HostMemory::ZeroFilledBytes() >> 20,
                  Common::HostMemory::ZeroAdvisedBytes() >> 20);

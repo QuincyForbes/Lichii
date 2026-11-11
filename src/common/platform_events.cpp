@@ -154,14 +154,18 @@ std::string FootprintSplit([[maybe_unused]] const ProcessMemory& memory,
     // Ledger-tagged guest memory is in the footprint once per resident or compressed page and
     // in none of the ledgers task_info reports; a file's pages are in neither.
     const u64 resident = HostMemory::ScannedResidentBytes();
+    // What the compressor holds of it: the rest of "compressed" is the emulator's own memory.
+    const u64 compressed = HostMemory::ScannedCompressedBytes();
     u64 guest = resident;
     std::string guest_text;
     switch (HostMemory::ScannedAccounting()) {
     case HostMemory::GuestAccounting::Once:
-        guest_text = fmt::format("{} MiB (counted once)", resident >> 20);
+        guest_text = fmt::format("{} MiB (counted once, {} MiB of it compressed)", resident >> 20,
+                                 compressed >> 20);
         break;
     case HostMemory::GuestAccounting::PerMapping:
-        guest_text = fmt::format("{} MiB or more (counted per mapping)", resident >> 20);
+        guest_text = fmt::format("{} MiB or more (counted per mapping, {} MiB of it compressed)",
+                                 resident >> 20, compressed >> 20);
         break;
     case HostMemory::GuestAccounting::File:
         guest = 0;
@@ -175,11 +179,13 @@ std::string FootprintSplit([[maybe_unused]] const ProcessMemory& memory,
     u64 jit = 0;
     std::string jit_text = "none";
 #if TARGET_OS_IPHONE
-    // The pool's pages were all touched when it was prepared. Code is written through a second
-    // mapping of them, which an untagged object's footprint may count again: that part is in
-    // the rest.
+    // An estimate: the pool is ordinary memory, counted per page and per view that touched it.
+    // Code is written through one view and run through the other, so a page can count twice
+    // (that part is in the rest) or, never touched by this process, not at all (then the rest
+    // is that much larger than shown). The "Memory regions" line has what each view holds.
     jit = IosJit::PreparedBytes();
-    jit_text = fmt::format("{} MiB ({} handed out)", jit >> 20, IosJit::HandedOutBytes() >> 20);
+    jit_text = fmt::format("{} MiB assumed ({} handed out)", jit >> 20,
+                           IosJit::HandedOutBytes() >> 20);
 #endif
     const u64 known = guest + jit + memory.graphics;
     return fmt::format("limit {} MiB | guest {}, JIT pool {}, graphics {} MiB, rest {} MiB",

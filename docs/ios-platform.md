@@ -84,6 +84,9 @@ Left at their defaults on purpose:
   keeps guest memory in a mapped file in tmp, outside the footprint; `chunked_guest` gives
   all-zero 2 MiB pieces of it back. `VM_LEDGER_FLAG_NO_FOOTPRINT` is not one of them: iOS refuses
   it without a private entitlement.
+- The `.nup` loader keeps 96 MiB of decompressed files in memory on iOS (`EDEN_NUP_CACHE_MIB`,
+  512 MiB elsewhere) and decompresses files over 48 MiB to `cache/nup/*.tmp`; files a closed
+  game left there are removed at launch. Experiment `nup_in_memory` keeps the 512 MiB.
 - Every 30 s, at a memory warning and when iOS is about to close the app, the log says what the
   footprint is made of (`Memory regions`, `Memory malloc`, `Storage`: `LogMemoryBreakdown`).
 

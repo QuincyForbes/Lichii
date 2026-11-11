@@ -79,6 +79,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/alignment.h"
@@ -1236,6 +1237,10 @@ private:
             if (mapped == MAP_FAILED) {
                 LOG_CRITICAL(HW_Memory, "mmap({}, {:#x}, offset {:#x}) of the guest file failed: {}",
                              fmt::ptr(address), size, host_offset, strerror(errno));
+            } else if (!std::exchange(file_view_logged, true)) {
+                LOG_INFO(HW_Memory, "Guest file: first view mapped ({:#x} bytes at {}, file offset "
+                                    "{:#x}, protection {})",
+                         size, fmt::ptr(address), host_offset, prot);
             }
             return mapped != MAP_FAILED;
         }
@@ -1607,6 +1612,9 @@ private:
         if (kr != KERN_SUCCESS) {
             LOG_CRITICAL(HW_Memory, "vm_map({}, {:#x}) of a reserved range failed: {}",
                          fmt::ptr(address), size, mach_error_string(kr));
+        } else if (file_backed && file_view_logged && !std::exchange(file_unmap_logged, true)) {
+            LOG_INFO(HW_Memory, "Guest file: first view unmapped ({:#x} bytes at {})", size,
+                     fmt::ptr(address));
         }
         return kr == KERN_SUCCESS;
     }
@@ -1716,6 +1724,19 @@ private:
 #endif
             } else {
                 int ret = mprotect(address, size, page.prot);
+#ifdef LICHII_IOS_MACH_MEMORY
+                if (ret != 0) {
+                    const int error = errno;
+                    LOG_CRITICAL(HW_Memory, "mprotect({}, {:#x}, {}) of a guest view failed: {}{}",
+                                 fmt::ptr(address), size, page.prot, strerror(error),
+                                 file_backed ? " (guest memory in a file)" : "");
+                    errno = error;
+                } else if (file_backed && !std::exchange(file_protect_logged, true)) {
+                    LOG_INFO(HW_Memory, "Guest file: first protection change ({:#x} bytes at {}, "
+                                        "protection {})",
+                             size, fmt::ptr(address), page.prot);
+                }
+#endif
                 ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
             }
         };
@@ -1753,6 +1774,11 @@ private:
     u64 released_total{};
     u32 skip_reports{};
     bool release_broken{};
+    // File mode, under page_states_mutex: the first of each step is logged, so a boot that stops
+    // shows where.
+    bool file_view_logged{};
+    bool file_unmap_logged{};
+    bool file_protect_logged{};
 #endif
     FreeRegionManager free_manager{};
     size_t host_page_size{PageAlignment};
@@ -1897,6 +1923,7 @@ namespace {
 std::atomic<u64> g_zero_filled_bytes{};
 [[maybe_unused]] std::atomic<u64> g_zero_advised_bytes{};
 [[maybe_unused]] std::atomic<u64> g_scanned_resident_bytes{};
+[[maybe_unused]] std::atomic<u64> g_scanned_compressed_bytes{};
 std::atomic<HostMemory::GuestAccounting> g_scanned_accounting{};
 [[maybe_unused]] std::atomic<u64> g_trimmed_zero_bytes{};
 [[maybe_unused]] std::atomic<u64> g_scanned_handed_out_bytes{};
@@ -2075,6 +2102,10 @@ u64 HostMemory::ScannedResidentBytes() noexcept {
     return g_scanned_resident_bytes.load(std::memory_order_relaxed);
 }
 
+u64 HostMemory::ScannedCompressedBytes() noexcept {
+    return g_scanned_compressed_bytes.load(std::memory_order_relaxed);
+}
+
 u64 HostMemory::TrimmedZeroBytes() noexcept {
     return g_trimmed_zero_bytes.load(std::memory_order_relaxed);
 }
@@ -2241,6 +2272,8 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
         return true;
     };
     size_t resident = 0;
+    // In the compressor: counted like a page in RAM, whatever it compressed to.
+    size_t compressed = 0;
     size_t trimmed = 0;
     // A guest write between the check and madvise is the one thing a reclaim could lose: each run
     // is checked again right after, and a page that changed is written to (unchanged) and reused.
@@ -2297,6 +2330,9 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
         bool zero = false;
         if ((residency[index] & counted) != 0) {
             resident += page_size;
+            if ((residency[index] & MINCORE_INCORE) == 0) {
+                compressed += page_size;
+            }
             if (!scan) {
                 continue;
             }
@@ -2356,6 +2392,7 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
     }
     g_scanned_handed_out_bytes.store(handed_out, std::memory_order_relaxed);
     g_scanned_resident_bytes.store(resident, std::memory_order_relaxed);
+    g_scanned_compressed_bytes.store((std::min)(compressed, resident), std::memory_order_relaxed);
     g_scanned_accounting.store(FileBacked()         ? GuestAccounting::File
                                : PagesCountedOnce() ? GuestAccounting::Once
                                                     : GuestAccounting::PerMapping,
@@ -2473,10 +2510,15 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
                                    GranuleReleased) != 0;
             cleared = ZeroWithoutFaulting(offset, clear_end - offset);
             if (!cleared && FileBacked()) {
-                g_zero_filled_bytes.fetch_add(
-                    ZeroNonZeroPages(backing_base + offset, clear_end - offset),
-                    std::memory_order_relaxed);
+                const size_t written = ZeroNonZeroPages(backing_base + offset, clear_end - offset);
+                g_zero_filled_bytes.fetch_add(written, std::memory_order_relaxed);
                 cleared = true;
+                static std::atomic<bool> logged{};
+                if (!logged.exchange(true, std::memory_order_relaxed)) {
+                    LOG_INFO(HW_Memory, "Guest file: first clear ({:#x} bytes at file offset {:#x}, "
+                                        "{:#x} of them held data and were rewritten)",
+                             clear_end - offset, offset, written);
+                }
             }
             if (!cleared && released) {
                 madvise(backing_base + granule_begin,

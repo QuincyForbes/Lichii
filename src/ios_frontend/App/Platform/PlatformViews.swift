@@ -293,6 +293,7 @@ struct ExperimentsView: View {
     @State private var noZeroTrim = lichii_platform_experiment("no_zero_trim") != 0
     @State private var chunkedGuest = lichii_platform_experiment("chunked_guest") != 0
     @State private var fileGuest = lichii_platform_experiment("file_guest") != 0
+    @State private var nupInMemory = lichii_platform_experiment("nup_in_memory") != 0
     @State private var confirmReset = false
     @State private var resetDone = false
 
@@ -322,10 +323,14 @@ struct ExperimentsView: View {
                     .onChange(of: noZeroTrim) { value in
                         lichii_platform_set_experiment("no_zero_trim", value ? 1 : 0)
                     }
+                Toggle("Keep Decompressed Game Files in Memory", isOn: $nupInMemory)
+                    .onChange(of: nupInMemory) { value in
+                        lichii_platform_set_experiment("nup_in_memory", value ? 1 : 0)
+                    }
             } header: {
                 Text("Memory")
             } footer: {
-                Text("Guest memory normally counts once toward the limit iOS closes Lichii at. Per mapping is the old accounting: pages both the game and the emulator touch count twice, and all-zero pages are trimmed. Both apply the next time Lichii starts.")
+                Text("Guest memory normally counts once toward the limit iOS closes Lichii at. Per mapping is the old accounting: pages both the game and the emulator touch count twice, and all-zero pages are trimmed.\n\nCompressed files of a .nup game are normally kept in memory up to 96 MB once read, and files over 48 MB (a movie, a texture archive) are unpacked to temporary files in storage instead. Keep Decompressed Game Files in Memory is the old behaviour: up to 512 MB in memory. Turn it on if a game that used to start no longer does.\n\nAll three apply the next time Lichii starts.")
             }
 
             Section {
