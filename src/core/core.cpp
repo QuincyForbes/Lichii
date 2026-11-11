@@ -367,6 +367,7 @@ struct System::Impl {
         }
         kernel.Initialize();
         kernel_initialized = true;
+        LOG_INFO(Core, "Boot: kernel initialized");
         return true;
     }
 
