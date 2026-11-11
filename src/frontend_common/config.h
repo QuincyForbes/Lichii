@@ -58,15 +58,17 @@ public:
 protected:
     explicit Config(ConfigType config_type = ConfigType::GlobalConfig);
 
-    void Initialize(const std::string& config_name = "config");
-    void Initialize(std::optional<std::string> config_path);
+    // write = false is for a frontend that stores its own values next and then writes the file
+    // itself: the shared values alone were a second write of the same file.
+    void Initialize(const std::string& config_name = "config", bool write = true);
+    void Initialize(std::optional<std::string> config_path, bool write = true);
 
     void WriteToIni() const;
 
     void SetUpIni();
     [[nodiscard]] bool IsCustomConfig() const;
 
-    void Reload();
+    void Reload(bool write = true);
 
     /**
      * Derived config classes must implement this so they can reload all platform-specific
@@ -113,7 +115,7 @@ protected:
     virtual void ReadUILayoutValues() = 0;
     virtual void ReadMultiplayerValues() = 0;
 
-    void SaveValues();
+    void SaveValues(bool write = true);
     void SavePlayerValues(std::size_t player_index);
     void SaveTouchscreenValues();
     void SaveMotionTouchValues();

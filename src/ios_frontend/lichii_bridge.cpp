@@ -81,8 +81,10 @@ char* Dup(std::string_view text) {
 // Per-game ini (config/custom/<program id>.ini). Only the shared sections matter on iOS.
 class GameConfig final : public Config {
 public:
+    // Reading needs no write: a boot only applies the file, and the settings screen saves it once
+    // when it closes.
     explicit GameConfig(u64 program_id) : Config(ConfigType::PerGameConfig) {
-        Initialize(fmt::format("{:016X}", program_id));
+        Initialize(fmt::format("{:016X}", program_id), false);
     }
 
     void ReloadAllValues() override {

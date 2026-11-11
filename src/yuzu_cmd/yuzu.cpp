@@ -1899,9 +1899,8 @@ extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
         break;
 #endif
     case SDL_EVENT_LOW_MEMORY:
-        LOG_WARNING(Frontend, "iOS: low memory warning ({} MiB left to this process)",
-                    os_proc_available_memory() >> 20);
-        Common::PlatformEvents::SignalMemoryPressure();
+        // The same UIKit warning reaches the platform layer's observer (lichii_platform_init),
+        // which logs it and signals the caches once per burst.
         break;
     case SDL_EVENT_TERMINATING:
         LOG_INFO(Frontend, "iOS: terminating");

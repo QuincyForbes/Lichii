@@ -293,12 +293,13 @@ ConfigureInputPlayer::ConfigureInputPlayer(QWidget* parent, std::size_t player_i
                                            QWidget* bottom_row_,
                                            InputCommon::InputSubsystem* input_subsystem_,
                                            InputProfiles* profiles_, Core::HID::HIDCore& hid_core_,
-                                           bool is_powered_on_, bool debug_)
+                                           bool is_powered_on_, bool debug_,
+                                           const std::vector<Common::ParamPackage>* input_devices_)
     : QWidget(parent), ui(std::make_unique<Ui::ConfigureInputPlayer>()),
       player_index{player_index_}, debug{debug_}, is_powered_on{is_powered_on_},
       input_subsystem{input_subsystem_}, profiles(profiles_),
       timeout_timer(std::make_unique<QTimer>()), poll_timer(std::make_unique<QTimer>()),
-      bottom_row{bottom_row_}, hid_core{hid_core_} {
+      initial_input_devices{input_devices_}, bottom_row{bottom_row_}, hid_core{hid_core_} {
     if (player_index == 0) {
         auto* emulated_controller_p1 =
             hid_core.GetEmulatedController(Core::HID::NpadIdType::Player1);
@@ -821,6 +822,7 @@ ConfigureInputPlayer::ConfigureInputPlayer(QWidget* parent, std::size_t player_i
             &ConfigureInputPlayer::SaveProfile);
 
     LoadConfiguration();
+    initial_input_devices = nullptr;
 }
 
 ConfigureInputPlayer::~ConfigureInputPlayer() {
@@ -901,15 +903,16 @@ void ConfigureInputPlayer::ConnectPlayer(bool connected) {
     }
 }
 
-void ConfigureInputPlayer::UpdateInputDeviceCombobox() {
+void ConfigureInputPlayer::UpdateInputDeviceCombobox(
+    const std::vector<Common::ParamPackage>* input_devices_) {
     // Skip input device persistence if "Input Devices" is set to "Any".
     if (ui->comboDevices->currentIndex() == 0) {
-        UpdateInputDevices();
+        UpdateInputDevices(input_devices_);
         return;
     }
 
     const auto devices = emulated_controller->GetMappedDevices();
-    UpdateInputDevices();
+    UpdateInputDevices(input_devices_);
 
     if (devices.empty()) {
         return;
@@ -1168,8 +1171,15 @@ int ConfigureInputPlayer::GetIndexFromControllerType(Core::HID::NpadStyleIndex t
     return it->first;
 }
 
-void ConfigureInputPlayer::UpdateInputDevices() {
-    input_devices = input_subsystem->GetInputDevices();
+void ConfigureInputPlayer::UpdateInputDevices(
+    const std::vector<Common::ParamPackage>* input_devices_) {
+    // Listing the devices enumerates every USB device while no GameCube adapter is open, so
+    // ConfigureInput lists them once for all eight players.
+    if (input_devices_ == nullptr) {
+        input_devices_ = initial_input_devices;
+    }
+    input_devices =
+        input_devices_ != nullptr ? *input_devices_ : input_subsystem->GetInputDevices();
     ui->comboDevices->clear();
     for (const auto& device : input_devices) {
         ui->comboDevices->addItem(QString::fromStdString(device.Get("display", "Unknown")), {});

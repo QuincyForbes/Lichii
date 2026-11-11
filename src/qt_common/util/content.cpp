@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "core/file_sys/card_image.h"
+#include "core/file_sys/nup_container.h"
 #include "qt_common/util/content.h"
 #include "qt_common/util/game.h"
 
@@ -558,6 +559,10 @@ void configureFilesystemProvider(const std::string& filepath) {
     // Ensure all NCAs are registered before launching the game
     const auto file = QtCommon::vfs->OpenFile(filepath, FileSys::OpenMode::Read);
     if (!file) {
+        return;
+    }
+    // A NUP container registers nothing below, and its loader parses the whole index.
+    if (FileSys::NupContainer::IsNupFile(file)) {
         return;
     }
 

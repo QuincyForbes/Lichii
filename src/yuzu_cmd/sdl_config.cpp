@@ -50,7 +50,8 @@ const std::array<int, 2> SdlConfig::default_ringcon_analogs{{
 }};
 
 SdlConfig::SdlConfig(const std::optional<std::string> config_path) {
-    Initialize(config_path);
+    // SaveSdlValues() writes the file, once.
+    Initialize(config_path, false);
     ReadSdlValues();
     SaveSdlValues();
 }
@@ -62,13 +63,13 @@ SdlConfig::~SdlConfig() {
 }
 
 void SdlConfig::ReloadAllValues() {
-    Reload();
+    Reload(false);
     ReadSdlValues();
     SaveSdlValues();
 }
 
 void SdlConfig::SaveAllValues() {
-    SaveValues();
+    SaveValues(false);
     SaveSdlValues();
 }
 

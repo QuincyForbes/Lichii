@@ -18,6 +18,10 @@ namespace Core {
 class System;
 }
 
+namespace Loader {
+class AppLoader;
+}
+
 class QGraphicsScene;
 class QStandardItem;
 class QStandardItemModel;
@@ -49,7 +53,8 @@ public:
     /// Save all button configurations to settings file
     void ApplyConfiguration();
 
-    void LoadFromFile(FileSys::VirtualFile file_);
+    /// `loader`: one the caller made for the same file already (a NUP's parses the whole index).
+    void LoadFromFile(FileSys::VirtualFile file_, Loader::AppLoader* loader = nullptr);
     void SetFile(FileSys::VirtualFile file_);
 
     void SetTitleId(u64 id);
@@ -70,7 +75,7 @@ private:
     void changeEvent(QEvent* event) override;
     void RetranslateUI();
 
-    void LoadConfiguration();
+    void LoadConfiguration(Loader::AppLoader* loader = nullptr);
     void OnItemChanged(QStandardItem* item);
 
     std::unique_ptr<Ui::ConfigurePerGameAddons> ui;

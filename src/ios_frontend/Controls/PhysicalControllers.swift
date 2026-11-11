@@ -64,6 +64,7 @@ final class PhysicalControllers: ObservableObject {
     private let motionManager = CMMotionManager()
     private let motionOperations = OperationQueue()
     private var deviceRumble: RumbleController?
+    private var deviceRumbleRetry: TimeInterval = 0
     private var deviceMotionTime: TimeInterval = 0
     private var started = false
 
@@ -300,7 +301,13 @@ final class PhysicalControllers: ObservableObject {
         }
         if deviceRumbleEnabled, !playerOneHasController {
             if deviceRumble == nil {
-                deviceRumble = RumbleController(deviceMultiplier: 2.0)
+                // Without a Taptic Engine (iPad), or when the engine does not start, this ran on
+                // every tick of the game.
+                let now = ProcessInfo.processInfo.systemUptime
+                if now >= deviceRumbleRetry {
+                    deviceRumble = RumbleController(deviceMultiplier: 2.0)
+                    deviceRumbleRetry = deviceRumble == nil ? now + 5 : 0
+                }
             }
             if lichii_controls_rumble(0, &value) {
                 deviceRumble?.update(value)
