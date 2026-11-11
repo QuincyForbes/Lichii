@@ -197,7 +197,9 @@ struct LibraryView: View {
             }
         }
         .onAppear {
-            if library.games.isEmpty { library.reload() }
+            // The scan started at launch is still running when the library first appears; asking
+            // again queued a second full scan behind it.
+            if library.games.isEmpty && !library.isScanning { library.reload() }
         }
     }
 
