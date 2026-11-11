@@ -624,7 +624,7 @@ private:
     void OnGPUASRegister(size_t map_id) final override;
 
     /// Runs the Garbage Collector.
-    void RunGarbageCollector(bool out_of_memory);
+    void RunGarbageCollector(bool out_of_memory, bool host_pressure = false);
 
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);

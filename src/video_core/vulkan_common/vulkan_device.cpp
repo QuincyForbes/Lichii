@@ -24,6 +24,10 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
+#include "common/platform_events.h"
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -945,7 +949,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             // after ten minutes, with 32 MiB ones ~0.5 GB: a block drains only once all of its
             // images are gone, and fewer per block drain sooner. VMA gives allocations over half a
             // block (8 MiB) their own memory, which goes back to the driver when they are freed.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+            // On iOS every VMA block is a resident MTLHeap billed to the 6.6 GiB Jetsam limit:
+            // 4 MiB blocks drain 4x faster and give > 2 MiB images/buffers dedicated Metal
+            // allocations that return RAM to iOS immediately upon free with zero block holes.
+            .preferredLargeHeapBlockSize = 4u * 1024u * 1024u,
+#else
             .preferredLargeHeapBlockSize = 16u * 1024u * 1024u,
+#endif
             .pAllocationCallbacks = nullptr,
             .pDeviceMemoryCallbacks = &churn_callbacks,
             .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,
@@ -2157,6 +2168,16 @@ u64 Device::GetDeviceMemoryBudget() const {
         // gives it (4 GiB, 6 GiB with aggressive VRAM use).
         result = (std::min)(result, device_access_memory);
     }
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // MoltenVK reports Metal's 8 GiB recommendedMaxWorkingSetSize, exceeding the ~6.6 GiB iOS
+    // Jetsam process limit; bound the reported budget by actual remaining Jetsam headroom.
+    if (const u64 avail = Common::PlatformEvents::AvailableProcessMemory(); avail != 0) {
+        const u64 used = AllocatedUsage(budget.heapUsage[main_heap], heap_budgets[main_heap]);
+        constexpr u64 Reserve = 512_MiB;
+        const u64 room = avail > Reserve ? avail - Reserve : 0;
+        result = (std::min)(result, used + room);
+    }
+#endif
     return result;
 }
 

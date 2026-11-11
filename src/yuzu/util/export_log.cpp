@@ -193,7 +193,11 @@ QString SystemSummary(const std::vector<VkDeviceInfo::Record>& vk_device_records
                         : QString{};
     text += Line(QStringLiteral("CPU"), cpu);
 #endif
+#ifdef ARCHITECTURE_x86_64
     const auto cores = Common::GetProcessorCount();
+#else
+    const std::optional<int> cores{};
+#endif
     text += Line(QStringLiteral("CPU cores / threads"),
                  QStringLiteral("%1 / %2")
                      .arg(cores ? QString::number(*cores) : QStringLiteral("?"))

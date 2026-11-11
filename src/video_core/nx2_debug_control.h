@@ -181,6 +181,13 @@ inline void LoadExperiments() {
         // EXP62 = 1: coalesce consecutive in-order stream buffer uploads into one command with
         // one pair of barriers (zortos293/Lichii#1245; Fritchii 25892ea154).
         g_experiments[62].store(1, std::memory_order_relaxed);
+        // EXP56 = 1: skip uploading cleared depth targets larger than colour targets.
+        // EXP57 = 1: at most one synchronous GPU download wait per frame in the texture collector
+        // unless an image allocation actually failed (prevents 40x runtime.Finish() stalls/frame).
+        // EXP58 = 2: sweep 60-frame-old superseded render targets without GPU readbacks.
+        g_experiments[56].store(1, std::memory_order_relaxed);
+        g_experiments[57].store(1, std::memory_order_relaxed);
+        g_experiments[58].store(2, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {

@@ -284,7 +284,11 @@ public:
         MediumImages,
         Count,
     };
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    static constexpr VkDeviceSize SeparatePoolBlockSize = 8ULL << 20;
+#else
     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+#endif
     static constexpr VkDeviceSize MediumImagePoolBlockSize = 128ULL << 20;
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).

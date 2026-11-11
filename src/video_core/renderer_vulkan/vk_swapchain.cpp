@@ -172,6 +172,7 @@ void Swapchain::Create(
 }
 
 bool Swapchain::AcquireNextImage(bool may_flush) {
+    acquire_failed = false;
     const VkResult result = device.GetLogical().AcquireNextImageKHR(
         *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
         VK_NULL_HANDLE, &image_index);
@@ -189,7 +190,8 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
         break;
     default:
         LOG_ERROR(Render_Vulkan, "vkAcquireNextImageKHR returned {}", string_VkResult(result));
-        break;
+        acquire_failed = true;
+        return false;
     }
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
         // No image was acquired, so image_index is stale: the caller recreates and tries again.

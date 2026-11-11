@@ -18,6 +18,9 @@
 #include "common/common_types.h"
 #include "common/literals.h"
 #include "common/logging.h"
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 #include <ranges>
 #include "video_core/vulkan_common/unbacked_fallback.h"
 #include "video_core/vulkan_common/vma.h"
@@ -401,6 +404,16 @@ bool MemoryAllocator::CreateImageInMediumPool(const VkImageCreateInfo& ci,
                                               const VmaAllocationCreateInfo& alloc_ci,
                                               VkImage& handle, VmaAllocation& allocation,
                                               VmaAllocationInfo& alloc_info) const {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // Avoid pinning 128 MiB MTLHeap blocks inside iOS's 6.6 GiB Jetsam footprint: > 2 MiB images
+    // get dedicated Metal allocations from VMA and return memory immediately when freed.
+    (void)ci;
+    (void)alloc_ci;
+    (void)handle;
+    (void)allocation;
+    (void)alloc_info;
+    return false;
+#else
     if (ci.pNext != nullptr || ci.tiling != VK_IMAGE_TILING_OPTIMAL ||
         ci.imageType != VK_IMAGE_TYPE_2D) {
         return false;
@@ -480,6 +493,7 @@ bool MemoryAllocator::CreateImageInMediumPool(const VkImageCreateInfo& ci,
     pool_ci.memoryTypeBits = 0;
     return vmaCreateImage(allocator, &ci, &pool_ci, &handle, &allocation, &alloc_info) ==
            VK_SUCCESS;
+#endif
 }
 
 bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, MemoryUsage usage,
@@ -487,8 +501,11 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
                                                  VkBuffer& handle, VmaAllocation& allocation,
                                                  VmaAllocationInfo& alloc_info) const {
     // The buffer cache's buffers, churned by its collector: in a pool of their own (see
-    // Device::SeparatePool). Anything over half a block takes the default blocks (dedicated).
-    if (usage != MemoryUsage::DeviceLocal || ci.size > Device::SeparatePoolBlockSize / 2) {
+    // Device::SeparatePool). On MoltenVK BufferCache uses MemoryUsage::Stream (type 1 DL+HV+HC),
+    // which otherwise fragmented default blocks (+745 MiB of empty holes on iPhone).
+    const bool buffer_cache_usage =
+        usage == MemoryUsage::DeviceLocal || (device.IsMoltenVK() && usage == MemoryUsage::Stream);
+    if (!buffer_cache_usage || ci.size > Device::SeparatePoolBlockSize / 2) {
         return false;
     }
     u32 memory_type{};

@@ -10,6 +10,7 @@
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
 #include "common/nx2_timeline.h"
+#include "common/platform_events.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #ifdef _WIN32
@@ -745,6 +746,12 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
 
     while (swapchain.AcquireNextImage(!use_present_thread)) {
         RecreateSwapchain(frame);
+    }
+    if (swapchain.AcquireFailed()) {
+        Common::PlatformEvents::NoteMemoryPressure();
+        scheduler.Flush();
+        DiscardFrame(frame);
+        return;
     }
 
     const vk::CommandBuffer cmdbuf{frame->cmdbuf};

@@ -142,21 +142,22 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 }
 
 template <class P>
-void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure) {
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
     u64 ticks_to_destroy = 0;
     size_t num_iterations = 0;
+    const bool urgent = out_of_memory || host_pressure;
     // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
     static const u64 min_age = [] {
         const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
         return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
     }();
     const auto Configure = [&](bool allow_aggressive) {
-        high_priority_mode = out_of_memory || total_used_memory >= expected_memory;
+        high_priority_mode = urgent || total_used_memory >= expected_memory;
         aggressive_mode =
-            allow_aggressive && (out_of_memory || total_used_memory >= critical_memory);
+            allow_aggressive && (urgent || total_used_memory >= critical_memory);
         ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
@@ -291,7 +292,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     // ~45 a frame (a shadow map sized by the camera moves every target behind it), far more than
     // the age-based pass below frees.
     if (const u64 bad_overlap_age = (std::max)(u64{4}, min_age); frame_tick > bad_overlap_age) {
-        const bool low_vram = out_of_memory || total_used_memory > minimum_memory;
+        const bool low_vram = urgent || total_used_memory > minimum_memory;
         size_t visits = 512;
         lru_cache.ForEachItemBelow(frame_tick - bad_overlap_age, [&](ImageId image_id) {
             auto& image = slot_images[image_id];
@@ -322,7 +323,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             return false;
         });
     }
-    if (!out_of_memory && total_used_memory <= minimum_memory) {
+    if (!urgent && total_used_memory <= minimum_memory) {
         return;
     }
     Configure(false);
@@ -336,7 +337,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         evict_old_costly = false;
     }
     Collect();
-    if (out_of_memory || total_used_memory >= critical_memory) {
+    if (urgent || total_used_memory >= critical_memory) {
         Configure(true);
         Collect();
     }
@@ -822,7 +823,7 @@ void TextureCache<P>::TickFrame() {
         minimum_memory = (std::min)(minimum_memory, host_memory_cap / 3);
     }
 #endif
-    RunGarbageCollector(out_of_memory || host_pressure);
+    RunGarbageCollector(out_of_memory, host_pressure);
     if (out_of_memory) {
         // Textures left out for lack of memory are made again on their next read, once a frame
         // while images keep failing.

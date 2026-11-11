@@ -62,6 +62,11 @@ public:
         return static_cast<bool>(swapchain);
     }
 
+    /// Returns true when the last AcquireNextImage failed without acquiring a drawable.
+    bool AcquireFailed() const {
+        return acquire_failed;
+    }
+
     /// Returns true when the swapchain is outdated.
     bool IsOutDated() const {
         return is_outdated;
@@ -163,6 +168,7 @@ private:
 
     bool is_outdated{};
     bool is_suboptimal{};
+    bool acquire_failed{};
 };
 
 } // namespace Vulkan
