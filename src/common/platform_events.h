@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <string>
 
 #include "common/common_types.h"
 
@@ -32,10 +33,16 @@ struct ProcessMemory {
     u64 reusable;       ///< Marked reusable (MADV_FREE_REUSABLE), outside the footprint
     u64 internal;       ///< Anonymous memory mapped by the process, per mapping (pmap ledger)
     u64 purgeable_nonvolatile;
+    u64 external;       ///< Resident pages of mapped files, outside the footprint
+    u64 graphics;       ///< Graphics ledger (Metal, IOSurface), part of the footprint
 };
 /// Apple: the process footprint and parts of it. Windows: the working set and its peak. Zeros
 /// elsewhere.
 ProcessMemory QueryProcessMemory();
+/// Apple: the footprint's limit (`left` from AvailableProcessMemory) and an estimate of its
+/// split into guest memory (as of the last zero trimming pass), the JIT pool, graphics and the
+/// rest, for the log.
+std::string FootprintSplit(const ProcessMemory& memory, u64 left);
 /// Apple: hands the memory malloc holds free back to the OS. Returns the bytes released.
 u64 RelieveMallocPressure();
 

@@ -88,6 +88,15 @@ public:
     /// One flag per 4 KiB page of the backing: resident through the backing or a view (Windows
     /// working set), or resident or compressed (mincore elsewhere). Empty where unknown.
     std::vector<bool> ResidentPages() const;
+    /// Starts measuring which guest pages get used. The host forgets which ones are in use:
+    /// Windows takes every page of the process out of the working set (each soft-faults back at
+    /// its next use), Apple clears the backing's reference bits. Contents stay. Until EndTouched,
+    /// zero trimming and HintCold do nothing. False where there is no way to measure.
+    bool ResetTouched() const;
+    void EndTouched() const;
+    /// One flag per 4 KiB page of the backing: read or written, through the backing or a view,
+    /// since ResetTouched. Empty when nothing is being measured.
+    std::vector<bool> TouchedPages() const;
     [[nodiscard]] size_t BackingSize() const noexcept {
         return backing_size;
     }
@@ -97,10 +106,24 @@ public:
     /// Apple: bytes ClearBackingRegion has zeroed with MADV_ZERO (no pages faulted in) since start.
     static u64 ZeroAdvisedBytes() noexcept;
     /// iOS: the guest memory object is ledger-tagged, so the footprint counts each of its pages
-    /// once however many views map it, and zero trimming can't make them reusable.
+    /// once however many views map it, and zero trimming can't make them reusable. Also true for
+    /// guest memory in a file, which the footprint doesn't count at all.
     [[nodiscard]] bool PagesCountedOnce() const noexcept;
-    /// Apple, as of the last TrimZeroPages: guest memory resident or compressed, guest memory the
-    /// kernel has handed out, and zero bytes trimmed so far.
+    /// iOS experiment: guest memory is a mapped file, outside the footprint.
+    [[nodiscard]] bool FileBacked() const noexcept;
+    /// iOS: TrimZeroPages only counts what is resident (ledger-tagged or in a file, and not in
+    /// chunks): a pass reads no guest memory and changes nothing.
+    [[nodiscard]] bool TrimOnlyCounts() const noexcept;
+    /// How the footprint counts a resident page of guest memory.
+    enum class GuestAccounting : u8 {
+        Uncounted,  ///< No TrimZeroPages yet
+        PerMapping, ///< Once per view that touched it
+        Once,       ///< Ledger-tagged
+        File,       ///< Not at all
+    };
+    /// Apple, as of the last TrimZeroPages: guest memory resident or compressed and how it is
+    /// counted, guest memory the kernel has handed out, and zero bytes trimmed so far.
+    static GuestAccounting ScannedAccounting() noexcept;
     static u64 ScannedResidentBytes() noexcept;
     static u64 ScannedHandedOutBytes() noexcept;
     static u64 TrimmedZeroBytes() noexcept;

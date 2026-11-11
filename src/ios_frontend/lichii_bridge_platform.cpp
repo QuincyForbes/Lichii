@@ -167,6 +167,14 @@ void ApplyExperiments() {
         setenv("LICHII_IOS_UNTAGGED_GUEST", "1", 0);
         LOG_WARNING(Frontend, "iOS: experiment untagged_guest on");
     }
+    if (lichii_platform_experiment("chunked_guest")) {
+        setenv("LICHII_IOS_CHUNKED_GUEST", "1", 0);
+        LOG_WARNING(Frontend, "iOS: experiment chunked_guest on");
+    }
+    if (lichii_platform_experiment("file_guest")) {
+        setenv("LICHII_IOS_FILE_GUEST", "1", 0);
+        LOG_WARNING(Frontend, "iOS: experiment file_guest on");
+    }
     if (lichii_platform_experiment("no_zero_trim")) {
         setenv("EDEN_NX2_TRIM_ZERO", "0", 0);
         LOG_WARNING(Frontend, "iOS: experiment no_zero_trim on");

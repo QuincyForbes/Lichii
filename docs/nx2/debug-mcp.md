@@ -178,6 +178,16 @@ allocations with the most resident memory. It also asks the renderer for its `Me
 `Memory detail:` lines (Vulkan memory types, image bytes by kind). It is logged at Info and
 returned as `report`.
 
+**`memory_touched`** `{reset?, end?}`. `Core::ProfileTouched` reports how much guest memory was
+used since the last `reset`, per memory state and GPU mapping (`classes`: `name`,
+`backing_bytes`, `touched_bytes`), without reading guest memory. `reset` starts a measurement
+with `HostMemory::ResetTouched`: Windows empties the process's working set (`K32EmptyWorkingSet`;
+contents stay, every page soft-faults back at its next use, so expect a hitch of about a second),
+and the pages back in the working set are the ones used. Apple clears the backing's reference
+bits (`madvise(MADV_DONTNEED)`) and reads them with `mincore`. A page counts when it was read or
+written through the backing or a view, by the game or by the emulator on its behalf. While a
+measurement runs, zero trimming and `HintCold` do nothing. `end` stops it.
+
 **`capture_frame`** `{sampled?, buffers?, timeout_s?, manifest_lines?, index?}`. It reuses
 `FrameDump`. `FrameDump::Arm` (`vk_frame_dump.cpp:268`) points the next capture at a fresh directory and resets
 the per-capture counters, so `EDEN_NX2_FRAME_DUMP` is not needed. When to capture is decided by

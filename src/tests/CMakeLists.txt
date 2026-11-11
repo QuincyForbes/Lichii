@@ -125,6 +125,7 @@ add_executable(tests
     common/frizti_settings.cpp
     common/fs_iterate.cpp
     common/game_presets.cpp
+    common/guest_chunks.cpp
     common/host_memory.cpp
     common/multi_level_page_table.cpp
     common/page_table.cpp

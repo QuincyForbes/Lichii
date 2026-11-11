@@ -42,6 +42,9 @@
 #include <mach/vm_statistics.h>
 #if TARGET_OS_IPHONE
 #include <dlfcn.h>
+#include <mach/vm_purgable.h>
+#include <sys/mount.h>
+#include <sys/param.h>
 // iOS forbids POSIX shared memory for third-party apps; the guest is backed by an anonymous Mach
 // memory object and every fastmem view is a vm_map of it.
 #define LICHII_IOS_MACH_MEMORY 1
@@ -68,17 +71,22 @@
 #endif // ^^^ POSIX ^^^
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <random>
+#include <string>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "common/free_region_manager.h"
+#include "common/guest_chunks.h"
 #include "common/host_memory.h"
 #include <fmt/format.h>
 #include "common/logging.h"
@@ -635,13 +643,23 @@ public:
             ledger_tagged = untagged_env == nullptr || untagged_env[0] != '1';
             const char* const no_footprint_env = std::getenv("LICHII_IOS_NO_FOOTPRINT");
             const bool no_footprint = no_footprint_env != nullptr && no_footprint_env[0] == '1';
-            constexpr int MapMemLedgerTagged = 0x002000;
+            const char* const file_env = std::getenv("LICHII_IOS_FILE_GUEST");
+            const bool file = file_env != nullptr && file_env[0] == '1' && InitFile();
+            if (file) {
+                ledger_tagged = false;
+            }
+            const char* const chunked_env = std::getenv("LICHII_IOS_CHUNKED_GUEST");
+            const bool chunked = !file && ledger_tagged && !no_footprint &&
+                                 chunked_env != nullptr && chunked_env[0] == '1' && InitChunks();
             memory_object_size_t entry_size = backing_size;
-            kern_return_t kr = mach_make_memory_entry_64(
-                mach_task_self(), &entry_size, 0,
-                MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE |
-                    (ledger_tagged ? MapMemLedgerTagged : 0),
-                &backing_entry, MACH_PORT_NULL);
+            kern_return_t kr = KERN_SUCCESS;
+            if (!chunked && !file) {
+                kr = mach_make_memory_entry_64(
+                    mach_task_self(), &entry_size, 0,
+                    MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE |
+                        (ledger_tagged ? MapMemLedgerTagged : 0),
+                    &backing_entry, MACH_PORT_NULL);
+            }
             if (kr != KERN_SUCCESS && ledger_tagged) {
                 LOG_WARNING(HW_Memory, "Ledger-tagged guest memory refused ({}): untagged",
                             mach_error_string(kr));
@@ -658,9 +676,13 @@ public:
                 return false;
             }
             LOG_INFO(HW_Memory, "Guest memory: {} MiB, {}", backing_size >> 20,
-                     ledger_tagged ? "ledger-tagged (each page counted once)"
-                                   : "untagged (counted per mapping; zero trimming on)");
-            if (no_footprint) {
+                     file ? "in a file (experiment: outside the footprint; iOS writes it to "
+                            "storage when it needs the memory)"
+                     : chunked ? "ledger-tagged in purgeable 2 MiB chunks (each page counted once; "
+                                 "chunks of zeros are given back)"
+                     : ledger_tagged ? "ledger-tagged (each page counted once)"
+                                     : "untagged (counted per mapping; zero trimming on)");
+            if (no_footprint && !file) {
                 // LICHII_IOS_NO_FOOTPRINT=1 (experiment): mach_memory_entry_ownership refuses
                 // VM_LEDGER_FLAG_NO_FOOTPRINT with KERN_NO_ACCESS for any tag or owner unless the
                 // app holds com.apple.private.memory.ownership_transfer (iOS 26.2: "no access").
@@ -678,16 +700,18 @@ public:
                 LOG_WARNING(HW_Memory, "Guest memory without footprint (experiment): {}",
                             owned == KERN_SUCCESS ? "on" : mach_error_string(owned));
             }
-            vm_address_t backing_address = 0;
-            kr = vm_map(mach_task_self(), &backing_address, backing_size, 0, VM_FLAGS_ANYWHERE,
-                        backing_entry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
-                        VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
-            if (kr != KERN_SUCCESS) {
-                LOG_CRITICAL(HW_Memory, "vm_map of the {:#x} byte backing object failed: {}",
-                             backing_size, mach_error_string(kr));
-                return false;
+            if (!chunked && !file) {
+                vm_address_t backing_address = 0;
+                kr = vm_map(mach_task_self(), &backing_address, backing_size, 0, VM_FLAGS_ANYWHERE,
+                            backing_entry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                            VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+                if (kr != KERN_SUCCESS) {
+                    LOG_CRITICAL(HW_Memory, "vm_map of the {:#x} byte backing object failed: {}",
+                                 backing_size, mach_error_string(kr));
+                    return false;
+                }
+                backing_base = reinterpret_cast<u8*>(backing_address);
             }
-            backing_base = reinterpret_cast<u8*>(backing_address);
             // Even with extended-virtual-addressing iOS hands out far less than the 512 GiB a 39-bit
             // guest spans, so take the largest power of two it grants: guest addresses above it
             // take dynarmic's page table path.
@@ -948,7 +972,86 @@ public:
                       VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE) == KERN_SUCCESS;
     }
 
+    bool Chunked() const noexcept {
+        return !chunk_entries.empty();
+    }
+
+    /// Chunked guest memory: gives back the chunks that held memory but no data on consecutive
+    /// passes. residency is mincore's answer for the whole backing and counted the bits of a page
+    /// that is charged. Returns the bytes given back.
+    ///
+    /// Nothing may write to a chunk between the check that it is all zeros and the purge, so both
+    /// happen with every other thread of the process suspended (thread_suspend returns once the
+    /// thread is off its core and it runs no user instruction until thread_resume). Whatever a
+    /// stopped thread wrote before is seen by the check; whatever it reads or writes after finds
+    /// zeros either way, as fresh zero-filled pages. The mappings and their protections are not
+    /// touched. A thread stopped inside a system call still finishes it in the kernel: a batch is
+    /// skipped while one sits in a read into guest memory, and the purge leaves wired and busy
+    /// pages (I/O in flight) alone.
+    size_t ReleaseZeroChunks(const std::vector<char>& residency, size_t page_size, int counted,
+                             const std::function<bool()>& pause) {
+        if (!Chunked() || release_broken) {
+            return 0;
+        }
+        const size_t chunk_pages = ChunkSize / page_size;
+        due.clear();
+        for (size_t chunk = 0; chunk < chunk_entries.size(); ++chunk) {
+            const char* const pages = residency.data() + chunk * chunk_pages;
+            const u8* const base = backing_base + chunk * ChunkSize;
+            bool has_memory = false;
+            bool has_data = false;
+            for (size_t page = 0; page < chunk_pages && !has_data; ++page) {
+                if ((pages[page] & counted) != 0) {
+                    has_memory = true;
+                    has_data = !IsZeroRange(base + page * page_size, page_size);
+                }
+            }
+            if (candidates.Observe(chunk, has_memory, has_data)) {
+                due.push_back(static_cast<u32>(chunk));
+            }
+        }
+        size_t released = 0;
+        size_t chunks = 0;
+        u32 stops = 0;
+        u32 skipped = 0;
+        s64 longest_us = 0;
+        for (size_t first = 0; first < due.size(); first += BatchChunks) {
+            const size_t batch = (std::min)(BatchChunks, due.size() - first);
+            const auto start = std::chrono::steady_clock::now();
+            const BatchResult result = PurgeBatch(due.data() + first, batch, page_size, counted);
+            longest_us = (std::max<s64>)(
+                longest_us, std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+            ++stops;
+            released += result.bytes;
+            chunks += result.chunks;
+            if (!result.stopped) {
+                // Not this pass: the same threads are likely where they were.
+                ++skipped;
+                break;
+            }
+            if (pause && !pause()) {
+                break;
+            }
+        }
+        released_total += released;
+        if (release_broken) {
+            LOG_ERROR(HW_Memory, "Guest chunks: a purge failed; zero chunks stay from now on");
+        }
+        if (released != 0 || (skipped != 0 && skip_reports++ < 8)) {
+            LOG_INFO(HW_Memory,
+                     "Guest chunks: {} MiB of zero pages given back in {} of {} due chunks, {} "
+                     "stops (longest {} us){}; {} MiB so far",
+                     released >> 20, chunks, due.size(), stops, longest_us,
+                     skipped != 0 ? ", stopped early: threads not stopped or a read in flight" : "",
+                     released_total >> 20);
+        }
+        return released;
+    }
+
     bool ledger_tagged{}; ///< The guest memory object is billed per page, not per mapping
+    bool file_backed{};   ///< The guest memory is a mapped file (InitFile)
 #endif
 
     const size_t backing_size; ///< Size of the backing memory in bytes
@@ -984,12 +1087,18 @@ private:
             mach_port_deallocate(mach_task_self(), backing_entry);
             backing_entry = MACH_PORT_NULL;
         }
+        for (const mach_port_t entry : chunk_entries) {
+            if (entry != MACH_PORT_NULL) {
+                mach_port_deallocate(mach_task_self(), entry);
+            }
+        }
+        chunk_entries.clear();
 #endif
     }
 
     bool HasBackingObject() const {
 #ifdef LICHII_IOS_MACH_MEMORY
-        return backing_entry != MACH_PORT_NULL;
+        return backing_entry != MACH_PORT_NULL || Chunked() || file_backed;
 #else
         return false;
 #endif
@@ -1008,16 +1117,369 @@ private:
     }
 
     bool MapBackingView(void* address, size_t size, size_t host_offset, int prot) {
+        if (file_backed) {
+            // MAP_FIXED replaces the reservation in one step (mmap: VM_FLAGS_OVERWRITE).
+            void* const mapped = mmap(address, size, prot & (PROT_READ | PROT_WRITE),
+                                      MAP_SHARED | MAP_FIXED, fd, static_cast<off_t>(host_offset));
+            if (mapped == MAP_FAILED) {
+                LOG_CRITICAL(HW_Memory, "mmap({}, {:#x}, offset {:#x}) of the guest file failed: {}",
+                             fmt::ptr(address), size, host_offset, strerror(errno));
+            }
+            return mapped != MAP_FAILED;
+        }
+        if (Chunked()) {
+            // One mapping per chunk the range touches; offsets into the backing stay linear.
+            return ForEachChunkPiece(
+                host_offset, size, ChunkSize,
+                [&](size_t chunk, size_t offset, size_t piece, size_t done) {
+                    return MapEntry(chunk_entries[chunk], static_cast<u8*>(address) + done, piece,
+                                    offset, prot);
+                });
+        }
+        return MapEntry(backing_entry, address, size, host_offset, prot);
+    }
+
+    static bool MapEntry(mach_port_t entry, void* address, size_t size, size_t offset, int prot) {
         vm_address_t target = reinterpret_cast<vm_address_t>(address);
         const kern_return_t kr = vm_map(mach_task_self(), &target, size, 0,
-                                        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, backing_entry,
-                                        host_offset, FALSE, ToVmProt(prot),
-                                        VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+                                        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, entry, offset, FALSE,
+                                        ToVmProt(prot), VM_PROT_READ | VM_PROT_WRITE,
+                                        VM_INHERIT_NONE);
         if (kr != KERN_SUCCESS) {
             LOG_CRITICAL(HW_Memory, "vm_map({}, {:#x}, offset {:#x}) failed: {}", fmt::ptr(address), size,
-                         host_offset, mach_error_string(kr));
+                         offset, mach_error_string(kr));
         }
         return kr == KERN_SUCCESS;
+    }
+
+    /// LICHII_IOS_FILE_GUEST=1 (experiment): the backing as a file in the app's tmp directory,
+    /// mapped shared. XNU bills a page of a file to the task's external ledger, which is not part
+    /// of the footprint (pmap_enter: only PMAP_OPTIONS_INTERNAL mappings reach phys_footprint, and
+    /// vm_fault sets that for internal objects only), counts it as available memory for the
+    /// system-wide jetsam and can write it out and drop it, which it never does to anonymous
+    /// memory on a phone. The price: a dirty page has to reach storage before its RAM is free, and
+    /// a page that left is read back on its next use.
+    ///
+    /// The file is unlinked while open, so it is gone when the process ends however it ends, and
+    /// its blocks are reserved up front: a write-out can't run out of space later. False (and a
+    /// log line) when storage is short; the caller then uses the usual memory object.
+    bool InitFile() {
+        const char* const directory = std::getenv("TMPDIR");
+        if (directory == nullptr || directory[0] == '\0') {
+            LOG_WARNING(HW_Memory, "Guest memory in a file refused: no TMPDIR");
+            return false;
+        }
+        std::string path{directory};
+        if (path.back() != '/') {
+            path += '/';
+        }
+        path += "lichii-guest-memory";
+        // Left by a run that died between open and unlink.
+        unlink(path.c_str());
+        struct statfs volume {};
+        if (statfs(directory, &volume) != 0) {
+            LOG_WARNING(HW_Memory, "Guest memory in a file refused: statfs: {}", strerror(errno));
+            return false;
+        }
+        constexpr u64 Margin = u64{2} << 30;
+        const u64 free_bytes = static_cast<u64>(volume.f_bavail) * volume.f_bsize;
+        if (free_bytes < backing_size + Margin) {
+            LOG_WARNING(HW_Memory,
+                        "Guest memory in a file refused: {} MiB of storage free, {} MiB needed",
+                        free_bytes >> 20, (backing_size + Margin) >> 20);
+            return false;
+        }
+        const int file =
+            open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (file < 0) {
+            LOG_WARNING(HW_Memory, "Guest memory in a file refused: open: {}", strerror(errno));
+            return false;
+        }
+        unlink(path.c_str());
+#ifdef F_SETPROTECTIONCLASS
+        // Class D (NSFileProtectionNone): readable and writable while the phone is locked.
+        constexpr int ProtectionClassD = 4;
+        const bool unprotected = fcntl(file, F_SETPROTECTIONCLASS, ProtectionClassD) == 0;
+#else
+        const bool unprotected = false;
+#endif
+        fstore_t store{};
+        store.fst_flags = F_ALLOCATEALL;
+        store.fst_posmode = F_PEOFPOSMODE;
+        store.fst_length = static_cast<off_t>(backing_size);
+        const bool reserved = fcntl(file, F_PREALLOCATE, &store) == 0;
+        const int reserve_error = errno;
+        if (ftruncate(file, static_cast<off_t>(backing_size)) != 0) {
+            LOG_WARNING(HW_Memory, "Guest memory in a file refused: ftruncate: {}", strerror(errno));
+            close(file);
+            return false;
+        }
+        void* const base =
+            mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+        if (base == MAP_FAILED) {
+            LOG_WARNING(HW_Memory, "Guest memory in a file refused: mmap: {}", strerror(errno));
+            close(file);
+            return false;
+        }
+        LOG_WARNING(HW_Memory,
+                    "Guest memory file: {} MiB in {} ({} MiB of storage were free), storage {}, "
+                    "data protection {}",
+                    backing_size >> 20, directory, free_bytes >> 20,
+                    reserved ? "reserved" : fmt::format("not reserved ({})", strerror(reserve_error)),
+                    unprotected ? "off" : "left at the default");
+        backing_base = static_cast<u8*>(base);
+        fd = file;
+        file_backed = true;
+        return true;
+    }
+
+    /// LICHII_IOS_CHUNKED_GUEST=1 (experiment): the backing as one ledger-tagged, purgeable memory
+    /// object per 2 MiB, mapped back to back. Emptying a purgeable object frees its pages and
+    /// takes them off the footprint at once while every mapping of it stays, and the next access
+    /// zero-fills (vm_object_purgable_control: vm_purgeable_accounting, vm_object_purge): the way
+    /// a chunk of zeros leaves the footprint, which tagged memory otherwise never does. The
+    /// objects stay non-volatile, so the kernel never empties one by itself. 2 MiB frees the most
+    /// (zero pages sit between data) and 6144 objects, ports and map entries are cheap in XNU.
+    bool InitChunks() {
+        if (backing_size % ChunkSize != 0) {
+            return false;
+        }
+        const size_t count = backing_size / ChunkSize;
+        vm_address_t address = 0;
+        kern_return_t kr = vm_map(mach_task_self(), &address, backing_size, 0, VM_FLAGS_ANYWHERE,
+                                  MACH_PORT_NULL, 0, FALSE, VM_PROT_NONE,
+                                  VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+        if (kr != KERN_SUCCESS) {
+            LOG_WARNING(HW_Memory, "Chunked guest memory: no address range ({}): one object",
+                        mach_error_string(kr));
+            return false;
+        }
+        chunk_entries.assign(count, MACH_PORT_NULL);
+        const char* step = "mach_make_memory_entry_64";
+        for (size_t chunk = 0; chunk < count; ++chunk) {
+            memory_object_size_t entry_size = ChunkSize;
+            kr = mach_make_memory_entry_64(mach_task_self(), &entry_size, 0,
+                                           MAP_MEM_NAMED_CREATE | MapMemPurgable |
+                                               MapMemLedgerTagged | VM_PROT_READ | VM_PROT_WRITE,
+                                           &chunk_entries[chunk], MACH_PORT_NULL);
+            if (kr == KERN_SUCCESS && entry_size < ChunkSize) {
+                kr = KERN_NO_SPACE;
+            }
+            if (kr != KERN_SUCCESS) {
+                break;
+            }
+            vm_address_t target = address + chunk * ChunkSize;
+            kr = vm_map(mach_task_self(), &target, ChunkSize, 0,
+                        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, chunk_entries[chunk], 0, FALSE,
+                        VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
+                        VM_INHERIT_NONE);
+            if (kr != KERN_SUCCESS) {
+                step = "vm_map";
+                break;
+            }
+        }
+        backing_base = reinterpret_cast<u8*>(address);
+        stopped.assign(MaxStopped, MACH_PORT_NULL);
+        if (kr == KERN_SUCCESS) {
+            // Everything a release needs, once, while nothing is at stake: a refusal here means
+            // one object instead, and no call binds or allocates for the first time later, with
+            // the other threads stopped.
+            step = "stopping the threads";
+            kr = KERN_FAILURE;
+            if (StopWorld()) {
+                static_cast<void>(KernelMayWriteGuest());
+                std::array<char, ChunkSize / PageAlignment> pages;
+                const bool queried = mincore(reinterpret_cast<char*>(backing_base), ChunkSize,
+                                             pages.data()) == 0;
+                step = "vm_purgable_control";
+                kr = Purge(0);
+                ResumeWorld();
+                if (kr == KERN_SUCCESS && !queried) {
+                    step = "mincore";
+                    kr = KERN_FAILURE;
+                }
+            }
+        }
+        if (kr != KERN_SUCCESS) {
+            LOG_WARNING(HW_Memory, "Chunked guest memory: {} failed ({}): one object", step,
+                        mach_error_string(kr));
+            for (const mach_port_t entry : chunk_entries) {
+                if (entry != MACH_PORT_NULL) {
+                    mach_port_deallocate(mach_task_self(), entry);
+                }
+            }
+            chunk_entries.clear();
+            vm_deallocate(mach_task_self(), address, backing_size);
+            backing_base = reinterpret_cast<u8*>(MAP_FAILED);
+            return false;
+        }
+        candidates = ChunkCandidates{count};
+        due.reserve(count);
+        return true;
+    }
+
+    static bool IsZeroRange(const u8* data, size_t size) {
+        const auto* words = reinterpret_cast<const u64*>(data);
+        for (size_t i = 0; i < size / sizeof(u64); i += 8) {
+            const u64 bits = words[i] | words[i + 1] | words[i + 2] | words[i + 3] | words[i + 4] |
+                             words[i + 5] | words[i + 6] | words[i + 7];
+            if (bits != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Empties a chunk and makes it non-volatile again.
+    kern_return_t Purge(size_t chunk) {
+        const vm_address_t address = reinterpret_cast<vm_address_t>(backing_base + chunk * ChunkSize);
+        int purgeable = VM_PURGABLE_EMPTY;
+        kern_return_t kr = vm_purgable_control(mach_task_self(), address, VM_PURGABLE_SET_STATE,
+                                               &purgeable);
+        if (kr != KERN_SUCCESS) {
+            return kr;
+        }
+        purgeable = VM_PURGABLE_NONVOLATILE;
+        kr = vm_purgable_control(mach_task_self(), address, VM_PURGABLE_SET_STATE, &purgeable);
+        if (kr != KERN_SUCCESS) {
+            purgeable = VM_PURGABLE_NONVOLATILE;
+            kr = vm_purgable_control(mach_task_self(), address, VM_PURGABLE_SET_STATE, &purgeable);
+        }
+        return kr;
+    }
+
+    // Between StopWorld and ResumeWorld another thread may hold any user-space lock (malloc, the
+    // log, the loader): only system calls, no allocation and no logging in there.
+
+    /// Suspends every other thread of the process, listing them again until a round finds no new
+    /// one. False (and nothing left suspended) when that fails.
+    bool StopWorld() {
+        const thread_act_t self = mach_thread_self();
+        num_stopped = 0;
+        bool complete = false;
+        bool failed = false;
+        for (int round = 0; round < 8 && !complete && !failed; ++round) {
+            thread_act_array_t list = nullptr;
+            mach_msg_type_number_t listed = 0;
+            if (task_threads(mach_task_self(), &list, &listed) != KERN_SUCCESS) {
+                failed = true;
+                break;
+            }
+            size_t added = 0;
+            for (mach_msg_type_number_t i = 0; i < listed; ++i) {
+                const thread_act_t thread = list[i];
+                const thread_act_t* const begin = stopped.data();
+                const thread_act_t* const end = begin + num_stopped;
+                bool kept = false;
+                if (thread != self && std::find(begin, end, thread) == end) {
+                    if (num_stopped == stopped.size()) {
+                        failed = true;
+                    } else if (thread_suspend(thread) == KERN_SUCCESS) {
+                        // Anything else is a thread that ended: it runs no more user code.
+                        stopped[num_stopped++] = thread;
+                        ++added;
+                        kept = true;
+                    }
+                }
+                if (!kept) {
+                    mach_port_deallocate(mach_task_self(), thread);
+                }
+            }
+            vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(list),
+                          listed * sizeof(thread_act_t));
+            complete = added == 0;
+        }
+        mach_port_deallocate(mach_task_self(), self);
+        if (failed || !complete) {
+            ResumeWorld();
+            return false;
+        }
+        return true;
+    }
+
+    void ResumeWorld() {
+        for (size_t i = 0; i < num_stopped; ++i) {
+            thread_resume(stopped[i]);
+            mach_port_deallocate(mach_task_self(), stopped[i]);
+        }
+        num_stopped = 0;
+    }
+
+    /// Whether a stopped thread sits in a system call that reads into guest memory: the kernel
+    /// would still copy into its buffer. The saved registers of a thread inside a system call
+    /// are the call's: x16 the number, x1 the buffer of the read family.
+    bool KernelMayWriteGuest() const {
+#if defined(__arm64__) || defined(__aarch64__)
+        constexpr std::array<u64, 6> ReadCalls{3, 29, 153, 396, 403, 414};
+        const auto backing = reinterpret_cast<u64>(backing_base);
+        const auto arena = reinterpret_cast<u64>(virtual_map_base);
+        for (size_t i = 0; i < num_stopped; ++i) {
+            arm_thread_state64_t registers;
+            mach_msg_type_number_t words = ARM_THREAD_STATE64_COUNT;
+            if (thread_get_state(stopped[i], ARM_THREAD_STATE64,
+                                 reinterpret_cast<thread_state_t>(&registers),
+                                 &words) != KERN_SUCCESS) {
+                continue;
+            }
+            const u64 number = registers.__x[16];
+            if (std::find(ReadCalls.begin(), ReadCalls.end(), number) == ReadCalls.end()) {
+                continue;
+            }
+            const u64 buffer = registers.__x[1];
+            if (buffer - backing < backing_size || buffer - arena < virtual_size) {
+                return true;
+            }
+        }
+#endif
+        return false;
+    }
+
+    struct BatchResult {
+        size_t bytes;
+        size_t chunks;
+        bool stopped;
+    };
+
+    /// Gives back the chunks of the list that hold only zeros, with the other threads stopped.
+    BatchResult PurgeBatch(const u32* list, size_t count, size_t page_size, int counted) {
+        BatchResult result{};
+        if (!StopWorld()) {
+            return result;
+        }
+        if (KernelMayWriteGuest()) {
+            ResumeWorld();
+            return result;
+        }
+        result.stopped = true;
+        const size_t chunk_pages = ChunkSize / page_size;
+        for (size_t i = 0; i < count; ++i) {
+            const u8* const base = backing_base + list[i] * ChunkSize;
+            std::array<char, ChunkSize / PageAlignment> pages;
+            if (mincore(reinterpret_cast<char*>(const_cast<u8*>(base)), ChunkSize,
+                        pages.data()) != 0) {
+                continue;
+            }
+            size_t held = 0;
+            bool zero = true;
+            for (size_t page = 0; page < chunk_pages && zero; ++page) {
+                if ((pages[page] & counted) != 0) {
+                    held += page_size;
+                    zero = IsZeroRange(base + page * page_size, page_size);
+                }
+            }
+            if (!zero || held == 0) {
+                continue;
+            }
+            if (Purge(list[i]) != KERN_SUCCESS) {
+                release_broken = true;
+                break;
+            }
+            candidates.Released(list[i]);
+            result.bytes += held;
+            ++result.chunks;
+        }
+        ResumeWorld();
+        return result;
     }
 
     bool ReserveRange(void* address, size_t size) {
@@ -1163,7 +1625,22 @@ private:
 
     int fd{-1}; // memfd file descriptor, -1 is the error value of memfd_create
 #ifdef LICHII_IOS_MACH_MEMORY
+    static constexpr int MapMemLedgerTagged = 0x002000;
+    static constexpr int MapMemPurgable = 0x040000;
+    static constexpr size_t ChunkSize = HugePageSize;
+    /// Chunks checked per stop of the other threads: 16 MiB to read at most, about a millisecond.
+    static constexpr size_t BatchChunks = 8;
+    static constexpr size_t MaxStopped = 2048;
+
     mach_port_t backing_entry{MACH_PORT_NULL};
+    std::vector<mach_port_t> chunk_entries; ///< Chunked: one memory object per ChunkSize
+    ChunkCandidates candidates;
+    std::vector<u32> due;
+    std::vector<thread_act_t> stopped;
+    size_t num_stopped{};
+    u64 released_total{};
+    u32 skip_reports{};
+    bool release_broken{};
 #endif
     FreeRegionManager free_manager{};
     size_t host_page_size{PageAlignment};
@@ -1268,9 +1745,15 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 #endif
 }
 
+namespace {
+/// ResetTouched is measuring: nothing of ours may take pages out of the working set or read them.
+std::atomic<bool> g_touch_window{};
+} // namespace
+
 void HostMemory::HintCold(size_t physical_offset, size_t length,
                           std::optional<size_t> virtual_offset) const {
-    if (length == 0 || backing_base == nullptr) {
+    if (length == 0 || backing_base == nullptr ||
+        g_touch_window.load(std::memory_order_relaxed)) {
         return;
     }
     const auto hint = [length](u8* address) {
@@ -1295,6 +1778,7 @@ namespace {
 std::atomic<u64> g_zero_filled_bytes{};
 [[maybe_unused]] std::atomic<u64> g_zero_advised_bytes{};
 [[maybe_unused]] std::atomic<u64> g_scanned_resident_bytes{};
+std::atomic<HostMemory::GuestAccounting> g_scanned_accounting{};
 [[maybe_unused]] std::atomic<u64> g_trimmed_zero_bytes{};
 [[maybe_unused]] std::atomic<u64> g_scanned_handed_out_bytes{};
 
@@ -1385,8 +1869,61 @@ std::vector<bool> HostMemory::ResidentPages() const {
     return resident;
 }
 
+bool HostMemory::ResetTouched() const {
+    if (backing_base == nullptr) {
+        return false;
+    }
+#ifdef _WIN32
+    g_touch_window.store(true, std::memory_order_relaxed);
+    // Not VirtualUnlock per range: this is the documented call, and it keeps the contents too.
+    return K32EmptyWorkingSet(GetCurrentProcess()) != 0;
+#elif defined(__APPLE__) && defined(MINCORE_REFERENCED)
+    g_touch_window.store(true, std::memory_order_relaxed);
+    // Deactivates the pages and clears their reference bits (per physical page, so a use
+    // through any view sets it again); nothing is discarded.
+    return madvise(backing_base, backing_size, MADV_DONTNEED) == 0;
+#else
+    return false;
+#endif
+}
+
+void HostMemory::EndTouched() const {
+    g_touch_window.store(false, std::memory_order_relaxed);
+}
+
+std::vector<bool> HostMemory::TouchedPages() const {
+    if (backing_base == nullptr || !g_touch_window.load(std::memory_order_relaxed)) {
+        return {};
+    }
+#if defined(__APPLE__) && defined(MINCORE_REFERENCED)
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t num_pages = backing_size / page_size;
+    std::vector<char> residency(num_pages);
+    if (mincore(backing_base, num_pages * page_size, residency.data()) != 0) {
+        return {};
+    }
+    std::vector<bool> touched(backing_size / PageAlignment);
+    const size_t per_page = page_size / PageAlignment;
+    for (size_t index = 0; index < num_pages; ++index) {
+        if ((residency[index] & MINCORE_REFERENCED) != 0) {
+            for (size_t i = 0; i < per_page; ++i) {
+                touched[index * per_page + i] = true;
+            }
+        }
+    }
+    return touched;
+#else
+    // Windows: the pages that came back into the working set.
+    return ResidentPages();
+#endif
+}
+
 u64 HostMemory::ZeroFilledBytes() noexcept {
     return g_zero_filled_bytes.load(std::memory_order_relaxed);
+}
+
+HostMemory::GuestAccounting HostMemory::ScannedAccounting() noexcept {
+    return g_scanned_accounting.load(std::memory_order_relaxed);
 }
 
 u64 HostMemory::ScannedResidentBytes() noexcept {
@@ -1404,6 +1941,9 @@ u64 HostMemory::ScannedHandedOutBytes() noexcept {
 std::pair<size_t, size_t> HostMemory::TrimZeroPages(
     [[maybe_unused]] ZeroTrimState* state,
     [[maybe_unused]] const std::function<bool()>& pause) const {
+    if (g_touch_window.load(std::memory_order_relaxed)) {
+        return {0, 0};
+    }
 #ifdef _WIN32
     if (backing_base == nullptr) {
         return {0, 0};
@@ -1658,6 +2198,10 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
     }
 #ifdef LICHII_IOS_MACH_MEMORY
     drop_mappings((std::min)(index, num_pages));
+    if (!scan && impl && impl->Chunked()) {
+        trimmed = impl->ReleaseZeroChunks(residency, page_size, counted, pause);
+        resident -= (std::min)(resident, trimmed);
+    }
 #endif
     u64 handed_out = 0;
     for (size_t granule = 0; granule < num_granules; ++granule) {
@@ -1667,6 +2211,10 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
     }
     g_scanned_handed_out_bytes.store(handed_out, std::memory_order_relaxed);
     g_scanned_resident_bytes.store(resident, std::memory_order_relaxed);
+    g_scanned_accounting.store(FileBacked()         ? GuestAccounting::File
+                               : PagesCountedOnce() ? GuestAccounting::Once
+                                                    : GuestAccounting::PerMapping,
+                               std::memory_order_relaxed);
     g_trimmed_zero_bytes.fetch_add(trimmed, std::memory_order_relaxed);
     return {resident, trimmed};
 #else
@@ -1676,7 +2224,23 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
 
 bool HostMemory::PagesCountedOnce() const noexcept {
 #ifdef LICHII_IOS_MACH_MEMORY
-    return impl && impl->ledger_tagged;
+    return impl && (impl->ledger_tagged || impl->file_backed);
+#else
+    return false;
+#endif
+}
+
+bool HostMemory::FileBacked() const noexcept {
+#ifdef LICHII_IOS_MACH_MEMORY
+    return impl && impl->file_backed;
+#else
+    return false;
+#endif
+}
+
+bool HostMemory::TrimOnlyCounts() const noexcept {
+#ifdef LICHII_IOS_MACH_MEMORY
+    return impl && (impl->ledger_tagged || impl->file_backed) && !impl->Chunked();
 #else
     return false;
 #endif
@@ -1697,7 +2261,8 @@ bool HostMemory::ZeroWithoutFaulting(size_t offset, size_t length) {
     static std::atomic<bool> unsupported{};
     static std::atomic<bool> logged{};
     static const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    if (unsupported.load(std::memory_order_relaxed)) {
+    // A file's pages can't be zeroed this way (vm_object_zero_preflight: anonymous memory only).
+    if (unsupported.load(std::memory_order_relaxed) || FileBacked()) {
         return false;
     }
     const size_t begin = Common::AlignUp(offset, page_size);

@@ -259,6 +259,26 @@ json AllocTrace(ToolState&, const json&) {
 }
 #endif
 
+json MemoryTouched(ToolState& state, const json& params) {
+    const Core::TouchedMemory touched = Core::ProfileTouched(
+        state.system, params.value("reset", false), params.value("end", false));
+    json classes = json::array();
+    for (const auto& entry : touched.classes) {
+        classes.push_back({{"name", entry.name},
+                           {"backing_bytes", entry.backing},
+                           {"touched_bytes", entry.touched},
+                           {"touched_16k_bytes", entry.touched_16k}});
+    }
+    return {
+        {"report", touched.text},
+        {"measuring", touched.measuring},
+        {"known", touched.known},
+        {"seconds", touched.seconds},
+        {"outside_bytes", touched.outside},
+        {"classes", std::move(classes)},
+    };
+}
+
 json Screenshot(ToolState& state, const json& params) {
     auto& renderer = state.system.GPU().Renderer();
     if (renderer.IsScreenshotPending()) {
@@ -975,6 +995,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
 #ifdef LICHII_ALLOC_TRACE
         {"alloc_trace", handler(AllocTrace)},
 #endif
+        {"memory_touched", handler(MemoryTouched)},
         {"log_filter", handler(LogFilter)},
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
