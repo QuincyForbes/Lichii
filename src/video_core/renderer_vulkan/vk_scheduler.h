@@ -30,6 +30,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_wait_site.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
+#include "video_core/renderer_vulkan/pushed_constants.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -176,6 +177,26 @@ public:
 
     /// Returns true when the descriptor buffer chunk has to be bound into the command buffer.
     bool UpdateDescriptorBufferChunk(u32 descriptor_chunk);
+
+    /// Draws of pipelines with the plain graphics layout (one push constant range, the same for
+    /// all of them): returns true when the draw has to push its rescaling words, false when the
+    /// last such draw of this render pass pushed the same ones. See PushedConstants for lands.
+    template <typename T>
+    [[nodiscard]] bool UpdateRescalingWords(const T& words, bool lands) noexcept {
+        return state.pushed_rescaling_words.Update(words, lands);
+    }
+
+    /// The same for the render area.
+    template <typename T>
+    [[nodiscard]] bool UpdateRenderArea(const T& words, bool lands) noexcept {
+        return state.pushed_render_area.Update(words, lands);
+    }
+
+    /// A draw pushed with another layout (mesh pipelines): the next plain draw pushes again.
+    void ForgetGraphicsPushConstants() noexcept {
+        state.pushed_rescaling_words.Forget();
+        state.pushed_render_area.Forget();
+    }
 
     /// Invalidates current command buffer state except for render passes
     void InvalidateState();
@@ -439,6 +460,10 @@ private:
         bool needs_state_enable_refresh = false;
         u32 descriptor_buffer_chunk = 0;
         bool descriptor_buffer_bound = false;
+        /// Known only inside one render pass: commands recorded between passes (compute
+        /// dispatches, compute passes) push at the same offsets without InvalidateState.
+        PushedConstants<24> pushed_rescaling_words;
+        PushedConstants<16> pushed_render_area;
     };
 
     struct DeferredClear {

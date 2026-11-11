@@ -27,6 +27,8 @@ void RemoveMemoryPressureListener(std::size_t id);
 u64 AvailableProcessMemory();
 /// Signal pressure whenever AvailableProcessMemory falls below `bytes` (0, the default: never).
 void SetMemoryLowWater(u64 bytes);
+/// The mark SetMemoryLowWater set (0: none).
+u64 MemoryLowWater();
 /// Checks the low-water mark at most every 250 ms. Called once per frame by the caches.
 void PollMemoryPressure();
 

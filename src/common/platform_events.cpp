@@ -134,6 +134,10 @@ void SetMemoryLowWater(u64 bytes) {
     g_low_water.store(bytes, std::memory_order_relaxed);
 }
 
+u64 MemoryLowWater() {
+    return g_low_water.load(std::memory_order_relaxed);
+}
+
 void PollMemoryPressure() {
     const u64 low_water = g_low_water.load(std::memory_order_relaxed);
     if (low_water == 0) {
