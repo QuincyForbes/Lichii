@@ -10,6 +10,10 @@
 #include <mutex>
 #include <string>
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include "audio_core/sink/silent_input_stream.h"
 #include "audio_core/sink/sink.h"
 #include "audio_core/sink/sink_stream.h"
@@ -226,12 +230,21 @@ Result SysmixOutput::Open(u32 sample_type, u32 channels, u32 rate, u32 frames, u
                  memory.Read32Acquire(p.buffer + WriteOffset, write) && read < slots &&
                  write < slots,
              ResultInvalidAddressInfo);
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    if (p.input_stream) {
+        p.UseSilentInput(channels);
+    } else {
+        p.host = p.sink.AcquireSinkStream(p.system, channels, "sysmix-" + std::to_string(p.id),
+                                          AudioCore::Sink::StreamType::Sysmix);
+    }
+#else
     p.host = p.sink.AcquireSinkStream(p.system, channels, "sysmix-" + std::to_string(p.id),
                                       p.input_stream ? AudioCore::Sink::StreamType::In
                                                      : AudioCore::Sink::StreamType::Sysmix);
     if (p.input_stream && (!p.host || !p.host->IsReady())) {
         p.UseSilentInput(channels);
     }
+#endif
     if (!p.host || !p.host->IsReady()) {
         p.ReleaseHost();
         R_RETURN(ResultOperationFailed);
@@ -318,7 +331,7 @@ Result SysmixOutput::Purge(u32 frames, u32& purged) {
         R_UNLESS(p.ReadOccupancy(read, write, filled), p.Fault());
         purged = count;
         if (frames == 0) {
-            p.host->DrainInputSamples(0x10000);
+            p.host->DiscardInputSamples();
         }
         p.Notify(filled);
         R_SUCCEED();
@@ -373,8 +386,7 @@ void SysmixOutput::Pump() {
             p.Notify(filled);
             return;
         }
-        const auto captured = p.host->DrainInputSamples(available);
-        const auto taken = static_cast<u32>(captured.size() / p.channels);
+        const auto taken = static_cast<u32>(p.host->DrainInputSamples(p.output, available));
         if (!taken) {
             p.Notify(filled);
             return;
@@ -385,7 +397,7 @@ void SysmixOutput::Pump() {
             for (u32 channel = 0; channel < p.channels; ++channel) {
                 const auto index = frame * p.channels + channel;
                 const auto value =
-                    std::clamp(static_cast<f32>(captured[index]) * p.gain, -32768.0f, 32767.0f);
+                    std::clamp(static_cast<f32>(p.output[index]) * p.gain, -32768.0f, 32767.0f);
                 audible |= value != 0;
                 if (p.format == AudioCore::SampleFormat::PcmInt16) {
                     const auto sample = static_cast<s16>(value);

@@ -214,8 +214,15 @@ public:
      */
     virtual std::vector<s16> ReleaseBuffer(u64 num_samples);
 
+    /// Read only captured frames into `out_samples`, without padding missing host input with
+    /// silence. Returns the number of guest frames written.
+    virtual std::size_t DrainInputSamples(std::span<s16> out_samples, u64 max_frames);
+
     /// Read only captured frames, without padding missing host input with silence.
     std::vector<s16> DrainInputSamples(u64 max_frames);
+
+    /// Discard buffered capture samples without allocating.
+    virtual void DiscardInputSamples();
 
     /**
      * Empty out the buffer queue.
@@ -256,7 +263,7 @@ public:
      *
      * @return The number of samples.
      */
-    u64 GetExpectedPlayedSampleCount();
+    virtual u64 GetExpectedPlayedSampleCount();
 
     /**
      * Waits for free space in the sample ring buffer
@@ -291,7 +298,7 @@ private:
     std::atomic<float> input_preview_gain{1.0f};
     std::atomic<u32> input_peak{};
     /// Audio buffers queued and waiting to play
-    Common::SPSCQueue<SinkBuffer, 0x10000> queue;
+    Common::SPSCQueue<SinkBuffer, 0x200> queue;
     /// The currently-playing audio buffer
     SinkBuffer playing_buffer{};
     /// The last played (or received) frame of audio, used when the callback underruns

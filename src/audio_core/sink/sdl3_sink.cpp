@@ -4,8 +4,13 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <span>
 #include <vector>
+
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
 #include <SDL3/SDL.h>
 
@@ -98,8 +103,12 @@ public:
         std::string device_name{output_device};
         bool capture{false};
         if (type == StreamType::In) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+            return;
+#else
             device_name = input_device;
             capture = true;
+#endif
         }
 
         const SDL_AudioDeviceID audio_device =
@@ -107,10 +116,13 @@ public:
                                            : SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK)
                                 : FindAudioDeviceByName(device_name, capture);
 
+        callback_buffer.resize(4096);
         stream = SDL_OpenAudioDeviceStream(audio_device, &spec, &SDLSinkStream::DataCallback,
                                            this);
 
         if (stream == nullptr) {
+            callback_buffer.clear();
+            callback_buffer.shrink_to_fit();
             LOG_CRITICAL(Audio_Sink, "Error opening SDL audio device: {}", SDL_GetError());
             return;
         }
@@ -211,15 +223,24 @@ private:
                 return;
             }
 
-            std::vector<s16> input(bytes_available / static_cast<int>(sizeof(s16)));
-            const int bytes_read = SDL_GetAudioStreamData(stream, input.data(), bytes_available);
+            const std::size_t samples_available =
+                static_cast<std::size_t>(bytes_available) / sizeof(s16);
+            if (samples_available == 0) {
+                return;
+            }
+            if (samples_available > impl->callback_buffer.size()) {
+                impl->callback_buffer.resize(samples_available);
+            }
+            const int bytes_read = SDL_GetAudioStreamData(
+                stream, impl->callback_buffer.data(),
+                static_cast<int>(samples_available * sizeof(s16)));
             if (bytes_read <= 0) {
                 return;
             }
 
             const std::size_t num_frames =
                 static_cast<std::size_t>(bytes_read) / sizeof(s16) / frame_size;
-            std::span<const s16> input_buffer{input.data(),
+            std::span<const s16> input_buffer{impl->callback_buffer.data(),
                                               static_cast<std::size_t>(bytes_read) / sizeof(s16)};
             impl->ProcessAudioIn(input_buffer, num_frames);
         } else {
@@ -228,17 +249,27 @@ private:
             }
 
             const int bytes_requested = additional_amount > 0 ? additional_amount : total_amount;
-            std::vector<s16> output(bytes_requested / static_cast<int>(sizeof(s16)));
-            const std::size_t num_frames =
-                static_cast<std::size_t>(bytes_requested) / sizeof(s16) / frame_size;
-            std::span<s16> output_buffer{output.data(), output.size()};
+            const std::size_t num_samples =
+                static_cast<std::size_t>(bytes_requested) / sizeof(s16);
+            if (num_samples == 0) {
+                return;
+            }
+            if (num_samples > impl->callback_buffer.size()) {
+                impl->callback_buffer.resize(num_samples);
+            }
+            std::fill_n(impl->callback_buffer.data(), num_samples, s16{0});
+            const std::size_t num_frames = num_samples / frame_size;
+            std::span<s16> output_buffer{impl->callback_buffer.data(), num_samples};
             impl->ProcessAudioOutAndRender(output_buffer, num_frames);
-            static_cast<void>(SDL_PutAudioStreamData(stream, output.data(), bytes_requested));
+            static_cast<void>(
+                SDL_PutAudioStreamData(stream, impl->callback_buffer.data(), bytes_requested));
         }
     }
 
     /// SDL stream attached to an opened input/output device
     SDL_AudioStream* stream{};
+    /// Pre-allocated scratch buffer for real-time audio callbacks (avoids per-callback heap allocs)
+    std::vector<s16> callback_buffer;
 };
 
 /// Configure the selected device name for both playback and capture streams.

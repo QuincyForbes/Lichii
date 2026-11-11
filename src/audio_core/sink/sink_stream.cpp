@@ -64,12 +64,27 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
 
         pushed = samples_buffer.Push(samples.subspan(0, device_samples));
     } else if (system_channels < device_channels) {
-        std::vector<s16> new_samples(samples.size() / system_channels * device_channels);
-        for (u32 r_offs = 0, w_offs = 0; r_offs < samples.size(); r_offs += system_channels, w_offs += device_channels)
-            for (u32 channel = 0; channel < system_channels; ++channel)
-                new_samples[w_offs + channel] = s16(std::clamp(s32(f32(samples[r_offs + channel]) * volume), min, max));
-
-        pushed = samples_buffer.Push(new_samples);
+        if (device_samples <= 2048) {
+            std::array<s16, 2048> stack_samples{};
+            for (u32 r_offs = 0, w_offs = 0; r_offs < samples.size();
+                 r_offs += system_channels, w_offs += device_channels) {
+                for (u32 channel = 0; channel < system_channels; ++channel) {
+                    stack_samples[w_offs + channel] =
+                        s16(std::clamp(s32(f32(samples[r_offs + channel]) * volume), min, max));
+                }
+            }
+            pushed = samples_buffer.Push(std::span<const s16>{stack_samples.data(), device_samples});
+        } else {
+            std::vector<s16> new_samples(device_samples);
+            for (u32 r_offs = 0, w_offs = 0; r_offs < samples.size();
+                 r_offs += system_channels, w_offs += device_channels) {
+                for (u32 channel = 0; channel < system_channels; ++channel) {
+                    new_samples[w_offs + channel] =
+                        s16(std::clamp(s32(f32(samples[r_offs + channel]) * volume), min, max));
+                }
+            }
+            pushed = samples_buffer.Push(new_samples);
+        }
     } else {
         if (volume != 1.0f) {
             for (u32 i = 0; i < samples.size(); ++i)
@@ -104,25 +119,73 @@ bool SinkStream::TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples
 
 /// Return a guest-sized capture buffer with gain, channel conversion, and underrun padding.
 std::vector<s16> SinkStream::ReleaseBuffer(u64 num_samples) {
-    const auto frames = num_samples / system_channels;
-    const auto captured = samples_buffer.Pop(frames * device_channels);
-    const auto volume{system_volume * device_volume};
-    return ConvertInputSamples(captured, num_samples, device_channels, system_channels, volume);
+    std::vector<s16> samples(static_cast<std::size_t>(num_samples), 0);
+    if (system_channels != 0 && device_channels != 0) {
+        DrainInputSamples(samples, num_samples / system_channels);
+    }
+    return samples;
+}
+
+std::size_t SinkStream::DrainInputSamples(std::span<s16> out_samples, u64 max_frames) {
+    if (system_channels == 0 || device_channels == 0 || max_frames == 0 || out_samples.empty()) {
+        return 0;
+    }
+    const std::size_t target_frames =
+        std::min<u64>(max_frames, out_samples.size() / system_channels);
+    const auto volume = system_volume * device_volume;
+    std::array<s16, 1024> raw_chunk{};
+    const std::size_t max_chunk_frames = raw_chunk.size() / device_channels;
+    if (max_chunk_frames == 0) {
+        return 0;
+    }
+
+    std::size_t written_frames = 0;
+    while (written_frames < target_frames) {
+        const std::size_t want_frames = std::min(target_frames - written_frames, max_chunk_frames);
+        const std::size_t popped_samples =
+            samples_buffer.Pop(raw_chunk.data(), want_frames * device_channels);
+        const std::size_t popped_frames = popped_samples / device_channels;
+        if (popped_frames == 0) {
+            break;
+        }
+        ConvertInputSamplesInto(
+            std::span<const s16>{raw_chunk.data(), popped_frames * device_channels},
+            out_samples.subspan(written_frames * system_channels, popped_frames * system_channels),
+            device_channels, system_channels, volume);
+        written_frames += popped_frames;
+        if (popped_frames < want_frames) {
+            break;
+        }
+    }
+    return written_frames;
 }
 
 /// Consume fresh input without inventing frames during capture underruns.
 std::vector<s16> SinkStream::DrainInputSamples(u64 max_frames) {
-    const auto captured = samples_buffer.Pop(max_frames * device_channels);
-    const auto frames = captured.size() / device_channels;
-    const auto volume = system_volume * device_volume;
-    return ConvertInputSamples(captured, frames * system_channels, device_channels, system_channels,
-                               volume);
+    if (system_channels == 0 || device_channels == 0 || max_frames == 0) {
+        return {};
+    }
+    const std::size_t avail_frames =
+        static_cast<std::size_t>(std::min<u64>(max_frames, samples_buffer.Size() / device_channels));
+    if (avail_frames == 0) {
+        return {};
+    }
+    std::vector<s16> out(avail_frames * system_channels);
+    const std::size_t got_frames = DrainInputSamples(out, avail_frames);
+    out.resize(got_frames * system_channels);
+    return out;
+}
+
+void SinkStream::DiscardInputSamples() {
+    std::array<s16, 512> discard{};
+    while (samples_buffer.Pop(discard.data(), discard.size()) != 0) {
+    }
 }
 
 void SinkStream::ClearQueue() {
     std::scoped_lock lk{release_mutex};
 
-    samples_buffer.Pop();
+    DiscardInputSamples();
     SinkBuffer tmp;
     while (queue.TryPop(tmp));
 
@@ -265,8 +328,7 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
     std::memcpy(last_frame.data(), &output_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
 
     // EDEN_NX2_AUDIO_LEVEL: log the output peak about every two seconds (is a game audible?).
-    if (static const bool meter = std::getenv("EDEN_NX2_AUDIO_LEVEL") != nullptr;
-        meter || type == StreamType::Sysmix) {
+    if (static const bool meter = std::getenv("EDEN_NX2_AUDIO_LEVEL") != nullptr; meter) {
         for (size_t i = 0; i < num_frames * frame_size; ++i) {
             level_peak = std::max<s32>(level_peak, std::abs(static_cast<s32>(output_buffer[i])));
         }

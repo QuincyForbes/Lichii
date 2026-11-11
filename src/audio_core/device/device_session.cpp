@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include "audio_core/audio_core.h"
 #include "audio_core/audio_manager.h"
 #include "audio_core/device/audio_buffer.h"
@@ -50,6 +54,11 @@ Result DeviceSession::Initialize(std::string_view name_, SampleFormat sample_for
 
     if (type == Sink::StreamType::In) {
         sink = &system.AudioCore().GetInputSink();
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        UseSilentInput();
+        initialized = true;
+        return ResultSuccess;
+#endif
     } else {
         sink = &system.AudioCore().GetOutputSink();
     }
