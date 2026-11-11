@@ -80,6 +80,14 @@ struct NupDecompressCache {
         }
         return spill;
     }
+
+    std::size_t Clear() {
+        const std::size_t freed = bytes;
+        lru.clear();
+        index.clear();
+        bytes = 0;
+        return freed;
+    }
 };
 
 struct NupMembers;
@@ -162,6 +170,7 @@ public:
     VirtualDir GetExeFSDir(std::size_t package_index);
     VirtualDir GetRomFSDir(std::size_t package_index);
     VirtualDir GetPackageDir(std::size_t package_index);
+    void ReleaseRomFSDirCache();
 
     /// Stream-hashes every member file against its stored SHA-256.
     Loader::ResultStatus VerifyIntegrity(
@@ -202,6 +211,7 @@ private:
     std::vector<VirtualDir> romfs_dir_cache;
 
     std::shared_ptr<NupDecompressCache> cache;
+    std::size_t pressure_listener_id{};
 };
 
 } // namespace FileSys

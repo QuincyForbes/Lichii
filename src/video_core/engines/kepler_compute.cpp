@@ -2199,15 +2199,60 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
     macro.native_jit->Prepare(macro.native_code, macro.native_code_generation);
     const auto result = macro.native_jit->Execute(
         start, fs.parameters, std::span<u32>{*macro.native_interpreter.active_dram}, read, emit);
-#else
-    const auto result =
-        macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read, emit);
-#endif
     if (!result.success) {
         macro.native_execution_failed = true;
         LOG_ERROR(HW_GPU, "Native MME (split front) failed: compute start={:#x}, consumed={}, error={}",
                   start, result.consumed, result.error);
     }
+#else
+    static const bool use_memo = [] {
+        const char* value = std::getenv("EDEN_NX2_MME_MEMO");
+        return value == nullptr || value[0] != '0';
+    }();
+    const auto parameter_count = fs.parameters.size();
+    bool memo_hit = false;
+    if (use_memo && !trace && macro.native_interpreter.active_dram != nullptr) {
+        macro.native_memo.Synchronize(macro.native_code_generation);
+        if (std::remove_reference_t<decltype(macro.native_memo)>::Effects effects;
+            macro.native_memo.Find(start, fs.parameters, *macro.native_interpreter.active_dram,
+                                   effects)) {
+            auto& data_ram = *macro.native_interpreter.active_dram;
+            for (size_t i = 0; i < effects.data_ram_writes.size(); i += 2) {
+                data_ram[effects.data_ram_writes[i]] = effects.data_ram_writes[i + 1];
+            }
+            for (size_t i = 0; i < effects.writes.size(); i += 2) {
+                emit(effects.writes[i], effects.writes[i + 1]);
+            }
+            memo_hit = true;
+        } else {
+            macro.native_writes.clear();
+        }
+    }
+    if (!memo_hit) {
+        const u64 code_generation = macro.native_code_generation;
+        const auto result = macro.native_interpreter.Execute(
+            macro.native_code, start, fs.parameters, read, [&](u32 address, u32 value) {
+                if (use_memo && !trace) {
+                    macro.native_writes.emplace_back(address, value);
+                }
+                return emit(address, value);
+            });
+        if (use_memo && !trace && macro.native_interpreter.active_dram != nullptr &&
+            result.success && !macro.native_interpreter.read_registers &&
+            !macro.native_interpreter.reread_data_ram &&
+            code_generation == macro.native_code_generation) {
+            macro.native_memo.Store(start, std::span<const u32>(fs.parameters.data(), parameter_count),
+                                    macro.native_interpreter.data_ram_reads,
+                                    macro.native_interpreter.data_ram_writes, macro.native_writes);
+        }
+        if (!result.success) {
+            macro.native_execution_failed = true;
+            LOG_ERROR(HW_GPU,
+                      "Native MME (split front) failed: compute start={:#x}, consumed={}, error={}",
+                      start, result.consumed, result.error);
+        }
+    }
+#endif
     if (trace) [[unlikely]] {
         LOG_INFO(HW_GPU, "{}", trace_text);
         g_follow_left = 260;

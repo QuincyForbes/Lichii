@@ -227,19 +227,12 @@ private:
     template <typename FuncMapped, typename FuncReserved, typename FuncUnmapped>
     inline void MemoryOperation(GPUVAddr gpu_src_addr, std::size_t size, bool is_big_page, FuncMapped&& func_mapped, FuncReserved&& func_reserved, FuncUnmapped&& func_unmapped) const;
 
-    /// Immutable copy of the device-contiguous runs and the kind map that readers query without
-    /// a lock; each thread swaps its copy when map_serial changes.
+    /// Immutable copy of the kind map that readers query without a lock; each thread swaps its
+    /// copy when map_serial changes.
     struct MappingSnapshot {
-        struct Run {
-            GPUVAddr begin;
-            GPUVAddr end;
-        };
-        std::vector<Run> runs;
         std::vector<std::pair<s64, PTEKind>> kinds;
     };
 
-    /// Rebuilds the runs through the big pages a page table operation touched.
-    void UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size);
     const MappingSnapshot& CurrentSnapshot() const;
 
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe) const;
@@ -329,13 +322,6 @@ private:
     /// Bumped after each page table change; readers keep their MappingSnapshot until then.
     std::atomic<u64> map_serial{};
 
-    struct ContinuousRun {
-        GPUVAddr end;
-        DAddr device_addr;
-    };
-    /// Maximal GPU ranges, keyed by their start, that are mapped to one device range: what
-    /// MaxContinuousRangeUncached walks to. Kept only with Nx2Perf on.
-    std::map<GPUVAddr, ContinuousRun> continuous_runs;
     mutable std::shared_ptr<const MappingSnapshot> snapshot;
     mutable u64 snapshot_serial{};
     mutable std::mutex runs_guard;

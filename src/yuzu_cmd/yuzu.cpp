@@ -649,6 +649,7 @@ static void IosStopGame(SdlState* state) {
     LOG_INFO(Frontend, "iOS: game window hidden");
     // Every dynarmic instance went with the process, so the prepared pool can be handed out again.
     Common::IosJit::Reset();
+    Common::PlatformEvents::RelieveMallocPressure();
     IosFrontend::RestoreGlobal();
     LOG_INFO(Frontend, "iOS: game stopped");
     IosFrontend::ClearRunningGame();
@@ -1947,6 +1948,9 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
 #endif
     const bool network_initialized = state->network_initialized;
     delete state;
+#ifdef _WIN32
+    Common::Windows::ReleaseTimerResolution();
+#endif
     if (network_initialized) {
         Network::Shutdown();
     }

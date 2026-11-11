@@ -566,6 +566,9 @@ void TextureCache<P>::TickFrame() {
             scratch->release();
         }
     }
+    if (astc_scan_buffer.capacity() > scratch_limit) {
+        std::vector<u8>{}.swap(astc_scan_buffer);
+    }
     if constexpr (HAS_DEVICE_MEMORY_INFO) {
         // Switch 2 titles (native tiling) stream far more texture data than Eden's thresholds
         // were tuned for: title 1's attract loop alone keeps ~5.3 GB resident, so the collector

@@ -3992,6 +3992,15 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
 void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                                  const vk::PipelineCache& pipeline_cache,
                                                  u32 cache_version) try {
+    size_t cache_size = 0;
+    if (pipeline_cache) {
+        pipeline_cache.Read(&cache_size, nullptr);
+    }
+    std::error_code exists_ec;
+    if (cache_size > 0 && cache_size == last_cache_size.load(std::memory_order_relaxed) &&
+        std::filesystem::exists(filename, exists_ec)) {
+        return;
+    }
     // Written beside the cache and renamed over it: the emulator stopped mid-write left the cache
     // empty, and every later boot failed to read it.
     auto temporary = filename;
@@ -4006,10 +4015,8 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
     file.write(VULKAN_CACHE_MAGIC_NUMBER.data(), VULKAN_CACHE_MAGIC_NUMBER.size())
         .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
 
-    size_t cache_size = 0;
     std::vector<char> cache_data;
-    if (pipeline_cache) {
-        pipeline_cache.Read(&cache_size, nullptr);
+    if (pipeline_cache && cache_size > 0) {
         cache_data.resize(cache_size);
         pipeline_cache.Read(&cache_size, cache_data.data());
     }
@@ -4031,6 +4038,7 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
         std::filesystem::remove(temporary, error);
         return;
     }
+    last_cache_size.store(cache_size, std::memory_order_relaxed);
 
     LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {} ({} KiB)",
              Common::FS::PathToUTF8String(filename), cache_size >> 10);
@@ -4103,7 +4111,12 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
                  Common::FS::PathToUTF8String(filename), cache_size >> 10);
 
         try {
-            return create_pipeline_cache(cache_size, cache_data.data());
+            auto loaded = create_pipeline_cache(cache_size, cache_data.data());
+            size_t driver_size = 0;
+            if (loaded && loaded.Read(&driver_size, nullptr) == VK_SUCCESS) {
+                last_cache_size.store(driver_size, std::memory_order_relaxed);
+            }
+            return loaded;
         } catch (const vk::Exception& e) {
             // The blob came from another driver or driver version (e.g. switching between
             // MoltenVK and KosmicKrisp on macOS): the driver rejects it. Start empty instead of

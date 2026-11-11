@@ -2199,7 +2199,7 @@ private:
                 bool done{};
             };
             auto wake = std::make_shared<Wake>();
-            syncpoints.RegisterGuestAction(fence_id, fence_value, [wake] {
+            const auto handle = syncpoints.RegisterGuestAction(fence_id, fence_value, [wake] {
                 {
                     std::scoped_lock lk{wake->mutex};
                     wake->done = true;
@@ -2216,10 +2216,17 @@ private:
                     gpu_waited |= system.GPU().HasSuspendedChannels();
                     if (gpu_waited &&
                         std::chrono::steady_clock::now() - start > std::chrono::milliseconds{3}) {
+                        lk.unlock();
+                        syncpoints.DeregisterGuestAction(fence_id, handle);
                         return false;
                     }
                 }
                 wake->cv.wait_for(lk, std::chrono::milliseconds{unless_gpu_waits ? 1 : 50});
+            }
+            const bool done = wake->done;
+            lk.unlock();
+            if (!done) {
+                syncpoints.DeregisterGuestAction(fence_id, handle);
             }
         }
         if (unless_gpu_waits && !syncpoints.IsReadyGuest(fence_id, fence_value)) {
@@ -2927,6 +2934,7 @@ private:
             LOG_INFO(Service, "nx2:vdec trace start syncpoint={}", m_syncpoint);
         }
         m_ready->SetRunning(system.Kernel(), true);
+        EnsureReadyTimerScheduled();
         m_ready->Signal(system.Kernel());
         TipcReplyWords(ctx, {});
     }
@@ -2975,7 +2983,23 @@ private:
         if (!m_worker.joinable()) {
             m_worker = std::thread{[this] { DecodeLoop(); }};
         }
+        EnsureReadyTimerScheduled();
         TipcReplyWords(ctx, {});
+    }
+
+    void EnsureReadyTimerScheduled() {
+        if (m_ready_timer && !m_ready_timer_scheduled) {
+            constexpr std::chrono::nanoseconds ReadyInterval{std::chrono::milliseconds{4}};
+            system.CoreTiming().ScheduleLoopingEvent(ReadyInterval, ReadyInterval, m_ready_timer);
+            m_ready_timer_scheduled = true;
+        }
+    }
+
+    void PauseReadyTimer() {
+        if (m_ready_timer && m_ready_timer_scheduled) {
+            system.CoreTiming().UnscheduleEvent(m_ready_timer);
+            m_ready_timer_scheduled = false;
+        }
     }
 
     void GetEvent(HLERequestContext& ctx) {
@@ -2996,8 +3020,7 @@ private:
                     ready->Signal(kernel);
                     return std::nullopt;
                 });
-            constexpr std::chrono::nanoseconds ReadyInterval{std::chrono::milliseconds{4}};
-            system.CoreTiming().ScheduleLoopingEvent(ReadyInterval, ReadyInterval, m_ready_timer);
+            EnsureReadyTimerScheduled();
         }
         m_ready->Signal(system.Kernel());
         IPC::ResponseBuilder rb{ctx, 2, 1, 0};
@@ -3136,6 +3159,7 @@ private:
         Log(ctx, ctx.GetCommand() == 8 ? "flush" : "stop");
         if (ctx.GetCommand() == 207) {
             m_ready->SetRunning(system.Kernel(), false);
+            PauseReadyTimer();
         }
         {
             std::scoped_lock lk{m_mutex};
@@ -3162,6 +3186,7 @@ private:
             // fence as a frame to acquire.
             if (ctx.GetCommand() == 207) {
                 CompleteHandedFences();
+                m_release_idle_buffers = true;
             }
         }
         m_cv.notify_one();
@@ -3171,6 +3196,7 @@ private:
     void Finalize(HLERequestContext& ctx) {
         Log(ctx, "finalize");
         m_ready->SetRunning(system.Kernel(), false);
+        PauseReadyTimer();
         {
             std::scoped_lock lk{m_mutex};
             if (Nx2VideoTraceEnabled()) {
@@ -3187,7 +3213,9 @@ private:
             m_clock_offset.reset();
             m_clock.Reset();
             m_stream_start.reset();
+            m_release_idle_buffers = true;
         }
+        m_cv.notify_one();
         TipcReplyWords(ctx, {});
     }
 
@@ -3422,14 +3450,38 @@ private:
         std::vector<Tegra::Host1x::Nx2Picture> pictures;
         std::vector<u8> bytes;
         std::unique_lock lk{m_mutex};
+        const auto has_work = [&] {
+            return m_quit || m_flush || m_release_idle_buffers ||
+                   (!m_decoded.empty() && !m_free.empty()) ||
+                   (!m_inputs.Empty() && m_decoded.size() < MaxDecodedAhead);
+        };
         while (true) {
-            m_cv.wait(lk, [&] {
-                return m_quit || m_flush || (!m_decoded.empty() && !m_free.empty()) ||
-                       (!m_inputs.Empty() && m_decoded.size() < MaxDecodedAhead);
-            });
+            if (!has_work()) {
+                const bool holds_buffers =
+                    decoder != nullptr || bytes.capacity() != 0 || m_tiled.capacity() != 0;
+                if (holds_buffers && m_decoded.empty() && m_inputs.Empty()) {
+                    if (!m_cv.wait_for(lk, std::chrono::seconds{2}, has_work)) {
+                        m_release_idle_buffers = true;
+                    }
+                } else {
+                    m_cv.wait(lk, has_work);
+                }
+            }
             if (m_quit) {
                 return;
             }
+            if (m_release_idle_buffers && m_decoded.empty() && m_inputs.Empty() && !m_flush) {
+                m_release_idle_buffers = false;
+                auto old_decoder = std::move(decoder);
+                std::vector<u8>{}.swap(bytes);
+                std::vector<u8>{}.swap(m_tiled);
+                std::vector<Tegra::Host1x::Nx2Picture>{}.swap(pictures);
+                lk.unlock();
+                old_decoder.reset();
+                lk.lock();
+                continue;
+            }
+            m_release_idle_buffers = false;
             if (m_flush) {
                 m_flush = false;
                 m_decoded.clear();
@@ -3942,6 +3994,8 @@ private:
     Kernel::KEvent* m_event{};
     std::shared_ptr<Nx2VideoReadyState> m_ready = std::make_shared<Nx2VideoReadyState>();
     std::shared_ptr<Core::Timing::EventType> m_ready_timer;
+    bool m_ready_timer_scheduled{};
+    bool m_release_idle_buffers{};
     u64 m_submitted{};
     u32 m_syncpoint{NoSyncpoint}; ///< Counts finished frames (allocated at the first register)
     u32 m_sync_base{};            ///< Its value before the first frame

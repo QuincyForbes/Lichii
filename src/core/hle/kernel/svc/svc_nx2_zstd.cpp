@@ -159,11 +159,25 @@ bool EdgesMatch(Core::Memory::Memory& memory, const DictEntry& entry) {
     return true;
 }
 
+// A host thread's buffer stays as large as its largest call, all of it written to (19 MiB at the
+// title). One that no call filled by half for two seconds is freed and allocated at the size in
+// use.
+void ResizeScratch(Common::ScratchBuffer<u8>& buffer, s64& filled_ns, size_t size, s64 now) {
+    if (size >= buffer.capacity() / 2) {
+        filled_ns = now;
+    } else if (now - filled_ns > kScratchIdleNs) {
+        buffer.release();
+        filled_ns = now;
+    }
+    buffer.resize_destructive(size);
+}
+
 // Full check, at most once a second per dictionary: the whole guest dictionary matches the copy.
-bool ContentMatches(Core::Memory::Memory& memory, const DictEntry& entry) {
+bool ContentMatches(Core::Memory::Memory& memory, const DictEntry& entry, s64 now) {
     thread_local Common::ScratchBuffer<u8> scratch;
+    thread_local s64 scratch_filled_ns{};
     const size_t size = entry.content.size();
-    scratch.resize_destructive(size);
+    ResizeScratch(scratch, scratch_filled_ns, size, now);
     return memory.ReadBlock(entry.key.content, scratch.data(), size) &&
            std::memcmp(scratch.data(), entry.content.data(), size) == 0;
 }
@@ -220,7 +234,7 @@ std::shared_ptr<DictEntry> GetDict(Core::Memory::Memory& memory, const GuestDDic
     if (entry) {
         bool valid = EdgesMatch(memory, *entry);
         if (valid && now - entry->validated_ns.load(std::memory_order_relaxed) >= kRevalidateNs) {
-            valid = ContentMatches(memory, *entry);
+            valid = ContentMatches(memory, *entry, now);
             if (valid) {
                 entry->validated_ns.store(now, std::memory_order_relaxed);
             }
@@ -292,19 +306,7 @@ unsigned long long StandardFramesBound(const u8* src, size_t size) {
     return total_bound;
 }
 
-// A host thread's buffer stays as large as its largest call, all of it written to (19 MiB at the
-// title). One that no call filled by half for two seconds is freed and allocated at the size in
-// use.
-void ResizeScratch(Common::ScratchBuffer<u8>& buffer, s64& filled_ns, size_t size, s64 now) {
-    if (size >= buffer.capacity() / 2) {
-        filled_ns = now;
-    } else if (now - filled_ns > kScratchIdleNs) {
-        buffer.release();
-        filled_ns = now;
-    }
-    buffer.resize_destructive(size);
-}
-
+// Duplicate ResizeScratch moved above ContentMatches removed.
 // Decompresses on the host. Returns nullptr on success (args[0] then holds the decompressed size,
 // as the function returns), or the reason the game's own function must run instead; then nothing
 // was written to guest memory.
@@ -443,6 +445,12 @@ bool CallNx2OotZstd(Core::System& system, u32 imm, std::span<uint64_t, 8> args) 
     }
     MaybeLogCounters(now);
     return true;
+}
+
+void ResetNx2OotZstd() {
+    auto& cache = Cache();
+    std::scoped_lock lock{cache.mutex};
+    std::vector<std::shared_ptr<DictEntry>>{}.swap(cache.entries);
 }
 
 } // namespace Kernel::Svc

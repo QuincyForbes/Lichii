@@ -269,6 +269,7 @@ ResultStatus AppLoader_NUP::ReadRomFS(FileSys::VirtualFile& out_file) {
         return ResultStatus::ErrorNoRomFS;
     }
     out_file = FileSys::CreateRomFS(merged);
+    nup->ReleaseRomFSDirCache();
     if (out_file == nullptr) {
         return ResultStatus::ErrorNoRomFS;
     }

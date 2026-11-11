@@ -22,6 +22,7 @@
 
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/platform_events.h"
 #include "common/swap.h"
 
 namespace FileSys {
@@ -281,15 +282,31 @@ private:
             std::scoped_lock lock{cache->mutex};
             spill = cache->GetSpill(cache_index);
         }
-        std::scoped_lock lock{spill->mutex};
-        if (!spill->attempted) {
-            spill->attempted = true;
-            DecompressToFile(*spill);
+        {
+            std::scoped_lock lock{spill->mutex};
+            if (!spill->attempted) {
+                spill->attempted = true;
+                DecompressToFile(*spill);
+            }
+            if (spill->file.IsOpen()) {
+                if (!spill->file.Seek(static_cast<s64>(offset))) {
+                    return 0;
+                }
+                return spill->file.ReadSpan(std::span{data, length});
+            }
         }
-        if (!spill->file.IsOpen() || !spill->file.Seek(static_cast<s64>(offset))) {
+        // Fallback if temporary-file creation or write failed (e.g. full disk): decompress in RAM.
+        std::vector<u8> scratch = Decompress();
+        if (scratch.empty() || offset >= scratch.size()) {
             return 0;
         }
-        return spill->file.ReadSpan(std::span{data, length});
+        const std::size_t avail = std::min(length, scratch.size() - offset);
+        std::memcpy(data, scratch.data() + offset, avail);
+        if (scratch.size() <= cache->cap) {
+            std::scoped_lock lock{cache->mutex};
+            cache->Insert(cache_index, scratch);
+        }
+        return avail;
     }
 
     void DecompressToFile(NupSpillFile& spill) const {
@@ -378,9 +395,13 @@ private:
             return {};
         }
         std::vector<u8> out(static_cast<std::size_t>(uncompressed_size));
+        thread_local std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{
+            ZSTD_createDCtx(), &ZSTD_freeDCtx};
         const auto zstd_begin = std::chrono::steady_clock::now();
         const std::size_t result =
-            ZSTD_decompress(out.data(), out.size(), compressed.data(), compressed.size());
+            dctx ? ZSTD_decompressDCtx(dctx.get(), out.data(), out.size(), compressed.data(),
+                                       compressed.size())
+                 : ZSTD_decompress(out.data(), out.size(), compressed.data(), compressed.size());
         {
             // sergio: count re-decompressions to see what the cache size buys.
             static std::atomic<u32> logged{};
@@ -443,6 +464,20 @@ NupContainer::NupContainer(VirtualFile file_, std::size_t memory_cache_cap,
     cache->spill_dir = spill_dir_.empty()
                            ? Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "nup"
                            : std::move(spill_dir_);
+    std::weak_ptr<NupDecompressCache> weak_cache = cache;
+    pressure_listener_id = Common::PlatformEvents::AddMemoryPressureListener([weak_cache] {
+        if (const auto shared = weak_cache.lock()) {
+            std::size_t freed = 0;
+            {
+                std::scoped_lock lock{shared->mutex};
+                freed = shared->Clear();
+            }
+            if (freed != 0) {
+                LOG_INFO(Loader, "NUP decompression cache: evicted {} MiB on memory pressure",
+                         freed >> 20);
+            }
+        }
+    });
     if (file == nullptr) {
         return;
     }
@@ -453,7 +488,9 @@ NupContainer::NupContainer(VirtualFile file_, std::size_t memory_cache_cap,
     }
 }
 
-NupContainer::~NupContainer() = default;
+NupContainer::~NupContainer() {
+    Common::PlatformEvents::RemoveMemoryPressureListener(pressure_listener_id);
+}
 
 bool NupContainer::Parse() {
     if (file->GetSize() < SuperblockSize) {
@@ -857,6 +894,10 @@ VirtualDir NupContainer::GetPackageDir(std::size_t package_index) {
         return nullptr;
     }
     return BuildPackageDir(packages[package_index].root_dir);
+}
+
+void NupContainer::ReleaseRomFSDirCache() {
+    std::vector<VirtualDir>{}.swap(romfs_dir_cache);
 }
 
 VirtualDir NupContainer::MergeShadowDirs(const VirtualDir& base, const VirtualDir& overlay) {

@@ -58,10 +58,40 @@ std::atomic<u64> g_signal_available{~u64{0}};
 std::mutex g_listeners_mutex;
 std::vector<std::pair<std::size_t, std::function<void()>>> g_listeners;
 std::size_t g_next_listener_id = 1;
+
+std::mutex g_pressure_listeners_mutex;
+std::vector<std::pair<std::size_t, std::function<void()>>> g_pressure_listeners;
+std::size_t g_next_pressure_listener_id = 1;
 } // Anonymous namespace
 
 void SignalMemoryPressure() {
     g_pressure_generation.fetch_add(1, std::memory_order_relaxed);
+    std::vector<std::function<void()>> listeners;
+    {
+        std::scoped_lock lock{g_pressure_listeners_mutex};
+        listeners.reserve(g_pressure_listeners.size());
+        for (const auto& entry : g_pressure_listeners) {
+            listeners.push_back(entry.second);
+        }
+    }
+    for (const auto& listener : listeners) {
+        listener();
+    }
+}
+
+std::size_t AddMemoryPressureListener(std::function<void()> listener) {
+    std::scoped_lock lock{g_pressure_listeners_mutex};
+    const std::size_t id = g_next_pressure_listener_id++;
+    g_pressure_listeners.emplace_back(id, std::move(listener));
+    return id;
+}
+
+void RemoveMemoryPressureListener(std::size_t id) {
+    if (id == 0) {
+        return;
+    }
+    std::scoped_lock lock{g_pressure_listeners_mutex};
+    std::erase_if(g_pressure_listeners, [id](const auto& entry) { return entry.first == id; });
 }
 
 u32 MemoryPressureGeneration() {

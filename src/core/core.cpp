@@ -43,6 +43,7 @@
 #include "core/file_sys/submission_package.h"
 #include "core/file_sys/vfs/vfs_concat.h"
 #include "core/file_sys/vfs/vfs_real.h"
+#include "core/hle/kernel/svc/svc_nx2_zstd.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_process.h"
@@ -624,6 +625,7 @@ struct System::Impl {
         LOG_INFO(Core, "Shutdown: CPU threads joined");
         debugger.reset();
         kernel.Shutdown();
+        Kernel::Svc::ResetNx2OotZstd();
         LOG_INFO(Core, "Shutdown: kernel released");
         kernel_initialized = false;
         stop_event = {};

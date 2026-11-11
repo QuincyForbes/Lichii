@@ -18,6 +18,9 @@ namespace Common::PlatformEvents {
 void SignalMemoryPressure();
 /// Bumped by every SignalMemoryPressure, including those PollMemoryPressure raises.
 u32 MemoryPressureGeneration();
+/// Listeners run inline during SignalMemoryPressure (must be fast and lock-safe).
+std::size_t AddMemoryPressureListener(std::function<void()> listener);
+void RemoveMemoryPressureListener(std::size_t id);
 
 /// Bytes the OS still lets this process allocate before it is killed (iOS), 0 where unknown.
 u64 AvailableProcessMemory();

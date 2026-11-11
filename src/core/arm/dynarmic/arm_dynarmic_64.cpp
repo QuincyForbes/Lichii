@@ -438,6 +438,8 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
 #if defined(_M_X64) || defined(__x86_64__)
             _mm_pause();
             _mm_pause();
+#elif defined(__APPLE__) && defined(__aarch64__)
+            __builtin_arm_isb(0xF);
 #elif defined(__aarch64__)
             asm volatile("yield");
 #endif
@@ -501,6 +503,8 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
 #if defined(_M_X64) || defined(__x86_64__)
         _mm_pause();
         _mm_pause();
+#elif defined(__APPLE__) && defined(__aarch64__)
+        __builtin_arm_isb(0xF);
 #elif defined(__aarch64__)
         asm volatile("yield");
 #endif
