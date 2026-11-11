@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <iterator>
 #include <vector>
 
 #include <fmt/format.h>
@@ -331,6 +332,9 @@ std::string ProfileHost(System& system) {
             mapped += PageSize;
         } else {
             (code ? private_code : private_data) += PageSize;
+            if (code) {
+                continue;
+            }
             const auto base = reinterpret_cast<uintptr_t>(region.AllocationBase);
             if (allocations.empty() || allocations.back().first != base) {
                 allocations.emplace_back(base, 0);
@@ -338,23 +342,126 @@ std::string ProfileHost(System& system) {
             allocations.back().second += PageSize;
         }
     }
-    // The private allocations with the most resident memory (heap segments, page tables, the
-    // driver's), with their reserved size.
-    std::sort(allocations.begin(), allocations.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
-    std::string allocations_text;
-    for (size_t i = 0; i < (std::min<size_t>)(allocations.size(), 16); ++i) {
-        u64 reserved = 0;
-        for (uintptr_t address = allocations[i].first;; address += region.RegionSize) {
+    // Busy heap blocks (malloc is the process heap), by size.
+    constexpr std::array<u64, 5> Limits{u64{4} << 10, u64{64} << 10, u64{1} << 20, u64{16} << 20,
+                                        ~u64{0}};
+    std::array<u64, Limits.size()> bucket_bytes{};
+    std::array<u64, Limits.size()> bucket_blocks{};
+    std::array<u64, 10> largest{};
+    std::array<HANDLE, 64> heaps{};
+    // Heap segments, and the blocks a heap gave an allocation of their own.
+    std::vector<std::pair<uintptr_t, uintptr_t>> segments;
+    std::vector<uintptr_t> large_blocks;
+    constexpr u64 LargeBlock = 0x7F000;
+    const DWORD num_heaps = (std::min)(GetProcessHeaps(static_cast<DWORD>(heaps.size()), heaps.data()),
+                                       static_cast<DWORD>(heaps.size()));
+    for (DWORD i = 0; i < num_heaps; ++i) {
+        if (!HeapLock(heaps[i])) {
+            continue;
+        }
+        PROCESS_HEAP_ENTRY entry{};
+        while (HeapWalk(heaps[i], &entry)) {
+            if ((entry.wFlags & PROCESS_HEAP_REGION) != 0) {
+                const auto begin = reinterpret_cast<uintptr_t>(entry.lpData);
+                segments.emplace_back(begin, begin + entry.Region.dwCommittedSize +
+                                                 entry.Region.dwUnCommittedSize);
+            }
+            if ((entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) == 0) {
+                continue;
+            }
+            const u64 size = entry.cbData;
+            size_t bucket = 0;
+            while (size >= Limits[bucket]) {
+                ++bucket;
+            }
+            bucket_bytes[bucket] += size;
+            ++bucket_blocks[bucket];
+            if (size >= LargeBlock) {
+                large_blocks.push_back(reinterpret_cast<uintptr_t>(entry.lpData));
+            }
+            if (size > largest.back()) {
+                largest.back() = size;
+                std::sort(largest.rbegin(), largest.rend());
+            }
+        }
+        HeapUnlock(heaps[i]);
+    }
+    std::sort(segments.begin(), segments.end());
+    std::sort(large_blocks.begin(), large_blocks.end());
+
+    // Resident private memory by what the allocation is: only touched pages count, which is
+    // what a footprint limit charges.
+    enum class Kind { Stack, Segment, Block, Other, Count };
+    struct KindTotal {
+        u64 resident;
+        u64 committed;
+        u64 allocations;
+    };
+    std::array<KindTotal, static_cast<size_t>(Kind::Count)> kinds{};
+    struct Allocation {
+        uintptr_t base;
+        u64 resident;
+        u64 committed;
+        u64 reserved;
+        Kind kind;
+    };
+    std::vector<Allocation> detailed;
+    detailed.reserve(allocations.size());
+    for (const auto& [base, resident] : allocations) {
+        Allocation allocation{base, resident, 0, 0, Kind::Other};
+        bool guard = false;
+        for (uintptr_t address = base;; address += region.RegionSize) {
             if (VirtualQuery(reinterpret_cast<void*>(address), &region, sizeof(region)) == 0 ||
-                reinterpret_cast<uintptr_t>(region.AllocationBase) != allocations[i].first) {
+                reinterpret_cast<uintptr_t>(region.AllocationBase) != base) {
                 break;
             }
-            reserved += region.RegionSize;
+            allocation.reserved += region.RegionSize;
+            if (region.State == MEM_COMMIT) {
+                allocation.committed += region.RegionSize;
+                guard = guard || (region.Protect & PAGE_GUARD) != 0;
+            }
         }
-        allocations_text += fmt::format("{}{} MiB of {} MiB at {:#x}", i == 0 ? "" : ", ",
-                                        MiB(allocations[i].second), MiB(reserved),
-                                        allocations[i].first);
+        const auto segment = std::upper_bound(
+            segments.begin(), segments.end(), std::pair<uintptr_t, uintptr_t>{base, ~uintptr_t{0}});
+        const auto block = std::lower_bound(large_blocks.begin(), large_blocks.end(), base);
+        if (guard) {
+            allocation.kind = Kind::Stack;
+        } else if (segment != segments.begin() && base < std::prev(segment)->second) {
+            allocation.kind = Kind::Segment;
+        } else if (block != large_blocks.end() && *block - base < allocation.reserved) {
+            allocation.kind = Kind::Block;
+        }
+        KindTotal& total = kinds[static_cast<size_t>(allocation.kind)];
+        total.resident += allocation.resident;
+        total.committed += allocation.committed;
+        ++total.allocations;
+        detailed.push_back(allocation);
+    }
+    std::sort(detailed.begin(), detailed.end(),
+              [](const auto& a, const auto& b) { return a.resident > b.resident; });
+    constexpr std::array<const char*, static_cast<size_t>(Kind::Count)> KindNames{
+        "thread stacks", "heap segments", "large heap blocks", "other allocations"};
+    std::string allocations_text;
+    for (size_t i = 0; i < kinds.size(); ++i) {
+        allocations_text += fmt::format("{}{} {} MiB of {} MiB committed ({})", i == 0 ? "" : ", ",
+                                        KindNames[i], MiB(kinds[i].resident),
+                                        MiB(kinds[i].committed), kinds[i].allocations);
+    }
+    // The ones that are not the heap's or a stack: page tables, the JIT's tables, the driver's.
+    allocations_text += "; largest other allocations:";
+    size_t listed = 0;
+    for (const Allocation& allocation : detailed) {
+        if (allocation.kind != Kind::Other) {
+            continue;
+        }
+        allocations_text += fmt::format(" {:.1f} of {:.1f} MiB ({:.0f} reserved) at {:#x},",
+                                        static_cast<double>(allocation.resident) / (1 << 20),
+                                        static_cast<double>(allocation.committed) / (1 << 20),
+                                        static_cast<double>(allocation.reserved) / (1 << 20),
+                                        allocation.base);
+        if (++listed == 48) {
+            break;
+        }
     }
 
     // Private memory committed, resident or not (malloc, the JIT, driver allocations).
@@ -376,38 +483,6 @@ std::string ProfileHost(System& system) {
         address = next;
     }
 
-    // Busy heap blocks (malloc is the process heap), by size.
-    constexpr std::array<u64, 5> Limits{u64{4} << 10, u64{64} << 10, u64{1} << 20, u64{16} << 20,
-                                        ~u64{0}};
-    std::array<u64, Limits.size()> bucket_bytes{};
-    std::array<u64, Limits.size()> bucket_blocks{};
-    std::array<u64, 10> largest{};
-    std::array<HANDLE, 64> heaps{};
-    const DWORD num_heaps = (std::min)(GetProcessHeaps(static_cast<DWORD>(heaps.size()), heaps.data()),
-                                       static_cast<DWORD>(heaps.size()));
-    for (DWORD i = 0; i < num_heaps; ++i) {
-        if (!HeapLock(heaps[i])) {
-            continue;
-        }
-        PROCESS_HEAP_ENTRY entry{};
-        while (HeapWalk(heaps[i], &entry)) {
-            if ((entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) == 0) {
-                continue;
-            }
-            const u64 size = entry.cbData;
-            size_t bucket = 0;
-            while (size >= Limits[bucket]) {
-                ++bucket;
-            }
-            bucket_bytes[bucket] += size;
-            ++bucket_blocks[bucket];
-            if (size > largest.back()) {
-                largest.back() = size;
-                std::sort(largest.rbegin(), largest.rend());
-            }
-        }
-        HeapUnlock(heaps[i]);
-    }
     std::string largest_text;
     for (const u64 size : largest) {
         if (size != 0) {
@@ -438,7 +513,7 @@ std::string ProfileHost(System& system) {
         "host: working set {} MiB (peak {}, private {}): guest {} MiB, images {} MiB, mapped {} MiB "
         "(driver), private data {} MiB, private code {} MiB (JIT); private committed {} MiB + "
         "code {} MiB; heap blocks <4K {} MiB ({}), <64K {} MiB ({}), <1M {} MiB ({}), <16M {} MiB "
-        "({}), >=16M {} MiB ({}); largest MiB: {}; private allocations resident: {}",
+        "({}), >=16M {} MiB ({}); largest MiB: {}; private data resident: {}",
         MiB(counters.WorkingSetSize), MiB(counters.PeakWorkingSetSize),
         MiB(counters.PrivateWorkingSetSize), MiB(guest), MiB(image), MiB(mapped),
         MiB(private_data), MiB(private_code), MiB(committed), MiB(committed_code),
