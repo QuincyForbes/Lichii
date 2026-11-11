@@ -212,18 +212,22 @@ std::string FootprintSplit([[maybe_unused]] const ProcessMemory& memory,
     const u64 compressed = HostMemory::ScannedCompressedBytes();
     u64 guest = resident;
     std::string guest_text;
+    const std::string age = HostMemory::GuestFootprintLive()
+                                ? std::string{"live"}
+                                : fmt::format("{} s ago", HostMemory::ScannedAgeSeconds());
     switch (HostMemory::ScannedAccounting()) {
     case HostMemory::GuestAccounting::Once:
-        guest_text = fmt::format("{} MiB (counted once, {} MiB of it compressed)", resident >> 20,
-                                 compressed >> 20);
+        guest_text = fmt::format("{} MiB (counted once, {} MiB of it compressed, {})",
+                                 resident >> 20, compressed >> 20, age);
         break;
     case HostMemory::GuestAccounting::PerMapping:
-        guest_text = fmt::format("{} MiB or more (counted per mapping, {} MiB of it compressed)",
-                                 resident >> 20, compressed >> 20);
+        guest_text = fmt::format("{} MiB or more (counted per mapping, {} MiB of it compressed, {})",
+                                 resident >> 20, compressed >> 20, age);
         break;
     case HostMemory::GuestAccounting::File:
         guest = 0;
-        guest_text = fmt::format("0 MiB (in a file, {} MiB of it resident)", resident >> 20);
+        guest_text = fmt::format("0 MiB (in a file, {} MiB of it resident, {})", resident >> 20,
+                                 age);
         break;
     case HostMemory::GuestAccounting::Uncounted:
         guest = 0;

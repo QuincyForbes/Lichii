@@ -130,6 +130,11 @@ public:
     static u64 ScannedCompressedBytes() noexcept;
     static u64 ScannedHandedOutBytes() noexcept;
     static u64 TrimmedZeroBytes() noexcept;
+    /// Seconds since that TrimZeroPages ended.
+    static u64 ScannedAgeSeconds() noexcept;
+    /// iOS: guest memory is in the media ledger, so ScannedResidentBytes and
+    /// ScannedCompressedBytes are read from task_info at each call instead of the last pass.
+    static bool GuestFootprintLive() noexcept;
 
     /// Pages the kernel hands out (cleared or not).
     void MarkUsed(size_t physical_offset, size_t length);

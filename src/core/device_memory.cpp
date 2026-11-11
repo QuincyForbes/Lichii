@@ -112,7 +112,10 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     // neither memory pressure nor a growing footprint is a reason for one. It runs every 30 s,
     // for the log (on an iPhone it took 0.5-0.9 s and came every 1.6 s under pressure).
     const bool counts_only = buffer.TrimOnlyCounts();
-    const std::chrono::seconds CountInterval = buffer.FileBacked() ? 180s : 30s;
+    // With the guest figure read live from task_info, the passes only refresh the handed-out
+    // figure.
+    const bool live = Common::HostMemory::GuestFootprintLive();
+    const std::chrono::seconds CountInterval = buffer.FileBacked() || live ? 180s : 30s;
     if (counts_only) {
         interval = CountInterval;
     }
@@ -181,6 +184,16 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
                     // And a fresh count of the guest memory.
                     imminent = true;
                     break;
+                }
+                // The count is what the "Memory:" lines split the footprint with: when the
+                // footprint moved by 256 MiB since it (a game loading), count again, at most
+                // every 5 s (an iPhone at 187 s: a 30 s old count left 2 GiB in "rest").
+                if (!live && waited >= 5s) {
+                    const u64 footprint = Common::PlatformEvents::QueryProcessMemory().footprint;
+                    if (footprint > footprint_after_pass + Growth ||
+                        footprint + Growth < footprint_after_pass) {
+                        break;
+                    }
                 }
                 continue;
             }
