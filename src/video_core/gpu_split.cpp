@@ -473,7 +473,7 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
     const size_t words = static_cast<size_t>(end - begin) / sizeof(u32);
     // Consecutive uploads continue one range (each word may use another of the 16 data methods).
     if (!ranged_writes.empty()) {
-        RangedWrite& last = ranged_writes.back();
+        RangedWrite& last = ranged_writes.Newest();
         if (last.end == begin) {
             last.end = end;
             last.position = write_position;
@@ -497,7 +497,12 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
         }
         ranged_writes.pop_front();
     }
-    RangedWrite& write = ranged_writes.emplace_back(RangedWrite{write_position, begin, end, method, 0, {}});
+    RangedWrite& write = ranged_writes.push_back();
+    write.position = write_position;
+    write.begin = begin;
+    write.end = end;
+    write.method = method;
+    write.space = 0;
     if (data != nullptr && space != 0 && (end - begin) % sizeof(u32) == 0) {
         write.space = space;
         write.data.assign(data, data + words);
@@ -512,8 +517,9 @@ bool GpuSplit::ForwardRead(size_t space, GPUVAddr begin, u32 words, u32* out) {
     if (target <= done) {
         return false; // Nothing to wait for: memory holds the words
     }
-    // The newest overlapping write; the deque is in send order.
-    for (auto it = ranged_writes.rbegin(); it != ranged_writes.rend(); ++it) {
+    // The newest overlapping write.
+    for (size_t age = 0; age < ranged_writes.size(); ++age) {
+        const RangedWrite* const it = &ranged_writes.Newest(age);
         if (!(it->begin < end && begin < it->end)) {
             continue;
         }
@@ -535,10 +541,13 @@ u64 GpuSplit::MemoryWriterTarget(u64 done, GPUVAddr begin, GPUVAddr end, u32& ta
     }
     u64 target = std::max({last_writer_position, last_sync_position, last_memory_write_position});
     target_method = last_memory_write_method;
-    // Newest first (positions rise along the deque): the first overlap is the target, and the
+    // Newest first (positions rise in send order): the first overlap is the target, and the
     // writes before `target` can't raise it.
-    for (auto it = ranged_writes.rbegin(); it != ranged_writes.rend() && it->position > target;
-         ++it) {
+    for (size_t age = 0; age < ranged_writes.size(); ++age) {
+        const RangedWrite* const it = &ranged_writes.Newest(age);
+        if (it->position <= target) {
+            break;
+        }
         if (it->begin < end && begin < it->end) {
             target = it->position;
             target_method = it->method;
@@ -650,7 +659,7 @@ bool GpuSplit::WaitForMemoryWriters(DrainSite site, GPUVAddr begin, GPUVAddr end
         // What the read waits for: the newest writer it depends on.
         using Cause = Nx2Profile::DmaWaitCause;
         const u64 all_writes =
-            ranged_writes.empty() ? unranged : std::max(unranged, ranged_writes.back().position);
+            ranged_writes.empty() ? unranged : std::max(unranged, ranged_writes.Newest().position);
         if (done < target) {
             Cause cause = Cause::HostSync;
             if (target != last_writer_position && target != last_sync_position) {
