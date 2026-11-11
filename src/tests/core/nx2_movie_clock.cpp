@@ -105,19 +105,19 @@ TEST_CASE("NX2 movie clock restarts after a pause, a loop or a long lag", "[nx2_
     s64 now = Start + Frame + Clock::PauseGap + 1;
     REQUIRE_FALSE(clock.Due(now, 0));
     REQUIRE(clock.Acquired(now, 2 * Frame, 0));
-    REQUIRE(clock.Due(now + 1000, 0) == 2 * Frame + 1000);
+    REQUIRE(clock.Due(now + 1000, 0) == static_cast<u64>(2 * Frame + 1000));
 
     // Emulation paused and resumed since the last acquire.
     const s64 resumed = now + 2000;
     REQUIRE_FALSE(clock.Due(now + 3000, resumed));
     now += 4000;
     REQUIRE(clock.Acquired(now, 3 * Frame, resumed));
-    REQUIRE(clock.Due(now, resumed) == 3 * Frame);
+    REQUIRE(clock.Due(now, resumed) == static_cast<u64>(3 * Frame));
 
     // The movie loops back to its start.
     now += Frame;
     REQUIRE(clock.Acquired(now, 0, resumed));
-    REQUIRE(clock.Due(now, resumed) == 0);
+    REQUIRE(clock.Due(now, resumed) == u64{0});
 
     // The client takes a frame every half second: once it lags by more than MaxCatchUp, the
     // clock restarts from its frame.
@@ -141,13 +141,13 @@ TEST_CASE("NX2 movie clock waits for audio the host device starved of", "[nx2_mo
     Clock clock;
     clock.Audio(Start, 900'000, 40'000);
     clock.Acquired(Start, 0, 0);
-    REQUIRE(clock.Due(Start + 100'000, 0) == 100'000);
+    REQUIRE(clock.Due(Start + 100'000, 0) == 100'000u);
 
     // 30 ms the device had nothing to play: the sound is 30 ms later from here on.
     clock.Audio(Start + 100'000, 970'000, 70'000);
-    REQUIRE(clock.Due(Start + 100'000, 0) == 70'000);
+    REQUIRE(clock.Due(Start + 100'000, 0) == 70'000u);
     clock.Audio(Start + 200'000, 1'070'000, 70'000);
-    REQUIRE(clock.Due(Start + 200'000, 0) == 170'000);
+    REQUIRE(clock.Due(Start + 200'000, 0) == 170'000u);
     // The client keeping up with that clock doesn't restart it.
     REQUIRE_FALSE(clock.Acquired(Start + 200'000, 170'000, 0));
 
@@ -167,7 +167,7 @@ TEST_CASE("NX2 movie clock waits for audio the host device starved of", "[nx2_mo
     silent.Audio(Start, 0, 0);
     silent.Acquired(Start, 0, 0);
     silent.Audio(Start + 100'000, 0, 100'000);
-    REQUIRE(silent.Due(Start + 100'000, 0) == 100'000);
+    REQUIRE(silent.Due(Start + 100'000, 0) == 100'000u);
 }
 
 TEST_CASE("NX2 movie frames are picked nearest the clock", "[nx2_movie_clock]") {
