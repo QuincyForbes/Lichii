@@ -32,5 +32,9 @@ template<std::size_t bitsize>
 void EmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst);
 template<std::size_t bitsize>
 void EmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst);
+template<std::size_t bitsize>
+void EmitAtomicRmwMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst);
+template<std::size_t bitsize>
+void EmitAtomicCasMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst);
 
 }  // namespace Dynarmic::Backend::Arm64

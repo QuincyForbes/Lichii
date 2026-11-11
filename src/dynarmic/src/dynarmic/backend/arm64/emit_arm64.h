@@ -46,6 +46,8 @@ using CodePtr = std::byte*;
 enum class LinkTarget {
     ReturnToDispatcher,
     ReturnFromRunCode,
+    PopRSBHint,
+    FastDispatchHint,
     ReadMemory8,
     ReadMemory16,
     ReadMemory32,
@@ -76,6 +78,14 @@ enum class LinkTarget {
     ExclusiveWriteMemory32,
     ExclusiveWriteMemory64,
     ExclusiveWriteMemory128,
+    WrappedAtomicRmw8,
+    WrappedAtomicRmw16,
+    WrappedAtomicRmw32,
+    WrappedAtomicRmw64,
+    WrappedAtomicCas8,
+    WrappedAtomicCas16,
+    WrappedAtomicCas32,
+    WrappedAtomicCas64,
     CallSVC,
     ExceptionRaised,
     InstructionSynchronizationBarrierRaised,
@@ -140,12 +150,15 @@ struct EmitConfig {
     // Fastmem
     std::optional<u64> fastmem_pointer;
     bool recompile_on_fastmem_failure;
+    bool recompile_on_exclusive_fastmem_failure;
     std::size_t fastmem_address_space_bits;
     bool silently_mirror_fastmem;
 
-    // Timing
+    // Timing & control flow
     bool wall_clock_cntpct;
     bool enable_cycle_counting;
+    bool halt_check_on_back_edges;
+    bool use_state_rsb;
 
     // Endianness
     bool always_little_endian;
@@ -161,6 +174,8 @@ struct EmitConfig {
     std::size_t state_nzcv_offset;
     std::size_t state_fpsr_offset;
     std::size_t state_exclusive_state_offset;
+    std::size_t state_rsb_ptr_offset;
+    std::size_t state_atomic_scratch_offset;
 
     // A32 specific
     std::array<std::shared_ptr<A32::Coprocessor>, 16> coprocessors{};

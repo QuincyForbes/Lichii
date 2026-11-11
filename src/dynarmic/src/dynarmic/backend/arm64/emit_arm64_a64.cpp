@@ -40,16 +40,23 @@ void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Re
     EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
 }
 
-void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::LinkBlock terminal, IR::LocationDescriptor, bool is_single_step) {
+static bool IsForwardLink(const EmitContext& ctx, const IR::LocationDescriptor& next, const IR::LocationDescriptor& initial_location) {
+    return ctx.conf.halt_check_on_back_edges && !ctx.conf.enable_cycle_counting &&
+           A64::LocationDescriptor{next}.PC() > A64::LocationDescriptor{initial_location}.PC();
+}
+
+void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::LinkBlock terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
     oaknut::Label fail;
 
     if (ctx.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
-        if (ctx.conf.enable_cycle_counting) {
+        if (IsForwardLink(ctx, terminal.next, initial_location)) {
+            EmitBlockLinkRelocation(code, ctx, terminal.next, BlockRelocationType::Branch);
+        } else if (ctx.conf.enable_cycle_counting) {
             code.CMP(Xticks, 0);
             code.B(LE, fail);
             EmitBlockLinkRelocation(code, ctx, terminal.next, BlockRelocationType::Branch);
         } else {
-            code.LDAR(Wscratch0, Xhalt);
+            code.LDR(Wscratch0, Xhalt);
             code.CBNZ(Wscratch0, fail);
             EmitBlockLinkRelocation(code, ctx, terminal.next, BlockRelocationType::Branch);
         }
@@ -61,11 +68,18 @@ void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Li
     EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
 }
 
-void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::LinkBlockFast terminal, IR::LocationDescriptor, bool is_single_step) {
+void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::LinkBlockFast terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    oaknut::Label fail;
+
     if (ctx.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
+        if (ctx.conf.halt_check_on_back_edges && !ctx.conf.enable_cycle_counting && !IsForwardLink(ctx, terminal.next, initial_location)) {
+            code.LDR(Wscratch0, Xhalt);
+            code.CBNZ(Wscratch0, fail);
+        }
         EmitBlockLinkRelocation(code, ctx, terminal.next, BlockRelocationType::Branch);
     }
 
+    code.l(fail);
     code.MOV(Xscratch0, A64::LocationDescriptor{terminal.next}.PC());
     code.STR(Xscratch0, Xstate, offsetof(A64JitState, pc));
     EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
@@ -73,41 +87,31 @@ void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Li
 
 void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
     if (ctx.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) && !is_single_step) {
-        oaknut::Label fail;
-
-        code.MOV(Wscratch0, A64::LocationDescriptor::fpcr_mask);
-        code.LDR(W0, Xstate, offsetof(A64JitState, fpcr));
-        code.LDR(X1, Xstate, offsetof(A64JitState, pc));
-        code.AND(W0, W0, Wscratch0);
-        code.AND(X1, X1, A64::LocationDescriptor::pc_mask);
-        code.LSL(X0, X0, A64::LocationDescriptor::fpcr_shift);
-        code.ORR(X0, X0, X1);
-
-        code.LDR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
-        code.AND(Wscratch2, Wscratch2, RSBIndexMask);
-        code.ADD(X2, SP, Xscratch2);
-        code.SUB(Wscratch2, Wscratch2, sizeof(RSBEntry));
-        code.STR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
-
-        code.LDP(Xscratch0, Xscratch1, X2, offsetof(StackLayout, rsb));
-
-        code.CMP(X0, Xscratch0);
-        code.B(NE, fail);
-        code.BR(Xscratch1);
-
-        code.l(fail);
+        EmitRelocation(code, ctx, LinkTarget::PopRSBHint);
+        return;
     }
 
     EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
 }
 
-void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::FastDispatchHint, IR::LocationDescriptor, bool) {
-    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
+void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::FastDispatchHint, IR::LocationDescriptor, bool is_single_step) {
+    if (ctx.conf.HasOptimization(OptimizationFlag::FastDispatch) && !is_single_step) {
+        EmitRelocation(code, ctx, LinkTarget::FastDispatchHint);
+        return;
+    }
 
-    // TODO: Implement FastDispatchHint optimization
+    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
 }
 
 void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::If terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    switch (terminal.if_) {
+    case IR::Cond::AL:
+    case IR::Cond::NV:
+        EmitA64LeafTerminal(code, ctx, terminal.then_, initial_location, is_single_step);
+        return;
+    default:
+        break;
+    }
     oaknut::Label pass = EmitA64Cond(code, ctx, terminal.if_);
     EmitA64LeafTerminal(code, ctx, terminal.else_, initial_location, is_single_step);
     code.l(pass);
@@ -125,7 +129,7 @@ void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Ch
 
 void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::CheckHalt terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
     oaknut::Label fail;
-    code.LDAR(Wscratch0, Xhalt);
+    code.LDR(Wscratch0, Xhalt);
     code.CBNZ(Wscratch0, fail);
     EmitA64LeafTerminal(code, ctx, terminal.else_, initial_location, is_single_step);
     code.l(fail);
@@ -459,12 +463,22 @@ void EmitIR<IR::Opcode::A64InstructionCacheOperationRaised>(oaknut::CodeGenerato
 
 template<>
 void EmitIR<IR::Opcode::A64DataSynchronizationBarrier>(oaknut::CodeGenerator& code, EmitContext&, IR::Inst*) {
-    code.DSB(oaknut::BarrierOp::SY);
+    code.DSB(oaknut::BarrierOp::ISH);
 }
 
 template<>
-void EmitIR<IR::Opcode::A64DataMemoryBarrier>(oaknut::CodeGenerator& code, EmitContext&, IR::Inst*) {
-    code.DMB(oaknut::BarrierOp::SY);
+void EmitIR<IR::Opcode::A64DataMemoryBarrier>(oaknut::CodeGenerator& code, EmitContext&, IR::Inst* inst) {
+    switch (inst->GetArg(0).GetU8() & 0b11) {
+    case 0b01:
+        code.DMB(oaknut::BarrierOp::ISHLD);
+        break;
+    case 0b10:
+        code.DMB(oaknut::BarrierOp::ISHST);
+        break;
+    default:
+        code.DMB(oaknut::BarrierOp::ISH);
+        break;
+    }
 }
 
 template<>

@@ -652,12 +652,12 @@ void EmitIR<IR::Opcode::A32ExceptionRaised>(oaknut::CodeGenerator& code, EmitCon
 
 template<>
 void EmitIR<IR::Opcode::A32DataSynchronizationBarrier>(oaknut::CodeGenerator& code, EmitContext&, IR::Inst*) {
-    code.DSB(oaknut::BarrierOp::SY);
+    code.DSB(oaknut::BarrierOp::ISH);
 }
 
 template<>
 void EmitIR<IR::Opcode::A32DataMemoryBarrier>(oaknut::CodeGenerator& code, EmitContext&, IR::Inst*) {
-    code.DMB(oaknut::BarrierOp::SY);
+    code.DMB(oaknut::BarrierOp::ISH);
 }
 
 template<>

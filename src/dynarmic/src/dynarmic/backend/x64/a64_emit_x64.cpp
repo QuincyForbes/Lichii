@@ -262,11 +262,11 @@ finish_this_inst:
 void A64EmitX64::ClearCache() {
     JitMapClear(code.GetCodeBegin(), code.getCode() + code.GetTotalCodeSize());
     EmitX64::ClearCache();
-    exit_stubs.clear();
-    pending_exit_stubs.clear();
+    exit_stubs = {};
+    pending_exit_stubs = {};
     block_ranges.ClearCache();
     ClearFastDispatchTable();
-    fastmem_patch_info.clear();
+    fastmem_patch_info = {};
 }
 
 void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {

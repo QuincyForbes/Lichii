@@ -688,7 +688,7 @@ A64OPC(ExceptionRaised,                                     Void,           U64,
 A64OPC(DataCacheOperationRaised,                            Void,           U64,            U64,            U64                             )
 A64OPC(InstructionCacheOperationRaised,                     Void,           U64,            U64                                             )
 A64OPC(DataSynchronizationBarrier,                          Void,                                                                           )
-A64OPC(DataMemoryBarrier,                                   Void,                                                                           )
+A64OPC(DataMemoryBarrier,                                   Void,           U8                                                              )
 A64OPC(InstructionSynchronizationBarrier,                   Void,                                                                           )
 A64OPC(GetCNTFRQ,                                           U32,                                                                            )
 A64OPC(GetCNTPCT,                                           U64,                                                                            )
@@ -720,8 +720,8 @@ A64OPC(ExclusiveWriteMemory16,                              U32,            U64,
 A64OPC(ExclusiveWriteMemory32,                              U32,            U64,            U64,            U32,            AccType         )
 A64OPC(ExclusiveWriteMemory64,                              U32,            U64,            U64,            U64,            AccType         )
 A64OPC(ExclusiveWriteMemory128,                             U32,            U64,            U64,            U128,           AccType         )
-#if defined(ARCHITECTURE_x86_64)
-// LSE atomics done by one host atomic (x64 only): return the old value.
+#if defined(ARCHITECTURE_x86_64) || defined(ARCHITECTURE_arm64)
+// LSE atomics done by one host atomic (x64 and arm64): return the old value.
 A64OPC(AtomicRmwMemory8,                                    U8,             U64,            U64,            U8,             U8              )
 A64OPC(AtomicRmwMemory16,                                   U16,            U64,            U64,            U16,            U8              )
 A64OPC(AtomicRmwMemory32,                                   U32,            U64,            U64,            U32,            U8              )

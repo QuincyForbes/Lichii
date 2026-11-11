@@ -84,14 +84,19 @@ bool TranslatorVisitor::AtomicMemOp(Imm<2> size, bool A, bool R, Reg Rs, Imm<4> 
         return UnallocatedEncoding();
     }
 
-#if defined(ARCHITECTURE_x86_64)
+#if defined(ARCHITECTURE_x86_64) || defined(ARCHITECTURE_arm64)
     if (options.native_lse_atomics) {
         // One host atomic: no retry, so the block goes on. The exclusive emulation below cleared
         // the local monitor; keep doing that.
         const IR::U64 address = AtomicAddress(*this, Rn);
         const IR::UAny s = AtomicTruncate(*this, X(64, Rs), bytes);
         ir.ClearExclusive();
-        const IR::UAny old = ir.AtomicRmwMemory(bytes, address, s, static_cast<u8>(opv));
+#if defined(ARCHITECTURE_arm64)
+        const u8 encoded_op = static_cast<u8>(opv | (A ? 0x20U : 0U) | (R ? 0x10U : 0U));
+#else
+        const u8 encoded_op = static_cast<u8>(opv);
+#endif
+        const IR::UAny old = ir.AtomicRmwMemory(bytes, address, s, encoded_op);
         if (Rt != Reg::ZR) {
             X(64, Rt, bytes == 8 ? IR::U64{old} : ir.ZeroExtendToLong(old));
         }
@@ -151,7 +156,7 @@ bool TranslatorVisitor::LDAPR_sz(Imm<2> size, Reg Rn, Reg Rt) {
 
 bool TranslatorVisitor::CompareAndSwap(Imm<2> size, bool L, Reg Rs, bool o0, Reg Rn, Reg Rt) {
     const size_t bytes = size_t{1} << size.ZeroExtend<size_t>();
-#if defined(ARCHITECTURE_x86_64)
+#if defined(ARCHITECTURE_x86_64) || defined(ARCHITECTURE_arm64)
     if (options.native_lse_atomics) {
         const IR::U64 native_address = AtomicAddress(*this, Rn);
         const IR::UAny expected_value = AtomicTruncate(*this, X(64, Rs), bytes);
