@@ -116,8 +116,10 @@ template<>
     }
     // check for sign bit, apply sign extension as needed
     if (ctx.conf.page_table_sign_extension) {
-        code.shl(page, 63 - int(*ctx.conf.page_table_sign_extension));
-        code.sar(page, 63 - int(*ctx.conf.page_table_sign_extension));
+        if (const int shift = 63 - int(*ctx.conf.page_table_sign_extension); shift > 0) {
+            code.shl(page, shift);
+            code.sar(page, shift);
+        }
     }
 
     code.jz(abort, code.T_NEAR);
@@ -191,8 +193,10 @@ template<>
     }
     // check for sign bit, apply sign extension as needed
     if (ctx.conf.page_table_sign_extension) {
-        code.shl(page, *ctx.conf.page_table_sign_extension);
-        code.sar(page, *ctx.conf.page_table_sign_extension);
+        if (const int shift = 63 - int(*ctx.conf.page_table_sign_extension); shift > 0) {
+            code.shl(page, shift);
+            code.sar(page, shift);
+        }
     }
 
     code.jz(abort, code.T_NEAR);
@@ -233,6 +237,96 @@ template<>
         }
         return r13 + *tmp;
     } else {
+        const u64 pt_mask = ctx.conf.page_table_pointer_mask;
+        const int pt_top_zeros = pt_mask == 0 ? 0 : std::countl_zero(pt_mask);
+        const u64 sign_filled_pt_mask = pt_top_zeros == 0 ? pt_mask : (pt_mask | (~u64{0} << (64 - pt_top_zeros)));
+        const size_t valid_pt_index_bits = ctx.conf.page_table_address_space_bits > page_table_const_bits
+                                             ? ctx.conf.page_table_address_space_bits - page_table_const_bits
+                                             : 0;
+        const bool can_pt_fallback =
+            ctx.conf.page_table != nullptr && ctx.conf.absolute_offset_page_table &&
+            ctx.conf.fastmem_address_space_bits < ctx.conf.page_table_address_space_bits &&
+            valid_pt_index_bits > 0 &&
+            (pt_mask == 0 || std::in_range<s32>(static_cast<s64>(sign_filled_pt_mask))) &&
+            (!ctx.conf.page_table_sign_extension || int(*ctx.conf.page_table_sign_extension) <= 63 - pt_top_zeros);
+
+        if (can_pt_fallback) {
+            const Xbyak::Reg64 base = tmp ? *tmp : ctx.reg_alloc.ScratchGpr(code);
+            SharedLabel pt_lookup = ctx.GenSharedLabel(), pt_done = ctx.GenSharedLabel();
+            Xbyak::Label* const abort_ptr = &abort;
+            if (ctx.conf.fastmem_address_space_bits < 32) {
+                code.test(vaddr, u32(-(1 << ctx.conf.fastmem_address_space_bits)));
+            } else {
+                code.mov(base, vaddr);
+                code.shr(base, int(ctx.conf.fastmem_address_space_bits));
+            }
+            code.mov(base, r13);
+            code.jnz(*pt_lookup, code.T_NEAR);
+            code.L(*pt_done);
+            require_abort_handling = true;
+
+            ColdEmits(code, ctx).emplace_back([=, &code, &ctx] {
+                code.L(*pt_lookup);
+                if (ctx.conf.detect_misaligned_access_via_page_table != 0) {
+                    if (!ctx.conf.only_detect_misalignment_via_page_table_on_page_boundary) {
+                        code.test(vaddr, 0xF);
+                        code.jnz(*abort_ptr, code.T_NEAR);
+                    } else {
+                        code.mov(base.cvt32(), vaddr.cvt32());
+                        code.and_(base.cvt32(), static_cast<u32>(page_table_const_mask));
+                        code.cmp(base.cvt32(), static_cast<u32>(page_table_const_size - 16));
+                        code.ja(*abort_ptr, code.T_NEAR);
+                    }
+                }
+
+                const size_t unused_pt_top_bits = 64 - ctx.conf.page_table_address_space_bits;
+                code.mov(base, vaddr);
+                if (unused_pt_top_bits == 0) {
+                    code.shr(base, int(page_table_const_bits));
+                } else if (ctx.conf.silently_mirror_page_table) {
+                    code.shl(base, int(unused_pt_top_bits));
+                    code.shr(base, int(unused_pt_top_bits + page_table_const_bits));
+                } else {
+                    code.shr(base, int(ctx.conf.page_table_address_space_bits));
+                    code.jnz(*abort_ptr, code.T_NEAR);
+                    code.mov(base, vaddr);
+                    code.shr(base, int(page_table_const_bits));
+                }
+
+                if (ctx.conf.page_table_log2_stride > 3) {
+                    code.shl(base, int(ctx.conf.page_table_log2_stride));
+                    code.mov(base, qword[r14 + base]);
+                } else {
+                    code.mov(base, qword[r14 + base * int(1 << ctx.conf.page_table_log2_stride)]);
+                }
+
+                if (ctx.conf.page_table_marked_bit) {
+                    code.bt(base, *ctx.conf.page_table_marked_bit);
+                    code.jc(*abort_ptr, code.T_NEAR);
+                }
+
+                if (pt_mask == 0) {
+                    code.test(base, base);
+                } else {
+                    code.and_(base, static_cast<s32>(static_cast<s64>(sign_filled_pt_mask)));
+                }
+
+                if (ctx.conf.page_table_sign_extension) {
+                    if (const int shift = 63 - int(*ctx.conf.page_table_sign_extension); shift > 0) {
+                        code.shl(base, shift);
+                        code.sar(base, shift);
+                    }
+                } else if (pt_top_zeros > 0) {
+                    code.shl(base, pt_top_zeros);
+                    code.shr(base, pt_top_zeros);
+                }
+
+                code.jz(*abort_ptr, code.T_NEAR);
+                code.jmp(*pt_done, code.T_NEAR);
+            });
+            return base + vaddr;
+        }
+
         if (ctx.conf.fastmem_address_space_bits < 32) {
             code.test(vaddr, u32(-(1 << ctx.conf.fastmem_address_space_bits)));
             code.jnz(abort, code.T_NEAR);
