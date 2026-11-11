@@ -125,6 +125,10 @@ private:
     void ReleaseCache(MemoryUsage usage);
 
     void ReleaseLevel(StagingBuffersCache& cache, size_t log2);
+
+    /// Frees every staging buffer the GPU is done with.
+    void ReleaseIdleBuffers();
+
     size_t Region(size_t iter) const noexcept {
         return iter / region_size;
     }
@@ -147,6 +151,9 @@ private:
     mutable ChunkPointer current_chunk{};
     bool use_rebar = false;
     u32 seen_host_pressure{};
+    bool low_memory{};         ///< Under the low-water mark at the last frame (iOS)
+    u64 low_memory_waits{};    ///< GPU waits in CreateStagingBuffer since the last log line
+    u64 frame_count{};
 
     StagingBuffersCache device_local_cache;
     StagingBuffersCache upload_cache;

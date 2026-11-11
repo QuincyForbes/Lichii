@@ -24,6 +24,7 @@
 #include "common/logging.h"
 #include "common/platform_events.h"
 #include "video_core/churn_counters.h"
+#include "video_core/gpu_split.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -200,22 +201,37 @@ void StagingBufferPool::TickFrame() {
         pressure != seen_host_pressure) {
         seen_host_pressure = pressure;
         const u64 before = CachedBytes();
-        for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
-            for (StagingBuffers& staging : *cache) {
-                std::erase_if(staging.entries, [this](const StagingBuffer& entry) {
-                    return !entry.deferred && scheduler.IsFree(entry.tick);
-                });
-                staging.delete_index = 0;
-                staging.iterate_index = 0;
-            }
-        }
+        ReleaseIdleBuffers();
         LOG_INFO(Render_Vulkan, "Host memory pressure: staging buffers {} -> {} MiB", before >> 20,
                  CachedBytes() >> 20);
+    }
+    if (const u64 low_water = Common::PlatformEvents::MemoryLowWater(); low_water != 0) {
+        const u64 available = Common::PlatformEvents::AvailableProcessMemory();
+        low_memory = available != 0 && available < low_water;
+    }
+    if (++frame_count % 60 == 0 && low_memory_waits != 0) {
+        LOG_INFO(Common_Memory,
+                 "Staging: waited for the GPU {} times under the low-water mark rather than "
+                 "make more staging buffers",
+                 low_memory_waits);
+        low_memory_waits = 0;
     }
 
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
     ReleaseCache(MemoryUsage::Download);
+}
+
+void StagingBufferPool::ReleaseIdleBuffers() {
+    for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
+        for (StagingBuffers& staging : *cache) {
+            std::erase_if(staging.entries, [this](const StagingBuffer& entry) {
+                return !entry.deferred && scheduler.IsFree(entry.tick);
+            });
+            staging.delete_index = 0;
+            staging.iterate_index = 0;
+        }
+    }
 }
 
 u64 StagingBufferPool::CachedBytes() const {
@@ -345,6 +361,23 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
 }
 
 StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred) {
+    // Under the low-water mark (iOS) a frame that uploads a new scene made a staging buffer for
+    // each upload the stream buffer had no room for, before the GPU had read any: Metal went
+    // 325 -> 549 MiB in the second before iOS closed the app. Past 32 MiB of them, wait for the
+    // command buffers already submitted and reuse or free what they used. Only those: buffers
+    // handed out for the current one may not have had their copies recorded yet.
+    constexpr u64 LowMemoryStagingBytes = 32_MiB;
+    if (low_memory && !deferred && usage != MemoryUsage::Download &&
+        VideoCommon::GpuSplit::OwnsScheduler() && scheduler.CurrentTick() > 1 &&
+        CachedBytes() + size > LowMemoryStagingBytes) {
+        ++low_memory_waits;
+        scheduler.Wait(scheduler.CurrentTick() - 1);
+        if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
+            ReleaseIdleBuffers();
+            return *ref;
+        }
+        ReleaseIdleBuffers();
+    }
     auto const log2_size = Common::Log2Ceil<u32>(u32(size));
     const VkDeviceSize logical_size = 1ULL << log2_size;
     // Upload fallbacks can also back Metal's reflected 64 KiB constant-buffer arguments.
