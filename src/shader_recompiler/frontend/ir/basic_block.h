@@ -82,11 +82,11 @@ public:
         return std::bit_cast<DefinitionType>(definition);
     }
 
-    void SetSsaRegValue(IR::Reg reg, const Value& value) noexcept {
-        ssa_reg_values[RegIndex(reg)] = value;
+    void SetSsaId(u32 id) noexcept {
+        ssa_id = id;
     }
-    const Value& SsaRegValue(IR::Reg reg) const noexcept {
-        return ssa_reg_values[RegIndex(reg)];
+    [[nodiscard]] u32 SsaId() const noexcept {
+        return ssa_id;
     }
 
     void SsaSeal() noexcept {
@@ -180,8 +180,8 @@ private:
     /// Block immediate successors
     std::vector<Block*> imm_successors;
 
-    /// Intrusively store the value of a register in the block.
-    std::array<Value, NUM_REGS> ssa_reg_values;
+    /// Block index in the active SSA rewrite pass (~0U outside it).
+    u32 ssa_id{~0U};
     /// Intrusively store if the block is sealed in the SSA pass.
     bool is_ssa_sealed{false};
 
