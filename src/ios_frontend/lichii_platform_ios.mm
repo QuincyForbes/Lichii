@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -240,6 +241,62 @@ void WriteCachesNow() {
     Common::PlatformEvents::NotifyEnteringBackground();
 }
 
+// iOS sends memory warnings in bursts (10 in 2 s on an iPhone18,2 while a game loaded),
+// each one seen by the UIKit observer and by the dispatch source. The first of a burst starts the
+// collections; the rest found nothing more to free and are only counted.
+constexpr auto MemoryWarningBurst = std::chrono::seconds{2};
+std::mutex g_warning_mutex;
+std::chrono::steady_clock::time_point g_warning_burst_end{};
+bool g_warning_burst_emitted = false;
+unsigned g_warnings_folded = 0;
+
+void OnMemoryWarning(const char* kind, bool from_uikit) {
+    const auto now = std::chrono::steady_clock::now();
+    bool first = false;
+    bool emit = false;
+    {
+        std::scoped_lock lock{g_warning_mutex};
+        if (now >= g_warning_burst_end) {
+            first = true;
+            g_warning_burst_end = now + MemoryWarningBurst;
+            g_warning_burst_emitted = false;
+            g_warnings_folded = 0;
+        } else {
+            ++g_warnings_folded;
+        }
+        // The app's own warning flag (the unclean-exit notice) still comes from UIKit only.
+        if (from_uikit && !g_warning_burst_emitted) {
+            g_warning_burst_emitted = true;
+            emit = true;
+        }
+    }
+    if (first) {
+        LOG_WARNING(Frontend, "iOS: {} ({} MiB left, footprint {} MiB)", kind,
+                    lichii_platform_available_memory_mib(), lichii_platform_footprint_mib());
+        Common::PlatformEvents::SignalMemoryPressure();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     std::chrono::nanoseconds{MemoryWarningBurst}.count()),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                         unsigned folded;
+                         {
+                             std::scoped_lock lock{g_warning_mutex};
+                             folded = g_warnings_folded;
+                         }
+                         if (folded != 0) {
+                             LOG_INFO(Frontend,
+                                      "iOS: {} more memory warnings in the same {} s folded into "
+                                      "the one above ({} MiB left, footprint {} MiB)",
+                                      folded, MemoryWarningBurst.count(),
+                                      lichii_platform_available_memory_mib(),
+                                      lichii_platform_footprint_mib());
+                         }
+                       });
+    }
+    if (emit) {
+        Emit(LICHII_PLATFORM_EVENT_MEMORY_WARNING);
+    }
+}
+
 void InstallObservers() {
     NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
     NSOperationQueue* main = [NSOperationQueue mainQueue];
@@ -257,12 +314,8 @@ void InstallObservers() {
             ^(NSNotification* note) { Emit(LICHII_PLATFORM_EVENT_WILL_ENTER_FOREGROUND); });
     observe(UIApplicationDidBecomeActiveNotification,
             ^(NSNotification* note) { Emit(LICHII_PLATFORM_EVENT_DID_BECOME_ACTIVE); });
-    observe(UIApplicationDidReceiveMemoryWarningNotification, ^(NSNotification* note) {
-      LOG_WARNING(Frontend, "iOS: memory warning ({} MiB left, footprint {} MiB)",
-                  lichii_platform_available_memory_mib(), lichii_platform_footprint_mib());
-      Common::PlatformEvents::SignalMemoryPressure();
-      Emit(LICHII_PLATFORM_EVENT_MEMORY_WARNING);
-    });
+    observe(UIApplicationDidReceiveMemoryWarningNotification,
+            ^(NSNotification* note) { OnMemoryWarning("memory warning", true); });
     observe(UIApplicationWillTerminateNotification, ^(NSNotification* note) {
       WriteCachesNow();
       Emit(LICHII_PLATFORM_EVENT_WILL_TERMINATE);
@@ -305,10 +358,10 @@ void InstallObservers() {
     if (pressure_source != nullptr) {
         dispatch_source_set_event_handler(pressure_source, ^{
           const unsigned long level = dispatch_source_get_data(pressure_source);
-          LOG_WARNING(Frontend, "iOS: system memory pressure {} ({} MiB left, footprint {} MiB)",
-                      (level & DISPATCH_MEMORYPRESSURE_CRITICAL) != 0 ? "critical" : "warning",
-                      lichii_platform_available_memory_mib(), lichii_platform_footprint_mib());
-          Common::PlatformEvents::SignalMemoryPressure();
+          OnMemoryWarning((level & DISPATCH_MEMORYPRESSURE_CRITICAL) != 0
+                              ? "system memory pressure critical"
+                              : "system memory pressure warning",
+                          false);
         });
         dispatch_resume(pressure_source);
     }
