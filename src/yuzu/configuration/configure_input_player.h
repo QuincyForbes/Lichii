@@ -53,7 +53,8 @@ public:
     explicit ConfigureInputPlayer(QWidget* parent, std::size_t player_index, QWidget* bottom_row,
                                   InputCommon::InputSubsystem* input_subsystem_,
                                   InputProfiles* profiles_, Core::HID::HIDCore& hid_core_,
-                                  bool is_powered_on_, bool debug = false);
+                                  bool is_powered_on_, bool debug = false,
+                                  const std::vector<Common::ParamPackage>* input_devices_ = nullptr);
     ~ConfigureInputPlayer() override;
 
     /// Save all button configurations to settings file.
@@ -62,8 +63,8 @@ public:
     /// Set the connection state checkbox (used to sync state).
     void ConnectPlayer(bool connected);
 
-    /// Update the input devices combobox.
-    void UpdateInputDeviceCombobox();
+    /// Update the input devices combobox, from `devices` when the caller listed them already.
+    void UpdateInputDeviceCombobox(const std::vector<Common::ParamPackage>* devices = nullptr);
 
     /// Updates the list of controller profiles.
     void UpdateInputProfiles();
@@ -138,7 +139,7 @@ private:
     int GetIndexFromControllerType(Core::HID::NpadStyleIndex type) const;
 
     /// Update the available input devices.
-    void UpdateInputDevices();
+    void UpdateInputDevices(const std::vector<Common::ParamPackage>* devices = nullptr);
 
     /// Hides and disables controller settings based on the current controller type.
     void UpdateControllerAvailableButtons();
@@ -218,6 +219,9 @@ private:
     /// List of physical devices users can map with. If a SDL backed device is selected, then you
     /// can use this device to get a default mapping.
     std::vector<Common::ParamPackage> input_devices;
+
+    /// The devices the parent listed once for every player; only used while constructing.
+    const std::vector<Common::ParamPackage>* initial_input_devices;
 
     /// Bottom row is where console wide settings are held, and its "owned" by the parent
     /// ConfigureInput widget. On show, add this widget to the main layout. This will change the

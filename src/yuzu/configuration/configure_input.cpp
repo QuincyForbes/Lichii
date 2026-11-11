@@ -15,6 +15,7 @@
 #include "core/hle/service/sm/sm.h"
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
+#include "input_common/main.h"
 #include "qt_common/qt_compat.h"
 #include "ui_configure_input.h"
 #include "ui_configure_input_advanced.h"
@@ -68,23 +69,25 @@ void ConfigureInput::Initialize(InputCommon::InputSubsystem* input_subsystem,
                                 std::size_t max_players) {
     const bool is_powered_on = system.IsPoweredOn();
     auto& hid_core = system.HIDCore();
+    // Listed once for every player (see ConfigureInputPlayer::UpdateInputDevices).
+    const auto devices = input_subsystem->GetInputDevices();
     player_controllers = {
         new ConfigureInputPlayer(this, 0, ui->consoleInputSettings, input_subsystem, profiles.get(),
-                                 hid_core, is_powered_on),
+                                 hid_core, is_powered_on, false, &devices),
         new ConfigureInputPlayer(this, 1, ui->consoleInputSettings, input_subsystem, profiles.get(),
-                                 hid_core, is_powered_on),
+                                 hid_core, is_powered_on, false, &devices),
         new ConfigureInputPlayer(this, 2, ui->consoleInputSettings, input_subsystem, profiles.get(),
-                                 hid_core, is_powered_on),
+                                 hid_core, is_powered_on, false, &devices),
         new ConfigureInputPlayer(this, 3, ui->consoleInputSettings, input_subsystem, profiles.get(),
-                                 hid_core, is_powered_on),
+                                 hid_core, is_powered_on, false, &devices),
         new ConfigureInputPlayer(this, 4, ui->consoleInputSettings, input_subsystem, profiles.get(),
-                                 hid_core, is_powered_on),
+                                 hid_core, is_powered_on, false, &devices),
         new ConfigureInputPlayer(this, 5, ui->consoleInputSettings, input_subsystem, profiles.get(),
-                                 hid_core, is_powered_on),
+                                 hid_core, is_powered_on, false, &devices),
         new ConfigureInputPlayer(this, 6, ui->consoleInputSettings, input_subsystem, profiles.get(),
-                                 hid_core, is_powered_on),
+                                 hid_core, is_powered_on, false, &devices),
         new ConfigureInputPlayer(this, 7, ui->consoleInputSettings, input_subsystem, profiles.get(),
-                                 hid_core, is_powered_on),
+                                 hid_core, is_powered_on, false, &devices),
     };
 
     player_tabs = {
