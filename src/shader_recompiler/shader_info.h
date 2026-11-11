@@ -388,7 +388,9 @@ struct Info {
 
     boost::container::static_vector<ConstantBufferDescriptor, MAX_CBUFS>
         constant_buffer_descriptors;
-    boost::container::static_vector<StorageBufferDescriptor, MAX_SSBOS> storage_buffers_descriptors;
+    /// Up to MAX_SSBOS. Room for all of them in the object made an Info 6.9 KiB, and every graphics
+    /// pipeline holds five.
+    boost::container::small_vector<StorageBufferDescriptor, 4> storage_buffers_descriptors;
     TextureBufferDescriptors texture_buffer_descriptors;
     ImageBufferDescriptors image_buffer_descriptors;
     TextureDescriptors texture_descriptors;
