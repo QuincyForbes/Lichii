@@ -101,7 +101,8 @@ struct UserCallbacks {
     virtual void MemoryWrite(VAddr vaddr, std::uint64_t value, std::size_t size) = 0;
     virtual void MemoryWrite128(VAddr vaddr, Vector value) = 0;
 
-    // Writes through these callbacks may not be aligned.
+    // Writes through these callbacks may not be aligned. false means memory did not hold
+    // `expected` and nothing else: the native LSE atomics retry until the write goes through.
     virtual bool MemoryWriteExclusive8(VAddr /*vaddr*/, std::uint8_t /*value*/, std::uint8_t /*expected*/) { return false; }
     virtual bool MemoryWriteExclusive16(VAddr /*vaddr*/, std::uint16_t /*value*/, std::uint16_t /*expected*/) { return false; }
     virtual bool MemoryWriteExclusive32(VAddr /*vaddr*/, std::uint32_t /*value*/, std::uint32_t /*expected*/) { return false; }
@@ -340,6 +341,10 @@ struct UserConfig {
     /// and friends, SWP, CAS) become one host atomic instruction (or a host CAS loop) instead
     /// of an exclusive load/store pair that ends the block.
     bool native_lse_atomics = false;
+
+    /// Test switch for native_lse_atomics. Every LSE atomic goes through the memory callbacks,
+    /// the slow path otherwise taken only by an instruction that faulted in fastmem.
+    bool atomics_through_callbacks = false;
 
     /// x64 only, diagnostic. Count RSB hits, fast dispatch lookups and misses, and native
     /// atomics in the JIT state; written to the EDEN_NX2_JIT_MAP file about once a second.

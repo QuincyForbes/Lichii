@@ -320,24 +320,26 @@ void DynarmicCallbacks64::MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value)
     }
 }
 
+// false is reserved for "memory did not hold `expected`", which the caller retries. An access that
+// CheckMemoryAccess refused has already halted the core and is not written; it is not a lost race.
 bool DynarmicCallbacks64::MemoryWriteExclusive8(u64 vaddr, std::uint8_t value, std::uint8_t expected) {
-    return CheckMemoryAccess(vaddr, 1, Kernel::DebugWatchpointType::Write) &&
+    return !CheckMemoryAccess(vaddr, 1, Kernel::DebugWatchpointType::Write) ||
             m_memory.WriteExclusive8(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive16(u64 vaddr, std::uint16_t value, std::uint16_t expected) {
-    return CheckMemoryAccess(vaddr, 2, Kernel::DebugWatchpointType::Write) &&
+    return !CheckMemoryAccess(vaddr, 2, Kernel::DebugWatchpointType::Write) ||
             m_memory.WriteExclusive16(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive32(u64 vaddr, std::uint32_t value, std::uint32_t expected) {
-    return CheckMemoryAccess(vaddr, 4, Kernel::DebugWatchpointType::Write) &&
+    return !CheckMemoryAccess(vaddr, 4, Kernel::DebugWatchpointType::Write) ||
             m_memory.WriteExclusive32(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive64(u64 vaddr, std::uint64_t value, std::uint64_t expected) {
-    return CheckMemoryAccess(vaddr, 8, Kernel::DebugWatchpointType::Write) &&
+    return !CheckMemoryAccess(vaddr, 8, Kernel::DebugWatchpointType::Write) ||
             m_memory.WriteExclusive64(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive128(u64 vaddr, Dynarmic::A64::Vector value, Dynarmic::A64::Vector expected) {
-    return CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Write) &&
+    return !CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Write) ||
             m_memory.WriteExclusive128(vaddr, value, expected);
 }
 
@@ -791,6 +793,13 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         static const bool native_atomics = Nx2EnvOn("EDEN_NX2_JIT_ATOMICS");
         config.native_lse_atomics = native_atomics && config.fastmem_exclusive_access &&
             config.HasOptimization(Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor);
+        // Test switch, off by default: EDEN_NX2_JIT_ATOMICS_SLOW=1 sends every LSE atomic through
+        // the callback slow path that is otherwise only taken after a fastmem fault.
+        static const bool atomics_slow = [] {
+            const char* value = std::getenv("EDEN_NX2_JIT_ATOMICS_SLOW");
+            return value != nullptr && value[0] == '1';
+        }();
+        config.atomics_through_callbacks = atomics_slow;
     }
     // Diagnostic, off by default: EDEN_NX2_JIT_MAP=<file> makes dynarmic append every block as
     // "host_start host_size guest_pc" plus per-core dispatch/atomic counters once a second.
