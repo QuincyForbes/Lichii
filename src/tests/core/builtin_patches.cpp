@@ -263,6 +263,9 @@ TEST_CASE("Built-in DLSS render scale follows the DLSS mode and is not listed",
     mode.SetValue(Settings::OcarinaDlssMode::UltraPerformance);
 #ifdef EGLANTINE_STREAMLINE
     CHECK(scale() == ScaleUltra);
+    Settings::values.oot_anti_aliasing.SetValue(Settings::OotAntiAliasing::Fsr3);
+    CHECK(scale() == ScaleOne);
+    Settings::values.oot_anti_aliasing.SetValue(Settings::OotAntiAliasing::Game);
     Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Off);
     CHECK(scale() == ScaleOne);
     Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Auto);

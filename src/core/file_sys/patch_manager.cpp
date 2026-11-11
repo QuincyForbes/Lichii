@@ -135,10 +135,11 @@ bool MaxResolutionDefault() {
 }
 
 // A shared config can carry the mode into a build without NVIDIA DLSS, where nothing would
-// upscale the smaller scene.
+// upscale the smaller scene. FSR 3.1 takes the upscale from DLSS, at the game's own render scale.
 bool RenderScaleChosen([[maybe_unused]] Settings::OcarinaDlssMode mode) {
 #ifdef EGLANTINE_STREAMLINE
     return Settings::values.nvidia_dlss.GetValue() &&
+           Settings::values.oot_anti_aliasing.GetValue() != Settings::OotAntiAliasing::Fsr3 &&
            Settings::values.ocarina_dlss_mode.GetValue() == mode;
 #else
     return false;

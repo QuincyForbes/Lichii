@@ -973,8 +973,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (scene_id) {
             const auto& scene = texture_cache.GetImageView(scene_id);
             if (scene.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
-                scene.size.width == oot_motion.extent.width &&
-                scene.size.height == oot_motion.extent.height && !scene.IsRescaled() &&
+                oot_motion.SceneSized(scene.size.width, scene.size.height) && !scene.IsRescaled() &&
                 scene.range == VideoCommon::SubresourceRange{}) {
                 oot_effects_scene = scene.Handle(Shader::TextureType::Color2D);
                 oot_effects_address = scene.gpu_addr;
@@ -2997,7 +2996,7 @@ void RasterizerVulkan::TrackOcarinaCamera() {
     // Reflections and half-size passes share the camera layout; the upscale reads the largest.
     if (oot_camera_sample_frame == render_trace_frame &&
         u64{color.size.width} * color.size.height <=
-            u64{oot_motion.extent.width} * oot_motion.extent.height) {
+            u64{oot_motion.image_extent.width} * oot_motion.image_extent.height) {
         return;
     }
 
@@ -3014,14 +3013,25 @@ void RasterizerVulkan::TrackOcarinaCamera() {
     std::array<f32, 2> proj_check{};
     device_memory.ReadBlockUnsafe(*device_addr + 0x120, extent_check.data(), sizeof(extent_check));
     device_memory.ReadBlockUnsafe(*device_addr + 0xa8, proj_check.data(), sizeof(proj_check));
-    if (extent_check[0] != static_cast<f32>(color.size.width) ||
-        extent_check[1] != static_cast<f32>(color.size.height) ||
-        proj_check[0] != -1.0f || proj_check[1] != 0.0f) {
+    if (proj_check[0] != -1.0f || proj_check[1] != 0.0f || !(extent_check[0] >= 640.0f) ||
+        !(extent_check[1] >= 360.0f) || extent_check[0] > 16384.0f || extent_check[1] > 16384.0f) {
+        return;
+    }
+    // The camera's extent is the scene's. The images are that size, or up to 15 pixels larger at
+    // a render scale the game pads (ocarina_dlss_mode Balanced); only NVIDIA DLSS takes those.
+    const VkExtent2D scene{static_cast<u32>(extent_check[0]), static_cast<u32>(extent_check[1])};
+    const bool padded = scene.width != color.size.width || scene.height != color.size.height;
+    if (static_cast<f32>(scene.width) != extent_check[0] ||
+        static_cast<f32>(scene.height) != extent_check[1] || color.size.width < scene.width ||
+        color.size.height < scene.height || color.size.width - scene.width >= 16 ||
+        color.size.height - scene.height >= 16 ||
+        (padded && oot_backend != VideoCommon::OcarinaUpscaleBackend::Dlss)) {
         return;
     }
     oot_camera_sample_frame = render_trace_frame;
     oot_motion.camera_channel = gpu_memory;
-    oot_motion.extent = {color.size.width, color.size.height};
+    oot_motion.extent = scene;
+    oot_motion.image_extent = {color.size.width, color.size.height};
     device_memory.ReadBlockUnsafe(*device_addr + 0x30, oot_motion.current.data(),
                                   sizeof(oot_motion.current));
     device_memory.ReadBlockUnsafe(*device_addr + 0x180, oot_motion.previous.data(),
@@ -3058,8 +3068,7 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
         const auto& targets = texture_cache.GetRenderTargets();
         if (targets.depth_buffer_id) {
             const auto& depth = texture_cache.GetImageView(targets.depth_buffer_id);
-            if (depth.size.width == oot_motion.extent.width &&
-                depth.size.height == oot_motion.extent.height && !depth.IsRescaled()) {
+            if (oot_motion.SceneSized(depth.size.width, depth.size.height) && !depth.IsRescaled()) {
                 // Halton (2, 3) with AMD's phase count for the last upscaled frame's scale.
                 const u32 index = static_cast<u32>(render_trace_frame % oot_jitter_phases) + 1;
                 want = {Halton(index, 2) - 0.5f, Halton(index, 3) - 0.5f};
@@ -3196,7 +3205,7 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
 bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace) {
     constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
     const u64 upscale_hash = pipeline.ShaderHash();
-    const bool upscale_4k =
+    bool upscale_4k =
         replace && (upscale_hash == ComputePipeline::Ocarina1440pShader ||
                     upscale_hash == ComputePipeline::Ocarina1440pScaledShader ||
                     upscale_hash == ComputePipeline::Ocarina1440pScaledFieldShader);
@@ -3225,8 +3234,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         const u32 index = gpu_memory->Read<u32>(cbuf.Address() + depth_handle_offset) & 0xfffff;
         const auto tic = read_tic(index);
         const bool scene_size = oot_camera_sample_frame != render_trace_frame ||
-                                (tic && tic->Width() == oot_motion.extent.width &&
-                                 tic->Height() == oot_motion.extent.height);
+                                (tic && oot_motion.SceneSized(tic->Width(), tic->Height()));
         if (tic && tic->Address() && scene_size) {
             oot_motion.depth_channel = gpu_memory;
             oot_motion.depth_frame = render_trace_frame;
@@ -3258,7 +3266,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     }
     const auto tic = read_tic(oot_motion.depth_tic);
     if (!tic || tic->Address() != oot_motion.depth_address ||
-        tic->Width() != oot_motion.extent.width || tic->Height() != oot_motion.extent.height) {
+        !oot_motion.SceneSized(tic->Width(), tic->Height())) {
         return fail("scene depth descriptor changed");
     }
 
@@ -3285,6 +3293,13 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     using VideoCore::Surface::PixelFormat;
     const auto extent = oot_motion.extent;
     const bool native_size = pipeline.ShaderHash() == ComputePipeline::OcarinaFullSizeShader;
+    // At the Performance render scale (1920x1080) the game runs its 3/4 pass to 2560x1440.
+    constexpr u64 three_quarter_pass = 0xe40f5efb5480e692ULL;
+    if (upscale_hash == three_quarter_pass && target.size.width == 2560 &&
+        target.size.height == 1440 &&
+        Settings::values.ocarina_dlss_mode.GetValue() == Settings::OcarinaDlssMode::Performance) {
+        upscale_4k = true;
+    }
     // 4K: any 16:9 scene up to 2560x1440 (the lower ocarina_dlss_mode render scales).
     const bool valid_extents = upscale_4k
         ? extent.width <= 2560 &&
@@ -3299,7 +3314,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         color.Samples() != VK_SAMPLE_COUNT_1_BIT || target.Samples() != VK_SAMPLE_COUNT_1_BIT ||
         color.range != VideoCommon::SubresourceRange{} || target.range != VideoCommon::SubresourceRange{} ||
         color.format != PixelFormat::E5B9G9R9_FLOAT || target.format != PixelFormat::B10G11R11_FLOAT ||
-        color.size.width != extent.width || color.size.height != extent.height ||
+        !oot_motion.SceneSized(color.size.width, color.size.height) ||
         color.ImageHandle() == target.ImageHandle() || depth.ImageHandle() == target.ImageHandle()) {
         return fail("unexpected upscale images");
     }
@@ -3345,7 +3360,8 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         const bool recorded = oot_live_dlss->Record(color_view, depth.DepthView(), target_view,
                                                    extent, output_extent, target_extent, oot_motion.current,
                                                    oot_motion.previous, mesh, depth.ImageHandle(),
-                                                   render_trace_frame, jitter);
+                                                   render_trace_frame, jitter,
+                                                   {depth.size.width, depth.size.height});
         if (!recorded) {
             return fail("DLSS declined the frame");
         }
