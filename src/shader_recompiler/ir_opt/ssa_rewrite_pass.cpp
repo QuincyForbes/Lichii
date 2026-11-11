@@ -54,13 +54,21 @@ struct IndirectBranchVariable {
 };
 
 using Variant = std::variant<IR::Reg, IR::Pred, ZeroFlagTag, SignFlagTag, CarryFlagTag, OverflowFlagTag, GotoVariable, IndirectBranchVariable>;
-// TODO: majority of these require stable iterators, test with XC beforehand
-using ValueMap = std::unordered_map<IR::Block*, IR::Value>;
-
 struct DefTable {
     static constexpr size_t REG_BANK_SIZE = 256;
     static constexpr size_t NUM_REG_BANKS = (IR::NUM_REGS + REG_BANK_SIZE - 1) / REG_BANK_SIZE;
     using RegBank = std::array<IR::Value, REG_BANK_SIZE>;
+    enum : size_t { ZeroFlag, SignFlag, CarryFlag, OverflowFlag, NumFlags };
+
+    /// The definitions in one tracked block, at its SSA id; the goto variables are apart.
+    /// (Each predicate and flag had a node map by block: a read walk allocated a node per
+    /// block it passed, for the lookup and again for the value it left there.)
+    struct BlockDefs {
+        std::array<RegBank*, NUM_REG_BANKS> regs{};
+        std::array<IR::Value, IR::NUM_USER_PREDS> preds{};
+        std::array<IR::Value, NumFlags> flags{};
+        IR::Value indirect_branch_var{};
+    };
 
     ~DefTable() {
         for (IR::Block* const block : tracked_blocks) {
@@ -68,92 +76,109 @@ struct DefTable {
         }
     }
 
-    const IR::Value& Def(IR::Block* block, IR::Reg variable) {
+    [[nodiscard]] const BlockDefs* Find(const IR::Block* block) const {
         const u32 id = block->SsaId();
-        if (id == ~0U) {
-            return empty_value;
-        }
-        const size_t reg_index = IR::RegIndex(variable);
-        const RegBank* const bank = reg_defs[id][reg_index / REG_BANK_SIZE];
-        return bank ? (*bank)[reg_index % REG_BANK_SIZE] : empty_value;
+        return id != ~0U ? &block_defs[id] : nullptr;
     }
-    void SetDef(IR::Block* block, IR::Reg variable, const IR::Value& value) {
+    [[nodiscard]] BlockDefs& Track(IR::Block* block) {
         u32 id = block->SsaId();
         if (id == ~0U) {
             id = static_cast<u32>(tracked_blocks.size());
             block->SetSsaId(id);
             tracked_blocks.push_back(block);
-            reg_defs.emplace_back();
+            block_defs.emplace_back();
+        }
+        return block_defs[id];
+    }
+
+    IR::Value Def(IR::Block* block, IR::Reg variable) const {
+        const BlockDefs* const defs = Find(block);
+        if (!defs) {
+            return {};
         }
         const size_t reg_index = IR::RegIndex(variable);
-        RegBank*& bank = reg_defs[id][reg_index / REG_BANK_SIZE];
+        const RegBank* const bank = defs->regs[reg_index / REG_BANK_SIZE];
+        return bank ? (*bank)[reg_index % REG_BANK_SIZE] : IR::Value{};
+    }
+    void SetDef(IR::Block* block, IR::Reg variable, const IR::Value& value) {
+        const size_t reg_index = IR::RegIndex(variable);
+        RegBank*& bank = Track(block).regs[reg_index / REG_BANK_SIZE];
         if (!bank) {
             bank = &reg_bank_pool.emplace_back();
         }
         (*bank)[reg_index % REG_BANK_SIZE] = value;
     }
 
-    const IR::Value& Def(IR::Block* block, IR::Pred variable) {
-        return preds[IR::PredIndex(variable)][block];
+    IR::Value Def(IR::Block* block, IR::Pred variable) const {
+        const BlockDefs* const defs = Find(block);
+        return defs ? defs->preds[IR::PredIndex(variable)] : IR::Value{};
     }
     void SetDef(IR::Block* block, IR::Pred variable, const IR::Value& value) {
-        preds[IR::PredIndex(variable)].insert_or_assign(block, value);
+        Track(block).preds[IR::PredIndex(variable)] = value;
     }
 
-    const IR::Value& Def(IR::Block* block, GotoVariable variable) {
-        return goto_vars[variable.index][block];
+    IR::Value Def(IR::Block* block, GotoVariable variable) const {
+        const u32 id = block->SsaId();
+        if (id == ~0U) {
+            return {};
+        }
+        const auto it = goto_vars.find(GotoKey(variable, id));
+        return it != goto_vars.end() ? it->second : IR::Value{};
     }
     void SetDef(IR::Block* block, GotoVariable variable, const IR::Value& value) {
-        goto_vars[variable.index].insert_or_assign(block, value);
+        static_cast<void>(Track(block));
+        goto_vars.insert_or_assign(GotoKey(variable, block->SsaId()), value);
     }
 
-    const IR::Value& Def(IR::Block* block, IndirectBranchVariable) {
-        return indirect_branch_var[block];
+    IR::Value Def(IR::Block* block, IndirectBranchVariable) const {
+        const BlockDefs* const defs = Find(block);
+        return defs ? defs->indirect_branch_var : IR::Value{};
     }
     void SetDef(IR::Block* block, IndirectBranchVariable, const IR::Value& value) {
-        indirect_branch_var.insert_or_assign(block, value);
+        Track(block).indirect_branch_var = value;
     }
 
-    const IR::Value& Def(IR::Block* block, ZeroFlagTag) {
-        return zero_flag[block];
+    IR::Value Def(IR::Block* block, ZeroFlagTag) const {
+        return Flag(block, ZeroFlag);
     }
     void SetDef(IR::Block* block, ZeroFlagTag, const IR::Value& value) {
-        zero_flag.insert_or_assign(block, value);
+        Track(block).flags[ZeroFlag] = value;
     }
 
-    const IR::Value& Def(IR::Block* block, SignFlagTag) {
-        return sign_flag[block];
+    IR::Value Def(IR::Block* block, SignFlagTag) const {
+        return Flag(block, SignFlag);
     }
     void SetDef(IR::Block* block, SignFlagTag, const IR::Value& value) {
-        sign_flag.insert_or_assign(block, value);
+        Track(block).flags[SignFlag] = value;
     }
 
-    const IR::Value& Def(IR::Block* block, CarryFlagTag) {
-        return carry_flag[block];
+    IR::Value Def(IR::Block* block, CarryFlagTag) const {
+        return Flag(block, CarryFlag);
     }
     void SetDef(IR::Block* block, CarryFlagTag, const IR::Value& value) {
-        carry_flag.insert_or_assign(block, value);
+        Track(block).flags[CarryFlag] = value;
     }
 
-    const IR::Value& Def(IR::Block* block, OverflowFlagTag) {
-        return overflow_flag[block];
+    IR::Value Def(IR::Block* block, OverflowFlagTag) const {
+        return Flag(block, OverflowFlag);
     }
     void SetDef(IR::Block* block, OverflowFlagTag, const IR::Value& value) {
-        overflow_flag.insert_or_assign(block, value);
+        Track(block).flags[OverflowFlag] = value;
     }
 
-    const IR::Value empty_value{};
+    [[nodiscard]] IR::Value Flag(const IR::Block* block, size_t flag) const {
+        const BlockDefs* const defs = Find(block);
+        return defs ? defs->flags[flag] : IR::Value{};
+    }
+    [[nodiscard]] static u64 GotoKey(GotoVariable variable, u32 block_id) {
+        return u64{variable.index} << 32 | block_id;
+    }
+
     std::vector<IR::Block*> tracked_blocks;
-    std::vector<std::array<RegBank*, NUM_REG_BANKS>> reg_defs;
+    std::vector<BlockDefs> block_defs;
     std::deque<RegBank> reg_bank_pool;
-    std::array<ValueMap, IR::NUM_USER_PREDS> preds;
-    // TODO: Requires stable iterators
-    std::unordered_map<u32, ValueMap> goto_vars;
-    ValueMap indirect_branch_var;
-    ValueMap zero_flag;
-    ValueMap sign_flag;
-    ValueMap carry_flag;
-    ValueMap overflow_flag;
+    /// By goto variable and SSA id of the block.
+    Common::unordered_map<u64, IR::Value> goto_vars;
 };
 
 IR::Opcode UndefOpcode(IR::Reg) noexcept {
@@ -179,7 +204,6 @@ enum class Status {
     PushPhiArgument,
 };
 
-template <typename Type>
 struct ReadState {
     ReadState(IR::Block* block_) : block{block_} {}
     ReadState() = default;
@@ -201,11 +225,11 @@ public:
 
     template <typename Type>
     IR::Value ReadVariable(Type variable, IR::Block* root_block) {
-        // TODO: Windows commits sodoku if you use small_vector
-        std::vector<ReadState<Type>> stack{
-            ReadState<Type>(nullptr),
-            ReadState<Type>(root_block),
-        };
+        // The pass's one stack: a read does not start another before it returns.
+        std::vector<ReadState>& stack{read_stack};
+        stack.clear();
+        stack.emplace_back(nullptr);
+        stack.emplace_back(root_block);
         const auto prepare_phi_operand{[&] {
             if (stack.back().pred_it == stack.back().pred_end) {
                 IR::Inst* const phi{stack.back().phi};
@@ -224,7 +248,7 @@ public:
             IR::Block* const block{stack.back().block};
             switch (stack.back().pc) {
             case Status::Start: {
-                if (const IR::Value& def = current_def.Def(block, variable); !def.IsEmpty()) {
+                if (const IR::Value def = current_def.Def(block, variable); !def.IsEmpty()) {
                     stack.back().result = def;
                 } else if (!block->IsSsaSealed()) {
                     // Incomplete CFG
@@ -335,6 +359,7 @@ private:
     // TODO: Windows dies with stack exhaustion?
     std::unordered_map<IR::Block*, std::map<Variant, IR::Inst*>> incomplete_phis;
     DefTable current_def;
+    std::vector<ReadState> read_stack;
 };
 
 void VisitInst(Pass& pass, IR::Block* block, IR::Inst& inst) {
