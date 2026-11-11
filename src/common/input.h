@@ -483,7 +483,14 @@ std::unique_ptr<InputDeviceType> CreateDeviceFromString(const std::string& param
     const auto pair = factory_list.find(engine);
     if (pair == factory_list.end()) {
         if (engine != "null") {
+#if defined(LICHII_IOS_UI) || (defined(__APPLE__) && defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE)
+            if (engine != "tas" && engine != "camera" && engine != "joycon" &&
+                engine != "mouse" && engine != "sdl") {
+                LOG_ERROR(Input, "Unknown engine name: {}", engine);
+            }
+#else
             LOG_ERROR(Input, "Unknown engine name: {}", engine);
+#endif
         }
         return std::make_unique<InputDeviceType>();
     }
@@ -510,7 +517,14 @@ std::unique_ptr<InputDeviceType> CreateDevice(const ParamPackage& package) {
     const auto pair = factory_list.find(engine);
     if (pair == factory_list.end()) {
         if (engine != "null") {
+#if defined(LICHII_IOS_UI) || (defined(__APPLE__) && defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE)
+            if (engine != "tas" && engine != "camera" && engine != "joycon" &&
+                engine != "mouse" && engine != "sdl") {
+                LOG_ERROR(Input, "Unknown engine name: {}", engine);
+            }
+#else
             LOG_ERROR(Input, "Unknown engine name: {}", engine);
+#endif
         }
         return std::make_unique<InputDeviceType>();
     }

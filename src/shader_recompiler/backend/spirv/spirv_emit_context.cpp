@@ -1096,7 +1096,6 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                     const Id ssbo_id{ssbos[index].*ssbo_member};
                     callback(OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index), ssbo_id,
                              ssbo_index);
-                    OpBranch(default_label);
                 }
                 AddLabel(default_label);
                 return;

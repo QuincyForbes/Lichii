@@ -54,6 +54,47 @@ std::vector<std::vector<u32>> Instructions(const std::vector<u32>& code, u32 opc
     return result;
 }
 
+// Verifies every SPIR-V basic block has exactly one terminator (SPIRV-Cross throws in
+// Parser::parse if a second terminator such as OpBranch follows OpReturn/OpReturnValue,
+// which SIGSEGVs MoltenVK in SPIRVToMSLConverter::convert).
+void RequireSingleBlockTerminators(const std::vector<u32>& code) {
+    constexpr u32 OpFunction = 54;
+    constexpr u32 OpFunctionParameter = 55;
+    constexpr u32 OpFunctionEnd = 56;
+    constexpr u32 OpLabel = 248;
+    const auto is_terminator = [](u32 op) { return op >= 249 && op <= 255; };
+
+    bool in_function = false;
+    bool in_block = false;
+    for (size_t i = 5; i < code.size();) {
+        const u32 count = code[i] >> 16;
+        const u32 op = code[i] & 0xffff;
+        REQUIRE(count > 0);
+        REQUIRE(i + count <= code.size());
+        if (op == OpFunction) {
+            in_function = true;
+            in_block = false;
+        } else if (op == OpFunctionParameter) {
+            REQUIRE(in_function);
+            REQUIRE_FALSE(in_block);
+        } else if (op == OpFunctionEnd) {
+            REQUIRE_FALSE(in_block);
+            in_function = false;
+        } else if (in_function) {
+            if (op == OpLabel) {
+                REQUIRE_FALSE(in_block);
+                in_block = true;
+            } else {
+                REQUIRE(in_block);
+                if (is_terminator(op)) {
+                    in_block = false;
+                }
+            }
+        }
+        i += count;
+    }
+}
+
 // A compute program whose atomic address comes from global memory, so the storage buffer pass
 // tracks the load but not the atomic.
 std::vector<u32> EmitUntrackedAtomic(IR::Opcode opcode) {
@@ -125,6 +166,7 @@ TEST_CASE("Untracked 32-bit global atomics route to their storage buffer",
         CAPTURE(static_cast<u32>(opcode));
         std::vector<u32> code;
         REQUIRE_NOTHROW(code = EmitUntrackedAtomic(opcode));
+        RequireSingleBlockTerminators(code);
         CHECK_FALSE(Instructions(code, atomic).empty());
         CHECK_FALSE(Instructions(code, OpFunctionCall).empty());
     }

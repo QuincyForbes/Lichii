@@ -579,7 +579,19 @@ void SetGuestMemoryRanges([[maybe_unused]] const void* backing,
 void LogMemoryBreakdown([[maybe_unused]] const char* reason) {
 #ifdef __APPLE__
     const ProcessMemory memory = QueryProcessMemory();
-    LogRegions(reason, memory);
+    // Walking 26,000+ Mach VM regions takes 700-1,500 ms holding the task's vm_map lock, causing
+    // visible hitches every 30 s. Only run the full region walk when memory is actually tight,
+    // on an OS memory warning, or when EDEN_IOS_MEM_REGIONS=1 is set.
+    const u64 available = AvailableProcessMemory();
+    const bool periodic = reason != nullptr && std::strcmp(reason, "every 30 s") == 0;
+    const bool tight = available != 0 && available < (u64{1536} << 20);
+    static const bool force_regions = [] {
+        const char* const env = std::getenv("EDEN_IOS_MEM_REGIONS");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    if (!periodic || tight || force_regions) {
+        LogRegions(reason, memory);
+    }
     // In use is what the emulator holds; the rest of what the zones took from the OS is free
     // inside them (malloc_zone_pressure_relief gives back the whole pages of it).
     malloc_statistics_t zones{};

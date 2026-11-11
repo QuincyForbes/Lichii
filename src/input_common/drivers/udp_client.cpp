@@ -141,7 +141,6 @@ static void SocketLoop(Socket* socket) {
 }
 
 UDPClient::UDPClient(std::string input_engine_) : InputEngine(std::move(input_engine_)) {
-    LOG_INFO(Input, "Udp Initialization started");
     ReloadSockets();
 }
 
@@ -158,6 +157,7 @@ void UDPClient::ReloadSockets() {
     if (!Settings::values.enable_udp_controller.GetValue()) {
         return;
     }
+    LOG_INFO(Input, "Udp Initialization started");
 
     std::stringstream servers_ss(Settings::values.udp_input_servers.GetValue());
     std::string server_token;

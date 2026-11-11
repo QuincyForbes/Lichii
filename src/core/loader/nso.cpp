@@ -194,8 +194,10 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     // Apply patches if necessary
     const auto name = nso_file.GetName();
     if (pm && (pm->HasNSOPatch(nso_header.build_id, name) || Settings::values.dump_nso)) {
-        std::span<u8> patchable_section(codeset.memory.data() + module_start, codeset.memory.size() - module_start);
-        std::vector<u8> pi_header(sizeof(NSOHeader) + patchable_section.size());
+        std::span<u8> patchable_section(codeset.memory.data() + module_start,
+                                        codeset.memory.size() - module_start);
+        const size_t full_module_size = image_size - module_start;
+        std::vector<u8> pi_header(sizeof(NSOHeader) + full_module_size);
         std::memcpy(pi_header.data(), &nso_header, sizeof(NSOHeader));
         std::memcpy(pi_header.data() + sizeof(NSOHeader), patchable_section.data(),
                     patchable_section.size());
@@ -203,15 +205,22 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         pi_header = pm->PatchNSO(pi_header, name);
 
         if (pi_header.size() > sizeof(NSOHeader)) {
-            const size_t patched_size = std::min<size_t>(
-                pi_header.size() - sizeof(NSOHeader), image_size - module_start);
-            if (module_start + patched_size > codeset.memory.size()) {
+            const u8* const patched_module = pi_header.data() + sizeof(NSOHeader);
+            const size_t max_patched =
+                std::min<size_t>(pi_header.size() - sizeof(NSOHeader), full_module_size);
+            size_t copy_size = std::min<size_t>(patchable_section.size(), max_patched);
+            for (size_t i = max_patched; i > copy_size; --i) {
+                if (patched_module[i - 1] != 0) {
+                    copy_size = i;
+                    break;
+                }
+            }
+            if (module_start + copy_size > codeset.memory.size()) {
                 codeset.memory.resize(
-                    std::min(PageAlignSize(static_cast<u32>(module_start + patched_size)),
+                    std::min(PageAlignSize(static_cast<u32>(module_start + copy_size)),
                              image_size));
             }
-            std::memcpy(codeset.memory.data() + module_start, pi_header.data() + sizeof(NSOHeader),
-                        patched_size);
+            std::memcpy(codeset.memory.data() + module_start, patched_module, copy_size);
         }
     }
 
