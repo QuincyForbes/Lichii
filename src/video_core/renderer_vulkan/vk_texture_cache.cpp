@@ -4864,6 +4864,21 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
     return *ocarina_fsr_lod_bias;
 }
 
+bool TextureCacheRuntime::CanRescaleImage(const VideoCommon::ImageInfo& info) const noexcept {
+    if (!resolution.active) {
+        return true;
+    }
+    const bool is_2d = info.type == ImageType::e2D;
+    const u64 scaled_width = resolution.ScaleUp(info.size.width);
+    const u64 scaled_height = is_2d ? resolution.ScaleUp(info.size.height) : info.size.height;
+    const auto& limits = device.GetPhysical().GetProperties().limits;
+    const u64 max_dim = std::min<u64>({limits.maxImageDimension2D, limits.maxFramebufferWidth,
+                                       limits.maxFramebufferHeight});
+    const u64 depth = (std::max)(info.size.depth, 1U);
+    const u64 layers = static_cast<u64>((std::max)(info.resources.layers, 1));
+    return CanRescaleImageExtent(scaled_width, scaled_height, depth, layers, max_dim);
+}
+
 Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& tsc) {
     const auto& device = runtime.device;
     device_ptr = &device;

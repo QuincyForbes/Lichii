@@ -3703,6 +3703,14 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
         return false;
     }
+    if (True(image.flags & (ImageFlagBits::SparseTiles | ImageFlagBits::SparseLayers))) {
+        return false;
+    }
+    if constexpr (requires { runtime.CanRescaleImage(image.info); }) {
+        if (!runtime.CanRescaleImage(image.info)) {
+            return false;
+        }
+    }
     if (True(image.flags & (ImageFlagBits::Rescaled | ImageFlagBits::CheckingRescalable))) {
         return true;
     }
@@ -3733,7 +3741,12 @@ void TextureCache<P>::NoteRescaleTrace(ImageBase& image, std::string_view role) 
     } else if (Settings::values.resolution_info.downscale && !info.downscaleable) {
         state = "native: too small to downscale";
     } else if (!ImageCanRescale(image)) {
-        state = "native: an alias can't rescale";
+        bool host_limited = false;
+        if constexpr (requires { runtime.CanRescaleImage(info); }) {
+            host_limited = !runtime.CanRescaleImage(info);
+        }
+        state = host_limited ? "native: scaled size exceeds host limit"
+                             : "native: an alias can't rescale";
     }
     ++rescale_trace_counts[fmt::format("{} {}x{} format {} levels {} layers {}: {}", role,
                                        info.size.width, info.size.height,
@@ -4172,6 +4185,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                                region_check_gpu);
 
     bool can_rescale = info.rescaleable;
+    if constexpr (requires { runtime.CanRescaleImage(info); }) {
+        can_rescale &= runtime.CanRescaleImage(info);
+    }
     bool any_rescaled = false;
     for (const auto& copy : join_copies_to_do) {
         if (!can_rescale) {

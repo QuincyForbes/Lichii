@@ -32,3 +32,15 @@ TEST_CASE("A caller that cannot fail still gets an unbacked image",
     REQUIRE(Vulkan::UsesUnbackedFallback(Texels(1280, 720), false));
     REQUIRE(Vulkan::UsesUnbackedFallback(Texels(8192, 8192, 1, 68), false));
 }
+
+TEST_CASE("A render target whose rescaled size exceeds the backing or dimension limit stays native",
+          "[video_core][vulkan][unbacked_fallback]") {
+    // Ocarina of Time's 12288x12288 sun shadow map fits backed at 1x, but 2x (24576x24576 = 604M
+    // texels) exceeds MaxBackedImageTexels (268M) and Apple's 16384 dimension limit.
+    REQUIRE(Vulkan::CanRescaleImageExtent(12288, 12288, 1, 1, 32768));
+    REQUIRE_FALSE(Vulkan::CanRescaleImageExtent(24576, 24576, 1, 1, 32768));
+    REQUIRE_FALSE(Vulkan::CanRescaleImageExtent(24576, 24576, 1, 1, 16384));
+    // Scene colour/depth targets (2560x1440) rescale cleanly at 2x, 3x and 4x.
+    REQUIRE(Vulkan::CanRescaleImageExtent(5120, 2880, 1, 1, 16384));
+    REQUIRE(Vulkan::CanRescaleImageExtent(10240, 5760, 1, 1, 16384));
+}

@@ -304,6 +304,8 @@ public:
     std::optional<f32> ocarina_fsr_lod_bias;
     /// Set when the Ocarina upscaler fails during the session: samplers drop the bias again.
     bool ocarina_fsr_failed{};
+    /// Whether the scaled dimensions and texel count of `info` stay within backed host limits.
+    [[nodiscard]] bool CanRescaleImage(const VideoCommon::ImageInfo& info) const noexcept;
     /// The game DLSS network's health check (ProbeGameDlssOutput), created on first use.
     std::unique_ptr<DlssNetworkProbe> dlss_network_probe;
     std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
