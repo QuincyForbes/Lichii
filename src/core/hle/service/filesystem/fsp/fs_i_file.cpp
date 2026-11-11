@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "core/file_sys/errors.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/fsp/fs_i_file.h"
@@ -34,10 +36,15 @@ Result IFile::Read(
     LOG_DEBUG(Service_FS, "called, option={}, offset={:#x}, length={}", option.value, offset,
               size);
 
-    // Read the data from the Storage backend
-    const ReadTraceScope trace{ReadTraceSource::File, size};
-    R_RETURN(
-        backend->Read(reinterpret_cast<size_t*>(out_size.Get()), offset, out_buffer.data(), size));
+    R_UNLESS(size >= 0, FileSys::ResultOutOfRange);
+    const size_t clamped_size = std::min<size_t>(static_cast<size_t>(size), out_buffer.size());
+
+    // Read the data from the Storage backend directly into the output span.
+    const ReadTraceScope trace{ReadTraceSource::File, static_cast<s64>(clamped_size)};
+    size_t bytes_read = 0;
+    R_TRY(backend->Read(&bytes_read, offset, out_buffer.data(), clamped_size, option));
+    *out_size = static_cast<s64>(bytes_read);
+    R_SUCCEED();
 }
 
 Result IFile::Write(
@@ -46,7 +53,9 @@ Result IFile::Write(
     LOG_DEBUG(Service_FS, "called, option={}, offset={:#x}, length={}", option.value, offset,
               size);
 
-    R_RETURN(backend->Write(offset, buffer.data(), size, option));
+    R_UNLESS(size >= 0, FileSys::ResultOutOfRange);
+    const size_t clamped_size = std::min<size_t>(static_cast<size_t>(size), buffer.size());
+    R_RETURN(backend->Write(offset, buffer.data(), clamped_size, option));
 }
 
 Result IFile::Flush() {

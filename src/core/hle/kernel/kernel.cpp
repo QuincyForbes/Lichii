@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <thread>
+#include <boost/container/small_vector.hpp>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <utility>
@@ -149,6 +150,7 @@ struct KernelCore::Impl {
             process = nullptr;
         }
         process_list.clear();
+        real_process_list.clear();
     }
 
     void Shutdown(KernelCore& kernel) {
@@ -333,14 +335,11 @@ struct KernelCore::Impl {
         sys_memory_block_heap->Initialize(std::addressof(*resource_manager_page_manager), SystemMemoryBlockSlabHeapSize);
         block_info_heap->Initialize(std::addressof(*resource_manager_page_manager), BlockInfoSlabHeapSize);
 
-        // Reserve all but a fixed number of remaining pages for the page table heap.
-        const size_t num_pt_pages = resource_manager_page_manager->GetCount() - resource_manager_page_manager->GetUsed() - ReservedDynamicPageCount;
+        // KPageTableBase uses host Common::PageTable rather than allocating from page_table_heap,
+        // so leave dynamic pages uncarved instead of pre-allocating ~20.7 MiB into page_table_heap.
         page_table_heap.emplace();
-
-        // TODO(bunnei): Pass in address once we support kernel virtual memory allocations.
         page_table_heap->Initialize(
-            std::addressof(*resource_manager_page_manager), num_pt_pages,
-            /*GetPointer<KPageTableManager::RefCount>(address + size)*/ nullptr);
+            std::addressof(*resource_manager_page_manager), 0, nullptr);
 
         // Setup the slab managers.
         KDynamicPageManager* const app_dynamic_page_manager = nullptr;
@@ -363,8 +362,8 @@ struct KernelCore::Impl {
         app_page_table_manager->Initialize(app_dynamic_page_manager, std::addressof(*page_table_heap));
         sys_page_table_manager->Initialize(sys_dynamic_page_manager, std::addressof(*page_table_heap));
 
-        // Check that we have the correct number of dynamic pages available.
-        ASSERT(resource_manager_page_manager->GetCount() - resource_manager_page_manager->GetUsed() == ReservedDynamicPageCount);
+        // Check that we have at least the reserved number of dynamic pages available.
+        ASSERT(resource_manager_page_manager->GetCount() - resource_manager_page_manager->GetUsed() >= ReservedDynamicPageCount);
 
         // Create the system page table managers.
         app_system_resource.emplace(kernel);
@@ -852,6 +851,7 @@ struct KernelCore::Impl {
     // Lists all processes that exist in the current session.
     std::mutex process_list_lock;
     std::vector<KProcess*> process_list;
+    std::vector<KProcess*> real_process_list;
     KProcess* application_process{};
     std::optional<Kernel::GlobalSchedulerContext> global_scheduler_context;
     std::optional<Kernel::KHardwareTimer> hardware_timer;
@@ -957,10 +957,14 @@ void KernelCore::AppendNewProcess(KProcess* process) {
 
     std::scoped_lock lk{impl->process_list_lock};
     impl->process_list.push_back(process);
+    if (process->GetProcessLocalRegionAddress() != 0 || process->GetProcessId() != 0) {
+        impl->real_process_list.push_back(process);
+    }
 }
 
 void KernelCore::RemoveProcess(KProcess* process) {
     std::scoped_lock lk{impl->process_list_lock};
+    std::erase(impl->real_process_list, process);
     if (std::erase(impl->process_list, process)) {
         process->Close(*this);
     }
@@ -980,6 +984,13 @@ const KProcess* KernelCore::ApplicationProcess() const {
 
 KScopedAutoObject<KProcess> KernelCore::GetProcessByProcessId(u64 process_id) {
     std::scoped_lock lk{impl->process_list_lock};
+    if (impl->application_process != nullptr &&
+        impl->application_process->GetProcessId() == process_id) {
+        return {*this, impl->application_process};
+    }
+    for (auto* const process : impl->real_process_list)
+        if (process != nullptr && process->GetProcessId() == process_id)
+            return {*this, process};
     for (auto* const process : impl->process_list)
         if (process != nullptr && process->GetProcessId() == process_id)
             return {*this, process};
@@ -992,6 +1003,32 @@ std::list<KScopedAutoObject<KProcess>> KernelCore::GetProcessList() {
     for (auto* const process : impl->process_list)
         processes.emplace_back(*this, process);
     return processes;
+}
+
+void KernelCore::ForEachProcessImpl(void* ctx, bool (*callback)(void*, KProcess*),
+                                    bool only_real) {
+    boost::container::small_vector<KProcess*, 64> processes;
+    {
+        std::scoped_lock lk{impl->process_list_lock};
+        const auto& src = only_real ? impl->real_process_list : impl->process_list;
+        processes.reserve(src.size());
+        for (auto* const process : src) {
+            if (process != nullptr) {
+                process->Open(*this);
+                processes.push_back(process);
+            }
+        }
+    }
+    SCOPE_EXIT {
+        for (auto* const process : processes) {
+            process->Close(*this);
+        }
+    };
+    for (auto* const process : processes) {
+        if (!callback(ctx, process)) {
+            break;
+        }
+    }
 }
 
 Kernel::GlobalSchedulerContext& KernelCore::GlobalSchedulerContext() {
@@ -1288,9 +1325,24 @@ const Kernel::KSharedMemory& KernelCore::GetHidBusSharedMem() const {
 
 void KernelCore::SuspendEmulation(bool suspended) {
     const bool should_suspend{exception_exited || suspended};
-    auto processes = GetProcessList();
+    boost::container::small_vector<KProcess*, 64> processes;
+    {
+        std::scoped_lock lk{impl->process_list_lock};
+        processes.reserve(impl->process_list.size());
+        for (auto* const process : impl->process_list) {
+            if (process != nullptr) {
+                process->Open(*this);
+                processes.push_back(process);
+            }
+        }
+    }
+    SCOPE_EXIT {
+        for (auto* const process : processes) {
+            process->Close(*this);
+        }
+    };
 
-    for (auto& process : processes) {
+    for (auto* process : processes) {
         KScopedLightLock ll{process->GetListLock()};
 
         for (auto& thread : process->GetThreadList()) {
@@ -1312,10 +1364,9 @@ void KernelCore::SuspendEmulation(bool suspended) {
     const auto TryWait = [&]() {
         KScopedSchedulerLock sl{*this};
 
-        for (auto& process : processes) {
+        for (auto* process : processes) {
             for (auto i = 0; i < static_cast<s32>(Core::Hardware::NUM_CPU_CORES); ++i) {
-                if (Scheduler(i).GetSchedulerCurrentThread()->GetOwnerProcess() ==
-                    process.GetPointerUnsafe()) {
+                if (Scheduler(i).GetSchedulerCurrentThread()->GetOwnerProcess() == process) {
                     // A thread has not finished running yet.
                     // Continue waiting.
                     return false;

@@ -275,15 +275,22 @@ namespace Kernel {
         R_SUCCEED();
     }
 
+    namespace {
+        constexpr std::size_t KernelFiberStackSize = 512 * 1024;
+        constexpr std::size_t UserFiberStackSize = Common::Fiber::DefaultStackSize;
+    } // namespace
+
     Result KThread::InitializeThread(KernelCore& kernel, KThread* thread, KThreadFunction func, uintptr_t arg,
                                      KProcessAddress user_stack_top, s32 prio, s32 core,
                                      KProcess* owner, ThreadType type,
-                                     std::function<void()>&& init_func) {
+                                     std::function<void()>&& init_func,
+                                     std::size_t host_stack_size) {
         // Initialize the thread.
         R_TRY(thread->Initialize(kernel, func, arg, user_stack_top, prio, core, owner, type));
 
         // Initialize emulation parameters.
-        thread->m_host_context = std::make_shared<Common::Fiber>(std::move(init_func));
+        thread->m_host_context =
+            std::make_shared<Common::Fiber>(std::move(init_func), host_stack_size);
 
         R_SUCCEED();
     }
@@ -299,20 +306,24 @@ namespace Kernel {
     }
 
     Result KThread::InitializeMainThread(Core::System& system, KThread* thread, s32 virt_core) {
-        R_RETURN(InitializeThread(system.Kernel(), thread, {}, {}, {}, IdleThreadPriority, virt_core, {}, ThreadType::Main, system.GetCpuManager().GetGuestActivateFunc(system.Kernel())));
+        R_RETURN(InitializeThread(system.Kernel(), thread, {}, {}, {}, IdleThreadPriority, virt_core, {}, ThreadType::Main, system.GetCpuManager().GetGuestActivateFunc(system.Kernel()), KernelFiberStackSize));
     }
 
     Result KThread::InitializeIdleThread(Core::System& system, KThread* thread, s32 virt_core) {
-        R_RETURN(InitializeThread(system.Kernel(), thread, {}, {}, {}, IdleThreadPriority, virt_core, {}, ThreadType::Main, system.GetCpuManager().GetIdleThreadStartFunc(system.Kernel())));
+        R_RETURN(InitializeThread(system.Kernel(), thread, {}, {}, {}, IdleThreadPriority, virt_core, {}, ThreadType::Main, system.GetCpuManager().GetIdleThreadStartFunc(system.Kernel()), KernelFiberStackSize));
     }
 
     Result KThread::InitializeHighPriorityThread(Core::System& system, KThread* thread, KThreadFunction func, uintptr_t arg, s32 virt_core) {
-        R_RETURN(InitializeThread(system.Kernel(), thread, func, arg, {}, {}, virt_core, nullptr, ThreadType::HighPriority, system.GetCpuManager().GetShutdownThreadStartFunc(system.Kernel())));
+        R_RETURN(InitializeThread(system.Kernel(), thread, func, arg, {}, {}, virt_core, nullptr, ThreadType::HighPriority, system.GetCpuManager().GetShutdownThreadStartFunc(system.Kernel()), KernelFiberStackSize));
     }
 
     Result KThread::InitializeUserThread(Core::System& system, KThread* thread, KThreadFunction func, uintptr_t arg, KProcessAddress user_stack_top, s32 prio, s32 virt_core, KProcess* owner) {
         system.Kernel().GlobalSchedulerContext().AddThread(thread);
-        R_RETURN(InitializeThread(system.Kernel(), thread, func, arg, user_stack_top, prio, virt_core, owner, ThreadType::User, system.GetCpuManager().GetGuestThreadFunc(system.Kernel())));
+        const std::size_t stack_size =
+            (owner != nullptr && owner->GetProcessLocalRegionAddress() == 0)
+                ? KernelFiberStackSize
+                : UserFiberStackSize;
+        R_RETURN(InitializeThread(system.Kernel(), thread, func, arg, user_stack_top, prio, virt_core, owner, ThreadType::User, system.GetCpuManager().GetGuestThreadFunc(system.Kernel()), stack_size));
     }
 
     Result KThread::InitializeServiceThread(Core::System& system, KThread* thread, std::function<void()>&& func, s32 prio, s32 virt_core, KProcess* owner) {
@@ -329,7 +340,7 @@ namespace Kernel {
         }};
 
         R_RETURN(InitializeThread(system.Kernel(), thread, {}, {}, {}, prio, virt_core, owner, ThreadType::HighPriority,
-                                  std::move(func2)));
+                                  std::move(func2), KernelFiberStackSize));
     }
 
     void KThread::PostDestroy(KernelCore& kernel, uintptr_t arg) {

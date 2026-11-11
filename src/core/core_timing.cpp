@@ -7,11 +7,14 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <tuple>
 #include <vector>
+#include <fmt/format.h>
 #include "common/cpu_features.h"
 #include "common/logging.h"
 #include "common/thread_cpu_clock.h"
@@ -104,22 +107,24 @@ std::shared_ptr<EventType> CreateEvent(std::string name, TimedCallback&& callbac
 struct CoreTiming::Event {
     s64 time;
     u64 fifo_order;
+    EventType* raw_type;
     std::weak_ptr<EventType> type;
     s64 reschedule_time;
-    heap_t::handle_type handle{};
 
     // Sort by time, unless the times are the same, in which case sort by
     // the order added to the queue
-    friend bool operator>(const Event& left, const Event& right) {
+    friend bool operator>(const Event& left, const Event& right) noexcept {
         return std::tie(left.time, left.fifo_order) > std::tie(right.time, right.fifo_order);
     }
 
-    friend bool operator<(const Event& left, const Event& right) {
+    friend bool operator<(const Event& left, const Event& right) noexcept {
         return std::tie(left.time, left.fifo_order) < std::tie(right.time, right.fifo_order);
     }
 };
 
-CoreTiming::CoreTiming() = default;
+CoreTiming::CoreTiming() {
+    event_queue.reserve(64);
+}
 CoreTiming::~CoreTiming() {
     Reset();
 }
@@ -200,7 +205,10 @@ void CoreTiming::WaitForEvent(s64 next_time) {
 void CoreTiming::ClearPendingEvents() {
     std::scoped_lock lock{advance_lock, basic_lock};
     event_queue.clear();
-    event.Set();
+    armed_wait_time = (std::numeric_limits<s64>::max)();
+    if (is_multicore) {
+        event.Set();
+    }
 }
 
 void CoreTiming::Pause(bool is_paused) {
@@ -243,50 +251,112 @@ bool CoreTiming::HasPendingEvents() const {
 
 void CoreTiming::ScheduleEvent(std::chrono::nanoseconds ns_into_future,
                                const std::shared_ptr<EventType>& event_type, bool absolute_time) {
+    bool should_wake = false;
     {
         std::scoped_lock scope{basic_lock};
-        const auto next_time{absolute_time ? ns_into_future : GetGlobalTimeNs() + ns_into_future};
+        const s64 target_time =
+            (absolute_time ? ns_into_future : GetGlobalTimeNs() + ns_into_future).count();
+        const bool was_empty = event_queue.empty();
+        const s64 prev_head =
+            was_empty ? (std::numeric_limits<s64>::max)() : event_queue.front().time;
 
-        auto h{event_queue.emplace(Event{next_time.count(), event_fifo_id++, event_type, 0})};
-        (*h).handle = h;
+        event_queue.push_back(
+            Event{target_time, event_fifo_id++, event_type.get(), event_type, 0});
+        std::push_heap(event_queue.begin(), event_queue.end(), std::greater<>{});
+
+        if (is_multicore &&
+            (was_empty || target_time < prev_head || target_time < armed_wait_time)) {
+            armed_wait_time = (std::min)(armed_wait_time, target_time);
+            should_wake = true;
+        }
     }
 
-    event.Set();
+    if (should_wake) {
+        event.Set();
+    }
+}
+
+void CoreTiming::RescheduleEvent(std::chrono::nanoseconds ns_into_future,
+                                 const std::shared_ptr<EventType>& event_type,
+                                 bool absolute_time) {
+    if (!event_type) {
+        return;
+    }
+    bool should_wake = false;
+    {
+        std::scoped_lock scope{basic_lock};
+        const s64 target_time =
+            (absolute_time ? ns_into_future : GetGlobalTimeNs() + ns_into_future).count();
+        const bool was_empty = event_queue.empty();
+        const s64 prev_head =
+            was_empty ? (std::numeric_limits<s64>::max)() : event_queue.front().time;
+
+        ++event_type->sequence_number;
+        const auto erased = std::erase_if(event_queue, [&](const Event& e) {
+            return e.raw_type == event_type.get();
+        });
+        event_queue.push_back(
+            Event{target_time, event_fifo_id++, event_type.get(), event_type, 0});
+        if (erased > 0) {
+            std::make_heap(event_queue.begin(), event_queue.end(), std::greater<>{});
+        } else {
+            std::push_heap(event_queue.begin(), event_queue.end(), std::greater<>{});
+        }
+
+        if (is_multicore &&
+            (was_empty || target_time < prev_head || target_time < armed_wait_time)) {
+            armed_wait_time = (std::min)(armed_wait_time, target_time);
+            should_wake = true;
+        }
+    }
+
+    if (should_wake) {
+        event.Set();
+    }
 }
 
 void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
                                       std::chrono::nanoseconds resched_time,
                                       const std::shared_ptr<EventType>& event_type,
                                       bool absolute_time) {
+    bool should_wake = false;
     {
         std::scoped_lock scope{basic_lock};
-        const auto next_time{absolute_time ? start_time : GetGlobalTimeNs() + start_time};
+        const s64 target_time =
+            (absolute_time ? start_time : GetGlobalTimeNs() + start_time).count();
+        const bool was_empty = event_queue.empty();
+        const s64 prev_head =
+            was_empty ? (std::numeric_limits<s64>::max)() : event_queue.front().time;
 
-        auto h{event_queue.emplace(
-            Event{next_time.count(), event_fifo_id++, event_type, resched_time.count()})};
-        (*h).handle = h;
+        event_queue.push_back(Event{target_time, event_fifo_id++, event_type.get(), event_type,
+                                    resched_time.count()});
+        std::push_heap(event_queue.begin(), event_queue.end(), std::greater<>{});
+
+        if (is_multicore &&
+            (was_empty || target_time < prev_head || target_time < armed_wait_time)) {
+            armed_wait_time = (std::min)(armed_wait_time, target_time);
+            should_wake = true;
+        }
     }
 
-    event.Set();
+    if (should_wake) {
+        event.Set();
+    }
 }
 
 void CoreTiming::UnscheduleEvent(const std::shared_ptr<EventType>& event_type,
                                  UnscheduleEventType type) {
+    if (!event_type) {
+        return;
+    }
     {
         std::scoped_lock lk{basic_lock};
-
-        std::vector<heap_t::handle_type> to_remove;
-        for (auto itr = event_queue.begin(); itr != event_queue.end(); itr++) {
-            const Event& e = *itr;
-            if (e.type.lock().get() == event_type.get()) {
-                to_remove.push_back(itr->handle);
-            }
+        const auto erased = std::erase_if(event_queue, [&](const Event& e) {
+            return e.raw_type == event_type.get();
+        });
+        if (erased > 0) {
+            std::make_heap(event_queue.begin(), event_queue.end(), std::greater<>{});
         }
-
-        for (auto& h : to_remove) {
-            event_queue.erase(h);
-        }
-
         event_type->sequence_number++;
     }
 
@@ -343,8 +413,10 @@ std::optional<s64> CoreTiming::Advance() {
     std::scoped_lock lock{advance_lock, basic_lock};
     global_timer = GetGlobalTimeNs().count();
 
-    while (!event_queue.empty() && event_queue.top().time <= global_timer) {
-        const Event& evt = event_queue.top();
+    while (!event_queue.empty() && event_queue.front().time <= global_timer) {
+        std::pop_heap(event_queue.begin(), event_queue.end(), std::greater<>{});
+        Event evt = std::move(event_queue.back());
+        event_queue.pop_back();
 
         if (const auto event_type{evt.type.lock()}) {
             const auto evt_time = evt.time;
@@ -355,8 +427,6 @@ std::optional<s64> CoreTiming::Advance() {
             }
 
             if (evt.reschedule_time == 0) {
-                event_queue.pop();
-
                 basic_lock.unlock();
 
                 event_type->callback(evt_time, late);
@@ -370,7 +440,7 @@ std::optional<s64> CoreTiming::Advance() {
                 basic_lock.lock();
 
                 if (evt_sequence_num != event_type->sequence_number) {
-                    // Heap handle is invalidated after external modification.
+                    global_timer = GetGlobalTimeNs().count();
                     continue;
                 }
 
@@ -380,13 +450,15 @@ std::optional<s64> CoreTiming::Advance() {
 
                 // If this event was scheduled into a pause, its time now is going to be way
                 // behind. Re-set this event to continue from the end of the pause.
-                auto next_time{evt.time + next_schedule_time};
-                if (evt.time < pause_end_time) {
-                    next_time = pause_end_time + next_schedule_time;
+                auto next_time{evt_time + next_schedule_time};
+                const s64 pause_end = pause_end_time.load(std::memory_order_relaxed);
+                if (evt_time < pause_end) {
+                    next_time = pause_end + next_schedule_time;
                 }
 
-                event_queue.update(evt.handle, Event{next_time, event_fifo_id++, evt.type,
-                                                     next_schedule_time, evt.handle});
+                event_queue.push_back(Event{next_time, event_fifo_id++, event_type.get(), evt.type,
+                                            next_schedule_time});
+                std::push_heap(event_queue.begin(), event_queue.end(), std::greater<>{});
             }
         }
 
@@ -394,8 +466,11 @@ std::optional<s64> CoreTiming::Advance() {
     }
 
     if (!event_queue.empty()) {
-        return event_queue.top().time;
+        const s64 next = event_queue.front().time;
+        armed_wait_time = next;
+        return next;
     } else {
+        armed_wait_time = (std::numeric_limits<s64>::max)();
         return std::nullopt;
     }
 }

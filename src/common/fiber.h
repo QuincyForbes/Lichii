@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 
@@ -32,7 +33,13 @@ namespace Common {
  */
 class Fiber {
 public:
-    Fiber(std::function<void()>&& entry_point_func);
+#ifdef __OPENORBIS__
+    static constexpr std::size_t DefaultStackSize = 512 * 1024;
+#else
+    static constexpr std::size_t DefaultStackSize = 2 * 1024 * 1024;
+#endif
+
+    Fiber(std::function<void()>&& entry_point_func, std::size_t stack_size = DefaultStackSize);
     ~Fiber();
 
     Fiber(const Fiber&) = delete;
@@ -44,14 +51,15 @@ public:
     /// Yields control from Fiber 'from' to Fiber 'to'
     /// Fiber 'from' must be the currently running fiber.
     static void YieldTo(std::weak_ptr<Fiber> weak_from, Fiber& to);
+    static void YieldTo(const std::shared_ptr<Fiber>& from, Fiber& to);
     [[nodiscard]] static std::shared_ptr<Fiber> ThreadToFiber();
     void SetRewindPoint(std::function<void()>&& rewind_func);
     /// Only call from main thread's fiber
     void Exit();
 private:
     Fiber();
-    void Start(boost::context::detail::transfer_t& transfer);
     struct FiberImpl;
+    static void YieldToImpl(FiberImpl* from_impl, FiberImpl* to_impl);
     std::unique_ptr<FiberImpl> impl;
 };
 

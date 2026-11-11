@@ -24,13 +24,12 @@ void AssertFailSoftImpl();
 #endif
 
 #define ASSERT_MSG(_a_, ...)                                                                       \
-    ([&]() YUZU_NO_INLINE {                                                                         \
-        auto&& assert_condition = (_a_);                                                           \
-        if (!(assert_condition)) [[unlikely]] {                                                   \
-            LOG_CRITICAL(Debug, __FILE__ ": assert " __VA_ARGS__);                                \
-            AssertFailSoftImpl();                                                                  \
-        }                                                                                          \
-    }())
+    (static_cast<bool>(_a_)                                                                        \
+         ? static_cast<void>(0)                                                                    \
+         : ([&]() YUZU_NO_INLINE {                                                                 \
+               LOG_CRITICAL(Debug, __FILE__ ": assert " __VA_ARGS__);                              \
+               AssertFailSoftImpl();                                                               \
+           }()))
 #define ASSERT(_a_) ASSERT_MSG(_a_, "{}", #_a_)
 
 #define UNREACHABLE_MSG(...)                                                                       \
@@ -61,8 +60,13 @@ void AssertFailSoftImpl();
 // If the assert is ignored, execute _b_
 #define ASSERT_OR_EXECUTE_MSG(_a_, _b_, ...)                                                       \
     do {                                                                                           \
-        ASSERT_MSG(_a_, __VA_ARGS__);                                                              \
-        if (!(_a_)) { _b_ }                                                                        \
+        if (!static_cast<bool>(_a_)) [[unlikely]] {                                                \
+            ([&]() YUZU_NO_INLINE {                                                                \
+                LOG_CRITICAL(Debug, __FILE__ ": assert " __VA_ARGS__);                             \
+                AssertFailSoftImpl();                                                              \
+            }());                                                                                  \
+            _b_                                                                                    \
+        }                                                                                          \
     } while (0)
 
 // If the assert is ignored, execute _b_

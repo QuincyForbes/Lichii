@@ -9,13 +9,13 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
-
-#include <boost/heap/fibonacci_heap.hpp>
+#include <vector>
 
 #include "common/common_types.h"
 #include "common/thread.h"
@@ -102,6 +102,10 @@ public:
     void ScheduleEvent(std::chrono::nanoseconds ns_into_future,
                        const std::shared_ptr<EventType>& event_type, bool absolute_time = false);
 
+    /// Replaces any existing scheduled instances of event_type and schedules it at the new time.
+    void RescheduleEvent(std::chrono::nanoseconds ns_into_future,
+                         const std::shared_ptr<EventType>& event_type, bool absolute_time = false);
+
     /// Schedules an event which will automatically re-schedule itself with the given time, until
     /// unscheduled
     void ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
@@ -149,8 +153,8 @@ public:
     /// Waits on `event` until next_time, sleeping in the OS for most of it.
     void WaitForEvent(s64 next_time);
 
-    using heap_t = boost::heap::fibonacci_heap<CoreTiming::Event, boost::heap::compare<std::greater<>>>;
-    heap_t event_queue;
+    std::vector<Event> event_queue;
+    s64 armed_wait_time{(std::numeric_limits<s64>::max)()};
     s64 global_timer = 0;
 #ifdef _WIN32
     s64 timer_resolution_ns;

@@ -43,7 +43,8 @@ struct ResponseBuilder {
         std::memset(cmdbuf, 0, sizeof(u32) * IPC::COMMAND_BUFFER_LENGTH);
 
         IPC::CommandHeader header{};
-        auto const mgr = ctx.GetManager().get();
+        const auto mgr_holder = ctx.GetManager();
+        auto* const mgr = mgr_holder.get();
 
         // The entire size of the raw data section in u32 units, including the 16 bytes of mandatory
         // padding.

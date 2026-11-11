@@ -305,6 +305,17 @@ public:
     std::size_t WriteBufferC(const void* buffer, std::size_t size,
                              std::size_t buffer_index = 0) const;
 
+    /// Returns a direct writable span into guest memory when the output buffer is contiguous,
+    /// invalidating GPU rasterizer caches for the range. Returns an empty span if non-contiguous.
+    [[nodiscard]] std::span<u8> GetWriteBufferSpan(std::size_t buffer_index = 0) const;
+    [[nodiscard]] std::span<u8> GetWriteBufferSpanB(std::size_t buffer_index = 0) const;
+    [[nodiscard]] std::span<u8> GetWriteBufferSpanC(std::size_t buffer_index = 0) const;
+
+    /// Finalizes GPU rasterizer invalidation after writing directly to a span returned by GetWriteBufferSpan*.
+    void CommitWriteBufferSpan(std::size_t buffer_index = 0) const;
+    void CommitWriteBufferSpanB(std::size_t buffer_index = 0) const;
+    void CommitWriteBufferSpanC(std::size_t buffer_index = 0) const;
+
     /* Helper function to write a buffer using the appropriate buffer descriptor
      *
      * @tparam T an arbitrary container that satisfies the

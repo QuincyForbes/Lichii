@@ -31,8 +31,12 @@ public:
 public:
     KSlabHeapImpl() = default;
 
-    void Initialize() {
+    void Initialize(void* memory = nullptr, size_t memory_size = 0, size_t obj_size = 0) {
         ASSERT(m_head == nullptr);
+        m_obj_size = obj_size;
+        m_next_free = reinterpret_cast<uintptr_t>(memory);
+        const size_t num_obj = obj_size != 0 ? (memory_size / obj_size) : 0;
+        m_end = m_next_free + num_obj * obj_size;
     }
 
     Node* GetHead() const {
@@ -44,9 +48,12 @@ public:
 
         m_lock.lock();
 
-        Node* ret = m_head;
+        void* ret = m_head.load(std::memory_order_relaxed);
         if (ret != nullptr) [[likely]] {
-            m_head = ret->next;
+            m_head.store(static_cast<Node*>(ret)->next, std::memory_order_relaxed);
+        } else if (m_next_free < m_end) [[likely]] {
+            ret = reinterpret_cast<void*>(m_next_free);
+            m_next_free += m_obj_size;
         }
 
         m_lock.unlock();
@@ -59,14 +66,17 @@ public:
         m_lock.lock();
 
         Node* node = static_cast<Node*>(obj);
-        node->next = m_head;
-        m_head = node;
+        node->next = m_head.load(std::memory_order_relaxed);
+        m_head.store(node, std::memory_order_relaxed);
 
         m_lock.unlock();
     }
 
 private:
     std::atomic<Node*> m_head{};
+    uintptr_t m_next_free{};
+    uintptr_t m_end{};
+    size_t m_obj_size{};
     std::mutex m_lock;
 };
 
@@ -109,22 +119,14 @@ public:
         // Set our object size.
         m_obj_size = obj_size;
 
-        // Initialize the base allocator.
-        KSlabHeapImpl::Initialize();
-
         // Set our tracking variables.
         const size_t num_obj = (memory_size / obj_size);
         m_start = reinterpret_cast<uintptr_t>(memory);
         m_end = m_start + num_obj * obj_size;
         m_peak = m_start;
 
-        // Free the objects.
-        u8* cur = reinterpret_cast<u8*>(m_end);
-
-        for (size_t i = 0; i < num_obj; i++) {
-            cur -= obj_size;
-            KSlabHeapImpl::Free(cur);
-        }
+        // Initialize the base allocator with bump range [m_start, m_end) so unused pages stay clean.
+        KSlabHeapImpl::Initialize(memory, num_obj * obj_size, obj_size);
     }
 
     size_t GetSlabHeapSize() const {

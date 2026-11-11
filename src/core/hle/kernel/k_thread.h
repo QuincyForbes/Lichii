@@ -779,7 +779,8 @@ private:
     static Result InitializeThread(KernelCore& kernel, KThread* thread, KThreadFunction func, uintptr_t arg,
                                    KProcessAddress user_stack_top, s32 prio, s32 core,
                                    KProcess* owner, ThreadType type,
-                                   std::function<void()>&& init_func);
+                                   std::function<void()>&& init_func,
+                                   std::size_t host_stack_size);
 
     // For core KThread implementation
     Svc::ThreadContext m_thread_context{};
