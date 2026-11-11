@@ -46,6 +46,19 @@ std::string FootprintSplit(const ProcessMemory& memory, u64 left);
 /// Apple: hands the memory malloc holds free back to the OS. Returns the bytes released.
 u64 RelieveMallocPressure();
 
+/// Where guest memory is mapped (its backing and the fastmem arena), so that LogMemoryBreakdown
+/// lists it under its own name and leaves its pages uncounted. Sizes of 0 forget a range.
+void SetGuestMemoryRanges(const void* backing, std::size_t backing_size, const void* arena,
+                          std::size_t arena_size);
+/// Apple: logs what the footprint is made of beyond FootprintSplit: the process's memory regions
+/// by kind, malloc's zones, host threads, Metal and the bytes written to storage. It asks the
+/// kernel about every page outside guest memory, which takes tens of milliseconds: not for a
+/// thread the game waits for. Nothing elsewhere.
+void LogMemoryBreakdown(const char* reason);
+/// Apple: logs the bytes this process wrote to storage since it started (guest memory kept in a
+/// file is written there when iOS needs its RAM).
+void LogStorageWrites(const char* reason);
+
 /// Work to finish before the app is suspended (write caches out). Listeners run on the thread
 /// calling NotifyEnteringBackground; they must not wait for the emulated CPU or the GPU thread.
 std::size_t AddBackgroundListener(std::function<void()> listener);
