@@ -500,6 +500,16 @@ json SpeedLimit(ToolState&, const json& params) {
     return {{"previous", previous}, {"on", setting.GetValue()}};
 }
 
+// Reads or sets the Switch 2 frame rate limit; a running game follows it from its next vsync.
+json FrameRateLimit(ToolState&, const json& params) {
+    auto& setting = Settings::values.frame_rate_limit;
+    const u16 previous = setting.GetValue();
+    if (params.contains("hz")) {
+        setting.SetValue(params.at("hz").get<u16>());
+    }
+    return {{"previous", previous}, {"hz", setting.GetValue()}};
+}
+
 json ReadMemory(ToolState& state, const json& params) {
     const u64 address = AddressParam(params, "address");
     const u64 size = ReadSize(params, address);
@@ -974,6 +984,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"pgo_dump", handler(PgoDump)},
         {"switch", handler(SetSwitch)},
         {"speed_limit", handler(SpeedLimit)},
+        {"frame_rate_limit", handler(FrameRateLimit)},
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},
         {"write_memory", handler(WriteMemory)},
