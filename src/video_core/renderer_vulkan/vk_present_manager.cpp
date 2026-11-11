@@ -748,7 +748,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         RecreateSwapchain(frame);
     }
     if (swapchain.AcquireFailed()) {
-        Common::PlatformEvents::NoteMemoryPressure();
+        Common::PlatformEvents::SignalMemoryPressure();
         scheduler.Flush();
         DiscardFrame(frame);
         return;
