@@ -1368,9 +1368,10 @@ private:
             size_t added = 0;
             for (mach_msg_type_number_t i = 0; i < listed; ++i) {
                 const thread_act_t thread = list[i];
-                const thread_act_t* const end = stopped.data() + num_stopped;
+                const thread_act_t* const begin = stopped.data();
+                const thread_act_t* const end = begin + num_stopped;
                 bool kept = false;
-                if (thread != self && std::find(stopped.data(), end, thread) == end) {
+                if (thread != self && std::find(begin, end, thread) == end) {
                     if (num_stopped == stopped.size()) {
                         failed = true;
                     } else if (thread_suspend(thread) == KERN_SUCCESS) {
