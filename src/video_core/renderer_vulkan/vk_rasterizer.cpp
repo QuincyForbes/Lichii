@@ -4122,12 +4122,8 @@ void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* draw_pipeline) {
     }
     const auto topology = maxwell3d->draw_manager.draw_state.topology;
     const bool topology_changed = !emulated_mesh && state_tracker.ChangePrimitiveTopology(topology);
-    const bool mask_unwritten_rt =
-        device.GetDriverID() == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
-        device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY ||
-        device.GetDriverID() == VK_DRIVER_ID_MESA_RADV;
     const bool color_output_changed =
-        mask_unwritten_rt && device.IsExtExtendedDynamicState3BlendingSupported() &&
+        device.IsExtExtendedDynamicState3BlendingSupported() &&
         (draw_pipeline ? draw_pipeline->ColorOutputMask() : ~0U) != last_color_output_mask;
     if (DynamicStateCacheEnabled()) {
         if (!dyn_state_mask_built) [[unlikely]] {
@@ -4932,14 +4928,9 @@ void RasterizerVulkan::UpdateLogicOp(Tegra::Engines::Maxwell3D::Regs& regs) {
 
 void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs,
                                       const GraphicsPipeline* pipeline) {
-    // The write mask also excludes components the fragment shader doesn't output on AMD drivers
-    // (where unwritten fragment outputs write garbage), so it is recorded again when needed.
-    const bool mask_unwritten_rt =
-        device.GetDriverID() == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
-        device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY ||
-        device.GetDriverID() == VK_DRIVER_ID_MESA_RADV;
-    const u32 color_output_mask =
-        (mask_unwritten_rt && pipeline) ? pipeline->ColorOutputMask() : ~0U;
+    // The write mask also excludes components the fragment shader doesn't output, so it has to be
+    // recorded again whenever the bound pipeline outputs a different set of components.
+    const u32 color_output_mask = pipeline ? pipeline->ColorOutputMask() : ~0U;
     const bool color_output_changed = color_output_mask != last_color_output_mask;
     if (!state_tracker.TouchBlending() && !color_output_changed) {
         return;

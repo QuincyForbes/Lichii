@@ -1800,34 +1800,60 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
         entry = CreateComputePipeline(key, shader);
     } else {
         if (entry.pending_rebuild && entry.pending_rebuild->IsBuilt()) {
-            if (entry.pipeline) {
+            if (!entry.pending_rebuild->BuildFailed()) {
+                if (entry.pipeline) {
+                    retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                           std::move(entry.pipeline));
+                }
+                entry.pipeline = std::move(entry.pending_rebuild);
+                entry.null_pointer_slots = std::move(entry.pending_null_pointer_slots);
+                entry.mapped_pointers = std::move(entry.pending_mapped_pointers);
+                ++entry.rebuilds;
+            } else {
+                LOG_WARNING(Render_Vulkan, "Keeping compute shader {:016x}: rebuild failed",
+                            key.unique_hash);
                 retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
-                                                       std::move(entry.pipeline));
+                                                       std::move(entry.pending_rebuild));
+                entry.pending_null_pointer_slots.clear();
+                entry.pending_mapped_pointers.clear();
+                entry.rebuilds = MaxComputeRebuilds;
             }
-            entry.pipeline = std::move(entry.pending_rebuild);
-            entry.null_pointer_slots = std::move(entry.pending_null_pointer_slots);
-            entry.mapped_pointers = std::move(entry.pending_mapped_pointers);
-            ++entry.rebuilds;
         }
         if (!entry.pending_rebuild && !entry.null_pointer_slots.empty() &&
             entry.rebuilds < MaxComputeRebuilds && StaleNullPointerSlot(entry)) {
             // The translation dropped accesses through a pointer that was null back then. Which
             // slots the game fills depends on the area, so the new one keeps binding every pointer
             // this one binds, null now or not: a null pointer binds nothing. Built on a worker
-            // while dispatches keep using the current pipeline (#995).
+            // while dispatches keep using the current pipeline (#969 / #995).
             auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
             if (rebuilt.pipeline) {
-                if (rebuilt.pipeline->IsBuilt()) {
+                if (entry.pipeline && !entry.pipeline->BuildFailed()) {
+                    if (rebuilt.pipeline->IsBuilt()) {
+                        if (!rebuilt.pipeline->BuildFailed()) {
+                            retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                                   std::move(entry.pipeline));
+                            rebuilt.rebuilds = entry.rebuilds + 1;
+                            entry = std::move(rebuilt);
+                        } else {
+                            LOG_WARNING(Render_Vulkan,
+                                        "Keeping compute shader {:016x}: rebuild failed",
+                                        key.unique_hash);
+                            retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                                   std::move(rebuilt.pipeline));
+                            entry.rebuilds = MaxComputeRebuilds;
+                        }
+                    } else {
+                        entry.pending_rebuild = std::move(rebuilt.pipeline);
+                        entry.pending_null_pointer_slots = std::move(rebuilt.null_pointer_slots);
+                        entry.pending_mapped_pointers = std::move(rebuilt.mapped_pointers);
+                    }
+                } else {
                     if (entry.pipeline) {
                         retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
                                                                std::move(entry.pipeline));
                     }
                     rebuilt.rebuilds = entry.rebuilds + 1;
                     entry = std::move(rebuilt);
-                } else {
-                    entry.pending_rebuild = std::move(rebuilt.pipeline);
-                    entry.pending_null_pointer_slots = std::move(rebuilt.null_pointer_slots);
-                    entry.pending_mapped_pointers = std::move(rebuilt.mapped_pointers);
                 }
             } else {
                 // Keep the working translation when the new one cannot be built (for example a

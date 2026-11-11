@@ -105,6 +105,11 @@ public:
         return is_built.load(std::memory_order::acquire);
     }
 
+    /// Whether the build ended without creating a pipeline (driver rejected the shader).
+    [[nodiscard]] bool BuildFailed() const noexcept {
+        return is_built.load(std::memory_order::acquire) && !pipeline;
+    }
+
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();
