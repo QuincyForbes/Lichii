@@ -58,7 +58,8 @@ namespace VkDeviceInfo {
 class Record {
 public:
     explicit Record(std::string_view name, const std::vector<VkPresentModeKHR>& vsync_modes,
-                    bool has_broken_compute, VkDriverId driver_id, bool dlss_capable);
+                    bool has_broken_compute, VkDriverId driver_id, bool dlss_capable,
+                    std::string_view driver_version = {});
     ~Record();
 
     const std::string name;
@@ -68,6 +69,8 @@ public:
     /// NVIDIA's proprietary driver on a GPU with tensor cores (GeForce/Quadro RTX), which DLSS
     /// needs. Streamline makes the final call when a game starts.
     const bool dlss_capable;
+    /// The driver's own version text (e.g. "581.57"), for support logs.
+    const std::string driver_version;
 };
 
 // TODO(crueter): Port some configure_graphics.cpp stuff

@@ -12,6 +12,7 @@ namespace FrontendCommon::DataManager {
 enum class DataDir { Saves, UserNand, SysNand, Mods, Shaders };
 
 const std::filesystem::path GetDataDir(DataDir dir, const std::string &user_id = "");
+// Returns a UTF-8 path, creating the directory if necessary.
 const std::string GetDataDirString(DataDir dir, const std::string &user_id = "");
 
 u64 ClearDir(DataDir dir, const std::string &user_id = "");

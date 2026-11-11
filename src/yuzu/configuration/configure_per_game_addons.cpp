@@ -21,6 +21,7 @@
 
 #include "common/common_types.h"
 #include "common/fs/fs.h"
+#include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "configuration/addon/mod_select_dialog.h"
 #include "core/core.h"
@@ -197,7 +198,7 @@ void ConfigurePerGameAddons::SetTitleId(u64 id) {
 void ConfigurePerGameAddons::InstallMods(const QStringList& mods) {
     QStringList failed;
     for (const auto& mod : mods) {
-        if (FrontendCommon::InstallMod(mod.toStdString(), title_id, true) ==
+        if (FrontendCommon::InstallModFromUTF8(mod.toStdString(), title_id, true) ==
             FrontendCommon::Failed) {
             failed << QFileInfo(mod).baseName();
         }
@@ -291,7 +292,8 @@ void ConfigurePerGameAddons::AddonDeleteRequested(QList<QModelIndex> selected) {
         return;
 
     for (const QModelIndex& index : filtered) {
-        std::filesystem::remove_all(index.data(PATCH_LOCATION).toString().toStdString());
+        std::filesystem::remove_all(std::filesystem::path{
+            Common::FS::ToU8String(index.data(PATCH_LOCATION).toString().toStdString())});
     }
 
     QtCommon::Frontend::Information(tr("Successfully deleted"),

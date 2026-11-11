@@ -62,6 +62,7 @@
 
 #include "util/clickable_label.h"
 #include "util/controller_navigation.h"
+#include "util/export_log.h"
 #include "util/overlay_dialog.h"
 
 #include "multiplayer/state.h"
@@ -127,6 +128,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 }
 
 // Frontend //
+#include "frontend_common/data_manager.h"
 #include "frontend_common/play_time_manager.h"
 
 #ifdef ENABLE_UPDATE_CHECKER
@@ -1527,16 +1529,19 @@ void MainWindow::InitializeHotkeys() {
     connect_shortcut(QStringLiteral("Audio Volume Up"), &MainWindow::OnIncreaseVolume);
 
     connect_shortcut(QStringLiteral("Toggle Framerate Limit"), [this] {
+        RememberSpeedLimitBeforeHotkey();
         Settings::ToggleStandardMode();
         SetFPSSuffix();
     });
 
     connect_shortcut(QStringLiteral("Toggle Turbo Speed"), [this] {
+        RememberSpeedLimitBeforeHotkey();
         Settings::ToggleTurboMode();
         SetFPSSuffix();
     });
 
     connect_shortcut(QStringLiteral("Toggle Slow Speed"), [this] {
+        RememberSpeedLimitBeforeHotkey();
         Settings::ToggleSlowMode();
         SetFPSSuffix();
     });
@@ -1821,6 +1826,8 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_SDMC_Folder, &MainWindow::OnOpenSDMCFolder);
     connect_menu(ui->action_Mod_Folder, &MainWindow::OnOpenModFolder);
     connect_menu(ui->action_Log_Folder, &MainWindow::OnOpenLogFolder);
+    connect_menu(ui->action_Export_Log, &MainWindow::OnExportLog);
+    connect_menu(ui->action_Delete_Shader_Cache, &MainWindow::OnDeleteShaderCache);
 
     connect_menu(ui->action_Verify_installed_contents, &MainWindow::OnVerifyInstalledContents);
     connect_menu(ui->action_Firmware_From_Folder, &MainWindow::OnInstallFirmware);
@@ -2070,17 +2077,19 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
         switch (result) {
         case Core::SystemResultStatus::ErrorGetLoader:
             LOG_CRITICAL(Frontend, "Failed to obtain loader for {}!", filename.toStdString());
-            QMessageBox::critical(this, tr("Error while loading ROM!"),
-                                  tr("The ROM format is not supported."));
+            ShowErrorWithExportLog(tr("Error while loading ROM!"),
+                                   tr("The ROM format is not supported."));
             break;
         case Core::SystemResultStatus::ErrorVideoCore:
-            QMessageBox::critical(this, tr("An error occurred initializing the video core."),
-                                  tr("This is usually caused by outdated GPU drivers. "
-                                     "Please see the log for more details. See: "
-                                     "<a "
-                                     "href='https://git.eden-emu.dev/eden-emu/eden/src/branch/"
-                                     "master/docs/user/HowToAccessLogs.md'>"
-                                     "How to access log files</a>."));
+            ShowErrorWithExportLog(
+                tr("An error occurred initializing the video core."),
+                tr("This is usually caused by outdated GPU drivers. "
+                   "Please update your graphics driver and try again, or click Export Log... "
+                   "to save a support archive. See: "
+                   "<a "
+                   "href='https://git.eden-emu.dev/eden-emu/eden/src/branch/"
+                   "master/docs/user/HowToAccessLogs.md'>"
+                   "How to access log files</a>."));
             break;
         default:
             if (result > Core::SystemResultStatus::ErrorLoader) {
@@ -2098,11 +2107,12 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
                         .arg(QString::fromStdString(
                             GetResultStatusString(static_cast<Loader::ResultStatus>(error_id))));
 
-                QMessageBox::critical(this, title, description);
+                ShowErrorWithExportLog(title, description);
             } else {
-                QMessageBox::critical(
-                    this, tr("Error while loading ROM!"),
-                    tr("An unknown error occurred. Please see the log for more details."));
+                ShowErrorWithExportLog(
+                    tr("Error while loading ROM!"),
+                    tr("An unknown error occurred. Click Export Log... for troubleshooting "
+                       "details."));
             }
             break;
         }
@@ -2224,6 +2234,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         LOG_INFO(Config, "Applied recommended MKW settings after per-game configuration");
     }
     PrepareShaderPrecache(title_id, std::filesystem::path{filename.toStdU16String()});
+    speed_limit_before_hotkeys.reset();
     Settings::LogSettings();
 
     if (UISettings::values.select_user_on_boot && !user_flag_cmd_line) {
@@ -2265,8 +2276,9 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
             prepared_romfs = watcher.result();
         } catch (const std::exception& error) {
             LOG_ERROR(Frontend, "Loose RomFS preparation failed: {}", error.what());
-            QMessageBox::critical(this, tr("Unable to prepare game files"),
-                                  tr("Game preparation failed. See the log for details."));
+            ShowErrorWithExportLog(
+                tr("Unable to prepare game files"),
+                tr("Game preparation failed. Click Export Log... to save the log for details."));
             return;
         }
         if (close_pending) {
@@ -2396,6 +2408,24 @@ void MainWindow::BootGameFromList(const QString& filename, StartGameType with_co
     BootGame(filename, ApplicationAppletParameters(), with_config);
 }
 
+void MainWindow::RememberSpeedLimitBeforeHotkey() {
+    if (!speed_limit_before_hotkeys) {
+        speed_limit_before_hotkeys = SessionSpeedLimit{
+            .value = Settings::values.use_speed_limit.GetValue(),
+            .using_global = Settings::values.use_speed_limit.UsingGlobal(),
+        };
+    }
+}
+
+void MainWindow::UndoSessionSpeedChanges() {
+    if (speed_limit_before_hotkeys &&
+        Settings::values.use_speed_limit.UsingGlobal() == speed_limit_before_hotkeys->using_global) {
+        Settings::values.use_speed_limit.SetValue(speed_limit_before_hotkeys->value);
+    }
+    speed_limit_before_hotkeys.reset();
+    Settings::values.current_speed_mode = Settings::SpeedMode::Standard;
+}
+
 bool MainWindow::OnShutdownBegin() {
     if (!emulation_running) {
         return false;
@@ -2407,21 +2437,19 @@ bool MainWindow::OnShutdownBegin() {
 
     AllowOSSleep();
 
-    // Disable unlimited frame rate and turbo/slow modes
-    Settings::values.use_speed_limit.SetValue(true);
-    Settings::values.current_speed_mode = Settings::SpeedMode::Standard;
+    UndoSessionSpeedChanges();
+
+    if (perf_overlay) {
+        perf_overlay->hide();
+        perf_overlay->deleteLater();
+        perf_overlay = nullptr;
+    }
 
     if (QtCommon::system->IsShuttingDown()) {
         status_bar_update_timer.stop();
         connect(QtCommon::emu_thread.get(), &QThread::finished, this,
                 &MainWindow::OnEmulationStopped, Qt::UniqueConnection);
         return false;
-    }
-
-    if (perf_overlay) {
-        perf_overlay->hide();
-        perf_overlay->deleteLater();
-        perf_overlay = nullptr;
     }
 
     QtCommon::system->SetShuttingDown(true);
@@ -2514,6 +2542,7 @@ void MainWindow::OnEmulationStopped() {
     if (QtCommon::emu_thread && QtCommon::emu_thread->isRunning()) {
         return;
     }
+    UndoSessionSpeedChanges();
     shutdown_timer.stop();
     emu_terminate_timer.stop();
     if (QtCommon::emu_thread) {
@@ -2853,7 +2882,24 @@ void MainWindow::OnGameListRemoveInstalledEntry(u64 program_id,
 
 void MainWindow::OnGameListRemoveFile(u64 program_id, QtCommon::Game::GameListRemoveTarget target,
                                       const std::string& game_path) {
-    const QString question = [target] {
+    if (emulation_running || boot_in_progress) {
+        QMessageBox::information(this, tr("Remove File"), tr("Stop the running game first."));
+        return;
+    }
+    const bool is_shader_target =
+        target == QtCommon::Game::GameListRemoveTarget::GlShaderCache ||
+        target == QtCommon::Game::GameListRemoveTarget::VkShaderCache ||
+        target == QtCommon::Game::GameListRemoveTarget::AllShaderCache;
+    if (is_shader_target && shader_warm_dialog && shader_warm_dialog->IsRunning() &&
+        shader_warm_dialog->TitleId() == program_id) {
+        QMessageBox::information(this, tr("Delete Shader Cache"),
+                                 tr("Shaders are being precached. Try again when it is done."));
+        shader_warm_dialog->raise();
+        shader_warm_dialog->activateWindow();
+        return;
+    }
+
+    const QString question_text = [target] {
         switch (target) {
         case QtCommon::Game::GameListRemoveTarget::GlShaderCache:
             return tr("Delete OpenGL Transferable Shader Cache?");
@@ -2870,8 +2916,20 @@ void MainWindow::OnGameListRemoveFile(u64 program_id, QtCommon::Game::GameListRe
         }
     }();
 
-    if (!MainWindow::question(this, tr("Remove File"), question, QMessageBox::Yes | QMessageBox::No,
-                              QMessageBox::No)) {
+    if (is_shader_target) {
+        QMessageBox box(QMessageBox::Warning, tr("Delete Shader Cache"), question_text,
+                        QMessageBox::NoButton, this);
+        box.setInformativeText(tr("Only delete the shader cache if the game crashes or renders "
+                                  "wrong because of it. Shaders will be rebuilt on the next "
+                                  "launch."));
+        QPushButton* remove = box.addButton(tr("Delete"), QMessageBox::DestructiveRole);
+        box.setDefaultButton(box.addButton(QMessageBox::Cancel));
+        box.exec();
+        if (box.clickedButton() != remove) {
+            return;
+        }
+    } else if (!MainWindow::question(this, tr("Remove File"), question_text,
+                                     QMessageBox::Yes | QMessageBox::No, QMessageBox::No)) {
         return;
     }
 
@@ -3897,6 +3955,7 @@ void MainWindow::OnConfigure() {
         SetDefaultUIGeometry();
         RestoreUIState();
     }
+    speed_limit_before_hotkeys.reset();
     InitializeHotkeys();
 
     if (UISettings::values.theme != old_theme) {
@@ -4150,6 +4209,7 @@ void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_
     } else if (result == QDialog::Accepted) {
         dialog.ApplyConfiguration();
     }
+    speed_limit_before_hotkeys.reset();
 
     const auto reload = UISettings::values.is_game_list_reload_pending.exchange(false);
     if (reload) {
@@ -4269,6 +4329,51 @@ void MainWindow::OnOpenModFolder() {
 
 void MainWindow::OnOpenLogFolder() {
     QtCommon::Game::OpenLogFolder();
+}
+
+void MainWindow::OnExportLog() {
+    if (!UISettings::values.has_broken_vulkan && std::exchange(vk_records_pending, false)) {
+        VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
+    }
+    ExportLog::Export(this, vk_device_records);
+}
+
+void MainWindow::ShowErrorWithExportLog(const QString& title, const QString& text) {
+    QMessageBox box(QMessageBox::Critical, title, text, QMessageBox::Ok, this);
+    box.setTextFormat(Qt::RichText);
+    QPushButton* export_button = box.addButton(tr("Export Log..."), QMessageBox::ActionRole);
+    box.setDefaultButton(QMessageBox::Ok);
+    box.exec();
+    if (box.clickedButton() == export_button) {
+        OnExportLog();
+    }
+}
+
+void MainWindow::OnDeleteShaderCache() {
+    const QString title = tr("Delete Shader Cache");
+    if (emulation_running || boot_in_progress) {
+        QMessageBox::information(this, title, tr("Stop the running game first."));
+        return;
+    }
+    if (shader_warm_dialog && shader_warm_dialog->IsRunning()) {
+        QMessageBox::information(this, title,
+                                 tr("Shaders are being precached. Try again when it is done."));
+        shader_warm_dialog->raise();
+        shader_warm_dialog->activateWindow();
+        return;
+    }
+    QMessageBox box(QMessageBox::Warning, title, tr("Delete all saved shader caches?"),
+                    QMessageBox::NoButton, this);
+    box.setInformativeText(tr("Only delete the shader cache if a game crashes or renders wrong "
+                              "because of it. Shaders will be rebuilt on the next launch.\n\n"
+                              "To delete only one game's shader cache, right-click the game in "
+                              "the game list and choose Remove."));
+    QPushButton* remove = box.addButton(tr("Delete"), QMessageBox::DestructiveRole);
+    box.setDefaultButton(box.addButton(QMessageBox::Cancel));
+    box.exec();
+    if (box.clickedButton() == remove) {
+        FrontendCommon::DataManager::ClearDir(FrontendCommon::DataManager::DataDir::Shaders);
+    }
 }
 
 void MainWindow::OnVerifyInstalledContents() {
@@ -5185,14 +5290,32 @@ void MainWindow::UpdateStatusBar() {
         emu_speed_label->setText(tr("Speed: %1%").arg(results.emulation_speed * 100.0, 0, 'f', 0));
     }
 
+    const auto fg_method_name = [] {
+        switch (Settings::values.frame_gen_type.GetValue()) {
+        case Settings::FrameGenType::Lsfg:
+            return QStringLiteral("LSFG");
+        case Settings::FrameGenType::MetalFx:
+            return QStringLiteral("MetalFX");
+        case Settings::FrameGenType::Fsr3:
+        default:
+            return QStringLiteral("FSR3");
+        }
+    };
+
     QString fpsText;
     if (results.generated_fps > 0.5 && results.average_game_fps > 0.5) {
         const double mult = results.total_fps / results.average_game_fps;
-        fpsText = tr("Real: %1 FPS | Generated: +%2 | Displayed: %3 FPS (%4x)")
+        fpsText = tr("Real: %1 FPS | Generated: +%2 (%5) | Displayed: %3 FPS (%4x)")
                       .arg(results.average_game_fps, 0, 'f', 1)
                       .arg(results.generated_fps, 0, 'f', 1)
                       .arg(results.total_fps, 0, 'f', 1)
-                      .arg(mult, 0, 'f', 1);
+                      .arg(mult, 0, 'f', 1)
+                      .arg(fg_method_name());
+    } else if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan &&
+               Settings::values.frame_gen.GetValue()) {
+        fpsText = tr("Real: %1 FPS | FG (%2): Warmup")
+                      .arg(results.average_game_fps, 0, 'f', 1)
+                      .arg(fg_method_name());
     } else {
         fpsText = tr("Real: %1 FPS").arg(results.average_game_fps, 0, 'f', 1);
     }

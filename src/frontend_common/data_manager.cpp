@@ -4,6 +4,7 @@
 #include <filesystem>
 #include "data_manager.h"
 #include "common/assert.h"
+#include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include <fmt/format.h>
 
@@ -18,17 +19,17 @@ const fs::path GetDataDir(DataDir dir, const std::string &user_id)
 
     switch (dir) {
     case DataDir::Saves:
-        return (save_dir / "user" / "save" / "0000000000000000" / user_id).string();
+        return save_dir / "user" / "save" / "0000000000000000" / user_id;
     case DataDir::UserNand:
-        return (nand_dir / "user" / "Contents" / "registered").string();
+        return nand_dir / "user" / "Contents" / "registered";
     case DataDir::SysNand:
         // NB: do NOT delete save
         // that contains profile data and other stuff
-        return (nand_dir / "system" / "Contents" / "registered").string();
+        return nand_dir / "system" / "Contents" / "registered";
     case DataDir::Mods:
-        return Common::FS::GetEdenPathString(Common::FS::EdenPath::LoadDir);
+        return Common::FS::GetEdenPath(Common::FS::EdenPath::LoadDir);
     case DataDir::Shaders:
-        return Common::FS::GetEdenPathString(Common::FS::EdenPath::ShaderDir);
+        return Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
     default:
         UNIMPLEMENTED();
     }
@@ -38,9 +39,9 @@ const fs::path GetDataDir(DataDir dir, const std::string &user_id)
 
 const std::string GetDataDirString(DataDir dir, const std::string &user_id)
 {
-    auto dirString = GetDataDir(dir, user_id).string();
-    std::filesystem::create_directories(dirString);
-    return dirString;
+    const auto path = GetDataDir(dir, user_id);
+    std::filesystem::create_directories(path);
+    return Common::FS::PathToUTF8String(path);
 }
 
 u64 ClearDir(DataDir dir, const std::string &user_id)

@@ -15,7 +15,7 @@
 namespace Settings::Frizti {
 
 // Bump when the tuned values change, so every player gets them once more.
-inline constexpr u32 Revision = 3;
+inline constexpr u32 Revision = 5;
 inline constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
 
 // The tuned settings. Frizti's value is each setting's default in settings.h.
@@ -43,7 +43,8 @@ std::vector<Change> ReconcileGlobal(std::span<BasicSetting* const> settings, con
                                     bool full);
 
 // `settings` hold Ocarina's per-game config. Resets to global the overrides Frizti did not write
-// (all of them with `full`).
+// (all of them with `full`), except deliberate per-game display/scaling overrides
+// (`resolution_setup` and `use_docked_mode`) which are always preserved.
 std::vector<Change> ReconcilePerGame(std::span<BasicSetting* const> settings, const Record& record,
                                      bool full);
 

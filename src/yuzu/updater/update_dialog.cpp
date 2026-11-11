@@ -6,6 +6,7 @@
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
+#include <QEventLoop>
 #include <QFileInfo>
 #include <QMessageBox>
 #include <QProcess>
@@ -14,6 +15,7 @@
 #include <QRadioButton>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include <QTimer>
 #include <qdesktopservices.h>
 #include "common/logging.h"
 #include "common/scm_rev.h"
@@ -396,8 +398,41 @@ bool UpdateDialog::DownloadTo(const QString& filename) {
         return true;
     };
 
-    // Now send off request
-    auto result = client->Get(m_asset.path, content_receiver, progress_callback);
+    // Now send off request. GitHub's file server occasionally answers 502-504 or drops the
+    // connection transiently; retry up to three times a few seconds apart, starting the file
+    // over each time. Size and SHA-256 verification below still decide whether it is kept.
+    constexpr int attempts = 3;
+    httplib::Result result;
+    for (int attempt = 1; attempt <= attempts; ++attempt) {
+        if (attempt > 1) {
+            file.seek(0);
+            file.resize(0);
+            hash.reset();
+            received = 0;
+            progress->setValue(0);
+            progress->setLabelText(tr("Downloading... (try %1 of %2)").arg(attempt).arg(attempts));
+            const int delay_ms = 2000 * (attempt - 1);
+            for (int waited = 0; waited < delay_ms && !progress->wasCanceled(); waited += 100) {
+                QEventLoop wait;
+                QTimer::singleShot(100, &wait, &QEventLoop::quit);
+                wait.exec();
+            }
+            if (progress->wasCanceled()) {
+                progress->close();
+                file.cancelWriting();
+                return false;
+            }
+        }
+        result = client->Get(m_asset.path, content_receiver, progress_callback);
+        const bool canceled = !result && result.error() == httplib::Error::Canceled;
+        const bool transient = (!result && !canceled) ||
+                               (result && (result->status >= 500 || result->status == 429));
+        if (!transient || attempt == attempts) {
+            break;
+        }
+        LOG_WARNING(Frontend, "GET to {}{} failed ({}), trying again", m_asset.url, m_asset.path,
+                    result ? std::to_string(result->status) : httplib::to_string(result.error()));
+    }
     progress->close();
 
     if (!result) {

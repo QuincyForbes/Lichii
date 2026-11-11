@@ -63,7 +63,7 @@ static Qt::HighDpiScaleFactorRoundingPolicy GetHighDpiRoundingPolicy() {
         return Qt::HighDpiScaleFactorRoundingPolicy::PassThrough;
     }
 
-    const QRect screen_rect = primary_screen->geometry();
+    const QRect screen_rect = primary_screen->availableGeometry();
     const qreal real_ratio = primary_screen->devicePixelRatio();
     const qreal real_width = std::trunc(screen_rect.width() * real_ratio);
     const qreal real_height = std::trunc(screen_rect.height() * real_ratio);
