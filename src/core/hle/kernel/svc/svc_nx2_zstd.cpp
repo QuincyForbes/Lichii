@@ -57,6 +57,7 @@ constexpr size_t kMaxDictEntries = 16;
 constexpr size_t kEdgeBytes = 64;
 constexpr s64 kRevalidateNs = 1'000'000'000;
 constexpr s64 kLogIntervalNs = 1'000'000'000;
+constexpr s64 kScratchIdleNs = 2'000'000'000;
 
 // EDEN_NX2_OOT_ZSTD_DICT: "0" sends calls with a ddict to the game's decoder again (wave-2
 // behaviour). Default on.
@@ -291,6 +292,19 @@ unsigned long long StandardFramesBound(const u8* src, size_t size) {
     return total_bound;
 }
 
+// A host thread's buffer stays as large as its largest call, all of it written to (19 MiB at the
+// title). One that no call filled by half for two seconds is freed and allocated at the size in
+// use.
+void ResizeScratch(Common::ScratchBuffer<u8>& buffer, s64& filled_ns, size_t size, s64 now) {
+    if (size >= buffer.capacity() / 2) {
+        filled_ns = now;
+    } else if (now - filled_ns > kScratchIdleNs) {
+        buffer.release();
+        filled_ns = now;
+    }
+    buffer.resize_destructive(size);
+}
+
 // Decompresses on the host. Returns nullptr on success (args[0] then holds the decompressed size,
 // as the function returns), or the reason the game's own function must run instead; then nothing
 // was written to guest memory.
@@ -327,11 +341,13 @@ const char* HostDecompress(Core::Memory::Memory& memory, std::span<uint64_t, 8> 
     }
     thread_local Common::ScratchBuffer<u8> input;
     thread_local Common::ScratchBuffer<u8> output;
+    thread_local s64 input_filled_ns{};
+    thread_local s64 output_filled_ns{};
     thread_local std::unique_ptr<ZSTD_DCtx, DCtxDeleter> dctx{ZSTD_createDCtx()};
     if (!dctx) {
         return "no host DCtx";
     }
-    input.resize_destructive(src_size);
+    ResizeScratch(input, input_filled_ns, src_size, now);
     if (!memory.ReadBlock(src, input.data(), src_size)) {
         return "source unreadable";
     }
@@ -344,7 +360,7 @@ const char* HostDecompress(Core::Memory::Memory& memory, std::span<uint64_t, 8> 
     if (out_capacity > kMaxSize) {
         return "output too large";
     }
-    output.resize_destructive(std::max<size_t>(out_capacity, 1));
+    ResizeScratch(output, output_filled_ns, std::max<size_t>(out_capacity, 1), now);
     const size_t result =
         dict ? ZSTD_decompress_usingDDict(dctx.get(), output.data(), out_capacity, input.data(),
                                           src_size, dict->ddict.get())
