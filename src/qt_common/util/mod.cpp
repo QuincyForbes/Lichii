@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <system_error>
 #include <JlCompress.h>
+#include "common/fs/fs_util.h"
 #include "frontend_common/mod_manager.h"
 #include "mod.h"
 #include "qt_common/abstract/frontend.h"
@@ -22,7 +23,7 @@ QStringList GetModFolders(const QString& root, const QString& fallbackName) {
         // If not, you're out of luck.
         QStringList qpaths;
         for (const fs::path& path : paths) {
-            qpaths << QString::fromStdString(path.string());
+            qpaths << QString::fromStdString(Common::FS::PathToUTF8String(path));
         }
 
         return qpaths;
@@ -37,8 +38,9 @@ QStringList GetModFolders(const QString& root, const QString& fallbackName) {
 
         // If this is an atmosphere-packed mod, the default name will end up as the game's title ID.
         // So in this case ignore it and use the zip name instead
-        if (!paths.empty() && std_path.string().find("atmosphere") == std::string::npos)
-            default_name = QString::fromStdString(std_path.filename().string());
+        if (!paths.empty() &&
+            Common::FS::PathToUTF8String(std_path).find("atmosphere") == std::string::npos)
+            default_name = QString::fromStdString(Common::FS::PathToUTF8String(std_path.filename()));
         else if (!fallbackName.isEmpty())
             default_name = fallbackName;
         else
@@ -85,19 +87,21 @@ QStringList GetModFolders(const QString& root, const QString& fallbackName) {
             }
 
             // now make a temp directory...
-            const auto mod_dir = fs::temp_directory_path() / "eden" / "mod" / name.toStdString();
+            const auto mod_dir =
+                fs::temp_directory_path() / "eden" / "mod" / Common::FS::ToU8String(name.toStdString());
             const auto tmp = mod_dir / to_make;
             std::error_code ec;
             fs::remove_all(mod_dir, ec);
             if (!fs::create_directories(tmp, ec)) {
-                LOG_ERROR(Frontend, "Failed to create temporary directory {}", tmp.string());
+                LOG_ERROR(Frontend, "Failed to create temporary directory {}",
+                          Common::FS::PathToUTF8String(tmp));
                 return {};
             }
 
             std_path = mod_dir;
 
             // ... and copy everything from the root to the temp dir
-            for (const auto& entry : fs::directory_iterator(root.toStdString())) {
+            for (const auto& entry : fs::directory_iterator(Common::FS::ToU8String(std_root))) {
                 const auto target = tmp / entry.path().filename();
 
                 fs::copy(entry.path(), target,
@@ -105,15 +109,19 @@ QStringList GetModFolders(const QString& root, const QString& fallbackName) {
             }
         } else {
             // Rename the existing mod folder.
-            const auto new_path = std_path.parent_path() / name.toStdString();
+            const auto new_path =
+                std_path.parent_path() / Common::FS::ToU8String(name.toStdString());
             if (new_path != std_path) {
-                fs::remove_all(new_path);
-                fs::rename(std_path, new_path);
+                std::error_code ec;
+                if (!fs::exists(new_path, ec) || !fs::equivalent(std_path, new_path, ec)) {
+                    fs::remove_all(new_path, ec);
+                }
+                fs::rename(std_path, new_path, ec);
             }
             std_path = new_path;
         }
 
-        return {QString::fromStdString(std_path.string())};
+        return {QString::fromStdString(Common::FS::PathToUTF8String(std_path))};
     }
 }
 
@@ -124,13 +132,14 @@ const QString ExtractMod(const QString& path) {
     std::error_code ec;
     fs::remove_all(tmp, ec);
     if (!fs::create_directories(tmp, ec)) {
-        QtCommon::Frontend::Critical(tr("Mod Extract Failed"),
-                                    tr("Failed to create temporary directory %1")
-                                        .arg(QString::fromStdString(tmp.string())));
+        QtCommon::Frontend::Critical(
+            tr("Mod Extract Failed"),
+            tr("Failed to create temporary directory %1")
+                .arg(QString::fromStdString(Common::FS::PathToUTF8String(tmp))));
         return QString();
     }
 
-    QString qCacheDir = QString::fromStdString(tmp.string());
+    QString qCacheDir = QString::fromStdString(Common::FS::PathToUTF8String(tmp));
 
     QFile zip{path};
 

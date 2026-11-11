@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <optional>
+#include <string>
 #include <vector>
 #include "common/common_types.h"
 
@@ -19,4 +20,7 @@ enum ModInstallResult {
 std::vector<std::filesystem::path> GetModFolder(const std::string& root);
 
 ModInstallResult InstallMod(const std::filesystem::path &path, const u64 program_id, const bool copy = true);
+
+// The source path is UTF-8, independent of the platform's narrow-path encoding.
+ModInstallResult InstallModFromUTF8(const std::string& path, u64 program_id, bool copy = true);
 }
