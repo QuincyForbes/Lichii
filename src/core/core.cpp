@@ -975,14 +975,21 @@ u64 System::GetProgramIdForProcessId(u64 process_id) const {
 }
 
 u64 System::ResolveCallerProgramId(u64 process_id) const {
-    if (const auto program_id = this->GetProgramIdForProcessId(process_id); program_id != 0) {
-        return program_id;
+    // Switch 2 TIPC descriptors often carry capability/session tokens above 32-bit kernel PIDs;
+    // avoid locking the kernel process lists twice and spamming warnings for the same caller token.
+    if (process_id <= 0xFFFF'FFFFULL) {
+        if (const auto program_id = this->GetProgramIdForProcessId(process_id); program_id != 0) {
+            return program_id;
+        }
     }
 
     const auto fallback = this->GetApplicationProcessProgramID();
-    LOG_WARNING(Core,
-                "Could not resolve caller process_id={}, falling back to application {:016X}",
-                process_id, fallback);
+    static std::atomic<u64> last_warned_pid{~u64{0}};
+    if (last_warned_pid.exchange(process_id, std::memory_order_relaxed) != process_id) {
+        LOG_DEBUG(Core,
+                  "Caller process_id={} is not a kernel PID, using application {:016X}",
+                  process_id, fallback);
+    }
     return fallback;
 }
 

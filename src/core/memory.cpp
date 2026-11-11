@@ -280,6 +280,9 @@ struct Memory::Impl {
 
     template<typename F1, typename F2, typename F3>
     inline bool WalkBlock(const Common::ProcessAddress addr, const std::size_t size, F1&& on_unmapped, F2&& on_memory, F3&& on_rasterizer) {
+        if (size == 0) {
+            return true;
+        }
         std::size_t offset = 0;
         if (!AddressSpaceContains(*current_page_table, addr, size)) {
             on_unmapped(offset, size, addr);
@@ -290,29 +293,45 @@ struct Memory::Impl {
         std::size_t page_offset = addr & YUZU_PAGEMASK;
         bool user_accessible = true;
 
-        current_page_table->entries.CommitRegion(page_index, page_index + (size >> YUZU_PAGEBITS) + 1);
+        std::size_t mem_run_offset = 0;
+        std::size_t mem_run_size = 0;
+        u8* mem_run_ptr = nullptr;
+        const auto flush_mem_run = [&] {
+            if (mem_run_size != 0) {
+                on_memory(mem_run_offset, mem_run_size, mem_run_ptr);
+                mem_run_size = 0;
+            }
+        };
+
+        const std::size_t end_page = ((GetInteger(addr) + size - 1) >> YUZU_PAGEBITS) + 1;
+        current_page_table->entries.CommitRegion(page_index, end_page);
         while (remaining_size != 0) {
             const std::size_t copy_amount = (std::min)(std::size_t(YUZU_PAGESIZE) - page_offset, remaining_size);
             const auto current_vaddr = u64((page_index << YUZU_PAGEBITS) + page_offset);
-            const auto [pointer, type, _] = current_page_table->entries.GetUnchecked(page_index).PointerTypeBlock();
+            const auto [pointer, type, _] = current_page_table->entries.GetUnchecked(page_index).PointerTypeBlock(true);
             switch (type) {
             case Common::PageType::Unmapped: {
+                flush_mem_run();
                 user_accessible = false;
                 on_unmapped(offset, copy_amount, current_vaddr);
                 break;
             }
-            case Common::PageType::Memory: {
-                u8* mem_ptr = reinterpret_cast<u8*>(pointer + page_offset + (page_index << YUZU_PAGEBITS));
-                on_memory(offset, copy_amount, mem_ptr);
-                break;
-            }
+            case Common::PageType::Memory:
             case Common::PageType::DebugMemory: {
-                u8* const mem_ptr = GetPointerFromDebugMemory(current_vaddr);
-                on_memory(offset, copy_amount, mem_ptr);
+                u8* const mem_ptr = pointer ? reinterpret_cast<u8*>(pointer + current_vaddr) : nullptr;
+                if (mem_run_size != 0 && mem_run_ptr != nullptr && mem_run_ptr + mem_run_size == mem_ptr) {
+                    mem_run_size += copy_amount;
+                } else {
+                    flush_mem_run();
+                    mem_run_offset = offset;
+                    mem_run_size = copy_amount;
+                    mem_run_ptr = mem_ptr;
+                }
                 break;
             }
             case Common::PageType::RasterizerCachedMemory: {
-                u8* const host_ptr = GetPointerFromRasterizerCachedMemory(current_vaddr);
+                flush_mem_run();
+                u8* const host_ptr = pointer ? reinterpret_cast<u8*>(pointer + current_vaddr) : nullptr;
                 on_rasterizer(current_vaddr, offset, copy_amount, host_ptr);
                 break;
             }
@@ -324,6 +343,7 @@ struct Memory::Impl {
             offset += copy_amount;
             remaining_size -= copy_amount;
         }
+        flush_mem_run();
         return user_accessible;
     }
 
@@ -337,8 +357,10 @@ struct Memory::Impl {
             std::memcpy(reinterpret_cast<u8*>(buffer) + offset, ptr, copy_amount);
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, const u8* const ptr) {
-            if (!unsafe) {
-                HandleRasterizerDownload(GetInteger(current_vaddr), copy_amount, ptr);
+            const u64 raw_vaddr = GetInteger(current_vaddr);
+            if (!unsafe && (!ReadTrapsEnabled() ||
+                            ReadTrapArmed(raw_vaddr & 0xffffffffffffULL, copy_amount))) {
+                HandleRasterizerDownload(raw_vaddr, copy_amount, ptr);
             }
             std::memcpy(reinterpret_cast<u8*>(buffer) + offset, ptr, copy_amount);
         });
@@ -383,6 +405,103 @@ struct Memory::Impl {
             }
             std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
         });
+    }
+
+    [[nodiscard]] const u8* GetSafeReadSpan(const Common::ProcessAddress src_addr,
+                                            const std::size_t size) {
+        const u64 addr = GetInteger(src_addr) & 0xffffffffffffULL;
+        if (size == 0 || !AddressSpaceContains(*current_page_table, addr, size)) {
+            return nullptr;
+        }
+        const std::size_t first_page = addr >> YUZU_PAGEBITS;
+        const std::size_t last_page = (addr + size - 1) >> YUZU_PAGEBITS;
+        current_page_table->entries.CommitRegion(first_page, last_page + 1);
+
+        uintptr_t first_delta = 0;
+        bool has_cached = false;
+        for (std::size_t p = first_page; p <= last_page; ++p) {
+            const auto [pointer, type, _] =
+                current_page_table->entries.GetUnchecked(p).PointerTypeBlock(true);
+            if (pointer == 0) {
+                return nullptr;
+            }
+            if (type == Common::PageType::RasterizerCachedMemory) {
+                has_cached = true;
+            } else if (type != Common::PageType::Memory) {
+                return nullptr;
+            }
+            if (p == first_page) {
+                first_delta = pointer;
+            } else if (pointer != first_delta) {
+                return nullptr;
+            }
+        }
+
+        u8* const base_ptr = reinterpret_cast<u8*>(first_delta + addr);
+        if (has_cached) {
+            const bool check_traps = ReadTrapsEnabled();
+            const u64 end_addr = addr + size;
+            for (std::size_t p = first_page; p <= last_page; ++p) {
+                if (current_page_table->entries.GetUnchecked(p).Type() !=
+                    Common::PageType::RasterizerCachedMemory) {
+                    continue;
+                }
+                const u64 p_begin = (std::max<u64>)(addr, u64{p} << YUZU_PAGEBITS);
+                const u64 p_end = (std::min<u64>)(end_addr, (u64{p} + 1) << YUZU_PAGEBITS);
+                const std::size_t chunk = static_cast<std::size_t>(p_end - p_begin);
+                if (!check_traps || ReadTrapArmed(p_begin, chunk)) {
+                    HandleRasterizerDownload(p_begin, chunk, base_ptr + (p_begin - addr));
+                }
+            }
+        }
+        return base_ptr;
+    }
+
+    [[nodiscard]] u8* GetSafeWriteSpan(const Common::ProcessAddress dest_addr,
+                                       const std::size_t size) {
+        const u64 addr = GetInteger(dest_addr) & 0xffffffffffffULL;
+        if (size == 0 || !AddressSpaceContains(*current_page_table, addr, size)) {
+            return nullptr;
+        }
+        const std::size_t first_page = addr >> YUZU_PAGEBITS;
+        const std::size_t last_page = (addr + size - 1) >> YUZU_PAGEBITS;
+        current_page_table->entries.CommitRegion(first_page, last_page + 1);
+
+        uintptr_t first_delta = 0;
+        bool has_cached = false;
+        for (std::size_t p = first_page; p <= last_page; ++p) {
+            const auto [pointer, type, _] =
+                current_page_table->entries.GetUnchecked(p).PointerTypeBlock(true);
+            if (pointer == 0) {
+                return nullptr;
+            }
+            if (type == Common::PageType::RasterizerCachedMemory) {
+                has_cached = true;
+            } else if (type != Common::PageType::Memory) {
+                return nullptr;
+            }
+            if (p == first_page) {
+                first_delta = pointer;
+            } else if (pointer != first_delta) {
+                return nullptr;
+            }
+        }
+
+        u8* const base_ptr = reinterpret_cast<u8*>(first_delta + addr);
+        if (has_cached) {
+            const u64 end_addr = addr + size;
+            for (std::size_t p = first_page; p <= last_page; ++p) {
+                if (current_page_table->entries.GetUnchecked(p).Type() !=
+                    Common::PageType::RasterizerCachedMemory) {
+                    continue;
+                }
+                const u64 p_begin = (std::max<u64>)(addr, u64{p} << YUZU_PAGEBITS);
+                const u64 p_end = (std::min<u64>)(end_addr, (u64{p} + 1) << YUZU_PAGEBITS);
+                const std::size_t chunk = static_cast<std::size_t>(p_end - p_begin);
+                HandleRasterizerWrite(p_begin, chunk, base_ptr + (p_begin - addr));
+            }
+        }
+        return base_ptr;
     }
 
     bool ZeroBlock(const Common::ProcessAddress addr, const std::size_t size) {
@@ -1399,6 +1518,14 @@ const u8* Memory::GetSpan(const VAddr src_addr, const std::size_t size) const {
 
 u8* Memory::GetSpan(const VAddr src_addr, const std::size_t size) {
     return impl->GetSpan(src_addr, size);
+}
+
+const u8* Memory::GetSafeReadSpan(const Common::ProcessAddress src_addr, const std::size_t size) {
+    return impl->GetSafeReadSpan(src_addr, size);
+}
+
+u8* Memory::GetSafeWriteSpan(const Common::ProcessAddress dest_addr, const std::size_t size) {
+    return impl->GetSafeWriteSpan(dest_addr, size);
 }
 
 bool Memory::WriteBlock(const Common::ProcessAddress dest_addr, const void* src_buffer,

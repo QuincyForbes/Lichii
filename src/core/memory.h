@@ -379,6 +379,11 @@ public:
     const u8* GetSpan(const VAddr src_addr, const std::size_t size) const;
     u8* GetSpan(const VAddr src_addr, const std::size_t size);
 
+    /// Contiguous host read/write spans that handle GPU rasterizer downloads/invalidations safely.
+    /// Returns nullptr if the range is unmapped, debug-trapped, or non-contiguous in host memory.
+    const u8* GetSafeReadSpan(Common::ProcessAddress src_addr, std::size_t size);
+    u8* GetSafeWriteSpan(Common::ProcessAddress dest_addr, std::size_t size);
+
     /**
      * Writes a range of bytes into the current process' address space at the specified
      * virtual address.

@@ -145,6 +145,13 @@ bool ReadGuestDDict(Core::Memory::Memory& memory, u64 address, GuestDDict& out) 
 bool EdgesMatch(Core::Memory::Memory& memory, const DictEntry& entry) {
     const size_t size = entry.content.size();
     const size_t n = std::min(size, kEdgeBytes);
+    if (const u8* dict_ptr = memory.GetSafeReadSpan(entry.key.content, size); dict_ptr != nullptr) {
+        if (std::memcmp(dict_ptr, entry.content.data(), n) != 0) {
+            return false;
+        }
+        return size <= n ||
+               std::memcmp(dict_ptr + size - n, entry.content.data() + size - n, n) == 0;
+    }
     std::array<u8, kEdgeBytes> buffer;
     if (!memory.ReadBlock(entry.key.content, buffer.data(), n) ||
         std::memcmp(buffer.data(), entry.content.data(), n) != 0) {
@@ -174,9 +181,12 @@ void ResizeScratch(Common::ScratchBuffer<u8>& buffer, s64& filled_ns, size_t siz
 
 // Full check, at most once a second per dictionary: the whole guest dictionary matches the copy.
 bool ContentMatches(Core::Memory::Memory& memory, const DictEntry& entry, s64 now) {
+    const size_t size = entry.content.size();
+    if (const u8* dict_ptr = memory.GetSafeReadSpan(entry.key.content, size); dict_ptr != nullptr) {
+        return std::memcmp(dict_ptr, entry.content.data(), size) == 0;
+    }
     thread_local Common::ScratchBuffer<u8> scratch;
     thread_local s64 scratch_filled_ns{};
-    const size_t size = entry.content.size();
     ResizeScratch(scratch, scratch_filled_ns, size, now);
     return memory.ReadBlock(entry.key.content, scratch.data(), size) &&
            std::memcmp(scratch.data(), entry.content.data(), size) == 0;
@@ -268,11 +278,12 @@ std::shared_ptr<DictEntry> GetDict(Core::Memory::Memory& memory, const GuestDDic
 // Validates that the input consists only of complete zstd1 and skippable frames, and computes the
 // upper bound on decompressed size in the same pass (avoiding a second full block-header walk in
 // ZSTD_decompressBound). Returns ZSTD_CONTENTSIZE_ERROR if any frame is legacy, truncated or bad.
-unsigned long long StandardFramesBound(const u8* src, size_t size) {
+unsigned long long StandardFramesBound(const u8* src, size_t size, bool* exact_out = nullptr) {
     if (size == 0) {
         return ZSTD_CONTENTSIZE_ERROR;
     }
     unsigned long long total_bound = 0;
+    bool exact = true;
     while (size != 0) {
         if (size < 4) {
             return ZSTD_CONTENTSIZE_ERROR;
@@ -293,6 +304,7 @@ unsigned long long StandardFramesBound(const u8* src, size_t size) {
                 return ZSTD_CONTENTSIZE_ERROR;
             }
             if (frame_bound == ZSTD_CONTENTSIZE_UNKNOWN) {
+                exact = false;
                 frame_bound = ZSTD_decompressBound(src, frame_size);
                 if (frame_bound == ZSTD_CONTENTSIZE_ERROR) {
                     return ZSTD_CONTENTSIZE_ERROR;
@@ -303,10 +315,12 @@ unsigned long long StandardFramesBound(const u8* src, size_t size) {
         src += frame_size;
         size -= frame_size;
     }
+    if (exact_out != nullptr) {
+        *exact_out = exact;
+    }
     return total_bound;
 }
 
-// Duplicate ResizeScratch moved above ContentMatches removed.
 // Decompresses on the host. Returns nullptr on success (args[0] then holds the decompressed size,
 // as the function returns), or the reason the game's own function must run instead; then nothing
 // was written to guest memory.
@@ -349,12 +363,20 @@ const char* HostDecompress(Core::Memory::Memory& memory, std::span<uint64_t, 8> 
     if (!dctx) {
         return "no host DCtx";
     }
-    ResizeScratch(input, input_filled_ns, src_size, now);
-    if (!memory.ReadBlock(src, input.data(), src_size)) {
-        return "source unreadable";
+
+    // Zero-copy read directly from guest physical backing memory when contiguous.
+    const u8* src_ptr = memory.GetSafeReadSpan(src, src_size);
+    if (src_ptr == nullptr) {
+        ResizeScratch(input, input_filled_ns, src_size, now);
+        if (!memory.ReadBlock(src, input.data(), src_size)) {
+            return "source unreadable";
+        }
+        src_ptr = input.data();
     }
+
     // Same result for any capacity >= the output, and a capacity below it fails either way.
-    const unsigned long long bound = StandardFramesBound(input.data(), src_size);
+    bool exact_bound = false;
+    const unsigned long long bound = StandardFramesBound(src_ptr, src_size, &exact_bound);
     if (bound == ZSTD_CONTENTSIZE_ERROR) {
         return "not only complete zstd1/skippable frames";
     }
@@ -362,21 +384,41 @@ const char* HostDecompress(Core::Memory::Memory& memory, std::span<uint64_t, 8> 
     if (out_capacity > kMaxSize) {
         return "output too large";
     }
-    ResizeScratch(output, output_filled_ns, std::max<size_t>(out_capacity, 1), now);
-    const size_t result =
-        dict ? ZSTD_decompress_usingDDict(dctx.get(), output.data(), out_capacity, input.data(),
-                                          src_size, dict->ddict.get())
-             : ZSTD_decompressDCtx(dctx.get(), output.data(), out_capacity, input.data(),
-                                   src_size);
-    if (ZSTD_isError(result)) {
-        return ZSTD_getErrorName(result);
-    }
-    if (result != 0) {
-        if (!memory.IsValidVirtualAddressRange(dst, result)) {
-            return "destination range";
+
+    // Zero-copy write directly into guest physical backing memory when exact_bound holds,
+    // capacity covers the full output, and [src, src+src_size) does not overlap [dst, dst+bound).
+    const bool non_overlapping = (dst <= UINT64_MAX - out_capacity && dst + out_capacity <= src) ||
+                                 (src <= UINT64_MAX - src_size && src + src_size <= dst);
+    u8* const direct_dst =
+        (exact_bound && capacity >= bound && bound > 0 && non_overlapping)
+            ? memory.GetSafeWriteSpan(dst, static_cast<size_t>(bound))
+            : nullptr;
+
+    size_t result = 0;
+    if (direct_dst != nullptr) {
+        result = dict ? ZSTD_decompress_usingDDict(dctx.get(), direct_dst, bound, src_ptr, src_size,
+                                                   dict->ddict.get())
+                      : ZSTD_decompressDCtx(dctx.get(), direct_dst, bound, src_ptr, src_size);
+        if (ZSTD_isError(result)) {
+            return ZSTD_getErrorName(result);
         }
-        memory.WriteBlock(dst, output.data(), result);
+    } else {
+        ResizeScratch(output, output_filled_ns, std::max<size_t>(out_capacity, 1), now);
+        result = dict ? ZSTD_decompress_usingDDict(dctx.get(), output.data(), out_capacity, src_ptr,
+                                                   src_size, dict->ddict.get())
+                      : ZSTD_decompressDCtx(dctx.get(), output.data(), out_capacity, src_ptr,
+                                            src_size);
+        if (ZSTD_isError(result)) {
+            return ZSTD_getErrorName(result);
+        }
+        if (result != 0) {
+            if (!memory.IsValidVirtualAddressRange(dst, result)) {
+                return "destination range";
+            }
+            memory.WriteBlock(dst, output.data(), result);
+        }
     }
+
     if (dict) {
         g_stats.dict_hits.fetch_add(1, std::memory_order_relaxed);
     }
@@ -451,6 +493,10 @@ void ResetNx2OotZstd() {
     auto& cache = Cache();
     std::scoped_lock lock{cache.mutex};
     std::vector<std::shared_ptr<DictEntry>>{}.swap(cache.entries);
+}
+
+const char* Nx2OotZstdDecompressForTest(Core::Memory::Memory& memory, std::span<uint64_t, 8> args) {
+    return HostDecompress(memory, args, NowNs());
 }
 
 } // namespace Kernel::Svc

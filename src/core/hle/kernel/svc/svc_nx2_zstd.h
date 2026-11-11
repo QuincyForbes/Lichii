@@ -10,7 +10,10 @@
 
 namespace Core {
 class System;
+namespace Memory {
+class Memory;
 }
+} // namespace Core
 
 namespace Kernel::Svc {
 
@@ -19,5 +22,6 @@ namespace Kernel::Svc {
 /// for any other SVC.
 bool CallNx2OotZstd(Core::System& system, u32 imm, std::span<uint64_t, 8> args);
 void ResetNx2OotZstd();
+const char* Nx2OotZstdDecompressForTest(Core::Memory::Memory& memory, std::span<uint64_t, 8> args);
 
 } // namespace Kernel::Svc

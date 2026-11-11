@@ -6,6 +6,7 @@
 #include <algorithm>
 #include "common/nx2_timeline.h"
 #include <array>
+#include <bit>
 #include <thread>
 #include <chrono>
 #include <condition_variable>
@@ -32,6 +33,7 @@
 #include "common/div_ceil.h"
 #include "common/dkb_frame_trace.h"
 #include "common/game_presets.h"
+#include "common/platform_events.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -1705,8 +1707,13 @@ inline u32 Nx2VsyncRateHz() {
         const char* text = std::getenv("EDEN_NX2_VSYNC_HZ");
         return text ? (std::max)(std::strtoll(text, nullptr, 10), 1LL) : 0LL;
     }();
-    return forced != 0 ? static_cast<u32>(forced)
-                       : (std::max<u32>)(Settings::values.frame_rate_limit.GetValue(), 1);
+    u32 hz = forced != 0 ? static_cast<u32>(forced)
+                         : (std::max<u32>)(Settings::values.frame_rate_limit.GetValue(), 1);
+    if (const u32 thermal_cap = Common::PlatformEvents::ThermalMaxFps();
+        thermal_cap != 0 && thermal_cap < hz) {
+        hz = thermal_cap;
+    }
+    return hz;
 }
 
 class INx2Vi2Session final : public ServiceFramework<INx2Vi2Session> {
@@ -4224,6 +4231,23 @@ public:
     }
 
     ~INx2GraphicsSystemSession() override {
+        if (m_syncpt_watch_state) {
+            {
+                std::scoped_lock lk{m_syncpt_watch_state->mutex};
+                m_syncpt_watch_state->alive = false;
+                m_syncpt_watch_state->core_timing = nullptr;
+            }
+            auto& manager = system.Host1x().GetSyncpointManager();
+            for (u32 id = 0; id < HostSyncpoints; ++id) {
+                if (m_syncpt_watch_handles[id] != 0) {
+                    manager.DeregisterGuestAction(id, m_syncpt_watch_handles[id]);
+                    m_syncpt_watch_handles[id] = 0;
+                }
+            }
+        }
+        if (m_syncpt_poll_now) {
+            system.CoreTiming().UnscheduleEvent(m_syncpt_poll_now);
+        }
         if (m_syncpt_poll) {
             system.CoreTiming().UnscheduleEvent(m_syncpt_poll);
         }
@@ -4381,7 +4405,14 @@ private:
             m_syncpt_rw = GetInteger(rw->GetSourceAddress());
             m_syncpt_ro = GetInteger(ro->GetSourceAddress());
             m_syncpt_count = max_syncpoints;
+            m_last_syncpt_values.fill(~u64{0});
+            m_last_ro_bits.fill(0);
+            m_last_ro_summary = ~u64{0};
+            m_active_syncpt_mask.fill(0);
             auto& memory = *m_syncpt_memory;
+            for (u32 w = 0; w < (m_syncpt_count + 63) / 64; ++w) {
+                m_last_ro_bits[w] = memory.Read64(m_syncpt_ro + SyncptRoBitsOffset + w * 8);
+            }
             memory.Write32(m_syncpt_ro + 0x00, 1); // version
             memory.Write32(m_syncpt_ro + 0x04, 0); // base id (guess)
             memory.Write32(m_syncpt_ro + 0x08, max_syncpoints);
@@ -4390,7 +4421,23 @@ private:
             memory.Write32(m_syncpt_ro + 0x14, SyncptRoSummaryOffset);
             memory.Write32(m_syncpt_ro + 0x18, SyncptRwBitsOffset);
             memory.Write32(m_syncpt_ro + 0x1c, SyncptRoBitsOffset);
+            if (!m_syncpt_watch_state) {
+                m_syncpt_watch_state = std::make_shared<SyncptWatchState>();
+                m_syncpt_watch_state->core_timing = &system.CoreTiming();
+            }
+            if (!m_syncpt_poll_now) {
+                m_syncpt_poll_now = Core::Timing::CreateEvent(
+                    "nx2:gsv:SyncptPollNow",
+                    [this](s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
+                        m_syncpt_watch_state->pending.store(false, std::memory_order_release);
+                        PollSyncpts();
+                        return std::nullopt;
+                    });
+                std::scoped_lock lk{m_syncpt_watch_state->mutex};
+                m_syncpt_watch_state->poll_now_event = m_syncpt_poll_now;
+            }
             UpdateSyncptValues();
+            ArmSyncptWatches();
             if (!m_syncpt_poll) {
                 m_syncpt_poll = Core::Timing::CreateEvent(
                     "nx2:gsv:SyncptPoll",
@@ -4415,19 +4462,63 @@ private:
         rb.PushCopyObjects(ctx, m_syncpt_events[1]->GetReadableEvent());
     }
 
-    // Mirrors Eden's guest syncpoint values into the shared RO page. Returns true if any changed.
+    // Mirrors Eden's guest syncpoint values into the shared RO page, skipping unchanged slots via
+    // L1-cached m_last_syncpt_values instead of 192 guest Memory::Read64 calls every 500 us.
     bool UpdateSyncptValues() {
         auto& manager = system.Host1x().GetSyncpointManager();
         bool changed = false;
-        for (u32 id = 0; id < std::min(m_syncpt_count, HostSyncpoints); ++id) {
+        const u32 limit = std::min(m_syncpt_count, HostSyncpoints);
+        for (u32 id = 0; id < limit; ++id) {
             const u64 value = manager.GetGuestSyncpointValue(id);
-            const u64 address = m_syncpt_ro + SyncptValuesOffset + id * 8;
-            if (m_syncpt_memory->Read64(address) != value) {
-                m_syncpt_memory->Write64(address, value);
+            if (value != 0) {
+                m_active_syncpt_mask[id / 64] |= (u64{1} << (id % 64));
+            }
+            if (m_last_syncpt_values[id] != value) {
+                m_last_syncpt_values[id] = value;
+                m_syncpt_memory->Write64(m_syncpt_ro + SyncptValuesOffset + id * 8, value);
                 changed = true;
             }
         }
         return changed;
+    }
+
+    // Registers one-shot guest increment callbacks on active/armed syncpoints (< HostSyncpoints)
+    // so SyncptNotify fires immediately when the GPU releases a syncpoint instead of up to 500 us
+    // later at the next periodic poll.
+    void ArmSyncptWatches() {
+        if (!m_syncpt_watch_state) {
+            return;
+        }
+        auto& manager = system.Host1x().GetSyncpointManager();
+        const u32 limit = std::min(m_syncpt_count, HostSyncpoints);
+        for (size_t w = 0; w < m_active_syncpt_mask.size(); ++w) {
+            u64 mask = m_active_syncpt_mask[w];
+            while (mask != 0) {
+                const u32 bit = static_cast<u32>(std::countr_zero(mask));
+                mask &= mask - 1;
+                const u32 id = static_cast<u32>(w * 64) + bit;
+                if (id >= limit) {
+                    break;
+                }
+                if (m_syncpt_watch_state->watch_active[id].exchange(true,
+                                                                    std::memory_order_acq_rel)) {
+                    continue;
+                }
+                const u32 next_val = static_cast<u32>(m_last_syncpt_values[id]) + 1U;
+                auto state = m_syncpt_watch_state;
+                m_syncpt_watch_handles[id] = manager.RegisterGuestAction(id, next_val, [state, id] {
+                    state->watch_active[id].store(false, std::memory_order_release);
+                    std::scoped_lock lk{state->mutex};
+                    if (!state->alive || state->core_timing == nullptr ||
+                        !state->poll_now_event ||
+                        state->pending.exchange(true, std::memory_order_acq_rel)) {
+                        return;
+                    }
+                    state->core_timing->ScheduleEvent(std::chrono::nanoseconds{0},
+                                                      state->poll_now_event);
+                });
+            }
+        }
     }
 
     // Answers every armed wait: the value page is current, so the client rechecks its threshold
@@ -4445,14 +4536,22 @@ private:
         UpdateSyncptValues();
         bool acked = false;
         for (u32 w = 0; w < words; ++w) {
-            const u64 ro_address = m_syncpt_ro + SyncptRoBitsOffset + w * 8;
-            if (m_syncpt_memory->Read64(ro_address) != armed[w]) {
-                m_syncpt_memory->Write64(ro_address, armed[w]);
+            const u64 diff = armed[w] ^ m_last_ro_bits[w];
+            if (diff != 0) {
+                if (w < m_active_syncpt_mask.size()) {
+                    m_active_syncpt_mask[w] |= diff;
+                }
+                m_last_ro_bits[w] = armed[w];
+                m_syncpt_memory->Write64(m_syncpt_ro + SyncptRoBitsOffset + w * 8, armed[w]);
                 acked = true;
             }
         }
-        m_syncpt_memory->Write64(m_syncpt_ro + SyncptRoSummaryOffset,
-                                 m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwSummaryOffset));
+        const u64 rw_summary = m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwSummaryOffset);
+        if (rw_summary != m_last_ro_summary) {
+            m_last_ro_summary = rw_summary;
+            m_syncpt_memory->Write64(m_syncpt_ro + SyncptRoSummaryOffset, rw_summary);
+        }
+        ArmSyncptWatches();
         if (acked) {
             m_syncpt_events[1]->Signal(system.Kernel());
         }
@@ -4891,6 +4990,15 @@ private:
 
     static constexpr std::chrono::nanoseconds SyncptPollInterval{std::chrono::microseconds{500}};
 
+    struct SyncptWatchState {
+        std::mutex mutex;
+        Core::Timing::CoreTiming* core_timing{};
+        std::shared_ptr<Core::Timing::EventType> poll_now_event;
+        std::atomic<bool> pending{false};
+        std::array<std::atomic<bool>, HostSyncpoints> watch_active{};
+        bool alive{true};
+    };
+
     std::shared_ptr<Nx2NativeObjects> m_objects{std::make_shared<Nx2NativeObjects>()};
     KernelHelpers::ServiceContext m_context;
     std::array<Kernel::KEvent*, 2> m_syncpt_events{};
@@ -4898,7 +5006,15 @@ private:
     u64 m_syncpt_rw{};
     u64 m_syncpt_ro{};
     u32 m_syncpt_count{};
+    std::array<u64, HostSyncpoints> m_last_syncpt_values{};
+    std::array<u64, 0x40> m_last_ro_bits{};
+    u64 m_last_ro_summary{~u64{0}};
+    std::array<u64, (HostSyncpoints + 63) / 64> m_active_syncpt_mask{};
+    std::array<Tegra::Host1x::SyncpointManager::ActionHandle, HostSyncpoints>
+        m_syncpt_watch_handles{};
+    std::shared_ptr<SyncptWatchState> m_syncpt_watch_state;
     std::shared_ptr<Core::Timing::EventType> m_syncpt_poll;
+    std::shared_ptr<Core::Timing::EventType> m_syncpt_poll_now;
 };
 
 } // namespace Service
