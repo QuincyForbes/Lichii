@@ -570,6 +570,7 @@ std::vector<KAFFINITY> GroupZeroMasks(LOGICAL_PROCESSOR_RELATIONSHIP relation) {
 
 /// Logical processors PinCurrentThread gave the GPU front and back threads.
 std::atomic<u64> pinned_gpu_mask{};
+thread_local int t_guest_core_index = -1;
 
 Common::ThreadPinning::Topology ReadPinningTopology() {
     Common::ThreadPinning::Topology topology;
@@ -686,6 +687,14 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 
 void SetCurrentThreadName(const char* name) {
     Nx2SampleProfile::OnThreadNamed(name);
+#ifdef _WIN32
+    if (name != nullptr && std::strncmp(name, "CPUCore_", 8) == 0 && name[8] >= '0' &&
+        name[8] <= '9') {
+        t_guest_core_index = std::atoi(name + 8);
+    } else if (name != nullptr && std::strcmp(name, "CPUThread") == 0) {
+        t_guest_core_index = -1;
+    }
+#endif
 #ifdef _MSC_VER
     // Sets the debugger-visible name of the current thread.
     if (auto pf = (decltype(&SetThreadDescription))(void*)GetProcAddress(GetModuleHandle(TEXT("KernelBase.dll")), "SetThreadDescription"); pf)
@@ -735,7 +744,7 @@ void SetCurrentThreadToPerformanceCores() {
 #endif
 }
 
-void PinCurrentThread(PinnedRole role) {
+void PinCurrentThread(PinnedRole role, int guest_core) {
 #ifdef _WIN32
     // Off with EDEN_NX2_PIN_THREADS=0, forced with 1, otherwise on with enough performance cores
     // (ThreadPinning::MakePlan): the split's back did about 8% more draws a second at Lake Hylia
@@ -744,6 +753,7 @@ void PinCurrentThread(PinnedRole role) {
         const auto mode = ThreadPinning::ParseMode(std::getenv("EDEN_NX2_PIN_THREADS"));
         const ThreadPinning::Topology topology = ReadPinningTopology();
         const ThreadPinning::Plan result = ThreadPinning::MakePlan(topology, mode);
+        pinned_gpu_mask.store(result.front | result.back, std::memory_order_relaxed);
         LOG_INFO(Common, "Thread pinning: {}", ThreadPinning::Describe(result, topology, mode));
         return result;
     }();
@@ -755,8 +765,36 @@ void PinCurrentThread(PinnedRole role) {
     case PinnedRole::GpuBack:
         mask = plan.back;
         break;
-    case PinnedRole::GuestCore:
+    case PinnedRole::GuestCore: {
         mask = plan.guest;
+        // EDEN_NX2_GUEST_PIN_EACH=1: one physical core each (the guest cores' JIT code was 73-80%
+        // of their busy time at Castle Town; two on one core's SMT siblings share its units).
+        static const std::vector<u64> guest_cores = [] {
+            std::vector<u64> masks;
+            const char* value = std::getenv("EDEN_NX2_GUEST_PIN_EACH");
+            if (plan.guest == 0 || value == nullptr || value[0] != '1') {
+                return masks;
+            }
+            for (const ThreadPinning::Core& core : ReadPinningTopology().cores) {
+                if (core.mask != 0 && (core.mask & ~plan.guest) == 0) {
+                    masks.push_back(core.mask);
+                }
+            }
+            LOG_INFO(Common, "Thread pinning: each guest core on its own physical core ({} cores)",
+                     masks.size());
+            return masks;
+        }();
+        const int core_idx = guest_core >= 0 ? guest_core : t_guest_core_index;
+        if (core_idx >= 0 && !guest_cores.empty()) {
+            mask = guest_cores[static_cast<size_t>(core_idx) % guest_cores.size()];
+        }
+        break;
+    }
+    case PinnedRole::Background:
+        mask = BackgroundWorkCpuMask();
+        if (mask == 0) {
+            mask = plan.guest;
+        }
         break;
     }
     if (mask != 0) {
@@ -765,12 +803,13 @@ void PinCurrentThread(PinnedRole role) {
         affinity.Group = 0;
         if (!SetThreadGroupAffinity(GetCurrentThread(), &affinity, nullptr)) {
             LOG_WARNING(Common, "Could not pin thread: {}", GetLastErrorMsg());
-        } else if (role != PinnedRole::GuestCore) {
+        } else if (role == PinnedRole::GpuFront || role == PinnedRole::GpuBack) {
             pinned_gpu_mask.fetch_or(mask, std::memory_order_relaxed);
         }
     }
 #else
     (void)role;
+    (void)guest_core;
 #endif
 }
 
@@ -841,6 +880,8 @@ void SetCurrentThreadToEfficiencyCores() {
 #elif defined(_WIN32)
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
         SelectCurrentThreadCpuSets(sets.efficiency);
+    } else {
+        PinCurrentThread(PinnedRole::Background);
     }
 #endif
 }
@@ -850,6 +891,7 @@ void SetCurrentThreadToBackgroundWork() {
     ADPF::AddCurrentThread(ADPF::Session::Background);
     SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);
 #elif defined(_WIN32)
+    PinCurrentThread(PinnedRole::Background);
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
         SelectCurrentThreadCpuSets({});
     }
@@ -861,6 +903,9 @@ void SetCurrentThreadToAllCores() {
     ADPF::RemoveCurrentThread();
     SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);
 #elif defined(_WIN32)
+    if (pinned_gpu_mask.load(std::memory_order_relaxed) != 0) {
+        SetCurrentThreadCpuMask(0);
+    }
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
         SelectCurrentThreadCpuSets({});
     }
