@@ -49,6 +49,7 @@ enum AppExtensions {
     /// overlay). Each returns a `Section`.
     static var graphicsSettingsSections: [() -> AnyView] {
         [
+            { AnyView(ThermalPacingSettingsSection()) },
             { AnyView(PerformanceOverlaySettingsSection()) },
         ]
     }

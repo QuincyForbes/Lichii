@@ -141,6 +141,8 @@ typedef struct LichiiThermalAdvice {
 int lichii_platform_thermal_state(void);
 int lichii_platform_low_power_mode(void);
 void lichii_platform_thermal_advice(LichiiThermalAdvice* out);
+/// Sets a live thermal/power FPS cap (0 = uncapped, never modifies saved config).
+void lichii_platform_set_thermal_max_fps(int fps);
 
 // ------------------------------------------------------------------------------------- memory
 

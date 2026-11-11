@@ -737,6 +737,8 @@ void SetCurrentThreadToPerformanceCores() {
         return;
     }
     SetCurrentThreadCoreGroup(CoreGroup::Performance);
+#elif defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #elif defined(_WIN32)
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
         SelectCurrentThreadCpuSets(sets.performance);
@@ -877,6 +879,10 @@ void SetCurrentThreadToEfficiencyCores() {
         return;
     }
     SetCurrentThreadCoreGroup(CoreGroup::Efficiency);
+#elif defined(__APPLE__)
+    // Schedules background shader/pipeline workers onto Apple Silicon efficiency cores without
+    // the I/O throttling of QOS_CLASS_BACKGROUND, keeping P-cores free for guest/GPU threads.
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 #elif defined(_WIN32)
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
         SelectCurrentThreadCpuSets(sets.efficiency);
@@ -890,6 +896,8 @@ void SetCurrentThreadToBackgroundWork() {
 #if defined(__ANDROID__)
     ADPF::AddCurrentThread(ADPF::Session::Background);
     SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);
+#elif defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 #elif defined(_WIN32)
     PinCurrentThread(PinnedRole::Background);
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
@@ -902,6 +910,8 @@ void SetCurrentThreadToAllCores() {
 #if defined(__ANDROID__)
     ADPF::RemoveCurrentThread();
     SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);
+#elif defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
 #elif defined(_WIN32)
     if (pinned_gpu_mask.load(std::memory_order_relaxed) != 0) {
         SetCurrentThreadCpuMask(0);

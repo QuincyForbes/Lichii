@@ -72,4 +72,8 @@ void NotifyEnteringBackground();
 void SetDisplayMaxFps(u32 fps);
 u32 DisplayMaxFps();
 
+/// Live thermal / low-power FPS cap (0 = uncapped; never modifies saved user settings).
+void SetThermalMaxFps(u32 fps);
+u32 ThermalMaxFps();
+
 } // namespace Common::PlatformEvents

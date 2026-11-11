@@ -32,6 +32,20 @@ final class PlatformCenter: ObservableObject {
         }
     }
 
+    /// Steps live frame-rate pacing down (45 FPS when hot / Low Power Mode, 30 FPS when critical)
+    /// and restores full speed once cool, without modifying saved settings. Default on.
+    @Published var autoCool: Bool = {
+        if UserDefaults.standard.object(forKey: "autoCoolThermalPacing") == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: "autoCoolThermalPacing")
+    }() {
+        didSet {
+            UserDefaults.standard.set(autoCool, forKey: "autoCoolThermalPacing")
+            applyAutoCoolPacing()
+        }
+    }
+
     /// Set when this layer paused the game (app inactive, audio interrupted); the game comes back
     /// paused with the menu open, and runs again when the user closes it.
     private var pausedForLifecycle = false
@@ -137,6 +151,21 @@ final class PlatformCenter: ObservableObject {
         thermalState = advice.thermal_state
         lowPowerMode = advice.low_power_mode != 0
         thermalMessage = Self.text(advice.message)
+        applyAutoCoolPacing()
+    }
+
+    private func applyAutoCoolPacing() {
+        guard autoCool else {
+            lichii_platform_set_thermal_max_fps(0)
+            return
+        }
+        if thermalState >= 3 {
+            lichii_platform_set_thermal_max_fps(30)
+        } else if thermalState == 2 || lowPowerMode {
+            lichii_platform_set_thermal_max_fps(45)
+        } else {
+            lichii_platform_set_thermal_max_fps(0)
+        }
     }
 
     /// A short form of the thermal state for the in-game menu and the HUD.

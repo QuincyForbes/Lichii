@@ -46,6 +46,7 @@ std::atomic<u32> g_pressure_generation{};
 std::atomic<u64> g_low_water{};
 std::atomic<long long> g_next_poll_ns{};
 std::atomic<u32> g_display_max_fps{};
+std::atomic<u32> g_thermal_max_fps{};
 
 // Pressure signals from the low-water mark: 1 s apart at first, up to 30 s.
 constexpr long long SignalWaitMin = 1'000'000'000LL;
@@ -579,17 +580,16 @@ void SetGuestMemoryRanges([[maybe_unused]] const void* backing,
 void LogMemoryBreakdown([[maybe_unused]] const char* reason) {
 #ifdef __APPLE__
     const ProcessMemory memory = QueryProcessMemory();
-    // Walking 26,000+ Mach VM regions takes 700-1,500 ms holding the task's vm_map lock, causing
-    // visible hitches every 30 s. Only run the full region walk when memory is actually tight,
-    // on an OS memory warning, or when EDEN_IOS_MEM_REGIONS=1 is set.
-    const u64 available = AvailableProcessMemory();
-    const bool periodic = reason != nullptr && std::strcmp(reason, "every 30 s") == 0;
-    const bool tight = available != 0 && available < (u64{1536} << 20);
+    // Walking 34,000+ Mach VM regions takes 1,100-2,550 ms holding the task's vm_map lock, causing
+    // multi-second freezes during gameplay and memory-warning bursts. QueryProcessMemory(),
+    // malloc_zone_statistics(), and MetalAllocatedBytes() below already report exact footprint,
+    // malloc, and Metal totals in < 0.1 ms, so only walk individual VM regions when explicitly
+    // requested via EDEN_IOS_MEM_REGIONS=1.
     static const bool force_regions = [] {
         const char* const env = std::getenv("EDEN_IOS_MEM_REGIONS");
         return env != nullptr && env[0] != '\0' && env[0] != '0';
     }();
-    if (!periodic || tight || force_regions) {
+    if (force_regions) {
         LogRegions(reason, memory);
     }
     // In use is what the emulator holds; the rest of what the zones took from the OS is free
@@ -663,6 +663,21 @@ void SetDisplayMaxFps(u32 fps) {
 
 u32 DisplayMaxFps() {
     return g_display_max_fps.load(std::memory_order_relaxed);
+}
+
+void SetThermalMaxFps(u32 fps) {
+    const u32 prev = g_thermal_max_fps.exchange(fps, std::memory_order_relaxed);
+    if (prev != fps) {
+        if (fps != 0) {
+            LOG_INFO(Common, "Auto-Cool: capping live frame rate to {} FPS", fps);
+        } else {
+            LOG_INFO(Common, "Auto-Cool: thermal state normal, restoring full frame rate");
+        }
+    }
+}
+
+u32 ThermalMaxFps() {
+    return g_thermal_max_fps.load(std::memory_order_relaxed);
 }
 
 } // namespace Common::PlatformEvents

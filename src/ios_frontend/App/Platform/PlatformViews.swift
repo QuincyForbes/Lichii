@@ -56,6 +56,21 @@ struct DeviceInfoRows: View {
     }
 }
 
+/// Settings > Graphics section for live thermal / Low Power Mode frame-rate pacing.
+struct ThermalPacingSettingsSection: View {
+    @ObservedObject private var platform = PlatformCenter.shared
+
+    var body: some View {
+        Section {
+            Toggle("Auto-Cool (Thermal Pacing)", isOn: $platform.autoCool)
+        } header: {
+            Text("Thermals & Battery")
+        } footer: {
+            Text("Smoothly steps the live frame rate down to 45 FPS when iOS reports high device heat or Low Power Mode (30 FPS if critical), and restores full speed automatically once cool.")
+        }
+    }
+}
+
 /// The thermal advice as a banner (library) or a small badge (in-game menu). `transient` (over
 /// the game): only for a few seconds after the device gets hot, and not for Low Power Mode, which
 /// gets a toast instead.

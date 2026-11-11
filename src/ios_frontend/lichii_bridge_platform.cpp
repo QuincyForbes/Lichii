@@ -156,18 +156,22 @@ LichiiDeviceDefaults ComputeDefaults(const LichiiDeviceInfo& info) {
                    "App ID at developer.apple.com and reinstall, or games will be closed by iOS.");
     }
 
-    // Budgets from what this process may allocate (CPU and GPU share it, and guest RAM takes
-    // most of it: 4.9 GB of footprint at Ocarina's title screen with 0.46 GB of textures). The
-    // texture cache also shrinks with what is left at run time (texture_cache.h).
+    // Budgets from what this process may allocate. Note that EDEN_NX2_TC_*_MIB compares against
+    // total_used_memory = runtime.GetDeviceMemoryUsage() (the entire unified Metal/Vulkan heap:
+    // render targets + textures + buffers + staging + VMA block slack, ~1.8-2.2 GiB in Ocarina's
+    // Kokiri Village), NOT cached textures alone: setting critical to 18% (1,195 MiB) locked the
+    // texture collector in permanent aggressive mode doing dozens of synchronous runtime.Finish()
+    // GPU readback stalls every frame (2-4 FPS). Runtime host_memory_cap in texture_cache.h still
+    // clamps dynamically whenever remaining process headroom gets tight.
     u64 available = info.launch_available_memory_mib;
     if (available == 0) {
         available = info.physical_memory_mib * 6 / 10;
     }
-    const u64 critical = Clamp<u64>(available * 18 / 100, 768, 2048);
+    const u64 critical = Clamp<u64>(available * 36 / 100, 1280, 2560);
     out.texture_cache_critical_mib = static_cast<u32>(critical);
-    out.texture_cache_expected_mib = static_cast<u32>(critical * 2 / 3);
-    out.buffer_cache_collect_mib = static_cast<u32>(Clamp<u64>(available / 24, 192, 512));
-    out.memory_low_water_mib = static_cast<u32>(Clamp<u64>(available / 10, 384, 768));
+    out.texture_cache_expected_mib = static_cast<u32>(critical * 3 / 4);
+    out.buffer_cache_collect_mib = static_cast<u32>(Clamp<u64>(available / 32, 160, 256));
+    out.memory_low_water_mib = static_cast<u32>(Clamp<u64>(available / 12, 384, 640));
     return out;
 }
 
@@ -305,6 +309,10 @@ void lichii_platform_thermal_advice(LichiiThermalAdvice* out) {
         *out = LichiiPlatform::ComputeThermalAdvice(lichii_platform_thermal_state(),
                                                    lichii_platform_low_power_mode());
     }
+}
+
+void lichii_platform_set_thermal_max_fps(int fps) {
+    Common::PlatformEvents::SetThermalMaxFps(fps > 0 ? static_cast<u32>(fps) : 0U);
 }
 
 void lichii_platform_trim_memory(void) {
