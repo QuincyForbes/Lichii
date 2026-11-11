@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -661,6 +662,12 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
     }
 
     scheduler.RequestOutsideRenderPassOperationContext();
+    if (barrier && VideoCore::Nx2Debug::Experiment(62) != 0 &&
+        src_buffer == staging_pool.StreamBuf() && !vk_copies.empty()) {
+        scheduler.RecordUpload(src_buffer, dst_buffer,
+                               std::span<const VkBufferCopy>{vk_copies.data(), vk_copies.size()});
+        return;
+    }
     scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
         if (barrier) {
             cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,

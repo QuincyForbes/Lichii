@@ -178,6 +178,9 @@ inline void LoadExperiments() {
         // queued for the back (a reset there let a channel run before its producer). A strict
         // tightening: only met answers become the normal path (puller.cpp QueuedWriteRefusesMet).
         g_experiments[34].store(1, std::memory_order_relaxed);
+        // EXP62 = 1: coalesce consecutive in-order stream buffer uploads into one command with
+        // one pair of barriers (zortos293/Lichii#1245; Fritchii 25892ea154).
+        g_experiments[62].store(1, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {

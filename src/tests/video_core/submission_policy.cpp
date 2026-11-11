@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <bit>
 #include <limits>
 #include <string_view>
 #include <vector>
@@ -7,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/renderer_vulkan/submission_policy.h"
+#include "video_core/renderer_vulkan/upload_batch.h"
 
 namespace {
 
@@ -143,4 +145,50 @@ TEST_CASE("Changing the active native policy preserves recorded work",
     REQUIRE(counter == 31);
     REQUIRE(Advance(counter, true, false) == Action::Dispatch);
     REQUIRE(counter == 32);
+}
+
+TEST_CASE("UploadBatch coalesces non-overlapping copies and rejects hazards",
+          "[video_core][submission_policy][upload_batch]") {
+    const auto buf = [](u64 id) { return std::bit_cast<VkBuffer>(id); };
+    const VkBuffer stream = buf(1);
+    const VkBuffer dst_a = buf(2);
+    const VkBuffer dst_b = buf(3);
+
+    Vulkan::UploadBatch batch;
+    REQUIRE(batch.Empty());
+
+    const VkBufferCopy c0{.srcOffset = 0, .dstOffset = 0x100, .size = 0x40};
+    const VkBufferCopy c1{.srcOffset = 0x40, .dstOffset = 0x140, .size = 0x40};
+    REQUIRE(batch.CanAdd(stream, dst_a, std::span{&c0, 1}));
+    batch.Add(stream, dst_a, std::span{&c0, 1});
+    REQUIRE(batch.CanAdd(stream, dst_a, std::span{&c1, 1}));
+    batch.Add(stream, dst_a, std::span{&c1, 1});
+    REQUIRE(batch.groups.size() == 1);
+    REQUIRE(batch.groups[0].count == 2);
+
+    // Overlapping destination bytes are rejected so WAW order is preserved.
+    const VkBufferCopy overlap{.srcOffset = 0x80, .dstOffset = 0x120, .size = 0x30};
+    REQUIRE_FALSE(batch.CanAdd(stream, dst_a, std::span{&overlap, 1}));
+
+    // Different destination buffer starts a second group in the same batch.
+    REQUIRE(batch.CanAdd(stream, dst_b, std::span{&c0, 1}));
+    batch.Add(stream, dst_b, std::span{&c0, 1});
+    REQUIRE(batch.groups.size() == 2);
+
+    // RAW (src == pending dst) and WAR (dst == pending src) hazards are rejected.
+    REQUIRE_FALSE(batch.CanAdd(dst_a, dst_b, std::span{&c0, 1}));
+    REQUIRE_FALSE(batch.CanAdd(dst_b, stream, std::span{&c0, 1}));
+
+    // Capacity cap (MaxCopies) is enforced.
+    for (size_t i = batch.copies.size(); i < Vulkan::UploadBatch::MaxCopies; ++i) {
+        const VkBufferCopy non_overlap{
+            .srcOffset = i * 0x10,
+            .dstOffset = 0x1000 + i * 0x10,
+            .size = 0x10,
+        };
+        REQUIRE(batch.CanAdd(stream, dst_b, std::span{&non_overlap, 1}));
+        batch.Add(stream, dst_b, std::span{&non_overlap, 1});
+    }
+    const VkBufferCopy past_cap{.srcOffset = 0, .dstOffset = 0x9000, .size = 0x10};
+    REQUIRE_FALSE(batch.CanAdd(stream, dst_b, std::span{&past_cap, 1}));
 }

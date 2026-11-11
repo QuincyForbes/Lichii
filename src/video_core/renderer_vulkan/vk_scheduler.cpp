@@ -24,9 +24,12 @@
 #include "common/settings.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/thread.h"
+#include <boost/container/small_vector.hpp>
+
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/renderer_vulkan/upload_batch.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -112,7 +115,8 @@ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
 Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     : device{device_}, state_tracker{state_tracker_},
       master_semaphore{std::make_unique<MasterSemaphore>(device)},
-      command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
+      command_pool{std::make_unique<CommandPool>(*master_semaphore, device)},
+      upload_batch{std::make_unique<UploadBatch>()} {
 
     if (Common::DkbFrameTrace::Enabled()) {
         const auto physical = device.GetPhysical();
@@ -299,6 +303,9 @@ void Scheduler::DispatchWork(bool lazy) {
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
     }
+    if (uploads_pending) {
+        FlushUploads();
+    }
     static const bool lazy_wake = [] {
         const char* value = std::getenv("EDEN_NX2_LAZY_WAKE");
         return value == nullptr || value[0] != '0';
@@ -323,6 +330,35 @@ void Scheduler::DispatchWork(bool lazy) {
     if (has_work) {
         AcquireNewChunk();
     }
+}
+
+void Scheduler::RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies) {
+    if (VideoCommon::GpuSplit::check_owner) {
+        VideoCommon::GpuSplit::CheckOwner("Scheduler::RecordUpload");
+    }
+    for (const VkBufferCopy& copy : copies) {
+        const std::span<const VkBufferCopy> region{&copy, 1};
+        if (uploads_pending && !upload_batch->CanAdd(src, dst, region)) {
+            FlushUploads();
+        }
+        upload_batch->Add(src, dst, region);
+        uploads_pending = true;
+        has_pending_commands = true;
+    }
+}
+
+void Scheduler::FlushUploads() {
+    boost::container::small_vector<VkBufferCopy, 16> copies(upload_batch->copies.begin(),
+                                                            upload_batch->copies.end());
+    boost::container::small_vector<UploadBatch::Group, 8> groups(upload_batch->groups.begin(),
+                                                                 upload_batch->groups.end());
+    upload_batch->copies.clear();
+    upload_batch->groups.clear();
+    uploads_pending = false;
+    Record([copies = std::move(copies), groups = std::move(groups)](vk::CommandBuffer cmdbuf) {
+        UploadBatch::Record(cmdbuf, std::span<const VkBufferCopy>{copies.data(), copies.size()},
+                            std::span<const UploadBatch::Group>{groups.data(), groups.size()});
+    });
 }
 
 bool Scheduler::RenderPassMatches(const Framebuffer* framebuffer) const {
@@ -831,6 +867,9 @@ void Scheduler::TraceGpuSubmission() {
 }
 
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+    if (uploads_pending) {
+        FlushUploads();
+    }
     if (VideoCommon::Nx2Profile::Enabled()) {
         g_profile_submits.fetch_add(1, std::memory_order_relaxed);
         ReportSubmitCounts();
