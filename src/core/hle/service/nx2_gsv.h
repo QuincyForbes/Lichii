@@ -1752,24 +1752,13 @@ public:
             {111, &INx2Vi2Session::StubReplyZeroed, "Unknown111"},
             {112, &INx2Vi2Session::StubReplyZeroed, "Unknown112"},
             {113, &INx2Vi2Session::StubReplyZeroed, "Unknown113"},
+            {201, &INx2Vi2Session::StubReplyZeroed, "Unknown201"},
             {202, &INx2Vi2Session::StubReplyZeroed, "Unknown202"},
             {230, &INx2Vi2Session::StubReplyZeroed, "Unknown230"},
             {231, &INx2Vi2Session::StubReplyZeroed, "Unknown231"},
             {232, &INx2Vi2Session::StubReplyZeroed, "Unknown232"},
             {251, &INx2Vi2Session::StubReplyZeroed, "Unknown251"},
             {252, &INx2Vi2Session::StubReplyZeroed, "Unknown252"},
-            {261, &INx2Vi2Session::StubReplyZeroed, "Unknown261"},
-            {262, &INx2Vi2Session::StubReplyZeroed, "Unknown262"},
-            {263, &INx2Vi2Session::StubReplyZeroed, "Unknown263"},
-            {264, &INx2Vi2Session::StubReplyZeroed, "Unknown264"},
-            {265, &INx2Vi2Session::StubReplyZeroed, "Unknown265"},
-            {266, &INx2Vi2Session::StubReplyZeroed, "Unknown266"},
-            {267, &INx2Vi2Session::StubReplyZeroed, "Unknown267"},
-            {268, &INx2Vi2Session::StubReplyZeroed, "Unknown268"},
-            {269, &INx2Vi2Session::StubReplyZeroed, "Unknown269"},
-            {270, &INx2Vi2Session::StubReplyZeroed, "Unknown270"},
-            {271, &INx2Vi2Session::StubReplyZeroed, "Unknown271"},
-            {272, &INx2Vi2Session::StubReplyZeroed, "Unknown272"},
             {301, &INx2Vi2Session::StubReplyZeroed, "Unknown301"},
             {302, &INx2Vi2Session::StubReplyZeroed, "Unknown302"},
             {351, &INx2Vi2Session::StubReplyZeroed, "Unknown351"},
@@ -3109,14 +3098,20 @@ private:
         const u64 pts = u64{w[words]} | (u64{w[words + 1]} << 32);
         const bool end = (w[words + 2] & 0xFF) != 0;
         Log(ctx, "submit");
-        // The SDK answers busy when the decoder cannot take a packet, and the client retries after
-        // the submission-ready event. Taking every packet let a player queue a whole movie: Ocarina
-        // of Time's title movie went in at ~330 packets a second (2,600 queued), and until the
-        // last was in, its pictures came at 20-28 fps, so the video started ~11 s behind its
-        // audio. End of stream is never refused.
-        if (!end) {
+        Input input{{}, pts, end};
+        if (!ctx.BufferDescriptorA().empty()) {
+            const auto data = ctx.ReadBufferA(0);
+            input.data.assign(data.begin(), data.end());
+        }
+        const auto input_size = input.data.size();
+        {
             std::scoped_lock lk{m_mutex};
-            if (m_inputs.Full()) {
+            // The SDK answers busy when the decoder cannot take a packet, and the client retries
+            // after the submission-ready event. Taking every packet let a player queue a whole
+            // movie: Ocarina of Time's title movie went in at ~330 packets a second (2,600
+            // queued), and until the last was in, its pictures came at 20-28 fps, so the video
+            // started ~11 s behind its audio. End of stream is never refused.
+            if (!m_inputs.Submit(std::move(input))) {
                 if (Nx2VideoTraceEnabled()) {
                     LOG_INFO(Service, "nx2:vdec trace refuse syncpoint={} pts={} queued={}",
                              m_syncpoint, pts, m_inputs.Size());
@@ -3127,16 +3122,6 @@ private:
                 rb.PushRaw<u32>(ResultDecoderBusy.raw);
                 return;
             }
-        }
-        Input input{{}, pts, end};
-        if (!ctx.BufferDescriptorA().empty()) {
-            const auto data = ctx.ReadBufferA(0);
-            input.data.assign(data.begin(), data.end());
-        }
-        const auto input_size = input.data.size();
-        {
-            std::scoped_lock lk{m_mutex};
-            m_inputs.Push(std::move(input));
             m_stream_ended = false;
             m_end_queued |= end;
             m_ready->room.store(!m_end_queued && m_inputs.BelowReadyWatermark(),
@@ -4122,7 +4107,6 @@ public:
             {403, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission403"},
             {424, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown424"},
             {425, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown425"},
-            {427, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown427"},
             {434, &INx2GraphicsSystemSession::AttachGpuAddressSpace, "AttachGpuAddressSpace"},
             {436, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown436"},
             {461, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown461"},
@@ -4150,6 +4134,7 @@ public:
             {814, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown814"},
             {861, &INx2GraphicsSystemSession::GetCpuImageDescriptor, "GetFeatureCpuImageDescriptor861"},
             {891, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize891"},
+            {903, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown903"},
             {1003, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1003"},
             {1011, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1011"},
             {1012, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1012"},
