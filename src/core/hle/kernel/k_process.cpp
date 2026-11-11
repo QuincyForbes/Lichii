@@ -1318,23 +1318,37 @@ void KProcess::InitializeInterfaces(KernelCore& kernel) {
     m_exclusive_monitor =
         Core::MakeExclusiveMonitor(this->GetMemory(), Core::Hardware::NUM_CPU_CORES);
 
+    const u64 all_cores_mask = (1ULL << Core::Hardware::NUM_CPU_CORES) - 1;
+    const u64 active_core_mask =
+        (this->IsSwitch2() || this->GetPhysicalCoreMask() == 0)
+            ? all_cores_mask
+            : ((this->GetPhysicalCoreMask() | (1ULL << this->GetIdealCoreId()) | 0xFULL) &
+               all_cores_mask);
+
 #ifdef HAS_NCE
     if (this->IsApplication() && Settings::IsNceEnabled()) {
-        for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++)
-            m_arm_interfaces[i] = std::make_unique<Core::ArmNce>(kernel.System(), true, i);
+        for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
+            if ((active_core_mask & (1ULL << i)) != 0) {
+                m_arm_interfaces[i] = std::make_unique<Core::ArmNce>(kernel.System(), true, i);
+            }
+        }
     } else
 #endif
         if (this->Is64Bit()) {
         for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
-            m_arm_interfaces[i] = std::make_unique<Core::ArmDynarmic64>(
-                kernel.System(), kernel.IsMulticore(), this,
-                static_cast<Core::DynarmicExclusiveMonitor&>(*m_exclusive_monitor), i);
+            if ((active_core_mask & (1ULL << i)) != 0) {
+                m_arm_interfaces[i] = std::make_unique<Core::ArmDynarmic64>(
+                    kernel.System(), kernel.IsMulticore(), this,
+                    static_cast<Core::DynarmicExclusiveMonitor&>(*m_exclusive_monitor), i);
+            }
         }
     } else {
         for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
-            m_arm_interfaces[i] = std::make_unique<Core::ArmDynarmic32>(
-                kernel.System(), kernel.IsMulticore(), this,
-                static_cast<Core::DynarmicExclusiveMonitor&>(*m_exclusive_monitor), i);
+            if ((active_core_mask & (1ULL << i)) != 0) {
+                m_arm_interfaces[i] = std::make_unique<Core::ArmDynarmic32>(
+                    kernel.System(), kernel.IsMulticore(), this,
+                    static_cast<Core::DynarmicExclusiveMonitor&>(*m_exclusive_monitor), i);
+            }
         }
     }
 }

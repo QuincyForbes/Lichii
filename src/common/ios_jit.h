@@ -69,6 +69,10 @@ bool Alloc(std::size_t bytes, void** wmem, void** xmem);
 /// shut down), so a second game in the same app session reuses the prepared pages.
 void Reset();
 
+/// Drops duplicate pmap PTEs of the writable alias in [wmem, wmem + size) (page-aligned inward to
+/// 16 KiB) on dual-mapped TXM chunks while keeping the executable view untouched and wmem valid.
+void DropWritablePtes(void* wmem, std::size_t size);
+
 struct PoolLocation {
     std::size_t chunk;
     std::size_t offset;

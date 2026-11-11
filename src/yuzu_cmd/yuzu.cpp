@@ -115,11 +115,10 @@ static bool IosJitEnabled() {
     }
     return (flags & kCsDebugged) != 0;
 }
-// dynarmic: one code cache per guest core (six), plus two chunks for smaller blocks. Acquired once
-// through StikDebug's universal script (iOS 26+), then the debugger is released. The script
-// prepares every page over the debug connection while this app waits in the background, so the
-// pool is kept small (800 MiB took long enough for iOS to kill the app).
-static constexpr std::size_t kIosJitPoolBytes = 8 * Common::IosJit::ChunkBytes;
+// dynarmic: one code cache per guest core (at most six). Acquired once through StikDebug's
+// universal script (iOS 26+), then the debugger is released. The script prepares every page over
+// the debug connection while this app waits in the background, so the pool is kept tight.
+static constexpr std::size_t kIosJitPoolBytes = 6 * Common::IosJit::ChunkBytes;
 static std::string IosBundleIdentifier() {
     std::string out;
     if (CFStringRef id = CFBundleGetIdentifier(CFBundleGetMainBundle())) {
@@ -1704,6 +1703,19 @@ static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem, Core::Sys
 
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    if (const auto jit = Common::IosJit::GetState();
+        jit == Common::IosJit::State::Ready || jit == Common::IosJit::State::Failed) {
+        if (state->jit_bg_task != 0) {
+            IosSupport::EndBackgroundTask(std::exchange(state->jit_bg_task, 0));
+        }
+#ifdef LICHII_IOS_UI
+        if (state->ios_config) {
+            IosFrontend::EndJitBackgroundTask();
+        }
+#endif
+    }
+#endif
 #ifdef LICHII_IOS_UI
     if (state->ios_config) {
         if (const auto result = IosAppIterate(state)) {
