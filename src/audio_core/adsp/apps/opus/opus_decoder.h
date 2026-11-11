@@ -7,6 +7,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <thread>
 
 #include "audio_core/adsp/apps/opus/shared_memory.h"
@@ -68,10 +69,7 @@ public:
     }
 
 private:
-    /**
-     * Initializing thread, launched at audio_core boot to avoid blocking the main emu boot thread.
-     */
-    void Init(std::stop_token stop_token);
+    void EnsureWorkerStarted();
     /**
      * Main OpusDecoder thread, responsible for processing the incoming Opus packets.
      */
@@ -81,12 +79,14 @@ private:
     Core::System& system;
     /// Mailbox to communicate messages with the host, drives the main thread
     Mailbox mailbox;
-    /// Init thread
-    std::jthread init_thread{};
-    /// Main thread
+    /// Guards lazy worker thread startup
+    std::mutex startup_mutex;
+    /// Main thread (started lazily on first Opus command)
     std::jthread main_thread{};
-    /// The current state
+    /// Logical ADSP app running state
     bool running{};
+    /// Whether `main_thread` has been spawned
+    bool worker_started{};
     /// Structure shared with the host, input data set by the host before sending a mailbox message,
     /// and the responses are written back by the OpusDecoder.
     SharedMemory* shared_memory{};

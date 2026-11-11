@@ -26,14 +26,14 @@ inline u32 InputPeak(std::span<const s16> samples, float gain) {
     return peak;
 }
 
-/// Convert capture to the guest layout and gain, padding missing samples with silence.
-inline std::vector<s16> ConvertInputSamples(std::span<const s16> captured, u64 num_samples,
-                                            u32 device_channels, u32 system_channels, float gain) {
-    std::vector<s16> samples(num_samples, 0);
+/// Convert capture to the guest layout and gain into `samples`, padding missing samples with silence.
+inline void ConvertInputSamplesInto(std::span<const s16> captured, std::span<s16> samples,
+                                    u32 device_channels, u32 system_channels, float gain) {
+    std::ranges::fill(samples, s16{0});
     if (device_channels == 0 || system_channels == 0) {
-        return samples;
+        return;
     }
-    const auto frames = std::min<size_t>(num_samples / system_channels,
+    const auto frames = std::min<size_t>(samples.size() / system_channels,
                                          captured.size() / device_channels);
     for (size_t frame = 0; frame < frames; ++frame) {
         if (system_channels == 1 && device_channels > 1) {
@@ -41,7 +41,8 @@ inline std::vector<s16> ConvertInputSamples(std::span<const s16> captured, u64 n
             for (u32 channel = 0; channel < device_channels; ++channel) {
                 sum += captured[frame * device_channels + channel];
             }
-            samples[frame] = ScaleInputSample(static_cast<s16>(sum / static_cast<s32>(device_channels)), gain);
+            samples[frame] =
+                ScaleInputSample(static_cast<s16>(sum / static_cast<s32>(device_channels)), gain);
             continue;
         }
         for (u32 channel = 0; channel < std::min(system_channels, device_channels); ++channel) {
@@ -49,6 +50,13 @@ inline std::vector<s16> ConvertInputSamples(std::span<const s16> captured, u64 n
                 ScaleInputSample(captured[frame * device_channels + channel], gain);
         }
     }
+}
+
+/// Convert capture to the guest layout and gain, padding missing samples with silence.
+inline std::vector<s16> ConvertInputSamples(std::span<const s16> captured, u64 num_samples,
+                                            u32 device_channels, u32 system_channels, float gain) {
+    std::vector<s16> samples(num_samples, 0);
+    ConvertInputSamplesInto(captured, samples, device_channels, system_channels, gain);
     return samples;
 }
 

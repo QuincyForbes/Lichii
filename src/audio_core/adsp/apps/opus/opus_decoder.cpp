@@ -36,45 +36,63 @@ bool IsValidMultiStreamStreamCounts(s32 total_stream_count, s32 stereo_stream_co
 }
 } // namespace
 
-OpusDecoder::OpusDecoder(Core::System& system_) : system{system_} {
-    init_thread = std::jthread([this](std::stop_token stop_token) { Init(stop_token); });
-}
+OpusDecoder::OpusDecoder(Core::System& system_) : system{system_} {}
 
 OpusDecoder::~OpusDecoder() {
-    if (!running) {
-        init_thread.request_stop();
+    bool has_worker = false;
+    {
+        std::scoped_lock lk{startup_mutex};
+        has_worker = worker_started;
+    }
+    if (!has_worker) {
+        running = false;
         return;
     }
 
     // Shutdown the thread
-    Send(Direction::DSP, Message::Shutdown);
+    mailbox.Send(Direction::DSP, Message::Shutdown);
     auto msg = Receive(Direction::Host);
     ASSERT_MSG(msg == Message::ShutdownOK, "Expected Opus shutdown code {}, got {}",
                Message::ShutdownOK, msg);
     main_thread.request_stop();
     main_thread.join();
     running = false;
+    worker_started = false;
+}
+
+void OpusDecoder::EnsureWorkerStarted() {
+    std::scoped_lock lk{startup_mutex};
+    if (!worker_started) {
+        main_thread = std::jthread([this](std::stop_token st) { Main(st); });
+        worker_started = true;
+    }
 }
 
 void OpusDecoder::Send(Direction dir, u32 message) {
+    if (dir == Direction::DSP) {
+        if (message == Message::Start) {
+            running = true;
+            mailbox.Send(Direction::Host, Message::StartOK);
+            return;
+        }
+        if (message == Message::Shutdown) {
+            std::scoped_lock lk{startup_mutex};
+            if (!worker_started) {
+                OpusDecodeObject::ReleaseAll();
+                OpusMultiStreamDecodeObject::ReleaseAll();
+                running = false;
+                mailbox.Send(Direction::Host, Message::ShutdownOK);
+                return;
+            }
+        } else {
+            EnsureWorkerStarted();
+        }
+    }
     mailbox.Send(dir, std::move(message));
 }
 
 u32 OpusDecoder::Receive(Direction dir, std::stop_token stop_token) {
     return mailbox.Receive(dir, stop_token);
-}
-
-void OpusDecoder::Init(std::stop_token stop_token) {
-    Common::SetCurrentThreadName("DSP_OpusDecoder_Init");
-
-    if (Receive(Direction::DSP, stop_token) != Message::Start) {
-        LOG_ERROR(Service_Audio,
-                  "DSP OpusDecoder failed to receive Start message. Opus initialization failed.");
-        return;
-    }
-    main_thread = std::jthread([this](std::stop_token st) { Main(st); });
-    running = true;
-    Send(Direction::Host, Message::StartOK);
 }
 
 void OpusDecoder::Main(std::stop_token stop_token) {

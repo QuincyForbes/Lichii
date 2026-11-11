@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import Foundation
+import LichiiBridge
 import SwiftUI
 import UIKit
 
@@ -87,19 +88,17 @@ final class GameLibrary: ObservableObject {
         }
         isScanning = true
         let roots = [Bridge.documentsDir] + linkedFolders
+        let documentsPrefix = Bridge.documentsDir.standardizedFileURL.path + "/"
+        let userDir = Bridge.userDir
         let hidden = hiddenPaths
         try? FileManager.default.createDirectory(at: Bridge.gamesDir, withIntermediateDirectories: true)
         Task.detached(priority: .userInitiated) {
-            var found: [Game] = []
-            var seen = Set<String>()
-            for root in roots {
-                for game in Bridge.scanGames(in: root) where seen.insert(game.path).inserted {
-                    if !hidden.contains(game.path) {
-                        found.append(game)
-                    }
-                }
-            }
-            let result = found
+            let result = LibraryMetadataStore.scan(
+                roots: roots,
+                documentsPrefix: documentsPrefix,
+                userDir: userDir,
+                hidden: hidden
+            )
             await MainActor.run {
                 self.games = result
                 self.isScanning = false
@@ -237,6 +236,7 @@ final class GameLibrary: ObservableObject {
         }
         do {
             try FileManager.default.removeItem(at: game.containerURL)
+            IconCache.removeDiskIcon(forPath: game.path)
             games.removeAll { $0.id == game.id }
         } catch {
             notice = LibraryNotice(title: "Could not delete \(game.title)", message: error.localizedDescription)
@@ -434,5 +434,271 @@ private final class CurrentPartial: @unchecked Sendable {
     func get() -> (String, UInt64)? {
         lock.lock(); defer { lock.unlock() }
         return value
+    }
+}
+
+// MARK: - Persistent Library Metadata & Icon Cache
+
+private struct CachedGameEntry: Codable {
+    var path: String
+    var stampedSize: UInt64
+    var mtimeMs: Int64
+    var envStamp: String
+    var bootable: Bool
+    var title: String
+    var developer: String
+    var version: String
+    var programId: UInt64
+    var fileSize: UInt64
+    var kindRaw: Int32
+    var isHomebrew: Bool
+    var hasIcon: Bool
+}
+
+private struct LibraryDiskManifest: Codable {
+    var version: Int = 1
+    var entries: [String: CachedGameEntry] = [:]
+}
+
+private extension Game {
+    init(cached entry: CachedGameEntry) {
+        self = entry.path.withCString { pathPtr in
+            entry.title.withCString { titlePtr in
+                entry.developer.withCString { devPtr in
+                    entry.version.withCString { verPtr in
+                        var raw = LichiiGame()
+                        raw.path = UnsafeMutablePointer(mutating: pathPtr)
+                        raw.title = UnsafeMutablePointer(mutating: titlePtr)
+                        raw.developer = UnsafeMutablePointer(mutating: devPtr)
+                        raw.version = UnsafeMutablePointer(mutating: verPtr)
+                        raw.program_id = entry.programId
+                        raw.file_size = entry.fileSize
+                        raw.file_type = entry.kindRaw
+                        raw.is_homebrew = entry.isHomebrew
+                        raw.icon = nil
+                        raw.icon_size = 0
+                        return Game(raw)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private enum LibraryMetadataStore {
+    private static let gameExtensions: Set<String> = [
+        "nup", "nsp", "nsz", "xci", "xcz", "nca", "nso", "nro",
+    ]
+    private static let resourceKeys: Set<URLResourceKey> = [
+        .isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey,
+        .fileSizeKey, .contentModificationDateKey,
+    ]
+
+    private struct Candidate {
+        let path: String
+        let ext: String
+        let stampedSize: UInt64
+        let mtimeMs: Int64
+    }
+
+    private static var manifestURL: URL {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return caches.appendingPathComponent("library-cache-v1.json")
+    }
+
+    private static func loadManifest() -> LibraryDiskManifest {
+        guard let data = try? Data(contentsOf: manifestURL),
+              let decoded = try? JSONDecoder().decode(LibraryDiskManifest.self, from: data),
+              decoded.version == 1 else {
+            return LibraryDiskManifest()
+        }
+        return decoded
+    }
+
+    private static func saveManifest(_ manifest: LibraryDiskManifest) {
+        guard let data = try? JSONEncoder().encode(manifest) else { return }
+        let dir = manifestURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? data.write(to: manifestURL, options: .atomic)
+    }
+
+    private static func fileStamp(_ url: URL) -> String {
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else {
+            return "0:0"
+        }
+        let size = values.fileSize ?? 0
+        let mtime = Int64((values.contentModificationDate?.timeIntervalSince1970 ?? 0) * 1000)
+        return "\(size):\(mtime)"
+    }
+
+    private static func directoryStamp(_ url: URL) -> String {
+        let fm = FileManager.default
+        let mtime = Int64(((try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+            .contentModificationDate?.timeIntervalSince1970 ?? 0) * 1000)
+        let count = (try? fm.contentsOfDirectory(atPath: url.path))?.count ?? 0
+        return "\(count):\(mtime)"
+    }
+
+    private static func containerDirectoryMetrics(_ root: URL) -> (UInt64, Int64) {
+        var total: UInt64 = 0
+        var latestMs: Int64 = Int64(((try? root.resourceValues(forKeys: [.contentModificationDateKey]))?
+            .contentModificationDate?.timeIntervalSince1970 ?? 0) * 1000)
+        let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+        let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys)
+        while let item = enumerator?.nextObject() as? URL {
+            guard let values = try? item.resourceValues(forKeys: Set(keys)),
+                  values.isRegularFile == true else { continue }
+            total += UInt64(values.fileSize ?? 0)
+            let mtime = Int64((values.contentModificationDate?.timeIntervalSince1970 ?? 0) * 1000)
+            if mtime > latestMs {
+                latestMs = mtime
+            }
+        }
+        return (total, latestMs)
+    }
+
+    private static func collectCandidates(in dir: URL, depth: Int, out: inout [Candidate]) {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+        for item in items {
+            let name = item.lastPathComponent
+            if name.isEmpty || name.hasPrefix(".") {
+                continue
+            }
+            guard let values = try? item.resourceValues(forKeys: resourceKeys) else {
+                continue
+            }
+            let ext = item.pathExtension.lowercased()
+            if values.isDirectory == true {
+                if depth == 0 && name == "eden" {
+                    continue
+                }
+                let mainPath = item.appendingPathComponent("main").path
+                let npdmPath = item.appendingPathComponent("main.npdm").path
+                if fm.fileExists(atPath: mainPath) && fm.fileExists(atPath: npdmPath) {
+                    let (size, mtime) = containerDirectoryMetrics(item)
+                    out.append(Candidate(path: item.path, ext: "", stampedSize: size, mtimeMs: mtime))
+                } else if gameExtensions.contains(ext),
+                          fm.fileExists(atPath: item.appendingPathComponent("00").path) {
+                    let (size, mtime) = containerDirectoryMetrics(item)
+                    out.append(Candidate(path: item.appendingPathComponent("00").path,
+                                         ext: ext, stampedSize: size, mtimeMs: mtime))
+                } else if depth < 2 {
+                    collectCandidates(in: item, depth: depth + 1, out: &out)
+                }
+            } else if (values.isRegularFile == true || values.isSymbolicLink == true),
+                      gameExtensions.contains(ext) {
+                let size = UInt64(values.fileSize ?? 0)
+                let mtime = Int64((values.contentModificationDate?.timeIntervalSince1970 ?? 0) * 1000)
+                out.append(Candidate(path: item.path, ext: ext, stampedSize: size, mtimeMs: mtime))
+            }
+        }
+    }
+
+    static func scan(
+        roots: [URL],
+        documentsPrefix: String,
+        userDir: URL,
+        hidden: Set<String>
+    ) -> [Game] {
+        let fm = FileManager.default
+        var manifest = loadManifest()
+        var dirty = false
+
+        let keysDir = userDir.appendingPathComponent("keys", isDirectory: true)
+        let keysStamp = "\(fileStamp(keysDir.appendingPathComponent("prod.keys")))|\(fileStamp(keysDir.appendingPathComponent("title.keys")))"
+        let registeredDir = userDir
+            .appendingPathComponent("nand/user/Contents/registered", isDirectory: true)
+        let nandStamp = directoryStamp(registeredDir)
+
+        var candidates: [Candidate] = []
+        for root in roots {
+            collectCandidates(in: root, depth: 0, out: &candidates)
+        }
+
+        var found: [Game] = []
+        var seen = Set<String>()
+        for candidate in candidates where seen.insert(candidate.path).inserted {
+            let usesNandUpdates = candidate.ext != "nup" && candidate.ext != "nro" && candidate.ext != "nso"
+            let envStamp = usesNandUpdates ? "\(keysStamp)|\(nandStamp)" : keysStamp
+
+            if let cached = manifest.entries[candidate.path],
+               cached.stampedSize == candidate.stampedSize,
+               cached.mtimeMs == candidate.mtimeMs,
+               cached.envStamp == envStamp,
+               (!cached.hasIcon || fm.fileExists(atPath: IconCache.iconFileURL(forPath: candidate.path).path)) {
+                if cached.bootable && !hidden.contains(candidate.path) {
+                    found.append(Game(cached: cached))
+                }
+                continue
+            }
+
+            dirty = true
+            if let scanned = Bridge.readGame(at: candidate.path) {
+                let hasIcon = (scanned.icon?.isEmpty == false)
+                IconCache.storeDiskIcon(scanned.icon, forPath: scanned.path)
+                let entry = CachedGameEntry(
+                    path: scanned.path,
+                    stampedSize: candidate.stampedSize,
+                    mtimeMs: candidate.mtimeMs,
+                    envStamp: envStamp,
+                    bootable: true,
+                    title: scanned.title,
+                    developer: scanned.developer,
+                    version: scanned.version,
+                    programId: scanned.programId,
+                    fileSize: scanned.fileSize,
+                    kindRaw: scanned.kind.rawValue,
+                    isHomebrew: scanned.isHomebrew,
+                    hasIcon: hasIcon
+                )
+                manifest.entries[candidate.path] = entry
+                if !hidden.contains(scanned.path) {
+                    found.append(Game(cached: entry))
+                }
+            } else {
+                IconCache.removeDiskIcon(forPath: candidate.path)
+                manifest.entries[candidate.path] = CachedGameEntry(
+                    path: candidate.path,
+                    stampedSize: candidate.stampedSize,
+                    mtimeMs: candidate.mtimeMs,
+                    envStamp: envStamp,
+                    bootable: false,
+                    title: "",
+                    developer: "",
+                    version: "",
+                    programId: 0,
+                    fileSize: candidate.stampedSize,
+                    kindRaw: FileKind.unknown.rawValue,
+                    isHomebrew: false,
+                    hasIcon: false
+                )
+            }
+        }
+
+        // Remove stale cache entries for deleted files inside the app's own Documents folder.
+        let staleKeys = manifest.entries.keys.filter { key in
+            let stdPath = URL(fileURLWithPath: key).standardizedFileURL.path
+            return stdPath.hasPrefix(documentsPrefix) && !seen.contains(key)
+        }
+        if !staleKeys.isEmpty {
+            dirty = true
+            for key in staleKeys {
+                manifest.entries.removeValue(forKey: key)
+                IconCache.removeDiskIcon(forPath: key)
+            }
+        }
+
+        if dirty {
+            saveManifest(manifest)
+        }
+        return found
     }
 }

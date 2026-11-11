@@ -22,53 +22,55 @@ struct LibraryView: View {
         // Only where it adds something: a small library shows every game in the grid anyway.
         let recent = query.isEmpty && sort != .recent && library.games.count > 3 ? library.recentlyPlayed : []
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                MemoryEntitlementBanner()
-                ThermalBanner()
-                if let progress = library.importProgress {
-                    ImportProgressBanner(progress: progress)
-                }
-                if !recent.isEmpty {
-                    RecentRow(games: recent, open: app.launch)
-                }
-                if games.isEmpty && !query.isEmpty && !library.games.isEmpty {
-                    ContentUnavailableView.search(text: query)
-                } else if games.isEmpty {
-                    EmptyLibraryView(scanning: library.isScanning, importAction: { showImporter = true })
-                } else if grid {
-                    // Columns fill the width: two on a phone in portrait, more in landscape and
-                    // on iPad.
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 240), spacing: 16,
-                                                 alignment: .top)],
-                              spacing: 20) {
-                        ForEach(games) { game in
-                            GameCard(game: game, play: { app.launch(game) }, info: { infoGame = game }) {
-                                menu(for: game)
-                            }
-                            .contextMenu { menu(for: game) }
-                        }
+            if app.libraryVisible {
+                VStack(alignment: .leading, spacing: 18) {
+                    MemoryEntitlementBanner()
+                    ThermalBanner()
+                    if let progress = library.importProgress {
+                        ImportProgressBanner(progress: progress)
                     }
-                } else {
-                    LazyVStack(spacing: 0) {
-                        ForEach(games) { game in
-                            HStack(spacing: 4) {
-                                Button {
-                                    app.launch(game)
-                                } label: {
-                                    GameRow(game: game, lastPlayed: library.playedDate(game))
-                                        .contentShape(Rectangle())
+                    if !recent.isEmpty {
+                        RecentRow(games: recent, open: app.launch)
+                    }
+                    if games.isEmpty && !query.isEmpty && !library.games.isEmpty {
+                        ContentUnavailableView.search(text: query)
+                    } else if games.isEmpty {
+                        EmptyLibraryView(scanning: library.isScanning, importAction: { showImporter = true })
+                    } else if grid {
+                        // Columns fill the width: two on a phone in portrait, more in landscape and
+                        // on iPad.
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 240), spacing: 16,
+                                                     alignment: .top)],
+                                  spacing: 20) {
+                            ForEach(games) { game in
+                                GameCard(game: game, play: { app.launch(game) }, info: { infoGame = game }) {
+                                    menu(for: game)
                                 }
-                                .buttonStyle(.plain)
-                                .gameAccessibility(game) { infoGame = game }
-                                GameMenuButton(title: game.title) { menu(for: game) }
+                                .contextMenu { menu(for: game) }
                             }
-                            .contextMenu { menu(for: game) }
-                            Divider().padding(.leading, 76)
+                        }
+                    } else {
+                        LazyVStack(spacing: 0) {
+                            ForEach(games) { game in
+                                HStack(spacing: 4) {
+                                    Button {
+                                        app.launch(game)
+                                    } label: {
+                                        GameRow(game: game, lastPlayed: library.playedDate(game))
+                                            .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .gameAccessibility(game) { infoGame = game }
+                                    GameMenuButton(title: game.title) { menu(for: game) }
+                                }
+                                .contextMenu { menu(for: game) }
+                                Divider().padding(.leading, 76)
+                            }
                         }
                     }
                 }
+                .padding()
             }
-            .padding()
         }
         .navigationTitle("Library")
         .searchable(text: $query, prompt: "Search games")

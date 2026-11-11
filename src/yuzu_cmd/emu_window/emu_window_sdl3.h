@@ -100,11 +100,11 @@ protected:
     void OnMinimalClientAreaChangeRequest(std::pair<u32, u32> minimal_size) override;
 
     /// Periodic changer of titlebar (independent of event loop)
-    SDL_TimerID titlebar_timer;
+    SDL_TimerID titlebar_timer{};
     std::atomic<std::string*> pending_title{};
 
     // Mouse resetter once it
-    SDL_TimerID mouse_timer;
+    SDL_TimerID mouse_timer{};
 
     /// Is the window still open?
     bool is_open = true;

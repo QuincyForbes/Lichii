@@ -47,16 +47,21 @@ NPad::NPad(Core::HID::HIDCore& hid_core_, KernelHelpers::ServiceContext& service
 {
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; ++aruid_index) {
         for (std::size_t i = 0; i < controller_data[aruid_index].size(); ++i) {
-            auto& controller = controller_data[aruid_index][i];
-            controller.device = hid_core.GetEmulatedControllerByIndex(i);
-            Core::HID::ControllerUpdateCallback engine_callback{
-                .on_change = [this, i, kernel = &hid_core.kernel](Core::HID::ControllerTriggerType type) {
-                    ControllerUpdate(*kernel, type, i);
-                },
-                .is_npad_service = true,
-            };
-            controller.callback_key = controller.device->SetCallback(engine_callback);
+            controller_data[aruid_index][i].device = hid_core.GetEmulatedControllerByIndex(i);
         }
+    }
+    for (std::size_t i = 0; i < controller_callback_keys.size(); ++i) {
+        auto* device = hid_core.GetEmulatedControllerByIndex(i);
+        if (!device) {
+            continue;
+        }
+        Core::HID::ControllerUpdateCallback engine_callback{
+            .on_change = [this, i, kernel = &hid_core.kernel](Core::HID::ControllerTriggerType type) {
+                ControllerUpdate(*kernel, type, i);
+            },
+            .is_npad_service = true,
+        };
+        controller_callback_keys[i] = device->SetCallback(engine_callback);
     }
     for (std::size_t i = 0; i < abstracted_pads.size(); ++i) {
         abstracted_pads[i].SetNpadId(IndexToNpadIdType(i));
@@ -64,11 +69,12 @@ NPad::NPad(Core::HID::HIDCore& hid_core_, KernelHelpers::ServiceContext& service
 }
 
 NPad::~NPad() {
-    for (std::size_t aruid = 0; aruid < AruidIndexMax; ++aruid) {
-        for (std::size_t i = 0; i < controller_data[aruid].size(); ++i) {
-            if (auto& controller = controller_data[aruid][i]; controller.device && controller.callback_key) {
-                controller.device->DeleteCallback(controller.callback_key);
-            }
+    for (std::size_t i = 0; i < controller_callback_keys.size(); ++i) {
+        if (controller_callback_keys[i] == 0) {
+            continue;
+        }
+        if (auto* device = hid_core.GetEmulatedControllerByIndex(i)) {
+            device->DeleteCallback(controller_callback_keys[i]);
         }
     }
 }
@@ -156,11 +162,11 @@ void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTri
         return;
     }
 
-    for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
-        if (controller_idx >= controller_data[aruid_index].size()) {
-            return;
-        }
+    if (controller_idx >= MaxSupportedNpadIdTypes) {
+        return;
+    }
 
+    for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
         auto* data = applet_resource->GetAruidDataByIndex(aruid_index);
 
         if (data == nullptr || !data->flag.is_assigned) {
@@ -175,7 +181,7 @@ void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTri
         case Core::HID::ControllerTriggerType::Connected:
         case Core::HID::ControllerTriggerType::Disconnected:
             if (is_connected == controller.is_connected) {
-                return;
+                continue;
             }
             UpdateControllerAt(kernel, data->aruid, npad_type, npad_id, is_connected);
             break;

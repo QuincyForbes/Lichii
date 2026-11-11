@@ -5,6 +5,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
+
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include "common/input.h"
 #include "common/param_package.h"
 #include "input_common/drivers/camera.h"
@@ -77,22 +82,24 @@ struct InputSubsystem::Impl {
 
         RegisterEngine("updater", update_engine);
         RegisterEngine("keyboard", keyboard);
-        RegisterEngine("mouse", mouse);
         RegisterEngine("touch", touch_screen);
-#ifdef ENABLE_LIBUSB
-        RegisterEngine("gcpad", gcadapter);
-#endif
         RegisterEngine("cemuhookudp", udp_client);
-        RegisterEngine("tas", tas_input);
-        RegisterEngine("camera", camera);
+        RegisterEngine("virtual_amiibo", virtual_amiibo);
+        RegisterEngine("virtual_gamepad", virtual_gamepad);
 #ifdef __ANDROID__
         RegisterEngine("android", android);
 #endif
-        RegisterEngine("virtual_amiibo", virtual_amiibo);
-        RegisterEngine("virtual_gamepad", virtual_gamepad);
+#if !(defined(__APPLE__) && TARGET_OS_IPHONE)
+        RegisterEngine("mouse", mouse);
+#ifdef ENABLE_LIBUSB
+        RegisterEngine("gcpad", gcadapter);
+#endif
+        RegisterEngine("tas", tas_input);
+        RegisterEngine("camera", camera);
 #ifdef HAVE_SDL3
         RegisterEngine("sdl", sdl);
         RegisterEngine("joycon", joycon);
+#endif
 #endif
 
         Common::Input::RegisterInputFactory("touch_from_button",
@@ -103,6 +110,9 @@ struct InputSubsystem::Impl {
 
     template <typename Engine>
     void UnregisterEngine(std::shared_ptr<Engine>& engine) {
+        if (!engine) {
+            return;
+        }
         Common::Input::UnregisterInputFactory(engine->GetEngineName());
         Common::Input::UnregisterOutputFactory(engine->GetEngineName());
         engine.reset();
@@ -139,26 +149,41 @@ struct InputSubsystem::Impl {
         };
 
 #ifndef __ANDROID__
-        auto keyboard_devices = keyboard->GetInputDevices();
-        devices.insert(devices.end(), keyboard_devices.begin(), keyboard_devices.end());
-        auto mouse_devices = mouse->GetInputDevices();
-        devices.insert(devices.end(), mouse_devices.begin(), mouse_devices.end());
+        if (keyboard) {
+            auto keyboard_devices = keyboard->GetInputDevices();
+            devices.insert(devices.end(), keyboard_devices.begin(), keyboard_devices.end());
+        }
+        if (mouse) {
+            auto mouse_devices = mouse->GetInputDevices();
+            devices.insert(devices.end(), mouse_devices.begin(), mouse_devices.end());
+        }
 #endif
 #ifdef __ANDROID__
-        auto android_devices = android->GetInputDevices();
-        devices.insert(devices.end(), android_devices.begin(), android_devices.end());
+        if (android) {
+            auto android_devices = android->GetInputDevices();
+            devices.insert(devices.end(), android_devices.begin(), android_devices.end());
+        }
 #endif
 #ifdef ENABLE_LIBUSB
-        auto gcadapter_devices = gcadapter->GetInputDevices();
-        devices.insert(devices.end(), gcadapter_devices.begin(), gcadapter_devices.end());
+        if (gcadapter) {
+            gcadapter->ProbeIfNeeded();
+            auto gcadapter_devices = gcadapter->GetInputDevices();
+            devices.insert(devices.end(), gcadapter_devices.begin(), gcadapter_devices.end());
+        }
 #endif
-        auto udp_devices = udp_client->GetInputDevices();
-        devices.insert(devices.end(), udp_devices.begin(), udp_devices.end());
+        if (udp_client) {
+            auto udp_devices = udp_client->GetInputDevices();
+            devices.insert(devices.end(), udp_devices.begin(), udp_devices.end());
+        }
 #ifdef HAVE_SDL3
-        auto joycon_devices = joycon->GetInputDevices();
-        devices.insert(devices.end(), joycon_devices.begin(), joycon_devices.end());
-        auto sdl_devices = sdl->GetInputDevices();
-        devices.insert(devices.end(), sdl_devices.begin(), sdl_devices.end());
+        if (joycon) {
+            auto joycon_devices = joycon->GetInputDevices();
+            devices.insert(devices.end(), joycon_devices.begin(), joycon_devices.end());
+        }
+        if (sdl) {
+            auto sdl_devices = sdl->GetInputDevices();
+            devices.insert(devices.end(), sdl_devices.begin(), sdl_devices.end());
+        }
 #endif
 
         return devices;
@@ -170,30 +195,30 @@ struct InputSubsystem::Impl {
             return nullptr;
         }
         const std::string engine = params.Get("engine", "");
-        if (engine == keyboard->GetEngineName()) {
+        if (keyboard && engine == keyboard->GetEngineName()) {
             return keyboard;
         }
-        if (engine == mouse->GetEngineName()) {
+        if (mouse && engine == mouse->GetEngineName()) {
             return mouse;
         }
 #ifdef __ANDROID__
-        if (engine == android->GetEngineName()) {
+        if (android && engine == android->GetEngineName()) {
             return android;
         }
 #endif
 #ifdef ENABLE_LIBUSB
-        if (engine == gcadapter->GetEngineName()) {
+        if (gcadapter && engine == gcadapter->GetEngineName()) {
             return gcadapter;
         }
 #endif
-        if (engine == udp_client->GetEngineName()) {
+        if (udp_client && engine == udp_client->GetEngineName()) {
             return udp_client;
         }
 #ifdef HAVE_SDL3
-        if (engine == sdl->GetEngineName()) {
+        if (sdl && engine == sdl->GetEngineName()) {
             return sdl;
         }
-        if (engine == joycon->GetEngineName()) {
+        if (joycon && engine == joycon->GetEngineName()) {
             return joycon;
         }
 #endif
@@ -258,33 +283,33 @@ struct InputSubsystem::Impl {
 
     bool IsController(const Common::ParamPackage& params) {
         const std::string engine = params.Get("engine", "");
-        if (engine == mouse->GetEngineName()) {
+        if (mouse && engine == mouse->GetEngineName()) {
             return true;
         }
 #ifdef __ANDROID__
-        if (engine == android->GetEngineName()) {
+        if (android && engine == android->GetEngineName()) {
             return true;
         }
 #endif
 #ifdef ENABLE_LIBUSB
-        if (engine == gcadapter->GetEngineName()) {
+        if (gcadapter && engine == gcadapter->GetEngineName()) {
             return true;
         }
 #endif
-        if (engine == udp_client->GetEngineName()) {
+        if (udp_client && engine == udp_client->GetEngineName()) {
             return true;
         }
-        if (engine == tas_input->GetEngineName()) {
+        if (tas_input && engine == tas_input->GetEngineName()) {
             return true;
         }
-        if (engine == virtual_gamepad->GetEngineName()) {
+        if (virtual_gamepad && engine == virtual_gamepad->GetEngineName()) {
             return true;
         }
 #ifdef HAVE_SDL3
-        if (engine == sdl->GetEngineName()) {
+        if (sdl && engine == sdl->GetEngineName()) {
             return true;
         }
-        if (engine == joycon->GetEngineName()) {
+        if (joycon && engine == joycon->GetEngineName()) {
             return true;
         }
 #endif
@@ -292,41 +317,75 @@ struct InputSubsystem::Impl {
     }
 
     void BeginConfiguration() {
-        keyboard->BeginConfiguration();
-        mouse->BeginConfiguration();
+        if (keyboard) {
+            keyboard->BeginConfiguration();
+        }
+        if (mouse) {
+            mouse->BeginConfiguration();
+        }
 #ifdef __ANDROID__
-        android->BeginConfiguration();
+        if (android) {
+            android->BeginConfiguration();
+        }
 #endif
 #ifdef ENABLE_LIBUSB
-        gcadapter->BeginConfiguration();
+        if (gcadapter) {
+            gcadapter->StartScanForConfiguration();
+            gcadapter->BeginConfiguration();
+        }
 #endif
-        udp_client->BeginConfiguration();
+        if (udp_client) {
+            udp_client->BeginConfiguration();
+        }
 #ifdef HAVE_SDL3
-        sdl->BeginConfiguration();
-        joycon->BeginConfiguration();
+        if (sdl) {
+            sdl->BeginConfiguration();
+        }
+        if (joycon) {
+            joycon->BeginConfiguration();
+        }
 #endif
     }
 
     void EndConfiguration() {
-        keyboard->EndConfiguration();
-        mouse->EndConfiguration();
+        if (keyboard) {
+            keyboard->EndConfiguration();
+        }
+        if (mouse) {
+            mouse->EndConfiguration();
+        }
 #ifdef __ANDROID__
-        android->EndConfiguration();
+        if (android) {
+            android->EndConfiguration();
+        }
 #endif
 #ifdef ENABLE_LIBUSB
-        gcadapter->EndConfiguration();
+        if (gcadapter) {
+            gcadapter->EndConfiguration();
+            gcadapter->ReloadConfiguration();
+        }
 #endif
-        udp_client->EndConfiguration();
+        if (udp_client) {
+            udp_client->EndConfiguration();
+        }
 #ifdef HAVE_SDL3
-        sdl->EndConfiguration();
-        joycon->EndConfiguration();
+        if (sdl) {
+            sdl->EndConfiguration();
+        }
+        if (joycon) {
+            joycon->EndConfiguration();
+        }
 #endif
     }
 
     void PumpEvents() const {
-        update_engine->PumpEvents();
+        if (update_engine) {
+            update_engine->PumpEvents();
+        }
 #ifdef HAVE_SDL3
-        sdl->PumpEvents();
+        if (sdl) {
+            sdl->PumpEvents();
+        }
 #endif
     }
 
@@ -470,7 +529,14 @@ bool InputSubsystem::IsStickInverted(const Common::ParamPackage& params) const {
 }
 
 void InputSubsystem::ReloadInputDevices() {
-    impl->udp_client.get()->ReloadSockets();
+    if (impl->udp_client) {
+        impl->udp_client->ReloadSockets();
+    }
+#ifdef ENABLE_LIBUSB
+    if (impl->gcadapter) {
+        impl->gcadapter->ReloadConfiguration();
+    }
+#endif
 }
 
 void InputSubsystem::BeginMapping(Polling::InputType type) {

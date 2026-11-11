@@ -38,20 +38,47 @@ struct Nx2SysmixStreams {
         timer = Core::Timing::CreateEvent("sysmix output", [this](s64, std::chrono::nanoseconds late) {
             std::unique_lock lock{mutex, std::try_to_lock};
             if (lock) {
+                bool any_active = false;
                 for (auto& [id, stream] : streams) {
                     stream->Pump();
+                    any_active |= stream->GetState() == 2;
+                }
+                if (!any_active) {
+                    if (timer_scheduled) {
+                        timer_scheduled = false;
+                        system.CoreTiming().UnscheduleEvent(
+                            timer, Core::Timing::UnscheduleEventType::NoWait);
+                    }
+                    return std::optional<std::chrono::nanoseconds>{};
                 }
             }
             const auto interval = std::chrono::nanoseconds{std::chrono::milliseconds{5}};
             const auto missed = std::max(late, std::chrono::nanoseconds::zero()) / interval;
             return std::optional<std::chrono::nanoseconds>{interval * (missed + 1)};
         });
-        system.CoreTiming().ScheduleLoopingEvent(std::chrono::milliseconds{5},
-                                                 std::chrono::milliseconds{5}, timer);
     }
 
     ~Nx2SysmixStreams() {
         system.CoreTiming().UnscheduleEvent(timer);
+    }
+
+    void UpdateTimerLocked() {
+        const bool any_active = std::ranges::any_of(streams, [](const auto& entry) {
+            return entry.second->GetState() == 2;
+        });
+        if (any_active && !timer_scheduled) {
+            timer_scheduled = true;
+            system.CoreTiming().ScheduleLoopingEvent(std::chrono::milliseconds{5},
+                                                     std::chrono::milliseconds{5}, timer);
+        } else if (!any_active && timer_scheduled) {
+            timer_scheduled = false;
+            system.CoreTiming().UnscheduleEvent(timer, Core::Timing::UnscheduleEventType::NoWait);
+        }
+    }
+
+    void UpdateTimer() {
+        std::scoped_lock lock{mutex};
+        UpdateTimerLocked();
     }
 
     Result SetEngaged(u32 id, bool engaged, const Kernel::KProcess* process) {
@@ -63,7 +90,9 @@ struct Nx2SysmixStreams {
             stream = it->second;
         }
         R_UNLESS(stream->IsOwnedBy(process), ResultInvalidHandle);
-        return stream->SetEngaged(engaged);
+        const Result res = stream->SetEngaged(engaged);
+        UpdateTimer();
+        return res;
     }
 
     /// Engage an owned stream only when its direction matches the device functionality.
@@ -77,7 +106,9 @@ struct Nx2SysmixStreams {
         }
         R_UNLESS(stream->IsOwnedBy(process), ResultInvalidHandle);
         R_UNLESS(functionality == (stream->IsInput() ? 2U : 1U), ResultNotSupported);
-        return stream->SetEngaged(true);
+        const Result res = stream->SetEngaged(true);
+        UpdateTimer();
+        return res;
     }
 
     std::mutex mutex;
@@ -85,6 +116,7 @@ struct Nx2SysmixStreams {
     u32 next_id{1};
     Core::System& system;
     std::shared_ptr<Core::Timing::EventType> timer;
+    bool timer_scheduled{};
 };
 
 // Switch 2 virtual output devices (nn::audio::ListVirtualOutputDevices and friends), reached through
@@ -307,11 +339,12 @@ public:
     }
 
     ~INx2SysmixStreamSession() override {
+        stream->Close();
         {
             std::scoped_lock lock{streams->mutex};
             streams->streams.erase(id);
+            streams->UpdateTimerLocked();
         }
-        stream->Close();
     }
 
 private:
@@ -333,6 +366,7 @@ private:
 
     void CloseStream(HLERequestContext& ctx) {
         stream->Close();
+        streams->UpdateTimer();
         Succeed(ctx);
     }
 

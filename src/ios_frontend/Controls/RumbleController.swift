@@ -153,7 +153,6 @@ final class RumbleController {
             }
         }
         guard leftChannel != nil || fallbackChannel != nil else { return nil }
-        scheduleRestarts()
     }
 
     /// The device's own Taptic Engine.
@@ -163,7 +162,6 @@ final class RumbleController {
         multiplier = deviceMultiplier
         fallbackChannel = HapticChannel(engine: engine, eventDuration: eventDuration)
         guard fallbackChannel != nil else { return nil }
-        scheduleRestarts()
     }
 
     deinit {
@@ -174,14 +172,18 @@ final class RumbleController {
     }
 
     private func scheduleRestarts() {
-        restartTimer = Timer.scheduledTimer(withTimeInterval: eventDuration - 1, repeats: true) { [weak self] _ in
-            guard let self else { return }
+        guard restartTimer == nil else { return }
+        let timer = Timer(timeInterval: eventDuration - 1, repeats: true) { [weak self] _ in
+            guard let self, self.enginesOn else { return }
             self.queue.async {
                 self.leftChannel?.restart()
                 self.rightChannel?.restart()
                 self.fallbackChannel?.restart()
             }
         }
+        timer.tolerance = 0.5
+        RunLoop.main.add(timer, forMode: .common)
+        restartTimer = timer
     }
 
     func stop() {
@@ -194,7 +196,10 @@ final class RumbleController {
         let silent = value.left_low <= 0 && value.left_high <= 0 && value.right_low <= 0 && value.right_high <= 0
         if !silent {
             lastActive = now
-            enginesOn = true
+            if !enginesOn {
+                enginesOn = true
+                scheduleRestarts()
+            }
         } else if enginesOn, now - lastActive > 2 {
             stopEngines()
         }
@@ -218,6 +223,8 @@ final class RumbleController {
     }
 
     private func stopEngines() {
+        restartTimer?.invalidate()
+        restartTimer = nil
         guard enginesOn else { return }
         enginesOn = false
         queue.async { [self] in

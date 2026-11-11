@@ -155,6 +155,9 @@ UDPClient::ClientConnection::~ClientConnection() = default;
 
 void UDPClient::ReloadSockets() {
     Reset();
+    if (!Settings::values.enable_udp_controller.GetValue()) {
+        return;
+    }
 
     std::stringstream servers_ss(Settings::values.udp_input_servers.GetValue());
     std::string server_token;

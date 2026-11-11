@@ -14,15 +14,23 @@
 #else
 #include <cstring>
 #include <errno.h>
+#include <limits.h>
 #include <spawn.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <sys/sysctl.h>
+#endif
 #endif
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include <fmt/format.h>
 #include "common/common_types.h"
@@ -163,6 +171,136 @@ std::filesystem::path VulkanCheckCachePath() {
 }
 
 } // Anonymous namespace
+#else
+namespace {
+
+void AddPosixFileStamp(std::string& out, const std::filesystem::path& path) {
+    out += path.string();
+    struct stat st{};
+    if (stat(path.c_str(), &st) == 0) {
+#ifdef __APPLE__
+        out += fmt::format("|{}|{}|{};", static_cast<u64>(st.st_size),
+                           static_cast<s64>(st.st_mtimespec.tv_sec),
+                           static_cast<s64>(st.st_mtimespec.tv_nsec));
+#else
+        out += fmt::format("|{}|{}|{};", static_cast<u64>(st.st_size),
+                           static_cast<s64>(st.st_mtim.tv_sec),
+                           static_cast<s64>(st.st_mtim.tv_nsec));
+#endif
+    } else {
+        out += "|missing;";
+    }
+}
+
+void AddPosixManifestDir(std::string& out, const std::filesystem::path& dir) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) {
+        return;
+    }
+    out += dir.string();
+    out += ':';
+    std::vector<std::filesystem::path> entries;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        entries.push_back(entry.path());
+    }
+    std::sort(entries.begin(), entries.end());
+    for (const auto& entry : entries) {
+        AddPosixFileStamp(out, entry);
+    }
+}
+
+std::string VulkanCheckFingerprint(const char* arg0) {
+    std::string out;
+    std::filesystem::path exe_path;
+#ifdef __APPLE__
+    uint32_t buf_size = 0;
+    _NSGetExecutablePath(nullptr, &buf_size);
+    if (buf_size > 0) {
+        std::string buf(buf_size, '\0');
+        if (_NSGetExecutablePath(buf.data(), &buf_size) == 0) {
+            exe_path = std::filesystem::path(buf.c_str());
+        }
+    }
+    char osversion[128]{};
+    size_t osversion_len = sizeof(osversion) - 1;
+    if (sysctlbyname("kern.osversion", osversion, &osversion_len, nullptr, 0) == 0) {
+        out += fmt::format("os={};", osversion);
+    }
+#else
+    char link_buf[PATH_MAX]{};
+    const ssize_t link_len = readlink("/proc/self/exe", link_buf, sizeof(link_buf) - 1);
+    if (link_len > 0) {
+        exe_path = std::filesystem::path(std::string_view{link_buf, static_cast<size_t>(link_len)});
+    }
+    AddPosixFileStamp(out, "/sys/module/nvidia/version");
+    AddPosixFileStamp(out, "/sys/module/amdgpu/srcversion");
+#endif
+    if (exe_path.empty() && arg0 != nullptr && arg0[0] != '\0') {
+        exe_path = arg0;
+    }
+    if (!exe_path.empty()) {
+        AddPosixFileStamp(out, exe_path);
+#ifdef __APPLE__
+        const auto frameworks = exe_path.parent_path() / ".." / "Frameworks";
+        AddPosixFileStamp(out, frameworks / "libMoltenVK.dylib");
+        AddPosixFileStamp(out, frameworks / "libvulkan.1.dylib");
+#endif
+    }
+
+    for (const char* lib : {
+#ifdef __APPLE__
+             "/opt/homebrew/lib/libMoltenVK.dylib",
+             "/usr/local/lib/libMoltenVK.dylib",
+             "/opt/homebrew/lib/libvulkan.1.dylib",
+             "/usr/local/lib/libvulkan.1.dylib",
+#else
+             "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+             "/usr/lib/aarch64-linux-gnu/libvulkan.so.1",
+             "/usr/lib64/libvulkan.so.1",
+             "/usr/lib/libvulkan.so.1",
+#endif
+         }) {
+        AddPosixFileStamp(out, lib);
+    }
+
+    for (const char* dir : {"/etc/vulkan/icd.d", "/usr/share/vulkan/icd.d",
+                            "/usr/local/share/vulkan/icd.d", "/etc/vulkan/implicit_layer.d",
+                            "/usr/share/vulkan/implicit_layer.d",
+                            "/usr/local/share/vulkan/implicit_layer.d",
+                            "/etc/vulkan/explicit_layer.d", "/usr/share/vulkan/explicit_layer.d",
+                            "/usr/local/share/vulkan/explicit_layer.d"}) {
+        AddPosixManifestDir(out, dir);
+    }
+    if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+        const std::filesystem::path home_path{home};
+        AddPosixManifestDir(out, home_path / ".local/share/vulkan/icd.d");
+        AddPosixManifestDir(out, home_path / ".local/share/vulkan/implicit_layer.d");
+        AddPosixManifestDir(out, home_path / ".config/vulkan/icd.d");
+    }
+
+    for (const char* variable :
+         {"VK_ICD_FILENAMES", "VK_DRIVER_FILES", "VK_ADD_DRIVER_FILES", "VK_LAYER_PATH",
+          "VK_ADD_LAYER_PATH", "VK_IMPLICIT_LAYER_PATH", "VK_ADD_IMPLICIT_LAYER_PATH",
+          "VK_INSTANCE_LAYERS", "VK_LOADER_LAYERS_ENABLE", "VK_LOADER_LAYERS_DISABLE",
+          "VK_LOADER_DRIVERS_SELECT", "VK_LOADER_DRIVERS_DISABLE", "LD_LIBRARY_PATH",
+          "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"}) {
+        if (const char* value = std::getenv(variable)) {
+            out += fmt::format("{}={};", variable, value);
+        }
+    }
+
+    u64 hash = 0xcbf29ce484222325ULL;
+    for (const char c : out) {
+        hash = (hash ^ static_cast<u8>(c)) * 0x100000001b3ULL;
+    }
+    return fmt::format("vulkan-check-ok {:016x}", hash);
+}
+
+std::filesystem::path VulkanCheckCachePath() {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "vulkan_check.txt";
+}
+
+} // Anonymous namespace
 #endif
 bool CheckEnvVars(bool* is_child) {
 #ifdef _WIN32
@@ -257,22 +395,39 @@ bool StartupChecks(const char* arg0, bool* has_broken_vulkan, bool perform_vulka
     }
 
 #else
-    const int env_var_set = setenv(STARTUP_CHECK_ENV_VAR, ENV_VAR_ENABLED_TEXT, 1);
-    if (env_var_set == -1) {
-        const int err = errno;
-        fmt::print(stderr, "setenv failed to set {} with error {}\n", STARTUP_CHECK_ENV_VAR, err);
-        return false;
+    const std::string fingerprint =
+        perform_vulkan_check ? VulkanCheckFingerprint(arg0) : std::string{};
+    if (perform_vulkan_check &&
+        Common::FS::ReadStringFromFile(VulkanCheckCachePath(), Common::FS::FileType::TextFile) ==
+            fingerprint) {
+        *has_broken_vulkan = false;
+        perform_vulkan_check = false;
     }
 
     if (perform_vulkan_check) {
+        const int env_var_set = setenv(STARTUP_CHECK_ENV_VAR, ENV_VAR_ENABLED_TEXT, 1);
+        if (env_var_set == -1) {
+            const int err = errno;
+            fmt::print(stderr, "setenv failed to set {} with error {}\n", STARTUP_CHECK_ENV_VAR,
+                       err);
+            return false;
+        }
+
         const pid_t pid = SpawnChild(arg0);
         if (pid == -1) {
+            unsetenv(STARTUP_CHECK_ENV_VAR);
             return false;
         }
 
         // Get exit code from child process
-        int status;
+        int status = 0;
         const int r_val = waitpid(pid, &status, 0);
+        const int env_var_cleared = unsetenv(STARTUP_CHECK_ENV_VAR);
+        if (env_var_cleared == -1) {
+            const int err = errno;
+            fmt::print(stderr, "unsetenv failed to clear {} with error {}\n", STARTUP_CHECK_ENV_VAR,
+                       err);
+        }
         if (r_val == -1) {
             const int err = errno;
             fmt::print(stderr, "wait failed with error {}\n", err);
@@ -280,13 +435,13 @@ bool StartupChecks(const char* arg0, bool* has_broken_vulkan, bool perform_vulka
         }
         // Vulkan is broken if the child crashed (return value is not zero)
         *has_broken_vulkan = (status != 0);
-    }
-
-    const int env_var_cleared = unsetenv(STARTUP_CHECK_ENV_VAR);
-    if (env_var_cleared == -1) {
-        const int err = errno;
-        fmt::print(stderr, "unsetenv failed to clear {} with error {}\n", STARTUP_CHECK_ENV_VAR,
-                   err);
+        const auto cache_path = VulkanCheckCachePath();
+        if (*has_broken_vulkan) {
+            Common::FS::RemoveFile(cache_path);
+        } else if (Common::FS::CreateParentDirs(cache_path)) {
+            void(Common::FS::WriteStringToFile(cache_path, Common::FS::FileType::TextFile,
+                                               fingerprint));
+        }
     }
 #endif
     return false;

@@ -65,6 +65,7 @@ final class JoystickView: UIView, ControllerTouchTarget {
     private var springAnimator: UIViewPropertyAnimator?
 
     private weak var activeTouch: UITouch?
+    private var lastLayoutSize: CGSize = .zero
 
     private var extendedRadius: CGFloat {
         let maxRadius = (boundarySize - joystickSize) / 2
@@ -84,6 +85,11 @@ final class JoystickView: UIView, ControllerTouchTarget {
     private func setup() {
         clipsToBounds = false
 
+        boundaryView.isUserInteractionEnabled = false
+        backgroundView.isUserInteractionEnabled = false
+        joystickBackgroundView.isUserInteractionEnabled = false
+        joystickView.isUserInteractionEnabled = false
+
         addSubview(boundaryView)
         addSubview(backgroundView)
         addSubview(joystickBackgroundView)
@@ -102,36 +108,42 @@ final class JoystickView: UIView, ControllerTouchTarget {
 
         isMultipleTouchEnabled = true
 
-        edgeImpact.prepare()
+        if UserDefaults.standard.object(forKey: "On-ScreenControllerHaptics") as? Bool ?? true {
+            edgeImpact.prepare()
+        }
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
 
-        let size = bounds.width
-        boundaryView.frame              = CGRect(origin: .zero, size: frame.size)
-        boundaryView.layer.cornerRadius = size / 2
+        if bounds.size != lastLayoutSize {
+            lastLayoutSize = bounds.size
+            let size = bounds.width
+            boundaryView.frame              = CGRect(origin: .zero, size: bounds.size)
+            boundaryView.layer.cornerRadius = size / 2
+            layer.shadowPath = UIBezierPath(ovalIn: bounds).cgPath
 
-        backgroundView.frame              = boundaryView.frame
-        backgroundView.layer.cornerRadius = size / 2
+            backgroundView.frame              = boundaryView.frame
+            backgroundView.layer.cornerRadius = size / 2
+
+            joystickBackgroundView.bounds = CGRect(
+                x: 0, y: 0,
+                width: joystickSize * 1.25,
+                height: joystickSize * 1.25
+            )
+            joystickBackgroundView.layer.cornerRadius = joystickBackgroundView.bounds.width / 2
+
+            joystickView.bounds = CGRect(
+                x: 0, y: 0,
+                width: joystickSize,
+                height: joystickSize
+            )
+            joystickView.layer.cornerRadius = joystickSize / 2
+            joystickView.layer.shadowPath = UIBezierPath(ovalIn: joystickView.bounds).cgPath
+        }
         if let origin {
             backgroundView.center = origin
         }
-
-        joystickBackgroundView.bounds = CGRect(
-            x: 0, y: 0,
-            width: joystickSize * 1.25,
-            height: joystickSize * 1.25
-        )
-        joystickBackgroundView.layer.cornerRadius = joystickBackgroundView.bounds.width / 2
-
-        joystickView.bounds = CGRect(
-            x: 0, y: 0,
-            width: joystickSize,
-            height: joystickSize
-        )
-        joystickView.layer.cornerRadius = joystickSize / 2
-        joystickView.layer.shadowPath = UIBezierPath(ovalIn: joystickView.bounds).cgPath
 
         if activeTouch == nil && springAnimator == nil {
             placeAtCenter()
@@ -250,7 +262,9 @@ final class JoystickView: UIView, ControllerTouchTarget {
         let rawOffset = rawOffset(for: location)
 
         didHitEdge = false
-        edgeImpact.prepare()
+        if UserDefaults.standard.object(forKey: "On-ScreenControllerHaptics") as? Bool ?? true {
+            edgeImpact.prepare()
+        }
         animateBackground(show: true)
 
         processOffset(rawOffset)

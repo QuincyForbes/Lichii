@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import Combine
 import LichiiBridge
 import SwiftUI
 import UIKit
@@ -146,32 +147,82 @@ final class PerformanceOverlayMonitor: ObservableObject {
 
     private static let historyLimit = 120
     private var timer: Timer?
+    private var stateObserver: AnyCancellable?
     private var viewers = 0
     private var history: [Double] = []
     private let hasMetalFxTemporal = QuickSettings.info("metalfx_temporal") != nil
 
     func start() {
         viewers += 1
-        guard timer == nil else { return }
-        UIDevice.current.isBatteryMonitoringEnabled = true
-        sample()
-        let timer = Timer(timeInterval: 0.5, repeats: true) { _ in
-            MainActor.assumeIsolated { PerformanceOverlayMonitor.shared.sample() }
+        if stateObserver == nil {
+            stateObserver = AppController.shared.$emuState
+                .removeDuplicates()
+                .sink { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.updateSamplingState()
+                    }
+                }
         }
-        timer.tolerance = 0.1
-        RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
+        updateSamplingState()
     }
 
     func stop() {
         viewers = max(0, viewers - 1)
         guard viewers == 0 else { return }
-        timer?.invalidate()
-        timer = nil
+        stopTimer()
+        stateObserver?.cancel()
+        stateObserver = nil
         UIDevice.current.isBatteryMonitoringEnabled = false
     }
 
+    private func stopTimer() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func updateSamplingState() {
+        guard viewers > 0 else {
+            stopTimer()
+            return
+        }
+        let state = Bridge.emuState
+        if state == .running {
+            guard timer == nil else { return }
+            UIDevice.current.isBatteryMonitoringEnabled = true
+            sample()
+            let timer = Timer(timeInterval: 0.5, repeats: true) { _ in
+                MainActor.assumeIsolated { PerformanceOverlayMonitor.shared.sample() }
+            }
+            timer.tolerance = 0.1
+            RunLoop.main.add(timer, forMode: .common)
+            self.timer = timer
+        } else {
+            // Pause the 2 Hz timer (and its task_threads walk) while paused or outside gameplay.
+            stopTimer()
+            if state == .paused {
+                var next = reading
+                var snapshot = LichiiPerfSnapshot()
+                next.active = lichii_perf_snapshot(&snapshot)
+                if next.active {
+                    apply(snapshot, to: &next)
+                }
+                next.paused = true
+                if next != reading {
+                    reading = next
+                }
+            } else if !state.inGame, reading.active {
+                var next = reading
+                next.active = false
+                reading = next
+            }
+        }
+    }
+
     private func sample() {
+        guard Bridge.emuState == .running else {
+            updateSamplingState()
+            return
+        }
         var next = reading
         var snapshot = LichiiPerfSnapshot()
         next.active = lichii_perf_snapshot(&snapshot)
