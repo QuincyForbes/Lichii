@@ -19,6 +19,7 @@
 #include "common/settings.h"
 #include "common/swap.h"
 #include "core/core.h"
+#include "core/device_memory.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/hle/kernel/code_set.h"
@@ -98,64 +99,75 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     }();
 
     auto const last_segment_it = &nso_header.segments[nso_header.segments.size() - 1];
-    // Build program image directly in codeset memory :)
+
+    bool needs_nce_patch_scan = false;
+#ifdef HAS_NCE
+    needs_nce_patch_scan = patches != nullptr;
+#endif
+    // Fast O(1) layout computation when !load_into_process: avoids reading and decompressing
+    // every NSO segment twice at boot.
+    if (!load_into_process && !needs_nce_patch_scan) {
+        u32 raw_size = last_segment_it->location + last_segment_it->size;
+        if (should_pass_arguments && !Settings::values.program_args.GetValue().empty()) {
+            raw_size += NSO_ARGUMENT_DATA_ALLOCATION_SIZE;
+        }
+        const u32 image_size = PageAlignSize(raw_size + nso_header.segments[2].bss_size);
+        return load_base + image_size;
+    }
+
+    // Build program image directly in codeset memory without a redundant decompression buffer.
     Kernel::CodeSet codeset;
-    codeset.memory.resize(module_start + last_segment_it->location + last_segment_it->size);
+    size_t initialized_end = module_start + last_segment_it->location + last_segment_it->size;
+    for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
+        initialized_end = std::max<size_t>(
+            initialized_end,
+            module_start + size_t{nso_header.segments[i].location} + nso_header.segments[i].size);
+    }
+    codeset.memory.resize(initialized_end);
     {
-        std::vector<u8> compressed_data(*std::ranges::max_element(nso_header.segments_compressed_size));
-        std::vector<u8> decompressed_size(std::ranges::max_element(nso_header.segments, [](auto const& a, auto const& b) {
-            return a.size < b.size;
-        })->size);
+        u32 max_compressed_size = 0;
         for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
-            nso_file.Read(compressed_data.data(), nso_header.segments_compressed_size[i], nso_header.segments[i].offset);
             if (nso_header.IsSegmentCompressed(i)) {
-                const u32 segment_size = nso_header.segments[i].size;
+                max_compressed_size =
+                    std::max<u32>(max_compressed_size, nso_header.segments_compressed_size[i]);
+            }
+        }
+        std::vector<u8> compressed_data(max_compressed_size);
+        for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
+            const u32 segment_size = nso_header.segments[i].size;
+            u8* const dst = codeset.memory.data() + module_start + nso_header.segments[i].location;
+            if (nso_header.IsSegmentCompressed(i)) {
+                const u32 comp_size = nso_header.segments_compressed_size[i];
+                nso_file.Read(compressed_data.data(), comp_size, nso_header.segments[i].offset);
                 if (nso_header.IsZBICCompressed()) {
                     // ZBIC compression
                     const int r = Common::Compression::DecompressDataZBIC(
-                        std::span<u8>{decompressed_size}.first(segment_size),
-                        std::span<const u8>{compressed_data}.first(nso_header.segments_compressed_size[i])
-                    );
-                    // A failed segment would leave the previous segment's bytes in the buffer and
-                    // boot a corrupt image that hangs without presenting; refuse to load instead.
+                        std::span<u8>{dst, segment_size},
+                        std::span<const u8>{compressed_data.data(), comp_size});
+                    // A failed segment would boot a corrupt image that hangs without presenting.
                     if (r <= 0) {
                         LOG_ERROR(Loader, "{}: segment {} failed ZBIC decompression",
                                   nso_file.GetName(), i);
                         return std::nullopt;
                     }
-                    if (static_cast<u32>(r) != segment_size) {
+                    if (static_cast<u32>(r) < segment_size) {
                         LOG_WARNING(Loader, "{}: segment {} decompressed to {:#x} of {:#x} bytes",
                                     nso_file.GetName(), i, r, segment_size);
-                        std::fill(decompressed_size.begin() + r,
-                                  decompressed_size.begin() + segment_size, u8{0});
+                        std::memset(dst + r, 0, segment_size - static_cast<u32>(r));
                     }
                 } else {
                     // LZ4 compression
-                    int r = Common::Compression::DecompressDataLZ4(
-                        decompressed_size.data(),
-                        segment_size,
-                        compressed_data.data(),
-                        nso_header.segments_compressed_size[i]
-                    );
+                    const int r = Common::Compression::DecompressDataLZ4(
+                        dst, segment_size, compressed_data.data(), comp_size);
                     ASSERT(r == int(segment_size));
                 }
-
-                std::memcpy(
-                    codeset.memory.data() + module_start + nso_header.segments[i].location,
-                    decompressed_size.data(),
-                    nso_header.segments[i].size
-                );
             } else {
-                // Not compressed
-                std::memcpy(
-                    codeset.memory.data() + module_start + nso_header.segments[i].location,
-                    compressed_data.data(),
-                    nso_header.segments[i].size
-                );
+                // Not compressed: read directly into codeset memory.
+                nso_file.Read(dst, segment_size, nso_header.segments[i].offset);
             }
             codeset.segments[i].addr = module_start + nso_header.segments[i].location;
             codeset.segments[i].offset = module_start + nso_header.segments[i].location;
-            codeset.segments[i].size = nso_header.segments[i].size;
+            codeset.segments[i].size = segment_size;
         }
     }
 
@@ -172,7 +184,8 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     codeset.DataSegment().size += nso_header.segments[2].bss_size;
     u32 image_size = PageAlignSize(u32(codeset.memory.size()) + nso_header.segments[2].bss_size);
-    codeset.memory.resize(image_size);
+    const u32 initialized_aligned_size = PageAlignSize(u32(codeset.memory.size()));
+    codeset.memory.resize(std::min(initialized_aligned_size, image_size));
 
     for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
         codeset.segments[i].size = PageAlignSize(codeset.segments[i].size);
@@ -189,7 +202,17 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
         pi_header = pm->PatchNSO(pi_header, name);
 
-        std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
+        if (pi_header.size() > sizeof(NSOHeader)) {
+            const size_t patched_size = std::min<size_t>(
+                pi_header.size() - sizeof(NSOHeader), image_size - module_start);
+            if (module_start + patched_size > codeset.memory.size()) {
+                codeset.memory.resize(
+                    std::min(PageAlignSize(static_cast<u32>(module_start + patched_size)),
+                             image_size));
+            }
+            std::memcpy(codeset.memory.data() + module_start, pi_header.data() + sizeof(NSOHeader),
+                        patched_size);
+        }
     }
 
     // Star Fox output pacing for the tested build. The engine's explicit-rate path
@@ -290,6 +313,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     const auto& code = codeset.CodeSegment();
     auto* patch = patches ? &patches->operator[](patch_index) : nullptr;
     if (patch && !load_into_process) {
+        codeset.memory.resize(image_size);
         //Set module ID using build_id from the NSO header
         patch->SetModuleID(nso_header.build_id);
         // Patch SVCs and MRS calls in the guest code
@@ -298,6 +322,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
             patch->SetModuleID(nso_header.build_id);  // In case the patcher is changed for big modules, the new patcher should also have the build_id
         }
     } else if (patch) {
+        codeset.memory.resize(image_size);
         // Relocate code patch and copy to the program image.
         // Save size before RelocateAndCopy (which may resize)
         const size_t size_before_relocate = codeset.memory.size();
@@ -370,6 +395,38 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     }
     Core::OotZstd::PatchModule(process.GetProgramId(), nso_header.build_id, name, codeset.memory,
                                load_base);
+    // Clear trailing .bss pages via ClearBackingRegion so untouched zero granules are not faulted in.
+    if (codeset.memory.size() < image_size) {
+        auto& page_table = process.GetPageTable();
+        auto& host_buffer = system.DeviceMemory().buffer;
+        VAddr cur_vaddr = load_base + codeset.memory.size();
+        const VAddr end_vaddr = load_base + image_size;
+        Kernel::KPhysicalAddress run_phys{};
+        size_t run_size = 0;
+        const auto flush_run = [&]() {
+            if (run_size > 0) {
+                host_buffer.ClearBackingRegion(
+                    GetInteger(run_phys) - Core::DramMemoryMap::Base, run_size, 0);
+                run_size = 0;
+            }
+        };
+        for (; cur_vaddr < end_vaddr; cur_vaddr += Core::Memory::YUZU_PAGESIZE) {
+            Kernel::KPhysicalAddress phys{};
+            if (page_table.GetPhysicalAddress(&phys, cur_vaddr)) {
+                if (run_size > 0 && phys == run_phys + run_size) {
+                    run_size += Core::Memory::YUZU_PAGESIZE;
+                } else {
+                    flush_run();
+                    run_phys = phys;
+                    run_size = Core::Memory::YUZU_PAGESIZE;
+                }
+            } else {
+                flush_run();
+                process.GetMemory().ZeroBlock(cur_vaddr, Core::Memory::YUZU_PAGESIZE);
+            }
+        }
+        flush_run();
+    }
     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
     if (name == "main" && process.GetProgramId() == Settings::MarioKartWorldProgramId) {
