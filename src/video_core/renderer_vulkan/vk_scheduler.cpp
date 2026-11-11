@@ -381,6 +381,8 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     state.clear_variant = false;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
+    state.pushed_rescaling_words.Forget();
+    state.pushed_render_area.Forget();
 
     if (GPU::Logging::IsActive() && Settings::values.gpu_log_vulkan_calls.GetValue()) {
         const std::string render_pass_info =
@@ -959,6 +961,8 @@ void Scheduler::InvalidateState() {
     state.graphics_pipeline = nullptr;
     state.rescaling_defined = false;
     state.descriptor_buffer_bound = false;
+    state.pushed_rescaling_words.Forget();
+    state.pushed_render_area.Forget();
     state_tracker.InvalidateCommandBufferState();
 }
 

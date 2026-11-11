@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <memory>
+#include <optional>
 #include <random>
 #include <span>
 #include <tuple>
@@ -18,6 +20,7 @@
 #include "video_core/buffer_cache/usage_tracker.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
+#include "video_core/renderer_vulkan/pushed_constants.h"
 
 namespace {
 
@@ -142,6 +145,51 @@ TEST_CASE("Nx2Perf draw-binds: deferred barrier survives unrelated draws", "[vid
     REQUIRE_FALSE(prepare_draw(true, true));
     barrier.Defer(false);
     REQUIRE_FALSE(prepare_draw(true, true));
+}
+
+TEST_CASE("Nx2Perf draw-binds: skipped push constants are the ones in the command buffer",
+          "[video_core]") {
+    using Words = std::array<u32, 6>;
+    Vulkan::PushedConstants<sizeof(Words)> tracker;
+    // What the command buffer holds; nothing after a pass begins or another user pushed.
+    std::optional<Words> recorded;
+    std::mt19937 rng{0x5eed};
+    u32 skipped = 0;
+    for (u32 step = 0; step < 20000; ++step) {
+        if (rng() % 16 == 0) {
+            recorded.reset();
+            tracker.Forget();
+            continue;
+        }
+        Words words{};
+        words[rng() % words.size()] = rng() % 3;
+        // A draw of a pipeline that is still building may return before its pushes.
+        const bool lands = rng() % 8 != 0;
+        const bool runs = lands || rng() % 2 == 0;
+        const bool push = tracker.Update(words, lands);
+        skipped += push ? 0 : 1;
+        if (!runs) {
+            continue;
+        }
+        if (push) {
+            recorded = words;
+        }
+        REQUIRE(recorded.has_value());
+        REQUIRE(*recorded == words);
+    }
+    REQUIRE(skipped > 1000);
+
+    // Bytes decide, not values: -0.0f is pushed over 0.0f.
+    Vulkan::PushedConstants<sizeof(std::array<f32, 4>)> area;
+    REQUIRE(area.Update(std::array<f32, 4>{0.0f, 1.0f, 2.0f, 3.0f}, true));
+    REQUIRE_FALSE(area.Update(std::array<f32, 4>{0.0f, 1.0f, 2.0f, 3.0f}, true));
+    REQUIRE(area.Update(std::array<f32, 4>{-0.0f, 1.0f, 2.0f, 3.0f}, true));
+    // An uncertain push is not relied on, but values known to be there still are.
+    REQUIRE(area.Update(std::array<f32, 4>{4.0f, 1.0f, 2.0f, 3.0f}, false));
+    REQUIRE(area.Update(std::array<f32, 4>{4.0f, 1.0f, 2.0f, 3.0f}, true));
+    REQUIRE_FALSE(area.Update(std::array<f32, 4>{4.0f, 1.0f, 2.0f, 3.0f}, false));
+    area.Forget();
+    REQUIRE(area.Update(std::array<f32, 4>{4.0f, 1.0f, 2.0f, 3.0f}, true));
 }
 
 TEST_CASE("Nx2Perf draw-binds: usage survives slot relocation and reset", "[video_core]") {

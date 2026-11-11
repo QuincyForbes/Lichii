@@ -56,6 +56,15 @@
 
 namespace Vulkan {
 namespace {
+// EDEN_NX2_PUSH_CONSTANT_REUSE=0: every draw pushes its rescaling words and render area again.
+bool PushConstantReuseEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_PUSH_CONSTANT_REUSE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 // EDEN_NX2_DRAW_REUSE_PROBE=1: how often a draw's setup (pipeline, texture handles and samplers,
 // constant buffer addresses, vertex streams, render targets) repeats, from frame to frame and
 // from the previous draw of the same pipeline: whether caching it can pay. Logged every 120 frames.
@@ -1401,7 +1410,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (writes_storage) {
         scheduler.NoteRenderPassStores();
     }
-    if (!IsBuilt()) {
+    const bool built{IsBuilt()};
+    if (!built) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
             const auto begin = std::chrono::steady_clock::now();
@@ -1418,6 +1428,20 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     const bool is_rescaling{texture_cache.IsRescaling()};
     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling, IsMeshPipeline())};
     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
+    // The rescaling words and the render area rarely change between the draws of a render pass,
+    // and the plain layouts share one push constant range, so what an earlier draw pushed stays.
+    // A pipeline that may still fail to build returns from the command below before its pushes.
+    bool push_rescaling_words{true};
+    bool push_render_area{render_area.uses_render_area};
+    if (IsMeshPipeline() || mesh_emulation || !PushConstantReuseEnabled()) {
+        scheduler.ForgetGraphicsPushConstants();
+    } else {
+        const bool lands{built && pipeline && !build->Failed()};
+        push_rescaling_words = scheduler.UpdateRescalingWords(rescaling.Data(), lands);
+        if (push_render_area) {
+            push_render_area = scheduler.UpdateRenderArea(render_area.words, lands);
+        }
+    }
     const bool push_mesh_draw_base{IsMeshPipeline() && MeshFirstEnabled()};
     MeshDrawBaseLayout mesh_draw_base{};
     if (push_mesh_draw_base) {
@@ -1451,7 +1475,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
-                      uses_render_area = render_area.uses_render_area,
+                      push_rescaling_words, push_render_area,
                       render_area_data = render_area.words, push_mesh_draw_base,
                       mesh_draw_base](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
@@ -1472,8 +1496,10 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
                       VK_SHADER_STAGE_MESH_BIT_EXT
                 : VK_SHADER_STAGE_ALL_GRAPHICS;
-        cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
-                             sizeof(rescaling_data), rescaling_data.data());
+        if (push_rescaling_words) {
+            cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
+                                 sizeof(rescaling_data), rescaling_data.data());
+        }
         if (update_rescaling || mesh_emulation) {
             const f32 config_down_factor{Settings::values.resolution_info.down_factor};
             const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
@@ -1481,7 +1507,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                  RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
                                  &scale_down_factor);
         }
-        if (uses_render_area) {
+        if (push_render_area) {
             cmdbuf.PushConstants(*pipeline_layout, push_stages, RENDERAREA_LAYOUT_OFFSET,
                                  sizeof(render_area_data), &render_area_data);
         }

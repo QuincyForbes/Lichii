@@ -247,6 +247,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_scheduler.h
     renderer_vulkan/upload_batch.h
     renderer_vulkan/fragment_barrier_state.h
+    renderer_vulkan/pushed_constants.h
     renderer_vulkan/vk_shader_util.cpp
     renderer_vulkan/vk_shader_util.h
     renderer_vulkan/vk_staging_buffer_pool.cpp
