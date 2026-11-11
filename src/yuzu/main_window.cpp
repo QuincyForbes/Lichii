@@ -2411,17 +2411,17 @@ bool MainWindow::OnShutdownBegin() {
     Settings::values.use_speed_limit.SetValue(true);
     Settings::values.current_speed_mode = Settings::SpeedMode::Standard;
 
+    if (perf_overlay) {
+        perf_overlay->hide();
+        perf_overlay->deleteLater();
+        perf_overlay = nullptr;
+    }
+
     if (QtCommon::system->IsShuttingDown()) {
         status_bar_update_timer.stop();
         connect(QtCommon::emu_thread.get(), &QThread::finished, this,
                 &MainWindow::OnEmulationStopped, Qt::UniqueConnection);
         return false;
-    }
-
-    if (perf_overlay) {
-        perf_overlay->hide();
-        perf_overlay->deleteLater();
-        perf_overlay = nullptr;
     }
 
     QtCommon::system->SetShuttingDown(true);
@@ -5185,14 +5185,32 @@ void MainWindow::UpdateStatusBar() {
         emu_speed_label->setText(tr("Speed: %1%").arg(results.emulation_speed * 100.0, 0, 'f', 0));
     }
 
+    const auto fg_method_name = [] {
+        switch (Settings::values.frame_gen_type.GetValue()) {
+        case Settings::FrameGenType::Lsfg:
+            return QStringLiteral("LSFG");
+        case Settings::FrameGenType::MetalFx:
+            return QStringLiteral("MetalFX");
+        case Settings::FrameGenType::Fsr3:
+        default:
+            return QStringLiteral("FSR3");
+        }
+    };
+
     QString fpsText;
     if (results.generated_fps > 0.5 && results.average_game_fps > 0.5) {
         const double mult = results.total_fps / results.average_game_fps;
-        fpsText = tr("Real: %1 FPS | Generated: +%2 | Displayed: %3 FPS (%4x)")
+        fpsText = tr("Real: %1 FPS | Generated: +%2 (%5) | Displayed: %3 FPS (%4x)")
                       .arg(results.average_game_fps, 0, 'f', 1)
                       .arg(results.generated_fps, 0, 'f', 1)
                       .arg(results.total_fps, 0, 'f', 1)
-                      .arg(mult, 0, 'f', 1);
+                      .arg(mult, 0, 'f', 1)
+                      .arg(fg_method_name());
+    } else if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan &&
+               Settings::values.frame_gen.GetValue()) {
+        fpsText = tr("Real: %1 FPS | FG (%2): Warmup")
+                      .arg(results.average_game_fps, 0, 'f', 1)
+                      .arg(fg_method_name());
     } else {
         fpsText = tr("Real: %1 FPS").arg(results.average_game_fps, 0, 'f', 1);
     }

@@ -17,10 +17,28 @@
 #include <QChart>
 #include <QChartView>
 #include <QGraphicsLayout>
+#include <QGuiApplication>
 #include <QLineSeries>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QValueAxis>
+#include <QWindow>
+
+#ifdef _WIN32
+// clang-format off
+#include <windows.h>
+#include <dxgi1_4.h>
+#include <psapi.h>
+// clang-format on
+#elif defined(__linux__)
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <unistd.h>
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include "common/memory_detect.h"
+#endif
 
 #ifdef HAS_LSFG
 #include <filesystem>
@@ -29,6 +47,8 @@
 
 namespace {
 
+constexpr double GiB = 1024.0 * 1024.0 * 1024.0;
+
 // LSFG without its Lossless.dll never generates a frame.
 bool LosslessMissing() {
 #ifdef HAS_LSFG
@@ -36,6 +56,160 @@ bool LosslessMissing() {
     return Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Lsfg &&
            !std::filesystem::exists(VideoCore::FrameGen::GetLosslessDllPath(), ec);
 #else
+    return false;
+#endif
+}
+
+QString FrameGenMethodLabel() {
+    switch (Settings::values.frame_gen_type.GetValue()) {
+    case Settings::FrameGenType::Lsfg:
+        return QStringLiteral("LSFG");
+    case Settings::FrameGenType::MetalFx:
+        return QStringLiteral("MetalFX");
+    case Settings::FrameGenType::Fsr3:
+    default:
+        return QStringLiteral("FSR3");
+    }
+}
+
+bool QueryProcessRam(double& used_gb, double& free_gb) {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS counters{};
+    counters.cb = sizeof(counters);
+    if (!K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+        return false;
+    }
+    used_gb = static_cast<double>(counters.WorkingSetSize) / GiB;
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    free_gb = GlobalMemoryStatusEx(&status) ? static_cast<double>(status.ullAvailPhys) / GiB : -1.0;
+    return true;
+#elif defined(__linux__)
+    std::ifstream statm("/proc/self/statm");
+    u64 total_pages = 0;
+    u64 rss_pages = 0;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (!(statm >> total_pages >> rss_pages) || page_size <= 0) {
+        return false;
+    }
+    used_gb = static_cast<double>(rss_pages) * static_cast<double>(page_size) / GiB;
+    free_gb = -1.0;
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    u64 value = 0;
+    std::string unit;
+    while (meminfo >> key >> value >> unit) {
+        if (key == "MemAvailable:") {
+            free_gb = static_cast<double>(value * 1024ULL) / GiB;
+            break;
+        }
+    }
+    return true;
+#elif defined(__APPLE__)
+    task_vm_info_data_t vm_info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&vm_info),
+                  &count) != KERN_SUCCESS) {
+        return false;
+    }
+    used_gb = static_cast<double>(vm_info.phys_footprint) / GiB;
+    const u64 total_phys = Common::GetMemInfo().TotalPhysicalMemory;
+    free_gb = total_phys > vm_info.phys_footprint
+                  ? static_cast<double>(total_phys - vm_info.phys_footprint) / GiB
+                  : -1.0;
+    return true;
+#else
+    used_gb = -1.0;
+    free_gb = -1.0;
+    return false;
+#endif
+}
+
+bool QueryProcessVram(double& used_gb, double& free_gb) {
+#ifdef _WIN32
+    using CreateFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
+    static const CreateFactoryFn create_factory = []() -> CreateFactoryFn {
+        const HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+        if (!dxgi) {
+            return nullptr;
+        }
+        return reinterpret_cast<CreateFactoryFn>(
+            reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")));
+    }();
+    if (!create_factory) {
+        return false;
+    }
+    static IDXGIFactory1* const factory = []() -> IDXGIFactory1* {
+        IDXGIFactory1* created = nullptr;
+        return SUCCEEDED(
+                   create_factory(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&created)))
+                   ? created
+                   : nullptr;
+    }();
+    if (!factory) {
+        return false;
+    }
+    UINT64 best_usage = 0;
+    UINT64 best_budget = 0;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT index = 0; factory->EnumAdapters1(index, &adapter) != DXGI_ERROR_NOT_FOUND; ++index) {
+        DXGI_ADAPTER_DESC1 desc{};
+        const bool hardware =
+            SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE);
+        IDXGIAdapter3* adapter3 = nullptr;
+        if (hardware && SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3),
+                                                          reinterpret_cast<void**>(&adapter3)))) {
+            DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+            if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+                                                         &info)) &&
+                info.CurrentUsage > best_usage) {
+                best_usage = info.CurrentUsage;
+                best_budget = info.Budget;
+            }
+            adapter3->Release();
+        }
+        adapter->Release();
+    }
+    if (best_usage == 0) {
+        return false;
+    }
+    used_gb = static_cast<double>(best_usage) / GiB;
+    free_gb = best_budget > best_usage ? static_cast<double>(best_budget - best_usage) / GiB : 0.0;
+    return true;
+#elif defined(__linux__)
+    static const std::filesystem::path gpu_device = []() -> std::filesystem::path {
+        std::error_code ec;
+        u64 best_total = 0;
+        std::filesystem::path best;
+        for (const auto& entry : std::filesystem::directory_iterator("/sys/class/drm", ec)) {
+            const auto dev = entry.path() / "device";
+            std::ifstream total_file(dev / "mem_info_vram_total");
+            std::ifstream used_file(dev / "mem_info_vram_used");
+            u64 total = 0;
+            u64 used = 0;
+            if ((total_file >> total) && (used_file >> used) && total > best_total) {
+                best_total = total;
+                best = dev;
+            }
+        }
+        return best;
+    }();
+    if (gpu_device.empty()) {
+        return false;
+    }
+    std::ifstream used_file(gpu_device / "mem_info_vram_used");
+    std::ifstream total_file(gpu_device / "mem_info_vram_total");
+    u64 used = 0;
+    u64 total = 0;
+    if (!(used_file >> used) || !(total_file >> total) || total == 0) {
+        return false;
+    }
+    used_gb = static_cast<double>(used) / GiB;
+    free_gb = total > used ? static_cast<double>(total - used) / GiB : 0.0;
+    return true;
+#else
+    used_gb = -1.0;
+    free_gb = -1.0;
     return false;
 #endif
 }
@@ -111,6 +285,8 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
     ui->fps->setFont(font);
     ui->fps_gen->setFont(font);
     ui->frametime->setFont(font);
+    ui->ram_widget->setVisible(false);
+    ui->vram_widget->setVisible(false);
 
     // pos/stats
     resetPosition(m_mainWindow->pos());
@@ -129,6 +305,10 @@ void PerformanceOverlay::resetPosition(const QPoint& _) {
 
 void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
                                      const VideoCore::ShaderNotify& shaders) {
+    if (!isVisible()) {
+        return;
+    }
+
     const double fps = results.average_game_fps;
     const double gen_fps = std::isnan(results.generated_fps) ? 0.0 : results.generated_fps;
     const double total_fps =
@@ -141,11 +321,15 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
 
         if (gen_fps > 0.5 && fps > 0.5) {
             const double mult = total_fps / fps;
-            ui->fps_gen->setText(tr("+%1 FPS (%2x)").arg(gen_fps, 0, 'f', 1).arg(mult, 0, 'f', 1));
-            ui->total_fps->setText(tr("%1 FPS (%2x FG)").arg(total_fps, 0, 'f', 1).arg(mult, 0, 'f', 1));
+            const QString method = FrameGenMethodLabel();
+            ui->fps_gen->setText(
+                tr("+%1 FPS (%2x %3)").arg(gen_fps, 0, 'f', 1).arg(mult, 0, 'f', 1).arg(method));
+            ui->total_fps->setText(
+                tr("%1 FPS (%2x %3)").arg(total_fps, 0, 'f', 1).arg(mult, 0, 'f', 1).arg(method));
         } else if (Settings::values.frame_gen.GetValue()) {
-            ui->fps_gen->setText(LosslessMissing() ? tr("Unavailable (no Lossless.dll, see Graphics)")
-                                                   : tr("+0.0 FPS (Warmup)"));
+            ui->fps_gen->setText(LosslessMissing()
+                                     ? tr("Unavailable (no Lossless.dll, see Graphics)")
+                                     : tr("+0.0 FPS (%1 Warmup)").arg(FrameGenMethodLabel()));
             ui->total_fps->setText(tr("%1 FPS").arg(fps, 0, 'f', 1));
         } else {
             ui->fps_gen->setText(tr("Off (0 FPS)"));
@@ -251,6 +435,38 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
         }
     }
 
+    double ram_used = -1.0;
+    double ram_free = -1.0;
+    if (QueryProcessRam(ram_used, ram_free) && ram_used >= 0.0) {
+        ui->ram_widget->setVisible(true);
+        ui->ram_usage->setText(ram_free >= 0.0
+                                   ? tr("%1 GB (%2 GB free)")
+                                         .arg(ram_used, 0, 'f', 1)
+                                         .arg(ram_free, 0, 'f', 1)
+                                   : tr("%1 GB").arg(ram_used, 0, 'f', 1));
+        ui->ram_usage->setStyleSheet(ram_free >= 0.0 && ram_free < 2.0
+                                         ? QStringLiteral("color: #fbbf24;")
+                                         : QStringLiteral("color: #e2e8f0;"));
+    } else {
+        ui->ram_widget->setVisible(false);
+    }
+
+    double vram_used = -1.0;
+    double vram_free = -1.0;
+    if (QueryProcessVram(vram_used, vram_free) && vram_used >= 0.0) {
+        ui->vram_widget->setVisible(true);
+        ui->vram_usage->setText(vram_free >= 0.0
+                                    ? tr("%1 GB (%2 GB free)")
+                                          .arg(vram_used, 0, 'f', 1)
+                                          .arg(vram_free, 0, 'f', 1)
+                                    : tr("%1 GB").arg(vram_used, 0, 'f', 1));
+        ui->vram_usage->setStyleSheet(vram_free >= 0.0 && vram_free < 1.0
+                                          ? QStringLiteral("color: #fbbf24;")
+                                          : QStringLiteral("color: #e2e8f0;"));
+    } else {
+        ui->vram_widget->setVisible(false);
+    }
+
     const double speed_pct =
         std::isnan(results.emulation_speed) ? 100.0 : results.emulation_speed * 100.0;
     const f32 res_scale = Settings::values.resolution_info.up_factor;
@@ -285,9 +501,14 @@ void PerformanceOverlay::paintEvent(QPaintEvent* event) {
 }
 
 void PerformanceOverlay::mousePressEvent(QMouseEvent* event) {
-    if (event->button() == Qt::LeftButton) {
-        m_drag_start_pos = event->pos();
+    if (event->button() != Qt::LeftButton) {
+        return;
     }
+    if (QGuiApplication::platformName().startsWith(QStringLiteral("wayland")) && windowHandle() &&
+        windowHandle()->startSystemMove()) {
+        return;
+    }
+    m_drag_start_pos = event->pos();
 }
 
 void PerformanceOverlay::mouseMoveEvent(QMouseEvent* event) {
