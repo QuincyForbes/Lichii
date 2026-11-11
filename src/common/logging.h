@@ -12,6 +12,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include <fmt/format.h>
 #include <fmt/ranges.h>
 #include "common/swap.h"
 
@@ -40,29 +41,29 @@ struct fmt::formatter<SwapStructT<T, U>> {
     }
 };
 
+#define LOG_GENERIC(log_class, log_level, ...)                                                     \
+    do {                                                                                           \
+        if (static_cast<u8>(::Common::Log::Level::log_level) >=                                    \
+            ::Common::Log::g_lowest_enabled_level.load(std::memory_order_relaxed)) {               \
+            ::Common::Log::FmtLogMessage(::Common::Log::Class::log_class,                          \
+                                         ::Common::Log::Level::log_level, __FILE__, __LINE__,      \
+                                         __func__, __VA_ARGS__);                                   \
+        }                                                                                          \
+    } while (0)
+
 #ifdef _DEBUG
-#define LOG_TRACE(log_class, ...) \
-    Common::Log::FmtLogMessage(Common::Log::Class::log_class, Common::Log::Level::Trace, \
-       __FILE__, __LINE__, __func__, __VA_ARGS__)
+#define LOG_TRACE(log_class, ...) LOG_GENERIC(log_class, Trace, __VA_ARGS__)
 #else
-#define LOG_TRACE(log_class, fmt, ...) (void(0))
+#define LOG_TRACE(log_class, ...)                                                                  \
+    do {                                                                                           \
+    } while (0)
 #endif
 
-#define LOG_DEBUG(log_class, ...) \
-    ::Common::Log::FmtLogMessage(::Common::Log::Class::log_class, ::Common::Log::Level::Debug, \
-       __FILE__, __LINE__, __func__, __VA_ARGS__)
-#define LOG_INFO(log_class, ...) \
-    ::Common::Log::FmtLogMessage(::Common::Log::Class::log_class, ::Common::Log::Level::Info, \
-       __FILE__, __LINE__, __func__, __VA_ARGS__)
-#define LOG_WARNING(log_class, ...) \
-    ::Common::Log::FmtLogMessage(::Common::Log::Class::log_class, ::Common::Log::Level::Warning, \
-       __FILE__, __LINE__, __func__, __VA_ARGS__)
-#define LOG_ERROR(log_class, ...) \
-    ::Common::Log::FmtLogMessage(::Common::Log::Class::log_class, ::Common::Log::Level::Error, \
-       __FILE__, __LINE__, __func__, __VA_ARGS__)
-#define LOG_CRITICAL(log_class, ...) \
-    ::Common::Log::FmtLogMessage(::Common::Log::Class::log_class, ::Common::Log::Level::Critical, \
-       __FILE__, __LINE__, __func__, __VA_ARGS__)
+#define LOG_DEBUG(log_class, ...) LOG_GENERIC(log_class, Debug, __VA_ARGS__)
+#define LOG_INFO(log_class, ...) LOG_GENERIC(log_class, Info, __VA_ARGS__)
+#define LOG_WARNING(log_class, ...) LOG_GENERIC(log_class, Warning, __VA_ARGS__)
+#define LOG_ERROR(log_class, ...) LOG_GENERIC(log_class, Error, __VA_ARGS__)
+#define LOG_CRITICAL(log_class, ...) LOG_GENERIC(log_class, Critical, __VA_ARGS__)
 
 namespace Common::Log {
 
