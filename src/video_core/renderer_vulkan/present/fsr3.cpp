@@ -50,12 +50,6 @@ void FSR3::CreateImages(const Device& device) {
         images.image_views[Rcas] =
             CreateWrappedImageView(device, images.images[Rcas], VK_FORMAT_R16G16B16A16_SFLOAT);
     }
-
-    // Allocate a history image for temporal accumulation feedback.
-    m_prev_frame_image =
-        CreateWrappedImage(m_memory_allocator, m_extent, VK_FORMAT_R16G16B16A16_SFLOAT);
-    m_prev_frame_view =
-        CreateWrappedImageView(device, m_prev_frame_image, VK_FORMAT_R16G16B16A16_SFLOAT);
 }
 
 void FSR3::CreateRenderPasses(const Device& device) {
@@ -149,7 +143,6 @@ void FSR3::UploadImages(const Device& device, Scheduler& scheduler) {
                 ClearColorImage(cmdbuf, *image.images[Easu]);
                 ClearColorImage(cmdbuf, *image.images[Rcas]);
             }
-            ClearColorImage(cmdbuf, *m_prev_frame_image);
         });
         scheduler.Finish();
     }
