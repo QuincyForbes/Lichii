@@ -226,6 +226,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 
     static constexpr u32 LayerUploadMinSize = 64U << 20;
     static constexpr size_t LargeScratchCapacity = 64U << 20;
+    static constexpr size_t SmallScratchCapacity = 8U << 20;
+    static constexpr u64 ScratchTrimFrames = 256;
 
     /// Splits large 2D image uploads into smaller chunks, avoiding multi-hundred MiB staging buffers.
     bool UploadInChunks(Image& image);

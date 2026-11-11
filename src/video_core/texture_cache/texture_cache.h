@@ -534,9 +534,12 @@ std::array<u64, 6> TextureCache<P>::ImageMemoryKinds() {
 template <class P>
 void TextureCache<P>::TickFrame() {
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
-    // rather than kept for the rest of the session.
+    // rather than kept for the rest of the session, and smaller ones now and then: they stay
+    // as large as the largest image since boot, all of it written to.
+    const size_t scratch_limit =
+        frame_tick % ScratchTrimFrames == 0 ? SmallScratchCapacity : LargeScratchCapacity;
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
-        if (scratch->capacity() > LargeScratchCapacity) {
+        if (scratch->capacity() > scratch_limit) {
             scratch->release();
         }
     }
