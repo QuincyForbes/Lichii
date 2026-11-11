@@ -28,7 +28,7 @@ namespace FS = Common::FS;
 Config::Config(const ConfigType config_type)
     : type(config_type), global{config_type == ConfigType::GlobalConfig} {}
 
-void Config::Initialize(const std::string& config_name) {
+void Config::Initialize(const std::string& config_name, const bool write) {
     const std::filesystem::path fs_config_loc = FS::GetEdenPath(FS::EdenPath::ConfigDir);
     const auto config_file = fmt::format("{}.ini", config_name);
 
@@ -37,13 +37,13 @@ void Config::Initialize(const std::string& config_name) {
         config_loc = FS::PathToUTF8String(fs_config_loc / config_file);
         void(FS::CreateParentDir(config_loc));
         SetUpIni();
-        Reload();
+        Reload(write);
         break;
     case ConfigType::PerGameConfig:
         config_loc = FS::PathToUTF8String(fs_config_loc / "custom" / FS::ToU8String(config_file));
         void(FS::CreateParentDir(config_loc));
         SetUpIni();
-        Reload();
+        Reload(write);
         break;
     case ConfigType::InputProfile:
         config_loc = FS::PathToUTF8String(fs_config_loc / "input" / config_file);
@@ -53,13 +53,13 @@ void Config::Initialize(const std::string& config_name) {
     }
 }
 
-void Config::Initialize(const std::optional<std::string> config_path) {
+void Config::Initialize(const std::optional<std::string> config_path, const bool write) {
     const std::filesystem::path default_sdl_config_path =
         FS::GetEdenPath(FS::EdenPath::ConfigDir) / "sdl2-config.ini";
     config_loc = config_path.value_or(FS::PathToUTF8String(default_sdl_config_path));
     void(FS::CreateParentDir(config_loc));
     SetUpIni();
-    Reload();
+    Reload(write);
 }
 
 void Config::WriteToIni() const {
@@ -546,7 +546,7 @@ void Config::SaveMotionTouchValues() {
     EndArray(); // touch_from_button_maps
 }
 
-void Config::SaveValues() {
+void Config::SaveValues(const bool write) {
     if (global) {
         LOG_DEBUG(Config, "Saving global generic configuration values");
         SaveDataStorageValues();
@@ -566,7 +566,9 @@ void Config::SaveValues() {
     SaveAudioValues();
     SaveSystemValues();
 
-    WriteToIni();
+    if (write) {
+        WriteToIni();
+    }
 }
 
 void Config::SaveAudioValues() {
@@ -914,10 +916,10 @@ void Config::WriteString(const std::string& key, const std::string& value) {
     config->SetValue(GetSection().c_str(), key.c_str(), value.c_str());
 }
 
-void Config::Reload() {
+void Config::Reload(const bool write) {
     ReadValues();
     // To apply default value changes
-    SaveValues();
+    SaveValues(write);
 }
 
 void Config::ClearControlPlayerValues() const {
