@@ -296,18 +296,23 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             }
             native_macro->native_writes.clear();
         }
-        // The interpreter consumes native_parameters as its FIFO: keep the call's own parameters.
-        native_memo_parameters.assign(native_parameters.begin(), native_parameters.end());
+        const bool track_memo = use_memo && !watched;
+        if (track_memo) {
+            native_memo_parameters.assign(native_parameters.begin(), native_parameters.end());
+        }
         const u64 code_generation = native_macro->native_code_generation;
+        native_macro->native_interpreter.Prepare(native_macro->native_code, code_generation);
         const auto result = native_macro->native_interpreter.Execute(native_macro->native_code,
             start, native_parameters,
             [&](u32 address) { return address < native_registers.size() ? native_registers[address] : 0U; },
             [&](u32 address, u32 value) {
-                if (use_memo) {
+                if (track_memo && !native_macro->native_interpreter.read_registers &&
+                    !native_macro->native_interpreter.reread_data_ram) {
                     native_macro->native_writes.emplace_back(address, value);
                 }
                 return emit(address, value);
-            });
+            },
+            track_memo);
         const auto& interpreter = native_macro->native_interpreter;
         if (use_memo && !watched && result.success && !interpreter.read_registers &&
             !interpreter.reread_data_ram && code_generation == native_macro->native_code_generation) {
@@ -2229,14 +2234,18 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         }
     }
     if (!memo_hit) {
+        const bool track_memo = use_memo && !trace && macro.native_interpreter.active_dram != nullptr;
         const u64 code_generation = macro.native_code_generation;
+        macro.native_interpreter.Prepare(macro.native_code, code_generation);
         const auto result = macro.native_interpreter.Execute(
             macro.native_code, start, fs.parameters, read, [&](u32 address, u32 value) {
-                if (use_memo && !trace) {
+                if (track_memo && !macro.native_interpreter.read_registers &&
+                    !macro.native_interpreter.reread_data_ram) {
                     macro.native_writes.emplace_back(address, value);
                 }
                 return emit(address, value);
-            });
+            },
+            track_memo);
         if (use_memo && !trace && macro.native_interpreter.active_dram != nullptr &&
             result.success && !macro.native_interpreter.read_registers &&
             !macro.native_interpreter.reread_data_ram &&

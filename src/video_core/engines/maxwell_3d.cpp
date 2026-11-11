@@ -1918,18 +1918,23 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             }
             if (!memo_hit) {
                 bool read_memory = false;
+                const bool track_memo = use_memo && !trace && !fs.oot_dump;
                 const u64 code_generation = engine.native_code_generation;
+                engine.native_interpreter.Prepare(engine.native_code, code_generation);
                 const auto result = engine.native_interpreter.Execute(
                     engine.native_code, start, fs.parameters, read,
                     [&](u32 address, u32 value) {
                         if (address == 0x157 || address == 0x158) {
                             read_memory = true;
                         }
-                        if (use_memo && !trace && !fs.oot_dump && !read_memory) {
+                        if (track_memo && !read_memory &&
+                            !engine.native_interpreter.read_registers &&
+                            !engine.native_interpreter.reread_data_ram) {
                             engine.native_writes.emplace_back(address, value);
                         }
                         return emit(address, value);
-                    });
+                    },
+                    track_memo);
                 if (use_memo && !trace && !fs.oot_dump && result.success && !read_memory &&
                     !engine.native_interpreter.read_registers &&
                     !engine.native_interpreter.reread_data_ram &&
@@ -1983,8 +1988,9 @@ std::optional<Maxwell3D::GpuArgumentDraw> Maxwell3D::FrontGpuArgumentDraw(u32 st
     // reads answered with 0). It qualifies only if both runs consume exactly the two parameters
     // and emit exactly draw.begin, vertex_buffer.first = the second, vertex_buffer.count = the
     // first and draw.end, with the same constant begin and end values, reading nothing else.
+    TuringMacroInterpreter sandbox;
+    sandbox.Prepare(engine.native_code, engine.native_code_generation);
     const auto run = [&](u32 count, u32 first) -> std::optional<GpuArgumentDraw> {
-        TuringMacroInterpreter sandbox;
         sandbox.dram = native_data_ram;
         sandbox.active_dram = &sandbox.dram;
         std::vector<u32> parameters{count, first};
@@ -2109,6 +2115,7 @@ bool Maxwell3D::FrontMacroCountsDraw(Core::System& system, VideoCommon::GpuSplit
         }
     }
     TuringMacroInterpreter sandbox;
+    sandbox.Prepare(engine.native_code, engine.native_code_generation);
     const auto run = [&](u32 first, u32 second, std::vector<std::pair<u32, u32>>& writes,
                          std::array<u32, 0xc00>& dram) {
         dram = native_data_ram;
@@ -2126,7 +2133,8 @@ bool Maxwell3D::FrontMacroCountsDraw(Core::System& system, VideoCommon::GpuSplit
             writes.emplace_back(address, value);
             return true;
         };
-        const auto result = sandbox.Execute(engine.native_code, start, parameters, read, emit);
+        const auto result =
+            sandbox.Execute(engine.native_code, start, parameters, read, emit, false);
         return result.success && !reads_memory && parameters.size() == 2;
     };
     constexpr u32 vertex_count = MAXWELL3D_REG_INDEX(vertex_buffer.count);
