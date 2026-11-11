@@ -71,7 +71,9 @@ public:
 private:
     void done(int result) override;
     void changeEvent(QEvent* event) override;
+    void showEvent(QShowEvent* event) override;
     void RetranslateUI();
+    void FitToAvailableScreen();
 
     void HandleApplyButtonClicked();
 
@@ -95,6 +97,7 @@ private:
     std::string initial_nup_title;
     std::vector<u8> pending_nup_icon;
     bool nup_icon_modified{false};
+    bool initial_geometry_clamped{false};
     QFutureWatcher<DetectIconResult> detect_watcher;
     std::shared_ptr<std::atomic_bool> detect_cancel;
 

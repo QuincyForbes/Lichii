@@ -7,6 +7,7 @@
 #pragma once
 
 #include <memory>
+#include <unordered_map>
 #include <vector>
 #include <QDialog>
 #include "configuration/shared_widget.h"
@@ -35,6 +36,7 @@ class ConfigureNetwork;
 class ConfigureUi;
 class ConfigureWeb;
 
+class QScrollArea;
 class HotkeyRegistry;
 
 namespace InputCommon {
@@ -66,7 +68,10 @@ signals:
 
 private:
     void changeEvent(QEvent* event) override;
+    void showEvent(QShowEvent* event) override;
     void RetranslateUI();
+    void FitToAvailableScreen();
+    QWidget* WrapTab(QWidget* tab);
 
     void HandleApplyButtonClicked();
 
@@ -80,6 +85,8 @@ private:
     Core::System& system;
     std::unique_ptr<ConfigurationShared::Builder> builder;
     std::vector<ConfigurationShared::Tab*> tab_group;
+    std::unordered_map<QWidget*, QScrollArea*> tab_scroll_areas;
+    bool initial_geometry_clamped{false};
 
     std::unique_ptr<ConfigureApplets> applets_tab;
     std::unique_ptr<ConfigureAudio> audio_tab;

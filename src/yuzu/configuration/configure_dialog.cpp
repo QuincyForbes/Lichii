@@ -4,7 +4,13 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <memory>
+#include <QFrame>
+#include <QGuiApplication>
+#include <QScreen>
+#include <QScrollArea>
+#include <QShowEvent>
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -66,23 +72,6 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
 
     ui->setupUi(this);
 
-    ui->tabWidget->addTab(applets_tab.get(), tr("Applets"));
-    ui->tabWidget->addTab(audio_tab.get(), tr("Audio"));
-    ui->tabWidget->addTab(cpu_tab.get(), tr("CPU"));
-    ui->tabWidget->addTab(debug_tab_tab.get(), tr("Debug"));
-    ui->tabWidget->addTab(filesystem_tab.get(), tr("Filesystem"));
-    ui->tabWidget->addTab(general_tab.get(), tr("General"));
-    ui->tabWidget->addTab(graphics_tab.get(), tr("Graphics"));
-    ui->tabWidget->addTab(graphics_advanced_tab.get(), tr("GraphicsAdvanced"));
-    ui->tabWidget->addTab(graphics_extensions_tab.get(), tr("GraphicsExtra"));
-    ui->tabWidget->addTab(hotkeys_tab.get(), tr("Hotkeys"));
-    ui->tabWidget->addTab(input_tab.get(), tr("Controls"));
-    ui->tabWidget->addTab(profile_tab.get(), tr("Profiles"));
-    ui->tabWidget->addTab(network_tab.get(), tr("Network"));
-    ui->tabWidget->addTab(system_tab.get(), tr("System"));
-    ui->tabWidget->addTab(ui_tab.get(), tr("Game List"));
-    ui->tabWidget->addTab(web_tab.get(), tr("Web"));
-
     web_tab->SetWebServiceConfigEnabled(enable_web_config);
     hotkeys_tab->Populate(registry);
 
@@ -110,8 +99,8 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
                 &ConfigureDialog::HandleApplyButtonClicked);
     }
 
-    adjustSize();
     ui->selectorList->setCurrentRow(0);
+    FitToAvailableScreen();
 
     // Selects the leftmost button on the bottom bar (Cancel as of writing)
     ui->buttonBox->setFocus();
@@ -148,6 +137,70 @@ void ConfigureDialog::changeEvent(QEvent* event) {
     }
 
     QDialog::changeEvent(event);
+}
+
+void ConfigureDialog::showEvent(QShowEvent* event) {
+    QDialog::showEvent(event);
+    if (!initial_geometry_clamped) {
+        initial_geometry_clamped = true;
+        FitToAvailableScreen();
+    }
+}
+
+void ConfigureDialog::FitToAvailableScreen() {
+    const QScreen* active_screen =
+        parentWidget() && parentWidget()->screen() ? parentWidget()->screen() : screen();
+    if (!active_screen) {
+        active_screen = QGuiApplication::primaryScreen();
+    }
+    if (!active_screen) {
+        return;
+    }
+    const QRect avail = active_screen->availableGeometry();
+    if (!avail.isValid()) {
+        return;
+    }
+    const QRect frame = frameGeometry();
+    const int extra_w = std::max(16, frame.width() - width());
+    const int extra_h = std::max(38, frame.height() - height());
+    const int max_client_w = std::max(minimumWidth(), avail.width() - extra_w - 16);
+    const int max_client_h = std::max(minimumHeight(), avail.height() - extra_h - 16);
+    const QSize desired = size().expandedTo(QSize(840, 720));
+    const int new_w = std::min(desired.width(), max_client_w);
+    const int new_h = std::min(desired.height(), max_client_h);
+    resize(new_w, new_h);
+
+    QPoint target = pos();
+    if (parentWidget() && parentWidget()->window()) {
+        const QRect p = parentWidget()->window()->frameGeometry();
+        target = QPoint(p.center().x() - (new_w + extra_w) / 2,
+                        p.center().y() - (new_h + extra_h) / 2);
+    } else {
+        target = QPoint(avail.center().x() - (new_w + extra_w) / 2,
+                        avail.center().y() - (new_h + extra_h) / 2);
+    }
+    const int max_x = std::max(avail.left(), avail.right() - new_w - extra_w + 1);
+    const int max_y = std::max(avail.top(), avail.bottom() - new_h - extra_h + 1);
+    move(std::clamp(target.x(), avail.left(), max_x),
+         std::clamp(target.y(), avail.top(), max_y));
+}
+
+QWidget* ConfigureDialog::WrapTab(QWidget* tab) {
+    if (!tab) {
+        return nullptr;
+    }
+    if (const auto it = tab_scroll_areas.find(tab); it != tab_scroll_areas.end()) {
+        it->second->setAccessibleName(tab->accessibleName());
+        return it->second;
+    }
+    auto* area = new QScrollArea(this);
+    area->setFrameShape(QFrame::NoFrame);
+    area->setWidgetResizable(true);
+    area->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    area->setAccessibleName(tab->accessibleName());
+    area->setWidget(tab);
+    tab_scroll_areas.emplace(tab, area);
+    return area;
 }
 
 void ConfigureDialog::RetranslateUI() {
@@ -219,6 +272,6 @@ void ConfigureDialog::UpdateVisibleTabs() {
 
     for (auto* const tab : tabs) {
         LOG_DEBUG(Frontend, "{}", tab->accessibleName().toStdString());
-        ui->tabWidget->addTab(tab, tab->accessibleName());
+        ui->tabWidget->addTab(WrapTab(tab), tab->accessibleName());
     }
 }

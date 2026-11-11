@@ -28,6 +28,8 @@
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
+#include <QFrame>
+#include <QGuiApplication>
 #include <QIcon>
 #include <QImage>
 #include <QImageReader>
@@ -38,6 +40,9 @@
 #include <QNetworkRequest>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QScreen>
+#include <QScrollArea>
+#include <QShowEvent>
 #include <QStandardPaths>
 #include <QString>
 #include <QTimer>
@@ -390,16 +395,35 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
 
     ui->setupUi(this);
 
-    ui->tabWidget->addTab(addons_tab.get(), tr("Add-Ons"));
-    ui->tabWidget->addTab(system_tab.get(), tr("System"));
-    ui->tabWidget->addTab(cpu_tab.get(), tr("CPU"));
-    ui->tabWidget->addTab(graphics_tab.get(), tr("Graphics"));
-    ui->tabWidget->addTab(graphics_advanced_tab.get(), tr("Adv. Graphics"));
-    ui->tabWidget->addTab(graphics_extensions_tab.get(), tr("Ext. Graphics"));
-    ui->tabWidget->addTab(audio_tab.get(), tr("Audio"));
-    ui->tabWidget->addTab(input_tab.get(), tr("Input Profiles"));
-    ui->tabWidget->addTab(network_tab.get(), tr("Network"));
-    ui->tabWidget->addTab(applets_tab.get(), tr("Applets"));
+    const auto make_scroll_page = [this](QWidget* page) {
+        auto* area = new QScrollArea(this);
+        area->setFrameShape(QFrame::NoFrame);
+        area->setWidgetResizable(true);
+        area->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        area->setWidget(page);
+        return area;
+    };
+
+    // Let the Info sidebar scroll vertically on high-DPI screens shorter than its full height.
+    auto* info_scroll = new QScrollArea(this);
+    info_scroll->setFrameShape(QFrame::NoFrame);
+    info_scroll->setWidgetResizable(true);
+    info_scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    info_scroll->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Preferred);
+    ui->horizontalLayout->removeWidget(ui->groupBox);
+    info_scroll->setWidget(ui->groupBox);
+    ui->horizontalLayout->insertWidget(0, info_scroll);
+
+    ui->tabWidget->addTab(make_scroll_page(addons_tab.get()), tr("Add-Ons"));
+    ui->tabWidget->addTab(make_scroll_page(system_tab.get()), tr("System"));
+    ui->tabWidget->addTab(make_scroll_page(cpu_tab.get()), tr("CPU"));
+    ui->tabWidget->addTab(make_scroll_page(graphics_tab.get()), tr("Graphics"));
+    ui->tabWidget->addTab(make_scroll_page(graphics_advanced_tab.get()), tr("Adv. Graphics"));
+    ui->tabWidget->addTab(make_scroll_page(graphics_extensions_tab.get()), tr("Ext. Graphics"));
+    ui->tabWidget->addTab(make_scroll_page(audio_tab.get()), tr("Audio"));
+    ui->tabWidget->addTab(make_scroll_page(input_tab.get()), tr("Input Profiles"));
+    ui->tabWidget->addTab(make_scroll_page(network_tab.get()), tr("Network"));
+    ui->tabWidget->addTab(make_scroll_page(applets_tab.get()), tr("Applets"));
 
     setFocusPolicy(Qt::ClickFocus);
     setWindowTitle(tr("Properties"));
@@ -453,6 +477,7 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
     }
 
     LoadConfiguration();
+    FitToAvailableScreen();
 }
 
 ConfigurePerGame::~ConfigurePerGame() {
@@ -497,6 +522,52 @@ void ConfigurePerGame::changeEvent(QEvent* event) {
     }
 
     QDialog::changeEvent(event);
+}
+
+void ConfigurePerGame::showEvent(QShowEvent* event) {
+    QDialog::showEvent(event);
+    if (!initial_geometry_clamped) {
+        initial_geometry_clamped = true;
+        FitToAvailableScreen();
+    }
+}
+
+void ConfigurePerGame::FitToAvailableScreen() {
+    const QScreen* active_screen =
+        parentWidget() && parentWidget()->screen() ? parentWidget()->screen() : screen();
+    if (!active_screen) {
+        active_screen = QGuiApplication::primaryScreen();
+    }
+    if (!active_screen) {
+        return;
+    }
+    const QRect avail = active_screen->availableGeometry();
+    if (!avail.isValid()) {
+        return;
+    }
+    const QRect frame = frameGeometry();
+    const int extra_w = std::max(16, frame.width() - width());
+    const int extra_h = std::max(38, frame.height() - height());
+    const int max_client_w = std::max(minimumWidth(), avail.width() - extra_w - 16);
+    const int max_client_h = std::max(minimumHeight(), avail.height() - extra_h - 16);
+    const QSize desired = size().expandedTo(QSize(920, 680));
+    const int new_w = std::min(desired.width(), max_client_w);
+    const int new_h = std::min(desired.height(), max_client_h);
+    resize(new_w, new_h);
+
+    QPoint target = pos();
+    if (parentWidget() && parentWidget()->window()) {
+        const QRect p = parentWidget()->window()->frameGeometry();
+        target = QPoint(p.center().x() - (new_w + extra_w) / 2,
+                        p.center().y() - (new_h + extra_h) / 2);
+    } else {
+        target = QPoint(avail.center().x() - (new_w + extra_w) / 2,
+                        avail.center().y() - (new_h + extra_h) / 2);
+    }
+    const int max_x = std::max(avail.left(), avail.right() - new_w - extra_w + 1);
+    const int max_y = std::max(avail.top(), avail.bottom() - new_h - extra_h + 1);
+    move(std::clamp(target.x(), avail.left(), max_x),
+         std::clamp(target.y(), avail.top(), max_y));
 }
 
 void ConfigurePerGame::RetranslateUI() {
