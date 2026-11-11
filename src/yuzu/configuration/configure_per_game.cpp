@@ -592,7 +592,9 @@ void ConfigurePerGame::LoadConfiguration() {
         return;
     }
 
-    addons_tab->LoadFromFile(file);
+    // One loader for both tabs.
+    const auto loader = Loader::GetLoader(system, file);
+    addons_tab->LoadFromFile(file, loader.get());
 
     ui->display_title_id->setText(
         QStringLiteral("%1").arg(title_id, 16, 16, QLatin1Char{'0'}).toUpper());
@@ -600,7 +602,6 @@ void ConfigurePerGame::LoadConfiguration() {
     const FileSys::PatchManager pm{title_id, system.GetFileSystemController(),
                                    system.GetContentProvider()};
     const auto control = pm.GetControlMetadata();
-    const auto loader = Loader::GetLoader(system, file);
 
     is_nup_file = loader != nullptr && loader->GetFileType() == Loader::FileType::NUP;
     if (is_nup_file && !ui->buttonBox->button(QDialogButtonBox::Apply)) {

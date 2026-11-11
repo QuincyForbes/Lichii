@@ -182,9 +182,10 @@ void ConfigurePerGameAddons::ApplyConfiguration() {
     Settings::values.disabled_addons[title_id] = disabled_addons;
 }
 
-void ConfigurePerGameAddons::LoadFromFile(FileSys::VirtualFile file_) {
+void ConfigurePerGameAddons::LoadFromFile(FileSys::VirtualFile file_,
+                                          Loader::AppLoader* loader) {
     SetFile(std::move(file_));
-    LoadConfiguration();
+    LoadConfiguration(loader);
 }
 
 void ConfigurePerGameAddons::SetFile(FileSys::VirtualFile file_) {
@@ -374,14 +375,18 @@ void ConfigurePerGameAddons::RetranslateUI() {
     ui->retranslateUi(this);
 }
 
-void ConfigurePerGameAddons::LoadConfiguration() {
+void ConfigurePerGameAddons::LoadConfiguration(Loader::AppLoader* loader) {
     if (file == nullptr) {
         return;
     }
 
     const FileSys::PatchManager pm{title_id, system.GetFileSystemController(),
                                    system.GetContentProvider()};
-    const auto loader = Loader::GetLoader(system, file);
+    std::unique_ptr<Loader::AppLoader> own_loader;
+    if (loader == nullptr) {
+        own_loader = Loader::GetLoader(system, file);
+        loader = own_loader.get();
+    }
 
     FileSys::VirtualFile update_raw;
     loader->ReadUpdateRaw(update_raw);
