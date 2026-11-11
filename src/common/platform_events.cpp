@@ -56,6 +56,10 @@ std::atomic<long long> g_signal_wait_ns{SignalWaitMin};
 std::atomic<long long> g_next_signal_ns{};
 std::atomic<u64> g_signal_available{~u64{0}};
 
+constexpr long long ReactionGap = 2'000'000'000LL;
+std::atomic<long long> g_next_reaction_ns{};
+std::atomic<u32> g_folded_signals{};
+
 std::mutex g_listeners_mutex;
 std::vector<std::pair<std::size_t, std::function<void()>>> g_listeners;
 std::size_t g_next_listener_id = 1;
@@ -66,6 +70,25 @@ std::size_t g_next_pressure_listener_id = 1;
 } // Anonymous namespace
 
 void SignalMemoryPressure() {
+    // iOS sends warnings in bursts (an iPhone: 10 in 2 s, from the UIKit warning and the
+    // dispatch source both), and each started every cache's collection again with nothing new
+    // to free: one reaction per burst.
+    const long long now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+    long long next = g_next_reaction_ns.load(std::memory_order_relaxed);
+    if (now < next ||
+        !g_next_reaction_ns.compare_exchange_strong(next, now + ReactionGap,
+                                                    std::memory_order_relaxed)) {
+        g_folded_signals.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (const u32 folded = g_folded_signals.exchange(0, std::memory_order_relaxed); folded != 0) {
+        LOG_INFO(Common_Memory,
+                 "Memory pressure: {} more signals came within {} s of a reaction and were "
+                 "folded into it",
+                 folded, ReactionGap / 1'000'000'000LL);
+    }
     g_pressure_generation.fetch_add(1, std::memory_order_relaxed);
     std::vector<std::function<void()>> listeners;
     {
