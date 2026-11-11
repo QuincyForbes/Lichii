@@ -29,6 +29,16 @@ EDEN_NX2_FENCE_BATCH=1
 # Drop reactive-flushing read traps on Switch 2 programs (opt-in; can reduce FPS from 29 to 24 in MKW).
 #EDEN_NX2_NO_REACTIVE=1
 
+# Graphics pipelines linked from per-stage shader libraries (VK_EXT_graphics_pipeline_library with
+# fast linking; not on MoltenVK). Off by default; EDEN_NX2_GPL_FAST_LINK=0 links optimized.
+#EDEN_NX2_GPL=1
+
+# With EDEN_NX2_GPL=1 and "Precache shaders before game start": the game's vertex and fragment
+# programs are also prepared (rebuild the precache after setting it). Ocarina of Time: a 1.5 GB
+# file, six more minutes on the first loading screen, 2.3 GB of driver cache; pop-in ends sooner,
+# frame times are the same as with the compute precache alone.
+#EDEN_NX2_GRAPHICS_PRECACHE=1
+
 #EDEN_NX2_MME_JIT=0
 #EDEN_NX2_PBFLUSH=0
 #EDEN_NX2_SKIP_SAME=0

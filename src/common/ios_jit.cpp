@@ -309,6 +309,15 @@ std::size_t PreparedBytes() {
     return g_prepared.load();
 }
 
+std::size_t HandedOutBytes() {
+    std::scoped_lock lock{g_pool_mutex};
+    std::size_t bytes = 0;
+    for (const Region& region : g_pool) {
+        bytes += region.used;
+    }
+    return bytes;
+}
+
 void SetStateCallback(StateCallback callback) {
     g_state_callback = callback;
 }

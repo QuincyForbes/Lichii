@@ -160,6 +160,18 @@ public:
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
+    /// Graphics pipeline libraries (EDEN_NX2_GPL): builds the pre-rasterization and fragment
+    /// shader libraries of the pipeline `key` would make, on the calling thread, with no draw and
+    /// no pipeline kept (for a warm-up). `pools` must be the calling thread's own. False when the
+    /// device has no libraries, the pipeline takes the monolithic route, or a build failed.
+    /// The key may hold a single stage (no partner): a vertex-only key builds just that vertex
+    /// program's pre-rasterization library (vertex SPIR-V does not depend on the fragment
+    /// stage); a fragment-only key builds just the fragment library, emitted as if the partner
+    /// writes every varying (the common variant). The key's state (attribute types, render
+    /// target formats, depth and raster state) is what the libraries are keyed and built with.
+    bool WarmGraphicsLibraries(ShaderPools& pools, const GraphicsPipelineCacheKey& key,
+                               std::span<Shader::Environment* const> envs);
+
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
@@ -234,7 +246,8 @@ private:
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
-        std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr);
+        std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr,
+        bool libraries_only = false);
 
     /// Builds a disk-cached graphics pipeline from the first of its records (newest first) that
     /// loads. When none does, the GPU thread's build of it is stored again.
@@ -272,6 +285,30 @@ private:
     [[nodiscard]] bool VulkanPipelineCacheSaveDue(
         std::chrono::steady_clock::time_point& last) const;
 
+    /// One build of the shader precache: builds a pipeline and destroys it, true when it built.
+    struct PrecacheJob {
+        u64 graphics_hash{}; ///< The cached graphics pipeline it builds, 0 for a compute program
+        Common::UniqueFunction<bool> build;
+    };
+
+    /// Shader precache before the game starts (precache_shaders), on every CPU thread: the cached
+    /// graphics pipelines this boot skipped (`jobs`; `precached` holds those built by earlier
+    /// precaches) and the compute programs of the title's precache file (made from the game files,
+    /// missing reads guessed) are built, then thrown away. They only fill the driver's shader
+    /// cache, so a later build of the same pipeline finds the driver's work done. Reports progress
+    /// through `callback` and returns when it is done, skipped from the loading screen or the load
+    /// is stopped. False when it was skipped or stopped.
+    bool PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
+                         std::unordered_set<u64> precached, std::stop_token stop_loading,
+                         const VideoCore::DiskResourceLoadCallback& callback);
+
+    /// EDEN_NX2_GRAPHICS_PRECACHE with graphics pipeline libraries (EDEN_NX2_GPL): builds each
+    /// vertex and fragment program of the title's graphics precache file as a single-stage library
+    /// and drops it, so the driver's shader cache holds it and a later pipeline with that stage
+    /// costs a link.
+    void PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop_loading,
+                                   const VideoCore::DiskResourceLoadCallback& callback);
+
     const Device& device;
     Scheduler& scheduler;
     DescriptorPool& descriptor_pool;
@@ -291,6 +328,10 @@ private:
     GraphicsPipelineCacheKey graphics_key{};
     u64 vertex_attribute_types{}; ///< graphics_key's attribute types before the programs' mask
     GraphicsPipeline* current_pipeline{};
+
+    /// EDEN_NX2_GPL: shader libraries shared by the graphics pipelines. Declared before the
+    /// pipelines, so it outlives them.
+    GraphicsPipelineLibraryCache graphics_libraries;
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();

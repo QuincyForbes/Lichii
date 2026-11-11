@@ -3446,12 +3446,14 @@ void RasterizerVulkan::TickFrame() {
 void RasterizerVulkan::TickMemoryReport() {
     // After host memory pressure the caches collect for 30 frames: then malloc hands what they
     // freed back to the OS.
+    bool pressured = false;
     if (const u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
         pressure != memory_report_pressure) {
         memory_report_pressure = pressure;
         malloc_relief_frames = 31;
         // And where the footprint went, now.
         memory_report_next = {};
+        pressured = true;
     }
     if (malloc_relief_frames != 0 && --malloc_relief_frames == 0) {
         const u64 released = Common::PlatformEvents::RelieveMallocPressure();
@@ -3496,13 +3498,15 @@ void RasterizerVulkan::TickMemoryReport() {
     const auto [graphics_pipelines, compute_pipelines] = pipeline_cache.PipelineCounts();
     LOG_INFO(Render_Vulkan,
              "Memory: footprint {} MiB (peak {}, internal {}, compressed {}, reusable {}, "
-             "purgeable {}), {} MiB left | guest RAM handed out {} MiB, resident {} MiB, zero "
+             "purgeable {}), {} MiB left, mapped files {} MiB resident (not in the footprint) | "
+             "{} | guest RAM handed out {} MiB, resident {} MiB, zero "
              "pages trimmed {} MiB (last scan) | Vulkan {} | textures {} images {} MiB (collector "
              "{} / {} / {} MiB) | buffers {} MiB | staging stream {} MiB + pooled {} MiB | "
              "pipelines {} graphics, {} compute | ASTC {}, BCn {}",
              process.footprint >> 20, process.footprint_peak >> 20, process.internal >> 20,
              process.compressed >> 20, process.reusable >> 20,
-             process.purgeable_nonvolatile >> 20, available >> 20,
+             process.purgeable_nonvolatile >> 20, available >> 20, process.external >> 20,
+             Common::PlatformEvents::FootprintSplit(process, available),
              Common::HostMemory::ScannedHandedOutBytes() >> 20,
              Common::HostMemory::ScannedResidentBytes() >> 20,
              Common::HostMemory::TrimmedZeroBytes() >> 20, device.MemoryHeapReport(),
@@ -3520,8 +3524,13 @@ void RasterizerVulkan::TickMemoryReport() {
                  (commit.first_net_offset >> 63) != 0 ? "virtual" : "backing",
                  commit.first_net_offset & ~(u64{1} << 63));
     }
-    // Where the Vulkan memory goes, for fitting a game into a limit.
-    if (requested || std::getenv("EDEN_NX2_MEMORY_REPORT") != nullptr) {
+    // Where the Vulkan memory goes, for fitting a game into a limit: on request, and under memory
+    // pressure (which repeats every second while little is left) at most every 10 s.
+    const bool pressure_detail = pressured && now >= memory_detail_next;
+    if (pressure_detail) {
+        memory_detail_next = now + std::chrono::seconds{10};
+    }
+    if (requested || pressure_detail || std::getenv("EDEN_NX2_MEMORY_REPORT") != nullptr) {
         LOG_INFO(Render_Vulkan,
                  "Memory detail: images (host bytes) GPU-written {} MiB, converted {} MiB, "
                  "rescaled {} MiB, other {} MiB, deleted {} MiB, pooled {} MiB | {} | driver "

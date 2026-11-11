@@ -103,6 +103,7 @@ add_executable(tests
     video_core/ampere_tennis_i2f.cpp
     video_core/ampere_tennis_tessellation.cpp
     video_core/pipeline_cache_files.cpp
+    video_core/shader_precache.cpp
     video_core/storage_binding_capacity.cpp
     video_core/native_indirect_reset.cpp
     video_core/native_qmd.cpp
@@ -124,6 +125,7 @@ add_executable(tests
     common/frizti_settings.cpp
     common/fs_iterate.cpp
     common/game_presets.cpp
+    common/guest_chunks.cpp
     common/host_memory.cpp
     common/multi_level_page_table.cpp
     common/page_table.cpp

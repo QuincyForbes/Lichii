@@ -501,6 +501,7 @@ private:
     /// Memory report (iOS, EDEN_NX2_MEMORY_REPORT) and malloc relief after host memory pressure.
     void TickMemoryReport();
     std::chrono::steady_clock::time_point memory_report_next{};
+    std::chrono::steady_clock::time_point memory_detail_next{};
     u32 memory_report_pressure{};
     u32 memory_report_requests{};
     u32 malloc_relief_frames{};

@@ -54,6 +54,8 @@ State GetState();
 std::string GetError();
 /// Bytes of the pool prepared so far (for progress while Acquiring).
 std::size_t PreparedBytes();
+/// Bytes of the pool code blocks have been carved from.
+std::size_t HandedOutBytes();
 
 /// Called on the acquiring thread whenever the state or the prepared bytes change.
 using StateCallback = void (*)();
