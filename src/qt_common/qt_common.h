@@ -59,5 +59,11 @@ const QString tr(const std::string& str);
 
 
 
+/// The OS name and version, e.g. "Windows 11 Version 24H2 (Build 26100.2314)".
+[[nodiscard]] QString PrettyProductName();
+
+/// The version line the log starts with, e.g. "Lichii Development Build | main-d0a4eaa50b".
+[[nodiscard]] std::string BuildVersionString();
+
 std::filesystem::path GetEdenCommand();
 } // namespace QtCommon

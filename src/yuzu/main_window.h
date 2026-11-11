@@ -403,6 +403,8 @@ private slots:
     void OnOpenSDMCFolder();
     void OnOpenModFolder();
     void OnOpenLogFolder();
+    void OnExportLog();
+    void ShowErrorWithExportLog(const QString& title, const QString& text);
     void OnDeleteShaderCache();
     void OnVerifyInstalledContents();
     void OnInstallFirmware();

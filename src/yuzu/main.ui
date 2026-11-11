@@ -232,6 +232,7 @@
     <property name="title">
      <string>&amp;Help</string>
     </property>
+    <addaction name="action_Export_Log"/>
     <addaction name="action_Delete_Shader_Cache"/>
     <addaction name="separator"/>
     <addaction name="action_Report_Compatibility"/>
@@ -626,6 +627,14 @@
    </property>
    <property name="toolTip">
     <string>Delete all saved shader caches after confirmation</string>
+   </property>
+  </action>
+  <action name="action_Export_Log">
+   <property name="text">
+    <string>&amp;Export Log...</string>
+   </property>
+   <property name="toolTip">
+    <string>Save logs, sanitized configs, and system summary into a zip file for bug reports</string>
    </property>
   </action>
  </widget>

@@ -62,6 +62,7 @@
 
 #include "util/clickable_label.h"
 #include "util/controller_navigation.h"
+#include "util/export_log.h"
 #include "util/overlay_dialog.h"
 
 #include "multiplayer/state.h"
@@ -1825,6 +1826,7 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_SDMC_Folder, &MainWindow::OnOpenSDMCFolder);
     connect_menu(ui->action_Mod_Folder, &MainWindow::OnOpenModFolder);
     connect_menu(ui->action_Log_Folder, &MainWindow::OnOpenLogFolder);
+    connect_menu(ui->action_Export_Log, &MainWindow::OnExportLog);
     connect_menu(ui->action_Delete_Shader_Cache, &MainWindow::OnDeleteShaderCache);
 
     connect_menu(ui->action_Verify_installed_contents, &MainWindow::OnVerifyInstalledContents);
@@ -2075,17 +2077,19 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
         switch (result) {
         case Core::SystemResultStatus::ErrorGetLoader:
             LOG_CRITICAL(Frontend, "Failed to obtain loader for {}!", filename.toStdString());
-            QMessageBox::critical(this, tr("Error while loading ROM!"),
-                                  tr("The ROM format is not supported."));
+            ShowErrorWithExportLog(tr("Error while loading ROM!"),
+                                   tr("The ROM format is not supported."));
             break;
         case Core::SystemResultStatus::ErrorVideoCore:
-            QMessageBox::critical(this, tr("An error occurred initializing the video core."),
-                                  tr("This is usually caused by outdated GPU drivers. "
-                                     "Please see the log for more details. See: "
-                                     "<a "
-                                     "href='https://git.eden-emu.dev/eden-emu/eden/src/branch/"
-                                     "master/docs/user/HowToAccessLogs.md'>"
-                                     "How to access log files</a>."));
+            ShowErrorWithExportLog(
+                tr("An error occurred initializing the video core."),
+                tr("This is usually caused by outdated GPU drivers. "
+                   "Please update your graphics driver and try again, or click Export Log... "
+                   "to save a support archive. See: "
+                   "<a "
+                   "href='https://git.eden-emu.dev/eden-emu/eden/src/branch/"
+                   "master/docs/user/HowToAccessLogs.md'>"
+                   "How to access log files</a>."));
             break;
         default:
             if (result > Core::SystemResultStatus::ErrorLoader) {
@@ -2103,11 +2107,12 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
                         .arg(QString::fromStdString(
                             GetResultStatusString(static_cast<Loader::ResultStatus>(error_id))));
 
-                QMessageBox::critical(this, title, description);
+                ShowErrorWithExportLog(title, description);
             } else {
-                QMessageBox::critical(
-                    this, tr("Error while loading ROM!"),
-                    tr("An unknown error occurred. Please see the log for more details."));
+                ShowErrorWithExportLog(
+                    tr("Error while loading ROM!"),
+                    tr("An unknown error occurred. Click Export Log... for troubleshooting "
+                       "details."));
             }
             break;
         }
@@ -2271,8 +2276,9 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
             prepared_romfs = watcher.result();
         } catch (const std::exception& error) {
             LOG_ERROR(Frontend, "Loose RomFS preparation failed: {}", error.what());
-            QMessageBox::critical(this, tr("Unable to prepare game files"),
-                                  tr("Game preparation failed. See the log for details."));
+            ShowErrorWithExportLog(
+                tr("Unable to prepare game files"),
+                tr("Game preparation failed. Click Export Log... to save the log for details."));
             return;
         }
         if (close_pending) {
@@ -4323,6 +4329,24 @@ void MainWindow::OnOpenModFolder() {
 
 void MainWindow::OnOpenLogFolder() {
     QtCommon::Game::OpenLogFolder();
+}
+
+void MainWindow::OnExportLog() {
+    if (!UISettings::values.has_broken_vulkan && std::exchange(vk_records_pending, false)) {
+        VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
+    }
+    ExportLog::Export(this, vk_device_records);
+}
+
+void MainWindow::ShowErrorWithExportLog(const QString& title, const QString& text) {
+    QMessageBox box(QMessageBox::Critical, title, text, QMessageBox::Ok, this);
+    box.setTextFormat(Qt::RichText);
+    QPushButton* export_button = box.addButton(tr("Export Log..."), QMessageBox::ActionRole);
+    box.setDefaultButton(QMessageBox::Ok);
+    box.exec();
+    if (box.clickedButton() == export_button) {
+        OnExportLog();
+    }
 }
 
 void MainWindow::OnDeleteShaderCache() {

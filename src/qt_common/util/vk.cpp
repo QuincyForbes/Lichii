@@ -23,9 +23,10 @@ class QWindow;
 
 namespace VkDeviceInfo {
 Record::Record(std::string_view name_, const std::vector<VkPresentModeKHR>& vsync_modes_,
-               bool has_broken_compute_, VkDriverId driver_id_, bool dlss_capable_)
+               bool has_broken_compute_, VkDriverId driver_id_, bool dlss_capable_,
+               std::string_view driver_version_)
     : name{name_}, vsync_support{vsync_modes_}, has_broken_compute{has_broken_compute_},
-      driver_id{driver_id_}, dlss_capable{dlss_capable_} {}
+      driver_id{driver_id_}, dlss_capable{dlss_capable_}, driver_version{driver_version_} {}
 
 Record::~Record() = default;
 
@@ -86,8 +87,9 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
 
         name = fmt::format("{} ({})", name, driver_string);
 
-        records.push_back(VkDeviceInfo::Record(name, present_modes, has_broken_compute, driverID,
-                                               dlss_capable));
+        records.push_back(VkDeviceInfo::Record(
+            name, present_modes, has_broken_compute, driverID, dlss_capable,
+            static_cast<const char*>(driver_properties.driverInfo)));
     }
 } catch (const Vulkan::vk::Exception& exception) {
     LOG_ERROR(Frontend, "Failed to enumerate devices with error: {}", exception.what());
