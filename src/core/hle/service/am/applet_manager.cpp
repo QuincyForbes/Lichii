@@ -17,6 +17,7 @@
 #include "core/hle/service/am/frontend/applet_software_keyboard_types.h"
 #include "core/hle/service/am/service/storage.h"
 #include "core/hle/service/am/window_system.h"
+#include "core/hle/service/nx2_auto_resolution.h"
 #include "hid_core/hid_types.h"
 #include "core/hle/service/am/process_creation.h"
 
@@ -252,7 +253,7 @@ void AppletManager::RequestExit() {
 // passed on.
 void AppletManager::OperationModeChanged() {
     std::scoped_lock lk{m_lock};
-    const bool docked = Settings::IsDockedMode();
+    const bool docked = Nx2::IsDockedForGame();
     if (!m_window_system || docked == m_docked) {
         return;
     }
@@ -262,12 +263,13 @@ void AppletManager::OperationModeChanged() {
 
 void AppletManager::SetWindowSystem(WindowSystem* window_system) {
     std::unique_lock lk{m_lock};
+    Nx2::SetGameHandheldOverride(false);
 
     m_window_system = window_system;
     if (!m_window_system) {
         return;
     }
-    m_docked = Settings::IsDockedMode();
+    m_docked = Nx2::IsDockedForGame();
 
     m_cv.wait(lk, [&] { return m_pending_process != nullptr; });
 

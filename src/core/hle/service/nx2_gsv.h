@@ -65,6 +65,7 @@
 #include "video_core/host1x/nx2_video_decoder.h"
 #include "video_core/nx2.h"
 #include "video_core/textures/decoders.h"
+#include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
@@ -73,6 +74,7 @@
 #include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
+#include "core/hle/service/nx2_auto_resolution.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/nx2_image_layout.h"
 #include "core/hle/service/nx2_movie_clock.h"
@@ -1770,9 +1772,11 @@ public:
             {358, &INx2Vi2Session::StubReplyZeroed, "Unknown358"},
             {359, &INx2Vi2Session::StubReplyZeroed, "Unknown359"},
         });
+        Nx2::SetGameHandheldOverride(false);
     }
 
     ~INx2Vi2Session() override {
+        Nx2::SetGameHandheldOverride(false);
         // The vsync callback may be running on the HostTiming thread: empty its event list under
         // its lock first (it holds the state, not this session), then close the events.
         {
@@ -1912,6 +1916,7 @@ private:
                 m_stats.frame_us += frame;
                 m_stats.max_frame_us = (std::max)(m_stats.max_frame_us, frame);
                 m_stats.hitches += frame > 100'000 ? 1 : 0;
+                UpdateAutoResolution(to_us(entered.time_since_epoch()), frame, w[12]);
             }
             m_stats.last_present = entered;
             if (++m_stats.presents == 600) {
@@ -1942,6 +1947,57 @@ private:
         u32 presents{}, ran_ahead{};
         std::chrono::steady_clock::time_point last_present{};
     } m_stats{};
+
+    // EDEN_NX2_AUTO_RESOLUTION=1: tells a docked game it is handheld while it runs well below its
+    // frame rate (Nx2::IsDockedForGame), and docked again once it keeps up.
+    void NotifyMaxResolutionChanged() {
+        if (m_max_res_event_slot && *m_max_res_event_slot < m_native_events.size() &&
+            m_native_events[*m_max_res_event_slot] != nullptr) {
+            m_native_events[*m_max_res_event_slot]->Signal(system.Kernel());
+        }
+    }
+
+    void UpdateAutoResolution(long long now_us, long long frame_us, u32 timing) {
+        if (!Nx2::AutoResolutionEnabled() || !Settings::IsDockedMode()) {
+            if (m_auto_resolution.Handheld() || Nx2::GameHandheldOverride()) {
+                m_auto_resolution.Reset();
+                Nx2::SetGameHandheldOverride(false);
+                system.GetAppletManager().OperationModeChanged();
+                NotifyMaxResolutionChanged();
+            }
+            return;
+        }
+        // The game's own rate: its swap interval at the display rate, or the FPS limit if lower.
+        u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
+        constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
+        if (system.GetApplicationProcessProgramID() == OcarinaOfTimeId &&
+            Settings::values.oot_30fps.GetValue()) {
+            swap_interval = (std::max)(swap_interval, 2U);
+        }
+        const u32 refresh =
+            (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
+        long long target_us = 1'000'000LL * swap_interval / refresh;
+        if (const u32 fps_limit = Nx2VsyncRateHz(); fps_limit != 0) {
+            target_us = (std::max)(target_us, 1'000'000LL / fps_limit);
+        }
+        if (Settings::values.use_speed_limit.GetValue() && Settings::SpeedLimit() > 0 &&
+            Settings::SpeedLimit() < 100) {
+            target_us = target_us * 100 / Settings::SpeedLimit();
+        }
+        const auto change = m_auto_resolution.Present(now_us, frame_us, target_us);
+        if (change == Nx2::AutoResolution::Change::None) {
+            return;
+        }
+        const bool handheld = change == Nx2::AutoResolution::Change::ToHandheld;
+        LOG_INFO(Service, "nx2:vi2 automatic resolution: {}: {} (present #{}, target {} us)",
+                 handheld ? "handheld" : "docked", m_auto_resolution.Reason(), m_presents,
+                 target_us);
+        Nx2::SetGameHandheldOverride(handheld);
+        system.GetAppletManager().OperationModeChanged();
+        NotifyMaxResolutionChanged();
+    }
+    Nx2::AutoResolution m_auto_resolution;
+
     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
     u32 m_previous_fence_value{};
     u32 m_frame_fence_relearn_logs{}; // the first 8 frame-fence learn lines
@@ -2310,7 +2366,7 @@ private:
         // into the top-left 1920x1080, the handheld panel's resolution; the console's display
         // scans out only that region. Showing whole images put the frame in a corner inside black
         // margins that scaled with the window (seen on Mario Kart World and Splatoon Raiders).
-        if (!Settings::IsDockedMode()) {
+        if (!Nx2::IsDockedForGame()) {
             crop_width = (std::min)(crop_width, 1920U);
             crop_height = (std::min)(crop_height, 1080U);
         } else if (!has_shown_size &&
@@ -2339,7 +2395,7 @@ private:
             LOG_INFO(Service,
                      "nx2:vi2 composite image {} layout {}x{}, drawn area {:#x}, crop {}x{}, docked={}",
                      image_id, layout.width, layout.height, shown_size, crop_width, crop_height,
-                     Settings::IsDockedMode());
+                     Nx2::IsDockedForGame());
         }
         std::vector<Tegra::FramebufferConfig> layers{Tegra::FramebufferConfig{
             .address = *device,
@@ -2505,7 +2561,8 @@ private:
             result = Result{ErrorModule::VI, 7};
             if (name == DefaultDisplay) {
                 static const char* forced = std::getenv("EDEN_VI2_MAX_RESOLUTION_MODE");
-                mode = forced ? std::strtoull(forced, nullptr, 0) : Settings::IsDockedMode() ? 4 : 2;
+                mode = forced ? std::strtoull(forced, nullptr, 0)
+                              : Nx2::IsDockedForGame() ? 4 : 2;
                 result = ResultSuccess;
             }
         }
@@ -2514,7 +2571,7 @@ private:
         rb.Push(mode);
         LOG_DEBUG(Service_VI,
                   "nx2:vi2 max resolution: name={:#x} docked={} result={:#x} mode={}",
-                  name, Settings::IsDockedMode(), result.raw, mode);
+                  name, Nx2::IsDockedForGame(), result.raw, mode);
     }
 
     // Must be < 8; nn::vi::detail::LayerHistory creates 7 timestamp recorders per layer.
@@ -2591,6 +2648,9 @@ private:
         LOG_INFO(Service, "nx2:vi2 {} native event {} -> change notification", ctx.GetCommand(), index);
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, false);
+            if (ctx.GetCommand() == 269) {
+                m_max_res_event_slot = index;
+            }
             m_native_events[index]->Signal(system.Kernel());
         }
         TipcReplyWords(ctx, {});
@@ -2600,6 +2660,9 @@ private:
     void UnbindNativeEvent(HLERequestContext& ctx) {
         const u32 index = ctx.CommandBuffer()[4];
         LOG_INFO(Service, "nx2:vi2 {} native event {} unbound", ctx.GetCommand(), index);
+        if (ctx.GetCommand() == 270 && m_max_res_event_slot == index) {
+            m_max_res_event_slot.reset();
+        }
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, false);
         }
@@ -2696,6 +2759,7 @@ private:
     std::shared_ptr<Nx2NativeObjects> m_objects;
     std::vector<Kernel::KEvent*> m_events;
     std::array<Kernel::KEvent*, 8> m_native_events{}; ///< 31's slots, also listed in m_events
+    std::optional<u32> m_max_res_event_slot;          ///< 269's bound slot, if any
     // Shared with the vsync timer callback, which can outlive the session by one call.
     struct VsyncState {
         std::mutex mutex;
