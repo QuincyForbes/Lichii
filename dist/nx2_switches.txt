@@ -46,3 +46,11 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_SPLIT_SKIP=1
 #EDEN_NX2_AUTO_STUB=1
 #EDEN_NX2_KEEP_ASTC=1
+
+# --- Memory ---
+# Windows: guest memory is committed as the game allocates it instead of all at start (about
+# 4.5 GiB less commit charge in Ocarina of Time). Set to 0 to commit all of it at start.
+#EDEN_NX2_SEC_RESERVE=0
+
+# Cap the texture cache's device memory (MiB) below what the graphics driver's budget allows.
+#EDEN_NX2_TC_CEILING_MIB=7680
