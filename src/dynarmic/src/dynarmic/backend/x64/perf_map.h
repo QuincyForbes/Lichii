@@ -14,6 +14,10 @@
 
 #include <bit>
 
+#ifdef _WIN32
+#    include "common/nx2_sampler.h"
+#endif
+
 namespace Dynarmic::Backend::X64 {
 
 /// Diagnostic, all hosts. With EDEN_NX2_JIT_MAP=<path> set, every emitted block is appended to
@@ -32,6 +36,15 @@ void PerfMapRegister(T start, const void* end, std::string_view friendly_name) n
     detail::PerfMapRegister(std::bit_cast<const void*>(start), end, friendly_name);
 }
 void PerfMapClear();
+#elif defined(_WIN32)
+// Windows has no perf; the names go to the nx2 sampler instead (common/nx2_sampler.h).
+template<typename T>
+void PerfMapRegister(T start, const void* end, std::string_view friendly_name) noexcept {
+    ::Common::JitSymbols::Register(std::bit_cast<const void*>(start), end, friendly_name);
+}
+inline void PerfMapClear() noexcept {
+    ::Common::JitSymbols::Clear();
+}
 #else
 // Resolve to no-op (compiler thinks fmt has side effects)
 template<typename T> inline void PerfMapRegister(T, const void*, std::string_view) noexcept {}

@@ -3,7 +3,27 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
+#include <string_view>
+
+// Host code ranges of JIT-compiled guest blocks, so the Windows sampler (nx2_sampler) can name
+// the guest code a guest CPU thread runs instead of "(jit)". Dynarmic's perf map feeds it on
+// Windows (on Linux the same names go to perf's /tmp/perf-<pid>.map). Opt-in only via
+// EDEN_NX2_JIT_SYMBOLS=1 so normal JIT block compilation never takes the lock.
+namespace Common::JitSymbols {
+
+bool Enabled() noexcept;
+
+void Register(const void* start, const void* end, std::string_view name) noexcept;
+
+/// Forgets every range (the JIT cleared its code cache).
+void Clear() noexcept;
+
+/// The name of the block holding the host address, if one is registered.
+std::optional<std::string> Lookup(const void* address);
+
+} // namespace Common::JitSymbols
 
 namespace Nx2Sampler {
 

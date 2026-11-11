@@ -3,6 +3,74 @@
 
 #include "common/nx2_sampler.h"
 
+#include <cstdint>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+
+namespace Common::JitSymbols {
+namespace {
+
+struct Range {
+    std::uintptr_t end;
+    std::string name;
+};
+
+std::mutex g_jit_mutex;
+std::map<std::uintptr_t, Range> g_jit_ranges;
+
+} // Anonymous namespace
+
+bool Enabled() noexcept {
+    static const bool enabled = [] {
+        // Opt-in only (Fritchii): EDEN_NX2_DEBUG_SERVER is often set by default, and every JIT
+        // block compile would otherwise take this lock and store a name nobody reads.
+        const char* const value = std::getenv("EDEN_NX2_JIT_SYMBOLS");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+void Register(const void* start, const void* end, std::string_view name) noexcept {
+    if (!Enabled() || start == end) {
+        return;
+    }
+    try {
+        const auto first = reinterpret_cast<std::uintptr_t>(start);
+        std::scoped_lock lock{g_jit_mutex};
+        g_jit_ranges.insert_or_assign(
+            first, Range{reinterpret_cast<std::uintptr_t>(end), std::string{name}});
+    } catch (...) {
+    }
+}
+
+void Clear() noexcept {
+    if (!Enabled()) {
+        return;
+    }
+    std::scoped_lock lock{g_jit_mutex};
+    g_jit_ranges.clear();
+}
+
+std::optional<std::string> Lookup(const void* address) {
+    if (!Enabled()) {
+        return std::nullopt;
+    }
+    const auto value = reinterpret_cast<std::uintptr_t>(address);
+    std::scoped_lock lock{g_jit_mutex};
+    auto it = g_jit_ranges.upper_bound(value);
+    if (it == g_jit_ranges.begin()) {
+        return std::nullopt;
+    }
+    --it;
+    if (value >= it->second.end) {
+        return std::nullopt;
+    }
+    return it->second.name;
+}
+
+} // namespace Common::JitSymbols
+
 #ifdef _WIN32
 
 #include <algorithm>
@@ -239,6 +307,11 @@ struct Symbolizer {
             GetModuleFileNameA(module, path, sizeof(path));
             const char* base = std::strrchr(path, '\\');
             it->second = std::string{base != nullptr ? base + 1 : path} + "!?";
+        } else if (auto block = Common::JitSymbols::Lookup(reinterpret_cast<const void*>(address))) {
+            // JIT code is reused for other blocks after a cache clear: don't keep the name.
+            jit_name = std::move(*block);
+            cache.erase(it);
+            return jit_name;
         } else {
             it->second = "(jit)";
         }
@@ -247,6 +320,7 @@ struct Symbolizer {
 
     SymFromAddrFn from_address{};
     std::unordered_map<DWORD64, std::string> cache;
+    std::string jit_name;
 };
 
 std::string Report(const std::vector<Target>& targets, const std::vector<Sample>& samples,
