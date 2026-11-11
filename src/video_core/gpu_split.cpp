@@ -147,6 +147,8 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     }();
     (void)switches_read;
     ring = std::make_unique<u64[]>(RingWords);
+    EnsurePendingWrites();
+    EnsureDispatchTables();
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
@@ -169,6 +171,9 @@ void GpuSplit::Stop() {
     // wrap at a time and never reached the old write position (the next game's first GPU work
     // never ran, it waited on its syncpoint forever), and the engines it held were freed.
     ring.reset();
+    pending_writes.reset();
+    dispatch_writes.reset();
+    dispatch_written_pages.reset();
     write_position = 0;
     ForgetFencesQuiet();
     last_writer_position = 0;
@@ -188,9 +193,6 @@ void GpuSplit::Stop() {
     dispatches_bounded.store(0, std::memory_order_relaxed);
     for (auto& count : dispatches_unbounded) {
         count.store(0, std::memory_order_relaxed);
-    }
-    for (auto& word : dispatch_written_pages) {
-        word.store(0, std::memory_order_relaxed);
     }
     back_entry_position = 0;
     async_writes.clear();
@@ -340,14 +342,17 @@ bool GpuSplit::WaitForMemoryWriters() {
 }
 
 bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {
+    if (!pending_writes || pending_write_count == 0) {
+        return true;
+    }
     consumed_cache = consumed.load(std::memory_order_acquire);
     const u64 end = begin + size;
-    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    const u64 remembered = (std::min<u64>)(pending_write_count, PendingWriteSlots);
     u64 target = 0;
     u64 scanned = 0;
     for (; scanned < remembered; ++scanned) {
         const PendingWrite& write =
-            pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+            pending_writes[(pending_write_count - 1 - scanned) % PendingWriteSlots];
         if (write.position <= consumed_cache) {
             break;
         }
@@ -355,7 +360,7 @@ bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {
             target = (std::max)(target, write.position);
         }
     }
-    if (scanned == pending_writes.size()) {
+    if (scanned == PendingWriteSlots) {
         return false;
     }
     if (target != 0) {
@@ -365,12 +370,15 @@ bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {
 }
 
 bool GpuSplit::HasQueuedWritesTo(u64 begin, u64 size) {
+    if (!pending_writes || pending_write_count == 0) {
+        return false;
+    }
     consumed_cache = consumed.load(std::memory_order_acquire);
     const u64 end = begin + size;
-    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    const u64 remembered = (std::min<u64>)(pending_write_count, PendingWriteSlots);
     for (u64 scanned = 0; scanned < remembered; ++scanned) {
         const PendingWrite& write =
-            pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+            pending_writes[(pending_write_count - 1 - scanned) % PendingWriteSlots];
         if (write.position <= consumed_cache) {
             return false;
         }
@@ -378,21 +386,24 @@ bool GpuSplit::HasQueuedWritesTo(u64 begin, u64 size) {
             return true;
         }
     }
-    return remembered == pending_writes.size();
+    return remembered == PendingWriteSlots;
 }
 
 bool GpuSplit::OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words) {
     if ((begin & 3) != 0) {
         return false;
     }
+    if (!pending_writes || pending_write_count == 0) {
+        return true;
+    }
     const u64 end = begin + u64{words} * sizeof(u32);
-    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    const u64 remembered = (std::min<u64>)(pending_write_count, PendingWriteSlots);
     // Newest first, back to what the back had consumed before guest memory was read.
     std::array<u32, 64> overlapping;
     u32 found = 0;
     u64 scanned = 0;
     for (; scanned < remembered; ++scanned) {
-        const u64 index = (pending_write_count - 1 - scanned) % pending_writes.size();
+        const u64 index = (pending_write_count - 1 - scanned) % PendingWriteSlots;
         const PendingWrite& write = pending_writes[index];
         if (write.position <= since) {
             break;
@@ -411,12 +422,12 @@ bool GpuSplit::OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words) {
             overlapping[found++] = static_cast<u32>(index);
         }
     }
-    if (scanned == pending_writes.size()) {
+    if (scanned == PendingWriteSlots) {
         static const bool trace = std::getenv("EDEN_NX2_OVERLAY_TRACE") != nullptr;
         static std::atomic<u32> traced{};
         if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 8) {
             LOG_INFO(HW_GPU, "overlay: read {:#x} with over {} queued writes", begin,
-                     pending_writes.size());
+                     PendingWriteSlots);
         }
         return false;
     }
@@ -890,6 +901,10 @@ GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, 
     // the snapshot.
     const u64 end = begin + size;
     const u64 count = dispatch_write_count.load(std::memory_order_acquire);
+    if (!dispatch_writes || count == 0) {
+        checked = count;
+        return DispatchCheck::Miss;
+    }
     const u64 oldest = count - (std::min)(count, DispatchWriteSlots);
     u64 index = count;
     bool reached = false;
@@ -930,8 +945,9 @@ GpuSplit::DispatchStats GpuSplit::GetDispatchStats() const {
 }
 
 void GpuSplit::AppendDispatchWrite(u64 begin, u64 end) {
+    EnsureDispatchTables();
     if (end > begin && !(begin == 0 && end == ~u64{0})) {
-        const u64 last = (std::min<u64>)((end - 1) >> 12, dispatch_written_pages.size() * 64 - 1);
+        const u64 last = (std::min<u64>)((end - 1) >> 12, DispatchWrittenPageWords * 64 - 1);
         for (u64 page = begin >> 12; page <= last;) {
             const u64 first_bit = page % 64;
             const u64 bits = (std::min<u64>)(64 - first_bit, last - page + 1);

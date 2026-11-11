@@ -349,65 +349,37 @@ NvResult nvhost_gpu::AllocateObjectContext(IoctlAllocObjCtx& params) {
     return NvResult::Success;
 }
 
-static boost::container::small_vector<Tegra::CommandHeader, 512> BuildWaitCommandList(
-    NvFence fence) {
-    return {
-        Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointPayload, 1,
-                                  Tegra::SubmissionMode::Increasing),
-        {fence.value},
-        Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointOperation, 1,
-                                  Tegra::SubmissionMode::Increasing),
-        BuildFenceAction(Tegra::Engines::Puller::FenceOperation::Acquire, fence.id),
-    };
-}
-
-static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementCommandList(
-    NvFence fence) {
-    boost::container::small_vector<Tegra::CommandHeader, 512> result{
-        Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointPayload, 1,
-                                  Tegra::SubmissionMode::Increasing),
-        {}};
-
-    for (u32 count = 0; count < 2; ++count) {
-        result.push_back(Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointOperation, 1,
-                                                   Tegra::SubmissionMode::Increasing));
-        result.push_back(
-            BuildFenceAction(Tegra::Engines::Puller::FenceOperation::Increment, fence.id));
-    }
-
-    return result;
+static void AppendWaitCommands(boost::container::small_vector<Tegra::CommandHeader, 512>& out,
+                               NvFence fence) {
+    out.push_back(Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointPayload, 1,
+                                            Tegra::SubmissionMode::Increasing));
+    out.push_back({fence.value});
+    out.push_back(Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointOperation, 1,
+                                            Tegra::SubmissionMode::Increasing));
+    out.push_back(BuildFenceAction(Tegra::Engines::Puller::FenceOperation::Acquire, fence.id));
 }
 
 // Switch 2 pushbuffers signal completion with semaphore releases, never host1x syncpoint methods,
 // but the driver still has the kernel raise the syncpoint max by the submission's increment value
 // and then waits for that value. Append the increments after its commands.
-static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementCountCommandList(
-    NvFence fence, u32 count) {
-    boost::container::small_vector<Tegra::CommandHeader, 512> result{
-        Tegra::BuildCommandHeader(Tegra::BufferMethods::WaitForIdle, 1,
-                                  Tegra::SubmissionMode::Increasing),
-        {},
-        Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointPayload, 1,
-                                  Tegra::SubmissionMode::Increasing),
-        {}};
+static void AppendIncrementCountCommands(
+    boost::container::small_vector<Tegra::CommandHeader, 512>& out, NvFence fence, u32 count,
+    bool with_wfi) {
+    out.reserve(out.size() + (with_wfi ? 4U : 2U) + count * 2U);
+    if (with_wfi) {
+        out.push_back(Tegra::BuildCommandHeader(Tegra::BufferMethods::WaitForIdle, 1,
+                                                Tegra::SubmissionMode::Increasing));
+        out.push_back({});
+    }
+    out.push_back(Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointPayload, 1,
+                                            Tegra::SubmissionMode::Increasing));
+    out.push_back({});
     for (u32 i = 0; i < count; ++i) {
-        result.push_back(Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointOperation, 1,
-                                                   Tegra::SubmissionMode::Increasing));
-        result.push_back(
+        out.push_back(Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointOperation, 1,
+                                                Tegra::SubmissionMode::Increasing));
+        out.push_back(
             BuildFenceAction(Tegra::Engines::Puller::FenceOperation::Increment, fence.id));
     }
-    return result;
-}
-
-static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementWithWfiCommandList(
-    NvFence fence) {
-    boost::container::small_vector<Tegra::CommandHeader, 512> result{
-        Tegra::BuildCommandHeader(Tegra::BufferMethods::WaitForIdle, 1,
-                                  Tegra::SubmissionMode::Increasing),
-        {}};
-    auto increment_list{BuildIncrementCommandList(fence)};
-    result.insert(result.end(), increment_list.begin(), increment_list.end());
-    return result;
 }
 
 NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandList&& entries) {
@@ -449,7 +421,8 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             const char* value = std::getenv("EDEN_NX2_PB_SNAPSHOT");
             return value == nullptr || value[0] != '0';
         }();
-        if (snapshot && channel_state->memory_manager && channel_state->payload) {
+        if (snapshot && !entries.command_lists.empty() && channel_state->memory_manager &&
+            channel_state->payload) {
             // Before the copy: a suspension during it must count as one after it.
             entries.snapshot_suspensions =
                 channel_state->payload->dma_pusher.suspensions.load(std::memory_order_acquire);
@@ -457,59 +430,94 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             for (const auto& entry : entries.command_lists) {
                 words += entry.size;
             }
-            entries.submitted_words.resize(words);
-            entries.submitted_offsets.reserve(entries.command_lists.size());
-            size_t offset = 0;
-            for (u32 i = 0; i < entries.command_lists.size(); ++i) {
-                const auto& entry = entries.command_lists[i];
-                entries.submitted_offsets.push_back(static_cast<u32>(offset));
-                // GMMU maps run on the GPU thread (GPU::MapInOrder): an entry on addresses a
-                // queued map changes would copy as zeros (Pokopia's first lists). DmaPusher::Push
-                // copies it after the map instead.
-                const u64 bytes = static_cast<u64>(entry.size) * sizeof(u32);
-                if (system.GPU().IsMapPending(entry.addr, bytes)) {
-                    entries.deferred_entries.push_back(i);
-                } else {
-                    channel_state->memory_manager->ReadBlockUnsafe(
-                        entry.addr, entries.submitted_words.data() + offset,
-                        entry.size * sizeof(u32));
+            if (words > 0) {
+                entries.submitted_words.reserve(words);
+                entries.submitted_offsets.reserve(entries.command_lists.size());
+                size_t offset = 0;
+                for (u32 i = 0; i < entries.command_lists.size(); ++i) {
+                    const auto& entry = entries.command_lists[i];
+                    entries.submitted_offsets.push_back(static_cast<u32>(offset));
+                    // GMMU maps run on the GPU thread (GPU::MapInOrder): an entry on addresses a
+                    // queued map changes would copy as zeros (Pokopia's first lists).
+                    // DmaPusher::Push copies it after the map instead.
+                    const u64 bytes = static_cast<u64>(entry.size) * sizeof(u32);
+                    if (entry.size == 0) {
+                        continue;
+                    }
+                    if (system.GPU().IsMapPending(entry.addr, bytes)) {
+                        entries.deferred_entries.push_back(i);
+                        entries.submitted_words.resize(offset + entry.size);
+                    } else if ((entry.addr & Core::Memory::YUZU_PAGEMASK) + bytes <=
+                               Core::Memory::YUZU_PAGESIZE) {
+                        if (const u8* const host =
+                                channel_state->memory_manager->GetPointer(entry.addr)) {
+                            const auto* const src =
+                                reinterpret_cast<const Tegra::CommandHeader*>(host);
+                            entries.submitted_words.insert(entries.submitted_words.end(), src,
+                                                           src + entry.size);
+                        } else {
+                            entries.submitted_words.resize(offset + entry.size);
+                            channel_state->memory_manager->ReadBlockUnsafe(
+                                entry.addr, entries.submitted_words.data() + offset, bytes);
+                        }
+                    } else {
+                        entries.submitted_words.resize(offset + entry.size);
+                        channel_state->memory_manager->ReadBlockUnsafe(
+                            entry.addr, entries.submitted_words.data() + offset, bytes);
+                    }
+                    offset += entry.size;
                 }
-                offset += entry.size;
             }
         }
     }
 
     auto& flags = params.flags;
 
+    boost::container::small_vector<Tegra::CommandHeader, 512> wait_cmds;
     if (flags.fence_wait.Value()) {
         if (flags.increment_value.Value()) {
             return NvResult::BadParameter;
         }
 
         if (!syncpoint_manager.IsFenceSignalled(params.fence)) {
-            gpu.PushGPUEntries(bind_id, Tegra::CommandList{BuildWaitCommandList(params.fence)});
+            AppendWaitCommands(wait_cmds, params.fence);
         }
     }
 
     params.fence.id = channel_syncpoint;
 
-    u32 increment{(flags.fence_increment.Value() != 0 ? 2 : 0) +
-                  (flags.increment_value.Value() != 0 ? params.fence.value : 0)};
+    const u32 increment{(flags.fence_increment.Value() != 0 ? 2 : 0) +
+                        (flags.increment_value.Value() != 0 ? params.fence.value : 0)};
     params.fence.value = syncpoint_manager.IncrementSyncpointMaxExt(channel_syncpoint, increment);
-    gpu.PushGPUEntries(bind_id, std::move(entries));
 
-    if (g_nx2_driver && !flags.fence_increment.Value() && increment > 0) {
-        gpu.PushGPUEntries(bind_id,
-                           Tegra::CommandList{BuildIncrementCountCommandList(params.fence, increment)});
-    }
+    if (entries.command_lists.empty()) {
+        // Fence-only submission: coalesce wait + increment into one prefetch command list instead
+        // of up to three separate queue submissions.
+        entries.prefetch_command_list = std::move(wait_cmds);
+        if (g_nx2_driver && !flags.fence_increment.Value() && increment > 0) {
+            AppendIncrementCountCommands(entries.prefetch_command_list, params.fence, increment,
+                                         true);
+        }
+        if (flags.fence_increment.Value()) {
+            AppendIncrementCountCommands(entries.prefetch_command_list, params.fence, 2,
+                                         !flags.suppress_wfi.Value());
+        }
+        gpu.PushGPUEntries(bind_id, std::move(entries));
+    } else {
+        if (!wait_cmds.empty()) {
+            gpu.PushGPUEntries(bind_id, Tegra::CommandList{std::move(wait_cmds)});
+        }
+        gpu.PushGPUEntries(bind_id, std::move(entries));
 
-    if (flags.fence_increment.Value()) {
-        if (flags.suppress_wfi.Value()) {
-            gpu.PushGPUEntries(bind_id,
-                               Tegra::CommandList{BuildIncrementCommandList(params.fence)});
-        } else {
-            gpu.PushGPUEntries(bind_id,
-                               Tegra::CommandList{BuildIncrementWithWfiCommandList(params.fence)});
+        boost::container::small_vector<Tegra::CommandHeader, 512> inc_cmds;
+        if (g_nx2_driver && !flags.fence_increment.Value() && increment > 0) {
+            AppendIncrementCountCommands(inc_cmds, params.fence, increment, true);
+        }
+        if (flags.fence_increment.Value()) {
+            AppendIncrementCountCommands(inc_cmds, params.fence, 2, !flags.suppress_wfi.Value());
+        }
+        if (!inc_cmds.empty()) {
+            gpu.PushGPUEntries(bind_id, Tegra::CommandList{std::move(inc_cmds)});
         }
     }
 
@@ -586,13 +594,13 @@ NvResult nvhost_gpu::SubmitGPFIFOBase1(IoctlSubmitGpfifo& params,
         return NvResult::InvalidSize;
     }
 
-    Tegra::CommandList entries(params.num_entries);
+    Tegra::CommandList entries;
     if (kickoff) {
+        entries.command_lists.resize(params.num_entries);
         this->GetSessionMemory(fd).ReadBlock(params.address, entries.command_lists.data(),
                                              params.num_entries * sizeof(Tegra::CommandListHeader));
     } else {
-        std::memcpy(entries.command_lists.data(), commands.data(),
-                    params.num_entries * sizeof(Tegra::CommandListHeader));
+        entries.command_lists.assign(commands.begin(), commands.begin() + params.num_entries);
     }
 
     return SubmitGPFIFOImpl(params, std::move(entries));
@@ -605,9 +613,8 @@ NvResult nvhost_gpu::SubmitGPFIFOBase2(IoctlSubmitGpfifo& params,
         return NvResult::InvalidSize;
     }
 
-    Tegra::CommandList entries(params.num_entries);
-    std::memcpy(entries.command_lists.data(), commands.data(),
-                params.num_entries * sizeof(Tegra::CommandListHeader));
+    Tegra::CommandList entries;
+    entries.command_lists.assign(commands.begin(), commands.begin() + params.num_entries);
     return SubmitGPFIFOImpl(params, std::move(entries));
 }
 

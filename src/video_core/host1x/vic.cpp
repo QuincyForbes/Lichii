@@ -10,6 +10,8 @@
 
 #if defined(ARCHITECTURE_x86_64)
 #include <immintrin.h>
+#elif defined(ARCHITECTURE_arm64)
+#include <arm_neon.h>
 #endif
 
 extern "C" {
@@ -344,6 +346,55 @@ void Vic::ReadProgressiveY8__V8U8_N420(const SlotStruct& slot, std::span<const P
 #endif
     } else {
         auto const alpha = u16(slot.config.planar_alpha.Value());
+#if defined(ARCHITECTURE_arm64)
+        const uint16x8_t v_alpha = vdupq_n_u16(alpha);
+        for (size_t y = 0; y < size_t(in_luma_height); y++) {
+            auto const src_luma = y * in_luma_stride;
+            auto const src_chroma = (y / 2) * in_chroma_stride;
+            auto const dst = y * out_luma_stride;
+            size_t x = 0;
+            for (; x + 16 <= size_t(in_luma_width); x += 16) {
+                const uint8x8_t luma0 = vld1_u8(&luma_buffer[src_luma + x]);
+                const uint8x8_t luma1 = vld1_u8(&luma_buffer[src_luma + x + 8]);
+                uint8x8_t u0;
+                uint8x8_t v0;
+                if (planar) {
+                    u0 = vld1_u8(&chroma_u_buffer[src_chroma + x / 2]);
+                    v0 = vld1_u8(&chroma_v_buffer[src_chroma + x / 2]);
+                } else {
+                    const uint8x8x2_t uv = vld2_u8(&chroma_u_buffer[src_chroma + x]);
+                    u0 = uv.val[0];
+                    v0 = uv.val[1];
+                }
+                const uint8x8x2_t u_dup = vzip_u8(u0, u0);
+                const uint8x8x2_t v_dup = vzip_u8(v0, v0);
+                uint16x8x4_t px0;
+                px0.val[0] = vshll_n_u8(luma0, 2);
+                px0.val[1] = vshll_n_u8(u_dup.val[0], 2);
+                px0.val[2] = vshll_n_u8(v_dup.val[0], 2);
+                px0.val[3] = v_alpha;
+                vst4q_u16(reinterpret_cast<u16*>(&slot_surface[dst + x]), px0);
+
+                uint16x8x4_t px1;
+                px1.val[0] = vshll_n_u8(luma1, 2);
+                px1.val[1] = vshll_n_u8(u_dup.val[1], 2);
+                px1.val[2] = vshll_n_u8(v_dup.val[1], 2);
+                px1.val[3] = v_alpha;
+                vst4q_u16(reinterpret_cast<u16*>(&slot_surface[dst + x + 8]), px1);
+            }
+            for (; x < size_t(in_luma_width); x++) {
+                slot_surface[dst + x].r = u16(luma_buffer[src_luma + x] << 2);
+                if (planar) {
+                    slot_surface[dst + x].g = u16(chroma_u_buffer[src_chroma + x / 2] << 2);
+                    slot_surface[dst + x].b = u16(chroma_v_buffer[src_chroma + x / 2] << 2);
+                } else {
+                    slot_surface[dst + x].g = u16(chroma_u_buffer[src_chroma + (x & ~1) + 0] << 2);
+                    slot_surface[dst + x].b = u16(chroma_u_buffer[src_chroma + (x & ~1) + 1] << 2);
+                }
+                slot_surface[dst + x].a = alpha;
+            }
+        }
+#else
         for (size_t y = 0; y < size_t(in_luma_height); y++) {
             auto const src_luma = y * in_luma_stride;
             auto const src_chroma = (y / 2) * in_chroma_stride;
@@ -361,6 +412,7 @@ void Vic::ReadProgressiveY8__V8U8_N420(const SlotStruct& slot, std::span<const P
                 slot_surface[dst + x].a = alpha;
             }
         }
+#endif
     }
 }
 
@@ -671,7 +723,43 @@ void Vic::Blend(const ConfigStruct& config, const SlotStruct& slot, VideoPixelFo
             for (u32 y = source_top; y < source_bottom; y++) {
                 const auto src{y * in_surface_width + source_left};
                 const auto dst{y * out_surface_width + rect_left};
-                for (u32 x = source_left; x < source_right; x++) {
+                u32 x = source_left;
+#if defined(ARCHITECTURE_arm64)
+                const int32x4_t v_shift = vdupq_n_s32(-shift);
+                const int32x4_t v_r0c3 = vdupq_n_s32(r0c3);
+                const int32x4_t v_r1c3 = vdupq_n_s32(r1c3);
+                const int32x4_t v_r2c3 = vdupq_n_s32(r2c3);
+                const int32x4_t v_clamp_min = vdupq_n_s32(clamp_min);
+                const int32x4_t v_clamp_max = vdupq_n_s32(clamp_max);
+                for (; x + 4 <= source_right; x += 4) {
+                    const uint16x4x4_t in_px =
+                        vld4_u16(reinterpret_cast<const u16*>(&slot_surface[src + x]));
+                    const int32x4_t ir = vreinterpretq_s32_u32(vmovl_u16(in_px.val[0]));
+                    const int32x4_t ig = vreinterpretq_s32_u32(vmovl_u16(in_px.val[1]));
+                    const int32x4_t ib = vreinterpretq_s32_u32(vmovl_u16(in_px.val[2]));
+                    const int32x4_t ia = vreinterpretq_s32_u32(vmovl_u16(in_px.val[3]));
+
+                    int32x4_t r = vmlaq_n_s32(vmlaq_n_s32(vmulq_n_s32(ir, r0c0), ig, r0c1), ib, r0c2);
+                    int32x4_t g = vmlaq_n_s32(vmlaq_n_s32(vmulq_n_s32(ir, r1c0), ig, r1c1), ib, r1c2);
+                    int32x4_t b = vmlaq_n_s32(vmlaq_n_s32(vmulq_n_s32(ir, r2c0), ig, r2c1), ib, r2c2);
+                    r = vshrq_n_s32(vaddq_s32(vshlq_s32(r, v_shift), v_r0c3), 8);
+                    g = vshrq_n_s32(vaddq_s32(vshlq_s32(g, v_shift), v_r1c3), 8);
+                    b = vshrq_n_s32(vaddq_s32(vshlq_s32(b, v_shift), v_r2c3), 8);
+
+                    r = vminq_s32(vmaxq_s32(r, v_clamp_min), v_clamp_max);
+                    g = vminq_s32(vmaxq_s32(g, v_clamp_min), v_clamp_max);
+                    b = vminq_s32(vmaxq_s32(b, v_clamp_min), v_clamp_max);
+                    const int32x4_t a = vminq_s32(vmaxq_s32(ia, v_clamp_min), v_clamp_max);
+
+                    uint16x4x4_t out_px;
+                    out_px.val[0] = vmovn_u32(vreinterpretq_u32_s32(r));
+                    out_px.val[1] = vmovn_u32(vreinterpretq_u32_s32(g));
+                    out_px.val[2] = vmovn_u32(vreinterpretq_u32_s32(b));
+                    out_px.val[3] = vmovn_u32(vreinterpretq_u32_s32(a));
+                    vst4_u16(reinterpret_cast<u16*>(&output_surface[dst + x]), out_px);
+                }
+#endif
+                for (; x < source_right; x++) {
                     auto [r, g, b, a] = MatMul(slot_surface[src + x]);
                     r = std::clamp(r, clamp_min, clamp_max);
                     g = std::clamp(g, clamp_min, clamp_max);
@@ -856,7 +944,27 @@ void Vic::WriteY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config) n
                 auto const dst_luma = y * out_luma_stride;
                 auto const src_chroma = y * surface_stride;
                 auto const dst_chroma = (y / 2) * out_chroma_stride;
-                for (size_t x = 0; x < surface_width; x += 2) {
+                size_t x = 0;
+#if defined(ARCHITECTURE_arm64)
+                for (; x + 16 <= surface_width; x += 16) {
+                    const uint16x8x4_t p0 =
+                        vld4q_u16(reinterpret_cast<const u16*>(&output_surface[src_luma + x]));
+                    const uint16x8x4_t p1 =
+                        vld4q_u16(reinterpret_cast<const u16*>(&output_surface[src_luma + x + 8]));
+                    const uint8x16_t luma =
+                        vcombine_u8(vqshrn_n_u16(p0.val[0], 2), vqshrn_n_u16(p1.val[0], 2));
+                    vst1q_u8(&out_luma[dst_luma + x], luma);
+                    if (y % 2 == 0) {
+                        const uint16x8_t g_even = vuzp1q_u16(p0.val[1], p1.val[1]);
+                        const uint16x8_t b_even = vuzp1q_u16(p0.val[2], p1.val[2]);
+                        uint8x8x2_t uv;
+                        uv.val[0] = vqshrn_n_u16(g_even, 2);
+                        uv.val[1] = vqshrn_n_u16(b_even, 2);
+                        vst2_u8(&out_chroma[dst_chroma + x], uv);
+                    }
+                }
+#endif
+                for (; x < surface_width; x += 2) {
                     out_luma[dst_luma + x + 0] = u8(output_surface[src_luma + x + 0].r >> 2);
                     out_luma[dst_luma + x + 1] = u8(output_surface[src_luma + x + 1].r >> 2);
                     out_chroma[dst_chroma + x + 0] = u8(output_surface[src_chroma + x].g >> 2);
@@ -886,14 +994,29 @@ void Vic::WriteY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config) n
         chroma_scratch.resize_destructive(out_chroma_size);
         Decode(luma_scratch.data(), chroma_scratch.data());
 
-        Tegra::Memory::GpuGuestMemoryScoped<u8, Core::Memory::GuestMemoryFlags::SafeWrite> out_luma(host1x.gmmu_manager, regs.output_surface.luma.Address(), out_luma_swizzle_size, &swizzle_scratch);
-        Tegra::Memory::GpuGuestMemoryScoped<u8, Core::Memory::GuestMemoryFlags::SafeWrite> out_chroma(host1x.gmmu_manager, regs.output_surface.chroma_u.Address(), out_chroma_swizzle_size, &swizzle_scratch);
-        if (block_height == 1) {
-            SwizzleSurface(out_luma, out_luma_stride, luma_scratch, out_luma_stride, out_luma_height);
-            SwizzleSurface(out_chroma, out_chroma_stride, chroma_scratch, out_chroma_stride, out_chroma_height);
-        } else {
-            Texture::SwizzleTexture(out_luma, luma_scratch, BytesPerPixel, out_luma_width, out_luma_height, 1, block_height, 0, 1);
-            Texture::SwizzleTexture(out_chroma, chroma_scratch, BytesPerPixel, out_chroma_width, out_chroma_height, 1, block_height, 0, 1);
+        {
+            Tegra::Memory::GpuGuestMemoryScoped<u8, Core::Memory::GuestMemoryFlags::SafeWrite>
+                out_luma(host1x.gmmu_manager, regs.output_surface.luma.Address(),
+                         out_luma_swizzle_size, &swizzle_scratch);
+            if (block_height == 1) {
+                SwizzleSurface(out_luma, out_luma_stride, luma_scratch, out_luma_stride,
+                               out_luma_height);
+            } else {
+                Texture::SwizzleTexture(out_luma, luma_scratch, BytesPerPixel, out_luma_width,
+                                        out_luma_height, 1, block_height, 0, 1);
+            }
+        }
+        {
+            Tegra::Memory::GpuGuestMemoryScoped<u8, Core::Memory::GuestMemoryFlags::SafeWrite>
+                out_chroma(host1x.gmmu_manager, regs.output_surface.chroma_u.Address(),
+                           out_chroma_swizzle_size, &swizzle_scratch);
+            if (block_height == 1) {
+                SwizzleSurface(out_chroma, out_chroma_stride, chroma_scratch, out_chroma_stride,
+                               out_chroma_height);
+            } else {
+                Texture::SwizzleTexture(out_chroma, chroma_scratch, BytesPerPixel, out_chroma_width,
+                                        out_chroma_height, 1, block_height, 0, 1);
+            }
         }
     } break;
     case BlkKind::Pitch: {
@@ -1021,7 +1144,27 @@ void Vic::WriteABGR(const OutputSurfaceConfig& output_surface_config, VideoPixel
         } else {
             for (size_t y = 0; y < surface_height; ++y) {
                 auto const src = y * surface_stride, dst = y * out_luma_stride;
-                for (size_t x = 0; x < surface_width; ++x) {
+                size_t x = 0;
+#if defined(ARCHITECTURE_arm64)
+                for (; x + 8 <= surface_width; x += 8) {
+                    const uint16x8x4_t p =
+                        vld4q_u16(reinterpret_cast<const u16*>(&inp[src + x]));
+                    uint8x8x4_t rgba;
+                    if (format == VideoPixelFormat::A8R8G8B8) {
+                        rgba.val[0] = vqshrn_n_u16(p.val[2], 2);
+                        rgba.val[1] = vqshrn_n_u16(p.val[1], 2);
+                        rgba.val[2] = vqshrn_n_u16(p.val[0], 2);
+                        rgba.val[3] = vqshrn_n_u16(p.val[3], 2);
+                    } else {
+                        rgba.val[0] = vqshrn_n_u16(p.val[0], 2);
+                        rgba.val[1] = vqshrn_n_u16(p.val[1], 2);
+                        rgba.val[2] = vqshrn_n_u16(p.val[2], 2);
+                        rgba.val[3] = vqshrn_n_u16(p.val[3], 2);
+                    }
+                    vst4_u8(&out[dst + x * 4], rgba);
+                }
+#endif
+                for (; x < surface_width; ++x) {
                     if(format == VideoPixelFormat::A8R8G8B8) {
                         out[dst + x * 4 + 0] = u8(inp[src + x].b >> 2);
                         out[dst + x * 4 + 1] = u8(inp[src + x].g >> 2);

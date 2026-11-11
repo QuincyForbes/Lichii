@@ -45,6 +45,8 @@ private:
     std::mutex scheduling_guard;
     std::vector<std::shared_ptr<ChannelState>> pending_channels; ///< Suspended on an acquire
     std::atomic<bool> any_pending{};
+    const GPU* bound_gpu{};
+    s32 bound_channel{-1};
 };
 
 } // namespace Control

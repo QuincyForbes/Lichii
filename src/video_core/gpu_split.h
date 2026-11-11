@@ -453,8 +453,11 @@ public:
         }
         const u64 first = begin >> 12;
         const u64 last = (begin + size - 1) >> 12;
-        if (last < first || last >= dispatch_written_pages.size() * 64) {
+        if (last < first || last >= DispatchWrittenPageWords * 64) {
             return true;
+        }
+        if (!dispatch_written_pages) {
+            return false;
         }
         for (u64 page = first; page <= last; ++page) {
             if ((dispatch_written_pages[page / 64].load(std::memory_order_relaxed) >>
@@ -606,7 +609,7 @@ public:
             }
             page_writes->count = dst;
         }
-        if (last_memory_writer_position <= cutoff) {
+        if (last_memory_writer_position <= cutoff || !pending_writes) {
             if (checked_writes != nullptr) {
                 *checked_writes = pending_write_count;
             }
@@ -617,12 +620,12 @@ public:
             return overlapped;
         }
         const u64 to_scan = pending_write_count - from;
-        const u64 limit = (std::min<u64>)(to_scan, pending_writes.size());
+        const u64 limit = (std::min<u64>)(to_scan, PendingWriteSlots);
         u64 next_checked = pending_write_count;
-        bool reached = to_scan <= pending_writes.size();
+        bool reached = to_scan <= PendingWriteSlots;
         for (u64 scanned = 0; scanned < limit; ++scanned) {
             const u64 index = pending_write_count - 1 - scanned;
-            const PendingWrite& write = pending_writes[index % pending_writes.size()];
+            const PendingWrite& write = pending_writes[index % PendingWriteSlots];
             if (write.position <= cutoff) {
                 reached = true;
                 break;
@@ -656,7 +659,8 @@ public:
     /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
     /// report, a semaphore release). size ~0 means an unknown range.
     void NoteMemoryWrite(u64 begin, u64 size, const char* what = "unknown") {
-        PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
+        EnsurePendingWrites();
+        PendingWrite& write = pending_writes[pending_write_count++ % PendingWriteSlots];
         write.what = what;
         write.begin = begin;
         write.end = size == ~u64{0} ? ~u64{0} : begin + size;
@@ -666,9 +670,12 @@ public:
     /// As NoteMemoryWrite, for a write whose words the front knows (a fence release payload,
     /// linear inline upload data): reads overlay them instead of waiting.
     void NoteMemoryWriteData(u64 begin, const u32* data, u32 words) {
+        if (words != 0) {
+            EnsurePendingWrites();
+        }
         while (words != 0) {
             const u32 count = (std::min<u32>)(words, PendingWriteWords);
-            PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
+            PendingWrite& write = pending_writes[pending_write_count++ % PendingWriteSlots];
             write.what = "known";
             write.begin = begin;
             write.end = begin + u64{count} * sizeof(u32);
@@ -936,15 +943,16 @@ private:
     u64 last_memory_writer_position{};
     u64 last_unranged_position{};
     static constexpr u32 PendingWriteWords = 8;
+    static constexpr size_t PendingWriteSlots = 8192;
     struct PendingWrite {
-        u64 begin;
-        u64 end;
-        u64 position;
-        u32 words; ///< Known words from begin, or 0 (unknown contents)
-        const char* what;
-        std::array<u32, PendingWriteWords> data;
+        u64 begin{};
+        u64 end{};
+        u64 position{};
+        u32 words{}; ///< Known words from begin, or 0 (unknown contents)
+        const char* what{};
+        std::array<u32, PendingWriteWords> data{};
     };
-    std::array<PendingWrite, 8192> pending_writes{};
+    std::unique_ptr<PendingWrite[]> pending_writes;
     u64 pending_write_count{};
     /// Compute and copy writes with a known device range (NoteWriterRange), newest last.
     struct WriterRange {
@@ -978,19 +986,33 @@ private:
     /// Dispatch writes the back recorded (begin, end; 0, ~0 for anything) with the position of
     /// the entry that ran them, newest last; written by the back, read by the front.
     struct DispatchWrite {
-        std::atomic<u64> position;
-        std::atomic<u64> begin;
-        std::atomic<u64> end;
+        std::atomic<u64> position{};
+        std::atomic<u64> begin{};
+        std::atomic<u64> end{};
     };
     static constexpr u64 DispatchWriteSlots = 8192;
     static constexpr u64 MaxDispatchScan = 2048;
-    std::array<DispatchWrite, DispatchWriteSlots> dispatch_writes{};
-    std::array<std::atomic<u64>, (u64{1} << (36 - 12)) / 64> dispatch_written_pages{};
+    static constexpr size_t DispatchWrittenPageWords = (size_t{1} << (36 - 12)) / 64;
+    std::unique_ptr<DispatchWrite[]> dispatch_writes;
+    std::unique_ptr<std::atomic<u64>[]> dispatch_written_pages;
     alignas(64) std::atomic<u64> dispatch_write_count{};
     std::atomic<u64> last_unbounded_dispatch_position{};
     std::atomic<u64> dispatches_bounded{};
     std::array<std::atomic<u64>, static_cast<size_t>(DispatchUnbounded::Count)>
         dispatches_unbounded{};
+    void EnsurePendingWrites() {
+        if (!pending_writes) [[unlikely]] {
+            pending_writes = std::make_unique<PendingWrite[]>(PendingWriteSlots);
+        }
+    }
+    void EnsureDispatchTables() {
+        if (!dispatch_writes) [[unlikely]] {
+            dispatch_writes = std::make_unique<DispatchWrite[]>(DispatchWriteSlots);
+        }
+        if (!dispatch_written_pages) [[unlikely]] {
+            dispatch_written_pages = std::make_unique<std::atomic<u64>[]>(DispatchWrittenPageWords);
+        }
+    }
     void AppendDispatchWrite(u64 begin, u64 end);
     u64 last_sync_position{};
     u64 last_memory_write_position{};

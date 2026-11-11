@@ -12,6 +12,12 @@
 #include <excpt.h>
 #endif
 
+#if defined(ARCHITECTURE_arm64)
+#include <arm_neon.h>
+#elif defined(ARCHITECTURE_x86_64)
+#include <emmintrin.h>
+#endif
+
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/host1x/ffmpeg.h"
@@ -479,7 +485,37 @@ void Nx2VideoDecoder::RenderUnguarded(const Nx2Picture& picture, Nx2PictureForma
             const u8* u = f->data[1] + y * f->linesize[1];
             const u8* v = f->data[2] + y * f->linesize[2];
             u8* dst = out.data() + chroma_offset + y * pitch;
-            for (u32 x = 0; x < chroma_width; ++x) {
+            u32 x = 0;
+#if defined(ARCHITECTURE_arm64)
+            for (; x + 16 <= chroma_width; x += 16) {
+                uint8x16x2_t uv;
+                uv.val[0] = vld1q_u8(u + x);
+                uv.val[1] = vld1q_u8(v + x);
+                vst2q_u8(dst + x * 2, uv);
+            }
+            for (; x + 8 <= chroma_width; x += 8) {
+                uint8x8x2_t uv;
+                uv.val[0] = vld1_u8(u + x);
+                uv.val[1] = vld1_u8(v + x);
+                vst2_u8(dst + x * 2, uv);
+            }
+#elif defined(ARCHITECTURE_x86_64)
+            for (; x + 16 <= chroma_width; x += 16) {
+                const __m128i u_vec = _mm_loadu_si128(reinterpret_cast<const __m128i*>(u + x));
+                const __m128i v_vec = _mm_loadu_si128(reinterpret_cast<const __m128i*>(v + x));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + x * 2),
+                                 _mm_unpacklo_epi8(u_vec, v_vec));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + x * 2 + 16),
+                                 _mm_unpackhi_epi8(u_vec, v_vec));
+            }
+            for (; x + 8 <= chroma_width; x += 8) {
+                const __m128i u_vec = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(u + x));
+                const __m128i v_vec = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(v + x));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + x * 2),
+                                 _mm_unpacklo_epi8(u_vec, v_vec));
+            }
+#endif
+            for (; x < chroma_width; ++x) {
                 dst[x * 2] = u[x];
                 dst[x * 2 + 1] = v[x];
             }

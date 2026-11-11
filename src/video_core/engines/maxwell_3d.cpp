@@ -1890,15 +1890,64 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
             const auto result = engine.native_jit->Execute(
                 start, fs.parameters, std::span<u32>{native_data_ram}, read, emit);
-#else
-            const auto result =
-                engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read, emit);
-#endif
             if (!result.success) {
                 engine.native_execution_failed = true;
                 LOG_ERROR(HW_GPU, "Native MME (split front) failed: start={:#x}, consumed={}/{}, error={}",
                           start, result.consumed, parameter_count, result.error);
             }
+#else
+            static const bool use_memo = [] {
+                const char* value = std::getenv("EDEN_NX2_MME_MEMO");
+                return value == nullptr || value[0] != '0';
+            }();
+            bool memo_hit = false;
+            if (use_memo && !trace && !fs.oot_dump) {
+                engine.native_memo.Synchronize(engine.native_code_generation);
+                if (decltype(engine.native_memo)::Effects effects;
+                    engine.native_memo.Find(start, fs.parameters, native_data_ram, effects)) {
+                    for (size_t i = 0; i < effects.data_ram_writes.size(); i += 2) {
+                        native_data_ram[effects.data_ram_writes[i]] = effects.data_ram_writes[i + 1];
+                    }
+                    for (size_t i = 0; i < effects.writes.size(); i += 2) {
+                        emit(effects.writes[i], effects.writes[i + 1]);
+                    }
+                    memo_hit = true;
+                } else {
+                    engine.native_writes.clear();
+                }
+            }
+            if (!memo_hit) {
+                bool read_memory = false;
+                const u64 code_generation = engine.native_code_generation;
+                const auto result = engine.native_interpreter.Execute(
+                    engine.native_code, start, fs.parameters, read,
+                    [&](u32 address, u32 value) {
+                        if (address == 0x157 || address == 0x158) {
+                            read_memory = true;
+                        }
+                        if (use_memo && !trace && !fs.oot_dump && !read_memory) {
+                            engine.native_writes.emplace_back(address, value);
+                        }
+                        return emit(address, value);
+                    });
+                if (use_memo && !trace && !fs.oot_dump && result.success && !read_memory &&
+                    !engine.native_interpreter.read_registers &&
+                    !engine.native_interpreter.reread_data_ram &&
+                    code_generation == engine.native_code_generation) {
+                    engine.native_memo.Store(
+                        start, std::span<const u32>(fs.parameters.data(), parameter_count),
+                        engine.native_interpreter.data_ram_reads,
+                        engine.native_interpreter.data_ram_writes, engine.native_writes);
+                }
+                if (!result.success) {
+                    engine.native_execution_failed = true;
+                    LOG_ERROR(
+                        HW_GPU,
+                        "Native MME (split front) failed: start={:#x}, consumed={}/{}, error={}",
+                        start, result.consumed, parameter_count, result.error);
+                }
+            }
+#endif
         }
     }
     if (trace) [[unlikely]] {
@@ -2037,7 +2086,6 @@ void Maxwell3D::DrawFromGpuArguments(Core::System& system, GPUVAddr arguments, D
 
 bool Maxwell3D::FrontMacroCountsDraw(Core::System& system, VideoCommon::GpuSplit& split,
                                      u32 method, u32 count) {
-#ifdef ARCHITECTURE_x86_64
     FrontState& fs = Front(system, split);
     if (count != 2 || fs.executing_macro != 0 || !fs.parameters.empty()) {
         return false;
@@ -2060,13 +2108,11 @@ bool Maxwell3D::FrontMacroCountsDraw(Core::System& system, VideoCommon::GpuSplit
             return verdict.counts;
         }
     }
-    if (!engine.native_jit) {
-        engine.native_jit = std::make_shared<TuringMacroJit>();
-    }
-    engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
+    TuringMacroInterpreter sandbox;
     const auto run = [&](u32 first, u32 second, std::vector<std::pair<u32, u32>>& writes,
                          std::array<u32, 0xc00>& dram) {
         dram = native_data_ram;
+        sandbox.active_dram = &dram;
         std::vector<u32> parameters{first, second};
         bool reads_memory = false;
         const auto read = [&fs](u32 address) {
@@ -2080,8 +2126,7 @@ bool Maxwell3D::FrontMacroCountsDraw(Core::System& system, VideoCommon::GpuSplit
             writes.emplace_back(address, value);
             return true;
         };
-        const auto result =
-            engine.native_jit->Execute(start, parameters, std::span<u32>{dram}, read, emit);
+        const auto result = sandbox.Execute(engine.native_code, start, parameters, read, emit);
         return result.success && !reads_memory && parameters.size() == 2;
     };
     constexpr u32 vertex_count = MAXWELL3D_REG_INDEX(vertex_buffer.count);
@@ -2111,9 +2156,6 @@ bool Maxwell3D::FrontMacroCountsDraw(Core::System& system, VideoCommon::GpuSplit
     LOG_INFO(HW_GPU, "GPU-counted draws: 3D macro {:#x} (start {:#x}) {}", method, start,
              counts ? "copies its count into the draw" : "uses its parameters otherwise: read as before");
     return counts;
-#else
-    return false;
-#endif
 }
 
 // Not inlined on GCC (zortos293/Lichii#491): GCC 13 -O3 unswitched a per-word loop on this
