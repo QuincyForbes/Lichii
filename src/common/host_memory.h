@@ -119,7 +119,7 @@ public:
     /// A new kernel on this memory: everything a previous one used may hold data.
     void ForgetContents();
 
-    /// EDEN_NX2_SEC_RESERVE=1 (Windows, off by default): the guest memory section is created
+    /// EDEN_NX2_SEC_RESERVE (Windows, on by default, =0 off): the guest memory section is created
     /// with SEC_RESERVE instead of SEC_COMMIT, so the commit charge follows what the guest uses
     /// instead of all of it (14 GiB) from boot. Commit commits the pages behind a range (whole
     /// 64 KiB granules, those committed already skipped); MarkUsed (so ClearBackingRegion too)
@@ -127,7 +127,7 @@ public:
     void Commit(size_t physical_offset, size_t length);
 
     /// Commits everything outside `lazy` (physical offset and length of the kernel's user pools,
-    /// whose pages are committed as they are allocated). A no-op without EDEN_NX2_SEC_RESERVE.
+    /// whose pages are committed as they are allocated). A no-op with EDEN_NX2_SEC_RESERVE=0.
     void CommitAllBut(std::span<const std::pair<size_t, size_t>> lazy);
 
     [[nodiscard]] bool CommitsOnUse() const noexcept {

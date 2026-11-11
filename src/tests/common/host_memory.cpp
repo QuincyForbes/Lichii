@@ -314,10 +314,8 @@ TEST_CASE("HostMemory: Trim zero pages keeps contents", "[common]") {
 
 #ifdef _WIN32
 TEST_CASE("HostMemory: Reserved section commits on use", "[common]") {
-    _putenv_s("EDEN_NX2_SEC_RESERVE", "1");
     {
         HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-        _putenv_s("EDEN_NX2_SEC_RESERVE", "");
         REQUIRE(mem.BackingBasePointer() != nullptr);
         REQUIRE(mem.CommitsOnUse());
         const auto before = HostMemory::GetCommitStats();
@@ -362,8 +360,38 @@ TEST_CASE("HostMemory: Reserved section commits on use", "[common]") {
     REQUIRE_FALSE(HostMemory::GetCommitStats().reserved);
 }
 
-TEST_CASE("HostMemory: Section committed whole without the switch", "[common]") {
+TEST_CASE("HostMemory: Two reserved sections commit on use", "[common]") {
+    HostMemory first(BACKING_SIZE, VIRTUAL_SIZE);
+    REQUIRE(first.CommitsOnUse());
+    const u64 net_commits = HostMemory::GetCommitStats().net_commits;
+    {
+        HostMemory second(BACKING_SIZE, VIRTUAL_SIZE);
+        REQUIRE(second.CommitsOnUse());
+        REQUIRE(HostMemory::GetCommitStats().section_bytes == 2 * BACKING_SIZE);
+
+        // Neither handed out nor mapped: the fault handler has to know both sections.
+        volatile u8* const first_backing = first.BackingBasePointer();
+        volatile u8* const second_backing = second.BackingBasePointer();
+        first_backing[0x800000] = 5;
+        second_backing[0x900000] = 6;
+        REQUIRE(first_backing[0x800000] == 5);
+        REQUIRE(second_backing[0x900000] == 6);
+        REQUIRE(HostMemory::GetCommitStats().net_commits == net_commits + 2);
+    }
+    // The first one outlives the second.
+    volatile u8* const backing = first.BackingBasePointer();
+    backing[0xa00000] = 7;
+    REQUIRE(backing[0xa00000] == 7);
+    const auto stats = HostMemory::GetCommitStats();
+    REQUIRE(stats.reserved);
+    REQUIRE(stats.section_bytes == BACKING_SIZE);
+    REQUIRE(stats.net_commits == net_commits + 3);
+}
+
+TEST_CASE("HostMemory: Section committed whole with the switch off", "[common]") {
+    _putenv_s("EDEN_NX2_SEC_RESERVE", "0");
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
+    _putenv_s("EDEN_NX2_SEC_RESERVE", "");
     REQUIRE(mem.BackingBasePointer() != nullptr);
     REQUIRE_FALSE(mem.CommitsOnUse());
     REQUIRE_FALSE(HostMemory::GetCommitStats().reserved);

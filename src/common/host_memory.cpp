@@ -146,22 +146,23 @@ static void GetFuncAddress(Common::DynamicLibrary& dll, const char* name, T& pfn
 }
 
 namespace {
-/// EDEN_NX2_SEC_RESERVE=1 (off by default): the guest memory section is created reserved, and
+/// EDEN_NX2_SEC_RESERVE (on by default, =0 off): the guest memory section is created reserved, and
 /// HostMemory::Commit commits its pages as the kernel hands them out (see host_memory.h).
 bool ReserveGuestMemory() {
     const char* value = std::getenv("EDEN_NX2_SEC_RESERVE");
-    return value != nullptr && value[0] == '1';
+    return value == nullptr || value[0] != '0';
 }
 
 /// The views of a reserved section, for ReservedPageHandler.
 struct ReservedViews {
-    std::atomic<bool> active{};
     u8* backing_base{};
     size_t backing_size{};
     u8* virtual_base{};
     size_t virtual_size{};
 };
-ReservedViews g_reserved_views;
+std::shared_mutex g_reserved_views_mutex;
+std::vector<ReservedViews> g_reserved_views;  ///< One for each reserved section alive
+std::atomic<size_t> g_reserved_sections{};    ///< Their number, read without the lock
 std::atomic<u64> g_committed_bytes{};  ///< Committed by HostMemory::Commit
 std::atomic<u64> g_net_commits{};      ///< Committed by ReservedPageHandler
 std::atomic<u64> g_first_net_offset{}; ///< Its first: backing offset, or virtual offset | 1 << 63
@@ -178,15 +179,27 @@ std::atomic<u64> g_first_net_offset{}; ///< Its first: backing offset, or virtua
 LONG CALLBACK ReservedPageHandler(PEXCEPTION_POINTERS info) {
     const EXCEPTION_RECORD& record = *info->ExceptionRecord;
     if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 ||
-        !g_reserved_views.active.load(std::memory_order_acquire)) {
+        g_reserved_sections.load(std::memory_order_acquire) == 0) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    const ReservedViews& views = g_reserved_views;
     u8* const address = reinterpret_cast<u8*>(record.ExceptionInformation[1]);
-    const bool in_backing =
-        address >= views.backing_base && address < views.backing_base + views.backing_size;
-    const bool in_virtual =
-        address >= views.virtual_base && address < views.virtual_base + views.virtual_size;
+    bool in_backing = false;
+    bool in_virtual = false;
+    u64 view_offset = 0;
+    {
+        std::shared_lock lock{g_reserved_views_mutex};
+        for (const ReservedViews& views : g_reserved_views) {
+            in_backing =
+                address >= views.backing_base && address < views.backing_base + views.backing_size;
+            in_virtual =
+                address >= views.virtual_base && address < views.virtual_base + views.virtual_size;
+            if (in_backing || in_virtual) {
+                u8* const base = in_backing ? views.backing_base : views.virtual_base;
+                view_offset = static_cast<u64>(address - base);
+                break;
+            }
+        }
+    }
     if (!in_backing && !in_virtual) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -205,9 +218,7 @@ LONG CALLBACK ReservedPageHandler(PEXCEPTION_POINTERS info) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     if (g_net_commits.fetch_add(1, std::memory_order_relaxed) == 0) {
-        g_first_net_offset.store(in_backing ? static_cast<u64>(address - views.backing_base)
-                                            : static_cast<u64>(address - views.virtual_base) |
-                                                  (u64{1} << 63),
+        g_first_net_offset.store(in_backing ? view_offset : view_offset | (u64{1} << 63),
                                  std::memory_order_relaxed);
     }
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -299,11 +310,11 @@ public:
             return false;
         }
         if (reserved) {
-            g_reserved_views.backing_base = backing_base;
-            g_reserved_views.backing_size = backing_size;
-            g_reserved_views.virtual_base = virtual_base;
-            g_reserved_views.virtual_size = virtual_size;
-            g_reserved_views.active.store(true, std::memory_order_release);
+            {
+                std::unique_lock lock{g_reserved_views_mutex};
+                g_reserved_views.push_back({backing_base, backing_size, virtual_base, virtual_size});
+                g_reserved_sections.store(g_reserved_views.size(), std::memory_order_release);
+            }
             static std::once_flag handler_added;
             std::call_once(handler_added, [] { AddVectoredExceptionHandler(1, ReservedPageHandler); });
             LOG_INFO(HW_Memory,
@@ -431,7 +442,14 @@ private:
     /// Release all resources in the object
     void Release() {
         if (reserved) {
-            g_reserved_views.active.store(false, std::memory_order_release);
+            std::unique_lock lock{g_reserved_views_mutex};
+            std::erase_if(g_reserved_views, [this](const ReservedViews& views) {
+                return views.backing_base == backing_base;
+            });
+            g_reserved_sections.store(g_reserved_views.size(), std::memory_order_release);
+            if (g_reserved_views.empty()) {
+                g_committed_bytes.store(0, std::memory_order_relaxed);
+            }
         }
         if (!placeholders.empty()) {
             for (const auto& placeholder : placeholders) {
@@ -2033,10 +2051,17 @@ void HostMemory::CommitAllBut(std::span<const std::pair<size_t, size_t>> lazy) {
 
 HostMemory::CommitStats HostMemory::GetCommitStats() {
 #ifdef _WIN32
+    size_t section_bytes = 0;
+    {
+        std::shared_lock lock{g_reserved_views_mutex};
+        for (const ReservedViews& views : g_reserved_views) {
+            section_bytes += views.backing_size;
+        }
+    }
     return CommitStats{
-        .reserved = g_reserved_views.active.load(std::memory_order_relaxed),
+        .reserved = section_bytes != 0,
         .committed_bytes = g_committed_bytes.load(std::memory_order_relaxed),
-        .section_bytes = g_reserved_views.backing_size,
+        .section_bytes = section_bytes,
         .net_commits = g_net_commits.load(std::memory_order_relaxed),
         .first_net_offset = g_first_net_offset.load(std::memory_order_relaxed),
     };
