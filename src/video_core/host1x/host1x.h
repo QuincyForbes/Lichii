@@ -172,10 +172,14 @@ public:
     void StopDevice(s32 fd, ChannelType type);
 
     void PushEntries(s32 fd, ChCommandHeaderList&& entries) {
-        if (auto const nvdec = std::get_if<Tegra::Host1x::Nvdec>(&devices[fd])) {
-            nvdec->PushEntries(std::move(entries));
-        } else if (auto const vic = std::get_if<Tegra::Host1x::Vic>(&devices[fd])) {
-            vic->PushEntries(std::move(entries));
+        if (fd < 0 || static_cast<size_t>(fd) >= devices.size()) {
+            return;
+        }
+        if (auto const* nvdec = std::get_if<std::unique_ptr<Tegra::Host1x::Nvdec>>(&devices[fd])) {
+            (*nvdec)->PushEntries(std::move(entries));
+        } else if (auto const* vic =
+                       std::get_if<std::unique_ptr<Tegra::Host1x::Vic>>(&devices[fd])) {
+            (*vic)->PushEntries(std::move(entries));
         }
     }
 
@@ -187,8 +191,8 @@ public:
     FrameQueue frame_queue;
     std::array<std::variant<
         std::monostate,
-        Tegra::Host1x::Nvdec,
-        Tegra::Host1x::Vic
+        std::unique_ptr<Tegra::Host1x::Nvdec>,
+        std::unique_ptr<Tegra::Host1x::Vic>
     >, 1024> devices;
 #ifdef YUZU_LEGACY
     std::once_flag nvdec_first_init;

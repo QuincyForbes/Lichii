@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <memory>
 
 #include "video_core/control/channel_state.h"
 #include "video_core/control/channel_state_cache.h"
@@ -25,7 +26,8 @@ void ChannelSetupCaches<P>::CreateChannel(struct Tegra::Control::ChannelState& c
         if (!free_channel_ids.empty()) {
             auto id = free_channel_ids.front();
             free_channel_ids.pop_front();
-            new (&channel_storage[id]) P(channel);
+            std::destroy_at(&channel_storage[id]);
+            std::construct_at(&channel_storage[id], channel);
             return id;
         }
         channel_storage.emplace_back(channel);
@@ -86,6 +88,15 @@ void ChannelSetupCaches<P>::EraseChannel(s32 id) {
     }
     active_channel_ids.erase(
         std::find(active_channel_ids.begin(), active_channel_ids.end(), this_id));
+    while (!channel_storage.empty()) {
+        const auto tail_it =
+            std::find(free_channel_ids.begin(), free_channel_ids.end(), channel_storage.size() - 1);
+        if (tail_it == free_channel_ids.end()) {
+            break;
+        }
+        free_channel_ids.erase(tail_it);
+        channel_storage.pop_back();
+    }
 }
 
 } // namespace VideoCommon

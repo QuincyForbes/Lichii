@@ -18,6 +18,11 @@
 namespace Tegra::Control {
 
 void Scheduler::BindChannel(GPU& gpu, s32 bind_id) {
+    if (bound_gpu == &gpu && bound_channel == bind_id) [[likely]] {
+        return;
+    }
+    bound_gpu = &gpu;
+    bound_channel = bind_id;
     // With the GPU thread split the rasterizer's channel switches with the methods around it, on
     // the back thread (deferred outside the lock: the back takes it to bind).
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {

@@ -231,6 +231,8 @@ public:
         VkBuffer buffer{};
         VkDeviceSize offset{};
         VkDeviceSize size{};
+
+        bool operator==(const MeshEmulationBuffer&) const noexcept = default;
     };
     /// With a task program: the task payload, offset and argument buffers, the arena counter,
     /// and the words of the output arena (the draw's group count is the task's).
@@ -461,6 +463,9 @@ private:
     vk::ShaderModule mesh_vertex_module;
     vk::Pipeline mesh_compute_pipeline;
     VkDescriptorSet mesh_descriptor_set{}; ///< shared by the dispatch and the draw it feeds
+    VkDescriptorSet mesh_distribution_set{};
+    u64 mesh_descriptor_tick{~0ULL};
+    u64 mesh_distribution_tick{~0ULL};
     VkBuffer mesh_output_buffer{};
     VkDeviceSize mesh_output_offset{};
     VkDeviceSize mesh_output_size{};
@@ -474,6 +479,7 @@ private:
     vk::Pipeline distribution_pipeline;
     DescriptorAllocator distribution_allocator;
     std::array<MeshEmulationBuffer, 4> mesh_task_buffers{};
+    std::array<MeshEmulationBuffer, 4> last_mesh_task_buffers{};
     u32 mesh_capacity{};
 
     std::optional<PipelineBuild> build;

@@ -513,7 +513,11 @@ public:
         u64 checked_write_serial = 0;
         bool recheck = false;
     };
+    static constexpr size_t MAX_NATIVE_BANK_SNAPSHOTS = 16384;
     std::unordered_map<DAddr, NativeBankPage> native_indirect_page_snapshots;
+    std::array<DAddr, MAX_NATIVE_BANK_SNAPSHOTS> native_indirect_page_ring{};
+    size_t native_indirect_page_ring_count = 0;
+    size_t native_indirect_page_clock = 0;
     struct NativeBankMemoEntry {
         DAddr device_addr = ~DAddr{0};
         u32 size = 0;
@@ -605,6 +609,9 @@ private:
 
     /// EDEN_NX2_EXP9: the native uniform bank check of a bind of [device_addr, device_addr + size).
     void CheckNativeBankPagesTracked(DAddr device_addr, u32 size, int mode);
+
+    std::pair<typename std::unordered_map<DAddr, NativeBankPage>::iterator, bool>
+    InsertNativeBankSnapshot(DAddr page);
 
     void BindHostGraphicsStorageBuffers(size_t stage);
 
@@ -1025,6 +1032,32 @@ private:
     };
     std::array<std::array<UniformBindMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
         uniform_bind_memo{};
+
+    /// Direct and indirect pointer-table SSBO address/layout memo per (stage, ssbo_index);
+    /// stage NUM_STAGES is compute.
+    struct SsboBindMemo {
+        const void* channel{};
+        size_t as_id{};
+        u64 map_serial{};
+        GPUVAddr cbuf_slot_addr{};
+        u32 indirect_offset{~0U};
+        u8 flags{}; ///< bit 0: valid, bit 1: written, bit 2: native_pointer, bit 3: table_pointer
+        const u8* cbuf_host{};
+        const u8* entry_host{};
+        u64 cbuf_qword0{};
+        u64 cbuf_qword1{};
+        u64 entry_qword0{};
+        u64 entry_qword1{};
+        GPUVAddr resolved_pointer{};
+        Binding binding{};
+    };
+    std::array<std::array<SsboBindMemo, NUM_STORAGE_BUFFERS>, NUM_STAGES + 1> ssbo_bind_memo{};
+
+    [[nodiscard]] Binding BindCachedStorageBuffer(size_t memo_stage, size_t ssbo_index,
+                                                  GPUVAddr cbuf_slot_addr, u32 cbuf_index,
+                                                  u32 cbuf_offset, bool is_written,
+                                                  bool native_pointer, u32 indirect_offset,
+                                                  GPUVAddr* out_pointer = nullptr);
 
     /// One storage binding's last lookup when it resolved to a single buffer (no segments)
     /// (EXP18 & 2). Index NUM_STAGES is compute.

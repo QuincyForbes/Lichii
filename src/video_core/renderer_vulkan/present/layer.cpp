@@ -72,6 +72,7 @@ Layer::Layer(const Device& device, MemoryAllocator& memory_allocator_, Scheduler
 {
     CreateDescriptorPool(device);
     CreateDescriptorSets(device, layout);
+    resource_ticks.resize(image_count, 0);
     if (filters.get_scaling_filter() == Settings::ScalingFilter::Fsr) {
         sr_filter.emplace<FSR>(device, memory_allocator, image_count, output_size);
     } else if (filters.get_scaling_filter() == Settings::ScalingFilter::Sgsr) {
@@ -112,11 +113,24 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
         (framebuffer.layer_stack_mask & Service::Nvnflinger::LayerStackBit(
                                             Service::Nvnflinger::LayerStackId::Recording)) == 0;
 
-    RefreshResources(device, framebuffer);
+    if (framebuffer.width != raw_width || framebuffer.height != raw_height ||
+        (framebuffer.pixel_format != pixel_format && !raw_images.empty())) {
+        raw_width = framebuffer.width;
+        raw_height = framebuffer.height;
+        pixel_format = framebuffer.pixel_format;
+        anti_alias.emplace<std::monostate>();
+        if (!raw_images.empty()) {
+            ReleaseRawImages();
+        }
+    }
     SetAntiAliasPass(device);
 #ifdef HAS_RESHADE
     SetPostProcessPass(device, is_applet);
 #endif
+
+    if (image_index >= resource_ticks.size()) {
+        resource_ticks.resize(image_index + 1, 0);
+    }
 
     // Finish any pending renderpass
     scheduler.RequestOutsideRenderPassOperationContext();
@@ -126,6 +140,7 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
     };
 
     if (!use_accelerated) {
+        RefreshResources(device, framebuffer);
         UpdateRawImage(framebuffer, image_index);
     }
 
@@ -312,6 +327,7 @@ void Layer::ReleaseRawImages() {
     for (const u64 tick : resource_ticks) {
         scheduler.Wait(tick);
     }
+    raw_image_views.clear();
     raw_images.clear();
     buffer.reset();
 }

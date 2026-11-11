@@ -8,25 +8,11 @@
 #include <utility>
 #include <vector>
 
-#include <boost/icl/interval.hpp>
-#include <boost/icl/interval_base_set.hpp>
-#include <boost/icl/interval_map.hpp>
-#include <boost/icl/interval_set.hpp>
-#include <boost/icl/split_interval_map.hpp>
-#include <boost/pool/pool.hpp>
-#include <boost/pool/pool_alloc.hpp>
-#include <boost/pool/poolfwd.hpp>
+#include <boost/container/small_vector.hpp>
 
 #include "common/range_sets.h"
 
 namespace Common {
-
-namespace {
-template <class T>
-using RangeSetsAllocator =
-    boost::fast_pool_allocator<T, boost::default_user_allocator_new_delete,
-                               boost::details::pool::default_mutex, 1024, 2048>;
-}
 
 // Sorted, disjoint, non-touching ranges in one array. The buffer cache looks these up tens of
 // thousands of times a frame and most lookups miss; sets stay small (Ocarina of Time: ~200 ranges
@@ -134,92 +120,161 @@ struct RangeSet<AddressType>::RangeSetImpl {
 
 template <typename AddressType>
 struct OverlapRangeSet<AddressType>::OverlapRangeSetImpl {
-    using IntervalSet = boost::icl::split_interval_map<
-        AddressType, s32, boost::icl::partial_enricher, std::less, boost::icl::inplace_plus,
-        boost::icl::inter_section,
-        ICL_INTERVAL_INSTANCE(ICL_INTERVAL_DEFAULT, AddressType, std::less), RangeSetsAllocator>;
-    using IntervalType = typename IntervalSet::interval_type;
+    struct Range {
+        AddressType lower;
+        AddressType upper;
+        s32 count;
+    };
+    using Iterator = typename std::vector<Range>::iterator;
+    using ConstIterator = typename std::vector<Range>::const_iterator;
 
     OverlapRangeSetImpl() = default;
     ~OverlapRangeSetImpl() = default;
 
+    ConstIterator FirstEndingAfter(AddressType address) const {
+        return std::upper_bound(
+            m_ranges.begin(), m_ranges.end(), address,
+            [](AddressType value, const Range& range) { return value < range.upper; });
+    }
+
+    static void AppendMerged(boost::container::small_vector<Range, 8>& out, AddressType lower,
+                             AddressType upper, s32 count) {
+        if (lower >= upper || count <= 0) {
+            return;
+        }
+        if (!out.empty() && out.back().upper == lower && out.back().count == count) {
+            out.back().upper = upper;
+        } else {
+            out.push_back(Range{lower, upper, count});
+        }
+    }
+
+    void ReplaceSpan(Iterator first, Iterator last,
+                     const boost::container::small_vector<Range, 8>& replacement) {
+        const size_t old_count = static_cast<size_t>(last - first);
+        if (replacement.size() <= old_count) {
+            const auto mid = std::copy(replacement.begin(), replacement.end(), first);
+            m_ranges.erase(mid, last);
+            return;
+        }
+        const size_t offset = static_cast<size_t>(first - m_ranges.begin());
+        std::copy(replacement.begin(), replacement.begin() + old_count, first);
+        m_ranges.insert(m_ranges.begin() + offset + old_count, replacement.begin() + old_count,
+                        replacement.end());
+    }
+
     void Add(AddressType base_address, size_t size) {
-        AddressType end_address = base_address + static_cast<AddressType>(size);
-        IntervalType interval{base_address, end_address};
-        m_split_ranges_set += std::make_pair(interval, 1);
+        const AddressType end_address = base_address + static_cast<AddressType>(size);
+        if (end_address <= base_address) {
+            return;
+        }
+        auto first = std::lower_bound(
+            m_ranges.begin(), m_ranges.end(), base_address,
+            [](const Range& range, AddressType value) { return range.upper < value; });
+        if (first == m_ranges.end()) {
+            m_ranges.push_back(Range{base_address, end_address, 1});
+            return;
+        }
+        const auto last = std::upper_bound(
+            first, m_ranges.end(), end_address,
+            [](AddressType value, const Range& range) { return value < range.lower; });
+        if (first == last) {
+            m_ranges.insert(first, Range{base_address, end_address, 1});
+            return;
+        }
+        boost::container::small_vector<Range, 8> out;
+        if (first->lower < base_address) {
+            AppendMerged(out, first->lower, base_address, first->count);
+        }
+        AddressType cursor = base_address;
+        for (auto it = first; it != last; ++it) {
+            const AddressType seg_lower = (std::max)(it->lower, base_address);
+            const AddressType seg_upper = (std::min)(it->upper, end_address);
+            if (cursor < seg_lower) {
+                AppendMerged(out, cursor, seg_lower, 1);
+                cursor = seg_lower;
+            }
+            if (seg_lower < seg_upper) {
+                AppendMerged(out, seg_lower, seg_upper, it->count + 1);
+                cursor = seg_upper;
+            }
+            if (it->upper > end_address) {
+                if (cursor < end_address) {
+                    AppendMerged(out, cursor, end_address, 1);
+                    cursor = end_address;
+                }
+                AppendMerged(out, (std::max)(it->lower, end_address), it->upper, it->count);
+            }
+        }
+        if (cursor < end_address) {
+            AppendMerged(out, cursor, end_address, 1);
+        }
+        ReplaceSpan(first, last, out);
     }
 
     template <bool has_on_delete, typename Func>
     void Subtract(AddressType base_address, size_t size, s32 amount,
                   [[maybe_unused]] Func&& on_delete) {
-        if (m_split_ranges_set.empty()) {
+        const AddressType end_address = base_address + static_cast<AddressType>(size);
+        if (m_ranges.empty() || end_address <= base_address || amount <= 0) {
             return;
         }
-        AddressType end_address = base_address + static_cast<AddressType>(size);
-        IntervalType interval{base_address, end_address};
-        m_split_ranges_set += std::make_pair(interval, -amount);
-        // One pass, erasing the segments that dropped to zero or below in address order (the
-        // search restarted after every erase: quadratic in the segments of the range, and the
-        // GPU fencing thread does this for each downloaded buffer range while holding the buffer
-        // cache's lock). Erasing a node leaves the other iterators valid.
-        auto it = m_split_ranges_set.lower_bound(interval);
-        const auto end_it = m_split_ranges_set.upper_bound(interval);
-        while (it != end_it) {
-            if (it->second > 0) {
-                ++it;
+        auto first = std::lower_bound(
+            m_ranges.begin(), m_ranges.end(), base_address,
+            [](const Range& range, AddressType value) { return range.upper < value; });
+        const auto last = std::upper_bound(
+            first, m_ranges.end(), end_address,
+            [](AddressType value, const Range& range) { return value < range.lower; });
+        if (first == last) {
+            return;
+        }
+        boost::container::small_vector<Range, 8> out;
+        for (auto it = first; it != last; ++it) {
+            if (it->upper <= base_address || it->lower >= end_address) {
+                AppendMerged(out, it->lower, it->upper, it->count);
                 continue;
             }
-            if constexpr (has_on_delete) {
-                if (it->second == 0) {
-                    on_delete(it->first.lower(), it->first.upper());
+            if (it->lower < base_address) {
+                AppendMerged(out, it->lower, base_address, it->count);
+            }
+            const AddressType seg_lower = (std::max)(it->lower, base_address);
+            const AddressType seg_upper = (std::min)(it->upper, end_address);
+            if (it->count > amount) {
+                AppendMerged(out, seg_lower, seg_upper, it->count - amount);
+            } else if constexpr (has_on_delete) {
+                if (it->count == amount) {
+                    on_delete(seg_lower, seg_upper);
                 }
             }
-            m_split_ranges_set.erase(it++);
+            if (it->upper > end_address) {
+                AppendMerged(out, end_address, it->upper, it->count);
+            }
         }
+        ReplaceSpan(first, last, out);
     }
 
     template <typename Func>
     void ForEach(Func&& func) const {
-        if (m_split_ranges_set.empty()) {
-            return;
-        }
-        auto it = m_split_ranges_set.begin();
-        auto end_it = m_split_ranges_set.end();
-        for (; it != end_it; it++) {
-            const AddressType inter_addr_end = it->first.upper();
-            const AddressType inter_addr = it->first.lower();
-            func(inter_addr, inter_addr_end, it->second);
+        for (const Range& range : m_ranges) {
+            func(range.lower, range.upper, range.count);
         }
     }
 
     template <typename Func>
     void ForEachInRange(AddressType base_address, size_t size, Func&& func) const {
-        if (m_split_ranges_set.empty()) {
-            return;
-        }
         const AddressType start_address = base_address;
-        const AddressType end_address = start_address + size;
-        const OverlapRangeSetImpl::IntervalType search_interval{start_address, end_address};
-        auto it = m_split_ranges_set.lower_bound(search_interval);
-        if (it == m_split_ranges_set.end()) {
+        const AddressType end_address = start_address + static_cast<AddressType>(size);
+        if (m_ranges.empty() || end_address <= start_address) {
             return;
         }
-        auto end_it = m_split_ranges_set.upper_bound(search_interval);
-        for (; it != end_it; it++) {
-            auto& inter = it->first;
-            AddressType inter_addr_end = inter.upper();
-            AddressType inter_addr = inter.lower();
-            if (inter_addr_end > end_address) {
-                inter_addr_end = end_address;
-            }
-            if (inter_addr < start_address) {
-                inter_addr = start_address;
-            }
-            func(inter_addr, inter_addr_end, it->second);
+        for (auto it = FirstEndingAfter(start_address);
+             it != m_ranges.end() && it->lower < end_address; ++it) {
+            func((std::max)(it->lower, start_address), (std::min)(it->upper, end_address),
+                 it->count);
         }
     }
 
-    IntervalSet m_split_ranges_set;
+    std::vector<Range> m_ranges;
 };
 
 template <typename AddressType>
@@ -303,15 +358,15 @@ OverlapRangeSet<AddressType>::~OverlapRangeSet() = default;
 template <typename AddressType>
 OverlapRangeSet<AddressType>::OverlapRangeSet(OverlapRangeSet&& other) {
     m_impl = std::make_unique<OverlapRangeSet<AddressType>::OverlapRangeSetImpl>();
-    m_impl->m_split_ranges_set = std::move(other.m_impl->m_split_ranges_set);
-    other.m_impl->m_split_ranges_set.clear();
+    m_impl->m_ranges = std::move(other.m_impl->m_ranges);
+    other.m_impl->m_ranges.clear();
 }
 
 template <typename AddressType>
 OverlapRangeSet<AddressType>& OverlapRangeSet<AddressType>::operator=(OverlapRangeSet&& other) {
     if (this != &other) {
-        m_impl->m_split_ranges_set = std::move(other.m_impl->m_split_ranges_set);
-        other.m_impl->m_split_ranges_set.clear();
+        m_impl->m_ranges = std::move(other.m_impl->m_ranges);
+        other.m_impl->m_ranges.clear();
     }
     return *this;
 }
@@ -341,12 +396,12 @@ void OverlapRangeSet<AddressType>::DeleteAll(AddressType base_address, size_t si
 
 template <typename AddressType>
 void OverlapRangeSet<AddressType>::Clear() {
-    m_impl->m_split_ranges_set.clear();
+    m_impl->m_ranges.clear();
 }
 
 template <typename AddressType>
 bool OverlapRangeSet<AddressType>::Empty() const {
-    return m_impl->m_split_ranges_set.empty();
+    return m_impl->m_ranges.empty();
 }
 
 template <typename AddressType>

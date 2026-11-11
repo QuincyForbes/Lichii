@@ -192,7 +192,8 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
 }
 
 void StagingBufferPool::TickFrame() {
-    current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
+    static constexpr size_t LARGE_BUFFER_LOG2 = 22; // 4 MiB
+    current_delete_level = (current_delete_level + 1) % LARGE_BUFFER_LOG2;
 
     // Host memory pressure (iOS): every idle buffer goes now rather than a level every frame.
     if (const u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
@@ -202,7 +203,7 @@ void StagingBufferPool::TickFrame() {
         for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
             for (StagingBuffers& staging : *cache) {
                 std::erase_if(staging.entries, [this](const StagingBuffer& entry) {
-                    return scheduler.IsFree(entry.tick);
+                    return !entry.deferred && scheduler.IsFree(entry.tick);
                 });
                 staging.delete_index = 0;
                 staging.iterate_index = 0;
@@ -439,13 +440,23 @@ StagingBufferPool::StagingBuffersCache& StagingBufferPool::GetCache(MemoryUsage 
 }
 
 void StagingBufferPool::ReleaseCache(MemoryUsage usage) {
-    ReleaseLevel(GetCache(usage), current_delete_level);
+    static constexpr size_t LARGE_BUFFER_LOG2 = 22; // >= 4 MiB swept every frame
+    auto& cache = GetCache(usage);
+    ReleaseLevel(cache, current_delete_level);
+    for (size_t log2 = LARGE_BUFFER_LOG2; log2 < NUM_LEVELS; ++log2) {
+        if (!cache[log2].entries.empty()) {
+            ReleaseLevel(cache, log2);
+        }
+    }
 }
 
 void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     constexpr size_t deletions_per_tick = 16;
     auto& staging = cache[log2];
     auto& entries = staging.entries;
+    if (entries.empty()) {
+        return;
+    }
     const size_t old_size = entries.size();
 
     // EDEN_NX2_EXP8 bit 1: keep two idle upload buffers per level up to 32 MiB (under 128 MiB in
@@ -458,7 +469,7 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
         (VideoCore::Nx2Debug::Experiment(8) & 1) != 0) {
         size_t idle = 0;
         std::erase_if(entries, [this, &idle](const StagingBuffer& entry) {
-            return scheduler.IsFree(entry.tick) && ++idle > KeepPerLevel;
+            return !entry.deferred && scheduler.IsFree(entry.tick) && ++idle > KeepPerLevel;
         });
         staging.delete_index = 0;
         if (staging.iterate_index >= entries.size()) {
@@ -468,7 +479,7 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     }
 
     const auto is_deletable = [this](const StagingBuffer& entry) {
-        return scheduler.IsFree(entry.tick);
+        return !entry.deferred && scheduler.IsFree(entry.tick);
     };
     const size_t begin_offset = staging.delete_index;
     const size_t end_offset = (std::min)(begin_offset + deletions_per_tick, old_size);

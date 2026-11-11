@@ -86,11 +86,7 @@ private:
     };
     std::vector<Images> m_dynamic_images;
 
-    // Previous-frame history for temporal accumulation
-    vk::Image m_prev_frame_image;
-    vk::ImageView m_prev_frame_view;
     bool m_images_ready{};
-    bool m_has_prev_frame{};
     u32 m_frame_counter{};
 };
 

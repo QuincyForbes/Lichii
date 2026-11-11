@@ -664,13 +664,12 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
             return true;
         }
         readable_word = word;
-        // An unmet word is answered without a drain for at most 16 polls or 1 ms since the back
-        // was last drained for this acquire. A release the back holds as deferred work lands only
-        // when the back runs, so a channel polled without ever draining again waited forever
-        // (Mario Kart World hung after 63 s once the 2 s report had been made).
+        // Throttle drains by elapsed time rather than poll count: 16 tight yield() iterations take
+        // a few microseconds on the front thread, which previously forced hundreds of thousands of
+        // drains per second while waiting on a semaphore.
         const auto now = std::chrono::steady_clock::now();
-        if (++pending_acquire->unmet_polls % 16 != 0 &&
-            now - pending_acquire->last_drain < std::chrono::milliseconds{1}) {
+        ++pending_acquire->unmet_polls;
+        if (now - pending_acquire->last_drain < std::chrono::microseconds{50}) {
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquirePollsFast, 1);
             return false;
         }
@@ -699,6 +698,13 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
             VideoCommon::GpuSplit::Get().NoteSync();
             return true;
         }
+        return false;
+    }
+    if (VideoCommon::GpuSplit::Get().Active() &&
+        std::chrono::steady_clock::now() - pending_acquire->last_drain <
+            std::chrono::microseconds{50} &&
+        !pending_acquire->Matches(dma_pusher.memory_manager.Read<u32>(pending_acquire->address))) {
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquirePollsFast, 1);
         return false;
     }
     // The release may still be queued for the split GPU thread's back half (and the caches

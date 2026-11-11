@@ -401,7 +401,8 @@ bool MemoryAllocator::CreateImageInMediumPool(const VkImageCreateInfo& ci,
                                               const VmaAllocationCreateInfo& alloc_ci,
                                               VkImage& handle, VmaAllocation& allocation,
                                               VmaAllocationInfo& alloc_info) const {
-    if (ci.tiling != VK_IMAGE_TILING_OPTIMAL || ci.imageType != VK_IMAGE_TYPE_2D) {
+    if (ci.pNext != nullptr || ci.tiling != VK_IMAGE_TILING_OPTIMAL ||
+        ci.imageType != VK_IMAGE_TYPE_2D) {
         return false;
     }
     // Quick texel-based precheck (~2M to ~64M texels) so tiny textures don't call vkCreateImage
@@ -410,21 +411,64 @@ bool MemoryAllocator::CreateImageInMediumPool(const VkImageCreateInfo& ci,
     if (texels < (1ULL << 19) || texels > (1ULL << 26)) {
         return false;
     }
-    VkImage temp{};
-    const auto& dld = device.GetDispatchLoader();
-    const VkDevice logical = *device.GetLogical();
-    if (dld.vkCreateImage(logical, &ci, nullptr, &temp) != VK_SUCCESS) {
-        return false;
+    const ImageTypeKey type_key{
+        .format = ci.format,
+        .tiling = ci.tiling,
+        .usage = ci.usage,
+        .flags = ci.flags,
+    };
+    const ImageShapeKey shape_key{
+        .format = ci.format,
+        .tiling = ci.tiling,
+        .flags = ci.flags,
+        .width = ci.extent.width,
+        .height = ci.extent.height,
+        .mip_levels = ci.mipLevels,
+        .array_layers = ci.arrayLayers,
+        .samples = ci.samples,
+    };
+    u32 type_bits{};
+    VkDeviceSize req_size{};
+    bool have_type = false;
+    bool have_size = false;
+    {
+        std::scoped_lock lk{buffer_type_mutex};
+        if (const auto it = image_memory_type_bits.find(type_key);
+            it != image_memory_type_bits.end()) {
+            type_bits = it->second;
+            have_type = true;
+        }
+        if (const auto it = image_req_sizes.find(shape_key); it != image_req_sizes.end()) {
+            req_size = it->second;
+            have_size = true;
+        }
     }
-    VkMemoryRequirements req{};
-    dld.vkGetImageMemoryRequirements(logical, temp, &req);
-    dld.vkDestroyImage(logical, temp, nullptr);
-    if (req.size <= (8ULL << 20) || req.size > Device::MediumImagePoolBlockSize / 2) {
+    if (!have_type || !have_size) {
+        VkImage temp{};
+        const auto& dld = device.GetDispatchLoader();
+        const VkDevice logical = *device.GetLogical();
+        if (dld.vkCreateImage(logical, &ci, nullptr, &temp) != VK_SUCCESS) {
+            return false;
+        }
+        VkMemoryRequirements req{};
+        dld.vkGetImageMemoryRequirements(logical, temp, &req);
+        dld.vkDestroyImage(logical, temp, nullptr);
+        type_bits = req.memoryTypeBits;
+        req_size = req.size;
+        {
+            std::scoped_lock lk{buffer_type_mutex};
+            image_memory_type_bits.try_emplace(type_key, type_bits);
+            if (image_req_sizes.size() >= 1024) {
+                image_req_sizes.clear();
+            }
+            image_req_sizes.insert_or_assign(shape_key, req_size);
+        }
+    }
+    if (req_size <= (8ULL << 20) || req_size > Device::MediumImagePoolBlockSize / 2) {
         return false;
     }
     u32 memory_type{};
-    if (vmaFindMemoryTypeIndex(allocator, req.memoryTypeBits, &alloc_ci, &memory_type) !=
-        VK_SUCCESS) {
+    if (vmaFindMemoryTypeIndex(allocator, type_bits, &alloc_ci, &memory_type) != VK_SUCCESS) {
         return false;
     }
     const VmaPool pool = device.GetSeparatePool(Device::SeparatePool::MediumImages, memory_type);

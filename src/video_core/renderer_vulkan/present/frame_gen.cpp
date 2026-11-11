@@ -205,10 +205,6 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
                        VkExtent2D guest_extent) {
     generated = false;
 
-    if (!shaders) {
-        shaders.emplace(device);
-    }
-
     if (unavailable || !Settings::values.frame_gen.GetValue()) {
         if (chain || fsr3_chain) {
             scheduler.Finish();
@@ -219,9 +215,14 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         return;
     }
 
-    if (!shaders->IsValid() && !UsesOpticalFlow()) {
-        unavailable = true;
-        return;
+    if (!UsesOpticalFlow()) {
+        if (!shaders) {
+            shaders.emplace(device);
+        }
+        if (!shaders->IsValid()) {
+            unavailable = true;
+            return;
+        }
     }
 
     if (!frame->storage_view) {
@@ -343,6 +344,9 @@ void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format,
     if (UsesOpticalFlow()) {
         fsr3_chain.emplace(device, memory_allocator, extent, format);
     } else {
+        if (!shaders) {
+            shaders.emplace(device);
+        }
         chain.emplace(device, memory_allocator, *shaders, extent, format, built_flow_scale);
     }
     built_extent = extent;

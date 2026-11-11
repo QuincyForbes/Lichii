@@ -58,11 +58,39 @@ using Variant = std::variant<IR::Reg, IR::Pred, ZeroFlagTag, SignFlagTag, CarryF
 using ValueMap = std::unordered_map<IR::Block*, IR::Value>;
 
 struct DefTable {
+    static constexpr size_t REG_BANK_SIZE = 256;
+    static constexpr size_t NUM_REG_BANKS = (IR::NUM_REGS + REG_BANK_SIZE - 1) / REG_BANK_SIZE;
+    using RegBank = std::array<IR::Value, REG_BANK_SIZE>;
+
+    ~DefTable() {
+        for (IR::Block* const block : tracked_blocks) {
+            block->SetSsaId(~0U);
+        }
+    }
+
     const IR::Value& Def(IR::Block* block, IR::Reg variable) {
-        return block->SsaRegValue(variable);
+        const u32 id = block->SsaId();
+        if (id == ~0U) {
+            return empty_value;
+        }
+        const size_t reg_index = IR::RegIndex(variable);
+        const RegBank* const bank = reg_defs[id][reg_index / REG_BANK_SIZE];
+        return bank ? (*bank)[reg_index % REG_BANK_SIZE] : empty_value;
     }
     void SetDef(IR::Block* block, IR::Reg variable, const IR::Value& value) {
-        block->SetSsaRegValue(variable, value);
+        u32 id = block->SsaId();
+        if (id == ~0U) {
+            id = static_cast<u32>(tracked_blocks.size());
+            block->SetSsaId(id);
+            tracked_blocks.push_back(block);
+            reg_defs.emplace_back();
+        }
+        const size_t reg_index = IR::RegIndex(variable);
+        RegBank*& bank = reg_defs[id][reg_index / REG_BANK_SIZE];
+        if (!bank) {
+            bank = &reg_bank_pool.emplace_back();
+        }
+        (*bank)[reg_index % REG_BANK_SIZE] = value;
     }
 
     const IR::Value& Def(IR::Block* block, IR::Pred variable) {
@@ -114,6 +142,10 @@ struct DefTable {
         overflow_flag.insert_or_assign(block, value);
     }
 
+    const IR::Value empty_value{};
+    std::vector<IR::Block*> tracked_blocks;
+    std::vector<std::array<RegBank*, NUM_REG_BANKS>> reg_defs;
+    std::deque<RegBank> reg_bank_pool;
     std::array<ValueMap, IR::NUM_USER_PREDS> preds;
     // TODO: Requires stable iterators
     std::unordered_map<u32, ValueMap> goto_vars;

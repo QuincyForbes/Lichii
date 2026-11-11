@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/alignment.h"
 #include "common/common_funcs.h"
 #include "common/common_types.h"
@@ -39,7 +41,7 @@ enum class Type {
 
 template <class DeviceTracker, size_t stack_words, size_t size_bytes>
 struct WordManager {
-    using CollectedRanges = std::vector<std::pair<VAddr, size_t>>;
+    using CollectedRanges = boost::container::small_vector<std::pair<VAddr, size_t>, 16>;
 
     static constexpr size_t num_words = Common::DivCeil(size_bytes, BYTES_PER_WORD);
     static_assert(num_words <= 64, "clean_words holds a bit per word");
@@ -324,7 +326,7 @@ struct WordManager {
             return;
         }
         // Coalesce adjacent/contiguous ranges
-        std::vector<std::pair<VAddr, size_t>> coalesced;
+        CollectedRanges coalesced;
         coalesced.reserve(ranges.size());
         VAddr cur_addr = ranges[0].first;
         size_t cur_size = static_cast<size_t>(ranges[0].second);
@@ -348,7 +350,8 @@ struct WordManager {
             }
         }
         // Use batch API to reduce lock acquisitions and contention.
-        tracker->UpdatePagesCachedBatch(coalesced, delta);
+        tracker->UpdatePagesCachedBatch(
+            std::span<const std::pair<VAddr, size_t>>(coalesced.data(), coalesced.size()), delta);
         ranges.clear();
     }
 

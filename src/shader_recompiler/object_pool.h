@@ -34,12 +34,24 @@ public:
         if (chunks.empty()) {
             return;
         }
+        static constexpr size_t MAX_RETAINED_BYTES = 2ULL << 20;
+        const size_t max_retained_objects =
+            (std::max)(new_chunk_size, MAX_RETAINED_BYTES / sizeof(Storage));
         Chunk& root{chunks.front()};
         if (root.used_objects == root.num_objects) {
-            // Root chunk has been filled, squash allocations into it
-            const size_t total_objects{root.num_objects + new_chunk_size * (chunks.size() - 1)};
+            if (chunks.size() == 1 && root.num_objects <= max_retained_objects) {
+                root.Release();
+            } else {
+                // Root chunk has been filled, squash allocations into it up to MAX_RETAINED_BYTES
+                const size_t total_objects{root.num_objects + new_chunk_size * (chunks.size() - 1)};
+                const size_t retained_objects{
+                    total_objects > max_retained_objects ? new_chunk_size : total_objects};
+                chunks.clear();
+                chunks.emplace_back(retained_objects);
+            }
+        } else if (root.num_objects > max_retained_objects) {
             chunks.clear();
-            chunks.emplace_back(total_objects);
+            chunks.emplace_back(new_chunk_size);
         } else {
             root.Release();
             chunks.resize(1);

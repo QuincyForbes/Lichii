@@ -193,6 +193,46 @@ namespace Vulkan {
         mutable std::mutex buffer_type_mutex;
         /// Memory type of device-local buffers by usage and flags (CreateBufferInSeparatePool).
         mutable std::unordered_map<u64, u32> buffer_memory_types;
+        struct ImageTypeKey {
+            VkFormat format;
+            VkImageTiling tiling;
+            VkImageUsageFlags usage;
+            VkImageCreateFlags flags;
+            bool operator==(const ImageTypeKey&) const noexcept = default;
+        };
+        struct ImageTypeKeyHash {
+            size_t operator()(const ImageTypeKey& k) const noexcept {
+                u64 h = (u64{static_cast<u32>(k.format)} << 32) | static_cast<u32>(k.usage);
+                h ^= ((u64{static_cast<u32>(k.tiling)} << 32) | static_cast<u32>(k.flags)) *
+                     0x9E3779B97F4A7C15ULL;
+                return static_cast<size_t>(h ^ (h >> 32));
+            }
+        };
+        struct ImageShapeKey {
+            VkFormat format;
+            VkImageTiling tiling;
+            VkImageCreateFlags flags;
+            u32 width;
+            u32 height;
+            u32 mip_levels;
+            u32 array_layers;
+            VkSampleCountFlagBits samples;
+            bool operator==(const ImageShapeKey&) const noexcept = default;
+        };
+        struct ImageShapeKeyHash {
+            size_t operator()(const ImageShapeKey& k) const noexcept {
+                u64 h = (u64{static_cast<u32>(k.format)} << 32) | k.width;
+                h = (h ^ ((u64{k.height} << 32) | (k.mip_levels << 16) | k.array_layers)) *
+                    0xBF58476D1CE4E5B9ULL;
+                h = (h ^ ((u64{static_cast<u32>(k.tiling)} << 32) |
+                          (u64{static_cast<u32>(k.samples)} << 16) | static_cast<u32>(k.flags))) *
+                    0x94D049BB133111EBULL;
+                return static_cast<size_t>(h ^ (h >> 31));
+            }
+        };
+        /// Cached memoryTypeBits and requirement size for CreateImageInMediumPool.
+        mutable std::unordered_map<ImageTypeKey, u32, ImageTypeKeyHash> image_memory_type_bits;
+        mutable std::unordered_map<ImageShapeKey, VkDeviceSize, ImageShapeKeyHash> image_req_sizes;
     };
 
     /// Logs VMA's blocks and allocations per memory type, and each heap's budget.
