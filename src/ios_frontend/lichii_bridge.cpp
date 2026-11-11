@@ -539,6 +539,8 @@ const std::map<u32, std::vector<EnumChoice>>& EnumTable() {
         AddEnum<GameListMode>(t);
         AddEnum<SpeedMode>(t);
         AddEnum<FrameGenType>(t);
+        AddEnum<FrameGenMotion>(t);
+        AddEnum<FrameGenFlowQuality>(t);
         return t;
     }();
     return table;

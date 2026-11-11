@@ -47,6 +47,10 @@ struct Frame {
     /// Time the present thread leaves before presenting the next frame: a generated frame's
     /// share of the real frame interval (zortos293/Lichii#783).
     std::chrono::nanoseconds present_spacing{};
+    /// Frame generation on the device's compute queue: the frame is shown only once its fence
+    /// signals, so the graphics queue never waits for it.
+    bool generated_async{};
+    vk::Fence generated_ready;
 };
 
 class PresentManager {

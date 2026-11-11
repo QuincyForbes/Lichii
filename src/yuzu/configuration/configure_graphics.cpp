@@ -237,8 +237,118 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     std::vector<QWidget*> hold_api;
     QCheckBox* frame_gen_checkbox = nullptr;
     QCheckBox* flow_scale_auto_checkbox = nullptr;
+    QComboBox* frame_gen_motion_combobox = nullptr;
+    const bool runtime_lock = !system.IsPoweredOn();
+    const auto make_enum_row = [&](Settings::BasicSetting* s, const QString& label_text,
+                                   const QString& tooltip_text,
+                                   std::initializer_list<std::pair<u32, QString>> items,
+                                   QComboBox*& out_combobox) -> QWidget* {
+        if (!Settings::IsConfiguringGlobal() && !s->Switchable()) {
+            return nullptr;
+        }
+        QWidget* row = new QWidget(this);
+        QHBoxLayout* layout = new QHBoxLayout(row);
+        layout->setContentsMargins(0, 0, 0, 0);
+        QLabel* label = new QLabel(label_text, row);
+        label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        QComboBox* cb = new QComboBox(row);
+        cb->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        const u32 current_val = static_cast<u32>(std::strtoul(s->ToString().c_str(), nullptr, 0));
+        int current_idx = 0;
+        int idx = 0;
+        for (const auto& [val, text] : items) {
+            cb->addItem(text, val);
+            if (val == current_val) {
+                current_idx = idx;
+            }
+            ++idx;
+        }
+        cb->setCurrentIndex(current_idx);
+        layout->addWidget(label);
+        layout->addWidget(cb);
+
+        if (!Settings::IsConfiguringGlobal()) {
+            QPushButton* restore_btn =
+                ConfigurationShared::Widget::CreateRestoreGlobalButton(s->UsingGlobal(), row);
+            layout->addWidget(restore_btn);
+            connect(cb, QOverload<int>::of(&QComboBox::activated), row, [restore_btn] {
+                restore_btn->setEnabled(true);
+                restore_btn->setVisible(true);
+            });
+            connect(restore_btn, &QAbstractButton::clicked, row, [s, cb, restore_btn](bool) {
+                restore_btn->setEnabled(false);
+                restore_btn->setVisible(false);
+                const u32 global_val =
+                    static_cast<u32>(std::strtoul(s->ToStringGlobal().c_str(), nullptr, 0));
+                const int found = cb->findData(global_val);
+                if (found >= 0) {
+                    cb->setCurrentIndex(found);
+                }
+            });
+            apply_funcs.push_back([s, cb, restore_btn](bool powered_on) {
+                if (s->RuntimeModifiable() || !powered_on) {
+                    const bool using_global = !restore_btn->isEnabled();
+                    s->SetGlobal(using_global);
+                    if (!using_global) {
+                        s->LoadString(std::to_string(cb->currentData().toUInt()));
+                    }
+                }
+            });
+        } else {
+            apply_funcs.push_back([s, cb](bool powered_on) {
+                if (s->RuntimeModifiable() || !powered_on) {
+                    s->LoadString(std::to_string(cb->currentData().toUInt()));
+                }
+            });
+        }
+
+        bool enable = runtime_lock || s->RuntimeModifiable();
+        QString reason;
+        if (!enable) {
+            reason = tr("Stop the game to change this.");
+        }
+        if (s->Switchable() && Settings::IsConfiguringGlobal() && !runtime_lock &&
+            !s->UsingGlobal()) {
+            enable = false;
+            reason = tr("The running game's Properties override this setting: change it there "
+                        "(right-click the game > Configure Game).");
+        }
+        row->setEnabled(enable);
+        row->setToolTip(reason.isEmpty() ? tooltip_text
+                                         : tooltip_text + QStringLiteral("\n\n") + reason);
+        out_combobox = cb;
+        return row;
+    };
 
     for (const auto setting : Settings::values.linkage.by_category[Settings::Category::Renderer]) {
+        if (setting->Id() == Settings::values.frame_gen_motion.Id()) {
+            if (QWidget* row = make_enum_row(
+                    setting, tr("Frame Generation Motion"),
+                    tr("Where the built-in frame generation gets its motion from. Auto uses "
+                       "NVIDIA's optical flow hardware (RTX 20 series and newer) when available, "
+                       "and the flow shader otherwise."),
+                    {{static_cast<u32>(Settings::FrameGenMotion::Auto),
+                      tr("Auto (optical flow hardware)")},
+                     {static_cast<u32>(Settings::FrameGenMotion::Shader), tr("Flow shader")}},
+                    frame_gen_motion_combobox)) {
+                hold_graphics.emplace(setting->Id(), row);
+            }
+            continue;
+        }
+        if (setting->Id() == Settings::values.frame_gen_flow_quality.Id()) {
+            QComboBox* quality_cb = nullptr;
+            if (QWidget* row = make_enum_row(
+                    setting, tr("Optical Flow Quality"),
+                    tr("Quality of the optical flow hardware's motion estimate. Higher quality "
+                       "costs more GPU time."),
+                    {{static_cast<u32>(Settings::FrameGenFlowQuality::Fast), tr("Fast")},
+                     {static_cast<u32>(Settings::FrameGenFlowQuality::Medium), tr("Medium")},
+                     {static_cast<u32>(Settings::FrameGenFlowQuality::Best), tr("Best")}},
+                    quality_cb)) {
+                hold_graphics.emplace(setting->Id(), row);
+            }
+            continue;
+        }
 #ifndef HAS_RESHADE
         if (setting->Id() == Settings::values.post_shader_enabled.Id()) {
             continue;
@@ -389,21 +499,6 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         graphics_layout.addWidget(widget);
     }
 
-    // Hide rather than disable, a disabled widget would read as using the global value
-    if (frame_gen_checkbox != nullptr) {
-        for (const u32 id : {Settings::values.frame_gen_type.Id(),
-                             Settings::values.frame_gen_multiplier.Id(),
-                             Settings::values.frame_gen_target_rate.Id(),
-                             Settings::values.frame_gen_flow_scale_auto.Id(),
-                             Settings::values.frame_gen_flow_scale.Id(),
-                             Settings::values.frame_gen_queue_target.Id()}) {
-            if (const auto it = hold_graphics.find(id); it != hold_graphics.end()) {
-                it->second->setVisible(frame_gen_checkbox->isChecked());
-                connect(frame_gen_checkbox, &QCheckBox::toggled, it->second, &QWidget::setVisible);
-            }
-        }
-    }
-
     // The manual flow scale is only read while Auto Flow Scale is off.
     if (const auto it = hold_graphics.find(Settings::values.frame_gen_flow_scale.Id());
         flow_scale_auto_checkbox != nullptr && it != hold_graphics.end()) {
@@ -450,11 +545,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         group_layout->addWidget(type_widget);
         group_layout->addWidget(row);
         type_widget->setVisible(true);
-        if (frame_gen_checkbox != nullptr) {
-            group->setVisible(frame_gen_checkbox->isChecked());
-            disconnect(frame_gen_checkbox, &QCheckBox::toggled, type_widget, &QWidget::setVisible);
-            connect(frame_gen_checkbox, &QCheckBox::toggled, group, &QWidget::setVisible);
-        }
+        hold_graphics[Settings::values.frame_gen_type.Id()] = group;
 
         const auto show_row = [this, row] {
             const auto& types = combobox_translations.at(
@@ -503,6 +594,51 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     }
     UpdateLosslessStatus();
 #endif
+
+    // Hide rather than disable, a disabled widget would read as using the global value. Each
+    // frame generation setting shows only while it applies: the flow scale to LSFG, the motion
+    // source to the built-in type, and the optical flow quality to its hardware.
+    if (frame_gen_checkbox != nullptr) {
+        const auto selected = [](QComboBox* combobox, auto value) {
+            return combobox == nullptr ||
+                   combobox->currentData().toUInt() == static_cast<u32>(value);
+        };
+        QCheckBox* const checkbox = frame_gen_checkbox;
+        QComboBox* const type = frame_gen_type_combobox;
+        QComboBox* const motion = frame_gen_motion_combobox;
+        std::vector<std::pair<QWidget*, std::function<bool()>>> dependents;
+        const auto add = [&](u32 id, std::function<bool()> applies) {
+            if (const auto it = hold_graphics.find(id); it != hold_graphics.end()) {
+                dependents.emplace_back(it->second, std::move(applies));
+            }
+        };
+        const auto always = [] { return true; };
+        const auto lsfg = [=] { return selected(type, Settings::FrameGenType::Lsfg); };
+        const auto built_in = [=] { return selected(type, Settings::FrameGenType::Fsr3); };
+        add(Settings::values.frame_gen_type.Id(), always);
+        add(Settings::values.frame_gen_multiplier.Id(), always);
+        add(Settings::values.frame_gen_target_rate.Id(), always);
+        add(Settings::values.frame_gen_flow_scale_auto.Id(), lsfg);
+        add(Settings::values.frame_gen_flow_scale.Id(), lsfg);
+        add(Settings::values.frame_gen_queue_target.Id(), always);
+        add(Settings::values.frame_gen_motion.Id(), built_in);
+        add(Settings::values.frame_gen_flow_quality.Id(), [=] {
+            return built_in() && selected(motion, Settings::FrameGenMotion::Auto);
+        });
+        const auto update = [checkbox, dependents] {
+            for (const auto& [widget, applies] : dependents) {
+                widget->setVisible(checkbox->isChecked() && applies());
+            }
+        };
+        update();
+        connect(checkbox, &QCheckBox::toggled, this, update);
+        for (QComboBox* const combobox : {type, motion}) {
+            if (combobox != nullptr) {
+                connect(combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                        update);
+            }
+        }
+    }
 
     for (auto widget : hold_api) {
         api_grid_layout->addWidget(widget);

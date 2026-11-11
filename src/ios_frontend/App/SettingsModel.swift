@@ -193,7 +193,8 @@ enum SettingsCatalog {
     /// Desktop input, debugger and bookkeeping keys with no use in the iOS app.
     static let hiddenKeys: Set<String> = [
         "vulkan_device", "fullscreen_mode", "output_device", "input_device", "dump_audio_commands",
-        "frame_gen_dump_flow", "oot_fps_asked", "frizti_settings_revision", "current_user",
+        "frame_gen_dump_flow", "frame_gen_motion", "frame_gen_flow_quality",
+        "oot_fps_asked", "frizti_settings_revision", "current_user",
         "current_speed_mode", "first_launch", "censor_username", "program_args", "gamecard_inserted",
         "gamecard_current_game", "gamecard_path", "nsight_aftermath", "renderdoc_hotkey", "use_gdbstub",
         "gdbstub_port", "perform_vulkan_check", "gpu_log_level", "gpu_log_vulkan_calls",

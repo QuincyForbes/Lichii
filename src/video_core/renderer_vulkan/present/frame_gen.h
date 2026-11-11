@@ -33,12 +33,21 @@ public:
 
     [[nodiscard]] size_t GeneratedFrameCount() const;
 
+    /// The semaphore the next graphics submission must wait on (hardware optical flow), or a
+    /// null handle.
+    [[nodiscard]] VkSemaphore TakeFlowWait() {
+        return fsr3_chain ? fsr3_chain->TakeFlowWait() : VK_NULL_HANDLE;
+    }
+
     void GenerateInto(const Device& device, Frame* destination, size_t generation);
 
     /// The smoothed time between real frames in seconds, or 0 while it is unknown.
     [[nodiscard]] f32 FrameInterval() const {
         return frame_interval;
     }
+
+    /// EDEN_NX2_FG_DUMP: saves a generated frame and its two sources, after its submission.
+    void DumpInterpolation(Frame* generated);
 
 private:
     void Rebuild(const Device& device, VkExtent2D extent, VkFormat format, f32 flow_scale);
@@ -73,6 +82,7 @@ private:
     bool generated{};
     bool unavailable{};
     bool dumped{};
+    u32 interpolation_dumps{};
 };
 
 } // namespace Vulkan
