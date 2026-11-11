@@ -799,12 +799,21 @@ void TextureCache<P>::TickFrame() {
     if (frame_tick % 30 == 0) {
         const u64 available = Common::PlatformEvents::AvailableProcessMemory();
         host_memory_cap = (std::numeric_limits<u64>::max)();
+        host_fixed_memory = 0;
         if (available != 0) {
             // Back to the configured thresholds, then the cap.
             ApplyThresholdOverrides(false);
             constexpr u64 Reserve = 768_MiB;
             const u64 room = available > Reserve ? available - Reserve : 0;
-            host_memory_cap = (std::max)(total_used_memory + room, u64{384_MiB});
+            // The heap also holds what the collector cannot free (the stream buffer, buffers,
+            // presentation images): an iPhone with 53-80 MiB of images had 260 MiB more. With the
+            // cap's fractions and its 384 MiB floor taken of all of it the collector stayed in
+            // high-priority mode for minutes with nothing left to delete (256 MiB expected, 315
+            // in use), so they are taken of the images only; the floor leaves them 128 MiB, about
+            // what 384 MiB left them there.
+            const u64 image_bytes = ImageMemory().second;
+            host_fixed_memory = total_used_memory - (std::min)(total_used_memory, image_bytes);
+            host_memory_cap = (std::max)(total_used_memory + room, host_fixed_memory + 128_MiB);
             const u64 effective = (std::min)(critical_memory, host_memory_cap);
             const u64 change = effective > host_memory_cap_logged ? effective - host_memory_cap_logged
                                                                   : host_memory_cap_logged - effective;
@@ -818,9 +827,10 @@ void TextureCache<P>::TickFrame() {
         }
     }
     if (host_memory_cap < critical_memory) {
+        const u64 collectable = host_memory_cap - (std::min)(host_memory_cap, host_fixed_memory);
         critical_memory = host_memory_cap;
-        expected_memory = (std::min)(expected_memory, host_memory_cap - host_memory_cap / 3);
-        minimum_memory = (std::min)(minimum_memory, host_memory_cap / 3);
+        expected_memory = (std::min)(expected_memory, host_memory_cap - collectable / 3);
+        minimum_memory = (std::min)(minimum_memory, host_fixed_memory + collectable / 3);
     }
 #endif
     RunGarbageCollector(out_of_memory, host_pressure);
