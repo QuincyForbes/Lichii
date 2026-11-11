@@ -15,4 +15,8 @@ class System;
 /// report at Info and returns it.
 std::string ProfileMemory(System& system);
 
+/// Live C++ allocations by call stack, as JSON (builds with LICHII_ALLOC_TRACE only): bytes,
+/// resident bytes and return addresses per stack. tools/nx2/alloc_trace_report.py names them.
+std::string AllocTraceReport();
+
 } // namespace Core

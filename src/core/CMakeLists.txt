@@ -1220,6 +1220,11 @@ else()
     target_sources(core PRIVATE internal_network/wifi_scanner_dummy.cpp)
 endif()
 
+if (LICHII_ALLOC_TRACE)
+    target_sources(core PRIVATE alloc_trace.cpp)
+    set_source_files_properties(debugger/nx2_debug_tools.cpp PROPERTIES COMPILE_DEFINITIONS LICHII_ALLOC_TRACE)
+endif()
+
 if (WIN32)
     target_compile_definitions(core PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
 
