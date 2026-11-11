@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -289,8 +290,18 @@ private:
         Mapped = 2,
     };
 
-    std::vector<u64> entries;
-    std::vector<u64> big_entries;
+    struct FreeDeleter {
+        void operator()(void* pointer) const noexcept {
+            std::free(pointer);
+        }
+    };
+    /// From calloc: the pages no mapping reaches are never written (as vectors, the three
+    /// tables of a 40-bit address space were 70 MiB of zero-filled memory).
+    using EntryWords = std::unique_ptr<u64[], FreeDeleter>;
+    [[nodiscard]] static EntryWords MakeEntryWords(size_t count);
+
+    EntryWords entries;
+    EntryWords big_entries;
 
     GPUVAddr PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, EntryType entry_type);
     GPUVAddr BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, EntryType entry_type);
@@ -302,7 +313,7 @@ private:
     mutable Common::RangeMap<GPUVAddr, PTEKind> kind_map;
     Common::SparseLargeVector<u32> big_page_table_dev;
 
-    std::vector<u64> big_page_continuous;
+    EntryWords big_page_continuous;
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash{};
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash2{};
 

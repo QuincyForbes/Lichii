@@ -10,6 +10,7 @@
 #include <map>
 #include <random>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 
 #include <fmt/format.h>
@@ -22,9 +23,33 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/swap.h"
-#include "core/file_sys/vfs/vfs_offset.h"
 
 namespace FileSys {
+
+/// What the member files of a container share and keep alive. Each file is an index into it:
+/// Ocarina of Time's container has 372,587 files, and a name, a hash and a backing file pointer
+/// in each node and each file object came to 97 MiB.
+struct NupMembers {
+    struct FileNode {
+        u32 name_offset{};
+        u32 name_length{};
+        u64 size{};
+        u64 extent_offset{};
+        u64 extent_size{};
+        u8 codec{};
+    };
+
+    std::string_view Name(const FileNode& node) const {
+        return std::string_view{names}.substr(node.name_offset, node.name_length);
+    }
+
+    VirtualFile backing;
+    std::shared_ptr<NupDecompressCache> cache;
+    /// The TOC's string pool.
+    std::string names;
+    std::vector<FileNode> files;
+};
+
 namespace {
 
 constexpr u32 NoDir = 0xFFFFFFFF;
@@ -152,25 +177,20 @@ bool Sha256(const u8* data, std::size_t size, std::array<u8, 0x20>& out) {
     return length == out.size();
 }
 
-/// A member file whose extent is zstd-compressed. Decompresses on first read and caches the
-/// result (LRU-evicted); a file over half the cache cap is decompressed once to a temporary file.
+/// A member file. A raw extent is a view into the container. A zstd extent is decompressed on
+/// first read and the result cached (LRU-evicted); a file over half the cache cap is decompressed
+/// once to a temporary file.
 class NupVfsFile final : public VfsFile {
 public:
-    NupVfsFile(VirtualFile backing_, u64 extent_offset_, u64 extent_size_, u64 uncompressed_size_,
-               std::string name_, std::shared_ptr<NupDecompressCache> cache_,
-               std::size_t cache_index_)
-        : backing(std::move(backing_)), extent_offset(extent_offset_), extent_size(extent_size_),
-          uncompressed_size(uncompressed_size_), name(std::move(name_)), cache(std::move(cache_)),
-          cache_index(cache_index_),
-          // Members over 256 MiB spill to disk even with a raised cap (each would be one vector).
-          cache_enabled(uncompressed_size <= std::min(cache->cap, NupDecompressCache::DefaultCap) / 2) {}
+    NupVfsFile(std::shared_ptr<const NupMembers> members_, u32 index_)
+        : members(std::move(members_)), cache_index(index_) {}
 
     std::string GetName() const override {
-        return name;
+        return std::string{Name()};
     }
 
     std::size_t GetSize() const override {
-        return static_cast<std::size_t>(uncompressed_size);
+        return static_cast<std::size_t>(Size());
     }
 
     bool Resize(std::size_t) override {
@@ -190,12 +210,20 @@ public:
     }
 
     std::size_t Read(u8* data, std::size_t length, std::size_t offset) const override {
+        const auto& node = Node();
+        const u64 uncompressed_size = Size();
         if (offset >= uncompressed_size) {
             return 0;
         }
         length = std::min(length, static_cast<std::size_t>(uncompressed_size) - offset);
+        if (node.codec == CodecRaw) {
+            return members->backing->Read(data, length,
+                                          static_cast<std::size_t>(node.extent_offset) + offset);
+        }
 
-        if (!cache_enabled) {
+        const auto& cache = members->cache;
+        // Members over 256 MiB spill to disk even with a raised cap (each would be one vector).
+        if (uncompressed_size > std::min(cache->cap, NupDecompressCache::DefaultCap) / 2) {
             return ReadSpilled(data, length, offset);
         }
 
@@ -228,13 +256,26 @@ public:
         return 0;
     }
 
-    bool Rename(std::string_view new_name) override {
-        name = std::string(new_name);
-        return true;
+    bool Rename(std::string_view) override {
+        return false;
     }
 
 private:
+    const NupMembers::FileNode& Node() const {
+        return members->files[cache_index];
+    }
+
+    std::string_view Name() const {
+        return members->Name(Node());
+    }
+
+    u64 Size() const {
+        const auto& node = Node();
+        return node.codec == CodecRaw ? node.extent_size : node.size;
+    }
+
     std::size_t ReadSpilled(u8* data, std::size_t length, std::size_t offset) const {
+        const auto& cache = members->cache;
         std::shared_ptr<NupSpillFile> spill;
         {
             std::scoped_lock lock{cache->mutex};
@@ -252,6 +293,12 @@ private:
     }
 
     void DecompressToFile(NupSpillFile& spill) const {
+        const auto& backing = members->backing;
+        const auto& cache = members->cache;
+        const std::string_view name = Name();
+        const u64 extent_offset = Node().extent_offset;
+        const u64 extent_size = Node().extent_size;
+        const u64 uncompressed_size = Node().size;
         const auto fail = [&](const char* reason) {
             LOG_ERROR(Loader, "NUP zstd decompression of {} to a temporary file failed: {}", name,
                       reason);
@@ -317,6 +364,11 @@ private:
     }
 
     std::vector<u8> Decompress() const {
+        const auto& backing = members->backing;
+        const std::string_view name = Name();
+        const u64 extent_offset = Node().extent_offset;
+        const u64 extent_size = Node().extent_size;
+        const u64 uncompressed_size = Node().size;
         if (extent_size > backing->GetSize() || extent_offset > backing->GetSize() - extent_size) {
             return {};
         }
@@ -346,14 +398,8 @@ private:
         return out;
     }
 
-    VirtualFile backing;
-    u64 extent_offset;
-    u64 extent_size;
-    u64 uncompressed_size;
-    std::string name;
-    std::shared_ptr<NupDecompressCache> cache;
-    std::size_t cache_index;
-    bool cache_enabled;
+    std::shared_ptr<const NupMembers> members;
+    u32 cache_index;
 };
 
 } // namespace
@@ -377,7 +423,10 @@ bool NupContainer::IsNupFile(const VirtualFile& file) {
 
 NupContainer::NupContainer(VirtualFile file_, std::size_t memory_cache_cap,
                            std::filesystem::path spill_dir_)
-    : file(std::move(file_)), cache(std::make_shared<NupDecompressCache>()) {
+    : file(std::move(file_)), members(std::make_shared<NupMembers>()),
+      cache(std::make_shared<NupDecompressCache>()) {
+    members->backing = file;
+    members->cache = cache;
     cache->cap = memory_cache_cap;
     // sergio: hosts with plenty of RAM can keep far more decompressed members, so area changes
     // stop re-running zstd on files the 512 MiB default evicted. EDEN_NUP_CACHE_MIB raises it
@@ -456,9 +505,11 @@ bool NupContainer::Parse() {
         return false;
     }
 
-    // The counts come from the file, so bound them by the TOC size before multiplying.
+    // The counts come from the file, so bound them by the TOC size before multiplying. The
+    // children array names directories and files by one u32.
     if (header.dir_count > toc.size() / DirRecordSize ||
-        header.file_count > toc.size() / FileRecordSize) {
+        header.file_count > toc.size() / FileRecordSize ||
+        header.dir_count + header.file_count > 0xFFFFFFFFULL) {
         status = Loader::ResultStatus::ErrorNUPBadFormat;
         return false;
     }
@@ -522,6 +573,10 @@ bool NupContainer::Parse() {
         dirs[i].child_count = record.child_count;
     }
 
+    file_records_offset = toc_offset + pos;
+    members->names.assign(reinterpret_cast<const char*>(base) + header.pool_offset,
+                          static_cast<std::size_t>(header.pool_size));
+    auto& files = members->files;
     files.resize(header.file_count);
     for (u64 i = 0; i < header.file_count; ++i) {
         FileRecord record{};
@@ -537,11 +592,9 @@ bool NupContainer::Parse() {
             status = Loader::ResultStatus::ErrorNUPBadFormat;
             return false;
         }
-        files[i].name = std::string(reinterpret_cast<const char*>(base) + header.pool_offset +
-                                        record.name_offset,
-                                    record.name_length);
+        files[i].name_offset = record.name_offset;
+        files[i].name_length = record.name_length;
         files[i].size = record.size;
-        files[i].sha256 = record.sha256;
         files[i].extent_offset = record.extent_offset;
         files[i].extent_size = record.extent_size;
         files[i].codec = record.codec;
@@ -730,20 +783,19 @@ std::optional<std::size_t> NupContainer::FindBestUpdatePackage() const {
 }
 
 VirtualFile NupContainer::OpenFile(std::size_t file_index) {
-    if (file_index >= files.size()) {
+    if (file_index >= members->files.size()) {
         return nullptr;
     }
-    const FileNode& node = files[file_index];
+    const auto& node = members->files[file_index];
     if (node.size == 0) {
-        return std::make_shared<VectorVfsFile>(std::vector<u8>{}, node.name);
+        return std::make_shared<VectorVfsFile>(std::vector<u8>{},
+                                               std::string{members->Name(node)});
     }
-    if (node.codec == CodecRaw) {
-        return std::make_shared<OffsetVfsFile>(
-            file, static_cast<std::size_t>(node.extent_size),
-            static_cast<std::size_t>(node.extent_offset), node.name);
-    }
-    return std::make_shared<NupVfsFile>(file, node.extent_offset, node.extent_size, node.size,
-                                        node.name, cache, file_index);
+    return std::make_shared<NupVfsFile>(members, static_cast<u32>(file_index));
+}
+
+std::size_t NupContainer::GetFileCount() const {
+    return members->files.size();
 }
 
 void NupContainer::BuildDirTree(u32 dir_index, VectorVfsDirectory& out) {
@@ -850,33 +902,33 @@ VirtualDir NupContainer::MergeShadowDirs(const VirtualDir& base, const VirtualDi
                                                 base->GetName());
 }
 
-std::vector<u8> NupContainer::ReadExtentRaw(const FileNode& node) const {
-    return file->ReadBytes(static_cast<std::size_t>(node.extent_size),
-                           static_cast<std::size_t>(node.extent_offset));
-}
-
 Loader::ResultStatus NupContainer::VerifyIntegrity(
     std::function<bool(std::size_t, std::size_t)> progress_callback) const {
-    const std::size_t total = files.size();
+    const std::size_t total = members->files.size();
     for (std::size_t i = 0; i < total; ++i) {
-        const FileNode& node = files[i];
+        const auto& node = members->files[i];
+        const std::string_view name = members->Name(node);
         std::vector<u8> content;
-        if (node.size == 0) {
-            content = ReadExtentRaw(node);
-        } else if (node.codec == CodecRaw) {
-            content = ReadExtentRaw(node);
+        if (node.size == 0 || node.codec == CodecRaw) {
+            content = file->ReadBytes(static_cast<std::size_t>(node.extent_size),
+                                      static_cast<std::size_t>(node.extent_offset));
         } else {
-            NupVfsFile view(file, node.extent_offset, node.extent_size, node.size, node.name,
-                            cache, i);
+            NupVfsFile view(members, static_cast<u32>(i));
             content = view.ReadAllBytes();
         }
         if (content.size() != node.size) {
-            LOG_ERROR(Loader, "NUP integrity check failed for {}: short read", node.name);
+            LOG_ERROR(Loader, "NUP integrity check failed for {}: short read", name);
             return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
         }
+        // The nodes do not keep the hashes: read from the file record.
+        std::array<u8, 0x20> expected{};
+        const u64 expected_offset =
+            file_records_offset + i * FileRecordSize + offsetof(FileRecord, sha256);
         std::array<u8, 0x20> hash{};
-        if (!Sha256(content.data(), content.size(), hash) || hash != node.sha256) {
-            LOG_ERROR(Loader, "NUP integrity check failed for {}: SHA-256 mismatch", node.name);
+        if (file->ReadObject(&expected, static_cast<std::size_t>(expected_offset)) !=
+                expected.size() ||
+            !Sha256(content.data(), content.size(), hash) || hash != expected) {
+            LOG_ERROR(Loader, "NUP integrity check failed for {}: SHA-256 mismatch", name);
             return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
         }
         if (progress_callback && !progress_callback(i + 1, total)) {

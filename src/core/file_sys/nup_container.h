@@ -82,6 +82,8 @@ struct NupDecompressCache {
     }
 };
 
+struct NupMembers;
+
 /**
  * NUP (NX Package) container: stores loose ExeFS/RomFS trees for a base program,
  * its updates and add-on content in one file. Layout:
@@ -165,9 +167,7 @@ public:
     Loader::ResultStatus VerifyIntegrity(
         std::function<bool(std::size_t, std::size_t)> progress_callback) const;
 
-    std::size_t GetFileCount() const {
-        return files.size();
-    }
+    std::size_t GetFileCount() const;
 
 private:
     struct DirNode {
@@ -176,21 +176,11 @@ private:
         u32 child_count{};
     };
 
-    struct FileNode {
-        std::string name;
-        u64 size{};
-        std::array<u8, 0x20> sha256{};
-        u64 extent_offset{};
-        u64 extent_size{};
-        u8 codec{};
-    };
-
     bool Parse();
     bool ParseMeta(PackageInfo& package);
     bool ValidateDirTree() const;
     void BuildDirTree(u32 dir_index, VectorVfsDirectory& out);
     VirtualDir BuildPackageDir(u32 dir_index);
-    std::vector<u8> ReadExtentRaw(const FileNode& node) const;
 
     VirtualFile file;
     Loader::ResultStatus status{Loader::ResultStatus::ErrorNullFile};
@@ -199,9 +189,12 @@ private:
     u64 toc_size{};
     u64 blob_offset{};
     u64 file_size{};
+    /// Where the TOC's file records start in the container (their SHA-256 is read from there).
+    u64 file_records_offset{};
 
     std::vector<DirNode> dirs;
-    std::vector<FileNode> files;
+    /// The file nodes and their names, shared with the member files.
+    std::shared_ptr<NupMembers> members;
     std::vector<u32> children;
     std::vector<PackageInfo> packages;
 

@@ -84,6 +84,7 @@ cmake_dependent_option(YUZU_USE_BUNDLED_QT "Download bundled Qt binaries" "${MSV
 
 option(ENABLE_DEBUG_TOOLS "Enable debugging tools (maxwell disassembler, SPIRV translator, etc)" OFF)
 option(ENABLE_WERROR "Enable -Werror diagnostics" ON)
+cmake_dependent_option(LICHII_ALLOC_TRACE "Record the call stacks of live allocations for the debug server (measurement builds)" OFF "MSVC" OFF)
 
 option(LICHII_FUZZERS "Build libFuzzer harnesses for the game-file parsers (clang only; instruments everything with ASan and UBSan)" OFF)
 if (LICHII_FUZZERS)

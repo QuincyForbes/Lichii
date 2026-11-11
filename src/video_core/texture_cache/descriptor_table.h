@@ -139,18 +139,23 @@ public:
     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
         current_gpu_addr = gpu_addr;
         current_limit = limit;
-        // Mario Brothership reallocates a lot of times, so use aggressive pre-alloc sizes
-        // std::vector<T> by default uses quadratic growth, but that isn't even enough to satisfy brothership
-        const size_t num_descriptors = ((limit + 0x80000) & (~0x7ffff)) + 1;
-        const size_t num_words = Common::DivCeil(num_descriptors, 64U);
-        read_descriptors.resize(num_words);
-        frame_verified.resize(num_words);
-        epoch_prepared.resize(num_words);
+        // Sized to the limit and never shrunk. Mario Brothership moves its tables a lot of times,
+        // so a larger limit at least doubles the size: no reallocation for most of them. (A fixed
+        // 512k-entry minimum zero-filled 18 MiB a table, 73 MiB for Ocarina's four.)
+        // As before, a limit within 512k of 2^32 gets no table of that size.
+        const size_t needed =
+            limit < 0xfff80000U ? Common::AlignUp(size_t{limit} + 1, size_t{0x400}) : 0x400;
+        if (needed > descriptors.size()) {
+            const size_t num_descriptors = (std::max)(needed, descriptors.size() * 2);
+            const size_t num_words = Common::DivCeil(num_descriptors, size_t{64});
+            read_descriptors.resize(num_words);
+            frame_verified.resize(num_words);
+            epoch_prepared.resize(num_words);
+            descriptors.resize(num_descriptors);
+            bound_ids.resize(num_descriptors, Id{0});
+        }
         ClearReadDescriptors();
         invalidated = false;
-        //
-        descriptors.resize(num_descriptors);
-        bound_ids.resize(num_descriptors, Id{0});
     }
 
     std::vector<u64> read_descriptors;

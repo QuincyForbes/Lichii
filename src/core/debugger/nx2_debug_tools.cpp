@@ -253,6 +253,12 @@ json MemoryProfile(ToolState& state, const json&) {
     return {{"report", Core::ProfileMemory(state.system)}};
 }
 
+#ifdef LICHII_ALLOC_TRACE
+json AllocTrace(ToolState&, const json&) {
+    return json::parse(Core::AllocTraceReport());
+}
+#endif
+
 json MemoryTouched(ToolState& state, const json& params) {
     const Core::TouchedMemory touched = Core::ProfileTouched(
         state.system, params.value("reset", false), params.value("end", false));
@@ -986,6 +992,9 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"screenshot", handler(Screenshot)},
         {"log_tail", handler(LogTail)},
         {"memory_profile", handler(MemoryProfile)},
+#ifdef LICHII_ALLOC_TRACE
+        {"alloc_trace", handler(AllocTrace)},
+#endif
         {"memory_touched", handler(MemoryTouched)},
         {"log_filter", handler(LogFilter)},
         {"capture_frame", handler(CaptureFrame)},
