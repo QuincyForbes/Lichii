@@ -28,7 +28,9 @@ struct Jit::Impl final {
     Impl(Jit*, A64::UserConfig conf)
             : conf(conf)
             , current_address_space(conf)
-            , core(conf) {}
+            , core(conf) {
+        current_address_space.SetJitState(&current_state, &halt_reason);
+    }
 
     HaltReason Run() {
         ASSERT(!is_executing);

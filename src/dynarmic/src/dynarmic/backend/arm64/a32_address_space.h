@@ -23,6 +23,7 @@ public:
     void GenerateIR(IR::Block& ir_block, IR::LocationDescriptor) const override;
 
     void InvalidateCacheRanges(const boost::icl::interval_set<u32>& ranges);
+    void ClearCache() override;
 
 protected:
     friend class A32Core;

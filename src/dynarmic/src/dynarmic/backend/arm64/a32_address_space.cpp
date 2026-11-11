@@ -209,6 +209,11 @@ void A32AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u32>&
     InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
 }
 
+void A32AddressSpace::ClearCache() {
+    block_ranges.ClearCache();
+    AddressSpace::ClearCache();
+}
+
 void A32AddressSpace::EmitPrelude() {
     using namespace oaknut::util;
 
@@ -419,11 +424,14 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
 
         .fastmem_pointer = conf.fastmem_pointer,
         .recompile_on_fastmem_failure = conf.recompile_on_fastmem_failure,
+        .recompile_on_exclusive_fastmem_failure = true,
         .fastmem_address_space_bits = 32,
         .silently_mirror_fastmem = true,
 
         .wall_clock_cntpct = conf.wall_clock_cntpct,
         .enable_cycle_counting = conf.enable_cycle_counting,
+        .halt_check_on_back_edges = false,
+        .use_state_rsb = false,
 
         .always_little_endian = conf.always_little_endian,
 
@@ -436,6 +444,8 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
         .state_nzcv_offset = offsetof(A32JitState, cpsr_nzcv),
         .state_fpsr_offset = offsetof(A32JitState, fpsr),
         .state_exclusive_state_offset = offsetof(A32JitState, exclusive_state),
+        .state_rsb_ptr_offset = 0,
+        .state_atomic_scratch_offset = 0,
 
         .coprocessors = conf.coprocessors,
 

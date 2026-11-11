@@ -8,8 +8,11 @@
 
 #pragma once
 
-#include <map>
+#include <array>
+#include <memory>
 #include <optional>
+#include <utility>
+#include <vector>
 
 #include "common/common_types.h"
 #include <oaknut/code_block.hpp>
@@ -47,10 +50,18 @@ public:
 
     void InvalidateBasicBlocks(const ::Common::unordered_set<IR::LocationDescriptor>& descriptors);
 
-    void ClearCache();
+    virtual void ClearCache();
 protected:
+    struct BlockReferences {
+        std::array<CodePtr, 2> first{};
+        std::unique_ptr<std::vector<CodePtr>> rest;
+
+        void Add(CodePtr ptr);
+    };
+
     virtual EmitConfig GetEmitConfig() = 0;
     virtual void RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) = 0;
+    virtual void OnInvalidateBasicBlock(IR::LocationDescriptor) {}
 
     void ProtectCodeMemory() {
 #if defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT) || defined(__APPLE__) || defined(__OpenBSD__)
@@ -75,15 +86,15 @@ protected:
     IR::Block ir_block;
     const std::size_t code_cache_size;
     u64 cache_generation = 0;
+    std::size_t dropped_writable_offset = 0;
     oaknut::CodeBlock mem;
     oaknut::CodeGenerator code;
 
-    // A IR::LocationDescriptor will have one current CodePtr.
-    // However, there can be multiple other CodePtrs which are older, previously invalidated blocks.
-    std::map<CodePtr, IR::LocationDescriptor> reverse_block_entries;
+    // CodePtr entries are appended monotonically between ClearCache() calls.
+    std::vector<std::pair<CodePtr, IR::LocationDescriptor>> reverse_block_entries;
     ::Common::unordered_map<IR::LocationDescriptor, CodePtr> block_entries;
     ::Common::unordered_map<CodePtr, EmittedBlockInfo> block_infos;
-    ::Common::unordered_map<IR::LocationDescriptor, ::Common::unordered_set<CodePtr>> block_references;
+    ::Common::unordered_map<IR::LocationDescriptor, BlockReferences> block_references;
 
     ExceptionHandler exception_handler;
     FastmemManager fastmem_manager;
@@ -96,6 +107,8 @@ protected:
         RunCodeFuncType step_code;
         void* return_to_dispatcher;
         void* return_from_run_code;
+        void* pop_rsb_hint = nullptr;
+        void* fast_dispatch_hint = nullptr;
 
         void* read_memory_8;
         void* read_memory_16;
@@ -127,6 +140,14 @@ protected:
         void* exclusive_write_memory_32;
         void* exclusive_write_memory_64;
         void* exclusive_write_memory_128;
+        void* wrapped_atomic_rmw_8 = nullptr;
+        void* wrapped_atomic_rmw_16 = nullptr;
+        void* wrapped_atomic_rmw_32 = nullptr;
+        void* wrapped_atomic_rmw_64 = nullptr;
+        void* wrapped_atomic_cas_8 = nullptr;
+        void* wrapped_atomic_cas_16 = nullptr;
+        void* wrapped_atomic_cas_32 = nullptr;
+        void* wrapped_atomic_cas_64 = nullptr;
 
         void* call_svc;
         void* exception_raised;

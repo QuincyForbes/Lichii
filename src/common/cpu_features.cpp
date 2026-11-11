@@ -311,7 +311,7 @@ bool WallClock::IsNative() const {
 u64 WallClock::NsToTicks(std::chrono::nanoseconds ns) const {
     return ns.count() * rdtsc_ns_integer + MultiplyHigh(ns.count(), rdtsc_ns_factor);
 }
-#elif defined(HAS_NCE)
+#elif defined(ARCHITECTURE_arm64) && defined(__SIZEOF_INT128__)
 namespace {
 [[nodiscard]] Common::WallClock::FactorType GetFixedPointFactor(u64 num, u64 den) noexcept {
     return (Common::WallClock::FactorType(num) << 64) / den;
@@ -345,7 +345,7 @@ namespace {
 }
 } // namespace
 
-WallClock::WallClock(bool invariant_, u64 rdtsc_frequency_) noexcept {
+WallClock::WallClock([[maybe_unused]] bool invariant_, [[maybe_unused]] u64 rdtsc_frequency_) noexcept {
     host_cntfrq = std::max<u64>(GetHostCNTFRQ(), 1);
     ns_cntfrq_factor = GetFixedPointFactor(NsRatio::den, host_cntfrq);
     us_cntfrq_factor = GetFixedPointFactor(UsRatio::den, host_cntfrq);
@@ -383,9 +383,8 @@ s64 WallClock::GetGPUTick() const {
 s64 WallClock::GetUptime() const {
     s64 cntvct_el0 = 0;
     asm volatile(
-        "dsb ish\n\t"
+        "isb\n\t"
         "mrs %[cntvct_el0], cntvct_el0\n\t"
-        "dsb ish\n\t"
         : [cntvct_el0] "=r"(cntvct_el0)
     );
     return cntvct_el0;
@@ -399,7 +398,7 @@ u64 WallClock::NsToTicks(std::chrono::nanoseconds ns) const {
     return MultiplyHigh(ns.count(), cntfrq_ns_factor);
 }
 #else
-WallClock::WallClock(bool invariant_, u64 rdtsc_frequency_) noexcept {}
+WallClock::WallClock([[maybe_unused]] bool invariant_, [[maybe_unused]] u64 rdtsc_frequency_) noexcept {}
 
 std::chrono::nanoseconds WallClock::GetTimeNS() const {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch());
@@ -448,7 +447,7 @@ WallClock g_wall_clock = [] {
 #if defined(ARCHITECTURE_x86_64)
     auto const& caps = Common::g_cpu_caps;
     return WallClock(caps.invariant_tsc && caps.tsc_frequency > std::nano::den, caps.tsc_frequency);
-#elif defined(HAS_NCE)
+#elif defined(ARCHITECTURE_arm64) && defined(__SIZEOF_INT128__)
     return WallClock(false, 1);
 #else
     return WallClock(true, 1);

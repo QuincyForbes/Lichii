@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <type_traits>
 
 #include "common/common_types.h"
 
@@ -22,12 +23,15 @@ namespace Dynarmic::Backend::Arm64 {
 constexpr std::size_t SpillCount = 64;
 
 struct alignas(16) RSBEntry {
-    u64 target;
-    u64 code_ptr;
+    u64 target = ~u64{0};
+    u64 code_ptr = 0;
 };
 
 constexpr std::size_t RSBCount = 8;
 constexpr u64 RSBIndexMask = (RSBCount - 1) * sizeof(RSBEntry);
+
+constexpr std::size_t A64RSBCount = 32;
+constexpr u64 A64RSBIndexMask = (A64RSBCount - 1) * sizeof(RSBEntry);
 
 struct alignas(16) StackLayout {
     std::array<RSBEntry, RSBCount> rsb;
@@ -47,6 +51,7 @@ struct alignas(16) StackLayout {
 #    pragma warning(pop)
 #endif
 
+static_assert(std::is_standard_layout_v<StackLayout>);
 static_assert(sizeof(StackLayout) % 16 == 0);
 
 }  // namespace Dynarmic::Backend::Arm64

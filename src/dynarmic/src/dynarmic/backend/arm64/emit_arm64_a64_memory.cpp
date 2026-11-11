@@ -125,4 +125,46 @@ void EmitIR<IR::Opcode::A64ExclusiveWriteMemory128>(oaknut::CodeGenerator& code,
     EmitExclusiveWriteMemory<128>(code, ctx, inst);
 }
 
+#if defined(ARCHITECTURE_arm64)
+template<>
+void EmitIR<IR::Opcode::A64AtomicRmwMemory8>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicRmwMemory<8>(code, ctx, inst);
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicRmwMemory16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicRmwMemory<16>(code, ctx, inst);
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicRmwMemory32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicRmwMemory<32>(code, ctx, inst);
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicRmwMemory64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicRmwMemory<64>(code, ctx, inst);
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicCasMemory8>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicCasMemory<8>(code, ctx, inst);
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicCasMemory16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicCasMemory<16>(code, ctx, inst);
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicCasMemory32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicCasMemory<32>(code, ctx, inst);
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicCasMemory64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicCasMemory<64>(code, ctx, inst);
+}
+#endif
+
 }  // namespace Dynarmic::Backend::Arm64

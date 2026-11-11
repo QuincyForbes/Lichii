@@ -57,6 +57,19 @@ void EmitIR<IR::Opcode::PushRSB>(oaknut::CodeGenerator& code, EmitContext& ctx, 
     ASSERT(args[0].IsImmediate());
     const IR::LocationDescriptor target{args[0].GetImmediateU64()};
 
+    if (ctx.conf.use_state_rsb) {
+        code.LDR(Wscratch2, Xstate, ctx.conf.state_rsb_ptr_offset);
+        code.ADD(Wscratch2, Wscratch2, sizeof(RSBEntry));
+        code.AND(Wscratch2, Wscratch2, A64RSBIndexMask);
+        code.STR(Wscratch2, Xstate, ctx.conf.state_rsb_ptr_offset);
+        code.ADD(Xscratch2, Xstate, Xscratch2);
+
+        code.MOV(Xscratch0, target.Value());
+        EmitBlockLinkRelocation(code, ctx, target, BlockRelocationType::MoveToScratch1);
+        code.STP(Xscratch0, Xscratch1, Xscratch2, 0);
+        return;
+    }
+
     code.LDR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
     code.ADD(Wscratch2, Wscratch2, sizeof(RSBEntry));
     code.AND(Wscratch2, Wscratch2, RSBIndexMask);
@@ -263,6 +276,8 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
     }
     code.BRK(0);
 
+    ebi.block_relocations.shrink_to_fit();
+    ebi.fastmem_patch_info.shrink_to_fit();
     ebi.size = code.xptr<CodePtr>() - ebi.entry_point;
     return ebi;
 }

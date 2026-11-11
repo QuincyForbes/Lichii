@@ -6,10 +6,17 @@
  * SPDX-License-Identifier: 0BSD
  */
 
-#include <cstdio>
-
+#include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdio>
+
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include "common/ios_jit.h"
+#endif
+#endif
 
 #include "dynarmic/backend/arm64/a64_address_space.h"
 #include "dynarmic/backend/arm64/a64_jitstate.h"
@@ -42,6 +49,24 @@ AddressSpace::AddressSpace(std::size_t code_cache_size)
 
 AddressSpace::~AddressSpace() = default;
 
+void AddressSpace::BlockReferences::Add(CodePtr ptr) {
+    for (CodePtr& slot : first) {
+        if (slot == ptr) {
+            return;
+        }
+        if (slot == nullptr) {
+            slot = ptr;
+            return;
+        }
+    }
+    if (!rest) {
+        rest = std::make_unique<std::vector<CodePtr>>();
+    } else if (std::find(rest->begin(), rest->end(), ptr) != rest->end()) {
+        return;
+    }
+    rest->push_back(ptr);
+}
+
 CodePtr AddressSpace::Get(IR::LocationDescriptor descriptor) {
     if (const auto iter = block_entries.find(descriptor); iter != block_entries.end()) {
         return iter->second;
@@ -50,8 +75,9 @@ CodePtr AddressSpace::Get(IR::LocationDescriptor descriptor) {
 }
 
 std::optional<IR::LocationDescriptor> AddressSpace::ReverseGetLocation(CodePtr host_pc) {
-    if (auto iter = reverse_block_entries.upper_bound(host_pc); iter != reverse_block_entries.begin()) {
-        // upper_bound locates the first value greater than host_pc, so we need to decrement
+    const auto cmp = [](CodePtr pc, const auto& entry) { return pc < entry.first; };
+    if (auto iter = std::upper_bound(reverse_block_entries.begin(), reverse_block_entries.end(), host_pc, cmp);
+        iter != reverse_block_entries.begin()) {
         --iter;
         return iter->second;
     }
@@ -59,8 +85,9 @@ std::optional<IR::LocationDescriptor> AddressSpace::ReverseGetLocation(CodePtr h
 }
 
 CodePtr AddressSpace::ReverseGetEntryPoint(CodePtr host_pc) {
-    if (auto iter = reverse_block_entries.upper_bound(host_pc); iter != reverse_block_entries.begin()) {
-        // upper_bound locates the first value greater than host_pc, so we need to decrement
+    const auto cmp = [](CodePtr pc, const auto& entry) { return pc < entry.first; };
+    if (auto iter = std::upper_bound(reverse_block_entries.begin(), reverse_block_entries.end(), host_pc, cmp);
+        iter != reverse_block_entries.begin()) {
         --iter;
         return iter->first;
     }
@@ -89,6 +116,7 @@ CodePtr AddressSpace::GetOrEmitFromDispatcher(IR::LocationDescriptor descriptor,
 void AddressSpace::InvalidateBasicBlocks(const ::Common::unordered_set<IR::LocationDescriptor>& descriptors) {
     UnprotectCodeMemory();
 
+    bool any_erased = false;
     for (const auto& descriptor : descriptors) {
         const auto iter = block_entries.find(descriptor);
         if (iter == block_entries.end()) {
@@ -98,8 +126,13 @@ void AddressSpace::InvalidateBasicBlocks(const ::Common::unordered_set<IR::Locat
         // Unlink before removal because InvalidateBasicBlocks can be called within a fastmem callback,
         // and the currently executing block may have references to itself which need to be unlinked.
         RelinkForDescriptor(descriptor, nullptr);
+        OnInvalidateBasicBlock(descriptor);
 
         block_entries.erase(iter);
+        any_erased = true;
+    }
+    if (any_erased) {
+        ++cache_generation;
     }
 
     ProtectCodeMemory();
@@ -111,6 +144,10 @@ void AddressSpace::ClearCache() {
     block_infos.clear();
     block_references.clear();
     code.set_offset(prelude_info.end_of_prelude);
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    ::Common::IosJit::DropWritablePtes(mem.wptr(), code_cache_size);
+    dropped_writable_offset = 0;
+#endif
     ++cache_generation;
 }
 
@@ -136,16 +173,33 @@ CodePtr AddressSpace::Emit(IR::Block block) {
     const CodePtr entry_point = block_info.entry_point;
 
     ASSERT(block_entries.insert({block.Location(), entry_point}).second);
-    ASSERT(reverse_block_entries.insert({entry_point, block.Location()}).second);
+    ASSERT(reverse_block_entries.empty() || reverse_block_entries.back().first < entry_point);
+    reverse_block_entries.emplace_back(entry_point, block.Location());
     const auto [info_iter, inserted] = block_infos.emplace(entry_point, std::move(block_info));
     ASSERT(inserted);
     EmittedBlockInfo& stored_info = info_iter->second;
 
     Link(stored_info);
+    std::vector<Relocation>{}.swap(stored_info.relocations);
     RelinkForDescriptor(block.Location(), entry_point);
 
     mem.invalidate(reinterpret_cast<u32*>(entry_point), stored_info.size);
     ProtectCodeMemory();
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    constexpr std::size_t kDropGranularity = 2 * 1024 * 1024;
+    constexpr std::size_t kIosPageSize = 16 * 1024;
+    const auto current_offset = static_cast<std::size_t>(code.offset());
+    if (current_offset - dropped_writable_offset >= kDropGranularity) {
+        const std::size_t drop_end = current_offset & ~(kIosPageSize - 1);
+        if (drop_end > dropped_writable_offset) {
+            ::Common::IosJit::DropWritablePtes(
+                reinterpret_cast<std::uint8_t*>(mem.wptr()) + dropped_writable_offset,
+                drop_end - dropped_writable_offset);
+            dropped_writable_offset = drop_end;
+        }
+    }
+#endif
 
     RegisterNewBasicBlock(block, stored_info);
 
@@ -166,6 +220,12 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
             break;
         case LinkTarget::ReturnFromRunCode:
             c.B(prelude_info.return_from_run_code);
+            break;
+        case LinkTarget::PopRSBHint:
+            c.B(prelude_info.pop_rsb_hint);
+            break;
+        case LinkTarget::FastDispatchHint:
+            c.B(prelude_info.fast_dispatch_hint);
             break;
         // { this, vaddr, size }
         case LinkTarget::ReadMemory8:
@@ -263,6 +323,30 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
         case LinkTarget::ExclusiveWriteMemory128:
             c.BL(prelude_info.exclusive_write_memory_128);
             break;
+        case LinkTarget::WrappedAtomicRmw8:
+            c.BL(prelude_info.wrapped_atomic_rmw_8);
+            break;
+        case LinkTarget::WrappedAtomicRmw16:
+            c.BL(prelude_info.wrapped_atomic_rmw_16);
+            break;
+        case LinkTarget::WrappedAtomicRmw32:
+            c.BL(prelude_info.wrapped_atomic_rmw_32);
+            break;
+        case LinkTarget::WrappedAtomicRmw64:
+            c.BL(prelude_info.wrapped_atomic_rmw_64);
+            break;
+        case LinkTarget::WrappedAtomicCas8:
+            c.BL(prelude_info.wrapped_atomic_cas_8);
+            break;
+        case LinkTarget::WrappedAtomicCas16:
+            c.BL(prelude_info.wrapped_atomic_cas_16);
+            break;
+        case LinkTarget::WrappedAtomicCas32:
+            c.BL(prelude_info.wrapped_atomic_cas_32);
+            break;
+        case LinkTarget::WrappedAtomicCas64:
+            c.BL(prelude_info.wrapped_atomic_cas_64);
+            break;
         case LinkTarget::CallSVC:
             c.BL(prelude_info.call_svc);
             break;
@@ -293,7 +377,7 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
     }
 
     for (const auto& [target_descriptor, list] : block_info.block_relocations) {
-        block_references[target_descriptor].insert(block_info.entry_point);
+        block_references[target_descriptor].Add(block_info.entry_point);
         LinkBlockLinks(block_info.entry_point, Get(target_descriptor), list);
     }
 }
@@ -328,15 +412,32 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
 }
 
 void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr) {
-    for (auto code_ptr : block_references[target_descriptor]) {
+    const auto refs_iter = block_references.find(target_descriptor);
+    if (refs_iter == block_references.end()) {
+        return;
+    }
+
+    const auto relink_one = [&](CodePtr code_ptr) {
         if (auto block_iter = block_infos.find(code_ptr); block_iter != block_infos.end()) {
             const EmittedBlockInfo& block_info = block_iter->second;
 
-            if (auto relocation_iter = block_info.block_relocations.find(target_descriptor); relocation_iter != block_info.block_relocations.end()) {
+            if (auto relocation_iter = block_info.block_relocations.find(target_descriptor);
+                relocation_iter != block_info.block_relocations.end()) {
                 LinkBlockLinks(block_info.entry_point, target_ptr, relocation_iter->second);
             }
 
             mem.invalidate(reinterpret_cast<u32*>(block_info.entry_point), block_info.size);
+        }
+    };
+
+    for (CodePtr code_ptr : refs_iter->second.first) {
+        if (code_ptr != nullptr) {
+            relink_one(code_ptr);
+        }
+    }
+    if (refs_iter->second.rest) {
+        for (CodePtr code_ptr : *refs_iter->second.rest) {
+            relink_one(code_ptr);
         }
     }
 }

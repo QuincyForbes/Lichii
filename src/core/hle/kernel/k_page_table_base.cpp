@@ -314,12 +314,15 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
 
     size_t remaining_size = alloc_size - needed_size;
 
-    // iOS grants a fastmem arena smaller than the address space; guest accesses above it take the
-    // page table path. EDEN_NX2_PACK_LAYOUT=1 keeps the regions inside it when they fit, else puts
-    // the hot ones first: heap, then stack, alias and kernel map. Off by default: Ocarina of Time
-    // jumped to 0 six seconds into boot with the heap packed right after its code, and runs with
-    // the console's layout. (NCE sizes its arena and layout itself.)
-    static const bool pack_layout = [] {
+    // iOS grants a fastmem arena (32 GiB) smaller than the 39-bit address space (512 GiB).
+    // Place heap and stack inside [0, fastmem_end) with >= 512 MiB - 1 GiB guard gaps so all
+    // code, heap, and stack accesses hit fastmem directly, while alias and kernel map sit cleanly
+    // above fastmem_end (serviced by the inline page table path). EDEN_NX2_PACK_LAYOUT=0 opts out.
+    static const bool pack_layout_enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_PACK_LAYOUT");
+        return value == nullptr || value[0] == '\0' || value[0] != '0';
+    }();
+    static const bool force_pack_layout = [] {
         const char* const value = std::getenv("EDEN_NX2_PACK_LAYOUT");
         return value != nullptr && value[0] == '1';
     }();
@@ -334,11 +337,29 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
 #endif
     }();
     const bool arena_short = fastmem_end != 0 && fastmem_end < GetInteger(end);
+    constexpr size_t kHeapStackGuardMin = 256_MiB;
+    const size_t code_heap_guard_min =
+        (GetInteger(process_code_end) + 1_GiB + heap_region_size + kHeapStackGuardMin +
+             stack_region_size <=
+         fastmem_end)
+            ? 1_GiB
+            : 512_MiB;
+    const u64 cold_start = Common::AlignUp(fastmem_end, RegionAlignment);
+    const bool guarded_fastmem_layout =
+        pack_layout_enabled && arena_short && m_address_space_width == 39 &&
+        alloc_start == process_code_end && stack_region_size != 0 && kernel_map_region_size != 0 &&
+        GetInteger(process_code_end) + code_heap_guard_min + heap_region_size + kHeapStackGuardMin +
+                stack_region_size <=
+            fastmem_end &&
+        cold_start + alias_region_size + kernel_map_region_size + RegionAlignment <=
+            GetInteger(end);
+
     const bool fastmem_short =
-        pack_layout && arena_short && GetInteger(alloc_start) < fastmem_end;
+        !guarded_fastmem_layout && force_pack_layout && arena_short &&
+        GetInteger(alloc_start) < fastmem_end;
     const bool hot_first = fastmem_short &&
                            GetInteger(alloc_start) + needed_size > fastmem_end &&
-                           remaining_size >= 3 * RegionAlignment;
+                           remaining_size >= 4 * RegionAlignment;
     if (fastmem_short && !hot_first) {
         remaining_size = (std::min)(
             remaining_size, static_cast<size_t>(fastmem_end - GetInteger(alloc_start) - needed_size));
@@ -346,10 +367,45 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
 
     // Determine random placements for each region.
     size_t alias_rnd = 0, heap_rnd = 0, stack_rnd = 0, kmap_rnd = 0;
-    if (hot_first) {
-        stack_rnd = RegionAlignment;
-        alias_rnd = 2 * RegionAlignment;
-        kmap_rnd = 3 * RegionAlignment;
+    if (guarded_fastmem_layout) {
+        const size_t min_cold_rnd = static_cast<size_t>(
+            cold_start - GetInteger(alloc_start) - heap_region_size - stack_region_size);
+        size_t hot_slack = static_cast<size_t>(
+            fastmem_end - (GetInteger(alloc_start) + code_heap_guard_min + heap_region_size +
+                           kHeapStackGuardMin + stack_region_size));
+        if (hot_slack >= RegionAlignment) {
+            hot_slack -= RegionAlignment;
+        } else {
+            hot_slack = 0;
+        }
+        if (enable_aslr) {
+            const size_t heap_aslr_max = (std::min)(hot_slack / 2, size_t{2_GiB});
+            const size_t heap_extra =
+                KSystemControl::GenerateRandomRange(0, heap_aslr_max / RegionAlignment) *
+                RegionAlignment;
+            const size_t stack_aslr_max = (std::min)(hot_slack - heap_extra, size_t{2_GiB});
+            const size_t stack_extra =
+                KSystemControl::GenerateRandomRange(0, stack_aslr_max / RegionAlignment) *
+                RegionAlignment;
+            heap_rnd = code_heap_guard_min + heap_extra;
+            stack_rnd = heap_rnd + kHeapStackGuardMin + stack_extra;
+            alias_rnd = KSystemControl::GenerateRandomRange(min_cold_rnd / RegionAlignment,
+                                                            remaining_size / RegionAlignment) *
+                        RegionAlignment;
+            kmap_rnd = KSystemControl::GenerateRandomRange(min_cold_rnd / RegionAlignment,
+                                                           remaining_size / RegionAlignment) *
+                       RegionAlignment;
+        } else {
+            heap_rnd = code_heap_guard_min;
+            stack_rnd = heap_rnd + kHeapStackGuardMin;
+            alias_rnd = min_cold_rnd;
+            kmap_rnd = min_cold_rnd + RegionAlignment;
+        }
+    } else if (hot_first) {
+        heap_rnd = RegionAlignment;
+        stack_rnd = 2 * RegionAlignment;
+        alias_rnd = 3 * RegionAlignment;
+        kmap_rnd = 4 * RegionAlignment;
     } else if (enable_aslr) {
         alias_rnd = KSystemControl::GenerateRandomRange(0, remaining_size / RegionAlignment) * RegionAlignment;
         heap_rnd = KSystemControl::GenerateRandomRange(0, remaining_size / RegionAlignment) * RegionAlignment;
@@ -471,6 +527,14 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
     ASSERT(alias_last < kmap_start || kmap_last < alias_start);
     ASSERT(heap_last < stack_start || stack_last < heap_start);
     ASSERT(heap_last < kmap_start || kmap_last < heap_start);
+    ASSERT(stack_last < kmap_start || kmap_last < stack_start || stack_region_size == 0);
+    if (guarded_fastmem_layout) {
+        ASSERT(process_code_end + code_heap_guard_min <= m_heap_region_start);
+        ASSERT(m_heap_region_end + kHeapStackGuardMin <= m_stack_region_start);
+        ASSERT(GetInteger(m_stack_region_end) <= fastmem_end);
+        ASSERT(GetInteger(m_alias_region_start) >= fastmem_end);
+        ASSERT(GetInteger(m_kernel_map_region_start) >= fastmem_end);
+    }
 
     LOG_INFO(Kernel,
              "Address space: {}-bit, code {:#x}-{:#x}, heap {:#x}-{:#x}, alias {:#x}-{:#x}, stack "
@@ -481,9 +545,10 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
              GetInteger(m_stack_region_start), GetInteger(m_stack_region_end),
              GetInteger(m_kernel_map_region_start), GetInteger(m_kernel_map_region_end),
              enable_aslr ? 1 : 0,
-             !fastmem_short ? ""
-             : hot_first    ? ", fastmem arena too small: hot regions first"
-                            : ", kept inside the fastmem arena");
+             guarded_fastmem_layout ? ", hot regions guarded inside fastmem"
+             : !fastmem_short       ? ""
+             : hot_first            ? ", fastmem arena too small: hot regions first"
+                                    : ", kept inside the fastmem arena");
     if (arena_short) {
         // How much of each region the arena covers (fastmem); the rest takes the page table.
         const auto covered = [&](KProcessAddress first, KProcessAddress last) {

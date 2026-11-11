@@ -116,7 +116,7 @@ public:
     std::atomic<u64> cntpct_rdtsc_factor;
     u64 gputick_rdtsc_factor;
     bool invariant;
-#elif defined(HAS_NCE)
+#elif defined(ARCHITECTURE_arm64) && defined(__SIZEOF_INT128__)
     using FactorType = unsigned __int128;
     [[nodiscard]] inline FactorType GetGuestCNTFRQFactor() const {
         return guest_cntfrq_factor;

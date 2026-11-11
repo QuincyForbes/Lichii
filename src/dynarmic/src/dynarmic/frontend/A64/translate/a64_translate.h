@@ -42,7 +42,7 @@ struct TranslationOptions {
     /// DMB xxLD and DMB xxST are translated as NOPs (for TSO hosts).
     bool elide_ld_st_barriers = false;
 
-    /// LSE atomics (not CASP) become AtomicRmwMemory/AtomicCasMemory (x64 backend only).
+    /// LSE atomics (not CASP) become AtomicRmwMemory/AtomicCasMemory (x64 and arm64 backends).
     bool native_lse_atomics = false;
 };
 

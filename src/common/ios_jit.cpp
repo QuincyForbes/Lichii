@@ -320,6 +320,12 @@ std::size_t HandedOutBytes() {
 
 void SetStateCallback(StateCallback callback) {
     g_state_callback = callback;
+    if (callback != nullptr) {
+        const State state = g_state.load();
+        if (state == State::Ready || state == State::Failed) {
+            callback();
+        }
+    }
 }
 
 bool Alloc(std::size_t bytes, void** wmem, void** xmem) {
@@ -347,9 +353,58 @@ bool Alloc(std::size_t bytes, void** wmem, void** xmem) {
     return false;
 }
 
+void DropWritablePtes(void* wmem, std::size_t size) {
+    if (wmem == nullptr || size < kJitPageSize || !g_pool_ready.load()) {
+        return;
+    }
+    const auto raw_start = reinterpret_cast<std::uintptr_t>(wmem);
+    const auto raw_end = raw_start + size;
+    const std::uintptr_t start = AlignUp(raw_start, kJitPageSize);
+    const std::uintptr_t end = raw_end & ~(kJitPageSize - 1);
+    if (end <= start) {
+        return;
+    }
+    const std::size_t aligned_size = end - start;
+
+    std::uintptr_t rx_src = 0;
+    for (const Region& region : g_pool) {
+        const auto rw_base = reinterpret_cast<std::uintptr_t>(region.rw);
+        const auto rx_base = reinterpret_cast<std::uintptr_t>(region.rx);
+        if (region.rw != nullptr && region.rw != region.rx &&
+            start >= rw_base && end <= rw_base + region.size) {
+            rx_src = rx_base + (start - rw_base);
+            break;
+        }
+    }
+    if (rx_src == 0) {
+        return;
+    }
+
+    vm_address_t target = static_cast<vm_address_t>(start);
+    vm_prot_t cur = 0, max = 0;
+    const kern_return_t kr = vm_remap(
+        mach_task_self(), &target, static_cast<vm_size_t>(aligned_size), 0,
+        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+        static_cast<vm_address_t>(rx_src), FALSE, &cur, &max, VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS) {
+        LOG_WARNING(Common, "iOS JIT: vm_remap overwrite failed: {}", mach_error_string(kr));
+        return;
+    }
+    const kern_return_t prot_kr = vm_protect(
+        mach_task_self(), target, static_cast<vm_size_t>(aligned_size), FALSE,
+        VM_PROT_READ | VM_PROT_WRITE);
+    if (prot_kr != KERN_SUCCESS) {
+        LOG_CRITICAL(Common, "iOS JIT: vm_protect(RW) after remap failed: {}",
+                     mach_error_string(prot_kr));
+    }
+}
+
 void Reset() {
     std::scoped_lock lock{g_pool_mutex};
     for (Region& region : g_pool) {
+        if (region.used != 0 && region.rw != region.rx) {
+            DropWritablePtes(region.rw, region.used);
+        }
         region.used = 0;
     }
     LOG_INFO(Common, "iOS JIT: pool reset ({} chunks free)", g_pool.size());
