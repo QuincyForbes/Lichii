@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <array>
 #include <bit>
+#include <bitset>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -46,6 +47,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_download_trace.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
@@ -655,11 +657,14 @@ private:
 
     void UpdateComputeTextureBuffers();
 
-    void MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync = false);
+    void MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync = false,
+                           bool capped = false);
 
-    /// Counts a GPU write to the command list pages in the range (invalidating their copies) and,
-    /// while collecting, asks for new copies.
-    void Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64 size);
+    /// Counts a GPU write to the command list pages in the range (invalidating their copies),
+    /// notes the words it may write (Nx2ListPage::gpu_words) and, while collecting, asks for new
+    /// copies.
+    void Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64 size,
+                          bool to_page_end = false);
 
     [[nodiscard]] BufferId FindBuffer(DAddr device_addr, u32 size, bool sparse_compatible);
 
@@ -1152,8 +1157,9 @@ private:
 
     /// A command list page (Nx2CopyListPages): the GPU writes noted to it and the last copy.
     using Nx2Staging = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));
+    static constexpr size_t Nx2ListPageWords = (size_t{1} << Tegra::Nx2WrittenPageBits) / 4;
     struct Nx2ListPage {
-        u64 writes{};      ///< GPU writes noted to the page
+        u64 writes{};      ///< GPU and host writes noted to the page
         u64 copy_writes{}; ///< `writes` when the copy was made: the copy is current while equal
         u64 copy_tick{};   ///< GPU tick that completes the copy
         /// `writes` when the front last flushed the page: guest memory holds it while equal
@@ -1167,8 +1173,14 @@ private:
         /// the page's lists read guest memory once the back ran the work before the last such
         /// wait and no write came since the front flushed the page (Nx2ReadListCopy).
         bool draw_written{};
+        std::bitset<Nx2ListPageWords> gpu_words;
+        bool flushed{};
         std::optional<Nx2Staging> copy;
     };
+    static void Nx2MarkListWords(Nx2ListPage& entry, u64 begin, u64 end, bool set);
+    [[nodiscard]] static bool Nx2HasListWords(const Nx2ListPage& entry, u64 begin, u64 end);
+    void Nx2ReadListWords(const Nx2ListPage& entry, DAddr device_addr, u64 offset,
+                          std::span<u8> out);
     std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies
     std::unordered_map<DAddr, Nx2ListPage> nx2_list_pages;
     /// A mesh task count word's slot in the mirror (Nx2MeshCountSlot).

@@ -56,6 +56,7 @@ enum class DrainSite : u32 {
     MacroDmaCheck,  ///< EDEN_NX2_CMDPAGE_DIAG: a macro's memory read repeated after a full drain
     DispatchWait,   ///< EXP10: a macro memory read waits for the dispatches sent since it flushed
     FenceWriters,   ///< EXP12: a fence release waits for the writers a semaphore read can't see
+    ListCopies,     ///< Lists on GPU-written pages: the dispatches and copies before the last sync
     Count,
 };
 
@@ -64,7 +65,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma writes",
     "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
-    "macro dma dispatch", "fence writers",
+    "macro dma dispatch", "fence writers", "list copy writers",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -731,6 +732,13 @@ public:
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
     bool WaitForSync();
+    /// Waits until the back executed the compute and copy work sent before the last NoteSync:
+    /// the writers a command list fetched now is ordered after (zortos293/Lichii#805).
+    bool WaitForSyncedWriters(DrainSite site = DrainSite::ListWriters);
+    /// Whether the back executed the work sent before `position`.
+    [[nodiscard]] bool Ran(u64 position) const {
+        return consumed.load(std::memory_order_acquire) >= position;
+    }
     /// Deferred work that can write memory was just sent (puller semaphore releases, maps).
     void NoteMemoryWrite() {
         last_memory_write_position = write_position;

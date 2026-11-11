@@ -572,6 +572,11 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick, u64 writer) {
     if (master.IsFree(tick)) {
         return;
     }
+    // Publish any buffered entries so GPUBack can execute them while the front waits for the copy.
+    if (auto& split = VideoCommon::GpuSplit::Get();
+        split.Active() && !VideoCommon::GpuSplit::OnBackThread()) {
+        split.Publish();
+    }
     if (ListWaitTrace* const trace = ListWaitTrace::Get()) [[unlikely]] {
         master.Refresh();
         const u64 known = master.KnownGpuTick();

@@ -1186,6 +1186,7 @@ struct Maxwell3D::FrontState {
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
     /// The inline upload being sent, when its words land linearly (EDEN_NX2_DMA_WAIT_WRITERS).
     bool upload_known{};
+    bool upload_has_release{};
     /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
     bool instance_loop{};
     bool loop_count_sent{};
@@ -2269,7 +2270,8 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
         // LAUNCH_DMA: bit 0 pitch (linear) layout, bits 5:4 completion (2 releases a semaphore).
         const u32 launch = words[count - 1];
         const bool linear = (launch & 1) != 0;
-        if (((launch >> 4) & 3) == 2) {
+        fs.upload_has_release = ((launch >> 4) & 3) == 2;
+        if (fs.upload_has_release) {
             unknown("upload release");
         }
         fs.upload_known = device && linear && lines == 1 && (*device & 3) == 0 &&
@@ -2284,28 +2286,41 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
             }
             split.NoteMemoryWrite(*device, size, "upload (not linear)");
         }
+        if (!fs.upload_has_release && device && size != 0 && size <= (u64{64} << 20)) {
+            split.RangeLastWrite(address, address + size);
+        }
         return;
     }
     // inline_data words of the current upload.
+    const GPUVAddr upload_address = (GPUVAddr{fs.regs[base + 2]} << 32) | fs.regs[base + 3];
     if (!fs.upload_known) {
-        const auto device = memory_manager.GpuToCpuAddress(
-            (GPUVAddr{fs.regs[base + 2]} << 32) | fs.regs[base + 3]);
+        const auto device = memory_manager.GpuToCpuAddress(upload_address);
         if (!device) {
             return unknown("upload data unmapped");
         }
-        split.NoteMemoryWrite(*device, fs.regs[base] * u64{(std::max)(fs.regs[base + 1], 1U)} +
-                                           u64{fs.regs[base + 4]} * fs.regs[base + 1],
-                              "upload data");
+        const u64 span = fs.regs[base] * u64{(std::max)(fs.regs[base + 1], 1U)} +
+                         u64{fs.regs[base + 4]} * fs.regs[base + 1];
+        split.NoteMemoryWrite(*device, span, "upload data");
+        if (!fs.upload_has_release && span != 0 && span <= (u64{64} << 20)) {
+            split.RangeLastWrite(upload_address, upload_address + span);
+        }
         return;
     }
     const u32 remaining_bytes =
         fs.upload_offset < fs.upload_size ? fs.upload_size - fs.upload_offset : 0;
+    const u32 step_bytes = (std::min<u32>)(count * 4, remaining_bytes);
     const u32 whole = (std::min<u32>)(count, remaining_bytes / 4);
     split.NoteMemoryWriteData(fs.upload_device + fs.upload_offset, words, whole);
     if (whole < count && remaining_bytes % 4 != 0) {
         split.NoteMemoryWrite(fs.upload_device + fs.upload_offset + whole * 4, remaining_bytes % 4);
     }
-    fs.upload_offset += (std::min<u32>)(count * 4, remaining_bytes);
+    if (!fs.upload_has_release && step_bytes != 0) {
+        const GPUVAddr step_begin = upload_address + fs.upload_offset;
+        split.RangeLastWrite(step_begin, step_begin + step_bytes,
+                             whole * 4 == step_bytes ? words : nullptr,
+                             memory_manager.GetID() + 1);
+    }
+    fs.upload_offset += step_bytes;
 }
 
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,

@@ -211,12 +211,17 @@ bool DmaPusher::Step() {
     // as this frame's commands (methods on unbound subchannels, garbage QMDs, then a channel
     // waiting forever on a release it never got). The acquire is released now, so the commands
     // are written and the memory not yet reused: copy them here. EDEN_NX2_RESNAPSHOT=0: off.
+    // The current list's entries before this one ran already and are never parsed again, and an
+    // entry the acquire suspended inside reads its remaining words from memory anyway
+    // (CanUseSubmittedCommands): neither is copied (zortos293/Lichii#805).
     if (ResnapshotEnabled() && suspensions.load(std::memory_order_relaxed) != suspensions_before) {
         const u64 now = suspensions.load(std::memory_order_acquire);
+        size_t first_entry = dma_pushbuffer_subindex + (command_resume_offset != 0 ? 1 : 0);
         for (CommandList& list : dma_pushbuffer) {
             if (!list.submitted_offsets.empty()) {
-                RefreshSnapshot(list, now);
+                RefreshSnapshot(list, now, first_entry);
             }
+            first_entry = 0;
         }
     }
 
@@ -821,9 +826,10 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     }
 }
 
-void DmaPusher::RefreshSnapshot(CommandList& list, u64 now) {
+void DmaPusher::RefreshSnapshot(CommandList& list, u64 now, size_t first_entry) {
     list.snapshot_suspensions = now;
-    for (size_t i = 0; i < list.command_lists.size() && i < list.submitted_offsets.size(); ++i) {
+    for (size_t i = first_entry;
+         i < list.command_lists.size() && i < list.submitted_offsets.size(); ++i) {
         const CommandListHeader& entry = list.command_lists[i];
         const u32 offset = list.submitted_offsets[i];
         if (offset + entry.size > list.submitted_words.size()) {
@@ -855,11 +861,11 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size) {
     auto& split = VideoCommon::GpuSplit::Get();
     // The host fetches command lists ahead of the engines, so a game that has the GPU write the
     // commands it runs next puts a host sync between them (a semaphore acquire, a host wait for
-    // idle, a GP entry's sync bit; NoteSync). Only the work sent before the last one can have
-    // written commands read now, not every dispatch and copy sent so far.
+    // idle, a GP entry's sync bit; NoteSync). Only compute and copy work sent before the last one
+    // can have written commands read now (not 3D draws, nor writers sent after the sync).
     // Checked again even without a wait: the back may have marked the pages since the caller's
     // check, before it passed the sync.
-    split.WaitForSync();
+    split.WaitForSyncedWriters();
     bool written = IsGpuWrittenCommands(address, size);
     if (!written && VideoCommon::Nx2Perf::Verify()) {
         split.WaitForWriters();
@@ -997,7 +1003,11 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
     }
     auto& split = VideoCommon::GpuSplit::Get();
     if (split.Active()) {
-        split.WaitForWriters();
+        if ((VideoCore::Nx2Debug::Experiment(40) & 2) != 0) {
+            split.WaitForSyncedWriters(VideoCommon::DrainSite::ListCopies);
+        } else {
+            split.WaitForWriters();
+        }
     }
     bool past_sync = !split.Active();
     using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;
