@@ -942,32 +942,19 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
     }
 
     const auto& cbufs = maxwell3d->state.shader_stages[stage];
-    GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
-    GPUVAddr holder{};
-    if (indirect_offset != ~0U) {
-        // The pointer is an entry of a table the constant buffer points to.
-        holder = gpu_memory->Read<u64>(ssbo_addr);
-        if (holder == 0) {
-            channel_state->storage_buffers[stage][ssbo_index] = NULL_BINDING;
-            return false;
-        }
-        ssbo_addr = holder + indirect_offset;
-    }
+    const GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
     // EDEN_NX2_GRAPHICS_SSBO_BARE=0 takes the word after a native graphics pointer as its size
     // again: much smaller bindings to synchronize per draw, for A/B runs.
     static const bool bare_pointers = [] {
         const char* const value = std::getenv("EDEN_NX2_GRAPHICS_SSBO_BARE");
         return value == nullptr || value[0] != '0';
     }();
+    const bool native_pointer =
+        (bare_pointers && maxwell3d->GetNativeMacroEngine().native_turing) ||
+        indirect_offset != ~0U;
     channel_state->storage_buffers[stage][ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
-                             (bare_pointers && maxwell3d->GetNativeMacroEngine().native_turing) ||
-                                 indirect_offset != ~0U,
-                             indirect_offset != ~0U);
-    if (indirect_offset != ~0U) {
-        TraceTablePointer(false, stage, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
-                          channel_state->storage_buffers[stage][ssbo_index]);
-    }
+        BindCachedStorageBuffer(stage, ssbo_index, ssbo_addr, cbuf_index, cbuf_offset, is_written,
+                                native_pointer, indirect_offset);
     return (channel_state->storage_buffers[stage][ssbo_index].buffer_id != NULL_BUFFER_ID);
 }
 
@@ -1046,27 +1033,16 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     ASSERT(((launch_desc.const_buffer_enable_mask >> cbuf_index) & 1) != 0);
 
     const auto& cbufs = launch_desc.const_buffer_config;
-    GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
-    GPUVAddr holder{};
-    const bool table_pointer = indirect_offset != ~0U;
-    if (table_pointer) {
-        holder = gpu_memory->Read<u64>(ssbo_addr);
-        ssbo_addr = holder + indirect_offset;
-    }
+    const GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
     const bool native_pointer = kepler_compute->IsNativeMode();
     channel_state->native_compute_storage_buffers =
         (channel_state->native_compute_storage_buffers & ~(u64{1} << ssbo_index)) |
         (u64{native_pointer ? 1U : 0U} << ssbo_index);
-    const Binding binding =
-        table_pointer && holder == 0
-            ? NULL_BINDING
-            : StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer,
-                                   table_pointer);
+    GPUVAddr resolved_pointer = 0;
+    const Binding binding = BindCachedStorageBuffer(
+        NUM_STAGES, ssbo_index, ssbo_addr, cbuf_index, cbuf_offset, is_written, native_pointer,
+        indirect_offset, &resolved_pointer);
     channel_state->compute_storage_buffers[ssbo_index] = binding;
-    if (table_pointer && holder != 0) {
-        TraceTablePointer(true, 0, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
-                          binding);
-    }
 
     // How much of the binding the dispatch marks GPU-written. A native pointer has no size, so the
     // binding is up to 8 MiB past it, and marking all of it defers the CPU's later writes to those
@@ -1087,7 +1063,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
                                          qmd.grid_dim_z.Value()};
             if (const auto extent = Shader::ResolveStorageWriteExtent(write_extent, block, grid)) {
                 // The extent counts from the pointer, the binding from the pointer aligned down.
-                const GPUVAddr pointer = gpu_memory->Read<u64>(ssbo_addr);
+                const GPUVAddr pointer = resolved_pointer;
                 const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
                 mark = std::min<u64>(binding.size, pad + *extent);
             }
@@ -1757,12 +1733,6 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         const u64 check_size = (std::min<u64>)(mapped_size, size);
         // Banks slide through larger buffers, a new address per draw: compare each page with
         // its last contents and mark only the pages that changed.
-        if (native_indirect_page_snapshots.size() >= 16384) {
-            const auto oldest = std::ranges::min_element(
-                native_indirect_page_snapshots, {},
-                [](const auto& entry) { return entry.second.checked_frame; });
-            native_indirect_page_snapshots.erase(oldest);
-        }
         const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = device_addr + check_size;
         const int cost_mode = VideoCore::Nx2Debug::Experiment(4);
@@ -1782,8 +1752,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             const u32 stop = trim ? static_cast<u32>((std::min<DAddr>)(page + Core::DEVICE_PAGESIZE,
                                                                       end) - page)
                                   : static_cast<u32>(Core::DEVICE_PAGESIZE);
-            auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
+            auto [it, inserted] = InsertNativeBankSnapshot(page);
             NativeBankPage& snapshot = it->second;
+            snapshot.checked_frame = frame_tick;
             if (once_per_draw && !inserted && snapshot.checked_draw == native_bank_draw &&
                 snapshot.checked_begin <= begin && stop <= snapshot.checked_end) {
                 ++cost.pages_skipped;
@@ -1951,6 +1922,42 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
 }
 
 template <class P>
+std::pair<typename std::unordered_map<DAddr, typename BufferCache<P>::NativeBankPage>::iterator,
+          bool>
+BufferCache<P>::InsertNativeBankSnapshot(DAddr page) {
+    auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
+    if (!inserted) {
+        return {it, false};
+    }
+    if (native_indirect_page_ring_count < MAX_NATIVE_BANK_SNAPSHOTS) {
+        native_indirect_page_ring[native_indirect_page_ring_count++] = page;
+        return {it, true};
+    }
+    size_t victim_slot = native_indirect_page_clock;
+    u64 oldest_frame = ~u64{0};
+    for (size_t step = 0; step < 8; ++step) {
+        const size_t slot = (native_indirect_page_clock + step) & (MAX_NATIVE_BANK_SNAPSHOTS - 1);
+        const auto cand = native_indirect_page_snapshots.find(native_indirect_page_ring[slot]);
+        if (cand == native_indirect_page_snapshots.end() ||
+            cand->second.checked_frame != frame_tick) {
+            victim_slot = slot;
+            break;
+        }
+        if (cand->second.checked_frame < oldest_frame) {
+            oldest_frame = cand->second.checked_frame;
+            victim_slot = slot;
+        }
+    }
+    const DAddr victim_page = native_indirect_page_ring[victim_slot];
+    if (victim_page != page) {
+        native_indirect_page_snapshots.erase(victim_page);
+    }
+    native_indirect_page_ring[victim_slot] = page;
+    native_indirect_page_clock = (victim_slot + 1) & (MAX_NATIVE_BANK_SNAPSHOTS - 1);
+    return {it, true};
+}
+
+template <class P>
 void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, int mode) {
     // EDEN_NX2_EXP9 (experiment, 0 = off): compare only the pages whose guest memory may have
     // changed since their last compare. 1: pages guest CPU writes were collected for (applied
@@ -1976,12 +1983,6 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         stats.pages_skipped += (end - first_page) >> Core::DEVICE_PAGEBITS;
         return;
     }
-    if (native_indirect_page_snapshots.size() >= 16384) {
-        const auto oldest = std::ranges::min_element(
-            native_indirect_page_snapshots, {},
-            [](const auto& entry) { return entry.second.checked_frame; });
-        native_indirect_page_snapshots.erase(oldest);
-    }
     // Most banks have no CPU-modified page: ask per page only when one has.
     const bool any_cpu_dirty = memory_tracker.IsRegionCpuModified(first_page, end - first_page);
     bool needs_per_bind = false;
@@ -1994,7 +1995,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         // Take the flags before reading the page: a write flagged later is compared next bind.
         const bool collected = Core::g_collected_write_pages.Take(page);
         const bool written = Core::g_buffer_write_pages.Take(page);
-        auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
+        auto [it, inserted] = InsertNativeBankSnapshot(page);
         NativeBankPage& snapshot = it->second;
         if (inserted) {
             ++stats.pages_new;
@@ -3994,6 +3995,159 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
         }
     }
     channel_state->has_deleted_buffers = true;
+}
+
+template <class P>
+Binding BufferCache<P>::BindCachedStorageBuffer(size_t memo_stage, size_t ssbo_index,
+                                                GPUVAddr cbuf_slot_addr, u32 cbuf_index,
+                                                u32 cbuf_offset, bool is_written,
+                                                bool native_pointer, u32 indirect_offset,
+                                                GPUVAddr* out_pointer) {
+    static const bool use_memo = [] {
+        const char* const value = std::getenv("EDEN_NX2_SSBO_MEMO");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool table_pointer = indirect_offset != ~0U;
+    const bool reads_size_word = !(table_pointer && !is_written) && !native_pointer;
+    const u8 flags = static_cast<u8>(1U | (is_written ? 2U : 0U) | (native_pointer ? 4U : 0U) |
+                                     (table_pointer ? 8U : 0U));
+    const size_t as_id = gpu_memory->GetID();
+    const u64 map_serial = gpu_memory->MapSerial();
+    SsboBindMemo& memo = ssbo_bind_memo[memo_stage][ssbo_index];
+
+    if (use_memo && memo.flags == flags &&
+        memo.channel == static_cast<const void*>(channel_state) && memo.as_id == as_id &&
+        memo.map_serial == map_serial && memo.cbuf_slot_addr == cbuf_slot_addr &&
+        memo.indirect_offset == indirect_offset && memo.cbuf_host != nullptr) [[likely]] {
+        u64 q0 = 0;
+        std::memcpy(&q0, memo.cbuf_host, sizeof(u64));
+        if (q0 == memo.cbuf_qword0) [[likely]] {
+            if (!table_pointer) {
+                u64 q1 = 0;
+                if (reads_size_word) {
+                    std::memcpy(&q1, memo.cbuf_host + sizeof(u64), sizeof(u64));
+                }
+                if (q1 == memo.cbuf_qword1) [[likely]] {
+                    if (out_pointer != nullptr) {
+                        *out_pointer = memo.resolved_pointer;
+                    }
+                    return memo.binding;
+                }
+            } else if (q0 == 0) {
+                if (out_pointer != nullptr) {
+                    *out_pointer = 0;
+                }
+                return NULL_BINDING;
+            } else if (memo.entry_host != nullptr) [[likely]] {
+                u64 eq0 = 0;
+                std::memcpy(&eq0, memo.entry_host, sizeof(u64));
+                u64 eq1 = 0;
+                if (reads_size_word) {
+                    std::memcpy(&eq1, memo.entry_host + sizeof(u64), sizeof(u64));
+                }
+                if (eq0 == memo.entry_qword0 && eq1 == memo.entry_qword1) [[likely]] {
+                    if (out_pointer != nullptr) {
+                        *out_pointer = memo.resolved_pointer;
+                    }
+                    return memo.binding;
+                }
+            }
+        }
+    }
+
+    const auto host_for_gpu = [&](GPUVAddr addr, size_t bytes) -> const u8* {
+        if ((addr & Core::Memory::YUZU_PAGEMASK) > Core::Memory::YUZU_PAGESIZE - bytes) {
+            return nullptr;
+        }
+        const std::optional<DAddr> daddr = gpu_memory->GpuToCpuAddress(addr);
+        return daddr ? device_memory.template GetPointer<u8>(*daddr) : nullptr;
+    };
+
+    const size_t cbuf_bytes = (!table_pointer && reads_size_word) ? 16 : 8;
+    const u8* const cbuf_host = use_memo ? host_for_gpu(cbuf_slot_addr, cbuf_bytes) : nullptr;
+    u64 cbuf_qword0 = 0;
+    u64 cbuf_qword1 = 0;
+    if (cbuf_host != nullptr) {
+        std::memcpy(&cbuf_qword0, cbuf_host, sizeof(u64));
+        if (!table_pointer && reads_size_word) {
+            std::memcpy(&cbuf_qword1, cbuf_host + sizeof(u64), sizeof(u64));
+        }
+    } else if (table_pointer || out_pointer != nullptr) {
+        cbuf_qword0 = gpu_memory->Read<u64>(cbuf_slot_addr);
+    }
+
+    if (table_pointer && cbuf_qword0 == 0) {
+        if (cbuf_host != nullptr) {
+            memo = SsboBindMemo{
+                .channel = channel_state,
+                .as_id = as_id,
+                .map_serial = map_serial,
+                .cbuf_slot_addr = cbuf_slot_addr,
+                .indirect_offset = indirect_offset,
+                .flags = flags,
+                .cbuf_host = cbuf_host,
+                .entry_host = nullptr,
+                .cbuf_qword0 = 0,
+                .resolved_pointer = 0,
+                .binding = NULL_BINDING,
+            };
+        } else {
+            memo.flags = 0;
+        }
+        if (out_pointer != nullptr) {
+            *out_pointer = 0;
+        }
+        return NULL_BINDING;
+    }
+
+    const GPUVAddr ssbo_addr = table_pointer ? (cbuf_qword0 + indirect_offset) : cbuf_slot_addr;
+    const size_t entry_bytes = reads_size_word ? 16 : 8;
+    const u8* const entry_host =
+        (use_memo && table_pointer) ? host_for_gpu(ssbo_addr, entry_bytes) : nullptr;
+    u64 entry_qword0 = 0;
+    u64 entry_qword1 = 0;
+    if (entry_host != nullptr) {
+        std::memcpy(&entry_qword0, entry_host, sizeof(u64));
+        if (reads_size_word) {
+            std::memcpy(&entry_qword1, entry_host + sizeof(u64), sizeof(u64));
+        }
+    } else if (table_pointer && out_pointer != nullptr) {
+        entry_qword0 = gpu_memory->Read<u64>(ssbo_addr);
+    }
+
+    const Binding binding =
+        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer, table_pointer);
+    if (table_pointer) {
+        TraceTablePointer(memo_stage == NUM_STAGES, memo_stage == NUM_STAGES ? 0 : memo_stage,
+                          ssbo_index, cbuf_index, cbuf_offset, indirect_offset, cbuf_qword0,
+                          binding);
+    }
+
+    const GPUVAddr resolved = table_pointer ? entry_qword0 : cbuf_qword0;
+    if (out_pointer != nullptr) {
+        *out_pointer = resolved;
+    }
+    if (cbuf_host != nullptr && (!table_pointer || entry_host != nullptr)) {
+        memo = SsboBindMemo{
+            .channel = channel_state,
+            .as_id = as_id,
+            .map_serial = map_serial,
+            .cbuf_slot_addr = cbuf_slot_addr,
+            .indirect_offset = indirect_offset,
+            .flags = flags,
+            .cbuf_host = cbuf_host,
+            .entry_host = entry_host,
+            .cbuf_qword0 = cbuf_qword0,
+            .cbuf_qword1 = cbuf_qword1,
+            .entry_qword0 = entry_qword0,
+            .entry_qword1 = entry_qword1,
+            .resolved_pointer = resolved,
+            .binding = binding,
+        };
+    } else {
+        memo.flags = 0;
+    }
+    return binding;
 }
 
 template <class P>
