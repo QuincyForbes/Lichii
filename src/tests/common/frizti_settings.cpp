@@ -22,6 +22,16 @@ void SetOtherBuildValues(Settings::Values& values) {
     values.cpu_accuracy.SetValue(Settings::CpuAccuracy::Accurate);
     values.use_disk_shader_cache.SetValue(false);
     values.use_vulkan_driver_pipeline_cache.SetValue(false);
+#if defined(__ANDROID__) || defined(__APPLE__)
+    values.dyna_state.SetValue(Settings::ExtendedDynamicState::EDS2);
+#else
+    values.dyna_state.SetValue(Settings::ExtendedDynamicState::Disabled);
+#endif
+#ifdef __ANDROID__
+    values.vertex_input_dynamic_state.SetValue(true);
+#else
+    values.vertex_input_dynamic_state.SetValue(false);
+#endif
 }
 
 void CheckFriztiValues(const Settings::Values& values) {
@@ -38,6 +48,16 @@ void CheckFriztiValues(const Settings::Values& values) {
     CHECK(values.cpu_accuracy.GetValue() == Settings::CpuAccuracy::Auto);
     CHECK(values.use_disk_shader_cache.GetValue());
     CHECK(values.use_vulkan_driver_pipeline_cache.GetValue());
+#if defined(__ANDROID__) || defined(__APPLE__)
+    CHECK(values.dyna_state.GetValue() == Settings::ExtendedDynamicState::Disabled);
+#else
+    CHECK(values.dyna_state.GetValue() == Settings::ExtendedDynamicState::EDS2);
+#endif
+#ifdef __ANDROID__
+    CHECK_FALSE(values.vertex_input_dynamic_state.GetValue());
+#else
+    CHECK(values.vertex_input_dynamic_state.GetValue());
+#endif
 }
 } // namespace
 
@@ -109,6 +129,35 @@ TEST_CASE("Ocarina's per-game overrides go back to global", "[frizti_settings]")
         CHECK_FALSE(values->gpu_accuracy.UsingGlobal());
         CHECK_FALSE(values->vsync_mode.UsingGlobal());
         CHECK(values->memory_layout_mode.UsingGlobal());
+    }
+
+    SECTION("per-game resolution_setup and use_docked_mode edits are always preserved") {
+        // Record says both used global when frizti.ini was last written, then the user or a
+        // harness edited custom/0400486024DEC000.ini directly to 0.5x Handheld.
+        Frizti::Record record;
+        record.revision = Frizti::Revision;
+        record.per_game = Frizti::PerGameValues(tuned);
+
+        override_value(values->resolution_setup, Settings::ResolutionSetup::Res1_2X);
+        override_value(values->use_docked_mode, Settings::ConsoleMode::Handheld);
+
+        const auto between_changes = Frizti::ReconcilePerGame(tuned, record, false);
+        CHECK(between_changes.empty());
+        CHECK_FALSE(values->resolution_setup.UsingGlobal());
+        CHECK(values->resolution_setup.GetValue() == Settings::ResolutionSetup::Res1_2X);
+        CHECK_FALSE(values->use_docked_mode.UsingGlobal());
+        CHECK(values->use_docked_mode.GetValue() == Settings::ConsoleMode::Handheld);
+
+        // Even a new revision bump drops non-preserved overrides while keeping per-game
+        // resolution and docked mode intact.
+        const auto full_changes = Frizti::ReconcilePerGame(tuned, {}, true);
+        CHECK(full_changes.size() == size_t{2});
+        CHECK(values->gpu_accuracy.UsingGlobal());
+        CHECK(values->vsync_mode.UsingGlobal());
+        CHECK_FALSE(values->resolution_setup.UsingGlobal());
+        CHECK(values->resolution_setup.GetValue() == Settings::ResolutionSetup::Res1_2X);
+        CHECK_FALSE(values->use_docked_mode.UsingGlobal());
+        CHECK(values->use_docked_mode.GetValue() == Settings::ConsoleMode::Handheld);
     }
 
     for (const auto& restore : values->linkage.restore_functions) {

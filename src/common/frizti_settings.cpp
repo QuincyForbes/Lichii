@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <fmt/format.h>
 #include "common/frizti_settings.h"
@@ -20,6 +20,13 @@ std::string_view Trim(std::string_view text) {
     }
     return text;
 }
+
+bool PreservedPerGameOverride(std::string_view label) {
+    // Per-game resolution scale and docked/handheld mode in custom/<title>.ini are deliberate
+    // per-title choices (including hand or script edits outside the GUI), unlike global values
+    // left over from other games in qt-config.ini.
+    return label == "resolution_setup" || label == "use_docked_mode";
+}
 } // namespace
 
 std::vector<BasicSetting*> TunedSettings(Values& vals) {
@@ -38,6 +45,11 @@ std::vector<BasicSetting*> TunedSettings(Values& vals) {
         &vals.cpu_accuracy,             // Auto
         &vals.use_disk_shader_cache,    // On: no shader rebuild every boot
         &vals.use_vulkan_driver_pipeline_cache, // On
+        // EDS2 and dynamic vertex input: the precompiled OoT recipe is recorded with them, and
+        // turning them off (an old AMD crash tip) caused precompiled graphics pipelines to be
+        // skipped as "for another device".
+        &vals.dyna_state,                 // EDS2 on desktop, Disabled on Apple/Android
+        &vals.vertex_input_dynamic_state, // On
     };
 }
 
@@ -108,7 +120,7 @@ std::vector<Change> ReconcilePerGame(std::span<BasicSetting* const> settings, co
                                      bool full) {
     std::vector<Change> changes;
     for (BasicSetting* const setting : settings) {
-        if (setting->UsingGlobal()) {
+        if (setting->UsingGlobal() || PreservedPerGameOverride(setting->GetLabel())) {
             continue;
         }
         if (!full) {
