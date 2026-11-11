@@ -41,7 +41,6 @@
 #include <mach/memory_object_types.h>
 #include <mach/vm_statistics.h>
 #if TARGET_OS_IPHONE
-#include <dlfcn.h>
 #include <mach/vm_purgable.h>
 #include <sys/mount.h>
 #include <sys/param.h>
@@ -641,16 +640,15 @@ public:
             // only applies untagged: LICHII_IOS_UNTAGGED_GUEST=1 (experiment) goes back to that.
             const char* const untagged_env = std::getenv("LICHII_IOS_UNTAGGED_GUEST");
             ledger_tagged = untagged_env == nullptr || untagged_env[0] != '1';
-            const char* const no_footprint_env = std::getenv("LICHII_IOS_NO_FOOTPRINT");
-            const bool no_footprint = no_footprint_env != nullptr && no_footprint_env[0] == '1';
             const char* const file_env = std::getenv("LICHII_IOS_FILE_GUEST");
-            const bool file = file_env != nullptr && file_env[0] == '1' && InitFile();
+            const bool file_wanted = file_env != nullptr && file_env[0] == '1';
+            const bool file = file_wanted && InitFile();
             if (file) {
                 ledger_tagged = false;
             }
             const char* const chunked_env = std::getenv("LICHII_IOS_CHUNKED_GUEST");
-            const bool chunked = !file && ledger_tagged && !no_footprint &&
-                                 chunked_env != nullptr && chunked_env[0] == '1' && InitChunks();
+            const bool chunked_wanted = chunked_env != nullptr && chunked_env[0] == '1';
+            const bool chunked = !file && ledger_tagged && chunked_wanted && InitChunks();
             memory_object_size_t entry_size = backing_size;
             kern_return_t kr = KERN_SUCCESS;
             if (!chunked && !file) {
@@ -682,23 +680,14 @@ public:
                                  "chunks of zeros are given back)"
                      : ledger_tagged ? "ledger-tagged (each page counted once)"
                                      : "untagged (counted per mapping; zero trimming on)");
-            if (no_footprint && !file) {
-                // LICHII_IOS_NO_FOOTPRINT=1 (experiment): mach_memory_entry_ownership refuses
-                // VM_LEDGER_FLAG_NO_FOOTPRINT with KERN_NO_ACCESS for any tag or owner unless the
-                // app holds com.apple.private.memory.ownership_transfer (iOS 26.2: "no access").
-                // A refusal leaves the object as it was.
-                using OwnershipFn = kern_return_t (*)(mach_port_t, task_t, int, int);
-                constexpr int VmLedgerTagDefault = 1;
-                constexpr int VmLedgerFlagNoFootprint = 1;
-                const auto ownership = reinterpret_cast<OwnershipFn>(
-                    dlsym(RTLD_DEFAULT, "mach_memory_entry_ownership"));
-                const kern_return_t owned =
-                    ownership != nullptr
-                        ? ownership(backing_entry, TASK_NULL, VmLedgerTagDefault,
-                                    VmLedgerFlagNoFootprint)
-                        : KERN_FAILURE;
-                LOG_WARNING(HW_Memory, "Guest memory without footprint (experiment): {}",
-                            owned == KERN_SUCCESS ? "on" : mach_error_string(owned));
+            if (file_wanted && !file) {
+                LOG_WARNING(HW_Memory, "Guest memory: the file experiment is on but was refused "
+                                       "(reason in the line above): memory as without it");
+            } else if (chunked_wanted && !chunked) {
+                LOG_WARNING(HW_Memory, "Guest memory: the chunk experiment is on but not in use ({})",
+                            file ? "the file experiment wins"
+                            : ledger_tagged ? "refused, reason in the line above"
+                                            : "it needs ledger-tagged memory");
             }
             if (!chunked && !file) {
                 vm_address_t backing_address = 0;
@@ -1795,6 +1784,32 @@ std::atomic<HostMemory::GuestAccounting> g_scanned_accounting{};
     return true;
 }
 
+#ifdef __APPLE__
+/// Zeroes a range of a mapped file, writing only to the pages that hold something: a write makes
+/// a page dirty, and a dirty page of a file has to reach storage before its RAM is free. Returns
+/// the bytes written.
+size_t ZeroNonZeroPages(u8* data, size_t length) {
+    size_t written = 0;
+    const auto zero = [&written](u8* at, size_t size) {
+        if (size != 0) {
+            std::memset(at, 0, size);
+            written += size;
+        }
+    };
+    u8* const end = data + length;
+    u8* page = (std::min)(end, reinterpret_cast<u8*>(Common::AlignUp(
+                                   reinterpret_cast<uintptr_t>(data), PageAlignment)));
+    zero(data, static_cast<size_t>(page - data));
+    for (; static_cast<size_t>(end - page) >= PageAlignment; page += PageAlignment) {
+        if (!IsZeroPage(page)) {
+            zero(page, PageAlignment);
+        }
+    }
+    zero(page, static_cast<size_t>(end - page));
+    return written;
+}
+#endif
+
 #ifdef _WIN32
 /// Addresses of the pages in this process's working set, entries[0] being the count; empty on
 /// failure.
@@ -2327,6 +2342,12 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
                                                              std::memory_order_acq_rel) &
                                    GranuleReleased) != 0;
             cleared = ZeroWithoutFaulting(offset, clear_end - offset);
+            if (!cleared && FileBacked()) {
+                g_zero_filled_bytes.fetch_add(
+                    ZeroNonZeroPages(backing_base + offset, clear_end - offset),
+                    std::memory_order_relaxed);
+                cleared = true;
+            }
             if (!cleared && released) {
                 madvise(backing_base + granule_begin,
                         (std::min)(granule_end, backing_size) - granule_begin, MADV_FREE_REUSE);

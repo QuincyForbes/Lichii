@@ -3457,7 +3457,7 @@ void RasterizerVulkan::TickMemoryReport() {
     }
     if (malloc_relief_frames != 0 && --malloc_relief_frames == 0) {
         const u64 released = Common::PlatformEvents::RelieveMallocPressure();
-        LOG_INFO(Render_Vulkan, "Host memory pressure: malloc released {} MiB", released >> 20);
+        LOG_INFO(Common_Memory, "Host memory pressure: malloc released {} MiB", released >> 20);
     }
     // Where the footprint goes, at the first frame, on memory pressure and every 30 s (5 s with
     // under 1 GiB left to the process). On by default on iOS; EDEN_NX2_MEMORY_REPORT=1
@@ -3496,7 +3496,9 @@ void RasterizerVulkan::TickMemoryReport() {
         buffer_bytes = buffer_cache.BufferBytes();
     }
     const auto [graphics_pipelines, compute_pipelines] = pipeline_cache.PipelineCounts();
-    LOG_INFO(Render_Vulkan,
+    // Logged as Common.Memory: the iOS log filter drops Render.Vulkan below Warning, which kept
+    // these lines out of every log from a phone.
+    LOG_INFO(Common_Memory,
              "Memory: footprint {} MiB (peak {}, internal {}, compressed {}, reusable {}, "
              "purgeable {}), {} MiB left, mapped files {} MiB resident (not in the footprint) | "
              "{} | guest RAM handed out {} MiB, resident {} MiB, zero "
@@ -3522,7 +3524,7 @@ void RasterizerVulkan::TickMemoryReport() {
         memory_detail_next = now + std::chrono::seconds{10};
     }
     if (requested || pressure_detail || std::getenv("EDEN_NX2_MEMORY_REPORT") != nullptr) {
-        LOG_INFO(Render_Vulkan,
+        LOG_INFO(Common_Memory,
                  "Memory detail: images (host bytes) GPU-written {} MiB, converted {} MiB, "
                  "rescaled {} MiB, other {} MiB, deleted {} MiB, pooled {} MiB | {} | driver "
                  "pipeline cache {} KiB",

@@ -10,7 +10,11 @@
 
 #include "common/logging.h"
 #include "common/platform_events.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
+#endif
+#ifdef __APPLE__
+#include <TargetConditionals.h>
 #endif
 
 #include "core/core.h"
@@ -28,12 +32,23 @@ constexpr size_t VirtualReserveSize = 1ULL << 39;
 DeviceMemory::DeviceMemory()
     : buffer{Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize(),
              VirtualReserveSize} {
+#ifdef __APPLE__
+    Common::PlatformEvents::SetGuestMemoryRanges(buffer.BackingBasePointer(), buffer.BackingSize(),
+                                                 buffer.VirtualBasePointer(),
+                                                 buffer.VirtualSize());
+#endif
 #if defined(_WIN32) || defined(__APPLE__)
     zero_trim_thread = std::jthread{[this](std::stop_token stop) { TrimZeroPages(stop); }};
 #endif
 }
 
-DeviceMemory::~DeviceMemory() = default;
+DeviceMemory::~DeviceMemory() {
+#ifdef __APPLE__
+    // The thread looks at the process's memory regions: it ends before the ranges are forgotten.
+    zero_trim_thread = {};
+    Common::PlatformEvents::SetGuestMemoryRanges(nullptr, 0, nullptr, 0);
+#endif
+}
 
 #if defined(_WIN32) || defined(__APPLE__)
 // Windows can't punch holes in the guest memory section, so pages holding only zeros (games clear
@@ -74,7 +89,8 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     // Apple: footprint growth since the last pass that starts the next one 2 s later (a game
     // clearing its heap while booting) rather than after the backed-off interval.
     constexpr u64 Growth = u64{256} << 20;
-    // iOS: with less than this left to the process, passes stay 5 s apart and are logged.
+    // iOS: with less than this left to the process, every pass is logged and passes that give
+    // nothing back come 30 s apart at most.
     constexpr u64 Tight = u64{1} << 30;
     u64 footprint_after_pass = Common::PlatformEvents::QueryProcessMemory().footprint;
     bool reported_boot = false;
@@ -92,8 +108,36 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
                     Common::PlatformEvents::FootprintSplit(memory, left));
     };
     bool imminent_reported = false;
-    // A pass that only counts changes nothing, so it need not wait for the game to boot.
+    // A pass that only counts changes nothing: it need not wait for the game to boot, and
+    // neither memory pressure nor a growing footprint is a reason for one. It runs every 30 s,
+    // for the log (on an iPhone it took 0.5-0.9 s and came every 1.6 s under pressure).
     const bool counts_only = buffer.TrimOnlyCounts();
+    constexpr std::chrono::seconds CountInterval = 30s;
+    if (counts_only) {
+        interval = CountInterval;
+    }
+    // A pass started by memory pressure that gave back next to nothing keeps the next signals
+    // from starting one for this long.
+    constexpr std::chrono::seconds PressureBackoff = 30s;
+    auto pressure_pass_next = std::chrono::steady_clock::time_point{};
+#ifdef __APPLE__
+    // What the footprint is made of, every 30 s, at a memory warning (at most every 10 s) and
+    // when little is left. On by default on iOS; EDEN_NX2_MEMORY_REPORT=1 elsewhere, =0 off.
+    const char* const report_env = std::getenv("EDEN_NX2_MEMORY_REPORT");
+#if TARGET_OS_IPHONE
+    const bool breakdown = report_env == nullptr || report_env[0] != '0';
+#else
+    const bool breakdown = report_env != nullptr && report_env[0] != '0';
+#endif
+    auto breakdown_next = std::chrono::steady_clock::now() + 30s;
+    auto breakdown_warning_next = std::chrono::steady_clock::time_point{};
+    u32 breakdown_pressure = pressure;
+    SCOPE_EXIT {
+        if (breakdown) {
+            Common::PlatformEvents::LogStorageWrites("game stopped");
+        }
+    };
+#endif
     u64 resident_logged = 0;
     while (true) {
         // Host memory pressure (iOS) starts a pass at once.
@@ -106,46 +150,66 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             // The caches poll the low-water mark once a frame; booting and loading draw few.
             Common::PlatformEvents::PollMemoryPressure();
             const u32 now = Common::PlatformEvents::MemoryPressureGeneration();
+            const auto tick = std::chrono::steady_clock::now();
+            bool closing = false;
             if (const u64 left = Common::PlatformEvents::AvailableProcessMemory();
                 left != 0 && left < Imminent) {
                 if (!imminent_reported) {
                     imminent_reported = true;
-                    if (counts_only) {
-                        // With a fresh count of the guest memory.
-                        imminent = true;
-                        break;
-                    }
+                    closing = true;
                     report_imminent(left);
                 }
             } else if (left > 2 * Imminent) {
                 imminent_reported = false;
             }
 #ifdef __APPLE__
+            if (breakdown) {
+                const bool warned = now != breakdown_pressure && tick >= breakdown_warning_next;
+                if (closing || warned || tick >= breakdown_next) {
+                    Common::PlatformEvents::LogMemoryBreakdown(closing  ? "closing soon"
+                                                               : warned ? "memory warning"
+                                                                        : "every 30 s");
+                    breakdown_pressure = now;
+                    breakdown_next = tick + 30s;
+                    breakdown_warning_next = tick + 10s;
+                }
+            }
+#endif
+            if (counts_only) {
+                pressure = now;
+                if (closing) {
+                    // And a fresh count of the guest memory.
+                    imminent = true;
+                    break;
+                }
+                continue;
+            }
+            bool held = false;
+#ifdef __APPLE__
             // Not while the game boots: no pass before its first frame, and for a minute after it
             // only under host memory pressure, so a reclaim is unlikely to race the heap clears
-            // and loads of the game's start. A pass that only counts runs every 10 s of that
-            // minute, for the log.
+            // and loads of the game's start.
             if (g_nx2_present_count.load(std::memory_order_relaxed) == 0) {
                 seconds_since_frame = 0;
                 pressure = now;
                 waited = 0s;
                 continue;
             }
-            if (seconds_since_frame < 60) {
+            held = seconds_since_frame < 60;
+            if (held) {
                 ++seconds_since_frame;
-                if (now == pressure) {
-                    if (counts_only && seconds_since_frame % 10 == 0) {
-                        break;
-                    }
-                    waited = 0s;
-                    continue;
-                }
             }
 #endif
             if (now != pressure) {
                 pressure = now;
-                urgent = true;
-                break;
+                if (tick >= pressure_pass_next) {
+                    urgent = true;
+                    break;
+                }
+            }
+            if (held) {
+                waited = 0s;
+                continue;
             }
             if (waited >= 1s && Common::PlatformEvents::QueryProcessMemory().footprint >
                                     footprint_after_pass + Growth) {
@@ -168,7 +232,11 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         const u64 available = Common::PlatformEvents::AvailableProcessMemory();
         const bool tight = available != 0 && available < Tight;
         if (imminent) {
+            // Once more, with the fresh count.
             report_imminent(available);
+        }
+        if (urgent && trimmed < Busy) {
+            pressure_pass_next = std::chrono::steady_clock::now() + PressureBackoff;
         }
         // The first pass after a game boots is always logged, and so is guest memory that is
         // only counted whenever the count moved by 256 MiB.
@@ -182,9 +250,14 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         // Windows: pages found zero for the first time go on the next pass if they stay zero.
         const size_t pending = state.zero_before.size() * 0x1000 - (std::min)(
             trimmed, state.zero_before.size() * 0x1000);
-        if (trimmed < Busy && pending < Busy && !tight) {
-            interval = (std::min)(interval * 2, std::chrono::seconds{60});
-            if (!boot) {
+        if (counts_only) {
+            if (!boot && !tight && !imminent) {
+                continue;
+            }
+        } else if (trimmed < Busy && pending < Busy) {
+            // Nothing to give back: wait longer, with little left as well (up to 30 s then).
+            interval = (std::min)(interval * 2, std::chrono::seconds{tight ? 30 : 60});
+            if (!boot && !tight) {
                 continue;
             }
         } else {

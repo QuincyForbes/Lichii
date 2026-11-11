@@ -289,7 +289,6 @@ struct ShaderCacheSettingsSection: View {
 /// Opt-in switches of the platform layer, audio mixing and the per-device defaults.
 struct ExperimentsView: View {
     @ObservedObject private var platform = PlatformCenter.shared
-    @State private var noFootprint = lichii_platform_experiment("no_footprint") != 0
     @State private var untaggedGuest = lichii_platform_experiment("untagged_guest") != 0
     @State private var noZeroTrim = lichii_platform_experiment("no_zero_trim") != 0
     @State private var chunkedGuest = lichii_platform_experiment("chunked_guest") != 0
@@ -323,14 +322,10 @@ struct ExperimentsView: View {
                     .onChange(of: noZeroTrim) { value in
                         lichii_platform_set_experiment("no_zero_trim", value ? 1 : 0)
                     }
-                Toggle("Untracked Guest Memory", isOn: $noFootprint)
-                    .onChange(of: noFootprint) { value in
-                        lichii_platform_set_experiment("no_footprint", value ? 1 : 0)
-                    }
             } header: {
                 Text("Memory")
             } footer: {
-                Text("Guest memory normally counts once toward the limit iOS closes Lichii at. Per mapping is the old accounting: pages both the game and the emulator touch count twice, and all-zero pages are trimmed. Untracked asks iOS to leave guest memory out entirely; current iOS versions refuse that for apps without a private Apple entitlement (the log shows \"no access\"), so it has no effect. All apply the next time Lichii starts.")
+                Text("Guest memory normally counts once toward the limit iOS closes Lichii at. Per mapping is the old accounting: pages both the game and the emulator touch count twice, and all-zero pages are trimmed. Both apply the next time Lichii starts.")
             }
 
             Section {

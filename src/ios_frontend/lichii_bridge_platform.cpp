@@ -159,10 +159,6 @@ void ApplyMemoryBudgets(const LichiiDeviceDefaults& defaults) {
 }
 
 void ApplyExperiments() {
-    if (lichii_platform_experiment("no_footprint")) {
-        setenv("LICHII_IOS_NO_FOOTPRINT", "1", 0);
-        LOG_WARNING(Frontend, "iOS: experiment no_footprint on");
-    }
     if (lichii_platform_experiment("untagged_guest")) {
         setenv("LICHII_IOS_UNTAGGED_GUEST", "1", 0);
         LOG_WARNING(Frontend, "iOS: experiment untagged_guest on");
