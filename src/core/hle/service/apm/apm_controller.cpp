@@ -13,6 +13,7 @@
 #include "common/settings_enums.h"
 #include "core/core_timing.h"
 #include "core/hle/service/apm/apm_controller.h"
+#include "core/hle/service/nx2_auto_resolution.h"
 
 namespace Service::APM {
 
@@ -69,7 +70,7 @@ void Controller::SetFromCpuBoostMode(CpuBoostMode mode) {
 }
 
 PerformanceMode Controller::GetCurrentPerformanceMode() const {
-    return Settings::IsDockedMode() ? PerformanceMode::Boost : PerformanceMode::Normal;
+    return Nx2::IsDockedForGame() ? PerformanceMode::Boost : PerformanceMode::Normal;
 }
 
 PerformanceConfiguration Controller::GetCurrentPerformanceConfiguration(PerformanceMode mode) {

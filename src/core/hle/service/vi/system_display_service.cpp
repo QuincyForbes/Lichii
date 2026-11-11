@@ -6,6 +6,7 @@
 
 #include "common/settings.h"
 #include "core/hle/service/cmif_serialization.h"
+#include "core/hle/service/nx2_auto_resolution.h"
 #include "core/hle/service/vi/container.h"
 #include "core/hle/service/vi/system_display_service.h"
 #include "core/hle/service/vi/vi_types.h"
@@ -116,7 +117,7 @@ Result ISystemDisplayService::ListDisplayModes(
 Result ISystemDisplayService::GetDisplayMode(Out<DisplayMode> out_display_mode, u64 display_id) {
     LOG_WARNING(Service_VI, "(STUBBED) called, display_id={}", display_id);
 
-    if (Settings::IsDockedMode()) {
+    if (Nx2::IsDockedForGame()) {
         out_display_mode->width = static_cast<u32>(DisplayResolution::DockedWidth);
         out_display_mode->height = static_cast<u32>(DisplayResolution::DockedHeight);
     } else {
@@ -128,7 +129,7 @@ Result ISystemDisplayService::GetDisplayMode(Out<DisplayMode> out_display_mode, 
     out_display_mode->unknown = 0;
 
     LOG_DEBUG(Service_VI, "Display mode: docked={} resolution={}x{} refresh={}",
-              Settings::IsDockedMode(), out_display_mode->width, out_display_mode->height,
+              Nx2::IsDockedForGame(), out_display_mode->width, out_display_mode->height,
               out_display_mode->refresh_rate);
 
     R_SUCCEED();

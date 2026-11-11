@@ -65,6 +65,7 @@
 #include "video_core/host1x/nx2_video_decoder.h"
 #include "video_core/nx2.h"
 #include "video_core/textures/decoders.h"
+#include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
@@ -73,6 +74,7 @@
 #include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
+#include "core/hle/service/nx2_auto_resolution.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/nx2_image_layout.h"
 #include "core/hle/service/nx2_movie_clock.h"
@@ -1752,24 +1754,13 @@ public:
             {111, &INx2Vi2Session::StubReplyZeroed, "Unknown111"},
             {112, &INx2Vi2Session::StubReplyZeroed, "Unknown112"},
             {113, &INx2Vi2Session::StubReplyZeroed, "Unknown113"},
+            {201, &INx2Vi2Session::StubReplyZeroed, "Unknown201"},
             {202, &INx2Vi2Session::StubReplyZeroed, "Unknown202"},
             {230, &INx2Vi2Session::StubReplyZeroed, "Unknown230"},
             {231, &INx2Vi2Session::StubReplyZeroed, "Unknown231"},
             {232, &INx2Vi2Session::StubReplyZeroed, "Unknown232"},
             {251, &INx2Vi2Session::StubReplyZeroed, "Unknown251"},
             {252, &INx2Vi2Session::StubReplyZeroed, "Unknown252"},
-            {261, &INx2Vi2Session::StubReplyZeroed, "Unknown261"},
-            {262, &INx2Vi2Session::StubReplyZeroed, "Unknown262"},
-            {263, &INx2Vi2Session::StubReplyZeroed, "Unknown263"},
-            {264, &INx2Vi2Session::StubReplyZeroed, "Unknown264"},
-            {265, &INx2Vi2Session::StubReplyZeroed, "Unknown265"},
-            {266, &INx2Vi2Session::StubReplyZeroed, "Unknown266"},
-            {267, &INx2Vi2Session::StubReplyZeroed, "Unknown267"},
-            {268, &INx2Vi2Session::StubReplyZeroed, "Unknown268"},
-            {269, &INx2Vi2Session::StubReplyZeroed, "Unknown269"},
-            {270, &INx2Vi2Session::StubReplyZeroed, "Unknown270"},
-            {271, &INx2Vi2Session::StubReplyZeroed, "Unknown271"},
-            {272, &INx2Vi2Session::StubReplyZeroed, "Unknown272"},
             {301, &INx2Vi2Session::StubReplyZeroed, "Unknown301"},
             {302, &INx2Vi2Session::StubReplyZeroed, "Unknown302"},
             {351, &INx2Vi2Session::StubReplyZeroed, "Unknown351"},
@@ -1781,9 +1772,11 @@ public:
             {358, &INx2Vi2Session::StubReplyZeroed, "Unknown358"},
             {359, &INx2Vi2Session::StubReplyZeroed, "Unknown359"},
         });
+        Nx2::SetGameHandheldOverride(false);
     }
 
     ~INx2Vi2Session() override {
+        Nx2::SetGameHandheldOverride(false);
         // The vsync callback may be running on the HostTiming thread: empty its event list under
         // its lock first (it holds the state, not this session), then close the events.
         {
@@ -1923,6 +1916,7 @@ private:
                 m_stats.frame_us += frame;
                 m_stats.max_frame_us = (std::max)(m_stats.max_frame_us, frame);
                 m_stats.hitches += frame > 100'000 ? 1 : 0;
+                UpdateAutoResolution(to_us(entered.time_since_epoch()), frame, w[12]);
             }
             m_stats.last_present = entered;
             if (++m_stats.presents == 600) {
@@ -1953,6 +1947,57 @@ private:
         u32 presents{}, ran_ahead{};
         std::chrono::steady_clock::time_point last_present{};
     } m_stats{};
+
+    // EDEN_NX2_AUTO_RESOLUTION=1: tells a docked game it is handheld while it runs well below its
+    // frame rate (Nx2::IsDockedForGame), and docked again once it keeps up.
+    void NotifyMaxResolutionChanged() {
+        if (m_max_res_event_slot && *m_max_res_event_slot < m_native_events.size() &&
+            m_native_events[*m_max_res_event_slot] != nullptr) {
+            m_native_events[*m_max_res_event_slot]->Signal(system.Kernel());
+        }
+    }
+
+    void UpdateAutoResolution(long long now_us, long long frame_us, u32 timing) {
+        if (!Nx2::AutoResolutionEnabled() || !Settings::IsDockedMode()) {
+            if (m_auto_resolution.Handheld() || Nx2::GameHandheldOverride()) {
+                m_auto_resolution.Reset();
+                Nx2::SetGameHandheldOverride(false);
+                system.GetAppletManager().OperationModeChanged();
+                NotifyMaxResolutionChanged();
+            }
+            return;
+        }
+        // The game's own rate: its swap interval at the display rate, or the FPS limit if lower.
+        u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
+        constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
+        if (system.GetApplicationProcessProgramID() == OcarinaOfTimeId &&
+            Settings::values.oot_30fps.GetValue()) {
+            swap_interval = (std::max)(swap_interval, 2U);
+        }
+        const u32 refresh =
+            (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
+        long long target_us = 1'000'000LL * swap_interval / refresh;
+        if (const u32 fps_limit = Nx2VsyncRateHz(); fps_limit != 0) {
+            target_us = (std::max)(target_us, 1'000'000LL / fps_limit);
+        }
+        if (Settings::values.use_speed_limit.GetValue() && Settings::SpeedLimit() > 0 &&
+            Settings::SpeedLimit() < 100) {
+            target_us = target_us * 100 / Settings::SpeedLimit();
+        }
+        const auto change = m_auto_resolution.Present(now_us, frame_us, target_us);
+        if (change == Nx2::AutoResolution::Change::None) {
+            return;
+        }
+        const bool handheld = change == Nx2::AutoResolution::Change::ToHandheld;
+        LOG_INFO(Service, "nx2:vi2 automatic resolution: {}: {} (present #{}, target {} us)",
+                 handheld ? "handheld" : "docked", m_auto_resolution.Reason(), m_presents,
+                 target_us);
+        Nx2::SetGameHandheldOverride(handheld);
+        system.GetAppletManager().OperationModeChanged();
+        NotifyMaxResolutionChanged();
+    }
+    Nx2::AutoResolution m_auto_resolution;
+
     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
     u32 m_previous_fence_value{};
     u32 m_frame_fence_relearn_logs{}; // the first 8 frame-fence learn lines
@@ -2321,7 +2366,7 @@ private:
         // into the top-left 1920x1080, the handheld panel's resolution; the console's display
         // scans out only that region. Showing whole images put the frame in a corner inside black
         // margins that scaled with the window (seen on Mario Kart World and Splatoon Raiders).
-        if (!Settings::IsDockedMode()) {
+        if (!Nx2::IsDockedForGame()) {
             crop_width = (std::min)(crop_width, 1920U);
             crop_height = (std::min)(crop_height, 1080U);
         } else if (!has_shown_size &&
@@ -2350,7 +2395,7 @@ private:
             LOG_INFO(Service,
                      "nx2:vi2 composite image {} layout {}x{}, drawn area {:#x}, crop {}x{}, docked={}",
                      image_id, layout.width, layout.height, shown_size, crop_width, crop_height,
-                     Settings::IsDockedMode());
+                     Nx2::IsDockedForGame());
         }
         std::vector<Tegra::FramebufferConfig> layers{Tegra::FramebufferConfig{
             .address = *device,
@@ -2516,7 +2561,8 @@ private:
             result = Result{ErrorModule::VI, 7};
             if (name == DefaultDisplay) {
                 static const char* forced = std::getenv("EDEN_VI2_MAX_RESOLUTION_MODE");
-                mode = forced ? std::strtoull(forced, nullptr, 0) : Settings::IsDockedMode() ? 4 : 2;
+                mode = forced ? std::strtoull(forced, nullptr, 0)
+                              : Nx2::IsDockedForGame() ? 4 : 2;
                 result = ResultSuccess;
             }
         }
@@ -2525,7 +2571,7 @@ private:
         rb.Push(mode);
         LOG_DEBUG(Service_VI,
                   "nx2:vi2 max resolution: name={:#x} docked={} result={:#x} mode={}",
-                  name, Settings::IsDockedMode(), result.raw, mode);
+                  name, Nx2::IsDockedForGame(), result.raw, mode);
     }
 
     // Must be < 8; nn::vi::detail::LayerHistory creates 7 timestamp recorders per layer.
@@ -2602,6 +2648,9 @@ private:
         LOG_INFO(Service, "nx2:vi2 {} native event {} -> change notification", ctx.GetCommand(), index);
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, false);
+            if (ctx.GetCommand() == 269) {
+                m_max_res_event_slot = index;
+            }
             m_native_events[index]->Signal(system.Kernel());
         }
         TipcReplyWords(ctx, {});
@@ -2611,6 +2660,9 @@ private:
     void UnbindNativeEvent(HLERequestContext& ctx) {
         const u32 index = ctx.CommandBuffer()[4];
         LOG_INFO(Service, "nx2:vi2 {} native event {} unbound", ctx.GetCommand(), index);
+        if (ctx.GetCommand() == 270 && m_max_res_event_slot == index) {
+            m_max_res_event_slot.reset();
+        }
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, false);
         }
@@ -2707,6 +2759,7 @@ private:
     std::shared_ptr<Nx2NativeObjects> m_objects;
     std::vector<Kernel::KEvent*> m_events;
     std::array<Kernel::KEvent*, 8> m_native_events{}; ///< 31's slots, also listed in m_events
+    std::optional<u32> m_max_res_event_slot;          ///< 269's bound slot, if any
     // Shared with the vsync timer callback, which can outlive the session by one call.
     struct VsyncState {
         std::mutex mutex;
@@ -3109,14 +3162,20 @@ private:
         const u64 pts = u64{w[words]} | (u64{w[words + 1]} << 32);
         const bool end = (w[words + 2] & 0xFF) != 0;
         Log(ctx, "submit");
-        // The SDK answers busy when the decoder cannot take a packet, and the client retries after
-        // the submission-ready event. Taking every packet let a player queue a whole movie: Ocarina
-        // of Time's title movie went in at ~330 packets a second (2,600 queued), and until the
-        // last was in, its pictures came at 20-28 fps, so the video started ~11 s behind its
-        // audio. End of stream is never refused.
-        if (!end) {
+        Input input{{}, pts, end};
+        if (!ctx.BufferDescriptorA().empty()) {
+            const auto data = ctx.ReadBufferA(0);
+            input.data.assign(data.begin(), data.end());
+        }
+        const auto input_size = input.data.size();
+        {
             std::scoped_lock lk{m_mutex};
-            if (m_inputs.Full()) {
+            // The SDK answers busy when the decoder cannot take a packet, and the client retries
+            // after the submission-ready event. Taking every packet let a player queue a whole
+            // movie: Ocarina of Time's title movie went in at ~330 packets a second (2,600
+            // queued), and until the last was in, its pictures came at 20-28 fps, so the video
+            // started ~11 s behind its audio. End of stream is never refused.
+            if (!m_inputs.Submit(std::move(input))) {
                 if (Nx2VideoTraceEnabled()) {
                     LOG_INFO(Service, "nx2:vdec trace refuse syncpoint={} pts={} queued={}",
                              m_syncpoint, pts, m_inputs.Size());
@@ -3127,16 +3186,6 @@ private:
                 rb.PushRaw<u32>(ResultDecoderBusy.raw);
                 return;
             }
-        }
-        Input input{{}, pts, end};
-        if (!ctx.BufferDescriptorA().empty()) {
-            const auto data = ctx.ReadBufferA(0);
-            input.data.assign(data.begin(), data.end());
-        }
-        const auto input_size = input.data.size();
-        {
-            std::scoped_lock lk{m_mutex};
-            m_inputs.Push(std::move(input));
             m_stream_ended = false;
             m_end_queued |= end;
             m_ready->room.store(!m_end_queued && m_inputs.BelowReadyWatermark(),
@@ -4122,7 +4171,6 @@ public:
             {403, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission403"},
             {424, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown424"},
             {425, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown425"},
-            {427, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown427"},
             {434, &INx2GraphicsSystemSession::AttachGpuAddressSpace, "AttachGpuAddressSpace"},
             {436, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown436"},
             {461, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown461"},
@@ -4150,6 +4198,7 @@ public:
             {814, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown814"},
             {861, &INx2GraphicsSystemSession::GetCpuImageDescriptor, "GetFeatureCpuImageDescriptor861"},
             {891, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize891"},
+            {903, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown903"},
             {1003, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1003"},
             {1011, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1011"},
             {1012, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1012"},

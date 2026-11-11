@@ -2,10 +2,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <qdebug.h>
-#include "common/scope_exit.h"
 #ifdef _WIN32
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <fmt/format.h>
+#include "common/logging.h"
 #include "common/windows/timer_resolution.h"
 #endif
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
@@ -32,6 +38,34 @@ void EmuThread::run() {
 
     auto& gpu = QtCommon::system->GPU();
     auto stop_token = m_stop_source.get_token();
+#ifdef _WIN32
+    // What a 1 ms sleep really takes in this process. Windows 11 may stop honouring the timer
+    // request above, and the system figure cannot show that because another program's request
+    // moves it too. Measure 20 short sleeps at start and once a minute for the first 10 minutes
+    // while emulation runs.
+    std::jthread timer_check_thread([stop_token] {
+        using namespace std::chrono;
+        for (int round = 0; round < 11 && !stop_token.stop_requested(); ++round) {
+            const auto start = steady_clock::now();
+            int completed = 0;
+            for (; completed < 20 && !stop_token.stop_requested(); ++completed) {
+                std::this_thread::sleep_for(milliseconds{1});
+            }
+            if (completed < 20) {
+                break;
+            }
+            const double sleep_ms =
+                duration<double, std::milli>(steady_clock::now() - start).count() / 20.0;
+            LOG_INFO(Frontend, "Timer check: a 1 ms sleep takes {:.2f} ms (system timer {:.4f} ms)",
+                     sleep_ms,
+                     duration<double, std::milli>(Common::Windows::GetCurrentTimerResolution())
+                         .count());
+            if (round == 10 || !Common::StoppableTimedWait(stop_token, seconds{60})) {
+                break;
+            }
+        }
+    });
+#endif
 
     QtCommon::system->RegisterHostThread();
 

@@ -12,6 +12,7 @@
 #include "core/hle/service/am/service/storage.h"
 #include "core/hle/service/apm/apm_interface.h"
 #include "core/hle/service/cmif_serialization.h"
+#include "core/hle/service/nx2_auto_resolution.h"
 #include "core/hle/service/pm/pm.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/vi/vi_types.h"
@@ -193,7 +194,7 @@ Result ICommonStateGetter::GetHdcpAuthenticationStateChangeEvent(
 }
 
 Result ICommonStateGetter::GetOperationMode(Out<OperationMode> out_operation_mode) {
-    const bool use_docked_mode{Settings::IsDockedMode()};
+    const bool use_docked_mode{Nx2::IsDockedForGame()};
     LOG_DEBUG(Service_AM, "called, use_docked_mode={}", use_docked_mode);
     *out_operation_mode = use_docked_mode ? OperationMode::Docked : OperationMode::Handheld;
     R_SUCCEED();
@@ -201,7 +202,7 @@ Result ICommonStateGetter::GetOperationMode(Out<OperationMode> out_operation_mod
 
 Result ICommonStateGetter::GetPerformanceMode(Out<APM::PerformanceMode> out_performance_mode) {
     *out_performance_mode = system.GetAPMController().GetCurrentPerformanceMode();
-    LOG_DEBUG(Service_AM, "called, docked={} performance_mode={}", Settings::IsDockedMode(),
+    LOG_DEBUG(Service_AM, "called, docked={} performance_mode={}", Nx2::IsDockedForGame(),
               static_cast<u32>(*out_performance_mode));
     R_SUCCEED();
 }
@@ -255,7 +256,7 @@ Result ICommonStateGetter::IsInControllerFirmwareUpdateSection(
 }
 
 Result ICommonStateGetter::GetDefaultDisplayResolution(Out<s32> out_width, Out<s32> out_height) {
-    if (Settings::IsDockedMode()) {
+    if (Nx2::IsDockedForGame()) {
         *out_width = static_cast<u32>(Service::VI::DisplayResolution::DockedWidth);
         *out_height = static_cast<u32>(Service::VI::DisplayResolution::DockedHeight);
     } else {
@@ -263,7 +264,7 @@ Result ICommonStateGetter::GetDefaultDisplayResolution(Out<s32> out_width, Out<s
         *out_height = static_cast<u32>(Service::VI::DisplayResolution::UndockedHeight);
     }
 
-    LOG_DEBUG(Service_AM, "called, docked={} resolution={}x{}", Settings::IsDockedMode(),
+    LOG_DEBUG(Service_AM, "called, docked={} resolution={}x{}", Nx2::IsDockedForGame(),
               *out_width, *out_height);
 
     R_SUCCEED();
