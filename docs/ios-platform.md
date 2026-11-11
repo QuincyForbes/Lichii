@@ -78,10 +78,14 @@ Left at their defaults on purpose:
 - Memory warnings (`UIApplicationDidReceiveMemoryWarningNotification`) and the low-water mark
   (checked every 250 ms from the texture cache's frame tick) raise
   `Common::PlatformEvents::SignalMemoryPressure`: the texture cache collects as if out of device
-  memory and the buffer cache collects unused buffers for 30 frames.
-- Experiment `no_footprint` (`lichii_platform_set_experiment`, next launch): the guest memory
-  object is tagged `VM_LEDGER_FLAG_NO_FOOTPRINT` (MeloNX's JIT workaround applied to guest RAM).
-  Unverified; off by default.
+  memory and the buffer cache collects unused buffers for 30 frames. While the process stays
+  below the mark without getting worse, the signals come 1, 2, 4 ... 30 s apart.
+- Experiments (`lichii_platform_set_experiment`, next launch, off by default): `file_guest`
+  keeps guest memory in a mapped file in tmp, outside the footprint; `chunked_guest` gives
+  all-zero 2 MiB pieces of it back. `VM_LEDGER_FLAG_NO_FOOTPRINT` is not one of them: iOS refuses
+  it without a private entitlement.
+- Every 30 s, at a memory warning and when iOS is about to close the app, the log says what the
+  footprint is made of (`Memory regions`, `Memory malloc`, `Storage`: `LogMemoryBreakdown`).
 
 ## Lifecycle, threads, display
 
