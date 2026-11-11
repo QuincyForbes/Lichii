@@ -65,8 +65,11 @@ public:
         ASSERT(references == 0);
         VideoCommon::BankBase::Reset();
         if (device.IsHostQueryResetSupported()) {
-            const auto& dev = device.GetLogical();
-            dev.ResetQueryPool(*query_pool, 0, BANK_SIZE);
+            // Record on VulkanWorker ahead of BeginQuery commands recorded after it, avoiding
+            // ~100 us host-side vkResetQueryPool stalls on GPUBack (zortos293/Lichii#1161).
+            scheduler.Record([dev = &device.GetLogical(), pool = *query_pool](vk::CommandBuffer) {
+                dev->ResetQueryPool(pool, 0, BANK_SIZE);
+            });
         } else {
             scheduler.RequestOutsideRenderPassOperationContext();
             scheduler.Record([pool = *query_pool](vk::CommandBuffer cmdbuf) {

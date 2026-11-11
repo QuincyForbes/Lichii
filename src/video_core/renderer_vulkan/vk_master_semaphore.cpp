@@ -66,6 +66,9 @@ void MasterSemaphore::Refresh() {
 
     const u64 counter = semaphore.GetCounter();
     u64 this_tick = gpu_tick.load(std::memory_order_acquire);
+    if (counter <= this_tick) {
+        return;
+    }
     while (counter > this_tick &&
            !gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
                                            std::memory_order_relaxed)) {
