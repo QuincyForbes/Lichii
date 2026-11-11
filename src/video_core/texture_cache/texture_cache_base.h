@@ -74,6 +74,16 @@ struct ImageViewInOut {
     ImageViewId id{};
 };
 
+/// The current draw's render targets as the asynchronous shaders' skip rule sees them
+/// (TextureCache::ClassifyDrawTargets): the class of the draw, and the target that gave it.
+struct DrawTargets {
+    DrawTargetClass kind{DrawTargetClass::Recurring};
+    GPUVAddr gpu_addr{};
+    u32 width{};
+    u32 height{};
+    VideoCore::Surface::PixelFormat format{};
+};
+
 /// EDEN_NX2_TEX_PAGES: the host pointers of the guest pages one draw or dispatch reads its
 /// texture handles and TIC/TSC entries from, each page translated once instead of once per read.
 struct GuestPageCache {
@@ -498,6 +508,11 @@ public:
         return render_targets;
     }
 
+    /// EDEN_NX2_ASYNC_DISCARD: classifies the render targets the current registers bind (the
+    /// bound ones when they are current, otherwise the registered images at the registers'
+    /// addresses; nothing is created). Takes the cache's lock. Runs per pipeline miss, not draw.
+    [[nodiscard]] DrawTargets ClassifyDrawTargets();
+
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
 
@@ -882,6 +897,10 @@ private:
     /// Returns true if the current clear parameters clear the whole image of a given image view
     [[nodiscard]] bool IsFullClear(ImageViewId id);
 
+    /// UpdateRenderTargets(true): records a full clear on the targets the clear writes (the
+    /// colour target it names, the depth target when depth is cleared), for ClassifyDrawTargets.
+    void NoteFullClears();
+
     [[nodiscard]] std::pair<u32, u32> PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                       bool mark_as_modified);
 
@@ -1003,6 +1022,7 @@ private:
     /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
     /// skip the upload of a new target the clear overwrites whole.
     bool clearing_render_targets = false;
+    u32 rt_cleared_undrawn_mask = 0;
     bool is_rescaling = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;
