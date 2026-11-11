@@ -18,12 +18,12 @@ namespace Vulkan {
 
 namespace {
 
-// CPU waits until the shared-event path is proven on a device (the first iPhone run with MetalFX
-// Temporal never presented a frame); EDEN_NX2_METALFX_SYNC=event opts back in.
+// Shared-event GPU synchronization is used by default where MTLSharedEvent export is available;
+// EDEN_NX2_METALFX_SYNC=cpu forces synchronous CPU waits for A/B debugging.
 bool ForceCpuSync() {
     static const bool force = [] {
         const char* const value = std::getenv("EDEN_NX2_METALFX_SYNC");
-        return value == nullptr || std::string_view{value} != "event";
+        return value != nullptr && std::string_view{value} == "cpu";
     }();
     return force;
 }
@@ -103,7 +103,11 @@ MetalFxContext::MetalFxContext(const Device& device_, Scheduler& scheduler_)
 }
 
 MetalFxContext::~MetalFxContext() {
-    // The bridge submissions wait for the last command buffer; Vulkan objects outlive it.
+    // Consume any pending next_wait_semaphore and let in-flight bridge submissions finish before
+    // metal_semaphore and bridge_semaphores are destroyed.
+    if (metal_value != 0) {
+        scheduler.Finish();
+    }
     if (last_command_buffer != nil) {
         [last_command_buffer waitUntilCompleted];
     }

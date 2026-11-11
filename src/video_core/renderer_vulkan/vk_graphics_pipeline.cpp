@@ -642,6 +642,12 @@ GraphicsPipeline::GraphicsPipeline(
         for (vk::ShaderModule& module : spv_modules) {
             module.reset();
         }
+        mesh_vertex_module.reset();
+        distribution_module.reset();
+        if (mesh_emulation) {
+            std::vector<u32>{}.swap(mesh_emulation->vertex_spirv);
+            std::vector<u32>{}.swap(mesh_emulation->distribution_spirv);
+        }
         if (worker_only_build) {
             const auto elapsed = std::chrono::steady_clock::now() - begin;
             static std::atomic<u32> logged{};
@@ -1229,6 +1235,24 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (!IsBuilt()) {
             scheduler.Record([this](vk::CommandBuffer) { build->Wait(!worker_only_build); });
         }
+        const u64 current_tick = scheduler.CurrentTick();
+        const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
+        const bool reuse_mesh_descriptors =
+            mesh_descriptor_tick == current_tick &&
+            last_descriptor_payload.size() == num_descriptor_entries &&
+            std::memcmp(last_descriptor_payload.data(), entries,
+                        num_descriptor_entries * sizeof(DescriptorUpdateEntry)) == 0;
+        if (!reuse_mesh_descriptors) {
+            last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+            mesh_descriptor_tick = current_tick;
+        }
+        const bool reuse_distribution_set =
+            mesh_emulation->has_task && mesh_distribution_tick == current_tick &&
+            last_mesh_task_buffers == mesh_task_buffers;
+        if (mesh_emulation->has_task && !reuse_distribution_set) {
+            last_mesh_task_buffers = mesh_task_buffers;
+            mesh_distribution_tick = current_tick;
+        }
         // EDEN_NX2_MESH_FIRST: the task (or mesh) compute shader adds the draw's first
         // workgroup index, as the native mesh path does.
         const bool push_draw_base{MeshFirstEnabled()};
@@ -1238,21 +1262,25 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             (stage_infos[0].is_task ? draw_base.task : draw_base.mesh) = first;
         }
         scheduler.Record([this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
-                          task_buffers = mesh_task_buffers,
+                          task_buffers = mesh_task_buffers, reuse_mesh_descriptors,
+                          reuse_distribution_set,
                           rescaling_data = rescaling.Data(), is_rescaling = texture_cache.IsRescaling(),
                           uses_render_area = render_area.uses_render_area,
                           render_area_data = render_area.words, push_draw_base,
                           draw_base](vk::CommandBuffer cmdbuf) {
-            mesh_descriptor_set = VK_NULL_HANDLE;
             const bool has_task{mesh_emulation->has_task};
             if (!pipeline || !mesh_compute_pipeline || build->Failed() || groups == 0 ||
                 (has_task && (!task_compute_pipeline || !distribution_pipeline))) {
+                mesh_descriptor_set = VK_NULL_HANDLE;
                 return;
             }
-            const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
-            device.GetLogical().UpdateDescriptorSet(descriptor_set, *descriptor_update_template,
-                                                    descriptor_data);
-            mesh_descriptor_set = descriptor_set;
+            if (!reuse_mesh_descriptors || mesh_descriptor_set == VK_NULL_HANDLE) {
+                const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
+                device.GetLogical().UpdateDescriptorSet(descriptor_set, *descriptor_update_template,
+                                                        descriptor_data);
+                mesh_descriptor_set = descriptor_set;
+            }
+            const VkDescriptorSet descriptor_set{mesh_descriptor_set};
             // The task and mesh programs read the draw's push constants and descriptors.
             const auto bind_program_state = [&] {
                 constexpr VkShaderStageFlags push_stages{VK_SHADER_STAGE_ALL_GRAPHICS |
@@ -1312,29 +1340,33 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
             // 2. Distribution: each task's first mesh workgroup, the draw's place in the output
             //    arena, and the mesh dispatch and draw arguments.
-            const VkDescriptorSet distribution_set{distribution_allocator.Commit()};
-            std::array<VkDescriptorBufferInfo, 4> buffer_infos{};
-            std::array<VkWriteDescriptorSet, 4> writes{};
-            for (u32 binding = 0; binding < 4; ++binding) {
-                buffer_infos[binding] = {
-                    .buffer = task_buffers[binding].buffer,
-                    .offset = task_buffers[binding].offset,
-                    .range = task_buffers[binding].size,
-                };
-                writes[binding] = {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .dstSet = distribution_set,
-                    .dstBinding = binding,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pImageInfo = nullptr,
-                    .pBufferInfo = &buffer_infos[binding],
-                    .pTexelBufferView = nullptr,
-                };
+            if (!reuse_distribution_set || mesh_distribution_set == VK_NULL_HANDLE) {
+                const VkDescriptorSet distribution_set{distribution_allocator.Commit()};
+                std::array<VkDescriptorBufferInfo, 4> buffer_infos{};
+                std::array<VkWriteDescriptorSet, 4> writes{};
+                for (u32 binding = 0; binding < 4; ++binding) {
+                    buffer_infos[binding] = {
+                        .buffer = task_buffers[binding].buffer,
+                        .offset = task_buffers[binding].offset,
+                        .range = task_buffers[binding].size,
+                    };
+                    writes[binding] = {
+                        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                        .pNext = nullptr,
+                        .dstSet = distribution_set,
+                        .dstBinding = binding,
+                        .dstArrayElement = 0,
+                        .descriptorCount = 1,
+                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                        .pImageInfo = nullptr,
+                        .pBufferInfo = &buffer_infos[binding],
+                        .pTexelBufferView = nullptr,
+                    };
+                }
+                device.GetLogical().UpdateDescriptorSets(writes, {});
+                mesh_distribution_set = distribution_set;
             }
-            device.GetLogical().UpdateDescriptorSets(writes, {});
+            const VkDescriptorSet distribution_set{mesh_distribution_set};
             const Shader::Backend::SPIRV::MeshEmulationDistributionConstants constants{
                 .tasks = groups,
                 .payload_words = mesh_emulation->payload_stride,
@@ -1404,8 +1436,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     }
 
     bool update_descriptors = true;
-    if ((descriptor_set_layout && !uses_push_descriptor && !uses_descriptor_buffer) ||
-        has_stage_sets) {
+    if (!mesh_emulation &&
+        ((descriptor_set_layout && !uses_push_descriptor && !uses_descriptor_buffer) ||
+         has_stage_sets)) {
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
         update_descriptors =
             bind_pipeline || last_descriptor_payload.size() != num_descriptor_entries ||
@@ -2073,6 +2106,13 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+
+    if (mesh_emulation) {
+        mesh_vertex_module.reset();
+        distribution_module.reset();
+        std::vector<u32>{}.swap(mesh_emulation->vertex_spirv);
+        std::vector<u32>{}.swap(mesh_emulation->distribution_spirv);
+    }
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {
