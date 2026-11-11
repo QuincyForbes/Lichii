@@ -785,8 +785,7 @@ public:
             // only applies untagged: LICHII_IOS_UNTAGGED_GUEST=1 (experiment) goes back to that.
             const char* const untagged_env = std::getenv("LICHII_IOS_UNTAGGED_GUEST");
             ledger_tagged = untagged_env == nullptr || untagged_env[0] != '1';
-            const char* const file_env = std::getenv("LICHII_IOS_FILE_GUEST");
-            const bool file_wanted = file_env != nullptr && file_env[0] == '1';
+            const bool file_wanted = EnvSwitch("LICHII_IOS_FILE_GUEST", FileGuestDefault);
             const bool file = file_wanted && InitFile();
             if (file) {
                 ledger_tagged = false;
@@ -1357,6 +1356,19 @@ private:
             ASSERT_MSG(ret == 0, "munmap failed: {}", strerror(errno));
         }
 
+#ifdef LICHII_IOS_MACH_MEMORY
+        if (file_backed && fd != -1) {
+            // The last close of a file writes its dirty pages out before it is freed (vclean:
+            // ubc_msync UBC_PUSHALL | UBC_SYNC), gigabytes for a guest that is going away.
+            // Truncating discards them unwritten (ubc_setsize: MEMORY_OBJECT_RETURN_NONE).
+            const auto start = std::chrono::steady_clock::now();
+            const bool truncated = ftruncate(fd, 0) == 0;
+            LOG_INFO(HW_Memory, "Guest file: {} in {} ms", truncated ? "discarded" : "not discarded",
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count());
+        }
+#endif
         if (fd != -1) {
             int ret = close(fd);
             ASSERT_MSG(ret == 0, "close failed: {}", strerror(errno));
@@ -1444,8 +1456,8 @@ private:
     /// a page that left is read back on its next use.
     ///
     /// The file is unlinked while open, so it is gone when the process ends however it ends, and
-    /// its blocks are reserved up front: a write-out can't run out of space later. False (and a
-    /// log line) when storage is short; the caller then uses the usual memory object.
+    /// its blocks are reserved up front as far as storage allows. False (and a log line) when
+    /// storage is short; the caller then uses the usual memory object.
     bool InitFile() {
         const char* const directory = std::getenv("TMPDIR");
         if (directory == nullptr || directory[0] == '\0') {
@@ -1464,14 +1476,22 @@ private:
             LOG_WARNING(HW_Memory, "Guest memory in a file refused: statfs: {}", strerror(errno));
             return false;
         }
+        // Blocks are reserved for as much of the file as storage allows, all of it with 16 GiB
+        // free. The rest stays sparse: a page there that can't be written out when storage is
+        // full stays in RAM, dirty and intact (cluster_ioerror leaves the pages of a failed
+        // pageout unchanged), so the game loses nothing but iOS can't take that memory back.
+        // A game rarely writes more than 8 GiB, so less storage than that is refused.
         constexpr u64 Margin = u64{2} << 30;
+        constexpr u64 MinReserved = u64{8} << 30;
         const u64 free_bytes = static_cast<u64>(volume.f_bavail) * volume.f_bsize;
-        if (free_bytes < backing_size + Margin) {
+        const u64 needed = (std::min<u64>)(backing_size, MinReserved) + Margin;
+        if (free_bytes < needed) {
             LOG_WARNING(HW_Memory,
                         "Guest memory in a file refused: {} MiB of storage free, {} MiB needed",
-                        free_bytes >> 20, (backing_size + Margin) >> 20);
+                        free_bytes >> 20, needed >> 20);
             return false;
         }
+        const u64 reserve_bytes = (std::min<u64>)(backing_size, free_bytes - Margin);
         const int file =
             open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (file < 0) {
@@ -1489,7 +1509,7 @@ private:
         fstore_t store{};
         store.fst_flags = F_ALLOCATEALL;
         store.fst_posmode = F_PEOFPOSMODE;
-        store.fst_length = static_cast<off_t>(backing_size);
+        store.fst_length = static_cast<off_t>(reserve_bytes);
         const bool reserved = fcntl(file, F_PREALLOCATE, &store) == 0;
         const int reserve_error = errno;
         if (ftruncate(file, static_cast<off_t>(backing_size)) != 0) {
@@ -1508,7 +1528,8 @@ private:
                     "Guest memory file: {} MiB in {} ({} MiB of storage were free), storage {}, "
                     "data protection {}",
                     backing_size >> 20, directory, free_bytes >> 20,
-                    reserved ? "reserved" : fmt::format("not reserved ({})", strerror(reserve_error)),
+                    reserved ? fmt::format("reserved for {} MiB", reserve_bytes >> 20)
+                             : fmt::format("not reserved ({})", strerror(reserve_error)),
                     unprotected ? "off" : "left at the default");
         backing_base = static_cast<u8*>(base);
         fd = file;

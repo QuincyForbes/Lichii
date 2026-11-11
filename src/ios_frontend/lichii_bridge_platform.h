@@ -193,6 +193,10 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// computer, instead of 96 MiB with the larger files in temporary files.
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
+/// Guest memory in a file: as set in Experiments ("file_guest" / "file_guest_off"), else the
+/// default of common/host_memory.cpp.
+int lichii_platform_file_guest(void);
+void lichii_platform_set_file_guest(int enabled);
 
 #ifdef __cplusplus
 }
