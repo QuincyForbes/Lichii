@@ -48,9 +48,13 @@ struct LibraryNotice: Identifiable {
 /// Games found in Documents (and the folders below it), with play history.
 @MainActor
 final class GameLibrary: ObservableObject {
-    @Published private(set) var games: [Game] = []
+    @Published private(set) var games: [Game] = [] {
+        didSet { forgetOrder() }
+    }
     @Published private(set) var isScanning = false
-    @Published private(set) var lastPlayed: [String: Date] = [:]
+    @Published private(set) var lastPlayed: [String: Date] = [:] {
+        didSet { forgetOrder() }
+    }
     @Published private(set) var importProgress: ImportProgress?
     @Published var notice: LibraryNotice?
     /// Games of linked folders removed from the library; their files stay where they are.
@@ -66,6 +70,11 @@ final class GameLibrary: ObservableObject {
     private var rescanPending = false
     private var scanWaiters: [() -> Void] = []
     private var queuedImports: [[URL]] = []
+    // The library view asks for both lists on every update of the app or the library (twice a
+    // second during an import); they only change with the games and the play dates.
+    private var sortedGames: (sort: LibrarySort, query: String, games: [Game])?
+    private var recentGames: [Game]?
+    private lazy var documentsPrefix = Bridge.documentsDir.standardizedFileURL.path + "/"
 
     init() {
         if let stored = UserDefaults.standard.dictionary(forKey: playedKey) as? [String: Date] {
@@ -88,7 +97,7 @@ final class GameLibrary: ObservableObject {
         }
         isScanning = true
         let roots = [Bridge.documentsDir] + linkedFolders
-        let documentsPrefix = Bridge.documentsDir.standardizedFileURL.path + "/"
+        let documentsPrefix = self.documentsPrefix
         let userDir = Bridge.userDir
         let hidden = hiddenPaths
         try? FileManager.default.createDirectory(at: Bridge.gamesDir, withIntermediateDirectories: true)
@@ -191,32 +200,48 @@ final class GameLibrary: ObservableObject {
     }
 
     var recentlyPlayed: [Game] {
-        games.compactMap { game in playedDate(game).map { (game, $0) } }
+        if let recentGames {
+            return recentGames
+        }
+        let recent = games.compactMap { game in playedDate(game).map { (game, $0) } }
             .sorted { $0.1 > $1.1 }
             .prefix(10)
             .map(\.0)
+        recentGames = recent
+        return recent
     }
 
     func sorted(_ sort: LibrarySort, matching query: String) -> [Game] {
+        if let sortedGames, sortedGames.sort == sort, sortedGames.query == query {
+            return sortedGames.games
+        }
         let filtered = query.isEmpty ? games : games.filter {
             $0.title.localizedCaseInsensitiveContains(query) ||
                 $0.developer.localizedCaseInsensitiveContains(query) ||
                 $0.programIdHex.localizedCaseInsensitiveContains(query)
         }
+        let result: [Game]
         switch sort {
         case .title:
-            return filtered.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+            result = filtered.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
         case .recent:
-            return filtered.sorted {
+            result = filtered.sorted {
                 (playedDate($0) ?? .distantPast, $1.title) > (playedDate($1) ?? .distantPast, $0.title)
             }
         case .developer:
-            return filtered.sorted { ($0.developer, $0.title) < ($1.developer, $1.title) }
+            result = filtered.sorted { ($0.developer, $0.title) < ($1.developer, $1.title) }
         case .size:
-            return filtered.sorted { $0.fileSize > $1.fileSize }
+            result = filtered.sorted { $0.fileSize > $1.fileSize }
         case .fileType:
-            return filtered.sorted { ($0.kind.label, $0.title) < ($1.kind.label, $1.title) }
+            result = filtered.sorted { ($0.kind.label, $0.title) < ($1.kind.label, $1.title) }
         }
+        sortedGames = (sort: sort, query: query, games: result)
+        return result
+    }
+
+    private func forgetOrder() {
+        sortedGames = nil
+        recentGames = nil
     }
 
     // MARK: - Removing games
@@ -224,8 +249,7 @@ final class GameLibrary: ObservableObject {
     /// A game Lichii doesn't own: it lives in a linked folder (the user's own files) rather than
     /// in the app's Documents.
     func isLinked(_ game: Game) -> Bool {
-        let documents = Bridge.documentsDir.standardizedFileURL.path + "/"
-        return !game.containerURL.standardizedFileURL.path.hasPrefix(documents)
+        !game.containerURL.standardizedFileURL.path.hasPrefix(documentsPrefix)
     }
 
     /// Deletes the game's file from the app's Documents. Linked games are only hidden (hide).
