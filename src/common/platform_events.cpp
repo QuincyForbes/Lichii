@@ -92,6 +92,7 @@ ProcessMemory QueryProcessMemory() {
         memory.reusable = info.reusable;
         memory.internal = info.internal;
         memory.purgeable_nonvolatile = static_cast<u64>(info.ledger_purgeable_nonvolatile);
+        memory.external = info.external;
     }
 #elif defined(_WIN32)
     // The closest Windows has: everything resident, guest memory included.

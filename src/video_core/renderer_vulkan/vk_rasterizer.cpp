@@ -3496,13 +3496,14 @@ void RasterizerVulkan::TickMemoryReport() {
     const auto [graphics_pipelines, compute_pipelines] = pipeline_cache.PipelineCounts();
     LOG_INFO(Render_Vulkan,
              "Memory: footprint {} MiB (peak {}, internal {}, compressed {}, reusable {}, "
-             "purgeable {}), {} MiB left | guest RAM handed out {} MiB, resident {} MiB, zero "
+             "purgeable {}), {} MiB left, mapped files {} MiB resident (not in the footprint) | "
+             "guest RAM handed out {} MiB, resident {} MiB, zero "
              "pages trimmed {} MiB (last scan) | Vulkan {} | textures {} images {} MiB (collector "
              "{} / {} / {} MiB) | buffers {} MiB | staging stream {} MiB + pooled {} MiB | "
              "pipelines {} graphics, {} compute | ASTC {}, BCn {}",
              process.footprint >> 20, process.footprint_peak >> 20, process.internal >> 20,
              process.compressed >> 20, process.reusable >> 20,
-             process.purgeable_nonvolatile >> 20, available >> 20,
+             process.purgeable_nonvolatile >> 20, available >> 20, process.external >> 20,
              Common::HostMemory::ScannedHandedOutBytes() >> 20,
              Common::HostMemory::ScannedResidentBytes() >> 20,
              Common::HostMemory::TrimmedZeroBytes() >> 20, device.MemoryHeapReport(),

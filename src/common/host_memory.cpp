@@ -43,6 +43,8 @@
 #if TARGET_OS_IPHONE
 #include <dlfcn.h>
 #include <mach/vm_purgable.h>
+#include <sys/mount.h>
+#include <sys/param.h>
 // iOS forbids POSIX shared memory for third-party apps; the guest is backed by an anonymous Mach
 // memory object and every fastmem view is a vm_map of it.
 #define LICHII_IOS_MACH_MEMORY 1
@@ -77,6 +79,7 @@
 #include <cstring>
 #include <mutex>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "common/alignment.h"
@@ -640,12 +643,17 @@ public:
             ledger_tagged = untagged_env == nullptr || untagged_env[0] != '1';
             const char* const no_footprint_env = std::getenv("LICHII_IOS_NO_FOOTPRINT");
             const bool no_footprint = no_footprint_env != nullptr && no_footprint_env[0] == '1';
+            const char* const file_env = std::getenv("LICHII_IOS_FILE_GUEST");
+            const bool file = file_env != nullptr && file_env[0] == '1' && InitFile();
+            if (file) {
+                ledger_tagged = false;
+            }
             const char* const chunked_env = std::getenv("LICHII_IOS_CHUNKED_GUEST");
-            const bool chunked = ledger_tagged && !no_footprint && chunked_env != nullptr &&
-                                 chunked_env[0] == '1' && InitChunks();
+            const bool chunked = !file && ledger_tagged && !no_footprint &&
+                                 chunked_env != nullptr && chunked_env[0] == '1' && InitChunks();
             memory_object_size_t entry_size = backing_size;
             kern_return_t kr = KERN_SUCCESS;
-            if (!chunked) {
+            if (!chunked && !file) {
                 kr = mach_make_memory_entry_64(
                     mach_task_self(), &entry_size, 0,
                     MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE |
@@ -668,11 +676,13 @@ public:
                 return false;
             }
             LOG_INFO(HW_Memory, "Guest memory: {} MiB, {}", backing_size >> 20,
-                     chunked ? "ledger-tagged in purgeable 2 MiB chunks (each page counted once; "
-                               "chunks of zeros are given back)"
+                     file ? "in a file (experiment: outside the footprint; iOS writes it to "
+                            "storage when it needs the memory)"
+                     : chunked ? "ledger-tagged in purgeable 2 MiB chunks (each page counted once; "
+                                 "chunks of zeros are given back)"
                      : ledger_tagged ? "ledger-tagged (each page counted once)"
                                      : "untagged (counted per mapping; zero trimming on)");
-            if (no_footprint) {
+            if (no_footprint && !file) {
                 // LICHII_IOS_NO_FOOTPRINT=1 (experiment): mach_memory_entry_ownership refuses
                 // VM_LEDGER_FLAG_NO_FOOTPRINT with KERN_NO_ACCESS for any tag or owner unless the
                 // app holds com.apple.private.memory.ownership_transfer (iOS 26.2: "no access").
@@ -690,7 +700,7 @@ public:
                 LOG_WARNING(HW_Memory, "Guest memory without footprint (experiment): {}",
                             owned == KERN_SUCCESS ? "on" : mach_error_string(owned));
             }
-            if (!chunked) {
+            if (!chunked && !file) {
                 vm_address_t backing_address = 0;
                 kr = vm_map(mach_task_self(), &backing_address, backing_size, 0, VM_FLAGS_ANYWHERE,
                             backing_entry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
@@ -1041,6 +1051,7 @@ public:
     }
 
     bool ledger_tagged{}; ///< The guest memory object is billed per page, not per mapping
+    bool file_backed{};   ///< The guest memory is a mapped file (InitFile)
 #endif
 
     const size_t backing_size; ///< Size of the backing memory in bytes
@@ -1087,7 +1098,7 @@ private:
 
     bool HasBackingObject() const {
 #ifdef LICHII_IOS_MACH_MEMORY
-        return backing_entry != MACH_PORT_NULL || Chunked();
+        return backing_entry != MACH_PORT_NULL || Chunked() || file_backed;
 #else
         return false;
 #endif
@@ -1106,6 +1117,16 @@ private:
     }
 
     bool MapBackingView(void* address, size_t size, size_t host_offset, int prot) {
+        if (file_backed) {
+            // MAP_FIXED replaces the reservation in one step (mmap: VM_FLAGS_OVERWRITE).
+            void* const mapped = mmap(address, size, prot & (PROT_READ | PROT_WRITE),
+                                      MAP_SHARED | MAP_FIXED, fd, static_cast<off_t>(host_offset));
+            if (mapped == MAP_FAILED) {
+                LOG_CRITICAL(HW_Memory, "mmap({}, {:#x}, offset {:#x}) of the guest file failed: {}",
+                             fmt::ptr(address), size, host_offset, strerror(errno));
+            }
+            return mapped != MAP_FAILED;
+        }
         if (Chunked()) {
             // One mapping per chunk the range touches; offsets into the backing stay linear.
             return ForEachChunkPiece(
@@ -1129,6 +1150,87 @@ private:
                          offset, mach_error_string(kr));
         }
         return kr == KERN_SUCCESS;
+    }
+
+    /// LICHII_IOS_FILE_GUEST=1 (experiment): the backing as a file in the app's tmp directory,
+    /// mapped shared. XNU bills a page of a file to the task's external ledger, which is not part
+    /// of the footprint (pmap_enter: only PMAP_OPTIONS_INTERNAL mappings reach phys_footprint, and
+    /// vm_fault sets that for internal objects only), counts it as available memory for the
+    /// system-wide jetsam and can write it out and drop it, which it never does to anonymous
+    /// memory on a phone. The price: a dirty page has to reach storage before its RAM is free, and
+    /// a page that left is read back on its next use.
+    ///
+    /// The file is unlinked while open, so it is gone when the process ends however it ends, and
+    /// its blocks are reserved up front: a write-out can't run out of space later. False (and a
+    /// log line) when storage is short; the caller then uses the usual memory object.
+    bool InitFile() {
+        const char* const directory = std::getenv("TMPDIR");
+        if (directory == nullptr || directory[0] == '\0') {
+            LOG_WARNING(HW_Memory, "Guest memory in a file refused: no TMPDIR");
+            return false;
+        }
+        std::string path{directory};
+        if (path.back() != '/') {
+            path += '/';
+        }
+        path += "lichii-guest-memory";
+        // Left by a run that died between open and unlink.
+        unlink(path.c_str());
+        struct statfs volume {};
+        if (statfs(directory, &volume) != 0) {
+            LOG_WARNING(HW_Memory, "Guest memory in a file refused: statfs: {}", strerror(errno));
+            return false;
+        }
+        constexpr u64 Margin = u64{2} << 30;
+        const u64 free_bytes = static_cast<u64>(volume.f_bavail) * volume.f_bsize;
+        if (free_bytes < backing_size + Margin) {
+            LOG_WARNING(HW_Memory,
+                        "Guest memory in a file refused: {} MiB of storage free, {} MiB needed",
+                        free_bytes >> 20, (backing_size + Margin) >> 20);
+            return false;
+        }
+        const int file =
+            open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (file < 0) {
+            LOG_WARNING(HW_Memory, "Guest memory in a file refused: open: {}", strerror(errno));
+            return false;
+        }
+        unlink(path.c_str());
+#ifdef F_SETPROTECTIONCLASS
+        // Class D (NSFileProtectionNone): readable and writable while the phone is locked.
+        constexpr int ProtectionClassD = 4;
+        const bool unprotected = fcntl(file, F_SETPROTECTIONCLASS, ProtectionClassD) == 0;
+#else
+        const bool unprotected = false;
+#endif
+        fstore_t store{};
+        store.fst_flags = F_ALLOCATEALL;
+        store.fst_posmode = F_PEOFPOSMODE;
+        store.fst_length = static_cast<off_t>(backing_size);
+        const bool reserved = fcntl(file, F_PREALLOCATE, &store) == 0;
+        const int reserve_error = errno;
+        if (ftruncate(file, static_cast<off_t>(backing_size)) != 0) {
+            LOG_WARNING(HW_Memory, "Guest memory in a file refused: ftruncate: {}", strerror(errno));
+            close(file);
+            return false;
+        }
+        void* const base =
+            mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+        if (base == MAP_FAILED) {
+            LOG_WARNING(HW_Memory, "Guest memory in a file refused: mmap: {}", strerror(errno));
+            close(file);
+            return false;
+        }
+        LOG_WARNING(HW_Memory,
+                    "Guest memory file: {} MiB in {} ({} MiB of storage were free), storage {}, "
+                    "data protection {}",
+                    backing_size >> 20, directory, free_bytes >> 20,
+                    reserved ? "reserved" : fmt::format("not reserved ({})", strerror(reserve_error)),
+                    unprotected ? "off" : "left at the default");
+        backing_base = static_cast<u8*>(base);
+        fd = file;
+        file_backed = true;
+        return true;
     }
 
     /// LICHII_IOS_CHUNKED_GUEST=1 (experiment): the backing as one ledger-tagged, purgeable memory
@@ -2112,7 +2214,15 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
 
 bool HostMemory::PagesCountedOnce() const noexcept {
 #ifdef LICHII_IOS_MACH_MEMORY
-    return impl && impl->ledger_tagged;
+    return impl && (impl->ledger_tagged || impl->file_backed);
+#else
+    return false;
+#endif
+}
+
+bool HostMemory::FileBacked() const noexcept {
+#ifdef LICHII_IOS_MACH_MEMORY
+    return impl && impl->file_backed;
 #else
     return false;
 #endif
@@ -2133,7 +2243,8 @@ bool HostMemory::ZeroWithoutFaulting(size_t offset, size_t length) {
     static std::atomic<bool> unsupported{};
     static std::atomic<bool> logged{};
     static const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    if (unsupported.load(std::memory_order_relaxed)) {
+    // A file's pages can't be zeroed this way (vm_object_zero_preflight: anonymous memory only).
+    if (unsupported.load(std::memory_order_relaxed) || FileBacked()) {
         return false;
     }
     const size_t begin = Common::AlignUp(offset, page_size);
