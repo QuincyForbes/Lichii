@@ -6,6 +6,11 @@
 #include <algorithm>
 #include <array>
 #include <numbers>
+
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include "common/logging.h"
 #include "common/math_util.h"
 #include "common/param_package.h"
@@ -697,6 +702,9 @@ void SDLDriver::CloseJoysticks() {
 }
 
 SDLDriver::SDLDriver(std::string input_engine_) : InputEngine(std::move(input_engine_)) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    return;
+#else
     // Set our application name. Currently passed to DBus by SDL and visible to the user through
     // their desktop environment.
     SDL_SetHint(SDL_HINT_APP_NAME, "Eden");
@@ -763,11 +771,14 @@ SDLDriver::SDLDriver(std::string input_engine_) : InputEngine(std::move(input_en
         }
         SDL_free(joysticks);
     }
+#endif
 }
 
 SDLDriver::~SDLDriver() {
     CloseJoysticks();
-    SDL_RemoveEventWatch(&SDLEventWatcher, this);
+    if (initialized) {
+        SDL_RemoveEventWatch(&SDLEventWatcher, this);
+    }
 
     initialized = false;
     if (start_thread) {

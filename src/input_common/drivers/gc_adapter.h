@@ -4,7 +4,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -24,6 +26,10 @@ class GCAdapter : public InputEngine {
 public:
     explicit GCAdapter(std::string input_engine_);
     ~GCAdapter() override;
+
+    void ReloadConfiguration();
+    void StartScanForConfiguration();
+    void ProbeIfNeeded();
 
     Common::Input::DriverResult SetVibration(
         const PadIdentifier& identifier, const Common::Input::VibrationStatus& vibration) override;
@@ -105,6 +111,10 @@ private:
 
     /// Returns true if there is a device connected to port
     bool DeviceConnected(std::size_t port) const;
+    bool AnyDeviceConnected() const;
+    bool HasConfiguredDevice() const;
+    bool EnsureLibUSBInitializedLocked();
+    void EnsureScanningLocked();
 
     /// For shutting down, clear all data, join all threads, release usb
     void Reset();
@@ -116,12 +126,14 @@ private:
 
     Common::Input::ButtonNames GetUIButtonName(const Common::ParamPackage& params) const;
 
+    mutable std::mutex scan_mutex;
     std::unique_ptr<LibUSBDeviceHandle> usb_adapter_handle;
     std::array<GCController, 4> pads;
 
     std::jthread adapter_input_thread;
     std::jthread adapter_scan_thread;
     bool restart_scan_thread{};
+    std::atomic<bool> scan_for_config{};
 
     std::unique_ptr<LibUSBContext> libusb_ctx;
 

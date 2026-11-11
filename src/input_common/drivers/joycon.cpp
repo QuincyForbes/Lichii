@@ -5,9 +5,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <fmt/ranges.h>
+#include <ranges>
+
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
 #include "common/param_package.h"
-#include <ranges>
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -18,6 +22,9 @@
 namespace InputCommon {
 
 Joycons::Joycons(const std::string& input_engine_) : InputEngine(input_engine_) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    return;
+#else
     // Avoid conflicting with SDL driver
     if (!Settings::values.enable_joycon_driver && !Settings::values.enable_procon_driver) {
         return;
@@ -29,6 +36,7 @@ Joycons::Joycons(const std::string& input_engine_) : InputEngine(input_engine_) 
     } else {
         LOG_ERROR(Input, "Hidapi could not be initialized. failed with error = {}", init_res);
     }
+#endif
 }
 
 Joycons::~Joycons() {
@@ -36,6 +44,7 @@ Joycons::~Joycons() {
 }
 
 void Joycons::Reset() {
+    const bool was_active = scan_thread.joinable();
     scan_thread = {};
     for (const auto& device : left_joycons) {
         if (!device) {
@@ -55,7 +64,9 @@ void Joycons::Reset() {
         }
         device->Stop();
     }
-    SDL_hid_exit();
+    if (was_active) {
+        SDL_hid_exit();
+    }
 }
 
 void Joycons::Setup() {

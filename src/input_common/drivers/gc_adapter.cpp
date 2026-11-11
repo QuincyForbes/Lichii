@@ -4,12 +4,14 @@
 // SPDX-FileCopyrightText: 2014 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <libusb.h>
 
 #include "common/logging.h"
 #include "common/param_package.h"
 #include "common/polyfill_thread.h"
+#include "common/settings.h"
 #include "common/settings_input.h"
 #include "common/thread.h"
 #include "input_common/drivers/gc_adapter.h"
@@ -73,23 +75,87 @@ private:
 };
 
 GCAdapter::GCAdapter(std::string input_engine_) : InputEngine(std::move(input_engine_)) {
-    if (usb_adapter_handle) {
-        return;
-    }
-    LOG_DEBUG(Input, "Initialization started");
-
-    libusb_ctx = std::make_unique<LibUSBContext>();
-    const int init_res = libusb_ctx->InitResult();
-    if (init_res == LIBUSB_SUCCESS) {
-        adapter_scan_thread =
-            std::jthread([this](std::stop_token stop_token) { AdapterScanThread(stop_token); });
-    } else {
-        LOG_ERROR(Input, "libusb could not be initialized. failed with error = {}", init_res);
-    }
+    ReloadConfiguration();
 }
 
 GCAdapter::~GCAdapter() {
     Reset();
+}
+
+bool GCAdapter::HasConfiguredDevice() const {
+    const std::string needle = fmt::format("engine:{}", GetEngineName());
+    for (const auto& player : Settings::values.players.GetValue()) {
+        if (player.controller_type == Settings::ControllerType::GameCube) {
+            return true;
+        }
+        for (const auto& button : player.buttons) {
+            if (button.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        for (const auto& analog : player.analogs) {
+            if (analog.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool GCAdapter::EnsureLibUSBInitializedLocked() {
+    if (!libusb_ctx) {
+        LOG_DEBUG(Input, "GCAdapter libusb initialization started");
+        libusb_ctx = std::make_unique<LibUSBContext>();
+        if (libusb_ctx->InitResult() != LIBUSB_SUCCESS) {
+            LOG_ERROR(Input, "libusb could not be initialized. failed with error = {}",
+                      libusb_ctx->InitResult());
+            libusb_ctx.reset();
+            return false;
+        }
+    }
+    return libusb_ctx->InitResult() == LIBUSB_SUCCESS;
+}
+
+void GCAdapter::EnsureScanningLocked() {
+    if (!EnsureLibUSBInitializedLocked()) {
+        return;
+    }
+    if (adapter_input_thread.joinable() || adapter_scan_thread.joinable()) {
+        return;
+    }
+    adapter_scan_thread =
+        std::jthread([this](std::stop_token stop_token) { AdapterScanThread(stop_token); });
+}
+
+void GCAdapter::ReloadConfiguration() {
+    scan_for_config.store(false, std::memory_order_relaxed);
+    if (HasConfiguredDevice()) {
+        std::scoped_lock lk{scan_mutex};
+        EnsureScanningLocked();
+        return;
+    }
+    std::jthread stop_scan;
+    {
+        std::scoped_lock lk{scan_mutex};
+        stop_scan = std::move(adapter_scan_thread);
+    }
+}
+
+void GCAdapter::StartScanForConfiguration() {
+    scan_for_config.store(true, std::memory_order_relaxed);
+    std::scoped_lock lk{scan_mutex};
+    EnsureScanningLocked();
+}
+
+void GCAdapter::ProbeIfNeeded() {
+    std::scoped_lock lk{scan_mutex};
+    if (adapter_input_thread.joinable() || adapter_scan_thread.joinable()) {
+        return;
+    }
+    if (!EnsureLibUSBInitializedLocked()) {
+        return;
+    }
+    static_cast<void>(Setup());
 }
 
 void GCAdapter::AdapterInputThread(std::stop_token stop_token) {
@@ -111,9 +177,12 @@ void GCAdapter::AdapterInputThread(std::stop_token stop_token) {
     }
 
     if (restart_scan_thread) {
-        adapter_scan_thread =
-            std::jthread([this](std::stop_token token) { AdapterScanThread(token); });
         restart_scan_thread = false;
+        if (scan_for_config.load(std::memory_order_relaxed) || HasConfiguredDevice()) {
+            std::scoped_lock lk{scan_mutex};
+            adapter_scan_thread =
+                std::jthread([this](std::stop_token token) { AdapterScanThread(token); });
+        }
     }
 }
 
@@ -221,7 +290,9 @@ void GCAdapter::AdapterScanThread(std::stop_token stop_token) {
     Common::SetCurrentThreadName("ScanGCAdapter");
     usb_adapter_handle = nullptr;
     pads = {};
-    while (!Setup() && Common::StoppableTimedWait(stop_token, std::chrono::seconds{2})) {
+    while (!stop_token.stop_requested() &&
+           (scan_for_config.load(std::memory_order_relaxed) || HasConfiguredDevice()) &&
+           !Setup() && Common::StoppableTimedWait(stop_token, std::chrono::seconds{2})) {
     }
 }
 
@@ -391,9 +462,27 @@ bool GCAdapter::DeviceConnected(std::size_t port) const {
     return pads[port].type != ControllerTypes::None;
 }
 
+bool GCAdapter::AnyDeviceConnected() const {
+    for (std::size_t port = 0; port < pads.size(); ++port) {
+        if (DeviceConnected(port)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void GCAdapter::Reset() {
-    adapter_scan_thread = {};
-    adapter_input_thread = {};
+    scan_for_config.store(false, std::memory_order_relaxed);
+    std::jthread stop_scan;
+    std::jthread stop_input;
+    {
+        std::scoped_lock lk{scan_mutex};
+        stop_scan = std::move(adapter_scan_thread);
+        stop_input = std::move(adapter_input_thread);
+    }
+    stop_scan = {};
+    stop_input = {};
+    std::scoped_lock lk{scan_mutex};
     usb_adapter_handle = nullptr;
     pads = {};
     libusb_ctx = nullptr;

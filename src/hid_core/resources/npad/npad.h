@@ -172,7 +172,6 @@ private:
         NPadGenericState npad_pad_state{};
         NPadGenericState npad_libnx_state{};
         NpadGcTriggerState npad_trigger_state{};
-        int callback_key{};
     };
 
     void ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTriggerType type, std::size_t controller_idx);
@@ -204,6 +203,7 @@ private:
     NpadVibration vibration_handler{};
 
     std::atomic<u64> press_state{};
+    std::array<int, MaxSupportedNpadIdTypes> controller_callback_keys{};
     std::array<std::array<NpadControllerData, MaxSupportedNpadIdTypes>, AruidIndexMax> controller_data{};
 };
 } // namespace Service::HID
