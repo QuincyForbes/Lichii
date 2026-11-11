@@ -171,26 +171,42 @@ std::string ProfileGuest(System& system) {
         bool data;
     };
     std::vector<Chunk> chunks((num_pages + ChunkPages - 1) / ChunkPages);
+    // Per 16 KiB (an iPhone page): resident ones holding only zeros, what giving zero pages back
+    // page by page would free there.
+    constexpr size_t HostPages = 4;
+    u64 zero_host_pages = 0;
+    bool host_zero = true;
+    bool host_resident = false;
     // Where the resident pages outside the application are, per 64 MiB of backing.
     constexpr size_t WindowPages = (size_t{64} << 20) / PageSize;
     std::vector<u32> other_windows((num_pages + WindowPages - 1) / WindowPages);
+    const auto note_host_page = [&](size_t index, bool zero, bool is_resident) {
+        host_zero = (index % HostPages == 0 || host_zero) && zero;
+        host_resident = (index % HostPages != 0 && host_resident) || is_resident;
+        if (index % HostPages == HostPages - 1 && host_zero && host_resident) {
+            ++zero_host_pages;
+        }
+    };
     for (size_t index = 0; index < num_pages; ++index) {
         const bool is_resident = known && resident[index];
         Chunk& chunk = chunks[index / ChunkPages];
         if (owner[index] == Unmapped) {
             // Kernel, services and pages the game gave back: only what is resident.
+            bool zero = true;
             if (is_resident) {
                 ++other.pages;
                 ++other_windows[index / WindowPages];
-                const bool zero = IsZeroPage(backing + index * PageSize);
+                zero = IsZeroPage(backing + index * PageSize);
                 (zero ? other.resident_zero : other.resident_data) += PageSize;
                 chunk.data = chunk.data || !zero;
             }
+            note_host_page(index, zero, is_resident);
             continue;
         }
         Tally& tally = tallies[owner[index]];
         ++tally.pages;
         const bool zero = IsZeroPage(backing + index * PageSize);
+        note_host_page(index, zero, is_resident);
         if (!zero) {
             CountData(tally, backing + index * PageSize);
             chunk.data = true;
@@ -260,6 +276,7 @@ std::string ProfileGuest(System& system) {
                                   size * 2, MiB(zero * PageSize), MiB(resident_zero * PageSize));
     }
     text += fmt::format("\n  application zero pages in backing chunks without data: {}", chunk_text);
+    text += fmt::format("\n  resident 16 KiB pages of zeros: {} MiB", MiB(zero_host_pages * HostPages * PageSize));
     // Runs of 64 MiB windows that each hold 8 MiB or more.
     std::string other_text;
     constexpr u32 WindowFloor = (u32{8} << 20) / PageSize;
