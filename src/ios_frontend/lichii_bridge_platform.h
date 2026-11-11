@@ -182,9 +182,8 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 // -------------------------------------------------------------------------------- experiments
 
 /// Opt-in switches, kept in the config dir and applied at the next launch:
-/// "no_footprint": ask for guest memory out of the process footprint (iOS 26 refuses it without
-/// a private entitlement: KERN_NO_ACCESS). "untagged_guest": guest memory counted per mapping, as
-/// before ledger tagging, with zero trimming. "no_zero_trim": no zero page trimming.
+/// "untagged_guest": guest memory counted per mapping, as before ledger tagging, with zero
+/// trimming. "no_zero_trim": no zero page trimming.
 /// "chunked_guest": guest memory in purgeable 2 MiB objects, the all-zero ones given back.
 /// "file_guest": guest memory in a mapped file in tmp, outside the footprint; iOS writes it to
 /// storage when it needs the memory. Wins over the other guest memory switches.
