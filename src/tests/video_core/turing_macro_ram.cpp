@@ -771,14 +771,14 @@ TEST_CASE("TuringMacroInterpreter matches reference across ALU, control flow, RA
                                     .dst = {0, 1},
                                     .src_a = {28, 29},
                                     .src_b = {25, 26},
-                                    .imm = {rng() & 0xffffU, rng() & 0xffffU},
+                                    .imm = {static_cast<u32>(rng() & 0xffffU), static_cast<u32>(rng() & 0xffffU)},
                                 });
         AppendInstruction(code, InsSpec{
                                     .op = {0, 15},
                                     .dst = {2, 3},
                                     .src_a = {28, 0},
                                     .src_b = {27, 1},
-                                    .imm = {rng() & 0xffffU, rng() & 0xffffU},
+                                    .imm = {static_cast<u32>(rng() & 0xffffU), static_cast<u32>(rng() & 0xffffU)},
                                 });
         const u32 body_len = 3 + (rng() % 8);
         for (u32 step = 0; step < body_len; ++step) {
