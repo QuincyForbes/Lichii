@@ -321,7 +321,7 @@ TEST_CASE("Descriptor Debug poisoning touches only the current addressable range
     REQUIRE(table.bound_ids.capacity() == 0);
 
     REQUIRE(table.Synchronize(0x1000, 127));
-    REQUIRE(table.bound_ids.size() == 524289);
+    REQUIRE(table.bound_ids.size() == 1024);
     REQUIRE(table.LiveBoundIds().size() == 128);
     std::ranges::fill(table.bound_ids, untouched);
     REQUIRE(table.Read(memory, 127).second);
