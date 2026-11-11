@@ -252,7 +252,15 @@ std::string FootprintSplit([[maybe_unused]] const ProcessMemory& memory,
 }
 
 u64 RelieveMallocPressure() {
-#ifdef __APPLE__
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // Nothing to give back (libmalloc source): xzone malloc's pressure_relief is a stub that
+    // returns 0; the magazine zones are built without the madvise pass on iOS
+    // (CONFIG_MADVISE_PRESSURE_RELIEF 0) and without the large cache, because iOS madvises free
+    // pages as they are freed (aggressive madvise); nano relieves only under a pressure madvise
+    // policy, not iOS's default. "Free inside" is address space of malloc's regions, most of it
+    // not in the footprint. An iPhone: 0 MiB on all 10 calls with 201-236 MiB "free".
+    return 0;
+#elif defined(__APPLE__)
     return static_cast<u64>(malloc_zone_pressure_relief(nullptr, 0));
 #else
     return 0;
@@ -615,8 +623,8 @@ void LogMemoryBreakdown([[maybe_unused]] const char* reason) {
     if (force_regions) {
         LogRegions(reason, memory);
     }
-    // In use is what the emulator holds; the rest of what the zones took from the OS is free
-    // inside them (malloc_zone_pressure_relief gives back the whole pages of it).
+    // In use is what the emulator holds; the rest of what the zones' regions span is free inside
+    // them (address space: on iOS its free pages are madvised at free and not in the footprint).
     malloc_statistics_t zones{};
     malloc_zone_statistics(nullptr, &zones);
     u64 metal = 0;

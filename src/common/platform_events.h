@@ -47,7 +47,8 @@ ProcessMemory QueryProcessMemory();
 /// split into guest memory (as of the last zero trimming pass), the JIT pool, graphics and the
 /// rest, for the log.
 std::string FootprintSplit(const ProcessMemory& memory, u64 left);
-/// Apple: hands the memory malloc holds free back to the OS. Returns the bytes released.
+/// macOS: hands the memory malloc holds free back to the OS. Returns the bytes released (0 on
+/// iOS, where libmalloc has nothing to do here).
 u64 RelieveMallocPressure();
 
 /// Where guest memory is mapped (its backing and the fastmem arena), so that LogMemoryBreakdown
