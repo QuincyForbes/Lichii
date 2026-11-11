@@ -42,6 +42,9 @@
 #include <mach/vm_statistics.h>
 #if TARGET_OS_IPHONE
 #include <mach/vm_purgable.h>
+#if __has_include(<mach/memory_entry.h>)
+#include <mach/memory_entry.h>
+#endif
 #include <sys/mount.h>
 #include <sys/param.h>
 // iOS forbids POSIX shared memory for third-party apps; the guest is backed by an anonymous Mach
@@ -77,6 +80,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <string>
 #include <utility>
@@ -106,6 +110,12 @@ namespace Common {
 [[maybe_unused]] constexpr size_t PageAlignment = 0x1000;
 [[maybe_unused]] constexpr int BackingAttempts = 5; // fastmem backing allocation tries (Windows)
 [[maybe_unused]] constexpr size_t HugePageSize = 0x200000;
+
+#ifdef LICHII_IOS_MACH_MEMORY
+// The guest object moved to the media ledger: task_info has what of it is resident and
+// compressed, without a counting pass.
+std::atomic<bool> g_guest_media_ledger{};
+#endif
 
 #ifdef _WIN32
 
@@ -813,6 +823,29 @@ public:
                             : ledger_tagged ? "refused, reason in the line above"
                                             : "it needs ledger-tagged memory");
             }
+#if defined(VM_LEDGER_TAG_MEDIA) && __has_include(<mach/memory_entry.h>)
+            // MAP_MEM_LEDGER_TAGGED bills the object to the "default" tag, which task_info does
+            // not report: the guest figure then needed a mincore pass over 14 GiB (0.3-0.5 s on
+            // an iPhone, every 30 s, stale in between). The media tag is reported
+            // (ledger_tag_media_footprint). For our own task and without the no-footprint flag
+            // xnu asks no entitlement and charges phys_footprint the same (vm_memory_entry.c
+            // mach_memory_entry_ownership, vm_object.c vm_object_ledger_tag_ledgers).
+            // LICHII_IOS_GUEST_MEDIA_LEDGER=0 keeps the default tag.
+            if (ledger_tagged && !chunked && !file) {
+                const char* const media_env = std::getenv("LICHII_IOS_GUEST_MEDIA_LEDGER");
+                if (media_env == nullptr || media_env[0] != '0') {
+                    const kern_return_t owner_kr = mach_memory_entry_ownership(
+                        backing_entry, mach_task_self(), VM_LEDGER_TAG_MEDIA, 0);
+                    g_guest_media_ledger.store(owner_kr == KERN_SUCCESS,
+                                               std::memory_order_relaxed);
+                    LOG_INFO(HW_Memory, "Guest memory: media ledger {}",
+                             owner_kr == KERN_SUCCESS
+                                 ? std::string{"(its footprint read from task_info)"}
+                                 : fmt::format("refused ({}): counted by passes",
+                                               mach_error_string(owner_kr)));
+                }
+            }
+#endif
             if (!chunked && !file) {
                 vm_address_t backing_address = 0;
                 kr = vm_map(mach_task_self(), &backing_address, backing_size, 0, VM_FLAGS_ANYWHERE,
@@ -1927,6 +1960,7 @@ std::atomic<u64> g_zero_filled_bytes{};
 std::atomic<HostMemory::GuestAccounting> g_scanned_accounting{};
 [[maybe_unused]] std::atomic<u64> g_trimmed_zero_bytes{};
 [[maybe_unused]] std::atomic<u64> g_scanned_handed_out_bytes{};
+std::atomic<s64> g_scanned_at_ns{};
 
 [[maybe_unused]] bool IsZeroPage(const u8* page) {
     // A cache line at a time: most pages that are not zero say so in their first line.
@@ -2095,14 +2129,57 @@ u64 HostMemory::ZeroFilledBytes() noexcept {
 }
 
 HostMemory::GuestAccounting HostMemory::ScannedAccounting() noexcept {
+#ifdef LICHII_IOS_MACH_MEMORY
+    if (g_guest_media_ledger.load(std::memory_order_relaxed)) {
+        return GuestAccounting::Once;
+    }
+#endif
     return g_scanned_accounting.load(std::memory_order_relaxed);
 }
 
+#ifdef LICHII_IOS_MACH_MEMORY
+namespace {
+// Resident and compressed bytes of the media ledger, which holds the guest object alone.
+std::optional<std::pair<u64, u64>> MediaLedger() {
+    if (!g_guest_media_ledger.load(std::memory_order_relaxed)) {
+        return std::nullopt;
+    }
+    task_vm_info_data_t info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) !=
+            KERN_SUCCESS ||
+        count < TASK_VM_INFO_REV3_COUNT) {
+        return std::nullopt;
+    }
+    const u64 compressed = static_cast<u64>(info.ledger_tag_media_footprint_compressed);
+    return std::pair{static_cast<u64>(info.ledger_tag_media_footprint) + compressed, compressed};
+}
+} // Anonymous namespace
+#endif
+
+bool HostMemory::GuestFootprintLive() noexcept {
+#ifdef LICHII_IOS_MACH_MEMORY
+    return g_guest_media_ledger.load(std::memory_order_relaxed);
+#else
+    return false;
+#endif
+}
+
 u64 HostMemory::ScannedResidentBytes() noexcept {
+#ifdef LICHII_IOS_MACH_MEMORY
+    if (const auto media = MediaLedger()) {
+        return media->first;
+    }
+#endif
     return g_scanned_resident_bytes.load(std::memory_order_relaxed);
 }
 
 u64 HostMemory::ScannedCompressedBytes() noexcept {
+#ifdef LICHII_IOS_MACH_MEMORY
+    if (const auto media = MediaLedger()) {
+        return media->second;
+    }
+#endif
     return g_scanned_compressed_bytes.load(std::memory_order_relaxed);
 }
 
@@ -2112,6 +2189,14 @@ u64 HostMemory::TrimmedZeroBytes() noexcept {
 
 u64 HostMemory::ScannedHandedOutBytes() noexcept {
     return g_scanned_handed_out_bytes.load(std::memory_order_relaxed);
+}
+
+u64 HostMemory::ScannedAgeSeconds() noexcept {
+    const s64 at = g_scanned_at_ns.load(std::memory_order_relaxed);
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    return at != 0 && now > at ? static_cast<u64>((now - at) / 1'000'000'000) : 0;
 }
 
 std::pair<size_t, size_t> HostMemory::TrimZeroPages(
@@ -2398,6 +2483,10 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
                                                     : GuestAccounting::PerMapping,
                                std::memory_order_relaxed);
     g_trimmed_zero_bytes.fetch_add(trimmed, std::memory_order_relaxed);
+    g_scanned_at_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count(),
+                          std::memory_order_relaxed);
     return {resident, trimmed};
 #else
     return {0, 0};

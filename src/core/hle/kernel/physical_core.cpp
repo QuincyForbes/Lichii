@@ -279,8 +279,12 @@ void PhysicalCore::LogBacktrace(KernelCore& kernel) {
 void PhysicalCore::Idle(KernelCore& kernel) {
     // Guest job systems hand work between cores many times per frame; blocking at once adds the
     // host's thread wake-up latency to every handoff. EDEN_NX2_IDLE_SPIN_US=<n>: poll for that
-    // many microseconds before blocking. Switch 2 titles poll 100 us by default outside Android
-    // (title 1's frames: 42 ms without, 35 ms with 50 us, 34 ms with 100 us, 36 ms with 300 us).
+    // many microseconds before blocking. Switch 2 titles poll 20 us by default outside Android
+    // and iOS (title 1's frames: 42 ms without, 35 ms with 50 us, 34 ms with 100 us, 36 ms with
+    // 300 us). 20 us is about what blocking and being woken costs: in a 100 fps scene with
+    // 34,000 idle entries per second, 62% end within 20 us and 84% within 100 us; the rest
+    // polled the whole window, which at 100 us was more CPU time than the caught handoffs took.
+    // The frame rate there is the same from 10 to 100 us and 5% lower without polling.
     static const long long spin_setting = [] {
         const char* text = std::getenv("EDEN_NX2_IDLE_SPIN_US");
         return text ? std::strtoll(text, nullptr, 10) : -1LL;
@@ -292,7 +296,7 @@ void PhysicalCore::Idle(KernelCore& kernel) {
         spin_us = 0;
 #else
         const KProcess* process = kernel.ApplicationProcess();
-        spin_us = process != nullptr && process->IsSwitch2() ? 100 : 0;
+        spin_us = process != nullptr && process->IsSwitch2() ? 20 : 0;
 #endif
     }
     const auto spin = std::chrono::microseconds{spin_us};

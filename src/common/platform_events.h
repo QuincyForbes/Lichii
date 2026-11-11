@@ -14,9 +14,10 @@
 // feeds them; nothing here changes behaviour until it does.
 namespace Common::PlatformEvents {
 
-/// A low-memory warning from the OS: the caches collect aggressively for a while.
+/// A low-memory warning from the OS: the caches collect aggressively for a while. Signals
+/// within 2 s of the last reaction are folded into it.
 void SignalMemoryPressure();
-/// Bumped by every SignalMemoryPressure, including those PollMemoryPressure raises.
+/// Bumped by every reaction of SignalMemoryPressure, including those PollMemoryPressure raises.
 u32 MemoryPressureGeneration();
 /// Listeners run inline during SignalMemoryPressure (must be fast and lock-safe).
 std::size_t AddMemoryPressureListener(std::function<void()> listener);
@@ -46,7 +47,8 @@ ProcessMemory QueryProcessMemory();
 /// split into guest memory (as of the last zero trimming pass), the JIT pool, graphics and the
 /// rest, for the log.
 std::string FootprintSplit(const ProcessMemory& memory, u64 left);
-/// Apple: hands the memory malloc holds free back to the OS. Returns the bytes released.
+/// macOS: hands the memory malloc holds free back to the OS. Returns the bytes released (0 on
+/// iOS, where libmalloc has nothing to do here).
 u64 RelieveMallocPressure();
 
 /// Where guest memory is mapped (its backing and the fastmem arena), so that LogMemoryBreakdown
