@@ -20,6 +20,12 @@
 #include "common/thread_cpu_clock.h"
 
 #ifdef _WIN32
+#include <windows.h>
+#undef CreateEvent
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+#include "common/scope_exit.h"
 #include "common/windows/timer_resolution.h"
 #endif
 
@@ -30,10 +36,6 @@
 namespace Core::Timing {
 
 constexpr s64 MAX_SLICE_LENGTH = 10000;
-
-// The timer thread sleeps in the OS until this long before the next event and waits the rest with
-// Event::WaitFor, which on x86 Windows is a hardware wait that keeps the thread running.
-constexpr s64 HOST_WAIT_MARGIN_NS = 0;
 
 constexpr u32 CPU_CLOCK_BASE_MHZ = 1020;
 constexpr u32 CPU_CLOCK_BOOST_MHZ = 1734;
@@ -51,6 +53,17 @@ constexpr u32 CpuClockTargetMhz(Settings::CpuClock clock) {
 }
 
 namespace {
+
+// The timer thread sleeps in the OS until this long before the next event and waits the rest with
+// Event::WaitFor, which on x86 Windows is a hardware wait that keeps the thread running.
+// EDEN_NX2_TIMING_SPIN_US overrides the tail margin in microseconds (default 0).
+s64 HostWaitMarginNs() {
+    static const s64 margin_ns = [] {
+        const char* v = std::getenv("EDEN_NX2_TIMING_SPIN_US");
+        return v != nullptr ? (std::max<s64>)(0, std::atoll(v) * 1000) : 0;
+    }();
+    return margin_ns;
+}
 
 // One second of the timer thread's waits, for EDEN_NX2_HOSTTIMING_STATS.
 struct HostWaitWindow {
@@ -127,6 +140,21 @@ CoreTiming::CoreTiming() {
 }
 CoreTiming::~CoreTiming() {
     Reset();
+#ifdef _WIN32
+    if (wake_handle != nullptr) {
+        CloseHandle(static_cast<HANDLE>(wake_handle));
+        wake_handle = nullptr;
+    }
+#endif
+}
+
+void CoreTiming::Wake() {
+    event.Set();
+#ifdef _WIN32
+    if (wake_handle != nullptr) {
+        SetEvent(static_cast<HANDLE>(wake_handle));
+    }
+#endif
 }
 
 void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
@@ -138,11 +166,34 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
         host_wait_stats = std::strtol(stats, nullptr, 10) != 0;
     }
     if (is_multicore) {
+#ifdef _WIN32
+        if (wake_handle == nullptr) {
+            wake_handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        }
+#endif
         timer_thread = std::jthread([this](std::stop_token stop_token) {
             Common::SetCurrentThreadName("HostTiming");
             Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
             Common::SetCurrentThreadToPerformanceCores();
             on_thread_init();
+            void* hires_timer = nullptr;
+#ifdef _WIN32
+            // EDEN_HIRES_CLOCK=0 or EDEN_NX2_TIMING_SLEEP=0 keeps the plain timed wait.
+            const char* const hires_switch = std::getenv("EDEN_HIRES_CLOCK");
+            const char* const sleep_switch = std::getenv("EDEN_NX2_TIMING_SLEEP");
+            const bool use_hires_timer =
+                (hires_switch == nullptr || hires_switch[0] != '0') &&
+                (sleep_switch == nullptr || sleep_switch[0] != '0');
+            if (use_hires_timer) {
+                hires_timer = CreateWaitableTimerExW(
+                    nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            }
+            SCOPE_EXIT {
+                if (hires_timer != nullptr) {
+                    CloseHandle(static_cast<HANDLE>(hires_timer));
+                }
+            };
+#endif
             has_started = true;
 
             // base frequency in MHz: 1ns (10^-9) = 1GHz (10^9)
@@ -151,7 +202,7 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                     paused_set = false;
                     if (auto const next_time = Advance(); next_time) {
                         // There are more events left in the queue, wait until the next event.
-                        WaitForEvent(*next_time);
+                        WaitForEvent(*next_time, hires_timer);
                     } else {
                         // Queue is empty, wait until another event is scheduled and signals us to
                         // continue.
@@ -167,17 +218,51 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
     }
 }
 
-void CoreTiming::WaitForEvent(s64 next_time) {
+void CoreTiming::WaitForEvent(s64 next_time, void* hires_timer) {
     const s64 start = GetGlobalTimeNs().count();
     if (next_time <= start) {
         return;
     }
+    const s64 margin_ns = HostWaitMarginNs();
     s64 now = start;
     bool signalled = false;
-    if (next_time - now > HOST_WAIT_MARGIN_NS) {
-        signalled = event.SleepFor(std::chrono::nanoseconds{next_time - HOST_WAIT_MARGIN_NS - now});
+#ifdef _WIN32
+    // A high resolution waitable timer (~0.5 ms precise on Windows 10 1803+) keeps the guest's
+    // events (vsync among them) on time even where Windows 11 ignores our timer resolution
+    // request, without holding a logical processor in MWAITX for the whole wait.
+    if (hires_timer != nullptr && wake_handle != nullptr && next_time - now > margin_ns) {
+        if (event.IsSet()) {
+            event.Reset();
+            ResetEvent(static_cast<HANDLE>(wake_handle));
+            signalled = true;
+        } else {
+            LARGE_INTEGER due{};
+            due.QuadPart =
+                -(std::max<LONGLONG>)(1, static_cast<LONGLONG>((next_time - margin_ns - now) / 100));
+            if (SetWaitableTimerEx(static_cast<HANDLE>(hires_timer), &due, 0, nullptr, nullptr,
+                                   nullptr, 0)) {
+                const HANDLE handles[2]{static_cast<HANDLE>(wake_handle),
+                                        static_cast<HANDLE>(hires_timer)};
+                const DWORD wait_res = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+                if (wait_res == WAIT_OBJECT_0) {
+                    event.Reset();
+                    signalled = true;
+                } else if (event.IsSet()) {
+                    event.Reset();
+                    ResetEvent(static_cast<HANDLE>(wake_handle));
+                    signalled = true;
+                }
+                now = GetGlobalTimeNs().count();
+            }
+        }
+    }
+#else
+    (void)hires_timer;
+    if (next_time - now > margin_ns) {
+        signalled = event.SleepFor(std::chrono::nanoseconds{next_time - margin_ns - now});
         now = GetGlobalTimeNs().count();
     }
+#endif
     const s64 sleep_ns = now - start;
     if (!signalled && next_time > now) {
         signalled = event.WaitFor(std::chrono::nanoseconds{next_time - now});
@@ -207,7 +292,7 @@ void CoreTiming::ClearPendingEvents() {
     event_queue.clear();
     armed_wait_time = (std::numeric_limits<s64>::max)();
     if (is_multicore) {
-        event.Set();
+        Wake();
     }
 }
 
@@ -230,7 +315,7 @@ void CoreTiming::SyncPause(bool is_paused) {
         if (!is_paused) {
             pause_event.Set();
         }
-        event.Set();
+        Wake();
         while (paused_set != is_paused)
             ;
     }
@@ -272,7 +357,7 @@ void CoreTiming::ScheduleEvent(std::chrono::nanoseconds ns_into_future,
     }
 
     if (should_wake) {
-        event.Set();
+        Wake();
     }
 }
 
@@ -311,7 +396,7 @@ void CoreTiming::RescheduleEvent(std::chrono::nanoseconds ns_into_future,
     }
 
     if (should_wake) {
-        event.Set();
+        Wake();
     }
 }
 
@@ -340,7 +425,7 @@ void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
     }
 
     if (should_wake) {
-        event.Set();
+        Wake();
     }
 }
 
@@ -484,7 +569,7 @@ void CoreTiming::Reset() {
         timer_thread.request_stop();
     }
     pause_event.Set();
-    event.Set();
+    Wake();
     if (timer_thread.joinable()) {
         timer_thread.join();
     }

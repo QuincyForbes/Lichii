@@ -151,14 +151,18 @@ public:
 
     void Reset();
     /// Waits on `event` until next_time, sleeping in the OS for most of it.
-    void WaitForEvent(s64 next_time);
+    void WaitForEvent(s64 next_time, void* hires_timer = nullptr);
 
     std::vector<Event> event_queue;
     s64 armed_wait_time{(std::numeric_limits<s64>::max)()};
     s64 global_timer = 0;
 #ifdef _WIN32
     s64 timer_resolution_ns;
+    /// The timer thread's early wake-up for its high resolution wait (see Wake).
+    void* wake_handle{};
 #endif
+    /// Wakes the timer thread: `event`, and on Windows the high resolution wait's wake handle.
+    void Wake();
     u64 event_fifo_id = 0;
     std::atomic<s64> pause_end_time{};
     /// Cycle timing
