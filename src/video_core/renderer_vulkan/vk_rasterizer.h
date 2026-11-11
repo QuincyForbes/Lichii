@@ -22,6 +22,7 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/ocarina_upscale.h"
 #include "video_core/oot_network.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
@@ -301,13 +302,17 @@ private:
     u32 UpdateVertexRepackLayout(bool dynamic_input);
 
     void FrameDumpPass(const Framebuffer* framebuffer);
-#ifdef LICHII_OCARINA_LIVE_UPSCALE
-    bool OcarinaDlssEnabled() const;
+    /// Whether FSR 3.1, DLSS or MetalFX replaces Ocarina's upscale pass; oot_backend says which.
+    bool OcarinaTemporalEnabled() const;
     void TrackOcarinaCamera();
+    /// Offsets the viewport of Ocarina's scene draws (depth-tested, into the scene depth) by a
+    /// sub-pixel amount that changes every frame while FSR replaces the game's upscale, so FSR
+    /// gets new sample positions each frame (the game renders without jitter). The offset goes to
+    /// FSR with the frame.
+    void UpdateOcarinaJitter();
     void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect);
-    bool TryOcarinaDlss(const ComputePipeline& pipeline, bool replace);
+    bool TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace);
     void ReadOcarinaActor(struct OcarinaActorMesh& mesh);
-#endif
     /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
     bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
@@ -347,8 +352,9 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
-#ifdef LICHII_OCARINA_LIVE_UPSCALE
     std::optional<u64> oot_camera_sample_frame;
+    /// Fsr or Native once chosen for the session; Dlss follows the DLSS or MetalFX setting live.
+    mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
     struct OcarinaMotionTrace {
         const Tegra::MemoryManager* camera_channel{};
         const Tegra::MemoryManager* depth_channel{};
@@ -356,14 +362,28 @@ private:
         GPUVAddr depth_address{};
         u32 depth_tic{};
         VkExtent2D extent{};
+        /// The scene render targets' size: wider than the extent at a render scale whose width
+        /// the game pads (ocarina_dlss_mode Balanced draws 2276x1280 into 2288x1280).
+        VkExtent2D image_extent{};
         std::array<f32, 16> current{};
         std::array<f32, 16> previous{};
+
+        /// Whether an image holds the whole scene: the game samples the padded targets through
+        /// descriptors of the scene's own size.
+        [[nodiscard]] bool SceneSized(u32 width, u32 height) const noexcept {
+            return (width == extent.width || width == image_extent.width) &&
+                   (height == extent.height || height == image_extent.height);
+        }
     } oot_motion;
-    std::unique_ptr<class OcarinaLiveDlss> oot_live_dlss;
+    std::unique_ptr<class OcarinaUpscaler> oot_live_dlss;
     bool oot_live_failed{};
     const char* oot_fallback_reason{};
     u32 oot_fallback_repeats{};
     std::optional<u64> oot_dlss_frame;
+    std::array<f32, 2> oot_jitter_applied{}; ///< in the viewport state now (render pixels)
+    std::array<f32, 2> oot_jitter_offset{};  ///< what oot_jitter_frame's scene draws used
+    std::optional<u64> oot_jitter_frame;
+    u32 oot_jitter_phases{8}; ///< Halton sequence length for the last upscaled frame's scale
     std::optional<u64> oot_4k_scene_frame;
     VkImage oot_4k_guest_present{};
     std::optional<u64> oot_effects_frame;
@@ -388,7 +408,6 @@ private:
         std::vector<u8> vertices;
         std::vector<u16> index_data;
     } oot_actor_mesh_cache;
-#endif
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;
@@ -447,7 +466,7 @@ private:
     struct DynamicStateCache {
         u64 epoch{};
         u64 valid{};
-        std::array<u32, 6 + 16 * 7> viewports{};
+        std::array<u32, 8 + 16 * 7> viewports{};
         std::array<u32, 6 + 16 * 3> scissors{};
         std::array<f32, 3> depth_bias{};
         std::array<f32, 4> blend_constants{};

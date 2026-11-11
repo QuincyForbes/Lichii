@@ -2641,20 +2641,29 @@ private:
             const u32 vsync_hz = Nx2VsyncRateHz();
             const std::chrono::nanoseconds VblankInterval{1'000'000'000LL / vsync_hz};
             LOG_INFO(Service, "nx2:vi2 vsync rate: {} Hz", vsync_hz);
+            m_vsync->interval = VblankInterval;
             m_vsync_timer = Core::Timing::CreateEvent(
                 "nx2:vi2 vsync",
-                [vsync_state = m_vsync, &kernel = system.Kernel(), VblankInterval](
+                [vsync_state = m_vsync, &kernel = system.Kernel()](
                     s64 scheduled,
                     std::chrono::nanoseconds late) -> std::optional<std::chrono::nanoseconds> {
                     std::scoped_lock lk{vsync_state->mutex};
                     for (auto* vsync : vsync_state->events) {
                         vsync->Signal(kernel);
                     }
+                    // The frame rate limit can change while the game runs.
+                    std::optional<std::chrono::nanoseconds> changed;
+                    if (const u32 hz = Nx2VsyncRateHz();
+                        std::chrono::nanoseconds{1'000'000'000LL / hz} != vsync_state->interval) {
+                        LOG_INFO(Service, "nx2:vi2 vsync rate: {} Hz", hz);
+                        vsync_state->interval = std::chrono::nanoseconds{1'000'000'000LL / hz};
+                        changed = vsync_state->interval;
+                    }
                     if (Common::DkbFrameTrace::Enabled()) {
                         const s64 observed = scheduled + late.count();
                         ++vsync_state->trace_callbacks;
                         vsync_state->trace_late_callbacks +=
-                            VblankInterval.count() > 0 && late >= VblankInterval;
+                            vsync_state->interval.count() > 0 && late >= vsync_state->interval;
                         vsync_state->trace_max_late =
                             (std::max)(vsync_state->trace_max_late, late.count());
                         if (vsync_state->trace_last_callback) {
@@ -2670,7 +2679,8 @@ private:
                                      "observed_global_ns={} guest_ticks={}",
                                      vsync_state->trace_present.load(std::memory_order_relaxed),
                                      vsync_state->trace_callbacks, vsync_state->events.size(),
-                                     VblankInterval.count(), vsync_state->trace_late_callbacks,
+                                     vsync_state->interval.count(),
+                                     vsync_state->trace_late_callbacks,
                                      vsync_state->trace_max_late,
                                      vsync_state->trace_min_gap.value_or(-1), observed,
                                      kernel.System().CoreTiming().GetClockTicks());
@@ -2680,7 +2690,7 @@ private:
                             vsync_state->trace_min_gap.reset();
                         }
                     }
-                    return std::nullopt;
+                    return changed;
                 });
             system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
         }
@@ -2694,6 +2704,7 @@ private:
     struct VsyncState {
         std::mutex mutex;
         std::vector<Kernel::KEvent*> events;
+        std::chrono::nanoseconds interval{};
         Common::DkbFrameTrace::RateLimit trace_rate;
         std::optional<s64> trace_last_callback, trace_min_gap;
         s64 trace_max_late{};

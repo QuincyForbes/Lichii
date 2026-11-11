@@ -44,6 +44,9 @@ public:
         bool hdr = true; ///< Linear HDR colour. False for tonemapped, perceptually encoded colour.
         /// R16F at the render size: 1 where DLSS should use this frame's colour instead of history.
         std::optional<Image> bias_current_color;
+        /// The depth image's size when it is larger than the render size (the scene lies in its
+        /// top left corner); zero for the render size.
+        VkExtent2D depth_size{};
     };
 
     /// Throws vk::Exception when Streamline has no DLSS for this device.

@@ -73,6 +73,8 @@ struct BuiltinPatch {
     std::string_view game{};
     std::string_view description{};
     std::string_view effect{};
+    // When set, the patch applies only with this DLSS mode chosen and is not listed in Add-Ons.
+    std::optional<Settings::OcarinaDlssMode> render_scale{};
 };
 
 constexpr std::string_view ENABLED_PREFIX = "enabled:";
@@ -132,6 +134,18 @@ bool MaxResolutionDefault() {
     return enabled;
 }
 
+// A shared config can carry the mode into a build without NVIDIA DLSS, where nothing would
+// upscale the smaller scene. FSR 3.1 takes the upscale from DLSS, at the game's own render scale.
+bool RenderScaleChosen([[maybe_unused]] Settings::OcarinaDlssMode mode) {
+#ifdef EGLANTINE_STREAMLINE
+    return Settings::values.nvidia_dlss.GetValue() &&
+           Settings::values.oot_anti_aliasing.GetValue() != Settings::OotAntiAliasing::Fsr3 &&
+           Settings::values.ocarina_dlss_mode.GetValue() == mode;
+#else
+    return false;
+#endif
+}
+
 bool OotNativeZstdEnabled() {
     static const bool enabled = OotEnvSwitch("EDEN_NX2_OOT_NATIVE_ZSTD", true);
     return enabled;
@@ -146,6 +160,23 @@ constexpr std::array<u8, 4> MAX_RESOLUTION_ORIGINAL{0xE8, 0x41, 0x00, 0x36};
 constexpr std::array<u8, 4> MAX_RESOLUTION_BRANCH{0x0F, 0x02, 0x00, 0x14};
 constexpr std::array MAX_RESOLUTION_RECORDS{
     BuiltinPatchRecord{0x805BD0, MAX_RESOLUTION_BRANCH, MAX_RESOLUTION_ORIGINAL},
+};
+
+// Render scale for "NVIDIA DLSS mode in Ocarina of Time", on top of Max Resolution: its
+// fixed-scale path returns 1.0 of 2560x1440 (main+0x806420: mov w9, #0x3f800000). Quality keeps
+// it; the other modes load a lower scale.
+constexpr std::array<u8, 4> RENDER_SCALE_ONE{0x09, 0xF0, 0xA7, 0x52};         // #0x3f800000, 1.0
+constexpr std::array<u8, 4> RENDER_SCALE_BALANCED{0xE9, 0xEB, 0xA7, 0x52};    // #0x3f5f0000, ~1254p
+constexpr std::array<u8, 4> RENDER_SCALE_PERFORMANCE{0x09, 0xE8, 0xA7, 0x52}; // #0x3f400000, 1080p
+constexpr std::array<u8, 4> RENDER_SCALE_ULTRA{0x09, 0xE0, 0xA7, 0x52};       // #0x3f000000, 720p
+constexpr std::array RENDER_BALANCED_RECORDS{
+    BuiltinPatchRecord{0x806420, RENDER_SCALE_BALANCED, RENDER_SCALE_ONE},
+};
+constexpr std::array RENDER_PERFORMANCE_RECORDS{
+    BuiltinPatchRecord{0x806420, RENDER_SCALE_PERFORMANCE, RENDER_SCALE_ONE},
+};
+constexpr std::array RENDER_ULTRA_RECORDS{
+    BuiltinPatchRecord{0x806420, RENDER_SCALE_ULTRA, RENDER_SCALE_ONE},
 };
 
 constexpr std::array<u8, 4> DYNAMIC_FPS_ORIGINAL{0x28, 0x18, 0x20, 0x1E};
@@ -178,13 +209,42 @@ constexpr std::array<u8, 128> FPS_UNLOCK_ROUTINE{
     0x0A, 0xD7, 0xA3, 0x3C, 0x00, 0x00, 0xC0, 0x40,
 };
 #undef DYNAMIC_FPS_ROUTINE_HEAD
+// The water ripple simulation runs iterations * (int)step passes per frame, so any step below 1.0
+// runs none: the ripples freeze and the grid shifts that follow the player are lost. With these
+// the pass count follows the step through an accumulator, with at least one pass while time moves.
+constexpr std::array<u8, 4> WATER_STEPS_ORIGINAL{0x09, 0x00, 0x38, 0x1E};
+constexpr std::array<u8, 4> WATER_STEPS_CALL{0x42, 0xFB, 0xEF, 0x94}; // bl main+0x3C46300
+constexpr std::array<u8, 4> WATER_MUL_ORIGINAL{0x08, 0x7D, 0x09, 0x1B};
+constexpr std::array<u8, 4> WATER_MUL_NOP{0x1F, 0x20, 0x03, 0xD5};
+// In: w8 iterations, s0 step, x21 the water object. Out: w8 passes. Each water object keeps its own
+// remainder: 8 slots of {u64 object, f32 remainder, pad} at state + 0x10 and the next slot to reuse
+// at state + 0x90, taken in turn when no slot has the object. Uses x9-x12 and s0-s2, which the game
+// doesn't read again before writing them.
+constexpr std::array<u8, 148> WATER_STEPS_ROUTINE{
+    0x01, 0x01, 0x22, 0x1E, 0x00, 0x08, 0x21, 0x1E, 0x08, 0x20, 0x20, 0x1E, 0x0D, 0x04, 0x00,
+    0x54, 0xC9, 0x92, 0x00, 0xB0, 0x29, 0x41, 0x38, 0x91, 0x2A, 0x01, 0x02, 0x91, 0xEB, 0x03,
+    0x09, 0xAA, 0x6C, 0x01, 0x40, 0xF9, 0x9F, 0x01, 0x15, 0xEB, 0x60, 0x01, 0x00, 0x54, 0x6B,
+    0x41, 0x00, 0x91, 0x7F, 0x01, 0x0A, 0xEB, 0x61, 0xFF, 0xFF, 0x54, 0x4C, 0x01, 0x40, 0xB9,
+    0x2B, 0x51, 0x2C, 0x8B, 0x75, 0x01, 0x00, 0xF9, 0x7F, 0x09, 0x00, 0xB9, 0x8C, 0x05, 0x00,
+    0x11, 0x8C, 0x09, 0x00, 0x12, 0x4C, 0x01, 0x00, 0xB9, 0x61, 0x09, 0x40, 0xBD, 0x00, 0x28,
+    0x21, 0x1E, 0x01, 0x10, 0x2C, 0x1E, 0x02, 0x28, 0x21, 0x1E, 0x48, 0x00, 0x38, 0x1E, 0x1F,
+    0x05, 0x00, 0x71, 0x4A, 0x00, 0x00, 0x54, 0x28, 0x00, 0x80, 0x52, 0x01, 0x01, 0x22, 0x1E,
+    0x00, 0x38, 0x21, 0x1E, 0x01, 0x10, 0x3C, 0x1E, 0x00, 0x48, 0x21, 0x1E, 0x60, 0x09, 0x00,
+    0xBD, 0xC0, 0x03, 0x5F, 0xD6, 0xE8, 0x03, 0x1F, 0x2A, 0xC0, 0x03, 0x5F, 0xD6,
+};
 constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
     BuiltinPatchRecord{0x3C46200, DYNAMIC_FPS_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x475F8, WATER_STEPS_CALL, WATER_STEPS_ORIGINAL},
+    BuiltinPatchRecord{0x4760C, WATER_MUL_NOP, WATER_MUL_ORIGINAL},
+    BuiltinPatchRecord{0x3C46300, WATER_STEPS_ROUTINE, {}, true},
 };
 constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
     BuiltinPatchRecord{0x3C46200, FPS_UNLOCK_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x475F8, WATER_STEPS_CALL, WATER_STEPS_ORIGINAL},
+    BuiltinPatchRecord{0x4760C, WATER_MUL_NOP, WATER_MUL_ORIGINAL},
+    BuiltinPatchRecord{0x3C46300, WATER_STEPS_ROUTINE, {}, true},
 };
 
 // The render pipeline's settings are mirrored into nodes (main+0x11ac..., per setting: init, then
@@ -368,6 +428,40 @@ constexpr std::array BUILTIN_PATCHES{
         .effect = "Sharper image; more GPU work, and the game can no longer drop resolution to "
                   "hold its frame rate.",
     },
+    // Lower render scales under Max Resolution, chosen by Settings ocarina_dlss_mode.
+    BuiltinPatch{
+        .name = "DLSS Balanced render scale (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_BALANCED_RECORDS,
+        .default_on = MaxResolutionDefault,
+        .kind = BuiltinPatchKind::Resolution,
+        .game = OOT_GAME,
+        .render_scale = Settings::OcarinaDlssMode::Balanced,
+    },
+    BuiltinPatch{
+        .name = "DLSS Performance render scale (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_PERFORMANCE_RECORDS,
+        .default_on = MaxResolutionDefault,
+        .kind = BuiltinPatchKind::Resolution,
+        .game = OOT_GAME,
+        .render_scale = Settings::OcarinaDlssMode::Performance,
+    },
+    BuiltinPatch{
+        .name = "DLSS Ultra Performance render scale (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_ULTRA_RECORDS,
+        .default_on = MaxResolutionDefault,
+        .kind = BuiltinPatchKind::Resolution,
+        .game = OOT_GAME,
+        .render_scale = Settings::OcarinaDlssMode::UltraPerformance,
+    },
     // Dark's routine with a tail that also lowers the step above 60 fps, so the game keeps real
     // speed at any frame rate limit (Settings frame_rate_limit).
     BuiltinPatch{
@@ -377,7 +471,7 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = FPS_UNLOCK_RECORDS,
         .state_offset = 0x4E9FE00,
-        .state_size = 16,
+        .state_size = 0x98,
         .replaces = "Dynamic FPS by Dark (built-in)",
         .kind = BuiltinPatchKind::FrameRate,
         .game = OOT_GAME,
@@ -393,7 +487,7 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = DYNAMIC_FPS_RECORDS,
         .state_offset = 0x4E9FE00,
-        .state_size = 16,
+        .state_size = 0x98,
         .kind = BuiltinPatchKind::FrameRate,
         .game = OOT_GAME,
         .description = "Dark's smoothed time step: the game keeps its speed below 60 fps.",
@@ -1009,6 +1103,9 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
     std::vector<std::string_view> replaced;
     for (const auto& patch : BUILTIN_PATCHES) {
         if (patch.title_id != title_id || patch.module != name) {
+            continue;
+        }
+        if (patch.render_scale && !RenderScaleChosen(*patch.render_scale)) {
             continue;
         }
         const auto decision = Decide(patch, disabled);
@@ -1685,7 +1782,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id) {
+        if (patch.title_id != title_id || patch.render_scale) {
             continue;
         }
         const auto builtin_disabled = GetDisabledAddons();

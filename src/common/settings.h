@@ -69,6 +69,7 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(OotMovieUpscale, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -399,7 +400,8 @@ struct Values {
                                                        true,
                                                        true};
     // Switch 2 VSync event rate. Games start frames on it, so above 60 only games with a
-    // real-time step (e.g. the Ocarina "FPS Unlock" built-in) keep their speed.
+    // real-time step (e.g. the Ocarina "FPS Unlock" built-in) keep their speed. A running game
+    // follows a change at its next vsync.
     SwitchableSetting<u16, true> frame_rate_limit{linkage,
                                                   60,
                                                   30,
@@ -408,7 +410,7 @@ struct Values {
                                                   Category::Renderer,
                                                   Specialization::Scalar,
                                                   true,
-                                                  false};
+                                                  true};
     // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS. Global only: a per-game
     // value (left in some players' OoT configs) silently overrode the checkbox, which then showed
     // unchecked and greyed once the game ran (2026-11-09, an RTX 5080 player).
@@ -418,6 +420,10 @@ struct Values {
     // still overrides it.
     Setting<DlssPreset> nvidia_dlss_preset{linkage, DlssPreset::K, "nvidia_dlss_preset",
                                            Category::Renderer};
+    // Ocarina of Time's render resolution under Max Resolution, as a DLSS mode to 4K. Global only,
+    // like nvidia_dlss.
+    Setting<OcarinaDlssMode> ocarina_dlss_mode{linkage, OcarinaDlssMode::Quality,
+                                               "ocarina_dlss_mode", Category::Renderer};
     // Apple only: MetalFX temporal upscaling in place of a game's DLSS and of Ocarina of Time's
     // upscaler (what NVIDIA DLSS does on Windows). Global only, like nvidia_dlss.
     Setting<bool> metalfx_temporal{linkage, false, "metalfx_temporal", Category::Renderer};
@@ -441,9 +447,16 @@ struct Values {
                                                   true,
                                                   true};
     // The Legend of Zelda: Ocarina of Time's own anti-aliasing network and its sharpening output
-    // pass, or the tonemapped image as the game renders it (video_core/oot_network.h).
+    // pass, or the tonemapped image as the game renders it (video_core/oot_network.h), or AMD
+    // FSR 3.1 in place of the game's upscale pass (video_core/ocarina_upscale.h).
     SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{linkage, OotAntiAliasing::Game,
                                                          "oot_anti_aliasing", Category::Renderer};
+    // The title screen's and cutscenes' videos (AV1 1080p60): a bilinear copy, or the game's own
+    // upscaler (removes banding, 1080p -> 1440p; tensor operations). Automatic: the game's where
+    // the GPU runs tensor operations natively (RTX), the copy elsewhere (its emulated matrices
+    // cost ~33 ms a frame). EDEN_NX2_OOT_MOVIE_NETWORK=0/1 overrides it for tests.
+    SwitchableSetting<OotMovieUpscale> oot_movie_upscale{linkage, OotMovieUpscale::Bilinear,
+                                                         "oot_movie_upscale", Category::Renderer};
 
     SwitchableSetting<std::string> post_shader_chain{linkage,
                                                      std::string(),

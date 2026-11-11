@@ -58,6 +58,7 @@
 #include "video_core/renderer_vulkan/framebuffer_clear_layers.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
+#include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
 #ifdef LICHII_METALFX
 #include "video_core/renderer_vulkan/present/metalfx_temporal.h"
 #endif
@@ -860,10 +861,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         return;
     }
 
-#ifdef LICHII_OCARINA_LIVE_UPSCALE
     TrackOcarinaCamera();
     TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect);
-#endif
     TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
     if (frame_dump.Capturing() || flash_watch.WatchesPasses()) {
@@ -906,6 +905,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
 
     {
         Profile::Scope scope{Profile::Zone::DynamicState};
+        UpdateOcarinaJitter();
         UpdateDynamicStates(pipeline);
     }
 
@@ -948,7 +948,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             });
     }
     submitted = true;
-#ifdef LICHII_OCARINA_LIVE_UPSCALE
     const auto& hashes = pipeline->ShaderHashes();
     if (oot_4k_scene_frame == render_trace_frame) {
         constexpr u64 final_vertex = 0x16aff33d999f993fULL;
@@ -966,16 +965,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
     // The game draws Navi's glow, fireflies and dust right after the fog. They write no depth and
-    // move on their own, so DLSS must not take them from its history.
+    // move on their own, so the upscaler must not take them from its history.
     constexpr u64 fog_fragment = 0x3ddfb1d7a854c849ULL;
-    if (hashes[5] == fog_fragment && oot_live_dlss && OcarinaDlssEnabled() &&
+    if (hashes[5] == fog_fragment && oot_live_dlss && OcarinaTemporalEnabled() &&
         oot_camera_sample_frame == render_trace_frame && !frame_dump.Capturing()) {
         const auto scene_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
         if (scene_id) {
             const auto& scene = texture_cache.GetImageView(scene_id);
             if (scene.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
-                scene.size.width == oot_motion.extent.width &&
-                scene.size.height == oot_motion.extent.height && !scene.IsRescaled() &&
+                oot_motion.SceneSized(scene.size.width, scene.size.height) && !scene.IsRescaled() &&
                 scene.range == VideoCommon::SubresourceRange{}) {
                 oot_effects_scene = scene.Handle(Shader::TextureType::Color2D);
                 oot_effects_address = scene.gpu_addr;
@@ -985,7 +983,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             }
         }
     }
-#endif
     static u32 native_capture_count{};
     if (maxwell3d->GetNativeMacroEngine().native_turing &&
         native_capture_count < 16 && [] {
@@ -1564,16 +1561,15 @@ void RasterizerVulkan::DrawIndirect() {
 }
 
 VideoCommon::OotNetwork::BypassState* RasterizerVulkan::OotNetworkBypass() {
-#ifdef LICHII_OCARINA_LIVE_UPSCALE
-    // NVIDIA DLSS replaces the same output pass and takes precedence until its evaluation fails.
-    if (OcarinaDlssEnabled() && !(oot_live_dlss && oot_live_dlss->EvaluationFailed())) {
+    // Temporal upscaling replaces the same output pass and takes precedence until it fails.
+    if (OcarinaTemporalEnabled() && !(oot_live_dlss && oot_live_dlss->EvaluationFailed())) {
         static bool logged = false;
         if (!std::exchange(logged, true)) {
-            LOG_INFO(Render_Vulkan, "Ocarina of Time: No sharpening is off while NVIDIA DLSS is on");
+            LOG_INFO(Render_Vulkan,
+                     "Ocarina of Time: No sharpening is off while temporal upscaling is on");
         }
         return nullptr;
     }
-#endif
     return &oot_network_bypass;
 }
 
@@ -2079,15 +2075,19 @@ void RasterizerVulkan::DispatchCompute() {
         }
     };
     const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
-#ifdef LICHII_OCARINA_LIVE_UPSCALE
+    // The full-size 1080p pass and the 3/4-scale pass ef542df87cacfe9e are replaced only by FSR.
+    // DLSS and MetalFX keep the passes they replaced before FSR 3.1 came.
+    constexpr u64 three_quarter_shader = 0xef542df87cacfe9eULL;
+    const bool fsr_only_pass = pipeline->ShaderHash() == ComputePipeline::OcarinaFullSizeShader ||
+                               pipeline->ShaderHash() == three_quarter_shader;
     const bool can_replace = pipeline->CanReplaceOcarinaUpscale() && !indirect_address &&
-                             OcarinaDlssEnabled() && !frame_dump.Capturing();
-    const bool marking_effects = oot_effects_frame == render_trace_frame && OcarinaDlssEnabled() &&
-                                 !indirect_address && !frame_dump.Capturing();
-#else
-    constexpr bool can_replace = false;
-    constexpr bool marking_effects = false;
-#endif
+                             OcarinaTemporalEnabled() &&
+                             (!fsr_only_pass ||
+                              oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr) &&
+                             !frame_dump.Capturing();
+    const bool marking_effects = oot_effects_frame == render_trace_frame &&
+                                 OcarinaTemporalEnabled() && !indirect_address &&
+                                 !frame_dump.Capturing();
     ComputePipeline::BindCommand deferred_bind;
     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
                              texture_cache, texture_cache_runtime, byte_addressed_shadow,
@@ -2211,39 +2211,43 @@ void RasterizerVulkan::DispatchCompute() {
     }
     scheduler.RequestOutsideRenderPassOperationContext();
     record_read_barrier();
-#ifdef LICHII_OCARINA_LIVE_UPSCALE
     if (marking_effects) {
         const auto written = pipeline->WrittenImages();
         if (std::ranges::any_of(written, [this](VideoCommon::ImageViewId id) {
-                return texture_cache.GetImageView(id).gpu_addr == oot_effects_address;
+                return id && texture_cache.GetImageView(id).gpu_addr == oot_effects_address;
             })) {
             oot_live_dlss->MarkEffects(oot_effects_scene, render_trace_frame);
             oot_effects_frame.reset();
         }
     }
     const auto* const replacement =
-        can_replace && !byte_addressed_shadow && TryOcarinaDlss(*pipeline, true)
+        can_replace && !byte_addressed_shadow && TryOcarinaUpscale(*pipeline, true)
             ? oot_live_dlss.get()
             : nullptr;
     if (!replacement) {
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
+    } else {
+        // Once per pass: which of the game's upscale passes the upscaler took, and with what.
+        static std::array<u64, 8> logged{};
+        const u64 hash = pipeline->ShaderHash();
+        if (std::ranges::find(logged, hash) == logged.end()) {
+            if (const auto slot = std::ranges::find(logged, 0ULL); slot != logged.end()) {
+                *slot = hash;
+            }
+            LOG_INFO(Render_Vulkan, "Ocarina temporal: {} replaces the game's pass {:016x}",
+                     oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr ? "FSR 3.1"
+                                                                            : "the live upscaler",
+                     hash);
+        }
     }
-#else
-    scheduler.TraceComputePipeline(pipeline->ShaderHash());
-#endif
-    scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind)
-#ifdef LICHII_OCARINA_LIVE_UPSCALE
-                      , replacement
-#endif
-                     ](vk::CommandBuffer cmdbuf) {
-#ifdef LICHII_OCARINA_LIVE_UPSCALE
+    scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind),
+                      replacement](vk::CommandBuffer cmdbuf) {
         if (replacement && !replacement->EvaluationFailed()) {
             return;
         }
         if (replacement) {
             LOG_WARNING(Render_Vulkan, "Ocarina DLSS evaluation failed; dispatching native upscaler");
         }
-#endif
         if (bind) {
             bind(cmdbuf);
         }
@@ -2266,11 +2270,9 @@ void RasterizerVulkan::DispatchCompute() {
     compute_since_count_barrier = true;
     SubmitNx2ListCopies(pipeline->ShaderHash());
 
-#ifdef LICHII_OCARINA_LIVE_UPSCALE
     if (!can_replace) {
-        TryOcarinaDlss(*pipeline, false);
+        TryOcarinaUpscale(*pipeline, false);
     }
-#endif
 
     // Log compute dispatch
     if (GPU::Logging::IsActive() &&
@@ -2941,17 +2943,34 @@ void RasterizerVulkan::TracePendingCpuWrites(bool compute, std::span<const u64> 
     });
 }
 
-#ifdef LICHII_OCARINA_LIVE_UPSCALE
-bool RasterizerVulkan::OcarinaDlssEnabled() const {
+bool RasterizerVulkan::OcarinaTemporalEnabled() const {
     constexpr u64 ocarina_program = 0x0400486024DEC000ULL;
+    if (program_id != ocarina_program || oot_live_failed) {
+        return false;
+    }
+    using Backend = VideoCommon::OcarinaUpscaleBackend;
+    if (!oot_backend) {
+        // Picks between FSR 3.1 and the build's live upscaler, whose own setting is read below.
+        const char* value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        oot_backend = VideoCommon::SelectOcarinaUpscaler(
+            Settings::values.oot_anti_aliasing.GetValue(), true, true, value ? value : "");
+        if (oot_backend == Backend::Fsr && !Fsr3Upscaler::IsSupported(device)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Ocarina FSR 3.1 unsupported on this device; using native upscale");
+            oot_backend = Backend::Native;
+        }
+    }
+    if (oot_backend != Backend::Dlss) {
+        return oot_backend == Backend::Fsr;
+    }
 #ifdef EGLANTINE_STREAMLINE
-    return program_id == ocarina_program && !oot_live_failed &&
-           Settings::values.nvidia_dlss.GetValue() && Streamline::IsDlssAvailable();
-#else
+    return Settings::values.nvidia_dlss.GetValue() && Streamline::IsDlssAvailable();
+#elif defined(LICHII_OCARINA_LIVE_UPSCALE)
     // Apple: MetalFX temporal upscaling in place of the game's upscaler.
     static const bool supported = MetalFxTemporalUpscaler::IsSupported(device);
-    return program_id == ocarina_program && !oot_live_failed &&
-           Settings::values.metalfx_temporal.GetValue() && supported;
+    return Settings::values.metalfx_temporal.GetValue() && supported;
+#else
+    return false;
 #endif
 }
 
@@ -2961,7 +2980,7 @@ bool RasterizerVulkan::OcarinaDlssEnabled() const {
 void RasterizerVulkan::TrackOcarinaCamera() {
     if ((oot_camera_sample_frame == render_trace_frame && oot_motion.extent.width >= 2560 &&
          oot_motion.extent.height >= 1440) ||
-        !OcarinaDlssEnabled()) {
+        !OcarinaTemporalEnabled()) {
         return;
     }
 
@@ -2977,7 +2996,7 @@ void RasterizerVulkan::TrackOcarinaCamera() {
     // Reflections and half-size passes share the camera layout; the upscale reads the largest.
     if (oot_camera_sample_frame == render_trace_frame &&
         u64{color.size.width} * color.size.height <=
-            u64{oot_motion.extent.width} * oot_motion.extent.height) {
+            u64{oot_motion.image_extent.width} * oot_motion.image_extent.height) {
         return;
     }
 
@@ -2994,24 +3013,80 @@ void RasterizerVulkan::TrackOcarinaCamera() {
     std::array<f32, 2> proj_check{};
     device_memory.ReadBlockUnsafe(*device_addr + 0x120, extent_check.data(), sizeof(extent_check));
     device_memory.ReadBlockUnsafe(*device_addr + 0xa8, proj_check.data(), sizeof(proj_check));
-    if (extent_check[0] != static_cast<f32>(color.size.width) ||
-        extent_check[1] != static_cast<f32>(color.size.height) ||
-        proj_check[0] != -1.0f || proj_check[1] != 0.0f) {
+    if (proj_check[0] != -1.0f || proj_check[1] != 0.0f || !(extent_check[0] >= 640.0f) ||
+        !(extent_check[1] >= 360.0f) || extent_check[0] > 16384.0f || extent_check[1] > 16384.0f) {
+        return;
+    }
+    // The camera's extent is the scene's. The images are that size, or up to 15 pixels larger at
+    // a render scale the game pads (ocarina_dlss_mode Balanced); only NVIDIA DLSS takes those.
+    const VkExtent2D scene{static_cast<u32>(extent_check[0]), static_cast<u32>(extent_check[1])};
+    const bool padded = scene.width != color.size.width || scene.height != color.size.height;
+    if (static_cast<f32>(scene.width) != extent_check[0] ||
+        static_cast<f32>(scene.height) != extent_check[1] || color.size.width < scene.width ||
+        color.size.height < scene.height || color.size.width - scene.width >= 16 ||
+        color.size.height - scene.height >= 16 ||
+        (padded && oot_backend != VideoCommon::OcarinaUpscaleBackend::Dlss)) {
         return;
     }
     oot_camera_sample_frame = render_trace_frame;
     oot_motion.camera_channel = gpu_memory;
-    oot_motion.extent = {color.size.width, color.size.height};
+    oot_motion.extent = scene;
+    oot_motion.image_extent = {color.size.width, color.size.height};
     device_memory.ReadBlockUnsafe(*device_addr + 0x30, oot_motion.current.data(),
                                   sizeof(oot_motion.current));
     device_memory.ReadBlockUnsafe(*device_addr + 0x180, oot_motion.previous.data(),
                                   sizeof(oot_motion.previous));
 }
 
+namespace {
+f32 Halton(u32 index, u32 base) {
+    f32 fraction = 1.0f;
+    f32 result = 0.0f;
+    while (index > 0) {
+        fraction /= static_cast<f32>(base);
+        result += fraction * static_cast<f32>(index % base);
+        index /= base;
+    }
+    return result;
+}
+} // Anonymous namespace
+
+void RasterizerVulkan::UpdateOcarinaJitter() {
+    if (!oot_dlss_frame) {
+        return;
+    }
+    std::array<f32, 2> want{};
+    // Only while the upscaler replaced the previous frame's upscale: a frame the game upscales
+    // itself would show the offset as a shake. Only draws that depth-test against the scene depth
+    // at the scene size, so a depth pre-pass and the colour passes move together; shadow maps,
+    // half-size passes and full-screen passes (which keep the depth bound without using it, some
+    // with depth writes on: with the test off nothing writes depth) stay put.
+    const auto& regs = maxwell3d->regs;
+    if (*oot_dlss_frame + 1 >= render_trace_frame && regs.depth_test_enable &&
+        oot_motion.extent.width != 0 && oot_backend &&
+        VideoCommon::OcarinaJitterEnabled(*oot_backend)) {
+        const auto& targets = texture_cache.GetRenderTargets();
+        if (targets.depth_buffer_id) {
+            const auto& depth = texture_cache.GetImageView(targets.depth_buffer_id);
+            if (oot_motion.SceneSized(depth.size.width, depth.size.height) && !depth.IsRescaled()) {
+                // Halton (2, 3) with AMD's phase count for the last upscaled frame's scale.
+                const u32 index = static_cast<u32>(render_trace_frame % oot_jitter_phases) + 1;
+                want = {Halton(index, 2) - 0.5f, Halton(index, 3) - 0.5f};
+                oot_jitter_frame = render_trace_frame;
+                oot_jitter_offset = want;
+            }
+        }
+    }
+    if (want != oot_jitter_applied) {
+        oot_jitter_applied = want;
+        state_tracker.InvalidateViewports();
+    }
+}
+
 /// Capture the skinning pose of the recognized Link draw for frame-to-frame motion.
 void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect) {
     if (shader_hash != 0x28c6e527634f814aULL || !is_indexed || is_indirect ||
-        !OcarinaDlssEnabled() ||
+        !OcarinaTemporalEnabled() ||
         oot_actor_poses[oot_actor_pose_index].frame == render_trace_frame) {
         return;
     }
@@ -3127,10 +3202,14 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
 }
 
 /// Track the scene depth on its reader dispatch, or try to replace a recognized upscale dispatch.
-bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool replace) {
+bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace) {
     constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
-    const bool upscale_4k = replace && pipeline.ShaderHash() == ComputePipeline::Ocarina1440pShader;
-    if ((!replace && pipeline.ShaderHash() != depth_reader) || !OcarinaDlssEnabled()) {
+    const u64 upscale_hash = pipeline.ShaderHash();
+    bool upscale_4k =
+        replace && (upscale_hash == ComputePipeline::Ocarina1440pShader ||
+                    upscale_hash == ComputePipeline::Ocarina1440pScaledShader ||
+                    upscale_hash == ComputePipeline::Ocarina1440pScaledFieldShader);
+    if ((!replace && pipeline.ShaderHash() != depth_reader) || !OcarinaTemporalEnabled()) {
         return false;
     }
     const auto read_tic = [this](u32 index) -> std::optional<Tegra::Texture::TICEntry> {
@@ -3155,8 +3234,7 @@ bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool repl
         const u32 index = gpu_memory->Read<u32>(cbuf.Address() + depth_handle_offset) & 0xfffff;
         const auto tic = read_tic(index);
         const bool scene_size = oot_camera_sample_frame != render_trace_frame ||
-                                (tic && tic->Width() == oot_motion.extent.width &&
-                                 tic->Height() == oot_motion.extent.height);
+                                (tic && oot_motion.SceneSized(tic->Width(), tic->Height()));
         if (tic && tic->Address() && scene_size) {
             oot_motion.depth_channel = gpu_memory;
             oot_motion.depth_frame = render_trace_frame;
@@ -3188,7 +3266,7 @@ bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool repl
     }
     const auto tic = read_tic(oot_motion.depth_tic);
     if (!tic || tic->Address() != oot_motion.depth_address ||
-        tic->Width() != oot_motion.extent.width || tic->Height() != oot_motion.extent.height) {
+        !oot_motion.SceneSized(tic->Width(), tic->Height())) {
         return fail("scene depth descriptor changed");
     }
 
@@ -3214,9 +3292,21 @@ bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool repl
     auto& target = texture_cache.GetImageView(written[0]);
     using VideoCore::Surface::PixelFormat;
     const auto extent = oot_motion.extent;
+    const bool native_size = pipeline.ShaderHash() == ComputePipeline::OcarinaFullSizeShader;
+    // At the Performance render scale (1920x1080) the game runs its 3/4 pass to 2560x1440.
+    constexpr u64 three_quarter_pass = 0xe40f5efb5480e692ULL;
+    if (upscale_hash == three_quarter_pass && target.size.width == 2560 &&
+        target.size.height == 1440 &&
+        Settings::values.ocarina_dlss_mode.GetValue() == Settings::OcarinaDlssMode::Performance) {
+        upscale_4k = true;
+    }
+    // 4K: any 16:9 scene up to 2560x1440 (the lower ocarina_dlss_mode render scales).
     const bool valid_extents = upscale_4k
-        ? extent.width == 2560 && extent.height == 1440 &&
+        ? extent.width <= 2560 &&
+            std::abs(static_cast<int>(extent.width * 9) - static_cast<int>(extent.height * 16)) <= 32 &&
             target.size.width == 2560 && target.size.height == 1440
+        : native_size
+        ? target.size.width == extent.width && target.size.height == extent.height
         : target.size.width == extent.width * 4 / 3 &&
             target.size.height == extent.height * 4 / 3;
     if (!valid_extents || !color.BackingImage() || !target.BackingImage() ||
@@ -3224,7 +3314,7 @@ bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool repl
         color.Samples() != VK_SAMPLE_COUNT_1_BIT || target.Samples() != VK_SAMPLE_COUNT_1_BIT ||
         color.range != VideoCommon::SubresourceRange{} || target.range != VideoCommon::SubresourceRange{} ||
         color.format != PixelFormat::E5B9G9R9_FLOAT || target.format != PixelFormat::B10G11R11_FLOAT ||
-        color.size.width != extent.width || color.size.height != extent.height ||
+        !oot_motion.SceneSized(color.size.width, color.size.height) ||
         color.ImageHandle() == target.ImageHandle() || depth.ImageHandle() == target.ImageHandle()) {
         return fail("unexpected upscale images");
     }
@@ -3238,7 +3328,7 @@ bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool repl
         return fail("unsupported storage format");
     }
     // Without Link's pose the mesh stays empty and the motion comes from the camera alone.
-    OcarinaActorMesh mesh;
+    OcarinaActorMesh mesh{};
     ReadOcarinaActor(mesh);
     try {
         const auto target_view =
@@ -3249,22 +3339,29 @@ bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool repl
             return fail("no upscale target view");
         }
         if (!oot_live_dlss) {
-            oot_live_dlss = std::make_unique<OcarinaLiveDlss>(
-                device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator);
+            oot_live_dlss = std::make_unique<OcarinaUpscaler>(
+                device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator,
+                staging_pool, *oot_backend);
         }
         const VkExtent2D target_extent{target.size.width, target.size.height};
-#ifdef EGLANTINE_STREAMLINE
+#ifndef __APPLE__
         const bool present_4k = upscale_4k;
 #else
-        // A 3840x2160 image only to be scaled down to a phone or laptop screen: MetalFX writes the
-        // game's 1440p target instead.
+        // A 3840x2160 image only to be scaled down to a phone or laptop screen: MetalFX and FSR
+        // write the game's 1440p target instead.
         constexpr bool present_4k = false;
 #endif
         const VkExtent2D output_extent = present_4k ? VkExtent2D{3840, 2160} : target_extent;
+        // The offset this frame's scene was drawn with (none when no scene draw was offset).
+        std::array<f32, 2> jitter{};
+        if (oot_jitter_frame == render_trace_frame) {
+            jitter = oot_jitter_offset;
+        }
         const bool recorded = oot_live_dlss->Record(color_view, depth.DepthView(), target_view,
                                                    extent, output_extent, target_extent, oot_motion.current,
                                                    oot_motion.previous, mesh, depth.ImageHandle(),
-                                                   render_trace_frame);
+                                                   render_trace_frame, jitter,
+                                                   {depth.size.width, depth.size.height});
         if (!recorded) {
             return fail("DLSS declined the frame");
         }
@@ -3274,6 +3371,7 @@ bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool repl
             oot_4k_guest_present = VK_NULL_HANDLE;
         }
         oot_dlss_frame = render_trace_frame;
+        oot_jitter_phases = VideoCommon::OcarinaJitterPhases(extent.width, output_extent.width);
         oot_fallback_reason = nullptr;
         return true;
     } catch (const vk::Exception& error) {
@@ -3282,7 +3380,6 @@ bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool repl
         return false;
     }
 }
-#endif
 
 bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
     static constexpr u32 BUFFER_CAP = 4U << 20;
@@ -3814,7 +3911,6 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     info.height = image_view->size.height;
     info.scaled_width = scaled ? resolution.ScaleUp(info.width) : info.width;
     info.scaled_height = scaled ? resolution.ScaleUp(info.height) : info.height;
-#ifdef LICHII_OCARINA_LIVE_UPSCALE
     info.anti_aliased = oot_live_dlss && oot_dlss_frame == render_trace_frame &&
                         !oot_live_dlss->EvaluationFailed();
     if (oot_live_dlss && oot_4k_scene_frame == render_trace_frame && info.image &&
@@ -3834,7 +3930,6 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
             oot_live_failed = true;
         }
     }
-#endif
     return info;
 }
 
@@ -4186,6 +4281,8 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
         AppendWords(out, regs.surface_clip);
         AppendWords(out, regs.depth_mode);
         AppendWords(out, scale);
+        AppendWords(out, oot_jitter_applied[0]);
+        AppendWords(out, oot_jitter_applied[1]);
         for (const auto& transform : regs.viewport_transform) {
             AppendWords(out, transform.scale_x);
             AppendWords(out, transform.scale_y);
@@ -4210,8 +4307,8 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
             height = -height;
         }
         VkViewport viewport{
-            .x = x,
-            .y = y,
+            .x = x + oot_jitter_applied[0],
+            .y = y + oot_jitter_applied[1],
             .width = width,
             .height = height,
             .minDepth = 0.0f,
@@ -4226,7 +4323,7 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
         });
         return;
     }
-    const std::array viewport_list{
+    std::array viewport_list{
         GetViewportState(device, regs, 0, scale),  GetViewportState(device, regs, 1, scale),
         GetViewportState(device, regs, 2, scale),  GetViewportState(device, regs, 3, scale),
         GetViewportState(device, regs, 4, scale),  GetViewportState(device, regs, 5, scale),
@@ -4236,6 +4333,12 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
         GetViewportState(device, regs, 12, scale), GetViewportState(device, regs, 13, scale),
         GetViewportState(device, regs, 14, scale), GetViewportState(device, regs, 15, scale),
     };
+    if (oot_jitter_applied != std::array<f32, 2>{}) {
+        for (VkViewport& viewport : viewport_list) {
+            viewport.x += oot_jitter_applied[0];
+            viewport.y += oot_jitter_applied[1];
+        }
+    }
     scheduler.Record([this, viewport_list](vk::CommandBuffer cmdbuf) {
         const u32 num_viewports = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
         const vk::Span<VkViewport> viewports(viewport_list.data(), num_viewports);

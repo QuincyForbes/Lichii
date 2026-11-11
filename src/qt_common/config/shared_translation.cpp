@@ -154,8 +154,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, frame_rate_limit, tr("Frame rate limit (Switch 2):"),
            tr("Rate of the Switch 2 VSync event that games start their frames on (default 60 Hz)."
               "\nAbove 60 Hz most games run too fast; use it with a game patch that follows real "
-              "time, such as \"FPS Unlock (built-in)\" for Ocarina of Time.\nTakes effect when a "
-              "game starts."));
+              "time, such as \"FPS Unlock (built-in)\" for Ocarina of Time.\nTakes effect at "
+              "once, also while a game runs."));
     INSERT(Settings, fsr_sharpening_slider, tr("RCAS Sharpness:"),
            tr("Strength of RCAS (AMD's contrast-adaptive sharpening) on the upscaler used in place "
               "of a game's DLSS (AMD FSR 3.1); 0% turns it off.\nAlso sets the sharpening "
@@ -175,6 +175,12 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
               "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
               "upscaler at 1x resolution scale.\nTakes effect when a game starts."));
+    INSERT(Settings, ocarina_dlss_mode, tr("NVIDIA DLSS mode in Ocarina of Time:"),
+           tr("How much of the game's output resolution Ocarina of Time renders before DLSS "
+              "upscales it.\nQuality: 67%.\nBalanced: 58%.\nPerformance: 50%.\nUltra "
+              "Performance: 33%, cheapest for smaller cards.\nNeeds NVIDIA DLSS on, docked "
+              "mode, the Max Resolution add-on and 1x resolution scale.\nTakes effect when the "
+              "game starts."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
@@ -182,7 +188,14 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("The Legend of Zelda: Ocarina of Time only.\nGame: the game's own anti-aliasing "
               "network, which sharpens heavily.\nNo sharpening: the image as the game renders it, "
               "without the network (faster; pairs well with a higher resolution). Has no effect while "
-              "NVIDIA DLSS is on.\nTakes effect when the game starts."));
+              "NVIDIA DLSS is on.\nAMD FSR 3.1: temporal upscaling in place of the game's upscale "
+              "pass, on any graphics card; it takes the place of NVIDIA DLSS and MetalFX in this "
+              "game.\nTakes effect when the game starts."));
+    INSERT(Settings, oot_movie_upscale, tr("Ocarina of Time movies:"),
+           tr("How the title screen and cutscene videos are scaled up.\nBilinear: a plain, fast "
+              "stretch.\nGame's own upscaler: the game's video upscaler, which removes banding and "
+              "sharpens. Fast on NVIDIA RTX, slow on GPUs that emulate its math.\nAutomatic: the "
+              "game's upscaler where the GPU runs it natively, bilinear elsewhere."));
     INSERT(Settings, patch_frame_rate, tr("Unlock frame rate:"),
            tr("Game enhancement. Applies to every game that ships a frame rate patch (currently "
               "Ocarina of Time: FPS Unlock, Dynamic FPS).\nAuto: each patch's default. On: "
@@ -636,16 +649,30 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(DlssPreset, L, tr("L")),
                               PAIR(DlssPreset, M, tr("M")),
                           }});
+    translations->insert({Settings::EnumMetadata<Settings::OcarinaDlssMode>::Index(),
+                          {
+                              PAIR(OcarinaDlssMode, Quality, tr("Quality")),
+                              PAIR(OcarinaDlssMode, Balanced, tr("Balanced")),
+                              PAIR(OcarinaDlssMode, Performance, tr("Performance")),
+                              PAIR(OcarinaDlssMode, UltraPerformance, tr("Ultra Performance")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::GamePatchMode>::Index(),
                           {
                               PAIR(GamePatchMode, Auto, tr("Auto")),
                               PAIR(GamePatchMode, On, tr("On")),
                               PAIR(GamePatchMode, Off, tr("Off")),
                           }});
+    translations->insert({Settings::EnumMetadata<Settings::OotMovieUpscale>::Index(),
+                          {
+                              PAIR(OotMovieUpscale, Automatic, tr("Automatic")),
+                              PAIR(OotMovieUpscale, Bilinear, tr("Bilinear (fast)")),
+                              PAIR(OotMovieUpscale, Game, tr("Game's own upscaler")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::OotAntiAliasing>::Index(),
                           {
                               PAIR(OotAntiAliasing, Game, tr("Game")),
                               PAIR(OotAntiAliasing, NoSharpening, tr("No sharpening")),
+                              PAIR(OotAntiAliasing, Fsr3, tr("AMD FSR 3.1")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AspectRatio>::Index(),
                           {

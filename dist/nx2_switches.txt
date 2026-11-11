@@ -39,6 +39,14 @@ EDEN_NX2_FENCE_BATCH=1
 # frame times are the same as with the compute precache alone.
 #EDEN_NX2_GRAPHICS_PRECACHE=1
 
+# Ocarina of Time with the "AMD FSR 3.1" anti-aliasing choice: 0 draws the scene without the
+# per-frame sub-pixel offset FSR is given.
+#EDEN_NX2_OOT_JITTER=0
+
+# Ocarina of Time with NVIDIA DLSS (or MetalFX temporal): 1 gives it the same sub-pixel offset,
+# 2 with the vertical sign flipped. Experiment, off by default.
+#EDEN_NX2_DLSS_JITTER=1
+
 #EDEN_NX2_MME_JIT=0
 #EDEN_NX2_PBFLUSH=0
 #EDEN_NX2_SKIP_SAME=0

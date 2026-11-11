@@ -23,6 +23,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/ampere/program_override.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
 #include "video_core/fire_emblem_upscale.h"
@@ -30,6 +31,7 @@
 #include "video_core/nx2_qmd_prediction.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/native_upscale.h"
@@ -46,6 +48,40 @@
 #include "video_core/textures/decoders.h"
 
 namespace Tegra::Engines {
+
+namespace {
+/// Settings oot_movie_upscale: whether Ocarina's movies keep the game's own upscaler (the network)
+/// instead of the bilinear copy. Automatic: where tensor operations run natively. Logged once.
+bool OotMovieNetworkChosen() {
+    static const char* const env = std::getenv("EDEN_NX2_OOT_MOVIE_NETWORK");
+    bool chosen = false;
+    const char* why = "setting";
+    if (env != nullptr && (env[0] == '0' || env[0] == '1')) {
+        chosen = env[0] == '1';
+        why = "EDEN_NX2_OOT_MOVIE_NETWORK";
+    } else {
+        switch (Settings::values.oot_movie_upscale.GetValue()) {
+        case Settings::OotMovieUpscale::Game:
+            chosen = true;
+            break;
+        case Settings::OotMovieUpscale::Bilinear:
+            break;
+        case Settings::OotMovieUpscale::Automatic:
+        default:
+            chosen = VideoCommon::Nx2Perf::g_native_tensor_ops.load(std::memory_order_relaxed);
+            why = chosen ? "Automatic: native tensor operations"
+                         : "Automatic: emulated tensor operations";
+            break;
+        }
+    }
+    static std::atomic<int> logged{-1};
+    if (logged.exchange(chosen ? 1 : 0) != (chosen ? 1 : 0)) {
+        LOG_INFO(HW_GPU, "Ocarina movies: {} ({})",
+                 chosen ? "the game's own upscaler" : "bilinear copy", why);
+    }
+    return chosen;
+}
+} // Anonymous namespace
 
 KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
     : memory_manager{memory_manager_}
@@ -701,6 +737,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     // network is left alone: its pair (+0xc0 -> +0xd0) carries the tonemap.
     if (!native_upscale_disabled && !dlss_chain.active &&
         Settings::GetCurrentProgramID() == VideoCommon::OotNetwork::ProgramId &&
+        !OotMovieNetworkChosen() &&
         (launch_description.const_buffer_enable_mask & 1)) {
         const auto& cbuf = launch_description.const_buffer_config[0];
         const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
@@ -849,6 +886,10 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
             split.FinishDispatch(!skipped, replaced);
         }
     };
+    if (BypassOotBaseNetwork()) {
+        replaced = true;
+        return true;
+    }
     try {
         rasterizer->DispatchCompute();
     } catch (const VideoCommon::FireEmblemUpscale::DispatchReplaced&) {
@@ -1187,6 +1228,29 @@ std::optional<Texture::TICEntry> KeplerCompute::ConstBuffer0Image(u32 offset) co
     return GetTICEntry(tic_index);
 }
 
+bool KeplerCompute::BypassOotBaseNetwork() {
+    using namespace VideoCommon::OotNetwork;
+    const u64 program_id = Settings::GetCurrentProgramID();
+    if (!BypassEnabled(program_id)) {
+        return false;
+    }
+    const GPUVAddr program = regs.code_loc.Address() + launch_description.program_start;
+    if (!memory_manager.IsFullyMappedRange(program, sizeof(u32))) {
+        return false;
+    }
+    const u32 first_word = memory_manager.Read<u32>(program);
+    const auto match =
+        std::ranges::find(BaseOutputPrograms, first_word, &BaseOutputProgram::first_word);
+    if (match == BaseOutputPrograms.end() ||
+        !memory_manager.IsFullyMappedRange(program, match->size)) {
+        return false;
+    }
+    std::vector<Shader::Ampere::Instruction> code(match->size / sizeof(Shader::Ampere::Instruction));
+    memory_manager.ReadBlock(program, code.data(), match->size);
+    return Shader::Ampere::NativeProgramKey(code) == match->key &&
+           BypassOotNetwork(program_id, match->key);
+}
+
 bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     using namespace VideoCommon::OotNetwork;
     if (!BypassEnabled(program_id)) {
@@ -1210,16 +1274,20 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     if (native_key == PrepassProgramKey || native_key == NetworkProgramKey) {
         return state->output_replaced.load(std::memory_order_relaxed);
     }
-    if (native_key != OutputProgramKey) {
+    const bool base_output = std::ranges::find(BaseOutputPrograms, native_key,
+                                               &BaseOutputProgram::key) != BaseOutputPrograms.end();
+    if (native_key != OutputProgramKey && !base_output) {
         return false;
     }
-    // The copy needs the tonemapped image to be a B10G11R11 block-linear image of the output's size.
+    // The copy needs the tonemapped image to be a B10G11R11 block-linear image of the output's
+    // size; the base game can run its tonemap at a lower resolution than the output.
     const auto output = ConstBuffer0Image(OutputImageHandleOffset);
     if (!output || output->format != Texture::TextureFormat::B10G11R11 || output->Address() == 0 ||
         output->Address() == tonemapped.Address() || !output->IsBlockLinear() ||
         tonemapped.format != Tegra::RenderTargetFormat::B10G11R11_FLOAT ||
-        tonemapped.tile_mode.is_pitch_linear || tonemapped.width != output->Width() ||
-        tonemapped.height != output->Height()) {
+        tonemapped.tile_mode.is_pitch_linear || tonemapped.width == 0 || tonemapped.height == 0 ||
+        (base_output ? tonemapped.width > output->Width() || tonemapped.height > output->Height()
+                     : tonemapped.width != output->Width() || tonemapped.height != output->Height())) {
         state->output_replaced.store(false, std::memory_order_relaxed);
         static bool warned = false;
         if (!std::exchange(warned, true)) {
@@ -1244,6 +1312,8 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     destination.addr_upper = static_cast<u32>(output->Address() >> 32);
     destination.addr_lower = static_cast<u32>(output->Address());
     Fermi2D::Surface source = destination;
+    source.width = tonemapped.width;
+    source.height = tonemapped.height;
     source.block_width.Assign(tonemapped.tile_mode.block_width);
     source.block_height.Assign(tonemapped.tile_mode.block_height);
     source.block_depth.Assign(tonemapped.tile_mode.block_depth);
@@ -1253,7 +1323,7 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     const s32 height = static_cast<s32>(output->Height());
     const Fermi2D::Config config{
         .operation = Fermi2D::Operation::SrcCopy,
-        .filter = Fermi2D::Filter::Point,
+        .filter = base_output ? Fermi2D::Filter::Bilinear : Fermi2D::Filter::Point,
         .must_accelerate = true,
         .dst_x0 = 0,
         .dst_y0 = 0,
@@ -1261,17 +1331,18 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
         .dst_y1 = height,
         .src_x0 = 0,
         .src_y0 = 0,
-        .src_x1 = width,
-        .src_y1 = height,
+        .src_x1 = static_cast<s32>(source.width),
+        .src_y1 = static_cast<s32>(source.height),
     };
     const bool copied = rasterizer->AccelerateSurfaceCopy(source, destination, config);
     state->output_replaced.store(copied, std::memory_order_relaxed);
     static bool logged = false;
     if (!std::exchange(logged, true)) {
         LOG_INFO(HW_GPU,
-                 "Ocarina of Time: anti-aliasing network bypassed ({}): {:#x} -> {:#x} {}x{}",
-                 copied ? "copy of the tonemapped image" : "copy failed", tonemapped.Address(),
-                 output->Address(), width, height);
+                 "Ocarina of Time: anti-aliasing network bypassed ({}): "
+                 "shader {:016x}, {:#x} {}x{} -> {:#x} {}x{}",
+                 copied ? "copy of the tonemapped image" : "copy failed", native_key,
+                 tonemapped.Address(), source.width, source.height, output->Address(), width, height);
     }
     return copied;
 }
