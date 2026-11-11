@@ -57,6 +57,27 @@ TEST_CASE("OoT jitter uses AMD's phase count for the upscale ratio", "[video_cor
     CHECK_FALSE(VideoCommon::OcarinaJitterEnabled(VideoCommon::OcarinaUpscaleBackend::Native));
 }
 
+TEST_CASE("OoT texture LOD bias follows the upscaler, the console mode and failure",
+          "[video_core][ocarina]") {
+    using enum VideoCommon::OcarinaUpscaleBackend;
+    using Settings::OcarinaDlssMode;
+    using VideoCommon::KeepOcarinaFsrLodBias;
+    using VideoCommon::OcarinaDlssLodBias;
+    using VideoCommon::OcarinaFsrLodBias;
+    CHECK(OcarinaFsrLodBias(Fsr) == -1.58f);
+    CHECK(OcarinaFsrLodBias(Dlss) == 0.0f);
+    CHECK(OcarinaFsrLodBias(Native) == 0.0f);
+    CHECK(OcarinaDlssLodBias(OcarinaDlssMode::Quality) == -0.58f);
+    CHECK(OcarinaDlssLodBias(OcarinaDlssMode::Balanced) == -0.75f);
+    CHECK(OcarinaDlssLodBias(OcarinaDlssMode::Performance) == -1.0f);
+    CHECK(OcarinaDlssLodBias(OcarinaDlssMode::UltraPerformance) == -1.58f);
+    CHECK(KeepOcarinaFsrLodBias(true, false, false));
+    CHECK_FALSE(KeepOcarinaFsrLodBias(false, false, false));
+    CHECK_FALSE(KeepOcarinaFsrLodBias(true, false, true));
+    CHECK_FALSE(KeepOcarinaFsrLodBias(true, true, false));
+    CHECK_FALSE(KeepOcarinaFsrLodBias(true, true, true));
+}
+
 TEST_CASE("FSR temporal sharpness uses the existing stops slider", "[video_core][fsr][ocarina]") {
     CHECK(FSR::RcasSharpnessFromStops(0.0f) == 1.0f);
     CHECK(FSR::RcasSharpnessFromStops(0.81f) == 0.595f);

@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
+#include "video_core/vulkan_common/streamline.h"
 #elif defined(LICHII_OCARINA_LIVE_UPSCALE)
 #include "video_core/renderer_vulkan/present/metalfx_temporal.h"
 #endif
@@ -1087,4 +1088,25 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
     state.last_view_projection = current;
     return true;
 }
+
+VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device) {
+    const char* value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+    bool dlss_enabled = false;
+    bool dlss_available = false;
+#ifdef EGLANTINE_STREAMLINE
+    dlss_enabled = Settings::values.nvidia_dlss.GetValue();
+    dlss_available = Streamline::IsDlssAvailable();
+#elif defined(LICHII_OCARINA_LIVE_UPSCALE)
+    dlss_enabled = Settings::values.metalfx_temporal.GetValue();
+    dlss_available = MetalFxTemporalUpscaler::IsSupported(device);
+#endif
+    const auto backend = VideoCommon::SelectOcarinaUpscaler(
+        Settings::values.oot_anti_aliasing.GetValue(), dlss_enabled, dlss_available,
+        value ? value : "");
+    if (backend == VideoCommon::OcarinaUpscaleBackend::Fsr && !Fsr3Upscaler::IsSupported(device)) {
+        return VideoCommon::OcarinaUpscaleBackend::Native;
+    }
+    return backend;
+}
+
 } // namespace Vulkan

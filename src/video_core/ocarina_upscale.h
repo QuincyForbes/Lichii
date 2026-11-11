@@ -82,4 +82,44 @@ constexpr u32 OcarinaJitterPhases(u32 render_width, u32 output_width) {
     return phases != 0 ? phases : 1;
 }
 
+/// NVIDIA's log2(render / output) mip bias for each 4K DLSS mode.
+constexpr float OcarinaDlssLodBias(Settings::OcarinaDlssMode mode) {
+    switch (mode) {
+    case Settings::OcarinaDlssMode::Quality:
+        return -0.58f;
+    case Settings::OcarinaDlssMode::Balanced:
+        return -0.75f;
+    case Settings::OcarinaDlssMode::Performance:
+        return -1.0f;
+    case Settings::OcarinaDlssMode::UltraPerformance:
+        return -1.58f;
+    }
+    return -0.58f;
+}
+
+/// Texture LOD bias added to Ocarina's mipmapped samplers while a jittered temporal upscaler runs.
+/// AMD recommends log2(render / output) - 1: -1.58 for docked 1440p -> 4K. With
+/// EDEN_NX2_DLSS_JITTER, DLSS / MetalFX Temporal gets log2(render / output) for its mode.
+inline float OcarinaFsrLodBias(
+    OcarinaUpscaleBackend backend,
+    Settings::OcarinaDlssMode dlss_mode = Settings::OcarinaDlssMode::Quality) {
+    if (!OcarinaJitterEnabled(backend)) {
+        return 0.0f;
+    }
+    if (backend == OcarinaUpscaleBackend::Fsr) {
+        return -1.58f;
+    }
+    if (backend == OcarinaUpscaleBackend::Dlss) {
+        return OcarinaDlssLodBias(dlss_mode);
+    }
+    return 0.0f;
+}
+
+/// Whether a sampler with that bias keeps it for an image: only docked (handheld isn't measured),
+/// not for images the GPU wrote (render targets would read a mip too sharp), and not once the
+/// upscaler failed this session (the game's own pass runs again).
+constexpr bool KeepOcarinaFsrLodBias(bool docked, bool upscaler_failed, bool gpu_written) {
+    return docked && !upscaler_failed && !gpu_written;
+}
+
 } // namespace VideoCommon

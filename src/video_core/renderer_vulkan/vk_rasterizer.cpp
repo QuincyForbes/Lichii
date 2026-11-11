@@ -2948,30 +2948,16 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
     if (program_id != ocarina_program || oot_live_failed) {
         return false;
     }
-    using Backend = VideoCommon::OcarinaUpscaleBackend;
     if (!oot_backend) {
-        // Picks between FSR 3.1 and the build's live upscaler, whose own setting is read below.
-        const char* value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        oot_backend = VideoCommon::SelectOcarinaUpscaler(
-            Settings::values.oot_anti_aliasing.GetValue(), true, true, value ? value : "");
-        if (oot_backend == Backend::Fsr && !Fsr3Upscaler::IsSupported(device)) {
+        oot_backend = ResolveOcarinaUpscaler(device);
+        if (*oot_backend == VideoCommon::OcarinaUpscaleBackend::Native &&
+            VideoCommon::OcarinaFsrChosen(Settings::values.oot_anti_aliasing.GetValue()) &&
+            !Fsr3Upscaler::IsSupported(device)) {
             LOG_WARNING(Render_Vulkan,
                         "Ocarina FSR 3.1 unsupported on this device; using native upscale");
-            oot_backend = Backend::Native;
         }
     }
-    if (oot_backend != Backend::Dlss) {
-        return oot_backend == Backend::Fsr;
-    }
-#ifdef EGLANTINE_STREAMLINE
-    return Settings::values.nvidia_dlss.GetValue() && Streamline::IsDlssAvailable();
-#elif defined(LICHII_OCARINA_LIVE_UPSCALE)
-    // Apple: MetalFX temporal upscaling in place of the game's upscaler.
-    static const bool supported = MetalFxTemporalUpscaler::IsSupported(device);
-    return Settings::values.metalfx_temporal.GetValue() && supported;
-#else
-    return false;
-#endif
+    return *oot_backend != VideoCommon::OcarinaUpscaleBackend::Native;
 }
 
 /// Capture the two camera matrices from a draw targeting the scene color and depth. Terrain and
@@ -3363,6 +3349,9 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
                                                    render_trace_frame, jitter,
                                                    {depth.size.width, depth.size.height});
         if (!recorded) {
+            if (oot_live_dlss->EvaluationFailed()) {
+                texture_cache_runtime.ocarina_fsr_failed = true;
+            }
             return fail("DLSS declined the frame");
         }
         if (present_4k) {
@@ -3377,6 +3366,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     } catch (const vk::Exception& error) {
         LOG_WARNING(Render_Vulkan, "Ocarina DLSS unavailable: {}", error.what());
         oot_live_failed = true;
+        texture_cache_runtime.ocarina_fsr_failed = true; // samplers drop the FSR LOD bias
         return false;
     }
 }
@@ -3928,6 +3918,7 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
         } catch (const vk::Exception& error) {
             LOG_WARNING(Render_Vulkan, "Ocarina DLSS 4K presentation unavailable: {}", error.what());
             oot_live_failed = true;
+            texture_cache_runtime.ocarina_fsr_failed = true; // samplers drop the FSR LOD bias
         }
     }
     return info;
