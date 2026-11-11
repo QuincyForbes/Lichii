@@ -23,6 +23,16 @@ constexpr size_t GraphicsPipelinesToEvict(size_t cached, size_t stale, size_t li
     return (std::min)(stale, cached - limit);
 }
 
+/// How many graphics pipelines to evict on host memory pressure, least recently used first.
+/// @param keep      Pipelines kept whatever their age.
+/// @param min_evict Fewer than this would free too little to be worth building them again.
+/// @return As GraphicsPipelinesToEvict with `keep` as the limit, or zero below `min_evict`.
+constexpr size_t PressurePipelinesToEvict(size_t cached, size_t stale, size_t keep,
+                                          size_t min_evict) {
+    const size_t evict = GraphicsPipelinesToEvict(cached, stale, keep);
+    return evict >= min_evict ? evict : 0;
+}
+
 /// Attribute mask of a native vertex program, two bits per attribute as in
 /// FixedPipelineState::attribute_types.
 /// @param input_generic Components of each generic attribute in the program header's input map.

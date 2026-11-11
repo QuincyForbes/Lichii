@@ -27,6 +27,22 @@ TEST_CASE("Graphics pipelines are evicted only past the limit", "[video_core][pi
     }
 }
 
+TEST_CASE("Memory pressure evicts only enough stale pipelines to matter",
+          "[video_core][pipeline_cache]") {
+    SECTION("the device log's sequence: one eviction, then none") {
+        CHECK(PressurePipelinesToEvict(1068, 1041, 256, 128) == 812);
+        CHECK(PressurePipelinesToEvict(256, 256, 256, 128) == 0);
+    }
+    SECTION("too few to free anything worth the rebuilds") {
+        CHECK(PressurePipelinesToEvict(300, 300, 256, 128) == 0);
+        CHECK(PressurePipelinesToEvict(1000, 100, 256, 128) == 0);
+    }
+    SECTION("recently used ones stay") {
+        CHECK(PressurePipelinesToEvict(1000, 200, 256, 128) == 200);
+        CHECK(PressurePipelinesToEvict(1000, 0, 0, 0) == 0);
+    }
+}
+
 TEST_CASE("Vertex attribute mask follows the header's input map", "[video_core][pipeline_cache]") {
     std::array<std::array<bool, 4>, 32> inputs{};
     CHECK(VertexAttributeMask(inputs) == 0);

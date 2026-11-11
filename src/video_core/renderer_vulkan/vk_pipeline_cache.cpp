@@ -2817,7 +2817,13 @@ void PipelineCache::EvictUnusedPipelines() {
     // pipelines are ~3.6 GB of driver memory at most. EDEN_NX2_PIPELINE_EVICT_ABOVE sets it.
     // Past it only the excess goes, least recently used first (from zortos293/Lichii#408), so
     // crossing it doesn't drop every stale pipeline at once.
-    const size_t evict_above = under_pressure ? 0 : EvictAbovePipelines();
+    // Under pressure the 256 most recently used stay, and fewer than 128 stale ones are kept too:
+    // an iPhone's 1,041 evicted at once gave back at most ~28 MiB of Metal memory and ~130 MiB of
+    // malloc with other caches freeing at the same time, and the later evictions (27 -> 7 -> 4
+    // -> 3) next to nothing, each one rebuilt with a Metal compile when its place came back.
+    constexpr size_t PressureKeptPipelines = 256;
+    constexpr size_t PressureMinEvicted = 128;
+    const size_t evict_above = under_pressure ? PressureKeptPipelines : EvictAbovePipelines();
     if (graphics_cache.size() <= evict_above) {
         return;
     }
@@ -2840,8 +2846,12 @@ void PipelineCache::EvictUnusedPipelines() {
         }
         candidates.emplace_back(pipeline->LastUse(), key);
     }
-    const size_t evicted = VideoCommon::GraphicsPipelinesToEvict(graphics_cache.size(),
-                                                                 candidates.size(), evict_above);
+    const size_t evicted =
+        under_pressure
+            ? VideoCommon::PressurePipelinesToEvict(graphics_cache.size(), candidates.size(),
+                                                    evict_above, PressureMinEvicted)
+            : VideoCommon::GraphicsPipelinesToEvict(graphics_cache.size(), candidates.size(),
+                                                    evict_above);
     if (evicted == 0) {
         return;
     }
@@ -2861,7 +2871,8 @@ void PipelineCache::EvictUnusedPipelines() {
             pipeline->ClearTransitions();
         }
     }
-    LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
+    // Common.Memory: the iOS log filter drops Render.Vulkan below Warning.
+    LOG_INFO(Common_Memory, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
              evict_after_frames, graphics_cache.size());
 }
 
