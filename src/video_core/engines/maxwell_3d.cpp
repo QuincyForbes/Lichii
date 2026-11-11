@@ -1193,7 +1193,9 @@ struct Maxwell3D::FrontState {
     u32 pending_instances{};
     /// EDEN_NX2_EXP2, read in Front(): same-value index_buffer.first writes are not sent.
     int same_experiment{};
-    int early_same{}; ///< EXP14, read once per front call like same_experiment
+    bool super_macro{}; ///< SuperMacroEnabled(), read once
+    /// SuperMacro or EXP14, read once per front call like same_experiment.
+    bool early_same{};
     /// An inline or small index draw (which binds an index buffer not taken from the registers)
     /// was sent since the last index_buffer.count write. Starts set: nothing is known.
     bool other_index_draw{true};
@@ -1360,9 +1362,14 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         macro_params.clear();
         executing_macro = 0;
         front_macros = true;
+        front->super_macro = SuperMacroEnabled();
+        VideoCore::Nx2Debug::LoadExperiments();
     }
-    front->same_experiment = VideoCore::Nx2Debug::Experiment(2);
-    front->early_same = VideoCore::Nx2Debug::Experiment(14);
+    // Once per front call: the two live switches, without Experiment()'s load check.
+    front->same_experiment = VideoCore::Nx2Debug::g_experiments[2].load(std::memory_order_relaxed);
+    front->early_same =
+        front->super_macro ||
+        VideoCore::Nx2Debug::g_experiments[14].load(std::memory_order_relaxed) != 0;
     return *front;
 }
 
@@ -1466,7 +1473,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     // EXP14 / SuperMacro: an unchanged state register (6.6M of Ocarina's 11.4M macro writes a
     // second) is dropped before the checks below, as the same-value skip further down would.
     if (!execution_mask[method] && fs.regs[method] == value && shadow_kept && fs.skip_same &&
-        (SuperMacroEnabled() || fs.early_same != 0)) [[likely]] {
+        fs.early_same) [[likely]] {
         if (Profile::Enabled()) [[unlikely]] {
             Profile::Add(Profile::Counter::MethodWrites, 1);
             Profile::Add(Profile::Counter::SameValueWrites, 1);

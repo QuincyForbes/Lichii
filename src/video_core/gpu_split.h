@@ -1041,7 +1041,69 @@ private:
     };
     /// Ranged writes kept before the oldest counts for every read again (EDEN_NX2_RANGED_MAX).
     static size_t MaxRangedWrites();
-    std::deque<RangedWrite> ranged_writes;
+    /// The ranged writes in send order. A free slot keeps the storage of its words for the next
+    /// write (a deque allocated per write: its block per element with MSVC, and the words).
+    class RangedWriteRing {
+    public:
+        [[nodiscard]] bool empty() const {
+            return count == 0;
+        }
+        [[nodiscard]] size_t size() const {
+            return count;
+        }
+        [[nodiscard]] RangedWrite& front() {
+            return slots[head];
+        }
+        /// The write sent `age` writes before the newest one.
+        [[nodiscard]] RangedWrite& Newest(size_t age = 0) {
+            return slots[(head + count - 1 - age) & (slots.size() - 1)];
+        }
+        [[nodiscard]] const RangedWrite& Newest(size_t age = 0) const {
+            return slots[(head + count - 1 - age) & (slots.size() - 1)];
+        }
+        void pop_front() {
+            RangedWrite& write = slots[head];
+            if (write.data.capacity() > KeptWords) {
+                std::vector<u32>{}.swap(write.data);
+            } else {
+                write.data.clear();
+            }
+            head = (head + 1) & (slots.size() - 1);
+            --count;
+        }
+        /// The slot of a new newest write: no words, the other fields are the caller's to set.
+        [[nodiscard]] RangedWrite& push_back() {
+            if (count == slots.size()) {
+                Grow();
+            }
+            ++count;
+            return Newest();
+        }
+        void clear() {
+            while (count != 0) {
+                pop_front();
+            }
+            head = 0;
+        }
+
+    private:
+        /// Words a free slot keeps allocated.
+        static constexpr size_t KeptWords = 1024;
+
+        void Grow() {
+            std::vector<RangedWrite> grown((std::max<size_t>)(slots.size() * 2, 16));
+            for (size_t i = 0; i < count; ++i) {
+                grown[i] = std::move(slots[(head + i) & (slots.size() - 1)]);
+            }
+            slots = std::move(grown);
+            head = 0;
+        }
+
+        std::vector<RangedWrite> slots; ///< A power of two of them
+        size_t head{};
+        size_t count{};
+    };
+    RangedWriteRing ranged_writes;
     struct QueuedRelease {
         u64 position;
         u64 device;

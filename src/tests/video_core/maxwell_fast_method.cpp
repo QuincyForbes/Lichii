@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <random>
 #include <vector>
@@ -66,6 +67,16 @@ struct GpuSplitTestAccess {
 
     static u64 NearWrap() {
         return GpuSplit::RingWords - 1;
+    }
+
+    /// What a read of [begin, end) waits for, and the method behind it.
+    static u64 WriterTarget(GpuSplit& split, u64 begin, u64 end, u32& method) {
+        return split.MemoryWriterTarget(split.consumed.load(std::memory_order_acquire), begin, end,
+                                        method);
+    }
+
+    static size_t MaxRangedWrites() {
+        return GpuSplit::MaxRangedWrites();
     }
 
     static u64 Execute(GpuSplit& split, u64 position, u64 available) {
@@ -818,4 +829,215 @@ TEST_CASE("Maxwell3D fast method dispatch cost", "[.][maxwell_fast_method_bench]
     const double run_ns = words(true);
     WARN("Three constant buffer words: " << single_ns << " ns one by one, " << run_ns
                                          << " ns as a run (unmapped buffer)");
+}
+
+namespace {
+
+// GpuSplit's ranged writes as it kept them before the ring: a deque, a new vector per write.
+struct RangedWritesModel {
+    struct Write {
+        u64 position;
+        u64 begin;
+        u64 end;
+        u32 method;
+        size_t space;
+        std::vector<u32> data;
+    };
+    std::deque<Write> writes;
+    u64 last_position{};
+    u32 last_method{~0U};
+    u64 previous_position{};
+    u32 previous_method{~0U};
+
+    void NoteMemoryWrite(u64 position) {
+        last_position = position;
+        last_method = ~0U;
+    }
+
+    void NoteMethodWrite(u64 position, u32 method) {
+        previous_position = last_position;
+        previous_method = last_method;
+        last_position = position;
+        last_method = method;
+    }
+
+    void Range(u64 position, u64 begin, u64 end, const u32* data, size_t space, size_t max) {
+        if (begin >= end || last_position != position) {
+            return;
+        }
+        const u32 method = last_method;
+        last_position = previous_position;
+        last_method = previous_method;
+        const size_t words = static_cast<size_t>(end - begin) / sizeof(u32);
+        if (!writes.empty()) {
+            Write& last = writes.back();
+            if (last.end == begin) {
+                last.end = end;
+                last.position = position;
+                last.method = method;
+                if (data != nullptr && last.space == space && space != 0 &&
+                    last.data.size() * sizeof(u32) == static_cast<size_t>(begin - last.begin)) {
+                    last.data.insert(last.data.end(), data, data + words);
+                } else {
+                    last.space = 0;
+                    last.data.clear();
+                }
+                return;
+            }
+        }
+        if (writes.size() >= max) {
+            const Write& oldest = writes.front();
+            if (oldest.position > last_position) {
+                last_position = oldest.position;
+                last_method = oldest.method;
+            }
+            writes.pop_front();
+        }
+        Write& write = writes.emplace_back(Write{position, begin, end, method, 0, {}});
+        if (data != nullptr && space != 0 && (end - begin) % sizeof(u32) == 0) {
+            write.space = space;
+            write.data.assign(data, data + words);
+        }
+    }
+
+    u64 Target(u64 done, u64 sent, u64 begin, u64 end, u32& method) {
+        while (!writes.empty() && writes.front().position <= done) {
+            writes.pop_front();
+        }
+        u64 target = last_position;
+        method = last_method;
+        for (auto it = writes.rbegin(); it != writes.rend() && it->position > target; ++it) {
+            if (it->begin < end && begin < it->end) {
+                target = it->position;
+                method = it->method;
+                break;
+            }
+        }
+        return std::min(target, sent);
+    }
+
+    bool Forward(u64 done, u64 sent, size_t space, u64 begin, u32 words, u32* out) {
+        const u64 end = begin + u64{words} * sizeof(u32);
+        u32 method{};
+        const u64 target = Target(done, sent, begin, end, method);
+        if (target <= done) {
+            return false;
+        }
+        for (auto it = writes.rbegin(); it != writes.rend(); ++it) {
+            if (!(it->begin < end && begin < it->end)) {
+                continue;
+            }
+            if (it->position != target || it->space != space || space == 0 || begin < it->begin ||
+                end > it->end || (begin - it->begin) % sizeof(u32) != 0 ||
+                it->data.size() * sizeof(u32) != static_cast<size_t>(it->end - it->begin)) {
+                return false;
+            }
+            std::memcpy(out, it->data.data() + (begin - it->begin) / sizeof(u32),
+                        size_t{words} * sizeof(u32));
+            return true;
+        }
+        return false;
+    }
+};
+
+} // Anonymous namespace
+
+TEST_CASE("GpuSplit ranged writes answer reads as a deque of them did",
+          "[video_core][maxwell_fast_method][gpu_split_ranged_writes]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    const auto split_storage = std::make_unique<VideoCommon::GpuSplit>();
+    VideoCommon::GpuSplit& split = *split_storage;
+    Access::Initialize(split, f.system, 100);
+    RangedWritesModel model;
+    const size_t max = Access::MaxRangedWrites();
+    std::mt19937 rng{0x52414e47};
+    const auto pick = [&rng](u32 below) { return static_cast<u32>(rng() % below); };
+    constexpr u64 Window = 0x10000;
+    u64 done = 100;
+    u64 last_end = Window;
+    u64 last_begin = Window;
+    u32 last_count = 1;
+    size_t last_space = 1;
+    std::vector<u32> words;
+    std::vector<u32> read;
+    std::vector<u32> expected;
+    u64 forwarded = 0;
+    u64 dropped = 0;
+    for (u32 step = 0; step < 300'000; ++step) {
+        // The back keeps up for a while, then falls behind far enough to overflow the writes.
+        const bool keeps_up = (step / 4000) % 2 == 0;
+        if (pick(keeps_up ? 4 : 600) == 0) {
+            const u64 sent = Access::End(split);
+            done += pick(static_cast<u32>(sent - done) + 1);
+            Access::Consume(split, done);
+        }
+        const u32 kind = pick(100);
+        if (kind < 3) {
+            Access::Advance(split, 1 + pick(3));
+            split.NoteMemoryWrite();
+            model.NoteMemoryWrite(Access::End(split));
+        } else if (kind < 60) {
+            Access::Advance(split, 1 + pick(3));
+            const u32 method = CbData + pick(16);
+            split.NoteMethodWrite(&f.fast, method);
+            model.NoteMethodWrite(Access::End(split), method);
+            if (pick(10) != 0) {
+                const u64 begin =
+                    pick(10) < 6 ? last_end : Window + u64{pick(256)} * sizeof(u32);
+                const u32 count = pick(200) == 0 ? 1100 + pick(500) : 1 + pick(6);
+                const u64 end = begin + u64{count} * sizeof(u32) + (pick(40) == 0 ? 2 : 0);
+                words.resize(count);
+                for (u32& word : words) {
+                    word = static_cast<u32>(rng());
+                }
+                const u32* const data = pick(8) != 0 ? words.data() : nullptr;
+                const size_t space = pick(12) == 0 ? 0 : 1 + pick(2);
+                const size_t before = model.writes.size();
+                const u64 oldest = before != 0 ? model.writes.front().position : 0;
+                split.RangeLastWrite(begin, end, data, space);
+                model.Range(Access::End(split), begin, end, data, space, max);
+                dropped += before == max && model.writes.front().position != oldest ? 1 : 0;
+                last_begin = begin;
+                last_count = count;
+                last_space = space;
+                // Uploads far from the window would never be read here.
+                last_end = end < Window + 0x800 ? end : Window + u64{pick(256)} * sizeof(u32);
+            }
+        }
+        // Half of the reads are inside the last ranged write, as a macro reads what it uploaded.
+        const bool inside = pick(2) == 0;
+        const u32 skipped = inside ? pick(last_count) : 0;
+        const u64 begin = inside ? last_begin + u64{skipped} * sizeof(u32)
+                                 : Window + u64{pick(300)} * sizeof(u32);
+        const u32 count = inside ? 1 + pick((std::min)(last_count - skipped, 8U)) : 1 + pick(8);
+        const u64 end = begin + u64{count} * sizeof(u32);
+        const u64 sent = Access::End(split);
+        if (pick(2) == 0) {
+            u32 method{};
+            u32 model_method{};
+            const u64 target = Access::WriterTarget(split, begin, end, method);
+            const u64 model_target = model.Target(done, sent, begin, end, model_method);
+            if (target != model_target || method != model_method) {
+                CAPTURE(step, begin, end, done, sent);
+                REQUIRE(target == model_target);
+                REQUIRE(method == model_method);
+            }
+        } else {
+            const size_t space = inside && last_space != 0 ? last_space : 1 + pick(2);
+            read.assign(count, 0);
+            expected.assign(count, 0);
+            const bool taken = split.ForwardRead(space, begin, count, read.data());
+            const bool model_taken = model.Forward(done, sent, space, begin, count, expected.data());
+            if (taken != model_taken || read != expected) {
+                CAPTURE(step, begin, end, done, sent, space);
+                REQUIRE(taken == model_taken);
+                REQUIRE(read == expected);
+            }
+            forwarded += taken ? 1 : 0;
+        }
+    }
+    // Both ends of the ring were used: reads took queued words, and the oldest write was dropped.
+    REQUIRE(forwarded > 1000);
+    REQUIRE(dropped > 1000);
 }
