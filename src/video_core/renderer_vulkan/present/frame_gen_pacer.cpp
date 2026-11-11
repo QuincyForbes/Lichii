@@ -136,10 +136,18 @@ FrameGenPlan FrameGenPacer::Plan(size_t capacity) {
     UpdateLimit(now, 1.0f / smoothed_interval, target_rate, ceiling);
 
     const size_t allowed = std::min(limit, ceiling);
-    const f32 desired_outputs = smoothed_interval * target_rate;
+    f32 desired_outputs = smoothed_interval * target_rate;
     if (allowed == 0 || desired_outputs <= 1.0f) {
         output_credit = 0.0f;
         return {};
+    }
+    // A "120 Hz" or "240 Hz" display often runs slightly below its nominal integer rate
+    // (e.g. 119.982 Hz -> 1.9997 outputs per 60 Hz frame); snap within 3% so steady 2x/3x/4x
+    // cadences do not periodically drop a generated frame as credit drains.
+    const f32 nearest_outputs = std::round(desired_outputs);
+    if (nearest_outputs >= 2.0f &&
+        std::abs(desired_outputs - nearest_outputs) <= nearest_outputs * 0.03f) {
+        desired_outputs = nearest_outputs;
     }
 
     output_credit += desired_outputs;

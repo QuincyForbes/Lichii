@@ -82,6 +82,8 @@ public:
     [[nodiscard]] VkFormat SwapchainImageFormat() const { return swapchain_image_format; }
 
 private:
+    void StartPresentThread();
+
     void PresentThread(std::stop_token token);
 
     /// Host frame pacer (vk_host_pacer.h): collects when earlier frames were shown and holds
@@ -104,6 +106,10 @@ private:
     void DiscardFrame(Frame* frame);
 
     void SetImageCount();
+
+    /// With EDEN_DKB_FRAME_TRACE=1 and frame generation on, logs the presents of every 10 s.
+    void LogPacing(const Frame* frame, std::chrono::steady_clock::duration took,
+                   std::chrono::steady_clock::time_point now);
 
 private:
     const vk::Instance& instance;
@@ -146,6 +152,13 @@ private:
     u64 last_present_id{};
     /// The present thread presents no frame before this (Frame::present_spacing).
     std::chrono::steady_clock::time_point next_present{};
+    struct {
+        std::chrono::steady_clock::time_point since{};
+        u64 real{};
+        u64 generated{};
+        std::chrono::nanoseconds spacing{};
+        std::chrono::steady_clock::duration present_time{};
+    } pacing_log;
     std::mutex present_wait_mutex; ///< Held while waiting on a swapchain; recreation takes it
     std::mutex wait_queue_mutex;
     std::condition_variable_any wait_queue_cv;
