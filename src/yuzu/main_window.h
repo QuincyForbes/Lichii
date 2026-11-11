@@ -403,6 +403,7 @@ private slots:
     void OnOpenSDMCFolder();
     void OnOpenModFolder();
     void OnOpenLogFolder();
+    void OnDeleteShaderCache();
     void OnVerifyInstalledContents();
     void OnInstallFirmware();
     void OnInstallFirmwareFromZIP();
@@ -531,6 +532,15 @@ private:
 #endif
 
     MultiplayerState* multiplayer_state = nullptr;
+    void RememberSpeedLimitBeforeHotkey();
+    void UndoSessionSpeedChanges();
+    /// Speed limit state before the session's first Toggle Framerate Limit / turbo / slow hotkey,
+    /// restored on game exit so user configuration changes to "Limit Speed Percent" persist.
+    struct SessionSpeedLimit {
+        bool value;
+        bool using_global;
+    };
+    std::optional<SessionSpeedLimit> speed_limit_before_hotkeys;
     bool use_recommended_mkw_settings = false;
     bool asked_recommended_mkw_settings = false;
 
