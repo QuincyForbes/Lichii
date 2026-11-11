@@ -56,14 +56,24 @@ void KHardwareTimer::DoTask() {
 }
 
 void KHardwareTimer::EnableInterrupt(s64 wakeup_time) {
-    this->DisableInterrupt();
-
+    if (m_wakeup_time == wakeup_time) {
+        return;
+    }
+    const bool was_enabled = this->GetInterruptEnabled();
     m_wakeup_time = wakeup_time;
-    m_kernel.System().CoreTiming().ScheduleEvent(std::chrono::nanoseconds{m_wakeup_time},
-                                                 m_event_type, true);
+    if (was_enabled) {
+        m_kernel.System().CoreTiming().RescheduleEvent(std::chrono::nanoseconds{m_wakeup_time},
+                                                       m_event_type, true);
+    } else {
+        m_kernel.System().CoreTiming().ScheduleEvent(std::chrono::nanoseconds{m_wakeup_time},
+                                                     m_event_type, true);
+    }
 }
 
 void KHardwareTimer::DisableInterrupt() {
+    if (!this->GetInterruptEnabled()) {
+        return;
+    }
     m_kernel.System().CoreTiming().UnscheduleEvent(m_event_type,
                                                    Core::Timing::UnscheduleEventType::NoWait);
     m_wakeup_time = (std::numeric_limits<s64>::max)();
