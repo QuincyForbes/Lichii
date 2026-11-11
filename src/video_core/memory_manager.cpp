@@ -62,9 +62,15 @@ MemoryManager::MemoryManager(Core::System& system_, MaxwellDeviceMemoryManager& 
     big_page_table_mask = big_page_table_size - 1;
 
     big_page_table_dev.ResizeAndClear(big_page_table_size);
-    big_entries.resize(big_page_table_size / 32, 0);
-    big_page_continuous.resize(big_page_table_size / continuous_bits, 0);
-    entries.resize(page_table_size / 32, 0);
+    big_entries = MakeEntryWords(big_page_table_size / 32);
+    big_page_continuous = MakeEntryWords(big_page_table_size / continuous_bits);
+    entries = MakeEntryWords(page_table_size / 32);
+}
+
+MemoryManager::EntryWords MemoryManager::MakeEntryWords(size_t count) {
+    EntryWords words{static_cast<u64*>(std::calloc(count, sizeof(u64)))};
+    ASSERT_MSG(words != nullptr, "No memory for {} GPU page table words", count);
+    return words;
 }
 
 MemoryManager::MemoryManager(Core::System& system_, u64 address_space_bits_, GPUVAddr split_address_, u64 big_page_bits_, u64 page_bits_)
