@@ -111,8 +111,19 @@ public:
     [[nodiscard]] bool PagesCountedOnce() const noexcept;
     /// iOS experiment: guest memory is a mapped file, outside the footprint.
     [[nodiscard]] bool FileBacked() const noexcept;
-    /// Apple, as of the last TrimZeroPages: guest memory resident or compressed, guest memory the
-    /// kernel has handed out, and zero bytes trimmed so far.
+    /// iOS: TrimZeroPages only counts what is resident (ledger-tagged or in a file, and not in
+    /// chunks): a pass reads no guest memory and changes nothing.
+    [[nodiscard]] bool TrimOnlyCounts() const noexcept;
+    /// How the footprint counts a resident page of guest memory.
+    enum class GuestAccounting : u8 {
+        Uncounted,  ///< No TrimZeroPages yet
+        PerMapping, ///< Once per view that touched it
+        Once,       ///< Ledger-tagged
+        File,       ///< Not at all
+    };
+    /// Apple, as of the last TrimZeroPages: guest memory resident or compressed and how it is
+    /// counted, guest memory the kernel has handed out, and zero bytes trimmed so far.
+    static GuestAccounting ScannedAccounting() noexcept;
     static u64 ScannedResidentBytes() noexcept;
     static u64 ScannedHandedOutBytes() noexcept;
     static u64 TrimmedZeroBytes() noexcept;

@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
+
+#include <fmt/format.h>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -21,6 +25,10 @@
 #include <psapi.h>
 #endif
 
+#include "common/host_memory.h"
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#include "common/ios_jit.h"
+#endif
 #include "common/logging.h"
 #include "common/platform_events.h"
 
@@ -93,6 +101,10 @@ ProcessMemory QueryProcessMemory() {
         memory.internal = info.internal;
         memory.purgeable_nonvolatile = static_cast<u64>(info.ledger_purgeable_nonvolatile);
         memory.external = info.external;
+        if (count >= TASK_VM_INFO_REV3_COUNT) {
+            memory.graphics = static_cast<u64>(info.ledger_tag_graphics_footprint +
+                                               info.ledger_tag_graphics_footprint_compressed);
+        }
     }
 #elif defined(_WIN32)
     // The closest Windows has: everything resident, guest memory included.
@@ -103,6 +115,49 @@ ProcessMemory QueryProcessMemory() {
     }
 #endif
     return memory;
+}
+
+std::string FootprintSplit([[maybe_unused]] const ProcessMemory& memory,
+                           [[maybe_unused]] u64 left) {
+#ifdef __APPLE__
+    // Ledger-tagged guest memory is in the footprint once per resident or compressed page and
+    // in none of the ledgers task_info reports; a file's pages are in neither.
+    const u64 resident = HostMemory::ScannedResidentBytes();
+    u64 guest = resident;
+    std::string guest_text;
+    switch (HostMemory::ScannedAccounting()) {
+    case HostMemory::GuestAccounting::Once:
+        guest_text = fmt::format("{} MiB (counted once)", resident >> 20);
+        break;
+    case HostMemory::GuestAccounting::PerMapping:
+        guest_text = fmt::format("{} MiB or more (counted per mapping)", resident >> 20);
+        break;
+    case HostMemory::GuestAccounting::File:
+        guest = 0;
+        guest_text = fmt::format("0 MiB (in a file, {} MiB of it resident)", resident >> 20);
+        break;
+    case HostMemory::GuestAccounting::Uncounted:
+        guest = 0;
+        guest_text = "not counted yet";
+        break;
+    }
+    u64 jit = 0;
+    std::string jit_text = "none";
+#if TARGET_OS_IPHONE
+    // The pool's pages were all touched when it was prepared. Code is written through a second
+    // mapping of them, which an untagged object's footprint may count again: that part is in
+    // the rest.
+    jit = IosJit::PreparedBytes();
+    jit_text = fmt::format("{} MiB ({} handed out)", jit >> 20, IosJit::HandedOutBytes() >> 20);
+#endif
+    const u64 known = guest + jit + memory.graphics;
+    return fmt::format("limit {} MiB | guest {}, JIT pool {}, graphics {} MiB, rest {} MiB",
+                       left != 0 ? fmt::format("{}", (memory.footprint + left) >> 20) : "unknown",
+                       guest_text, jit_text, memory.graphics >> 20,
+                       (memory.footprint - (std::min)(memory.footprint, known)) >> 20);
+#else
+    return "not known on this OS";
+#endif
 }
 
 u64 RelieveMallocPressure() {

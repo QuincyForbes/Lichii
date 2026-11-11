@@ -1777,6 +1777,7 @@ namespace {
 std::atomic<u64> g_zero_filled_bytes{};
 [[maybe_unused]] std::atomic<u64> g_zero_advised_bytes{};
 [[maybe_unused]] std::atomic<u64> g_scanned_resident_bytes{};
+std::atomic<HostMemory::GuestAccounting> g_scanned_accounting{};
 [[maybe_unused]] std::atomic<u64> g_trimmed_zero_bytes{};
 [[maybe_unused]] std::atomic<u64> g_scanned_handed_out_bytes{};
 
@@ -1918,6 +1919,10 @@ std::vector<bool> HostMemory::TouchedPages() const {
 
 u64 HostMemory::ZeroFilledBytes() noexcept {
     return g_zero_filled_bytes.load(std::memory_order_relaxed);
+}
+
+HostMemory::GuestAccounting HostMemory::ScannedAccounting() noexcept {
+    return g_scanned_accounting.load(std::memory_order_relaxed);
 }
 
 u64 HostMemory::ScannedResidentBytes() noexcept {
@@ -2205,6 +2210,10 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
     }
     g_scanned_handed_out_bytes.store(handed_out, std::memory_order_relaxed);
     g_scanned_resident_bytes.store(resident, std::memory_order_relaxed);
+    g_scanned_accounting.store(FileBacked()         ? GuestAccounting::File
+                               : PagesCountedOnce() ? GuestAccounting::Once
+                                                    : GuestAccounting::PerMapping,
+                               std::memory_order_relaxed);
     g_trimmed_zero_bytes.fetch_add(trimmed, std::memory_order_relaxed);
     return {resident, trimmed};
 #else
@@ -2223,6 +2232,14 @@ bool HostMemory::PagesCountedOnce() const noexcept {
 bool HostMemory::FileBacked() const noexcept {
 #ifdef LICHII_IOS_MACH_MEMORY
     return impl && impl->file_backed;
+#else
+    return false;
+#endif
+}
+
+bool HostMemory::TrimOnlyCounts() const noexcept {
+#ifdef LICHII_IOS_MACH_MEMORY
+    return impl && (impl->ledger_tagged || impl->file_backed) && !impl->Chunked();
 #else
     return false;
 #endif

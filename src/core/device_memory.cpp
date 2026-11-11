@@ -78,9 +78,27 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     constexpr u64 Tight = u64{1} << 30;
     u64 footprint_after_pass = Common::PlatformEvents::QueryProcessMemory().footprint;
     bool reported_boot = false;
+    // iOS closes the app when nothing is left: with less than this, where the footprint is goes
+    // to the log once, while there is time to write it.
+    constexpr u64 Imminent = u64{300} << 20;
+    const auto report_imminent = [](u64 left) {
+        const auto memory = Common::PlatformEvents::QueryProcessMemory();
+        LOG_WARNING(HW_Memory,
+                    "Memory: {} MiB left before iOS closes the app | footprint {} MiB (peak {}, "
+                    "internal {}, compressed {}, purgeable {}, mapped files {} not counted) | {}",
+                    left >> 20, memory.footprint >> 20, memory.footprint_peak >> 20,
+                    memory.internal >> 20, memory.compressed >> 20,
+                    memory.purgeable_nonvolatile >> 20, memory.external >> 20,
+                    Common::PlatformEvents::FootprintSplit(memory, left));
+    };
+    bool imminent_reported = false;
+    // A pass that only counts changes nothing, so it need not wait for the game to boot.
+    const bool counts_only = buffer.TrimOnlyCounts();
+    u64 resident_logged = 0;
     while (true) {
         // Host memory pressure (iOS) starts a pass at once.
         bool urgent = false;
+        bool imminent = false;
         for (std::chrono::seconds waited = 0s; waited < interval; waited += 1s) {
             if (!sleep(1s)) {
                 return;
@@ -88,10 +106,25 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             // The caches poll the low-water mark once a frame; booting and loading draw few.
             Common::PlatformEvents::PollMemoryPressure();
             const u32 now = Common::PlatformEvents::MemoryPressureGeneration();
+            if (const u64 left = Common::PlatformEvents::AvailableProcessMemory();
+                left != 0 && left < Imminent) {
+                if (!imminent_reported) {
+                    imminent_reported = true;
+                    if (counts_only) {
+                        // With a fresh count of the guest memory.
+                        imminent = true;
+                        break;
+                    }
+                    report_imminent(left);
+                }
+            } else if (left > 2 * Imminent) {
+                imminent_reported = false;
+            }
 #ifdef __APPLE__
             // Not while the game boots: no pass before its first frame, and for a minute after it
             // only under host memory pressure, so a reclaim is unlikely to race the heap clears
-            // and loads of the game's start.
+            // and loads of the game's start. A pass that only counts runs every 10 s of that
+            // minute, for the log.
             if (g_nx2_present_count.load(std::memory_order_relaxed) == 0) {
                 seconds_since_frame = 0;
                 pressure = now;
@@ -101,6 +134,9 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             if (seconds_since_frame < 60) {
                 ++seconds_since_frame;
                 if (now == pressure) {
+                    if (counts_only && seconds_since_frame % 10 == 0) {
+                        break;
+                    }
                     waited = 0s;
                     continue;
                 }
@@ -131,9 +167,18 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         footprint_after_pass = after.footprint;
         const u64 available = Common::PlatformEvents::AvailableProcessMemory();
         const bool tight = available != 0 && available < Tight;
-        // The first pass after a game boots is always logged.
-        const bool boot = !reported_boot && resident >= Growth;
+        if (imminent) {
+            report_imminent(available);
+        }
+        // The first pass after a game boots is always logged, and so is guest memory that is
+        // only counted whenever the count moved by 256 MiB.
+        const bool moved = buffer.PagesCountedOnce() &&
+                           (resident > resident_logged + Growth || resident + Growth < resident_logged);
+        const bool boot = (!reported_boot && resident >= Growth) || moved;
         reported_boot = reported_boot || boot;
+        if (boot) {
+            resident_logged = resident;
+        }
         // Windows: pages found zero for the first time go on the next pass if they stay zero.
         const size_t pending = state.zero_before.size() * 0x1000 - (std::min)(
             trimmed, state.zero_before.size() * 0x1000);
