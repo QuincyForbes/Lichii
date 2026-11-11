@@ -115,6 +115,17 @@ namespace Common {
 // The guest object moved to the media ledger: task_info has what of it is resident and
 // compressed, without a counting pass.
 std::atomic<bool> g_guest_media_ledger{};
+
+// Ledger-tagged guest memory: zero pages get MADV_FREE (cleared, freed and periodically found).
+// EDEN_NX2_FREE_ZERO=0/1 overrides.
+constexpr bool FreeZeroPagesDefault = true;
+// Guest memory in a file (outside the footprint). LICHII_IOS_FILE_GUEST=0/1 overrides.
+constexpr bool FileGuestDefault = false;
+
+[[maybe_unused]] bool EnvSwitch(const char* name, bool fallback) {
+    const char* const value = std::getenv(name);
+    return value == nullptr || value[0] == '\0' ? fallback : value[0] != '0';
+}
 #endif
 
 #ifdef _WIN32
@@ -884,6 +895,16 @@ public:
             virtual_size = guest_space + HugePageSize;
             vm_protect(mach_task_self(), virtual_address, virtual_size, FALSE, VM_PROT_NONE);
             virtual_base = virtual_map_base = reinterpret_cast<u8*>(virtual_address);
+            if (ledger_tagged && !chunked && !file) {
+                free_zero = EnvSwitch("EDEN_NX2_FREE_ZERO", FreeZeroPagesDefault);
+                if (free_zero) {
+                    PrepareZeroFreeing();
+                }
+                LOG_INFO(HW_Memory, "Guest zero pages: {}",
+                         !free_zero        ? "kept (EDEN_NX2_FREE_ZERO=0)"
+                         : stopped.empty() ? "marked free (MADV_FREE) when cleared or freed"
+                                           : "marked free (MADV_FREE) when cleared, freed or found");
+            }
         }
 #else
 #if defined(__sun__) || defined(__HAIKU__) || defined(__NetBSD__) || defined(__DragonFly__)
@@ -1196,8 +1217,120 @@ public:
         return released;
     }
 
+    /// Ledger-tagged guest memory in one object: MADV_FREE_REUSABLE does nothing there
+    /// (vm_map_reusable_pages skips entries without use_pmap), but MADV_FREE does: it drops the
+    /// compressed copy of a page at once and marks a resident one clean, so the next pageout scan
+    /// frees it instead of compressing it, and a later read zero-fills (vm_map_msync
+    /// VM_SYNC_KILLPAGES -> deactivate_pages_in_object DEACTIVATE_KILL; the modified bit is
+    /// cleared for every mapping of the page, so a write through the fastmem view keeps it). This
+    /// pass gives that hint for the resident pages that hold only zeros. A guest write between
+    /// the check and the hint would be lost, so both happen with the other threads stopped, as
+    /// for chunks. Compressed pages are not read (that would bring them back). Returns the bytes
+    /// hinted.
+    size_t FreeZeroPages(const std::vector<char>& residency, size_t page_size,
+                         const std::function<bool()>& pause) {
+        if (!free_zero || stopped.empty()) {
+            return 0;
+        }
+        const size_t num_pages = residency.size();
+        if (freed_pages.size() != num_pages) {
+            freed_pages.assign(num_pages, false);
+        }
+        due.clear();
+        for (size_t index = 0; index < num_pages; ++index) {
+            if ((residency[index] & MINCORE_INCORE) == 0) {
+                continue;
+            }
+            if (!IsZeroRange(backing_base + index * page_size, page_size)) {
+                freed_pages[index] = false;
+            } else if (!freed_pages[index]) {
+                due.push_back(static_cast<u32>(index));
+            }
+        }
+        const size_t batch_pages = (std::max)(size_t{1}, FreeBatchBytes / page_size);
+        size_t hinted = 0;
+        u32 stops = 0;
+        s64 longest_us = 0;
+        bool stopped_early = false;
+        for (size_t first = 0; first < due.size(); first += batch_pages) {
+            const size_t end = (std::min)(first + batch_pages, due.size());
+            const auto start = std::chrono::steady_clock::now();
+            if (!StopWorld()) {
+                stopped_early = true;
+                break;
+            }
+            if (KernelMayWriteGuest()) {
+                ResumeWorld();
+                stopped_early = true;
+                break;
+            }
+            // Nothing in here allocates or logs (another thread may hold the lock).
+            size_t run_begin = 0;
+            size_t run_end = 0;
+            size_t batch_hinted = 0;
+            const auto flush = [&] {
+                if (run_end > run_begin &&
+                    madvise(backing_base + run_begin * page_size, (run_end - run_begin) * page_size,
+                            MADV_FREE) == 0) {
+                    for (size_t page = run_begin; page < run_end; ++page) {
+                        freed_pages[page] = true;
+                    }
+                    batch_hinted += (run_end - run_begin) * page_size;
+                }
+                run_begin = run_end = 0;
+            };
+            for (size_t i = first; i < end; ++i) {
+                const size_t index = due[i];
+                if (!IsZeroRange(backing_base + index * page_size, page_size)) {
+                    continue;
+                }
+                if (run_end != index) {
+                    flush();
+                    run_begin = index;
+                }
+                run_end = index + 1;
+            }
+            flush();
+            ResumeWorld();
+            ++stops;
+            hinted += batch_hinted;
+            longest_us = (std::max<s64>)(
+                longest_us, std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+            if (pause && !pause()) {
+                stopped_early = true;
+                break;
+            }
+        }
+        freed_total += hinted;
+        if (hinted != 0 || stopped_early) {
+            LOG_INFO(HW_Memory,
+                     "Guest zero pages: {} MiB marked free (MADV_FREE) of {} MiB found, {} stops "
+                     "(longest {} us){}; {} MiB so far",
+                     hinted >> 20, (due.size() * page_size) >> 20, stops, longest_us,
+                     stopped_early ? ", stopped early: threads not stopped or a read in flight" : "",
+                     freed_total >> 20);
+        }
+        return hinted;
+    }
+
+    /// The other threads can be stopped for FreeZeroPages: once, while nothing is at stake.
+    void PrepareZeroFreeing() {
+        stopped.assign(MaxStopped, MACH_PORT_NULL);
+        if (!StopWorld()) {
+            stopped.clear();
+            LOG_WARNING(HW_Memory, "Guest zero pages: the other threads can't be stopped: they "
+                                   "stay counted");
+            return;
+        }
+        static_cast<void>(KernelMayWriteGuest());
+        ResumeWorld();
+    }
+
     bool ledger_tagged{}; ///< The guest memory object is billed per page, not per mapping
     bool file_backed{};   ///< The guest memory is a mapped file (InitFile)
+    bool free_zero{};     ///< Ledger-tagged, one object: zero pages get MADV_FREE
 #endif
 
     const size_t backing_size; ///< Size of the backing memory in bytes
@@ -1796,6 +1929,8 @@ private:
     static constexpr size_t ChunkSize = HugePageSize;
     /// Chunks checked per stop of the other threads: 16 MiB to read at most, about a millisecond.
     static constexpr size_t BatchChunks = 8;
+    /// Zero pages checked again per stop of the other threads: about half a millisecond to read.
+    static constexpr size_t FreeBatchBytes = size_t{4} << 20;
     static constexpr size_t MaxStopped = 2048;
 
     mach_port_t backing_entry{MACH_PORT_NULL};
@@ -1805,6 +1940,8 @@ private:
     std::vector<thread_act_t> stopped;
     size_t num_stopped{};
     u64 released_total{};
+    std::vector<bool> freed_pages; ///< Host pages FreeZeroPages hinted that held zeros since
+    u64 freed_total{};
     u32 skip_reports{};
     bool release_broken{};
     // File mode, under page_states_mutex: the first of each step is logged, so a boot that stops
@@ -1955,6 +2092,7 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
 namespace {
 std::atomic<u64> g_zero_filled_bytes{};
 [[maybe_unused]] std::atomic<u64> g_zero_advised_bytes{};
+[[maybe_unused]] std::atomic<u64> g_zero_hinted_bytes{}; ///< MADV_FREE at clears and frees
 [[maybe_unused]] std::atomic<u64> g_scanned_resident_bytes{};
 [[maybe_unused]] std::atomic<u64> g_scanned_compressed_bytes{};
 std::atomic<HostMemory::GuestAccounting> g_scanned_accounting{};
@@ -2334,6 +2472,32 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
     if (!enabled || backing_base == nullptr) {
         return {0, 0};
     }
+    const auto count_handed_out = [this] {
+        u64 handed_out = 0;
+        for (size_t granule = 0; granule < num_granules; ++granule) {
+            if ((granules[granule].load(std::memory_order_relaxed) & GranuleUsed) != 0) {
+                handed_out += u64{1} << GranuleShift;
+            }
+        }
+        g_scanned_handed_out_bytes.store(handed_out, std::memory_order_relaxed);
+    };
+    const auto mark_scanned = [] {
+        g_scanned_at_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count(),
+                              std::memory_order_relaxed);
+    };
+#ifdef LICHII_IOS_MACH_MEMORY
+    const bool free_pass = state != nullptr && state->free_zero && FreesZeroPages();
+    // The media ledger has the resident and compressed figures: the mincore walk over the whole
+    // backing (0.3-0.5 s on an iPhone) is only needed to find zero pages.
+    if (GuestFootprintLive() && !free_pass) {
+        count_handed_out();
+        g_scanned_accounting.store(GuestAccounting::Once, std::memory_order_relaxed);
+        mark_scanned();
+        return {ScannedResidentBytes(), 0};
+    }
+#endif
     const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     const size_t num_pages = backing_size / page_size;
     std::vector<char> residency(num_pages);
@@ -2468,14 +2632,12 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
         trimmed = impl->ReleaseZeroChunks(residency, page_size, counted, pause);
         resident -= (std::min)(resident, trimmed);
     }
-#endif
-    u64 handed_out = 0;
-    for (size_t granule = 0; granule < num_granules; ++granule) {
-        if ((granules[granule].load(std::memory_order_relaxed) & GranuleUsed) != 0) {
-            handed_out += u64{1} << GranuleShift;
-        }
+    if (free_pass) {
+        // Not trimmed yet: the pages leave once the OS needs memory.
+        static_cast<void>(impl->FreeZeroPages(residency, page_size, pause));
     }
-    g_scanned_handed_out_bytes.store(handed_out, std::memory_order_relaxed);
+#endif
+    count_handed_out();
     g_scanned_resident_bytes.store(resident, std::memory_order_relaxed);
     g_scanned_compressed_bytes.store((std::min)(compressed, resident), std::memory_order_relaxed);
     g_scanned_accounting.store(FileBacked()         ? GuestAccounting::File
@@ -2483,10 +2645,7 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
                                                     : GuestAccounting::PerMapping,
                                std::memory_order_relaxed);
     g_trimmed_zero_bytes.fetch_add(trimmed, std::memory_order_relaxed);
-    g_scanned_at_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                              std::chrono::steady_clock::now().time_since_epoch())
-                              .count(),
-                          std::memory_order_relaxed);
+    mark_scanned();
     return {resident, trimmed};
 #else
     return {0, 0};
@@ -2507,6 +2666,26 @@ bool HostMemory::FileBacked() const noexcept {
 #else
     return false;
 #endif
+}
+
+bool HostMemory::FileGuestByDefault() noexcept {
+#ifdef LICHII_IOS_MACH_MEMORY
+    return FileGuestDefault;
+#else
+    return false;
+#endif
+}
+
+bool HostMemory::FreesZeroPages() const noexcept {
+#ifdef LICHII_IOS_MACH_MEMORY
+    return impl && impl->free_zero;
+#else
+    return false;
+#endif
+}
+
+u64 HostMemory::ZeroHintedBytes() noexcept {
+    return g_zero_hinted_bytes.load(std::memory_order_relaxed);
 }
 
 bool HostMemory::TrimOnlyCounts() const noexcept {
@@ -2558,6 +2737,12 @@ bool HostMemory::ZeroWithoutFaulting(size_t offset, size_t length) {
     if (!PagesCountedOnce()) {
         madvise(backing_base + begin, end - begin, MADV_FREE_REUSABLE);
     }
+#ifdef LICHII_IOS_MACH_MEMORY
+    // Memory being handed out: nothing else writes to it until the clear returns.
+    if (impl && impl->free_zero && madvise(backing_base + begin, end - begin, MADV_FREE) == 0) {
+        g_zero_hinted_bytes.fetch_add(end - begin, std::memory_order_relaxed);
+    }
+#endif
     g_zero_filled_bytes.fetch_add(length - (end - begin), std::memory_order_relaxed);
     g_zero_advised_bytes.fetch_add(end - begin, std::memory_order_relaxed);
     return true;
@@ -2662,8 +2847,14 @@ void HostMemory::ReleaseFreed(size_t physical_offset, size_t length) {
         const char* value = std::getenv("EDEN_NX2_RELEASE_FREED");
         return value == nullptr || value[0] != '0';
     }();
-    // Ledger-tagged guest memory ignores MADV_FREE_REUSABLE.
-    if (!enabled || length == 0 || backing_base == nullptr || PagesCountedOnce()) {
+    // Ledger-tagged guest memory ignores MADV_FREE_REUSABLE, but not MADV_FREE (nothing uses
+    // freed memory, and a granule is cleared before reuse).
+#ifdef LICHII_IOS_MACH_MEMORY
+    const bool hint_free = impl && impl->free_zero;
+#else
+    constexpr bool hint_free = false;
+#endif
+    if (!enabled || length == 0 || backing_base == nullptr || (PagesCountedOnce() && !hint_free)) {
         return;
     }
     // Whole granules only: the rest of a partial one may still be in use. They stay Dirty, so the
@@ -2673,6 +2864,12 @@ void HostMemory::ReleaseFreed(size_t physical_offset, size_t length) {
     const size_t end = (std::min)(Common::AlignDown(physical_offset + length, GranuleSize),
                                   Common::AlignDown(backing_size, GranuleSize));
     if (first >= end) {
+        return;
+    }
+    if (hint_free) {
+        if (madvise(backing_base + first, end - first, MADV_FREE) == 0) {
+            g_zero_hinted_bytes.fetch_add(end - first, std::memory_order_relaxed);
+        }
         return;
     }
     for (size_t offset = first; offset < end; offset += GranuleSize) {
