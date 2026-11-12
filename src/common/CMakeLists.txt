@@ -86,6 +86,8 @@ add_library(
     logging.h
     lz4_compression.cpp
     lz4_compression.h
+    malloc_census.cpp
+    malloc_census.h
     math_util.h
     memory_detect.cpp
     memory_detect.h

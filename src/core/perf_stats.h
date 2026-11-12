@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <mutex>
+#include <vector>
 #include "common/common_types.h"
 
 namespace Core {
@@ -74,11 +75,13 @@ private:
 
     /// Title ID for the game that is running. 0 if there is no game running yet
     u64 title_id{0};
-    /// Current index for writing to the perf_history array
+    /// Number of frame times counted, at most an hour of them
     std::size_t current_index{0};
-    /// Stores an hour of historical frametime data useful for processing and tracking performance
-    /// regressions with code changes.
-    std::array<double, 216000> perf_history{};
+    /// Sum of the counted frame times after the first IgnoreFrames
+    double history_sum{};
+    /// The counted frame times, kept only while record_frame_times is on (written to a file at the
+    /// end, useful for tracking performance regressions with code changes)
+    std::vector<double> perf_history;
 
     /// Point when the cumulative counters were reset
     Clock::time_point reset_point = Clock::now();
