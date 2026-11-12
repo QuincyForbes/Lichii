@@ -133,6 +133,10 @@ struct RuntimeInfo {
     u32 mesh_task_offsets_binding{~0U};
     u32 mesh_task_args_binding{~0U};
     u32 mesh_task_payload_stride{}; ///< payload buffer words per task workgroup
+    /// Native mesh program: stage buffer attribute writes go straight to the outputs instead of
+    /// a workgroup copy of the attribute region. MoltenVK keeps the outputs in threadgroup memory
+    /// already, so the copy doubled the program's threadgroup memory past Metal's 32 KiB.
+    bool mesh_direct_outputs{};
 };
 
 } // namespace Shader

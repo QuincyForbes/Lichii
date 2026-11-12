@@ -3035,7 +3035,7 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
     if (!oot_backend) {
         oot_backend = ResolveOcarinaUpscaler(device);
         if (*oot_backend == VideoCommon::OcarinaUpscaleBackend::Native &&
-            VideoCommon::OcarinaFsrChosen(Settings::values.oot_anti_aliasing.GetValue()) &&
+            Settings::OcarinaFsrChosen() &&
             !Fsr3Upscaler::IsSupported(device)) {
             LOG_WARNING(Render_Vulkan,
                         "Ocarina FSR 3.1 unsupported on this device; using native upscale");
@@ -3367,7 +3367,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     constexpr u64 three_quarter_pass = 0xe40f5efb5480e692ULL;
     if (upscale_hash == three_quarter_pass && target.size.width == 2560 &&
         target.size.height == 1440 &&
-        Settings::values.nvidia_dlss.GetValue() &&
+        Settings::NvidiaDlssChosen() &&
         Settings::OcarinaDlssModeFor(Settings::values.oot_resolution.GetValue()) ==
             Settings::OcarinaDlssMode::Performance) {
         upscale_4k = true;

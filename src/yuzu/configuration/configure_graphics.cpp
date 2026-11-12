@@ -39,6 +39,7 @@
 #include <vulkan/vulkan_core.h>
 
 #include "common/common_types.h"
+#include "common/game_settings.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "core/core.h"
@@ -128,17 +129,21 @@ ConfigureGraphics::ConfigureGraphics(
 
         const auto& combobox_enumerations_resolution = builder.ComboboxTranslations().at(
             Settings::EnumMetadata<Settings::ResolutionSetup>::Index());
-        const auto res_index = resolution_combobox->currentIndex();
-        const auto setup = static_cast<Settings::ResolutionSetup>(
-            combobox_enumerations_resolution[res_index].first);
+        const auto setup =
+            resolution_combobox != nullptr
+                ? static_cast<Settings::ResolutionSetup>(
+                      combobox_enumerations_resolution[resolution_combobox->currentIndex()].first)
+                : Settings::values.resolution_setup.GetValue();
 
         update_aspect_ratio(ratio, setup);
     };
 
     connect(aspect_ratio_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged),
             update_screenshot_info);
-    connect(resolution_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            update_screenshot_info);
+    if (resolution_combobox != nullptr) {
+        connect(resolution_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                update_screenshot_info);
+    }
 
     api_combobox->setEnabled(!UISettings::values.has_broken_vulkan && api_combobox->isEnabled());
     ui->api_widget->setEnabled(
@@ -479,21 +484,22 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 
             hold_graphics.emplace(setting->Id(), widget);
 #endif
+        } else if (setting->Id() == Settings::values.upscaler.Id()) {
+            upscaler_combobox = widget->combobox;
+            connect(widget->combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                    [this] { UpdateFeatureAvailability(); });
 #ifdef EGLANTINE_STREAMLINE
-        } else if (setting->Id() == Settings::values.nvidia_dlss.Id()) {
-            // NVIDIA's files and a download button under the checkbox.
+            // NVIDIA's files and a download button under the upscaler while DLSS is chosen.
             QWidget* group = new QWidget(this);
             QVBoxLayout* group_layout = new QVBoxLayout(group);
             group_layout->setContentsMargins(0, 0, 0, 0);
             group_layout->setSpacing(2);
             group_layout->addWidget(widget);
-            NvidiaDlssPanel* panel = new NvidiaDlssPanel(group);
-            group_layout->addWidget(panel);
-            nvidia_dlss_checkbox = widget->checkbox;
-            nvidia_dlss_panel = panel;
-            connect(widget->checkbox, &QCheckBox::toggled, this,
-                    [this] { UpdateFeatureAvailability(); });
+            nvidia_dlss_panel = new NvidiaDlssPanel(group);
+            group_layout->addWidget(nvidia_dlss_panel);
             hold_graphics.emplace(setting->Id(), group);
+#else
+            hold_graphics.emplace(setting->Id(), widget);
 #endif
         } else if (setting->Id() == Settings::values.frame_gen.Id()) {
             frame_gen_checkbox = widget->checkbox;
@@ -507,32 +513,48 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     // rest follows in the settings' order.
     {
         const auto& v = Settings::values;
-        const std::vector<std::tuple<QString, QString, std::vector<u32>>> sections{
-            {tr("Resolution"),
-             tr("Three steps, in this order: the size a game draws at (Ocarina of Time has its "
-                "own choice), the emulator's resolution scale on top of it, then the upscaler "
-                "or window filter to the screen. NVIDIA DLSS, MetalFX and AMD FSR 3.1 take the "
-                "place of a game's own upscaler and need 1x."),
-             {v.oot_resolution.Id(), v.resolution_setup.Id(), v.nvidia_dlss.Id(),
-              v.nvidia_dlss_preset.Id(), v.metalfx_temporal.Id(), v.game_dlss_network.Id(),
-              v.oot_anti_aliasing.Id(), v.oot_movie_upscale.Id(), v.scaling_filter.Id(),
-              v.fsr_sharpening_slider.Id(), v.anti_aliasing.Id(), v.aspect_ratio.Id()}},
+        std::vector<std::tuple<QString, QString, std::vector<u32>>> sections{
+            {tr("Resolution and textures"),
+             Settings::ConfiguringProgramId() == 0
+                 ? tr("The size games draw at and their texture detail. Games with their own "
+                      "resolution choice have it under their name below.")
+                 : QString(),
+             {v.resolution_setup.Id(), v.texture_quality.Id(), v.aspect_ratio.Id()}},
+            {tr("Upscaling"),
+             tr("The game's picture goes through the upscaler (in place of the game's own), then "
+                "the screen filter to the window."),
+             {v.upscaler.Id(), v.nvidia_dlss_preset.Id(), v.scaling_filter.Id(),
+              v.fsr_sharpening_slider.Id(), v.anti_aliasing.Id()}},
             {tr("Frame rate"),
-             tr("Ocarina of Time and Mario Kart World have their own choice. The Switch 2 frame "
-                "rate limit paces every other game, and Ocarina of Time when Unlocked. Frame "
+             tr("The Switch 2 frame rate limit paces every game without its own choice. Frame "
                 "generation adds frames on top of the game's."),
-             {v.oot_frame_rate.Id(), v.mkw_frame_rate.Id(), v.frame_rate_limit.Id(),
-              v.vsync_mode.Id(), v.frame_gen.Id(), v.frame_gen_type.Id(),
+             {v.frame_rate_limit.Id(), v.vsync_mode.Id(), v.frame_gen.Id(), v.frame_gen_type.Id(),
               v.frame_gen_multiplier.Id(), v.frame_gen_target_rate.Id(),
               v.frame_gen_flow_scale_auto.Id(), v.frame_gen_flow_scale.Id(),
               v.frame_gen_queue_target.Id(), v.frame_gen_motion.Id(),
               v.frame_gen_flow_quality.Id()}},
-            {tr("Game patches"),
-             tr("Built-in changes to a game's code with a trade-off. A game's own choice in its "
-                "Properties > Add-Ons overrides these."),
-             {v.patch_performance.Id(), v.patch_image.Id()}},
-            {tr("Other"), QString(), {}},
         };
+        // Each game's own settings under its name (on a per-game page only that game's).
+        for (const auto& game : Settings::GamesWithSettings()) {
+            std::vector<u32> ids;
+            for (const auto key : game.keys) {
+                if (const auto it = v.linkage.by_key.find(std::string{key});
+                    it != v.linkage.by_key.end()) {
+                    ids.push_back(it->second->Id());
+                }
+            }
+            sections.emplace_back(QString::fromUtf8(game.name.data(),
+                                                    static_cast<qsizetype>(game.name.size())),
+                                  Settings::ConfiguringProgramId() == 0
+                                      ? tr("Game-specific: these apply to this game only.")
+                                      : QString(),
+                                  std::move(ids));
+        }
+        sections.emplace_back(tr("Game patches"),
+                              tr("Built-in changes to a game's code with a trade-off. A game's own "
+                                 "choice in its Properties > Add-Ons overrides these."),
+                              std::vector<u32>{v.patch_performance.Id(), v.patch_image.Id()});
+        sections.emplace_back(tr("Other"), QString(), std::vector<u32>{});
         std::map<u32, QWidget*> rest = hold_graphics;
         const auto add_heading = [&](const QString& title, const QString& text) {
             QLabel* heading = new QLabel(QStringLiteral("<b>%1</b>").arg(title), this);
@@ -583,10 +605,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         const auto it = hold_graphics.find(setting.Id());
         return it != hold_graphics.end() ? it->second : nullptr;
     };
-    nvidia_dlss_widget = held(Settings::values.nvidia_dlss);
     nvidia_dlss_preset_widget = held(Settings::values.nvidia_dlss_preset);
     frame_gen_widget = held(Settings::values.frame_gen);
-    metalfx_temporal_widget = held(Settings::values.metalfx_temporal);
 
 #ifdef HAS_LSFG
     // Where LSFG's Lossless.dll comes from, under the type combobox.
@@ -878,21 +898,26 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     [[maybe_unused]] const VkDeviceInfo::Record* record =
         device >= 0 && size_t(device) < records.size() ? &records[device] : nullptr;
 
-    // NVIDIA DLSS shows only where it can run: a build with Streamline (Windows), the Vulkan
-    // renderer and an NVIDIA RTX GPU selected. Elsewhere the widgets don't exist or stay hidden;
-    // the saved values are kept.
+    // NVIDIA DLSS is offered only where it can run: a build with Streamline (Windows), the Vulkan
+    // renderer and an NVIDIA RTX GPU selected; MetalFX only in Apple builds. Their entries in the
+    // upscaler list hide elsewhere (unless chosen, as in a config from another machine).
 #ifdef EGLANTINE_STREAMLINE
     const bool dlss_offered = vulkan && record != nullptr && record->dlss_capable;
-    const bool dlss_on = nvidia_dlss_checkbox != nullptr && nvidia_dlss_checkbox->isChecked();
-    if (nvidia_dlss_widget != nullptr) {
-        nvidia_dlss_widget->setVisible(dlss_offered);
-    }
+#else
+    constexpr bool dlss_offered = false;
+#endif
+    const auto upscaler_is = [this](Settings::Upscaler value) {
+        return upscaler_combobox != nullptr &&
+               upscaler_combobox->currentData().toUInt() == static_cast<u32>(value);
+    };
+    [[maybe_unused]] const bool dlss_on = dlss_offered && upscaler_is(Settings::Upscaler::Dlss);
     for (QWidget* const widget :
          std::initializer_list<QWidget*>{nvidia_dlss_panel, nvidia_dlss_preset_widget}) {
         if (widget != nullptr) {
-            widget->setVisible(dlss_offered && dlss_on);
+            widget->setVisible(dlss_on);
         }
     }
+#ifdef EGLANTINE_STREAMLINE
     // Ocarina of Time's fixed sizes are DLSS's input then: name the mode each one is.
     if (oot_resolution_combobox != nullptr) {
         const auto& names =
@@ -904,7 +929,7 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
                 continue;
             }
             QString mode;
-            if (dlss_offered && dlss_on) {
+            if (dlss_on) {
                 switch (static_cast<Settings::OotResolution>(value)) {
                 case Settings::OotResolution::Full:
                     mode = tr("DLSS Quality");
@@ -941,18 +966,13 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     }
 #endif
 
-    QString metalfx_reason;
-#ifndef LICHII_METALFX
-    metalfx_reason = tr("Apple only (MetalFX).");
+#ifdef LICHII_METALFX
+    const bool metalfx = vulkan;
 #else
-    if (!vulkan) {
-        metalfx_reason = tr("Needs the Vulkan renderer.");
-    }
+    constexpr bool metalfx = false;
 #endif
-    ConfigurationShared::SetUnavailable(metalfx_temporal_widget, metalfx_reason);
-    // The MetalFX entries of the two lists show only on Apple, or while one is the current value
-    // (a config from a Mac).
-    const auto gate_item = [&](QComboBox* combobox, u32 enumeration, u32 value) {
+    // The entries of the lists that can't run here show only while one is the current value.
+    const auto gate_item = [&](QComboBox* combobox, u32 enumeration, u32 value, bool offered) {
         auto* view = combobox != nullptr ? qobject_cast<QListView*>(combobox->view()) : nullptr;
         if (view == nullptr) {
             return;
@@ -961,15 +981,18 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
         for (size_t i = 0; i < items.size(); ++i) {
             if (items[i].first == value) {
                 view->setRowHidden(static_cast<int>(i),
-                                   !metalfx_reason.isEmpty() &&
-                                       combobox->currentIndex() != static_cast<int>(i));
+                                   !offered && combobox->currentIndex() != static_cast<int>(i));
             }
         }
     };
     gate_item(scaling_filter_combobox, Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
-              static_cast<u32>(Settings::ScalingFilter::MetalFxSpatial));
+              static_cast<u32>(Settings::ScalingFilter::MetalFxSpatial), metalfx);
     gate_item(frame_gen_type_combobox, Settings::EnumMetadata<Settings::FrameGenType>::Index(),
-              static_cast<u32>(Settings::FrameGenType::MetalFx));
+              static_cast<u32>(Settings::FrameGenType::MetalFx), metalfx);
+    gate_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
+              static_cast<u32>(Settings::Upscaler::MetalFx), metalfx);
+    gate_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
+              static_cast<u32>(Settings::Upscaler::Dlss), dlss_offered);
 }
 
 void ConfigureGraphics::UpdateLosslessStatus() {

@@ -2059,9 +2059,12 @@ void EmitContext::DefineMesh(const IR::Program& program) {
         1U);
     mesh_map_bytes = 4 + mesh_info.PrimitiveVertices() * mesh_info.max_primitives;
     mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
-    mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
-                                     std::nullopt, spv::StorageClass::Workgroup);
-    Name(mesh_attributes, "isbe_attributes");
+    const bool direct_outputs{runtime_info.mesh_direct_outputs && !as_compute};
+    if (!direct_outputs) {
+        mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
+                                         std::nullopt, spv::StorageClass::Workgroup);
+        Name(mesh_attributes, "isbe_attributes");
+    }
     mesh_map = DefineVariable(*this, TypeArray(U32[1], Const(mesh_map_bytes)), std::nullopt,
                               spv::StorageClass::Workgroup);
     Name(mesh_map, "isbe_map");
@@ -2152,6 +2155,81 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     for (const u32 line : mesh_info.primitive_lines) {
         mesh_primitive_targets.push_back(target(line, true));
     }
+    if (direct_outputs) {
+        DefineMeshAttributeWrite();
+    }
+}
+
+void EmitContext::DefineMeshAttributeWrite() {
+    // Word w of the attribute region: groups of 32 vertices with one 32-word line per attribute,
+    // then the primitives' groups. A switch on the line stores the word to that line's output.
+    const u32 vertex_lines{static_cast<u32>(mesh_info.vertex_lines.size())};
+    const u32 primitive_lines{static_cast<u32>(mesh_info.primitive_lines.size())};
+    const Id output_f32_pointer{TypePointer(spv::StorageClass::Output, F32[1])};
+    const Id output_u32_pointer{TypePointer(spv::StorageClass::Output, U32[1])};
+    mesh_attribute_write = OpFunction(void_id, spv::FunctionControlMask::MaskNone,
+                                      TypeFunction(void_id, U32[1], U32[1]));
+    Name(mesh_attribute_write, "isbe_attribute_write");
+    const Id word_parameter{OpFunctionParameter(U32[1])};
+    const Id value{OpFunctionParameter(U32[1])};
+    AddLabel();
+    const Id word{OpUMin(U32[1], word_parameter, Const(mesh_attribute_words - 1))};
+    const auto locate = [&](Id local, u32 lines, u32 count) {
+        const Id stride{Const((std::max)(lines, 1U) * 32)};
+        const Id rest{OpUMod(U32[1], local, stride)};
+        const Id element{OpIAdd(U32[1],
+                                OpIMul(U32[1], OpUDiv(U32[1], local, stride), Const(32U)),
+                                OpBitwiseAnd(U32[1], rest, Const(31U)))};
+        return std::array<Id, 3>{OpShiftRightLogical(U32[1], rest, Const(5U)), element,
+                                 OpULessThan(U1, element, Const(count))};
+    };
+    const auto [vertex_line, vertex, vertex_valid] =
+        locate(word, vertex_lines, mesh_info.max_vertices);
+    const Id in_primitives{OpUGreaterThanEqual(U1, word, Const(mesh_primitive_base))};
+    const auto [primitive_line, primitive, primitive_valid] =
+        locate(OpISub(U32[1], word, Const(mesh_primitive_base)), primitive_lines,
+               mesh_info.max_primitives);
+    const Id selector{OpSelect(
+        U32[1],
+        OpSelect(U1, in_primitives, primitive_valid, vertex_valid),
+        OpSelect(U32[1], in_primitives, OpIAdd(U32[1], primitive_line, Const(vertex_lines)),
+                 vertex_line),
+        Const(~0U))};
+    const Id element{OpSelect(U32[1], in_primitives, primitive, vertex)};
+
+    std::vector<Sirit::Literal> literals;
+    std::vector<Id> labels;
+    std::vector<const MeshLineTarget*> cases;
+    const auto add_cases = [&](const std::vector<MeshLineTarget>& targets, u32 first) {
+        for (u32 line = 0; line < targets.size(); ++line) {
+            if (Sirit::ValidId(targets[line].variable)) {
+                literals.push_back(first + line);
+                labels.push_back(OpLabel());
+                cases.push_back(&targets[line]);
+            }
+        }
+    };
+    add_cases(mesh_vertex_targets, 0);
+    add_cases(mesh_primitive_targets, vertex_lines);
+    if (!labels.empty()) {
+        const Id merge{OpLabel()};
+        OpSelectionMerge(merge, spv::SelectionControlMask::MaskNone);
+        OpSwitch(selector, merge, literals, labels);
+        for (size_t index = 0; index < labels.size(); ++index) {
+            const MeshLineTarget& target{*cases[index]};
+            AddLabel(labels[index]);
+            const Id pointer_type{target.is_float ? output_f32_pointer : output_u32_pointer};
+            const Id pointer{target.element == ~0U
+                                 ? OpAccessChain(pointer_type, target.variable, element)
+                                 : OpAccessChain(pointer_type, target.variable, element,
+                                                 Const(target.element))};
+            OpStore(pointer, target.is_float ? OpBitcast(F32[1], value) : value);
+            OpBranch(merge);
+        }
+        AddLabel(merge);
+    }
+    OpReturn();
+    OpFunctionEnd();
 }
 
 void EmitContext::DefineMeshEmulationOutput() {

@@ -1096,15 +1096,14 @@ VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device) 
     bool dlss_enabled = false;
     bool dlss_available = false;
 #ifdef EGLANTINE_STREAMLINE
-    dlss_enabled = Settings::values.nvidia_dlss.GetValue();
+    dlss_enabled = Settings::NvidiaDlssChosen();
     dlss_available = Streamline::IsDlssAvailable();
 #elif defined(LICHII_OCARINA_LIVE_UPSCALE)
-    dlss_enabled = Settings::values.metalfx_temporal.GetValue();
+    dlss_enabled = Settings::MetalFxTemporalChosen();
     dlss_available = MetalFxTemporalUpscaler::IsSupported(device);
 #endif
     const auto backend = VideoCommon::SelectOcarinaUpscaler(
-        Settings::values.oot_anti_aliasing.GetValue(), dlss_enabled, dlss_available,
-        value ? value : "");
+        Settings::OcarinaFsrChosen(), dlss_enabled, dlss_available, value ? value : "");
     if (backend == VideoCommon::OcarinaUpscaleBackend::Fsr && !Fsr3Upscaler::IsSupported(device)) {
         return VideoCommon::OcarinaUpscaleBackend::Native;
     }

@@ -59,7 +59,8 @@ class Record {
 public:
     explicit Record(std::string_view name, const std::vector<VkPresentModeKHR>& vsync_modes,
                     bool has_broken_compute, VkDriverId driver_id, bool dlss_capable,
-                    std::string_view driver_version = {});
+                    std::string_view driver_version = {}, bool integrated = false,
+                    u64 vram_mib = 0);
     ~Record();
 
     const std::string name;
@@ -71,6 +72,10 @@ public:
     const bool dlss_capable;
     /// The driver's own version text (e.g. "581.57"), for support logs.
     const std::string driver_version;
+    /// Shares the CPU's memory (VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU).
+    const bool integrated;
+    /// The largest device-local memory heap.
+    const u64 vram_mib;
 };
 
 // TODO(crueter): Port some configure_graphics.cpp stuff

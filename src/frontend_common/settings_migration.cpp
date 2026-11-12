@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <utility>
+
+#include "common/settings.h"
 #include "frontend_common/settings_migration.h"
 
 namespace SettingsMigration {
@@ -47,6 +53,54 @@ Settings::MkwFrameRate MkwFrameRateFrom(bool mkw_30fps, bool mkw_dynamic_fps) {
         return Settings::MkwFrameRate::Dynamic;
     }
     return mkw_30fps ? Settings::MkwFrameRate::Fps30 : Settings::MkwFrameRate::Game;
+}
+
+Settings::Upscaler UpscalerFrom(bool oot_fsr3, bool nvidia_dlss, bool metalfx_temporal,
+                                bool game_dlss_network) {
+    using Settings::Upscaler;
+    if (oot_fsr3) {
+        return Upscaler::Fsr3;
+    }
+    if (nvidia_dlss) {
+        return Upscaler::Dlss;
+    }
+    if (metalfx_temporal) {
+        return Upscaler::MetalFx;
+    }
+    return game_dlss_network ? Upscaler::Game : Upscaler::Auto;
+}
+
+Settings::OotResolution OotResolutionWithScale(Settings::OotResolution resolution,
+                                               Settings::ResolutionSetup scale) {
+    using Settings::OotResolution;
+    using Settings::ResolutionSetup;
+    constexpr std::array<std::pair<OotResolution, int>, 8> percent{{
+        {OotResolution::Percent50, 50},
+        {OotResolution::Percent56, 56},
+        {OotResolution::Percent75, 75},
+        {OotResolution::Percent87, 87},
+        {OotResolution::Full, 100},
+        {OotResolution::Percent150, 150},
+        {OotResolution::Percent200, 200},
+        {OotResolution::Percent300, 300},
+    }};
+    const auto own = std::ranges::find(percent, resolution, &std::pair<OotResolution, int>::first);
+    if (resolution == OotResolution::Game || own == percent.end() ||
+        scale == ResolutionSetup::Res1X) {
+        return resolution;
+    }
+    Settings::ResolutionScalingInfo info;
+    Settings::TranslateResolutionInfo(scale, info);
+    const float product = static_cast<float>(own->second) * info.up_factor;
+    // The nearest share; on a tie the smaller one (less GPU work, as the scale was a choice).
+    auto best = percent.front();
+    for (const auto& entry : percent) {
+        if (std::abs(static_cast<float>(entry.second) - product) <
+            std::abs(static_cast<float>(best.second) - product)) {
+            best = entry;
+        }
+    }
+    return best.first;
 }
 
 } // namespace SettingsMigration

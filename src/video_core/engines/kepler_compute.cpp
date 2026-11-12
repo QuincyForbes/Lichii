@@ -999,7 +999,7 @@ VideoCore::GameDlssReason KeplerCompute::GameDlssBlocker() const {
         VideoCommon::FireEmblemUpscale::OutputProgramKey, option);
     const bool forced_native = option && !forced_replacement;
     if (forced_replacement ||
-        (!forced_native && !Settings::values.game_dlss_network.GetValue())) {
+        (!forced_native && !Settings::GameDlssNetworkChosen())) {
         return GameDlssReason::TurnedOff;
     }
     // NVIDIA DLSS, when turned on and running, comes first.

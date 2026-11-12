@@ -13,6 +13,7 @@ using Settings::GamePatchMode;
 using Settings::MkwFrameRate;
 using Settings::OotFrameRate;
 using Settings::OotResolution;
+using Settings::Upscaler;
 
 class MigrationConfig final : public Config {
 public:
@@ -144,6 +145,39 @@ TEST_CASE("Mario Kart World frame rate from its two switches", "[settings_migrat
     CHECK(MkwFrameRateFrom(true, true) == MkwFrameRate::Dynamic);
 }
 
+TEST_CASE("One upscaler from the four earlier switches", "[settings_migration]") {
+    using SettingsMigration::UpscalerFrom;
+    CHECK(UpscalerFrom(false, false, false, false) == Upscaler::Auto);
+    CHECK(UpscalerFrom(true, true, true, true) == Upscaler::Fsr3);
+    CHECK(UpscalerFrom(false, true, true, true) == Upscaler::Dlss);
+    CHECK(UpscalerFrom(false, false, true, true) == Upscaler::MetalFx);
+    CHECK(UpscalerFrom(false, false, false, true) == Upscaler::Game);
+}
+
+TEST_CASE("Ocarina resolution times the resolution scale", "[settings_migration]") {
+    using SettingsMigration::OotResolutionWithScale;
+    using Settings::ResolutionSetup;
+    CHECK(OotResolutionWithScale(OotResolution::Full, ResolutionSetup::Res1X) ==
+          OotResolution::Full);
+    CHECK(OotResolutionWithScale(OotResolution::Full, ResolutionSetup::Res3_2X) ==
+          OotResolution::Percent150);
+    CHECK(OotResolutionWithScale(OotResolution::Full, ResolutionSetup::Res3X) ==
+          OotResolution::Percent300);
+    CHECK(OotResolutionWithScale(OotResolution::Full, ResolutionSetup::Res8X) ==
+          OotResolution::Percent300);
+    CHECK(OotResolutionWithScale(OotResolution::Full, ResolutionSetup::Res1_2X) ==
+          OotResolution::Percent50);
+    CHECK(OotResolutionWithScale(OotResolution::Full, ResolutionSetup::Res3_4X) ==
+          OotResolution::Percent75);
+    // A tie goes to the smaller size.
+    CHECK(OotResolutionWithScale(OotResolution::Full, ResolutionSetup::Res5_4X) ==
+          OotResolution::Full);
+    CHECK(OotResolutionWithScale(OotResolution::Percent75, ResolutionSetup::Res2X) ==
+          OotResolution::Percent150);
+    CHECK(OotResolutionWithScale(OotResolution::Game, ResolutionSetup::Res2X) ==
+          OotResolution::Game);
+}
+
 TEST_CASE("Config of an earlier build loads into the new settings", "[settings_migration]") {
     MigrationScope scope;
 
@@ -173,6 +207,54 @@ TEST_CASE("Config of an earlier build loads into the new settings", "[settings_m
         CHECK(Settings::values.oot_resolution.GetValue() ==
               (DlssBuild ? OotResolution::Percent75 : OotResolution::Full));
         CHECK(Settings::values.mkw_frame_rate.GetValue() == MkwFrameRate::Fps30);
+        CHECK(Settings::values.upscaler.GetValue() == Upscaler::Dlss);
+    }
+
+    SECTION("AMD FSR 3.1 in Ocarina's anti-aliasing becomes the upscaler") {
+        MigrationConfig{}.Load("[Renderer]\n"
+                               "oot_anti_aliasing\\default=false\noot_anti_aliasing=2\n"
+                               "nvidia_dlss\\default=false\nnvidia_dlss=true\n");
+        CHECK(Settings::values.upscaler.GetValue() == Upscaler::Fsr3);
+        CHECK(Settings::values.oot_anti_aliasing.GetValue() == Settings::OotAntiAliasing::Game);
+    }
+
+    SECTION("MetalFX and the game's own DLSS network") {
+        MigrationConfig{}.Load("[Renderer]\nmetalfx_temporal\\default=false\n"
+                               "metalfx_temporal=true\n");
+        CHECK(Settings::values.upscaler.GetValue() == Upscaler::MetalFx);
+        MigrationConfig{}.Load("[Renderer]\ngame_dlss_network\\default=false\n"
+                               "game_dlss_network=true\n");
+        CHECK(Settings::values.upscaler.GetValue() == Upscaler::Game);
+    }
+
+    SECTION("The resolution scale folds into Ocarina's resolution") {
+        MigrationConfig{}.Load("[Renderer]\nresolution_setup\\default=false\nresolution_setup=6\n"
+                               "oot_resolution\\default=true\noot_resolution=1\n");
+        CHECK(Settings::values.oot_resolution.GetValue() == OotResolution::Percent200);
+        // Other games keep the scale.
+        CHECK(Settings::values.resolution_setup.GetValue() == Settings::ResolutionSetup::Res2X);
+        MigrationConfig{}.Load("[Renderer]\nresolution_setup\\default=false\nresolution_setup=6\n"
+                               "oot_resolution\\default=false\noot_resolution=0\n");
+        CHECK(Settings::values.oot_resolution.GetValue() == OotResolution::Game);
+    }
+
+    SECTION("No remapping once the upscaler is written") {
+        MigrationConfig{}.Load("[Renderer]\nupscaler\\default=true\nupscaler=0\n"
+                               "metalfx_temporal\\default=false\nmetalfx_temporal=true\n"
+                               "resolution_setup\\default=false\nresolution_setup=6\n"
+                               "oot_resolution\\default=true\noot_resolution=1\n");
+        CHECK(Settings::values.upscaler.GetValue() == Upscaler::Auto);
+        CHECK(Settings::values.oot_resolution.GetValue() == OotResolution::Full);
+    }
+
+    SECTION("A per-game DLSS value earlier builds never read stays unread") {
+        MigrationConfig{}.Load("[Renderer]\n");
+        MigrationConfig game{Config::ConfigType::PerGameConfig, "custom/0400486024DEC000.ini"};
+        game.Load("[Renderer]\nnvidia_dlss\\use_global=false\nnvidia_dlss\\default=false\n"
+                  "nvidia_dlss=true\nresolution_setup\\use_global=true\n"
+                  "oot_resolution\\use_global=true\n");
+        CHECK(Settings::values.upscaler.UsingGlobal());
+        CHECK(Settings::values.oot_resolution.UsingGlobal());
     }
 
     SECTION("Max Resolution turned off in Ocarina's Add-Ons") {

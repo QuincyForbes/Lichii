@@ -76,6 +76,8 @@ add_executable(yuzu
     configuration/configure_graphics.h
     configuration/nvidia_dlss_panel.cpp
     configuration/nvidia_dlss_panel.h
+    configuration/recommended_settings.cpp
+    configuration/recommended_settings.h
     configuration/configure_graphics.ui
     configuration/configure_graphics_advanced.cpp
     configuration/configure_graphics_advanced.h

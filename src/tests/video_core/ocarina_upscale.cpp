@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <catch2/catch_test_macros.hpp>
+#include "common/settings.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/fsr.h"
 
@@ -25,27 +26,31 @@ TEST_CASE("OoT temporal backend selection is opt-in and vendor neutral", "[video
     CHECK(SelectOcarinaUpscaler(false, false, false, "garbage") == Native);
 }
 
-TEST_CASE("OoT anti-aliasing choice picks the upscaler; DLSS keeps its setting",
+TEST_CASE("One upscaler setting picks Ocarina's upscaler and the DLSS replacements",
           "[video_core][ocarina]") {
-    using enum VideoCommon::OcarinaUpscaleBackend;
-    using VideoCommon::SelectOcarinaUpscaler;
-    using Settings::OotAntiAliasing;
-    // Game and No sharpening: DLSS when its setting is on and it's available, as before.
-    CHECK(SelectOcarinaUpscaler(OotAntiAliasing::Game, false, true, "") == Native);
-    CHECK(SelectOcarinaUpscaler(OotAntiAliasing::Game, true, true, "") == Dlss);
-    CHECK(SelectOcarinaUpscaler(OotAntiAliasing::Game, true, false, "") == Native);
-    CHECK(SelectOcarinaUpscaler(OotAntiAliasing::NoSharpening, true, true, "") == Dlss);
-    CHECK(SelectOcarinaUpscaler(OotAntiAliasing::NoSharpening, false, false, "") == Native);
-    // An FSR choice wins over the DLSS setting.
-    CHECK(SelectOcarinaUpscaler(OotAntiAliasing::Fsr3, true, true, "") == Fsr);
-    CHECK(SelectOcarinaUpscaler(OotAntiAliasing::Fsr3, false, false, "") == Fsr);
-    // The environment override still decides.
-    CHECK(SelectOcarinaUpscaler(OotAntiAliasing::Fsr3, false, false, "native") == Native);
-    CHECK(SelectOcarinaUpscaler(OotAntiAliasing::Fsr3, false, true, "dlss") == Dlss);
-    // The setting stores the number, so the order must not change.
-    CHECK(static_cast<u32>(OotAntiAliasing::Game) == 0);
-    CHECK(static_cast<u32>(OotAntiAliasing::NoSharpening) == 1);
-    CHECK(static_cast<u32>(OotAntiAliasing::Fsr3) == 2);
+    using Settings::Upscaler;
+    auto& upscaler = Settings::values.upscaler;
+    const auto previous = upscaler.GetValue();
+    upscaler.SetValue(Upscaler::Auto);
+    CHECK_FALSE(Settings::OcarinaFsrChosen());
+    CHECK_FALSE(Settings::NvidiaDlssChosen());
+    CHECK_FALSE(Settings::GameDlssNetworkChosen());
+    upscaler.SetValue(Upscaler::Fsr3);
+    CHECK(Settings::OcarinaFsrChosen());
+    CHECK_FALSE(Settings::NvidiaDlssChosen());
+    upscaler.SetValue(Upscaler::Dlss);
+    CHECK(Settings::NvidiaDlssChosen());
+    CHECK_FALSE(Settings::OcarinaFsrChosen());
+    upscaler.SetValue(Upscaler::MetalFx);
+    CHECK(Settings::MetalFxTemporalChosen());
+    upscaler.SetValue(Upscaler::Game);
+    CHECK(Settings::GameDlssNetworkChosen());
+    upscaler.SetValue(previous);
+    // Settings store the numbers, so the order must not change.
+    CHECK(static_cast<u32>(Settings::OotAntiAliasing::Game) == 0);
+    CHECK(static_cast<u32>(Settings::OotAntiAliasing::NoSharpening) == 1);
+    CHECK(static_cast<u32>(Upscaler::Auto) == 0);
+    CHECK(static_cast<u32>(Upscaler::MetalFx) == 4);
 }
 
 TEST_CASE("OoT jitter uses AMD's phase count for the upscale ratio", "[video_core][ocarina]") {

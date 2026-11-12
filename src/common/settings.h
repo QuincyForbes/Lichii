@@ -69,6 +69,7 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(Upscaler, false);
 SWITCHABLE(OotMovieUpscale, false);
 SWITCHABLE(TextureQuality, false);
 SWITCHABLE(OotResolution, false);
@@ -385,10 +386,13 @@ struct Values {
                                                     Specialization::Default,
                                                     true,
                                                     true};
-    // A Switch 2 game's own DLSS network (translated) in place of AMD FSR 3.1, where it runs and
-    // its output passes the checks.
-    SwitchableSetting<bool> game_dlss_network{linkage, false, "game_dlss_network",
-                                              Category::Renderer};
+    // The one choice of what replaces a game's own upscaler (Ocarina of Time's upscale pass, the
+    // DLSS calls of Fire Emblem and other Switch 2 games). Auto: Ocarina's own pass, AMD FSR 3.1 for
+    // DLSS calls. Game: each game's own (its translated DLSS network where it runs and passes the
+    // checks). AMD FSR 3.1, NVIDIA DLSS (Streamline, Windows with an RTX GPU) and MetalFX temporal
+    // (Apple) replace both; they need 1x. Replaces game_dlss_network, nvidia_dlss, metalfx_temporal
+    // and oot_anti_aliasing's FSR 3.1 (frontend_common/settings_migration.h).
+    SwitchableSetting<Upscaler> upscaler{linkage, Upscaler::Auto, "upscaler", Category::Renderer};
     SwitchableSetting<int, true> fsr_sharpening_slider{linkage,
 #ifdef __ANDROID__
                                                        0,
@@ -415,18 +419,11 @@ struct Values {
                                                   Specialization::Scalar,
                                                   true,
                                                   true};
-    // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS. Global only: a per-game
-    // value (left in some players' OoT configs) silently overrode the checkbox, which then showed
-    // unchecked and greyed once the game ran (2026-11-09, an RTX 5080 player).
-    Setting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
     // The DLSS model (preset) for every mode: K by default (NVIDIA's defaults for Performance and
     // Ultra Performance drew thin lines); Default leaves the choice to NVIDIA. EDEN_NX2_DLSS_PRESET
     // still overrides it.
     Setting<DlssPreset> nvidia_dlss_preset{linkage, DlssPreset::K, "nvidia_dlss_preset",
                                            Category::Renderer};
-    // Apple only: MetalFX temporal upscaling in place of a game's DLSS and of Ocarina of Time's
-    // upscaler (what NVIDIA DLSS does on Windows). Global only, like nvidia_dlss.
-    Setting<bool> metalfx_temporal{linkage, false, "metalfx_temporal", Category::Renderer};
     // Apple only: which bundled MoltenVK to load. Read once per process, at the first Vulkan start.
     Setting<MoltenVkDriver> moltenvk_driver{linkage, MoltenVkDriver::Legacy, "moltenvk_driver",
                                             Category::Renderer};
@@ -450,8 +447,7 @@ struct Values {
                                                   true,
                                                   true};
     // The Legend of Zelda: Ocarina of Time's own anti-aliasing network and its sharpening output
-    // pass, or the tonemapped image as the game renders it (video_core/oot_network.h), or AMD
-    // FSR 3.1 in place of the game's upscale pass (video_core/ocarina_upscale.h).
+    // pass, or the tonemapped image as the game renders it (video_core/oot_network.h).
     SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{linkage, OotAntiAliasing::Game,
                                                          "oot_anti_aliasing", Category::Renderer};
     // The title screen's and cutscenes' videos (AV1 1080p60): a bilinear copy, or the game's own
@@ -462,10 +458,11 @@ struct Values {
                                                          "oot_movie_upscale", Category::Renderer};
     // Ocarina of Time's 3D resolution, the one source for it (built-in patches in
     // core/file_sys/patch_manager.cpp): Game is the game's dynamic resolution (down to 480p), the
-    // others a fixed share of its full size. With NVIDIA DLSS the fixed sizes are DLSS's input
-    // (OcarinaDlssModeFor). Phones default to the game's own, the safety valve their GPUs need.
-    // EDEN_NX2_OOT_MAX_RESOLUTION=0/1 and EDEN_NX2_OOT_RENDER_SCALE=1..3 override it for tests.
-    // Read when the game starts.
+    // others a fixed share of its full size; above 100 % the full size with the emulator's
+    // resolution scale, which otherwise doesn't apply to the game (EffectiveResolutionSetup). With
+    // NVIDIA DLSS the fixed sizes are DLSS's input (OcarinaDlssModeFor). Phones get 56 % from the
+    // device profile (common/device_profile.h). EDEN_NX2_OOT_MAX_RESOLUTION=0/1 and
+    // EDEN_NX2_OOT_RENDER_SCALE=1..3 override it for tests. Read when the game starts.
     SwitchableSetting<OotResolution> oot_resolution{linkage,
 #if defined(__APPLE__) && TARGET_OS_IPHONE
                                                     OotResolution::Game,
@@ -744,10 +741,10 @@ struct Values {
     Setting<bool> oot_fps_asked{linkage, false, "oot_fps_asked", Category::RendererAdvanced};
     // Half / Quarter: the RomFS serves each .bntx.zs texture of 512 px or more with its top one or
     // two mip levels dropped (file_sys/texture_quality.h): softer textures, less guest and GPU
-    // memory. Read when the game starts.
+    // memory. Read when the game starts. Shown with the Graphics settings (same ini group as
+    // before).
     SwitchableSetting<TextureQuality> texture_quality{linkage, TextureQuality::Full,
-                                                      "texture_quality",
-                                                      Category::RendererAdvanced};
+                                                      "texture_quality", Category::Renderer};
     // Which revision of the Frizti tuned settings (common/frizti_settings.h) this config has had
     // applied once (MainWindow::MigrateFriztiSettings; config/frizti.ini keeps it too).
     Setting<u32> frizti_settings_revision{linkage, 0, "frizti_settings_revision",
@@ -1170,6 +1167,22 @@ bool OcarinaHalfRate(u64 program_id);
 // Full Quality, 87% Balanced, 75% Performance, 50% Ultra Performance; the others render as they
 // are and count as Quality.
 OcarinaDlssMode OcarinaDlssModeFor(OotResolution resolution);
+// The size Ocarina of Time itself draws at: the shares above 100 % draw at Full and get the rest
+// from the resolution scale.
+OotResolution OcarinaGameResolution(OotResolution resolution);
+// The emulator's resolution scale for the running program. Ocarina of Time takes it from
+// oot_resolution (1x up to 100 %, and always with a temporal upscaler, which needs 1x); every
+// other program from resolution_setup.
+ResolutionSetup EffectiveResolutionSetup();
+
+// Settings upscaler, by what reads it.
+bool NvidiaDlssChosen();
+bool MetalFxTemporalChosen();
+// A Switch 2 game's own translated DLSS network in place of AMD FSR 3.1.
+bool GameDlssNetworkChosen();
+// AMD FSR 3.1 in place of Ocarina of Time's upscale pass.
+bool OcarinaFsrChosen();
+
 void SetSpeedMode(const SpeedMode &mode);
 void ToggleStandardMode();
 void ToggleTurboMode();
@@ -1187,5 +1200,10 @@ void RestoreGlobalState(bool is_powered_on);
 
 bool IsConfiguringGlobal();
 void SetConfiguringGlobal(bool is_global);
+
+// The program a per-game settings page configures (0 outside one), so it lists only the settings
+// that apply to that game (common/device_profile.h AppliesToGame).
+void SetConfiguringProgramId(u64 program_id);
+u64 ConfiguringProgramId();
 
 } // namespace Settings

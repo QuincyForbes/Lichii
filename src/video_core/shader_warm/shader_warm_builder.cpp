@@ -310,6 +310,7 @@ void WriteHeader(std::ofstream& out) {
 
 std::atomic<bool> warm_before_start{false};
 std::atomic<bool> skip_warm{false};
+std::atomic<bool> build_only{false};
 
 /// Records `entries` for the finished precache file at `warm_file` (see WarmCountPath).
 void WriteWarmCount(const fs::path& warm_file, u64 entries) {
@@ -416,6 +417,21 @@ void RequestSkipWarm() {
 
 bool TakeSkipWarm() {
     return skip_warm.exchange(false, std::memory_order_relaxed);
+}
+
+void RequestBuildOnly(bool only) {
+    build_only.store(only, std::memory_order_relaxed);
+    if (only) {
+        skip_warm.store(false, std::memory_order_relaxed);
+    }
+}
+
+bool BuildOnlyRequested() {
+    return build_only.load(std::memory_order_relaxed);
+}
+
+bool TakeBuildOnly() {
+    return build_only.exchange(false, std::memory_order_relaxed);
 }
 
 fs::path PrecachedPipelinesPath(u64 title_id) {

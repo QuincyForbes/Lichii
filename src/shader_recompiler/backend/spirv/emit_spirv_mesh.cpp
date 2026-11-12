@@ -257,16 +257,41 @@ void MeshEpilogue(EmitContext& ctx) {
     // Points need a size per vertex: the fixed state one, unless the program writes its own.
     const bool points{mesh.PrimitiveVertices() == 1};
     const Id point_size{ctx.Const(ctx.runtime_info.fixed_state_point_size.value_or(1.0f))};
-    for (u32 first = 0; first < mesh.max_vertices; first += threads) {
+    // With direct outputs the program's writes are in the outputs already.
+    const bool direct{Sirit::ValidId(ctx.mesh_attribute_write)};
+    const bool fixed_point_size{
+        points && (!direct || std::ranges::find(mesh.vertex_lines,
+                                                static_cast<u32>(IR::Attribute::PointSize)) ==
+                                  mesh.vertex_lines.end())};
+    const bool direct_depth{
+        direct && convert_depth &&
+        std::ranges::find(mesh.vertex_lines, static_cast<u32>(IR::Attribute::PositionZ)) !=
+            mesh.vertex_lines.end() &&
+        std::ranges::find(mesh.vertex_lines, static_cast<u32>(IR::Attribute::PositionW)) !=
+            mesh.vertex_lines.end()};
+    for (u32 first = 0; (fixed_point_size || !direct || direct_depth) && first < mesh.max_vertices;
+         first += threads) {
         const Id vertex{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
         const auto copy = [&] {
-            if (points) {
+            if (fixed_point_size) {
                 ctx.OpStore(ctx.OpAccessChain(ctx.output_f32, ctx.mesh_point_size, vertex),
                             point_size);
             }
-            CopyLines(ctx, vertex, 0, vertex_lines, ctx.mesh_vertex_targets);
-            if (convert_depth) {
-                ConvertDepth(ctx, vertex);
+            if (!direct) {
+                CopyLines(ctx, vertex, 0, vertex_lines, ctx.mesh_vertex_targets);
+                if (convert_depth) {
+                    ConvertDepth(ctx, vertex);
+                }
+            } else if (direct_depth) {
+                // OpenGL-style clip space from the written position: z = (z + w) / 2.
+                const auto component = [&](u32 element) {
+                    return ctx.OpAccessChain(ctx.output_f32, ctx.output_position, vertex,
+                                             ctx.Const(element));
+                };
+                const Id z{ctx.OpLoad(ctx.F32[1], component(2))};
+                const Id w{ctx.OpLoad(ctx.F32[1], component(3))};
+                ctx.OpStore(component(2), ctx.OpFMul(ctx.F32[1], ctx.OpFAdd(ctx.F32[1], z, w),
+                                                     ctx.Const(0.5f)));
             }
         };
         if (first + threads > mesh.max_vertices) {
@@ -297,8 +322,10 @@ void MeshEpilogue(EmitContext& ctx) {
                             : ctx.OpCompositeConstruct(
                                   index_type,
                                   std::span<const Id>(indices.data(), primitive_vertices)));
-            CopyLines(ctx, primitive, ctx.mesh_primitive_base, primitive_lines,
-                      ctx.mesh_primitive_targets);
+            if (!direct) {
+                CopyLines(ctx, primitive, ctx.mesh_primitive_base, primitive_lines,
+                          ctx.mesh_primitive_targets);
+            }
         });
     }
 }
@@ -330,6 +357,10 @@ void EmitIsbeWriteAttribute(EmitContext& ctx, Id address, Id value) {
     const Id index{ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.Const(2U))};
     if (ctx.stage == Stage::Task) {
         ctx.OpStore(PayloadWord(ctx, index), value);
+        return;
+    }
+    if (Sirit::ValidId(ctx.mesh_attribute_write)) {
+        ctx.OpFunctionCall(ctx.void_id, ctx.mesh_attribute_write, index, value);
         return;
     }
     ctx.OpStore(SharedWord(ctx, ctx.mesh_attributes, Clamped(ctx, index, ctx.mesh_attribute_words)),

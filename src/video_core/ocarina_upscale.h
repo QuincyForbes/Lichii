@@ -28,21 +28,6 @@ constexpr OcarinaUpscaleBackend SelectOcarinaUpscaler(bool fsr_enabled, bool dls
     return fsr_enabled ? OcarinaUpscaleBackend::Fsr : OcarinaUpscaleBackend::Native;
 }
 
-/// Whether the "Ocarina of Time anti-aliasing" choice asks for AMD FSR 3.1.
-constexpr bool OcarinaFsrChosen(Settings::OotAntiAliasing choice) {
-    return choice == Settings::OotAntiAliasing::Fsr3;
-}
-
-/// The backend for the "Ocarina of Time anti-aliasing" choice and the DLSS (or MetalFX) setting.
-/// An FSR choice wins; with Game or No sharpening, DLSS replaces the game's pass when it's on and
-/// available (as before FSR came in).
-constexpr OcarinaUpscaleBackend SelectOcarinaUpscaler(Settings::OotAntiAliasing choice,
-                                                    bool dlss_enabled, bool dlss_available,
-                                                    std::string_view override) {
-    const bool fsr = OcarinaFsrChosen(choice);
-    return SelectOcarinaUpscaler(fsr, dlss_enabled && !fsr, dlss_available, override);
-}
-
 /// EDEN_NX2_DLSS_JITTER (boot, 0 = off): DLSS or MetalFX gets the camera jitter the FSR path uses.
 /// 1 = the jitter as FSR gets it, 2 = with its vertical sign flipped.
 inline int OcarinaDlssJitterMode() {

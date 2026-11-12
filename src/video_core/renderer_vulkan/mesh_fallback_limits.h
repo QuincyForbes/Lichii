@@ -26,6 +26,7 @@ struct NativeMeshShape {
     std::uint32_t vertex_locations; ///< vec4 outputs per vertex (generics, then built-ins)
     std::uint32_t primitive_locations;
     std::uint32_t shared_memory_bytes; ///< The program's own workgroup memory
+    bool direct_outputs{};             ///< RuntimeInfo::mesh_direct_outputs: no attribute region
 };
 
 // Threadgroup memory of a native mesh program on MoltenVK: the attribute and map regions of
@@ -33,8 +34,10 @@ struct NativeMeshShape {
 // mesh object (outputs, triangle indices as 16-byte uint3 and the two counts).
 [[nodiscard]] constexpr std::uint64_t MetalMeshThreadgroupBytes(const NativeMeshShape& s) noexcept {
     const auto groups = [](std::uint64_t count) { return (count + 31) / 32; };
-    const std::uint64_t attribute_words{groups(s.max_vertices) * s.vertex_lines * 32 +
-                                        groups(s.max_primitives) * s.primitive_lines * 32};
+    const std::uint64_t attribute_words{
+        s.direct_outputs ? 0
+                         : groups(s.max_vertices) * s.vertex_lines * 32 +
+                               groups(s.max_primitives) * s.primitive_lines * 32};
     const std::uint64_t map_words{4 + std::uint64_t{s.primitive_vertices} * s.max_primitives};
     const std::uint64_t workgroup{s.shared_memory_bytes + (attribute_words + map_words + 1) * 4};
     const std::uint64_t outputs{std::uint64_t{s.max_vertices} * s.vertex_locations * 16 +
