@@ -25,6 +25,7 @@ struct LibraryView: View {
             if app.libraryVisible {
                 VStack(alignment: .leading, spacing: 18) {
                     MemoryEntitlementBanner()
+                    JitLibraryBanner()
                     ThermalBanner()
                     if let progress = library.importProgress {
                         ImportProgressBanner(progress: progress)
