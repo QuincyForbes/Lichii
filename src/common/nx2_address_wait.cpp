@@ -7,6 +7,14 @@
 #include <windows.h>
 #endif
 
+#if defined(__APPLE__) && __has_include(<os/os_sync_wait_on_address.h>)
+#define LICHII_OS_SYNC_WAIT 1
+#include <array>
+#include <cstdint>
+#include <cstdlib>
+#include <os/os_sync_wait_on_address.h>
+#endif
+
 namespace Common::Nx2AddressWait {
 
 namespace {
@@ -45,6 +53,41 @@ const AddressApi& Api() {
 }
 #endif
 
+#ifdef LICHII_OS_SYNC_WAIT
+// Apple's libc++ (LLVM 17-19) std::atomic::wait polls, then calls sched_yield for up to 64 us
+// before it sleeps: every idle guest core and every contended kernel lock burned that much CPU
+// per wait. os_sync_wait_on_address (iOS 17.4, macOS 14.4) sleeps at once. A wake is a syscall
+// even with nobody asleep, so sleepers are counted per address slot and wakes skip empty ones.
+// EDEN_NX2_APPLE_OS_SYNC=0 goes back to std::atomic::wait.
+bool UseOsSync() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_APPLE_OS_SYNC");
+        if (value != nullptr && value[0] == '0') {
+            return false;
+        }
+        if (__builtin_available(iOS 17.4, macOS 14.4, *)) {
+            return true;
+        }
+        return false;
+    }();
+    return enabled;
+}
+
+std::array<std::atomic<u32>, 256> g_sleepers{};
+
+std::atomic<u32>& Sleepers(const void* address) {
+    const auto value = reinterpret_cast<std::uintptr_t>(address);
+    return g_sleepers[(value >> 2 ^ value >> 10) % g_sleepers.size()];
+}
+
+bool HasSleepers(std::atomic<u32>& word) {
+    // Pairs with the sleeper's increment before the kernel compares the word: either it sees
+    // the waker's store, or the waker sees the count.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    return Sleepers(&word).load(std::memory_order_seq_cst) != 0;
+}
+#endif
+
 } // Anonymous namespace
 
 void Wait(std::atomic<u32>& word, u32 expected) {
@@ -52,6 +95,20 @@ void Wait(std::atomic<u32>& word, u32 expected) {
     if (const AddressApi& api = Api(); api.wait != nullptr) {
         api.wait(static_cast<void*>(&word), &expected, sizeof(u32), INFINITE);
         return;
+    }
+#endif
+#ifdef LICHII_OS_SYNC_WAIT
+    if (UseOsSync()) {
+        if (__builtin_available(iOS 17.4, macOS 14.4, *)) {
+            std::atomic<u32>& sleepers = Sleepers(&word);
+            sleepers.fetch_add(1, std::memory_order_seq_cst);
+            if (word.load(std::memory_order_seq_cst) == expected) {
+                os_sync_wait_on_address(static_cast<void*>(&word), expected, sizeof(u32),
+                                        OS_SYNC_WAIT_ON_ADDRESS_NONE);
+            }
+            sleepers.fetch_sub(1, std::memory_order_relaxed);
+            return;
+        }
     }
 #endif
     word.wait(expected, std::memory_order_relaxed);
@@ -64,6 +121,17 @@ void WakeOne(std::atomic<u32>& word) {
         return;
     }
 #endif
+#ifdef LICHII_OS_SYNC_WAIT
+    if (UseOsSync()) {
+        if (__builtin_available(iOS 17.4, macOS 14.4, *)) {
+            if (HasSleepers(word)) {
+                os_sync_wake_by_address_any(static_cast<void*>(&word), sizeof(u32),
+                                            OS_SYNC_WAKE_BY_ADDRESS_NONE);
+            }
+            return;
+        }
+    }
+#endif
     word.notify_one();
 }
 
@@ -72,6 +140,17 @@ void WakeAll(std::atomic<u32>& word) {
     if (const AddressApi& api = Api(); api.wake_all != nullptr) {
         api.wake_all(static_cast<void*>(&word));
         return;
+    }
+#endif
+#ifdef LICHII_OS_SYNC_WAIT
+    if (UseOsSync()) {
+        if (__builtin_available(iOS 17.4, macOS 14.4, *)) {
+            if (HasSleepers(word)) {
+                os_sync_wake_by_address_all(static_cast<void*>(&word), sizeof(u32),
+                                            OS_SYNC_WAKE_BY_ADDRESS_NONE);
+            }
+            return;
+        }
     }
 #endif
     word.notify_all();
