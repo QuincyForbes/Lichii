@@ -51,17 +51,27 @@ std::atomic<u64> g_profile_finish_ns{};
 std::atomic<u64> g_profile_window_start{};
 std::mutex g_profile_end_mutex;
 std::map<std::string, u64> g_profile_ends;
+std::map<std::string, u64> g_profile_flushes;
 
-void CountRenderPassEnd(const char* file, u32 line) {
+void CountSite(std::map<std::string, u64>& sites, const char* file, u32 line) {
     if (!VideoCommon::Nx2Profile::Enabled()) {
         return;
     }
     std::string_view name{file};
-    if (const auto slash = name.find_last_of('/'); slash != std::string_view::npos) {
+    if (const auto slash = name.find_last_of("/\\"); slash != std::string_view::npos) {
         name.remove_prefix(slash + 1);
     }
     std::scoped_lock lock{g_profile_end_mutex};
-    ++g_profile_ends[fmt::format("{}:{}", name, line)];
+    ++sites[fmt::format("{}:{}", name, line)];
+}
+
+void CountRenderPassEnd(const char* file, u32 line) {
+    CountSite(g_profile_ends, file, line);
+}
+
+// The callers of Flush and Finish: who asks for the queue submissions.
+void CountFlush(const char* file, u32 line) {
+    CountSite(g_profile_flushes, file, line);
 }
 
 void ReportSubmitCounts() {
@@ -83,19 +93,23 @@ void ReportSubmitCounts() {
              static_cast<double>(g_profile_renderpasses.exchange(0)) / seconds,
              static_cast<double>(g_profile_finishes.exchange(0)) / seconds,
              static_cast<double>(g_profile_finish_ns.exchange(0)) / 1e6 / seconds);
-    std::vector<std::pair<u64, std::string>> ends;
-    {
-        std::scoped_lock lock{g_profile_end_mutex};
-        for (const auto& [site, count] : g_profile_ends) {
-            ends.emplace_back(count, site);
+    const auto report = [seconds](std::map<std::string, u64>& sites, const char* what) {
+        std::vector<std::pair<u64, std::string>> counts;
+        {
+            std::scoped_lock lock{g_profile_end_mutex};
+            for (const auto& [site, count] : sites) {
+                counts.emplace_back(count, site);
+            }
+            sites.clear();
         }
-        g_profile_ends.clear();
-    }
-    std::sort(ends.rbegin(), ends.rend());
-    for (size_t i = 0; i < ends.size() && i < 16; ++i) {
-        LOG_INFO(Render_Vulkan, "Render pass ends {:.0f}/s at {}",
-                 static_cast<double>(ends[i].first) / seconds, ends[i].second);
-    }
+        std::sort(counts.rbegin(), counts.rend());
+        for (size_t i = 0; i < counts.size() && i < 16; ++i) {
+            LOG_INFO(Render_Vulkan, "{} {:.0f}/s at {}", what,
+                     static_cast<double>(counts[i].first) / seconds, counts[i].second);
+        }
+    };
+    report(g_profile_ends, "Render pass ends");
+    report(g_profile_flushes, "Submits asked");
 }
 }
 
@@ -273,6 +287,7 @@ void Scheduler::CollectGpuTime() {
 
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                      std::source_location location) {
+    CountFlush(location.file_name(), location.line());
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
@@ -357,6 +372,7 @@ bool Scheduler::WaitSubmitted(u64 tick) {
 
 void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                        std::source_location location) {
+    CountFlush(location.file_name(), location.line());
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
