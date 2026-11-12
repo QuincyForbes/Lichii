@@ -394,6 +394,12 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "textures as they load: softer textures up close, much less memory (about 1.2 GB "
               "less in Ocarina of Time). Your game files are not changed.\nTakes effect at the next "
               "game start."));
+    INSERT(Settings, oot_render_scale, tr("Ocarina of Time: render scale:"),
+           tr("Game lets the game choose (Max Resolution or its dynamic resolution). A percentage "
+              "renders the 3D at that fixed fraction of the game's own size (1920x1080 handheld, "
+              "2560x1440 docked) and upscales it: less GPU work and graphics memory, a softer "
+              "picture. Ignored while an NVIDIA DLSS mode sets the scale.\nTakes effect at the "
+              "next game start."));
     INSERT(Settings, mkw_30fps, tr("Mario Kart World: 30 FPS mode"),
            tr("Forces the game to use its native 30 FPS mode at normal game speed. "
               "Takes effect after restarting the game."));
@@ -676,6 +682,13 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(TextureQuality, Full, tr("Full")),
                               PAIR(TextureQuality, Half, tr("Half (less memory)")),
                               PAIR(TextureQuality, Quarter, tr("Quarter (least memory)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::OotRenderScale>::Index(),
+                          {
+                              PAIR(OotRenderScale, Game, tr("Game")),
+                              PAIR(OotRenderScale, Percent75, tr("75%")),
+                              PAIR(OotRenderScale, Percent56, tr("56% (1080x608 handheld)")),
+                              PAIR(OotRenderScale, Percent50, tr("50%")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::OotMovieUpscale>::Index(),
                           {

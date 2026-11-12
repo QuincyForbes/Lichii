@@ -157,6 +157,8 @@ ENUM(OcarinaDlssMode, Quality, Balanced, Performance, UltraPerformance);
 ENUM(OotMovieUpscale, Automatic, Bilinear, Game);
 // Mip levels dropped from the game's textures as they are read (Settings texture_quality).
 ENUM(TextureQuality, Full, Half, Quarter);
+// Ocarina of Time's internal render scale (Settings oot_render_scale, built-in patch).
+ENUM(OotRenderScale, Game, Percent75, Percent56, Percent50);
 ENUM(GamePatchMode, Auto, On, Off);
 ENUM(AspectRatio, R16_9, R4_3, R21_9, R16_10, Stretch);
 ENUM(ConsoleMode, Handheld, Docked);

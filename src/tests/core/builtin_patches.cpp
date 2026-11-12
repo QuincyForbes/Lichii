@@ -286,6 +286,52 @@ TEST_CASE("Built-in DLSS render scale follows the DLSS mode and is not listed",
     mode.SetValue(previous_mode);
 }
 
+TEST_CASE("Ocarina render scale setting applies Max Resolution's path at its scale",
+          "[patch_manager]") {
+    constexpr size_t ScaleOffset = sizeof(Loader::NSOHeader) + 0x806420;
+    constexpr u32 ScaleOne = 0x52A7F009;
+    constexpr u32 Scale75 = 0x52A7E809;
+    constexpr u32 Scale56 = 0x52A7E209;
+    constexpr u32 Scale50 = 0x52A7E009;
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+    auto nso = MakeMain(OcarinaBuildId, TbzInstruction);
+    nso.resize(ScaleOffset + 0x100);
+    std::memcpy(nso.data() + ScaleOffset, &ScaleOne, sizeof(ScaleOne));
+    const auto words = [&] {
+        const auto out = manager.PatchNSO(nso, "main");
+        return std::pair{WordAt(out), WordAt(out, ScaleOffset)};
+    };
+
+    auto& setting = Settings::values.oot_render_scale;
+    auto& dlss = Settings::values.nvidia_dlss;
+    const bool previous_dlss = dlss.GetValue();
+    dlss.SetValue(false);
+
+    setting.SetValue(Settings::OotRenderScale::Game);
+    CHECK(words() == std::pair{BranchInstruction, ScaleOne});
+    setting.SetValue(Settings::OotRenderScale::Percent75);
+    CHECK(words() == std::pair{BranchInstruction, Scale75});
+    setting.SetValue(Settings::OotRenderScale::Percent56);
+    CHECK(words() == std::pair{BranchInstruction, Scale56});
+
+    // An explicit scale applies even with Max Resolution and resolution patches turned off.
+    setting.SetValue(Settings::OotRenderScale::Percent50);
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
+    Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Off);
+    CHECK(words() == std::pair{BranchInstruction, Scale50});
+    setting.SetValue(Settings::OotRenderScale::Game);
+    CHECK(words() == std::pair{TbzInstruction, ScaleOne});
+    Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Auto);
+    Settings::values.disabled_addons.erase(OcarinaTitleId);
+
+    const auto patches = manager.GetPatches();
+    CHECK(std::ranges::none_of(patches, [](const FileSys::Patch& patch) {
+        return patch.name.starts_with("Render scale");
+    }));
+    dlss.SetValue(previous_dlss);
+}
+
 TEST_CASE("Built-in patch kind settings: game choice, then global, then default",
           "[patch_manager]") {
     PatchManagerTestContext context;
