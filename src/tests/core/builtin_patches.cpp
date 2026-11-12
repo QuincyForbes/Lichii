@@ -279,11 +279,12 @@ TEST_CASE("Ocarina resolution setting picks Max Resolution's path and its scale"
     };
     using Settings::OotResolution;
     auto& setting = Settings::values.oot_resolution;
-    const bool previous_dlss = Settings::values.nvidia_dlss.GetValue();
+    const auto previous_upscaler = Settings::values.upscaler.GetValue();
 
     // NVIDIA DLSS changes nothing here: the scale is DLSS's input when it runs.
     for (const bool dlss : {false, true}) {
-        Settings::values.nvidia_dlss.SetValue(dlss);
+        Settings::values.upscaler.SetValue(dlss ? Settings::Upscaler::Dlss
+                                                : Settings::Upscaler::Auto);
         setting.SetValue(OotResolution::Game);
         CHECK(words() == std::pair{TbzInstruction, ScaleOne});
         setting.SetValue(OotResolution::Full);
@@ -296,8 +297,14 @@ TEST_CASE("Ocarina resolution setting picks Max Resolution's path and its scale"
         CHECK(words() == std::pair{BranchInstruction, Scale56});
         setting.SetValue(OotResolution::Percent50);
         CHECK(words() == std::pair{BranchInstruction, Scale50});
+        // Above 100 % the game draws at its full size; the resolution scale does the rest.
+        for (const auto above : {OotResolution::Percent150, OotResolution::Percent200,
+                                 OotResolution::Percent300}) {
+            setting.SetValue(above);
+            CHECK(words() == std::pair{BranchInstruction, ScaleOne});
+        }
     }
-    Settings::values.nvidia_dlss.SetValue(previous_dlss);
+    Settings::values.upscaler.SetValue(previous_upscaler);
 
     // An old per-game Add-Ons entry for Max Resolution no longer decides anything.
     setting.SetValue(OotResolution::Full);
