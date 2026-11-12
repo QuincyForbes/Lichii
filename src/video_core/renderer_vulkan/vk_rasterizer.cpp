@@ -3989,6 +3989,11 @@ void RasterizerVulkan::FlushWork() {
     if (native && !android) {
         pending_native_work = true;
     }
+    if (staging_pool.BoundUploads()) {
+        draw_counter = 0;
+        pending_native_work = false;
+        return;
+    }
     switch (SubmissionPolicy::Advance(draw_counter, native, android, budget, legacy_budget)) {
     case SubmissionPolicy::Action::None:
         break;

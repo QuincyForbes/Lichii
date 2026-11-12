@@ -131,6 +131,31 @@ size_t GetStreamBufferSize(const Device& device) {
     }
     return (std::min)(Common::AlignUp(size, MAX_ALIGNMENT), MAX_STREAM_BUFFER_SIZE);
 }
+
+// A scene load records thousands of uploads into one command buffer: the policy in
+// RasterizerVulkan::FlushWork does not submit inside render passes, so the stream buffer's
+// regions all belong to the command buffer being recorded and every upload past them took a
+// pooled buffer of its own (iPhone, forest load: 8460 buffers, 1418 MiB, then out of memory).
+// Submitting once a command buffer's pooled uploads pass the first mark lets the GPU free them;
+// past the second (all pooled upload buffers, busy or idle), the GPU thread waits.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+constexpr u64 UPLOAD_SUBMIT_MIB = 24;
+constexpr u64 UPLOAD_CAP_MIB = 96;
+#else
+constexpr u64 UPLOAD_SUBMIT_MIB = 256;
+constexpr u64 UPLOAD_CAP_MIB = 1024;
+#endif
+
+u64 UploadBoundBytes(const char* name, u64 default_mib) {
+    // EDEN_NX2_STAGING_SUBMIT_MIB / EDEN_NX2_STAGING_CAP_MIB: other marks; SUBMIT 0 turns it off.
+    if (const char* const env = std::getenv(name)) {
+        const long mib = std::strtol(env, nullptr, 10);
+        if (mib >= 0) {
+            return static_cast<u64>(mib) << 20;
+        }
+    }
+    return default_mib << 20;
+}
 } // Anonymous namespace
 
 StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& memory_allocator_,
@@ -177,6 +202,14 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     current_chunk.offset.store(0, std::memory_order_relaxed);
     current_chunk.limit.store(0, std::memory_order_relaxed);
     current_chunk.blocked_tick.store(0, std::memory_order_relaxed);
+
+    upload_submit_bytes = UploadBoundBytes("EDEN_NX2_STAGING_SUBMIT_MIB", UPLOAD_SUBMIT_MIB);
+    upload_cap_bytes = (std::max)(UploadBoundBytes("EDEN_NX2_STAGING_CAP_MIB", UPLOAD_CAP_MIB),
+                                  upload_submit_bytes * 2);
+    LOG_INFO(Common_Memory,
+             "Staging: stream buffer {} MiB; uploads submit every {} MiB, pooled upload buffers "
+             "capped at {} MiB",
+             stream_buffer_size >> 20, upload_submit_bytes >> 20, upload_cap_bytes >> 20);
 }
 
 StagingBufferPool::~StagingBufferPool() = default;
@@ -226,6 +259,19 @@ void StagingBufferPool::TickFrame() {
                  low_memory_waits);
         low_memory_waits = 0;
     }
+    if (frame_count % 60 == 0 && early_submits != 0) {
+        LOG_INFO(Common_Memory,
+                 "Staging: {} command buffers submitted early for {} MiB of pooled uploads, {} "
+                 "waits for the GPU at the {} MiB cap ({} of the submits with under twice the "
+                 "low-water mark left); pooled upload buffers {} MiB now, peak {} MiB",
+                 early_submits, early_submit_bytes >> 20, cap_waits, upload_cap_bytes >> 20,
+                 low_memory_cap_waits, UploadPoolBytes() >> 20, upload_pool_peak >> 20);
+        early_submits = 0;
+        early_submit_bytes = 0;
+        cap_waits = 0;
+        low_memory_cap_waits = 0;
+        upload_pool_peak = 0;
+    }
 
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
@@ -247,16 +293,113 @@ void StagingBufferPool::ReleaseIdleBuffers() {
 u64 StagingBufferPool::CachedBytes() const {
     u64 bytes = 0;
     for (const StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
-        for (const StagingBuffers& staging : *cache) {
-            for (const StagingBuffer& entry : staging.entries) {
-                bytes += u64{1} << entry.log2_level;
-            }
+        for (size_t log2 = 0; log2 < NUM_LEVELS; ++log2) {
+            bytes += u64{(*cache)[log2].entries.size()} << log2;
         }
     }
     return bytes;
 }
 
+u64 StagingBufferPool::AllocationBytes(MemoryUsage usage, size_t log2) const noexcept {
+    const u64 logical_size = u64{1} << log2;
+    return device.IsMoltenVK() && usage == MemoryUsage::Upload
+               ? (std::max)(logical_size, u64{STREAM_BUFFER_TAIL})
+               : logical_size;
+}
+
+u64 StagingBufferPool::OldestBusyUploadTick() const {
+    u64 oldest = 0;
+    for (const StagingBuffersCache* const cache : {&upload_cache, &device_local_cache}) {
+        for (const StagingBuffers& staging : *cache) {
+            for (const StagingBuffer& entry : staging.entries) {
+                if (!entry.deferred && !scheduler.IsFree(entry.tick) &&
+                    (oldest == 0 || entry.tick < oldest)) {
+                    oldest = entry.tick;
+                }
+            }
+        }
+    }
+    return oldest;
+}
+
+u64 StagingBufferPool::UploadPoolBytes() const {
+    u64 bytes = 0;
+    for (size_t log2 = 0; log2 < NUM_LEVELS; ++log2) {
+        bytes += upload_cache[log2].entries.size() * AllocationBytes(MemoryUsage::Upload, log2);
+        bytes += device_local_cache[log2].entries.size() << log2;
+    }
+    return bytes;
+}
+
+void StagingBufferPool::ReleaseIdleUploadsDownTo(u64 bytes) {
+    u64 held = UploadPoolBytes();
+    for (size_t level = NUM_LEVELS; level-- > 0 && held > bytes;) {
+        for (StagingBuffersCache* const cache : {&upload_cache, &device_local_cache}) {
+            StagingBuffers& staging = (*cache)[level];
+            const u64 each = AllocationBytes(cache == &upload_cache ? MemoryUsage::Upload
+                                                                    : MemoryUsage::DeviceLocal,
+                                             level);
+            std::erase_if(staging.entries, [&](const StagingBuffer& entry) {
+                if (held <= bytes || entry.deferred || !scheduler.IsFree(entry.tick)) {
+                    return false;
+                }
+                held -= each;
+                return true;
+            });
+            staging.delete_index = 0;
+            staging.iterate_index = 0;
+        }
+    }
+}
+
+bool StagingBufferPool::BoundUploads() {
+    if (upload_submit_bytes == 0 || tick_upload_bytes < upload_submit_bytes ||
+        upload_tick != scheduler.CurrentTick() || !VideoCommon::GpuSplit::OwnsScheduler()) {
+        return false;
+    }
+    ++early_submits;
+    early_submit_bytes += tick_upload_bytes;
+    tick_upload_bytes = 0;
+    const u64 submitted = scheduler.Flush();
+    u64 pooled = UploadPoolBytes();
+    upload_pool_peak = (std::max)(upload_pool_peak, pooled);
+    // iOS, with less than twice the low-water mark left to the process: only the command buffer
+    // just submitted may hold upload buffers.
+    u64 cap = upload_cap_bytes;
+    if (const u64 low_water = Common::PlatformEvents::MemoryLowWater(); low_water != 0) {
+        const u64 available = Common::PlatformEvents::AvailableProcessMemory();
+        if (available != 0 && available < low_water * 2) {
+            cap = upload_submit_bytes * 2;
+            ++low_memory_cap_waits;
+        }
+    }
+    if (pooled <= cap) {
+        return true;
+    }
+    // Wait for the oldest submissions first, the one just made last, and free what they used
+    // beyond the room the next command buffer's uploads need.
+    ++cap_waits;
+    const u64 keep = cap - upload_submit_bytes;
+    for (const u64 tick : {OldestBusyUploadTick(), submitted - 1, submitted}) {
+        if (tick == 0 || tick > submitted) {
+            continue;
+        }
+        scheduler.Wait(tick);
+        ReleaseIdleUploadsDownTo(keep);
+        pooled = UploadPoolBytes();
+        if (pooled <= cap) {
+            break;
+        }
+    }
+    return true;
+}
+
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
+    // Checked before wrapping: wrapping first marked the start free (free_iterator = size), so the
+    // next request was handed the start of the ring while the GPU could still read it.
+    if (iterator + size >= stream_buffer_size && AreRegionsActive(0, Region(size) + 1)) {
+        return GetStagingBuffer(size, MemoryUsage::Upload);
+    }
     if (AreRegionsActive(Region(free_iterator) + 1,
                          (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
         // Avoid waiting for the previous usages to be free
@@ -274,11 +417,6 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
         used_iterator = 0;
         iterator = 0;
         free_iterator = size;
-
-        if (AreRegionsActive(0, Region(size) + 1)) {
-            // Avoid waiting for the previous usages to be free
-            return GetStagingBuffer(size, MemoryUsage::Upload);
-        }
     }
     const size_t offset = iterator;
     iterator = Common::AlignUp(iterator + size, MAX_ALIGNMENT);
@@ -309,6 +447,14 @@ bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end)
 
 StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage usage,
                                                      bool deferred) {
+    if (usage != MemoryUsage::Download && !deferred) {
+        const u64 tick = scheduler.CurrentTick();
+        if (tick != upload_tick) {
+            upload_tick = tick;
+            tick_upload_bytes = 0;
+        }
+        tick_upload_bytes += AllocationBytes(usage, Common::Log2Ceil(size));
+    }
     if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
         return *ref;
     }
@@ -376,17 +522,45 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
     // 325 -> 549 MiB in the second before iOS closed the app. Past 32 MiB of them, wait for the
     // command buffers already submitted and reuse or free what they used. Only those: buffers
     // handed out for the current one may not have had their copies recorded yet.
+    // The same past the cap of pooled upload buffers, on any device: BoundUploads holds it between
+    // draws, this within one (a scene's first draws upload hundreds of MiB each on desktop).
     constexpr u64 LowMemoryStagingBytes = 32_MiB;
-    if (low_memory && !deferred && usage != MemoryUsage::Download &&
-        VideoCommon::GpuSplit::OwnsScheduler() && scheduler.CurrentTick() > 1 &&
-        CachedBytes() + size > LowMemoryStagingBytes) {
-        ++low_memory_waits;
-        scheduler.Wait(scheduler.CurrentTick() - 1);
-        if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
+    // iOS: also with under 768 MiB left to the process after this buffer, read now rather than at
+    // the last frame (the forest load went from 1743 to 936 MiB left within a frame).
+    constexpr u64 MinRoomBytes = 768_MiB;
+    if (!deferred && usage != MemoryUsage::Download && VideoCommon::GpuSplit::OwnsScheduler() &&
+        scheduler.CurrentTick() > 1) {
+        const u64 available = Common::PlatformEvents::AvailableProcessMemory();
+        const bool room_low = available != 0 && available < size + MinRoomBytes;
+        if ((low_memory || room_low) && CachedBytes() + size > LowMemoryStagingBytes) {
+            ++low_memory_waits;
+            scheduler.Wait(scheduler.CurrentTick() - 1);
+            if (const std::optional<StagingBufferRef> ref =
+                    TryGetReservedBuffer(size, usage, deferred)) {
+                ReleaseIdleBuffers();
+                return *ref;
+            }
             ReleaseIdleBuffers();
-            return *ref;
+        } else if (upload_submit_bytes != 0 && UploadPoolBytes() + size > upload_cap_bytes) {
+            // The oldest submission first: waiting for all of them stalled area loads on desktop.
+            ++cap_waits;
+            const u64 room = upload_cap_bytes - (std::min)(upload_cap_bytes, u64{size});
+            const u64 oldest = OldestBusyUploadTick();
+            for (const u64 tick : {oldest, scheduler.CurrentTick() - 1}) {
+                if (tick == 0 || tick >= scheduler.CurrentTick()) {
+                    continue;
+                }
+                scheduler.Wait(tick);
+                if (const std::optional<StagingBufferRef> ref =
+                        TryGetReservedBuffer(size, usage, deferred)) {
+                    return *ref;
+                }
+                ReleaseIdleUploadsDownTo(room);
+                if (UploadPoolBytes() + size <= upload_cap_bytes) {
+                    break;
+                }
+            }
         }
-        ReleaseIdleBuffers();
     }
     auto const log2_size = Common::Log2Ceil<u32>(u32(size));
     const VkDeviceSize logical_size = 1ULL << log2_size;

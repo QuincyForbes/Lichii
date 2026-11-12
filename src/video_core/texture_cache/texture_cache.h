@@ -3195,6 +3195,11 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    // The uploads before this one are recorded: one draw's new textures (a scene's first frame)
+    // may submit on the way instead of all waiting for the draw.
+    if constexpr (requires { runtime.BoundUploads(); }) {
+        runtime.BoundUploads();
+    }
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
