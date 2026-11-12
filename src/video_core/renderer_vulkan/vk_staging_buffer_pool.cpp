@@ -22,6 +22,7 @@
 #include "common/common_types.h"
 #include "common/literals.h"
 #include "common/logging.h"
+#include "common/perf_report.h"
 #include "common/platform_events.h"
 #include "video_core/churn_counters.h"
 #include "video_core/gpu_split.h"
@@ -227,6 +228,9 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
 StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
+    if (usage != MemoryUsage::Download) {
+        Common::PerfReport::Add(Common::PerfReport::StagingUploadBytes, size);
+    }
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
         return GetStreamBuffer(size);
     }
@@ -399,6 +403,7 @@ bool StagingBufferPool::BoundUploads() {
         return false;
     }
     ++early_submits;
+    Common::PerfReport::Add(Common::PerfReport::EarlySubmits);
     early_submit_bytes += tick_upload_bytes;
     tick_upload_bytes = 0;
     const u64 submitted = scheduler.Flush();
@@ -420,6 +425,7 @@ bool StagingBufferPool::BoundUploads() {
     // Wait for the oldest submissions first, the one just made last, and free what they used
     // beyond the room the next command buffer's uploads need.
     ++cap_waits;
+    Common::PerfReport::Add(Common::PerfReport::CapWaits);
     const u64 keep = cap - upload_submit_bytes;
     for (const u64 tick : {OldestBusyUploadTick(), submitted - 1, submitted}) {
         if (tick == 0 || tick > submitted) {
@@ -495,6 +501,8 @@ StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage us
             tick_upload_bytes = 0;
         }
         tick_upload_bytes += AllocationBytes(usage, Common::Log2Ceil(size));
+        Common::PerfReport::Add(Common::PerfReport::StagingPooledBytes,
+                                AllocationBytes(usage, Common::Log2Ceil(size)));
     }
     if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
         return *ref;
@@ -585,6 +593,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         } else if (upload_submit_bytes != 0 && UploadPoolBytes() + size > upload_cap_bytes) {
             // The oldest submission first: waiting for all of them stalled area loads on desktop.
             ++cap_waits;
+        Common::PerfReport::Add(Common::PerfReport::CapWaits);
             const u64 room = upload_cap_bytes - (std::min)(upload_cap_bytes, u64{size});
             const u64 oldest = OldestBusyUploadTick();
             for (const u64 tick : {oldest, scheduler.CurrentTick() - 1}) {

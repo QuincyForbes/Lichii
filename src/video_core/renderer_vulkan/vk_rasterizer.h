@@ -18,7 +18,9 @@
 #include "common/common_types.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/dkb_frame_trace.h"
+#include "common/perf_report.h"
 #include "video_core/buffer_cache/nx2_write_handoff.h"
+#include "video_core/churn_counters.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -533,6 +535,15 @@ private:
     u32 memory_report_pressure{};
     u32 memory_report_requests{};
     u32 malloc_relief_frames{};
+    /// "Perf:" line every 10 s (Common::PerfReport): frame rate, thread load, cache churn.
+    void TickPerfReport();
+    std::chrono::steady_clock::time_point perf_report_start{};
+    std::chrono::steady_clock::time_point perf_frame_last{};
+    std::array<u64, Common::PerfReport::Count> perf_report_counters{};
+    std::optional<Common::DkbCpuTrace::Snapshot> perf_report_cpu;
+    std::array<u64, VideoCommon::Churn::Count> perf_report_churn{};
+    u64 perf_report_frames{};
+    double perf_frame_max_ms{};
     bool trace_sample_frame{true};
     u64 trace_frame{};
     u64 trace_window_frames{};

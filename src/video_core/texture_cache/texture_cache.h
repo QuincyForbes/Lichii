@@ -22,6 +22,7 @@
 
 #include "common/alignment.h"
 #include "common/memory_detect.h"
+#include "common/perf_report.h"
 #include "common/platform_events.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -196,6 +197,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
             runtime.Finish();
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
             ++gc_download_deletes;
+            Common::PerfReport::Add(Common::PerfReport::TextureCollectorDownloads);
             // Guest memory holds the GPU's data now (DeleteImage must not mark it stale).
             image.flags &= ~ImageFlagBits::GpuModified;
             ClearStaleImage(image);
@@ -206,6 +208,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
             UntrackImage(image, image_id);
         }
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+        Common::PerfReport::Add(Common::PerfReport::TextureCollected);
         UnregisterImage(image_id);
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         if (out_of_memory) {
@@ -320,6 +323,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
                 UntrackImage(image, image_id);
             }
             ++gc_deletes;
+            Common::PerfReport::Add(Common::PerfReport::TextureCollected);
             UnregisterImage(image_id);
             DeleteImage(image_id, image.scale_tick > frame_tick + 5);
             return false;
@@ -3323,6 +3327,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     }
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
+    Common::PerfReport::Add(Common::PerfReport::TextureUploadBytes, image.guest_size_bytes);
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
     // EDEN_NX2_EXP7: log the uploads that hold a draw back (over 2 ms).
     const bool upload_trace = VideoCore::Nx2Debug::Experiment(7) != 0;
@@ -3489,6 +3494,7 @@ void TextureCache<P>::RefreshSparseTiles(Image& image) {
         runtime.InsertUploadMemoryBarrier();
         ++images_uploaded;
         uploaded_bytes += bytes;
+        Common::PerfReport::Add(Common::PerfReport::TextureUploadBytes, bytes);
     }
 }
 
@@ -3613,6 +3619,8 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
             image.UploadMemory(staging, copies);
             ++images_uploaded;
             uploaded_bytes += u64{image.info.layer_stride} * layers.size();
+            Common::PerfReport::Add(Common::PerfReport::TextureUploadBytes,
+                                    u64{image.info.layer_stride} * layers.size());
             ++layer_uploads;
             return;
         }
@@ -3634,6 +3642,7 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
         runtime.AccelerateImageUploadLayers(image, staging, uploads, layers);
         ++images_uploaded;
         uploaded_bytes += tail * layers.size();
+        Common::PerfReport::Add(Common::PerfReport::TextureUploadBytes, tail * layers.size());
         ++layer_uploads;
     }
 }

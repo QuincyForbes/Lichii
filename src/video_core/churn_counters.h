@@ -37,16 +37,29 @@ enum Counter : size_t {
 };
 
 inline std::array<std::atomic<u64>, Count> g_counters{};
+/// The counts at the last Take (the counters themselves only grow, see Read).
+inline std::array<u64, Count> g_taken{};
 
 inline void Add(Counter counter, u64 amount = 1) {
     g_counters[counter].fetch_add(amount, std::memory_order_relaxed);
 }
 
-/// The counts since the last call, and resets them.
-inline std::array<u64, Count> Take() {
+/// The counts since boot.
+inline std::array<u64, Count> Read() {
     std::array<u64, Count> values{};
     for (size_t i = 0; i < Count; ++i) {
-        values[i] = g_counters[i].exchange(0, std::memory_order_relaxed);
+        values[i] = g_counters[i].load(std::memory_order_relaxed);
+    }
+    return values;
+}
+
+/// The counts since the last call (one caller: TextureCache::TickFrame).
+inline std::array<u64, Count> Take() {
+    std::array<u64, Count> values = Read();
+    for (size_t i = 0; i < Count; ++i) {
+        const u64 total = values[i];
+        values[i] -= g_taken[i];
+        g_taken[i] = total;
     }
     return values;
 }

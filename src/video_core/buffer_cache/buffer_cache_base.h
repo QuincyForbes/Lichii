@@ -249,6 +249,11 @@ public:
         return buffer_bytes;
     }
 
+    /// Where the collector starts (Switch 2 titles; 0 before the first frame).
+    [[nodiscard]] u64 CollectBytes() const noexcept {
+        return collect_bytes;
+    }
+
     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
                                std::span<const MultiRangeSegment> pool,
                                u64 write_mark_limit = ~u64{0});
@@ -1142,12 +1147,12 @@ private:
     std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;
     u64 total_used_memory = 0;
     u64 buffer_bytes = 0; ///< The buffers' own size (total_used_memory may be the device's)
+    u64 collect_bytes = 0; ///< Switch 2 titles: buffer_bytes from which the collector runs
     u64 minimum_memory = 0;
     u64 critical_memory = 0;
     u32 seen_host_pressure = 0;   ///< Common::PlatformEvents memory pressure already answered
     u32 host_pressure_frames = 0; ///< Frames left collecting after it
     BufferId inline_buffer_id;
-    u64 collect_bytes = 0; ///< Switch 2 titles: buffer_bytes from which the collector runs
 #ifdef YUZU_LEGACY
     bool immediately_free = false;
 #endif

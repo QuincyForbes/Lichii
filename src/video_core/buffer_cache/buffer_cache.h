@@ -17,6 +17,7 @@
 #include <vector>
 #include <fmt/ranges.h>
 
+#include "common/perf_report.h"
 #include "common/platform_events.h"
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
@@ -26,8 +27,8 @@
 #include "video_core/churn_counters.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
-#include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host_budget.h"
+#include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_perf.h"
@@ -109,6 +110,7 @@ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
     for (const BufferId buffer_id : evicted) {
         DeleteBuffer(buffer_id);
     }
+    Common::PerfReport::Add(Common::PerfReport::BufferCollected, evicted.size());
 }
 
 template <class P>
@@ -180,8 +182,6 @@ void BufferCache<P>::TickFrame() {
                             : (HostBudget::Simulated() ? HostBudget::SimulatedBufferCollect()
                                                        : u64{512_MiB});
         }();
-        if (buffer_bytes >= collect_bytes || host_pressure) {
-            RunGarbageCollector(buffer_bytes >= collect_bytes * 2);
         if (collect_bytes == 0) {
             collect_bytes = configured_bytes;
         }
@@ -209,6 +209,8 @@ void BufferCache<P>::TickFrame() {
                 }
             }
         }
+        if (buffer_bytes >= collect_bytes || host_pressure) {
+            RunGarbageCollector(buffer_bytes >= collect_bytes * 2);
         }
     } else {
         if (runtime.CanReportMemoryUsage()) {
@@ -3691,6 +3693,7 @@ void BufferCache<P>::NoteCpuDirty(DAddr device_addr, u64 size) {
 template <class P>
 void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                                   std::span<BufferCopy> copies) {
+    Common::PerfReport::Add(Common::PerfReport::BufferUploadBytes, total_size_bytes);
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
         MappedUploadMemory(buffer, total_size_bytes, copies);
     } else {
