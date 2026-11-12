@@ -50,6 +50,9 @@ final class PlatformCenter: ObservableObject {
     /// paused with the menu open, and runs again when the user closes it.
     private var pausedForLifecycle = false
     private var badgeTask: Task<Void, Never>?
+    /// When the memory warning toast named Keep Guest Memory in a File in this game; the short
+    /// toast of the warnings after it waits until it has been read.
+    private var memoryHintShown: Date?
 
     func start() {
         uncleanExit = GameSession.takeUncleanExit()
@@ -70,6 +73,7 @@ final class PlatformCenter: ObservableObject {
     func handle(appEvent event: Int32) {
         if event == Int32(LICHII_EVENT_GAME_WINDOW_READY.rawValue) {
             GameSession.begin(AppController.shared.currentGame)
+            memoryHintShown = nil
             flashThermalBadge()
             return
         }
@@ -125,7 +129,13 @@ final class PlatformCenter: ObservableObject {
         case Int32(LICHII_PLATFORM_EVENT_MEMORY_WARNING.rawValue):
             GameSession.update { $0.memoryWarning = true }
             if ControlsCenter.shared.gameRunning {
-                ControlsCenter.shared.show(toast: "Memory is low: caches trimmed")
+                // The way out once per game; iOS sends several warnings in a row.
+                if memoryHintShown == nil, !GuestMemoryFile.enabled {
+                    memoryHintShown = Date()
+                    ControlsCenter.shared.show(toast: "Memory is low: caches trimmed. If iOS closes the game, turn on Keep Guest Memory in a File in Settings > Memory & Experiments.")
+                } else if memoryHintShown.map({ -$0.timeIntervalSinceNow > 6 }) ?? true {
+                    ControlsCenter.shared.show(toast: "Memory is low: caches trimmed")
+                }
             }
         case Int32(LICHII_PLATFORM_EVENT_WILL_TERMINATE.rawValue):
             GameSession.end()
