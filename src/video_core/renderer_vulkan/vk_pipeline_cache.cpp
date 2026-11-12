@@ -1201,6 +1201,17 @@ bool PreloadAllPipelines(const Device& device) {
     return all < 0 ? !device.IsMoltenVK() : all != 0;
 }
 
+/// Native mesh programs write their outputs directly (RuntimeInfo::mesh_direct_outputs): on
+/// MoltenVK by default, EDEN_NX2_MESH_DIRECT_OUTPUTS=0 keeps the workgroup attribute region, =1
+/// uses direct outputs on every driver.
+bool MeshDirectOutputs(const Device& device) {
+    static const int direct = [] {
+        const char* value = std::getenv("EDEN_NX2_MESH_DIRECT_OUTPUTS");
+        return value == nullptr ? -1 : (value[0] != '0' ? 1 : 0);
+    }();
+    return direct < 0 ? device.IsMoltenVK() : direct != 0;
+}
+
 /// Destroys the pipelines of `pipelines` (a map or a deque of pairs holding unique_ptrs), telling
 /// the frontend every few hundred that the teardown still moves: tens of thousands of them took
 /// longer than the frontend waited for the emulation thread.
@@ -3116,6 +3127,7 @@ std::optional<std::string> NativeMeshLimitExceeded(const Device& device,
         .vertex_locations = vertex_locations,
         .primitive_locations = primitive_locations,
         .shared_memory_bytes = mesh->shared_memory_size,
+        .direct_outputs = MeshDirectOutputs(device),
     })};
     const u64 available{device.GetMaxComputeSharedMemorySize()};
     if (bytes > available) {
@@ -3533,6 +3545,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     runtime_info.convert_depth_mode && !profile.support_native_ndc,
                     runtime_info.fixed_state_point_size.value_or(1.0f));
             }
+        } else if (program.stage == Shader::Stage::Mesh && MeshDirectOutputs(device)) {
+            runtime_info.mesh_direct_outputs = true;
         }
         ConvertLegacyToGeneric(program, runtime_info);
         // EDEN_NX2_MESH_EMULATION_DUMP=<dir>: write the emulation's vertex shader for spirv-val.
