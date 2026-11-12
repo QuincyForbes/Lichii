@@ -273,8 +273,6 @@ enum SettingsCatalog {
             return nil
         case "game_dlss_network":
             return "Used only at 1x resolution."
-        case "texture_quality":
-            return "Half or Quarter loads the game's large textures with less detail: softer up close, much less memory (about 1.2 GB less in Ocarina of Time). Applies the next time the game starts."
         default:
             return descriptions[item.key]
         }
@@ -292,6 +290,7 @@ enum SettingsCatalog {
         "use_asynchronous_shaders": "Builds new shaders in the background: less stutter, but an object can be missing for a moment.",
         "use_disk_shader_cache": "Keeps built shaders in storage, so the next start of a game stutters less.",
         "memory_layout_mode": "Switch 1 games only: Switch 2 games always get 12 GB.",
+        "texture_quality": "Half or Quarter loads the game's large textures with less detail: softer up close, much less memory (about 1.2 GB less in Ocarina of Time). Applies the next time the game starts.",
     ]
 
     /// The settings a search finds that do nothing here, as one footer naming each and why.
