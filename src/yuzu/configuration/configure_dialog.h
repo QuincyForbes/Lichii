@@ -72,6 +72,8 @@ private:
     void RetranslateUI();
     void FitToAvailableScreen();
     QWidget* WrapTab(QWidget* tab);
+    /// The Controls page's tabs, built the first time the page is shown (eight player pages).
+    QList<QWidget*> ControlsTabs();
 
     void HandleApplyButtonClicked();
 
@@ -104,4 +106,5 @@ private:
     std::unique_ptr<ConfigureProfileManager> profile_tab;
     std::unique_ptr<ConfigureSystem> system_tab;
     std::unique_ptr<ConfigureWeb> web_tab;
+    InputCommon::InputSubsystem* input_subsystem;
 };
