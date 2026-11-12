@@ -911,11 +911,13 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
                upscaler_combobox->currentData().toUInt() == static_cast<u32>(value);
     };
     [[maybe_unused]] const bool dlss_on = dlss_offered && upscaler_is(Settings::Upscaler::Dlss);
-    for (QWidget* const widget :
-         std::initializer_list<QWidget*>{nvidia_dlss_panel, nvidia_dlss_preset_widget}) {
-        if (widget != nullptr) {
-            widget->setVisible(dlss_on);
-        }
+#ifdef EGLANTINE_STREAMLINE
+    if (nvidia_dlss_panel != nullptr) {
+        nvidia_dlss_panel->setVisible(dlss_on);
+    }
+#endif
+    if (nvidia_dlss_preset_widget != nullptr) {
+        nvidia_dlss_preset_widget->setVisible(dlss_on);
     }
 #ifdef EGLANTINE_STREAMLINE
     // Ocarina of Time's fixed sizes are DLSS's input then: name the mode each one is.
