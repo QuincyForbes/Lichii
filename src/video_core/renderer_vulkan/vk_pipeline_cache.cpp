@@ -3110,18 +3110,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         Shader::Environment& env{*envs[env_index]};
         ++env_index;
 
-        // Without VK_EXT_mesh_shader the driver cannot build a task/mesh pipeline; the draw is
-        // skipped (see the pipeline check in the rasterizer). The stages are still translated
-        // so the skipped pipeline's needs can be reported below.
+        // Without VK_EXT_mesh_shader the driver cannot build a task/mesh pipeline: eligible ones
+        // are emulated below (compute plus a vertex pipeline), the others skipped.
         if ((env.ShaderStage() == Shader::Stage::Task ||
              env.ShaderStage() == Shader::Stage::Mesh) &&
             !device.IsExtMeshShaderSupported()) {
             static std::atomic<bool> logged{};
             if (!logged.exchange(true, std::memory_order_relaxed)) {
                 LOG_WARNING(Render_Vulkan,
-                            "{} has no VK_EXT_mesh_shader: pipelines with task/mesh shaders are "
-                            "skipped, so the geometry they draw (such as foliage and props) will "
-                            "be missing",
+                            "{} has no VK_EXT_mesh_shader: task/mesh pipelines are emulated with "
+                            "compute where they can be (triangles, points or lines without "
+                            "per-primitive outputs) and skipped otherwise; indirect mesh draws "
+                            "are skipped",
                             device.GetModelName());
             }
             mesh_unsupported = true;
