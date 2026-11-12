@@ -165,6 +165,9 @@ ENUM(OotFrameRate, Fps30, Fps60, Unlocked);
 // Mario Kart World's frame rate mode (Settings mkw_frame_rate, loader/nso.cpp).
 ENUM(MkwFrameRate, Game, Fps30, Dynamic);
 ENUM(GamePatchMode, Auto, On, Off);
+// The MoltenVK an Apple build loads (Settings moltenvk_driver, vulkan_library.cpp): the release it
+// always shipped, or the one with native mesh shaders (KhronosGroup/MoltenVK#2842).
+ENUM(MoltenVkDriver, Legacy, Mesh);
 ENUM(AspectRatio, R16_9, R4_3, R21_9, R16_10, Stretch);
 ENUM(ConsoleMode, Handheld, Docked);
 ENUM(AppletMode, HLE, LLE, Disabled);

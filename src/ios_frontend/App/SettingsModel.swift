@@ -109,6 +109,12 @@ struct SettingsPlatform {
         frameGenCapable = PlatformCenter.deviceDefaults.map { $0.frame_gen_capable != 0 } ?? true
     }
 
+    /// MoltenVKMesh.framework, the MoltenVK with native mesh shaders (Settings moltenvk_driver).
+    var meshMoltenVkBundled: Bool {
+        FileManager.default.fileExists(atPath: Bundle.main.bundleURL
+            .appendingPathComponent("Frameworks/MoltenVKMesh.framework/MoltenVKMesh").path)
+    }
+
     /// Lossless Scaling's library, which LSFG frame generation loads; the user copies it in.
     var losslessInstalled: Bool {
         FileManager.default.fileExists(atPath: Bridge.userDir
@@ -255,6 +261,9 @@ enum SettingsCatalog {
         if item.key.hasPrefix("post_shader"), !platform.postShadersBuilt {
             return .unavailable("ReShade post-processing isn't part of the iOS app.")
         }
+        if item.key == "moltenvk_driver", !platform.meshMoltenVkBundled {
+            return .unavailable("This build has only the legacy MoltenVK.")
+        }
         return .available
     }
 
@@ -294,6 +303,7 @@ enum SettingsCatalog {
         "oot_resolution": "The size the game draws its 3D at, before the resolution scale. Dynamic: the game's own, lower when the GPU is busy. A percentage: a fixed share of full size (handheld 100% 1920x1080, 75% 1440x810, 56% 1080x608, 50% 960x540): less GPU work and memory, softer picture. Applies the next time the game starts.",
         "oot_frame_rate": "30 FPS saves power and heat; Unlocked follows the frame rate limit. The game keeps its normal speed at each.",
         "mkw_frame_rate": "The game's native 30 FPS mode, or dynamic 30-60 FPS (experimental). Applies the next time the game starts.",
+        "moltenvk_driver": "Which MoltenVK runs Vulkan on Metal. The new one draws mesh shaders (Ocarina of Time's foliage) with the GPU's own mesh shaders; the legacy one emulates them with compute. Lichii uses the legacy one when the new one doesn't load. Applies the next time Lichii starts.",
     ]
 
     /// The settings a search finds that do nothing here, as one footer naming each and why.
@@ -459,6 +469,7 @@ enum SettingLabels {
         "oot_resolution": "Ocarina of Time Resolution",
         "oot_frame_rate": "Ocarina of Time Frame Rate",
         "mkw_frame_rate": "Mario Kart World Frame Rate",
+        "moltenvk_driver": "Graphics Driver",
         "nx2_frame_rate_limit": "Frame Rate Limit (Switch 2)",
         "accelerate_astc": "ASTC Decoding",
         "astc_recompression": "ASTC Recompression",
@@ -499,6 +510,7 @@ enum SettingLabels {
         ],
         "oot_frame_rate": ["Fps30": "30 FPS", "Fps60": "60 FPS", "Unlocked": "Unlocked (frame rate limit)"],
         "mkw_frame_rate": ["Game": "Game's own", "Fps30": "30 FPS", "Dynamic": "Dynamic 30-60 FPS"],
+        "moltenvk_driver": ["Legacy": "Legacy MoltenVK", "Mesh": "New MoltenVK (native mesh shaders)"],
         "use_vsync": [
             "Immediate": "Off (Immediate)", "Mailbox": "Mailbox", "Fifo": "On (FIFO)",
             "FifoRelaxed": "Relaxed FIFO",

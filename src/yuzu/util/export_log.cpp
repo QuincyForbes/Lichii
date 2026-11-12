@@ -240,6 +240,9 @@ QString SystemSummary(const std::vector<VkDeviceInfo::Record>& vk_device_records
         &values.precache_shaders,  &values.accelerate_astc,   &values.astc_recompression,
         &values.texture_quality,   &values.mkw_frame_rate,
     };
+#ifdef __APPLE__
+    settings.push_back(&values.moltenvk_driver);
+#endif
     for (auto* setting : Settings::Frizti::TunedSettings(values)) {
         settings.push_back(setting);
     }
