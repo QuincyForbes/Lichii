@@ -322,3 +322,24 @@ TEST_CASE("Mesh fallback reserves auxiliary storage buffers in the descriptor se
     REQUIRE(FitsStorageBufferSetLimit(200, 4, 0));
     REQUIRE_FALSE(FitsStorageBufferSetLimit((std::numeric_limits<size_t>::max)(), 4, 8));
 }
+
+TEST_CASE("Native mesh programs on MoltenVK count their threadgroup memory",
+          "[video_core][mesh_fallback]") {
+    using Vulkan::MetalMeshThreadgroupBytes;
+
+    Vulkan::NativeMeshShape shape{
+        .max_vertices = 64,
+        .max_primitives = 126,
+        .primitive_vertices = 3,
+        .vertex_lines = 8,
+        .primitive_lines = 0,
+        .vertex_locations = 2,
+        .primitive_locations = 0,
+        .shared_memory_bytes = 0,
+    };
+    // Workgroup: (2 * 8 * 32 attribute words + 4 + 3 * 126 map words + 1) * 4 = 3580 B.
+    // Metal mesh object: 64 * 2 * 16 + 126 * 16 + 8 = 4072 B.
+    REQUIRE(MetalMeshThreadgroupBytes(shape) == 3580 + 4072);
+    shape.shared_memory_bytes = 1024;
+    REQUIRE(MetalMeshThreadgroupBytes(shape) == 3580 + 4072 + 1024);
+}

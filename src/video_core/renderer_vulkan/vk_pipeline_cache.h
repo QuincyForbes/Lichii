@@ -144,6 +144,12 @@ public:
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
 
+    /// Whether a task/mesh pipeline was emulated although the device has VK_EXT_mesh_shader (it
+    /// was over the native limits).
+    [[nodiscard]] bool HasEmulatedNativeMeshPipelines() const noexcept {
+        return emulated_native_mesh.load(std::memory_order_relaxed);
+    }
+
     void TickFrame();
 
     /// Graphics and compute pipelines in the cache.
@@ -383,6 +389,7 @@ private:
     /// GPU thread builds them.
     std::unordered_set<u64> failed_disk_pipelines;
     std::mutex failed_disk_pipelines_mutex;
+    std::atomic<bool> emulated_native_mesh{};
     std::unordered_map<u64, u8> used_pipelines; ///< Key hash -> sessions since it was last used
     std::unordered_set<const GraphicsPipeline*> used_this_session;
     std::filesystem::path used_pipelines_filename;
