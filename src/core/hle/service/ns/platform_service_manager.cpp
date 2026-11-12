@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -122,10 +124,8 @@ private:
     std::vector<FontRegion> regions;
 };
 
-struct IPlatformServiceManager::Impl {
-    const FontRegion& GetSharedFontRegion(std::size_t index) const {
-        return index < shared_font_regions.size() ? shared_font_regions[index] : EMPTY_REGION;
-    }
+/// The decrypted system fonts. pl:u and pl:s share one copy.
+struct SharedFonts {
     // Automatically populated based on shared_fonts dump or system archives.
     // 6 builtin fonts + extra 2 for whatever may come after
     boost::container::static_vector<FontRegion, 8> shared_font_regions;
@@ -137,39 +137,29 @@ struct IPlatformServiceManager::Impl {
     /// The standard font with the controller button icons added, when the firmware's lacks them.
     std::vector<u8> builtin_standard_font;
     u32 builtin_font_memory_size{};
-    /// Made by the first GetBuiltInFontSharedMemory (Switch 2 titles only).
-    Kernel::KSharedMemory* builtin_font_memory{};
-    /// Backing memory for the shared font data
-    std::array<u8, SHARED_FONT_MEM_SIZE> shared_font;
+    /// The shared font memory's contents up to the end of the last font; the rest is zero.
+    std::vector<u8> shared_font;
 };
 
-IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const char* service_name_)
-    : ServiceFramework{system_, service_name_}, impl{std::make_unique<Impl>()} {
-    // clang-format off
-    static const FunctionInfo functions[] = {
-        {0, D<&IPlatformServiceManager::RequestLoad>, "RequestLoad"},
-        {1, D<&IPlatformServiceManager::GetLoadState>, "GetLoadState"},
-        {2, D<&IPlatformServiceManager::GetSize>, "GetSize"},
-        {3, D<&IPlatformServiceManager::GetSharedMemoryAddressOffset>, "GetSharedMemoryAddressOffset"},
-        {4, D<&IPlatformServiceManager::GetSharedMemoryNativeHandle>, "GetSharedMemoryNativeHandle"},
-        {5, D<&IPlatformServiceManager::GetSharedFontInOrderOfPriority>, "GetSharedFontInOrderOfPriority"},
-        {6, D<&IPlatformServiceManager::GetSharedFontInOrderOfPriority>, "GetSharedFontInOrderOfPriorityForSystem"},
-        {100, nullptr, "RequestApplicationFunctionAuthorization"},
-        {101, nullptr, "RequestApplicationFunctionAuthorizationByProcessId"},
-        {102, nullptr, "RequestApplicationFunctionAuthorizationByApplicationId"},
-        {103, nullptr, "RefreshApplicationFunctionBlackListDebugRecord"},
-        {104, nullptr, "RequestApplicationFunctionAuthorizationByProgramId"},
-        {105, nullptr, "GetFunctionBlackListSystemVersionToAuthorize"},
-        {106, nullptr, "GetFunctionBlackListVersion"},
-        {1000, nullptr, "LoadNgWordDataForPlatformRegionChina"},
-        {1001, nullptr, "GetNgWordDataSizeForPlatformRegionChina"},
-        {2100, &IPlatformServiceManager::RequestLoadNxFont, "RequestLoadNxFont"},
-        {2000, &IPlatformServiceManager::GetBuiltInFontSharedMemory, "GetBuiltInFontSharedMemory (Switch 2)"},
-        {2010, &IPlatformServiceManager::GetBuiltInFontData, "GetBuiltInFontData (Switch 2)"},
-    };
-    // clang-format on
-    RegisterHandlers(functions);
+struct IPlatformServiceManager::Impl {
+    const FontRegion& GetSharedFontRegion(std::size_t index) const {
+        return index < fonts->shared_font_regions.size() ? fonts->shared_font_regions[index]
+                                                         : EMPTY_REGION;
+    }
+    std::shared_ptr<const SharedFonts> fonts;
+    /// Made by the first GetBuiltInFontSharedMemory (Switch 2 titles only).
+    Kernel::KSharedMemory* builtin_font_memory{};
+};
 
+static std::shared_ptr<const SharedFonts> LoadSharedFonts(Core::System& system) {
+    static std::mutex mutex;
+    static std::weak_ptr<const SharedFonts> loaded;
+    static const Core::System* loaded_for{};
+    std::scoped_lock lock{mutex};
+    if (auto fonts = loaded.lock(); fonts && loaded_for == &system) {
+        return fonts;
+    }
+    auto fonts = std::make_shared<SharedFonts>();
     auto& fsc = system.GetFileSystemController();
 
     // Attempt to load shared font data from disk
@@ -213,8 +203,9 @@ IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const ch
                        Common::swap32);
         // Font offset and size do not account for the header
         const FontRegion region{u32(offset + 8), u32((font_data_u32.size() * sizeof(u32)) - 8)};
-        DecryptSharedFont(font_data_u32, impl->shared_font, offset);
-        impl->shared_font_regions.push_back(region);
+        fonts->shared_font.resize(offset + font_data_u32.size() * sizeof(u32));
+        DecryptSharedFont(font_data_u32, fonts->shared_font, offset);
+        fonts->shared_font_regions.push_back(region);
         type_regions[font_index] = region;
     }
 
@@ -225,25 +216,61 @@ IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const ch
     constexpr size_t extension_type = static_cast<size_t>(SharedFontType::NintendoExtended);
     if (type_regions[standard_type].size != 0 && type_regions[extension_type].size != 0) {
         const auto font_data = [&](const FontRegion& region) {
-            return std::span<const u8>{impl->shared_font.data() + region.offset, region.size};
+            return std::span<const u8>{fonts->shared_font.data() + region.offset, region.size};
         };
-        impl->builtin_standard_font = MergeGlyphs(font_data(type_regions[standard_type]),
-                                                  font_data(type_regions[extension_type]),
-                                                  BUTTON_GLYPHS);
+        fonts->builtin_standard_font = MergeGlyphs(font_data(type_regions[standard_type]),
+                                                   font_data(type_regions[extension_type]),
+                                                   BUTTON_GLYPHS);
     }
 
     // The data after each BFTTF header is the plain font: GetBuiltInFontSharedMemory copies it.
     u32 builtin_offset = 0;
     for (size_t type_index = 0; type_index < type_regions.size(); ++type_index) {
         const auto& region = type_regions[type_index];
-        const u32 size = type_index == standard_type && !impl->builtin_standard_font.empty()
-                             ? static_cast<u32>(impl->builtin_standard_font.size())
+        const u32 size = type_index == standard_type && !fonts->builtin_standard_font.empty()
+                             ? static_cast<u32>(fonts->builtin_standard_font.size())
                              : region.size;
-        impl->builtin_font_sources.push_back(region.offset);
-        impl->builtin_font_regions.push_back({builtin_offset, size});
+        fonts->builtin_font_sources.push_back(region.offset);
+        fonts->builtin_font_regions.push_back({builtin_offset, size});
         builtin_offset = Common::AlignUp(builtin_offset + size, 0x1000);
     }
-    impl->builtin_font_memory_size = std::max<u32>(builtin_offset, 0x1000);
+    fonts->builtin_font_memory_size = std::max<u32>(builtin_offset, 0x1000);
+    LOG_INFO(Service_NS, "Shared fonts: {} KiB decrypted, {} KiB built-in standard font, one copy "
+                         "for pl:u and pl:s",
+             fonts->shared_font.size() >> 10, fonts->builtin_standard_font.size() >> 10);
+    loaded = fonts;
+    loaded_for = &system;
+    return fonts;
+}
+
+IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const char* service_name_)
+    : ServiceFramework{system_, service_name_}, impl{std::make_unique<Impl>()} {
+    // clang-format off
+    static const FunctionInfo functions[] = {
+        {0, D<&IPlatformServiceManager::RequestLoad>, "RequestLoad"},
+        {1, D<&IPlatformServiceManager::GetLoadState>, "GetLoadState"},
+        {2, D<&IPlatformServiceManager::GetSize>, "GetSize"},
+        {3, D<&IPlatformServiceManager::GetSharedMemoryAddressOffset>, "GetSharedMemoryAddressOffset"},
+        {4, D<&IPlatformServiceManager::GetSharedMemoryNativeHandle>, "GetSharedMemoryNativeHandle"},
+        {5, D<&IPlatformServiceManager::GetSharedFontInOrderOfPriority>, "GetSharedFontInOrderOfPriority"},
+        {6, D<&IPlatformServiceManager::GetSharedFontInOrderOfPriority>, "GetSharedFontInOrderOfPriorityForSystem"},
+        {100, nullptr, "RequestApplicationFunctionAuthorization"},
+        {101, nullptr, "RequestApplicationFunctionAuthorizationByProcessId"},
+        {102, nullptr, "RequestApplicationFunctionAuthorizationByApplicationId"},
+        {103, nullptr, "RefreshApplicationFunctionBlackListDebugRecord"},
+        {104, nullptr, "RequestApplicationFunctionAuthorizationByProgramId"},
+        {105, nullptr, "GetFunctionBlackListSystemVersionToAuthorize"},
+        {106, nullptr, "GetFunctionBlackListVersion"},
+        {1000, nullptr, "LoadNgWordDataForPlatformRegionChina"},
+        {1001, nullptr, "GetNgWordDataSizeForPlatformRegionChina"},
+        {2100, &IPlatformServiceManager::RequestLoadNxFont, "RequestLoadNxFont"},
+        {2000, &IPlatformServiceManager::GetBuiltInFontSharedMemory, "GetBuiltInFontSharedMemory (Switch 2)"},
+        {2010, &IPlatformServiceManager::GetBuiltInFontData, "GetBuiltInFontData (Switch 2)"},
+    };
+    // clang-format on
+    RegisterHandlers(functions);
+
+    impl->fonts = LoadSharedFonts(system);
 }
 
 // The Nx font SDK supplies transfer memory and expects an interface whose offsets refer to it.
@@ -258,9 +285,9 @@ void IPlatformServiceManager::RequestLoadNxFont(HLERequestContext& ctx) {
         rb.Push(Kernel::ResultInvalidHandle);
         return;
     }
-    if (requested_size > transfer->GetSize() || requested_size < impl->builtin_font_memory_size) {
+    if (requested_size > transfer->GetSize() || requested_size < impl->fonts->builtin_font_memory_size) {
         LOG_ERROR(Service_NS, "Font transfer memory too small: requested {:#x}, transfer {:#x}, fonts {:#x}",
-                  requested_size, transfer->GetSize(), impl->builtin_font_memory_size);
+                  requested_size, transfer->GetSize(), impl->fonts->builtin_font_memory_size);
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(Kernel::ResultInvalidSize);
         return;
@@ -269,15 +296,15 @@ void IPlatformServiceManager::RequestLoadNxFont(HLERequestContext& ctx) {
              flags, requested_size);
     auto& memory = transfer->GetOwner()->GetMemory();
     const auto address = transfer->GetSourceAddress();
-    for (size_t i = 0; i < impl->builtin_font_regions.size(); ++i) {
-        const auto& region = impl->builtin_font_regions[i];
+    for (size_t i = 0; i < impl->fonts->builtin_font_regions.size(); ++i) {
+        const auto& region = impl->fonts->builtin_font_regions[i];
         if (region.size != 0) {
             memory.WriteBlock(address + region.offset,
-                              impl->shared_font.data() + impl->builtin_font_sources[i], region.size);
+                              impl->fonts->shared_font.data() + impl->fonts->builtin_font_sources[i], region.size);
         }
     }
-    std::vector<FontRegion> regions{impl->builtin_font_regions.begin(),
-                                    impl->builtin_font_regions.end()};
+    std::vector<FontRegion> regions{impl->fonts->builtin_font_regions.begin(),
+                                    impl->fonts->builtin_font_regions.end()};
     IPC::ResponseBuilder rb{ctx, 2, 0, 1};
     rb.Push(ResultSuccess);
     rb.PushIpcInterface<INx2FontService>(ctx, system, std::move(regions));
@@ -287,16 +314,16 @@ void IPlatformServiceManager::RequestLoadNxFont(HLERequestContext& ctx) {
 // SDK maps it read-only. It holds plain copies of the fonts, apart from the Switch 1 font memory.
 void IPlatformServiceManager::GetBuiltInFontSharedMemory(HLERequestContext& ctx) {
     LOG_WARNING(Service_NS, "(STUBBED) Switch 2 GetBuiltInFontSharedMemory, {:#x} bytes",
-                impl->builtin_font_memory_size);
+                impl->fonts->builtin_font_memory_size);
     if (impl->builtin_font_memory == nullptr) {
         auto* const memory = Kernel::KSharedMemory::Create(kernel);
         if (const Result result = memory->Initialize(kernel, system.DeviceMemory(), nullptr,
                                                      Kernel::Svc::MemoryPermission::None,
                                                      Kernel::Svc::MemoryPermission::Read,
-                                                     impl->builtin_font_memory_size);
+                                                     impl->fonts->builtin_font_memory_size);
             result.IsError()) {
             LOG_ERROR(Service_NS, "Failed to make {:#x} bytes of built-in font memory: {:#x}",
-                      impl->builtin_font_memory_size, result.raw);
+                      impl->fonts->builtin_font_memory_size, result.raw);
             memory->Close(kernel);
             IPC::ResponseBuilder rb{ctx, 2};
             rb.Push(result);
@@ -304,21 +331,21 @@ void IPlatformServiceManager::GetBuiltInFontSharedMemory(HLERequestContext& ctx)
         }
         Kernel::KSharedMemory::Register(kernel, memory);
         u8* const data = memory->GetPointer();
-        std::memset(data, 0, impl->builtin_font_memory_size);
-        for (size_t i = 0; i < impl->builtin_font_regions.size(); ++i) {
-            const u8* source = impl->shared_font.data() + impl->builtin_font_sources[i];
+        std::memset(data, 0, impl->fonts->builtin_font_memory_size);
+        for (size_t i = 0; i < impl->fonts->builtin_font_regions.size(); ++i) {
+            const u8* source = impl->fonts->shared_font.data() + impl->fonts->builtin_font_sources[i];
             if (i == static_cast<size_t>(SharedFontType::JapanUSEuropeStandard) &&
-                !impl->builtin_standard_font.empty()) {
-                source = impl->builtin_standard_font.data();
+                !impl->fonts->builtin_standard_font.empty()) {
+                source = impl->fonts->builtin_standard_font.data();
             }
-            std::memcpy(data + impl->builtin_font_regions[i].offset, source,
-                        impl->builtin_font_regions[i].size);
+            std::memcpy(data + impl->fonts->builtin_font_regions[i].offset, source,
+                        impl->fonts->builtin_font_regions[i].size);
         }
         impl->builtin_font_memory = memory;
     }
     IPC::ResponseBuilder rb{ctx, 3, 1};
     rb.Push(ResultSuccess);
-    rb.Push<u32>(impl->builtin_font_memory_size);
+    rb.Push<u32>(impl->fonts->builtin_font_memory_size);
     rb.PushCopyObjects(ctx, *impl->builtin_font_memory);
 }
 
@@ -334,7 +361,7 @@ void IPlatformServiceManager::GetBuiltInFontData(HLERequestContext& ctx) {
     const u32 args = rp.Pop<u32>();
     const u32 type = args & 0xff;
     const bool flag = ((args >> 8) & 1) != 0;
-    const auto& regions = impl->builtin_font_regions;
+    const auto& regions = impl->fonts->builtin_font_regions;
     const bool found = type < regions.size() && regions[type].size != 0;
     const FontRegion region = found ? regions[type] : EMPTY_REGION;
     LOG_WARNING(Service_NS, "(STUBBED) Switch 2 GetBuiltInFontData type={} flag={} -> offset={:#x} size={:#x}",
@@ -383,7 +410,7 @@ Result IPlatformServiceManager::GetSharedMemoryNativeHandle(OutCopyHandle<Kernel
     LOG_DEBUG(Service_NS, "called");
 
     // Create shared font memory object
-    std::memcpy(kernel.GetFontSharedMem().GetPointer(), impl->shared_font.data(), impl->shared_font.size());
+    std::memcpy(kernel.GetFontSharedMem().GetPointer(), impl->fonts->shared_font.data(), impl->fonts->shared_font.size());
 
     // FIXME: this shouldn't belong to the kernel
     *out_shared_memory_native_handle = &kernel.GetFontSharedMem();
@@ -403,7 +430,7 @@ Result IPlatformServiceManager::GetSharedFontInOrderOfPriority(
 
     // TODO(ogniK): Have actual priority order
     const auto max_size = (std::min)({MaxElementCount, out_font_codes.size(), out_font_offsets.size(),
-                                    out_font_sizes.size(), impl->shared_font_regions.size()});
+                                    out_font_sizes.size(), impl->fonts->shared_font_regions.size()});
 
     for (size_t i = 0; i < max_size; i++) {
         auto& region = impl->GetSharedFontRegion(i);
