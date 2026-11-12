@@ -179,4 +179,8 @@ private:
     const bool runtime_lock;
 };
 
+/// Whether the setting does anything on this platform and in this build; the Builder makes no
+/// widget for those that don't.
+[[nodiscard]] bool AppliesToThisPlatform(const Settings::BasicSetting& setting);
+
 } // namespace ConfigurationShared

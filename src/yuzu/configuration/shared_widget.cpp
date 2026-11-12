@@ -46,6 +46,7 @@
 #include "common/settings.h"
 #include "common/settings_common.h"
 #include "qt_common/config/shared_translation.h"
+#include "qt_common/config/uisettings.h"
 #include "qt_common/qt_compat.h"
 
 namespace ConfigurationShared {
@@ -794,16 +795,41 @@ Builder::Builder(QWidget* parent_, bool runtime_lock_)
 
 Builder::~Builder() = default;
 
-static bool IsAndroidOnly(const Settings::BasicSetting& setting) {
-    const std::string& label = setting.GetLabel();
-    return label == "emulate_bgr565";
+// Settings that do nothing on this platform or in this build get no widget. Their values still load
+// and save, so a config written on another platform keeps them.
+bool AppliesToThisPlatform(const Settings::BasicSetting& setting) {
+    const u32 id = setting.Id();
+    const auto& values = Settings::values;
+    // Android only.
+    if (id == values.emulate_bgr565.Id()) {
+        return false;
+    }
+#ifndef EGLANTINE_STREAMLINE
+    // NVIDIA DLSS runs through NVIDIA Streamline: Windows x64 builds made with it.
+    if (id == values.nvidia_dlss.Id() || id == values.nvidia_dlss_preset.Id() ||
+        id == values.ocarina_dlss_mode.Id()) {
+        return false;
+    }
+#endif
+#ifndef LICHII_METALFX
+    if (id == values.metalfx_temporal.Id()) {
+        return false;
+    }
+#endif
+#ifndef __linux__
+    // Feral GameMode (libgamemode) exists on Linux only.
+    if (id == UISettings::values.enable_gamemode.Id()) {
+        return false;
+    }
+#endif
+    return true;
 }
 
 Widget* Builder::BuildWidget(Settings::BasicSetting* setting,
                              std::vector<std::function<void(bool)>>& apply_funcs,
                              RequestType request, bool managed, float multiplier,
                              Settings::BasicSetting* other_setting, const QString& suffix) const {
-    if (IsAndroidOnly(*setting)) {
+    if (!AppliesToThisPlatform(*setting)) {
         return nullptr;
     }
 
