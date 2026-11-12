@@ -79,6 +79,7 @@
 #include "yuzu/configuration/configure_per_game.h"
 #include "yuzu/configuration/configure_per_game_addons.h"
 #include "yuzu/configuration/configure_system.h"
+#include "yuzu/configuration/recommended_settings.h"
 #include "yuzu/util/util.h"
 
 namespace {
@@ -375,6 +376,8 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
       system{system_},
       builder{std::make_unique<ConfigurationShared::Builder>(this, !system_.IsPoweredOn())},
       tab_group{std::make_shared<std::vector<ConfigurationShared::Tab*>>()} {
+    // The tabs list only the settings that apply to this game.
+    Settings::SetConfiguringProgramId(title_id);
     const auto config_file_name = title_id == 0 ? Common::FS::PathToUTF8String(file_path.filename())
                                                 : fmt::format("{:016X}", title_id);
     game_config = std::make_unique<QtConfig>(config_file_name, Config::ConfigType::PerGameConfig);
@@ -476,6 +479,21 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
                 &ConfigurePerGame::HandleApplyButtonClicked);
     }
 
+    // Saves the game's config without its overrides, then closes so the tabs don't write them
+    // back.
+    QPushButton* reset = ui->buttonBox->addButton(tr("Reset to Recommended..."),
+                                                  QDialogButtonBox::ResetRole);
+    reset->setToolTip(tr("Removes this game's overrides, so it uses the global settings."));
+    connect(reset, &QAbstractButton::clicked, this, [this] {
+        if (RecommendedSettings::ConfirmAndResetGame(this, *builder)) {
+            game_config->SaveAllValues();
+            if (system.IsPoweredOn()) {
+                system.ApplySettings();
+            }
+            reject();
+        }
+    });
+
     LoadConfiguration();
     FitToAvailableScreen();
 }
@@ -484,6 +502,7 @@ ConfigurePerGame::~ConfigurePerGame() {
     if (detect_cancel) {
         detect_cancel->store(true);
     }
+    Settings::SetConfiguringProgramId(0);
 }
 
 void ConfigurePerGame::done(int result) {

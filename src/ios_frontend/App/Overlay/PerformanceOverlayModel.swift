@@ -150,7 +150,6 @@ final class PerformanceOverlayMonitor: ObservableObject {
     private var stateObserver: AnyCancellable?
     private var viewers = 0
     private var history: [Double] = []
-    private let hasMetalFxTemporal = QuickSettings.info("metalfx_temporal") != nil
 
     func start() {
         viewers += 1
@@ -287,7 +286,7 @@ final class PerformanceOverlayMonitor: ObservableObject {
     }
 
     private func upscaler(_ snapshot: LichiiPerfSnapshot) -> String {
-        if hasMetalFxTemporal, QuickSettings.bool("metalfx_temporal") {
+        if QuickSettings.canonical("upscaler") == "MetalFx" {
             return "MetalFX Temporal"
         }
         if snapshot.game_dlss_network {

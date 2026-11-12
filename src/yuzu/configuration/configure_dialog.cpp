@@ -36,6 +36,7 @@
 #include "yuzu/configuration/configure_system.h"
 #include "yuzu/configuration/configure_ui.h"
 #include "yuzu/configuration/configure_web.h"
+#include "yuzu/configuration/recommended_settings.h"
 #include "yuzu/hotkeys.h"
 
 Q_DECLARE_METATYPE(QList<QWidget*>);
@@ -106,6 +107,21 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
         connect(apply_button, &QAbstractButton::clicked, this,
                 &ConfigureDialog::HandleApplyButtonClicked);
     }
+
+    // The recommended settings for this PC replace the global values, then the dialog closes so
+    // its pages don't write their old values back.
+    QPushButton* recommended = ui->buttonBox->addButton(
+        tr("Use Recommended Settings for This Device..."), QDialogButtonBox::ResetRole);
+    recommended->setEnabled(!system.IsPoweredOn());
+    recommended->setToolTip(system.IsPoweredOn()
+                                ? tr("Stop the game first: it has its own values loaded.")
+                                : tr("Shows what changes, and why, before anything is set."));
+    connect(recommended, &QAbstractButton::clicked, this, [this, &vk_device_records] {
+        if (RecommendedSettings::ConfirmAndApply(this, *builder, vk_device_records)) {
+            UISettings::values.configuration_applied = true;
+            close();
+        }
+    });
 
     ui->selectorList->setCurrentRow(0);
     FitToAvailableScreen();

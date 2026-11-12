@@ -13,7 +13,7 @@ struct InGameMenuView: View {
     @ObservedObject private var external = ExternalDisplay.shared
     @State private var confirmQuit = false
     @State private var showControllers = false
-    @State private var resolution = QuickSettings.string("resolution_setup")
+    @State private var resolution = QuickSettings.string(InGameMenuView.resolutionKey)
     @State private var frameGen = QuickSettings.bool("frame_gen")
     @State private var frameGenMultiplier = max(2, QuickSettings.int("frame_gen_multiplier"))
     @State private var frameGenMetalFx = QuickSettings.string("frame_gen_type") == "MetalFx"
@@ -21,7 +21,18 @@ struct InGameMenuView: View {
     @State private var speedPercent = QuickSettings.int("speed_limit")
     @State private var pendingRestart = false
 
-    private let resolutions = QuickSettings.choices("resolution_setup")
+    /// The one resolution setting of the running game: its own (Ocarina of Time's) where it has
+    /// one, else the resolution for every game.
+    @MainActor
+    private static var resolutionKey: String {
+        guard let id = ControlsCenter.shared.currentGame?.programId,
+              !"resolution_setup".withCString({ lichii_settings_applies($0, id) }) else {
+            return "resolution_setup"
+        }
+        return SettingsCatalog.all.first { $0.game == id && $0.key.hasSuffix("_resolution") }?.key
+            ?? "resolution_setup"
+    }
+    private let resolutions = QuickSettings.choices(InGameMenuView.resolutionKey)
     /// Built into this app and the chip can run it (SettingsCatalog.availability).
     private let frameGenAvailable = SettingsCatalog.all.first { $0.key == "frame_gen" }
         .map { SettingsCatalog.availability(of: $0) == .available } ?? false
@@ -144,7 +155,7 @@ struct InGameMenuView: View {
                 Picker("Resolution", selection: $resolution) {
                     ForEach(resolutions) { Text($0.name).tag($0.value) }
                 }
-                .onChange(of: resolution) { value in change("resolution_setup", value) }
+                .onChange(of: resolution) { value in change(InGameMenuView.resolutionKey, value) }
             }
 
             if frameGenAvailable {

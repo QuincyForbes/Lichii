@@ -3,13 +3,24 @@
 
 #pragma once
 
+#include <string>
+#include <string_view>
+
+#include "common/device_profile.h"
 #include "ios_frontend/lichii_bridge_platform.h"
 
 // Shared between lichii_bridge_platform.cpp (portable policy) and lichii_platform_ios.mm (UIKit).
 namespace LichiiPlatform {
 
-/// The per-device defaults for `info` (pure: the table in lichii_bridge_platform.cpp).
+/// `info` as the recommended settings see a device (lichii_platform_init hands it to
+/// Settings::DeviceProfile::SetHostDetails).
+Settings::DeviceProfile::Device DeviceOf(const LichiiDeviceInfo& info);
+
+/// The per-device defaults for `info` (pure: the recommended settings for that device).
 LichiiDeviceDefaults ComputeDefaults(const LichiiDeviceInfo& info);
+
+/// The value `profile` recommends for a settings key, as LoadString takes it ("" if none).
+std::string Recommended(const Settings::DeviceProfile::Profile& profile, std::string_view key);
 
 /// Exports the cache budgets of `defaults` to the texture/buffer caches and the .nup loader
 /// (environment, kept when already set) and the memory low-water mark; removes the temporary

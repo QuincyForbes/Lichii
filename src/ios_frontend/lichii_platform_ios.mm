@@ -375,6 +375,7 @@ void lichii_platform_init(void) {
     std::call_once(g_init_once, [] {
         @autoreleasepool {
             GatherDeviceInfo();
+            Settings::DeviceProfile::SetHostDetails(LichiiPlatform::DeviceOf(g_info));
             g_initialized.store(true);
             const LichiiDeviceDefaults defaults = LichiiPlatform::ComputeDefaults(g_info);
             LichiiPlatform::ApplyMemoryBudgets(defaults);

@@ -42,6 +42,8 @@ add_library(
     demangle.h
     device_power_state.cpp
     device_power_state.h
+    device_profile.cpp
+    device_profile.h
     div_ceil.h
     dkb_cpu_trace.cpp
     dkb_cpu_trace.h
@@ -71,6 +73,8 @@ add_library(
     fs/fs_util.h
     fs/path_util.cpp
     fs/path_util.h
+    game_settings.cpp
+    game_settings.h
     guest_chunks.h
     hash.h
     heap_tracker.cpp

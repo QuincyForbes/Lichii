@@ -27,6 +27,8 @@ struct SettingItem: Identifiable, Hashable {
     let minimum: Double
     let maximum: Double
     let choices: [SettingChoice]
+    /// The game this setting belongs to (Ocarina of Time's own...), 0 for every game.
+    let game: UInt64
 
     var id: String { key }
     var label: String { SettingLabels.title(for: key) }
@@ -43,14 +45,30 @@ struct SettingItem: Identifiable, Hashable {
         percentage = info.percentage
         minimum = info.minimum
         maximum = info.maximum
-        choices = (0..<info.enum_count).map { index in
+        game = key.withCString { lichii_settings_game($0) }
+        let hidden = SettingLabels.hiddenChoices[key] ?? []
+        let all = (0..<info.enum_count).map { index in
             key.withCString { pointer in
                 let name = Bridge.constant(lichii_settings_enum_name(pointer, index))
                 return SettingChoice(name: SettingLabels.choice(name, for: key),
                                      value: String(lichii_settings_enum_value(pointer, index)),
                                      canonical: name)
             }
+        }.filter { !hidden.contains($0.canonical) }
+        // In the order SettingLabels.choiceOrder gives, where it has one.
+        if let order = SettingLabels.choiceOrder[key] {
+            choices = all.sorted { (order.firstIndex(of: $0.canonical) ?? Int.max) < (order.firstIndex(of: $1.canonical) ?? Int.max) }
+        } else {
+            choices = all
         }
+    }
+
+    /// The name of a value of this setting ("56%", "On").
+    func displayName(of value: String) -> String {
+        if kind == .bool {
+            return value == "true" ? "On" : "Off"
+        }
+        return choices.first { $0.value == value }?.name ?? value
     }
 
     func value() -> String {
@@ -146,9 +164,12 @@ enum SettingsGroup: String, CaseIterable, Identifiable {
         }
     }
 
+    @MainActor
     var categories: [String] {
         switch self {
-        case .graphics: return ["Renderer", SettingsCatalog.ocarinaCategory, "RendererAdvanced", SettingsCatalog.enhancementsCategory]
+        case .graphics:
+            return [SettingsCatalog.resolutionCategory, SettingsCatalog.upscalingCategory, "Renderer"] +
+                SettingsCatalog.gameCategories + ["RendererAdvanced", SettingsCatalog.enhancementsCategory]
         case .audio: return ["Audio", "SystemAudio"]
         case .system: return ["Core", "Cpu", "System", "Controls", "LibraryApplet", "DataStorage", "Overlay"]
         case .advanced: return Array(SettingsCatalog.advancedCategories).sorted()
@@ -161,8 +182,7 @@ enum SettingsGroup: String, CaseIterable, Identifiable {
         case (.graphics, "Renderer"): return "Image"
         case (.graphics, "RendererAdvanced"): return "Performance"
         case (.graphics, SettingsCatalog.enhancementsCategory): return "Game Enhancements"
-        case (.graphics, SettingsCatalog.ocarinaCategory): return "Ocarina of Time"
-        default: return SettingsCatalog.categoryTitles[category] ?? category
+        default: return SettingsCatalog.title(of: category)
         }
     }
 }
@@ -186,8 +206,8 @@ enum SettingsCatalog {
 
     /// Shown first, in this order.
     static let essentials = [
-        "resolution_setup", "scaling_filter", "fsr_sharpening_slider", "anti_aliasing",
-        "metalfx_temporal", "frame_gen", "frame_gen_type", "frame_gen_multiplier", "use_vsync", "frame_pacing_mode",
+        "resolution_setup", "oot_resolution", "texture_quality", "upscaler", "scaling_filter",
+        "fsr_sharpening_slider", "anti_aliasing", "oot_frame_rate", "mkw_frame_rate", "frame_gen", "frame_gen_type", "frame_gen_multiplier", "use_vsync", "frame_pacing_mode",
         "use_speed_limit", "speed_limit", "use_docked_mode", "gpu_accuracy", "cpu_accuracy",
         "use_asynchronous_shaders", "use_disk_shader_cache", "aspect_ratio", "volume", "audio_muted",
     ]
@@ -219,7 +239,6 @@ enum SettingsCatalog {
 
     /// Settings that do nothing in the iOS app: not listed, and a search that finds one says why.
     static let unavailableReasons: [String: String] = [
-        "nvidia_dlss": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.",
         "nvidia_dlss_preset": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.",
         "backend": "iOS has one graphics API: Vulkan through MoltenVK.",
         "cpu_backend": "iOS runs games with the Dynarmic JIT only.",
@@ -280,8 +299,6 @@ enum SettingsCatalog {
                 return "MetalFX makes the 2x frame on iOS 26. Before iOS 26, and at 3x or 4x, AMD FSR 3 does."
             }
             return nil
-        case "game_dlss_network":
-            return "Used only at 1x resolution."
         default:
             return descriptions[item.key]
         }
@@ -289,9 +306,9 @@ enum SettingsCatalog {
 
     /// What the everyday settings do, in a line.
     static let descriptions: [String: String] = [
-        "scaling_filter": "How the rendered picture is scaled to the screen.",
+        "scaling_filter": "The last step: how the finished picture is scaled to the screen.",
         "anti_aliasing": "Smooths jagged edges after the game has drawn its frame.",
-        "metalfx_temporal": "Apple's MetalFX upscaler in place of the game's own, in games that have one (Ocarina of Time, games with DLSS).",
+        "upscaler": "What takes the place of a game's own upscaler. Automatic: Ocarina of Time's own, AMD FSR 3.1 in games that call DLSS. Game's Own also runs those games' translated DLSS network. AMD FSR 3.1 and MetalFX replace both and draw at 1x. Applies the next time the game starts.",
         "frame_gen": "Adds generated frames between the game's own: smoother motion, more GPU work and slightly more input lag.",
         "use_docked_mode": "Docked renders games at their TV resolution, which costs more GPU time and memory than Handheld.",
         "gpu_accuracy": "Higher fixes graphics in some games and is slower.",
@@ -299,8 +316,8 @@ enum SettingsCatalog {
         "use_disk_shader_cache": "Keeps built shaders in storage, so the next start of a game stutters less.",
         "memory_layout_mode": "Switch 1 games only: Switch 2 games always get 12 GB.",
         "texture_quality": "Half or Quarter loads the game's large textures with less detail: softer up close, much less memory (about 1.2 GB less in Ocarina of Time). Applies the next time the game starts.",
-        "resolution_setup": "Multiplies the size every game draws at (for Ocarina of Time: on top of its own resolution). Higher is sharper and costs GPU time, memory and battery.",
-        "oot_resolution": "The size the game draws its 3D at, before the resolution scale. Dynamic: the game's own, lower when the GPU is busy. A percentage: a fixed share of full size (handheld 100% 1920x1080, 75% 1440x810, 56% 1080x608, 50% 960x540): less GPU work and memory, softer picture. Applies the next time the game starts.",
+        "resolution_setup": "The size games draw at. Games with their own Resolution (Ocarina of Time) use that instead. Higher is sharper and costs GPU time, memory and battery.",
+        "oot_resolution": "The size the game draws at, the one resolution setting for it. Dynamic: the game's own, lower when it thinks the GPU is busy. A percentage: a fixed share of full size (handheld 100% 1920x1080, 75% 1440x810, 56% 1080x608, 50% 960x540): less GPU work and memory, softer picture. Above 100% the emulator scales it up. Applies the next time the game starts.",
         "oot_frame_rate": "30 FPS saves power and heat; Unlocked follows the frame rate limit. The game keeps its normal speed at each.",
         "mkw_frame_rate": "The game's native 30 FPS mode, or dynamic 30-60 FPS (experimental). Applies the next time the game starts.",
         "moltenvk_driver": "Which MoltenVK runs Vulkan on Metal. The new one draws mesh shaders (Ocarina of Time's foliage) with the GPU's own mesh shaders; the legacy one emulates them with compute. Lichii uses the legacy one when the new one doesn't load. Applies the next time Lichii starts.",
@@ -329,26 +346,51 @@ enum SettingsCatalog {
         "Debugging": "Debugging", "DebuggingGraphics": "Graphics Debugging", "Network": "Network",
         "Miscellaneous": "Miscellaneous", "Services": "Services", "LibraryApplet": "System Applets",
         "Overlay": "Overlay", "GpuDriver": "GPU Driver", "AddOns": "Add-ons",
-        "OcarinaOfTime": "Ocarina of Time", "GameEnhancements": "Game Enhancements",
+        "GameEnhancements": "Game Enhancements", "Resolution": "Resolution & Textures",
+        "Upscaling": "Upscaling",
     ]
 
     /// Settings shown with another group than their own: shader building is a hack in the core
-    /// but an everyday switch on a phone.
+    /// but an everyday switch on a phone. One place each for resolution, textures and upscaling.
     static let categoryOverrides: [String: String] = [
         "use_asynchronous_shaders": "RendererAdvanced",
         "patch_performance": enhancementsCategory,
         "patch_image": enhancementsCategory,
-        "oot_resolution": ocarinaCategory,
-        "oot_frame_rate": ocarinaCategory,
-        "oot_anti_aliasing": ocarinaCategory,
-        "oot_movie_upscale": ocarinaCategory,
+        "resolution_setup": resolutionCategory,
+        "texture_quality": resolutionCategory,
+        "max_anisotropy": resolutionCategory,
+        "upscaler": upscalingCategory,
+        "scaling_filter": upscalingCategory,
+        "fsr_sharpening_slider": upscalingCategory,
+        "anti_aliasing": upscalingCategory,
     ]
 
-    /// Ocarina of Time's own settings (Settings > Graphics > Ocarina of Time).
-    static let ocarinaCategory = "OcarinaOfTime"
+    static let resolutionCategory = "Resolution"
+    static let upscalingCategory = "Upscaling"
 
     /// Built-in game patches by kind (Settings > Graphics > Game Enhancements).
     static let enhancementsCategory = "GameEnhancements"
+
+    /// A game's own settings, under its name (Settings > Graphics).
+    static func gameCategory(_ programId: UInt64) -> String {
+        "Game:" + String(programId, radix: 16, uppercase: true)
+    }
+
+    @MainActor
+    static var gameCategories: [String] {
+        var seen: [UInt64] = []
+        for item in all where item.game != 0 && !seen.contains(item.game) {
+            seen.append(item.game)
+        }
+        return seen.map(gameCategory)
+    }
+
+    static func title(of category: String) -> String {
+        if category.hasPrefix("Game:"), let id = UInt64(category.dropFirst(5), radix: 16) {
+            return Bridge.constant(lichii_settings_game_name(id))
+        }
+        return categoryTitles[category] ?? category
+    }
 
     /// Explains the Game Enhancements rows, listing the games that ship such patches.
     static func enhancementsFooter() -> String {
@@ -358,7 +400,10 @@ enum SettingsCatalog {
     }
 
     static func displayCategory(of item: SettingItem) -> String {
-        categoryOverrides[item.key] ?? item.category
+        if item.game != 0 {
+            return gameCategory(item.game)
+        }
+        return categoryOverrides[item.key] ?? item.category
     }
 
     /// One page of the global settings. A search covers every page.
@@ -387,16 +432,36 @@ enum SettingsCatalog {
                 (rank[a.element.key] ?? Int.max, a.offset) < (rank[b.element.key] ?? Int.max, b.offset)
             }.map(\.element)
             return SettingSection(id: category, title: group.sectionTitle(category), items: sorted,
-                                  footer: category == enhancementsCategory ? enhancementsFooter() : nil)
+                                  footer: footer(of: category))
         }
         return sections + [unavailableSection(query: query, perGame: false)].compactMap { $0 }
     }
 
-    /// The per-game page (`advanced` false) or its advanced part; a search covers both.
     @MainActor
-    static func sections(perGame: Bool, query: String, advanced: Bool = false) -> [SettingSection] {
+    private static func footer(of category: String) -> String? {
+        switch category {
+        case enhancementsCategory:
+            return enhancementsFooter()
+        case resolutionCategory:
+            let games = gameCategories.filter { id in
+                all.contains { displayCategory(of: $0) == id && $0.key.hasSuffix("_resolution") }
+            }.map(title(of:))
+            return games.isEmpty ? nil : "\(games.joined(separator: ", ")) has its own Resolution in its section below."
+        case upscalingCategory:
+            return "The game's picture goes through the upscaler, then the screen filter."
+        default:
+            return nil
+        }
+    }
+
+    /// The per-game page (`advanced` false) or its advanced part; a search covers both. Settings
+    /// of other games, and those the game's own replace, are not listed.
+    @MainActor
+    static func sections(perGame: Bool, query: String, advanced: Bool = false,
+                         programId: UInt64 = 0) -> [SettingSection] {
         let visible = all.filter { item in
             availability(of: item) == .available && (!perGame || item.switchable) &&
+                (!perGame || item.key.withCString { lichii_settings_applies($0, programId) }) &&
                 (query.isEmpty ? advancedCategories.contains(displayCategory(of: item)) == advanced
                     : item.label.localizedCaseInsensitiveContains(query) ||
                         item.key.localizedCaseInsensitiveContains(query))
@@ -418,7 +483,7 @@ enum SettingsCatalog {
             grouped[category, default: []].append(item)
         }
         for category in order {
-            sections.append(SettingSection(id: category, title: categoryTitles[category] ?? category,
+            sections.append(SettingSection(id: category, title: title(of: category),
                                            items: grouped[category] ?? []))
         }
         if !advanced, let unavailable = unavailableSection(query: query, perGame: perGame) {
@@ -431,8 +496,9 @@ enum SettingsCatalog {
 /// Readable names for keys and enum values; anything missing is derived from the key.
 enum SettingLabels {
     static let titles: [String: String] = [
-        "resolution_setup": "Resolution Scale",
-        "scaling_filter": "Upscaling Filter",
+        "resolution_setup": "Resolution",
+        "scaling_filter": "Screen Filter",
+        "upscaler": "Upscaler",
         "fsr_sharpening_slider": "FSR Sharpness",
         "anti_aliasing": "Anti-Aliasing",
         "frame_gen": "Frame Generation",
@@ -462,13 +528,12 @@ enum SettingLabels {
         "backend": "Graphics API",
         "cpu_backend": "CPU Backend",
         "nvidia_dlss_preset": "DLSS Preset",
-        "game_dlss_network": "Game's Own DLSS Network",
-        "oot_anti_aliasing": "Ocarina of Time Anti-Aliasing",
-        "oot_movie_upscale": "Ocarina of Time Movies",
+        "oot_anti_aliasing": "Sharpening",
+        "oot_movie_upscale": "Movies",
         "texture_quality": "Texture Quality",
-        "oot_resolution": "Ocarina of Time Resolution",
-        "oot_frame_rate": "Ocarina of Time Frame Rate",
-        "mkw_frame_rate": "Mario Kart World Frame Rate",
+        "oot_resolution": "Resolution",
+        "oot_frame_rate": "Frame Rate",
+        "mkw_frame_rate": "Frame Rate",
         "moltenvk_driver": "Graphics Driver",
         "nx2_frame_rate_limit": "Frame Rate Limit (Switch 2)",
         "accelerate_astc": "ASTC Decoding",
@@ -476,8 +541,6 @@ enum SettingLabels {
         "output_engine": "Audio Output Engine",
         "force_max_clock": "Force Maximum GPU Clocks",
         "use_vulkan_driver_pipeline_cache": "Driver Pipeline Cache",
-        "nvidia_dlss": "NVIDIA DLSS",
-        "metalfx_temporal": "MetalFX Upscaling (replaces the game's)",
         "patch_performance": "Occlusion Off",
         "patch_image": "Disable Game Anti-Aliasing",
         "device_name": "Console Name",
@@ -506,8 +569,14 @@ enum SettingLabels {
         "texture_quality": ["Full": "Full", "Half": "Half (less memory)", "Quarter": "Quarter (least memory)"],
         "oot_resolution": [
             "Game": "Dynamic (the game's own)", "Full": "100%", "Percent87": "87%", "Percent75": "75%",
-            "Percent56": "56%", "Percent50": "50%",
+            "Percent56": "56% (1080x608)", "Percent50": "50%", "Percent150": "150%", "Percent200": "200%",
+            "Percent300": "300%",
         ],
+        "upscaler": [
+            "Auto": "Automatic", "Game": "Game's Own", "Fsr3": "AMD FSR 3.1", "Dlss": "NVIDIA DLSS",
+            "MetalFx": "MetalFX Temporal",
+        ],
+        "oot_anti_aliasing": ["Game": "Game's own", "NoSharpening": "No sharpening"],
         "oot_frame_rate": ["Fps30": "30 FPS", "Fps60": "60 FPS", "Unlocked": "Unlocked (frame rate limit)"],
         "mkw_frame_rate": ["Game": "Game's own", "Fps30": "30 FPS", "Dynamic": "Dynamic 30-60 FPS"],
         "moltenvk_driver": ["Legacy": "Legacy MoltenVK", "Mesh": "New MoltenVK (native mesh shaders)"],
@@ -530,6 +599,19 @@ enum SettingLabels {
         ],
         "aspect_ratio": [
             "R16_9": "16:9", "R4_3": "4:3", "R21_9": "21:9", "R16_10": "16:10", "Stretch": "Stretch",
+        ],
+    ]
+
+    /// Values that do nothing on iOS, by their enum name; not offered.
+    static let hiddenChoices: [String: Set<String>] = [
+        "upscaler": ["Dlss"],
+    ]
+
+    /// Lists shown in another order than the enum's.
+    static let choiceOrder: [String: [String]] = [
+        "oot_resolution": [
+            "Game", "Percent50", "Percent56", "Percent75", "Percent87", "Full", "Percent150",
+            "Percent200", "Percent300",
         ],
     ]
 

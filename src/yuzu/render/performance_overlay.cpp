@@ -477,7 +477,7 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
     // What NVIDIA DLSS does in this game, not just the setting.
     QString dlss_tag;
 #ifdef EGLANTINE_STREAMLINE
-    if (Settings::values.nvidia_dlss.GetValue()) {
+    if (Settings::NvidiaDlssChosen()) {
         const auto dlss = Vulkan::Streamline::GetSessionStatus();
         dlss_tag = dlss.available && dlss.frames > 0 ? QStringLiteral(" | DLSS")
                    : dlss.available                  ? tr(" | DLSS idle")

@@ -140,18 +140,21 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Changes the output graphics API.\nVulkan is recommended."));
     INSERT(Settings, vulkan_device, tr("Device:"),
            tr("This setting selects the GPU to use (Vulkan only)."));
-    INSERT(Settings, resolution_setup, tr("Emulator resolution scale:"),
-           tr("Multiplies whatever size the game renders at, in every game (for Ocarina of Time: "
-              "on top of its own resolution below).\nHigher scales need more VRAM and bandwidth; "
-              "scales below 1x can cause artifacts.\nNVIDIA DLSS and AMD FSR 3.1 in place of a "
-              "game's upscaler need 1x."));
-    INSERT(Settings, scaling_filter, tr("Window Adapting Filter:"), QString());
-    INSERT(Settings, game_dlss_network, tr("Use the game's own DLSS"),
-           tr("Runs a Switch 2 game's own DLSS (its upscaling network, translated for this GPU) "
-              "instead of AMD FSR 3.1 in its place.\nAMD FSR 3.1 still draws while the network is "
-              "checked, when it can't run on this GPU, with resolution scaling, and for the rest "
-              "of the session if its output fails Lichii's checks.\nTakes effect when a game "
-              "starts."));
+    INSERT(Settings, resolution_setup, tr("Resolution:"),
+           tr("The size games draw at, as a multiple of their own. Games with their own "
+              "Resolution setting (Ocarina of Time, under Game-specific) use that instead.\nHigher "
+              "scales need more VRAM and bandwidth; scales below 1x can cause artifacts.\nNVIDIA "
+              "DLSS, MetalFX and AMD FSR 3.1 as the upscaler need 1x."));
+    INSERT(Settings, scaling_filter, tr("Screen filter:"),
+           tr("The last step: how the finished picture is scaled to the window or screen."));
+    INSERT(Settings, upscaler, tr("Upscaler:"),
+           tr("What takes the place of a game's own upscaler.\nAutomatic: Ocarina of Time's own "
+              "upscale pass, AMD FSR 3.1 in games that call DLSS (Fire Emblem: Fortune's Weave).\n"
+              "Game's own: also runs those games' own DLSS network, translated for this GPU (AMD "
+              "FSR 3.1 still draws while it is checked or fails Lichii's checks).\nAMD FSR 3.1, "
+              "NVIDIA DLSS (GeForce RTX, NVIDIA's files from the download button) and MetalFX "
+              "(Apple) replace both, at 1x; Ocarina of Time's resolution then picks the DLSS mode."
+              "\nTakes effect when a game starts."));
     INSERT(Settings, frame_rate_limit, tr("Frame rate limit (Switch 2):"),
            tr("Rate of the Switch 2 VSync event that games start their frames on (default 60 Hz)."
               "\nAbove 60 Hz most games run too fast. Ocarina of Time follows it only with its "
@@ -164,53 +167,39 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, nvidia_dlss_preset, tr("DLSS preset:"),
            tr("The DLSS model. K is the tested default; L and M are NVIDIA's newer models, J the "
               "older one. Default lets NVIDIA choose per quality mode."));
-    INSERT(Settings, metalfx_temporal, tr("Use MetalFX in place of a game's upscaler (Apple)"),
-           tr("Apple MetalFX temporal upscaling in place of a Switch 2 game's DLSS and of "
-              "Ocarina of Time's own upscaler, instead of AMD FSR 3.1 and the game's.\nNeeds "
-              "macOS 13 or iOS 16 on an Apple GPU."));
     INSERT(Settings, moltenvk_driver, tr("Graphics driver:"),
            tr("Which MoltenVK runs Vulkan on Metal. The new one draws mesh shaders (Ocarina of "
               "Time's foliage) with Metal's own mesh shaders; the legacy one emulates them with "
               "compute. Lichii falls back to the legacy one when the new one doesn't load.\n"
               "Takes effect the next time Lichii starts."));
-    INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS (experimental)"),
-           tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a game's own upscaler, where "
-              "Lichii can give DLSS the frame's colour, depth, motion vectors and jitter:\n"
-              "- The Legend of Zelda: Ocarina of Time: its upscale pass to 4K, at 1x resolution "
-              "scale (motion rebuilt from the scene depth and camera). Its resolution setting "
-              "then picks the DLSS mode.\n"
-              "- Fire Emblem: Fortune's Weave: its own DLSS evaluation.\n"
-              "Other games keep their own upscaling: Lichii doesn't have those inputs for them "
-              "yet.\nNeeds NVIDIA's Streamline and DLSS files; Lichii does not ship them. Use "
-              "the download button below.\nTakes effect when a game starts."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
-    INSERT(Settings, oot_anti_aliasing, tr("Ocarina of Time anti-aliasing:"),
-           tr("The Legend of Zelda: Ocarina of Time only.\nGame: the game's own anti-aliasing "
-              "network, which sharpens heavily.\nNo sharpening: the image as the game renders it, "
-              "without the network (faster; pairs well with a higher resolution). Has no effect while "
-              "NVIDIA DLSS is on.\nAMD FSR 3.1: temporal upscaling in place of the game's upscale "
-              "pass, on any graphics card; it takes the place of NVIDIA DLSS and MetalFX in this "
-              "game.\nTakes effect when the game starts."));
-    INSERT(Settings, oot_movie_upscale, tr("Ocarina of Time movies:"),
+    INSERT(Settings, oot_anti_aliasing, tr("Sharpening:"),
+           tr("Game: the game's own anti-aliasing network, which sharpens heavily.\nNo "
+              "sharpening: the image as the game renders it, without the network (faster; pairs "
+              "well with a higher resolution). Has no effect while an upscaler replaces the "
+              "game's.\nTakes effect when the game starts."));
+    INSERT(Settings, oot_movie_upscale, tr("Movies:"),
            tr("How the title screen and cutscene videos are scaled up.\nBilinear: a plain, fast "
               "stretch.\nGame's own upscaler: the game's video upscaler, which removes banding and "
               "sharpens. Fast on NVIDIA RTX, slow on GPUs that emulate its math.\nAutomatic: the "
               "game's upscaler where the GPU runs it natively, bilinear elsewhere."));
-    INSERT(Settings, oot_resolution, tr("Ocarina of Time resolution:"),
-           tr("The size the game draws its 3D at, before the emulator's resolution scale and an "
-              "upscaler.\nDynamic: the game's own, which drops toward 480p when the GPU is busy. "
-              "100%: always full size (1920x1080 handheld, 2560x1440 docked). A lower percentage: "
-              "a fixed share of that, less GPU work and graphics memory, a softer picture.\nWith "
-              "NVIDIA DLSS on it is DLSS's input to 4K: 100% Quality, 87% Balanced, 75% "
-              "Performance, 50% Ultra Performance.\nTakes effect when the game starts."));
-    INSERT(Settings, oot_frame_rate, tr("Ocarina of Time frame rate:"),
+    INSERT(Settings, oot_resolution, tr("Resolution:"),
+           tr("The one resolution setting for this game (the Resolution for other games doesn't "
+              "apply to it).\nDynamic: the game's own, which drops toward 480p when the GPU is "
+              "busy. 100%: always full size (1920x1080 handheld, 2560x1440 docked). A lower "
+              "percentage: a fixed share of that, less GPU work and graphics memory, a softer "
+              "picture. 150-300%: full size scaled up by the emulator.\nWith NVIDIA DLSS as the "
+              "upscaler it is DLSS's input to 4K: 100% Quality, 87% Balanced, 75% Performance, "
+              "50% Ultra Performance (above 100% counts as 100%).\nTakes effect when the game "
+              "starts."));
+    INSERT(Settings, oot_frame_rate, tr("Frame rate:"),
            tr("30 FPS: for lower-end PCs. 60 FPS: the game's normal rate. Unlocked: up to the "
               "Frame rate limit (Switch 2) below.\nThe game keeps its normal speed at each (its "
               "time step follows real time).\nTakes effect at once; the FPS button in the status "
               "bar switches it too."));
-    INSERT(Settings, mkw_frame_rate, tr("Mario Kart World frame rate:"),
+    INSERT(Settings, mkw_frame_rate, tr("Frame rate:"),
            tr("Game's own: no change. 30 FPS: the game's native 30 FPS mode at normal speed. "
               "Dynamic: the game moves between 30 and 60 FPS using whole-frame timing to keep "
               "normal speed (experimental).\nTakes effect when the game starts."));
@@ -680,6 +669,17 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(OotResolution, Percent75, tr("75% (1080p)")),
                               PAIR(OotResolution, Percent56, tr("56% (810p)")),
                               PAIR(OotResolution, Percent50, tr("50% (720p)")),
+                              PAIR(OotResolution, Percent150, tr("150% (2160p)")),
+                              PAIR(OotResolution, Percent200, tr("200% (2880p)")),
+                              PAIR(OotResolution, Percent300, tr("300% (4320p)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::Upscaler>::Index(),
+                          {
+                              PAIR(Upscaler, Auto, tr("Automatic")),
+                              PAIR(Upscaler, Game, tr("Game's own (translated DLSS too)")),
+                              PAIR(Upscaler, Fsr3, tr("AMD FSR 3.1")),
+                              PAIR(Upscaler, Dlss, tr("NVIDIA DLSS")),
+                              PAIR(Upscaler, MetalFx, tr("MetalFX (Apple)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::OotFrameRate>::Index(),
                           {
@@ -703,7 +703,6 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                           {
                               PAIR(OotAntiAliasing, Game, tr("Game")),
                               PAIR(OotAntiAliasing, NoSharpening, tr("No sharpening")),
-                              PAIR(OotAntiAliasing, Fsr3, tr("AMD FSR 3.1")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AspectRatio>::Index(),
                           {

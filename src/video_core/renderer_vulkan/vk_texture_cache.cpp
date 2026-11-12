@@ -1851,7 +1851,7 @@ bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
     }
 #endif
 #ifdef LICHII_METALFX
-    if (Settings::values.metalfx_temporal.GetValue() && !metalfx_unsupported) {
+    if (Settings::MetalFxTemporalChosen() && !metalfx_unsupported) {
         return true;
     }
 #endif
@@ -2099,7 +2099,7 @@ bool TextureCacheRuntime::UpscaleWithMetalFx(Framebuffer* dst_framebuffer, Image
                                              std::array<u32, 2> render_size,
                                              std::array<f32, 2> jitter,
                                              std::array<f32, 2> motion_scale, bool reset) {
-    if (!Settings::values.metalfx_temporal.GetValue() || metalfx_unsupported) {
+    if (!Settings::MetalFxTemporalChosen() || metalfx_unsupported) {
         return false;
     }
     if (!metalfx_upscaler) {

@@ -26,6 +26,7 @@
 #include <boost/algorithm/string/replace.hpp>
 
 #include "common/assert.h"
+#include "common/device_profile.h"
 
 namespace FS = Common::FS;
 
@@ -141,23 +142,21 @@ void Config::SetUpIni() {
 
 #ifndef __ANDROID__
     if (new_global_config) {
-        BeginGroup(Settings::TranslateCategory(Settings::Category::Renderer));
-        const auto seed = [this](const Settings::BasicSetting& setting, const std::string& value) {
-            WriteStringSetting(setting.GetLabel(), value);
-            WriteBooleanSetting(setting.GetLabel() + "\\default", false);
-        };
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-        // FSR 3's optical flow and accumulation cost a phone GPU too much for a present filter.
-        seed(Settings::values.scaling_filter,
-             ToString(u32(Settings::ScalingFilter::MetalFxSpatial)));
-#else
-        seed(Settings::values.scaling_filter, ToString(u32(Settings::ScalingFilter::Fsr3)));
-#endif
-        seed(Settings::values.gpu_accuracy, ToString(u32(Settings::GpuAccuracy::Low)));
-        seed(Settings::values.nvdec_emulation, ToString(u32(Settings::NvdecEmulation::Gpu)));
-        seed(Settings::values.async_presentation, ToString(true));
-        seed(Settings::values.use_asynchronous_shaders, ToString(true));
-        EndGroup();
+        // A new configuration starts from the recommended settings for this device. Written as
+        // chosen values, so a later change of a built-in default doesn't move them.
+        const auto profile = Settings::DeviceProfile::ForHost();
+        for (const auto& value : profile.settings) {
+            const auto it = Settings::values.linkage.by_key.find(value.key);
+            if (it == Settings::values.linkage.by_key.end() || !it->second->Save()) {
+                continue;
+            }
+            BeginGroup(Settings::TranslateCategory(it->second->GetCategory()));
+            WriteStringSetting(value.key, value.value);
+            WriteBooleanSetting(value.key + "\\default", false);
+            EndGroup();
+        }
+        LOG_INFO(Config, "New configuration: recommended settings for {} ({} tier)",
+                 profile.device_name, profile.tier_name);
     }
 #endif
 }
@@ -493,9 +492,9 @@ void Config::MigrateRendererValues() {
 #ifdef EGLANTINE_STREAMLINE
             old.dlss_build = true;
 #endif
-            old.nvidia_dlss = values.nvidia_dlss.GetValue();
-            old.fsr3 =
-                values.oot_anti_aliasing.GetValue(true) == Settings::OotAntiAliasing::Fsr3;
+            // Both keys as earlier builds wrote them (now read by the upscaler mapping below).
+            old.nvidia_dlss = old_flag("nvidia_dlss").value_or(false);
+            old.fsr3 = old_int("oot_anti_aliasing") == 2;
             if (render_scale || patch_resolution || dlss_mode || old.max_resolution_choice) {
                 set(values.oot_resolution, Migration::OotResolutionFrom(old));
                 LOG_INFO(Config,
@@ -516,6 +515,48 @@ void Config::MigrateRendererValues() {
             set(values.oot_resolution, Migration::OotResolutionFrom(old));
             LOG_INFO(Config, "Earlier settings: oot_render_scale={} -> oot_resolution={}",
                      old.render_scale, Settings::CanonicalizeEnum(values.oot_resolution.GetValue()));
+        }
+    }
+
+    if (missing("upscaler")) {
+        // oot_anti_aliasing was read as a 2-value enum: its old FSR 3.1 value 2 came out clamped.
+        const auto oot_aa = old_int("oot_anti_aliasing");
+        const bool fsr = oot_aa == 2;
+        const bool network = old_flag("game_dlss_network").value_or(false);
+        // Both were global only; a per-game value some configs have was never read.
+        const bool dlss = global && old_flag("nvidia_dlss").value_or(false);
+        const bool metalfx = global && old_flag("metalfx_temporal").value_or(false);
+        if (fsr) {
+            set(values.oot_anti_aliasing, Settings::OotAntiAliasing::Game);
+        }
+        if (fsr || network || dlss || metalfx) {
+            set(values.upscaler, Migration::UpscalerFrom(fsr, dlss, metalfx, network));
+            LOG_INFO(Config,
+                     "Earlier settings: oot_anti_aliasing FSR 3.1={} nvidia_dlss={} "
+                     "metalfx_temporal={} game_dlss_network={} -> upscaler={}",
+                     fsr, dlss, metalfx, network,
+                     Settings::CanonicalizeEnum(values.upscaler.GetValue()));
+        }
+
+        // The resolution scale no longer multiplies Ocarina of Time's own size.
+        const bool scale_set = global ? HasSetting("resolution_setup")
+                                      : !values.resolution_setup.UsingGlobal();
+        const bool resolution_set = !global && !values.oot_resolution.UsingGlobal();
+        const auto scale = values.resolution_setup.GetValue();
+        if (ocarina && (scale_set || resolution_set) && scale != Settings::ResolutionSetup::Res1X) {
+            const auto before = values.oot_resolution.GetValue();
+            const auto after = Migration::OotResolutionWithScale(before, scale);
+            if (after != before) {
+                set(values.oot_resolution, after);
+            }
+            LOG_INFO(Config,
+                     "Earlier settings: oot_resolution={} x resolution_setup={} -> "
+                     "oot_resolution={}{}",
+                     Settings::CanonicalizeEnum(before), Settings::CanonicalizeEnum(scale),
+                     Settings::CanonicalizeEnum(after),
+                     before == Settings::OotResolution::Game
+                         ? " (the scale no longer applies to the game's dynamic resolution)"
+                         : "");
         }
     }
 

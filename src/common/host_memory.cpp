@@ -119,8 +119,11 @@ std::atomic<bool> g_guest_media_ledger{};
 // Ledger-tagged guest memory: zero pages get MADV_FREE (cleared, freed and periodically found).
 // EDEN_NX2_FREE_ZERO=0/1 overrides.
 constexpr bool FreeZeroPagesDefault = true;
-// Guest memory in a file (outside the footprint). LICHII_IOS_FILE_GUEST=0/1 overrides.
-constexpr bool FileGuestDefault = false;
+// Guest memory in a file (outside the footprint). LICHII_IOS_FILE_GUEST=0/1 overrides. On since
+// the device logs of builds 56-59 (iPhone18,2): the footprint stayed at 1.6-1.8 GiB with it, and
+// without it iOS closed Ocarina of Time at 6485 of 6656 MiB entering the forest (build 54).
+// Without 10 GiB of free storage the game runs with guest memory in RAM as before.
+constexpr bool FileGuestDefault = true;
 
 [[maybe_unused]] bool EnvSwitch(const char* name, bool fallback) {
     const char* const value = std::getenv(name);

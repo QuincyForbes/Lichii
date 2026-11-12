@@ -47,6 +47,7 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(Upscaler, false);
 SWITCHABLE(OotMovieUpscale, false);
 SWITCHABLE(TextureQuality, false);
 SWITCHABLE(OotResolution, false);
@@ -398,7 +399,7 @@ void TranslateResolutionInfo(ResolutionSetup setup, ResolutionScalingInfo& info)
 }
 
 void UpdateRescalingInfo() {
-    const auto setup = values.resolution_setup.GetValue();
+    const auto setup = EffectiveResolutionSetup();
     auto& info = values.resolution_info;
     TranslateResolutionInfo(setup, info);
 }
@@ -449,6 +450,16 @@ void SetConfiguringGlobal(bool is_global) {
     configuring_global = is_global;
 }
 
+static u64 configuring_program_id = 0;
+
+void SetConfiguringProgramId(u64 program_id) {
+    configuring_program_id = program_id;
+}
+
+u64 ConfiguringProgramId() {
+    return configuring_program_id;
+}
+
 u16 SpeedLimit() {
     switch (SpeedMode(values.current_speed_mode)) {
     case SpeedMode::Standard:
@@ -492,6 +503,57 @@ OcarinaDlssMode OcarinaDlssModeFor(OotResolution resolution) {
     default:
         return OcarinaDlssMode::Quality;
     }
+}
+
+OotResolution OcarinaGameResolution(OotResolution resolution) {
+    switch (resolution) {
+    case OotResolution::Percent150:
+    case OotResolution::Percent200:
+    case OotResolution::Percent300:
+        return OotResolution::Full;
+    default:
+        return resolution;
+    }
+}
+
+ResolutionSetup EffectiveResolutionSetup() {
+    if (GetCurrentProgramID() != OcarinaOfTimeId) {
+        return values.resolution_setup.GetValue();
+    }
+    switch (values.upscaler.GetValue()) {
+    case Upscaler::Fsr3:
+    case Upscaler::Dlss:
+    case Upscaler::MetalFx:
+        return ResolutionSetup::Res1X;
+    default:
+        break;
+    }
+    switch (values.oot_resolution.GetValue()) {
+    case OotResolution::Percent150:
+        return ResolutionSetup::Res3_2X;
+    case OotResolution::Percent200:
+        return ResolutionSetup::Res2X;
+    case OotResolution::Percent300:
+        return ResolutionSetup::Res3X;
+    default:
+        return ResolutionSetup::Res1X;
+    }
+}
+
+bool NvidiaDlssChosen() {
+    return values.upscaler.GetValue() == Upscaler::Dlss;
+}
+
+bool MetalFxTemporalChosen() {
+    return values.upscaler.GetValue() == Upscaler::MetalFx;
+}
+
+bool GameDlssNetworkChosen() {
+    return values.upscaler.GetValue() == Upscaler::Game;
+}
+
+bool OcarinaFsrChosen() {
+    return values.upscaler.GetValue() == Upscaler::Fsr3;
 }
 
 void SetSpeedMode(const SpeedMode& mode) {
