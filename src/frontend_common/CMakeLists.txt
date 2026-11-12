@@ -15,6 +15,7 @@ add_library(frontend_common STATIC
     play_time_manager.cpp
     play_time_manager.h
     settings_generator.h settings_generator.cpp
+    settings_migration.h settings_migration.cpp
     update_checker.h update_checker.cpp
     update_installer.h update_installer.cpp
     mod_manager.h mod_manager.cpp
@@ -30,3 +31,5 @@ create_target_directory_groups(frontend_common)
 target_link_libraries(frontend_common
     PUBLIC core SimpleIni::SimpleIni frozen::frozen-headers
     PRIVATE common Boost::headers)
+# EGLANTINE_STREAMLINE: whether this build has NVIDIA DLSS (settings_migration).
+target_link_libraries(frontend_common PRIVATE video_core)
