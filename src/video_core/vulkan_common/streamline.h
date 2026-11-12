@@ -25,7 +25,27 @@ struct DlssFiles {
     std::string interposer_version;
     std::string model_version;
     std::string app_model_version;
+    /// Streamline's plugins (sl.common.dll, sl.dlss.dll) the loader starts DLSS with, missing ones
+    /// first. Without them Streamline only finds DLSS where the NVIDIA app downloaded its own.
+    std::vector<std::filesystem::path> missing_plugins;
 };
+
+/// What DLSS did in the current (or last) game session, for the settings and the overlay.
+struct SessionStatus {
+    bool started{};       ///< Streamline started for this session.
+    bool available{};     ///< DLSS runs on the renderer's device.
+    u64 frames{};         ///< Frames DLSS upscaled.
+    std::string version;  ///< DLSS version Streamline loaded.
+    std::string problem;  ///< Why DLSS doesn't run (empty while it does, or before a game).
+};
+
+[[nodiscard]] SessionStatus GetSessionStatus();
+
+/// Records why DLSS stopped running this session.
+void SetProblem(std::string problem);
+
+/// Counts one frame DLSS upscaled.
+void NoteEvaluation();
 
 [[nodiscard]] DlssFiles FindDlssFiles();
 

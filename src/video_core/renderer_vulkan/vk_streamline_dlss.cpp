@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <string_view>
 #include <boost/container/static_vector.hpp>
+#include <fmt/format.h>
 
 #include "common/logging.h"
 #include "common/settings.h"
@@ -133,6 +134,7 @@ StreamlineDlssUpscaler::StreamlineDlssUpscaler(const Device& device_, Scheduler&
     if (result != sl::Result::eOk || !set_options) {
         LOG_ERROR(Render_Vulkan, "Streamline's DLSS has no slDLSSSetOptions (result {})",
                   static_cast<int>(result));
+        Streamline::SetProblem("This DLSS plugin has no slDLSSSetOptions; FSR 3.1 is used.");
         throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
     }
     point_sampler = device.GetLogical().CreateSampler(VkSamplerCreateInfo{
@@ -457,9 +459,14 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             LOG_ERROR(Render_Vulkan,
                       "NVIDIA DLSS recording failed at stage {} (Streamline result {}); using FSR 3.1",
                       static_cast<int>(result), static_cast<int>(api_result));
+            Streamline::SetProblem(fmt::format(
+                "DLSS failed while upscaling (stage {}, Streamline result {}); FSR 3.1 took over.",
+                static_cast<int>(result), static_cast<int>(api_result)));
         }
         if (result != VideoCommon::DlssEvaluationResult::Succeeded) {
             clear_output();
+        } else {
+            Streamline::NoteEvaluation();
         }
     });
     // DLSS binds its own pipelines and descriptors on the command buffer.

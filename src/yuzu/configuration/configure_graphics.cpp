@@ -17,6 +17,7 @@
 #include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListView>
 #include <QMessageBox>
 #include <QPixmap>
 #include <QPushButton>
@@ -483,8 +484,10 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             group_layout->addWidget(widget);
             NvidiaDlssPanel* panel = new NvidiaDlssPanel(group);
             group_layout->addWidget(panel);
-            panel->setVisible(widget->checkbox->isChecked());
-            connect(widget->checkbox, &QCheckBox::toggled, panel, &QWidget::setVisible);
+            nvidia_dlss_checkbox = widget->checkbox;
+            nvidia_dlss_panel = panel;
+            connect(widget->checkbox, &QCheckBox::toggled, this,
+                    [this] { UpdateFeatureAvailability(); });
             hold_graphics.emplace(setting->Id(), group);
 #endif
         } else if (setting->Id() == Settings::values.frame_gen.Id()) {
@@ -811,37 +814,35 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     [[maybe_unused]] const VkDeviceInfo::Record* record =
         device >= 0 && size_t(device) < records.size() ? &records[device] : nullptr;
 
-    QString dlss_reason;
-#if defined(__APPLE__)
-    dlss_reason = tr("Not available on macOS: NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.");
-#elif !defined(EGLANTINE_STREAMLINE)
-#ifdef _WIN32
-    dlss_reason = tr("Not included in this build (built without NVIDIA Streamline).");
-#else
-    dlss_reason = tr("Windows only: NVIDIA DLSS runs through NVIDIA Streamline, which is Windows "
-                     "only.");
-#endif
-#else
-    if (!vulkan) {
-        dlss_reason = tr("Needs the Vulkan renderer.");
-    } else if (record != nullptr && !record->dlss_capable) {
-        dlss_reason = tr("Requires an NVIDIA RTX GPU with NVIDIA's driver (selected: %1).")
-                          .arg(QString::fromStdString(record->name));
+    // NVIDIA DLSS shows only where it can run: a build with Streamline (Windows), the Vulkan
+    // renderer and an NVIDIA RTX GPU selected. Elsewhere the widgets don't exist or stay hidden;
+    // the saved values are kept.
+#ifdef EGLANTINE_STREAMLINE
+    const bool dlss_offered = vulkan && record != nullptr && record->dlss_capable;
+    const bool dlss_on = nvidia_dlss_checkbox != nullptr && nvidia_dlss_checkbox->isChecked();
+    if (nvidia_dlss_widget != nullptr) {
+        nvidia_dlss_widget->setVisible(dlss_offered);
+    }
+    for (QWidget* const widget : std::initializer_list<QWidget*>{
+             nvidia_dlss_panel, nvidia_dlss_preset_widget, ocarina_dlss_mode_widget}) {
+        if (widget != nullptr) {
+            widget->setVisible(dlss_offered && dlss_on);
+        }
+    }
+    if (nvidia_dlss_panel != nullptr && record != nullptr) {
+        nvidia_dlss_panel->SetDevice(QString::fromStdString(record->name));
     }
 #endif
-    ConfigurationShared::SetUnavailable(nvidia_dlss_widget, dlss_reason);
-    ConfigurationShared::SetUnavailable(nvidia_dlss_preset_widget, dlss_reason);
-    ConfigurationShared::SetUnavailable(ocarina_dlss_mode_widget, dlss_reason);
 
-    QString frame_gen_reason;
-#ifndef HAS_LSFG
-    frame_gen_reason = tr("Frame generation is not included in this build.");
+#ifdef HAS_LSFG
+    ConfigurationShared::SetUnavailable(frame_gen_widget,
+                                        vulkan ? QString() : tr("Needs the Vulkan renderer."));
 #else
-    if (!vulkan) {
-        frame_gen_reason = tr("Needs the Vulkan renderer.");
+    // Not in this build.
+    if (frame_gen_widget != nullptr) {
+        frame_gen_widget->setVisible(false);
     }
 #endif
-    ConfigurationShared::SetUnavailable(frame_gen_widget, frame_gen_reason);
 
     QString metalfx_reason;
 #ifndef LICHII_METALFX
@@ -852,23 +853,19 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     }
 #endif
     ConfigurationShared::SetUnavailable(metalfx_temporal_widget, metalfx_reason);
-    // The MetalFX entries of the two lists stay selectable while they are the current value.
+    // The MetalFX entries of the two lists show only on Apple, or while one is the current value
+    // (a config from a Mac).
     const auto gate_item = [&](QComboBox* combobox, u32 enumeration, u32 value) {
-        auto* model = combobox != nullptr
-                          ? qobject_cast<QStandardItemModel*>(combobox->model())
-                          : nullptr;
-        if (model == nullptr) {
+        auto* view = combobox != nullptr ? qobject_cast<QListView*>(combobox->view()) : nullptr;
+        if (view == nullptr) {
             return;
         }
         const auto& items = combobox_translations.at(enumeration);
         for (size_t i = 0; i < items.size(); ++i) {
-            if (items[i].first != value) {
-                continue;
-            }
-            if (QStandardItem* item = model->item(static_cast<int>(i))) {
-                item->setEnabled(metalfx_reason.isEmpty() ||
-                                 combobox->currentIndex() == static_cast<int>(i));
-                item->setToolTip(metalfx_reason);
+            if (items[i].first == value) {
+                view->setRowHidden(static_cast<int>(i),
+                                   !metalfx_reason.isEmpty() &&
+                                       combobox->currentIndex() != static_cast<int>(i));
             }
         }
     };

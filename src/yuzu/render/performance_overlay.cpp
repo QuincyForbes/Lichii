@@ -11,6 +11,9 @@
 #include "performance_overlay.h"
 #include "ui_performance_overlay.h"
 #include "video_core/shader_notify.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#endif
 
 #include "main_window.h"
 
@@ -471,8 +474,16 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
         std::isnan(results.emulation_speed) ? 100.0 : results.emulation_speed * 100.0;
     const f32 res_scale = Settings::values.resolution_info.up_factor;
     const int building = const_cast<VideoCore::ShaderNotify&>(shaders).ShadersBuilding();
-    const QString dlss_tag =
-        Settings::values.nvidia_dlss.GetValue() ? QStringLiteral(" | DLSS") : QString{};
+    // What NVIDIA DLSS does in this game, not just the setting.
+    QString dlss_tag;
+#ifdef EGLANTINE_STREAMLINE
+    if (Settings::values.nvidia_dlss.GetValue()) {
+        const auto dlss = Vulkan::Streamline::GetSessionStatus();
+        dlss_tag = dlss.available && dlss.frames > 0 ? QStringLiteral(" | DLSS")
+                   : dlss.available                  ? tr(" | DLSS idle")
+                                                     : tr(" | DLSS off");
+    }
+#endif
     if (building > 0) {
         ui->status_info->setText(tr("Speed: %1% | Scale: %2x%3 | Shaders: %4")
                                      .arg(speed_pct, 0, 'f', 0)

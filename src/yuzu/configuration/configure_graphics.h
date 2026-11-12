@@ -25,8 +25,10 @@
 class QPushButton;
 class QEvent;
 class QObject;
+class QCheckBox;
 class QComboBox;
 class QLabel;
+class NvidiaDlssPanel;
 
 namespace Settings {
 enum class NvdecEmulation : u32;
@@ -118,6 +120,8 @@ private:
     QComboBox* resolution_combobox;
 
     QWidget* nvidia_dlss_widget{};
+    QCheckBox* nvidia_dlss_checkbox{};
+    NvidiaDlssPanel* nvidia_dlss_panel{};
     QWidget* nvidia_dlss_preset_widget{};
     QWidget* ocarina_dlss_mode_widget{};
     QWidget* frame_gen_widget{};
