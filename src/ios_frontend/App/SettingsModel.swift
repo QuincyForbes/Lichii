@@ -269,6 +269,8 @@ enum SettingsCatalog {
             return nil
         case "game_dlss_network":
             return "Used only at 1x resolution."
+        case "texture_quality":
+            return "Half or Quarter loads the game's large textures with less detail: softer up close, much less memory (about 1.2 GB less in Ocarina of Time). Applies the next time the game starts."
         default:
             return nil
         }
@@ -409,6 +411,7 @@ enum SettingLabels {
         "game_dlss_network": "Game's Own DLSS Network",
         "oot_anti_aliasing": "Ocarina of Time Anti-Aliasing",
         "oot_movie_upscale": "Ocarina of Time Movies",
+        "texture_quality": "Texture Quality",
         "accelerate_astc": "ASTC Decoding",
         "astc_recompression": "ASTC Recompression",
         "output_engine": "Audio Output Engine",
@@ -443,6 +446,7 @@ enum SettingLabels {
             "Res5X": "5x", "Res6X": "6x", "Res7X": "7x", "Res8X": "8x",
         ],
         "use_docked_mode": ["Handheld": "Handheld", "Docked": "Docked"],
+        "texture_quality": ["Full": "Full", "Half": "Half (less memory)", "Quarter": "Quarter (least memory)"],
         "use_vsync": [
             "Immediate": "Off (Immediate)", "Mailbox": "Mailbox", "Fifo": "On (FIFO)",
             "FifoRelaxed": "Relaxed FIFO",

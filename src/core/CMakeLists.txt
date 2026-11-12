@@ -56,6 +56,8 @@ add_library(core STATIC
     device_memory_manager.inc
     file_sys/bis_factory.cpp
     file_sys/bis_factory.h
+    file_sys/bntx_reduce.cpp
+    file_sys/bntx_reduce.h
     file_sys/card_image.cpp
     file_sys/card_image.h
     file_sys/common_funcs.h
@@ -176,6 +178,8 @@ add_library(core STATIC
     file_sys/system_archive/system_version.h
     file_sys/system_archive/time_zone_binary.cpp
     file_sys/system_archive/time_zone_binary.h
+    file_sys/texture_quality.cpp
+    file_sys/texture_quality.h
     file_sys/vfs/vfs.cpp
     file_sys/vfs/vfs.h
     file_sys/vfs/vfs_cached.cpp
