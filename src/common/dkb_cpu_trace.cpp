@@ -5,9 +5,14 @@
 
 #include "common/dkb_cpu_trace.h"
 #include "common/dkb_frame_trace.h"
+#include "common/perf_report.h"
 
 namespace Common::DkbCpuTrace {
 namespace {
+
+bool Enabled() {
+    return DkbFrameTrace::Enabled() || PerfReport::Enabled();
+}
 
 struct Registry {
     std::mutex mutex;
@@ -22,8 +27,8 @@ Registry& GetRegistry() {
 
 } // namespace
 
-Registration::Registration(Role role_) : clock{DkbFrameTrace::Enabled()}, role{role_} {
-    if (!DkbFrameTrace::Enabled()) {
+Registration::Registration(Role role_) : clock{Enabled()}, role{role_} {
+    if (!Enabled()) {
         return;
     }
     auto& registry = GetRegistry();

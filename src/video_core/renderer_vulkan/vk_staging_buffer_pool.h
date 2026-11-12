@@ -180,6 +180,8 @@ private:
 
     u64 upload_submit_bytes{}; ///< Uploads per command buffer before BoundUploads submits (0: off)
     u64 upload_cap_bytes{};    ///< Pooled upload buffers before BoundUploads waits for the GPU
+    u64 configured_submit_bytes{}; ///< The marks set at boot, which room to spare raises (iOS)
+    u64 configured_cap_bytes{};
     u64 tick_upload_bytes{};   ///< Pooled upload bytes handed out for upload_tick
     u64 upload_tick{};
     u64 early_submits{};       ///< Since the last log line

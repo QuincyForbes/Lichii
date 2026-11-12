@@ -17,6 +17,7 @@
 #include <vector>
 #include <fmt/ranges.h>
 
+#include "common/perf_report.h"
 #include "common/platform_events.h"
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
@@ -26,6 +27,7 @@
 #include "video_core/churn_counters.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
+#include "video_core/host_budget.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
@@ -108,6 +110,7 @@ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
     for (const BufferId buffer_id : evicted) {
         DeleteBuffer(buffer_id);
     }
+    Common::PerfReport::Add(Common::PerfReport::BufferCollected, evicted.size());
 }
 
 template <class P>
@@ -172,11 +175,40 @@ void BufferCache<P>::TickFrame() {
         // long gone: title 1's title screen grew to ~0.9 GB of buffers in ten minutes.
         // EDEN_NX2_BC_COLLECT_MIB moves the threshold (aggressive at twice it); iOS sets it from
         // the process budget, since buffers share memory with everything else there.
-        static const u64 collect_bytes = [] {
+        static const u64 configured_bytes = [] {
             const char* value = std::getenv("EDEN_NX2_BC_COLLECT_MIB");
             const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
-            return mib != 0 ? mib << 20 : u64{512_MiB};
+            return mib != 0 ? mib << 20
+                            : (HostBudget::Simulated() ? HostBudget::SimulatedBufferCollect()
+                                                       : u64{512_MiB});
         }();
+        if (collect_bytes == 0) {
+            collect_bytes = configured_bytes;
+        }
+        // iOS: past that floor, a third of the room left to the process (re-read every 30
+        // frames, up to 1 GiB). Buffers the collector deletes are uploaded again in full at
+        // their next use: an iPhone with 400-600 MiB of buffers collected at 207 MiB, aggressively
+        // (with downloads and a wait for the GPU) every frame. Small moves are ignored.
+        if (HostBudget::FollowsHeadroom() && frame_tick % 30 == 0) {
+            const u64 available = HostBudget::Available(
+                HostBudget::Simulated() && runtime.CanReportMemoryUsage()
+                    ? runtime.GetDeviceMemoryUsage()
+                    : 0);
+            if (available != 0) {
+                const u64 room =
+                    available > HostBudget::Reserve ? available - HostBudget::Reserve : 0;
+                const u64 target =
+                    std::clamp(buffer_bytes + room / 3, configured_bytes,
+                               (std::max)(configured_bytes, u64{1_GiB}));
+                if (target + 32_MiB < collect_bytes || target > collect_bytes + 64_MiB) {
+                    LOG_INFO(Common_Memory,
+                             "Buffer cache with {} MiB left to the process: collects from {} MiB "
+                             "({} MiB of buffers)",
+                             available >> 20, target >> 20, buffer_bytes >> 20);
+                    collect_bytes = target;
+                }
+            }
+        }
         if (buffer_bytes >= collect_bytes || host_pressure) {
             RunGarbageCollector(buffer_bytes >= collect_bytes * 2);
         }
@@ -3661,6 +3693,7 @@ void BufferCache<P>::NoteCpuDirty(DAddr device_addr, u64 size) {
 template <class P>
 void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                                   std::span<BufferCopy> copies) {
+    Common::PerfReport::Add(Common::PerfReport::BufferUploadBytes, total_size_bytes);
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
         MappedUploadMemory(buffer, total_size_bytes, copies);
     } else {

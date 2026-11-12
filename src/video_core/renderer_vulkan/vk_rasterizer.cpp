@@ -44,6 +44,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu_split.h"
+#include "video_core/host_budget.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/native_indirect_reset.h"
 #include "video_core/render_probe.h"
@@ -403,14 +404,21 @@ const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
     }
     // At most MaxMeshArenas submissions in flight hold one: past that, wait for the oldest rather
     // than make another (early staging submits during a scene load made one per submission).
+    // Two more with over 1.5 GiB left to the process (an iPhone in Kokiri with 2 GiB left waited
+    // for one 16 times in 3600 submissions).
     constexpr size_t MaxMeshArenas = 4;
-    if (mesh_arenas.size() >= MaxMeshArenas &&
-        std::ranges::none_of(mesh_arenas, [this](const MeshArena& arena) {
+    const auto busy = [this] {
+        return std::ranges::none_of(mesh_arenas, [this](const MeshArena& arena) {
             return arena.counted || scheduler.IsFree(arena.tick);
-        })) {
+        });
+    };
+    if (mesh_arenas.size() >= MaxMeshArenas && busy() &&
+        (mesh_arenas.size() >= MaxMeshArenas + 2 ||
+         Common::PlatformEvents::AvailableProcessMemory() < (u64{3} << 29) + mesh_arena_size)) {
         const auto oldest{std::ranges::min_element(mesh_arenas, {}, &MeshArena::tick)};
         scheduler.Wait(oldest->tick);
         ++mesh_arena_waits;
+        Common::PerfReport::Add(Common::PerfReport::MeshArenaWaits);
     }
     // A finished submission's counter holds the words its draws asked for, including those
     // that did not fit: grow later arenas to hold them.
@@ -666,6 +674,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     if (Common::DkbFrameTrace::Enabled()) {
         ++trace_draws;
     }
+    Common::PerfReport::Add(Common::PerfReport::Draws);
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -716,6 +725,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         return pipeline_cache.CurrentGraphicsPipeline();
     }()};
     if (!pipeline) {
+        Common::PerfReport::Add(Common::PerfReport::DrawsSkipped);
         report_failure("no pipeline");
         TraceRenderState(is_indexed, "no-pipeline", nullptr);
         // Mesh emulation survey: how many task/mesh draws a device without
@@ -3591,6 +3601,127 @@ void RasterizerVulkan::TickFrame() {
         buffer_cache.TickFrame();
     }
     TickMemoryReport();
+    TickPerfReport();
+}
+
+void RasterizerVulkan::TickPerfReport() {
+    if (!Common::PerfReport::Enabled()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (perf_report_frames != 0) {
+        perf_frame_max_ms = (std::max)(
+            perf_frame_max_ms,
+            std::chrono::duration<double, std::milli>(now - perf_frame_last).count());
+    }
+    perf_frame_last = now;
+    if (perf_report_frames++ == 0) {
+        perf_report_start = now;
+        perf_report_counters = Common::PerfReport::Read();
+        perf_report_churn = VideoCommon::Churn::Read();
+        perf_report_cpu = Common::DkbCpuTrace::ReadSnapshot();
+        perf_frame_max_ms = 0.0;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - perf_report_start).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const u64 frames = perf_report_frames - 1;
+    const auto counters = Common::PerfReport::Read();
+    const auto churn = VideoCommon::Churn::Read();
+    const auto cpu = Common::DkbCpuTrace::ReadSnapshot();
+    const auto delta = [&](Common::PerfReport::Counter counter) {
+        return counters[counter] - perf_report_counters[counter];
+    };
+    const auto churned = [&](VideoCommon::Churn::Counter counter) {
+        return churn[counter] - perf_report_churn[counter];
+    };
+    const auto per_second = [seconds](u64 value) { return static_cast<double>(value) / seconds; };
+    const auto mib_per_second = [seconds](u64 bytes) {
+        return static_cast<double>(bytes) / static_cast<double>(1 << 20) / seconds;
+    };
+    // Busy % of each thread's wall time; "-" when the OS has no thread clock.
+    const auto busy = [&](Common::DkbCpuTrace::Role role) -> std::optional<double> {
+        const size_t index = static_cast<size_t>(role);
+        if (!perf_report_cpu) {
+            return std::nullopt;
+        }
+        const auto ns = Common::DkbCpuTrace::CpuTimeDelta(perf_report_cpu->threads[index],
+                                                          cpu.threads[index]);
+        if (!ns) {
+            return std::nullopt;
+        }
+        return static_cast<double>(*ns) / 1e7 / seconds;
+    };
+    const auto percent = [&](Common::DkbCpuTrace::Role role) {
+        const auto value = busy(role);
+        return value ? fmt::format("{:.0f}%", *value) : std::string{"-"};
+    };
+    double guest_sum = 0.0;
+    double guest_max = 0.0;
+    bool guest_known = false;
+    for (size_t core = 0; core <= Common::DkbCpuTrace::GuestCoreCount; ++core) {
+        if (const auto value = busy(static_cast<Common::DkbCpuTrace::Role>(core))) {
+            guest_known = true;
+            guest_sum += *value;
+            guest_max = (std::max)(guest_max, *value);
+        }
+    }
+    const u64 texture_bytes = delta(Common::PerfReport::TextureUploadBytes);
+    const u64 buffer_bytes = delta(Common::PerfReport::BufferUploadBytes);
+    const u64 staging_bytes = delta(Common::PerfReport::StagingUploadBytes);
+    const u64 other_bytes = staging_bytes - (std::min)(staging_bytes, texture_bytes + buffer_bytes);
+    std::array<u64, 3> collector;
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        collector = texture_cache.CollectorMemory();
+    }
+    u64 buffers;
+    u64 buffers_collect;
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffers = buffer_cache.BufferBytes();
+        buffers_collect = buffer_cache.CollectBytes();
+    }
+    const u64 available = VideoCommon::HostBudget::Available(
+        VideoCommon::HostBudget::Simulated() ? device.GetDeviceMemoryUsage() : 0);
+    LOG_INFO(Common_Memory,
+             "Perf: {:.1f} fps, frame {:.1f} ms avg {:.0f} max | busy: GPU thread {}, GPU back {}, "
+             "Vulkan worker {}, guest cores {} (max {}) | draws {:.0f}/frame, {:.1f} skipped "
+             "(no pipeline) | uploads MiB/s: textures {:.1f}, buffers {:.1f}, other {:.1f}, "
+             "past the stream buffer {:.1f} | {} early submits, {} waits at the cap, {} mesh "
+             "arena waits | textures {:.1f} collected/s ({} downloaded), {:.1f} made/s, {} MiB "
+             "(collect {} / {} MiB) | buffers {:.1f} collected/s, {:.1f} made/s, {} MiB (collect "
+             "{} MiB) | {} MiB left",
+             static_cast<double>(frames) / seconds, seconds * 1000.0 / static_cast<double>(frames),
+             perf_frame_max_ms, percent(Common::DkbCpuTrace::Role::GpuCommand),
+             percent(Common::DkbCpuTrace::Role::GpuBack),
+             percent(Common::DkbCpuTrace::Role::VulkanWorker),
+             guest_known ? fmt::format("{:.0f}%", guest_sum) : std::string{"-"},
+             guest_known ? fmt::format("{:.0f}%", guest_max) : std::string{"-"},
+             static_cast<double>(delta(Common::PerfReport::Draws)) / static_cast<double>(frames),
+             static_cast<double>(delta(Common::PerfReport::DrawsSkipped)) /
+                 static_cast<double>(frames),
+             mib_per_second(texture_bytes), mib_per_second(buffer_bytes),
+             mib_per_second(other_bytes),
+             mib_per_second(delta(Common::PerfReport::StagingPooledBytes)),
+             delta(Common::PerfReport::EarlySubmits), delta(Common::PerfReport::CapWaits),
+             delta(Common::PerfReport::MeshArenaWaits),
+             per_second(delta(Common::PerfReport::TextureCollected)),
+             delta(Common::PerfReport::TextureCollectorDownloads),
+             per_second(churned(VideoCommon::Churn::ImagesCreated)), collector[0] >> 20,
+             collector[1] >> 20, collector[2] >> 20,
+             per_second(delta(Common::PerfReport::BufferCollected)),
+             per_second(churned(VideoCommon::Churn::BuffersCreated)), buffers >> 20,
+             buffers_collect >> 20,
+             available != 0 ? fmt::format("{}", available >> 20) : std::string{"?"});
+    perf_report_start = now;
+    perf_report_counters = counters;
+    perf_report_churn = churn;
+    perf_report_cpu = cpu;
+    perf_report_frames = 1;
+    perf_frame_max_ms = 0.0;
 }
 
 void RasterizerVulkan::TickMemoryReport() {

@@ -8,6 +8,9 @@
 #elif defined(__linux__)
 #include <pthread.h>
 #include <time.h>
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <pthread.h>
 #endif
 
 namespace Common {
@@ -28,6 +31,16 @@ std::optional<u64> ReadNativeClock(std::intptr_t native_clock) {
         return std::nullopt;
     }
     return static_cast<u64>(time.tv_sec) * 1'000'000'000 + static_cast<u64>(time.tv_nsec);
+#elif defined(__APPLE__)
+    thread_basic_info_data_t info{};
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(static_cast<thread_act_t>(native_clock), THREAD_BASIC_INFO,
+                    reinterpret_cast<thread_info_t>(&info), &count) != KERN_SUCCESS) {
+        return std::nullopt;
+    }
+    const u64 seconds = static_cast<u64>(info.user_time.seconds) + info.system_time.seconds;
+    const u64 micros = static_cast<u64>(info.user_time.microseconds) + info.system_time.microseconds;
+    return seconds * 1'000'000'000 + micros * 1'000;
 #else
     static_cast<void>(native_clock);
     return std::nullopt;
@@ -63,6 +76,10 @@ ThreadCpuClock::ThreadCpuClock(bool enabled) {
         native_clock = clock;
         available = true;
     }
+#elif defined(__APPLE__)
+    // The thread's port, without a reference of its own: the clock lives on the thread's stack.
+    native_clock = static_cast<std::intptr_t>(pthread_mach_thread_np(pthread_self()));
+    available = native_clock != 0;
 #endif
 }
 

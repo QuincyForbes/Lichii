@@ -159,13 +159,12 @@ LichiiDeviceDefaults ComputeDefaults(const LichiiDeviceInfo& info) {
                    "App ID at developer.apple.com and reinstall, or games will be closed by iOS.");
     }
 
-    // Budgets from what this process may allocate. Note that EDEN_NX2_TC_*_MIB compares against
-    // total_used_memory = runtime.GetDeviceMemoryUsage() (the entire unified Metal/Vulkan heap:
-    // render targets + textures + buffers + staging + VMA block slack, ~1.8-2.2 GiB in Ocarina's
-    // Kokiri Village), NOT cached textures alone: setting critical to 18% (1,195 MiB) locked the
-    // texture collector in permanent aggressive mode doing dozens of synchronous runtime.Finish()
-    // GPU readback stalls every frame (2-4 FPS). Runtime host_memory_cap in texture_cache.h still
-    // clamps dynamically whenever remaining process headroom gets tight.
+    // Ceilings from what this process may allocate. EDEN_NX2_TC_*_MIB compare with the texture
+    // cache's images, and both caches collect earlier when little is left to the process
+    // (VideoCommon::HostBudget, re-read as the game runs). Compared with the whole Metal heap
+    // (2254 MiB for 271 MiB of images in Kokiri) the collector never stopped, and the buffer
+    // cache's 207 MiB with 400-600 MiB of buffers did the same: 4-5 fps, gigabytes uploaded
+    // again every few seconds.
     u64 available = info.launch_available_memory_mib;
     if (available == 0) {
         available = info.physical_memory_mib * 6 / 10;
@@ -173,7 +172,7 @@ LichiiDeviceDefaults ComputeDefaults(const LichiiDeviceInfo& info) {
     const u64 critical = Clamp<u64>(available * 36 / 100, 1280, 2560);
     out.texture_cache_critical_mib = static_cast<u32>(critical);
     out.texture_cache_expected_mib = static_cast<u32>(critical * 3 / 4);
-    out.buffer_cache_collect_mib = static_cast<u32>(Clamp<u64>(available / 32, 160, 256));
+    out.buffer_cache_collect_mib = static_cast<u32>(Clamp<u64>(available / 16, 256, 512));
     out.memory_low_water_mib = static_cast<u32>(Clamp<u64>(available / 12, 384, 640));
     return out;
 }
@@ -193,8 +192,9 @@ void ApplyMemoryBudgets(const LichiiDeviceDefaults& defaults) {
     Common::PlatformEvents::SetMemoryLowWater(u64{defaults.memory_low_water_mib} << 20);
     const char* const nup_cache = std::getenv("EDEN_NUP_CACHE_MIB");
     LOG_INFO(Frontend,
-             "iOS: tier {}, texture cache {} / {} MiB, buffer cache collects at {} MiB, caches "
-             "collect below {} MiB left, decompressed .nup files {} MiB",
+             "iOS: tier {}, texture cache {} / {} MiB of images, buffer cache collects from {} "
+             "MiB or later (both follow the memory left), caches collect below {} MiB left, "
+             "decompressed .nup files {} MiB",
              defaults.tier_name, defaults.texture_cache_expected_mib,
              defaults.texture_cache_critical_mib, defaults.buffer_cache_collect_mib,
              defaults.memory_low_water_mib, nup_cache != nullptr ? nup_cache : "512");
