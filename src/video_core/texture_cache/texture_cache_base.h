@@ -355,6 +355,12 @@ public:
     /// (decoded ASTC/BCn and other host formats), rescaled, the rest; then deleted images whose
     /// memory is not free yet, and pooled images.
     [[nodiscard]] std::array<u64, 6> ImageMemoryKinds();
+    /// Images by shape, GPU-written ones not written lately and images overlapping others, for
+    /// the "Memory census" line.
+    [[nodiscard]] std::string ImageCensus();
+    /// Phone budgets: deletes textures unused for EDEN_NX2_TC_IDLE_FRAMES.
+    void CollectIdleImages();
+    u64 idle_deleted = 0;
     /// The device memory of the registered images, as the collector counts it.
     [[nodiscard]] u64 CollectableImageBytes();
 

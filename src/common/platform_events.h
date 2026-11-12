@@ -39,7 +39,7 @@ bool GuestInFile();
 /// What the caches leave to a guest memory file on top of their own reserve: 0 unless the guest
 /// is in a file. It grows while the process pages the file back in (the caches crowd it out),
 /// signalling memory pressure, and shrinks back when that stops. EDEN_NX2_GUEST_FILE_RESERVE_MIB
-/// (base, default 2048 on iOS; 0 off), _MAX_MIB (default 3072), EDEN_NX2_PAGEIN_PRESSURE (page
+/// (base, default 1024 on iOS; 0 off), _MAX_MIB (default 3072), EDEN_NX2_PAGEIN_PRESSURE (page
 /// -ins a second that count as thrashing, default 1500; 0 off).
 u64 GuestFileReserve();
 

@@ -588,6 +588,122 @@ std::array<u64, 6> TextureCache<P>::ImageMemoryKinds() {
 }
 
 template <class P>
+void TextureCache<P>::CollectIdleImages() {
+    // Phone budgets (HostBudget::FollowsHeadroom): textures nothing used for this many frames
+    // go, whatever the budget, as the collector deletes them (made again from guest memory at
+    // their next use). The collector only starts at its minimum, so a scene's textures stayed
+    // long after it. GPU-written and costly images stay (they would need a download or a slow
+    // decode). EDEN_NX2_TC_IDLE_FRAMES=<frames> (off by default: on a PC set to the phone's
+    // budget, Kokiri Forest, 600 frames remade what it freed and held as much as without it).
+    static const u64 idle_frames = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_IDLE_FRAMES");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+    }();
+    if (idle_frames == 0 || frame_tick <= idle_frames || frame_tick % 30 != 0) {
+        return;
+    }
+    constexpr size_t MaxPerPass = 32;
+    constexpr ImageFlagBits kept = ImageFlagBits::IsDecoding | ImageFlagBits::CostlyLoad |
+                                   ImageFlagBits::GpuModified | ImageFlagBits::AsynchronousDecode;
+    boost::container::small_vector<ImageId, MaxPerPass> idle;
+    lru_cache.ForEachItemBelow(frame_tick - idle_frames, [&](ImageId image_id) {
+        const auto& image = slot_images[image_id];
+        if (True(image.flags & kept) || IsDownloadable(image)) {
+            return false;
+        }
+        idle.push_back(image_id);
+        return idle.size() >= MaxPerPass;
+    });
+    for (const ImageId image_id : idle) {
+        auto& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        ++gc_deletes;
+        ++idle_deleted;
+        Common::PerfReport::Add(Common::PerfReport::TextureCollected);
+        UnregisterImage(image_id);
+        DeleteImage(image_id, false);
+    }
+}
+
+template <class P>
+std::string TextureCache<P>::ImageCensus() {
+    struct Shape {
+        u64 bytes;
+        u32 count;
+        u32 cold;
+    };
+    std::map<std::tuple<bool, u32, u32, u32, u32, u32, u32>, Shape> shapes;
+    std::vector<std::pair<VAddr, std::pair<VAddr, u64>>> ranges;
+    u64 cold_written = 0;
+    u64 written = 0;
+    // Not touched (bound, sampled, prepared) for 600 frames.
+    std::array<u64, 2> unused{};
+    for (const auto [image_id, image] : slot_images) {
+        const u64 bytes = ImageMemoryBytes(*image);
+        const bool gpu = True(image->flags & ImageFlagBits::GpuModified);
+        if (image->lru_index != SIZE_MAX && frame_tick > 600 &&
+            lru_cache.Tick(image->lru_index) + 600 < frame_tick) {
+            unused[gpu ? 1 : 0] += bytes;
+        }
+        // Not written for 10 s at 60 fps (never written: ~0).
+        const bool cold = gpu && image->last_write_frame != ~u64{0} &&
+                          RenderFrame() > image->last_write_frame + 600;
+        if (gpu) {
+            written += bytes;
+            cold_written += cold ? bytes : 0;
+        }
+        Shape& shape = shapes[{gpu, image->info.size.width, image->info.size.height,
+                               static_cast<u32>(image->info.format),
+                               static_cast<u32>(image->info.resources.layers),
+                               static_cast<u32>(image->info.resources.levels),
+                               image->info.num_samples}];
+        shape.bytes += bytes;
+        ++shape.count;
+        shape.cold += cold ? 1 : 0;
+        if (True(image->flags & ImageFlagBits::Registered)) {
+            ranges.push_back({image->cpu_addr, {image->cpu_addr_end, bytes}});
+        }
+    }
+    // Registered images whose guest range starts inside an earlier one: views of the same memory
+    // as other formats or sizes, each with host memory of its own.
+    std::sort(ranges.begin(), ranges.end());
+    u64 overlapped = 0;
+    u32 overlapped_count = 0;
+    VAddr reach = 0;
+    for (const auto& [begin, rest] : ranges) {
+        if (begin < reach) {
+            overlapped += rest.second;
+            ++overlapped_count;
+        }
+        reach = (std::max)(reach, rest.first);
+    }
+    std::vector<std::pair<u64, std::string>> top;
+    for (const auto& [key, shape] : shapes) {
+        const auto& [gpu, width, height, format, layers, levels, samples] = key;
+        top.emplace_back(shape.bytes,
+                         fmt::format("{} {}x{} fmt {} L{} M{}{} x{} {} MiB{}",
+                                     gpu ? "written" : "texture", width, height, format, layers,
+                                     levels, samples > 1 ? fmt::format(" S{}", samples) : "",
+                                     shape.count, shape.bytes >> 20,
+                                     shape.cold != 0 ? fmt::format(" ({} cold)", shape.cold)
+                                                     : std::string{}));
+    }
+    std::sort(top.rbegin(), top.rend());
+    std::string text = fmt::format(
+        "GPU-written {} MiB ({} MiB not written for 600 frames), unused for 600 frames: "
+        "textures {} MiB, GPU-written {} MiB, overlapping registered images {} ({} MiB), idle "
+        "sweep deleted {} | largest shapes:",
+        written >> 20, cold_written >> 20, unused[0] >> 20, unused[1] >> 20, overlapped_count,
+        overlapped >> 20, idle_deleted);
+    for (size_t i = 0; i < (std::min<size_t>)(16, top.size()); ++i) {
+        text += fmt::format("{} {}", i == 0 ? "" : ";", top[i].second);
+    }
+    return text;
+}
+
+template <class P>
 void TextureCache<P>::TickFrame() {
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session, and smaller ones now and then: they stay
@@ -805,6 +921,7 @@ void TextureCache<P>::TickFrame() {
         images_created = images_deleted = 0;
     }
     SweepColdImages();
+    CollectIdleImages();
     EvictTransientTargets();
     // An image that could not be made at all: the driver is out of memory whatever the counts
     // say, so collect as at the critical threshold.

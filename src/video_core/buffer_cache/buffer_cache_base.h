@@ -249,6 +249,12 @@ public:
         return buffer_bytes;
     }
 
+    /// Buffers by size and by how long ago they were used, for the "Memory census" line.
+    [[nodiscard]] std::string BufferCensus();
+    /// Phone budgets: deletes buffers unused for EDEN_NX2_BC_IDLE_FRAMES.
+    void CollectIdleBuffers();
+    u64 idle_buffers_deleted = 0;
+
     /// Where the collector starts (Switch 2 titles; 0 before the first frame).
     [[nodiscard]] u64 CollectBytes() const noexcept {
         return collect_bytes;

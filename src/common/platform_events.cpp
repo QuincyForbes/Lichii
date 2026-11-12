@@ -93,7 +93,7 @@ u64 EnvMiB(const char* name, u64 fallback) {
 
 u64 GuestReserveBase() {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-    constexpr u64 Default = 2048;
+    constexpr u64 Default = 1024;
 #else
     constexpr u64 Default = 0;
 #endif

@@ -3913,6 +3913,18 @@ void RasterizerVulkan::TickMemoryReport() {
                  image_kinds[3] >> 20, image_kinds[4] >> 20, image_kinds[5] >> 20,
                  device.MemoryTypeReport(),
                  pipeline_cache.DriverPipelineCacheBytes() >> 10);
+        std::string image_census;
+        {
+            std::scoped_lock lock{texture_cache.mutex};
+            image_census = texture_cache.ImageCensus();
+        }
+        std::string buffer_census;
+        {
+            std::scoped_lock lock{buffer_cache.mutex};
+            buffer_census = buffer_cache.BufferCensus();
+        }
+        LOG_INFO(Common_Memory, "Memory census: images: {} | buffers: {}", image_census,
+                 buffer_census);
     }
     // Every Vulkan allocation by what it is for: once, on request and with the detail line.
     if (!graphics_report_logged || requested || pressure_detail) {

@@ -114,6 +114,83 @@ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
 }
 
 template <class P>
+void BufferCache<P>::CollectIdleBuffers() {
+    // Phone budgets (HostBudget::FollowsHeadroom): buffers nothing used for this many frames go
+    // whatever the budget, as the collector deletes them (uploaded again at their next use);
+    // ones with GPU-written data stay (they would need a download). Ocarina's Kokiri Forest on a
+    // PC set to the phone's budget: 139 of 565 MiB unused for 600 frames.
+    // EDEN_NX2_BC_IDLE_FRAMES (default 1800 there, 0 off).
+    static const u64 idle_frames = [] {
+        const char* value = std::getenv("EDEN_NX2_BC_IDLE_FRAMES");
+        if (value != nullptr && value[0] != '\0') {
+            return std::strtoull(value, nullptr, 10);
+        }
+        return HostBudget::FollowsHeadroom() ? 1800ULL : 0ULL;
+    }();
+    if (idle_frames == 0 || frame_tick <= idle_frames || frame_tick % 30 != 0) {
+        return;
+    }
+    constexpr size_t MaxPerPass = 32;
+    boost::container::small_vector<BufferId, MaxPerPass> idle;
+    lru_cache.ForEachItemBelow(frame_tick - idle_frames, [&](BufferId buffer_id) {
+        const Buffer& buffer = slot_buffers[buffer_id];
+        if (gpu_modified_ranges.Intersects(buffer.CpuAddr(), buffer.SizeBytes())) {
+            return false;
+        }
+        idle.push_back(buffer_id);
+        return idle.size() >= MaxPerPass;
+    });
+    for (const BufferId buffer_id : idle) {
+        DeleteBuffer(buffer_id);
+    }
+    idle_buffers_deleted += idle.size();
+    Common::PerfReport::Add(Common::PerfReport::BufferCollected, idle.size());
+}
+
+template <class P>
+std::string BufferCache<P>::BufferCensus() {
+    // By size: up to 64 KiB (one caching page), 1 MiB, 16 MiB, larger.
+    std::array<std::pair<u32, u64>, 4> by_size{};
+    std::vector<u64> largest;
+    u32 count = 0;
+    for (const auto [buffer_id, buffer] : slot_buffers) {
+        if (buffer_id == NULL_BUFFER_ID) {
+            continue;
+        }
+        const u64 size = buffer->SizeBytes();
+        const size_t bucket = size <= 64_KiB ? 0 : size <= 1_MiB ? 1 : size <= 16_MiB ? 2 : 3;
+        ++by_size[bucket].first;
+        by_size[bucket].second += size;
+        largest.push_back(size);
+        ++count;
+    }
+    std::sort(largest.rbegin(), largest.rend());
+    // Not touched by a draw, copy or dispatch for 60 / 600 frames.
+    const auto unused_for = [&](u64 frames) {
+        u64 bytes = 0;
+        if (frame_tick > frames) {
+            lru_cache.ForEachItemBelow(frame_tick - frames, [&](BufferId id) {
+                bytes += slot_buffers[id].SizeBytes();
+            });
+        }
+        return bytes;
+    };
+    std::string top;
+    for (size_t i = 0; i < (std::min<size_t>)(8, largest.size()); ++i) {
+        top += fmt::format("{}{:.1f}", i == 0 ? "" : ", ",
+                           static_cast<double>(largest[i]) / static_cast<double>(1_MiB));
+    }
+    return fmt::format(
+        "{} buffers {} MiB: <=64 KiB {} ({} MiB), <=1 MiB {} ({} MiB), <=16 MiB {} ({} MiB), "
+        "larger {} ({} MiB); unused for 60 frames {} MiB, for 600 frames {} MiB; idle sweep "
+        "deleted {}; largest MiB: {}",
+        count, buffer_bytes >> 20, by_size[0].first, by_size[0].second >> 20, by_size[1].first,
+        by_size[1].second >> 20, by_size[2].first, by_size[2].second >> 20, by_size[3].first,
+        by_size[3].second >> 20, unused_for(60) >> 20, unused_for(600) >> 20,
+        idle_buffers_deleted, top);
+}
+
+template <class P>
 void BufferCache<P>::TickFrame() {
     // Read once per frame: FindBuffer asked for it on every binding of every draw.
     fence_behavior_accurate = Settings::IsGPUFenceBehaviorAccurate();
@@ -212,6 +289,7 @@ void BufferCache<P>::TickFrame() {
         if (buffer_bytes >= collect_bytes || host_pressure) {
             RunGarbageCollector(buffer_bytes >= collect_bytes * 2);
         }
+        CollectIdleBuffers();
     } else {
         if (runtime.CanReportMemoryUsage()) {
             total_used_memory = runtime.GetDeviceMemoryUsage();
