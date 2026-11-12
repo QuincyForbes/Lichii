@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <catch2/catch_test_macros.hpp>
+#include "common/settings.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/fsr.h"
 

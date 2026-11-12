@@ -285,18 +285,19 @@ Device DetectHost() {
 
 void SetHostDetails(const Device& device) {
     std::scoped_lock lock{g_host_mutex};
-    Device merged = device;
-    if (const AppleModel* known = FindAppleModel(merged.model)) {
-        merged.model_name = known->name;
-        merged.chip = known->chip;
-        if (merged.apple_gpu_family == 0) {
-            merged.apple_gpu_family = known->gpu_family;
-        }
-    }
-    g_host_details = std::move(merged);
+    g_host_details = device;
 }
 
-Profile Recommend(const Device& device) {
+Profile Recommend(const Device& input) {
+    // The model table names the phone and its chip ("A19 Pro"; Metal's GPU name says "A19").
+    Device device = input;
+    if (const AppleModel* known = FindAppleModel(device.model)) {
+        device.model_name = known->name;
+        device.chip = known->chip;
+        if (device.apple_gpu_family == 0) {
+            device.apple_gpu_family = known->gpu_family;
+        }
+    }
     Profile p;
     auto& v = values;
     if (device.os == Os::IOS) {
