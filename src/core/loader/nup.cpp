@@ -4,9 +4,14 @@
 #include "core/loader/nup.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
+#include <fmt/format.h>
+
+#include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "common/string_util.h"
 #include "core/core.h"
 #include "core/file_sys/nup_container.h"
@@ -14,6 +19,7 @@
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
+#include "core/file_sys/texture_quality.h"
 #include "core/file_sys/vfs/vfs_vector.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -266,9 +272,21 @@ ResultStatus AppLoader_NUP::ReadRomFS(FileSys::VirtualFile& out_file) {
         update_index ? nup->GetRomFSDir(*update_index) : FileSys::VirtualDir{};
     // A standalone update carries the complete merged tree; a base+update pair
     // overlays the update onto the base (SPEC §4.1.4).
-    const auto merged = FileSys::NupContainer::MergeShadowDirs(base_romfs, update_romfs);
+    auto merged = FileSys::NupContainer::MergeShadowDirs(base_romfs, update_romfs);
     if (merged == nullptr) {
         return ResultStatus::ErrorNoRomFS;
+    }
+    // EDEN_NX2_TEXTURE_QUALITY=0/1/2 overrides the setting for tests.
+    u32 levels = static_cast<u32>(Settings::values.texture_quality.GetValue());
+    if (const char* v = std::getenv("EDEN_NX2_TEXTURE_QUALITY"); v != nullptr && v[0] >= '0' &&
+                                                                  v[0] <= '2' && v[1] == '\0') {
+        levels = static_cast<u32>(v[0] - '0');
+    }
+    if (patch_system != nullptr && levels != 0) {
+        merged = FileSys::ApplyTextureQuality(
+            merged, levels,
+            Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "texture_quality" /
+                fmt::format("{:016X}-{}-{}.bin", base_title_id, file->GetSize(), levels));
     }
     // Mods go into the tree before the RomFS is built: layering them over the built RomFS
     // unpacks all of its files again and keeps both RomFS tables alive.

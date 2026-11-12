@@ -155,6 +155,8 @@ ENUM(DlssPreset, Default, J, K, L, M);
 ENUM(OcarinaDlssMode, Quality, Balanced, Performance, UltraPerformance);
 // Ocarina of Time's movies: the game's own upscaler, or a bilinear copy (Settings oot_movie_upscale).
 ENUM(OotMovieUpscale, Automatic, Bilinear, Game);
+// Mip levels dropped from the game's textures as they are read (Settings texture_quality).
+ENUM(TextureQuality, Full, Half, Quarter);
 ENUM(GamePatchMode, Auto, On, Off);
 ENUM(AspectRatio, R16_9, R4_3, R21_9, R16_10, Stretch);
 ENUM(ConsoleMode, Handheld, Docked);

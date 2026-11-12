@@ -526,6 +526,7 @@ const std::map<u32, std::vector<EnumChoice>>& EnumTable() {
         AddEnum<DlssPreset>(t);
         AddEnum<OcarinaDlssMode>(t);
         AddEnum<OotMovieUpscale>(t);
+        AddEnum<TextureQuality>(t);
         AddEnum<GamePatchMode>(t);
         AddEnum<AspectRatio>(t);
         AddEnum<ConsoleMode>(t);

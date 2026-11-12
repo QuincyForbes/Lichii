@@ -389,6 +389,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     // Internal state, not settings.
     INSERT(Settings, oot_fps_asked, QString(), QString());
     INSERT(Settings, frizti_settings_revision, QString(), QString());
+    INSERT(Settings, texture_quality, tr("Texture quality:"),
+           tr("Half or Quarter drops the top one or two detail levels of the game's large "
+              "textures as they load: softer textures up close, much less memory (about 1.2 GB "
+              "less in Ocarina of Time). Your game files are not changed.\nTakes effect at the next "
+              "game start."));
     INSERT(Settings, mkw_30fps, tr("Mario Kart World: 30 FPS mode"),
            tr("Forces the game to use its native 30 FPS mode at normal game speed. "
               "Takes effect after restarting the game."));
@@ -665,6 +670,12 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(GamePatchMode, Auto, tr("Auto")),
                               PAIR(GamePatchMode, On, tr("On")),
                               PAIR(GamePatchMode, Off, tr("Off")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::TextureQuality>::Index(),
+                          {
+                              PAIR(TextureQuality, Full, tr("Full")),
+                              PAIR(TextureQuality, Half, tr("Half (less memory)")),
+                              PAIR(TextureQuality, Quarter, tr("Quarter (least memory)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::OotMovieUpscale>::Index(),
                           {

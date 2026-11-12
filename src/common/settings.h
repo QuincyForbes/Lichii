@@ -70,6 +70,7 @@ SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
 SWITCHABLE(OotMovieUpscale, false);
+SWITCHABLE(TextureQuality, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -721,6 +722,12 @@ struct Values {
     // first launch (oot_fps_asked).
     SwitchableSetting<bool> oot_30fps{linkage, false, "oot_30fps", Category::RendererAdvanced};
     Setting<bool> oot_fps_asked{linkage, false, "oot_fps_asked", Category::RendererAdvanced};
+    // Half / Quarter: the RomFS serves each .bntx.zs texture of 512 px or more with its top one or
+    // two mip levels dropped (file_sys/texture_quality.h): softer textures, less guest and GPU
+    // memory. Read when the game starts.
+    SwitchableSetting<TextureQuality> texture_quality{linkage, TextureQuality::Full,
+                                                      "texture_quality",
+                                                      Category::RendererAdvanced};
     // Which revision of the Frizti tuned settings (common/frizti_settings.h) this config has had
     // applied once (MainWindow::MigrateFriztiSettings; config/frizti.ini keeps it too).
     Setting<u32> frizti_settings_revision{linkage, 0, "frizti_settings_revision",

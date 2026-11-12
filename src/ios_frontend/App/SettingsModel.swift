@@ -290,6 +290,7 @@ enum SettingsCatalog {
         "use_asynchronous_shaders": "Builds new shaders in the background: less stutter, but an object can be missing for a moment.",
         "use_disk_shader_cache": "Keeps built shaders in storage, so the next start of a game stutters less.",
         "memory_layout_mode": "Switch 1 games only: Switch 2 games always get 12 GB.",
+        "texture_quality": "Half or Quarter loads the game's large textures with less detail: softer up close, much less memory (about 1.2 GB less in Ocarina of Time). Applies the next time the game starts.",
     ]
 
     /// The settings a search finds that do nothing here, as one footer naming each and why.
@@ -446,6 +447,7 @@ enum SettingLabels {
         "game_dlss_network": "Game's Own DLSS Network",
         "oot_anti_aliasing": "Ocarina of Time Anti-Aliasing",
         "oot_movie_upscale": "Ocarina of Time Movies",
+        "texture_quality": "Texture Quality",
         "accelerate_astc": "ASTC Decoding",
         "astc_recompression": "ASTC Recompression",
         "output_engine": "Audio Output Engine",
@@ -480,6 +482,7 @@ enum SettingLabels {
             "Res5X": "5x", "Res6X": "6x", "Res7X": "7x", "Res8X": "8x",
         ],
         "use_docked_mode": ["Handheld": "Handheld", "Docked": "Docked"],
+        "texture_quality": ["Full": "Full", "Half": "Half (less memory)", "Quarter": "Quarter (least memory)"],
         "use_vsync": [
             "Immediate": "Off (Immediate)", "Mailbox": "Mailbox", "Fifo": "On (FIFO)",
             "FifoRelaxed": "Relaxed FIFO",
