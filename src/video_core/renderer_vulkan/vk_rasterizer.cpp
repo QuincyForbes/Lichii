@@ -909,6 +909,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             }
         }
     }
+    SCOPE_EXIT {
+        staging_pool.HoldSubmits(false);
+    };
     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
         report_failure("configure failed");
         TraceRenderState(is_indexed, "configure-failed", nullptr);

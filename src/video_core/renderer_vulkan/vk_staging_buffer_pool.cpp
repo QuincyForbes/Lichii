@@ -259,14 +259,17 @@ void StagingBufferPool::TickFrame() {
                  low_memory_waits);
         low_memory_waits = 0;
     }
-    if (frame_count % 60 == 0 && early_submits != 0) {
+    if (frame_count % 60 == 0 && (early_submits != 0 || held_submits != 0)) {
         LOG_INFO(Common_Memory,
-                 "Staging: {} command buffers submitted early for {} MiB of pooled uploads, {} "
-                 "waits for the GPU at the {} MiB cap ({} of the submits with under twice the "
-                 "low-water mark left); pooled upload buffers {} MiB now, peak {} MiB",
-                 early_submits, early_submit_bytes >> 20, cap_waits, upload_cap_bytes >> 20,
-                 low_memory_cap_waits, UploadPoolBytes() >> 20, upload_pool_peak >> 20);
+                 "Staging: {} command buffers submitted early for {} MiB of pooled uploads ({} "
+                 "put off to the end of a draw), {} waits for the GPU at the {} MiB cap ({} of "
+                 "the submits with under twice the low-water mark left); pooled upload buffers "
+                 "{} MiB now, peak {} MiB",
+                 early_submits, early_submit_bytes >> 20, held_submits, cap_waits,
+                 upload_cap_bytes >> 20, low_memory_cap_waits, UploadPoolBytes() >> 20,
+                 upload_pool_peak >> 20);
         early_submits = 0;
+        held_submits = 0;
         early_submit_bytes = 0;
         cap_waits = 0;
         low_memory_cap_waits = 0;
@@ -355,6 +358,11 @@ void StagingBufferPool::ReleaseIdleUploadsDownTo(u64 bytes) {
 bool StagingBufferPool::BoundUploads() {
     if (upload_submit_bytes == 0 || tick_upload_bytes < upload_submit_bytes ||
         upload_tick != scheduler.CurrentTick() || !VideoCommon::GpuSplit::OwnsScheduler()) {
+        return false;
+    }
+    if (submits_held) {
+        // The next BoundUploads between draws submits.
+        ++held_submits;
         return false;
     }
     ++early_submits;

@@ -169,6 +169,9 @@ public:
 
     void PostCopyBarrier();
 
+    /// See StagingBufferPool::HoldSubmits.
+    void HoldStagingSubmits(bool hold) noexcept;
+
     void ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t size, u32 value);
 
     /// Switch 2: mesh task indirect commands {count, 1, 1} for the counts GPU-written command

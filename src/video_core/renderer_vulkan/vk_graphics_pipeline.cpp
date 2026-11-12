@@ -1079,6 +1079,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         buffer_cache.BindHostGeometryBuffers(is_indexed);
+        // Released by the rasterizer once the draw is recorded (a render target's upload in
+        // UpdateRenderTargets must not submit them away from it).
+        buffer_cache.runtime.HoldStagingSubmits(true);
     }
     mark();
     {

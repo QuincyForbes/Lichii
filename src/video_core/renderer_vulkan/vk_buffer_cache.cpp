@@ -701,6 +701,10 @@ void BufferCacheRuntime::PreCopyBarrier() {
     });
 }
 
+void BufferCacheRuntime::HoldStagingSubmits(bool hold) noexcept {
+    staging_pool.HoldSubmits(hold);
+}
+
 void BufferCacheRuntime::PostCopyBarrier() {
     static constexpr VkMemoryBarrier WRITE_BARRIER{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
