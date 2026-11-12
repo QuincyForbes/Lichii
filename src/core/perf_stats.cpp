@@ -31,6 +31,8 @@ using std::chrono::microseconds;
 // Purposefully ignore the first five frames, as there's a significant amount of overhead in
 // booting that we shouldn't account for
 constexpr std::size_t IgnoreFrames = 5;
+// An hour of frames at 60 fps.
+constexpr std::size_t MaxHistoryFrames = 216000;
 
 namespace Core {
 
@@ -43,8 +45,10 @@ PerfStats::~PerfStats() {
 
     const std::time_t t = std::time(nullptr);
     std::ostringstream stream;
-    std::copy(perf_history.begin() + IgnoreFrames, perf_history.begin() + current_index,
-              std::ostream_iterator<double>(stream, "\n"));
+    if (perf_history.size() > IgnoreFrames) {
+        std::copy(perf_history.begin() + IgnoreFrames, perf_history.end(),
+                  std::ostream_iterator<double>(stream, "\n"));
+    }
 
     const auto path = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir);
     // %F Date format expanded is "%Y-%m-%d"
@@ -76,9 +80,15 @@ void PerfStats::EndSystemFrame() {
 
     auto frame_end = Clock::now();
     const auto frame_time = frame_end - frame_begin;
-    if (current_index < perf_history.size()) {
-        perf_history[current_index++] =
-            std::chrono::duration<double, std::milli>(frame_time).count();
+    if (current_index < MaxHistoryFrames) {
+        const double frame_ms = std::chrono::duration<double, std::milli>(frame_time).count();
+        if (current_index >= IgnoreFrames) {
+            history_sum += frame_ms;
+        }
+        if (Settings::values.record_frame_times && perf_history.size() == current_index) {
+            perf_history.push_back(frame_ms);
+        }
+        ++current_index;
     }
     accumulated_frametime += frame_time;
     system_frames += 1;
@@ -166,9 +176,7 @@ double PerfStats::GetMeanFrametime() const {
         return 0;
     }
 
-    const double sum = std::accumulate(perf_history.begin() + IgnoreFrames,
-                                       perf_history.begin() + current_index, 0.0);
-    return sum / static_cast<double>(current_index - IgnoreFrames);
+    return history_sum / static_cast<double>(current_index - IgnoreFrames);
 }
 
 PerfStatsResults PerfStats::GetAndResetStats(microseconds current_system_time_us) {
