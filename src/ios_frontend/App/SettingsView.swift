@@ -37,13 +37,14 @@ struct SettingsView: View {
                             GameIcon(game: game, size: 44)
                             VStack(alignment: .leading) {
                                 Text(game.title).font(.headline)
-                                Text("Overrides apply to this game only. Tap the globe next to a setting to override it.")
+                                Text("Overrides apply to this game only. Tap the globe next to a setting to override it. Only settings that apply to this game are listed.")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                         }
                     }
-                    SettingSectionsList(sections: SettingsCatalog.sections(perGame: true, query: query),
+                    SettingSectionsList(sections: SettingsCatalog.sections(perGame: true, query: query,
+                                                                           programId: game.programId),
                                         perGame: true)
                         .id(generation)
                     if query.isEmpty {
@@ -55,13 +56,16 @@ struct SettingsView: View {
                             Text("Debug switches, CPU and GPU hacks. Changing them can stop the game from starting.")
                         }
                         if showAdvanced {
-                            SettingSectionsList(sections: SettingsCatalog.sections(perGame: true, query: "", advanced: true),
+                            SettingSectionsList(sections: SettingsCatalog.sections(perGame: true, query: "", advanced: true,
+                                                                                   programId: game.programId),
                                                 perGame: true)
                                 .id(generation)
                         }
                     }
                     Section {
-                        Button("Remove All Overrides", role: .destructive) { showReset = true }
+                        Button("Reset This Game to Recommended", role: .destructive) { showReset = true }
+                    } footer: {
+                        Text("Removes this game's overrides, so it uses the global settings (Settings > Recommended Settings sets those for this device).")
                     }
                 } else if !query.isEmpty {
                     SettingSectionsList(sections: SettingsCatalog.sections(group: .graphics, query: query),
@@ -80,14 +84,14 @@ struct SettingsView: View {
                 }
             }
         }
-        .confirmationDialog("Use the global value for every setting of this game?", isPresented: $showReset,
+        .confirmationDialog("Remove this game's overrides?", isPresented: $showReset,
                             titleVisibility: .visible) {
-            Button("Remove Overrides", role: .destructive) {
-                for item in SettingsCatalog.all where item.switchable {
-                    item.setUsesGlobal(true)
-                }
+            Button("Reset to Recommended", role: .destructive) {
+                lichii_settings_reset_game()
                 generation += 1
             }
+        } message: {
+            Text(overrideSummary)
         }
         .onAppear(perform: open)
         .onDisappear(perform: close)
@@ -97,6 +101,15 @@ struct SettingsView: View {
                 lichii_settings_save()
             }
         }
+    }
+
+    /// The overrides a reset removes, one per line.
+    private var overrideSummary: String {
+        let overridden = SettingsCatalog.all.filter { $0.switchable && !$0.usesGlobal }
+        if overridden.isEmpty {
+            return "This game has no overrides."
+        }
+        return overridden.map { "\($0.label): \($0.displayName(of: $0.value()))" }.joined(separator: "\n")
     }
 
     private func open() {
@@ -151,6 +164,15 @@ private struct GlobalSettingsRoot: View {
     var body: some View {
         let links = AppExtensions.settingsLinks
         SettingsHeader()
+        Section {
+            NavigationLink {
+                RecommendedSettingsView()
+            } label: {
+                Label("Recommended Settings", systemImage: "wand.and.stars")
+            }
+        } footer: {
+            Text("What this device should use, and one button to set it.")
+        }
         Section {
             groupLink(.graphics)
             ForEach(links.filter { $0.id == "controls" }) { link(for: $0) }

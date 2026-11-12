@@ -93,8 +93,8 @@ bool lichii_perf_snapshot(LichiiPerfSnapshot* out) {
     out->speed = Finite(rates.speed);
 
     out->frame_gen_enabled = Settings::values.frame_gen.GetValue();
-    out->game_dlss_network = Settings::values.game_dlss_network.GetValue();
-    out->nvidia_dlss = Settings::values.nvidia_dlss.GetValue();
+    out->game_dlss_network = Settings::GameDlssNetworkChosen();
+    out->nvidia_dlss = Settings::NvidiaDlssChosen();
     out->frame_gen_type = static_cast<int32_t>(Settings::values.frame_gen_type.GetValue());
     out->frame_gen_multiplier = Settings::FrameGenMultiplier();
     out->scaling_filter = static_cast<int32_t>(Settings::values.scaling_filter.GetValue());

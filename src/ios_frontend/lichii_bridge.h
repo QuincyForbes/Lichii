@@ -133,6 +133,39 @@ bool lichii_settings_set_effective(const char* key, const char* value);
 bool lichii_settings_frame_gen_built(void);
 bool lichii_settings_post_shaders_built(void);
 
+/// The game a setting belongs to (common/game_settings.h), 0 when it applies to every game. A
+/// per-game page lists it only for that game.
+uint64_t lichii_settings_game(const char* key);
+/// Whether the per-game page of `program_id` lists the setting: not another game's own settings,
+/// nor those the game's own replace (Ocarina of Time's resolution includes the scale).
+bool lichii_settings_applies(const char* key, uint64_t program_id);
+/// The name of a game with settings of its own, "" otherwise.
+const char* lichii_settings_game_name(uint64_t program_id);
+/// Inside a per-game scope: every override goes back to the global value. Returns how many, -1
+/// outside a scope.
+int lichii_settings_reset_game(void);
+
+/* ----------------------------------------------------------------------- recommended settings */
+
+/// One recommended value for this device (common/device_profile.h).
+typedef struct LichiiRecommended {
+    const char* key;     ///< settings key, or an app item ("guest_memory_file", "auto_cool")
+    const char* value;   ///< as lichii_settings_set takes it
+    const char* display; ///< canonical name ("Percent56", "On")
+    const char* reason;
+    bool app;            ///< an app item the app applies itself
+} LichiiRecommended;
+
+/// Builds the recommended settings for this device; returns how many. The strings stay valid
+/// until the next call.
+size_t lichii_recommended_load(void);
+bool lichii_recommended_get(size_t index, LichiiRecommended* out);
+/// "iPhone 17 Pro Max (A19 Pro, 12 GB)"
+char* lichii_recommended_device(void);
+/// Writes the recommended settings to the global config and saves it. Returns how many changed,
+/// -1 while a game runs or a per-game scope is open.
+int lichii_recommended_apply(void);
+
 /* ------------------------------------------------------------------------------------ emulation */
 
 typedef enum LichiiEmuState {
