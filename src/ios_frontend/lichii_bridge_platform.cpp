@@ -14,6 +14,8 @@
 #include <type_traits>
 #include <vector>
 
+#include <sys/mount.h>
+
 #include <fmt/format.h>
 
 #include "common/fs/path_util.h"
@@ -215,6 +217,10 @@ void ApplyExperiments() {
     } else if (lichii_platform_experiment("file_guest_off")) {
         setenv("LICHII_IOS_FILE_GUEST", "0", 0);
         LOG_WARNING(Frontend, "iOS: experiment file_guest off");
+    } else {
+        // Set either way, so a switch in Experiments later replaces the value instead of growing
+        // the environment while other threads read it.
+        setenv("LICHII_IOS_FILE_GUEST", Common::HostMemory::FileGuestByDefault() ? "1" : "0", 0);
     }
     if (lichii_platform_experiment("no_zero_trim")) {
         setenv("EDEN_NX2_TRIM_ZERO", "0", 0);
@@ -451,6 +457,38 @@ int lichii_platform_file_guest(void) {
 void lichii_platform_set_file_guest(int enabled) {
     lichii_platform_set_experiment("file_guest", enabled);
     lichii_platform_set_experiment("file_guest_off", enabled == 0 ? 1 : 0);
+    // HostMemory reads it each time a game boots; the user's choice replaces the launch value.
+    setenv("LICHII_IOS_FILE_GUEST", enabled != 0 ? "1" : "0", 1);
+    LOG_INFO(HW_Memory, "iOS app: Keep Guest Memory in a File turned {} (from the next game start)",
+             enabled != 0 ? "on" : "off");
+}
+
+int lichii_platform_file_guest_storage(LichiiFileGuestStorage* out) {
+    if (out == nullptr) {
+        return 0;
+    }
+    *out = {};
+    const char* const directory = std::getenv("TMPDIR");
+    struct statfs volume {};
+    if (directory == nullptr || directory[0] == '\0' || statfs(directory, &volume) != 0) {
+        return 0;
+    }
+    // The figures of HostMemory InitFile: a 14 GiB file, refused under min(file, 8 GiB) + 2 GiB
+    // free, reserved in full from file + 2 GiB free.
+    constexpr u64 FileMib = 14336;
+    constexpr u64 MarginMib = 2048;
+    constexpr u64 MinReservedMib = 8192;
+    out->free_mib = (static_cast<u64>(volume.f_bavail) * volume.f_bsize) >> 20;
+    out->file_mib = FileMib;
+    out->needed_mib = std::min(FileMib, MinReservedMib) + MarginMib;
+    out->full_mib = FileMib + MarginMib;
+    return 1;
+}
+
+void lichii_platform_log_memory(const char* message) {
+    if (message != nullptr) {
+        LOG_INFO(HW_Memory, "iOS app: {}", message);
+    }
 }
 
 } // extern "C"

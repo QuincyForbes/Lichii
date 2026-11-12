@@ -30,7 +30,7 @@ struct LibraryView: View {
                         ImportProgressBanner(progress: progress)
                     }
                     if !recent.isEmpty {
-                        RecentRow(games: recent, open: app.launch)
+                        RecentRow(games: recent, open: { app.launch($0) })
                     }
                     if games.isEmpty && !query.isEmpty && !library.games.isEmpty {
                         ContentUnavailableView.search(text: query)
