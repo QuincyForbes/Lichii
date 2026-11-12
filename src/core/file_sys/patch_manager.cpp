@@ -574,7 +574,7 @@ constexpr std::array BUILTIN_PATCHES{
                        "the game's decompressor.",
         .effect = "Faster loading and streaming with less CPU use; no visible change.",
         .chosen = OotNativeZstdEnabled,
-        .chosen_by = "always on",
+        .chosen_by = "default (always on)",
     },
     BuiltinPatch{
         .name = "Fast lookup strcmp (built-in)",
@@ -588,7 +588,7 @@ constexpr std::array BUILTIN_PATCHES{
                        "time.",
         .effect = "Less CPU use while the game loads assets; same results.",
         .chosen = OotFastLookupEnabled,
-        .chosen_by = "always on",
+        .chosen_by = "default (always on)",
     },
     BuiltinPatch{
         .name = "Resource poll backoff (built-in)",
@@ -602,7 +602,7 @@ constexpr std::array BUILTIN_PATCHES{
                        "when a request is not ready.",
         .effect = "Frees a CPU core; no change to gameplay.",
         .chosen = OotPollBackoffEnabled,
-        .chosen_by = "always on",
+        .chosen_by = "default (always on)",
     },
     BuiltinPatch{
         .name = "Texture Pool x2 (built-in)",
@@ -616,7 +616,7 @@ constexpr std::array BUILTIN_PATCHES{
                        "house and pot room could exhaust and hang on.",
         .effect = "Fixes that hang; uses a little more memory.",
         .chosen = OotTexturePoolEnabled,
-        .chosen_by = "always on",
+        .chosen_by = "default (always on)",
     },
 };
 
