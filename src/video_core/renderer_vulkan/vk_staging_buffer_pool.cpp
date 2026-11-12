@@ -47,9 +47,10 @@ constexpr VkDeviceSize MAX_ALIGNMENT = 256;
 #if defined(__FreeBSD__)
 constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
 #elif defined(__APPLE__) && TARGET_OS_IPHONE
-// iOS counts all of it in the footprint once the ring has gone round; uploads past a region (4 MiB)
-// take pooled staging buffers instead.
-constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 64_MiB;
+// iOS counts all of it in the footprint once the ring has gone round; uploads past a region (2 MiB)
+// take pooled staging buffers instead. 32 MiB (and 16) cost no frame rate on desktop, where
+// decoded ASTC uploads several times the bytes the phone does.
+constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 32_MiB;
 #else
 constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 256_MiB;
 #endif
@@ -88,6 +89,12 @@ bool IsRebarUploadEnabled(const Device& device) {
 }
 
 size_t GetStreamBufferSize(const Device& device) {
+    // EDEN_NX2_STREAM_BUFFER_MIB=<n>: another size, for measuring what it costs.
+    if (const char* const env = std::getenv("EDEN_NX2_STREAM_BUFFER_MIB")) {
+        if (const long mib = std::strtol(env, nullptr, 10); mib >= 4 && mib <= 1024) {
+            return static_cast<size_t>(mib) << 20;
+        }
+    }
     if (!device.HasDebuggingToolAttached()) {
         if (device.IsIntegrated()) {
             // An integrated GPU's device-local host-visible heap can be no bigger than the stream
