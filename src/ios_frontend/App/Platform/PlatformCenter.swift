@@ -168,10 +168,17 @@ final class PlatformCenter: ObservableObject {
         applyAutoCoolPacing()
     }
 
+    private var autoCoolLogged: (Int32, Bool)?
+
     private func applyAutoCoolPacing() {
         guard autoCool else {
             lichii_platform_set_thermal_max_fps(0)
             return
+        }
+        // Which of the two set a cap ("Auto-Cool: capping ..." follows in the log).
+        if autoCoolLogged.map({ $0 != (thermalState, lowPowerMode) }) ?? true {
+            autoCoolLogged = (thermalState, lowPowerMode)
+            lichii_platform_log_memory("Auto-Cool: thermal state \(thermalState) (2 = serious, 3 = critical), Low Power Mode \(lowPowerMode ? "on" : "off")")
         }
         if thermalState >= 3 {
             lichii_platform_set_thermal_max_fps(30)

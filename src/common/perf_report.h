@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 
@@ -38,12 +39,25 @@ enum Counter : std::size_t {
     BufferUploadBytes,   ///< Guest buffer data uploaded by the buffer cache
     StagingUploadBytes,  ///< Every upload staging request (the sources above and the rest)
     StagingPooledBytes,  ///< Upload staging past the stream buffer, at its allocation size
+    StagingScratchBytes, ///< Device-local scratch from the staging pool (mesh emulation output)
     EarlySubmits,        ///< Command buffers submitted for their pooled uploads
     CapWaits,            ///< Waits for the GPU at the pooled upload cap
     TextureCollected,    ///< Images the texture collector deleted
     TextureCollectorDownloads, ///< Of them, downloaded first (a wait for the GPU each)
     BufferCollected,     ///< Buffers the buffer collector deleted
     MeshArenaWaits,      ///< Waits for a submission's mesh emulation arena
+    UniformStreamBytes,  ///< Of StagingUploadBytes: uniform buffers streamed per draw
+    UniformPadBytes,     ///< Of them, zeroed padding past the bound size (MoltenVK)
+    IndexStreamBytes,    ///< Of StagingUploadBytes: inline and widened index data
+    GpuBusyNs,           ///< GPU time of finished command buffers, overlaps counted once
+    GpuTimedBuffers,     ///< Command buffers that GpuBusyNs covers
+    RenderPasses,        ///< Render passes begun
+    MeshEmulatedDraws,   ///< Mesh draws run as compute + a vertex draw
+    MeshPassBreaks,      ///< Of them, ones that ended a render pass for their compute
+    GuestRunNs,          ///< Guest cores: wall time in guest code (the JIT)
+    GuestKernelNs,       ///< Guest cores: wall time in SVCs, the scheduler and fiber switches
+    GuestIdleNs,         ///< Guest cores: wall time waiting with nothing to run
+    GuestIdles,          ///< Guest cores: waits begun
     Count,
 };
 
@@ -54,6 +68,21 @@ inline void Add(Counter counter, u64 amount = 1) {
         return;
     }
     g_counters[counter].fetch_add(amount, std::memory_order_relaxed);
+}
+
+/// Guest core time split: adds the time since this thread's previous mark to `closed`.
+inline void MarkGuest(Counter closed) {
+    if (!Enabled()) {
+        return;
+    }
+    thread_local u64 last_ns = 0;
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    if (last_ns != 0) {
+        g_counters[closed].fetch_add(now - last_ns, std::memory_order_relaxed);
+    }
+    last_ns = now;
 }
 
 inline std::array<u64, Count> Read() {

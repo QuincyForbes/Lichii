@@ -16,6 +16,7 @@
 #include <arm_acle.h>
 #endif
 #endif
+#include "common/perf_report.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -147,6 +148,7 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
                 return;
             }
 
+            Common::PerfReport::MarkGuest(Common::PerfReport::GuestKernelNs);
             if (thread->GetStepState() == StepState::StepPending) {
                 hr = interface->StepThread(thread);
 
@@ -156,6 +158,7 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
             } else {
                 hr = interface->RunThread(thread);
             }
+            Common::PerfReport::MarkGuest(Common::PerfReport::GuestRunNs);
 
             ExitContext();
         }
@@ -277,6 +280,11 @@ void PhysicalCore::LogBacktrace(KernelCore& kernel) {
 }
 
 void PhysicalCore::Idle(KernelCore& kernel) {
+    Common::PerfReport::MarkGuest(Common::PerfReport::GuestKernelNs);
+    Common::PerfReport::Add(Common::PerfReport::GuestIdles);
+    SCOPE_EXIT {
+        Common::PerfReport::MarkGuest(Common::PerfReport::GuestIdleNs);
+    };
     // Guest job systems hand work between cores many times per frame; blocking at once adds the
     // host's thread wake-up latency to every handoff. EDEN_NX2_IDLE_SPIN_US=<n>: poll for that
     // many microseconds before blocking. Switch 2 titles poll 20 us by default outside Android

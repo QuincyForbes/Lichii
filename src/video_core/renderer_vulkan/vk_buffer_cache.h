@@ -6,11 +6,15 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <utility>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
+#include "common/perf_report.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/buffer_cache/usage_tracker.h"
@@ -195,7 +199,13 @@ public:
         return (device.IsMoltenVK() || forced) && !device.IsExtIndexTypeUint8Supported();
     }
 
-    void BindHostUint8IndexBuffer(std::span<const u8> indices);
+    /// Widens `indices` (the guest buffer from its first byte) to 16 bits and binds them. With a
+    /// guest address, the copy is kept for BindCachedUint8IndexBuffer.
+    void BindHostUint8IndexBuffer(std::span<const u8> indices, DAddr address);
+
+    /// Binds the buffer widened from `address` earlier in this command buffer if it holds
+    /// `draw_indices` at byte `first`.
+    bool BindCachedUint8IndexBuffer(DAddr address, u32 first, std::span<const u8> draw_indices);
 
     void BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset, u32 size, u32 stride);
 
@@ -213,13 +223,33 @@ public:
         u32 offset;
     };
 
+    /// The bytes the next BindMappedUniformBuffer's shader may read (its used size): on MoltenVK
+    /// the allocation is zeroed up to there. 0 = unknown, the whole 64 KiB bank.
+    void SetStreamUniformReadableSize(u32 bytes) noexcept {
+        stream_uniform_readable = bytes;
+    }
+
     std::span<u8> BindMappedUniformBuffer([[maybe_unused]] size_t stage,
                                           [[maybe_unused]] u32 binding_index,
                                           u32 size) {
-        const u32 allocation_size = device.IsMoltenVK() ? (std::max)(size, 65536U) : size;
+        const u32 readable = std::exchange(stream_uniform_readable, 0U);
+        u32 allocation_size = size;
+        switch (UniformPadMode()) {
+        case UniformPad::None:
+            break;
+        case UniformPad::Readable:
+            allocation_size = (std::max)(size, readable != 0 ? readable : 65536U);
+            break;
+        case UniformPad::Bank:
+            allocation_size = (std::max)(size, 65536U);
+            break;
+        }
         const StagingBufferRef ref = staging_pool.Request(allocation_size, MemoryUsage::Upload);
-        if (device.IsMoltenVK()) {
-            std::fill(ref.mapped_span.begin() + size, ref.mapped_span.end(), u8{0});
+        Common::PerfReport::Add(Common::PerfReport::UniformStreamBytes, allocation_size);
+        if (allocation_size != size) {
+            Common::PerfReport::Add(Common::PerfReport::UniformPadBytes, allocation_size - size);
+            std::fill(ref.mapped_span.begin() + size, ref.mapped_span.begin() + allocation_size,
+                      u8{0});
         }
         last_stream_uniform = StreamUniformRef{
             .buffer = ref.buffer,
@@ -227,7 +257,7 @@ public:
             .offset = static_cast<u32>(ref.offset),
         };
         RebindStreamUniform(last_stream_uniform, size);
-        return device.IsMoltenVK() ? ref.mapped_span.first(size) : ref.mapped_span;
+        return allocation_size != size ? ref.mapped_span.first(size) : ref.mapped_span;
     }
 
     /// The allocation of the latest BindMappedUniformBuffer call.
@@ -349,6 +379,33 @@ private:
     VkDeviceSize multi_range_total{};
 
     StreamUniformRef last_stream_uniform{};
+    u32 stream_uniform_readable{};
+
+    /// Shaders declare every uniform buffer as a 64 KiB array. MoltenVK streamed ones were padded
+    /// to all of it (zeroed); the shader reads only below its used size, so that is enough.
+    /// EDEN_NX2_UBO_PAD=bank: the whole 64 KiB, =readable: the used size, =0: none.
+    /// Default: readable on MoltenVK, none elsewhere.
+    enum class UniformPad : u8 { None, Readable, Bank };
+    UniformPad uniform_pad{UniformPad::None};
+
+    UniformPad UniformPadMode() const noexcept {
+        return uniform_pad;
+    }
+
+    /// Guest 8-bit index buffers widened in the current command buffer (BindHostUint8IndexBuffer),
+    /// bound again by BindCachedUint8IndexBuffer. EDEN_NX2_UINT8_REUSE=0 turns that off.
+    struct WidenedUint8 {
+        DAddr address{};
+        u64 tick{};
+        u64 used{};
+        VkBuffer buffer{};
+        VkDeviceSize offset{};
+        std::vector<u8> bytes;
+    };
+    std::array<WidenedUint8, 4> widened_uint8{};
+    u64 widened_uint8_uses{};
+
+    void BindWidenedIndexBuffer(VkBuffer buffer, VkDeviceSize offset);
 
     bool limit_dynamic_storage_buffers = false;
     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();

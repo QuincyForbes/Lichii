@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
@@ -432,6 +433,17 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                                                                      scheduler_, staging_pool_);
     quad_strip_index_buffer = std::make_shared<QuadStripIndexBuffer>(device_, memory_allocator_,
                                                                      scheduler_, staging_pool_);
+    uniform_pad = device.IsMoltenVK() ? UniformPad::Readable : UniformPad::None;
+    if (const char* const pad = std::getenv("EDEN_NX2_UBO_PAD")) {
+        const std::string_view value{pad};
+        uniform_pad = value == "bank"       ? UniformPad::Bank
+                      : value == "readable" ? UniformPad::Readable
+                                            : UniformPad::None;
+    }
+    if (uniform_pad != UniformPad::None) {
+        LOG_INFO(Render_Vulkan, "Streamed uniform buffers are zero-padded to {}",
+                 uniform_pad == UniformPad::Bank ? "64 KiB" : "their shader's used size");
+    }
 }
 
 u32 BufferCacheRuntime::SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs,
@@ -829,15 +841,60 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
     });
 }
 
-void BufferCacheRuntime::BindHostUint8IndexBuffer(std::span<const u8> indices) {
+namespace {
+bool Uint8ReuseEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_UINT8_REUSE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // Anonymous namespace
+
+void BufferCacheRuntime::BindWidenedIndexBuffer(VkBuffer buffer, VkDeviceSize offset) {
     bound_index_valid = false;
-    const auto staging = staging_pool.Request(indices.size() * sizeof(u16), MemoryUsage::Upload);
-    u16* const widened = reinterpret_cast<u16*>(staging.mapped_span.data());
-    std::ranges::transform(indices, widened, [](u8 index) -> u16 { return index == 0xff ? 0xffff : index; });
-    scheduler.Record([this, buffer = staging.buffer, offset = staging.offset](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, buffer, offset](vk::CommandBuffer cmdbuf) {
         cmdbuf.BindIndexBuffer(buffer, offset, VK_INDEX_TYPE_UINT16);
         scheduler.NoteIndexBufferBound();
     });
+}
+
+bool BufferCacheRuntime::BindCachedUint8IndexBuffer(DAddr address, u32 first,
+                                                    std::span<const u8> draw_indices) {
+    if (!Uint8ReuseEnabled() || address == 0) {
+        return false;
+    }
+    // A stream allocation made on the current tick is still live: the GPU has not run it yet.
+    const u64 tick = scheduler.CurrentTick();
+    for (WidenedUint8& entry : widened_uint8) {
+        if (entry.address != address || entry.tick != tick ||
+            u64{first} + draw_indices.size() > entry.bytes.size() ||
+            std::memcmp(entry.bytes.data() + first, draw_indices.data(), draw_indices.size()) !=
+                0) {
+            continue;
+        }
+        entry.used = ++widened_uint8_uses;
+        BindWidenedIndexBuffer(entry.buffer, entry.offset);
+        return true;
+    }
+    return false;
+}
+
+void BufferCacheRuntime::BindHostUint8IndexBuffer(std::span<const u8> indices, DAddr address) {
+    const auto staging = staging_pool.Request(indices.size() * sizeof(u16), MemoryUsage::Upload);
+    Common::PerfReport::Add(Common::PerfReport::IndexStreamBytes, indices.size() * sizeof(u16));
+    u16* const widened = reinterpret_cast<u16*>(staging.mapped_span.data());
+    std::ranges::transform(indices, widened, [](u8 index) -> u16 { return index == 0xff ? 0xffff : index; });
+    if (address != 0 && Uint8ReuseEnabled()) {
+        WidenedUint8& entry = *std::ranges::min_element(widened_uint8, {}, &WidenedUint8::used);
+        entry.address = address;
+        entry.tick = scheduler.CurrentTick();
+        entry.used = ++widened_uint8_uses;
+        entry.buffer = staging.buffer;
+        entry.offset = staging.offset;
+        entry.bytes.assign(indices.begin(), indices.end());
+    }
+    BindWidenedIndexBuffer(staging.buffer, staging.offset);
 }
 
 void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 first, u32 count) {
