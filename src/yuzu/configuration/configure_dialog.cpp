@@ -38,8 +38,10 @@
 #include "yuzu/configuration/configure_web.h"
 #include "yuzu/hotkeys.h"
 
+Q_DECLARE_METATYPE(QList<QWidget*>);
+
 ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
-                                 InputCommon::InputSubsystem* input_subsystem,
+                                 InputCommon::InputSubsystem* input_subsystem_,
                                  std::vector<VkDeviceInfo::Record>& vk_device_records,
                                  Core::System& system_, bool enable_web_config)
     : QDialog(parent), ui{std::make_unique<Ui::ConfigureDialog>()}, registry(registry_),
@@ -63,11 +65,10 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
           },
           nullptr, *builder, this)},
       hotkeys_tab{std::make_unique<ConfigureHotkeys>(system_.HIDCore(), this)},
-      input_tab{std::make_unique<ConfigureInput>(system_, this)},
       network_tab{std::make_unique<ConfigureNetwork>(system_, this)},
       profile_tab{std::make_unique<ConfigureProfileManager>(system_, this)},
       system_tab{std::make_unique<ConfigureSystem>(system_, nullptr, *builder, this)},
-      web_tab{std::make_unique<ConfigureWeb>(this)} {
+      web_tab{std::make_unique<ConfigureWeb>(this)}, input_subsystem{input_subsystem_} {
     Settings::SetConfiguringGlobal(true);
 
     ui->setupUi(this);
@@ -75,12 +76,19 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
     web_tab->SetWebServiceConfigEnabled(enable_web_config);
     hotkeys_tab->Populate(registry);
 
-    input_tab->Initialize(input_subsystem);
-
     general_tab->SetResetCallback([&] { this->close(); });
 
     SetConfiguration();
     PopulateSelectionList();
+
+    // Every tab is the dialog's child until its page first shows it; hidden until then, or it
+    // draws at the dialog's top left behind the list and the buttons.
+    for (int row = 0; row < ui->selectorList->count(); ++row) {
+        const QVariant tabs = ui->selectorList->item(row)->data(Qt::UserRole);
+        for (QWidget* const tab : qvariant_cast<QList<QWidget*>>(tabs)) {
+            tab->hide();
+        }
+    }
 
     connect(ui->tabWidget, &QTabWidget::currentChanged, this, [this](int index) {
         if (index != -1) {
@@ -116,7 +124,9 @@ void ConfigureDialog::ApplyConfiguration() {
     system_tab->ApplyConfiguration();
     profile_tab->ApplyConfiguration();
     filesystem_tab->ApplyConfiguration();
-    input_tab->ApplyConfiguration();
+    if (input_tab) {
+        input_tab->ApplyConfiguration();
+    }
     hotkeys_tab->ApplyConfiguration(registry);
     cpu_tab->ApplyConfiguration();
     graphics_tab->ApplyConfiguration();
@@ -199,6 +209,7 @@ QWidget* ConfigureDialog::WrapTab(QWidget* tab) {
     area->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     area->setAccessibleName(tab->accessibleName());
     area->setWidget(tab);
+    tab->show();
     tab_scroll_areas.emplace(tab, area);
     return area;
 }
@@ -221,8 +232,6 @@ void ConfigureDialog::HandleApplyButtonClicked() {
     ApplyConfiguration();
 }
 
-Q_DECLARE_METATYPE(QList<QWidget*>);
-
 void ConfigureDialog::PopulateSelectionList() {
     const std::array<std::pair<QString, QList<QWidget*>>, 6> items{
         {{tr("General"),
@@ -234,7 +243,7 @@ void ConfigureDialog::PopulateSelectionList() {
          {tr("Graphics"),
           {graphics_tab.get(), graphics_advanced_tab.get(), graphics_extensions_tab.get()}},
          {tr("Audio"), {audio_tab.get()}},
-         {tr("Controls"), input_tab->GetSubTabs()}},
+         {tr("Controls"), {}}},
     };
 
     [[maybe_unused]] const QSignalBlocker blocker(ui->selectorList);
@@ -268,10 +277,21 @@ void ConfigureDialog::UpdateVisibleTabs() {
 
     ui->tabWidget->clear();
 
-    const auto tabs = qvariant_cast<QList<QWidget*>>(items[0]->data(Qt::UserRole));
+    const auto tabs = items[0] == ui->selectorList->item(ui->selectorList->count() - 1)
+                          ? ControlsTabs()
+                          : qvariant_cast<QList<QWidget*>>(items[0]->data(Qt::UserRole));
 
     for (auto* const tab : tabs) {
         LOG_DEBUG(Frontend, "{}", tab->accessibleName().toStdString());
         ui->tabWidget->addTab(WrapTab(tab), tab->accessibleName());
     }
+}
+
+QList<QWidget*> ConfigureDialog::ControlsTabs() {
+    if (!input_tab) {
+        input_tab = std::make_unique<ConfigureInput>(system, this);
+        input_tab->hide();
+        input_tab->Initialize(input_subsystem);
+    }
+    return input_tab->GetSubTabs();
 }

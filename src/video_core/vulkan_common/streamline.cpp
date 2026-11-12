@@ -5,12 +5,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -47,13 +50,34 @@ struct State {
     std::wstring model_dir;
     std::vector<std::string> instance_extensions;
     std::vector<std::string> device_extensions;
-    bool started{};
-    bool attached{};
+    std::atomic<bool> started{};
+    std::atomic<bool> attached{};
 };
 
 State& GetState() {
     static State state;
     return state;
+}
+
+/// Read by the frontend while the renderer runs.
+struct Session {
+    std::mutex mutex;
+    std::string version;
+    std::string problem;
+    std::atomic<u64> frames{};
+};
+
+Session& GetSession() {
+    static Session session;
+    return session;
+}
+
+/// Logs a warning and keeps it as the session's reason DLSS doesn't run.
+template <typename... Args>
+void Problem(fmt::format_string<Args...> format, Args&&... args) {
+    std::string text = fmt::format(format, std::forward<Args>(args)...);
+    LOG_WARNING(Render_Vulkan, "{}", text);
+    SetProblem(std::move(text));
 }
 
 int LogLevel() {
@@ -193,12 +217,15 @@ bool Load(State& state, const std::filesystem::path& path) {
     if (!IsStreamlineModule(path)) {
         LOG_ERROR(Render_Vulkan, "{} is not signed by NVIDIA; not loading it",
                   Common::FS::PathToUTF8String(path));
+        SetProblem("sl.interposer.dll is not signed by NVIDIA. Download the files again.");
         return false;
     }
     state.module = LoadLibraryW(path.c_str());
     if (!state.module) {
+        const DWORD error = GetLastError();
         LOG_ERROR(Render_Vulkan, "Could not load {} (error {})", Common::FS::PathToUTF8String(path),
-                  GetLastError());
+                  error);
+        SetProblem(fmt::format("Windows could not load sl.interposer.dll (error {}).", error));
         return false;
     }
     Api& api = state.api;
@@ -218,6 +245,7 @@ bool Load(State& state, const std::filesystem::path& path) {
     FreeLibrary(state.module);
     state.module = nullptr;
     state.api = {};
+    SetProblem("This sl.interposer.dll is not a Streamline 2 loader. Download the files again.");
     return false;
 }
 
@@ -284,6 +312,11 @@ DlssFiles FindDlssFiles() {
     if (std::filesystem::is_regular_file(files.folder / MODEL, ec)) {
         files.model = files.folder / MODEL;
     }
+    for (const wchar_t* const plugin : {L"sl.common.dll", L"sl.dlss.dll"}) {
+        if (!std::filesystem::is_regular_file(files.folder / plugin, ec)) {
+            files.missing_plugins.push_back(files.folder / plugin);
+        }
+    }
     files.app_model = FindAppModel();
     files.interposer_version = VersionText(files.interposer);
     files.model_version = VersionText(files.model);
@@ -299,18 +332,23 @@ bool Start() {
     if (!Settings::values.nvidia_dlss.GetValue()) {
         return false;
     }
+    {
+        std::scoped_lock lock{GetSession().mutex};
+        GetSession().problem.clear();
+        GetSession().version.clear();
+    }
+    GetSession().frames = 0;
     if (!state.module) {
         const DlssFiles files = FindDlssFiles();
         if (!files.model.empty() && !IsSignedByNvidia(files.model)) {
-            LOG_WARNING(Render_Vulkan, "DLSS model {} is not signed by NVIDIA; using FSR 3.1",
-                        Common::FS::PathToUTF8String(files.model));
+            Problem("DLSS model {} is not signed by NVIDIA; using FSR 3.1",
+                    Common::FS::PathToUTF8String(files.model));
             return false;
         }
         if (files.interposer.empty()) {
-            LOG_WARNING(Render_Vulkan,
-                        "NVIDIA DLSS is on, but sl.interposer.dll (NVIDIA Streamline) is not in "
-                        "{} (the Graphics settings can download it); using FSR 3.1",
-                        Common::FS::PathToUTF8String(files.folder));
+            Problem("NVIDIA DLSS is on, but sl.interposer.dll (NVIDIA Streamline) is not in {} "
+                    "(the Graphics settings can download it); using FSR 3.1",
+                    Common::FS::PathToUTF8String(files.folder));
             return false;
         }
         if (!Load(state, files.interposer)) {
@@ -352,21 +390,22 @@ bool Start() {
         result != sl::Result::eOk) {
         LOG_ERROR(Render_Vulkan, "NVIDIA Streamline failed to start (result {}); using FSR 3.1",
                   static_cast<int>(result));
+        SetProblem(fmt::format("NVIDIA Streamline failed to start (result {}).",
+                               static_cast<int>(result)));
         return false;
     }
     sl::FeatureRequirements requirements{};
     if (const sl::Result result = api.get_feature_requirements(sl::kFeatureDLSS, requirements);
         result != sl::Result::eOk) {
-        LOG_WARNING(Render_Vulkan,
-                    "Streamline found no DLSS plugin (result {}); put sl.dlss.dll next to "
-                    "sl.interposer.dll or install the NVIDIA app. Using FSR 3.1",
-                    static_cast<int>(result));
+        Problem("Streamline found no DLSS plugin (result {}); put sl.dlss.dll and sl.common.dll "
+                "next to sl.interposer.dll (the Graphics settings can download them). Using FSR 3.1",
+                static_cast<int>(result));
         api.shutdown();
         return false;
     }
     if (requirements.vkNumComputeQueuesRequired != 0 ||
         requirements.vkNumGraphicsQueuesRequired != 0) {
-        LOG_WARNING(Render_Vulkan, "This DLSS wants extra Vulkan queues; using FSR 3.1");
+        Problem("This DLSS wants extra Vulkan queues; using FSR 3.1");
         api.shutdown();
         return false;
     }
@@ -386,6 +425,10 @@ bool Start() {
              version.versionSL.toStr(),
              Common::FS::PathToUTF8String(std::filesystem::path{state.plugin_dir}),
              version.versionNGX.toStr());
+    {
+        std::scoped_lock lock{GetSession().mutex};
+        GetSession().version = version.versionNGX.toStr();
+    }
     state.started = true;
     return true;
 }
@@ -420,6 +463,8 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
     if (const sl::Result result = state.api.set_vulkan_info(info); result != sl::Result::eOk) {
         LOG_ERROR(Render_Vulkan, "Streamline did not take the Vulkan device (result {})",
                   static_cast<int>(result));
+        SetProblem(fmt::format("Streamline did not take the Vulkan device (result {}).",
+                               static_cast<int>(result)));
         Stop();
         return false;
     }
@@ -427,10 +472,9 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
     adapter.vkPhysicalDevice = physical;
     if (const sl::Result result = state.api.is_feature_supported(sl::kFeatureDLSS, adapter);
         result != sl::Result::eOk) {
-        LOG_WARNING(Render_Vulkan,
-                    "NVIDIA DLSS is not supported on this GPU or driver (Streamline result {}); "
-                    "using FSR 3.1",
-                    static_cast<int>(result));
+        Problem("NVIDIA DLSS is not supported on this GPU or driver (Streamline result {}); "
+                "using FSR 3.1",
+                static_cast<int>(result));
         Stop();
         return false;
     }
@@ -471,6 +515,29 @@ void Stop() {
 
 const Api& GetApi() {
     return GetState().api;
+}
+
+SessionStatus GetSessionStatus() {
+    const State& state = GetState();
+    Session& session = GetSession();
+    SessionStatus status{
+        .started = state.started,
+        .available = state.started && state.attached,
+        .frames = session.frames.load(std::memory_order_relaxed),
+    };
+    std::scoped_lock lock{session.mutex};
+    status.version = session.version;
+    status.problem = session.problem;
+    return status;
+}
+
+void SetProblem(std::string problem) {
+    std::scoped_lock lock{GetSession().mutex};
+    GetSession().problem = std::move(problem);
+}
+
+void NoteEvaluation() {
+    GetSession().frames.fetch_add(1, std::memory_order_relaxed);
 }
 
 } // namespace Vulkan::Streamline

@@ -89,7 +89,7 @@ void MultiplayerState::Close() {
 }
 
 void MultiplayerState::retranslateUi() {
-    status_text->setToolTip(tr("Current connection status"));
+    status_text->setToolTip(tr("Current connection status. Click here to find a room."));
 
     UpdateNotificationStatus();
 
@@ -116,7 +116,7 @@ void MultiplayerState::UpdateNotificationStatus() {
     switch (notification_status) {
     case NotificationStatus::Uninitialized:
         status_icon->setPixmap(QIcon::fromTheme(QStringLiteral("disconnected")).pixmap(16));
-        status_text->setText(tr("Not Connected. Click here to find a room!"));
+        status_text->setText(tr("Not Connected"));
         leave_room->setEnabled(false);
         show_room->setEnabled(false);
         break;

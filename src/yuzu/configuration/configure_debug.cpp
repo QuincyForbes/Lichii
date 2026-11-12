@@ -82,17 +82,14 @@ void ConfigureDebug::SetConfiguration() {
 #ifdef HAS_NSIGHT_AFTERMATH
     ui->enable_nsight_aftermath->setEnabled(runtime_lock);
 #else
-    ui->enable_nsight_aftermath->setEnabled(false);
-    ui->enable_nsight_aftermath->setToolTip(
-        tr("Not included in this build (needs ENABLE_NSIGHT_AFTERMATH and the NVIDIA Nsight "
-           "Aftermath SDK)."));
+    // Not in this build (needs ENABLE_NSIGHT_AFTERMATH and NVIDIA's Nsight Aftermath SDK).
+    ui->enable_nsight_aftermath->setVisible(false);
 #endif
     ui->enable_nsight_aftermath->setChecked(Settings::values.enable_nsight_aftermath.GetValue());
 #ifdef HAS_LSFG
     ui->frame_gen_dump_flow->setEnabled(runtime_lock);
 #else
-    ui->frame_gen_dump_flow->setEnabled(false);
-    ui->frame_gen_dump_flow->setToolTip(tr("Frame generation is not included in this build."));
+    ui->frame_gen_dump_flow->setVisible(false);
 #endif
     ui->frame_gen_dump_flow->setChecked(Settings::values.frame_gen_dump_flow.GetValue());
     ui->dump_guest_shaders->setEnabled(runtime_lock);

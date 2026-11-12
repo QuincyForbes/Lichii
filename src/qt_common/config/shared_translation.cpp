@@ -167,14 +167,15 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Apple MetalFX temporal upscaling in place of a Switch 2 game's DLSS and of "
               "Ocarina of Time's own upscaler, instead of AMD FSR 3.1 and the game's.\nNeeds "
               "macOS 13 or iOS 16 on an Apple GPU."));
-    INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS in place of a game's DLSS (experimental)"),
-           tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
-              "instead of AMD FSR 3.1.\nNeeds NVIDIA's Streamline loader, and NVIDIA DLSS unless "
-              "the NVIDIA app has downloaded it; Lichii does not ship NVIDIA's files. Use the "
-              "download button below.\nFire Emblem: Fortune's Weave also needs "
-              "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
-              "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
-              "upscaler at 1x resolution scale.\nTakes effect when a game starts."));
+    INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS (experimental)"),
+           tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a game's own upscaler, where "
+              "Lichii can give DLSS the frame's colour, depth, motion vectors and jitter:\n"
+              "- The Legend of Zelda: Ocarina of Time: its upscale pass, at 1x resolution scale "
+              "(motion rebuilt from the scene depth and camera).\n"
+              "- Fire Emblem: Fortune's Weave: its own DLSS evaluation.\n"
+              "Other games keep their own upscaling: Lichii doesn't have those inputs for them "
+              "yet.\nNeeds NVIDIA's Streamline and DLSS files; Lichii does not ship them. Use "
+              "the download button below.\nTakes effect when a game starts."));
     INSERT(Settings, ocarina_dlss_mode, tr("NVIDIA DLSS mode in Ocarina of Time:"),
            tr("How much of the game's output resolution Ocarina of Time renders before DLSS "
               "upscales it.\nQuality: 67%.\nBalanced: 58%.\nPerformance: 50%.\nUltra "
@@ -385,6 +386,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, oot_30fps, tr("Ocarina of Time: 30 FPS mode (lower-end PCs)"),
            tr("Caps Ocarina of Time at 30 FPS. The game keeps its normal speed. Takes effect at "
               "once; the 60 FPS / 30 FPS button in the status bar switches it too."));
+    // Internal state, not settings.
+    INSERT(Settings, oot_fps_asked, QString(), QString());
+    INSERT(Settings, frizti_settings_revision, QString(), QString());
     INSERT(Settings, mkw_30fps, tr("Mario Kart World: 30 FPS mode"),
            tr("Forces the game to use its native 30 FPS mode at normal game speed. "
               "Takes effect after restarting the game."));

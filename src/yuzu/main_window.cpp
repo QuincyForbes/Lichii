@@ -1419,6 +1419,11 @@ void MainWindow::InitializeWidgets() {
 
     statusBar()->insertPermanentWidget(0, refresh_button);
 
+    // In a narrow window the status bar squeezed these below their text ("OCKED", "ILINEAR").
+    for (QWidget* const button : statusBar()->findChildren<QPushButton*>()) {
+        button->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+    }
+
     statusBar()->setVisible(true);
     setStyleSheet(QStringLiteral("QStatusBar::item{border: none;}"));
 }

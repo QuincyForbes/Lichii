@@ -640,6 +640,8 @@ void ConfigurePerGame::LoadConfiguration() {
             ui->display_version->setText(QStringLiteral("1.0.0"));
         }
     }
+    // Show the start of a long name, not its end.
+    ui->display_name->setCursorPosition(0);
     initial_nup_title = ui->display_name->text().trimmed().toStdString();
     if (!initial_nup_title.empty()) {
         setWindowTitle(tr("Properties - %1").arg(ui->display_name->text().trimmed()));
