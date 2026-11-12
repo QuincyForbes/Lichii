@@ -9,7 +9,6 @@
 #pragma once
 
 #include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -25,22 +24,6 @@ namespace Dynarmic {
 namespace A64 {
 
 using VAddr = std::uint64_t;
-
-/// Indexes into UserConfig::jit_stats.
-enum class JitStat : std::size_t {
-    BlocksCompiled,
-    CompileNs,
-    CacheFlushes,
-    FastmemFaults,
-    BlocksInvalidated,
-    Count,
-};
-
-inline void AddJitStat(std::atomic<std::uint64_t>* stats, JitStat stat, std::uint64_t amount = 1) {
-    if (stats != nullptr) {
-        stats[static_cast<std::size_t>(stat)].fetch_add(amount, std::memory_order_relaxed);
-    }
-}
 
 using Vector = std::array<std::uint64_t, 2>;
 static_assert(sizeof(Vector) == sizeof(std::uint64_t) * 2, "Vector must be 128 bits in size");
@@ -371,13 +354,6 @@ struct UserConfig {
     /// x64 only, diagnostic. Count RSB hits, fast dispatch lookups and misses, and native
     /// atomics in the JIT state; written to the EDEN_NX2_JIT_MAP file about once a second.
     bool jit_counters = false;
-
-    /// Optional, both backends: JitStat::Count consecutive counters the JIT adds to (relaxed):
-    /// blocks compiled, nanoseconds spent translating and emitting them, full code cache
-    /// flushes, fastmem faults and blocks invalidated. Null = not counted.
-    std::atomic<std::uint64_t>* jit_stats = nullptr;
-    /// Optional, x64 and arm64: bytes of this JIT's code cache in use, stored after each block.
-    std::atomic<std::uint64_t>* code_cache_used = nullptr;
 
     /// This option relates to translation. Generally when we run into an unpredictable
     /// instruction the ExceptionRaised callback is called. If this is true, we define

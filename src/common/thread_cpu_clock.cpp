@@ -16,7 +16,8 @@
 namespace Common {
 namespace {
 
-std::optional<u64> ReadNativeClock(std::intptr_t native_clock) {
+// system_only: the time in the kernel alone (page faults, system calls).
+std::optional<u64> ReadNativeClock(std::intptr_t native_clock, bool system_only = false) {
 #ifdef _WIN32
     FILETIME creation{}, exit{}, kernel{}, user{};
     if (!GetThreadTimes(reinterpret_cast<HANDLE>(native_clock), &creation, &exit, &kernel, &user)) {
@@ -24,8 +25,11 @@ std::optional<u64> ReadNativeClock(std::intptr_t native_clock) {
     }
     const u64 kernel_ticks = (u64{kernel.dwHighDateTime} << 32) | kernel.dwLowDateTime;
     const u64 user_ticks = (u64{user.dwHighDateTime} << 32) | user.dwLowDateTime;
-    return (kernel_ticks + user_ticks) * 100;
+    return (kernel_ticks + (system_only ? 0 : user_ticks)) * 100;
 #elif defined(__linux__)
+    if (system_only) {
+        return std::nullopt;
+    }
     timespec time{};
     if (clock_gettime(static_cast<clockid_t>(native_clock), &time) != 0) {
         return std::nullopt;
@@ -38,11 +42,14 @@ std::optional<u64> ReadNativeClock(std::intptr_t native_clock) {
                     reinterpret_cast<thread_info_t>(&info), &count) != KERN_SUCCESS) {
         return std::nullopt;
     }
-    const u64 seconds = static_cast<u64>(info.user_time.seconds) + info.system_time.seconds;
-    const u64 micros = static_cast<u64>(info.user_time.microseconds) + info.system_time.microseconds;
+    const u64 seconds = (system_only ? 0 : static_cast<u64>(info.user_time.seconds)) +
+                        static_cast<u64>(info.system_time.seconds);
+    const u64 micros = (system_only ? 0 : static_cast<u64>(info.user_time.microseconds)) +
+                       static_cast<u64>(info.system_time.microseconds);
     return seconds * 1'000'000'000 + micros * 1'000;
 #else
     static_cast<void>(native_clock);
+    static_cast<void>(system_only);
     return std::nullopt;
 #endif
 }
@@ -93,6 +100,10 @@ ThreadCpuClock::~ThreadCpuClock() {
 
 std::optional<u64> ThreadCpuClock::Read() const {
     return available ? ReadNativeClock(native_clock) : std::nullopt;
+}
+
+std::optional<u64> ThreadCpuClock::ReadSystem() const {
+    return available ? ReadNativeClock(native_clock, true) : std::nullopt;
 }
 
 } // namespace Common

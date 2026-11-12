@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
-#include <chrono>
 #include <cstdio>
 
 #ifdef __APPLE__
@@ -19,6 +18,7 @@
 #endif
 #endif
 
+#include "common/perf_report.h"
 #include "dynarmic/backend/arm64/a64_address_space.h"
 #include "dynarmic/backend/arm64/a64_jitstate.h"
 #include "dynarmic/backend/arm64/abi.h"
@@ -99,18 +99,20 @@ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
     if (CodePtr block_entry = Get(descriptor)) {
         return block_entry;
     }
-    if (jit_stats == nullptr) {
-        GenerateIR(ir_block, descriptor);
-        return Emit(std::move(ir_block));
-    }
-    const auto start = std::chrono::steady_clock::now();
+    const bool counted = ::Common::PerfReport::Enabled();
+    const u64 start_ns = counted ? ::Common::PerfReport::NowNs() : 0;
+    const std::size_t start_offset = static_cast<std::size_t>(code.offset());
     GenerateIR(ir_block, descriptor);
     const CodePtr entry_point = Emit(std::move(ir_block));
-    A64::AddJitStat(jit_stats, A64::JitStat::BlocksCompiled);
-    A64::AddJitStat(jit_stats, A64::JitStat::CompileNs,
-                    static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                         std::chrono::steady_clock::now() - start)
-                                         .count()));
+    if (counted) {
+        const std::size_t end_offset = static_cast<std::size_t>(code.offset());
+        ::Common::PerfReport::Add(::Common::PerfReport::JitBlocks);
+        ::Common::PerfReport::Add(::Common::PerfReport::JitBytes,
+                                  end_offset > start_offset ? end_offset - start_offset : end_offset);
+        ::Common::PerfReport::Add(::Common::PerfReport::JitCompileNs,
+                                  ::Common::PerfReport::NowNs() - start_ns);
+        ::Common::PerfReport::NoteJitUse(end_offset, code_cache_size);
+    }
     return entry_point;
 }
 
@@ -176,8 +178,8 @@ CodePtr AddressSpace::Emit(IR::Block block) {
         std::fprintf(stderr, "dynarmic: code cache full (%zu MiB), flushed; %u full flushes so far\n",
                      code_cache_size >> 20, full_flushes.fetch_add(1, std::memory_order_relaxed) + 1);
 #endif
+        ::Common::PerfReport::Add(::Common::PerfReport::JitCacheFullFlushes);
         ClearCache();
-        A64::AddJitStat(jit_stats, A64::JitStat::CacheFlushes);
     }
 
     UnprotectCodeMemory();
@@ -215,9 +217,6 @@ CodePtr AddressSpace::Emit(IR::Block block) {
 #endif
 
     RegisterNewBasicBlock(block, stored_info);
-    if (code_cache_used != nullptr) {
-        code_cache_used->store(static_cast<std::uint64_t>(code.offset()), std::memory_order_relaxed);
-    }
 
     return entry_point;
 }
@@ -459,7 +458,7 @@ void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor,
 }
 
 FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
-    A64::AddJitStat(jit_stats, A64::JitStat::FastmemFaults);
+    ::Common::PerfReport::Add(::Common::PerfReport::JitFastmemFaults);
     {
         const auto host_ptr = std::bit_cast<CodePtr>(host_pc);
 

@@ -12,6 +12,7 @@
 #include <boost/icl/interval_set.hpp>
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/perf_report.h"
 
 #include "dynarmic/backend/arm64/a64_address_space.h"
 #include "dynarmic/backend/arm64/a64_core.h"
@@ -152,6 +153,7 @@ private:
             ClearHalt(HaltReason::CacheInvalidation);
 
             if (invalidate_entire_cache) {
+                ::Common::PerfReport::Add(::Common::PerfReport::JitCacheClears);
                 current_address_space.ClearCache();
 
                 invalidate_entire_cache = false;
@@ -160,6 +162,8 @@ private:
             }
 
             if (!invalid_cache_ranges.empty()) {
+                ::Common::PerfReport::Add(::Common::PerfReport::JitRangeInvalidations,
+                                          invalid_cache_ranges.iterative_size());
                 current_address_space.InvalidateCacheRanges(invalid_cache_ranges);
 
                 invalid_cache_ranges.clear();

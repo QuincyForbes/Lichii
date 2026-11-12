@@ -218,16 +218,6 @@ void BlockOfCode::DisableWriting() {
 #endif
 }
 
-size_t BlockOfCode::CodeBytesUsed() const {
-    const u8* const near_ptr = in_far_code ? near_code_ptr : getCurr<const u8*>();
-    size_t used = static_cast<size_t>(near_ptr - reinterpret_cast<const u8*>(code_begin));
-    if (far_code_begin) {
-        const u8* const far_ptr = in_far_code ? getCurr<const u8*>() : far_code_ptr;
-        used += static_cast<size_t>(far_ptr - far_code_begin);
-    }
-    return used;
-}
-
 void BlockOfCode::ClearCache() {
     ASSERT(prelude_complete);
     ASSERT(!in_far_code);
@@ -272,6 +262,16 @@ size_t BlockOfCode::SpaceRemaining() const {
         remaining = far_ptr >= &top_[maxSize_] ? 0 : (std::min<size_t>)(remaining, &top_[maxSize_] - far_ptr);
     }
     return remaining;
+}
+
+size_t BlockOfCode::UsedBytes() const {
+    const u8* const near_ptr = in_far_code ? near_code_ptr : getCurr<const u8*>();
+    size_t used = static_cast<size_t>(near_ptr - reinterpret_cast<const u8*>(code_begin));
+    if (far_code_begin) {
+        const u8* const far_ptr = in_far_code ? getCurr<const u8*>() : far_code_ptr;
+        used += static_cast<size_t>(far_ptr - far_code_begin);
+    }
+    return used;
 }
 
 void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {

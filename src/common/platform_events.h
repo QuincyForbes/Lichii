@@ -32,6 +32,17 @@ u64 MemoryLowWater();
 /// Checks the low-water mark at most every 250 ms. Called once per frame by the caches.
 void PollMemoryPressure();
 
+/// Guest memory is in a file (iOS): outside the footprint, so AvailableProcessMemory does not see
+/// it, but iOS takes RAM for the rest of the process from its pages.
+void SetGuestInFile(bool in_file);
+bool GuestInFile();
+/// What the caches leave to a guest memory file on top of their own reserve: 0 unless the guest
+/// is in a file. It grows while the process pages the file back in (the caches crowd it out),
+/// signalling memory pressure, and shrinks back when that stops. EDEN_NX2_GUEST_FILE_RESERVE_MIB
+/// (base, default 1024 on iOS; 0 off), _MAX_MIB (default 3072), EDEN_NX2_PAGEIN_PRESSURE (page
+/// -ins a second that count as thrashing, default 1500; 0 off).
+u64 GuestFileReserve();
+
 struct ProcessMemory {
     u64 footprint;      ///< What jetsam compares with the limit (phys_footprint)
     u64 footprint_peak;
@@ -45,6 +56,19 @@ struct ProcessMemory {
 /// Apple: the process footprint and parts of it. Windows: the working set and its peak. Zeros
 /// elsewhere.
 ProcessMemory QueryProcessMemory();
+/// Counters that only grow, for rates: how often the process waits on memory and storage.
+struct ProcessEvents {
+    bool known;
+    u64 faults;         ///< Page faults of every kind (Apple: 32-bit, wraps)
+    u64 pageins;        ///< Of them, pages read in from a file or swap (Linux: major faults)
+    u64 cow_faults;     ///< Copy-on-write faults (Apple)
+    u64 decompressions; ///< Pages taken back from the memory compressor (Apple)
+    u64 storage_read;   ///< Bytes read from storage (Windows: every read, cached ones too)
+    u64 storage_written;
+    u64 file_resident;  ///< Resident pages of mapped files (Apple), not a counter
+};
+ProcessEvents QueryProcessEvents();
+
 /// Apple: the footprint's limit (`left` from AvailableProcessMemory) and an estimate of its
 /// split into guest memory (as of the last zero trimming pass), the JIT pool, graphics and the
 /// rest, for the log.

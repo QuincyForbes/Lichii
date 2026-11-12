@@ -59,31 +59,28 @@ enum Counter : std::size_t {
     GuestKernelNs,       ///< Guest cores: wall time in SVCs, the scheduler and fiber switches
     GuestIdleNs,         ///< Guest cores: wall time waiting with nothing to run
     GuestIdles,          ///< Guest cores: waits begun
-    // The JIT's own counters, in the order of Dynarmic::A64::JitStat (UserConfig::jit_stats).
-    JitBlocksCompiled,   ///< Blocks translated and emitted
-    JitCompileNs,        ///< Time spent doing so
-    JitCacheFlushes,     ///< Full code caches thrown away
+    JitBlocks,           ///< Blocks the JIT translated
+    JitBytes,            ///< Host code they took
+    JitCompileNs,        ///< Wall time translating them (inside guest code time)
+    JitCacheFullFlushes, ///< Code caches emptied because they were full
+    JitCacheClears,      ///< Code caches emptied on request (guest instruction cache ops)
+    JitRangeInvalidations, ///< Ranges of translated code dropped on request
     JitFastmemFaults,    ///< Host faults in fastmem accesses (each recompiles its block)
-    JitBlocksInvalidated, ///< Blocks dropped for guest code changes (cache maintenance)
     // Per guest core, added when the JIT returns (FlushGuestEvents), not one by one.
     GuestSvcs,           ///< Supervisor calls
     GuestSlowReads,      ///< Loads through the JIT's memory callbacks
     GuestSlowWrites,     ///< Stores through them
     GuestClockReads,     ///< CNTPCT reads through the JIT's callback (not inline)
     GuestSpinHints,      ///< WFE and YIELD hints
-    GuestClockWaits,     ///< Clock polls the guest core slept in (EDEN_NX2_CLOCK_POLL_SLEEP)
+    GuestClockWaits,     ///< Clock polls the guest core slept in (guest_wait_backoff)
     GuestClockWaitNs,    ///< Time slept there
     GuestFutileYields,   ///< Yields that found nothing else to run
-    GuestYieldSleeps,    ///< Of them, slept in (EDEN_NX2_YIELD_BACKOFF)
+    GuestYieldSleeps,    ///< Of them, slept in (guest_wait_backoff)
     GuestYieldSleepNs,   ///< Time slept there
     Count,
 };
 
 inline std::array<std::atomic<u64>, Count> g_counters{};
-/// Each guest core's JIT code cache: bytes in use (dynarmic stores it after each block), and the
-/// cache size.
-inline std::array<std::atomic<u64>, 6> g_code_cache_used{};
-inline std::atomic<u64> g_code_cache_size{};
 /// Supervisor calls by number (guest cores add theirs every 1024 calls).
 inline std::array<std::atomic<u64>, 256> g_svc_counts{};
 
@@ -92,6 +89,31 @@ inline void Add(Counter counter, u64 amount = 1) {
         return;
     }
     g_counters[counter].fetch_add(amount, std::memory_order_relaxed);
+}
+
+/// The fullest any guest core's code cache got since the last TakeJitPeak, and its size.
+inline std::atomic<u64> g_jit_peak_used{};
+inline std::atomic<u64> g_jit_cache_size{};
+
+inline void NoteJitUse(u64 used, u64 cache_size) {
+    if (!Enabled()) {
+        return;
+    }
+    g_jit_cache_size.store(cache_size, std::memory_order_relaxed);
+    u64 peak = g_jit_peak_used.load(std::memory_order_relaxed);
+    while (used > peak &&
+           !g_jit_peak_used.compare_exchange_weak(peak, used, std::memory_order_relaxed)) {
+    }
+}
+
+inline u64 TakeJitPeak() {
+    return g_jit_peak_used.exchange(0, std::memory_order_relaxed);
+}
+
+inline u64 NowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
 }
 
 /// Guest core time split: adds the time since this thread's previous mark to `closed`.

@@ -14,6 +14,7 @@
 
 #include <boost/icl/interval_set.hpp>
 #include "common/assert.h"
+#include "common/perf_report.h"
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/common/llvm_disassemble.h"
 #include <bit>
@@ -277,13 +278,17 @@ private:
         constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
             // Immediately evacuate cache
+            ::Common::PerfReport::Add(::Common::PerfReport::JitCacheFullFlushes);
             invalidate_entire_cache = true;
+            full_flush = true;
             PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
-            AddJitStat(conf.jit_stats, JitStat::CacheFlushes);
+            full_flush = false;
         }
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
 
-        const auto start = conf.jit_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool counted = ::Common::PerfReport::Enabled();
+        const u64 start_ns = counted ? ::Common::PerfReport::NowNs() : 0;
+        const size_t start_used = counted ? block_of_code.UsedBytes() : 0;
         // JIT Compile
         const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
@@ -292,15 +297,12 @@ private:
         A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, true, conf.elide_ld_st_barriers, conf.native_lse_atomics});
         Optimization::Optimize(ir_block, conf, polyfill_options);
         const CodePtr entrypoint = emitter.Emit(ir_block).entrypoint;
-        if (conf.code_cache_used) {
-            conf.code_cache_used->store(block_of_code.CodeBytesUsed(), std::memory_order_relaxed);
-        }
-        if (conf.jit_stats) {
-            AddJitStat(conf.jit_stats, JitStat::BlocksCompiled);
-            AddJitStat(conf.jit_stats, JitStat::CompileNs,
-                       static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                            std::chrono::steady_clock::now() - start)
-                                            .count()));
+        if (counted) {
+            const size_t used = block_of_code.UsedBytes();
+            ::Common::PerfReport::Add(::Common::PerfReport::JitBlocks);
+            ::Common::PerfReport::Add(::Common::PerfReport::JitBytes, used > start_used ? used - start_used : 0);
+            ::Common::PerfReport::Add(::Common::PerfReport::JitCompileNs, ::Common::PerfReport::NowNs() - start_ns);
+            ::Common::PerfReport::NoteJitUse(used, block_of_code.CacheSize());
         }
         return entrypoint;
     }
@@ -317,9 +319,13 @@ private:
 
             jit_state.ResetRSB();
             if (invalidate_entire_cache) {
+                if (!full_flush) {
+                    ::Common::PerfReport::Add(::Common::PerfReport::JitCacheClears);
+                }
                 block_of_code.ClearCache();
                 emitter.ClearCache();
             } else {
+                ::Common::PerfReport::Add(::Common::PerfReport::JitRangeInvalidations, invalid_cache_ranges.iterative_size());
                 emitter.InvalidateCacheRanges(invalid_cache_ranges);
             }
             invalid_cache_ranges.clear();
@@ -335,6 +341,7 @@ private:
     Optimization::PolyfillOptions polyfill_options;
     bool is_executing = false;
     bool invalidate_entire_cache = false;
+    bool full_flush = false;
     u64 counter_runs = 0;
     std::chrono::steady_clock::time_point counter_last_dump{};
     boost::icl::interval_set<u64> invalid_cache_ranges;
