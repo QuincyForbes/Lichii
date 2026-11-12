@@ -25,6 +25,7 @@
 #include "common/platform_events.h"
 #include "video_core/churn_counters.h"
 #include "video_core/gpu_split.h"
+#include "video_core/host_budget.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -138,9 +139,14 @@ size_t GetStreamBufferSize(const Device& device) {
 // pooled buffer of its own (iPhone, forest load: 8460 buffers, 1418 MiB, then out of memory).
 // Submitting once a command buffer's pooled uploads pass the first mark lets the GPU free them;
 // past the second (all pooled upload buffers, busy or idle), the GPU thread waits.
+// With room to spare (VideoCommon::HostBudget) both marks rise, up to a quarter of the room past
+// the reserve: every early submit is a submission of its own and ends the render pass.
+constexpr u64 IOS_UPLOAD_SUBMIT_MIB = 24;
+constexpr u64 IOS_UPLOAD_CAP_MIB = 96;
+constexpr u64 IOS_UPLOAD_MAX_CAP = 256_MiB;
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-constexpr u64 UPLOAD_SUBMIT_MIB = 24;
-constexpr u64 UPLOAD_CAP_MIB = 96;
+constexpr u64 UPLOAD_SUBMIT_MIB = IOS_UPLOAD_SUBMIT_MIB;
+constexpr u64 UPLOAD_CAP_MIB = IOS_UPLOAD_CAP_MIB;
 #else
 constexpr u64 UPLOAD_SUBMIT_MIB = 256;
 constexpr u64 UPLOAD_CAP_MIB = 1024;
@@ -203,9 +209,15 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     current_chunk.limit.store(0, std::memory_order_relaxed);
     current_chunk.blocked_tick.store(0, std::memory_order_relaxed);
 
-    upload_submit_bytes = UploadBoundBytes("EDEN_NX2_STAGING_SUBMIT_MIB", UPLOAD_SUBMIT_MIB);
-    upload_cap_bytes = (std::max)(UploadBoundBytes("EDEN_NX2_STAGING_CAP_MIB", UPLOAD_CAP_MIB),
-                                  upload_submit_bytes * 2);
+    const bool phone = VideoCommon::HostBudget::Simulated();
+    upload_submit_bytes = UploadBoundBytes("EDEN_NX2_STAGING_SUBMIT_MIB",
+                                           phone ? IOS_UPLOAD_SUBMIT_MIB : UPLOAD_SUBMIT_MIB);
+    upload_cap_bytes =
+        (std::max)(UploadBoundBytes("EDEN_NX2_STAGING_CAP_MIB",
+                                    phone ? IOS_UPLOAD_CAP_MIB : UPLOAD_CAP_MIB),
+                   upload_submit_bytes * 2);
+    configured_submit_bytes = upload_submit_bytes;
+    configured_cap_bytes = upload_cap_bytes;
     LOG_INFO(Common_Memory,
              "Staging: stream buffer {} MiB; uploads submit every {} MiB, pooled upload buffers "
              "capped at {} MiB",
@@ -251,6 +263,27 @@ void StagingBufferPool::TickFrame() {
     if (const u64 low_water = Common::PlatformEvents::MemoryLowWater(); low_water != 0) {
         const u64 available = Common::PlatformEvents::AvailableProcessMemory();
         low_memory = available != 0 && available < low_water;
+    }
+    if (configured_submit_bytes != 0 && VideoCommon::HostBudget::FollowsHeadroom() &&
+        frame_count % 30 == 0) {
+        const u64 available = VideoCommon::HostBudget::Available(
+            VideoCommon::HostBudget::Simulated() ? device.GetDeviceMemoryUsage() : 0);
+        const u64 room = available > VideoCommon::HostBudget::Reserve
+                             ? available - VideoCommon::HostBudget::Reserve
+                             : 0;
+        const u64 cap = std::clamp(room / 4, configured_cap_bytes,
+                                   (std::max)(configured_cap_bytes, IOS_UPLOAD_MAX_CAP));
+        const u64 submit = (std::max)(configured_submit_bytes, cap / 4);
+        if (cap != upload_cap_bytes && (cap > upload_cap_bytes + 32_MiB ||
+                                        cap + 32_MiB < upload_cap_bytes ||
+                                        cap == configured_cap_bytes)) {
+            LOG_INFO(Common_Memory,
+                     "Staging: {} MiB left to the process: uploads submit every {} MiB, pooled "
+                     "upload buffers capped at {} MiB",
+                     available >> 20, submit >> 20, cap >> 20);
+            upload_cap_bytes = cap;
+            upload_submit_bytes = submit;
+        }
     }
     if (++frame_count % 60 == 0 && low_memory_waits != 0) {
         LOG_INFO(Common_Memory,
