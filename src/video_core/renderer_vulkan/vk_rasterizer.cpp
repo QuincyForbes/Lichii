@@ -404,10 +404,16 @@ const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
     // At most MaxMeshArenas submissions in flight hold one: past that, wait for the oldest rather
     // than make another (early staging submits during a scene load made one per submission).
     constexpr size_t MaxMeshArenas = 4;
-    if (mesh_arenas.size() >= MaxMeshArenas &&
-        std::ranges::none_of(mesh_arenas, [this](const MeshArena& arena) {
+    // Two more with over 1.5 GiB left to the process (an iPhone in Kokiri with 2 GiB left waited
+    // for one 16 times in 3600 submissions).
+    const auto busy = [this] {
+        return std::ranges::none_of(mesh_arenas, [this](const MeshArena& arena) {
             return arena.counted || scheduler.IsFree(arena.tick);
-        })) {
+        });
+    };
+    if (mesh_arenas.size() >= MaxMeshArenas && busy() &&
+        (mesh_arenas.size() >= MaxMeshArenas + 2 ||
+         Common::PlatformEvents::AvailableProcessMemory() < (u64{3} << 29) + mesh_arena_size)) {
         const auto oldest{std::ranges::min_element(mesh_arenas, {}, &MeshArena::tick)};
         scheduler.Wait(oldest->tick);
         ++mesh_arena_waits;
