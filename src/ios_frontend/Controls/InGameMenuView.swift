@@ -22,6 +22,9 @@ struct InGameMenuView: View {
     @State private var pendingRestart = false
 
     private let resolutions = QuickSettings.choices("resolution_setup")
+    /// Built into this app and the chip can run it (SettingsCatalog.availability).
+    private let frameGenAvailable = SettingsCatalog.all.first { $0.key == "frame_gen" }
+        .map { SettingsCatalog.availability(of: $0) == .available } ?? false
 
     var body: some View {
         GeometryReader { proxy in
@@ -144,14 +147,18 @@ struct InGameMenuView: View {
                 .onChange(of: resolution) { value in change("resolution_setup", value) }
             }
 
-            Toggle("Frame Generation", isOn: $frameGen)
-                .onChange(of: frameGen) { value in change("frame_gen", value ? "true" : "false") }
-            if frameGen {
-                Stepper("Multiplier: \(frameGenMultiplier)x", value: $frameGenMultiplier, in: 2...4)
-                    .onChange(of: frameGenMultiplier) { value in change("frame_gen_multiplier", String(value)) }
-                // Apple's interpolation (iOS 26) makes the 2x frame; 3x and 4x stay built-in.
-                Toggle("MetalFX Interpolation", isOn: $frameGenMetalFx)
-                    .onChange(of: frameGenMetalFx) { value in change("frame_gen_type", value ? "MetalFx" : "Fsr3") }
+            if frameGenAvailable {
+                Toggle("Frame Generation", isOn: $frameGen)
+                    .onChange(of: frameGen) { value in change("frame_gen", value ? "true" : "false") }
+                if frameGen {
+                    Stepper("Multiplier: \(frameGenMultiplier)x", value: $frameGenMultiplier, in: 2...4)
+                        .onChange(of: frameGenMultiplier) { value in change("frame_gen_multiplier", String(value)) }
+                    // Apple's interpolation (iOS 26) makes the 2x frame; 3x and 4x stay built-in.
+                    if #available(iOS 26, *) {
+                        Toggle("MetalFX Interpolation", isOn: $frameGenMetalFx)
+                            .onChange(of: frameGenMetalFx) { value in change("frame_gen_type", value ? "MetalFx" : "Fsr3") }
+                    }
+                }
             }
 
             Toggle("Limit Speed", isOn: $speedLimit)

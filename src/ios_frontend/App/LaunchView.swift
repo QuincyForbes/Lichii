@@ -49,8 +49,16 @@ struct LaunchView: View {
                 Text(Bridge.emuError)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                Button("Back to Library") { app.cancelLaunch() }
-                    .buttonStyle(.borderedProminent)
+                HStack {
+                    if FileManager.default.fileExists(atPath: Bridge.logFile.path) {
+                        ShareLink(item: Bridge.logFile) {
+                            Label("Share the Log", systemImage: "square.and.arrow.up")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    Button("Back to Library") { app.cancelLaunch() }
+                        .buttonStyle(.borderedProminent)
+                }
             }
         case .booting, .running, .paused:
             VStack(spacing: 12) {

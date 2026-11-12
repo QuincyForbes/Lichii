@@ -12,8 +12,8 @@ enum SettingsScope: Equatable {
 
 /// Every setting the core saves, generated from the bridge's metadata. The per-game scope lists the
 /// settings a game can override, each with a switch back to the global value. Settings that do
-/// nothing on iOS are hidden or greyed out (SettingsCatalog.availability); debug switches and hacks
-/// are on the Advanced page.
+/// nothing on iOS are not listed (SettingsCatalog.availability); debug switches and hacks are on
+/// the Advanced page.
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     let scope: SettingsScope
@@ -363,13 +363,12 @@ struct SettingRow: View {
     }
 
     var body: some View {
-        let reason = unavailableReason
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .center, spacing: 10) {
                 control
-                    .disabled((perGame && useGlobal) || reason != nil)
-                    .opacity((perGame && useGlobal) || reason != nil ? 0.55 : 1)
-                if perGame && reason == nil {
+                    .disabled(perGame && useGlobal)
+                    .opacity(perGame && useGlobal ? 0.55 : 1)
+                if perGame {
                     Button {
                         useGlobal.toggle()
                         item.setUsesGlobal(useGlobal)
@@ -390,25 +389,16 @@ struct SettingRow: View {
                     .accessibilityAddTraits(.isToggle)
                 }
             }
-            if let reason {
-                Caption(text: reason, systemImage: "nosign", color: .secondary)
-            } else if let refusal {
+            if let refusal {
                 Caption(text: refusal, systemImage: "exclamationmark.circle", color: .orange)
             } else if let note = SettingsCatalog.note(for: item, value: value) {
                 Caption(text: note, systemImage: "info.circle", color: .secondary)
             }
-            if reason == nil, !item.runtimeModifiable, Bridge.emuState.inGame {
+            if !item.runtimeModifiable, Bridge.emuState.inGame {
                 Caption(text: "Applies the next time the game starts.", systemImage: "arrow.clockwise",
                         color: .secondary)
             }
         }
-    }
-
-    private var unavailableReason: String? {
-        if case .unavailable(let reason) = SettingsCatalog.availability(of: item) {
-            return reason
-        }
-        return nil
     }
 
     @ViewBuilder

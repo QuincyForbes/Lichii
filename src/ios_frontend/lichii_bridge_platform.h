@@ -196,7 +196,22 @@ int lichii_platform_experiment(const char* name);
 /// Guest memory in a file: as set in Experiments ("file_guest" / "file_guest_off"), else the
 /// default of common/host_memory.cpp.
 int lichii_platform_file_guest(void);
+/// Also takes effect at the next game start (guest memory is made at each boot).
 void lichii_platform_set_file_guest(int enabled);
+
+/// Storage for "file_guest", in MiB, as common/host_memory.cpp InitFile judges it for a Switch 2
+/// game (14 GiB of guest memory).
+typedef struct LichiiFileGuestStorage {
+    uint64_t free_mib;   ///< free on the volume of the app's tmp directory
+    uint64_t needed_mib; ///< below this the game runs without the file (guest memory in RAM)
+    uint64_t full_mib;   ///< from this on the whole file is reserved up front
+    uint64_t file_mib;   ///< the file's size
+} LichiiFileGuestStorage;
+/// 0 when the free storage can't be read.
+int lichii_platform_file_guest_storage(LichiiFileGuestStorage* out);
+
+/// Writes "iOS app: <message>" to the log (HW_Memory, Info): app-side memory decisions.
+void lichii_platform_log_memory(const char* message);
 
 #ifdef __cplusplus
 }

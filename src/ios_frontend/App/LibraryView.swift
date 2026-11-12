@@ -25,12 +25,13 @@ struct LibraryView: View {
             if app.libraryVisible {
                 VStack(alignment: .leading, spacing: 18) {
                     MemoryEntitlementBanner()
+                    JitLibraryBanner()
                     ThermalBanner()
                     if let progress = library.importProgress {
                         ImportProgressBanner(progress: progress)
                     }
                     if !recent.isEmpty {
-                        RecentRow(games: recent, open: app.launch)
+                        RecentRow(games: recent, open: { app.launch($0) })
                     }
                     if games.isEmpty && !query.isEmpty && !library.games.isEmpty {
                         ContentUnavailableView.search(text: query)
