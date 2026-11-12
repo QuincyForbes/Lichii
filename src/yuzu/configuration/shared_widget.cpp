@@ -815,6 +815,12 @@ bool AppliesToThisPlatform(const Settings::BasicSetting& setting) {
         return false;
     }
 #endif
+#ifndef __APPLE__
+    // MoltenVK runs on macOS and iOS only.
+    if (id == values.moltenvk_driver.Id()) {
+        return false;
+    }
+#endif
 #ifndef __linux__
     // Feral GameMode (libgamemode) exists on Linux only.
     if (id == UISettings::values.enable_gamemode.Id()) {

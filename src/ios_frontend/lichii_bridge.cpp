@@ -531,6 +531,7 @@ const std::map<u32, std::vector<EnumChoice>>& EnumTable() {
         AddEnum<OotFrameRate>(t);
         AddEnum<MkwFrameRate>(t);
         AddEnum<GamePatchMode>(t);
+        AddEnum<MoltenVkDriver>(t);
         AddEnum<AspectRatio>(t);
         AddEnum<ConsoleMode>(t);
         AddEnum<AppletMode>(t);

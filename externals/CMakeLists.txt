@@ -478,4 +478,77 @@ if (APPLE)
 
         set(MOLTENVK_LIBRARY "${moltenvk_SOURCE_DIR}/MoltenVK/dylib/macOS/libMoltenVK.dylib" CACHE STRING "" FORCE)
     endif()
+
+    # MoltenVK with native mesh shaders (KhronosGroup/MoltenVK#2842), built by
+    # .github/workflows/moltenvk.yml, bundled next to the MoltenVK above under its own name:
+    # MoltenVKMesh.framework on iOS, libMoltenVKMesh.dylib on macOS. Settings moltenvk_driver picks
+    # one at run time (vulkan_library.cpp). Without it the build ships the legacy MoltenVK only.
+    option(LICHII_MOLTENVK_MESH "Bundle MoltenVK with native mesh shaders as a second driver" ON)
+    unset(MOLTENVK_MESH_FRAMEWORK_DIR CACHE)
+    unset(MOLTENVK_MESH_LIBRARY CACHE)
+    if (LICHII_MOLTENVK_MESH AND (IOS OR YUZU_USE_BUNDLED_MOLTENVK))
+        set(moltenvk_mesh_tag moltenvk-mesh-c516eb4)
+        if (IOS)
+            set(moltenvk_mesh_tar MoltenVK-ios.tar)
+            set(moltenvk_mesh_hash 9e6f714e3f79f368c3ea155b0abbfd888500e909860d606f71e94ef4d923c65070498cf7a23d365ee35e7065d6cda678437c08d52a2d8b141835a247d0456357)
+        else()
+            set(moltenvk_mesh_tar MoltenVK-macos.tar)
+            set(moltenvk_mesh_hash 741b275396a5a4b3a0498a6918c3daf72ea1963f130f5a1248bd51e128180f8fb2bfb42b733e2a7728475ac54d3eab6a69d7fc1c92eb83e72ceac64ba99ad3ad)
+        endif()
+        set(moltenvk_mesh_dir "${CMAKE_BINARY_DIR}/externals/${moltenvk_mesh_tag}")
+        set(moltenvk_mesh_package "${moltenvk_mesh_dir}/MoltenVK/MoltenVK/dynamic")
+        if (NOT EXISTS "${moltenvk_mesh_dir}/${moltenvk_mesh_tar}.done")
+            message(STATUS "Downloading MoltenVK with mesh shaders (${moltenvk_mesh_tag})")
+            file(DOWNLOAD
+                "https://github.com/QuincyForbes/Lichii/releases/download/${moltenvk_mesh_tag}/${moltenvk_mesh_tar}"
+                "${moltenvk_mesh_dir}/${moltenvk_mesh_tar}"
+                EXPECTED_HASH SHA512=${moltenvk_mesh_hash}
+                STATUS moltenvk_mesh_status)
+            list(GET moltenvk_mesh_status 0 moltenvk_mesh_error)
+            if (moltenvk_mesh_error)
+                message(WARNING "MoltenVK with mesh shaders not bundled, download failed: ${moltenvk_mesh_status}")
+            else()
+                file(ARCHIVE_EXTRACT INPUT "${moltenvk_mesh_dir}/${moltenvk_mesh_tar}" DESTINATION "${moltenvk_mesh_dir}")
+                file(TOUCH "${moltenvk_mesh_dir}/${moltenvk_mesh_tar}.done")
+            endif()
+        endif()
+        if (EXISTS "${moltenvk_mesh_dir}/${moltenvk_mesh_tar}.done")
+            # Its own install name and bundle id, so neither collides with the legacy MoltenVK.
+            if (IOS)
+                set(source_fw "${moltenvk_mesh_package}/MoltenVK.xcframework/ios-arm64/MoltenVK.framework")
+                set(mesh_fw "${moltenvk_mesh_dir}/MoltenVKMesh.framework")
+                if (NOT EXISTS "${mesh_fw}/MoltenVKMesh")
+                    file(REMOVE_RECURSE "${mesh_fw}")
+                    file(COPY "${source_fw}/" DESTINATION "${mesh_fw}")
+                    file(RENAME "${mesh_fw}/MoltenVK" "${mesh_fw}/MoltenVKMesh")
+                    file(REMOVE_RECURSE "${mesh_fw}/_CodeSignature")
+                    execute_process(COMMAND plutil -replace CFBundleExecutable -string MoltenVKMesh "${mesh_fw}/Info.plist")
+                    execute_process(COMMAND plutil -replace CFBundleName -string MoltenVKMesh "${mesh_fw}/Info.plist")
+                    execute_process(COMMAND plutil -replace CFBundleIdentifier -string com.khronos.MoltenVKMesh "${mesh_fw}/Info.plist")
+                    execute_process(COMMAND install_name_tool -id @rpath/MoltenVKMesh.framework/MoltenVKMesh "${mesh_fw}/MoltenVKMesh"
+                                    RESULT_VARIABLE mesh_id_result)
+                    if (mesh_id_result)
+                        message(FATAL_ERROR "install_name_tool failed on ${mesh_fw}/MoltenVKMesh")
+                    endif()
+                    # The new install name voids the signature; the IPA step signs it again.
+                    execute_process(COMMAND codesign --force --sign - "${mesh_fw}")
+                endif()
+                set(MOLTENVK_MESH_FRAMEWORK_DIR "${mesh_fw}" CACHE PATH "" FORCE)
+            else()
+                set(mesh_dylib "${moltenvk_mesh_dir}/libMoltenVKMesh.dylib")
+                if (NOT EXISTS "${mesh_dylib}")
+                    file(COPY_FILE "${moltenvk_mesh_package}/dylib/macOS/libMoltenVK.dylib" "${mesh_dylib}")
+                    execute_process(COMMAND install_name_tool -id @rpath/libMoltenVKMesh.dylib "${mesh_dylib}"
+                                    RESULT_VARIABLE mesh_id_result)
+                    if (mesh_id_result)
+                        message(FATAL_ERROR "install_name_tool failed on ${mesh_dylib}")
+                    endif()
+                    # The new install name voids the signature; arm64 Macs load signed code only.
+                    execute_process(COMMAND codesign --force --sign - "${mesh_dylib}")
+                endif()
+                set(MOLTENVK_MESH_LIBRARY "${mesh_dylib}" CACHE STRING "" FORCE)
+            endif()
+            message(STATUS "MoltenVK with mesh shaders: ${MOLTENVK_MESH_FRAMEWORK_DIR}${MOLTENVK_MESH_LIBRARY}")
+        endif()
+    endif()
 endif()

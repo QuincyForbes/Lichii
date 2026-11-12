@@ -168,6 +168,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Apple MetalFX temporal upscaling in place of a Switch 2 game's DLSS and of "
               "Ocarina of Time's own upscaler, instead of AMD FSR 3.1 and the game's.\nNeeds "
               "macOS 13 or iOS 16 on an Apple GPU."));
+    INSERT(Settings, moltenvk_driver, tr("Graphics driver:"),
+           tr("Which MoltenVK runs Vulkan on Metal. The new one draws mesh shaders (Ocarina of "
+              "Time's foliage) with Metal's own mesh shaders; the legacy one emulates them with "
+              "compute. Lichii falls back to the legacy one when the new one doesn't load.\n"
+              "Takes effect the next time Lichii starts."));
     INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS (experimental)"),
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a game's own upscaler, where "
               "Lichii can give DLSS the frame's colour, depth, motion vectors and jitter:\n"
@@ -653,6 +658,11 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(GamePatchMode, Auto, tr("Auto")),
                               PAIR(GamePatchMode, On, tr("On")),
                               PAIR(GamePatchMode, Off, tr("Off")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::MoltenVkDriver>::Index(),
+                          {
+                              PAIR(MoltenVkDriver, Legacy, tr("Legacy MoltenVK")),
+                              PAIR(MoltenVkDriver, Mesh, tr("New MoltenVK (native mesh shaders)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::TextureQuality>::Index(),
                           {

@@ -1,0 +1,232 @@
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index e6a6593f..8ee96a89 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -36,6 +36,7 @@
+ #include <cereal/archives/binary.hpp>
+ #include <cereal/types/map.hpp>
+ #include <cereal/types/string.hpp>
++#include <cereal/types/utility.hpp>
+ #include <cereal/types/vector.hpp>
+ #endif
+ 
+@@ -1204,7 +1205,8 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLRenderPipelineDescriptor
+ 
+ 	SPIRVShaderOutputs vtxOutputs;
+ 	std::string errorLog;
+-	if (!getShaderOutputs(_vertexModule->getSPIRV(), meshDesc ? spv::ExecutionModelMeshEXT : spv::ExecutionModelVertex, pVertexSS->pName, vtxOutputs, errorLog) ) {
++	if (!getShaderOutputs(_vertexModule->getSPIRV(), meshDesc ? spv::ExecutionModelMeshEXT : spv::ExecutionModelVertex, pVertexSS->pName, vtxOutputs, errorLog,
++						  mvkGetSpecializationValues(pVertexSS->pSpecializationInfo)) ) {
+ 		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get vertex outputs: %s", errorLog.c_str()));
+ 		return nil;
+ 	}
+@@ -3026,7 +3028,8 @@ namespace mvk {
+ 				cfg.shaderOutputs,
+ 				cfg.resourceBindings,
+ 				cfg.discreteDescriptorSets,
+-				cfg.dynamicBufferDescriptors);
++				cfg.dynamicBufferDescriptors,
++				cfg.specializationConstants);
+ 	}
+ 
+ 	template<class Archive>
+@@ -3218,7 +3221,7 @@ void mvkValidateCeralArchiveDefinitions() {
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLShaderInterfaceVariable>(3);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLResourceBinding>(2);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::DescriptorBinding>();
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(109);	// Contains collection
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(125);	// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(40);		// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLSpecializationMacroInfo>(22);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<MVKShaderModuleKey>();
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
+index c5b74991..94fc54d7 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
+@@ -32,6 +32,9 @@ class MVKShaderCacheIterator;
+ class MVKShaderLibraryCache;
+ class MVKShaderModule;
+ 
++/** Returns the values in the specialization info as constant ID and value pairs, sorted by constant ID. */
++std::vector<std::pair<uint32_t, uint64_t>> mvkGetSpecializationValues(const VkSpecializationInfo* pSpecInfo);
++
+ #pragma mark -
+ #pragma mark MVKShaderLibrary
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index 3aa44a44..c64cf9ae 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -52,6 +52,19 @@ MVKMTLFunction::~MVKMTLFunction() {
+ }
+ 
+ 
++std::vector<std::pair<uint32_t, uint64_t>> mvkGetSpecializationValues(const VkSpecializationInfo* pSpecInfo) {
++	std::vector<std::pair<uint32_t, uint64_t>> values;
++	for (uint32_t i = 0; pSpecInfo && i < pSpecInfo->mapEntryCount; i++) {
++		auto& me = pSpecInfo->pMapEntries[i];
++		uint64_t val = 0;
++		memcpy(&val, (char*)pSpecInfo->pData + me.offset, min(me.size, sizeof(val)));
++		values.emplace_back(me.constantID, val);
++	}
++	std::sort(values.begin(), values.end());
++	return values;
++}
++
++
+ #pragma mark -
+ #pragma mark MVKShaderLibrary
+ 
+@@ -399,13 +412,23 @@ MVKMTLFunction MVKShaderModule::getMTLFunction(SPIRVToMSLConversionConfiguration
+ 											   VkPipelineCreationFeedback* pShaderFeedback) {
+ 	MVKShaderLibrary* mvkLib = _directMSLLibrary;
+ 	if ( !mvkLib ) {
+-		uint64_t startTime = pShaderFeedback ? mvkGetTimestamp() : getPerformanceTimestamp();
+ 		MVKPipelineCache* pipelineCache = pipeline->getPipelineCache();
+-		if (pipelineCache) {
+-			mvkLib = pipelineCache->getShaderLibrary(pShaderConfig, this, pipeline, pShaderFeedback, startTime);
+-		} else {
++		auto getLib = [&]() {
++			uint64_t startTime = pShaderFeedback ? mvkGetTimestamp() : getPerformanceTimestamp();
++			if (pipelineCache) { return pipelineCache->getShaderLibrary(pShaderConfig, this, pipeline, pShaderFeedback, startTime); }
+ 			lock_guard<mutex> lock(_accessLock);
+-			mvkLib = _shaderLibraryCache.getShaderLibrary(pShaderConfig, this, pipeline, nullptr, pShaderFeedback, startTime);
++			return _shaderLibraryCache.getShaderLibrary(pShaderConfig, this, pipeline, nullptr, pShaderFeedback, startTime);
++		};
++		pShaderConfig->specializationConstants.clear();
++		mvkLib = getLib();
++
++		// array sizes are resolved during conversion, so convert again with the specialized values of array sizing constants
++		for (auto& v : mvkGetSpecializationValues(mvkLib ? pSpecializationInfo : nullptr)) {
++			if (mvkLib->_shaderConversionResultInfo.specializationMacros.count(v.first)) { pShaderConfig->specializationConstants.push_back(v); }
++		}
++		if ( !pShaderConfig->specializationConstants.empty() ) {
++			if (pShaderFeedback) { mvkDisableFlags(pShaderFeedback->flags, VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT); }
++			mvkLib = getLib();
+ 		}
+ 	} else {
+ 		mvkLib->setEntryPointName(pShaderConfig->options.entryPointName);
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h
+index 2525eea7..9db2dca1 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h
+@@ -233,6 +233,23 @@ namespace mvk {
+ 
+ 	auto addSat = [](uint32_t a, uint32_t b) { return a == uint32_t(-1) ? a : a + b; };
+ 
++	typedef std::vector<std::pair<uint32_t, uint64_t>> SPIRVSpecializationValues;
++
++	/** Sets these specialization constant values, so that the array sizes they define resolve to them. */
++	static inline void setSpecializationValues(SPIRV_CROSS_NAMESPACE::Compiler& compiler, const SPIRVSpecializationValues& values) {
++		for (auto& v : values) {
++			for (auto& sc : compiler.get_specialization_constants()) {
++				if (v.first == sc.constant_id) { compiler.get_constant(sc.id).m.c[0].r[0].u64 = v.second; }
++			}
++		}
++	}
++
++	// an array sized by a specialization constant holds the constant's id
++	static inline uint32_t getElementCount(const SPIRV_CROSS_NAMESPACE::CompilerReflection& reflect, const SPIRV_CROSS_NAMESPACE::SPIRType* type) {
++		uint32_t arrCnt = type->array.empty() ? 1 : type->array_size_literal[0] ? type->array[0] : reflect.evaluate_constant_u32(type->array[0]);
++		return arrCnt * type->columns;
++	}
++
+ 	template<typename Vi>
+ 	static inline uint32_t getShaderInterfaceStructMembers(const SPIRV_CROSS_NAMESPACE::CompilerReflection& reflect,
+ 														   Vi& vars, SPIRVShaderInterfaceVariable* pParentFirstMember,
+@@ -256,7 +273,7 @@ namespace mvk {
+ 				isUsed = reflect.has_active_builtin(biType, storage);
+ 			}
+ 			const SPIRV_CROSS_NAMESPACE::SPIRType* type = &reflect.get_type(structType->member_types[mbrIdx]);
+-			uint32_t elemCnt = (type->array.empty() ? 1 : type->array[0]) * type->columns;
++			uint32_t elemCnt = getElementCount(reflect, type);
+ 			for (uint32_t elemIdx = 0; elemIdx < elemCnt; elemIdx++) {
+ 				if (type->basetype == SPIRV_CROSS_NAMESPACE::SPIRType::Struct)
+ 					loc = getShaderInterfaceStructMembers(reflect, vars, pFirstMember, type, storage, patch, loc);
+@@ -292,7 +309,8 @@ namespace mvk {
+ 	/** Given a shader in SPIR-V format, returns interface reflection data. */
+ 	template<typename Vs, typename Vi>
+ 	static inline bool getShaderInterfaceVariables(const Vs& spirv, spv::StorageClass storage, spv::ExecutionModel model,
+-												   const std::string& entryName, Vi& vars, std::string& errorLog) {
++												   const std::string& entryName, Vi& vars, std::string& errorLog,
++												   const SPIRVSpecializationValues& specValues = {}) {
+ #ifndef SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS
+ 		try {
+ #endif
+@@ -302,6 +320,7 @@ namespace mvk {
+ 			if (!entryName.empty()) {
+ 				reflect.set_entry_point(entryName, model);
+ 			}
++			setSpecializationValues(reflect, specValues);
+ 			reflect.compile();
+ 			reflect.update_active_builtins();
+ 
+@@ -340,7 +359,7 @@ namespace mvk {
+ 					(model == spv::ExecutionModelMeshEXT && storage == spv::StorageClassOutput))
+ 					type = &reflect.get_type(type->parent_type);
+ 
+-				uint32_t elemCnt = (type->array.empty() ? 1 : type->array[0]) * type->columns;
++				uint32_t elemCnt = getElementCount(reflect, type);
+ 				for (uint32_t i = 0; i < elemCnt; i++) {
+ 					if (type->basetype == SPIRV_CROSS_NAMESPACE::SPIRType::Struct) {
+ 						SPIRVShaderInterfaceVariable* pFirstMember = nullptr;
+@@ -371,8 +390,8 @@ namespace mvk {
+ 	}
+ 	template<typename Vs, typename Vo>
+ 	static inline bool getShaderOutputs(const Vs& spirv, spv::ExecutionModel model, const std::string& entryName,
+-										Vo& outputs, std::string& errorLog) {
+-		return getShaderInterfaceVariables(spirv, spv::StorageClassOutput, model, entryName, outputs, errorLog);
++										Vo& outputs, std::string& errorLog, const SPIRVSpecializationValues& specValues = {}) {
++		return getShaderInterfaceVariables(spirv, spv::StorageClassOutput, model, entryName, outputs, errorLog, specValues);
+ 	}
+ 	template<typename Vs, typename Vo>
+ 	static inline bool getShaderInputs(const Vs& spirv, spv::ExecutionModel model, const std::string& entryName,
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+index c34e6b8c..6b03c5bc 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "SPIRVToMSLConverter.h"
++#include "SPIRVReflection.h"
+ #include "MVKCommonEnvironment.h"
+ #include "MVKStrings.h"
+ #include "FileSupport.h"
+@@ -190,7 +191,7 @@ MVK_PUBLIC_SYMBOL void SPIRVToMSLConversionConfiguration::markAllInterfaceVarsAn
+ // and shaderInputs and shaderOutputs are populated before each stage, so neither needs to be filtered by stage here.
+ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToMSLConversionConfiguration& other) const {
+ 
+-    if ( !options.matches(other.options) ) { return false; }
++    if ( !options.matches(other.options) || specializationConstants != other.specializationConstants ) { return false; }
+ 
+ 	for (const auto& si : shaderInputs) {
+ 		if (si.outIsUsedByShader && !containsMatching(other.shaderInputs, si)) { return false; }
+@@ -349,6 +350,7 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+ 				}
+ 			}
+ 		}
++		setSpecializationValues(*pMSLCompiler, shaderConfig.specializationConstants);
+ 		conversionResult.msl = pMSLCompiler->compile();
+ 
+         if (shouldLogMSL) { logSource(conversionResult.resultLog, conversionResult.msl, "MSL", "Converted"); }
+@@ -380,6 +382,7 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+ 	conversionResult.resultInfo.needsDrawId = pMSLCompiler && pMSLCompiler->has_active_builtin(spv::BuiltInDrawIndex, spv::StorageClassInput);
+ 	conversionResult.resultInfo.usesPhysicalStorageBufferAddressesCapability = usesPhysicalStorageBufferAddressesCapability(pMSLCompiler);
+ 	populateSpecializationMacros(pMSLCompiler, conversionResult.resultInfo.specializationMacros);
++	for (auto& v : shaderConfig.specializationConstants) { conversionResult.resultInfo.specializationMacros.erase(v.first); }
+ 
+ 	// When using Metal argument buffers, if the shader is provided with dynamic buffer offsets,
+ 	// then it needs a buffer to hold these dynamic offsets.
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
+index bffc0725..963dd9e2 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
+@@ -153,6 +153,7 @@ namespace mvk {
+ 		std::vector<MSLResourceBinding> resourceBindings;
+ 		std::vector<uint32_t> discreteDescriptorSets;
+ 		std::vector<DescriptorBinding> dynamicBufferDescriptors;
++		std::vector<std::pair<uint32_t, uint64_t>> specializationConstants;
+ 
+ 		/** Returns whether the pipeline stage being converted supports vertex attributes. */
+ 		bool stageSupportsVertexAttributes() const;

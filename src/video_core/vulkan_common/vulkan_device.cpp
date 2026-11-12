@@ -1550,6 +1550,10 @@ bool Device::GetSuitability(bool requires_swapchain) {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
         SetNext(next, properties.integer_dot_product);
     }
+    if (supported_extensions.contains(VK_EXT_MESH_SHADER_EXTENSION_NAME)) {
+        properties.mesh_shader.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT;
+        SetNext(next, properties.mesh_shader);
+    }
 
     if (graphics_pipeline_library_requested) {
         properties.graphics_pipeline_library.sType =

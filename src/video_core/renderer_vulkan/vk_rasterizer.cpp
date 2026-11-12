@@ -1507,6 +1507,13 @@ bool RasterizerVulkan::DrawMeshTasksFromGpu(DAddr count_addr) {
     if (!device.IsExtMeshShaderSupported() || !maxwell3d->regs.IsMeshEnabled()) {
         return false;
     }
+    // A pipeline over the native limits is emulated: it needs the count on the CPU.
+    if (pipeline_cache.HasEmulatedNativeMeshPipelines()) {
+        const GraphicsPipeline* const pipeline{pipeline_cache.CurrentGraphicsPipeline()};
+        if (pipeline != nullptr && pipeline->IsEmulatedMesh()) {
+            return false;
+        }
+    }
     std::optional<u32> slot;
     {
         std::scoped_lock lock{buffer_cache.mutex};

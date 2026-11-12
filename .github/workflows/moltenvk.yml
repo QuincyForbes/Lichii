@@ -1,0 +1,165 @@
+name: MoltenVK (mesh shaders)
+
+# Builds MoltenVK with VK_EXT_mesh_shader (KhronosGroup/MoltenVK#2842) for iOS and macOS and publishes it as
+# a release of this repository. externals/moltenvk-patches/README.md lists what goes in.
+on:
+  # A workflow that is not on the default branch yet cannot be dispatched: pushing a branch named
+  # moltenvk-build/<anything> runs it with the defaults below.
+  push:
+    branches: ['moltenvk-build/**']
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner image
+        type: choice
+        options: [macos-26, macos-15-intel, macos-15]
+        default: macos-15-intel
+      tag:
+        description: Release tag (a new build needs a new tag; externals/CMakeLists.txt pins its hash)
+        type: string
+        default: moltenvk-mesh-c516eb4
+
+permissions:
+  contents: write
+
+env:
+  MVK_COMMIT: c516eb423516187204c68cd1ed82fb81520315eb
+
+jobs:
+  build:
+    name: MoltenVK iOS + macOS
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
+    timeout-minutes: 300
+    steps:
+      - name: Check out patches
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: externals/moltenvk-patches
+
+      # glslang's update_glslang_sources.py, run by fetchDependencies, needs distutils (gone in 3.12).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Select Xcode
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$xcode" ]; then sudo xcode-select -s "$xcode/Contents/Developer"; fi
+          xcodebuild -version
+
+      - name: Check out MoltenVK and apply patches
+        run: |
+          set -euo pipefail
+          git init -q mvk
+          cd mvk
+          git remote add origin https://github.com/KhronosGroup/MoltenVK.git
+          git fetch -q --depth 1 origin "$MVK_COMMIT"
+          git checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$MVK_COMMIT"
+          for patch in ../externals/moltenvk-patches/*.patch; do
+            echo "Applying $patch"
+            git apply --whitespace=nowarn "$patch"
+          done
+          git status --short
+          cat ExternalRevisions/SPIRV-Cross_repo_revision
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            mvk/External/build
+            !mvk/External/build/Intermediates
+          key: mvk-deps-${{ inputs.runner || 'macos-15-intel' }}-${{ env.MVK_COMMIT }}-${{ hashFiles('externals/moltenvk-patches/*.patch') }}
+
+      - name: Fetch dependencies
+        working-directory: mvk
+        run: |
+          set -euo pipefail
+          if [ -d External/build/Release ]; then
+            ./fetchDependencies -v --none
+          else
+            # One platform at a time: with --parallel-build the Intel runner stopped answering
+            # ("lost communication with the server") twice, 23 and 64 minutes in.
+            ./fetchDependencies -v --ios --macos
+          fi
+
+      - name: Dependency build log
+        if: failure()
+        working-directory: mvk
+        run: tail -300 dependenciesbuild.log || true
+
+      - name: Build MoltenVK
+        working-directory: mvk
+        run: |
+          set -euo pipefail
+          make ios
+          make macos
+
+      - name: MoltenVK build log
+        if: failure()
+        working-directory: mvk
+        run: grep -E 'error:|BUILD FAILED' -A 4 xcodebuild.log | head -300 || tail -300 xcodebuild.log || true
+
+      - name: Check mesh entry points
+        working-directory: mvk
+        run: |
+          set -euo pipefail
+          ios=Package/Release/MoltenVK/dynamic/MoltenVK.xcframework/ios-arm64/MoltenVK.framework/MoltenVK
+          mac=Package/Release/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
+          ls -la "$ios" "$mac"
+          for bin in "$ios" "$mac"; do
+            lipo -info "$bin"
+            otool -L "$bin" | head -20
+            nm -gU "$bin" | grep -E '_vkCmdDrawMeshTasks(EXT|IndirectEXT|IndirectCountEXT)$' | tee symbols.txt
+            test "$(wc -l < symbols.txt)" -ge 3
+            strings "$bin" | grep -c VK_EXT_mesh_shader
+          done
+          printf '::notice title=Mesh entry points::%s\n' "$(nm -gU "$ios" | grep -E 'DrawMeshTasks' | tr '\n' ' ')"
+
+      - name: Package
+        working-directory: mvk
+        run: |
+          set -euo pipefail
+          rm -rf Package/Release/MoltenVKShaderConverter
+          cp LICENSE Package/Release/MoltenVK/LICENSE
+          {
+            echo "MoltenVK $MVK_COMMIT (KhronosGroup/MoltenVK#2842)"
+            echo "SPIRV-Cross $(cat ExternalRevisions/SPIRV-Cross_repo_revision)"
+            echo "Patches: $(cd ../externals/moltenvk-patches && ls *.patch | tr '\n' ' ')"
+            echo "Built by $GITHUB_REPOSITORY run $GITHUB_RUN_ID from $GITHUB_SHA"
+            xcodebuild -version
+          } > Package/Release/MoltenVK/LICHII-BUILD.txt
+          mkdir -p ../out ios-pkg/Release mac-pkg/Release
+          # Same layout as the official MoltenVK-ios.tar / MoltenVK-macos.tar: MoltenVK/MoltenVK/dynamic/...
+          rsync -a --exclude 'dylib/macOS' --exclude 'macos-*' --exclude 'static' Package/Release/ ios-pkg/Release/
+          rsync -a --exclude 'ios-*' --exclude 'static' Package/Release/ mac-pkg/Release/
+          tar -C ios-pkg -s/Release/MoltenVK/ -cf ../out/MoltenVK-ios.tar Release/
+          tar -C mac-pkg -s/Release/MoltenVK/ -cf ../out/MoltenVK-macos.tar Release/
+          tar -tf ../out/MoltenVK-ios.tar | grep -E 'LICENSE|ios-arm64/MoltenVK.framework/MoltenVK$'
+          tar -tf ../out/MoltenVK-macos.tar | grep -E 'LICENSE|libMoltenVK.dylib$'
+          cd ../out
+          shasum -a 512 *.tar | tee SHA512SUMS
+          ls -la
+          printf '::notice title=SHA-512::%s\n' "$(tr '\n' ' ' < SHA512SUMS)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.tag || 'moltenvk-mesh-c516eb4' }}
+          path: out/*
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || 'moltenvk-mesh-c516eb4' }}
+        run: |
+          set -euo pipefail
+          cd out
+          notes="MoltenVK with VK_EXT_mesh_shader (KhronosGroup/MoltenVK#2842 at ${MVK_COMMIT}, #2843, SPIRV-Cross#2686), built from ${GITHUB_SHA} by run ${GITHUB_RUN_ID}. Used by externals/CMakeLists.txt (LICHII_MOLTENVK_MESH). Apache-2.0, see LICENSE in each tarball."
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" MoltenVK-ios.tar MoltenVK-macos.tar SHA512SUMS --clobber
+          else
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" MoltenVK-ios.tar MoltenVK-macos.tar SHA512SUMS \
+              --target "$GITHUB_SHA" --prerelease --title "MoltenVK mesh shaders (${TAG#moltenvk-mesh-})" --notes "$notes"
+          fi

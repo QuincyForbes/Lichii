@@ -787,6 +787,11 @@ FN_MAX_LIMIT_LIST
                features.mesh_shader.meshShader;
     }
 
+    /// VK_EXT_mesh_shader limits (zero without the extension).
+    const VkPhysicalDeviceMeshShaderPropertiesEXT& GetMeshShaderProperties() const {
+        return properties.mesh_shader;
+    }
+
     /// Returns true if the device supports VK_KHR_image_format_list.
     bool IsKhrImageFormatListSupported() const {
         return extensions.image_format_list || instance_version >= VK_API_VERSION_1_2;
@@ -1141,6 +1146,11 @@ FN_MAX_LIMIT_LIST
         return properties.driver.driverName;
     }
 
+    /// Returns the driver's own version text (MoltenVK: its release and git revision).
+    std::string_view GetDriverInfo() const {
+        return properties.driver.driverInfo;
+    }
+
     /// Returns the list of available extensions.
     const std::set<std::string, std::less<>>& GetAvailableExtensions() const {
         return supported_extensions;
@@ -1436,6 +1446,7 @@ private:
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
         VkPhysicalDeviceCooperativeMatrixPropertiesKHR cooperative_matrix{};
         VkPhysicalDeviceShaderIntegerDotProductProperties integer_dot_product{};
+        VkPhysicalDeviceMeshShaderPropertiesEXT mesh_shader{};
 
         VkPhysicalDeviceProperties properties{};
     };

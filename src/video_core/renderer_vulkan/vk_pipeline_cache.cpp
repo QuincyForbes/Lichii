@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -1950,8 +1951,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     size_t precache_capture_bytes = 0;
 
     if (use_vulkan_pipeline_cache) {
-        vulkan_pipeline_cache_filename =
-            VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_pipelines", CACHE_VERSION);
+        // MoltenVK with mesh shaders (Settings moltenvk_driver) has its own file: each MoltenVK
+        // rejects the other's (another git revision in the cache UUID) and would overwrite it.
+        const bool mvk_mesh{device.IsMoltenVK() && device.IsExtMeshShaderSupported()};
+        vulkan_pipeline_cache_filename = VideoCommon::VersionedPipelineCachePath(
+            base_dir, mvk_mesh ? "vulkan_pipelines_mvk_mesh" : "vulkan_pipelines", CACHE_VERSION);
         vulkan_pipeline_cache =
             LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
     }
@@ -3043,6 +3047,82 @@ void ReportUnsupportedMeshPipeline(const GraphicsPipelineCacheKey& key, const Pr
                 position, generic, other, others, info.primitive_lines.size(), has_pixel,
                 with_task, per_primitive, non_triangle);
 }
+
+// With VK_EXT_mesh_shader: why a task/mesh pipeline cannot be built natively, if it cannot. Such a
+// pipeline takes the compute emulation instead. MoltenVK (KhronosGroup/MoltenVK#2842) builds the
+// mesh program as a Metal mesh function: SPIRV-Cross keeps its outputs, their counts and triangle
+// indices in threadgroup memory next to the program's own workgroup memory (the attribute and map
+// regions of emit_spirv_mesh.cpp), and Metal refuses a function that needs more than the device has.
+template <typename Programs>
+std::optional<std::string> NativeMeshLimitExceeded(const Device& device,
+                                                   const GraphicsPipelineCacheKey& key,
+                                                   const Programs& programs) {
+    const Shader::IR::Program* task{};
+    const Shader::IR::Program* mesh{};
+    for (size_t index = 1; index < programs.size(); ++index) {
+        if (key.unique_hashes[index] == 0) {
+            continue;
+        }
+        if (programs[index].stage == Shader::Stage::Task) {
+            task = &programs[index];
+        } else if (programs[index].stage == Shader::Stage::Mesh) {
+            mesh = &programs[index];
+        }
+    }
+    if (mesh == nullptr) {
+        return std::nullopt;
+    }
+    const auto& limits{device.GetMeshShaderProperties()};
+    const auto& info{mesh->mesh};
+    if (info.max_vertices > limits.maxMeshOutputVertices ||
+        info.max_primitives > limits.maxMeshOutputPrimitives) {
+        return fmt::format("{} vertices / {} primitives, device {} / {}", info.max_vertices,
+                           info.max_primitives, limits.maxMeshOutputVertices,
+                           limits.maxMeshOutputPrimitives);
+    }
+    if (task != nullptr && info.payload_words * 4 > limits.maxTaskPayloadSize) {
+        return fmt::format("task payload {} B, device {} B", info.payload_words * 4,
+                           limits.maxTaskPayloadSize);
+    }
+    if (!device.IsMoltenVK()) {
+        return std::nullopt;
+    }
+    // Output locations: one vec4 per generic, plus position and the other built-ins.
+    const auto locations = [](const auto& lines) {
+        std::bitset<Shader::IR::NUM_GENERICS> generics;
+        bool builtins{};
+        for (const u32 line : lines) {
+            const auto attribute{static_cast<Shader::IR::Attribute>(line)};
+            if (Shader::IR::IsGeneric(attribute)) {
+                generics.set(Shader::IR::GenericAttributeIndex(attribute));
+            } else {
+                builtins = true;
+            }
+        }
+        return static_cast<u32>(generics.count()) + (builtins ? 1U : 0U);
+    };
+    const u32 vertex_locations{locations(info.vertex_lines)};
+    const u32 primitive_locations{locations(info.primitive_lines)};
+    if (vertex_locations * 4 > limits.maxMeshOutputComponents) {
+        return fmt::format("{} output components, device {}", vertex_locations * 4,
+                           limits.maxMeshOutputComponents);
+    }
+    const u64 bytes{MetalMeshThreadgroupBytes({
+        .max_vertices = info.max_vertices,
+        .max_primitives = info.max_primitives,
+        .primitive_vertices = info.PrimitiveVertices(),
+        .vertex_lines = static_cast<u32>(info.vertex_lines.size()),
+        .primitive_lines = static_cast<u32>(info.primitive_lines.size()),
+        .vertex_locations = vertex_locations,
+        .primitive_locations = primitive_locations,
+        .shared_memory_bytes = mesh->shared_memory_size,
+    })};
+    const u64 available{device.GetMaxComputeSharedMemorySize()};
+    if (bytes > available) {
+        return fmt::format("threadgroup memory {} B, device {} B", bytes, available);
+    }
+    return std::nullopt;
+}
 } // Anonymous namespace
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateCachedGraphicsPipeline(
@@ -3177,6 +3257,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     break;
                 }
             }
+        }
+    }
+    if (!mesh_unsupported && device.IsExtMeshShaderSupported()) {
+        if (const auto reason{NativeMeshLimitExceeded(device, key, programs)}) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+                LOG_WARNING(Render_Vulkan,
+                            "Mesh pipeline {:016x} exceeds the native mesh limits ({}): emulated",
+                            hash, *reason);
+            }
+            mesh_unsupported = true;
+            emulated_native_mesh.store(true, std::memory_order_relaxed);
         }
     }
     // Mesh emulation without VK_EXT_mesh_shader (prototype): a mesh program, after an optional

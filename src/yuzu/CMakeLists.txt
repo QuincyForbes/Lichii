@@ -420,6 +420,13 @@ if (APPLE)
         MACOSX_PACKAGE_LOCATION Frameworks
         XCODE_FILE_ATTRIBUTES "CodeSignOnCopy")
     target_sources(yuzu PRIVATE ${MOLTENVK_LIBRARY})
+    if (MOLTENVK_MESH_LIBRARY)
+        # The second driver (Settings moltenvk_driver, externals/CMakeLists.txt).
+        set_source_files_properties(${MOLTENVK_MESH_LIBRARY} PROPERTIES
+            MACOSX_PACKAGE_LOCATION Frameworks
+            XCODE_FILE_ATTRIBUTES "CodeSignOnCopy")
+        target_sources(yuzu PRIVATE ${MOLTENVK_MESH_LIBRARY})
+    endif()
 elseif(WIN32)
     # compile as a win32 gui application instead of a console application
     target_link_libraries(yuzu PRIVATE Qt6::EntryPointPrivate)

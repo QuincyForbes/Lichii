@@ -339,6 +339,31 @@ void RendererVulkan::Report() const {
     LOG_INFO(Render_Vulkan, "Device: {}", model_name);
     LOG_INFO(Render_Vulkan, "Vulkan: {}", api_version);
     LOG_INFO(Render_Vulkan, "Available VRAM: {:.2f} GiB", available_vram);
+    // Warning level: iOS filters Render.Vulkan below it.
+    if (device.IsMoltenVK()) {
+        LOG_WARNING(Render_Vulkan, "MoltenVK {} ({}), VK_EXT_mesh_shader {}",
+                    device.GetDriverInfo(), driver_version,
+                    device.GetAvailableExtensions().contains(VK_EXT_MESH_SHADER_EXTENSION_NAME)
+                        ? "exposed"
+                        : "not exposed");
+    }
+    if (device.IsExtMeshShaderSupported()) {
+        const auto& mesh = device.GetMeshShaderProperties();
+        LOG_WARNING(Render_Vulkan,
+                    "Mesh shaders: native (VK_EXT_mesh_shader on {}): max {} vertices, {} "
+                    "primitives, {} output components, task payload {} B, output memory {} B, mesh "
+                    "shared memory {} B, threadgroup memory {} B, mesh groups {} (total {}), task "
+                    "groups {}",
+                    driver_name, mesh.maxMeshOutputVertices, mesh.maxMeshOutputPrimitives,
+                    mesh.maxMeshOutputComponents, mesh.maxTaskPayloadSize,
+                    mesh.maxMeshOutputMemorySize, mesh.maxMeshSharedMemorySize,
+                    device.GetMaxComputeSharedMemorySize(), mesh.maxMeshWorkGroupCount[0],
+                    mesh.maxMeshWorkGroupTotalCount, mesh.maxTaskWorkGroupCount[0]);
+    } else {
+        LOG_WARNING(Render_Vulkan,
+                    "Mesh shaders: emulated with compute (no VK_EXT_mesh_shader on {})",
+                    driver_name);
+    }
     if (VideoCommon::RenderTrace::Enabled()) {
         LOG_INFO(Render_Vulkan, "Render trace enabled: interval=600 frames, log_filter={}",
                  Settings::values.log_filter.GetValue());

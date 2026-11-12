@@ -427,6 +427,9 @@ struct Values {
     // Apple only: MetalFX temporal upscaling in place of a game's DLSS and of Ocarina of Time's
     // upscaler (what NVIDIA DLSS does on Windows). Global only, like nvidia_dlss.
     Setting<bool> metalfx_temporal{linkage, false, "metalfx_temporal", Category::Renderer};
+    // Apple only: which bundled MoltenVK to load. Read once per process, at the first Vulkan start.
+    Setting<MoltenVkDriver> moltenvk_driver{linkage, MoltenVkDriver::Legacy, "moltenvk_driver",
+                                            Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",

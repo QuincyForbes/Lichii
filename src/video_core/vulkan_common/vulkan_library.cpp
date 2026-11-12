@@ -6,7 +6,9 @@
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
+#include <dlfcn.h>
 #include <cstdlib>
+#include <string_view>
 #endif
 #include <string>
 
@@ -24,6 +26,9 @@
 #include "common/dynamic_library.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#ifdef __APPLE__
+#include "common/settings.h"
+#endif
 #ifdef _WIN32
 #include "common/scope_exit.h"
 #endif
@@ -155,25 +160,60 @@ std::shared_ptr<Common::DynamicLibrary> OpenLibrary(
         return true;
     }();
     (void)mvk_tuning;
+    // Two MoltenVKs are bundled (Settings moltenvk_driver): the release Lichii always shipped and
+    // one with native mesh shaders (KhronosGroup/MoltenVK#2842). The first start of this process
+    // picks one, so a process never loads both (they define the same Objective-C classes).
+    // EDEN_NX2_MOLTENVK=mesh|legacy overrides the setting.
+    static const bool want_mesh = [] {
+        if (const char* const env = std::getenv("EDEN_NX2_MOLTENVK")) {
+            return std::string_view{env} == "mesh";
+        }
+        return Settings::values.moltenvk_driver.GetValue() == Settings::MoltenVkDriver::Mesh;
+    }();
 #if TARGET_OS_IPHONE
-    // iOS: MoltenVK.framework is embedded in the flat app bundle (no Contents/ directory).
-    const auto libvulkan_filename =
-        Common::FS::GetBundleDirectory() / "Frameworks/MoltenVK.framework/MoltenVK";
-    const auto libmoltenvk_filename =
-        Common::FS::GetBundleDirectory() / "Frameworks/libMoltenVK.dylib";
+    // iOS: the frameworks are embedded in the flat app bundle (no Contents/ directory).
+    const auto frameworks = Common::FS::GetBundleDirectory() / "Frameworks";
+    const auto mesh_filename = frameworks / "MoltenVKMesh.framework/MoltenVKMesh";
+    const auto libvulkan_filename = frameworks / "MoltenVK.framework/MoltenVK";
+    const auto libmoltenvk_filename = libvulkan_filename;
 #else
-    const auto libvulkan_filename =
-        Common::FS::GetBundleDirectory() / "Contents/Frameworks/libvulkan.1.dylib";
-    const auto libmoltenvk_filename =
-        Common::FS::GetBundleDirectory() / "Contents/Frameworks/libMoltenVK.dylib";
+    const auto frameworks = Common::FS::GetBundleDirectory() / "Contents/Frameworks";
+    const auto mesh_filename = frameworks / "libMoltenVKMesh.dylib";
+    const auto libvulkan_filename = frameworks / "libvulkan.1.dylib";
+    const auto libmoltenvk_filename = frameworks / "libMoltenVK.dylib";
 #endif
-    const char* library_paths[] = {std::getenv("LIBVULKAN_PATH"), libvulkan_filename.c_str(),
-                                   libmoltenvk_filename.c_str()};
+    const char* const env_path = std::getenv("LIBVULKAN_PATH");
+    const char* library_paths[] = {env_path, want_mesh ? mesh_filename.c_str() : nullptr,
+                                   libvulkan_filename.c_str(), libmoltenvk_filename.c_str()};
+    std::string mesh_error;
     // Check if a path to a specific Vulkan library has been specified.
     for (const auto& library_path : library_paths) {
-        if (library_path && library->Open(library_path)) {
-            break;
+        if (library_path == nullptr) {
+            continue;
         }
+        const bool mesh = library_path == mesh_filename.c_str();
+        if (!library->Open(library_path)) {
+            if (mesh) {
+                const char* const error = dlerror();
+                mesh_error = error != nullptr ? error : "not found";
+            }
+            continue;
+        }
+        if (library->GetSymbolAddress("vkGetInstanceProcAddr") == nullptr) {
+            LOG_ERROR(Render_Vulkan, "{} has no vkGetInstanceProcAddr", library_path);
+            library->Close();
+            continue;
+        }
+        // Warning level: iOS filters Render.Vulkan below it.
+        if (want_mesh && !mesh && library_path != env_path) {
+            LOG_WARNING(Render_Vulkan,
+                        "MoltenVK with mesh shaders did not load ({}): legacy MoltenVK at {}",
+                        mesh_error.empty() ? mesh_filename.string() : mesh_error, library_path);
+        } else {
+            LOG_WARNING(Render_Vulkan, "Vulkan library: {} ({} MoltenVK)", library_path,
+                        library_path == env_path ? "LIBVULKAN_PATH" : (mesh ? "mesh" : "legacy"));
+        }
+        break;
     }
 #else
     std::string filename = Common::DynamicLibrary::GetVersionedFilename("vulkan", 1);
