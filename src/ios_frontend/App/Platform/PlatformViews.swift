@@ -307,7 +307,7 @@ struct ExperimentsView: View {
     @State private var untaggedGuest = lichii_platform_experiment("untagged_guest") != 0
     @State private var noZeroTrim = lichii_platform_experiment("no_zero_trim") != 0
     @State private var chunkedGuest = lichii_platform_experiment("chunked_guest") != 0
-    @State private var fileGuest = lichii_platform_experiment("file_guest") != 0
+    @State private var fileGuest = lichii_platform_file_guest() != 0
     @State private var nupInMemory = lichii_platform_experiment("nup_in_memory") != 0
     @State private var confirmReset = false
     @State private var resetDone = false
@@ -321,12 +321,12 @@ struct ExperimentsView: View {
                     }
                 Toggle("Keep Guest Memory in a File", isOn: $fileGuest)
                     .onChange(of: fileGuest) { value in
-                        lichii_platform_set_experiment("file_guest", value ? 1 : 0)
+                        lichii_platform_set_file_guest(value ? 1 : 0)
                     }
             } header: {
                 Text("Memory Savings")
             } footer: {
-                Text("Both are untested on a device and apply the next time Lichii starts.\n\nGive Back Zeroed Guest Memory splits guest memory into 2 MiB pieces and returns the ones holding only zeros to iOS (about 0.5 GB in Ocarina of Time). To do that safely Lichii stops all of its threads for about a millisecond at a time, which may show as a stutter. No effect with Count Guest Memory per Mapping on.\n\nKeep Guest Memory in a File takes the game's memory (most of what Lichii uses while a game runs) out of the limit iOS closes Lichii at: it lives in a 14 GB file in Lichii's temporary folder (tmp), and iOS writes the parts the game isn't using to storage when memory is short and reads them back when the game needs them. The cost: stutter while a game loads, and wear on the storage from several gigabytes written per play session. iOS may still close Lichii if storage can't keep up. The whole file is reserved when a game starts, so it needs 16 GB of free storage (Lichii falls back to normal memory with less); the file is removed when Lichii closes, however it closes. Overrides the other guest memory switches.")
+                Text("Both are untested on a device and apply the next time Lichii starts.\n\nGive Back Zeroed Guest Memory splits guest memory into 2 MiB pieces and returns the ones holding only zeros to iOS (about 0.5 GB in Ocarina of Time). To do that safely Lichii stops all of its threads for about a millisecond at a time, which may show as a stutter. No effect with Count Guest Memory per Mapping on.\n\nKeep Guest Memory in a File takes the game's memory (most of what Lichii uses while a game runs) out of the limit iOS closes Lichii at: it lives in a 14 GB file in Lichii's temporary folder (tmp), and iOS writes the parts the game isn't using to storage when memory is short and reads them back when the game needs them. The cost: stutter while a game loads, and wear on the storage from several gigabytes written per play session. iOS may still close Lichii if storage can't keep up. Storage for the file is reserved when a game starts, as much as there is room for; it needs 10 GB of free storage (Lichii falls back to normal memory with less). The file is removed when the game stops or Lichii closes, however it closes. Overrides the other guest memory switches.")
             }
 
             Section {

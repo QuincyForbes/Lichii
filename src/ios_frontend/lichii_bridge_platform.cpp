@@ -17,6 +17,7 @@
 #include <fmt/format.h>
 
 #include "common/fs/path_util.h"
+#include "common/host_memory.h"
 #include "common/logging.h"
 #include "common/platform_events.h"
 #include "common/settings.h"
@@ -207,9 +208,13 @@ void ApplyExperiments() {
         setenv("LICHII_IOS_CHUNKED_GUEST", "1", 0);
         LOG_WARNING(Frontend, "iOS: experiment chunked_guest on");
     }
+    // Set in Experiments either way, or neither: guest memory's own default.
     if (lichii_platform_experiment("file_guest")) {
         setenv("LICHII_IOS_FILE_GUEST", "1", 0);
         LOG_WARNING(Frontend, "iOS: experiment file_guest on");
+    } else if (lichii_platform_experiment("file_guest_off")) {
+        setenv("LICHII_IOS_FILE_GUEST", "0", 0);
+        LOG_WARNING(Frontend, "iOS: experiment file_guest off");
     }
     if (lichii_platform_experiment("no_zero_trim")) {
         setenv("EDEN_NX2_TRIM_ZERO", "0", 0);
@@ -431,6 +436,21 @@ int lichii_platform_experiment(const char* name) {
     std::error_code error;
     return std::filesystem::exists(LichiiPlatform::ConfigPath("experiments") / name, error) ? 1
                                                                                             : 0;
+}
+
+int lichii_platform_file_guest(void) {
+    if (lichii_platform_experiment("file_guest")) {
+        return 1;
+    }
+    if (lichii_platform_experiment("file_guest_off")) {
+        return 0;
+    }
+    return Common::HostMemory::FileGuestByDefault() ? 1 : 0;
+}
+
+void lichii_platform_set_file_guest(int enabled) {
+    lichii_platform_set_experiment("file_guest", enabled);
+    lichii_platform_set_experiment("file_guest_off", enabled == 0 ? 1 : 0);
 }
 
 } // extern "C"

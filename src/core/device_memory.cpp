@@ -119,6 +119,13 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     if (counts_only) {
         interval = CountInterval;
     }
+    // Ledger-tagged: a pass that marks the resident zero pages free, under memory pressure, with
+    // little left, or every FreeInterval, at most every FreeBackoff, once the game draws.
+    [[maybe_unused]] const bool frees = buffer.FreesZeroPages();
+    [[maybe_unused]] constexpr std::chrono::seconds FreeInterval = 120s;
+    [[maybe_unused]] constexpr std::chrono::seconds FreeBackoff = 30s;
+    [[maybe_unused]] auto free_next = std::chrono::steady_clock::now() + FreeBackoff;
+    [[maybe_unused]] auto free_periodic = std::chrono::steady_clock::now() + FreeInterval;
     // A pass started by memory pressure that gave back next to nothing keeps the next signals
     // from starting one for this long.
     constexpr std::chrono::seconds PressureBackoff = 30s;
@@ -146,6 +153,7 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         // Host memory pressure (iOS) starts a pass at once.
         bool urgent = false;
         bool imminent = false;
+        state.free_zero = false;
         for (std::chrono::seconds waited = 0s; waited < interval; waited += 1s) {
             if (!sleep(1s)) {
                 return;
@@ -179,7 +187,22 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             }
 #endif
             if (counts_only) {
+                [[maybe_unused]] const bool pressed = now != pressure;
                 pressure = now;
+#ifdef __APPLE__
+                if (frees && g_nx2_present_count.load(std::memory_order_relaxed) != 0 &&
+                    tick >= free_next) {
+                    const u64 left = Common::PlatformEvents::AvailableProcessMemory();
+                    if (pressed || closing || (left != 0 && left < Tight) || tick >= free_periodic) {
+                        // Not urgent: the other threads run between its stops.
+                        state.free_zero = true;
+                        imminent = closing;
+                        free_next = tick + FreeBackoff;
+                        free_periodic = tick + FreeInterval;
+                        break;
+                    }
+                }
+#endif
                 if (closing) {
                     // And a fresh count of the guest memory.
                     imminent = true;
@@ -287,7 +310,8 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         LOG_INFO(HW_Memory,
                  "Guest memory {} MiB resident ({}, {} MiB of it compressed), {} MiB trimmed over "
                  "{} ms: footprint {} -> {} MiB (internal {}, compressed {}, reusable {}), {} MiB "
-                 "left; clears so far {} MiB memset, {} MiB without faulting",
+                 "left; clears so far {} MiB memset, {} MiB without faulting, {} MiB marked free at "
+                 "clears and frees",
                  resident >> 20,
                  buffer.FileBacked()         ? "in a file, outside the footprint"
                  : buffer.PagesCountedOnce() ? "counted once"
@@ -296,7 +320,8 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
                  before.footprint >> 20, after.footprint >> 20,
                  after.internal >> 20, after.compressed >> 20, after.reusable >> 20,
                  available >> 20, Common::HostMemory::ZeroFilledBytes() >> 20,
-                 Common::HostMemory::ZeroAdvisedBytes() >> 20);
+                 Common::HostMemory::ZeroAdvisedBytes() >> 20,
+                 Common::HostMemory::ZeroHintedBytes() >> 20);
     }
 }
 #endif

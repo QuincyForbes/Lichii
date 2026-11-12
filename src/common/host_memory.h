@@ -77,6 +77,9 @@ public:
         std::vector<uintptr_t> trim;
         std::vector<uintptr_t> zero_now;
         std::vector<uintptr_t> zero_before; ///< Sorted
+        /// iOS, ledger-tagged: this pass also marks the resident zero pages free (MADV_FREE).
+        /// Without it, and with the guest figure read from task_info, a pass reads nothing.
+        bool free_zero{};
     };
     /// Windows: resident pages of guest memory (backing and its views) that hold only zeros leave
     /// the working set, like HintCold. Apple: resident and compressed zero pages of the backing
@@ -112,6 +115,8 @@ public:
     [[nodiscard]] bool PagesCountedOnce() const noexcept;
     /// iOS experiment: guest memory is a mapped file, outside the footprint.
     [[nodiscard]] bool FileBacked() const noexcept;
+    /// iOS: whether guest memory goes in a file when LICHII_IOS_FILE_GUEST is not set.
+    static bool FileGuestByDefault() noexcept;
     /// iOS: TrimZeroPages only counts what is resident (ledger-tagged or in a file, and not in
     /// chunks): a pass reads no guest memory and changes nothing.
     [[nodiscard]] bool TrimOnlyCounts() const noexcept;
@@ -135,6 +140,10 @@ public:
     /// iOS: guest memory is in the media ledger, so ScannedResidentBytes and
     /// ScannedCompressedBytes are read from task_info at each call instead of the last pass.
     static bool GuestFootprintLive() noexcept;
+    /// iOS, ledger-tagged: zero pages are marked free (MADV_FREE) when cleared, freed and by
+    /// TrimZeroPages with ZeroTrimState::free_zero. Bytes hinted at clears and frees so far.
+    [[nodiscard]] bool FreesZeroPages() const noexcept;
+    static u64 ZeroHintedBytes() noexcept;
 
     /// Pages the kernel hands out (cleared or not).
     void MarkUsed(size_t physical_offset, size_t length);
