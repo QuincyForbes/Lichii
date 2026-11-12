@@ -9,6 +9,8 @@ pixels or more cuts guest memory by about 1.2 GiB there (Windows, handheld, Max 
 |---|---|---|---|
 | Title | 2881 MiB | 2059 MiB | -822 |
 | Kokiri Forest | 4548 MiB (GPU-mapped 2342, CPU heap 2106) | 3336-3351 MiB (1711-1727, 1524-1526) | -1197 to -1212 |
+| Kokiri Forest, `--levels 2` | 4548 MiB | 3027 MiB (1551, 1376) | -1521 |
+| Title, `--levels 2` | 2881 MiB | 1849 MiB | -1032 |
 
 The picture is softer up close (textures at half resolution); nothing else changes. Remove the mod
 folder (or switch the add-on off) to get the full textures back.
@@ -25,8 +27,8 @@ python3 tools/nx2/oot_texture_mod.py make "<game>.nup" "<mod folder>/Reduced tex
 Copy `Reduced textures` (it contains `romfs/Tex/...`) into the title's mod folder:
 `<user dir>/load/0400486024DEC000/` (Windows: `%APPDATA%\eden\load\0400486024DEC000\`; iOS: the app's
 `load/0400486024DEC000/` in its Documents). It is 1.7 GiB at the default zstd level 3 and takes
-about 2 minutes. `--levels 2` drops two mip levels (about 94 % less per texture; not yet run in
-the game);
+about 2 minutes. `--levels 2` drops two mip levels (about 94 % less per texture, quarter
+resolution up close);
 `--min-size 1024` keeps the 512-pixel textures. Arrays, cube maps, 3D textures and textures with
 one mip level are left as they are.
 
