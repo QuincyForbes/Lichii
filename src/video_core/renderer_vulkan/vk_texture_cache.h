@@ -118,6 +118,11 @@ public:
 
     StagingBufferRef UploadStagingBuffer(size_t size, bool deferred = false);
 
+    /// Before an image upload: see StagingBufferPool::BoundUploads.
+    void BoundUploads() {
+        staging_buffer_pool.BoundUploads();
+    }
+
     StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
 
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);

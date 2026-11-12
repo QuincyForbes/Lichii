@@ -796,8 +796,11 @@ void TextureCache<P>::TickFrame() {
     // iOS: textures share the process's memory limit with guest RAM, which grows on its own. The
     // cache may only use what is left of the limit past a reserve (re-read every 30 frames); with
     // less left than that, the collector runs aggressively down to two thirds of what it holds.
-    if (frame_tick % 30 == 0) {
+    // Every frame with under 2 GiB left: a scene load took 3.7 GiB in two seconds, past a cap
+    // made 30 frames before.
+    if (frame_tick % 30 == 0 || host_available_last < 2_GiB) {
         const u64 available = Common::PlatformEvents::AvailableProcessMemory();
+        host_available_last = available != 0 ? available : (std::numeric_limits<u64>::max)();
         host_memory_cap = (std::numeric_limits<u64>::max)();
         host_fixed_memory = 0;
         if (available != 0) {
@@ -3195,6 +3198,11 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    // The uploads before this one are recorded: one draw's new textures (a scene's first frame)
+    // may submit on the way instead of all waiting for the draw.
+    if constexpr (requires { runtime.BoundUploads(); }) {
+        runtime.BoundUploads();
+    }
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
