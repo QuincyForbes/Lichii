@@ -827,6 +827,16 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     result->source_size = native_header_size + lowered.source_size;
     result->trap_prefix.assign(native.begin(), native.begin() + trap_count);
     auto& lowered_code = result->code;
+    // Kept for as long as the program is cached (the native programs of a game add up to tens
+    // of MiB): exactly the words it needs, not what push_back's growth leaves over.
+    size_t code_words = sizeof(sph) / sizeof(u64);
+    for (size_t i = 0; i < lowered.instructions.size(); ++i) {
+        code_words += (code_words * sizeof(u64)) % 32 == 0 ? 2 : 1;
+    }
+    code_words += 1 + (lowered.source_instruction_offsets.empty()
+                           ? 0
+                           : lowered.source_instruction_offsets.size() + 2);
+    lowered_code.reserve(code_words);
     lowered_code.resize(sizeof(sph) / sizeof(u64));
     std::memcpy(lowered_code.data(), &sph, sizeof(sph));
     for (const u64 instruction : lowered.instructions) {
