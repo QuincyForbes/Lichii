@@ -233,12 +233,12 @@ QString SystemSummary(const std::vector<VkDeviceInfo::Record>& vk_device_records
     text += QStringLiteral("\n== Settings ==\n");
     auto& values = Settings::values;
     std::vector<Settings::BasicSetting*> settings{
-        &values.renderer_backend,  &values.vulkan_device,     &values.oot_30fps,
+        &values.renderer_backend,  &values.vulkan_device,     &values.oot_frame_rate,
         &values.frame_rate_limit,  &values.use_speed_limit,   &values.speed_limit,
-        &values.nvidia_dlss,       &values.ocarina_dlss_mode, &values.oot_anti_aliasing,
+        &values.nvidia_dlss,       &values.oot_resolution,    &values.oot_anti_aliasing,
         &values.oot_movie_upscale, &values.frame_gen,         &values.frame_gen_type,
         &values.precache_shaders,  &values.accelerate_astc,   &values.astc_recompression,
-        &values.texture_quality,   &values.oot_render_scale,
+        &values.texture_quality,   &values.mkw_frame_rate,
     };
     for (auto* setting : Settings::Frizti::TunedSettings(values)) {
         settings.push_back(setting);

@@ -4,8 +4,11 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <filesystem>
 #include <functional>
+#include <map>
+#include <tuple>
 #include <vector>
 #include <QBoxLayout>
 #include <QCheckBox>
@@ -395,6 +398,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             widget->spinbox->setSpecialValueText(tr("Off (use the multiplier)"));
         } else if (setting->Id() == Settings::values.frame_gen_flow_scale_auto.Id()) {
             flow_scale_auto_checkbox = widget->checkbox;
+        } else if (setting->Id() == Settings::values.oot_resolution.Id()) {
+            oot_resolution_combobox = widget->combobox;
         }
 
         if (setting->Id() == Settings::values.renderer_backend.Id()) {
@@ -498,8 +503,68 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         }
     }
 
-    for (const auto& [id, widget] : hold_graphics) {
-        graphics_layout.addWidget(widget);
+    // Sections, each under a heading that says what its settings do and how they combine; the
+    // rest follows in the settings' order.
+    {
+        const auto& v = Settings::values;
+        const std::vector<std::tuple<QString, QString, std::vector<u32>>> sections{
+            {tr("Resolution"),
+             tr("Three steps, in this order: the size a game draws at (Ocarina of Time has its "
+                "own choice), the emulator's resolution scale on top of it, then the upscaler "
+                "or window filter to the screen. NVIDIA DLSS, MetalFX and AMD FSR 3.1 take the "
+                "place of a game's own upscaler and need 1x."),
+             {v.oot_resolution.Id(), v.resolution_setup.Id(), v.nvidia_dlss.Id(),
+              v.nvidia_dlss_preset.Id(), v.metalfx_temporal.Id(), v.game_dlss_network.Id(),
+              v.oot_anti_aliasing.Id(), v.oot_movie_upscale.Id(), v.scaling_filter.Id(),
+              v.fsr_sharpening_slider.Id(), v.anti_aliasing.Id(), v.aspect_ratio.Id()}},
+            {tr("Frame rate"),
+             tr("Ocarina of Time and Mario Kart World have their own choice. The Switch 2 frame "
+                "rate limit paces every other game, and Ocarina of Time when Unlocked. Frame "
+                "generation adds frames on top of the game's."),
+             {v.oot_frame_rate.Id(), v.mkw_frame_rate.Id(), v.frame_rate_limit.Id(),
+              v.vsync_mode.Id(), v.frame_gen.Id(), v.frame_gen_type.Id(),
+              v.frame_gen_multiplier.Id(), v.frame_gen_target_rate.Id(),
+              v.frame_gen_flow_scale_auto.Id(), v.frame_gen_flow_scale.Id(),
+              v.frame_gen_queue_target.Id(), v.frame_gen_motion.Id(),
+              v.frame_gen_flow_quality.Id()}},
+            {tr("Game patches"),
+             tr("Built-in changes to a game's code with a trade-off. A game's own choice in its "
+                "Properties > Add-Ons overrides these."),
+             {v.patch_performance.Id(), v.patch_image.Id()}},
+            {tr("Other"), QString(), {}},
+        };
+        std::map<u32, QWidget*> rest = hold_graphics;
+        const auto add_heading = [&](const QString& title, const QString& text) {
+            QLabel* heading = new QLabel(QStringLiteral("<b>%1</b>").arg(title), this);
+            heading->setContentsMargins(0, 8, 0, 0);
+            graphics_layout.addWidget(heading);
+            if (!text.isEmpty()) {
+                QLabel* description = new QLabel(text, this);
+                description->setWordWrap(true);
+                graphics_layout.addWidget(description);
+            }
+        };
+        for (const auto& [title, text, ids] : sections) {
+            std::vector<QWidget*> widgets;
+            for (const u32 id : ids) {
+                if (const auto it = rest.find(id); it != rest.end()) {
+                    widgets.push_back(it->second);
+                    rest.erase(it);
+                }
+            }
+            if (ids.empty()) {
+                for (const auto& [id, widget] : rest) {
+                    widgets.push_back(widget);
+                }
+            }
+            if (widgets.empty()) {
+                continue;
+            }
+            add_heading(title, text);
+            for (QWidget* const widget : widgets) {
+                graphics_layout.addWidget(widget);
+            }
+        }
     }
 
     // The manual flow scale is only read while Auto Flow Scale is off.
@@ -520,7 +585,6 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     };
     nvidia_dlss_widget = held(Settings::values.nvidia_dlss);
     nvidia_dlss_preset_widget = held(Settings::values.nvidia_dlss_preset);
-    ocarina_dlss_mode_widget = held(Settings::values.ocarina_dlss_mode);
     frame_gen_widget = held(Settings::values.frame_gen);
     metalfx_temporal_widget = held(Settings::values.metalfx_temporal);
 
@@ -823,10 +887,43 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     if (nvidia_dlss_widget != nullptr) {
         nvidia_dlss_widget->setVisible(dlss_offered);
     }
-    for (QWidget* const widget : std::initializer_list<QWidget*>{
-             nvidia_dlss_panel, nvidia_dlss_preset_widget, ocarina_dlss_mode_widget}) {
+    for (QWidget* const widget :
+         std::initializer_list<QWidget*>{nvidia_dlss_panel, nvidia_dlss_preset_widget}) {
         if (widget != nullptr) {
             widget->setVisible(dlss_offered && dlss_on);
+        }
+    }
+    // Ocarina of Time's fixed sizes are DLSS's input then: name the mode each one is.
+    if (oot_resolution_combobox != nullptr) {
+        const auto& names =
+            combobox_translations.at(Settings::EnumMetadata<Settings::OotResolution>::Index());
+        for (int i = 0; i < oot_resolution_combobox->count(); ++i) {
+            const u32 value = oot_resolution_combobox->itemData(i).toUInt();
+            const auto name = std::ranges::find(names, value, &std::pair<u32, QString>::first);
+            if (name == names.end()) {
+                continue;
+            }
+            QString mode;
+            if (dlss_offered && dlss_on) {
+                switch (static_cast<Settings::OotResolution>(value)) {
+                case Settings::OotResolution::Full:
+                    mode = tr("DLSS Quality");
+                    break;
+                case Settings::OotResolution::Percent87:
+                    mode = tr("DLSS Balanced");
+                    break;
+                case Settings::OotResolution::Percent75:
+                    mode = tr("DLSS Performance");
+                    break;
+                case Settings::OotResolution::Percent50:
+                    mode = tr("DLSS Ultra Performance");
+                    break;
+                default:
+                    break;
+                }
+            }
+            oot_resolution_combobox->setItemText(
+                i, mode.isEmpty() ? name->second : tr("%1 - %2 to 4K").arg(name->second, mode));
         }
     }
     if (nvidia_dlss_panel != nullptr && record != nullptr) {

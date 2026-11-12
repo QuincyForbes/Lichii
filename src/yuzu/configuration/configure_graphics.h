@@ -123,7 +123,7 @@ private:
     QCheckBox* nvidia_dlss_checkbox{};
     NvidiaDlssPanel* nvidia_dlss_panel{};
     QWidget* nvidia_dlss_preset_widget{};
-    QWidget* ocarina_dlss_mode_widget{};
+    QComboBox* oot_resolution_combobox{};
     QWidget* frame_gen_widget{};
     QComboBox* frame_gen_type_combobox{};
     QLabel* lossless_status_label{};

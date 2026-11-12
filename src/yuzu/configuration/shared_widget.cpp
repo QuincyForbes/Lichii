@@ -806,8 +806,7 @@ bool AppliesToThisPlatform(const Settings::BasicSetting& setting) {
     }
 #ifndef EGLANTINE_STREAMLINE
     // NVIDIA DLSS runs through NVIDIA Streamline: Windows x64 builds made with it.
-    if (id == values.nvidia_dlss.Id() || id == values.nvidia_dlss_preset.Id() ||
-        id == values.ocarina_dlss_mode.Id()) {
+    if (id == values.nvidia_dlss.Id() || id == values.nvidia_dlss_preset.Id()) {
         return false;
     }
 #endif
