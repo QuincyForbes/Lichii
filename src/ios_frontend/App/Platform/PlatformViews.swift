@@ -368,6 +368,9 @@ struct ExperimentsView: View {
     @State private var noZeroTrim = lichii_platform_experiment("no_zero_trim") != 0
     @State private var chunkedGuest = lichii_platform_experiment("chunked_guest") != 0
     @State private var nupInMemory = lichii_platform_experiment("nup_in_memory") != 0
+    @State private var noEarlySubmits = lichii_platform_experiment("no_early_submits") != 0
+    @State private var noMeshEmulation = lichii_platform_experiment("no_mesh_emulation") != 0
+    @State private var mvkUint8Indices = lichii_platform_experiment("mvk_uint8_indices") != 0
     @State private var confirmReset = false
     @State private var resetDone = false
 
@@ -403,6 +406,25 @@ struct ExperimentsView: View {
                 Text("Memory")
             } footer: {
                 Text("Guest memory normally counts once toward the limit iOS closes Lichii at. Per mapping is the old accounting: pages both the game and the emulator touch count twice, and all-zero pages are trimmed.\n\nCompressed files of a .nup game are normally kept in memory up to 96 MB once read, and files over 48 MB (a movie, a texture archive) are unpacked to temporary files in storage instead. Keep Decompressed Game Files in Memory is the old behaviour: up to 512 MB in memory. Turn it on if a game that used to start no longer does.\n\nAll three apply the next time Lichii starts.")
+            }
+
+            Section {
+                Toggle("Early Submits During Loads Off", isOn: $noEarlySubmits)
+                    .onChange(of: noEarlySubmits) { value in
+                        lichii_platform_set_experiment("no_early_submits", value ? 1 : 0)
+                    }
+                Toggle("Mesh Shader Emulation Off", isOn: $noMeshEmulation)
+                    .onChange(of: noMeshEmulation) { value in
+                        lichii_platform_set_experiment("no_mesh_emulation", value ? 1 : 0)
+                    }
+                Toggle("MoltenVK Converts 8-bit Indices", isOn: $mvkUint8Indices)
+                    .onChange(of: mvkUint8Indices) { value in
+                        lichii_platform_set_experiment("mvk_uint8_indices", value ? 1 : 0)
+                    }
+            } header: {
+                Text("Graphics")
+            } footer: {
+                Text("For tracking down crashes. Early submits hand the GPU a scene load's texture uploads in parts, which keeps graphics memory down while a level loads; off, a large load can run out of memory. Mesh shader emulation draws some of Ocarina of Time's foliage and walls; off, they are missing. MoltenVK Converts 8-bit Indices is the old way of drawing models stored with 8-bit indices, which crashed Ocarina of Time entering Kokiri Forest; Lichii now converts them itself.\n\nAll three apply the next time Lichii starts.")
             }
 
             Section {
