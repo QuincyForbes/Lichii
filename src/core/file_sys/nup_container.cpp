@@ -49,6 +49,8 @@ struct NupMembers {
     /// The TOC's string pool.
     std::string names;
     std::vector<FileNode> files;
+    /// EDEN_NX2_NUP_READ_LOG: one flag per file, set at its first read (null when off).
+    std::unique_ptr<std::atomic<u8>[]> read_seen;
 };
 
 namespace {
@@ -217,6 +219,10 @@ public:
             return 0;
         }
         length = std::min(length, static_cast<std::size_t>(uncompressed_size) - offset);
+        if (members->read_seen && members->read_seen[cache_index].exchange(1) == 0) {
+            LOG_INFO(Loader, "NUP first read: #{} {} ({} bytes, {} stored)", cache_index, Name(),
+                     uncompressed_size, node.extent_size);
+        }
         if (node.codec == CodecRaw) {
             return members->backing->Read(data, length,
                                           static_cast<std::size_t>(node.extent_offset) + offset);
@@ -635,6 +641,9 @@ bool NupContainer::Parse() {
         files[i].extent_offset = record.extent_offset;
         files[i].extent_size = record.extent_size;
         files[i].codec = record.codec;
+    }
+    if (const char* v = std::getenv("EDEN_NX2_NUP_READ_LOG"); v != nullptr && v[0] == '1') {
+        members->read_seen = std::make_unique<std::atomic<u8>[]>(files.size());
     }
 
     children.resize(children_bytes / sizeof(u32));
