@@ -274,6 +274,9 @@ private:
 
     void ReleaseSemaphore();
 
+    /// On host memory pressure, frees the software copy buffers that grew past 1 MiB.
+    void TrimScratchBuffers();
+
     void ConsumeSinkImpl(Core::System& system) override;
 
     MemoryManager& memory_manager;
@@ -282,6 +285,7 @@ private:
     Common::ScratchBuffer<u8> read_buffer;
     Common::ScratchBuffer<u8> write_buffer;
     Common::ScratchBuffer<u8> intermediate_buffer;
+    u32 scratch_pressure{};
 
     /// The front's copy of the registers below src_params (FrontMethod), made on first use.
     std::unique_ptr<std::array<u32, 0x200>> front_regs;
