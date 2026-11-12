@@ -158,6 +158,15 @@ struct ShaderProgressView: View {
                     .font(.footnote.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
+        case Int32(LICHII_SHADER_WARM.rawValue) where platform.shaderTotal > 0:
+            VStack(spacing: 6) {
+                ProgressView(value: Double(min(platform.shaderDone, platform.shaderTotal)),
+                             total: Double(platform.shaderTotal))
+                    .tint(Theme.accent)
+                Text("Building shaders \(platform.shaderDone) / \(platform.shaderTotal)")
+                    .font(.footnote.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
         default:
             EmptyView()
         }

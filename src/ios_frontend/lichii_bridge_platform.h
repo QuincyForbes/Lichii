@@ -163,6 +163,7 @@ typedef enum LichiiShaderStage {
     LICHII_SHADER_PREPARE = 0,
     LICHII_SHADER_BUILD = 1,
     LICHII_SHADER_COMPLETE = 2,
+    LICHII_SHADER_WARM = 3, ///< the shader precache (Build Shaders): pipelines built / total
 } LichiiShaderStage;
 
 /// The front end forwards the disk cache loader's progress here (VideoCore's

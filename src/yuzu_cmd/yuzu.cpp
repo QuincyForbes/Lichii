@@ -719,6 +719,7 @@ static void IosFinishBoot(SdlState* state) {
     boot.started = true;
     IosSupport::EndBackgroundTask(std::exchange(boot.background_task, 0));
     unsetenv("EDEN_CLI_RESTART_HANDOFF");
+    const bool build_only = VideoCommon::ShaderWarm::TakeBuildOnly();
     if (boot.stop.stop_requested()) {
         LOG_INFO(Frontend, "iOS: launch cancelled");
         IosStopGame(state);
@@ -726,6 +727,12 @@ static void IosFinishBoot(SdlState* state) {
     }
     if (boot.result != SDL_APP_CONTINUE) {
         IosBootFailed(state);
+        return;
+    }
+    if (build_only) {
+        // lichii_emu_build_shaders: the load built the pipelines; the game is not started.
+        LOG_INFO(Frontend, "iOS: shaders built, returning to the library");
+        IosStopGame(state);
         return;
     }
     IOS_MARK("game loaded");

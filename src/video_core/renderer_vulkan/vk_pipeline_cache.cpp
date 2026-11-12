@@ -1961,7 +1961,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     // on the loading screen too, unless an earlier precache built them for this driver.
     namespace ShaderWarm = VideoCommon::ShaderWarm;
     const bool precache = ShaderWarm::PrecacheBeforeStart(
-        Settings::values.precache_shaders.GetValue(), ShaderWarm::TakeWarmBeforeStart());
+                              Settings::values.precache_shaders.GetValue(),
+                              ShaderWarm::TakeWarmBeforeStart()) ||
+                          ShaderWarm::BuildOnlyRequested();
     std::unordered_set<u64> precached_pipelines;
     if (precache) {
         precached_pipelines = ShaderWarm::ReadPrecachedPipelines(
@@ -2192,8 +2194,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         const u64 hash = deferred.first.Hash();
         return rekeyed_pipelines.contains(hash) && !native_pipelines.contains(hash);
     });
+    // A "Build shaders" launch builds them all now: the game does not start after it.
     const size_t background_count =
-        BackgroundPipelinesEnabled()
+        BackgroundPipelinesEnabled() && !ShaderWarm::BuildOnlyRequested()
             ? (std::min)(deferred_graphics.size(), BackgroundPipelineLimit(queued_graphics))
             : 0;
     // The shader precache builds the rest, those otherwise built when a draw first needs them.

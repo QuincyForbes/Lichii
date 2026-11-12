@@ -47,6 +47,7 @@
 #include "ios_frontend/lichii_bridge_platform.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
+#include "video_core/shader_warm/shader_warm_builder.h"
 #include "yuzu_cmd/ios_support.h"
 
 namespace IosFrontend {
@@ -881,12 +882,13 @@ bool lichii_settings_post_shaders_built(void) {
 
 /* ------------------------------------------------------------------------------ emulation */
 
-bool lichii_emu_launch(const char* path) {
+static bool Launch(const char* path, bool build_only) {
     const auto state = g_state.load();
     if (path == nullptr || state == LICHII_EMU_BOOTING || state == LICHII_EMU_RUNNING ||
         state == LICHII_EMU_PAUSED) {
         return false;
     }
+    VideoCommon::ShaderWarm::RequestBuildOnly(build_only);
     {
         std::scoped_lock lock{g_mutex};
         g_launch_request = path;
@@ -895,11 +897,20 @@ bool lichii_emu_launch(const char* path) {
     return true;
 }
 
+bool lichii_emu_launch(const char* path) {
+    return Launch(path, false);
+}
+
+bool lichii_emu_build_shaders(const char* path) {
+    return Launch(path, true);
+}
+
 void lichii_emu_cancel_launch(void) {
     {
         std::scoped_lock lock{g_mutex};
         g_launch_request.reset();
     }
+    VideoCommon::ShaderWarm::RequestBuildOnly(false);
     g_cancel_request = true;
 }
 

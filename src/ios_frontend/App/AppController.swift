@@ -103,23 +103,31 @@ final class AppController: ObservableObject {
     struct StorageWarning: Identifiable {
         let game: Game
         let storage: LichiiFileGuestStorage
+        var buildShaders = false
         var id: String { game.id }
     }
 
-    func launch(_ game: Game, storageChecked: Bool = false) {
+    /// buildShaders: boot the game only to build all of its cached shaders (with progress on the
+    /// launch screen), then return to the library.
+    func launch(_ game: Game, storageChecked: Bool = false, buildShaders: Bool = false) {
         guard !emuState.inGame, emuState != .booting else { return }
         if !storageChecked {
             let storage = GuestMemoryFile.enabled ? GuestMemoryFile.storage : nil
             let short = storage.map { GuestMemoryFile.fit($0) == .short } ?? false
             GuestMemoryFile.logLaunchCheck(title: game.title, storage: storage, askedUser: short)
             if short, let storage {
-                storageWarning = StorageWarning(game: game, storage: storage)
+                storageWarning = StorageWarning(game: game, storage: storage, buildShaders: buildShaders)
                 return
             }
         }
         currentGame = game
-        library.markPlayed(game)
-        guard game.path.withCString({ lichii_emu_launch($0) }) else { return }
+        if !buildShaders {
+            library.markPlayed(game)
+        }
+        let launched = game.path.withCString {
+            buildShaders ? lichii_emu_build_shaders($0) : lichii_emu_launch($0)
+        }
+        guard launched else { return }
         showLaunch = true
         if Bridge.jitState == .waiting {
             jitRequested = false
