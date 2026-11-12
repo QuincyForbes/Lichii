@@ -331,6 +331,7 @@ PostProcessChain::PostProcessChain(const Device& device, MemoryAllocator& alloca
     m_start = std::chrono::steady_clock::now();
     m_previous = m_start;
 
+    const MemoryTagScope memory_tag{MemoryTag::PresentFilter};
     CreatePingPongImages(device, allocator);
 
     m_fallback_sampler = CreateWrappedSampler(device);

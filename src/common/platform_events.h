@@ -62,6 +62,8 @@ void SetGuestMemoryRanges(const void* backing, std::size_t backing_size, const v
 /// kernel about every page outside guest memory, which takes tens of milliseconds: not for a
 /// thread the game waits for. Nothing elsewhere.
 void LogMemoryBreakdown(const char* reason);
+/// A line LogMemoryBreakdown adds after its own (the renderer's memory by use); empty: none.
+void SetGraphicsMemoryReport(std::function<std::string()> report);
 /// Apple: logs the bytes this process wrote to storage since it started (guest memory kept in a
 /// file is written there when iOS needs its RAM).
 void LogStorageWrites(const char* reason);

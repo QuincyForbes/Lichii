@@ -35,6 +35,14 @@ struct DescriptorBankInfo {
     s32 score{};           ///< Number of descriptors in total
 };
 
+/// Live descriptor pools, the descriptors they were sized for and the sets taken from them.
+struct DescriptorPoolStats {
+    u64 pools;
+    u64 descriptors;
+    u64 sets;
+};
+[[nodiscard]] DescriptorPoolStats GetDescriptorPoolStats() noexcept;
+
 class DescriptorAllocator final : public ResourcePool {
     friend class DescriptorPool;
 

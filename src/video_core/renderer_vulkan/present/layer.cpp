@@ -226,6 +226,7 @@ void Layer::CreateStagingBuffer(const Device& device, const Tegra::FramebufferCo
         .pQueueFamilyIndices = nullptr,
     };
 
+    const MemoryTagScope memory_tag{MemoryTag::PresentLayer};
     buffer = memory_allocator.CreateBuffer(ci, MemoryUsage::Upload);
 }
 

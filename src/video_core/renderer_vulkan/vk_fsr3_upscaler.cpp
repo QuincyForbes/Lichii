@@ -365,6 +365,7 @@ VkImageView Fsr3Upscaler::OutputView() const noexcept {
 Fsr3Upscaler::Texture Fsr3Upscaler::CreateTexture(VkFormat format, u32 width, u32 height,
                                                   u32 levels) {
     Texture texture;
+    const MemoryTagScope memory_tag{MemoryTag::Upscaler};
     texture.image = memory_allocator.CreateImage(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,

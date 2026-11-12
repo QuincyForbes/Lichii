@@ -170,6 +170,7 @@ void StreamlineDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {
     if (output_image) {
         scheduler.Finish(); // the old output may still be in use
     }
+    const MemoryTagScope memory_tag{MemoryTag::Upscaler};
     output_image = memory_allocator.CreateImage(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,

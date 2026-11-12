@@ -50,6 +50,7 @@ vk::Image CreateChainImage(MemoryAllocator& memory_allocator, VkExtent2D extent,
         .pQueueFamilyIndices = nullptr,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
+    const MemoryTagScope memory_tag{MemoryTag::FrameGeneration};
     return memory_allocator.CreateImage(image_ci);
 }
 
@@ -64,6 +65,7 @@ vk::Buffer CreateUniformBuffer(MemoryAllocator& memory_allocator, VkDeviceSize s
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    const MemoryTagScope memory_tag{MemoryTag::FrameGeneration};
     return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::Upload);
 }
 

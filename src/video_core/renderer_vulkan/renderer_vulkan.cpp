@@ -359,12 +359,14 @@ vk::Buffer RendererVulkan::RenderToBuffer(std::span<const Tegra::FramebufferConf
         frame.width = layout.width;
         frame.height = layout.height;
         screenshot_format = format;
+        const MemoryTagScope memory_tag{MemoryTag::Readback};
         frame.image =
             CreateWrappedImage(memory_allocator, VkExtent2D{layout.width, layout.height}, format);
         frame.image_view = CreateWrappedImageView(device, frame.image, format);
         frame.framebuffer = blit_capture.CreateFramebuffer(device, layout, *frame.image_view, format);
     }
 
+    const MemoryTagScope memory_tag{MemoryTag::Readback};
     auto dst_buffer = CreateWrappedBuffer(memory_allocator, buffer_size, MemoryUsage::Download);
     blit_capture.DrawToFrame(device, rasterizer, &frame, framebuffers, layout, 1, format);
 
@@ -409,6 +411,7 @@ std::vector<u8> RendererVulkan::GetAppletCaptureBuffer() {
         return out;
     }
 
+    const MemoryTagScope memory_tag{MemoryTag::Readback};
     const auto dst_buffer =
         CreateWrappedBuffer(memory_allocator, VideoCore::Capture::TiledSize, MemoryUsage::Download);
 
@@ -437,6 +440,7 @@ void RendererVulkan::RenderAppletCaptureLayer(
         return;
 
     if (!applet_frame.image) {
+        const MemoryTagScope memory_tag{MemoryTag::Readback};
         applet_frame.image = CreateWrappedImage(memory_allocator, CaptureImageSize, CaptureFormat);
         applet_frame.image_view = CreateWrappedImageView(device, applet_frame.image, CaptureFormat);
         applet_frame.framebuffer = blit_applet.CreateFramebuffer(device,

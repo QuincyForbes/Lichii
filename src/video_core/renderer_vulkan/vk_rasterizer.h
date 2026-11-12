@@ -519,6 +519,10 @@ private:
     u64 trace_cpu_frame{};
     /// Memory report (iOS, EDEN_NX2_MEMORY_REPORT) and malloc relief after host memory pressure.
     void TickMemoryReport();
+    /// Vulkan memory by use (MemoryTag), the allocator's blocks and the descriptor pools. Safe
+    /// from any thread.
+    std::string GraphicsMemoryReport() const;
+    bool graphics_report_logged{};
     std::chrono::steady_clock::time_point memory_report_next{};
     std::chrono::steady_clock::time_point memory_detail_next{};
     u32 memory_report_pressure{};

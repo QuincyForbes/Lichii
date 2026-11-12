@@ -276,6 +276,7 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
         };
+        const MemoryTagScope memory_tag{MemoryTag::MultiRangeBuffer};
         entry.gathered = memory_allocator.CreateBuffer(gather_ci, MemoryUsage::DeviceLocal);
         entry.dirty = true;
     }

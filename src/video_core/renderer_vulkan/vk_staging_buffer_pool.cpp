@@ -154,7 +154,10 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     if (device.IsBufferDeviceAddressSupported()) {
         stream_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
-    stream_buffer = memory_allocator.CreateBuffer(stream_ci, MemoryUsage::Stream);
+    {
+        const MemoryTagScope memory_tag{MemoryTag::StreamBuffer};
+        stream_buffer = memory_allocator.CreateBuffer(stream_ci, MemoryUsage::Stream);
+    }
     if (device.HasDebuggingToolAttached()) {
         stream_buffer.SetObjectNameEXT("Stream Buffer");
     }
@@ -407,6 +410,9 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         (use_rebar && usage == MemoryUsage::Upload && (1ULL << log2_size) <= 1_MiB)
             ? MemoryUsage::Stream
             : usage;
+    const MemoryTagScope memory_tag{usage == MemoryUsage::Upload        ? MemoryTag::StagingUpload
+                                    : usage == MemoryUsage::DeviceLocal ? MemoryTag::StagingDeviceLocal
+                                                                        : MemoryTag::StagingDownload};
     vk::Buffer buffer;
     try {
         buffer = memory_allocator.CreateBuffer(buffer_ci, alloc_usage);

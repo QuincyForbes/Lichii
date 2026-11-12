@@ -15,6 +15,7 @@
 #include "common/logging.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/vulkan_common/vulkan_memory_tags.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan::vk {
@@ -533,6 +534,7 @@ void Image::SetObjectNameEXT(const char* name) const {
 
 void Image::Release() const noexcept {
     if (handle) {
+        MemoryTags::Untag(allocator, allocation);
         vmaDestroyImage(allocator, handle, allocation);
     }
 }
@@ -577,6 +579,7 @@ void Buffer::SetObjectNameEXT(const char* name) const {
 
 void Buffer::Release() const noexcept {
     if (handle) {
+        MemoryTags::Untag(allocator, allocation);
         vmaDestroyBuffer(allocator, handle, allocation);
     }
 }

@@ -98,6 +98,7 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    const MemoryTagScope memory_tag{MemoryTag::BufferCache};
     if (sparse_alignment > 1) {
         return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal, sparse_alignment);
     }
@@ -232,6 +233,7 @@ public:
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
         };
+        const MemoryTagScope memory_tag{MemoryTag::BufferCache};
         buffer = memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
         if (device.HasDebuggingToolAttached()) {
             buffer.SetObjectNameEXT("Quad LUT");
@@ -1048,6 +1050,7 @@ VkBuffer BufferCacheRuntime::Nx2MeshMirror() {
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
         };
+        const MemoryTagScope memory_tag{MemoryTag::MeshEmulation};
         nx2_mesh_mirror = memory_allocator.CreateBuffer(create_info, MemoryUsage::DeviceLocal);
         if (device.HasDebuggingToolAttached()) {
             nx2_mesh_mirror.SetObjectNameEXT("Mesh task count mirror");
@@ -1077,6 +1080,7 @@ vk::Buffer BufferCacheRuntime::CreateNullBuffer() {
     if (device.IsBufferDeviceAddressSupported()) {
         create_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
+    const MemoryTagScope memory_tag{MemoryTag::BufferCache};
     vk::Buffer ret = memory_allocator.CreateBuffer(create_info, MemoryUsage::DeviceLocal);
     if (device.HasDebuggingToolAttached()) {
         ret.SetObjectNameEXT("Null buffer");

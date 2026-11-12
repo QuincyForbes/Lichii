@@ -49,6 +49,7 @@ DescriptorBufferRing::DescriptorBufferRing(const Device& device_,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    const MemoryTagScope memory_tag{MemoryTag::DescriptorBuffer};
     const size_t total_chunks{chunks_per_frame * FRAMES_IN_FLIGHT};
     chunks.reserve(total_chunks);
     chunk_addresses.reserve(total_chunks);

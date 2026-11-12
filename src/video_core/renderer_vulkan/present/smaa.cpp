@@ -45,6 +45,7 @@ SMAA::SMAA(const Device& device, MemoryAllocator& allocator, size_t image_count,
 SMAA::~SMAA() = default;
 
 void SMAA::CreateImages(const Device& device) {
+    const MemoryTagScope memory_tag{MemoryTag::PresentFilter};
     static constexpr VkExtent2D area_extent{AREATEX_WIDTH, AREATEX_HEIGHT};
     static constexpr VkExtent2D search_extent{SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT};
 

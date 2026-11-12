@@ -425,6 +425,7 @@ const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
     });
     auto it{std::ranges::find_if(mesh_arenas, [](const MeshArena& arena) { return arena.counted; })};
     if (it == mesh_arenas.end()) {
+        const MemoryTagScope memory_tag{MemoryTag::MeshEmulation};
         const auto make_buffer = [&](u64 size, VkBufferUsageFlags usage, MemoryUsage memory) {
             return memory_allocator.CreateBuffer(
                 VkBufferCreateInfo{
@@ -520,9 +521,11 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                 });
             },
             this);
+    Common::PlatformEvents::SetGraphicsMemoryReport([this] { return GraphicsMemoryReport(); });
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
+    Common::PlatformEvents::SetGraphicsMemoryReport({});
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     VideoCommon::GpuSplit::Get().SetFenceQuietCheck(nullptr, nullptr);
     scheduler.WaitWorker();
@@ -1674,6 +1677,7 @@ void RasterizerVulkan::CaptureIndirectTrace() {
         return;
     }
     if (!slot->readback) {
+        const MemoryTagScope memory_tag{MemoryTag::Diagnostics};
         slot->readback = memory_allocator.CreateBuffer(
             VkBufferCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -3637,6 +3641,18 @@ void RasterizerVulkan::TickMemoryReport() {
                  device.MemoryTypeReport(),
                  pipeline_cache.DriverPipelineCacheBytes() >> 10);
     }
+    // Every Vulkan allocation by what it is for: once, on request and with the detail line.
+    if (!graphics_report_logged || requested || pressure_detail) {
+        graphics_report_logged = true;
+        LOG_INFO(Common_Memory, "Graphics memory (renderer): {}", GraphicsMemoryReport());
+    }
+}
+
+std::string RasterizerVulkan::GraphicsMemoryReport() const {
+    const DescriptorPoolStats pools = GetDescriptorPoolStats();
+    return fmt::format("by use {} | {} | descriptor pools {} ({} descriptors, {} sets)",
+                       MemoryTags::Report(), device.MemoryTypeReport(), pools.pools,
+                       pools.descriptors, pools.sets);
 }
 
 bool RasterizerVulkan::AccelerateConditionalRendering() {

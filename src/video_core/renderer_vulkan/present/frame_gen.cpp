@@ -434,6 +434,7 @@ void FrameGen::DumpInterpolation(Frame* generated_frame) {
         {"c_current", fsr3_chain->CurrentFrame()},
     }};
     for (const auto& [name, image] : images) {
+        const MemoryTagScope memory_tag{MemoryTag::Diagnostics};
         vk::Buffer buffer = CreateWrappedBuffer(memory_allocator, size, MemoryUsage::Download);
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.Record([image, dst = *buffer, extent](vk::CommandBuffer cmdbuf) {
@@ -463,6 +464,7 @@ void FrameGen::DumpDebugImages(u64 count) {
         const VkDeviceSize size =
             static_cast<VkDeviceSize>(extent.width) * extent.height * texel_size;
 
+        const MemoryTagScope memory_tag{MemoryTag::Diagnostics};
         vk::Buffer buffer = CreateWrappedBuffer(memory_allocator, size, MemoryUsage::Download);
 
         scheduler.RequestOutsideRenderPassOperationContext();

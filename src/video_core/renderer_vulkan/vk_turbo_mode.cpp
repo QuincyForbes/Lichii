@@ -54,6 +54,7 @@ void TurboMode::Run(std::stop_token stop_token) {
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    const MemoryTagScope memory_tag{MemoryTag::TurboMode};
     vk::Buffer buffer = m_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
 
     // Create the descriptor pool to contain our descriptor.
