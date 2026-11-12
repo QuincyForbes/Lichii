@@ -41,9 +41,11 @@ QString Label(const ConfigurationShared::Builder& builder, const Settings::Basic
     return label;
 }
 
-// A stored value ("3", "true") in the words of the settings pages.
+// A stored value ("3", "true") in the words of the settings pages; `fallback` (the enum's name)
+// where they have none (VSync's list is built from the GPU).
 QString ValueText(const ConfigurationShared::Builder& builder,
-                  const Settings::BasicSetting& setting, const std::string& value) {
+                  const Settings::BasicSetting& setting, const std::string& value,
+                  const std::string& fallback) {
     if (setting.TypeId() == "bool") {
         return value == "true" ? QObject::tr("On") : QObject::tr("Off");
     }
@@ -57,7 +59,7 @@ QString ValueText(const ConfigurationShared::Builder& builder,
             }
         }
     }
-    return QString::fromStdString(value);
+    return QString::fromStdString(fallback.empty() ? value : fallback);
 }
 
 } // namespace
@@ -109,14 +111,16 @@ bool ConfirmAndApply(QWidget* parent, const ConfigurationShared::Builder& builde
         if (setting == nullptr || !ConfigurationShared::AppliesToThisPlatform(*setting)) {
             continue;
         }
-        const QString line = QStringLiteral("%1: %2").arg(Label(builder, *setting),
-                                                          ValueText(builder, *setting, value.value));
-        all << QStringLiteral("%1\n    %2").arg(line, QString::fromStdString(value.reason));
+        const QString label = Label(builder, *setting);
+        const QString to = ValueText(builder, *setting, value.value, value.display);
+        all << QStringLiteral("%1: %2\n    %3")
+                   .arg(label, to, QString::fromStdString(value.reason));
         if (setting->ToStringGlobal() != value.value) {
             changes << QStringLiteral("%1: %2 -> %3")
-                           .arg(Label(builder, *setting),
-                                ValueText(builder, *setting, setting->ToStringGlobal()),
-                                ValueText(builder, *setting, value.value));
+                           .arg(label,
+                                ValueText(builder, *setting, setting->ToStringGlobal(),
+                                          setting->Canonicalize()),
+                                to);
         }
     }
     const QString device = QString::fromStdString(profile.device_name);
@@ -149,7 +153,8 @@ bool ConfirmAndResetGame(QWidget* parent, const ConfigurationShared::Builder& bu
     for (const auto& [key, setting] : Settings::values.linkage.by_key) {
         if (setting->Switchable() && !setting->UsingGlobal() && setting->Save()) {
             overrides << QStringLiteral("%1: %2").arg(
-                Label(builder, *setting), ValueText(builder, *setting, setting->ToString()));
+                Label(builder, *setting), ValueText(builder, *setting, setting->ToString(),
+                                                     setting->Canonicalize()));
         }
     }
     if (overrides.isEmpty()) {

@@ -316,18 +316,28 @@ Profile Recommend(const Device& input) {
     Add(p, v.vsync_mode, VSyncMode::Mailbox, "Mailbox: the host frame pacer times presents.");
 
     p.tier_name = std::string{TierName(p.tier)};
-    std::string name = device.model_name;
-    if (name.empty()) {
-        name = !device.gpu_name.empty() ? device.gpu_name : device.model;
+    if (device.os == Os::IOS) {
+        // "iPhone 17 Pro Max (A19 Pro, 12 GB)"
+        const std::string name = device.model_name.empty() ? device.model : device.model_name;
+        std::string detail = device.chip;
+        if (device.memory_mib != 0) {
+            detail += fmt::format("{}{} GB", detail.empty() ? "" : ", ",
+                                  MarketedGb(device.memory_mib));
+        }
+        p.device_name = detail.empty() ? name : fmt::format("{} ({})", name, detail);
+    } else {
+        // "NVIDIA GeForce RTX 5090 (32 GB), 64 GB RAM"
+        std::string name = device.gpu_name;
+        if (name.empty()) {
+            name = !device.chip.empty() ? device.chip
+                                        : (device.os == Os::Windows ? "This PC" : "This computer");
+        } else if (device.vram_mib != 0 && !device.gpu_integrated) {
+            name += fmt::format(" ({} GB)", MarketedGb(device.vram_mib));
+        }
+        p.device_name = device.memory_mib != 0
+                            ? fmt::format("{}, {} GB RAM", name, MarketedGb(device.memory_mib))
+                            : name;
     }
-    std::string detail = device.chip;
-    if (device.memory_mib != 0) {
-        detail += fmt::format("{}{} GB", detail.empty() ? "" : ", ", MarketedGb(device.memory_mib));
-    }
-    if (name.empty()) {
-        name = device.os == Os::Windows ? "This PC" : "This computer";
-    }
-    p.device_name = detail.empty() ? name : fmt::format("{} ({})", name, detail);
     return p;
 }
 
