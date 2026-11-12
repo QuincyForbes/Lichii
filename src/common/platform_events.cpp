@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -349,7 +350,8 @@ ProcessEvents QueryProcessEvents() {
     if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) ==
         KERN_SUCCESS) {
         events.file_resident = info.external;
-        if (count >= TASK_VM_INFO_REV4_COUNT) {
+        if (u64{count} * sizeof(natural_t) >=
+            offsetof(task_vm_info_data_t, decompressions) + sizeof(info.decompressions)) {
             events.decompressions = static_cast<u32>(info.decompressions);
         }
     }
