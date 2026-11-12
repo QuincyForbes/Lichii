@@ -170,6 +170,7 @@ public:
                         const QString& suffix = default_suffix) const;
 
     const ComboboxTranslationMap& ComboboxTranslations() const;
+    const TranslationMap& Translations() const;
 
 private:
     std::unique_ptr<TranslationMap> translations;

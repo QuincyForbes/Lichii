@@ -42,6 +42,7 @@
 
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/game_settings.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_common.h"
@@ -806,15 +807,14 @@ bool AppliesToThisPlatform(const Settings::BasicSetting& setting) {
     }
 #ifndef EGLANTINE_STREAMLINE
     // NVIDIA DLSS runs through NVIDIA Streamline: Windows x64 builds made with it.
-    if (id == values.nvidia_dlss.Id() || id == values.nvidia_dlss_preset.Id()) {
+    if (id == values.nvidia_dlss_preset.Id()) {
         return false;
     }
 #endif
-#ifndef LICHII_METALFX
-    if (id == values.metalfx_temporal.Id()) {
+    // A per-game page lists another game's own settings nowhere, nor what the game's own replace.
+    if (!Settings::AppliesToGame(setting.GetLabel(), Settings::ConfiguringProgramId())) {
         return false;
     }
-#endif
 #ifndef __APPLE__
     // MoltenVK runs on macOS and iOS only.
     if (id == values.moltenvk_driver.Id()) {
@@ -860,6 +860,10 @@ Widget* Builder::BuildWidget(Settings::BasicSetting* setting,
 
 const ComboboxTranslationMap& Builder::ComboboxTranslations() const {
     return *combobox_translations;
+}
+
+const TranslationMap& Builder::Translations() const {
+    return *translations;
 }
 
 } // namespace ConfigurationShared

@@ -41,4 +41,15 @@ Settings::OotResolution OotResolutionFrom(const OldOcarinaResolution& old);
 /// mkw_30fps and mkw_dynamic_fps -> mkw_frame_rate (dynamic took precedence).
 Settings::MkwFrameRate MkwFrameRateFrom(bool mkw_30fps, bool mkw_dynamic_fps);
 
+/// oot_anti_aliasing AMD FSR 3.1 (value 2), nvidia_dlss, metalfx_temporal and game_dlss_network ->
+/// upscaler. FSR 3.1 won over DLSS and MetalFX in Ocarina of Time, the game this was set for.
+Settings::Upscaler UpscalerFrom(bool oot_fsr3, bool nvidia_dlss, bool metalfx_temporal,
+                                bool game_dlss_network);
+
+/// Ocarina of Time drew at oot_resolution times resolution_setup; the resolution scale no longer
+/// applies to it, so the product becomes the nearest oot_resolution. The game's dynamic
+/// resolution stays as it is.
+Settings::OotResolution OotResolutionWithScale(Settings::OotResolution resolution,
+                                               Settings::ResolutionSetup scale);
+
 } // namespace SettingsMigration

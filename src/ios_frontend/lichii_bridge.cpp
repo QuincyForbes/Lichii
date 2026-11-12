@@ -22,8 +22,10 @@
 #include <fmt/format.h>
 #include <unistd.h>
 
+#include "common/device_profile.h"
 #include "common/fs/fs.h"
 #include "common/fs/fs_paths.h"
+#include "common/game_settings.h"
 #include "common/fs/path_util.h"
 #include "common/ios_jit.h"
 #include "common/logging.h"
@@ -119,6 +121,8 @@ protected:
 
 std::unique_ptr<GameConfig> g_game_config;
 u64 g_game_scope{};
+/// What lichii_recommended_get hands out (lichii_recommended_load).
+Settings::DeviceProfile::Profile g_recommended;
 
 std::filesystem::path GameConfigPath(u64 program_id) {
     return Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "custom" /
@@ -524,6 +528,7 @@ const std::map<u32, std::vector<EnumChoice>>& EnumTable() {
         AddEnum<ScalingFilter>(t);
         AddEnum<AntiAliasing>(t);
         AddEnum<OotAntiAliasing>(t);
+        AddEnum<Upscaler>(t);
         AddEnum<DlssPreset>(t);
         AddEnum<OcarinaDlssMode>(t);
         AddEnum<OotMovieUpscale>(t);
@@ -794,6 +799,7 @@ bool lichii_settings_begin_game(uint64_t program_id) {
         return false;
     }
     Settings::SetConfiguringGlobal(false);
+    Settings::SetConfiguringProgramId(program_id);
     g_game_config = std::make_unique<GameConfig>(program_id);
     g_game_scope = program_id;
     return true;
@@ -806,6 +812,7 @@ void lichii_settings_end_game(void) {
     g_game_config->SaveAllValues();
     g_game_config.reset();
     Settings::SetConfiguringGlobal(true);
+    Settings::SetConfiguringProgramId(0);
     if (RunningProgramId() == g_game_scope && System().IsPoweredOn()) {
         KeepIosOverrides();
         System().ApplySettings();
@@ -878,6 +885,69 @@ bool lichii_settings_post_shaders_built(void) {
 #else
     return false;
 #endif
+}
+
+uint64_t lichii_settings_game(const char* key) {
+    const auto* game = key != nullptr ? Settings::GameOfSetting(key) : nullptr;
+    return game != nullptr ? game->program_id : 0;
+}
+
+bool lichii_settings_applies(const char* key, uint64_t program_id) {
+    return key != nullptr && Settings::AppliesToGame(key, program_id);
+}
+
+const char* lichii_settings_game_name(uint64_t program_id) {
+    for (const auto& game : Settings::GamesWithSettings()) {
+        if (game.program_id == program_id) {
+            return game.name.data();
+        }
+    }
+    return "";
+}
+
+int lichii_settings_reset_game(void) {
+    if (!InGameScope()) {
+        return -1;
+    }
+    const auto changes = Settings::DeviceProfile::ResetGameOverrides();
+    LOG_INFO(Frontend, "iOS app: {:016X} reset to the global settings ({} overrides): {}",
+             g_game_scope, changes.size(), Settings::DeviceProfile::FormatChanges(changes));
+    return static_cast<int>(changes.size());
+}
+
+size_t lichii_recommended_load(void) {
+    g_recommended = Settings::DeviceProfile::ForHost();
+    return g_recommended.settings.size() + g_recommended.app.size();
+}
+
+bool lichii_recommended_get(size_t index, LichiiRecommended* out) {
+    const auto& settings = g_recommended.settings;
+    const auto& app = g_recommended.app;
+    if (out == nullptr || index >= settings.size() + app.size()) {
+        return false;
+    }
+    const bool is_app = index >= settings.size();
+    const auto& value = is_app ? app[index - settings.size()] : settings[index];
+    *out = {value.key.c_str(), value.value.c_str(), value.display.c_str(), value.reason.c_str(),
+            is_app};
+    return true;
+}
+
+char* lichii_recommended_device(void) {
+    return Dup(g_recommended.device_name);
+}
+
+int lichii_recommended_apply(void) {
+    // A running game has its own values loaded; they are not what this replaces.
+    if (InGameScope() || System().IsPoweredOn() || g_state.load() == LICHII_EMU_BOOTING) {
+        return -1;
+    }
+    const auto changes = Settings::DeviceProfile::Apply(g_recommended);
+    SaveGlobalConfig();
+    LOG_INFO(Frontend, "iOS app: recommended settings for {} applied ({} changed): {}",
+             g_recommended.device_name, changes.size(),
+             Settings::DeviceProfile::FormatChanges(changes));
+    return static_cast<int>(changes.size());
 }
 
 /* ------------------------------------------------------------------------------ emulation */

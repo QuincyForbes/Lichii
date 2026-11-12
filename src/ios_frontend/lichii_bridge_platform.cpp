@@ -29,28 +29,9 @@
 namespace LichiiPlatform {
 namespace {
 
-/// Bump when the table changes: devices then get the new defaults once more.
+/// Marker of the first-launch defaults (LICHII_DEFAULTS_FIRST_LAUNCH). Not bumped with the
+/// recommended settings: an existing install changes only through Use Recommended Settings.
 constexpr int DefaultsVersion = 1;
-
-struct TierRow {
-    LichiiDeviceTier tier;
-    const char* name;
-    u64 min_memory_mib; ///< hw.memsize reports a little under the marketed size
-    int min_gpu_family;
-    Settings::ResolutionSetup resolution;
-    float scale;
-    const char* note;
-};
-
-// First match wins. Switch 2 titles get a 12 GB memory layout and iOS gives an app about 60-70%
-// of the device's memory with the increased-memory-limit entitlement, so memory decides first.
-constexpr TierRow Tiers[] = {
-    {LICHII_TIER_ULTRA, "ultra", 14000, 8, Settings::ResolutionSetup::Res3_2X, 1.5f, ""},
-    {LICHII_TIER_HIGH, "high", 10000, 9, Settings::ResolutionSetup::Res1X, 1.0f, ""},
-    {LICHII_TIER_MID, "mid", 7000, 8, Settings::ResolutionSetup::Res1X, 1.0f, ""},
-    {LICHII_TIER_LOW, "low", 5000, 8, Settings::ResolutionSetup::Res3_4X, 0.75f,
-     "6 GB device: larger games may run out of memory."},
-};
 
 template <typename T>
 T Clamp(T value, T low, T high) {
@@ -122,37 +103,49 @@ void RemoveLeftoverNupFiles() {
 
 } // Anonymous namespace
 
+std::string Recommended(const Settings::DeviceProfile::Profile& profile, std::string_view key) {
+    const auto* value = Settings::DeviceProfile::Find(profile, key);
+    return value != nullptr ? value->value : std::string{};
+}
+
+Settings::DeviceProfile::Device DeviceOf(const LichiiDeviceInfo& info) {
+    Settings::DeviceProfile::Device device;
+    device.os = Settings::DeviceProfile::Os::IOS;
+    device.model = info.machine;
+    device.chip = info.chip;
+    device.apple_gpu_family = info.gpu_family;
+    device.is_ipad = info.is_ipad != 0;
+    device.memory_mib = info.physical_memory_mib;
+    device.max_fps = info.max_fps;
+    device.gpu_known = info.gpu_name[0] != '\0';
+    device.gpu_name = info.gpu_name;
+    device.gpu_vendor = Settings::DeviceProfile::GpuVendor::Apple;
+    device.gpu_integrated = true;
+    return device;
+}
+
 LichiiDeviceDefaults ComputeDefaults(const LichiiDeviceInfo& info) {
     LichiiDeviceDefaults out{};
-    const TierRow* row = nullptr;
-    for (const TierRow& candidate : Tiers) {
-        if (info.physical_memory_mib >= candidate.min_memory_mib &&
-            info.gpu_family >= candidate.min_gpu_family) {
-            row = &candidate;
-            break;
-        }
-    }
-    if (row != nullptr) {
-        out.tier = row->tier;
-        CopyString(out.tier_name, sizeof(out.tier_name), row->name);
-        out.resolution_setup = static_cast<int>(row->resolution);
-        out.resolution_scale = row->scale;
-        CopyString(out.note, sizeof(out.note), row->note);
-    } else {
-        out.tier = LICHII_TIER_UNSUPPORTED;
-        CopyString(out.tier_name, sizeof(out.tier_name), "unsupported");
-        out.resolution_setup = static_cast<int>(Settings::ResolutionSetup::Res1_2X);
-        out.resolution_scale = 0.5f;
-        CopyString(out.note, sizeof(out.note),
-                   "Under 6 GB of memory or older than A15: Switch 2 games will likely be "
-                   "closed by iOS.");
-    }
+    // The tier and its values come from the recommended settings (common/device_profile.cpp).
+    const auto profile = Settings::DeviceProfile::Recommend(DeviceOf(info));
+    out.tier = static_cast<int>(profile.tier);
+    CopyString(out.tier_name, sizeof(out.tier_name), profile.tier_name);
+    CopyString(out.note, sizeof(out.note), profile.note);
+    const auto resolution = static_cast<Settings::ResolutionSetup>(
+        std::strtoul(Recommended(profile, "resolution_setup").c_str(), nullptr, 10));
+    Settings::ResolutionScalingInfo scaling;
+    Settings::TranslateResolutionInfo(resolution, scaling);
+    out.resolution_setup = static_cast<int>(resolution);
+    out.resolution_scale = scaling.up_factor;
     out.frame_gen_capable = info.gpu_family >= 9 || info.is_m_series ? 1 : 0;
-    // Only where the GPU has room to spare and the display can show the extra frames.
-    out.frame_gen = out.tier == LICHII_TIER_ULTRA && info.max_fps >= 120 ? 1 : 0;
-    out.gpu_accuracy = static_cast<int>(Settings::GpuAccuracy::Low);
-    out.async_shaders = 1;
-    out.docked = 0;
+    out.frame_gen = Recommended(profile, "frame_gen") == "true" ? 1 : 0;
+    out.gpu_accuracy = static_cast<int>(
+        std::strtoul(Recommended(profile, "gpu_accuracy").c_str(), nullptr, 10));
+    out.async_shaders = Recommended(profile, "use_asynchronous_shaders") == "true" ? 1 : 0;
+    out.docked = Recommended(profile, "use_docked_mode") ==
+                         std::to_string(static_cast<u32>(Settings::ConsoleMode::Docked))
+                     ? 1
+                     : 0;
     if (info.increased_memory_limit == 0) {
         CopyString(out.note, sizeof(out.note),
                    "The increased memory limit entitlement is missing: enable it for Lichii's "
@@ -296,24 +289,30 @@ int lichii_platform_apply_device_defaults(int mode) {
     }
     const bool only_unchanged = mode == LICHII_DEFAULTS_UNCHANGED;
     bool applied = false;
-    const auto apply = [&](auto& setting, auto value) {
-        using Value = std::remove_cvref_t<decltype(setting.GetValue())>;
-        const Value typed = static_cast<Value>(value);
-        if (only_unchanged && setting.GetValue() != setting.GetDefault()) {
-            return;
+    const auto profile = Settings::DeviceProfile::ForHost();
+    if (mode == LICHII_DEFAULTS_FORCE) {
+        applied = !Settings::DeviceProfile::Apply(profile).empty();
+    } else {
+        // The first-launch subset these modes always had; a new config already starts from the
+        // whole profile (Config::SetUpIni).
+        auto& values = Settings::values;
+        for (Settings::BasicSetting* const setting :
+             {static_cast<Settings::BasicSetting*>(&values.resolution_setup),
+              static_cast<Settings::BasicSetting*>(&values.frame_gen),
+              static_cast<Settings::BasicSetting*>(&values.gpu_accuracy),
+              static_cast<Settings::BasicSetting*>(&values.use_asynchronous_shaders),
+              static_cast<Settings::BasicSetting*>(&values.use_docked_mode)}) {
+            const std::string target = LichiiPlatform::Recommended(profile, setting->GetLabel());
+            if (target.empty() ||
+                (only_unchanged && setting->ToString() != setting->DefaultToString())) {
+                continue;
+            }
+            if (setting->ToString() != target) {
+                setting->LoadString(target);
+                applied = true;
+            }
         }
-        if (setting.GetValue() != typed) {
-            setting.SetValue(typed);
-            applied = true;
-        }
-    };
-    auto& values = Settings::values;
-    apply(values.resolution_setup, defaults.resolution_setup);
-    apply(values.frame_gen, defaults.frame_gen != 0);
-    apply(values.gpu_accuracy, defaults.gpu_accuracy);
-    apply(values.use_asynchronous_shaders, defaults.async_shaders != 0);
-    apply(values.use_docked_mode,
-          defaults.docked != 0 ? Settings::ConsoleMode::Docked : Settings::ConsoleMode::Handheld);
+    }
     Settings::UpdateRescalingInfo();
     if (mode != LICHII_DEFAULTS_UNCHANGED) {
         std::error_code error;

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <utility>
 #include <vector>
 
@@ -24,9 +25,10 @@ class QWindow;
 namespace VkDeviceInfo {
 Record::Record(std::string_view name_, const std::vector<VkPresentModeKHR>& vsync_modes_,
                bool has_broken_compute_, VkDriverId driver_id_, bool dlss_capable_,
-               std::string_view driver_version_)
+               std::string_view driver_version_, bool integrated_, u64 vram_mib_)
     : name{name_}, vsync_support{vsync_modes_}, has_broken_compute{has_broken_compute_},
-      driver_id{driver_id_}, dlss_capable{dlss_capable_}, driver_version{driver_version_} {}
+      driver_id{driver_id_}, dlss_capable{dlss_capable_}, driver_version{driver_version_},
+      integrated{integrated_}, vram_mib{vram_mib_} {}
 
 Record::~Record() = default;
 
@@ -87,9 +89,19 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
 
         name = fmt::format("{} ({})", name, driver_string);
 
+        const auto memory = physical_device.GetMemoryProperties().memoryProperties;
+        u64 vram = 0;
+        for (u32 i = 0; i < memory.memoryHeapCount; ++i) {
+            if ((memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+                vram = (std::max)(vram, u64{memory.memoryHeaps[i].size});
+            }
+        }
+        const bool integrated =
+            properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+
         records.push_back(VkDeviceInfo::Record(
             name, present_modes, has_broken_compute, driverID, dlss_capable,
-            static_cast<const char*>(driver_properties.driverInfo)));
+            static_cast<const char*>(driver_properties.driverInfo), integrated, vram >> 20));
     }
 } catch (const Vulkan::vk::Exception& exception) {
     LOG_ERROR(Frontend, "Failed to enumerate devices with error: {}", exception.what());

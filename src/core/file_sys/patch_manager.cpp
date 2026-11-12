@@ -121,7 +121,7 @@ bool OotNoNdsrEnabled() {
 // MetalFX temporal upscaling (Apple) replaces the output pass this removes, and skips its
 // dispatch itself.
 bool MetalFxReplacesNdsr() {
-    return Settings::values.metalfx_temporal.GetValue();
+    return Settings::MetalFxTemporalChosen();
 }
 
 // Settings oot_resolution. For tests, EDEN_NX2_OOT_RENDER_SCALE=1..3 picks 75/56/50%, and
@@ -135,7 +135,8 @@ Settings::OotResolution OotResolution() {
                                     OotResolution::Percent50};
         return scales[v[0] - '1'];
     }
-    const auto resolution = Settings::values.oot_resolution.GetValue();
+    const auto resolution =
+        Settings::OcarinaGameResolution(Settings::values.oot_resolution.GetValue());
     if (const char* v = std::getenv("EDEN_NX2_OOT_MAX_RESOLUTION"); v != nullptr && v[0] != 0) {
         if (v[0] == '0' && resolution == OotResolution::Full) {
             return OotResolution::Game;

@@ -380,8 +380,6 @@ struct ExperimentsView: View {
     @State private var noEarlySubmits = lichii_platform_experiment("no_early_submits") != 0
     @State private var noMeshEmulation = lichii_platform_experiment("no_mesh_emulation") != 0
     @State private var mvkUint8Indices = lichii_platform_experiment("mvk_uint8_indices") != 0
-    @State private var confirmReset = false
-    @State private var resetDone = false
 
     var body: some View {
         List {
@@ -447,27 +445,16 @@ struct ExperimentsView: View {
             if let defaults = PlatformCenter.deviceDefaults {
                 Section {
                     LabeledContent("Tier", value: PlatformCenter.text(defaults.tier_name))
-                    LabeledContent("Resolution", value: String(format: "%gx", defaults.resolution_scale))
-                    LabeledContent("Frame Generation", value: defaults.frame_gen != 0 ? "On" : "Off")
-                    LabeledContent("Asynchronous Shaders", value: defaults.async_shaders != 0 ? "On" : "Off")
-                    LabeledContent("Docked Mode", value: defaults.docked != 0 ? "On" : "Off")
-                    Button("Reset to Device Defaults", role: .destructive) { confirmReset = true }
-                        .disabled(Bridge.emuState.inGame)
+                    NavigationLink("Recommended Settings") {
+                        RecommendedSettingsView()
+                    }
                 } header: {
-                    Text("Device Defaults")
+                    Text("Device")
                 } footer: {
-                    Text(resetDone ? "Device defaults applied." : PlatformCenter.text(defaults.note))
+                    Text(PlatformCenter.text(defaults.note))
                 }
             }
         }
         .navigationTitle("Memory & Experiments")
-        .confirmationDialog("Overwrite resolution, frame generation, accuracy and docked mode with this device's defaults?",
-                            isPresented: $confirmReset, titleVisibility: .visible) {
-            Button("Reset", role: .destructive) {
-                lichii_platform_apply_device_defaults(Int32(LICHII_DEFAULTS_FORCE.rawValue))
-                lichii_settings_save()
-                resetDone = true
-            }
-        }
     }
 }

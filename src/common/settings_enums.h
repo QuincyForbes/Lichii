@@ -150,7 +150,13 @@ ENUM(NvdecEmulation, Off, Cpu, Gpu);
 ENUM(ResolutionSetup, Res1_4X, Res1_2X, Res3_4X, Res1X, Res5_4X, Res3_2X, Res2X, Res3X, Res4X, Res5X, Res6X, Res7X, Res8X);
 ENUM(ScalingFilter, NearestNeighbor, Bilinear, Bicubic, Gaussian, Lanczos, ScaleForce, Fsr, Area, ZeroTangent, BSpline, Mitchell, Spline1, Mmpx, Sgsr, SgsrEdge, Fsr3, MetalFxSpatial);
 ENUM(AntiAliasing, None, Fxaa, Smaa);
-ENUM(OotAntiAliasing, Game, NoSharpening, Fsr3);
+// Ocarina of Time's sharpening output pass (Settings oot_anti_aliasing). Its upscaler is chosen by
+// Settings upscaler; earlier builds had AMD FSR 3.1 here as value 2.
+ENUM(OotAntiAliasing, Game, NoSharpening);
+// What takes the place of a game's own upscaler (Settings upscaler): Auto keeps Ocarina of Time's
+// own pass and gives games that call DLSS AMD FSR 3.1; Game runs each game's own (translated DLSS
+// network included); the others replace both.
+ENUM(Upscaler, Auto, Game, Fsr3, Dlss, MetalFx);
 ENUM(DlssPreset, Default, J, K, L, M);
 ENUM(OcarinaDlssMode, Quality, Balanced, Performance, UltraPerformance);
 // Ocarina of Time's movies: the game's own upscaler, or a bilinear copy (Settings oot_movie_upscale).
@@ -159,7 +165,9 @@ ENUM(OotMovieUpscale, Automatic, Bilinear, Game);
 ENUM(TextureQuality, Full, Half, Quarter);
 // Ocarina of Time's internal 3D resolution (Settings oot_resolution, built-in patches): the game's
 // dynamic resolution, or a fixed share of its full size (1920x1080 handheld, 2560x1440 docked).
-ENUM(OotResolution, Game, Full, Percent87, Percent75, Percent56, Percent50);
+// Above 100 % it is Full with the emulator's resolution scale (EffectiveResolutionSetup).
+ENUM(OotResolution, Game, Full, Percent87, Percent75, Percent56, Percent50, Percent150, Percent200,
+     Percent300);
 // Ocarina of Time's frame rate (Settings oot_frame_rate).
 ENUM(OotFrameRate, Fps30, Fps60, Unlocked);
 // Mario Kart World's frame rate mode (Settings mkw_frame_rate, loader/nso.cpp).

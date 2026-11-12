@@ -20,6 +20,7 @@ add_library(lichii_ios_app STATIC
     JitView.swift
     LaunchView.swift
     LibraryView.swift
+    RecommendedSettingsView.swift
     RootView.swift
     SettingsModel.swift
     SettingsView.swift

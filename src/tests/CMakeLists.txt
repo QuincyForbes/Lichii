@@ -126,6 +126,7 @@ add_executable(tests
     common/container_hash.cpp
     common/event.cpp
     common/fibers.cpp
+    common/device_profile.cpp
     common/frizti_settings.cpp
     common/fs_iterate.cpp
     common/game_presets.cpp

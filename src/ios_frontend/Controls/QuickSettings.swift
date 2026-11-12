@@ -25,6 +25,17 @@ enum QuickSettings {
         Int(string(key)) ?? 0
     }
 
+    /// An enum setting's value in effect by its enum name ("MetalFx"), "" when unknown.
+    static func canonical(_ key: String) -> String {
+        guard let info = info(key) else { return "" }
+        let value = string(key)
+        for index in 0..<info.enum_count where
+            String(key.withCString { lichii_settings_enum_value($0, index) }) == value {
+            return Bridge.constant(key.withCString { lichii_settings_enum_name($0, index) })
+        }
+        return ""
+    }
+
     /// Sets and saves to the per-game or the global config, wherever the value comes from; a
     /// running game picks up runtime-modifiable values at once.
     static func set(_ key: String, _ value: String) {
@@ -63,9 +74,9 @@ enum QuickSettings {
         }
     }
 
-    /// "Res3_2X" -> "1.5x (1080p)" and so on; other enum names pass through.
+    /// "Res3_2X" -> "1.5x (1080p)" and so on; other enum names as the settings list names them.
     private static func displayName(_ key: String, _ name: String) -> String {
-        guard key == "resolution_setup" else { return name }
+        guard key == "resolution_setup" else { return SettingLabels.choice(name, for: key) }
         let table: [String: String] = [
             "Res1_4X": "0.25x (180p)", "Res1_2X": "0.5x (360p)", "Res3_4X": "0.75x (540p)",
             "Res1X": "1x (720p)", "Res5_4X": "1.25x (900p)", "Res3_2X": "1.5x (1080p)",
