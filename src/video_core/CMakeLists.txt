@@ -608,9 +608,11 @@ if (APPLE)
         renderer_vulkan/present/metalfx_frame_gen.mm
         renderer_vulkan/present/metalfx_spatial.mm
         renderer_vulkan/present/metalfx_temporal.mm
+        renderer_vulkan/metal_gpu_time.mm
     )
     target_sources(video_core PRIVATE
         ${METALFX_SOURCES}
+        renderer_vulkan/metal_gpu_time.h
         renderer_vulkan/present/metalfx_context.h
         renderer_vulkan/present/metalfx_frame_gen.h
         renderer_vulkan/present/metalfx_spatial.h

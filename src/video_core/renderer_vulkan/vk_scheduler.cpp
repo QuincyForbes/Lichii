@@ -24,6 +24,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/dkb_cpu_trace.h"
+#include "common/perf_report.h"
 #include "common/thread.h"
 #include <boost/container/small_vector.hpp>
 
@@ -153,19 +154,120 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
         }
     }
 
+    if (Common::PerfReport::Enabled() && !device.IsMoltenVK()) {
+        const auto physical = device.GetPhysical();
+        gpu_time_bits =
+            physical.GetQueueFamilyProperties()[device.GetGraphicsFamily()].timestampValidBits;
+        gpu_time_period = physical.GetProperties().limits.timestampPeriod;
+        if (gpu_time_bits >= 36 && gpu_time_period > 0.0) {
+            try {
+                gpu_time_pool = device.GetLogical().CreateQueryPool({
+                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                    .queryCount = GpuTimeSlots * 2,
+                    .pipelineStatistics = 0,
+                });
+            } catch (const vk::Exception& error) {
+                LOG_WARNING(Render_Vulkan, "Perf: no GPU timestamps: {}", error.what());
+            }
+        }
+    }
+
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
 }
 
 Scheduler::~Scheduler() {
-    if (trace_query_pool) {
+    if (trace_query_pool || gpu_time_pool) {
         WaitWorker();
         worker_thread.request_stop();
         worker_thread.join();
         if (trace_gpu_tick != 0) {
             master_semaphore->Wait(trace_gpu_tick);
         }
+        if (gpu_time_count != 0) {
+            master_semaphore->Wait(
+                gpu_time_slots[(gpu_time_head + gpu_time_count - 1) % GpuTimeSlots].tick);
+        }
+    }
+}
+
+void Scheduler::BeginGpuTime() {
+    if (!gpu_time_pool) {
+        return;
+    }
+    CollectGpuTime();
+    if (gpu_time_count == GpuTimeSlots) {
+        gpu_time_open = ~0U;
+        return;
+    }
+    const u32 index = (gpu_time_head + gpu_time_count) % GpuTimeSlots;
+    current_upload_cmdbuf.ResetQueryPool(*gpu_time_pool, index * 2, 2);
+    current_upload_cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, *gpu_time_pool,
+                                         index * 2);
+    gpu_time_open = index;
+}
+
+void Scheduler::EndGpuTime(vk::CommandBuffer cmdbuf, u64 tick) {
+    if (gpu_time_open == ~0U) {
+        return;
+    }
+    cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *gpu_time_pool,
+                          gpu_time_open * 2 + 1);
+    gpu_time_slots[gpu_time_open] = {.tick = tick, .query = gpu_time_open * 2};
+    ++gpu_time_count;
+    gpu_time_open = ~0U;
+}
+
+void Scheduler::CollectGpuTime() {
+    const u64 mask = gpu_time_bits >= 64 ? ~u64{0} : (u64{1} << gpu_time_bits) - 1;
+    const u64 second = static_cast<u64>(1e9 / gpu_time_period);
+    bool refreshed = false;
+    while (gpu_time_count != 0) {
+        const GpuTimeSlot& slot = gpu_time_slots[gpu_time_head];
+        if (!master_semaphore->IsFree(slot.tick)) {
+            if (refreshed) {
+                break;
+            }
+            master_semaphore->Refresh();
+            refreshed = true;
+            continue;
+        }
+        struct Result {
+            u64 timestamp;
+            u64 available;
+        };
+        std::array<Result, 2> results{};
+        const VkResult result = device.GetLogical().GetQueryResults(
+            *gpu_time_pool, slot.query, 2, sizeof(results), results.data(), sizeof(Result),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        if (result == VK_NOT_READY ||
+            (result == VK_SUCCESS && (results[0].available == 0 || results[1].available == 0))) {
+            break;
+        }
+        if (result == VK_SUCCESS) {
+            const u64 begin = results[0].timestamp & mask;
+            const u64 end = results[1].timestamp & mask;
+            if (end > begin && end - begin < second * 10) {
+                // Submissions overlap on the GPU: count each moment once. A counter that
+                // wrapped leaves the last end far ahead; start over from there.
+                if (gpu_time_last_end > end + second) {
+                    gpu_time_last_end = 0;
+                }
+                const u64 from = gpu_time_last_end > begin ? (std::min)(gpu_time_last_end, end)
+                                                           : begin;
+                gpu_time_last_end = (std::max)(gpu_time_last_end, end);
+                Common::PerfReport::Add(
+                    Common::PerfReport::GpuBusyNs,
+                    static_cast<u64>(static_cast<double>(end - from) * gpu_time_period));
+                Common::PerfReport::Add(Common::PerfReport::GpuTimedBuffers);
+            }
+        }
+        gpu_time_head = (gpu_time_head + 1) % GpuTimeSlots;
+        --gpu_time_count;
     }
 }
 
@@ -376,6 +478,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     if (VideoCommon::Nx2Profile::Enabled()) {
         g_profile_renderpasses.fetch_add(1, std::memory_order_relaxed);
     }
+    Common::PerfReport::Add(Common::PerfReport::RenderPasses);
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
     state.renderpass = renderpass;
@@ -685,6 +788,7 @@ void Scheduler::AllocateWorkerCommandBuffer() {
     if (trace_query_pool && !trace_gpu_failed) {
         TraceGpuSubmission();
     }
+    BeginGpuTime();
 }
 
 void Scheduler::TraceShader(u64 hash, u32 stage) {
@@ -921,6 +1025,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         } else if (trace_gpu_sampling) {
             ++trace_gpu_skipped;
         }
+        EndGpuTime(cmdbuf, signal_value);
         cmdbuf.End();
 
         if (on_submit) {

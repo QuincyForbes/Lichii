@@ -228,8 +228,10 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
 StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
-    if (usage != MemoryUsage::Download) {
+    if (usage == MemoryUsage::Upload) {
         Common::PerfReport::Add(Common::PerfReport::StagingUploadBytes, size);
+    } else if (usage == MemoryUsage::DeviceLocal) {
+        Common::PerfReport::Add(Common::PerfReport::StagingScratchBytes, size);
     }
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
         return GetStreamBuffer(size);
@@ -501,8 +503,10 @@ StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage us
             tick_upload_bytes = 0;
         }
         tick_upload_bytes += AllocationBytes(usage, Common::Log2Ceil(size));
-        Common::PerfReport::Add(Common::PerfReport::StagingPooledBytes,
-                                AllocationBytes(usage, Common::Log2Ceil(size)));
+        if (usage == MemoryUsage::Upload) {
+            Common::PerfReport::Add(Common::PerfReport::StagingPooledBytes,
+                                    AllocationBytes(usage, Common::Log2Ceil(size)));
+        }
     }
     if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
         return *ref;

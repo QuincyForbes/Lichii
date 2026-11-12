@@ -560,6 +560,26 @@ private:
     bool trace_gpu_pending{};
     bool trace_gpu_failed{};
 
+    /// GPU busy time for the "Perf:" line (Common::PerfReport::GpuBusyNs): a timestamp at the
+    /// start and end of every submission, read back once its tick is done. Not on MoltenVK,
+    /// where timestamps add Metal passes (Apple reads its command buffers' GPU times instead).
+    void BeginGpuTime();
+    void EndGpuTime(vk::CommandBuffer cmdbuf, u64 tick);
+    void CollectGpuTime();
+    static constexpr u32 GpuTimeSlots = 256;
+    struct GpuTimeSlot {
+        u64 tick{};
+        u32 query{};
+    };
+    vk::QueryPool gpu_time_pool;
+    std::array<GpuTimeSlot, GpuTimeSlots> gpu_time_slots{};
+    u32 gpu_time_head{};
+    u32 gpu_time_count{};
+    u32 gpu_time_open{~0U};
+    u32 gpu_time_bits{};
+    double gpu_time_period{};
+    u64 gpu_time_last_end{};
+
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 
     vk::CommandBuffer current_cmdbuf;

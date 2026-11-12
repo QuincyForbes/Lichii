@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
+#include "common/perf_report.h"
 #include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
@@ -1243,6 +1244,10 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (mesh_emulation) {
         // The mesh program runs as a compute dispatch outside the render pass and writes the
         // triangles the draw then reads; both use the descriptor set committed here.
+        Common::PerfReport::Add(Common::PerfReport::MeshEmulatedDraws);
+        if (scheduler.IsRenderPassActive()) {
+            Common::PerfReport::Add(Common::PerfReport::MeshPassBreaks);
+        }
         scheduler.RequestOutsideRenderPassOperationContext();
         if (!IsBuilt()) {
             scheduler.Record([this](vk::CommandBuffer) { build->Wait(!worker_only_build); });

@@ -61,6 +61,7 @@
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
 #ifdef LICHII_METALFX
+#include "video_core/renderer_vulkan/metal_gpu_time.h"
 #include "video_core/renderer_vulkan/present/metalfx_temporal.h"
 #endif
 #ifdef EGLANTINE_STREAMLINE
@@ -535,6 +536,11 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       frame_dump(device, memory_allocator, scheduler),
       flash_watch(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
+#ifdef LICHII_METALFX
+    if (Common::PerfReport::Enabled()) {
+        MetalGpuTime::Start();
+    }
+#endif
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
             gpu.ForEachPendingCpuWrite(callback);
@@ -3686,26 +3692,55 @@ void RasterizerVulkan::TickPerfReport() {
     }
     const u64 available = VideoCommon::HostBudget::Available(
         VideoCommon::HostBudget::Simulated() ? device.GetDeviceMemoryUsage() : 0);
+    const double frame_count = static_cast<double>(frames);
+    const auto per_frame = [&](Common::PerfReport::Counter counter) {
+        return static_cast<double>(delta(counter)) / frame_count;
+    };
+    // GPU: busy time of the finished command buffers (overlaps once), per frame and of the wall.
+    const u64 gpu_buffers = delta(Common::PerfReport::GpuTimedBuffers);
+    const double gpu_ms = static_cast<double>(delta(Common::PerfReport::GpuBusyNs)) / 1e6;
+    const std::string gpu_text =
+        gpu_buffers == 0
+            ? std::string{"GPU - (no timings)"}
+            : fmt::format("GPU {:.1f} ms/frame, {:.0f}% busy, {:.1f} command buffers/frame",
+                          gpu_ms / frame_count, gpu_ms / 10.0 / seconds,
+                          static_cast<double>(gpu_buffers) / frame_count);
+    // Guest cores by wall time: guest code, kernel (SVCs, scheduling, fiber switches), idle.
+    const auto wall_percent = [&](Common::PerfReport::Counter counter) {
+        return static_cast<double>(delta(counter)) / 1e7 / seconds;
+    };
     LOG_INFO(Common_Memory,
-             "Perf: {:.1f} fps, frame {:.1f} ms avg {:.0f} max | busy: GPU thread {}, GPU back {}, "
-             "Vulkan worker {}, guest cores {} (max {}) | draws {:.0f}/frame, {:.1f} skipped "
-             "(no pipeline) | uploads MiB/s: textures {:.1f}, buffers {:.1f}, other {:.1f}, "
-             "past the stream buffer {:.1f} | {} early submits, {} waits at the cap, {} mesh "
+             "Perf: {:.1f} fps, frame {:.1f} ms avg {:.0f} max | {} | busy: GPU thread {}, GPU "
+             "back {}, Vulkan worker {}, guest cores {} (max {}) | guest cores' time: guest code "
+             "{:.0f}%, kernel {:.0f}%, idle {:.0f}% ({:.0f} waits/s) | draws {:.0f}/frame, {:.1f} "
+             "skipped (no pipeline), {:.1f} render passes/frame, {:.1f} mesh emulated/frame "
+             "({:.1f} ended a render pass) | uploads MiB/s: textures {:.1f}, buffers {:.1f}, "
+             "other {:.1f}, past the stream buffer {:.1f} | other: uniforms {:.1f} (padding "
+             "{:.1f}), 8-bit indices {:.1f} | GPU scratch (mesh emulation) {:.1f} MiB/s | {} "
+             "early submits, {} waits at the cap, {} mesh "
              "arena waits | textures {:.1f} collected/s ({} downloaded), {:.1f} made/s, {} MiB "
              "(collect {} / {} MiB) | buffers {:.1f} collected/s, {:.1f} made/s, {} MiB (collect "
              "{} MiB) | {} MiB left",
-             static_cast<double>(frames) / seconds, seconds * 1000.0 / static_cast<double>(frames),
-             perf_frame_max_ms, percent(Common::DkbCpuTrace::Role::GpuCommand),
+             frame_count / seconds, seconds * 1000.0 / frame_count, perf_frame_max_ms, gpu_text,
+             percent(Common::DkbCpuTrace::Role::GpuCommand),
              percent(Common::DkbCpuTrace::Role::GpuBack),
              percent(Common::DkbCpuTrace::Role::VulkanWorker),
              guest_known ? fmt::format("{:.0f}%", guest_sum) : std::string{"-"},
              guest_known ? fmt::format("{:.0f}%", guest_max) : std::string{"-"},
-             static_cast<double>(delta(Common::PerfReport::Draws)) / static_cast<double>(frames),
-             static_cast<double>(delta(Common::PerfReport::DrawsSkipped)) /
-                 static_cast<double>(frames),
-             mib_per_second(texture_bytes), mib_per_second(buffer_bytes),
-             mib_per_second(other_bytes),
+             wall_percent(Common::PerfReport::GuestRunNs),
+             wall_percent(Common::PerfReport::GuestKernelNs),
+             wall_percent(Common::PerfReport::GuestIdleNs),
+             per_second(delta(Common::PerfReport::GuestIdles)),
+             per_frame(Common::PerfReport::Draws), per_frame(Common::PerfReport::DrawsSkipped),
+             per_frame(Common::PerfReport::RenderPasses),
+             per_frame(Common::PerfReport::MeshEmulatedDraws),
+             per_frame(Common::PerfReport::MeshPassBreaks), mib_per_second(texture_bytes),
+             mib_per_second(buffer_bytes), mib_per_second(other_bytes),
              mib_per_second(delta(Common::PerfReport::StagingPooledBytes)),
+             mib_per_second(delta(Common::PerfReport::UniformStreamBytes)),
+             mib_per_second(delta(Common::PerfReport::UniformPadBytes)),
+             mib_per_second(delta(Common::PerfReport::IndexStreamBytes)),
+             mib_per_second(delta(Common::PerfReport::StagingScratchBytes)),
              delta(Common::PerfReport::EarlySubmits), delta(Common::PerfReport::CapWaits),
              delta(Common::PerfReport::MeshArenaWaits),
              per_second(delta(Common::PerfReport::TextureCollected)),
