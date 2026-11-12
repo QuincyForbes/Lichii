@@ -163,6 +163,7 @@ public:
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
         };
+        const MemoryTagScope memory_tag{MemoryTag::QueryCache};
         accumulation_buffer = memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.Record([buffer = *accumulation_buffer](vk::CommandBuffer cmdbuf) {
@@ -639,6 +640,7 @@ private:
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
         };
+        const MemoryTagScope memory_tag{MemoryTag::QueryCache};
         buffers.emplace_back(memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal));
         if constexpr (is_resolve) {
             resolve_table[log_2] = buffers.size();
@@ -702,6 +704,7 @@ public:
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
         };
+        const MemoryTagScope memory_tag{MemoryTag::QueryCache};
         buffer = memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
     }
 
@@ -781,6 +784,7 @@ public:
             .pQueueFamilyIndices = nullptr,
         };
 
+        const MemoryTagScope memory_tag{MemoryTag::QueryCache};
         counters_buffer = memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
         for (auto& c : counter_buffers) {
             c = *counters_buffer;
@@ -1400,6 +1404,7 @@ struct QueryCacheRuntimeImpl {
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
         };
+        const MemoryTagScope memory_tag{MemoryTag::QueryCache};
         hcr_resolve_buffer = memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
     }
 

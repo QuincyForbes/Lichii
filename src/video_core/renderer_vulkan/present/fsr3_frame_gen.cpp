@@ -280,6 +280,7 @@ void Fsr3FrameGen::CreateAsyncResources(const Device& device) {
 }
 
 void Fsr3FrameGen::CreateResources(const Device& device) {
+    const MemoryTagScope memory_tag{MemoryTag::FrameGeneration};
     m_linear_sampler = CreateBilinearSampler(device);
 
     const bool shared = !m_shared_families.empty();

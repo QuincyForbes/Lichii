@@ -26,6 +26,7 @@
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+#include "video_core/vulkan_common/vulkan_memory_tags.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
@@ -177,6 +178,7 @@ void MemoryCommit::Release() {
             vmaUnmapMemory(allocator, allocation);
             mapped_ptr = nullptr;
         }
+        MemoryTags::Untag(allocator, allocation);
         vmaFreeMemory(allocator, allocation);
     }
     allocation = nullptr;
@@ -251,6 +253,7 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     const bool huge = texels > MaxBackedImageTexels;
     if (!huge && !dedicated &&
         CreateImageInMediumPool(ci, alloc_ci, handle, allocation, alloc_info)) {
+        MemoryTags::Tag(allocator, allocation, alloc_info.size);
         image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
                           device.GetDispatchLoader());
         return VK_SUCCESS;
@@ -330,6 +333,7 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         );
     }
 
+    MemoryTags::Tag(allocator, allocation, alloc_info.size);
     image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
                       device.GetDispatchLoader());
     return VK_SUCCESS;
@@ -380,6 +384,8 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
             pool_ci.pool = pool;
             if (vmaAllocateMemory(allocator, &requirements, &pool_ci, &allocation, &info) ==
                 VK_SUCCESS) {
+                const MemoryTagScope memory_tag{MemoryTag::SparseImageMemory};
+                MemoryTags::Tag(allocator, allocation, info.size);
                 memory = info.deviceMemory;
                 offset = info.offset;
                 return allocation;
@@ -389,6 +395,10 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
     if (vmaAllocateMemory(allocator, &requirements, &alloc_ci, &allocation, &info) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
+    {
+        const MemoryTagScope memory_tag{MemoryTag::SparseImageMemory};
+        MemoryTags::Tag(allocator, allocation, info.size);
+    }
     memory = info.deviceMemory;
     offset = info.offset;
     return allocation;
@@ -396,6 +406,7 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
 
 void MemoryAllocator::FreeSparseMemory(VmaAllocation allocation) const {
     if (allocation != VK_NULL_HANDLE) {
+        MemoryTags::Untag(allocator, allocation);
         vmaFreeMemory(allocator, allocation);
     }
 }
@@ -574,6 +585,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         }
         vk::Check(result);
     }
+    MemoryTags::Tag(allocator, allocation, alloc_info.size);
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     // Log GPU memory allocation for buffers
@@ -631,6 +643,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
 
     vk::Check(vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
                                            &allocation, &alloc_info));
+    MemoryTags::Tag(allocator, allocation, alloc_info.size);
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);
@@ -679,6 +692,7 @@ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsa
     }
 
     vk::Check(res);
+    MemoryTags::Tag(allocator, a, info.size);
     return MemoryCommit(allocator, a, info);
 }
 
@@ -717,6 +731,7 @@ MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage
 
     vk::Check(res);
     vk::Check(vmaBindBufferMemory2(allocator, a, 0, raw, nullptr));
+    MemoryTags::Tag(allocator, a, info.size);
     return MemoryCommit(allocator, a, info);
 }
 

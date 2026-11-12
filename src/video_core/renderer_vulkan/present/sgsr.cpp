@@ -30,6 +30,7 @@ SGSR::SGSR(const Device& device, MemoryAllocator& memory_allocator, size_t image
     // Not finished yet initializing at ctor time?
     m_dynamic_images.resize(m_image_count);
     for (auto& images : m_dynamic_images) {
+        const MemoryTagScope memory_tag{MemoryTag::PresentFilter};
         images.image = CreateWrappedImage(m_memory_allocator, m_extent, VK_FORMAT_R16G16B16A16_SFLOAT);
         images.image_view = CreateWrappedImageView(device, images.image, VK_FORMAT_R16G16B16A16_SFLOAT);
     }

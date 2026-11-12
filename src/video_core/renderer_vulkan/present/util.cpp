@@ -22,6 +22,7 @@ vk::Buffer CreateWrappedBuffer(MemoryAllocator& allocator, VkDeviceSize size, Me
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    const MemoryTagScope memory_tag{MemoryTags::CurrentOr(MemoryTag::PresentLayer)};
     return allocator.CreateBuffer(dst_buffer_info, usage);
 }
 
@@ -44,6 +45,7 @@ vk::Image CreateWrappedImage(MemoryAllocator& allocator, VkExtent2D dimensions, 
         .pQueueFamilyIndices = nullptr,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
+    const MemoryTagScope memory_tag{MemoryTags::CurrentOr(MemoryTag::PresentLayer)};
     return allocator.CreateImage(image_ci);
 }
 
@@ -86,6 +88,7 @@ void UploadImage(const Device& device, MemoryAllocator& allocator, Scheduler& sc
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    const MemoryTagScope memory_tag{MemoryTags::CurrentOr(MemoryTag::PresentLayer)};
     auto upload_buffer = allocator.CreateBuffer(upload_ci, MemoryUsage::Upload);
     std::ranges::copy(initial_contents, upload_buffer.Mapped().begin());
     upload_buffer.Flush();

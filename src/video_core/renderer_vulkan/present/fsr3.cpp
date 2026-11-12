@@ -39,6 +39,7 @@ FSR3::FSR3(const Device& device, MemoryAllocator& memory_allocator, size_t image
 FSR3::~FSR3() = default;
 
 void FSR3::CreateImages(const Device& device) {
+    const MemoryTagScope memory_tag{MemoryTag::Upscaler};
     m_dynamic_images.resize(m_image_count);
     for (auto& images : m_dynamic_images) {
         images.images[Easu] =

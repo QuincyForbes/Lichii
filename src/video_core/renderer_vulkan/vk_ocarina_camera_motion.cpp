@@ -127,6 +127,7 @@ struct ActorTransforms {
 
 vk::Buffer UploadActorData(MemoryAllocator& allocator, std::span<const std::byte> data,
                            VkBufferUsageFlags usage) {
+    const MemoryTagScope memory_tag{MemoryTag::Upscaler};
     auto buffer = allocator.CreateBuffer(VkBufferCreateInfo{
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = data.size(),
@@ -649,6 +650,7 @@ constexpr VkFormat BIAS_FORMAT = VK_FORMAT_R16_SFLOAT;
 
 vk::Image CreateOcarinaImage(MemoryAllocator& allocator, VkExtent2D extent, VkFormat format,
                             VkImageUsageFlags usage) {
+    const MemoryTagScope memory_tag{MemoryTag::Upscaler};
     return allocator.CreateImage(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType = VK_IMAGE_TYPE_2D,

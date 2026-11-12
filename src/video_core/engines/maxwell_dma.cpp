@@ -9,6 +9,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/platform_events.h"
 #include <ranges>
 #include "common/settings.h"
 #include "core/core.h"
@@ -202,6 +203,7 @@ void MaxwellDMA::Launch() {
         if (!is_src_pitch && !is_dst_pitch) {
             // If both the source and the destination are in block layout, assert.
             CopyBlockLinearToBlockLinear();
+            TrimScratchBuffers();
             ReleaseSemaphore();
             return;
         }
@@ -281,9 +283,32 @@ void MaxwellDMA::Launch() {
         }
     }
 
+    TrimScratchBuffers();
     ReleaseSemaphore();
 }
 
+void MaxwellDMA::TrimScratchBuffers() {
+    // Software copies of large images leave their size in these (8 MiB each in title 1). Freed
+    // after each copy they were made again every few milliseconds; on host memory pressure (iOS)
+    // those past 1 MiB go back to the heap.
+    const u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
+    if (pressure == scratch_pressure) {
+        return;
+    }
+    scratch_pressure = pressure;
+    constexpr size_t Keep = size_t{1} << 20;
+    size_t released = 0;
+    for (Common::ScratchBuffer<u8>* const buffer : {&read_buffer, &write_buffer, &intermediate_buffer}) {
+        if (buffer->capacity() > Keep) {
+            released += buffer->capacity();
+            buffer->release();
+        }
+    }
+    if (released != 0) {
+        LOG_INFO(Common_Memory, "Host memory pressure: DMA copy buffers {} KiB released",
+                 released >> 10);
+    }
+}
 void MaxwellDMA::CopyBlockLinearToPitch() {
    
 

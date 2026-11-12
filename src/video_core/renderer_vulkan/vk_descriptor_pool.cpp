@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <span>
 #include <vector>
@@ -24,10 +25,32 @@ namespace Vulkan {
 constexpr size_t SETS_GROW_RATE = 16;
 constexpr s32 SCORE_THRESHOLD = 3;
 
+namespace {
+std::atomic<u64> g_pools{};
+std::atomic<u64> g_descriptors{};
+std::atomic<u64> g_sets{};
+} // Anonymous namespace
+
 struct DescriptorBank {
+    ~DescriptorBank() {
+        g_pools.fetch_sub(pools.size(), std::memory_order_relaxed);
+        g_descriptors.fetch_sub(descriptors, std::memory_order_relaxed);
+        g_sets.fetch_sub(sets, std::memory_order_relaxed);
+    }
+
     DescriptorBankInfo info;
     std::vector<vk::DescriptorPool> pools;
+    u64 descriptors{};
+    u64 sets{};
 };
+
+DescriptorPoolStats GetDescriptorPoolStats() noexcept {
+    return {
+        .pools = g_pools.load(std::memory_order_relaxed),
+        .descriptors = g_descriptors.load(std::memory_order_relaxed),
+        .sets = g_sets.load(std::memory_order_relaxed),
+    };
+}
 
 bool DescriptorBankInfo::IsSuperset(const DescriptorBankInfo& subset) const noexcept {
     return uniform_buffers >= subset.uniform_buffers && storage_buffers >= subset.storage_buffers &&
@@ -82,6 +105,13 @@ static void AllocatePool(const Device& device, DescriptorBank& bank) {
     add(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, info.sampled_images);
     add(VK_DESCRIPTOR_TYPE_SAMPLER, info.samplers);
     VideoCommon::Churn::Add(VideoCommon::Churn::DescriptorPools);
+    u64 descriptors = 0;
+    for (size_t i = 0; i < pool_cursor; ++i) {
+        descriptors += pool_sizes[i].descriptorCount;
+    }
+    bank.descriptors += descriptors;
+    g_pools.fetch_add(1, std::memory_order_relaxed);
+    g_descriptors.fetch_add(descriptors, std::memory_order_relaxed);
     bank.pools.push_back(device.GetLogical().CreateDescriptorPool({
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = nullptr,
@@ -115,6 +145,8 @@ vk::DescriptorSets DescriptorAllocator::AllocateDescriptors(size_t count) {
         .descriptorSetCount = static_cast<u32>(count),
         .pSetLayouts = layouts.data(),
     };
+    bank->sets += count;
+    g_sets.fetch_add(count, std::memory_order_relaxed);
     vk::DescriptorSets new_sets = bank->pools.back().Allocate(allocate_info);
     if (!new_sets.IsOutOfPoolMemory()) {
         return new_sets;

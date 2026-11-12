@@ -651,6 +651,7 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
         return false;
     }
     recorded_bytes += size;
+    const MemoryTagScope memory_tag{MemoryTag::Diagnostics};
     vk::Buffer buffer = memory_allocator.CreateBuffer(
         VkBufferCreateInfo{
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -705,6 +706,7 @@ bool FrameDump::RecordBuffer(VkBuffer source, u32 offset, u32 size, std::string 
         return false;
     }
     recorded_bytes += size;
+    const MemoryTagScope memory_tag{MemoryTag::Diagnostics};
     vk::Buffer buffer = memory_allocator.CreateBuffer(
         VkBufferCreateInfo{
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,

@@ -115,6 +115,7 @@ DlssNetworkProbe::DlssNetworkProbe(const Device& device_, Scheduler& scheduler_,
         .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
         .unnormalizedCoordinates = VK_FALSE,
     });
+    const MemoryTagScope memory_tag{MemoryTag::Diagnostics};
     results = memory_allocator.CreateBuffer(
         VkBufferCreateInfo{
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,

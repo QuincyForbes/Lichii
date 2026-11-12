@@ -377,6 +377,7 @@ FlashWatch::FlashWatch(const Device& device_, MemoryAllocator& memory_allocator_
                                                          });
         slots.resize(SLOTS);
         for (Slot& slot : slots) {
+            const MemoryTagScope memory_tag{MemoryTag::Diagnostics};
             slot.buffer = memory_allocator.CreateBuffer(
                 VkBufferCreateInfo{
                     .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,

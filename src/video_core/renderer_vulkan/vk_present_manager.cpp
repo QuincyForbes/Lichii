@@ -322,6 +322,7 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
         storage_usage = VK_IMAGE_USAGE_STORAGE_BIT;
     }
 
+    const MemoryTagScope memory_tag{MemoryTag::PresentFrame};
     frame->image = memory_allocator.CreateImage({
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,

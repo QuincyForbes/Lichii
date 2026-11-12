@@ -34,6 +34,7 @@ FXAA::FXAA(const Device& device, MemoryAllocator& allocator, size_t image_count,
 FXAA::~FXAA() = default;
 
 void FXAA::CreateImages(const Device& device, MemoryAllocator& allocator) {
+    const MemoryTagScope memory_tag{MemoryTag::PresentFilter};
     for (u32 i = 0; i < m_image_count; i++) {
         Image& image = m_dynamic_images.emplace_back();
         image.image = CreateWrappedImage(allocator, m_extent, VK_FORMAT_R16G16B16A16_SFLOAT);

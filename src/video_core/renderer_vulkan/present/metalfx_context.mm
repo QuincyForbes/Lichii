@@ -49,6 +49,7 @@ vk::Image CreateMetalFxImage(MemoryAllocator& allocator, VkExtent2D extent, VkFo
         .pNext = nullptr,
         .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT,
     };
+    const MemoryTagScope memory_tag{MemoryTag::Upscaler};
     return allocator.CreateImage(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = &export_ci,

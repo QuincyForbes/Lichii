@@ -67,6 +67,9 @@ std::size_t g_next_listener_id = 1;
 std::mutex g_pressure_listeners_mutex;
 std::vector<std::pair<std::size_t, std::function<void()>>> g_pressure_listeners;
 std::size_t g_next_pressure_listener_id = 1;
+
+std::mutex g_graphics_report_mutex;
+std::function<std::string()> g_graphics_report;
 } // Anonymous namespace
 
 void SignalMemoryPressure() {
@@ -645,8 +648,19 @@ void LogMemoryBreakdown([[maybe_unused]] const char* reason) {
              zones.size_in_use >> 20, zones.size_allocated >> 20,
              (zones.size_allocated - (std::min)(zones.size_allocated, zones.size_in_use)) >> 20,
              HostThreadCount(), metal >> 20, memory.graphics >> 20);
+    {
+        std::scoped_lock lock{g_graphics_report_mutex};
+        if (g_graphics_report) {
+            LOG_INFO(Common_Memory, "Graphics memory ({}): {}", reason, g_graphics_report());
+        }
+    }
     LogStorageWrites(reason);
 #endif
+}
+
+void SetGraphicsMemoryReport(std::function<std::string()> report) {
+    std::scoped_lock lock{g_graphics_report_mutex};
+    g_graphics_report = std::move(report);
 }
 
 void LogStorageWrites([[maybe_unused]] const char* reason) {

@@ -147,6 +147,7 @@ NvOpticalFlow::NvOpticalFlow(const Device& device_, MemoryAllocator& allocator, 
             .pNext = nullptr,
             .usage = flow_usage,
         };
+        const MemoryTagScope memory_tag{MemoryTag::FrameGeneration};
         return allocator.CreateImage(VkImageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext = &flow_info,
@@ -188,6 +189,7 @@ NvOpticalFlow::NvOpticalFlow(const Device& device_, MemoryAllocator& allocator, 
         flows[i] = create_image(flow_extent, flow_format, VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                                 VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV);
         flow_views[i] = create_view(flows[i], flow_format);
+        const MemoryTagScope memory_tag{MemoryTag::FrameGeneration};
         flow_copies[i] = allocator.CreateImage(VkImageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext = nullptr,

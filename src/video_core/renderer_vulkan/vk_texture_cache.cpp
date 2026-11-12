@@ -577,6 +577,7 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
             return image;
         }
     }
+    const MemoryTagScope memory_tag{MemoryTags::CurrentOr(MemoryTag::GuestImage)};
     return may_fail ? allocator.TryCreateImage(image_ci) : allocator.CreateImage(image_ci);
 }
 
@@ -1417,6 +1418,7 @@ VkBuffer TextureCacheRuntime::GetTemporaryBuffer(size_t needed_size) {
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    const MemoryTagScope memory_tag{MemoryTag::TextureHelper};
     buffers[level] = memory_allocator.CreateBuffer(temp_ci, MemoryUsage::DeviceLocal);
     return *buffers[level];
 }
@@ -1440,6 +1442,7 @@ VkImageView TextureCacheRuntime::GetOrCreateResolveShadow(VkImage msaa_image, Vk
     if (shadow.image) {
         pending_resolve_shadows.emplace_back(scheduler.CurrentTick(), std::move(shadow));
     }
+    const MemoryTagScope memory_tag{MemoryTag::TextureHelper};
     shadow.image = memory_allocator.CreateImage(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,
@@ -1545,6 +1548,7 @@ ByteAddressedShadow TextureCacheRuntime::CreateByteAddressedShadow(const ImageVi
                                   FormatType::Optimal)) {
         throw Shader::RuntimeError("Unsupported packed R16 byte-addressed image binding");
     }
+    const MemoryTagScope memory_tag{MemoryTag::TextureHelper};
     PendingByteAddressedShadow pending{
         .tick = (std::numeric_limits<u64>::max)(),
         .image = memory_allocator.CreateImage(VkImageCreateInfo{
@@ -2220,6 +2224,7 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
         if (temporal_history.images[0]) {
             scheduler.Finish(); // the old history may still be in use
         }
+        const MemoryTagScope memory_tag{MemoryTag::Upscaler};
         for (size_t i = 0; i < temporal_history.images.size(); ++i) {
             temporal_history.images[i] = memory_allocator.CreateImage(VkImageCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -3000,6 +3005,7 @@ VkImage TextureCacheRuntime::AcquireMsaaScratchImage(const VkImageCreateInfo& im
         scratch.unused_frames = 0;
         return *scratch.image;
     }
+    const MemoryTagScope memory_tag{MemoryTag::TextureHelper};
     MsaaScratchImage scratch{
         .key = key,
         .image = memory_allocator.CreateImage(image_ci),
@@ -3342,6 +3348,7 @@ void Image::AllocateComputeUnswizzleBuffer(u32 max_slices) {
         .pQueueFamilyIndices = nullptr,
     };
 
+    const MemoryTagScope memory_tag{MemoryTag::TextureHelper};
     compute_unswizzle_buffer =
         runtime->memory_allocator.CreateBuffer(ci, MemoryUsage::DeviceLocal);
 
@@ -4352,6 +4359,7 @@ bool Image::ScaleUp(bool ignore) {
         auto scaled_info = info;
         scaled_info.size.width = scaled_width;
         scaled_info.size.height = scaled_height;
+        const MemoryTagScope memory_tag{MemoryTag::RescaledImage};
         scaled_image = MakeImage(runtime->device, runtime->memory_allocator, scaled_info,
                                  runtime->ViewFormats(info.format), {}, false, false, false,
                                  runtime, &scaled_pool_key);
@@ -4657,6 +4665,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::NullImageV
     ImageInfo info{};
     info.format = PixelFormat::A8B8G8R8_UNORM;
 
+    const MemoryTagScope memory_tag{MemoryTag::NullImage};
     null_image = MakeImage(*device, runtime.memory_allocator, info, {});
     image_handle = *null_image;
     for (u32 i = 0; i < Shader::NUM_TEXTURE_TYPES; i++) {
@@ -5412,6 +5421,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .pQueueFamilyIndices = nullptr,
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         };
+        const MemoryTagScope memory_tag{MemoryTag::TextureHelper};
         vk::Image decode = memory_allocator.TryCreateImage(decode_ci, true);
         if (!decode && !free_transcodes.empty()) {
             // The GPU is done with these: their memory goes back to the driver now.
