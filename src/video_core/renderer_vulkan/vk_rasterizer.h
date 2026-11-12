@@ -459,7 +459,12 @@ private:
     };
     std::vector<MeshArena> mesh_arenas;
     size_t mesh_arena_current{~size_t{}};
-    u64 mesh_arena_size{64ULL << 20};
+    u64 mesh_arena_size{32ULL << 20};
+    u64 mesh_need_peak{};      ///< Most bytes a counted submission asked for, since the last line
+    u64 mesh_need_previous_peak{}; ///< The same over the 3600 submissions before
+    u32 mesh_arena_pressure{}; ///< Host memory pressure generation the arenas last saw
+    u64 mesh_need_counted{};   ///< Submissions counted since the last line
+    u64 mesh_arena_waits{};    ///< Waits for an arena's submission since the last line
     /// The current submission's arena, after its counter is reset.
     const MeshArena& AcquireMeshArena();
 

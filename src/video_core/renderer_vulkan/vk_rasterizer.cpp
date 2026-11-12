@@ -401,6 +401,17 @@ const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
     if (mesh_arena_current < mesh_arenas.size() && mesh_arenas[mesh_arena_current].tick == tick) {
         return mesh_arenas[mesh_arena_current];
     }
+    // At most MaxMeshArenas submissions in flight hold one: past that, wait for the oldest rather
+    // than make another (early staging submits during a scene load made one per submission).
+    constexpr size_t MaxMeshArenas = 4;
+    if (mesh_arenas.size() >= MaxMeshArenas &&
+        std::ranges::none_of(mesh_arenas, [this](const MeshArena& arena) {
+            return arena.counted || scheduler.IsFree(arena.tick);
+        })) {
+        const auto oldest{std::ranges::min_element(mesh_arenas, {}, &MeshArena::tick)};
+        scheduler.Wait(oldest->tick);
+        ++mesh_arena_waits;
+    }
     // A finished submission's counter holds the words its draws asked for, including those
     // that did not fit: grow later arenas to hold them.
     const u64 max_size{(std::min)(u64{1} << 30, u64{device.GetMaxStorageBufferRange()})};
@@ -413,15 +424,41 @@ const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
         u32 words;
         std::memcpy(&words, arena.counter.Mapped().data(), sizeof(words));
         const u64 needed{u64{words} * 4};
+        mesh_need_peak = (std::max)(mesh_need_peak, needed);
+        if (++mesh_need_counted % 3600 == 0) {
+            LOG_INFO(Common_Memory,
+                     "Mesh emulation arenas: {} of {} MiB; the last 3600 submissions asked for at "
+                     "most {:.1f} MiB; {} waits for a submission's arena",
+                     mesh_arenas.size(), mesh_arena_size >> 20,
+                     static_cast<double>(mesh_need_peak) / (1 << 20), mesh_arena_waits);
+            mesh_need_previous_peak = mesh_need_peak;
+            mesh_need_peak = 0;
+            mesh_arena_waits = 0;
+        }
         if (needed > arena.size && mesh_arena_size < max_size) {
             mesh_arena_size = (std::min)(std::bit_ceil(needed + needed / 4), max_size);
-            LOG_INFO(Render_Vulkan, "Mesh emulation: a submission needed {} MiB of output, arenas "
+            LOG_INFO(Common_Memory, "Mesh emulation: a submission needed {} MiB of output, arenas "
                                     "grow to {} MiB",
                      needed >> 20, mesh_arena_size >> 20);
         }
     }
+    // Host memory pressure: arenas shrink to what recent submissions asked for, with half of it
+    // again as margin (they grow back from the counter if a submission needs more).
+    if (const u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
+        pressure != mesh_arena_pressure) {
+        mesh_arena_pressure = pressure;
+        constexpr u64 MinArenaSize = 8ULL << 20;
+        const u64 recent{(std::max)(mesh_need_peak, mesh_need_previous_peak)};
+        const u64 target{(std::max)(std::bit_ceil(recent + recent / 2), MinArenaSize)};
+        if (target < mesh_arena_size) {
+            LOG_INFO(Common_Memory,
+                     "Mesh emulation: host memory pressure, arenas shrink from {} to {} MiB",
+                     mesh_arena_size >> 20, target >> 20);
+            mesh_arena_size = target;
+        }
+    }
     std::erase_if(mesh_arenas, [&](const MeshArena& arena) {
-        return arena.counted && arena.size < mesh_arena_size;
+        return arena.counted && arena.size != mesh_arena_size;
     });
     auto it{std::ranges::find_if(mesh_arenas, [](const MeshArena& arena) { return arena.counted; })};
     if (it == mesh_arenas.end()) {
