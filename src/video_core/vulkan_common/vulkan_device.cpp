@@ -9,6 +9,7 @@
 #include <bitset>
 #include <chrono>
 #include <cstdlib>
+#include <string_view>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -712,6 +713,21 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             (std::min)(properties.properties.limits.maxVertexInputAttributes, 16U);
         properties.properties.limits.maxVertexInputBindings =
             (std::min)(properties.properties.limits.maxVertexInputBindings, 16U);
+    }
+    // MoltenVK converts 8-bit indices while it encodes each draw: it ends the Metal render pass,
+    // converts the whole bound range (to the end of the VkBuffer) into a new temporary MTLBuffer
+    // with a compute pass and starts the render pass again, about 7000 times a second in Ocarina
+    // of Time, whose first scene crashed in the Metal driver inside such a draw. Lichii widens
+    // them itself instead (BufferCacheRuntime::WidensUint8IndicesOnHost).
+    // EDEN_NX2_UINT8_INDICES=1: the driver's 8-bit indices, MoltenVK too; 0: Lichii's on any device.
+    if (extensions.index_type_uint8) {
+        const char* const uint8_env = std::getenv("EDEN_NX2_UINT8_INDICES");
+        const bool keep = uint8_env != nullptr ? std::string_view{uint8_env} != "0" : !is_mvk;
+        if (!keep) {
+            LOG_INFO(HW_GPU, "8-bit indices are widened by Lichii, not by the driver");
+            RemoveExtensionFeature(extensions.index_type_uint8, features.index_type_uint8,
+                                   VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
+        }
     }
 
     if (is_turnip || is_qualcomm) {

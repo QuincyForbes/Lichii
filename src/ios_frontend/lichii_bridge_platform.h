@@ -191,6 +191,10 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// storage when it needs the memory. Wins over the other guest memory switches.
 /// "nup_in_memory": the .nup loader keeps up to 512 MiB of decompressed files in memory, as on a
 /// computer, instead of 96 MiB with the larger files in temporary files.
+/// "no_early_submits": uploads during a scene load do not submit command buffers early
+/// (EDEN_NX2_STAGING_SUBMIT_MIB=0). "no_mesh_emulation": task/mesh draws are skipped instead of
+/// emulated with compute (EDEN_NX2_NO_MESH_EMULATION=1). "mvk_uint8_indices": MoltenVK converts
+/// 8-bit indices itself, as before (EDEN_NX2_UINT8_INDICES=1).
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
 /// Guest memory in a file: as set in Experiments ("file_guest" / "file_guest_off"), else the

@@ -226,6 +226,18 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_TRIM_ZERO", "0", 0);
         LOG_WARNING(Frontend, "iOS: experiment no_zero_trim on");
     }
+    if (lichii_platform_experiment("no_early_submits")) {
+        setenv("EDEN_NX2_STAGING_SUBMIT_MIB", "0", 0);
+        LOG_WARNING(Frontend, "iOS: experiment no_early_submits on");
+    }
+    if (lichii_platform_experiment("no_mesh_emulation")) {
+        setenv("EDEN_NX2_NO_MESH_EMULATION", "1", 0);
+        LOG_WARNING(Frontend, "iOS: experiment no_mesh_emulation on");
+    }
+    if (lichii_platform_experiment("mvk_uint8_indices")) {
+        setenv("EDEN_NX2_UINT8_INDICES", "1", 0);
+        LOG_WARNING(Frontend, "iOS: experiment mvk_uint8_indices on");
+    }
 }
 
 LichiiThermalAdvice ComputeThermalAdvice(int thermal_state, int low_power_mode) {

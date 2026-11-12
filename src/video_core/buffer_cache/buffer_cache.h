@@ -2404,6 +2404,14 @@ void BufferCache<P>::UpdateIndexBuffer() {
         }
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
             ++binding_epoch;
+            // Draws recorded before still read it (MoltenVK encodes them at submit): destroyed
+            // with the deleted buffers, not now.
+            static u32 logged{};
+            if (logged++ < 8) {
+                LOG_INFO(HW_GPU, "Inline index buffer grows from {} to {} bytes",
+                         slot_buffers[inline_buffer_id].SizeBytes(), buffer_size);
+            }
+            delayed_destruction_ring.Push(std::move(slot_buffers[inline_buffer_id]));
             slot_buffers.erase(inline_buffer_id);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }

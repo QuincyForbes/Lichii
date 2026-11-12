@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <limits>
 
 #include <boost/container/small_vector.hpp>
@@ -169,6 +170,9 @@ public:
 
     void PostCopyBarrier();
 
+    /// See StagingBufferPool::HoldSubmits.
+    void HoldStagingSubmits(bool hold) noexcept;
+
     void ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t size, u32 value);
 
     /// Switch 2: mesh task indirect commands {count, 1, 1} for the counts GPU-written command
@@ -183,7 +187,12 @@ public:
     void BindQuadIndexBuffer(PrimitiveTopology topology, u32 first, u32 count);
 
     bool WidensUint8IndicesOnHost() const {
-        return device.IsMoltenVK() && !device.IsExtIndexTypeUint8Supported();
+        // EDEN_NX2_UINT8_INDICES=0 (vulkan_device.cpp): the MoltenVK path on any device.
+        static const bool forced = [] {
+            const char* const env = std::getenv("EDEN_NX2_UINT8_INDICES");
+            return env != nullptr && env[0] == '0';
+        }();
+        return (device.IsMoltenVK() || forced) && !device.IsExtIndexTypeUint8Supported();
     }
 
     void BindHostUint8IndexBuffer(std::span<const u8> indices);

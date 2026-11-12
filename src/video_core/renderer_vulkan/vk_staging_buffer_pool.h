@@ -65,6 +65,12 @@ public:
     /// and waits for the GPU while the pooled upload buffers pass the cap. True if it submitted.
     bool BoundUploads();
 
+    /// While a draw's vertex and index buffers are recorded and the draw is not, BoundUploads
+    /// does not submit: the draw would land in a command buffer without them.
+    void HoldSubmits(bool hold) noexcept {
+        submits_held = hold;
+    }
+
     [[nodiscard]] VkDeviceSize StreamBufferSize() const noexcept {
         return stream_buffer_size;
     }
@@ -181,6 +187,8 @@ private:
     u64 cap_waits{};
     u64 low_memory_cap_waits{}; ///< Early submits that found under twice the low-water mark left
     u64 upload_pool_peak{};
+    bool submits_held{};
+    u64 held_submits{};        ///< Early submits put off inside a draw since the last log line
 
     StagingBuffersCache device_local_cache;
     StagingBuffersCache upload_cache;

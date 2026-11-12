@@ -3207,6 +3207,17 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             eligible = emulated || key.unique_hashes[index] == 0 ||
                        programs[index].stage == Shader::Stage::Fragment;
         }
+        // EDEN_NX2_NO_MESH_EMULATION=1: skip them all, as before mesh emulation.
+        static const bool no_emulation{std::getenv("EDEN_NX2_NO_MESH_EMULATION") != nullptr};
+        if (no_emulation) {
+            static std::atomic<bool> logged{};
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                LOG_WARNING(Render_Vulkan,
+                            "Mesh emulation off (EDEN_NX2_NO_MESH_EMULATION): task/mesh draws "
+                            "are skipped");
+            }
+            return nullptr;
+        }
         if (!eligible) {
             return nullptr;
         }
