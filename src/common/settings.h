@@ -308,6 +308,15 @@ struct Values {
                                            true,
                                            &use_custom_cpu_ticks};
 
+    // A guest thread that yields to nobody, or polls the counter, for 2 ms sleeps a little
+    // (EDEN_NX2_YIELD_BACKOFF / EDEN_NX2_CLOCK_POLL_SLEEP override it).
+    SwitchableSetting<bool> guest_wait_backoff{linkage, false, "guest_wait_backoff",
+                                               Category::Cpu};
+    // Where the fastmem arena is smaller than the guest address space (phones), accesses past it
+    // take the slow path instead of an inline page table walk at every load and store.
+    Setting<bool> cpuopt_compact_jit_code{linkage, true, "cpuopt_compact_jit_code",
+                                          Category::Cpu};
+
     Setting<bool> cpuopt_page_tables{linkage, true, "cpuopt_page_tables", Category::CpuDebug};
     Setting<bool> cpuopt_block_linking{linkage, true, "cpuopt_block_linking", Category::CpuDebug};
     Setting<bool> cpuopt_return_stack_buffer{linkage, true, "cpuopt_return_stack_buffer",

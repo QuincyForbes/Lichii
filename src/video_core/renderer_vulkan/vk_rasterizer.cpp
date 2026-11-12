@@ -3633,6 +3633,8 @@ void RasterizerVulkan::TickPerfReport() {
         perf_report_counters = Common::PerfReport::Read();
         perf_report_churn = VideoCommon::Churn::Read();
         perf_report_cpu = Common::DkbCpuTrace::ReadSnapshot();
+        perf_report_process_cpu = Common::PerfReport::ReadProcessCpu();
+        perf_report_placement = Common::PerfReport::ReadPlacement();
         perf_frame_max_ms = 0.0;
         return;
     }
@@ -3758,6 +3760,85 @@ void RasterizerVulkan::TickPerfReport() {
              per_second(churned(VideoCommon::Churn::BuffersCreated)), buffers >> 20,
              buffers_collect >> 20,
              available != 0 ? fmt::format("{}", available >> 20) : std::string{"?"});
+    // The guest CPU's own costs: the JIT's compiles and faults, and what guest code asks of the
+    // host per second (all guest cores together).
+    const auto process_cpu = Common::PerfReport::ReadProcessCpu();
+    std::string host_cpu_text;
+    if (process_cpu && perf_report_process_cpu &&
+        process_cpu->cpu_ns > perf_report_process_cpu->cpu_ns) {
+        const u64 cpu_ns = process_cpu->cpu_ns - perf_report_process_cpu->cpu_ns;
+        const u64 performance_ns =
+            process_cpu->performance_ns - perf_report_process_cpu->performance_ns;
+        const u64 energy_nj = process_cpu->energy_nj - perf_report_process_cpu->energy_nj;
+        host_cpu_text = fmt::format(
+            " | process CPU {:.0f}%, {:.0f}% of it on performance cores, {:.2f} W",
+            static_cast<double>(cpu_ns) / 1e7 / seconds,
+            100.0 * static_cast<double>(performance_ns) / static_cast<double>(cpu_ns),
+            static_cast<double>(energy_nj) / 1e9 / seconds);
+    }
+    const auto placement = Common::PerfReport::ReadPlacement();
+    if (const u32 high_first = Common::PerfReport::HighCpuFirst(); high_first != 0) {
+        std::string cores;
+        for (size_t core = 0; core < Common::PerfReport::PlacementCores; ++core) {
+            const u64 samples = placement.samples[core] - perf_report_placement.samples[core];
+            const u64 high = placement.high[core] - perf_report_placement.high[core];
+            cores += samples == 0 ? std::string{" -"}
+                                  : fmt::format(" {:.0f}%", 100.0 * static_cast<double>(high) /
+                                                                static_cast<double>(samples));
+        }
+        host_cpu_text += fmt::format(" | guest cores on CPU {}+ (performance):{}", high_first, cores);
+    }
+    std::array<u64, 256> svcs{};
+    std::array<std::pair<u64, size_t>, 256> svc_rank{};
+    for (size_t i = 0; i < svcs.size(); ++i) {
+        svcs[i] = Common::PerfReport::g_svc_counts[i].load(std::memory_order_relaxed);
+        svc_rank[i] = {svcs[i] - perf_report_svcs[i], i};
+    }
+    std::partial_sort(svc_rank.begin(), svc_rank.begin() + 6, svc_rank.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string svc_text;
+    for (size_t i = 0; i < 6 && svc_rank[i].first != 0; ++i) {
+        svc_text += fmt::format("{}{:#04x} {:.0f}", i == 0 ? " (" : ", ", svc_rank[i].second,
+                                per_second(svc_rank[i].first));
+    }
+    if (!svc_text.empty()) {
+        svc_text += ")";
+    }
+    perf_report_svcs = svcs;
+    std::string cache_text;
+    if (const u64 cache_size = Common::PerfReport::g_code_cache_size.load(std::memory_order_relaxed);
+        cache_size != 0) {
+        cache_text = " (MiB used of " + std::to_string(cache_size >> 20) + ":";
+        for (const auto& used : Common::PerfReport::g_code_cache_used) {
+            cache_text += fmt::format(" {:.1f}", static_cast<double>(used.load(std::memory_order_relaxed)) /
+                                                     static_cast<double>(1 << 20));
+        }
+        cache_text += ")";
+    }
+    const double compile_ms = static_cast<double>(delta(Common::PerfReport::JitCompileNs)) / 1e6;
+    LOG_INFO(Common_Memory,
+             "Perf JIT: {:.0f} blocks compiled/s, {:.1f} ms/s compiling, {} code cache flushes{}, "
+             "{:.1f} fastmem faults/s, {:.0f} blocks invalidated/s | guest events/s: SVCs {:.0f}{}, "
+             "memory callbacks: reads {:.0f}, writes {:.0f}, clock reads {:.0f} (callback), "
+             "WFE/YIELD {:.0f}, clock poll sleeps {:.0f} ({:.1f} ms/s), yields to nobody {:.0f}, "
+             "yield sleeps {:.0f} ({:.1f} ms/s){}",
+             per_second(delta(Common::PerfReport::JitBlocksCompiled)), compile_ms / seconds,
+             delta(Common::PerfReport::JitCacheFlushes), cache_text,
+             per_second(delta(Common::PerfReport::JitFastmemFaults)),
+             per_second(delta(Common::PerfReport::JitBlocksInvalidated)),
+             per_second(delta(Common::PerfReport::GuestSvcs)), svc_text,
+             per_second(delta(Common::PerfReport::GuestSlowReads)),
+             per_second(delta(Common::PerfReport::GuestSlowWrites)),
+             per_second(delta(Common::PerfReport::GuestClockReads)),
+             per_second(delta(Common::PerfReport::GuestSpinHints)),
+             per_second(delta(Common::PerfReport::GuestClockWaits)),
+             static_cast<double>(delta(Common::PerfReport::GuestClockWaitNs)) / 1e6 / seconds,
+             per_second(delta(Common::PerfReport::GuestFutileYields)),
+             per_second(delta(Common::PerfReport::GuestYieldSleeps)),
+             static_cast<double>(delta(Common::PerfReport::GuestYieldSleepNs)) / 1e6 / seconds,
+             host_cpu_text);
+    perf_report_process_cpu = process_cpu;
+    perf_report_placement = placement;
     perf_report_start = now;
     perf_report_counters = counters;
     perf_report_churn = churn;

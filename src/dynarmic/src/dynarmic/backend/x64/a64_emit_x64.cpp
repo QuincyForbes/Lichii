@@ -77,6 +77,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
 
     if (conf.fastmem_pointer.has_value()) {
         exception_handler.SetFastmemCallback([this](u64 rip_) {
+            A64::AddJitStat(this->conf.jit_stats, A64::JitStat::FastmemFaults);
             return FastmemCallback(rip_);
         });
     }
@@ -270,7 +271,9 @@ void A64EmitX64::ClearCache() {
 }
 
 void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
+    const auto blocks = block_ranges.InvalidateRanges(ranges);
+    A64::AddJitStat(conf.jit_stats, A64::JitStat::BlocksInvalidated, blocks.size());
+    InvalidateBasicBlocks(blocks);
 }
 
 void A64EmitX64::ClearFastDispatchTable() {

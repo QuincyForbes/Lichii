@@ -8,11 +8,14 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 #include <fmt/format.h>
 #if defined(_M_X64) || defined(__x86_64__)
@@ -24,6 +27,7 @@
 #if defined(__APPLE__) && TARGET_OS_IPHONE
 #include "common/ios_jit.h"
 #endif
+#include "common/perf_report.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -53,6 +57,37 @@ u32 Nx2DispatchBits() {
     }
     const long bits = std::strtol(value, nullptr, 10);
     return bits >= 8 && bits <= 24 ? u32(bits) : 0;
+}
+
+struct ClockPollSleep {
+    std::optional<bool> forced; ///< From the environment; otherwise the guest_wait_backoff setting
+    u64 gate_us; ///< Polling this long before the first sleep
+    u64 min_us;
+    u64 cap_us;
+
+    bool Enabled() const {
+        return forced ? *forced : Settings::values.guest_wait_backoff.GetValue();
+    }
+};
+
+/// EDEN_NX2_CLOCK_POLL_SLEEP: 0 off, 1 on, or <gate us>:<cap us>; unset follows guest_wait_backoff.
+const ClockPollSleep& ClockPollSleepSetting() {
+    static const ClockPollSleep setting = [] {
+        ClockPollSleep result{std::nullopt, 2000, 10, 200};
+        const char* value = std::getenv("EDEN_NX2_CLOCK_POLL_SLEEP");
+        if (value == nullptr || value[0] == '\0') {
+            return result;
+        }
+        result.forced = value[0] != '0';
+        if (const char* colon = std::strchr(value, ':')) {
+            result.gate_us = std::strtoull(value, nullptr, 10);
+            result.cap_us = (std::max)(u64{10}, std::strtoull(colon + 1, nullptr, 10));
+        }
+        LOG_INFO(Core_ARM, "Clock poll sleep: {} (after {} us of polling, {}-{} us)",
+                 *result.forced ? "on" : "off", result.gate_us, result.min_us, result.cap_us);
+        return result;
+    }();
+    return setting;
 }
 
 constexpr u32 NoRegister = 32;
@@ -252,6 +287,7 @@ DynarmicCallbacks64::DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess
 {}
 
 u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {
+    ++m_slow_reads;
     CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Read);
     u64 value{};
     switch (size) {
@@ -278,6 +314,7 @@ u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {
     return value;
 }
 Dynarmic::A64::Vector DynarmicCallbacks64::MemoryRead128(u64 vaddr) {
+    ++m_slow_reads;
     CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Read);
     return {m_memory.Read64(vaddr), m_memory.Read64(vaddr + 8)};
 }
@@ -303,6 +340,7 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
 }
 
 void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) {
+    ++m_slow_writes;
     if (CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Write)) {
         switch (size) {
         case sizeof(u64): return m_memory.Write64(vaddr, u64(value));
@@ -314,6 +352,7 @@ void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std
     }
 }
 void DynarmicCallbacks64::MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value) {
+    ++m_slow_writes;
     if (CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Write)) {
         m_memory.Write64(vaddr, value[0]);
         m_memory.Write64(vaddr + 8, value[1]);
@@ -431,6 +470,7 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
     switch (exception) {
     case Dynarmic::A64::Exception::WaitForEvent:
     case Dynarmic::A64::Exception::Yield: {
+        ++m_spin_hints;
         // A guest spin-wait hint: give the SMT sibling the core for a moment, as GetCNTPCT does.
         // EDEN_NX2_HINT_PAUSE=0 turns it off.
         [[maybe_unused]] static const bool hint_pause = Nx2EnvOn("EDEN_NX2_HINT_PAUSE");
@@ -466,6 +506,9 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
 }
 
 void DynarmicCallbacks64::CallSVC(u32 svc) {
+    ++m_svcs;
+    ++m_svc_counts[svc & 0xFF];
+    ++m_svcs_pending;
     m_parent.m_svc = svc;
     m_parent.m_jit->HaltExecution(SupervisorCall);
 }
@@ -489,6 +532,7 @@ u64 DynarmicCallbacks64::GetTicksRemaining() {
 }
 
 u64 DynarmicCallbacks64::GetCNTPCT() {
+    ++m_clock_reads;
     const u64 ticks = m_parent.m_system.CoreTiming().GetClockTicks();
     // Guest code that waits by polling the counter (title 1's main thread reads it ~17 million
     // times a second while waiting for the GPU) keeps a host core busy at full speed, and the
@@ -508,6 +552,30 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
 #elif defined(__aarch64__)
         asm volatile("yield");
 #endif
+        // A poll that has run for the whole gate waits for a time or for another thread, not
+        // for itself: sleep an eighth of the run so far (cap/min below) so the host core can run
+        // something else. The guest then reads the counter after the sleep. On a phone with two
+        // performance cores a polling guest core otherwise holds one of them at full speed.
+        if (const ClockPollSleep& poll = ClockPollSleepSetting(); poll.Enabled()) {
+            if (m_poll_start == 0) {
+                m_poll_start = ticks;
+            } else if (const u64 run = ticks - m_poll_start; run > m_poll_gate_ticks) {
+                const u64 run_us = run * 1'000'000 / m_cntfrq;
+                const u64 sleep_us = std::clamp<u64>(run_us / 8, poll.min_us, poll.cap_us);
+                const auto start = std::chrono::steady_clock::now();
+                std::this_thread::sleep_for(std::chrono::microseconds{sleep_us});
+                ++m_clock_waits;
+                m_clock_wait_ns += static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count());
+                const u64 after = m_parent.m_system.CoreTiming().GetClockTicks();
+                m_last_cntpct = after;
+                return after;
+            }
+        }
+    } else {
+        m_poll_start = 0;
     }
     m_last_cntpct = ticks;
     return ticks;
@@ -593,6 +661,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // 31.25 MHz for Switch 2 titles (Common::WallClock::SetGuestCNTFRQ, set at boot).
     config.cntfrq_el0 = static_cast<u32>(Common::g_wall_clock.GetGuestCNTFRQ());
     m_cb->m_spin_ticks = config.cntfrq_el0 / 600'000;
+    m_cb->m_cntfrq = (std::max)(config.cntfrq_el0, 1U);
+    m_cb->m_poll_gate_ticks = ClockPollSleepSetting().gate_us * m_cb->m_cntfrq / 1'000'000;
 
     // Unpredictable instructions
     config.define_unpredictable_behaviour = true;
@@ -736,6 +806,31 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         }
     }
 #endif
+    // Diagnostic: EDEN_NX2_FASTMEM_BITS=<n> bounds fastmem to the low 2^n bytes of the guest
+    // address space as on a phone, the rest going through the page table.
+    if (const char* bits = std::getenv("EDEN_NX2_FASTMEM_BITS"); bits && config.fastmem_pointer) {
+        const auto value = static_cast<std::uint32_t>(std::strtoul(bits, nullptr, 10));
+        if (value >= 32 && value < address_space_bits) {
+            config.fastmem_address_space_bits = value;
+        }
+    }
+    // cpuopt_compact_jit_code (EDEN_NX2_JIT_PT_FALLBACK=1/0 overrides): accesses past the fastmem
+    // arena use the memory callbacks instead of an inline page table walk emitted next to every
+    // load and store. With the phone's 32 GiB arena that walk made 2.1x the code (x64, 35-bit
+    // bounds: 196 vs 92 MiB on core 0 in Kokiri) while the compact layout (k_page_table_base.cpp)
+    // left ~85,000 accesses a second past the arena.
+    static const char* const pt_fallback = std::getenv("EDEN_NX2_JIT_PT_FALLBACK");
+    // Only with that layout: the alias region (the busiest one past the heap) starting inside the
+    // arena.
+    const auto& kernel_table = m_cb->m_process->GetPageTable().GetBasePageTable();
+    const bool alias_in_arena =
+        config.fastmem_pointer &&
+        GetInteger(kernel_table.GetAliasRegionStart()) <
+            (u64{1} << (std::min)(config.fastmem_address_space_bits, std::uint32_t{63}));
+    config.inline_page_table_fallback =
+        pt_fallback != nullptr
+            ? pt_fallback[0] != '0'
+            : !(Settings::values.cpuopt_compact_jit_code.GetValue() && alias_in_arena);
 #if defined(ARCHITECTURE_x86_64)
     // x86-64 is TSO: LDAPR/LDAR/LDAXR need no locked RMW (STLR keeps XCHG), and DMB xxLD/xxST
     // order nothing TSO does not already order. Ocarina of Time has ~68k LDAPRB sites (static
@@ -813,17 +908,60 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     }();
     config.jit_counters = jit_map;
 #endif
+    if (Common::PerfReport::Enabled()) {
+        static_assert(Common::PerfReport::JitBlocksInvalidated - Common::PerfReport::JitBlocksCompiled + 1 ==
+                      static_cast<std::size_t>(Dynarmic::A64::JitStat::Count));
+        config.jit_stats = &Common::PerfReport::g_counters[Common::PerfReport::JitBlocksCompiled];
+        if (page_table && m_core_index < Common::PerfReport::g_code_cache_used.size()) {
+            config.code_cache_used = &Common::PerfReport::g_code_cache_used[m_core_index];
+            Common::PerfReport::g_code_cache_size.store(config.code_cache_size,
+                                                        std::memory_order_relaxed);
+        }
+    }
     m_jit.emplace(config);
+}
+
+void ArmDynarmic64::FlushGuestEvents() {
+    if (!Common::PerfReport::Enabled()) {
+        return;
+    }
+    DynarmicCallbacks64& cb = *m_cb;
+    const auto flush = [](u64& count, Common::PerfReport::Counter counter) {
+        if (count != 0) {
+            Common::PerfReport::Add(counter, count);
+            count = 0;
+        }
+    };
+    flush(cb.m_svcs, Common::PerfReport::GuestSvcs);
+    if (cb.m_svcs_pending >= 1024) {
+        cb.m_svcs_pending = 0;
+        for (size_t i = 0; i < cb.m_svc_counts.size(); ++i) {
+            if (cb.m_svc_counts[i] != 0) {
+                Common::PerfReport::g_svc_counts[i].fetch_add(cb.m_svc_counts[i], std::memory_order_relaxed);
+                cb.m_svc_counts[i] = 0;
+            }
+        }
+    }
+    flush(cb.m_slow_reads, Common::PerfReport::GuestSlowReads);
+    flush(cb.m_slow_writes, Common::PerfReport::GuestSlowWrites);
+    flush(cb.m_clock_reads, Common::PerfReport::GuestClockReads);
+    flush(cb.m_spin_hints, Common::PerfReport::GuestSpinHints);
+    flush(cb.m_clock_waits, Common::PerfReport::GuestClockWaits);
+    flush(cb.m_clock_wait_ns, Common::PerfReport::GuestClockWaitNs);
 }
 
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     m_jit->ClearExclusiveState();
-    return TranslateHaltReason(m_jit->Run());
+    const HaltReason hr = TranslateHaltReason(m_jit->Run());
+    FlushGuestEvents();
+    return hr;
 }
 
 HaltReason ArmDynarmic64::StepThread(Kernel::KThread* thread) {
     m_jit->ClearExclusiveState();
-    return TranslateHaltReason(m_jit->Step());
+    const HaltReason hr = TranslateHaltReason(m_jit->Step());
+    FlushGuestEvents();
+    return hr;
 }
 
 u32 ArmDynarmic64::GetSvcNumber() const {

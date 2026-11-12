@@ -503,6 +503,8 @@ void* EmitWrappedAtomicCallTrampoline(
 A64AddressSpace::A64AddressSpace(const A64::UserConfig& conf)
         : AddressSpace(conf.code_cache_size)
         , conf(conf) {
+    jit_stats = conf.jit_stats;
+    code_cache_used = conf.code_cache_used;
     atomic_ctx.conf = &this->conf;
     if (this->conf.HasOptimization(OptimizationFlag::FastDispatch) && Arm64EnvOn("EDEN_NX2_JIT_DISPATCH")) {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -541,7 +543,9 @@ void A64AddressSpace::GenerateIR(IR::Block& ir_block, IR::LocationDescriptor des
 }
 
 void A64AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
+    const auto blocks = block_ranges.InvalidateRanges(ranges);
+    A64::AddJitStat(jit_stats, A64::JitStat::BlocksInvalidated, blocks.size());
+    InvalidateBasicBlocks(blocks);
 }
 
 void A64AddressSpace::ClearFastDispatchTable() {
@@ -889,6 +893,7 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
         .recompile_on_exclusive_fastmem_failure = conf.recompile_on_exclusive_fastmem_failure,
         .fastmem_address_space_bits = conf.fastmem_address_space_bits,
         .silently_mirror_fastmem = conf.silently_mirror_fastmem,
+        .inline_page_table_fallback = conf.inline_page_table_fallback,
 
         .wall_clock_cntpct = conf.wall_clock_cntpct,
         .enable_cycle_counting = conf.enable_cycle_counting,

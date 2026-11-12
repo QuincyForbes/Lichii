@@ -9,6 +9,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -84,6 +86,9 @@ protected:
     FakeCall FastmemCallback(u64 host_pc);
 
     IR::Block ir_block;
+    /// UserConfig::jit_stats of the A64 front end (null: not counted).
+    std::atomic<std::uint64_t>* jit_stats = nullptr;
+    std::atomic<std::uint64_t>* code_cache_used = nullptr;
     const std::size_t code_cache_size;
     u64 cache_generation = 0;
     std::size_t dropped_writable_offset = 0;

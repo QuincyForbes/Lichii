@@ -190,6 +190,10 @@ void RecommendApple(const Device& device, Profile& p) {
         "Off: on unified memory the readback is still a fence wait.");
     Add(p, v.moltenvk_driver, MoltenVkDriver::Legacy,
         "Legacy MoltenVK until a device run proves the native mesh shader one.");
+    Add(p, v.guest_wait_backoff, true,
+        "On: a game thread that yields or polls the clock for 2 ms sleeps instead of holding one "
+        "of the two performance cores (nxnative measured 78 -> 19 % of a core in Fire Emblem: "
+        "Three Houses this way). Ocarina of Time never waits that long on a PC.");
     AddApp(p, "guest_memory_file", true,
            "Guest memory in a file, outside the memory iOS counts: 1.6-1.8 GiB footprint on "
            "builds 56-59; without it iOS closed the game at 6485 of 6656 MiB (build 54). Needs "

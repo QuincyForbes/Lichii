@@ -279,9 +279,11 @@ private:
             // Immediately evacuate cache
             invalidate_entire_cache = true;
             PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
+            AddJitStat(conf.jit_stats, JitStat::CacheFlushes);
         }
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
 
+        const auto start = conf.jit_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // JIT Compile
         const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
@@ -289,7 +291,18 @@ private:
         ir_block.Reset(arch_descriptor);
         A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, true, conf.elide_ld_st_barriers, conf.native_lse_atomics});
         Optimization::Optimize(ir_block, conf, polyfill_options);
-        return emitter.Emit(ir_block).entrypoint;
+        const CodePtr entrypoint = emitter.Emit(ir_block).entrypoint;
+        if (conf.code_cache_used) {
+            conf.code_cache_used->store(block_of_code.CodeBytesUsed(), std::memory_order_relaxed);
+        }
+        if (conf.jit_stats) {
+            AddJitStat(conf.jit_stats, JitStat::BlocksCompiled);
+            AddJitStat(conf.jit_stats, JitStat::CompileNs,
+                       static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - start)
+                                            .count()));
+        }
+        return entrypoint;
     }
 
     void PerformRequestedCacheInvalidation(HaltReason hr) {

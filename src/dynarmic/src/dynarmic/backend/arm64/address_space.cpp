@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 
 #ifdef __APPLE__
@@ -98,8 +99,19 @@ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
     if (CodePtr block_entry = Get(descriptor)) {
         return block_entry;
     }
+    if (jit_stats == nullptr) {
+        GenerateIR(ir_block, descriptor);
+        return Emit(std::move(ir_block));
+    }
+    const auto start = std::chrono::steady_clock::now();
     GenerateIR(ir_block, descriptor);
-    return Emit(std::move(ir_block));
+    const CodePtr entry_point = Emit(std::move(ir_block));
+    A64::AddJitStat(jit_stats, A64::JitStat::BlocksCompiled);
+    A64::AddJitStat(jit_stats, A64::JitStat::CompileNs,
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - start)
+                                         .count()));
+    return entry_point;
 }
 
 CodePtr AddressSpace::GetOrEmitFromDispatcher(IR::LocationDescriptor descriptor, StackLayout& stack) {
@@ -165,6 +177,7 @@ CodePtr AddressSpace::Emit(IR::Block block) {
                      code_cache_size >> 20, full_flushes.fetch_add(1, std::memory_order_relaxed) + 1);
 #endif
         ClearCache();
+        A64::AddJitStat(jit_stats, A64::JitStat::CacheFlushes);
     }
 
     UnprotectCodeMemory();
@@ -202,6 +215,9 @@ CodePtr AddressSpace::Emit(IR::Block block) {
 #endif
 
     RegisterNewBasicBlock(block, stored_info);
+    if (code_cache_used != nullptr) {
+        code_cache_used->store(static_cast<std::uint64_t>(code.offset()), std::memory_order_relaxed);
+    }
 
     return entry_point;
 }
@@ -443,6 +459,7 @@ void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor,
 }
 
 FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
+    A64::AddJitStat(jit_stats, A64::JitStat::FastmemFaults);
     {
         const auto host_ptr = std::bit_cast<CodePtr>(host_pc);
 

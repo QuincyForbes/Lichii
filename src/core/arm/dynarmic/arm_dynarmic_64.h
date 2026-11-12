@@ -71,6 +71,19 @@ public:
     u64 m_tpidr_el0{};
     u64 m_last_cntpct{}; ///< The previous counter read (GetCNTPCT spin detection)
     u64 m_spin_ticks{32}; ///< Reads closer than this (~1.7 us) count as a polling loop
+    // Perf report counts of this core, added to the totals when the JIT returns.
+    u64 m_svcs{};
+    u32 m_svcs_pending{};
+    std::array<u32, 256> m_svc_counts{};
+    u64 m_slow_reads{};
+    u64 m_slow_writes{};
+    u64 m_clock_reads{};
+    u64 m_spin_hints{};
+    u64 m_clock_waits{};
+    u64 m_clock_wait_ns{};
+    u64 m_poll_start{}; ///< Counter value at the first read of the current polling run (0: none)
+    u64 m_poll_gate_ticks{};
+    u64 m_cntfrq{1};
     Kernel::KProcess* m_process{};
     std::shared_ptr<WindowTrace::Session> m_window_trace;
     const bool m_debugger_enabled{};
@@ -115,6 +128,8 @@ private:
     friend class DynarmicCallbacks64;
 
     void MakeJit(Common::PageTable* page_table, std::size_t address_space_bits);
+    /// Adds this core's callback counts to the perf report.
+    void FlushGuestEvents();
     std::optional<DynarmicCallbacks64> m_cb{};
     std::size_t m_core_index{};
 

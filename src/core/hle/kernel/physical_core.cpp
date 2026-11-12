@@ -159,6 +159,7 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
                 hr = interface->RunThread(thread);
             }
             Common::PerfReport::MarkGuest(Common::PerfReport::GuestRunNs);
+            Common::PerfReport::SampleGuestCorePlacement(m_core_index);
 
             ExitContext();
         }

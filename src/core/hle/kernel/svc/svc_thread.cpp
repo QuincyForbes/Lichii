@@ -4,12 +4,19 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <optional>
 #include <thread>
 
+#include "common/perf_report.h"
 #include "common/scope_exit.h"
+#include "common/settings.h"
+#include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_hardware_timer.h"
@@ -39,6 +46,93 @@ constexpr u64 FoldExtraCoreMask(u64 mask) {
     return (mask & low) | ((mask >> Core::Hardware::NUM_CPU_CORES) & low);
 }
 
+struct YieldBackoff {
+    std::optional<bool> forced; ///< From the environment; otherwise the guest_wait_backoff setting
+    u64 gate_ns; ///< Yielding to nobody this long before the first sleep
+    u64 min_ns;
+    u64 cap_ns;
+};
+
+/// EDEN_NX2_YIELD_BACKOFF: 0 off, 1 on, or <gate us>:<cap us>; unset follows guest_wait_backoff.
+const YieldBackoff& YieldBackoffSetting() {
+    static const YieldBackoff setting = [] {
+        YieldBackoff result{std::nullopt, 2'000'000, 10'000, 200'000};
+        const char* value = std::getenv("EDEN_NX2_YIELD_BACKOFF");
+        if (value == nullptr || value[0] == '\0') {
+            return result;
+        }
+        result.forced = value[0] != '0';
+        if (const char* colon = std::strchr(value, ':')) {
+            result.gate_ns = std::strtoull(value, nullptr, 10) * 1000;
+            result.cap_ns = (std::max)(u64{10}, std::strtoull(colon + 1, nullptr, 10)) * 1000;
+        }
+        LOG_INFO(Kernel_SVC, "Yield backoff: {} (after {} us of yields to nobody, {}-{} us)",
+                 *result.forced ? "on" : "off", result.gate_ns / 1000, result.min_ns / 1000,
+                 result.cap_ns / 1000);
+        return result;
+    }();
+    return setting;
+}
+
+/// On the Switch a yield with nothing else to run costs nothing, so guest code waits for other
+/// threads by yielding in a loop. Here each pass is a host round trip that keeps a host core busy
+/// (on a phone, one of its two performance cores). A thread that has yielded to nobody for the
+/// whole gate with the same callee-saved registers (a poll keeps its state there; a loop that
+/// works between yields changes them) sleeps an eighth of the run so far instead: its guest core
+/// idles, and anything that becomes runnable there runs at once.
+void YieldBackoffAfterYield(Core::System& system) {
+    auto& kernel = system.Kernel();
+    KThread& thread = GetCurrentThread(kernel);
+    KProcess& process = GetCurrentProcess(kernel);
+    if (thread.GetYieldScheduleCount() != process.GetScheduledCount()) {
+        // Another thread runs next: a real yield.
+        thread.m_nx2_yield_run_start = 0;
+        return;
+    }
+    Common::PerfReport::Add(Common::PerfReport::GuestFutileYields);
+    if (!YieldBackoffEnabled()) {
+        return;
+    }
+    const YieldBackoff& setting = YieldBackoffSetting();
+    const auto steady_ns = [] {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    };
+    const u64 now = steady_ns();
+    Svc::ThreadContext context{};
+    if (auto* arm = process.GetArmInterface(kernel.CurrentPhysicalCoreIndex())) {
+        arm->GetContext(context);
+    }
+    u64 regs = 0;
+    for (size_t i = 19; i <= 28; ++i) {
+        regs = (regs ^ context.r[i]) * 0x100000001B3ULL;
+    }
+    constexpr u64 MaxGapNs = 100'000;
+    if (thread.m_nx2_yield_run_start == 0 || now - thread.m_nx2_yield_last > MaxGapNs ||
+        regs != thread.m_nx2_yield_regs) {
+        thread.m_nx2_yield_run_start = now;
+        thread.m_nx2_yield_last = now;
+        thread.m_nx2_yield_regs = regs;
+        return;
+    }
+    thread.m_nx2_yield_last = now;
+    const u64 run = now - thread.m_nx2_yield_run_start;
+    if (run < setting.gate_ns) {
+        return;
+    }
+    const u64 sleep_ns = std::clamp(run / 8, setting.min_ns, setting.cap_ns);
+    s64 timeout = kernel.HardwareTimer().GetTick() + static_cast<s64>(sleep_ns) + 2;
+    if (timeout <= 0) {
+        timeout = (std::numeric_limits<s64>::max)();
+    }
+    static_cast<void>(thread.Sleep(kernel, timeout));
+    const u64 after = steady_ns();
+    thread.m_nx2_yield_last = after;
+    Common::PerfReport::Add(Common::PerfReport::GuestYieldSleeps);
+    Common::PerfReport::Add(Common::PerfReport::GuestYieldSleepNs, after - now);
+}
+
 // Ocarina of Time's two main threads (priorities 55 and 47) may only run on two of cores 3-5,
 // where the per-core job workers (priority 44) keep preempting them while cores 0-2 sit idle
 // about 30% of the time. Any mask of more than one core is widened to all of the process's cores,
@@ -54,6 +148,11 @@ bool WidenAffinity(const KProcess& process, u64 affinity_mask) {
 }
 
 } // Anonymous namespace
+
+bool YieldBackoffEnabled() {
+    const YieldBackoff& setting = YieldBackoffSetting();
+    return setting.forced ? *setting.forced : Settings::values.guest_wait_backoff.GetValue();
+}
 
 /// Creates a new thread
 Result CreateThread(Core::System& system, Handle* out_handle, u64 entry_point, u64 arg,
@@ -204,10 +303,13 @@ void SleepThread(Core::System& system, s64 ns) {
         static_cast<void>(GetCurrentThread(kernel).Sleep(kernel, timeout));
     } else if (yield_type == Svc::YieldType::WithoutCoreMigration) {
         KScheduler::YieldWithoutCoreMigration(kernel);
+        YieldBackoffAfterYield(system);
     } else if (yield_type == Svc::YieldType::WithCoreMigration) {
         KScheduler::YieldWithCoreMigration(kernel);
+        YieldBackoffAfterYield(system);
     } else if (yield_type == Svc::YieldType::ToAnyThread) {
         KScheduler::YieldToAnyThread(kernel);
+        YieldBackoffAfterYield(system);
     } else {
         // Nintendo does nothing at all if an otherwise invalid value is passed.
     }

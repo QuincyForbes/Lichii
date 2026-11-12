@@ -103,6 +103,7 @@ add_library(
     param_package.cpp
     param_package.h
     parent_of_member.h
+    perf_report.cpp
     perf_report.h
     platform_events.cpp
     platform_events.h

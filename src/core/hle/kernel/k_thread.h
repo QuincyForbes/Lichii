@@ -1024,6 +1024,13 @@ public:
     /// by the thread itself.
     u8 m_nx2_arb_spin_credit{8};
     u8 m_nx2_arb_spin_probe{};
+
+    /// EDEN_NX2_YIELD_BACKOFF (SleepThread): the current run of yields that found nothing else
+    /// to run (host steady clock ns), and the callee-saved registers of the last one, whose
+    /// change means the loop made progress. Touched only by the thread itself.
+    u64 m_nx2_yield_run_start{};
+    u64 m_nx2_yield_last{};
+    u64 m_nx2_yield_regs{};
 };
 
 class KScopedDisableDispatch {

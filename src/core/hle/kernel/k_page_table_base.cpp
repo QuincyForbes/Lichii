@@ -316,8 +316,9 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
 
     // iOS grants a fastmem arena (32 GiB) smaller than the 39-bit address space (512 GiB).
     // Place heap and stack inside [0, fastmem_end) with >= 512 MiB - 1 GiB guard gaps so all
-    // code, heap, and stack accesses hit fastmem directly, while alias and kernel map sit cleanly
-    // above fastmem_end (serviced by the inline page table path). EDEN_NX2_PACK_LAYOUT=0 opts out.
+    // code, heap, and stack accesses hit fastmem directly; alias and the kernel map region follow
+    // (see compact_layout below for how much of them the arena covers). EDEN_NX2_PACK_LAYOUT=0
+    // opts out.
     static const bool pack_layout_enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_PACK_LAYOUT");
         return value == nullptr || value[0] == '\0' || value[0] != '0';
@@ -331,9 +332,17 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
         return 0;
 #else
         const auto& fastmem = m_system.DeviceMemory().buffer;
-        return fastmem.VirtualBasePointer() != nullptr && Settings::IsFastmemEnabled()
-                   ? fastmem.VirtualSize()
-                   : 0;
+        if (fastmem.VirtualBasePointer() == nullptr || !Settings::IsFastmemEnabled()) {
+            return 0;
+        }
+        // EDEN_NX2_FASTMEM_BITS=<n> (diagnostic): lay out and bound fastmem as for a 2^n byte arena,
+        // as a phone grants (the JIT reads it too).
+        static const u64 simulated = [] {
+            const char* value = std::getenv("EDEN_NX2_FASTMEM_BITS");
+            const u64 bits = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+            return bits >= 32 && bits < 64 ? u64{1} << bits : u64{0};
+        }();
+        return simulated != 0 ? (std::min)(simulated, u64{fastmem.VirtualSize()}) : u64{fastmem.VirtualSize()};
 #endif
     }();
     const bool arena_short = fastmem_end != 0 && fastmem_end < GetInteger(end);
@@ -353,6 +362,13 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
             fastmem_end &&
         cold_start + alias_region_size + kernel_map_region_size + RegionAlignment <=
             GetInteger(end);
+
+    // EDEN_NX2_COMPACT_LAYOUT=0 keeps alias and the kernel map region above the arena.
+    static const bool compact_layout_enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_COMPACT_LAYOUT");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool compact_layout = guarded_fastmem_layout && compact_layout_enabled;
 
     const bool fastmem_short =
         !guarded_fastmem_layout && force_pack_layout && arena_short &&
@@ -400,6 +416,17 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
             stack_rnd = heap_rnd + kHeapStackGuardMin;
             alias_rnd = min_cold_rnd;
             kmap_rnd = min_cold_rnd + RegionAlignment;
+        }
+        if (compact_layout) {
+            // Ocarina of Time in Kokiri read ~18 million times a second from the bottom 4.5 GiB of
+            // alias (its physical memory mappings) and ~3 million from thread-local storage (the
+            // kernel map region's first pages), all on the page table path above the arena. The
+            // kernel map region is the kernel's own (no SVC reports it) and holds only TLS pages
+            // and static mappings here: 1 GiB of it goes right after the stack, then alias, whose
+            // bottom 9-10 GiB fall inside a 32 GiB arena.
+            kernel_map_region_size = (std::min)(kernel_map_region_size, size_t{1_GiB});
+            kmap_rnd = stack_rnd + kHeapStackGuardMin;
+            alias_rnd = kmap_rnd + RegionAlignment;
         }
     } else if (hot_first) {
         heap_rnd = RegionAlignment;
@@ -532,8 +559,8 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
         ASSERT(process_code_end + code_heap_guard_min <= m_heap_region_start);
         ASSERT(m_heap_region_end + kHeapStackGuardMin <= m_stack_region_start);
         ASSERT(GetInteger(m_stack_region_end) <= fastmem_end);
-        ASSERT(GetInteger(m_alias_region_start) >= fastmem_end);
-        ASSERT(GetInteger(m_kernel_map_region_start) >= fastmem_end);
+        ASSERT(compact_layout || GetInteger(m_alias_region_start) >= fastmem_end);
+        ASSERT(compact_layout || GetInteger(m_kernel_map_region_start) >= fastmem_end);
     }
 
     LOG_INFO(Kernel,
