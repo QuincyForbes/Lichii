@@ -544,8 +544,18 @@ bool DriverCachesPipelines(const Device& device) {
     case VK_DRIVER_ID_AMD_PROPRIETARY:
         return true;
     default:
-        return false;
+        break;
     }
+    // MoltenVK converts SPIR-V to MSL and compiles it to a MTLLibrary while it holds its pipeline
+    // cache's one mutex, so every build that names the cache runs one at a time (build 62: 1,773
+    // pipelines in ~175 s on six cores). Creating the cache from a file compiles every library in
+    // it again on the calling thread before any pipeline is built, and the file keeps only MSL;
+    // Metal's own shader cache keeps the compiled code. EDEN_NX2_MVK_PIPELINE_CACHE=1 uses it.
+    if (device.IsMoltenVK()) {
+        const char* const value = std::getenv("EDEN_NX2_MVK_PIPELINE_CACHE");
+        return value == nullptr || value[0] == '0';
+    }
+    return false;
 }
 } // Anonymous namespace
 
@@ -2129,6 +2139,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         });
         ++state.total;
     }};
+    const auto boot_build_begin = std::chrono::steady_clock::now();
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
                                load_graphics);
     for (auto& [key, records] : graphics_records) {
@@ -2168,6 +2179,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+    LOG_INFO(Render_Vulkan,
+             "Boot pipelines: {} built in {:.1f} s on {} threads ({} driver pipeline cache)",
+             state.total,
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - boot_build_begin)
+                 .count(),
+             num_pipeline_workers, use_vulkan_pipeline_cache ? "with the" : "without a");
 
     // Built newest first (from the end): this driver's own records before those only another
     // driver stored, which a merged pack appends after them.
