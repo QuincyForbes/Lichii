@@ -157,8 +157,13 @@ ENUM(OcarinaDlssMode, Quality, Balanced, Performance, UltraPerformance);
 ENUM(OotMovieUpscale, Automatic, Bilinear, Game);
 // Mip levels dropped from the game's textures as they are read (Settings texture_quality).
 ENUM(TextureQuality, Full, Half, Quarter);
-// Ocarina of Time's internal render scale (Settings oot_render_scale, built-in patch).
-ENUM(OotRenderScale, Game, Percent75, Percent56, Percent50);
+// Ocarina of Time's internal 3D resolution (Settings oot_resolution, built-in patches): the game's
+// dynamic resolution, or a fixed share of its full size (1920x1080 handheld, 2560x1440 docked).
+ENUM(OotResolution, Game, Full, Percent87, Percent75, Percent56, Percent50);
+// Ocarina of Time's frame rate (Settings oot_frame_rate).
+ENUM(OotFrameRate, Fps30, Fps60, Unlocked);
+// Mario Kart World's frame rate mode (Settings mkw_frame_rate, loader/nso.cpp).
+ENUM(MkwFrameRate, Game, Fps30, Dynamic);
 ENUM(GamePatchMode, Auto, On, Off);
 ENUM(AspectRatio, R16_9, R4_3, R21_9, R16_10, Stretch);
 ENUM(ConsoleMode, Handheld, Docked);

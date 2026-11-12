@@ -49,7 +49,9 @@ SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
 SWITCHABLE(OotMovieUpscale, false);
 SWITCHABLE(TextureQuality, false);
-SWITCHABLE(OotRenderScale, false);
+SWITCHABLE(OotResolution, false);
+SWITCHABLE(OotFrameRate, false);
+SWITCHABLE(MkwFrameRate, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -460,6 +462,36 @@ u16 SpeedLimit() {
     }
 
     return 100;
+}
+
+namespace {
+constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
+}
+
+u16 FrameRateLimit() {
+    if (GetCurrentProgramID() == OcarinaOfTimeId &&
+        values.oot_frame_rate.GetValue() != OotFrameRate::Unlocked) {
+        return 60;
+    }
+    return values.frame_rate_limit.GetValue();
+}
+
+bool OcarinaHalfRate(u64 program_id) {
+    return program_id == OcarinaOfTimeId &&
+           values.oot_frame_rate.GetValue() == OotFrameRate::Fps30;
+}
+
+OcarinaDlssMode OcarinaDlssModeFor(OotResolution resolution) {
+    switch (resolution) {
+    case OotResolution::Percent87:
+        return OcarinaDlssMode::Balanced;
+    case OotResolution::Percent75:
+        return OcarinaDlssMode::Performance;
+    case OotResolution::Percent50:
+        return OcarinaDlssMode::UltraPerformance;
+    default:
+        return OcarinaDlssMode::Quality;
+    }
 }
 
 void SetSpeedMode(const SpeedMode& mode) {

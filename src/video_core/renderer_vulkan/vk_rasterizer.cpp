@@ -3332,7 +3332,9 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     constexpr u64 three_quarter_pass = 0xe40f5efb5480e692ULL;
     if (upscale_hash == three_quarter_pass && target.size.width == 2560 &&
         target.size.height == 1440 &&
-        Settings::values.ocarina_dlss_mode.GetValue() == Settings::OcarinaDlssMode::Performance) {
+        Settings::values.nvidia_dlss.GetValue() &&
+        Settings::OcarinaDlssModeFor(Settings::values.oot_resolution.GetValue()) ==
+            Settings::OcarinaDlssMode::Performance) {
         upscale_4k = true;
     }
     // 4K: any 16:9 scene up to 2560x1440 (the lower ocarina_dlss_mode render scales).

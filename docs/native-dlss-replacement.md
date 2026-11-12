@@ -44,13 +44,14 @@ default, any GPU with the needed Vulkan features) replaces the same pass with FS
 and wins over the DLSS setting; it also replaces the passes `c033c3ddc9f0897b` (full size) and
 `ef542df87cacfe9e` (3/4 scale), which DLSS leaves to the game.
 
-- Max Resolution add-on off: the 3/4-scale pass (`e40f5efb5480e692`) is replaced and DLSS
+- Ocarina of Time resolution Dynamic: the 3/4-scale pass (`e40f5efb5480e692`) is replaced and DLSS
   writes the game's output size (1080p to 1440p docked, 810p to 1080p handheld).
-- Max Resolution add-on on, docked: the full-size pass (`6bd913e1f34e83eb`) at 2560x1440 is
+- Ocarina of Time resolution 100%, docked: the full-size pass (`6bd913e1f34e83eb`) at 2560x1440 is
   replaced by a 3840x2160 DLSS image. The game still finishes its 1440p frame. At presentation,
   the HUD is taken from the difference between that frame and a 1440p copy of the DLSS scene,
   and composited over the 4K scene. The 4K image skips the presentation's post-processing and
-  upscale filters.
+  upscale filters. 87%, 75% and 50% are DLSS Balanced, Performance and Ultra Performance to the
+  same 4K image.
 - The game has no motion vectors or jitter. Motion comes from the scene depth reprojected
   through this and the previous frame's camera (vertex constant buffer 3). Link's recognized
   skinned draw is replayed with both poses where his depth matches. Without his pose the frame

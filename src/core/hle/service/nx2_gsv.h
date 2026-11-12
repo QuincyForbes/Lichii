@@ -1700,7 +1700,7 @@ inline Nx2DecoderImageLayout Nx2CalculateDecoderImageLayout(const u32* preferenc
 // shapes read from the SDK: TIPC 1 -> u32 < 0x400, TIPC 3 -> u32 < 8, TIPC 11/31(u32) and
 // 32(handle, u32) -> one handle at word 3 then the result. Handles returned here are events (a
 // guess); everything else is auto-stubbed through the nx2: prefix.
-/// Rate of the nx2:vi2 vsync event the game starts frames on: Settings frame_rate_limit, or
+/// Rate of the nx2:vi2 vsync event the game starts frames on: Settings::FrameRateLimit(), or
 /// EDEN_NX2_VSYNC_HZ=<rate> for experiments.
 inline u32 Nx2VsyncRateHz() {
     static const long long forced = [] {
@@ -1708,7 +1708,7 @@ inline u32 Nx2VsyncRateHz() {
         return text ? (std::max)(std::strtoll(text, nullptr, 10), 1LL) : 0LL;
     }();
     u32 hz = forced != 0 ? static_cast<u32>(forced)
-                         : (std::max<u32>)(Settings::values.frame_rate_limit.GetValue(), 1);
+                         : (std::max<u32>)(Settings::FrameRateLimit(), 1);
     if (const u32 thermal_cap = Common::PlatformEvents::ThermalMaxFps();
         thermal_cap != 0 && thermal_cap < hz) {
         hz = thermal_cap;
@@ -1976,9 +1976,7 @@ private:
         }
         // The game's own rate: its swap interval at the display rate, or the FPS limit if lower.
         u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
-        constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
-        if (system.GetApplicationProcessProgramID() == OcarinaOfTimeId &&
-            Settings::values.oot_30fps.GetValue()) {
+        if (Settings::OcarinaHalfRate(system.GetApplicationProcessProgramID())) {
             swap_interval = (std::max)(swap_interval, 2U);
         }
         const u32 refresh =
@@ -2049,7 +2047,8 @@ private:
         }();
         const bool mkw_dynamic =
             process != nullptr && process->GetProgramId() == Settings::MarioKartWorldProgramId &&
-            process->IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
+            process->IsMkwDynamicFpsPatchApplied() &&
+            Settings::values.mkw_frame_rate.GetValue() == Settings::MkwFrameRate::Dynamic;
         u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
         if (mkw_dynamic) {
             swap_interval = 1;
@@ -2057,11 +2056,9 @@ private:
         if (forced_interval != 0) {
             swap_interval = forced_interval;
         }
-        // Ocarina of Time's 30 FPS mode (lower-end PCs): two vblanks a frame. Its frame step
-        // follows the time measured (Dynamic FPS by Dark), so it keeps full speed.
-        constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
-        if (process != nullptr && process->GetProgramId() == OcarinaOfTimeId &&
-            Settings::values.oot_30fps.GetValue()) {
+        // Ocarina of Time at 30 FPS (lower-end PCs): two vblanks a frame. Its frame step
+        // follows the time measured (built-in FPS Unlock), so it keeps full speed.
+        if (process != nullptr && Settings::OcarinaHalfRate(process->GetProgramId())) {
             swap_interval = (std::max)(swap_interval, 2U);
         }
         const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
