@@ -719,12 +719,15 @@ void MainWindow::AskOotFrameRate() {
     box.setInformativeText(
         tr("60 FPS needs a fast, recent CPU.\n"
            "30 FPS is for lower-end PCs. The game keeps its normal speed either way.\n\n"
-           "Switch any time with the 60 FPS / 30 FPS button at the bottom of the window."));
+           "Switch any time with the FPS button at the bottom of the window, or in Configure > "
+           "Graphics > Frame rate (also Unlocked, up to the frame rate limit)."));
     QPushButton* const fps60 = box.addButton(tr("60 FPS"), QMessageBox::AcceptRole);
     QPushButton* const fps30 = box.addButton(tr("30 FPS (lower-end PCs)"), QMessageBox::AcceptRole);
     box.setDefaultButton(fps60);
     box.exec();
-    Settings::values.oot_30fps.SetValue(box.clickedButton() == fps30);
+    Settings::values.oot_frame_rate.SetValue(box.clickedButton() == fps30
+                                                 ? Settings::OotFrameRate::Fps30
+                                                 : Settings::OotFrameRate::Fps60);
     Settings::values.oot_fps_asked.SetValue(true);
     UpdateOotFpsButton();
     config->SaveAllValues();
@@ -5352,13 +5355,13 @@ void MainWindow::UpdateGPUAccuracyButton() {
     gpu_accuracy_button->setChecked(gpu_accuracy != Settings::GpuAccuracy::Low);
 }
 
+// Shows and cycles Settings oot_frame_rate: 60 -> 30 -> Unlocked -> 60.
 void MainWindow::UpdateOotFpsButton() {
-    const bool fps30 = Settings::values.oot_30fps.GetValue();
-    oot_fps_button->setChecked(fps30);
-    // The 30 FPS mode only applies while the Switch 2 vsync event runs at 60 Hz and the speed is
-    // limited (nx2_gsv.h PaceToVblank); otherwise show the cap that does apply.
+    using Settings::OotFrameRate;
+    const auto rate = Settings::values.oot_frame_rate.GetValue();
+    oot_fps_button->setChecked(rate != OotFrameRate::Fps60);
     const char* forced_hz = std::getenv("EDEN_NX2_VSYNC_HZ");
-    const u32 vsync_hz =
+    const u32 limit_hz =
         forced_hz != nullptr
             ? static_cast<u32>((std::max)(std::strtoll(forced_hz, nullptr, 10), 1LL))
             : (std::max<u32>)(Settings::values.frame_rate_limit.GetValue(), 1);
@@ -5368,26 +5371,43 @@ void MainWindow::UpdateOotFpsButton() {
         oot_fps_button->setEnabled(false);
         oot_fps_button->setText(tr("FPS UNLOCKED"));
         oot_fps_button->setToolTip(tr("Ocarina of Time frame rate: the speed limit is off, so the "
-                                      "60 / 30 FPS switch has no effect. Turn the speed limit back "
+                                      "frame rate choice has no effect. Turn the speed limit back "
                                       "on (Toggle Framerate Limit hotkey or Configure > General)."));
-    } else if (vsync_hz != 60) {
-        oot_fps_button->setEnabled(false);
-        oot_fps_button->setText(tr("%1 FPS").arg(vsync_hz));
-        oot_fps_button->setToolTip(
-            tr("Ocarina of Time frame rate: capped by Frame rate limit (Switch 2) = %1 Hz%2. The "
-               "60 / 30 FPS switch only works at 60 Hz (Configure > Graphics).")
-                .arg(vsync_hz)
-                .arg(forced_hz != nullptr ? tr(" (EDEN_NX2_VSYNC_HZ)") : QString{}));
-    } else {
-        oot_fps_button->setEnabled(true);
-        oot_fps_button->setText(fps30 ? tr("30 FPS") : tr("60 FPS"));
-        oot_fps_button->setToolTip(tr("Ocarina of Time frame rate. Click to switch between 60 FPS "
-                                      "and 30 FPS (lower-end PCs); it takes effect at once."));
+        return;
     }
+    oot_fps_button->setEnabled(true);
+    switch (rate) {
+    case OotFrameRate::Fps30:
+        oot_fps_button->setText(tr("30 FPS"));
+        break;
+    case OotFrameRate::Fps60:
+        oot_fps_button->setText(tr("60 FPS"));
+        break;
+    case OotFrameRate::Unlocked:
+        oot_fps_button->setText(tr("%1 FPS MAX").arg(limit_hz));
+        break;
+    }
+    oot_fps_button->setToolTip(
+        tr("Ocarina of Time frame rate. Click to switch: 60 FPS, 30 FPS (lower-end PCs), "
+           "Unlocked (Frame rate limit (Switch 2) = %1 Hz%2). It takes effect at once.")
+            .arg(limit_hz)
+            .arg(forced_hz != nullptr ? tr(", EDEN_NX2_VSYNC_HZ") : QString{}));
 }
 
 void MainWindow::OnToggleOotFrameRate() {
-    Settings::values.oot_30fps.SetValue(!Settings::values.oot_30fps.GetValue());
+    using Settings::OotFrameRate;
+    auto& rate = Settings::values.oot_frame_rate;
+    switch (rate.GetValue()) {
+    case OotFrameRate::Fps60:
+        rate.SetValue(OotFrameRate::Fps30);
+        break;
+    case OotFrameRate::Fps30:
+        rate.SetValue(OotFrameRate::Unlocked);
+        break;
+    case OotFrameRate::Unlocked:
+        rate.SetValue(OotFrameRate::Fps60);
+        break;
+    }
     Settings::values.oot_fps_asked.SetValue(true);
     UpdateOotFpsButton();
     config->SaveAllValues();

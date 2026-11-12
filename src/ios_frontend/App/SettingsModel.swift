@@ -142,7 +142,7 @@ enum SettingsGroup: String, CaseIterable, Identifiable {
 
     var categories: [String] {
         switch self {
-        case .graphics: return ["Renderer", "RendererAdvanced", SettingsCatalog.enhancementsCategory]
+        case .graphics: return ["Renderer", SettingsCatalog.ocarinaCategory, "RendererAdvanced", SettingsCatalog.enhancementsCategory]
         case .audio: return ["Audio", "SystemAudio"]
         case .system: return ["Core", "Cpu", "System", "Controls", "LibraryApplet", "DataStorage", "Overlay"]
         case .advanced: return Array(SettingsCatalog.advancedCategories).sorted()
@@ -155,6 +155,7 @@ enum SettingsGroup: String, CaseIterable, Identifiable {
         case (.graphics, "Renderer"): return "Image"
         case (.graphics, "RendererAdvanced"): return "Performance"
         case (.graphics, SettingsCatalog.enhancementsCategory): return "Game Enhancements"
+        case (.graphics, SettingsCatalog.ocarinaCategory): return "Ocarina of Time"
         default: return SettingsCatalog.categoryTitles[category] ?? category
         }
     }
@@ -214,7 +215,6 @@ enum SettingsCatalog {
     static let unavailableReasons: [String: String] = [
         "nvidia_dlss": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.",
         "nvidia_dlss_preset": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.",
-        "ocarina_dlss_mode": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows. MetalFX Upscaling is the iPhone's counterpart.",
         "backend": "iOS has one graphics API: Vulkan through MoltenVK.",
         "cpu_backend": "iOS runs games with the Dynarmic JIT only.",
         "nvdec_emulation": "Lichii decodes game videos on the CPU on iOS and sets this at every start.",
@@ -280,7 +280,6 @@ enum SettingsCatalog {
 
     /// What the everyday settings do, in a line.
     static let descriptions: [String: String] = [
-        "resolution_setup": "Renders games at this multiple of their own resolution. Higher is sharper and costs GPU time, memory and battery.",
         "scaling_filter": "How the rendered picture is scaled to the screen.",
         "anti_aliasing": "Smooths jagged edges after the game has drawn its frame.",
         "metalfx_temporal": "Apple's MetalFX upscaler in place of the game's own, in games that have one (Ocarina of Time, games with DLSS).",
@@ -291,7 +290,10 @@ enum SettingsCatalog {
         "use_disk_shader_cache": "Keeps built shaders in storage, so the next start of a game stutters less.",
         "memory_layout_mode": "Switch 1 games only: Switch 2 games always get 12 GB.",
         "texture_quality": "Half or Quarter loads the game's large textures with less detail: softer up close, much less memory (about 1.2 GB less in Ocarina of Time). Applies the next time the game starts.",
-        "oot_render_scale": "A fixed internal size for the 3D instead of the game's dynamic resolution (Handheld: 75% 1440x810, 56% 1080x608, 50% 960x540), upscaled to the screen: less GPU work and graphics memory, softer picture. Applies the next time the game starts.",
+        "resolution_setup": "Multiplies the size every game draws at (for Ocarina of Time: on top of its own resolution). Higher is sharper and costs GPU time, memory and battery.",
+        "oot_resolution": "The size the game draws its 3D at, before the resolution scale. Dynamic: the game's own, lower when the GPU is busy. A percentage: a fixed share of full size (handheld 100% 1920x1080, 75% 1440x810, 56% 1080x608, 50% 960x540): less GPU work and memory, softer picture. Applies the next time the game starts.",
+        "oot_frame_rate": "30 FPS saves power and heat; Unlocked follows the frame rate limit. The game keeps its normal speed at each.",
+        "mkw_frame_rate": "The game's native 30 FPS mode, or dynamic 30-60 FPS (experimental). Applies the next time the game starts.",
     ]
 
     /// The settings a search finds that do nothing here, as one footer naming each and why.
@@ -317,17 +319,23 @@ enum SettingsCatalog {
         "Debugging": "Debugging", "DebuggingGraphics": "Graphics Debugging", "Network": "Network",
         "Miscellaneous": "Miscellaneous", "Services": "Services", "LibraryApplet": "System Applets",
         "Overlay": "Overlay", "GpuDriver": "GPU Driver", "AddOns": "Add-ons",
+        "OcarinaOfTime": "Ocarina of Time", "GameEnhancements": "Game Enhancements",
     ]
 
     /// Settings shown with another group than their own: shader building is a hack in the core
     /// but an everyday switch on a phone.
     static let categoryOverrides: [String: String] = [
         "use_asynchronous_shaders": "RendererAdvanced",
-        "patch_frame_rate": enhancementsCategory,
-        "patch_resolution": enhancementsCategory,
         "patch_performance": enhancementsCategory,
         "patch_image": enhancementsCategory,
+        "oot_resolution": ocarinaCategory,
+        "oot_frame_rate": ocarinaCategory,
+        "oot_anti_aliasing": ocarinaCategory,
+        "oot_movie_upscale": ocarinaCategory,
     ]
+
+    /// Ocarina of Time's own settings (Settings > Graphics > Ocarina of Time).
+    static let ocarinaCategory = "OcarinaOfTime"
 
     /// Built-in game patches by kind (Settings > Graphics > Game Enhancements).
     static let enhancementsCategory = "GameEnhancements"
@@ -444,12 +452,14 @@ enum SettingLabels {
         "backend": "Graphics API",
         "cpu_backend": "CPU Backend",
         "nvidia_dlss_preset": "DLSS Preset",
-        "ocarina_dlss_mode": "DLSS Mode in Ocarina of Time",
         "game_dlss_network": "Game's Own DLSS Network",
         "oot_anti_aliasing": "Ocarina of Time Anti-Aliasing",
         "oot_movie_upscale": "Ocarina of Time Movies",
         "texture_quality": "Texture Quality",
-        "oot_render_scale": "Ocarina of Time Render Scale",
+        "oot_resolution": "Ocarina of Time Resolution",
+        "oot_frame_rate": "Ocarina of Time Frame Rate",
+        "mkw_frame_rate": "Mario Kart World Frame Rate",
+        "nx2_frame_rate_limit": "Frame Rate Limit (Switch 2)",
         "accelerate_astc": "ASTC Decoding",
         "astc_recompression": "ASTC Recompression",
         "output_engine": "Audio Output Engine",
@@ -457,9 +467,7 @@ enum SettingLabels {
         "use_vulkan_driver_pipeline_cache": "Driver Pipeline Cache",
         "nvidia_dlss": "NVIDIA DLSS",
         "metalfx_temporal": "MetalFX Upscaling (replaces the game's)",
-        "patch_frame_rate": "Unlock Frame Rate",
-        "patch_resolution": "Max Resolution",
-        "patch_performance": "Performance Patches",
+        "patch_performance": "Occlusion Off",
         "patch_image": "Disable Game Anti-Aliasing",
         "device_name": "Console Name",
         "log_filter": "Log Filter",
@@ -485,7 +493,12 @@ enum SettingLabels {
         ],
         "use_docked_mode": ["Handheld": "Handheld", "Docked": "Docked"],
         "texture_quality": ["Full": "Full", "Half": "Half (less memory)", "Quarter": "Quarter (least memory)"],
-        "oot_render_scale": ["Game": "Game", "Percent75": "75%", "Percent56": "56%", "Percent50": "50%"],
+        "oot_resolution": [
+            "Game": "Dynamic (the game's own)", "Full": "100%", "Percent87": "87%", "Percent75": "75%",
+            "Percent56": "56%", "Percent50": "50%",
+        ],
+        "oot_frame_rate": ["Fps30": "30 FPS", "Fps60": "60 FPS", "Unlocked": "Unlocked (frame rate limit)"],
+        "mkw_frame_rate": ["Game": "Game's own", "Fps30": "30 FPS", "Dynamic": "Dynamic 30-60 FPS"],
         "use_vsync": [
             "Immediate": "Off (Immediate)", "Mailbox": "Mailbox", "Fifo": "On (FIFO)",
             "FifoRelaxed": "Relaxed FIFO",

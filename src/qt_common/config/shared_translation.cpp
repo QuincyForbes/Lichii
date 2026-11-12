@@ -140,10 +140,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Changes the output graphics API.\nVulkan is recommended."));
     INSERT(Settings, vulkan_device, tr("Device:"),
            tr("This setting selects the GPU to use (Vulkan only)."));
-    INSERT(Settings, resolution_setup, tr("Resolution:"),
-           tr("Forces to render at a different resolution.\n"
-              "Higher resolutions require more VRAM and bandwidth.\n"
-              "Options lower than 1X can cause artifacts."));
+    INSERT(Settings, resolution_setup, tr("Emulator resolution scale:"),
+           tr("Multiplies whatever size the game renders at, in every game (for Ocarina of Time: "
+              "on top of its own resolution below).\nHigher scales need more VRAM and bandwidth; "
+              "scales below 1x can cause artifacts.\nNVIDIA DLSS and AMD FSR 3.1 in place of a "
+              "game's upscaler need 1x."));
     INSERT(Settings, scaling_filter, tr("Window Adapting Filter:"), QString());
     INSERT(Settings, game_dlss_network, tr("Use the game's own DLSS"),
            tr("Runs a Switch 2 game's own DLSS (its upscaling network, translated for this GPU) "
@@ -153,9 +154,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "starts."));
     INSERT(Settings, frame_rate_limit, tr("Frame rate limit (Switch 2):"),
            tr("Rate of the Switch 2 VSync event that games start their frames on (default 60 Hz)."
-              "\nAbove 60 Hz most games run too fast; use it with a game patch that follows real "
-              "time, such as \"FPS Unlock (built-in)\" for Ocarina of Time.\nTakes effect at "
-              "once, also while a game runs."));
+              "\nAbove 60 Hz most games run too fast. Ocarina of Time follows it only with its "
+              "frame rate set to Unlocked, and keeps its speed there.\nTakes effect at once, "
+              "also while a game runs."));
     INSERT(Settings, fsr_sharpening_slider, tr("RCAS Sharpness:"),
            tr("Strength of RCAS (AMD's contrast-adaptive sharpening) on the upscaler used in place "
               "of a game's DLSS (AMD FSR 3.1); 0% turns it off.\nAlso sets the sharpening "
@@ -170,18 +171,13 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS (experimental)"),
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a game's own upscaler, where "
               "Lichii can give DLSS the frame's colour, depth, motion vectors and jitter:\n"
-              "- The Legend of Zelda: Ocarina of Time: its upscale pass, at 1x resolution scale "
-              "(motion rebuilt from the scene depth and camera).\n"
+              "- The Legend of Zelda: Ocarina of Time: its upscale pass to 4K, at 1x resolution "
+              "scale (motion rebuilt from the scene depth and camera). Its resolution setting "
+              "then picks the DLSS mode.\n"
               "- Fire Emblem: Fortune's Weave: its own DLSS evaluation.\n"
               "Other games keep their own upscaling: Lichii doesn't have those inputs for them "
               "yet.\nNeeds NVIDIA's Streamline and DLSS files; Lichii does not ship them. Use "
               "the download button below.\nTakes effect when a game starts."));
-    INSERT(Settings, ocarina_dlss_mode, tr("NVIDIA DLSS mode in Ocarina of Time:"),
-           tr("How much of the game's output resolution Ocarina of Time renders before DLSS "
-              "upscales it.\nQuality: 67%.\nBalanced: 58%.\nPerformance: 50%.\nUltra "
-              "Performance: 33%, cheapest for smaller cards.\nNeeds NVIDIA DLSS on, docked "
-              "mode, the Max Resolution add-on and 1x resolution scale.\nTakes effect when the "
-              "game starts."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
@@ -197,25 +193,29 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "stretch.\nGame's own upscaler: the game's video upscaler, which removes banding and "
               "sharpens. Fast on NVIDIA RTX, slow on GPUs that emulate its math.\nAutomatic: the "
               "game's upscaler where the GPU runs it natively, bilinear elsewhere."));
-    INSERT(Settings, patch_frame_rate, tr("Unlock frame rate:"),
-           tr("Game enhancement. Applies to every game that ships a frame rate patch (currently "
-              "Ocarina of Time: FPS Unlock, Dynamic FPS).\nAuto: each patch's default. On: "
-              "game logic follows real time, so the game keeps its speed above 30 or 60 fps. "
-              "Off: the game's own fixed frame rate.\nA game's Add-Ons choice overrides this. "
-              "Takes effect when the game starts."));
-    INSERT(Settings, patch_resolution, tr("Max resolution:"),
-           tr("Game enhancement. Applies to every game that ships a resolution patch (currently "
-              "Ocarina of Time).\nAuto: on, except on iOS. On: the game renders at full scale "
-              "instead of lowering its resolution when the GPU is busy (sharper, more GPU work). "
-              "Off: the game's own dynamic resolution (down to 480p).\nA game's Add-Ons choice "
+    INSERT(Settings, oot_resolution, tr("Ocarina of Time resolution:"),
+           tr("The size the game draws its 3D at, before the emulator's resolution scale and an "
+              "upscaler.\nDynamic: the game's own, which drops toward 480p when the GPU is busy. "
+              "100%: always full size (1920x1080 handheld, 2560x1440 docked). A lower percentage: "
+              "a fixed share of that, less GPU work and graphics memory, a softer picture.\nWith "
+              "NVIDIA DLSS on it is DLSS's input to 4K: 100% Quality, 87% Balanced, 75% "
+              "Performance, 50% Ultra Performance.\nTakes effect when the game starts."));
+    INSERT(Settings, oot_frame_rate, tr("Ocarina of Time frame rate:"),
+           tr("30 FPS: for lower-end PCs. 60 FPS: the game's normal rate. Unlocked: up to the "
+              "Frame rate limit (Switch 2) below.\nThe game keeps its normal speed at each (its "
+              "time step follows real time).\nTakes effect at once; the FPS button in the status "
+              "bar switches it too."));
+    INSERT(Settings, mkw_frame_rate, tr("Mario Kart World frame rate:"),
+           tr("Game's own: no change. 30 FPS: the game's native 30 FPS mode at normal speed. "
+              "Dynamic: the game moves between 30 and 60 FPS using whole-frame timing to keep "
+              "normal speed (experimental).\nTakes effect when the game starts."));
+    INSERT(Settings, patch_performance, tr("Ocarina of Time: Occlusion Off:"),
+           tr("Game patch with a trade-off (currently Ocarina of Time: Occlusion Off).\nAuto and "
+              "On: the game stops issuing per-object occlusion queries (fewer query stalls and "
+              "pop-in problems; hidden objects are drawn, so more GPU work). Off: the game's own "
+              "queries.\nThe game's fixes with no visible effect (native zstd, fast lookup, "
+              "resource poll backoff, texture pool x2) are always on.\nA game's Add-Ons choice "
               "overrides this. Takes effect when the game starts."));
-    INSERT(Settings, patch_performance, tr("Performance patches:"),
-           tr("Game enhancement. Applies to every game that ships performance patches (currently "
-              "Ocarina of Time: Occlusion Off, Native zstd, Fast lookup strcmp, Resource poll "
-              "backoff, Texture Pool x2).\nAuto: each patch's default. On: all of them; they "
-              "trade a little GPU work (Occlusion Off) or host-side code for less CPU time and "
-              "fewer stalls. Off: the game's own code.\nA game's Add-Ons choice overrides this. "
-              "Takes effect when the game starts."));
     INSERT(Settings, patch_image, tr("Disable game anti-aliasing:"),
            tr("Game enhancement. Applies to every game that ships a patch removing its own "
               "anti-aliasing (currently Ocarina of Time: No NDSR anti-aliasing).\nAuto: on "
@@ -383,9 +383,6 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, use_video_framerate, tr("Sync to framerate of video playback"),
            tr("Run the game at normal speed during video playback, even when the framerate is "
               "unlocked."));
-    INSERT(Settings, oot_30fps, tr("Ocarina of Time: 30 FPS mode (lower-end PCs)"),
-           tr("Caps Ocarina of Time at 30 FPS. The game keeps its normal speed. Takes effect at "
-              "once; the 60 FPS / 30 FPS button in the status bar switches it too."));
     // Internal state, not settings.
     INSERT(Settings, oot_fps_asked, QString(), QString());
     INSERT(Settings, frizti_settings_revision, QString(), QString());
@@ -394,19 +391,6 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "textures as they load: softer textures up close, much less memory (about 1.2 GB "
               "less in Ocarina of Time). Your game files are not changed.\nTakes effect at the next "
               "game start."));
-    INSERT(Settings, oot_render_scale, tr("Ocarina of Time: render scale:"),
-           tr("Game lets the game choose (Max Resolution or its dynamic resolution). A percentage "
-              "renders the 3D at that fixed fraction of the game's own size (1920x1080 handheld, "
-              "2560x1440 docked) and upscales it: less GPU work and graphics memory, a softer "
-              "picture. Ignored while an NVIDIA DLSS mode sets the scale.\nTakes effect at the "
-              "next game start."));
-    INSERT(Settings, mkw_30fps, tr("Mario Kart World: 30 FPS mode"),
-           tr("Forces the game to use its native 30 FPS mode at normal game speed. "
-              "Takes effect after restarting the game."));
-    INSERT(Settings, mkw_dynamic_fps, tr("Mario Kart World: dynamic FPS (experimental)"),
-           tr("Lets the game adjust between 30 and 60 FPS using whole-frame timing to maintain "
-              "normal game speed. Takes effect after restarting the game and takes precedence over "
-              "the 30 FPS mode."));
     INSERT(Settings, barrier_feedback_loops, tr("Barrier feedback loops"),
            tr("Improves rendering of transparency effects in specific games."));
     INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),
@@ -664,13 +648,6 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(DlssPreset, L, tr("L")),
                               PAIR(DlssPreset, M, tr("M")),
                           }});
-    translations->insert({Settings::EnumMetadata<Settings::OcarinaDlssMode>::Index(),
-                          {
-                              PAIR(OcarinaDlssMode, Quality, tr("Quality")),
-                              PAIR(OcarinaDlssMode, Balanced, tr("Balanced")),
-                              PAIR(OcarinaDlssMode, Performance, tr("Performance")),
-                              PAIR(OcarinaDlssMode, UltraPerformance, tr("Ultra Performance")),
-                          }});
     translations->insert({Settings::EnumMetadata<Settings::GamePatchMode>::Index(),
                           {
                               PAIR(GamePatchMode, Auto, tr("Auto")),
@@ -683,12 +660,28 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(TextureQuality, Half, tr("Half (less memory)")),
                               PAIR(TextureQuality, Quarter, tr("Quarter (least memory)")),
                           }});
-    translations->insert({Settings::EnumMetadata<Settings::OotRenderScale>::Index(),
+    // Sizes docked (handheld is 3/4 of each); ConfigureGraphics adds the DLSS mode while NVIDIA
+    // DLSS is on.
+    translations->insert({Settings::EnumMetadata<Settings::OotResolution>::Index(),
                           {
-                              PAIR(OotRenderScale, Game, tr("Game")),
-                              PAIR(OotRenderScale, Percent75, tr("75%")),
-                              PAIR(OotRenderScale, Percent56, tr("56% (1080x608 handheld)")),
-                              PAIR(OotRenderScale, Percent50, tr("50%")),
+                              PAIR(OotResolution, Game, tr("Dynamic (the game's own, 480p-1440p)")),
+                              PAIR(OotResolution, Full, tr("100% (1440p)")),
+                              PAIR(OotResolution, Percent87, tr("87% (1254p)")),
+                              PAIR(OotResolution, Percent75, tr("75% (1080p)")),
+                              PAIR(OotResolution, Percent56, tr("56% (810p)")),
+                              PAIR(OotResolution, Percent50, tr("50% (720p)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::OotFrameRate>::Index(),
+                          {
+                              PAIR(OotFrameRate, Fps30, tr("30 FPS (lower-end PCs)")),
+                              PAIR(OotFrameRate, Fps60, tr("60 FPS")),
+                              PAIR(OotFrameRate, Unlocked, tr("Unlocked (up to the frame rate limit)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::MkwFrameRate>::Index(),
+                          {
+                              PAIR(MkwFrameRate, Game, tr("Game's own")),
+                              PAIR(MkwFrameRate, Fps30, tr("30 FPS")),
+                              PAIR(MkwFrameRate, Dynamic, tr("Dynamic 30-60 FPS (experimental)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::OotMovieUpscale>::Index(),
                           {

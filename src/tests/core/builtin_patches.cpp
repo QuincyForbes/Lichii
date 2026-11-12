@@ -12,6 +12,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <cstdlib>
 #include <catch2/catch_test_macros.hpp>
 #include <fmt/format.h>
 #include "common/common_funcs.h"
@@ -32,6 +33,7 @@ namespace {
 constexpr u64 OcarinaTitleId = 0x0400486024DEC000;
 constexpr u64 OtherTitleId = 0x0100000000010000;
 constexpr std::string_view MaxResolution = "Max Resolution (built-in)";
+constexpr std::string_view OcclusionOff = "Occlusion Off (built-in)";
 constexpr std::string_view DynamicFps = "Dynamic FPS by Dark (built-in)";
 constexpr std::string_view FpsUnlock = "FPS Unlock (built-in)";
 constexpr std::string_view OcarinaBuildIdHex = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348";
@@ -64,6 +66,19 @@ constexpr std::string_view WaterRoutine =
     "C0035FD6";
 constexpr u32 DynamicCallInstruction = 0x94D57D4F;
 constexpr u32 DynamicOriginalInstruction = 0x1E201828;
+
+// EDEN_NX2_OOT_FRAME_TIMING (dark, game); null restores the default (FPS Unlock).
+void SetFrameTiming(const char* value) {
+#ifdef _WIN32
+    _putenv_s("EDEN_NX2_OOT_FRAME_TIMING", value ? value : "");
+#else
+    if (value) {
+        setenv("EDEN_NX2_OOT_FRAME_TIMING", value, 1);
+    } else {
+        unsetenv("EDEN_NX2_OOT_FRAME_TIMING");
+    }
+#endif
+}
 
 constexpr std::array<std::pair<Common::FS::EdenPath, const char*>, 4> TestDirectories{{
     {Common::FS::EdenPath::NANDDir, "nand"},
@@ -123,6 +138,9 @@ public:
             Common::FS::SetEdenPath(TestDirectories[i].first, previous[i]);
         }
         Settings::values.disabled_addons.erase(OcarinaTitleId);
+        Settings::values.oot_resolution.SetValue(resolution);
+        Settings::values.patch_performance.SetValue(Settings::GamePatchMode::Auto);
+        SetFrameTiming(nullptr);
         std::error_code error;
         std::filesystem::remove_all(root, error);
     }
@@ -136,6 +154,7 @@ public:
     }
 
 private:
+    const Settings::OotResolution resolution = Settings::values.oot_resolution.GetValue();
     std::array<std::filesystem::path, TestDirectories.size()> previous;
     const std::filesystem::path root =
         std::filesystem::temp_directory_path() /
@@ -195,8 +214,8 @@ TEST_CASE("Built-in Max Resolution patch is gated on build id and original word"
                 TbzInstruction);
     }
 
-    SECTION("Disabled in Add-Ons skips") {
-        Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
+    SECTION("The game's dynamic resolution skips") {
+        Settings::values.oot_resolution.SetValue(Settings::OotResolution::Game);
         REQUIRE(PatchMain(context, OcarinaBuildId, TbzInstruction) == TbzInstruction);
     }
 }
@@ -213,14 +232,14 @@ TEST_CASE("Built-in Max Resolution patch defers to a user mod at the same offset
         REQUIRE(PatchMain(context, OcarinaBuildId, TbzInstruction) == BranchInstruction);
     }
 
-    SECTION("Disabling the built-in patch keeps the mod") {
+    SECTION("The game's dynamic resolution keeps the mod") {
         PatchManagerTestContext context{BranchInstruction};
-        Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
+        Settings::values.oot_resolution.SetValue(Settings::OotResolution::Game);
         REQUIRE(PatchMain(context, OcarinaBuildId, TbzInstruction) == BranchInstruction);
     }
 }
 
-TEST_CASE("Built-in Max Resolution patch is listed and loaded for Ocarina's main",
+TEST_CASE("Ocarina's settings-chosen built-ins load for its main and are not listed",
           "[patch_manager]") {
     PatchManagerTestContext context;
     const auto manager = context.Manager();
@@ -229,67 +248,23 @@ TEST_CASE("Built-in Max Resolution patch is listed and loaded for Ocarina's main
     REQUIRE_FALSE(manager.HasNSOPatch(OcarinaBuildId, "sdk"));
     REQUIRE_FALSE(context.Manager(OtherTitleId).HasNSOPatch(OcarinaBuildId, "main"));
 
-    const auto builtin_enabled = [&] {
-        const auto patches = manager.GetPatches();
-        const auto it = std::ranges::find(patches, MaxResolution, &FileSys::Patch::name);
-        REQUIRE(it != patches.end());
-        REQUIRE(it->type == FileSys::PatchType::Mod);
-        return it->enabled;
-    };
-    REQUIRE(builtin_enabled());
-
-    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
-    REQUIRE_FALSE(builtin_enabled());
-}
-
-TEST_CASE("Built-in DLSS render scale follows the DLSS mode and is not listed",
-          "[patch_manager]") {
-    constexpr size_t ScaleOffset = sizeof(Loader::NSOHeader) + 0x806420;
-    constexpr u32 ScaleOne = 0x52A7F009;
-    constexpr u32 ScaleUltra = 0x52A7E009;
-    PatchManagerTestContext context;
-    const auto manager = context.Manager();
-    auto nso = MakeMain(OcarinaBuildId, TbzInstruction);
-    nso.resize(ScaleOffset + 0x100);
-    std::memcpy(nso.data() + ScaleOffset, &ScaleOne, sizeof(ScaleOne));
-    const auto scale = [&] { return WordAt(manager.PatchNSO(nso, "main"), ScaleOffset); };
-
-    auto& dlss = Settings::values.nvidia_dlss;
-    auto& mode = Settings::values.ocarina_dlss_mode;
-    const bool previous_dlss = dlss.GetValue();
-    const auto previous_mode = mode.GetValue();
-
-    dlss.SetValue(true);
-    mode.SetValue(Settings::OcarinaDlssMode::Quality);
-    CHECK(scale() == ScaleOne);
-    mode.SetValue(Settings::OcarinaDlssMode::UltraPerformance);
-#ifdef EGLANTINE_STREAMLINE
-    CHECK(scale() == ScaleUltra);
-    Settings::values.oot_anti_aliasing.SetValue(Settings::OotAntiAliasing::Fsr3);
-    CHECK(scale() == ScaleOne);
-    Settings::values.oot_anti_aliasing.SetValue(Settings::OotAntiAliasing::Game);
-    Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Off);
-    CHECK(scale() == ScaleOne);
-    Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Auto);
-#else
-    CHECK(scale() == ScaleOne);
-    CHECK(ScaleUltra != ScaleOne);
-#endif
+    // Only the patches with a trade-off stay in Add-Ons.
     const auto patches = manager.GetPatches();
-    CHECK(std::ranges::none_of(patches, [](const FileSys::Patch& patch) {
-        return patch.name.find("render scale") != std::string::npos;
-    }));
-    dlss.SetValue(false);
-    CHECK(scale() == ScaleOne);
-
-    dlss.SetValue(previous_dlss);
-    mode.SetValue(previous_mode);
+    std::vector<std::string> builtins;
+    for (const auto& patch : patches) {
+        if (patch.builtin) {
+            builtins.push_back(patch.name);
+        }
+    }
+    REQUIRE(builtins == std::vector<std::string>{std::string{OcclusionOff},
+                                                 "No NDSR anti-aliasing (built-in)"});
 }
 
-TEST_CASE("Ocarina render scale setting applies Max Resolution's path at its scale",
+TEST_CASE("Ocarina resolution setting picks Max Resolution's path and its scale",
           "[patch_manager]") {
     constexpr size_t ScaleOffset = sizeof(Loader::NSOHeader) + 0x806420;
     constexpr u32 ScaleOne = 0x52A7F009;
+    constexpr u32 Scale87 = 0x52A7EBE9;
     constexpr u32 Scale75 = 0x52A7E809;
     constexpr u32 Scale56 = 0x52A7E209;
     constexpr u32 Scale50 = 0x52A7E009;
@@ -302,34 +277,40 @@ TEST_CASE("Ocarina render scale setting applies Max Resolution's path at its sca
         const auto out = manager.PatchNSO(nso, "main");
         return std::pair{WordAt(out), WordAt(out, ScaleOffset)};
     };
+    using Settings::OotResolution;
+    auto& setting = Settings::values.oot_resolution;
+    const bool previous_dlss = Settings::values.nvidia_dlss.GetValue();
 
-    auto& setting = Settings::values.oot_render_scale;
-    auto& dlss = Settings::values.nvidia_dlss;
-    const bool previous_dlss = dlss.GetValue();
-    dlss.SetValue(false);
+    // NVIDIA DLSS changes nothing here: the scale is DLSS's input when it runs.
+    for (const bool dlss : {false, true}) {
+        Settings::values.nvidia_dlss.SetValue(dlss);
+        setting.SetValue(OotResolution::Game);
+        CHECK(words() == std::pair{TbzInstruction, ScaleOne});
+        setting.SetValue(OotResolution::Full);
+        CHECK(words() == std::pair{BranchInstruction, ScaleOne});
+        setting.SetValue(OotResolution::Percent87);
+        CHECK(words() == std::pair{BranchInstruction, Scale87});
+        setting.SetValue(OotResolution::Percent75);
+        CHECK(words() == std::pair{BranchInstruction, Scale75});
+        setting.SetValue(OotResolution::Percent56);
+        CHECK(words() == std::pair{BranchInstruction, Scale56});
+        setting.SetValue(OotResolution::Percent50);
+        CHECK(words() == std::pair{BranchInstruction, Scale50});
+    }
+    Settings::values.nvidia_dlss.SetValue(previous_dlss);
 
-    setting.SetValue(Settings::OotRenderScale::Game);
-    CHECK(words() == std::pair{BranchInstruction, ScaleOne});
-    setting.SetValue(Settings::OotRenderScale::Percent75);
-    CHECK(words() == std::pair{BranchInstruction, Scale75});
-    setting.SetValue(Settings::OotRenderScale::Percent56);
-    CHECK(words() == std::pair{BranchInstruction, Scale56});
-
-    // An explicit scale applies even with Max Resolution and resolution patches turned off.
-    setting.SetValue(Settings::OotRenderScale::Percent50);
+    // An old per-game Add-Ons entry for Max Resolution no longer decides anything.
+    setting.SetValue(OotResolution::Full);
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
-    Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Off);
-    CHECK(words() == std::pair{BranchInstruction, Scale50});
-    setting.SetValue(Settings::OotRenderScale::Game);
-    CHECK(words() == std::pair{TbzInstruction, ScaleOne});
-    Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Auto);
-    Settings::values.disabled_addons.erase(OcarinaTitleId);
+    CHECK(words() == std::pair{BranchInstruction, ScaleOne});
 
-    const auto patches = manager.GetPatches();
-    CHECK(std::ranges::none_of(patches, [](const FileSys::Patch& patch) {
-        return patch.name.starts_with("Render scale");
-    }));
-    dlss.SetValue(previous_dlss);
+    CHECK(Settings::OcarinaDlssModeFor(OotResolution::Full) == Settings::OcarinaDlssMode::Quality);
+    CHECK(Settings::OcarinaDlssModeFor(OotResolution::Percent87) ==
+          Settings::OcarinaDlssMode::Balanced);
+    CHECK(Settings::OcarinaDlssModeFor(OotResolution::Percent75) ==
+          Settings::OcarinaDlssMode::Performance);
+    CHECK(Settings::OcarinaDlssModeFor(OotResolution::Percent50) ==
+          Settings::OcarinaDlssMode::UltraPerformance);
 }
 
 TEST_CASE("Built-in patch kind settings: game choice, then global, then default",
@@ -338,10 +319,10 @@ TEST_CASE("Built-in patch kind settings: game choice, then global, then default"
     const auto manager = context.Manager();
     const auto info = [&] {
         const auto patches = manager.GetPatches();
-        const auto it = std::ranges::find(patches, MaxResolution, &FileSys::Patch::name);
+        const auto it = std::ranges::find(patches, OcclusionOff, &FileSys::Patch::name);
         REQUIRE(it != patches.end());
         REQUIRE(it->builtin);
-        REQUIRE(it->builtin->kind == FileSys::BuiltinPatchKind::Resolution);
+        REQUIRE(it->builtin->kind == FileSys::BuiltinPatchKind::Performance);
         return std::pair{it->enabled, it->builtin->source};
     };
     using Source = FileSys::BuiltinPatchSource;
@@ -353,39 +334,35 @@ TEST_CASE("Built-in patch kind settings: game choice, then global, then default"
     }
 
     SECTION("The global setting of the kind decides") {
-        Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Off);
+        Settings::values.patch_performance.SetValue(Settings::GamePatchMode::Off);
         auto [enabled, source] = info();
         REQUIRE_FALSE(enabled);
         REQUIRE(source == Source::Global);
-        REQUIRE(PatchMain(context, OcarinaBuildId, TbzInstruction) == TbzInstruction);
 
-        Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::On);
+        Settings::values.patch_performance.SetValue(Settings::GamePatchMode::On);
         std::tie(enabled, source) = info();
         REQUIRE(enabled);
         REQUIRE(source == Source::Global);
     }
 
     SECTION("The game's choice overrides the global setting") {
-        Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Off);
+        Settings::values.patch_performance.SetValue(Settings::GamePatchMode::Off);
         FileSys::ApplyBuiltinPatchChoice(Settings::values.disabled_addons[OcarinaTitleId],
-                                         MaxResolution, FileSys::BuiltinPatchChoice::On);
+                                         OcclusionOff, FileSys::BuiltinPatchChoice::On);
         const auto [enabled, source] = info();
         REQUIRE(enabled);
         REQUIRE(source == Source::Game);
-        REQUIRE(PatchMain(context, OcarinaBuildId, TbzInstruction) == BranchInstruction);
 
         FileSys::ApplyBuiltinPatchChoice(Settings::values.disabled_addons[OcarinaTitleId],
-                                         MaxResolution, FileSys::BuiltinPatchChoice::FollowGlobal);
+                                         OcclusionOff, FileSys::BuiltinPatchChoice::FollowGlobal);
         REQUIRE_FALSE(info().first);
     }
 
     SECTION("Other kinds are not affected") {
-        Settings::values.patch_frame_rate.SetValue(Settings::GamePatchMode::Off);
+        Settings::values.patch_image.SetValue(Settings::GamePatchMode::Off);
         REQUIRE(info().first);
+        Settings::values.patch_image.SetValue(Settings::GamePatchMode::Auto);
     }
-
-    Settings::values.patch_frame_rate.SetValue(Settings::GamePatchMode::Auto);
-    Settings::values.patch_resolution.SetValue(Settings::GamePatchMode::Auto);
 }
 
 namespace {
@@ -413,16 +390,10 @@ std::vector<u8> MakeDynamicMain() {
 
 } // Anonymous namespace
 
-TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_manager]") {
+TEST_CASE("Ocarina frame timing: FPS Unlock at every frame rate, Dark's routine on request",
+          "[patch_manager]") {
     PatchManagerTestContext context;
     const auto manager = context.Manager();
-    const auto listed = [&](std::string_view name) {
-        const auto patches = manager.GetPatches();
-        const auto it = std::ranges::find(patches, name, &FileSys::Patch::name);
-        REQUIRE(it != patches.end());
-        REQUIRE(it->type == FileSys::PatchType::Mod);
-        return *it;
-    };
     const auto routine = [](const std::vector<u8>& nso, size_t size) {
         return Common::HexToString(std::span{nso}.subspan(DynamicRoutineOffset, size));
     };
@@ -442,31 +413,30 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
                WordAt(nso, WaterRoutineOffset) == 0;
     };
     const auto nso = MakeDynamicMain();
+    const auto patches = manager.GetPatches();
+    REQUIRE(std::ranges::find(patches, FpsUnlock, &FileSys::Patch::name) == patches.end());
+    REQUIRE(std::ranges::find(patches, DynamicFps, &FileSys::Patch::name) == patches.end());
 
-    // Default: FPS Unlock applies, Dynamic FPS is listed as replaced by it when it applies.
-    REQUIRE(listed(FpsUnlock).enabled);
-    REQUIRE(listed(DynamicFps).enabled);
-    REQUIRE(listed(DynamicFps).version ==
-            fmt::format("IPS, replaced by {} when it applies", FpsUnlock));
-    auto patched = manager.PatchNSO(nso, "main");
-    REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
-    REQUIRE(routine(patched, UnlockRoutineSize) ==
-            std::string{RoutineHead} + "E300001C4268231EC300001C4278231E4840201EC0035FD6"
-                                       "1F2003D50AD7A33C0000C040");
-    REQUIRE(WordAt(patched) == BranchInstruction);
-    REQUIRE(water_patched(patched));
-
-    // Unchecking only Dynamic FPS keeps FPS Unlock.
-    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{DynamicFps}};
-    REQUIRE_FALSE(listed(DynamicFps).enabled);
-    REQUIRE(routine(manager.PatchNSO(nso, "main"), UnlockRoutineSize) ==
-            routine(patched, UnlockRoutineSize));
-
-    // Without FPS Unlock, Dark's routine applies unchanged.
+    // Every oot_frame_rate choice: FPS Unlock, with Max Resolution by default.
+    for (const auto rate : {Settings::OotFrameRate::Fps30, Settings::OotFrameRate::Fps60,
+                            Settings::OotFrameRate::Unlocked}) {
+        Settings::values.oot_frame_rate.SetValue(rate);
+        const auto patched = manager.PatchNSO(nso, "main");
+        REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
+        REQUIRE(routine(patched, UnlockRoutineSize) ==
+                std::string{RoutineHead} + "E300001C4268231EC300001C4278231E4840201EC0035FD6"
+                                           "1F2003D50AD7A33C0000C040");
+        REQUIRE(WordAt(patched) == BranchInstruction);
+        REQUIRE(water_patched(patched));
+    }
+    Settings::values.oot_frame_rate.SetValue(Settings::OotFrameRate::Fps60);
+    // An old Add-Ons entry turning FPS Unlock off no longer decides anything.
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{FpsUnlock}};
-    REQUIRE_FALSE(listed(FpsUnlock).enabled);
-    REQUIRE(listed(DynamicFps).version == "IPS");
-    patched = manager.PatchNSO(nso, "main");
+    REQUIRE(WordAt(manager.PatchNSO(nso, "main"), DynamicCallOffset) == DynamicCallInstruction);
+
+    // EDEN_NX2_OOT_FRAME_TIMING=dark: Dark's routine unchanged.
+    SetFrameTiming("dark");
+    auto patched = manager.PatchNSO(nso, "main");
     REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
     REQUIRE(routine(patched, DynamicRoutineSize) ==
             std::string{RoutineHead} + "C300001C0309231E4020231E4D0000544840201EC0035FD6"
@@ -474,28 +444,51 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
     REQUIRE(WordAt(patched, DynamicRoutineOffset + DynamicRoutineSize) == 0);
     REQUIRE(water_patched(patched));
 
-    // Both unchecked: hook and code cave stay untouched.
-    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{FpsUnlock},
-                                                        std::string{DynamicFps}};
+    // =game: hook and code cave stay untouched.
+    SetFrameTiming("game");
     patched = manager.PatchNSO(nso, "main");
     REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicOriginalInstruction);
     REQUIRE(WordAt(patched, DynamicRoutineOffset) == 0);
     REQUIRE(water_untouched(patched));
+    SetFrameTiming(nullptr);
 
-    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
+    Settings::values.oot_resolution.SetValue(Settings::OotResolution::Game);
     patched = manager.PatchNSO(nso, "main");
     REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
     REQUIRE(WordAt(patched) == TbzInstruction);
-
-    const auto unrelated = context.Manager(OtherTitleId).GetPatches();
-    REQUIRE(std::ranges::find(unrelated, DynamicFps, &FileSys::Patch::name) == unrelated.end());
-    REQUIRE(std::ranges::find(unrelated, FpsUnlock, &FileSys::Patch::name) == unrelated.end());
 }
 
-TEST_CASE("Built-in Dynamic FPS rejects mismatched or truncated modules transactionally",
+TEST_CASE("Ocarina frame rate decides its vsync rate and half rate", "[patch_manager]") {
+    PatchManagerTestContext context;
+    const u64 previous_program = Settings::GetCurrentProgramID();
+    const u16 previous_limit = Settings::values.frame_rate_limit.GetValue();
+    Settings::values.frame_rate_limit.SetValue(120);
+
+    Settings::SetCurrentProgramID(OcarinaTitleId);
+    Settings::values.oot_frame_rate.SetValue(Settings::OotFrameRate::Fps60);
+    CHECK(Settings::FrameRateLimit() == 60);
+    CHECK_FALSE(Settings::OcarinaHalfRate(OcarinaTitleId));
+    Settings::values.oot_frame_rate.SetValue(Settings::OotFrameRate::Fps30);
+    CHECK(Settings::FrameRateLimit() == 60);
+    CHECK(Settings::OcarinaHalfRate(OcarinaTitleId));
+    CHECK_FALSE(Settings::OcarinaHalfRate(OtherTitleId));
+    Settings::values.oot_frame_rate.SetValue(Settings::OotFrameRate::Unlocked);
+    CHECK(Settings::FrameRateLimit() == 120);
+
+    // Other games follow the limit whatever Ocarina's choice.
+    Settings::values.oot_frame_rate.SetValue(Settings::OotFrameRate::Fps30);
+    Settings::SetCurrentProgramID(OtherTitleId);
+    CHECK(Settings::FrameRateLimit() == 120);
+
+    Settings::values.oot_frame_rate.SetValue(Settings::OotFrameRate::Fps60);
+    Settings::values.frame_rate_limit.SetValue(previous_limit);
+    Settings::SetCurrentProgramID(previous_program);
+}
+
+TEST_CASE("Built-in frame timing rejects mismatched or truncated modules transactionally",
           "[patch_manager]") {
     PatchManagerTestContext context;
-    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
+    Settings::values.oot_resolution.SetValue(Settings::OotResolution::Game);
     auto nso = MakeDynamicMain();
     std::string module = "main";
     u64 title = OcarinaTitleId;
@@ -559,7 +552,7 @@ TEST_CASE("Built-in Dynamic FPS rejects mismatched or truncated modules transact
     REQUIRE(context.Manager(title).PatchNSO(nso, module) == nso);
 }
 
-TEST_CASE("Built-in Dynamic FPS leaves both records alone when a user mod changes either",
+TEST_CASE("Built-in frame timing leaves both records alone when a user mod changes either",
           "[patch_manager]") {
     size_t offset = DynamicCallOffset;
     u32 mod_word = 0x11223344;
@@ -577,7 +570,7 @@ TEST_CASE("Built-in Dynamic FPS leaves both records alone when a user mod change
         offset = DynamicStateOffset;
     }
     PatchManagerTestContext context{mod_word, offset};
-    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
+    Settings::values.oot_resolution.SetValue(Settings::OotResolution::Game);
     const auto nso = MakeDynamicMain();
     auto expected = nso;
     std::memcpy(expected.data() + offset, &mod_word, sizeof(mod_word));

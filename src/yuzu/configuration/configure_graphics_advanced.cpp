@@ -74,19 +74,6 @@ void ConfigureGraphicsAdvanced::Setup(const ConfigurationShared::Builder& builde
         ConfigurationShared::SetUnavailable(held(Settings::values.renderer_force_max_clock), reason);
         ConfigurationShared::SetUnavailable(held(Settings::values.frame_pacing_mode), reason);
     }
-    // nx2_gsv.h PaceToVblank only holds the two-vblank interval at a 60 Hz vsync event with the
-    // speed limited.
-    if (const u32 hz = Settings::values.frame_rate_limit.GetValue(); hz != 60) {
-        ConfigurationShared::SetUnavailable(
-            held(Settings::values.oot_30fps),
-            tr("Has no effect while Frame rate limit (Switch 2) is %1 Hz: set it to 60 Hz in the "
-               "Graphics tab first.")
-                .arg(hz));
-    } else if (!Settings::values.use_speed_limit.GetValue()) {
-        ConfigurationShared::SetUnavailable(
-            held(Settings::values.oot_30fps),
-            tr("Has no effect while the speed limit is off (Configure > General)."));
-    }
 }
 
 void ConfigureGraphicsAdvanced::ApplyConfiguration() {

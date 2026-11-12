@@ -4867,7 +4867,8 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
         ocarina_fsr_lod_bias =
             ocarina ? VideoCommon::OcarinaFsrLodBias(
                           ResolveOcarinaUpscaler(device),
-                          Settings::values.ocarina_dlss_mode.GetValue())
+                          Settings::OcarinaDlssModeFor(
+                              Settings::values.oot_resolution.GetValue()))
                     : 0.0f;
     }
     return *ocarina_fsr_lod_bias;

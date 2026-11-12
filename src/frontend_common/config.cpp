@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <optional>
+#include <string_view>
+#include <fmt/format.h>
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -14,6 +17,7 @@
 #include "common/settings_common.h"
 #include "common/settings_enums.h"
 #include "config.h"
+#include "frontend_common/settings_migration.h"
 
 #ifdef _WIN32
 #include "common/string_util.h"
@@ -404,8 +408,130 @@ void Config::ReadRendererValues() {
     ReadCategory(Settings::Category::RendererHacks);
     ReadCategory(Settings::Category::RendererExtensions);
     ReadCategory(Settings::Category::RendererDebug);
+    MigrateRendererValues();
 
     EndGroup();
+}
+
+bool Config::HasSetting(const std::string& key) {
+    return config->GetValue(GetSection().c_str(), GetFullKey(key, false).c_str(), nullptr) !=
+           nullptr;
+}
+
+// Runs until this build has written the new key, so a config another build saves meanwhile is
+// still read the way that build left it. The old keys stay for builds that still read them.
+void Config::MigrateRendererValues() {
+    namespace Migration = SettingsMigration;
+    auto& values = Settings::values;
+    const auto missing = [&](const char* key) {
+        return !HasSetting(global ? std::string(key) : std::string(key).append("\\use_global"));
+    };
+    // An old key's value, if this file sets it (for a game: without using the global value).
+    const auto sets = [&](const char* key) {
+        return HasSetting(key) &&
+               (global || !ReadBooleanSetting(std::string(key).append("\\use_global"), true));
+    };
+    const auto old_int = [&](const char* key) -> std::optional<s64> {
+        return sets(key) ? std::optional<s64>{ReadIntegerSetting(key, 0)} : std::nullopt;
+    };
+    // Booleans are written as "true"/"false".
+    const auto old_flag = [&](const char* key) -> std::optional<bool> {
+        return sets(key) ? std::optional<bool>{ReadBooleanSetting(key, false)} : std::nullopt;
+    };
+    const auto set = [&](auto& setting, auto value) {
+        if (!global) {
+            if (value == setting.GetValue(true)) {
+                return;
+            }
+            setting.SetGlobal(false);
+        }
+        setting.SetValue(value);
+    };
+    const std::string_view file = config_loc;
+    const bool ocarina = global || file.ends_with("0400486024DEC000.ini");
+    const bool mario_kart = global || file.ends_with("0400C3F00006E000.ini");
+
+    if (ocarina && missing("oot_frame_rate")) {
+        const auto thirty = old_flag("oot_30fps");
+        const bool limit_set = global ? HasSetting("nx2_frame_rate_limit")
+                                      : !values.frame_rate_limit.UsingGlobal();
+        if (thirty || limit_set) {
+            const bool was_thirty = thirty.value_or(
+                values.oot_frame_rate.GetValue(true) == Settings::OotFrameRate::Fps30);
+            set(values.oot_frame_rate, Migration::OotFrameRateFrom(
+                                           was_thirty, values.frame_rate_limit.GetValue()));
+            LOG_INFO(Config,
+                     "Earlier settings: oot_30fps={} nx2_frame_rate_limit={} -> oot_frame_rate={}",
+                     was_thirty, values.frame_rate_limit.GetValue(),
+                     Settings::CanonicalizeEnum(values.oot_frame_rate.GetValue()));
+        }
+    }
+
+    if (ocarina && missing("oot_resolution")) {
+        Migration::OldOcarinaResolution old;
+        const auto render_scale = old_int("oot_render_scale");
+        old.render_scale = static_cast<int>(render_scale.value_or(0));
+        if (global) {
+            const auto patch_resolution = old_int("patch_resolution");
+            const auto dlss_mode = old_int("ocarina_dlss_mode");
+            old.patch_resolution =
+                static_cast<Settings::GamePatchMode>(patch_resolution.value_or(0));
+            old.dlss_mode = static_cast<int>(dlss_mode.value_or(0));
+            constexpr std::string_view MaxResolution = "Max Resolution (built-in)";
+            if (const auto it = values.disabled_addons.find(0x0400486024DEC000ULL);
+                it != values.disabled_addons.end()) {
+                const auto& disabled = it->second;
+                if (std::ranges::find(disabled, MaxResolution) != disabled.end()) {
+                    old.max_resolution_choice = false;
+                } else if (std::ranges::find(disabled, fmt::format("enabled:{}", MaxResolution)) !=
+                           disabled.end()) {
+                    old.max_resolution_choice = true;
+                }
+            }
+            old.max_resolution_default =
+                values.oot_resolution.GetDefault() == Settings::OotResolution::Full;
+#ifdef EGLANTINE_STREAMLINE
+            old.dlss_build = true;
+#endif
+            old.nvidia_dlss = values.nvidia_dlss.GetValue();
+            old.fsr3 =
+                values.oot_anti_aliasing.GetValue(true) == Settings::OotAntiAliasing::Fsr3;
+            if (render_scale || patch_resolution || dlss_mode || old.max_resolution_choice) {
+                set(values.oot_resolution, Migration::OotResolutionFrom(old));
+                LOG_INFO(Config,
+                         "Earlier settings: oot_render_scale={} patch_resolution={} Max "
+                         "Resolution add-on={} ocarina_dlss_mode={} -> oot_resolution={}",
+                         old.render_scale, static_cast<int>(old.patch_resolution),
+                         old.max_resolution_choice ? (*old.max_resolution_choice ? "on" : "off")
+                                                   : "default",
+                         old.dlss_mode, Settings::CanonicalizeEnum(values.oot_resolution.GetValue()));
+                // The game list caches the add-on summary that listed the built-ins now set here.
+                std::error_code ec;
+                std::filesystem::remove(FS::GetEdenPath(FS::EdenPath::CacheDir) / "game_list" /
+                                            "0400486024DEC000.pv.txt",
+                                        ec);
+            }
+        } else if (render_scale && *render_scale != 0) {
+            // For a game only a fixed scale was its own; the rest followed the global choice.
+            set(values.oot_resolution, Migration::OotResolutionFrom(old));
+            LOG_INFO(Config, "Earlier settings: oot_render_scale={} -> oot_resolution={}",
+                     old.render_scale, Settings::CanonicalizeEnum(values.oot_resolution.GetValue()));
+        }
+    }
+
+    if (mario_kart && missing("mkw_frame_rate")) {
+        const auto thirty = old_flag("mkw_30fps");
+        const auto dynamic = old_flag("mkw_dynamic_fps");
+        if (thirty || dynamic) {
+            const auto before = values.mkw_frame_rate.GetValue(true);
+            const bool was_thirty = thirty.value_or(before == Settings::MkwFrameRate::Fps30);
+            const bool was_dynamic = dynamic.value_or(before == Settings::MkwFrameRate::Dynamic);
+            set(values.mkw_frame_rate, Migration::MkwFrameRateFrom(was_thirty, was_dynamic));
+            LOG_INFO(Config,
+                     "Earlier settings: mkw_30fps={} mkw_dynamic_fps={} -> mkw_frame_rate={}",
+                     was_thirty, was_dynamic, Settings::CanonicalizeEnum(values.mkw_frame_rate.GetValue()));
+        }
+    }
 }
 
 void Config::ReadScreenshotValues() {

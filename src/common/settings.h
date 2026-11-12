@@ -71,7 +71,9 @@ SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
 SWITCHABLE(OotMovieUpscale, false);
 SWITCHABLE(TextureQuality, false);
-SWITCHABLE(OotRenderScale, false);
+SWITCHABLE(OotResolution, false);
+SWITCHABLE(OotFrameRate, false);
+SWITCHABLE(MkwFrameRate, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -402,8 +404,8 @@ struct Values {
                                                        true,
                                                        true};
     // Switch 2 VSync event rate. Games start frames on it, so above 60 only games with a
-    // real-time step (e.g. the Ocarina "FPS Unlock" built-in) keep their speed. A running game
-    // follows a change at its next vsync.
+    // real-time step keep their speed. Ocarina of Time follows it only with oot_frame_rate
+    // Unlocked (FrameRateLimit()). A running game follows a change at its next vsync.
     SwitchableSetting<u16, true> frame_rate_limit{linkage,
                                                   60,
                                                   30,
@@ -422,10 +424,6 @@ struct Values {
     // still overrides it.
     Setting<DlssPreset> nvidia_dlss_preset{linkage, DlssPreset::K, "nvidia_dlss_preset",
                                            Category::Renderer};
-    // Ocarina of Time's render resolution under Max Resolution, as a DLSS mode to 4K. Global only,
-    // like nvidia_dlss.
-    Setting<OcarinaDlssMode> ocarina_dlss_mode{linkage, OcarinaDlssMode::Quality,
-                                               "ocarina_dlss_mode", Category::Renderer};
     // Apple only: MetalFX temporal upscaling in place of a game's DLSS and of Ocarina of Time's
     // upscaler (what NVIDIA DLSS does on Windows). Global only, like nvidia_dlss.
     Setting<bool> metalfx_temporal{linkage, false, "metalfx_temporal", Category::Renderer};
@@ -459,6 +457,28 @@ struct Values {
     // cost ~33 ms a frame). EDEN_NX2_OOT_MOVIE_NETWORK=0/1 overrides it for tests.
     SwitchableSetting<OotMovieUpscale> oot_movie_upscale{linkage, OotMovieUpscale::Bilinear,
                                                          "oot_movie_upscale", Category::Renderer};
+    // Ocarina of Time's 3D resolution, the one source for it (built-in patches in
+    // core/file_sys/patch_manager.cpp): Game is the game's dynamic resolution (down to 480p), the
+    // others a fixed share of its full size. With NVIDIA DLSS the fixed sizes are DLSS's input
+    // (OcarinaDlssModeFor). Phones default to the game's own, the safety valve their GPUs need.
+    // EDEN_NX2_OOT_MAX_RESOLUTION=0/1 and EDEN_NX2_OOT_RENDER_SCALE=1..3 override it for tests.
+    // Read when the game starts.
+    SwitchableSetting<OotResolution> oot_resolution{linkage,
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+                                                    OotResolution::Game,
+#else
+                                                    OotResolution::Full,
+#endif
+                                                    "oot_resolution", Category::Renderer};
+    // Ocarina of Time: 30 FPS (two vblanks a frame, nx2_gsv.h PaceToVblank), 60 FPS, or the
+    // frame rate limit. The game's step follows real time (built-in FPS Unlock), so it keeps full
+    // speed at each. The first desktop launch asks (oot_fps_asked). Takes effect at once.
+    SwitchableSetting<OotFrameRate> oot_frame_rate{linkage, OotFrameRate::Fps60, "oot_frame_rate",
+                                                   Category::Renderer};
+    // Mario Kart World: the game's own frame rate, its native 30 FPS mode, or dynamic 30-60 FPS
+    // (loader/nso.cpp). Read when the game starts.
+    SwitchableSetting<MkwFrameRate> mkw_frame_rate{linkage, MkwFrameRate::Game, "mkw_frame_rate",
+                                                   Category::Renderer};
 
     SwitchableSetting<std::string> post_shader_chain{linkage,
                                                      std::string(),
@@ -718,10 +738,6 @@ struct Values {
     SwitchableSetting<bool> use_video_framerate{linkage, false, "use_video_framerate",
                                                 Category::RendererAdvanced};
 
-    // Ocarina of Time: present at 30 fps for lower-end PCs (nx2_gsv.h PaceToVblank). The game's
-    // timing follows real time (Dynamic FPS by Dark), so it keeps full speed. Asked once at the
-    // first launch (oot_fps_asked).
-    SwitchableSetting<bool> oot_30fps{linkage, false, "oot_30fps", Category::RendererAdvanced};
     Setting<bool> oot_fps_asked{linkage, false, "oot_fps_asked", Category::RendererAdvanced};
     // Half / Quarter: the RomFS serves each .bntx.zs texture of 512 px or more with its top one or
     // two mip levels dropped (file_sys/texture_quality.h): softer textures, less guest and GPU
@@ -729,20 +745,10 @@ struct Values {
     SwitchableSetting<TextureQuality> texture_quality{linkage, TextureQuality::Full,
                                                       "texture_quality",
                                                       Category::RendererAdvanced};
-    // Ocarina of Time: a fixed internal render scale for the 3D instead of Max Resolution or
-    // the game's dynamic resolution (built-in patch). Read when the game starts.
-    SwitchableSetting<OotRenderScale> oot_render_scale{linkage, OotRenderScale::Game,
-                                                       "oot_render_scale",
-                                                       Category::RendererAdvanced};
     // Which revision of the Frizti tuned settings (common/frizti_settings.h) this config has had
     // applied once (MainWindow::MigrateFriztiSettings; config/frizti.ini keeps it too).
     Setting<u32> frizti_settings_revision{linkage, 0, "frizti_settings_revision",
                                           Category::RendererAdvanced};
-
-    // Mario Kart World: select a fixed or dynamic in-game frame-rate mode (loader/nso.cpp).
-    SwitchableSetting<bool> mkw_30fps{linkage, false, "mkw_30fps", Category::RendererAdvanced};
-    SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
-                                            Category::RendererAdvanced};
 
     // Apple: unified memory doesn't make the readback free, it is still a fence wait (Ocarina of
     // Time is tuned without it).
@@ -1086,12 +1092,9 @@ struct Values {
     Setting<std::string> eden_token{linkage, "",
                                     "eden_token", Category::WebService};
 
-    // Built-in game patches by kind (core/file_sys/patch_manager.h). Auto keeps the platform's
-    // default for each patch; a game's own add-on choice overrides these.
-    Setting<GamePatchMode> patch_frame_rate{linkage, GamePatchMode::Auto, "patch_frame_rate",
-                                            Category::Renderer};
-    Setting<GamePatchMode> patch_resolution{linkage, GamePatchMode::Auto, "patch_resolution",
-                                            Category::Renderer};
+    // Built-in game patches with a choice, by kind (core/file_sys/patch_manager.h). Auto keeps the
+    // platform's default for each patch; a game's own add-on choice overrides these. Frame rate
+    // and resolution patches follow their game's settings (oot_frame_rate, oot_resolution).
     Setting<GamePatchMode> patch_performance{linkage, GamePatchMode::Auto, "patch_performance",
                                              Category::Renderer};
     Setting<GamePatchMode> patch_image{linkage, GamePatchMode::Auto, "patch_image",
@@ -1153,6 +1156,17 @@ float Volume();
 
 // speed limit ops
 u16 SpeedLimit();
+
+// The Switch 2 vsync rate for the running program: Ocarina of Time at 30 or 60 FPS keeps 60 Hz
+// (oot_frame_rate), every other case follows frame_rate_limit.
+u16 FrameRateLimit();
+// Ocarina of Time runs two vblanks a frame (oot_frame_rate 30 FPS).
+bool OcarinaHalfRate(u64 program_id);
+
+// The NVIDIA DLSS mode whose input size an Ocarina of Time resolution renders at (to 4K):
+// Full Quality, 87% Balanced, 75% Performance, 50% Ultra Performance; the others render as they
+// are and count as Quality.
+OcarinaDlssMode OcarinaDlssModeFor(OotResolution resolution);
 void SetSpeedMode(const SpeedMode &mode);
 void ToggleStandardMode();
 void ToggleTurboMode();

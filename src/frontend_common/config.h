@@ -99,6 +99,9 @@ protected:
     void ReadMiscellaneousValues();
     void ReadCpuValues();
     void ReadRendererValues();
+    // Maps the keys earlier builds used for settings that are now one (settings_migration.h).
+    void MigrateRendererValues();
+    bool HasSetting(const std::string& key);
     void ReadScreenshotValues();
     void ReadSystemValues();
     void ReadWebServiceValues();

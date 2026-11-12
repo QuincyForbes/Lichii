@@ -73,11 +73,10 @@ struct BuiltinPatch {
     std::string_view game{};
     std::string_view description{};
     std::string_view effect{};
-    // When set, the patch applies only with this DLSS mode chosen and is not listed in Add-Ons.
-    std::optional<Settings::OcarinaDlssMode> render_scale{};
-    // When set, the patch applies exactly while this returns true (a setting of its own) and is
-    // not listed in Add-Ons.
+    // When set, the patch applies exactly while this returns true (a setting of its own, named in
+    // chosen_by, or an always-on fix) and is not listed in Add-Ons.
     bool (*chosen)() = nullptr;
+    std::string_view chosen_by{};
 };
 
 constexpr std::string_view ENABLED_PREFIX = "enabled:";
@@ -89,9 +88,9 @@ bool IsListed(const std::vector<std::string>& list, std::string_view name) {
 Settings::GamePatchMode GlobalPatchMode(BuiltinPatchKind kind) {
     switch (kind) {
     case BuiltinPatchKind::FrameRate:
-        return Settings::values.patch_frame_rate.GetValue();
     case BuiltinPatchKind::Resolution:
-        return Settings::values.patch_resolution.GetValue();
+        // Chosen by the game's own settings (oot_frame_rate, oot_resolution).
+        return Settings::GamePatchMode::Auto;
     case BuiltinPatchKind::Performance:
         return Settings::values.patch_performance.GetValue();
     case BuiltinPatchKind::Image:
@@ -125,61 +124,52 @@ bool MetalFxReplacesNdsr() {
     return Settings::values.metalfx_temporal.GetValue();
 }
 
-// The game's dynamic resolution is the safety valve a phone GPU needs.
-// EDEN_NX2_OOT_MAX_RESOLUTION=0 gives a desktop run the phone's default.
-bool MaxResolutionDefault() {
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-    constexpr bool platform_default = false;
-#else
-    constexpr bool platform_default = true;
-#endif
-    static const bool enabled = OotEnvSwitch("EDEN_NX2_OOT_MAX_RESOLUTION", platform_default);
-    return enabled;
-}
-
-// A shared config can carry the mode into a build without NVIDIA DLSS, where nothing would
-// upscale the smaller scene. FSR 3.1 takes the upscale from DLSS, at the game's own render scale.
-bool RenderScaleChosen([[maybe_unused]] Settings::OcarinaDlssMode mode) {
-#ifdef EGLANTINE_STREAMLINE
-    return Settings::values.nvidia_dlss.GetValue() &&
-           Settings::values.oot_anti_aliasing.GetValue() != Settings::OotAntiAliasing::Fsr3 &&
-           Settings::values.ocarina_dlss_mode.GetValue() == mode;
-#else
-    return false;
-#endif
-}
-
-bool DlssRenderScaleChosen() {
-    return RenderScaleChosen(Settings::OcarinaDlssMode::Balanced) ||
-           RenderScaleChosen(Settings::OcarinaDlssMode::Performance) ||
-           RenderScaleChosen(Settings::OcarinaDlssMode::UltraPerformance);
-}
-
-// Settings oot_render_scale; EDEN_NX2_OOT_RENDER_SCALE=0..3 overrides it for tests. A DLSS mode's
-// render scale takes precedence.
-Settings::OotRenderScale OotRenderScale() {
-    auto scale = Settings::values.oot_render_scale.GetValue();
+// Settings oot_resolution. For tests, EDEN_NX2_OOT_RENDER_SCALE=1..3 picks 75/56/50%, and
+// EDEN_NX2_OOT_MAX_RESOLUTION=0 turns Full into the game's dynamic resolution (the phone's
+// default on a desktop run), =1 the other way round.
+Settings::OotResolution OotResolution() {
+    using Settings::OotResolution;
     if (const char* v = std::getenv("EDEN_NX2_OOT_RENDER_SCALE");
-        v != nullptr && v[0] >= '0' && v[0] <= '3' && v[1] == '\0') {
-        scale = static_cast<Settings::OotRenderScale>(v[0] - '0');
+        v != nullptr && v[0] >= '1' && v[0] <= '3' && v[1] == '\0') {
+        constexpr std::array scales{OotResolution::Percent75, OotResolution::Percent56,
+                                    OotResolution::Percent50};
+        return scales[v[0] - '1'];
     }
-    return DlssRenderScaleChosen() ? Settings::OotRenderScale::Game : scale;
+    const auto resolution = Settings::values.oot_resolution.GetValue();
+    if (const char* v = std::getenv("EDEN_NX2_OOT_MAX_RESOLUTION"); v != nullptr && v[0] != 0) {
+        if (v[0] == '0' && resolution == OotResolution::Full) {
+            return OotResolution::Game;
+        }
+        if (v[0] != '0' && resolution == OotResolution::Game) {
+            return OotResolution::Full;
+        }
+    }
+    return resolution;
 }
 
-bool OotRenderScaleSet() {
-    return OotRenderScale() != Settings::OotRenderScale::Game;
+template <Settings::OotResolution Resolution>
+bool OotResolutionIs() {
+    return OotResolution() == Resolution;
 }
 
-bool OotRenderScale75() {
-    return OotRenderScale() == Settings::OotRenderScale::Percent75;
+// The game step follows real time (FPS Unlock) at every Settings oot_frame_rate choice. For tests,
+// EDEN_NX2_OOT_FRAME_TIMING=dark gives Dark's original routine, =game the game's fixed step.
+enum class OotFrameTiming { Unlock, Dark, Game };
+
+OotFrameTiming FrameTiming() {
+    const char* v = std::getenv("EDEN_NX2_OOT_FRAME_TIMING");
+    if (v != nullptr && std::strcmp(v, "dark") == 0) {
+        return OotFrameTiming::Dark;
+    }
+    if (v != nullptr && std::strcmp(v, "game") == 0) {
+        return OotFrameTiming::Game;
+    }
+    return OotFrameTiming::Unlock;
 }
 
-bool OotRenderScale56() {
-    return OotRenderScale() == Settings::OotRenderScale::Percent56;
-}
-
-bool OotRenderScale50() {
-    return OotRenderScale() == Settings::OotRenderScale::Percent50;
+template <OotFrameTiming Timing>
+bool FrameTimingIs() {
+    return FrameTiming() == Timing;
 }
 
 bool OotNativeZstdEnabled() {
@@ -198,25 +188,18 @@ constexpr std::array MAX_RESOLUTION_RECORDS{
     BuiltinPatchRecord{0x805BD0, MAX_RESOLUTION_BRANCH, MAX_RESOLUTION_ORIGINAL},
 };
 
-// Render scale for "NVIDIA DLSS mode in Ocarina of Time", on top of Max Resolution: its
-// fixed-scale path returns 1.0 of 2560x1440 (main+0x806420: mov w9, #0x3f800000). Quality keeps
-// it; the other modes load a lower scale.
+// Settings oot_resolution below Full: Max Resolution's fixed-scale path, which returns 1.0 of the
+// mode's base (1920x1080 handheld, 2560x1440 docked; main+0x806420: mov w9, #0x3f800000), at a
+// lower scale. 87/75/50% docked are NVIDIA DLSS Balanced/Performance/Ultra Performance to 4K.
 constexpr std::array<u8, 4> RENDER_SCALE_ONE{0x09, 0xF0, 0xA7, 0x52};         // #0x3f800000, 1.0
 constexpr std::array<u8, 4> RENDER_SCALE_BALANCED{0xE9, 0xEB, 0xA7, 0x52};    // #0x3f5f0000, ~1254p
 constexpr std::array<u8, 4> RENDER_SCALE_PERFORMANCE{0x09, 0xE8, 0xA7, 0x52}; // #0x3f400000, 1080p
 constexpr std::array<u8, 4> RENDER_SCALE_ULTRA{0x09, 0xE0, 0xA7, 0x52};       // #0x3f000000, 720p
-constexpr std::array RENDER_BALANCED_RECORDS{
+constexpr std::array<u8, 4> RENDER_SCALE_56{0x09, 0xE2, 0xA7, 0x52}; // #0x3f100000, 0.5625
+constexpr std::array OOT_RENDER_87_RECORDS{
+    BuiltinPatchRecord{0x805BD0, MAX_RESOLUTION_BRANCH, MAX_RESOLUTION_ORIGINAL},
     BuiltinPatchRecord{0x806420, RENDER_SCALE_BALANCED, RENDER_SCALE_ONE},
 };
-constexpr std::array RENDER_PERFORMANCE_RECORDS{
-    BuiltinPatchRecord{0x806420, RENDER_SCALE_PERFORMANCE, RENDER_SCALE_ONE},
-};
-constexpr std::array RENDER_ULTRA_RECORDS{
-    BuiltinPatchRecord{0x806420, RENDER_SCALE_ULTRA, RENDER_SCALE_ONE},
-};
-// Settings oot_render_scale: Max Resolution's fixed-scale path at a lower scale of the mode's base
-// (1920x1080 handheld, 2560x1440 docked), without a DLSS mode.
-constexpr std::array<u8, 4> RENDER_SCALE_56{0x09, 0xE2, 0xA7, 0x52}; // #0x3f100000, 0.5625
 constexpr std::array OOT_RENDER_75_RECORDS{
     BuiltinPatchRecord{0x805BD0, MAX_RESOLUTION_BRANCH, MAX_RESOLUTION_ORIGINAL},
     BuiltinPatchRecord{0x806420, RENDER_SCALE_PERFORMANCE, RENDER_SCALE_ONE},
@@ -471,48 +454,22 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = MAX_RESOLUTION_RECORDS,
-        .default_on = MaxResolutionDefault,
-        .blocked = OotRenderScaleSet,
         .kind = BuiltinPatchKind::Resolution,
         .game = OOT_GAME,
-        .description = "Renders the 3D at full scale instead of letting the game lower its "
-                       "resolution toward 480p when the GPU is busy.",
-        .effect = "Sharper image; more GPU work, and the game can no longer drop resolution to "
-                  "hold its frame rate.",
+        .chosen = OotResolutionIs<Settings::OotResolution::Full>,
+        .chosen_by = "oot_resolution",
     },
-    // Lower render scales under Max Resolution, chosen by Settings ocarina_dlss_mode.
+    // The fixed-scale path at a lower scale (Settings oot_resolution).
     BuiltinPatch{
-        .name = "DLSS Balanced render scale (built-in)",
+        .name = "Render scale 87% (built-in)",
         .title_id = 0x0400486024DEC000,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
-        .records = RENDER_BALANCED_RECORDS,
-        .default_on = MaxResolutionDefault,
+        .records = OOT_RENDER_87_RECORDS,
         .kind = BuiltinPatchKind::Resolution,
         .game = OOT_GAME,
-        .render_scale = Settings::OcarinaDlssMode::Balanced,
-    },
-    BuiltinPatch{
-        .name = "DLSS Performance render scale (built-in)",
-        .title_id = 0x0400486024DEC000,
-        .module = "main",
-        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
-        .records = RENDER_PERFORMANCE_RECORDS,
-        .default_on = MaxResolutionDefault,
-        .kind = BuiltinPatchKind::Resolution,
-        .game = OOT_GAME,
-        .render_scale = Settings::OcarinaDlssMode::Performance,
-    },
-    BuiltinPatch{
-        .name = "DLSS Ultra Performance render scale (built-in)",
-        .title_id = 0x0400486024DEC000,
-        .module = "main",
-        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
-        .records = RENDER_ULTRA_RECORDS,
-        .default_on = MaxResolutionDefault,
-        .kind = BuiltinPatchKind::Resolution,
-        .game = OOT_GAME,
-        .render_scale = Settings::OcarinaDlssMode::UltraPerformance,
+        .chosen = OotResolutionIs<Settings::OotResolution::Percent87>,
+        .chosen_by = "oot_resolution",
     },
     BuiltinPatch{
         .name = "Render scale 75% (built-in)",
@@ -522,7 +479,8 @@ constexpr std::array BUILTIN_PATCHES{
         .records = OOT_RENDER_75_RECORDS,
         .kind = BuiltinPatchKind::Resolution,
         .game = OOT_GAME,
-        .chosen = OotRenderScale75,
+        .chosen = OotResolutionIs<Settings::OotResolution::Percent75>,
+        .chosen_by = "oot_resolution",
     },
     BuiltinPatch{
         .name = "Render scale 56% (built-in)",
@@ -532,7 +490,8 @@ constexpr std::array BUILTIN_PATCHES{
         .records = OOT_RENDER_56_RECORDS,
         .kind = BuiltinPatchKind::Resolution,
         .game = OOT_GAME,
-        .chosen = OotRenderScale56,
+        .chosen = OotResolutionIs<Settings::OotResolution::Percent56>,
+        .chosen_by = "oot_resolution",
     },
     BuiltinPatch{
         .name = "Render scale 50% (built-in)",
@@ -542,10 +501,11 @@ constexpr std::array BUILTIN_PATCHES{
         .records = OOT_RENDER_50_RECORDS,
         .kind = BuiltinPatchKind::Resolution,
         .game = OOT_GAME,
-        .chosen = OotRenderScale50,
+        .chosen = OotResolutionIs<Settings::OotResolution::Percent50>,
+        .chosen_by = "oot_resolution",
     },
     // Dark's routine with a tail that also lowers the step above 60 fps, so the game keeps real
-    // speed at any frame rate limit (Settings frame_rate_limit).
+    // speed at 30 and 60 fps and up to any frame rate limit (Settings oot_frame_rate).
     BuiltinPatch{
         .name = "FPS Unlock (built-in)",
         .title_id = 0x0400486024DEC000,
@@ -554,13 +514,10 @@ constexpr std::array BUILTIN_PATCHES{
         .records = FPS_UNLOCK_RECORDS,
         .state_offset = 0x4E9FE00,
         .state_size = 0x98,
-        .replaces = "Dynamic FPS by Dark (built-in)",
         .kind = BuiltinPatchKind::FrameRate,
         .game = OOT_GAME,
-        .description = "Game logic follows real time at any frame rate limit, so the game keeps "
-                       "its speed above 60 fps and down to 10 fps.",
-        .effect = "Lets 90 or 120 fps and frame generation run at full game speed; no cost "
-                  "beyond rendering the extra frames.",
+        .chosen = FrameTimingIs<OotFrameTiming::Unlock>,
+        .chosen_by = "oot_frame_rate",
     },
     BuiltinPatch{
         .name = "Dynamic FPS by Dark (built-in)",
@@ -572,9 +529,8 @@ constexpr std::array BUILTIN_PATCHES{
         .state_size = 0x98,
         .kind = BuiltinPatchKind::FrameRate,
         .game = OOT_GAME,
-        .description = "Dark's smoothed time step: the game keeps its speed below 60 fps.",
-        .effect = "Fixes slow-motion at low frame rates; does not keep speed above 60 fps "
-                  "(FPS Unlock does).",
+        .chosen = FrameTimingIs<OotFrameTiming::Dark>,
+        .chosen_by = "EDEN_NX2_OOT_FRAME_TIMING",
     },
     BuiltinPatch{
         .name = "Occlusion Off (built-in)",
@@ -604,18 +560,21 @@ constexpr std::array BUILTIN_PATCHES{
         .effect = "Much less GPU time (the network needs cooperative matrices, which Apple GPUs "
                   "lack); a softer, unsharpened image.",
     },
+    // Fixes with no visible effect: always on and not listed in Add-Ons. Their EDEN_NX2_OOT_*=0
+    // switch turns one off for tests.
     BuiltinPatch{
         .name = "Native zstd (built-in)",
         .title_id = 0x0400486024DEC000,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = OOT_NATIVE_ZSTD_RECORDS,
-        .default_on = OotNativeZstdEnabled,
         .kind = BuiltinPatchKind::Performance,
         .game = OOT_GAME,
         .description = "Decompresses the game's data with the host's zstd instead of emulating "
                        "the game's decompressor.",
         .effect = "Faster loading and streaming with less CPU use; no visible change.",
+        .chosen = OotNativeZstdEnabled,
+        .chosen_by = "default (always on)",
     },
     BuiltinPatch{
         .name = "Fast lookup strcmp (built-in)",
@@ -623,12 +582,13 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = OOT_FAST_LOOKUP_RECORDS,
-        .default_on = OotFastLookupEnabled,
         .kind = BuiltinPatchKind::Performance,
         .game = OOT_GAME,
         .description = "Rewrites the game's name-keyed asset lookup to compare eight bytes at a "
                        "time.",
         .effect = "Less CPU use while the game loads assets; same results.",
+        .chosen = OotFastLookupEnabled,
+        .chosen_by = "default (always on)",
     },
     BuiltinPatch{
         .name = "Resource poll backoff (built-in)",
@@ -636,12 +596,13 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = OOT_POLL_BACKOFF_RECORDS,
-        .default_on = OotPollBackoffEnabled,
         .kind = BuiltinPatchKind::Performance,
         .game = OOT_GAME,
         .description = "Makes the resource request thread sleep instead of rescanning at once "
                        "when a request is not ready.",
         .effect = "Frees a CPU core; no change to gameplay.",
+        .chosen = OotPollBackoffEnabled,
+        .chosen_by = "default (always on)",
     },
     BuiltinPatch{
         .name = "Texture Pool x2 (built-in)",
@@ -649,12 +610,13 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = OOT_TEXTURE_POOL_RECORDS,
-        .default_on = OotTexturePoolEnabled,
         .kind = BuiltinPatchKind::Performance,
         .game = OOT_GAME,
         .description = "Doubles the game's internal texture pool, which the Castle Town guard "
                        "house and pot room could exhaust and hang on.",
         .effect = "Fixes that hang; uses a little more memory.",
+        .chosen = OotTexturePoolEnabled,
+        .chosen_by = "default (always on)",
     },
 };
 
@@ -1187,9 +1149,6 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (patch.title_id != title_id || patch.module != name) {
             continue;
         }
-        if (patch.render_scale && !RenderScaleChosen(*patch.render_scale)) {
-            continue;
-        }
         if (patch.chosen != nullptr && !patch.chosen()) {
             continue;
         }
@@ -1294,10 +1253,12 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         }
         LOG_INFO(Loader, "    - Applying built-in patch \"{}\" ({} records) to {}: on by {}",
                  patch.name, patch.records.size(), name,
-                 patch.chosen != nullptr ? "its setting" : SourceText(decision.source));
-        if (patch.chosen != nullptr) {
-            // Loader lines are filtered out of the iOS log.
+                 patch.chosen != nullptr ? patch.chosen_by : SourceText(decision.source));
+        // Loader lines are filtered out of the iOS log.
+        if (patch.kind == BuiltinPatchKind::Resolution) {
             LOG_INFO(Common_Memory, "Ocarina render scale: \"{}\" applied", patch.name);
+        } else if (patch.kind == BuiltinPatchKind::FrameRate) {
+            LOG_INFO(Common_Memory, "Ocarina frame timing: \"{}\" applied", patch.name);
         }
         if (!patch.replaces.empty()) {
             replaced.push_back(patch.replaces);
@@ -1898,7 +1859,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id || patch.render_scale || patch.chosen) {
+        if (patch.title_id != title_id || patch.chosen) {
             continue;
         }
         const auto builtin_disabled = GetDisabledAddons();

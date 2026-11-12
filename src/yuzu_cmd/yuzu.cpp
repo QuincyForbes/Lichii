@@ -553,10 +553,9 @@ static void IosApplyFirstRunDefaults(SdlState* state) {
         std::ofstream{marker} << "1\n";
         changed = true;
     }
-    // Max Resolution (Ocarina of Time) is off by default on iOS now (the patch table's default),
-    // so the per-game "disabled" entry an earlier build wrote once is dropped and the game follows
-    // the global "Max resolution" setting. A build that wrote it and a user who then turned the
-    // patch on keep that choice as a per-game On.
+    // Max Resolution (Ocarina of Time) is off by default on iOS now (oot_resolution Game), so the
+    // per-game "disabled" entry an earlier build wrote once is dropped. A build that wrote it and a
+    // user who then turned the patch on keep that choice as oot_resolution Full.
     const auto marker_v2 =
         Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "ios-defaults-v2";
     const auto marker_v3 =
@@ -567,8 +566,7 @@ static void IosApplyFirstRunDefaults(SdlState* state) {
         auto& disabled = Settings::values.disabled_addons[OcarinaOfTime];
         const bool was_disabled = std::erase(disabled, std::string{MaxResolution}) != 0;
         if (!was_disabled && Common::FS::Exists(marker_v2)) {
-            FileSys::ApplyBuiltinPatchChoice(disabled, MaxResolution,
-                                             FileSys::BuiltinPatchChoice::On);
+            Settings::values.oot_resolution.SetValue(Settings::OotResolution::Full);
         }
         // The game list caches each game's add-on summary.
         std::error_code ec;

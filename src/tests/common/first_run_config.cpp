@@ -127,8 +127,7 @@ void CheckUnchangedProfile() {
     CHECK(values.use_disk_shader_cache.GetValue());
     CHECK(values.use_vulkan_driver_pipeline_cache.GetValue());
     CHECK_FALSE(values.use_video_framerate.GetValue());
-    CHECK_FALSE(values.mkw_30fps.GetValue());
-    CHECK_FALSE(values.mkw_dynamic_fps.GetValue());
+    CHECK(values.mkw_frame_rate.GetValue() == Settings::MkwFrameRate::Game);
     CHECK(values.use_reactive_flushing.GetValue());
     CHECK(values.barrier_feedback_loops.GetValue());
     CHECK_FALSE(values.enable_buffer_history.GetValue());

@@ -7,6 +7,7 @@
 add_executable(tests
     video_core/vulkan_overlay_filter.cpp
     common/addon_config.cpp
+    common/settings_migration.cpp
     video_core/unswizzle_workers.cpp
     video_core/aftermath_dump.cpp
     video_core/gpu_timestamp.cpp
