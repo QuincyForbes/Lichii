@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <memory>
@@ -643,7 +644,22 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
     }
 }
 
+bool Scheduler::CheckIndexBufferBound(u64 vertex_hash, u64 fragment_hash) {
+    if (index_buffer_bound) {
+        return true;
+    }
+    ++unbound_index_draws;
+    if (unbound_index_draws <= 8 || std::has_single_bit(unbound_index_draws)) {
+        LOG_ERROR(HW_GPU,
+                  "Indexed draw with no index buffer bound in its command buffer: skipped ({} so "
+                  "far; shaders {:016x}/{:016x})",
+                  unbound_index_draws, vertex_hash, fragment_hash);
+    }
+    return false;
+}
+
 void Scheduler::AllocateWorkerCommandBuffer() {
+    index_buffer_bound = false;
     current_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
     current_cmdbuf.Begin({
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,

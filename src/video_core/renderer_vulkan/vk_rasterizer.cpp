@@ -1464,6 +1464,9 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 cmdbuf, hashes.first, hashes.second,
                 {draw_params.num_vertices, draw_params.num_instances, 0}, [&] {
                     if (draw_params.is_indexed) {
+                        if (!scheduler.CheckIndexBufferBound(hashes.first, hashes.second)) {
+                            return;
+                        }
                         cmdbuf.DrawIndexed(draw_params.num_vertices, draw_params.num_instances,
                                            draw_params.first_index, draw_params.base_vertex,
                                            draw_params.base_instance);
@@ -1575,6 +1578,9 @@ void RasterizerVulkan::DrawIndirect() {
                     return;
                 }
                 if (params.is_indexed) {
+                    if (!scheduler.CheckIndexBufferBound(0, 0)) {
+                        return;
+                    }
                     cmdbuf.DrawIndexedIndirectCount(
                         buffer_obj, offset, draw_buffer_obj, offset_base,
                         static_cast<u32>(params.max_draw_counts), static_cast<u32>(params.stride));
@@ -1593,6 +1599,9 @@ void RasterizerVulkan::DrawIndirect() {
             }
             scheduler.TraceGpuWork(cmdbuf, hashes.first, hashes.second, {}, [&] {
                 if (params.is_indexed) {
+                    if (!scheduler.CheckIndexBufferBound(hashes.first, hashes.second)) {
+                        return;
+                    }
                     cmdbuf.DrawIndexedIndirect(buffer_obj, offset,
                                                static_cast<u32>(params.max_draw_counts),
                                                static_cast<u32>(params.stride));

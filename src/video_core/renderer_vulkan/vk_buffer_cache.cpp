@@ -291,8 +291,9 @@ public:
         const size_t sub_first_offset = static_cast<size_t>(first % 4) * GetQuadsNum(num_indices);
         const size_t offset =
             (sub_first_offset + GetQuadsNum(first)) * 6ULL * BytesPerIndex(index_type);
-        scheduler.Record([buffer_ = *buffer, index_type_, offset](vk::CommandBuffer cmdbuf) {
+        scheduler.Record([this, buffer_ = *buffer, index_type_, offset](vk::CommandBuffer cmdbuf) {
             cmdbuf.BindIndexBuffer(buffer_, offset, index_type_);
+            scheduler.NoteIndexBufferBound();
         });
     }
 
@@ -820,8 +821,9 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
         bound_index_type = vk_index_type;
         bound_index_epoch = epoch;
     }
-    scheduler.Record([vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
         cmdbuf.BindIndexBuffer(vk_buffer, vk_offset, vk_index_type);
+        scheduler.NoteIndexBufferBound();
     });
 }
 
@@ -830,8 +832,9 @@ void BufferCacheRuntime::BindHostUint8IndexBuffer(std::span<const u8> indices) {
     const auto staging = staging_pool.Request(indices.size() * sizeof(u16), MemoryUsage::Upload);
     u16* const widened = reinterpret_cast<u16*>(staging.mapped_span.data());
     std::ranges::transform(indices, widened, [](u8 index) -> u16 { return index == 0xff ? 0xffff : index; });
-    scheduler.Record([buffer = staging.buffer, offset = staging.offset](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, buffer = staging.buffer, offset = staging.offset](vk::CommandBuffer cmdbuf) {
         cmdbuf.BindIndexBuffer(buffer, offset, VK_INDEX_TYPE_UINT16);
+        scheduler.NoteIndexBufferBound();
     });
 }
 
@@ -841,6 +844,7 @@ void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 fir
         ReserveNullBuffer();
         scheduler.Record([this](vk::CommandBuffer cmdbuf) {
             cmdbuf.BindIndexBuffer(*null_buffer, 0, VK_INDEX_TYPE_UINT32);
+            scheduler.NoteIndexBufferBound();
         });
         return;
     }

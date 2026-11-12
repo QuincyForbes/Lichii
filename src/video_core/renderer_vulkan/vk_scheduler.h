@@ -270,6 +270,15 @@ public:
         return recording_epoch;
     }
 
+    /// In recorded commands (worker thread): an index buffer was bound in this command buffer.
+    void NoteIndexBufferBound() noexcept {
+        index_buffer_bound = true;
+    }
+
+    /// In recorded commands (worker thread): false when an indexed draw would have no index
+    /// buffer (MoltenVK then hands Metal nil and the driver crashes); logs the first ones.
+    [[nodiscard]] bool CheckIndexBufferBound(u64 vertex_hash, u64 fragment_hash);
+
     /// Returns true when a tick has been triggered by the GPU.
     [[nodiscard]] bool IsFree(u64 tick) const noexcept {
         return master_semaphore->IsFree(tick);
@@ -564,6 +573,8 @@ private:
 
     State state;
     u64 recording_epoch = 0;
+    bool index_buffer_bound = false; ///< Worker thread: in current_cmdbuf
+    u64 unbound_index_draws = 0;     ///< Worker thread
 
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};
