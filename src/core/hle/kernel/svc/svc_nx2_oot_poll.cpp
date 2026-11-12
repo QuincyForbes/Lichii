@@ -7,6 +7,10 @@
 #include <cstdlib>
 #include <mutex>
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include "common/logging.h"
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
@@ -76,11 +80,16 @@ constexpr s64 kLogIntervalNs = 10'000'000'000;
 
 // EDEN_NX2_OOT_POLL_BACKOFF: "0" leaves main unpatched (patch_manager.cpp), and then this SVC never
 // runs. A number above 1 is the longest sleep in us (at most 16000); "500" is wave 3's fixed sleep.
-// Anything else: 4000 us.
+// Anything else: 4000 us, and 16000 us on phones: an iPhone walks for ~4.1 ms, so a 4 ms cap kept
+// the poll walking half of the time (101 walks a second, 40% of a core); 4x a 4 ms walk fits.
 s64 MaxSleepNs() {
     static const s64 ns = [] {
         const char* value = std::getenv("EDEN_NX2_OOT_POLL_BACKOFF");
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+        s64 us = kLimitMaxSleepNs / 1000;
+#else
         s64 us = kDefaultMaxSleepNs / 1000;
+#endif
         if (value != nullptr && value[0] != 0) {
             const long long parsed = std::strtoll(value, nullptr, 10);
             if (parsed > 1) {
