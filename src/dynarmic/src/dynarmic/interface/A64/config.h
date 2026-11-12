@@ -275,6 +275,11 @@ struct UserConfig {
     /// This is only used if fastmem_pointer is set.
     bool silently_mirror_fastmem = true;
 
+    /// With fastmem_address_space_bits below page_table_address_space_bits, an access past the
+    /// fastmem arena walks the page table inline. False sends it to the memory callbacks
+    /// instead: about 8-10 fewer instructions of cold code per memory access.
+    bool inline_page_table_fallback = true;
+
     /// Determines if we should use the above fastmem_pointer for exclusive reads and
     /// writes. On x64, dynarmic currently relies on x64 cmpxchg semantics which may not
     /// provide fully accurate emulation.

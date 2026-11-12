@@ -61,6 +61,10 @@ struct Profile {
     std::vector<Value> settings;
     /// Frontend-side choices that are not Settings values (iOS: guest memory in a file, Auto-Cool).
     std::vector<Value> app;
+    /// iOS: each guest core's JIT code cache in MiB (the debugger-prepared pool holds one per
+    /// guest core, sized at app start); 0 = Common::IosJit's default.
+    u32 jit_cache_mib = 0;
+    std::string jit_cache_reason;
 };
 
 Profile Recommend(const Device& device);

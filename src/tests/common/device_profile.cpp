@@ -60,6 +60,9 @@ TEST_CASE("iPhone 17 Pro Max gets the phone profile", "[device_profile]") {
     CHECK(Value(profile, "use_asynchronous_shaders") == "On");
     CHECK(Value(profile, "guest_memory_file") == "On");
     CHECK(Value(profile, "auto_cool") == "On");
+    CHECK(Value(profile, "guest_wait_backoff") == "On");
+    CHECK(profile.jit_cache_mib == 64);
+    CHECK_FALSE(profile.jit_cache_reason.empty());
     // Every value has its reason.
     for (const auto* list : {&profile.settings, &profile.app}) {
         for (const auto& value : *list) {

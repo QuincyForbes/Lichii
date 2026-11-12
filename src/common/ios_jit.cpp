@@ -44,6 +44,7 @@ std::vector<Region> g_pool;
 std::mutex g_pool_mutex;
 std::atomic<bool> g_pool_ready{false};
 std::atomic<std::size_t> g_prepared{0};
+std::atomic<std::size_t> g_code_cache_bytes{DefaultCodeCacheBytes};
 std::atomic<State> g_state{State::Waiting};
 std::mutex g_error_mutex;
 std::string g_error;
@@ -114,6 +115,19 @@ void InstallTrapGuard() {
     sigaction(SIGTRAP, &sa, nullptr);
 }
 
+/// The process's phys_footprint (what iOS limits), MiB; 0 when unknown.
+std::size_t FootprintMib() {
+    task_vm_info_data_t info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) !=
+        KERN_SUCCESS) {
+        return 0;
+    }
+    return static_cast<std::size_t>(info.phys_footprint >> 20);
+}
+
+std::atomic<std::size_t> g_footprint_before_pool{0};
+
 std::size_t AlignUp(std::size_t v, std::size_t a) {
     return (v + a - 1) & ~(a - 1);
 }
@@ -141,7 +155,11 @@ bool PublishPool(std::vector<Region> regions) {
         g_pool = std::move(regions);
         g_pool_ready = true;
     }
-    LOG_INFO(Common, "iOS JIT: pool ready ({} MiB), self-test passed", total >> 20);
+    // Whether prepared pages count against the footprint before code is written to them.
+    LOG_INFO(Common,
+             "iOS JIT: pool ready ({} MiB in {} MiB chunks), self-test passed; footprint {} MiB, "
+             "{} MiB before the pool was prepared",
+             total >> 20, CodeCacheBytes() >> 20, FootprintMib(), g_footprint_before_pool.load());
     SetState(State::Ready);
     return true;
 }
@@ -172,11 +190,12 @@ std::uint8_t* MapWritableAlias(std::uint8_t* rx, std::size_t bytes, std::string&
 // once the requests were answered, failed or not.
 bool AcquireThroughDebugger(std::size_t bytes) {
     g_prepared = 0;
+    g_footprint_before_pool = FootprintMib();
     SetState(State::Acquiring);
     std::vector<Region> regions;
     std::string error;
     while (g_prepared < bytes) {
-        const std::size_t chunk = (std::min)(ChunkBytes, bytes - g_prepared);
+        const std::size_t chunk = (std::min)(CodeCacheBytes(), bytes - g_prepared);
         auto* rx = static_cast<std::uint8_t*>(Jit26PrepareRegion(nullptr, chunk));
         if (rx == nullptr) {
             if (regions.empty()) {
@@ -287,6 +306,14 @@ bool Debugged() {
 
 bool PoolReady() {
     return g_pool_ready.load();
+}
+
+void SetCodeCacheBytes(std::size_t bytes) {
+    g_code_cache_bytes = AlignUp((std::max)(bytes, DefaultCodeCacheBytes), kJitPageSize);
+}
+
+std::size_t CodeCacheBytes() {
+    return g_code_cache_bytes.load(std::memory_order_relaxed);
 }
 
 void StartAcquire(std::size_t bytes, bool txm) {

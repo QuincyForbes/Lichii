@@ -534,4 +534,7 @@ void SvcWrap_CallSecureMonitor64(Core::System& system, std::span<uint64_t, 8> ar
 // Perform a supervisor call by index.
 void Call(Core::System& system, u32 imm);
 
+/// Whether a yield to nobody may sleep (guest_wait_backoff, EDEN_NX2_YIELD_BACKOFF).
+bool YieldBackoffEnabled();
+
 } // namespace Kernel::Svc

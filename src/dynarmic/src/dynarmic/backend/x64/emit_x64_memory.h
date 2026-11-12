@@ -245,6 +245,7 @@ template<>
                                              : 0;
         const bool can_pt_fallback =
             ctx.conf.page_table != nullptr && ctx.conf.absolute_offset_page_table &&
+            ctx.conf.inline_page_table_fallback &&
             ctx.conf.fastmem_address_space_bits < ctx.conf.page_table_address_space_bits &&
             valid_pt_index_bits > 0 &&
             (pt_mask == 0 || std::in_range<s32>(static_cast<s64>(sign_filled_pt_mask))) &&

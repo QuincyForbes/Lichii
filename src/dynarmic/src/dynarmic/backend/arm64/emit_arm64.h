@@ -153,6 +153,7 @@ struct EmitConfig {
     bool recompile_on_exclusive_fastmem_failure;
     std::size_t fastmem_address_space_bits;
     bool silently_mirror_fastmem;
+    bool inline_page_table_fallback = true;
 
     // Timing & control flow
     bool wall_clock_cntpct;

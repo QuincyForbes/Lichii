@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <optional>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -64,10 +65,24 @@ enum Counter : std::size_t {
     JitCacheFullFlushes, ///< Code caches emptied because they were full
     JitCacheClears,      ///< Code caches emptied on request (guest instruction cache ops)
     JitRangeInvalidations, ///< Ranges of translated code dropped on request
+    JitFastmemFaults,    ///< Host faults in fastmem accesses (each recompiles its block)
+    // Per guest core, added when the JIT returns (FlushGuestEvents), not one by one.
+    GuestSvcs,           ///< Supervisor calls
+    GuestSlowReads,      ///< Loads through the JIT's memory callbacks
+    GuestSlowWrites,     ///< Stores through them
+    GuestClockReads,     ///< CNTPCT reads through the JIT's callback (not inline)
+    GuestSpinHints,      ///< WFE and YIELD hints
+    GuestClockWaits,     ///< Clock polls the guest core slept in (guest_wait_backoff)
+    GuestClockWaitNs,    ///< Time slept there
+    GuestFutileYields,   ///< Yields that found nothing else to run
+    GuestYieldSleeps,    ///< Of them, slept in (guest_wait_backoff)
+    GuestYieldSleepNs,   ///< Time slept there
     Count,
 };
 
 inline std::array<std::atomic<u64>, Count> g_counters{};
+/// Supervisor calls by number (guest cores add theirs every 1024 calls).
+inline std::array<std::atomic<u64>, 256> g_svc_counts{};
 
 inline void Add(Counter counter, u64 amount = 1) {
     if (!Enabled()) {
@@ -115,6 +130,28 @@ inline void MarkGuest(Counter closed) {
     }
     last_ns = now;
 }
+
+/// The process's CPU time and where it ran (Apple: proc_pid_rusage). Empty where the OS does
+/// not say.
+struct ProcessCpu {
+    u64 cpu_ns;         ///< User + system time on all cores
+    u64 performance_ns; ///< Of it, on performance cores
+    u64 energy_nj;      ///< CPU energy (0 if not reported)
+};
+std::optional<ProcessCpu> ReadProcessCpu();
+
+constexpr std::size_t PlacementCores = 6;
+/// Guest core threads, sampled now and then: the host CPU each ran on (Apple).
+struct Placement {
+    std::array<u64, PlacementCores> samples;
+    std::array<u64, PlacementCores> high; ///< On a CPU id at or above HighCpuFirst()
+};
+/// Called by guest core `core` between JIT runs; samples every 64th call.
+void SampleGuestCorePlacement(std::size_t core);
+Placement ReadPlacement();
+/// The first CPU id counted as "high" (Apple: the number of efficiency cores, which come first);
+/// 0 when unknown.
+u32 HighCpuFirst();
 
 inline std::array<u64, Count> Read() {
     std::array<u64, Count> values{};

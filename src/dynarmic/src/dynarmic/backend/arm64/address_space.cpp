@@ -458,6 +458,7 @@ void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor,
 }
 
 FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
+    ::Common::PerfReport::Add(::Common::PerfReport::JitFastmemFaults);
     {
         const auto host_ptr = std::bit_cast<CodePtr>(host_pc);
 

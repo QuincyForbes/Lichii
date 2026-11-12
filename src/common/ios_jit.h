@@ -25,12 +25,13 @@
 // pool, prepared in ChunkBytes chunks before the emulated CPU starts.
 namespace Common::IosJit {
 
-/// dynarmic's code cache per guest core on iOS. The pool is prepared page by page through the
-/// debugger, so it is kept small: a full cache is flushed and translated again.
-inline constexpr std::size_t CodeCacheBytes = 32 * 1024 * 1024;
-/// The pool is prepared in chunks of this size, each a contiguous code block or several small
-/// ones, so progress shows and no block straddles two chunks.
-inline constexpr std::size_t ChunkBytes = CodeCacheBytes;
+/// dynarmic's code cache per guest core on iOS: a full cache is flushed and translated again.
+/// The pool is prepared in chunks of this size, each one guest core's code block, so progress
+/// shows and no block straddles two chunks.
+inline constexpr std::size_t DefaultCodeCacheBytes = 32 * 1024 * 1024;
+/// The device profile's size (Settings::DeviceProfile, jit_cache_mib); set before StartAcquire.
+void SetCodeCacheBytes(std::size_t bytes);
+std::size_t CodeCacheBytes();
 
 enum class State {
     Waiting,   ///< no debugger yet

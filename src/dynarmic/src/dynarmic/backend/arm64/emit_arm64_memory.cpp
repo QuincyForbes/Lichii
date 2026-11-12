@@ -541,6 +541,7 @@ inline bool ShouldExt32(EmitContext& ctx) {
 
 inline bool CanInlinePageTableFallback(const EmitContext& ctx) {
     return ctx.conf.page_table_pointer != 0 &&
+           ctx.conf.inline_page_table_fallback &&
            !ctx.conf.silently_mirror_fastmem &&
            ctx.conf.fastmem_address_space_bits < 64 &&
            ctx.conf.fastmem_address_space_bits < ctx.conf.page_table_address_space_bits;

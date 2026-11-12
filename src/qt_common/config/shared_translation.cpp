@@ -101,6 +101,13 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Set a custom value of CPU ticks. Higher values can increase performance, but may "
               "cause deadlocks. A range of 77-21000 is recommended."));
     INSERT(Settings, cpu_backend, tr("Backend:"), QString());
+    INSERT(Settings, guest_wait_backoff, tr("Sleep in long guest waits"),
+           tr("A game thread that yields to no other thread, or polls the clock, for 2 ms sleeps "
+              "briefly instead of keeping a host core busy. Frees CPU cores on phones."));
+    INSERT(Settings, cpuopt_compact_jit_code, tr("Compact JIT code"),
+           tr("Where the host grants less address space than the guest uses (phones), memory "
+              "accesses outside it take the slow path instead of an inline page table walk at "
+              "every load and store: about half the code, so the code cache holds twice as much."));
 
     // Cpu Debug
 

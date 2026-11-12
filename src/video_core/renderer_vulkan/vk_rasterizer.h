@@ -542,6 +542,9 @@ private:
     std::chrono::steady_clock::time_point perf_frame_last{};
     std::array<u64, Common::PerfReport::Count> perf_report_counters{};
     std::optional<Common::DkbCpuTrace::Snapshot> perf_report_cpu;
+    std::optional<Common::PerfReport::ProcessCpu> perf_report_process_cpu;
+    Common::PerfReport::Placement perf_report_placement{};
+    std::array<u64, 256> perf_report_svcs{};
     std::array<u64, VideoCommon::Churn::Count> perf_report_churn{};
     Common::PlatformEvents::ProcessEvents perf_report_events{};
     u64 perf_report_frames{};

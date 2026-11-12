@@ -13,6 +13,7 @@
 #include <fmt/ostream.h>
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/perf_report.h"
 #include "dynarmic/ir/terminal.h"
 #include "dynarmic/mcl/integer_of_size.hpp"
 #include <boost/container/static_vector.hpp>
@@ -77,6 +78,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
 
     if (conf.fastmem_pointer.has_value()) {
         exception_handler.SetFastmemCallback([this](u64 rip_) {
+            ::Common::PerfReport::Add(::Common::PerfReport::JitFastmemFaults);
             return FastmemCallback(rip_);
         });
     }

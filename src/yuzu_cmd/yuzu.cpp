@@ -84,8 +84,10 @@
 #include <filesystem>
 #include <vector>
 #include <os/log.h>
+#include "common/device_profile.h"
 #include "common/ios_jit.h"
 #include "common/malloc_census.h"
+#include "core/hardware_properties.h"
 #include "common/thread.h"
 #include "ios_frontend/lichii_bridge_platform.h"
 #include "yuzu_cmd/ios_support.h"
@@ -116,10 +118,19 @@ static bool IosJitEnabled() {
     }
     return (flags & kCsDebugged) != 0;
 }
-// dynarmic: one code cache per guest core (at most six). Acquired once through StikDebug's
-// universal script (iOS 26+), then the debugger is released. The script prepares every page over
-// the debug connection while this app waits in the background, so the pool is kept tight.
-static constexpr std::size_t kIosJitPoolBytes = 6 * Common::IosJit::ChunkBytes;
+// dynarmic: one code cache per guest core (at most six), sized by the device profile. Acquired
+// once through StikDebug's universal script (iOS 26+), then the debugger is released.
+static std::size_t IosJitPoolBytes() {
+    static const std::size_t bytes = [] {
+        const auto profile = Settings::DeviceProfile::ForHost();
+        if (profile.jit_cache_mib != 0) {
+            Common::IosJit::SetCodeCacheBytes(std::size_t{profile.jit_cache_mib} << 20);
+        }
+        LOG_INFO(Frontend, "iOS JIT: {} ({})", profile.jit_cache_reason, profile.device_name);
+        return Core::Hardware::NUM_CPU_CORES * Common::IosJit::CodeCacheBytes();
+    }();
+    return bytes;
+}
 static std::string IosBundleIdentifier() {
     std::string out;
     if (CFStringRef id = CFBundleGetIdentifier(CFBundleGetMainBundle())) {
@@ -599,7 +610,7 @@ static SDL_AppResult IosStartApp(SdlState* state, Core::LaunchParams lp) {
         .save_config = [state] { state->ios_config->SaveAllValues(); },
     });
     LichiiControls::Attach(state->system, state->input_subsystem);
-    IosFrontend::SetJitPoolBytes(kIosJitPoolBytes);
+    IosFrontend::SetJitPoolBytes(IosJitPoolBytes());
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
     IOS_MARK("showing the app");
     lichii_ui_main();
@@ -1267,7 +1278,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
              IosSupport::MajorVersion(), txm, IosJitEnabled(), Common::IosJit::DebuggerAttached(),
              state->jit_have_stikdebug ? "installed" : "not installed");
     IOS_MARK(IosJitEnabled() ? "JIT enabled at launch, acquiring pool" : "JIT not enabled, waiting");
-    Common::IosJit::StartAcquire(kIosJitPoolBytes, txm);
+    Common::IosJit::StartAcquire(IosJitPoolBytes(), txm);
 #ifdef LICHII_IOS_UI
     // The pool is acquired while the library is open; a game launches from the app.
     if (lp.filepath.empty()) {
@@ -1834,7 +1845,7 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
                 lines = {"Preparing JIT memory...", "",
                          "StikDebug has mapped " +
                              std::to_string(Common::IosJit::PreparedBytes() >> 20) + " of " +
-                             std::to_string(kIosJitPoolBytes >> 20) + " MiB."};
+                             std::to_string(IosJitPoolBytes() >> 20) + " MiB."};
                 break;
             case State::Failed: {
                 lines = {"JIT unavailable", ""};

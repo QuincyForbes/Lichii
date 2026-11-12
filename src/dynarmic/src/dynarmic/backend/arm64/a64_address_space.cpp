@@ -889,6 +889,7 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
         .recompile_on_exclusive_fastmem_failure = conf.recompile_on_exclusive_fastmem_failure,
         .fastmem_address_space_bits = conf.fastmem_address_space_bits,
         .silently_mirror_fastmem = conf.silently_mirror_fastmem,
+        .inline_page_table_fallback = conf.inline_page_table_fallback,
 
         .wall_clock_cntpct = conf.wall_clock_cntpct,
         .enable_cycle_counting = conf.enable_cycle_counting,
