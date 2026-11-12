@@ -179,6 +179,9 @@ typedef enum LichiiEmuState {
 
 /// Queues a game; it boots as soon as the JIT pool is ready. False while another game runs.
 bool lichii_emu_launch(const char* path);
+/// Like lichii_emu_launch, but the boot builds every cached pipeline of the game (the shader
+/// precache, whatever precache_shaders says) and returns to the library instead of starting it.
+bool lichii_emu_build_shaders(const char* path);
 /// Drops a queued launch, or stops a boot once the game has loaded (the shader cache load ends
 /// early); the state returns to IDLE.
 void lichii_emu_cancel_launch(void);

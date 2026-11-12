@@ -407,6 +407,9 @@ public:
     Id mesh_payload{};
     Id mesh_payload_u32{};  ///< pointer type to one payload word
     Id mesh_attributes{};
+    /// RuntimeInfo::mesh_direct_outputs: function (word, value) storing a stage buffer
+    /// attribute word to its output, in place of mesh_attributes.
+    Id mesh_attribute_write{};
     Id mesh_map{};
     Id mesh_primitive_count{};
     Id mesh_shared_u32{};   ///< pointer type to one workgroup word
@@ -475,6 +478,7 @@ private:
     void DefineInputs(const IR::Program& program);
     void DefineOutputs(const IR::Program& program);
     void DefineMesh(const IR::Program& program);
+    void DefineMeshAttributeWrite();
     void DefineMeshEmulationOutput();
 };
 

@@ -132,7 +132,8 @@ Profile MakeProfile() {
 // A one-triangle mesh program (or the task program launching it), as the frontend lowers them.
 // With lane_id the mesh program writes its lane as the vertex's first attribute word.
 std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
-                             Profile profile = MakeProfile(), bool lane_id = false) {
+                             Profile profile = MakeProfile(), bool lane_id = false,
+                             bool direct_outputs = false) {
     ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     IR::Program program;
@@ -162,6 +163,7 @@ std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
 
     RuntimeInfo runtime_info;
     runtime_info.mesh_as_compute = as_compute;
+    runtime_info.mesh_direct_outputs = direct_outputs;
     runtime_info.mesh_output_binding = OUTPUT_BINDING;
     if (with_task) {
         runtime_info.mesh_task_payload_binding = PAYLOAD_BINDING;
@@ -194,6 +196,35 @@ TEST_CASE("Mesh fallback leaves native task and mesh programs as mesh shaders",
     Dump(task, "native-task");
     REQUIRE(Model(task) == spv::ExecutionModel::TaskEXT);
     REQUIRE(UsesStorageClass(task, spv::StorageClass::TaskPayloadWorkgroupEXT));
+}
+
+TEST_CASE("Native mesh programs with direct outputs keep no attribute region",
+          "[video_core][spirv][mesh_fallback]") {
+    const auto workgroup_variables = [](const std::vector<u32>& code) {
+        return std::ranges::count_if(Instructions(code), [](const Instruction& inst) {
+            return inst.op == spv::Op::OpVariable &&
+                   inst.operands[2] == static_cast<u32>(spv::StorageClass::Workgroup);
+        });
+    };
+    const auto calls = [](const std::vector<u32>& code) {
+        return std::ranges::count_if(Instructions(code), [](const Instruction& inst) {
+            return inst.op == spv::Op::OpFunctionCall;
+        });
+    };
+    const std::vector<u32> copied{EmitProgram(Stage::Mesh, false, false)};
+    const std::vector<u32> direct{
+        EmitProgram(Stage::Mesh, false, false, MakeProfile(), false, true)};
+    Dump(direct, "native-mesh-direct");
+    REQUIRE(Model(direct) == spv::ExecutionModel::MeshEXT);
+    // The map region and the primitive count stay; the attribute region goes.
+    REQUIRE(workgroup_variables(copied) == 3);
+    REQUIRE(workgroup_variables(direct) == 2);
+    REQUIRE(calls(direct) == calls(copied) + 1);
+
+    // The emulation keeps its region whatever the switch says.
+    const std::vector<u32> emulated{
+        EmitProgram(Stage::Mesh, true, false, MakeProfile(), false, true)};
+    RequireNoMeshShading(emulated);
 }
 
 TEST_CASE("Mesh fallback emits mesh programs as compute shaders writing storage buffers",
@@ -342,4 +373,44 @@ TEST_CASE("Native mesh programs on MoltenVK count their threadgroup memory",
     REQUIRE(MetalMeshThreadgroupBytes(shape) == 3580 + 4072);
     shape.shared_memory_bytes = 1024;
     REQUIRE(MetalMeshThreadgroupBytes(shape) == 3580 + 4072 + 1024);
+}
+
+TEST_CASE("Ocarina of Time's mesh programs fit Metal with direct outputs",
+          "[video_core][mesh_fallback]") {
+    using Vulkan::MetalMeshThreadgroupBytes;
+    constexpr std::uint64_t metal_threadgroup_bytes = 32768;
+
+    // The three shapes an iPhone 17 Pro Max emulated (build 62 log, "exceeds the native mesh
+    // limits"): vertices, triangles, stage buffer lines (position + generics), vec4 outputs.
+    struct Case {
+        Vulkan::NativeMeshShape shape;
+        std::uint64_t with_region;
+        std::uint64_t direct;
+    };
+    const auto shape = [](std::uint32_t vertices, std::uint32_t primitives, std::uint32_t lines,
+                          std::uint32_t locations) {
+        return Vulkan::NativeMeshShape{
+            .max_vertices = vertices,
+            .max_primitives = primitives,
+            .primitive_vertices = 3,
+            .vertex_lines = lines,
+            .primitive_lines = 0,
+            .vertex_locations = locations,
+            .primitive_locations = 0,
+            .shared_memory_bytes = 0,
+        };
+    };
+    // Direct: (4 + 3 * primitives map words + 1) * 4, plus the Metal mesh object.
+    const std::array cases{
+        Case{shape(128, 64, 25, 10), 35100, 788 + 21512},
+        Case{shape(160, 128, 24, 9), 42012, 1556 + 25096},
+        Case{shape(128, 64, 23, 10), 34076, 788 + 21512},
+    };
+    for (Case test : cases) {
+        REQUIRE(MetalMeshThreadgroupBytes(test.shape) == test.with_region);
+        REQUIRE(test.with_region > metal_threadgroup_bytes);
+        test.shape.direct_outputs = true;
+        REQUIRE(MetalMeshThreadgroupBytes(test.shape) == test.direct);
+        REQUIRE(test.direct <= metal_threadgroup_bytes);
+    }
 }

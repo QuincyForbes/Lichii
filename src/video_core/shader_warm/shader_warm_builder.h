@@ -97,6 +97,13 @@ bool TakeWarmBeforeStart();
 void RequestSkipWarm();
 bool TakeSkipWarm();
 
+/// "Build shaders" launch: the boot precaches every cached pipeline whatever precache_shaders
+/// says, and the frontend stops the game once the load is done instead of starting it. The
+/// renderer only reads it; the frontend takes (and clears) it when the load ends.
+void RequestBuildOnly(bool only);
+bool BuildOnlyRequested();
+bool TakeBuildOnly();
+
 /// The GPU driver, device and pipeline cache version pipelines were precached for.
 struct DriverStamp {
     u32 driver{};

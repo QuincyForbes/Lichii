@@ -544,8 +544,18 @@ bool DriverCachesPipelines(const Device& device) {
     case VK_DRIVER_ID_AMD_PROPRIETARY:
         return true;
     default:
-        return false;
+        break;
     }
+    // MoltenVK converts SPIR-V to MSL and compiles it to a MTLLibrary while it holds its pipeline
+    // cache's one mutex, so every build that names the cache runs one at a time (build 62: 1,773
+    // pipelines in ~175 s on six cores). Creating the cache from a file compiles every library in
+    // it again on the calling thread before any pipeline is built, and the file keeps only MSL;
+    // Metal's own shader cache keeps the compiled code. EDEN_NX2_MVK_PIPELINE_CACHE=1 uses it.
+    if (device.IsMoltenVK()) {
+        const char* const value = std::getenv("EDEN_NX2_MVK_PIPELINE_CACHE");
+        return value == nullptr || value[0] == '0';
+    }
+    return false;
 }
 } // Anonymous namespace
 
@@ -1199,6 +1209,17 @@ bool PreloadAllPipelines(const Device& device) {
         return value == nullptr ? -1 : (value[0] != '0' ? 1 : 0);
     }();
     return all < 0 ? !device.IsMoltenVK() : all != 0;
+}
+
+/// Native mesh programs write their outputs directly (RuntimeInfo::mesh_direct_outputs): on
+/// MoltenVK by default, EDEN_NX2_MESH_DIRECT_OUTPUTS=0 keeps the workgroup attribute region, =1
+/// uses direct outputs on every driver.
+bool MeshDirectOutputs(const Device& device) {
+    static const int direct = [] {
+        const char* value = std::getenv("EDEN_NX2_MESH_DIRECT_OUTPUTS");
+        return value == nullptr ? -1 : (value[0] != '0' ? 1 : 0);
+    }();
+    return direct < 0 ? device.IsMoltenVK() : direct != 0;
 }
 
 /// Destroys the pipelines of `pipelines` (a map or a deque of pairs holding unique_ptrs), telling
@@ -1940,7 +1961,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     // on the loading screen too, unless an earlier precache built them for this driver.
     namespace ShaderWarm = VideoCommon::ShaderWarm;
     const bool precache = ShaderWarm::PrecacheBeforeStart(
-        Settings::values.precache_shaders.GetValue(), ShaderWarm::TakeWarmBeforeStart());
+                              Settings::values.precache_shaders.GetValue(),
+                              ShaderWarm::TakeWarmBeforeStart()) ||
+                          ShaderWarm::BuildOnlyRequested();
     std::unordered_set<u64> precached_pipelines;
     if (precache) {
         precached_pipelines = ShaderWarm::ReadPrecachedPipelines(
@@ -2118,6 +2141,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         });
         ++state.total;
     }};
+    const auto boot_build_begin = std::chrono::steady_clock::now();
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
                                load_graphics);
     for (auto& [key, records] : graphics_records) {
@@ -2157,6 +2181,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+    LOG_INFO(Render_Vulkan,
+             "Boot pipelines: {} built in {:.1f} s on {} threads ({} driver pipeline cache)",
+             state.total,
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - boot_build_begin)
+                 .count(),
+             num_pipeline_workers, use_vulkan_pipeline_cache ? "with the" : "without a");
 
     // Built newest first (from the end): this driver's own records before those only another
     // driver stored, which a merged pack appends after them.
@@ -2164,8 +2194,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         const u64 hash = deferred.first.Hash();
         return rekeyed_pipelines.contains(hash) && !native_pipelines.contains(hash);
     });
+    // A "Build shaders" launch builds them all now: the game does not start after it.
     const size_t background_count =
-        BackgroundPipelinesEnabled()
+        BackgroundPipelinesEnabled() && !ShaderWarm::BuildOnlyRequested()
             ? (std::min)(deferred_graphics.size(), BackgroundPipelineLimit(queued_graphics))
             : 0;
     // The shader precache builds the rest, those otherwise built when a draw first needs them.
@@ -3116,6 +3147,7 @@ std::optional<std::string> NativeMeshLimitExceeded(const Device& device,
         .vertex_locations = vertex_locations,
         .primitive_locations = primitive_locations,
         .shared_memory_bytes = mesh->shared_memory_size,
+        .direct_outputs = MeshDirectOutputs(device),
     })};
     const u64 available{device.GetMaxComputeSharedMemorySize()};
     if (bytes > available) {
@@ -3533,6 +3565,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     runtime_info.convert_depth_mode && !profile.support_native_ndc,
                     runtime_info.fixed_state_point_size.value_or(1.0f));
             }
+        } else if (program.stage == Shader::Stage::Mesh && MeshDirectOutputs(device)) {
+            runtime_info.mesh_direct_outputs = true;
         }
         ConvertLegacyToGeneric(program, runtime_info);
         // EDEN_NX2_MESH_EMULATION_DUMP=<dir>: write the emulation's vertex shader for spirv-val.

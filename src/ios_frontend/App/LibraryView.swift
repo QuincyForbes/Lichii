@@ -218,6 +218,11 @@ struct LibraryView: View {
                 Label("Play", systemImage: "play.fill")
             }
             Button {
+                app.launch(game, buildShaders: true)
+            } label: {
+                Label("Build Shaders", systemImage: "hammer")
+            }
+            Button {
                 infoGame = game
             } label: {
                 Label("Game Info", systemImage: "info.circle")

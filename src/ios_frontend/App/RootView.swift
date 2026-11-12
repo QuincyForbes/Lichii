@@ -46,7 +46,9 @@ struct RootView: View {
         .alert("Not Enough Free Storage", isPresented: Binding(get: { app.storageWarning != nil },
                                                                set: { if !$0 { app.storageWarning = nil } }),
                presenting: app.storageWarning) { warning in
-            Button("Start Anyway") { app.launch(warning.game, storageChecked: true) }
+            Button("Start Anyway") {
+                app.launch(warning.game, storageChecked: true, buildShaders: warning.buildShaders)
+            }
             Button("Cancel", role: .cancel) {}
         } message: { warning in
             Text("Keep Guest Memory in a File needs \(GuestMemoryFile.size(warning.storage.needed_mib)) of free storage; \(GuestMemoryFile.size(warning.storage.free_mib)) is free. \(warning.game.title) would start with its memory in RAM, and iOS may close Lichii in a large game. Free up storage in the Settings app > General > iPhone Storage, or start anyway.")
