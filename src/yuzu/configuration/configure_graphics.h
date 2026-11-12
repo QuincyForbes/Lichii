@@ -117,16 +117,15 @@ private:
     QWidget* vulkan_device_widget;
     QWidget* api_widget;
     QComboBox* aspect_ratio_combobox;
-    QComboBox* resolution_combobox;
+    /// Not built on the per-game page of a game with its own resolution (Ocarina of Time).
+    QComboBox* resolution_combobox{};
 
-    QWidget* nvidia_dlss_widget{};
-    QCheckBox* nvidia_dlss_checkbox{};
+    QComboBox* upscaler_combobox{};
     NvidiaDlssPanel* nvidia_dlss_panel{};
     QWidget* nvidia_dlss_preset_widget{};
     QComboBox* oot_resolution_combobox{};
     QWidget* frame_gen_widget{};
     QComboBox* frame_gen_type_combobox{};
     QLabel* lossless_status_label{};
-    QWidget* metalfx_temporal_widget{};
     QComboBox* scaling_filter_combobox{};
 };
