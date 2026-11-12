@@ -80,8 +80,8 @@ const ClockPollSleep& ClockPollSleepSetting() {
         }
         result.forced = value[0] != '0';
         if (const char* colon = std::strchr(value, ':')) {
-            result.gate_us = std::strtoull(value, nullptr, 10);
-            result.cap_us = (std::max)(u64{10}, std::strtoull(colon + 1, nullptr, 10));
+            result.gate_us = static_cast<u64>(std::strtoull(value, nullptr, 10));
+            result.cap_us = (std::max)(u64{10}, static_cast<u64>(std::strtoull(colon + 1, nullptr, 10)));
         }
         LOG_INFO(Core_ARM, "Clock poll sleep: {} (after {} us of polling, {}-{} us)",
                  *result.forced ? "on" : "off", result.gate_us, result.min_us, result.cap_us);

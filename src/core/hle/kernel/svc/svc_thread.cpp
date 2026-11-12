@@ -63,8 +63,8 @@ const YieldBackoff& YieldBackoffSetting() {
         }
         result.forced = value[0] != '0';
         if (const char* colon = std::strchr(value, ':')) {
-            result.gate_ns = std::strtoull(value, nullptr, 10) * 1000;
-            result.cap_ns = (std::max)(u64{10}, std::strtoull(colon + 1, nullptr, 10)) * 1000;
+            result.gate_ns = static_cast<u64>(std::strtoull(value, nullptr, 10)) * 1000;
+            result.cap_ns = (std::max)(u64{10}, static_cast<u64>(std::strtoull(colon + 1, nullptr, 10))) * 1000;
         }
         LOG_INFO(Kernel_SVC, "Yield backoff: {} (after {} us of yields to nobody, {}-{} us)",
                  *result.forced ? "on" : "off", result.gate_ns / 1000, result.min_ns / 1000,
