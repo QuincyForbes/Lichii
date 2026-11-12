@@ -85,6 +85,7 @@
 #include <vector>
 #include <os/log.h>
 #include "common/ios_jit.h"
+#include "common/malloc_census.h"
 #include "common/thread.h"
 #include "ios_frontend/lichii_bridge_platform.h"
 #include "yuzu_cmd/ios_support.h"
@@ -373,6 +374,10 @@ struct IosBootSession {
     SDL_AppResult result{SDL_APP_CONTINUE};
     Core::LaunchParams lp;
     std::uint64_t background_task{};
+    /// SDL ticks when the game started, and the malloc census lines logged since.
+    std::uint64_t started_ms{};
+    int census_count{};
+    bool census_low_done{};
 };
 #endif
 
@@ -726,10 +731,34 @@ static void IosFinishBoot(SdlState* state) {
         return;
     }
     IOS_MARK("game loaded");
+    boot.started_ms = SDL_GetTicks();
     SDL_ShowWindow(state->emu_window->GetSdlWindow());
     // Loaded while the app was inactive (a call, the app switcher): the game waits paused, as it
     // would have been paused then; the app shows its menu.
     StartGame(state, boot.lp, true, IosSupport::IsActive());
+}
+
+// What malloc holds while the game runs, for the device log: 60 s and 180 s after the start, and
+// once when less than 512 MiB are left before iOS closes the app.
+static void IosMaybeLogMallocCensus(SdlState* state) {
+    if (!state->ios_boot || !state->ios_boot->started) {
+        return;
+    }
+    IosBootSession& boot = *state->ios_boot;
+    const std::uint64_t running_ms = SDL_GetTicks() - boot.started_ms;
+    if ((boot.census_count == 0 && running_ms >= 60'000) ||
+        (boot.census_count == 1 && running_ms >= 180'000)) {
+        ++boot.census_count;
+        Common::LogMallocCensus(boot.census_count == 1 ? "60 s in" : "180 s in");
+        return;
+    }
+    if (!boot.census_low_done) {
+        const u64 left = Common::PlatformEvents::AvailableProcessMemory();
+        if (left != 0 && left < (u64{512} << 20)) {
+            boot.census_low_done = true;
+            Common::LogMallocCensus("under 512 MiB left");
+        }
+    }
 }
 
 // The main callbacks run off a CADisplayLink: slow while nothing happens on the SDL side (library,
@@ -818,6 +847,7 @@ static std::optional<SDL_AppResult> IosAppIterate(SdlState* state) {
     if (!state->system.IsPoweredOn()) {
         return SDL_APP_CONTINUE;
     }
+    IosMaybeLogMallocCensus(state);
     return std::nullopt;
 }
 #endif
