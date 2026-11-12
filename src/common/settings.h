@@ -71,6 +71,7 @@ SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
 SWITCHABLE(OotMovieUpscale, false);
 SWITCHABLE(TextureQuality, false);
+SWITCHABLE(OotRenderScale, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -728,6 +729,11 @@ struct Values {
     SwitchableSetting<TextureQuality> texture_quality{linkage, TextureQuality::Full,
                                                       "texture_quality",
                                                       Category::RendererAdvanced};
+    // Ocarina of Time: a fixed internal render scale for the 3D instead of Max Resolution or
+    // the game's dynamic resolution (built-in patch). Read when the game starts.
+    SwitchableSetting<OotRenderScale> oot_render_scale{linkage, OotRenderScale::Game,
+                                                       "oot_render_scale",
+                                                       Category::RendererAdvanced};
     // Which revision of the Frizti tuned settings (common/frizti_settings.h) this config has had
     // applied once (MainWindow::MigrateFriztiSettings; config/frizti.ini keeps it too).
     Setting<u32> frizti_settings_revision{linkage, 0, "frizti_settings_revision",

@@ -238,7 +238,7 @@ QString SystemSummary(const std::vector<VkDeviceInfo::Record>& vk_device_records
         &values.nvidia_dlss,       &values.ocarina_dlss_mode, &values.oot_anti_aliasing,
         &values.oot_movie_upscale, &values.frame_gen,         &values.frame_gen_type,
         &values.precache_shaders,  &values.accelerate_astc,   &values.astc_recompression,
-        &values.texture_quality,
+        &values.texture_quality,   &values.oot_render_scale,
     };
     for (auto* setting : Settings::Frizti::TunedSettings(values)) {
         settings.push_back(setting);
