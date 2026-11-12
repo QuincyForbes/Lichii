@@ -199,6 +199,16 @@ void RecommendApple(const Device& device, Profile& p) {
            "builds 56-59; without it iOS closed the game at 6485 of 6656 MiB (build 54). Needs "
            "10 GB free storage.");
     AddApp(p, "auto_cool", true, "Steps the frame rate down while the device is hot.");
+    // PC phone sim (Ocarina of Time, Kokiri, x64 code with the phone's compact JIT code): 32 MiB
+    // per core flushed 13-18 times per 10 s at 5-13 fps; 48 MiB 0-2 flushes, 86 fps; 64 MiB 0-1;
+    // 96 MiB none (fullest 74 MiB). arm64 code is somewhat larger than x64's. The pool is six of
+    // these, prepared through the debugger at app start (~0.1 s per 32 MiB) and resident.
+    p.jit_cache_mib = p.tier == Tier::Ultra ? 96 : p.tier == Tier::High ? 64
+                    : p.tier == Tier::Mid  ? 48 : 32;
+    p.jit_cache_reason = fmt::format(
+        "{} MiB of JIT code per guest core ({} MiB for six): Ocarina of Time in Kokiri needs "
+        "40-75 MiB of code per core and recompiled everything several times a second at 32 MiB.",
+        p.jit_cache_mib, p.jit_cache_mib * 6);
 }
 
 void RecommendDesktop(const Device& device, Profile& p) {
