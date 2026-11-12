@@ -142,6 +142,11 @@ public:
                                          VirtualFile packed_update_raw = nullptr,
                                          bool apply_layeredfs = true) const;
 
+    // Builds a RomFS from an unpacked tree with the LayeredFS mods over it, or returns nullptr
+    // when no mod has a romfs layer. Saves unpacking a built RomFS again (NUP containers).
+    [[nodiscard]] VirtualFile CreateLayeredRomFS(VirtualDir base,
+                                                 ContentRecordType type) const;
+
     // Returns a vector of patches
     [[nodiscard]] std::vector<Patch> GetPatches(VirtualFile update_raw = nullptr) const;
 
@@ -164,6 +169,8 @@ private:
     [[nodiscard]] VirtualDir GetModificationLoadRoot(bool sdmc = false) const;
     [[nodiscard]] std::vector<std::string> GetDisabledAddons() const;
     void ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const;
+    void CollectLayers(ContentRecordType type, std::vector<VirtualDir>& layers,
+                       std::vector<VirtualDir>& layers_ext) const;
     [[nodiscard]] std::vector<VirtualFile> CollectPatches(const std::vector<VirtualDir>& patch_dirs,
                                                           const std::string& build_id) const;
 

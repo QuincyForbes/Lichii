@@ -48,6 +48,9 @@ public:
 
     ResultStatus ReadRomFS(FileSys::VirtualFile& out_file) override;
     bool IsRomFSUpdatable() const override;
+    bool IsRomFSLayered() const override {
+        return romfs_layered;
+    }
     ResultStatus ReadProgramId(u64& out_program_id) override;
     ResultStatus ReadProgramIds(std::vector<u64>& out_program_ids) override;
     ResultStatus ReadIcon(std::vector<u8>& buffer) override;
@@ -65,6 +68,9 @@ private:
     std::string display_title;
     std::string display_version;
     bool has_program{};
+    /// Set while Load builds the process's RomFS, which takes the LayeredFS mods in its tree.
+    Core::System* patch_system{};
+    bool romfs_layered{};
 };
 
 } // namespace Loader

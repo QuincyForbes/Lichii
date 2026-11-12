@@ -319,6 +319,13 @@ public:
     }
 
     /**
+     * Whether the last ReadRomFS already applied the LayeredFS mods.
+     */
+    virtual bool IsRomFSLayered() const {
+        return false;
+    }
+
+    /**
      * Get the title of the application
      *
      * @param[out] title Reference to store the application title into

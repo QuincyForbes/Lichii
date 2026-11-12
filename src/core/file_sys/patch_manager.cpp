@@ -1300,7 +1300,8 @@ std::vector<Core::Memory::CheatEntry> PatchManager::CreateCheatList(const BuildI
     return out;
 }
 
-void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const {
+void PatchManager::CollectLayers(ContentRecordType type, std::vector<VirtualDir>& layers,
+                                 std::vector<VirtualDir>& layers_ext) const {
     const auto load_dir = GetModificationLoadRoot();
     const auto sdmc_load_dir = GetModificationLoadRoot(true);
     if ((type != ContentRecordType::Program && type != ContentRecordType::Data &&
@@ -1321,8 +1322,6 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
     std::sort(patch_dirs.begin(), patch_dirs.end(),
               [](const VirtualDir& l, const VirtualDir& r) { return l->GetName() < r->GetName(); });
 
-    std::vector<VirtualDir> layers;
-    std::vector<VirtualDir> layers_ext;
     layers.reserve(patch_dirs.size() + 1);
     layers_ext.reserve(patch_dirs.size() + 1);
     for (const auto& subdir : patch_dirs) {
@@ -1349,6 +1348,12 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
                 layers.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(manual_dir)));
         }
     }
+}
+
+void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const {
+    std::vector<VirtualDir> layers;
+    std::vector<VirtualDir> layers_ext;
+    CollectLayers(type, layers, layers_ext);
 
     // When there are no layers to apply, return early as there is no need to rebuild the RomFS
     if (layers.empty() && layers_ext.empty()) {
@@ -1375,6 +1380,24 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
 
     LOG_INFO(Loader, "    RomFS: LayeredFS patches applied successfully");
     romfs = std::move(packed);
+}
+
+VirtualFile PatchManager::CreateLayeredRomFS(VirtualDir base, ContentRecordType type) const {
+    std::vector<VirtualDir> layers;
+    std::vector<VirtualDir> layers_ext;
+    CollectLayers(type, layers, layers_ext);
+    if (base == nullptr || (layers.empty() && layers_ext.empty())) {
+        return nullptr;
+    }
+    const auto mods = layers.size() + layers_ext.size();
+    layers.emplace_back(std::move(base));
+    auto layered = LayeredVfsDirectory::MakeLayeredDirectory(std::move(layers));
+    auto layered_ext = LayeredVfsDirectory::MakeLayeredDirectory(std::move(layers_ext));
+    auto packed = CreateRomFS(std::move(layered), std::move(layered_ext));
+    if (packed != nullptr) {
+        LOG_INFO(Loader, "    RomFS: {} LayeredFS layer(s) applied to the unpacked RomFS", mods);
+    }
+    return packed;
 }
 
 VirtualFile PatchManager::PatchRomFS(const NCA* base_nca, VirtualFile base_romfs,
