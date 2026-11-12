@@ -1533,7 +1533,8 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
         const char* const option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
         return option && (std::string_view{option} == "fsr" || std::string_view{option} == "dlss");
     }();
-    const bool use_history = allow_history && requested_history;
+    // NVIDIA DLSS, when on and running, takes the temporal inputs like the explicit overrides.
+    const bool use_history = allow_history && (requested_history || rasterizer->UsesNvidiaDlss());
     const size_t game_index = dlss_chain.spatial_only ? 1 : 0;
     const char* const game = dlss_chain.spatial_only ? "Star Fox" : "Fire Emblem";
     const auto jitter = fe_upscale_jitter.Take();
