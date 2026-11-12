@@ -97,9 +97,9 @@ TEST_CASE("Ocarina resolution from the render scale, Max Resolution and DLSS mod
     CHECK(OotResolutionFrom(old) == OotResolution::Game);
 
     // A fixed render scale won over Max Resolution either way.
-    for (const auto [scale, expected] : {std::pair{1, OotResolution::Percent75},
-                                         std::pair{2, OotResolution::Percent56},
-                                         std::pair{3, OotResolution::Percent50}}) {
+    for (const auto& [scale, expected] : {std::pair{1, OotResolution::Percent75},
+                                          std::pair{2, OotResolution::Percent56},
+                                          std::pair{3, OotResolution::Percent50}}) {
         old.render_scale = scale;
         CHECK(OotResolutionFrom(old) == expected);
     }
@@ -109,9 +109,9 @@ TEST_CASE("Ocarina resolution from the render scale, Max Resolution and DLSS mod
     old.render_scale = 2;
     old.dlss_build = true;
     old.nvidia_dlss = true;
-    for (const auto [mode, expected] : {std::pair{1, OotResolution::Percent87},
-                                        std::pair{2, OotResolution::Percent75},
-                                        std::pair{3, OotResolution::Percent50}}) {
+    for (const auto& [mode, expected] : {std::pair{1, OotResolution::Percent87},
+                                         std::pair{2, OotResolution::Percent75},
+                                         std::pair{3, OotResolution::Percent50}}) {
         old.dlss_mode = mode;
         CHECK(OotResolutionFrom(old) == expected);
     }

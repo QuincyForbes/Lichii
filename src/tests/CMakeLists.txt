@@ -236,7 +236,8 @@ if (NOT ANDROID)
 
     add_executable(config_tests
         common/first_run_config.cpp
-        ../frontend_common/config.cpp)
+        ../frontend_common/config.cpp
+        ../frontend_common/settings_migration.cpp)
     target_link_libraries(config_tests PRIVATE common SimpleIni::SimpleIni Catch2::Catch2WithMain
         ${PLATFORM_LIBRARIES})
     add_test(NAME config_tests COMMAND config_tests)
