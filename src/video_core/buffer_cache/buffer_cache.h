@@ -1422,27 +1422,44 @@ void BufferCache<P>::BindHostIndexBuffer() {
     const u32 offset = buffer.Offset(channel_state->index_buffer.device_addr);
     const u32 size = channel_state->index_buffer.size;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    if constexpr (requires { runtime.BindHostUint8IndexBuffer(std::span<const u8>{}); }) {
+    if constexpr (requires { runtime.BindHostUint8IndexBuffer(std::span<const u8>{}, DAddr{}); }) {
         if (draw_state.index_buffer.format == Maxwell::IndexFormat::UnsignedByte &&
             draw_state.topology != Maxwell::PrimitiveTopology::Quads &&
             draw_state.topology != Maxwell::PrimitiveTopology::QuadStrip &&
             runtime.WidensUint8IndicesOnHost()) {
             std::span<const u8> indices;
             const auto& index_buffer = draw_state.index_buffer;
-            const u32 guest_size = (std::min)(
-                static_cast<u32>(index_buffer.EndAddress() - index_buffer.StartAddress()),
-                index_buffer.first + index_buffer.count);
+            const DAddr index_addr = channel_state->index_buffer.device_addr;
+            const u32 buffer_size =
+                static_cast<u32>(index_buffer.EndAddress() - index_buffer.StartAddress());
+            const u32 guest_size = (std::min)(buffer_size, index_buffer.first + index_buffer.count);
+            bool cacheable = false;
             if (!draw_state.inline_index_draw_indexes.empty()) {
                 indices = std::span{draw_state.inline_index_draw_indexes.data(), size};
-            } else if (guest_size != 0 &&
-                       !IsRegionGpuModified(channel_state->index_buffer.device_addr, guest_size)) {
-                guest_uint8_indices.resize(guest_size);
-                device_memory.ReadBlockUnsafe(channel_state->index_buffer.device_addr,
-                                              guest_uint8_indices.data(), guest_size);
+            } else if (guest_size != 0 && !IsRegionGpuModified(index_addr, guest_size)) {
+                // Draws walk one index buffer at growing first indices: compare this draw's own
+                // bytes with the copy the runtime widened earlier in this command buffer, and
+                // widen the whole buffer (up to 1 MiB) when it has to, so later draws hit.
+                const u32 first = index_buffer.first;
+                const u32 count = guest_size - (std::min)(first, guest_size);
+                guest_uint8_indices.resize(count);
+                device_memory.ReadBlockUnsafe(index_addr + first, guest_uint8_indices.data(),
+                                              count);
+                if (runtime.BindCachedUint8IndexBuffer(index_addr, first, guest_uint8_indices)) {
+                    return;
+                }
+                const u32 widen_size =
+                    buffer_size <= (1U << 20) &&
+                            !IsRegionGpuModified(index_addr, buffer_size)
+                        ? buffer_size
+                        : guest_size;
+                guest_uint8_indices.resize(widen_size);
+                device_memory.ReadBlockUnsafe(index_addr, guest_uint8_indices.data(), widen_size);
                 indices = guest_uint8_indices;
+                cacheable = true;
             }
             if (!indices.empty()) {
-                runtime.BindHostUint8IndexBuffer(indices);
+                runtime.BindHostUint8IndexBuffer(indices, cacheable ? index_addr : DAddr{0});
                 return;
             }
         }
@@ -1676,6 +1693,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             runtime.BindFastUniformBuffer(stage, binding_index, copied);
             runtime.PushFastUniformBuffer(stage, binding_index, std::span<const u8>(data.data(), copied));
         } else {
+            if constexpr (requires { runtime.SetStreamUniformReadableSize(0U); }) {
+                runtime.SetStreamUniformReadableSize(size);
+            }
             const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
             std::memset(span.data(), 0, span.size());
             std::memcpy(span.data(), words.data(), copied);
@@ -1727,6 +1747,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
         channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
+        if constexpr (requires { runtime.SetStreamUniformReadableSize(0U); }) {
+            runtime.SetStreamUniformReadableSize((*channel_state->uniform_buffer_sizes)[stage][index]);
+        }
         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
         bool streamed = false;
         if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
@@ -2281,6 +2304,10 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
                     const char* value = std::getenv("EDEN_NX2_COMPUTE_BINDCACHE");
                     return value == nullptr || value[0] != '0';
                 }();
+                if constexpr (requires { runtime.SetStreamUniformReadableSize(0U); }) {
+                    runtime.SetStreamUniformReadableSize(
+                        (*channel_state->compute_uniform_buffer_sizes)[index]);
+                }
                 if constexpr (VideoCommon::StreamUniformReusable<Runtime>) {
                     if (compute_bindcache && VideoCommon::UniformStreamReuseEnabled() &&
                         VideoCommon::BindSmallUniformReusing(
