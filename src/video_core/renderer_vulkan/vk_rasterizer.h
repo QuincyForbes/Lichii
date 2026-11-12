@@ -19,6 +19,7 @@
 #include "common/dkb_cpu_trace.h"
 #include "common/dkb_frame_trace.h"
 #include "common/perf_report.h"
+#include "common/platform_events.h"
 #include "video_core/buffer_cache/nx2_write_handoff.h"
 #include "video_core/churn_counters.h"
 #include "video_core/control/channel_state_cache.h"
@@ -542,6 +543,7 @@ private:
     std::array<u64, Common::PerfReport::Count> perf_report_counters{};
     std::optional<Common::DkbCpuTrace::Snapshot> perf_report_cpu;
     std::array<u64, VideoCommon::Churn::Count> perf_report_churn{};
+    Common::PlatformEvents::ProcessEvents perf_report_events{};
     u64 perf_report_frames{};
     double perf_frame_max_ms{};
     bool trace_sample_frame{true};

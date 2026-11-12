@@ -6,7 +6,9 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -31,6 +33,10 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
+#endif
+
+#ifdef __linux__
+#include <sys/resource.h>
 #endif
 
 #include "common/host_memory.h"
@@ -70,6 +76,97 @@ std::size_t g_next_pressure_listener_id = 1;
 
 std::mutex g_graphics_report_mutex;
 std::function<std::string()> g_graphics_report;
+
+std::atomic<bool> g_guest_in_file{};
+std::atomic<u64> g_guest_reserve_extra{};
+// Only the PollMemoryPressure caller that won its 250 ms slot touches these.
+u64 g_pagein_last{};
+long long g_pagein_last_ns{};
+long long g_pagein_quiet_since_ns{};
+
+constexpr u64 ReserveStep = u64{256} << 20;
+constexpr u64 ReserveDecay = u64{128} << 20;
+
+u64 EnvMiB(const char* name, u64 fallback) {
+    const char* const value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : fallback;
+}
+
+u64 GuestReserveBase() {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    constexpr u64 Default = 1024;
+#else
+    constexpr u64 Default = 0;
+#endif
+    static const u64 base = EnvMiB("EDEN_NX2_GUEST_FILE_RESERVE_MIB", Default) << 20;
+    return base;
+}
+
+u64 GuestReserveMax() {
+    static const u64 max = EnvMiB("EDEN_NX2_GUEST_FILE_RESERVE_MAX_MIB", 3072) << 20;
+    return max;
+}
+
+u64 PageInThreshold() {
+    static const u64 threshold = EnvMiB("EDEN_NX2_PAGEIN_PRESSURE", 1500);
+    return threshold;
+}
+
+// A guest memory file paged back in faster than the threshold: the rest of the process took its
+// RAM. The caches then leave it 256 MiB more and collect now; after 30 s below a quarter of the
+// threshold they get 128 MiB of it back.
+void TrackGuestPageIns(long long now) {
+    if (!g_guest_in_file.load(std::memory_order_relaxed) || GuestReserveBase() == 0 ||
+        PageInThreshold() == 0) {
+        return;
+    }
+    const ProcessEvents events = QueryProcessEvents();
+    if (g_pagein_last_ns == 0) {
+        g_pagein_last = events.pageins;
+        g_pagein_last_ns = now;
+        return;
+    }
+    const double seconds = static_cast<double>(now - g_pagein_last_ns) / 1e9;
+    if (seconds < 1.0) {
+        return;
+    }
+    const double rate =
+        static_cast<double>(events.pageins - (std::min)(events.pageins, g_pagein_last)) / seconds;
+    g_pagein_last = events.pageins;
+    g_pagein_last_ns = now;
+    const double threshold = static_cast<double>(PageInThreshold());
+    const u64 extra = g_guest_reserve_extra.load(std::memory_order_relaxed);
+    const u64 room_to_grow = GuestReserveMax() > GuestReserveBase() + extra
+                                 ? GuestReserveMax() - GuestReserveBase() - extra
+                                 : 0;
+    if (rate >= threshold) {
+        g_pagein_quiet_since_ns = 0;
+        if (room_to_grow == 0) {
+            return;
+        }
+        const u64 grown = extra + (std::min)(ReserveStep, room_to_grow);
+        g_guest_reserve_extra.store(grown, std::memory_order_relaxed);
+        LOG_WARNING(Common_Memory,
+                    "Guest memory file: {:.0f} page-ins/s: the caches leave it {} MiB (was {}) "
+                    "and collect",
+                    rate, (GuestReserveBase() + grown) >> 20, (GuestReserveBase() + extra) >> 20);
+        SignalMemoryPressure();
+        return;
+    }
+    if (rate >= threshold / 4 || extra == 0) {
+        g_pagein_quiet_since_ns = 0;
+        return;
+    }
+    if (g_pagein_quiet_since_ns == 0) {
+        g_pagein_quiet_since_ns = now;
+    } else if (now - g_pagein_quiet_since_ns >= 30'000'000'000LL) {
+        const u64 shrunk = extra - (std::min)(extra, ReserveDecay);
+        g_guest_reserve_extra.store(shrunk, std::memory_order_relaxed);
+        g_pagein_quiet_since_ns = now;
+        LOG_INFO(Common_Memory, "Guest memory file: {:.0f} page-ins/s: the caches leave it {} MiB",
+                 rate, (GuestReserveBase() + shrunk) >> 20);
+    }
+}
 } // Anonymous namespace
 
 void SignalMemoryPressure() {
@@ -141,17 +238,44 @@ u64 MemoryLowWater() {
     return g_low_water.load(std::memory_order_relaxed);
 }
 
-void PollMemoryPressure() {
-    const u64 low_water = g_low_water.load(std::memory_order_relaxed);
-    if (low_water == 0) {
-        return;
+void SetGuestInFile(bool in_file) {
+    g_guest_in_file.store(in_file, std::memory_order_relaxed);
+    g_guest_reserve_extra.store(0, std::memory_order_relaxed);
+    g_pagein_last_ns = 0;
+}
+
+bool GuestInFile() {
+    return g_guest_in_file.load(std::memory_order_relaxed);
+}
+
+u64 GuestFileReserve() {
+    const u64 base = GuestReserveBase();
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    if (base == 0 || !GuestInFile()) {
+        return 0;
     }
+#else
+    // A PC simulating a phone (HostBudget's EDEN_NX2_CACHE_BUDGET=ios): only when asked for.
+    if (base == 0) {
+        return 0;
+    }
+#endif
+    return (std::min)(base + g_guest_reserve_extra.load(std::memory_order_relaxed),
+                      (std::max)(base, GuestReserveMax()));
+}
+
+void PollMemoryPressure() {
     const long long now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                               std::chrono::steady_clock::now().time_since_epoch())
                               .count();
     long long next = g_next_poll_ns.load(std::memory_order_relaxed);
     if (now < next || !g_next_poll_ns.compare_exchange_strong(next, now + 250'000'000LL,
                                                               std::memory_order_relaxed)) {
+        return;
+    }
+    TrackGuestPageIns(now);
+    const u64 low_water = g_low_water.load(std::memory_order_relaxed);
+    if (low_water == 0) {
         return;
     }
     const u64 available = AvailableProcessMemory();
@@ -207,6 +331,64 @@ ProcessMemory QueryProcessMemory() {
     }
 #endif
     return memory;
+}
+
+ProcessEvents QueryProcessEvents() {
+    ProcessEvents events{};
+#ifdef __APPLE__
+    task_events_info_data_t counts{};
+    mach_msg_type_number_t count = TASK_EVENTS_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_EVENTS_INFO, reinterpret_cast<task_info_t>(&counts),
+                  &count) == KERN_SUCCESS) {
+        events.known = true;
+        events.faults = static_cast<u32>(counts.faults);
+        events.pageins = static_cast<u32>(counts.pageins);
+        events.cow_faults = static_cast<u32>(counts.cow_faults);
+    }
+    task_vm_info_data_t info{};
+    count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) ==
+        KERN_SUCCESS) {
+        events.file_resident = info.external;
+        if (u64{count} * sizeof(natural_t) >=
+            offsetof(task_vm_info_data_t, decompressions) + sizeof(info.decompressions)) {
+            events.decompressions = static_cast<u32>(info.decompressions);
+        }
+    }
+    // Declared in <libproc.h>, which the iOS SDK lacks.
+    using ProcessUsage = int (*)(int pid, int flavor, rusage_info_t* buffer);
+    static const auto process_usage =
+        reinterpret_cast<ProcessUsage>(dlsym(RTLD_DEFAULT, "proc_pid_rusage"));
+    rusage_info_v4 usage{};
+    if (process_usage != nullptr &&
+        process_usage(getpid(), RUSAGE_INFO_V4, reinterpret_cast<rusage_info_t*>(&usage)) == 0) {
+        // 64-bit, unlike task_events_info.
+        events.pageins = usage.ri_pageins;
+        events.storage_read = usage.ri_diskio_bytesread;
+        events.storage_written = usage.ri_diskio_byteswritten;
+    }
+#elif defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+        events.known = true;
+        events.faults = counters.PageFaultCount;
+    }
+    IO_COUNTERS io{};
+    if (GetProcessIoCounters(GetCurrentProcess(), &io)) {
+        events.storage_read = io.ReadTransferCount;
+        events.storage_written = io.WriteTransferCount;
+    }
+#elif defined(__linux__)
+    rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        events.known = true;
+        events.faults = static_cast<u64>(usage.ru_minflt) + static_cast<u64>(usage.ru_majflt);
+        events.pageins = static_cast<u64>(usage.ru_majflt);
+        events.storage_read = static_cast<u64>(usage.ru_inblock) * 512;
+        events.storage_written = static_cast<u64>(usage.ru_oublock) * 512;
+    }
+#endif
+    return events;
 }
 
 std::string FootprintSplit([[maybe_unused]] const ProcessMemory& memory,

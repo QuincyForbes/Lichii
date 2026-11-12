@@ -56,10 +56,18 @@ inline bool FollowsHeadroom() {
     return follows;
 }
 
-/// Memory left to the process (0: not known).
+/// Memory left to the caches (0: not known): what the process may still allocate, less what a
+/// guest memory file needs of the RAM (Common::PlatformEvents::GuestFileReserve). The file is
+/// outside the footprint, so the footprint's limit left the caches room that iOS then took from
+/// the guest's pages: an iPhone grew graphics to 2.9 GiB while the file fell from 3235 to 1253 MiB
+/// resident.
 inline u64 Available([[maybe_unused]] u64 device_usage) {
+    const u64 reserve = Common::PlatformEvents::GuestFileReserve();
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-    return Common::PlatformEvents::AvailableProcessMemory();
+    const u64 left = Common::PlatformEvents::AvailableProcessMemory();
+    if (left == 0) {
+        return 0;
+    }
 #else
     if (!Simulated()) {
         return 0;
@@ -69,9 +77,10 @@ inline u64 Available([[maybe_unused]] u64 device_usage) {
         const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
         return (mib != 0 ? mib : 4352) << 20;
     }();
-    // Never 0, which means not known.
-    return limit > device_usage + 1_MiB ? limit - device_usage : 1_MiB;
+    const u64 left = limit > device_usage ? limit - device_usage : 0;
 #endif
+    // Never 0, which means not known.
+    return left > reserve + 1_MiB ? left - reserve : 1_MiB;
 }
 
 /// What ApplyMemoryBudgets gives an iPhone 18 Pro Max, for a simulated phone (the buffer cache's

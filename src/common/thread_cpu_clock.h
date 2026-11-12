@@ -20,6 +20,8 @@ public:
     ThreadCpuClock& operator=(const ThreadCpuClock&) = delete;
 
     std::optional<u64> Read() const;
+    /// Of it, the time in the kernel (not on Linux).
+    std::optional<u64> ReadSystem() const;
 
 private:
     std::intptr_t native_clock{};

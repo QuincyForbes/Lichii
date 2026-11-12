@@ -58,6 +58,12 @@ enum Counter : std::size_t {
     GuestKernelNs,       ///< Guest cores: wall time in SVCs, the scheduler and fiber switches
     GuestIdleNs,         ///< Guest cores: wall time waiting with nothing to run
     GuestIdles,          ///< Guest cores: waits begun
+    JitBlocks,           ///< Blocks the JIT translated
+    JitBytes,            ///< Host code they took
+    JitCompileNs,        ///< Wall time translating them (inside guest code time)
+    JitCacheFullFlushes, ///< Code caches emptied because they were full
+    JitCacheClears,      ///< Code caches emptied on request (guest instruction cache ops)
+    JitRangeInvalidations, ///< Ranges of translated code dropped on request
     Count,
 };
 
@@ -68,6 +74,31 @@ inline void Add(Counter counter, u64 amount = 1) {
         return;
     }
     g_counters[counter].fetch_add(amount, std::memory_order_relaxed);
+}
+
+/// The fullest any guest core's code cache got since the last TakeJitPeak, and its size.
+inline std::atomic<u64> g_jit_peak_used{};
+inline std::atomic<u64> g_jit_cache_size{};
+
+inline void NoteJitUse(u64 used, u64 cache_size) {
+    if (!Enabled()) {
+        return;
+    }
+    g_jit_cache_size.store(cache_size, std::memory_order_relaxed);
+    u64 peak = g_jit_peak_used.load(std::memory_order_relaxed);
+    while (used > peak &&
+           !g_jit_peak_used.compare_exchange_weak(peak, used, std::memory_order_relaxed)) {
+    }
+}
+
+inline u64 TakeJitPeak() {
+    return g_jit_peak_used.exchange(0, std::memory_order_relaxed);
+}
+
+inline u64 NowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
 }
 
 /// Guest core time split: adds the time since this thread's previous mark to `closed`.

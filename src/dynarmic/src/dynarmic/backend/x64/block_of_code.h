@@ -57,6 +57,9 @@ public:
     void ClearCache();
     /// Calculates how much space is remaining to use.
     size_t SpaceRemaining() const;
+    /// Bytes of code emitted since the last ClearCache (near and far).
+    size_t UsedBytes() const;
+    size_t CacheSize() const { return maxSize_; }
     /// Ensure at least codesize bytes of code cache memory are committed at the current code_ptr.
     void EnsureMemoryCommitted(size_t codesize);
 

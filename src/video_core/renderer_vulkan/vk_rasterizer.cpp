@@ -3633,6 +3633,8 @@ void RasterizerVulkan::TickPerfReport() {
         perf_report_counters = Common::PerfReport::Read();
         perf_report_churn = VideoCommon::Churn::Read();
         perf_report_cpu = Common::DkbCpuTrace::ReadSnapshot();
+        perf_report_events = Common::PlatformEvents::QueryProcessEvents();
+        static_cast<void>(Common::PerfReport::TakeJitPeak());
         perf_frame_max_ms = 0.0;
         return;
     }
@@ -3674,13 +3676,57 @@ void RasterizerVulkan::TickPerfReport() {
     double guest_sum = 0.0;
     double guest_max = 0.0;
     bool guest_known = false;
+    double guest_system = 0.0;
+    bool guest_system_known = false;
     for (size_t core = 0; core <= Common::DkbCpuTrace::GuestCoreCount; ++core) {
         if (const auto value = busy(static_cast<Common::DkbCpuTrace::Role>(core))) {
             guest_known = true;
             guest_sum += *value;
             guest_max = (std::max)(guest_max, *value);
         }
+        if (perf_report_cpu) {
+            if (const auto ns = Common::DkbCpuTrace::SystemTimeDelta(perf_report_cpu->threads[core],
+                                                                     cpu.threads[core])) {
+                guest_system_known = true;
+                guest_system += static_cast<double>(*ns) / 1e7 / seconds;
+            }
+        }
     }
+    // Page faults and storage: a guest memory file that iOS pages out shows as page-ins here and
+    // as guest cores' time in the kernel (system) or off the CPU (guest code time over CPU time).
+    const auto events = Common::PlatformEvents::QueryProcessEvents();
+    std::string memory_events = "not known";
+    if (events.known && perf_report_events.known) {
+        const auto rate32 = [&](u64 after, u64 before) {
+            return per_second(static_cast<u32>(after - before));
+        };
+        memory_events = fmt::format(
+            "faults {:.0f}/s, page-ins {:.0f}/s, decompressions {:.0f}/s, copy-on-write {:.0f}/s "
+            "| storage read {:.1f} MiB/s, written {:.1f} MiB/s{}",
+            rate32(events.faults, perf_report_events.faults),
+            per_second(events.pageins - perf_report_events.pageins),
+            rate32(events.decompressions, perf_report_events.decompressions),
+            rate32(events.cow_faults, perf_report_events.cow_faults),
+            mib_per_second(events.storage_read - perf_report_events.storage_read),
+            mib_per_second(events.storage_written - perf_report_events.storage_written),
+            events.file_resident != 0
+                ? fmt::format(", mapped files resident {} MiB", events.file_resident >> 20)
+                : std::string{});
+    }
+    if (const u64 reserve = Common::PlatformEvents::GuestFileReserve(); reserve != 0) {
+        memory_events += fmt::format(", caches leave the guest file {} MiB", reserve >> 20);
+    }
+    const u64 jit_peak = Common::PerfReport::TakeJitPeak();
+    const std::string jit_text = fmt::format(
+        "JIT {:.0f} blocks/s ({:.2f} MiB/s), compiling {:.0f}%, {} "
+        "full-cache flushes, {} clears, {} ranges dropped, fullest code cache {:.1f} of {} MiB",
+        per_second(delta(Common::PerfReport::JitBlocks)),
+        mib_per_second(delta(Common::PerfReport::JitBytes)),
+        static_cast<double>(delta(Common::PerfReport::JitCompileNs)) / 1e7 / seconds,
+        delta(Common::PerfReport::JitCacheFullFlushes), delta(Common::PerfReport::JitCacheClears),
+        delta(Common::PerfReport::JitRangeInvalidations),
+        static_cast<double>(jit_peak) / static_cast<double>(1 << 20),
+        Common::PerfReport::g_jit_cache_size.load(std::memory_order_relaxed) >> 20);
     const u64 texture_bytes = delta(Common::PerfReport::TextureUploadBytes);
     const u64 buffer_bytes = delta(Common::PerfReport::BufferUploadBytes);
     const u64 staging_bytes = delta(Common::PerfReport::StagingUploadBytes);
@@ -3718,8 +3764,9 @@ void RasterizerVulkan::TickPerfReport() {
     };
     LOG_INFO(Common_Memory,
              "Perf: {:.1f} fps, frame {:.1f} ms avg {:.0f} max | {} | busy: GPU thread {}, GPU "
-             "back {}, Vulkan worker {}, guest cores {} (max {}) | guest cores' time: guest code "
-             "{:.0f}%, kernel {:.0f}%, idle {:.0f}% ({:.0f} waits/s) | draws {:.0f}/frame, {:.1f} "
+             "back {}, Vulkan worker {}, guest cores {} (max {}, in the host kernel {}) | guest "
+             "cores' time: guest code {:.0f}%, kernel {:.0f}%, idle {:.0f}% ({:.0f} waits/s) | {} "
+             "| memory: {} | draws {:.0f}/frame, {:.1f} "
              "skipped (no pipeline), {:.1f} render passes/frame, {:.1f} mesh emulated/frame "
              "({:.1f} ended a render pass) | uploads MiB/s: textures {:.1f}, buffers {:.1f}, "
              "other {:.1f}, past the stream buffer {:.1f} | other: uniforms {:.1f} (padding "
@@ -3734,10 +3781,11 @@ void RasterizerVulkan::TickPerfReport() {
              percent(Common::DkbCpuTrace::Role::VulkanWorker),
              guest_known ? fmt::format("{:.0f}%", guest_sum) : std::string{"-"},
              guest_known ? fmt::format("{:.0f}%", guest_max) : std::string{"-"},
+             guest_system_known ? fmt::format("{:.0f}%", guest_system) : std::string{"-"},
              wall_percent(Common::PerfReport::GuestRunNs),
              wall_percent(Common::PerfReport::GuestKernelNs),
              wall_percent(Common::PerfReport::GuestIdleNs),
-             per_second(delta(Common::PerfReport::GuestIdles)),
+             per_second(delta(Common::PerfReport::GuestIdles)), jit_text, memory_events,
              per_frame(Common::PerfReport::Draws), per_frame(Common::PerfReport::DrawsSkipped),
              per_frame(Common::PerfReport::RenderPasses),
              per_frame(Common::PerfReport::MeshEmulatedDraws),
@@ -3762,6 +3810,7 @@ void RasterizerVulkan::TickPerfReport() {
     perf_report_counters = counters;
     perf_report_churn = churn;
     perf_report_cpu = cpu;
+    perf_report_events = events;
     perf_report_frames = 1;
     perf_frame_max_ms = 0.0;
 }
@@ -3864,6 +3913,18 @@ void RasterizerVulkan::TickMemoryReport() {
                  image_kinds[3] >> 20, image_kinds[4] >> 20, image_kinds[5] >> 20,
                  device.MemoryTypeReport(),
                  pipeline_cache.DriverPipelineCacheBytes() >> 10);
+        std::string image_census;
+        {
+            std::scoped_lock lock{texture_cache.mutex};
+            image_census = texture_cache.ImageCensus();
+        }
+        std::string buffer_census;
+        {
+            std::scoped_lock lock{buffer_cache.mutex};
+            buffer_census = buffer_cache.BufferCensus();
+        }
+        LOG_INFO(Common_Memory, "Memory census: images: {} | buffers: {}", image_census,
+                 buffer_census);
     }
     // Every Vulkan allocation by what it is for: once, on request and with the detail line.
     if (!graphics_report_logged || requested || pressure_detail) {
