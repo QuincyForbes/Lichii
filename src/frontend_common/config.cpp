@@ -463,7 +463,7 @@ void Config::MigrateRendererValues() {
             LOG_INFO(Config,
                      "Earlier settings: oot_30fps={} nx2_frame_rate_limit={} -> oot_frame_rate={}",
                      was_thirty, values.frame_rate_limit.GetValue(),
-                     values.oot_frame_rate.ToString());
+                     Settings::CanonicalizeEnum(values.oot_frame_rate.GetValue()));
         }
     }
 
@@ -504,13 +504,18 @@ void Config::MigrateRendererValues() {
                          old.render_scale, static_cast<int>(old.patch_resolution),
                          old.max_resolution_choice ? (*old.max_resolution_choice ? "on" : "off")
                                                    : "default",
-                         old.dlss_mode, values.oot_resolution.ToString());
+                         old.dlss_mode, Settings::CanonicalizeEnum(values.oot_resolution.GetValue()));
+                // The game list caches the add-on summary that listed the built-ins now set here.
+                std::error_code ec;
+                std::filesystem::remove(FS::GetEdenPath(FS::EdenPath::CacheDir) / "game_list" /
+                                            "0400486024DEC000.pv.txt",
+                                        ec);
             }
         } else if (render_scale && *render_scale != 0) {
             // For a game only a fixed scale was its own; the rest followed the global choice.
             set(values.oot_resolution, Migration::OotResolutionFrom(old));
             LOG_INFO(Config, "Earlier settings: oot_render_scale={} -> oot_resolution={}",
-                     old.render_scale, values.oot_resolution.ToString());
+                     old.render_scale, Settings::CanonicalizeEnum(values.oot_resolution.GetValue()));
         }
     }
 
@@ -524,7 +529,7 @@ void Config::MigrateRendererValues() {
             set(values.mkw_frame_rate, Migration::MkwFrameRateFrom(was_thirty, was_dynamic));
             LOG_INFO(Config,
                      "Earlier settings: mkw_30fps={} mkw_dynamic_fps={} -> mkw_frame_rate={}",
-                     was_thirty, was_dynamic, values.mkw_frame_rate.ToString());
+                     was_thirty, was_dynamic, Settings::CanonicalizeEnum(values.mkw_frame_rate.GetValue()));
         }
     }
 }
