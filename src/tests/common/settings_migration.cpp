@@ -16,9 +16,9 @@ using Settings::OotResolution;
 
 class MigrationConfig final : public Config {
 public:
-    explicit MigrationConfig(ConfigType type = ConfigType::GlobalConfig,
+    explicit MigrationConfig(ConfigType config_type = ConfigType::GlobalConfig,
                              std::string path = "qt-config.ini")
-        : Config(type) {
+        : Config(config_type) {
         config_loc = std::move(path);
     }
 
