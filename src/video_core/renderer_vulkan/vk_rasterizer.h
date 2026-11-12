@@ -363,7 +363,7 @@ private:
         u32 depth_tic{};
         VkExtent2D extent{};
         /// The scene render targets' size: wider than the extent at a render scale whose width
-        /// the game pads (ocarina_dlss_mode Balanced draws 2276x1280 into 2288x1280).
+        /// the game pads (oot_resolution 87 % draws 2276x1280 into 2288x1280).
         VkExtent2D image_extent{};
         std::array<f32, 16> current{};
         std::array<f32, 16> previous{};

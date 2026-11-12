@@ -3065,7 +3065,7 @@ void RasterizerVulkan::TrackOcarinaCamera() {
         return;
     }
     // The camera's extent is the scene's. The images are that size, or up to 15 pixels larger at
-    // a render scale the game pads (ocarina_dlss_mode Balanced); only NVIDIA DLSS takes those.
+    // a render scale the game pads (oot_resolution 87 %); only NVIDIA DLSS takes those.
     const VkExtent2D scene{static_cast<u32>(extent_check[0]), static_cast<u32>(extent_check[1])};
     const bool padded = scene.width != color.size.width || scene.height != color.size.height;
     if (static_cast<f32>(scene.width) != extent_check[0] ||
@@ -3349,7 +3349,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
             Settings::OcarinaDlssMode::Performance) {
         upscale_4k = true;
     }
-    // 4K: any 16:9 scene up to 2560x1440 (the lower ocarina_dlss_mode render scales).
+    // 4K: any 16:9 scene up to 2560x1440 (the lower oot_resolution scales).
     const bool valid_extents = upscale_4k
         ? extent.width <= 2560 &&
             std::abs(static_cast<int>(extent.width * 9) - static_cast<int>(extent.height * 16)) <= 32 &&
