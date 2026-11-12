@@ -212,6 +212,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 host_memory_cap{(std::numeric_limits<u64>::max)()};
     u64 host_memory_cap_logged{}; ///< Collection threshold last logged for host_memory_cap
     u64 host_fixed_memory{};      ///< Device memory in use that is not the cache's images
+    u64 host_available_last{(std::numeric_limits<u64>::max)()}; ///< Last AvailableProcessMemory
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image

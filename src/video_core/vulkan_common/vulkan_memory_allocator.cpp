@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -18,6 +20,7 @@
 #include "common/common_types.h"
 #include "common/literals.h"
 #include "common/logging.h"
+#include "common/platform_events.h"
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
@@ -33,6 +36,27 @@
 
 namespace Vulkan {
 namespace {
+
+// iOS: an allocation past the budget is made anyway, but the caches are told to collect at once
+// (at most once a second) instead of after the low-water mark is crossed at a later frame.
+void SignalOverBudget([[maybe_unused]] u64 bytes) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    static std::atomic<s64> next_ns{};
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 next = next_ns.load(std::memory_order_relaxed);
+    if (now < next ||
+        !next_ns.compare_exchange_strong(next, now + 1'000'000'000LL, std::memory_order_relaxed)) {
+        return;
+    }
+    LOG_WARNING(Common_Memory,
+                "Graphics allocation of about {} KiB over the memory budget with {} MiB left: "
+                "signalling memory pressure",
+                bytes >> 10, Common::PlatformEvents::AvailableProcessMemory() >> 20);
+    Common::PlatformEvents::SignalMemoryPressure();
+#endif
+}
 
 // Helpers translating MemoryUsage to flags/usage
 
@@ -272,6 +296,7 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
                         ci.arrayLayers, static_cast<u32>(ci.format));
         }
         pressure_events.fetch_add(1, std::memory_order_relaxed);
+        SignalOverBudget(u64{ci.extent.width} * ci.extent.height * 4);
         VmaAllocationCreateInfo relaxed = alloc_ci;
         relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
         result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
@@ -579,6 +604,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
                 usage == MemoryUsage::Stream) {
                 pressure_events.fetch_add(1, std::memory_order_relaxed);
             }
+            SignalOverBudget(ci.size);
             VmaAllocationCreateInfo relaxed = alloc_ci;
             relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
             result = vmaCreateBuffer(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
