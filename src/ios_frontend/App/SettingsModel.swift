@@ -82,12 +82,13 @@ struct SettingSection: Identifiable {
     var footer: String? = nil
 }
 
-/// Whether a setting does anything in this build on this device.
+/// Whether a setting does anything in this build on this device. Only available settings are
+/// listed.
 enum SettingAvailability: Equatable {
     case available
-    /// Greyed out, with the reason.
+    /// Does nothing here; a search that finds it names the reason.
     case unavailable(String)
-    /// Desktop or debug only: not listed.
+    /// Desktop or debug only.
     case hidden
 }
 
@@ -209,20 +210,23 @@ enum SettingsCatalog {
         "enable_ir_sensor", "ir_sensor_device",
     ]
 
-    /// Settings that do nothing in the iOS app, shown greyed out with the reason.
+    /// Settings that do nothing in the iOS app: not listed, and a search that finds one says why.
     static let unavailableReasons: [String: String] = [
         "nvidia_dlss": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.",
         "nvidia_dlss_preset": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.",
-        "ocarina_dlss_mode": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.",
+        "ocarina_dlss_mode": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows. MetalFX Upscaling is the iPhone's counterpart.",
         "backend": "iOS has one graphics API: Vulkan through MoltenVK.",
         "cpu_backend": "iOS runs games with the Dynarmic JIT only.",
-        "nvdec_emulation": "Lichii decodes game videos on the CPU on iOS and sets this at every boot.",
+        "nvdec_emulation": "Lichii decodes game videos on the CPU on iOS and sets this at every start.",
         "force_max_clock": "Only works with AMD, NVIDIA, Intel and Qualcomm drivers.",
         "enable_compute_pipelines": "Only matters for some Intel drivers on Windows.",
+        "patch_old_qcom_drivers": "Only for old Qualcomm drivers on Android.",
         "disable_macro_jit": "The macro JIT exists only on x86-64 PCs.",
         "accelerate_astc": "Apple GPUs read ASTC textures directly; this is for GPUs without ASTC.",
         "astc_recompression": "Apple GPUs read ASTC textures directly; this is for GPUs without ASTC.",
         "output_engine": "Lichii plays audio through SDL on iOS.",
+        "log_filter": "Lichii sets its own log filter on iOS at every start.",
+        "flush_line": "On iOS every log line is written at once, so a log survives iOS closing Lichii.",
     ]
 
     /// Kept off the main page: debug switches and hacks that can stop games from starting.
@@ -254,7 +258,7 @@ enum SettingsCatalog {
         return .available
     }
 
-    /// A hint under a usable setting, depending on its value.
+    /// A hint under a usable setting: about its value where that matters, else what it does.
     @MainActor
     static func note(for item: SettingItem, value: String) -> String? {
         switch item.key {
@@ -270,8 +274,37 @@ enum SettingsCatalog {
         case "game_dlss_network":
             return "Used only at 1x resolution."
         default:
-            return nil
+            return descriptions[item.key]
         }
+    }
+
+    /// What the everyday settings do, in a line.
+    static let descriptions: [String: String] = [
+        "resolution_setup": "Renders games at this multiple of their own resolution. Higher is sharper and costs GPU time, memory and battery.",
+        "scaling_filter": "How the rendered picture is scaled to the screen.",
+        "anti_aliasing": "Smooths jagged edges after the game has drawn its frame.",
+        "metalfx_temporal": "Apple's MetalFX upscaler in place of the game's own, in games that have one (Ocarina of Time, games with DLSS).",
+        "frame_gen": "Adds generated frames between the game's own: smoother motion, more GPU work and slightly more input lag.",
+        "use_docked_mode": "Docked renders games at their TV resolution, which costs more GPU time and memory than Handheld.",
+        "gpu_accuracy": "Higher fixes graphics in some games and is slower.",
+        "use_asynchronous_shaders": "Builds new shaders in the background: less stutter, but an object can be missing for a moment.",
+        "use_disk_shader_cache": "Keeps built shaders in storage, so the next start of a game stutters less.",
+        "memory_layout_mode": "Switch 1 games only: Switch 2 games always get 12 GB.",
+    ]
+
+    /// The settings a search finds that do nothing here, as one footer naming each and why.
+    @MainActor
+    private static func unavailableSection(query: String, perGame: Bool) -> SettingSection? {
+        guard !query.isEmpty else { return nil }
+        let lines = all.compactMap { item -> String? in
+            guard !perGame || item.switchable,
+                  item.label.localizedCaseInsensitiveContains(query) || item.key.localizedCaseInsensitiveContains(query),
+                  case .unavailable(let reason) = availability(of: item) else { return nil }
+            return "\(item.label): \(reason)"
+        }
+        guard !lines.isEmpty else { return nil }
+        return SettingSection(id: "unavailable", title: "Not Available on iOS", items: [],
+                              footer: lines.joined(separator: "\n"))
     }
 
     static let categoryTitles: [String: String] = [
@@ -313,7 +346,7 @@ enum SettingsCatalog {
     static func sections(group: SettingsGroup, query: String) -> [SettingSection] {
         let rank = Dictionary(essentials.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
         let visible = all.filter { item in
-            availability(of: item) != .hidden &&
+            availability(of: item) == .available &&
                 (query.isEmpty ? group.categories.contains(displayCategory(of: item))
                     : item.label.localizedCaseInsensitiveContains(query) ||
                         item.key.localizedCaseInsensitiveContains(query))
@@ -327,7 +360,7 @@ enum SettingsCatalog {
             }
             grouped[category, default: []].append(item)
         }
-        return order.compactMap { category in
+        let sections = order.compactMap { category -> SettingSection? in
             guard let items = grouped[category], !items.isEmpty else { return nil }
             // The everyday settings first, then the core's order (a stable sort).
             let sorted = items.enumerated().sorted { a, b in
@@ -336,13 +369,14 @@ enum SettingsCatalog {
             return SettingSection(id: category, title: group.sectionTitle(category), items: sorted,
                                   footer: category == enhancementsCategory ? enhancementsFooter() : nil)
         }
+        return sections + [unavailableSection(query: query, perGame: false)].compactMap { $0 }
     }
 
     /// The per-game page (`advanced` false) or its advanced part; a search covers both.
     @MainActor
     static func sections(perGame: Bool, query: String, advanced: Bool = false) -> [SettingSection] {
         let visible = all.filter { item in
-            availability(of: item) != .hidden && (!perGame || item.switchable) &&
+            availability(of: item) == .available && (!perGame || item.switchable) &&
                 (query.isEmpty ? advancedCategories.contains(displayCategory(of: item)) == advanced
                     : item.label.localizedCaseInsensitiveContains(query) ||
                         item.key.localizedCaseInsensitiveContains(query))
@@ -366,6 +400,9 @@ enum SettingsCatalog {
         for category in order {
             sections.append(SettingSection(id: category, title: categoryTitles[category] ?? category,
                                            items: grouped[category] ?? []))
+        }
+        if !advanced, let unavailable = unavailableSection(query: query, perGame: perGame) {
+            sections.append(unavailable)
         }
         return sections
     }
