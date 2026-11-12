@@ -50,9 +50,16 @@ final class PlatformCenter: ObservableObject {
     /// paused with the menu open, and runs again when the user closes it.
     private var pausedForLifecycle = false
     private var badgeTask: Task<Void, Never>?
+    /// When the memory warning toast named Keep Guest Memory in a File in this game; the short
+    /// toast of the warnings after it waits until it has been read.
+    private var memoryHintShown: Date?
 
     func start() {
         uncleanExit = GameSession.takeUncleanExit()
+        if let session = uncleanExit {
+            let file = session.fileGuest.map { $0 ? "on" : "off" } ?? "unknown"
+            lichii_platform_log_memory("the last session (\(session.title), started \(Int(-session.started.timeIntervalSinceNow)) s ago) ended without a clean stop; memory warning \(session.memoryWarning ? "yes" : "no"), Keep Guest Memory in a File \(file): shown the Last Session sheet")
+        }
         lichii_platform_init()
         lichii_platform_set_event_handler(platformEvent, nil)
         lichii_platform_set_shader_progress_handler(shaderProgress, nil)
@@ -66,6 +73,7 @@ final class PlatformCenter: ObservableObject {
     func handle(appEvent event: Int32) {
         if event == Int32(LICHII_EVENT_GAME_WINDOW_READY.rawValue) {
             GameSession.begin(AppController.shared.currentGame)
+            memoryHintShown = nil
             flashThermalBadge()
             return
         }
@@ -121,7 +129,13 @@ final class PlatformCenter: ObservableObject {
         case Int32(LICHII_PLATFORM_EVENT_MEMORY_WARNING.rawValue):
             GameSession.update { $0.memoryWarning = true }
             if ControlsCenter.shared.gameRunning {
-                ControlsCenter.shared.show(toast: "Memory is low: caches trimmed")
+                // The way out once per game; iOS sends several warnings in a row.
+                if memoryHintShown == nil, !GuestMemoryFile.enabled {
+                    memoryHintShown = Date()
+                    ControlsCenter.shared.show(toast: "Memory is low: caches trimmed. If iOS closes the game, turn on Keep Guest Memory in a File in Settings > Memory & Experiments.")
+                } else if memoryHintShown.map({ -$0.timeIntervalSinceNow > 6 }) ?? true {
+                    ControlsCenter.shared.show(toast: "Memory is low: caches trimmed")
+                }
             }
         case Int32(LICHII_PLATFORM_EVENT_WILL_TERMINATE.rawValue):
             GameSession.end()
@@ -237,6 +251,55 @@ final class PlatformCenter: ObservableObject {
     }
 }
 
+/// Experiments > Keep Guest Memory in a File, and whether storage has room for it.
+@MainActor
+enum GuestMemoryFile {
+    enum Fit {
+        /// The whole file is reserved up front.
+        case full
+        /// Enough to start with it; the rest of the file is reserved as the game uses it.
+        case partial
+        /// The game starts with its memory in RAM instead.
+        case short
+        case unknown
+    }
+
+    static var enabled: Bool {
+        get { lichii_platform_file_guest() != 0 }
+        set { lichii_platform_set_file_guest(newValue ? 1 : 0) }
+    }
+
+    static var storage: LichiiFileGuestStorage? {
+        var storage = LichiiFileGuestStorage()
+        return lichii_platform_file_guest_storage(&storage) != 0 ? storage : nil
+    }
+
+    static func fit(_ storage: LichiiFileGuestStorage?) -> Fit {
+        guard let storage else { return .unknown }
+        if storage.free_mib >= storage.full_mib { return .full }
+        return storage.free_mib >= storage.needed_mib ? .partial : .short
+    }
+
+    /// "12.3 GB" from MiB.
+    static func size(_ mib: UInt64) -> String {
+        (mib << 20).byteCount
+    }
+
+    /// One line for the log before a game starts, so the next device log shows the decision.
+    static func logLaunchCheck(title: String, storage: LichiiFileGuestStorage?, askedUser: Bool) {
+        let line: String
+        if !enabled {
+            line = "launch check for \(title): Keep Guest Memory in a File off"
+        } else if let storage {
+            line = "launch check for \(title): Keep Guest Memory in a File on, \(storage.free_mib) MiB free, \(storage.needed_mib) MiB needed, \(storage.full_mib) MiB for the whole file" +
+                (askedUser ? ": too little, asked whether to start anyway" : "")
+        } else {
+            line = "launch check for \(title): Keep Guest Memory in a File on, free storage unknown"
+        }
+        lichii_platform_log_memory(line)
+    }
+}
+
 /// A game that is up, kept in UserDefaults until it stops cleanly. Still there at the next launch
 /// means the app ended with it (a crash, or iOS closed Lichii, usually for memory).
 struct GameSession: Codable, Identifiable {
@@ -246,6 +309,8 @@ struct GameSession: Codable, Identifiable {
     var started: Date
     var background = false
     var memoryWarning = false
+    /// Keep Guest Memory in a File was on (nil: a session saved by an older build).
+    var fileGuest: Bool?
 
     var id: Date { started }
 
@@ -253,7 +318,8 @@ struct GameSession: Codable, Identifiable {
 
     @MainActor static func begin(_ game: Game?) {
         let session = GameSession(title: game?.title ?? "The game", programId: lichii_emu_program_id(),
-                                  resolution: QuickSettings.string("resolution_setup"), started: Date())
+                                  resolution: QuickSettings.string("resolution_setup"), started: Date(),
+                                  fileGuest: GuestMemoryFile.enabled)
         save(session)
     }
 

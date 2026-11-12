@@ -172,6 +172,39 @@ struct JitStatusCard: View {
     }
 }
 
+/// Library banner while JIT isn't ready: games can't run until it is, so the library says so
+/// before a game is picked.
+struct JitLibraryBanner: View {
+    @EnvironmentObject private var app: AppController
+
+    var body: some View {
+        let status = app.jit
+        if status.state != .ready {
+            VStack(alignment: .leading, spacing: 8) {
+                JitStatusCard(status: status)
+                if status.state == .waiting && status.providerInstalled {
+                    Button {
+                        app.requestJitIfNeeded(automatic: false)
+                    } label: {
+                        Label("Enable JIT with \(status.provider.label)", systemImage: "bolt")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.accent)
+                } else if status.state == .waiting {
+                    Text("Games you start wait for JIT.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(status.color.opacity(0.12),
+                        in: RoundedRectangle(cornerRadius: Theme.cornerRadius, style: .continuous))
+            .accessibilityElement(children: .contain)
+        }
+    }
+}
+
 struct JitView: View {
     @EnvironmentObject private var app: AppController
     @AppStorage("autoRequestJit") private var autoRequest = true

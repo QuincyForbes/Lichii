@@ -10,7 +10,7 @@ import UIKit
 enum PlatformEntries {
     static var settingsLinks: [SettingsLink] {
         [
-            SettingsLink(id: "experiments", title: "Experiments", systemImage: "flask",
+            SettingsLink(id: "experiments", title: "Memory & Experiments", systemImage: "memorychip",
                          view: { AnyView(ExperimentsView()) }),
         ]
     }
@@ -178,6 +178,14 @@ struct UncleanExitView: View {
         return [previous, startup].filter { FileManager.default.fileExists(atPath: $0.path) }
     }
 
+    /// Off when the sheet opened; stays in view once switched on here.
+    @State private var fileGuestWasOff = !GuestMemoryFile.enabled
+
+    /// The run was without Keep Guest Memory in a File: offered to switch it on here.
+    private var offerFile: Bool {
+        session.fileGuest != true && fileGuestWasOff
+    }
+
     private var lowerResolution: QuickSettings.Choice? {
         let choices = QuickSettings.choices("resolution_setup")
         let current = QuickSettings.string("resolution_setup")
@@ -193,9 +201,12 @@ struct UncleanExitView: View {
                         .font(.headline)
                         .foregroundStyle(.orange)
                     Text(session.memoryWarning
-                         ? "iOS warned that memory was running low just before, so it most likely closed Lichii to free memory. A lower resolution uses less."
+                         ? "iOS warned that memory was running low just before, so it most likely closed Lichii to free memory. \(offerFile ? "Keeping the game's memory in a file helps most; a lower resolution also uses less." : "A lower resolution uses less.")"
                          : "Lichii stopped while the game was running: a crash, or iOS closed it, often for memory. The log of that run helps find out which.")
                         .fixedSize(horizontal: false, vertical: true)
+                }
+                if offerFile {
+                    GuestMemoryFileSection()
                 }
                 Section {
                     if !logFiles.isEmpty {
@@ -301,32 +312,78 @@ struct ShaderCacheSettingsSection: View {
     }
 }
 
+/// Experiments > Keep Guest Memory in a File: what it does, and the storage it needs against what
+/// is free. Also offered after a game was closed by iOS.
+struct GuestMemoryFileSection: View {
+    @State private var enabled = GuestMemoryFile.enabled
+    @State private var storage = GuestMemoryFile.storage
+
+    var body: some View {
+        let fit = GuestMemoryFile.fit(storage)
+        Section {
+            Toggle(isOn: $enabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Keep Guest Memory in a File")
+                    Text("Recommended for large games")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .onChange(of: enabled) { _, value in
+                GuestMemoryFile.enabled = value
+            }
+            .disabled(Bridge.emuState.inGame || Bridge.emuState == .booting)
+            if let storage {
+                LabeledContent("Free storage", value: GuestMemoryFile.size(storage.free_mib))
+                LabeledContent("Needed", value: "\(GuestMemoryFile.size(storage.needed_mib)) free")
+            }
+            if enabled {
+                Label(fitText(fit), systemImage: fit == .short ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(fit == .short ? Color.orange : fit == .unknown ? Color.secondary : Color.green)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        } header: {
+            Text("Large Games")
+        } footer: {
+            Text("A game's own memory is most of what Lichii uses while it runs, and iOS closes Lichii when it uses too much. This moves that memory into a temporary file in storage, which iOS doesn't count: large games such as Ocarina of Time need it to get past their first areas.\n\nThe file can grow to \(GuestMemoryFile.size(storage?.file_mib ?? 14336)) and needs \(GuestMemoryFile.size(storage?.needed_mib ?? 10240)) of free storage when the game starts. Expect some stutter while a game loads, and a few GB written to storage per session (about 2.5 GB in Ocarina of Time). The file is deleted when the game stops. Takes effect the next time a game starts\(Bridge.emuState.inGame ? "; quit the game to change it" : "").")
+        }
+        .onAppear { storage = GuestMemoryFile.storage }
+    }
+
+    private func fitText(_ fit: GuestMemoryFile.Fit) -> String {
+        switch fit {
+        case .full: return "Enough free storage: the whole file is reserved when a game starts."
+        case .partial: return "Enough free storage to start. With less than \(GuestMemoryFile.size(storage?.full_mib ?? 16384)) free, part of the file is reserved as the game uses it."
+        case .short: return "Not enough free storage: games start without the file, and iOS may close Lichii in large games. Free up storage in the Settings app > General > iPhone Storage."
+        case .unknown: return "Free storage couldn't be read; Lichii checks again when a game starts."
+        }
+    }
+}
+
 /// Opt-in switches of the platform layer, audio mixing and the per-device defaults.
 struct ExperimentsView: View {
     @ObservedObject private var platform = PlatformCenter.shared
     @State private var untaggedGuest = lichii_platform_experiment("untagged_guest") != 0
     @State private var noZeroTrim = lichii_platform_experiment("no_zero_trim") != 0
     @State private var chunkedGuest = lichii_platform_experiment("chunked_guest") != 0
-    @State private var fileGuest = lichii_platform_file_guest() != 0
     @State private var nupInMemory = lichii_platform_experiment("nup_in_memory") != 0
     @State private var confirmReset = false
     @State private var resetDone = false
 
     var body: some View {
         List {
+            GuestMemoryFileSection()
+
             Section {
                 Toggle("Give Back Zeroed Guest Memory", isOn: $chunkedGuest)
                     .onChange(of: chunkedGuest) { value in
                         lichii_platform_set_experiment("chunked_guest", value ? 1 : 0)
                     }
-                Toggle("Keep Guest Memory in a File", isOn: $fileGuest)
-                    .onChange(of: fileGuest) { value in
-                        lichii_platform_set_file_guest(value ? 1 : 0)
-                    }
             } header: {
                 Text("Memory Savings")
             } footer: {
-                Text("Both are untested on a device and apply the next time Lichii starts.\n\nGive Back Zeroed Guest Memory splits guest memory into 2 MiB pieces and returns the ones holding only zeros to iOS (about 0.5 GB in Ocarina of Time). To do that safely Lichii stops all of its threads for about a millisecond at a time, which may show as a stutter. No effect with Count Guest Memory per Mapping on.\n\nKeep Guest Memory in a File takes the game's memory (most of what Lichii uses while a game runs) out of the limit iOS closes Lichii at: it lives in a 14 GB file in Lichii's temporary folder (tmp), and iOS writes the parts the game isn't using to storage when memory is short and reads them back when the game needs them. The cost: stutter while a game loads, and wear on the storage from several gigabytes written per play session. iOS may still close Lichii if storage can't keep up. Storage for the file is reserved when a game starts, as much as there is room for; it needs 10 GB of free storage (Lichii falls back to normal memory with less). The file is removed when the game stops or Lichii closes, however it closes. Overrides the other guest memory switches.")
+                Text("Untested on a device; applies the next time Lichii starts. Splits guest memory into 2 MB pieces and returns the ones holding only zeros to iOS (about 0.5 GB in Ocarina of Time). To do that safely Lichii stops all of its threads for about a millisecond at a time, which may show as a stutter. No effect while Keep Guest Memory in a File or Count Guest Memory per Mapping is on.")
             }
 
             Section {
@@ -372,7 +429,7 @@ struct ExperimentsView: View {
                 }
             }
         }
-        .navigationTitle("Experiments")
+        .navigationTitle("Memory & Experiments")
         .confirmationDialog("Overwrite resolution, frame generation, accuracy and docked mode with this device's defaults?",
                             isPresented: $confirmReset, titleVisibility: .visible) {
             Button("Reset", role: .destructive) {

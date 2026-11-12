@@ -97,8 +97,26 @@ final class AppController: ObservableObject {
         provider.request()
     }
 
-    func launch(_ game: Game) {
+    /// Keep Guest Memory in a File is on but storage is short: asks before the game starts.
+    @Published var storageWarning: StorageWarning?
+
+    struct StorageWarning: Identifiable {
+        let game: Game
+        let storage: LichiiFileGuestStorage
+        var id: String { game.id }
+    }
+
+    func launch(_ game: Game, storageChecked: Bool = false) {
         guard !emuState.inGame, emuState != .booting else { return }
+        if !storageChecked {
+            let storage = GuestMemoryFile.enabled ? GuestMemoryFile.storage : nil
+            let short = storage.map { GuestMemoryFile.fit($0) == .short } ?? false
+            GuestMemoryFile.logLaunchCheck(title: game.title, storage: storage, askedUser: short)
+            if short, let storage {
+                storageWarning = StorageWarning(game: game, storage: storage)
+                return
+            }
+        }
         currentGame = game
         library.markPlayed(game)
         guard game.path.withCString({ lichii_emu_launch($0) }) else { return }

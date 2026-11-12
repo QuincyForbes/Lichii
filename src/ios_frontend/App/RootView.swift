@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import LichiiBridge
 import SwiftUI
 
 struct RootView: View {
@@ -41,6 +42,14 @@ struct RootView: View {
         }
         .sheet(item: $platform.uncleanExit) { session in
             UncleanExitView(session: session)
+        }
+        .alert("Not Enough Free Storage", isPresented: Binding(get: { app.storageWarning != nil },
+                                                               set: { if !$0 { app.storageWarning = nil } }),
+               presenting: app.storageWarning) { warning in
+            Button("Start Anyway") { app.launch(warning.game, storageChecked: true) }
+            Button("Cancel", role: .cancel) {}
+        } message: { warning in
+            Text("Keep Guest Memory in a File needs \(GuestMemoryFile.size(warning.storage.needed_mib)) of free storage; \(GuestMemoryFile.size(warning.storage.free_mib)) is free. \(warning.game.title) would start with its memory in RAM, and iOS may close Lichii in a large game. Free up storage in the Settings app > General > iPhone Storage, or start anyway.")
         }
     }
 }
