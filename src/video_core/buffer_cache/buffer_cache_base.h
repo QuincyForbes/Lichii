@@ -1147,6 +1147,7 @@ private:
     u32 seen_host_pressure = 0;   ///< Common::PlatformEvents memory pressure already answered
     u32 host_pressure_frames = 0; ///< Frames left collecting after it
     BufferId inline_buffer_id;
+    u64 collect_bytes = 0; ///< Switch 2 titles: buffer_bytes from which the collector runs
 #ifdef YUZU_LEGACY
     bool immediately_free = false;
 #endif

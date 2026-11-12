@@ -213,6 +213,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 host_memory_cap_logged{}; ///< Collection threshold last logged for host_memory_cap
     u64 host_fixed_memory{};      ///< Device memory in use that is not the cache's images
     u64 host_available_last{(std::numeric_limits<u64>::max)()}; ///< Last AvailableProcessMemory
+    u64 device_used_memory{}; ///< The driver's figure, when total_used_memory counts images only
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image
@@ -354,8 +355,11 @@ public:
     /// (decoded ASTC/BCn and other host formats), rescaled, the rest; then deleted images whose
     /// memory is not free yet, and pooled images.
     [[nodiscard]] std::array<u64, 6> ImageMemoryKinds();
+    /// The device memory of the registered images, as the collector counts it.
+    [[nodiscard]] u64 CollectableImageBytes();
 
-    /// Device memory the collector counts as in use, and its expected and critical thresholds.
+    /// Memory the collector counts as in use (the device's, or with HostBudget::FollowsHeadroom
+    /// the images'), and its expected and critical thresholds.
     [[nodiscard]] std::array<u64, 3> CollectorMemory() const noexcept {
         return {total_used_memory, expected_memory, critical_memory};
     }

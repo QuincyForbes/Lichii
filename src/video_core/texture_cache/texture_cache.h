@@ -16,6 +16,7 @@
 #include <vector>
 #include <optional>
 #include <bit>
+#include <tuple>
 #include "common/container/unordered_map.h"
 #include <boost/container/small_vector.hpp>
 
@@ -29,6 +30,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
+#include "video_core/host_budget.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/render_probe.h"
@@ -500,18 +502,28 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
         }
     }
     // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB override the collector's thresholds.
-    for (const auto& [name, target] : {std::pair{"EDEN_NX2_TC_EXPECTED_MIB", &expected_memory},
-                                       std::pair{"EDEN_NX2_TC_CRITICAL_MIB", &critical_memory}}) {
+    for (const auto& [name, target, simulated] :
+         {std::tuple{"EDEN_NX2_TC_EXPECTED_MIB", &expected_memory,
+                     HostBudget::SimulatedTextureExpected},
+          std::tuple{"EDEN_NX2_TC_CRITICAL_MIB", &critical_memory,
+                     HostBudget::SimulatedTextureCritical}}) {
         if (const char* value = std::getenv(name)) {
             *target = std::strtoull(value, nullptr, 10) << 20;
+        } else if (HostBudget::Simulated()) {
+            *target = simulated;
         }
     }
 #ifdef __APPLE__
-    // The iOS memory budget sets these overrides. The minimum taken from the device's (unified,
-    // large) heap above would hold the collector off until long past them.
-    minimum_memory = (std::min)(minimum_memory,
-                                expected_memory - (std::min)(expected_memory, u64{512_MiB}));
+    constexpr bool memory_budget = true;
+#else
+    const bool memory_budget = HostBudget::Simulated();
 #endif
+    if (memory_budget) {
+        // The iOS memory budget sets these overrides. The minimum taken from the device's
+        // (unified, large) heap above would hold the collector off until long past them.
+        minimum_memory = (std::min)(minimum_memory,
+                                    expected_memory - (std::min)(expected_memory, u64{512_MiB}));
+    }
     if (log) {
         LOG_INFO(HW_GPU, "Texture cache thresholds: expected {} MiB, critical {} MiB, minimum {} MiB",
                  expected_memory >> 20, critical_memory >> 20, minimum_memory >> 20);
@@ -527,6 +539,22 @@ std::pair<size_t, u64> TextureCache<P>::ImageMemory() {
         ++images;
     }
     return {images, bytes};
+}
+
+template <class P>
+u64 TextureCache<P>::CollectableImageBytes() {
+    // What RegisterImage, ScaleUp and DeleteImage add and take from total_used_memory.
+    u64 bytes = 0;
+    for (const auto [image_id, image] : slot_images) {
+        if (False(image->flags & ImageFlagBits::Registered)) {
+            continue;
+        }
+        bytes += ImageMemoryBytes(*image);
+        if (image->HasScaled()) {
+            bytes += GetScaledImageSizeBytes(*image);
+        }
+    }
+    return bytes;
 }
 
 template <class P>
@@ -692,6 +720,10 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, runtime.PooledImageBytes());
         }
     }
+    device_used_memory = total_used_memory;
+    if (HostBudget::FollowsHeadroom()) {
+        total_used_memory = CollectableImageBytes();
+    }
     VideoCore::Probe::texture_cache_bytes.store(total_used_memory, std::memory_order_relaxed);
     VideoCore::Probe::texture_cache_expected.store(expected_memory, std::memory_order_relaxed);
     // Every 600 frames: device memory in use against the collector's thresholds.
@@ -792,50 +824,70 @@ void TextureCache<P>::TickFrame() {
     if (host_pressure) {
         --host_pressure_frames;
     }
-#ifdef __APPLE__
     // iOS: textures share the process's memory limit with guest RAM, which grows on its own. The
     // cache may only use what is left of the limit past a reserve (re-read every 30 frames); with
     // less left than that, the collector runs aggressively down to two thirds of what it holds.
     // Every frame with under 2 GiB left: a scene load took 3.7 GiB in two seconds, past a cap
     // made 30 frames before.
-    if (frame_tick % 30 == 0 || host_available_last < 2_GiB) {
-        const u64 available = Common::PlatformEvents::AvailableProcessMemory();
+    if (HostBudget::Active() && (frame_tick % 30 == 0 || host_available_last < 2_GiB)) {
+        const u64 available = HostBudget::Available(device_used_memory);
         host_available_last = available != 0 ? available : (std::numeric_limits<u64>::max)();
+        const u64 previous_cap = host_memory_cap;
         host_memory_cap = (std::numeric_limits<u64>::max)();
         host_fixed_memory = 0;
         if (available != 0) {
             // Back to the configured thresholds, then the cap.
             ApplyThresholdOverrides(false);
-            constexpr u64 Reserve = 768_MiB;
-            const u64 room = available > Reserve ? available - Reserve : 0;
-            // The heap also holds what the collector cannot free (the stream buffer, buffers,
-            // presentation images): an iPhone with 53-80 MiB of images had 260 MiB more. With the
-            // cap's fractions and its 384 MiB floor taken of all of it the collector stayed in
-            // high-priority mode for minutes with nothing left to delete (256 MiB expected, 315
-            // in use), so they are taken of the images only; the floor leaves them 128 MiB, about
-            // what 384 MiB left them there.
-            const u64 image_bytes = ImageMemory().second;
-            host_fixed_memory = total_used_memory - (std::min)(total_used_memory, image_bytes);
-            host_memory_cap = (std::max)(total_used_memory + room, host_fixed_memory + 128_MiB);
+            const u64 room = available > HostBudget::Reserve ? available - HostBudget::Reserve : 0;
+            if (HostBudget::FollowsHeadroom()) {
+                // The images and the room left: that stays put while they grow (what they take
+                // is gone from the room). It moves when something else takes or frees memory,
+                // so small moves are ignored (lower at once past 32 MiB, higher past 128 MiB).
+                host_memory_cap = (std::max)(total_used_memory + room, u64{128_MiB});
+                if (previous_cap != (std::numeric_limits<u64>::max)() &&
+                    host_memory_cap < previous_cap + 128_MiB &&
+                    host_memory_cap + 32_MiB > previous_cap) {
+                    host_memory_cap = previous_cap;
+                }
+            } else {
+                // The heap also holds what the collector cannot free (the stream buffer,
+                // buffers, presentation images): an iPhone with 53-80 MiB of images had 260 MiB
+                // more. With the cap's fractions and its 384 MiB floor taken of all of it the
+                // collector stayed in high-priority mode for minutes with nothing left to
+                // delete (256 MiB expected, 315 in use), so they are taken of the images only;
+                // the floor leaves them 128 MiB, about what 384 MiB left them there.
+                const u64 image_bytes = ImageMemory().second;
+                host_fixed_memory = total_used_memory - (std::min)(total_used_memory, image_bytes);
+                host_memory_cap =
+                    (std::max)(total_used_memory + room, host_fixed_memory + 128_MiB);
+            }
             const u64 effective = (std::min)(critical_memory, host_memory_cap);
             const u64 change = effective > host_memory_cap_logged ? effective - host_memory_cap_logged
                                                                   : host_memory_cap_logged - effective;
             if (change >= 128_MiB) {
                 host_memory_cap_logged = effective;
-                LOG_INFO(HW_GPU,
+                LOG_INFO(Common_Memory,
                          "Texture cache with {} MiB left to the process: collects from {} MiB "
-                         "({} MiB in use)",
-                         available >> 20, effective >> 20, total_used_memory >> 20);
+                         "({} MiB of {} in use)",
+                         available >> 20, effective >> 20, total_used_memory >> 20,
+                         HostBudget::FollowsHeadroom() ? "images" : "device memory");
             }
         }
     }
     if (host_memory_cap < critical_memory) {
-        const u64 collectable = host_memory_cap - (std::min)(host_memory_cap, host_fixed_memory);
-        critical_memory = host_memory_cap;
-        expected_memory = (std::min)(expected_memory, host_memory_cap - collectable / 3);
-        minimum_memory = (std::min)(minimum_memory, host_fixed_memory + collectable / 3);
+        if (HostBudget::FollowsHeadroom()) {
+            // Images only: collect from three quarters of the cap, start at half of it.
+            critical_memory = host_memory_cap;
+            expected_memory = (std::min)(expected_memory, host_memory_cap / 4 * 3);
+            minimum_memory = (std::min)(minimum_memory, host_memory_cap / 2);
+        } else {
+            const u64 collectable =
+                host_memory_cap - (std::min)(host_memory_cap, host_fixed_memory);
+            critical_memory = host_memory_cap;
+            expected_memory = (std::min)(expected_memory, host_memory_cap - collectable / 3);
+            minimum_memory = (std::min)(minimum_memory, host_fixed_memory + collectable / 3);
+        }
     }
-#endif
     RunGarbageCollector(out_of_memory, host_pressure);
     if (out_of_memory) {
         // Textures left out for lack of memory are made again on their next read, once a frame
