@@ -29,6 +29,9 @@ RomFSFactory::RomFSFactory(Loader::AppLoader& app_loader, ContentProvider& provi
     }
 
     updatable = app_loader.IsRomFSUpdatable();
+    if (app_loader.IsRomFSLayered()) {
+        layered_file = file;
+    }
 }
 
 RomFSFactory::~RomFSFactory() = default;

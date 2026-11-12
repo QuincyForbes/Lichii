@@ -21,7 +21,9 @@
 #include "core/core.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
+#include "core/file_sys/romfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
+#include "core/file_sys/vfs/vfs_vector.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/nso.h"
 
@@ -534,4 +536,61 @@ TEST_CASE("Built-in Dynamic FPS leaves both records alone when a user mod change
     auto expected = nso;
     std::memcpy(expected.data() + offset, &mod_word, sizeof(mod_word));
     REQUIRE(context.Manager().PatchNSO(nso, "main") == expected);
+}
+
+namespace {
+
+FileSys::VirtualFile TextFile(std::string_view text, std::string name) {
+    return std::make_shared<FileSys::VectorVfsFile>(std::vector<u8>(text.begin(), text.end()),
+                                                    std::move(name));
+}
+
+std::string ReadText(const FileSys::VirtualDir& root, std::string_view path) {
+    const auto file = root->GetFileRelative(path);
+    REQUIRE(file != nullptr);
+    const auto bytes = file->ReadAllBytes();
+    return std::string(bytes.begin(), bytes.end());
+}
+
+FileSys::VirtualDir UnpackedRomFS() {
+    auto tex = std::make_shared<FileSys::VectorVfsDirectory>(
+        std::vector<FileSys::VirtualFile>{TextFile("base", "a.bntx.zs"),
+                                          TextFile("keep", "b.bntx.zs")},
+        std::vector<FileSys::VirtualDir>{}, "Tex");
+    return std::make_shared<FileSys::VectorVfsDirectory>(
+        std::vector<FileSys::VirtualFile>{TextFile("root", "top.bin")},
+        std::vector<FileSys::VirtualDir>{tex}, "");
+}
+
+} // Anonymous namespace
+
+TEST_CASE("LayeredFS mods apply to an unpacked RomFS tree", "[patch_manager]") {
+    PatchManagerTestContext context;
+    const auto mod_tex = Common::FS::GetEdenPath(Common::FS::EdenPath::LoadDir) /
+                         fmt::format("{:016X}", OcarinaTitleId) / "Smaller" / "romfs" / "Tex";
+    const auto manager = context.Manager();
+
+    SECTION("No mod builds nothing") {
+        REQUIRE(manager.CreateLayeredRomFS(UnpackedRomFS(), FileSys::ContentRecordType::Program) ==
+                nullptr);
+    }
+    SECTION("A mod file replaces the game's file and the rest stays") {
+        std::filesystem::create_directories(mod_tex);
+        std::ofstream{mod_tex / "a.bntx.zs", std::ios::binary} << "mod";
+        const auto romfs =
+            manager.CreateLayeredRomFS(UnpackedRomFS(), FileSys::ContentRecordType::Program);
+        REQUIRE(romfs != nullptr);
+        const auto root = FileSys::ExtractRomFS(romfs);
+        REQUIRE(root != nullptr);
+        REQUIRE(ReadText(root, "Tex/a.bntx.zs") == "mod");
+        REQUIRE(ReadText(root, "Tex/b.bntx.zs") == "keep");
+        REQUIRE(ReadText(root, "top.bin") == "root");
+    }
+    SECTION("A disabled mod is left out") {
+        std::filesystem::create_directories(mod_tex);
+        std::ofstream{mod_tex / "a.bntx.zs", std::ios::binary} << "mod";
+        Settings::values.disabled_addons[OcarinaTitleId] = {"Smaller"};
+        REQUIRE(manager.CreateLayeredRomFS(UnpackedRomFS(), FileSys::ContentRecordType::Program) ==
+                nullptr);
+    }
 }

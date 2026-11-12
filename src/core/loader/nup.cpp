@@ -239,10 +239,12 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
         return result;
     }
 
-    system.GetFileSystemController().RegisterProcess(
-        process.GetProcessId(), base_title_id,
-        std::make_shared<FileSys::RomFSFactory>(*this, system.GetContentProvider(),
-                                                system.GetFileSystemController()));
+    patch_system = &system;
+    auto romfs_factory = std::make_shared<FileSys::RomFSFactory>(
+        *this, system.GetContentProvider(), system.GetFileSystemController());
+    patch_system = nullptr;
+    system.GetFileSystemController().RegisterProcess(process.GetProcessId(), base_title_id,
+                                                     std::move(romfs_factory));
 
     is_loaded = true;
     return result;
@@ -268,7 +270,19 @@ ResultStatus AppLoader_NUP::ReadRomFS(FileSys::VirtualFile& out_file) {
     if (merged == nullptr) {
         return ResultStatus::ErrorNoRomFS;
     }
-    out_file = FileSys::CreateRomFS(merged);
+    // Mods go into the tree before the RomFS is built: layering them over the built RomFS
+    // unpacks all of its files again and keeps both RomFS tables alive.
+    romfs_layered = false;
+    if (patch_system != nullptr) {
+        const FileSys::PatchManager patch_manager{base_title_id,
+                                                  patch_system->GetFileSystemController(),
+                                                  patch_system->GetContentProvider()};
+        out_file = patch_manager.CreateLayeredRomFS(merged, FileSys::ContentRecordType::Program);
+        romfs_layered = out_file != nullptr;
+    }
+    if (!romfs_layered) {
+        out_file = FileSys::CreateRomFS(merged);
+    }
     nup->ReleaseRomFSDirCache();
     if (out_file == nullptr) {
         return ResultStatus::ErrorNoRomFS;
