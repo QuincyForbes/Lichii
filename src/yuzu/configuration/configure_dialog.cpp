@@ -38,6 +38,8 @@
 #include "yuzu/configuration/configure_web.h"
 #include "yuzu/hotkeys.h"
 
+Q_DECLARE_METATYPE(QList<QWidget*>);
+
 ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
                                  InputCommon::InputSubsystem* input_subsystem,
                                  std::vector<VkDeviceInfo::Record>& vk_device_records,
@@ -81,6 +83,16 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
 
     SetConfiguration();
     PopulateSelectionList();
+
+    // Every tab is the dialog's child until its page first shows it; hidden until then, or it
+    // draws at the dialog's top left behind the list and the buttons.
+    input_tab->hide();
+    for (int row = 0; row < ui->selectorList->count(); ++row) {
+        const QVariant tabs = ui->selectorList->item(row)->data(Qt::UserRole);
+        for (QWidget* const tab : qvariant_cast<QList<QWidget*>>(tabs)) {
+            tab->hide();
+        }
+    }
 
     connect(ui->tabWidget, &QTabWidget::currentChanged, this, [this](int index) {
         if (index != -1) {
@@ -199,6 +211,7 @@ QWidget* ConfigureDialog::WrapTab(QWidget* tab) {
     area->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     area->setAccessibleName(tab->accessibleName());
     area->setWidget(tab);
+    tab->show();
     tab_scroll_areas.emplace(tab, area);
     return area;
 }
@@ -220,8 +233,6 @@ void ConfigureDialog::HandleApplyButtonClicked() {
     UISettings::values.configuration_applied = true;
     ApplyConfiguration();
 }
-
-Q_DECLARE_METATYPE(QList<QWidget*>);
 
 void ConfigureDialog::PopulateSelectionList() {
     const std::array<std::pair<QString, QList<QWidget*>>, 6> items{
