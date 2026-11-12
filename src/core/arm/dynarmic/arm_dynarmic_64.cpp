@@ -623,6 +623,14 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 #else
     config.code_cache_size = std::uint32_t(512_MiB);
 #endif
+#if !(defined(__APPLE__) && TARGET_OS_IPHONE)
+    // EDEN_NX2_JIT_CACHE_MIB=<n>: a phone-sized code cache per core, to see how often it fills.
+    if (const char* const cache_mib = std::getenv("EDEN_NX2_JIT_CACHE_MIB")) {
+        if (const unsigned long mib = std::strtoul(cache_mib, nullptr, 10); mib >= 8 && mib <= 1024) {
+            config.code_cache_size = std::uint32_t(mib << 20);
+        }
+    }
+#endif
 
     // Allow memory fault handling to work
     if (m_system.DebuggerEnabled()) {

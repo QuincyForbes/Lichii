@@ -60,6 +60,7 @@ Snapshot ReadSnapshot() {
             .generation = registry.generations[i],
             .active = registry.clocks[i] != nullptr,
             .cpu_ns = registry.clocks[i] ? registry.clocks[i]->Read() : std::nullopt,
+            .system_ns = registry.clocks[i] ? registry.clocks[i]->ReadSystem() : std::nullopt,
         };
     }
     return result;

@@ -18,6 +18,7 @@
 #endif
 #endif
 
+#include "common/perf_report.h"
 #include "dynarmic/backend/arm64/a64_address_space.h"
 #include "dynarmic/backend/arm64/a64_jitstate.h"
 #include "dynarmic/backend/arm64/abi.h"
@@ -98,8 +99,21 @@ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
     if (CodePtr block_entry = Get(descriptor)) {
         return block_entry;
     }
+    const bool counted = ::Common::PerfReport::Enabled();
+    const u64 start_ns = counted ? ::Common::PerfReport::NowNs() : 0;
+    const std::size_t start_offset = static_cast<std::size_t>(code.offset());
     GenerateIR(ir_block, descriptor);
-    return Emit(std::move(ir_block));
+    const CodePtr entry_point = Emit(std::move(ir_block));
+    if (counted) {
+        const std::size_t end_offset = static_cast<std::size_t>(code.offset());
+        ::Common::PerfReport::Add(::Common::PerfReport::JitBlocks);
+        ::Common::PerfReport::Add(::Common::PerfReport::JitBytes,
+                                  end_offset > start_offset ? end_offset - start_offset : end_offset);
+        ::Common::PerfReport::Add(::Common::PerfReport::JitCompileNs,
+                                  ::Common::PerfReport::NowNs() - start_ns);
+        ::Common::PerfReport::NoteJitUse(end_offset, code_cache_size);
+    }
+    return entry_point;
 }
 
 CodePtr AddressSpace::GetOrEmitFromDispatcher(IR::LocationDescriptor descriptor, StackLayout& stack) {
@@ -164,6 +178,7 @@ CodePtr AddressSpace::Emit(IR::Block block) {
         std::fprintf(stderr, "dynarmic: code cache full (%zu MiB), flushed; %u full flushes so far\n",
                      code_cache_size >> 20, full_flushes.fetch_add(1, std::memory_order_relaxed) + 1);
 #endif
+        ::Common::PerfReport::Add(::Common::PerfReport::JitCacheFullFlushes);
         ClearCache();
     }
 

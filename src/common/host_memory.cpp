@@ -94,6 +94,7 @@
 #include "common/host_memory.h"
 #include <fmt/format.h>
 #include "common/logging.h"
+#include "common/platform_events.h"
 
 #if defined(__ANDROID__) && __ANDROID_API__ < 30
 #include <sys/syscall.h>
@@ -790,6 +791,7 @@ public:
             if (file) {
                 ledger_tagged = false;
             }
+            PlatformEvents::SetGuestInFile(file);
             const char* const chunked_env = std::getenv("LICHII_IOS_CHUNKED_GUEST");
             const bool chunked_wanted = chunked_env != nullptr && chunked_env[0] == '1';
             const bool chunked = !file && ledger_tagged && chunked_wanted && InitChunks();

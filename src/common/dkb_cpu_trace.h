@@ -38,6 +38,7 @@ struct ThreadSample {
     u64 generation{};
     bool active{};
     std::optional<u64> cpu_ns;
+    std::optional<u64> system_ns{}; ///< Of cpu_ns, in the kernel
 };
 
 struct Snapshot {
@@ -51,6 +52,14 @@ constexpr std::optional<u64> CpuTimeDelta(const ThreadSample& before, const Thre
         return std::nullopt;
     }
     return *after.cpu_ns - *before.cpu_ns;
+}
+
+constexpr std::optional<u64> SystemTimeDelta(const ThreadSample& before, const ThreadSample& after) {
+    if (!CpuTimeDelta(before, after) || !before.system_ns || !after.system_ns ||
+        *after.system_ns < *before.system_ns) {
+        return std::nullopt;
+    }
+    return *after.system_ns - *before.system_ns;
 }
 
 Snapshot ReadSnapshot();
