@@ -14,5 +14,8 @@ order:
 
 The workflow publishes `MoltenVK-ios.tar` and `MoltenVK-macos.tar` (laid out like the official release tarballs,
 with MoltenVK's `LICENSE`) on the release `moltenvk-mesh-<tag>` of this repository. `externals/CMakeLists.txt`
-downloads the iOS one when `LICHII_MOLTENVK_MESH=ON` (the default) and checks its SHA-512; the official v1.4.2
-framework is embedded next to it as `MoltenVKLegacy.framework`.
+downloads the one for the target when `LICHII_MOLTENVK_MESH=ON` (the default), checks its SHA-512 and renames it
+so it sits next to the legacy MoltenVK: `MoltenVKMesh.framework` on iOS (next to the official v1.4.2
+`MoltenVK.framework`), `libMoltenVKMesh.dylib` on macOS (next to `libMoltenVK.dylib`). The setting
+`moltenvk_driver` (Legacy by default) chooses which one `vulkan_library.cpp` loads; Lichii falls back to the
+legacy one when the new one doesn't load.

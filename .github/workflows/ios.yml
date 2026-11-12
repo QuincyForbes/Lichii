@@ -181,11 +181,22 @@ jobs:
           app=build/bin/Lichii.app
           test -x "$app/Lichii"
           test -f "$app/Frameworks/MoltenVK.framework/MoltenVK"
+          # The legacy MoltenVK and the one with mesh shaders (Settings moltenvk_driver).
+          mesh="$app/Frameworks/MoltenVKMesh.framework/MoltenVKMesh"
+          test -f "$mesh"
+          test "$(plutil -extract CFBundleExecutable raw "$app/Frameworks/MoltenVKMesh.framework/Info.plist")" = MoltenVKMesh
+          # Whole outputs first: grep -q closing the pipe early fails nm with pipefail.
+          otool -D "$mesh" > mesh-id.txt
+          grep -q '@rpath/MoltenVKMesh.framework/MoltenVKMesh' mesh-id.txt
+          nm -gU "$mesh" > mesh-symbols.txt
+          grep -q '_vkCmdDrawMeshTasksEXT$' mesh-symbols.txt
+          printf '::notice title=MoltenVK::%s\n' "$(otool -D "$app/Frameworks/MoltenVK.framework/MoltenVK" "$mesh" | grep -v ':$' | tr '\n' ' ')"
           ls -la "$app" "$app/Frameworks"
           cp dist/ios/Lichii.entitlements Lichii.entitlements
           # Ad-hoc signature carrying the entitlements: SideStore/AltStore keep an app's existing
           # entitlements when re-signing, so JIT + memory limits survive the sideload.
           codesign --force --sign - --entitlements dist/ios/Lichii.entitlements "$app/Frameworks/MoltenVK.framework/MoltenVK"
+          codesign --force --sign - --entitlements dist/ios/Lichii.entitlements "$mesh"
           codesign --force --sign - --entitlements dist/ios/Lichii.entitlements "$app"
           codesign -d --entitlements - "$app" 2>&1 | head -40
           rm -rf Payload && mkdir Payload

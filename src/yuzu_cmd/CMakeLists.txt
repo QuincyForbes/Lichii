@@ -91,6 +91,12 @@ if (IOS)
         COMMAND ${CMAKE_COMMAND} -E copy "${PROJECT_SOURCE_DIR}/dist/ios/Lichii.entitlements" "$<TARGET_BUNDLE_DIR:yuzu-cmd>/../Lichii.entitlements"
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${PROJECT_SOURCE_DIR}/dist/ios/AppIcon" "$<TARGET_BUNDLE_DIR:yuzu-cmd>"
         COMMENT "Embedding MoltenVK.framework and the app icons into Lichii.app")
+    if (MOLTENVK_MESH_FRAMEWORK_DIR)
+        # The second driver (Settings moltenvk_driver, externals/CMakeLists.txt).
+        add_custom_command(TARGET yuzu-cmd POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory "${MOLTENVK_MESH_FRAMEWORK_DIR}" "$<TARGET_BUNDLE_DIR:yuzu-cmd>/Frameworks/MoltenVKMesh.framework"
+            COMMENT "Embedding MoltenVKMesh.framework into Lichii.app")
+    endif()
     if (LICHII_IOS_UI)
         target_compile_definitions(yuzu-cmd PRIVATE LICHII_IOS_UI)
         target_link_libraries(yuzu-cmd PRIVATE lichii_ios_app lichii_ios_bridge)

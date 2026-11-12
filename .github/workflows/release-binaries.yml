@@ -624,6 +624,9 @@ jobs:
           app=build/release/bin/lichii.app
           test -x "$app/Contents/MacOS/lichii"
           test -x build/release/bin/eden-cli
+          # The legacy MoltenVK and the one with mesh shaders (Settings moltenvk_driver).
+          test -f "$app/Contents/Frameworks/libMoltenVK.dylib"
+          test -f "$app/Contents/Frameworks/libMoltenVKMesh.dylib"
           cp build/release/bin/eden-cli "$app/Contents/MacOS/eden-cli"
           qt_bin="${QT_ROOT_DIR:-$(brew --prefix qt@6)}/bin"
           "$qt_bin/macdeployqt" "$app" \
