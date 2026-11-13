@@ -109,7 +109,7 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
 } // Anonymous namespace
 
 Buffer::Buffer(BufferCacheRuntime& runtime, VideoCommon::NullBufferParams null_params)
-    : VideoCommon::BufferBase(null_params), scheduler{&runtime.scheduler}, tracker{4096} {
+    : VideoCommon::BufferBase(null_params), scheduler{&runtime.scheduler}, tracker{4096}, pass_tracker{4096} {
     if (runtime.device.HasNullDescriptor()) {
         return;
     }
@@ -127,7 +127,7 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
       scheduler{&runtime.scheduler},
       buffer{CreateBuffer(*device, runtime.memory_allocator, SizeBytes(),
                           runtime.SparseAlignmentFor(sparse_compatible_))},
-      tracker{SizeBytes()} {
+      tracker{SizeBytes()}, pass_tracker{SizeBytes()} {
     sparse_compatible = sparse_compatible_;
     if (runtime.device.HasDebuggingToolAttached()) {
         buffer.SetObjectNameEXT(fmt::format("Buffer {:#x}", CpuAddr()).c_str());
@@ -158,6 +158,11 @@ void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
     }
     tracker.Track(offset, size);
     last_usage_tick = current_tick;
+    if (const u64 serial = scheduler->BeforePassSerial(); serial != last_use_before_pass_serial) {
+        pass_tracker.Reset();
+        last_use_before_pass_serial = serial;
+    }
+    pass_tracker.Track(offset, size);
 }
 
 VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat format) {
@@ -635,6 +640,7 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
     if (Settings::values.disable_buffer_reorder) {
         return false;
     }
+    upload_before_pass = false;
     if (buffer.LastUsageTick() != scheduler.CurrentTick()) {
         buffer.ResetUsageTracking();
         return true;
@@ -642,6 +648,14 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
     const bool can_use_upload_cmdbuf =
         std::ranges::all_of(copies, [&](const VideoCommon::BufferCopy& copy) {
             return !buffer.IsRegionUsed(copy.dst_offset, copy.size);
+        });
+    // Used earlier in this submission, but not since the open render pass began: the copy can
+    // run between those uses and the pass instead of ending and reopening it.
+    upload_before_pass =
+        !can_use_upload_cmdbuf && scheduler.CanRecordBeforePass() &&
+        std::ranges::none_of(copies, [&](const VideoCommon::BufferCopy& copy) {
+            return buffer.IsRegionUsedSince(scheduler.BeforePassSerial(), copy.dst_offset,
+                                            copy.size);
         });
     return can_use_upload_cmdbuf;
 }
@@ -675,8 +689,22 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
         });
         return;
     }
+    if (std::exchange(upload_before_pass, false) && !can_reorder_upload &&
+        scheduler.CanRecordBeforePass() && !WrittenInOrder(dst_buffer)) {
+        scheduler.RecordBeforePass([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
+            if (barrier) {
+                cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
+            }
+            cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, WRITE_BARRIER);
+        });
+        return;
+    }
 
-    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.RequestOutsideRenderPassKeepClear();
+    NoteInOrderWrite(dst_buffer);
     if (barrier && VideoCore::Nx2Debug::Experiment(62) != 0 &&
         src_buffer == staging_pool.StreamBuf() && !vk_copies.empty()) {
         scheduler.RecordUpload(src_buffer, dst_buffer,
@@ -700,6 +728,21 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
     });
 }
 
+void BufferCacheRuntime::NoteInOrderWrite(VkBuffer buffer) {
+    if (written_in_order_serial != scheduler.BeforePassSerial()) {
+        written_in_order_serial = scheduler.BeforePassSerial();
+        written_in_order.clear();
+    }
+    if (std::ranges::find(written_in_order, buffer) == written_in_order.end()) {
+        written_in_order.push_back(buffer);
+    }
+}
+
+bool BufferCacheRuntime::WrittenInOrder(VkBuffer buffer) const {
+    return written_in_order_serial == scheduler.BeforePassSerial() &&
+           std::ranges::find(written_in_order, buffer) != written_in_order.end();
+}
+
 void BufferCacheRuntime::PreCopyBarrier() {
     static constexpr VkMemoryBarrier READ_BARRIER{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -707,7 +750,7 @@ void BufferCacheRuntime::PreCopyBarrier() {
         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
     };
-    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.RequestOutsideRenderPassKeepClear();
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
         cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                0, READ_BARRIER);
@@ -725,7 +768,7 @@ void BufferCacheRuntime::PostCopyBarrier() {
         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
     };
-    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.RequestOutsideRenderPassKeepClear();
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
         // Later transfers too, as after CopyBuffer's own barrier: the downloads, gathers and
         // compute uploads this closes are in-order copies a later reordered upload of the same
@@ -752,7 +795,8 @@ void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t si
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
     };
 
-    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.RequestOutsideRenderPassKeepClear();
+    NoteInOrderWrite(dest_buffer);
     scheduler.Record([dest_buffer, offset, size, value](vk::CommandBuffer cmdbuf) {
         cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                0, READ_BARRIER);

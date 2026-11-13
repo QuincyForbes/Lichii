@@ -693,6 +693,13 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     zero_texture_handles = 0;
+    if (!scheduler.IsRenderPassActive()) {
+        // Before this draw binds anything: its render pass may get a command buffer of its own.
+        const auto& target_regs = maxwell3d->regs;
+        const u64 clip = u64{target_regs.surface_clip.width} * target_regs.surface_clip.height;
+        (void)scheduler.SplitBeforeNextPass(
+            clip != 0 ? clip : u64{target_regs.rt[0].width} * target_regs.rt[0].height);
+    }
     boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
@@ -1178,6 +1185,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         if (scheduler.HasFragmentBarrier() &&
             (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
             scheduler.RequestOutsideRenderPassOperationContext();
+        }
+        // The draw leaves the open pass for another target (or a barrier ended it): its pass may
+        // still get a command buffer of its own, with the draw's geometry bound again there.
+        const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
+        if (framebuffer != nullptr && (scheduler.SplitBeforeTargetSwitch(framebuffer) ||
+            (!scheduler.IsRenderPassActive() &&
+             scheduler.SplitBeforeNextPass(u64{framebuffer->RenderArea().width} *
+                                           framebuffer->RenderArea().height)))) {
+            buffer_cache.BindHostGeometryBuffers(is_indexed);
         }
     }
     if (IsBuilt() && (!pipeline || build->Failed())) {

@@ -3826,8 +3826,10 @@ void RasterizerVulkan::TickPerfReport() {
              "back {}, Vulkan worker {}, guest cores {} (max {}, in the host kernel {}) | guest "
              "cores' time: guest code {:.0f}%, kernel {:.0f}%, idle {:.0f}% ({:.0f} waits/s) | {} "
              "| memory: {} | draws {:.0f}/frame, {:.1f} "
-             "skipped (no pipeline), {:.1f} render passes/frame ({:.1f} reopened the target the "
-             "last one left; attachments load {:.0f}, store {:.0f} MiB/frame), {:.1f} mesh "
+             "skipped (no pipeline; {:.1f} while it was built, held {:.0f} ms/s for builds), {:.1f} "
+             "render passes/frame ({:.1f} reopened the target the "
+             "last one left; attachments load {:.0f}, store {:.0f} MiB/frame; {:.1f} copies "
+             "before their pass, {:.1f} clears kept), {:.1f} mesh "
              "emulated/frame "
              "({:.1f} ended a render pass) | uploads MiB/s: textures {:.1f}, buffers {:.1f}, "
              "other {:.1f}, past the stream buffer {:.1f} | other: uniforms {:.1f} (padding "
@@ -3849,10 +3851,14 @@ void RasterizerVulkan::TickPerfReport() {
              wall_percent(Common::PerfReport::GuestIdleNs),
              per_second(delta(Common::PerfReport::GuestIdles)), jit_text, memory_events,
              per_frame(Common::PerfReport::Draws), per_frame(Common::PerfReport::DrawsSkipped),
+             per_frame(Common::PerfReport::DrawsSkippedBuilding),
+             static_cast<double>(delta(Common::PerfReport::DrawHoldNs)) / 1e6 / seconds,
              per_frame(Common::PerfReport::RenderPasses),
              per_frame(Common::PerfReport::RenderPassReopens),
              per_frame(Common::PerfReport::AttachmentLoadBytes) / (1 << 20),
              per_frame(Common::PerfReport::AttachmentStoreBytes) / (1 << 20),
+             per_frame(Common::PerfReport::BeforePassCommands),
+             per_frame(Common::PerfReport::DeferredClearsKept),
              per_frame(Common::PerfReport::MeshEmulatedDraws),
              per_frame(Common::PerfReport::MeshPassBreaks), mib_per_second(texture_bytes),
              mib_per_second(buffer_bytes), mib_per_second(other_bytes),

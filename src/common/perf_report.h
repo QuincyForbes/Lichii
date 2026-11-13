@@ -62,6 +62,10 @@ enum Counter : std::size_t {
     AttachmentLoadBytes, ///< Attachment bytes render passes load (neither cleared nor don't-care)
     AttachmentStoreBytes, ///< Attachment bytes render passes store
     RenderPassReopens,   ///< Render passes begun on the framebuffer the last one ended on, no clear
+    BeforePassCommands,  ///< Copies recorded before the open render pass instead of ending it
+    DeferredClearsKept,  ///< Work outside render passes that left a parked clear parked
+    DrawsSkippedBuilding, ///< Of DrawsSkipped: the pipeline was still being built
+    DrawHoldNs,          ///< Vulkan worker time draws waited for their pipeline's build
     GuestRunNs,          ///< Guest cores: wall time in guest code (the JIT)
     GuestKernelNs,       ///< Guest cores: wall time in SVCs, the scheduler and fiber switches
     GuestIdleNs,         ///< Guest cores: wall time waiting with nothing to run

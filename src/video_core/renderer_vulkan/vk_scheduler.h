@@ -26,6 +26,7 @@
 #include "common/logging.h"
 #include "common/polyfill_thread.h"
 #include "common/nx2_timeline.h"
+#include "common/perf_report.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_wait_site.h"
@@ -153,6 +154,51 @@ public:
     /// of a renderpass.
     void RequestOutsideRenderPassOperationContext(
         std::source_location location = std::source_location::current());
+
+    /// As RequestOutsideRenderPassOperationContext, for work that touches none of the images of
+    /// a parked deferred clear (buffer copies, image copies between other images): the clear stays
+    /// parked and becomes the next render pass on its framebuffer instead of a pass of its own
+    /// that the next draws reopen (EDEN_NX2_KEEP_DEFERRED_CLEAR=0 realizes it as before).
+    void RequestOutsideRenderPassKeepClear(
+        std::span<const VkImage> touched_images = {},
+        std::source_location location = std::source_location::current());
+    [[nodiscard]] static bool KeepsDeferredClear();
+
+    /// Before a draw records anything, outside a render pass: when its render targets have at
+    /// least EDEN_NX2_BEFORE_PASS pixels (default 256x256, 0 = off), what follows goes to a new
+    /// command buffer after one that the next render pass can take copies into (RecordBeforePass).
+    /// True when it split now.
+    bool SplitBeforeNextPass(u64 pixels);
+
+    /// A draw that will leave the open render pass for another framebuffer, after it bound its
+    /// buffers: ends the pass and splits as SplitBeforeNextPass. True when it split; the draw's
+    /// bindings are gone then and must be recorded again.
+    bool SplitBeforeTargetSwitch(const Framebuffer* framebuffer,
+                                 std::source_location location = std::source_location::current());
+
+    /// Inside a render pass that began on a command buffer of its own (EDEN_NX2_BEFORE_PASS):
+    /// work recorded with RecordBeforePass runs before the pass instead of ending and reopening
+    /// it. Valid only for work whose inputs were final before the pass began and whose outputs
+    /// nothing in the pass used so far (see BeforePassSerial).
+    [[nodiscard]] bool CanRecordBeforePass() const noexcept {
+        return before_pass_open;
+    }
+
+    /// Changes at every render pass that can take work before it: a buffer marked with an older
+    /// serial was not used since that pass began.
+    [[nodiscard]] u64 BeforePassSerial() const noexcept {
+        return before_pass_serial;
+    }
+
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void RecordBeforePass(T&& c) {
+        Common::PerfReport::Add(Common::PerfReport::BeforePassCommands);
+        this->RecordWithUploadBuffer(
+            [this, command = std::move(c)](vk::CommandBuffer, vk::CommandBuffer) {
+                command(before_pass_cmdbuf);
+            });
+    }
 
     void DeferFragmentBarrier() {
         fragment_barrier.Defer(state.renderpass != VK_NULL_HANDLE);
@@ -434,7 +480,8 @@ private:
 
     class CommandChunk final {
     public:
-        void ExecuteAll(vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf);
+        /// By reference: a command may start a new command buffer (SplitBeforePass).
+        void ExecuteAll(const vk::CommandBuffer& cmdbuf, const vk::CommandBuffer& upload_cmdbuf);
 
         template <typename T>
         bool Record(T& command) {
@@ -685,6 +732,19 @@ private:
 
     vk::CommandBuffer current_cmdbuf;
     vk::CommandBuffer current_upload_cmdbuf;
+    /// Worker thread: runs before the last render pass that began on a command buffer of its
+    /// own (RecordBeforePass); null when there is none in this submission.
+    vk::CommandBuffer before_pass_cmdbuf;
+    /// Worker thread: finished command buffers of this submission, in order, between the upload
+    /// command buffer and current_cmdbuf (before_pass_cmdbuf among them, still open).
+    std::vector<VkCommandBuffer> segment_cmdbufs;
+    /// Worker thread: closes current_cmdbuf and starts before_pass_cmdbuf and a new
+    /// current_cmdbuf for the render pass that begins next.
+    void SplitBeforePass();
+    // Recording thread:
+    u64 before_pass_serial = 0;
+    bool before_pass_split = false; ///< SplitBeforeNextPass ran, no render pass began since
+    bool before_pass_open = false;  ///< The open render pass began after a SplitBeforePass
 
     DeferredClear deferred_clear;
 

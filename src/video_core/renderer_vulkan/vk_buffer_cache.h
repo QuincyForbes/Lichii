@@ -74,6 +74,11 @@ public:
         return last_usage_tick;
     }
 
+    /// Whether a range was used since Scheduler::BeforePassSerial took this value.
+    [[nodiscard]] bool IsRegionUsedSince(u64 serial, u64 offset, u64 size) const noexcept {
+        return last_use_before_pass_serial == serial && pass_tracker.IsUsed(offset, size);
+    }
+
     [[nodiscard]] std::span<const u8> Mapped() const noexcept {
         return buffer.IsHostCoherent() ? buffer.Mapped() : std::span<const u8>{};
     }
@@ -95,8 +100,11 @@ private:
     vk::Buffer buffer;
     std::vector<BufferView> views;
     mutable VideoCommon::UsageTracker tracker;
+    /// The uses since Scheduler::BeforePassSerial last changed.
+    VideoCommon::UsageTracker pass_tracker;
     VkDeviceAddress device_address{};
     u64 last_usage_tick{};
+    u64 last_use_before_pass_serial{};
     bool is_null{};
     bool sparse_compatible{};
 };
@@ -162,6 +170,8 @@ public:
 
     [[nodiscard]] StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
 
+    /// Also decides, for an upload that can't be reordered, whether the next CopyBuffer from a
+    /// staging buffer may run before the open render pass (Scheduler::RecordBeforePass).
     bool CanReorderUpload(const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies);
 
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
@@ -361,6 +371,14 @@ private:
     Scheduler& scheduler;
     StagingBufferPool& staging_pool;
     GuestDescriptorQueue& guest_descriptor_queue;
+    /// Set by CanReorderUpload for the CopyBuffer that follows it.
+    bool upload_before_pass{};
+    /// Buffers in-order copies and clears wrote since Scheduler::BeforePassSerial last changed:
+    /// a copy into one of them can't go before the render pass, ahead of that write.
+    boost::container::small_vector<VkBuffer, 16> written_in_order;
+    u64 written_in_order_serial{};
+    void NoteInOrderWrite(VkBuffer buffer);
+    [[nodiscard]] bool WrittenInOrder(VkBuffer buffer) const;
 
     std::shared_ptr<QuadArrayIndexBuffer> quad_array_index_buffer;
     std::shared_ptr<QuadStripIndexBuffer> quad_strip_index_buffer;

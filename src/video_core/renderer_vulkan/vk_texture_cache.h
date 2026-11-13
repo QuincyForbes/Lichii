@@ -131,6 +131,8 @@ public:
 
     void FlushDeferredClear();
 
+    [[nodiscard]] bool KeepsDeferredClearAcrossCopies() const;
+
     u64 GetDeviceLocalMemory() const;
 
     u64 GetDeviceMemoryUsage() const;

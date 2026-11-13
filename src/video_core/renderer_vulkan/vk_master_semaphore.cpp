@@ -7,6 +7,9 @@
 #include <thread>
 
 #include <ranges>
+
+#include <boost/container/small_vector.hpp>
+
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -115,16 +118,31 @@ void MasterSemaphore::Wait(u64 tick) {
     Refresh();
 }
 
-VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
+VkResult MasterSemaphore::SubmitQueue(std::span<const VkCommandBuffer> cmdbufs,
                                       VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                                       u64 host_tick) {
     if (semaphore) {
-        return SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
-                                   host_tick);
+        return SubmitQueueTimeline(cmdbufs, signal_semaphore, wait_semaphore, host_tick);
     } else {
-        return SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick);
+        return SubmitQueueFence(cmdbufs, signal_semaphore, wait_semaphore, host_tick);
     }
 }
+
+namespace {
+boost::container::small_vector<VkCommandBufferSubmitInfo, 8> SubmitInfos(
+    std::span<const VkCommandBuffer> cmdbufs) {
+    boost::container::small_vector<VkCommandBufferSubmitInfo, 8> infos;
+    for (const VkCommandBuffer cmdbuf : cmdbufs) {
+        infos.push_back({
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+            .pNext = nullptr,
+            .commandBuffer = cmdbuf,
+            .deviceMask = 0,
+        });
+    }
+    return infos;
+}
+} // Anonymous namespace
 
 // Compute and transfer: frame generation waits for its optical flow before interpolating.
 static constexpr VkPipelineStageFlags wait_stage_mask =
@@ -132,27 +150,13 @@ static constexpr VkPipelineStageFlags wait_stage_mask =
     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
     VK_PIPELINE_STAGE_TRANSFER_BIT;
 
-VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
-                                              vk::CommandBuffer& upload_cmdbuf,
+VkResult MasterSemaphore::SubmitQueueTimeline(std::span<const VkCommandBuffer> cmdbufs,
                                               VkSemaphore signal_semaphore,
                                               VkSemaphore wait_semaphore, u64 host_tick) {
     const VkSemaphore timeline_semaphore = *semaphore;
 
     if (device.HasSynchronization2()) {
-        const std::array<VkCommandBufferSubmitInfo, 2> cmdbuffer_infos{{
-            {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-                .pNext = nullptr,
-                .commandBuffer = *upload_cmdbuf,
-                .deviceMask = 0,
-            },
-            {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-                .pNext = nullptr,
-                .commandBuffer = *cmdbuf,
-                .deviceMask = 0,
-            },
-        }};
+        const auto cmdbuffer_infos = SubmitInfos(cmdbufs);
 
         std::array<VkSemaphoreSubmitInfo, 2> signal_infos{{
             {
@@ -207,8 +211,6 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
     const std::array signal_values{host_tick, u64(0)};
     const std::array signal_semaphores{timeline_semaphore, signal_semaphore};
 
-    const std::array cmdbuffers{*upload_cmdbuf, *cmdbuf};
-
     const u32 num_wait_semaphores = wait_semaphore ? 1 : 0;
     // Pointers must be null when the count is zero (best-practices)
     const VkSemaphore* p_wait_sems =
@@ -232,8 +234,8 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
         .waitSemaphoreCount = num_wait_semaphores,
         .pWaitSemaphores = p_wait_sems,
         .pWaitDstStageMask = p_wait_masks,
-        .commandBufferCount = static_cast<u32>(cmdbuffers.size()),
-        .pCommandBuffers = cmdbuffers.data(),
+        .commandBufferCount = static_cast<u32>(cmdbufs.size()),
+        .pCommandBuffers = cmdbufs.data(),
         .signalSemaphoreCount = num_signal_semaphores,
         .pSignalSemaphores = p_signal_sems,
     };
@@ -241,25 +243,11 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
     return device.GetGraphicsQueue().Submit(submit_info);
 }
 
-VkResult MasterSemaphore::SubmitQueueFence(vk::CommandBuffer& cmdbuf,
-                                           vk::CommandBuffer& upload_cmdbuf,
+VkResult MasterSemaphore::SubmitQueueFence(std::span<const VkCommandBuffer> cmdbufs,
                                            VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                                            u64 host_tick) {
     if (device.HasSynchronization2()) {
-        const std::array<VkCommandBufferSubmitInfo, 2> cmdbuffer_infos{{
-            {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-                .pNext = nullptr,
-                .commandBuffer = *upload_cmdbuf,
-                .deviceMask = 0,
-            },
-            {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-                .pNext = nullptr,
-                .commandBuffer = *cmdbuf,
-                .deviceMask = 0,
-            },
-        }};
+        const auto cmdbuffer_infos = SubmitInfos(cmdbufs);
 
         const u32 num_signal_semaphores = signal_semaphore ? 1 : 0;
         const VkSemaphoreSubmitInfo signal_info{
@@ -314,16 +302,14 @@ VkResult MasterSemaphore::SubmitQueueFence(vk::CommandBuffer& cmdbuf,
         (num_wait_semaphores > 0) ? &wait_stage_mask : nullptr;
     const VkSemaphore* p_signal_sems =
         (num_signal_semaphores > 0) ? &signal_semaphore : nullptr;
-    const std::array cmdbuffers{*upload_cmdbuf, *cmdbuf};
-
     const VkSubmitInfo submit_info{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .pNext = nullptr,
         .waitSemaphoreCount = num_wait_semaphores,
         .pWaitSemaphores = p_wait_sems,
         .pWaitDstStageMask = p_wait_masks,
-        .commandBufferCount = static_cast<u32>(cmdbuffers.size()),
-        .pCommandBuffers = cmdbuffers.data(),
+        .commandBufferCount = static_cast<u32>(cmdbufs.size()),
+        .pCommandBuffers = cmdbufs.data(),
         .signalSemaphoreCount = num_signal_semaphores,
         .pSignalSemaphores = p_signal_sems,
     };

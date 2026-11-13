@@ -259,6 +259,11 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_FENCE_FLUSH_US", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment fence_submit_each on");
     }
+    if (lichii_platform_experiment("render_passes_old")) {
+        setenv("EDEN_NX2_BEFORE_PASS", "0", 1);
+        setenv("EDEN_NX2_KEEP_DEFERRED_CLEAR", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment render_passes_old on");
+    }
 }
 
 LichiiThermalAdvice ComputeThermalAdvice(int thermal_state, int low_power_mode) {

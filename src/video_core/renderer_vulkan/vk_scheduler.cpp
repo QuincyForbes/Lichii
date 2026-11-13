@@ -119,6 +119,26 @@ void CountReopen(const char* file, u32 line, VkExtent2D area) {
     ++g_profile_reopens[fmt::format("{}:{} ({}x{})", name, line, area.width, area.height)];
 }
 
+// EDEN_NX2_BEFORE_PASS=<pixels>: render passes of at least that many pixels begin on a command
+// buffer of their own, after one that copies can go to instead of ending the pass (0 = off).
+// A tiler stores and loads back every attachment of a pass that is ended and begun again.
+u64 BeforePassMinPixels() {
+    static const u64 pixels = [] {
+        const char* const value = std::getenv("EDEN_NX2_BEFORE_PASS");
+        return value != nullptr ? static_cast<u64>(std::strtoull(value, nullptr, 10))
+                                : u64{256 * 256};
+    }();
+    return pixels;
+}
+
+bool KeepDeferredClear() {
+    static const bool keep = [] {
+        const char* const value = std::getenv("EDEN_NX2_KEEP_DEFERRED_CLEAR");
+        return value == nullptr || value[0] != '0';
+    }();
+    return keep;
+}
+
 // The callers of Flush and Finish: who asks for the queue submissions.
 void CountFlush(const char* file, u32 line) {
     CountSite(g_profile_flushes, file, line);
@@ -164,8 +184,8 @@ void ReportSubmitCounts() {
 }
 }
 
-void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
-                                         vk::CommandBuffer upload_cmdbuf) {
+void Scheduler::CommandChunk::ExecuteAll(const vk::CommandBuffer& cmdbuf,
+                                         const vk::CommandBuffer& upload_cmdbuf) {
     auto command = first;
     while (command != nullptr) {
         auto next = command->GetNext();
@@ -1133,6 +1153,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     for (u32 i = 0; i < clear_value_count && i < values.size(); ++i) {
         values[i] = clear_values[i];
     }
+    before_pass_open = std::exchange(before_pass_split, false);
     const bool after_compute = std::exchange(compute_writes_pending, false);
     Record([this, renderpass, framebuffer_handle, render_area, values, clear_value_count,
             after_compute, time_pass, shape](vk::CommandBuffer cmdbuf) {
@@ -1283,6 +1304,34 @@ void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location lo
             PassTimeLabel(cmdbuf, file, line);
         });
     }
+}
+
+bool Scheduler::KeepsDeferredClear() {
+    return KeepDeferredClear();
+}
+
+void Scheduler::RequestOutsideRenderPassKeepClear(std::span<const VkImage> touched_images,
+                                                  std::source_location location) {
+    // A parked clear means no pass is open (DeferColorClear ended it).
+    if (deferred_clear.framebuffer != nullptr && KeepDeferredClear()) {
+        const auto& images = deferred_clear.framebuffer->Images();
+        const size_t num_images = deferred_clear.framebuffer->NumImages();
+        const bool touched = std::ranges::any_of(touched_images, [&](VkImage image) {
+            return std::find(images.begin(), images.begin() + num_images, image) !=
+                   images.begin() + num_images;
+        });
+        if (!touched) {
+            Common::PerfReport::Add(Common::PerfReport::DeferredClearsKept);
+            if (pass_time_host_sampling) [[unlikely]] {
+                Record([this, file = location.file_name(),
+                        line = location.line()](vk::CommandBuffer cmdbuf) {
+                    PassTimeLabel(cmdbuf, file, line);
+                });
+            }
+            return;
+        }
+    }
+    RequestOutsideRenderPassOperationContext(location);
 }
 
 bool Scheduler::UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
@@ -1651,6 +1700,8 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     }
     EndPendingOperations();
     InvalidateState();
+    // The worker closes the command buffer before the pass with this submission.
+    before_pass_split = false;
 
     if (!wait_semaphore && next_wait_semaphore.load(std::memory_order_relaxed)) {
         wait_semaphore = next_wait_semaphore.exchange(VK_NULL_HANDLE, std::memory_order_acq_rel);
@@ -1683,16 +1734,25 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         }
         EndGpuTime(cmdbuf, signal_value);
         cmdbuf.End();
+        if (*before_pass_cmdbuf != VK_NULL_HANDLE) {
+            before_pass_cmdbuf.End();
+            before_pass_cmdbuf = {};
+        }
 
         if (on_submit) {
             on_submit();
         }
 
+        boost::container::small_vector<VkCommandBuffer, 16> cmdbufs;
+        cmdbufs.push_back(*upload_cmdbuf);
+        cmdbufs.insert(cmdbufs.end(), segment_cmdbufs.begin(), segment_cmdbufs.end());
+        cmdbufs.push_back(*cmdbuf);
+        segment_cmdbufs.clear();
         VkResult result;
         {
             std::scoped_lock lock{submit_mutex};
-            result = master_semaphore->SubmitQueue(cmdbuf, upload_cmdbuf, signal_semaphore,
-                                                   wait_semaphore, signal_value);
+            result = master_semaphore->SubmitQueue(cmdbufs, signal_semaphore, wait_semaphore,
+                                                   signal_value);
         }
         switch (result) {
         case VK_SUCCESS:
@@ -1837,8 +1897,61 @@ void Scheduler::EndRenderPass()
 
         state.renderpass = VkRenderPass{};
         state.clear_variant = false;
+        before_pass_open = false;
         num_renderpass_images = 0;
     }
+
+bool Scheduler::SplitBeforeNextPass(u64 pixels) {
+    if (state.renderpass || before_pass_split) {
+        return false;
+    }
+    const u64 min_pixels = BeforePassMinPixels();
+    if (min_pixels == 0 || pixels < min_pixels) {
+        return false;
+    }
+    ++before_pass_serial;
+    before_pass_split = true;
+    // A new command buffer starts here: nothing bound before it is bound there.
+    InvalidateState();
+    Record([this](vk::CommandBuffer) { SplitBeforePass(); });
+    return true;
+}
+
+bool Scheduler::SplitBeforeTargetSwitch(const Framebuffer* framebuffer,
+                                        std::source_location location) {
+    if (!state.renderpass || RenderPassMatches(framebuffer) ||
+        deferred_clear.framebuffer == framebuffer) {
+        return false;
+    }
+    const VkExtent2D area = framebuffer->RenderArea();
+    const u64 min_pixels = BeforePassMinPixels();
+    if (min_pixels == 0 || u64{area.width} * area.height < min_pixels) {
+        return false;
+    }
+    NotePassEnd(location);
+    EndRenderPass();
+    return SplitBeforeNextPass(u64{area.width} * area.height);
+}
+
+void Scheduler::SplitBeforePass() {
+    if (*before_pass_cmdbuf != VK_NULL_HANDLE) {
+        before_pass_cmdbuf.End();
+    }
+    current_cmdbuf.End();
+    segment_cmdbufs.push_back(*current_cmdbuf);
+    static constexpr VkCommandBufferBeginInfo begin_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext = nullptr,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        .pInheritanceInfo = nullptr,
+    };
+    before_pass_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
+    before_pass_cmdbuf.Begin(begin_info);
+    segment_cmdbufs.push_back(*before_pass_cmdbuf);
+    current_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
+    current_cmdbuf.Begin(begin_info);
+    index_buffer_bound = false;
+}
 
 
 void Scheduler::AcquireNewChunk() {

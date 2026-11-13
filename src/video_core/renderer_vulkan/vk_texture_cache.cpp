@@ -2704,7 +2704,7 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
     });
     const VkImage dst_image = dst.Handle();
     const VkImage src_image = src.Handle();
-    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.RequestOutsideRenderPassKeepClear(std::array{dst_image, src_image});
     scheduler.Record([dst_image, src_image, aspect_mask, vk_copies](vk::CommandBuffer cmdbuf) {
         RangedBarrierRange dst_range;
         RangedBarrierRange src_range;
@@ -2983,6 +2983,10 @@ bool TextureCacheRuntime::UseOpaqueAstcFormat() const {
 
 void TextureCacheRuntime::FlushDeferredClear() {
     scheduler.FlushDeferredClear();
+}
+
+bool TextureCacheRuntime::KeepsDeferredClearAcrossCopies() const {
+    return Scheduler::KeepsDeferredClear();
 }
 
 VkImage TextureCacheRuntime::AcquireMsaaScratchImage(const VkImageCreateInfo& image_ci) {

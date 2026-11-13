@@ -12,6 +12,7 @@
 #include <mutex>
 #include <thread>
 #include <queue>
+#include <span>
 
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
@@ -59,15 +60,16 @@ public:
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
 
-    /// Submits the device graphics queue, updating the tick as necessary
-    VkResult SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
-                         VkSemaphore signal_semaphore, VkSemaphore wait_semaphore, u64 host_tick);
+    /// Submits the device graphics queue, updating the tick as necessary. The command buffers
+    /// run in order (the upload command buffer first).
+    VkResult SubmitQueue(std::span<const VkCommandBuffer> cmdbufs, VkSemaphore signal_semaphore,
+                         VkSemaphore wait_semaphore, u64 host_tick);
 
 private:
-    VkResult SubmitQueueTimeline(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
+    VkResult SubmitQueueTimeline(std::span<const VkCommandBuffer> cmdbufs,
                                  VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                                  u64 host_tick);
-    VkResult SubmitQueueFence(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
+    VkResult SubmitQueueFence(std::span<const VkCommandBuffer> cmdbufs,
                               VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                               u64 host_tick);
 
