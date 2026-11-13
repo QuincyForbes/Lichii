@@ -774,6 +774,8 @@ const FrameWorkgroup& AppleFrameWorkgroup() {
     return workgroup;
 }
 
+std::atomic<int> g_frame_workgroup_threads{};
+
 struct FrameWorkgroupMember {
     os_workgroup_join_token_s token{};
     bool joined{};
@@ -785,6 +787,7 @@ struct FrameWorkgroupMember {
         }
         if (joined) {
             os_workgroup_leave(workgroup.group, &token);
+            g_frame_workgroup_threads.fetch_sub(1, std::memory_order_relaxed);
         }
     }
 };
@@ -797,7 +800,9 @@ void JoinAppleFrameWorkgroup() {
     }
     const int result = os_workgroup_join(workgroup.group, &t_frame_workgroup.token);
     t_frame_workgroup.joined = result == 0;
-    if (result != 0) {
+    if (result == 0) {
+        g_frame_workgroup_threads.fetch_add(1, std::memory_order_relaxed);
+    } else {
         LOG_WARNING(Common, "Frame workgroup: a thread could not join ({})", result);
     }
 }
@@ -806,6 +811,17 @@ void JoinAppleFrameWorkgroup() {
 
 void SetAppleHelperQos(bool demote) {
     g_apple_helper_qos.store(demote, std::memory_order_relaxed);
+}
+
+int FrameWorkgroupThreads() {
+#ifdef __APPLE__
+    if (std::getenv("EDEN_NX2_APPLE_WORKGROUP") == nullptr || AppleFrameWorkgroup().group == nullptr) {
+        return -1;
+    }
+    return g_frame_workgroup_threads.load(std::memory_order_relaxed);
+#else
+    return -1;
+#endif
 }
 
 void TickFrameWorkgroup() {

@@ -251,6 +251,10 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_APPLE_WORKGROUP", "30", 0);
         LOG_WARNING(Frontend, "iOS: experiment frame_deadlines on");
     }
+    if (lichii_platform_experiment("malloc_census")) {
+        setenv("EDEN_NX2_MALLOC_CENSUS", "1", 1);
+        LOG_WARNING(Frontend, "iOS: experiment malloc_census on");
+    }
     if (lichii_platform_experiment("fence_submit_each")) {
         setenv("EDEN_NX2_FENCE_FLUSH_US", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment fence_submit_each on");

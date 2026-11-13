@@ -2318,7 +2318,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         for (auto& [key, records] : std::views::reverse(deferred_graphics) | std::views::take(limit)) {
             precache_graphics_job(key, records);
         }
-        LOG_INFO(Render_Vulkan,
+        LOG_INFO(Common_Memory,
                  "Build shaders: the {} pipelines boot builds and {} of the {} it leaves to later, "
                  "{} of them already built for this driver",
                  boot_pipelines, (std::min)(limit, deferred_graphics.size()),

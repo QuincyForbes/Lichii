@@ -759,16 +759,22 @@ static void IosFinishBoot(SdlState* state) {
     StartGame(state, boot.lp, true, IosSupport::IsActive());
 }
 
-// What malloc holds while the game runs, for the device log: 60 s and 180 s after the start, and
-// once when less than 512 MiB are left before iOS closes the app.
+// What malloc holds while the game runs, for the device log: once when less than 512 MiB are left
+// before iOS closes the app, and with EDEN_NX2_MALLOC_CENSUS=1 (Experiments) also 60 s and 180 s
+// after the start. The census holds every malloc zone's locks while it counts (16 ms for 2.7 M
+// blocks in Kokiri, IPA 143), so every thread that allocates waits for it.
 static void IosMaybeLogMallocCensus(SdlState* state) {
     if (!state->ios_boot || !state->ios_boot->started) {
         return;
     }
     IosBootSession& boot = *state->ios_boot;
     const std::uint64_t running_ms = SDL_GetTicks() - boot.started_ms;
-    if ((boot.census_count == 0 && running_ms >= 60'000) ||
-        (boot.census_count == 1 && running_ms >= 180'000)) {
+    static const bool timed = [] {
+        const char* const value = std::getenv("EDEN_NX2_MALLOC_CENSUS");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (timed && ((boot.census_count == 0 && running_ms >= 60'000) ||
+        (boot.census_count == 1 && running_ms >= 180'000))) {
         ++boot.census_count;
         Common::LogMallocCensus(boot.census_count == 1 ? "60 s in" : "180 s in");
         return;

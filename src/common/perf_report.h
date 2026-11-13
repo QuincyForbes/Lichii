@@ -256,6 +256,11 @@ struct ProcessCpu {
     u64 cpu_ns;         ///< User + system time on all cores
     u64 performance_ns; ///< Of it, on performance cores
     u64 energy_nj;      ///< CPU energy (0 if not reported)
+    u64 runnable_ns{};  ///< Time the process's threads were ready to run but had no CPU
+    u64 cycles{};       ///< CPU cycles on all cores
+    u64 instructions{};
+    u64 performance_cycles{}; ///< Of them, on performance cores
+    u64 performance_instructions{};
 };
 std::optional<ProcessCpu> ReadProcessCpu();
 

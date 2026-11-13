@@ -141,6 +141,9 @@ void SetAppleHelperQos(bool demote);
 /// the efficiency cores. No-op elsewhere.
 void TickFrameWorkgroup();
 
+/// Apple: threads in the frame workgroup now (-1: no workgroup, elsewhere too).
+int FrameWorkgroupThreads();
+
 /// Windows: one physical performance core each for the split GPU thread's halves, and the guest
 /// cores and background workers kept off them, so an SMT sibling never shares the GPU threads'
 /// core. See ThreadPinning::MakePlan for when it applies; EDEN_NX2_PIN_THREADS=0 turns it off,

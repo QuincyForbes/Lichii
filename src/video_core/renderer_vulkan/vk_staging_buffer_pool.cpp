@@ -263,7 +263,7 @@ void StagingBufferPool::TickFrame() {
         seen_host_pressure = pressure;
         const u64 before = CachedBytes();
         ReleaseIdleBuffers();
-        LOG_INFO(Render_Vulkan, "Host memory pressure: staging buffers {} -> {} MiB", before >> 20,
+        LOG_INFO(Common_Memory, "Host memory pressure: staging buffers {} -> {} MiB", before >> 20,
                  CachedBytes() >> 20);
     }
     if (const u64 low_water = Common::PlatformEvents::MemoryLowWater(); low_water != 0) {

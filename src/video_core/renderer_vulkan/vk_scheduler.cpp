@@ -42,6 +42,9 @@
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#ifdef LICHII_METALFX
+#include "video_core/renderer_vulkan/metal_gpu_time.h"
+#endif
 
 namespace Vulkan {
 
@@ -257,7 +260,10 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
                     .pipelineStatistics = 0,
                 });
                 pass_time_records.reserve(PassTimeQueries / 2);
-                LOG_INFO(Render_Vulkan, "Perf passes: one frame timed every {} s", value);
+                LOG_INFO(Common_Memory, "Perf passes: one frame timed every {} s", value);
+#ifdef LICHII_METALFX
+                MetalGpuTime::TimestampNsPerTick();
+#endif
             } catch (const vk::Exception& error) {
                 LOG_WARNING(Render_Vulkan, "Perf passes: no timestamp queries: {}", error.what());
             }
@@ -532,7 +538,7 @@ void Scheduler::ReportPerfSites(u64 frames) {
         }
         return text.empty() ? std::string{"none"} : text;
     };
-    LOG_INFO(Render_Vulkan,
+    LOG_INFO(Common_Memory,
              "Perf sites per frame: submits by caller: {} | render pass ends by caller: {} | "
              "passes reopened on the target the last one left, after: {}",
              top(sites[SiteSubmit]), top(sites[SitePassEnd]), top(sites[SiteReopen]));
@@ -712,11 +718,39 @@ void Scheduler::ReportPassTimes() {
                                             sizeof(u64), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
         return;
     }
+    // MoltenVK on an Apple GPU: each timestamp is the start of a blit pass it adds once the Metal
+    // encoder the query was recorded in has ended, and it reports a period of 1 ns.
+    double period = pass_time_period;
+    std::string method;
+    if (device.IsMoltenVK()) {
+#ifdef LICHII_METALFX
+        if (const double measured = MetalGpuTime::TimestampNsPerTick(); measured > 0.0) {
+            period = measured;
+        }
+#endif
+        method = fmt::format(
+            " | MoltenVK: each time is taken after the Metal encoder its query fell in ends, so a "
+            "pass counts from the end of the encoder before it to the end of its own, dispatches "
+            "or copies sharing one encoder put its whole time on the first, and this frame ran "
+            "{} extra Metal passes (slower than the others); {:.2f} ns per tick (driver says {:.2f})",
+            pass_time_next_query, period, pass_time_period);
+    }
     const auto ms_between = [&](u32 first, u32 second) {
         const u64 a = stamps[first] & pass_time_mask;
         const u64 b = stamps[second] & pass_time_mask;
-        return b > a ? static_cast<double>(b - a) * pass_time_period / 1e6 : 0.0;
+        return b > a ? static_cast<double>(b - a) * period / 1e6 : 0.0;
     };
+    const size_t timed = static_cast<size_t>(std::ranges::count_if(
+        pass_time_records, [](const PassTimeRecord& record) { return record.end_query != ~0U; }));
+    const size_t nonzero = static_cast<size_t>(
+        std::ranges::count_if(pass_time_records, [&](const PassTimeRecord& record) {
+            return record.end_query != ~0U && ms_between(record.begin_query, record.end_query) > 0.0;
+        }));
+    if (timed >= 8 && nonzero * 10 < timed) {
+        method += fmt::format(" | only {} of {} timed blocks took any time: the driver gave one "
+                              "time per command buffer, per-pass times are not real",
+                              nonzero, timed);
+    }
     using VideoCore::Surface::PixelFormat;
     const auto bytes_of = [](u8 format) -> u64 {
         const auto pixel_format = static_cast<PixelFormat>(format);
@@ -862,7 +896,7 @@ void Scheduler::ReportPassTimes() {
         u32 submission{};
         const auto flush = [&] {
             if (!line.empty()) {
-                LOG_INFO(Render_Vulkan, "Perf pass list {}: {}", part++, line);
+                LOG_INFO(Common_Memory, "Perf pass list {}: {}", part++, line);
                 line.clear();
             }
         };
@@ -917,15 +951,15 @@ void Scheduler::ReportPassTimes() {
         return !record.dispatch && record.site_file == nullptr;
     });
     const size_t num_dispatches = count([](const PassTimeRecord& record) { return record.dispatch; });
-    LOG_INFO(Render_Vulkan,
+    LOG_INFO(Common_Memory,
              "Perf passes: {} submissions take {:.2f} ms of GPU time: {} render passes {:.2f} ms, "
              "{} guest dispatches {:.2f} ms, other work after leaving a pass {:.2f} ms, the rest "
              "{:.2f} ms; attachments load {} MiB, store {} MiB | passes: {} | dispatches: {} | "
-             "other work by caller: {} | {} passes reopened the target the last one left, after: {}",
+             "other work by caller: {} | {} passes reopened the target the last one left, after: {}{}",
              pass_time_spans.size(), submitted, num_passes, in_passes, num_dispatches,
              in_dispatches, in_labels,
              (std::max)(submitted - in_passes - in_dispatches - in_labels, 0.0), load_bytes >> 20,
-             store_bytes >> 20, top, top_dispatches, top_labels, num_reopens, top_reopens);
+             store_bytes >> 20, top, top_dispatches, top_labels, num_reopens, top_reopens, method);
 }
 
 void Scheduler::DispatchWork(bool lazy) {

@@ -11,4 +11,10 @@ namespace Vulkan::MetalGpuTime {
 /// EDEN_NX2_METAL_GPU_TIME=0 leaves Metal alone.
 void Start();
 
+/// Nanoseconds per Metal GPU timestamp tick (MoltenVK's VK_QUERY_TYPE_TIMESTAMP values come from
+/// a Metal counter sample buffer and it reports timestampPeriod 1.0 on Apple GPUs), measured with
+/// -[MTLDevice sampleTimestamps:gpuTimestamp:] against the CPU clock since the first call. 0 until
+/// 50 ms have passed or without Metal.
+double TimestampNsPerTick();
+
 } // namespace Vulkan::MetalGpuTime

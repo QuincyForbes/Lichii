@@ -3283,7 +3283,7 @@ void RasterizerVulkan::CountOcarinaUpscale(bool upscaled) {
     if (oot_upscaled_passes + oot_game_passes < 600) {
         return;
     }
-    LOG_INFO(Render_Vulkan,
+    LOG_INFO(Common_Memory,
              "Ocarina upscaler: {} of {} upscale passes replaced, {} switches to or from the "
              "game's own; scene {}x{}",
              oot_upscaled_passes, oot_upscaled_passes + oot_game_passes, oot_switches,
@@ -3887,6 +3887,35 @@ void RasterizerVulkan::TickPerfReport() {
             static_cast<double>(cpu_ns) / 1e7 / seconds,
             100.0 * static_cast<double>(performance_ns) / static_cast<double>(cpu_ns),
             static_cast<double>(energy_nj) / 1e9 / seconds);
+        // Waiting for a CPU (runnable, not run) against blocked: what iOS withholds shows here.
+        // Cycles per CPU nanosecond is the average clock while running.
+        const auto since = [&](u64 now_value, u64 then_value) {
+            return now_value > then_value ? now_value - then_value : u64{0};
+        };
+        const u64 runnable_ns = since(process_cpu->runnable_ns, perf_report_process_cpu->runnable_ns);
+        const u64 cycles = since(process_cpu->cycles, perf_report_process_cpu->cycles);
+        const u64 p_cycles =
+            since(process_cpu->performance_cycles, perf_report_process_cpu->performance_cycles);
+        const u64 instructions =
+            since(process_cpu->instructions, perf_report_process_cpu->instructions);
+        const u64 p_instructions = since(process_cpu->performance_instructions,
+                                         perf_report_process_cpu->performance_instructions);
+        const u64 e_ns = cpu_ns - (std::min)(cpu_ns, performance_ns);
+        const u64 e_cycles = cycles - (std::min)(cycles, p_cycles);
+        const auto ghz = [](u64 count, u64 ns) {
+            return ns == 0 ? 0.0 : static_cast<double>(count) / static_cast<double>(ns);
+        };
+        const auto ipc = [](u64 count, u64 clocks) {
+            return clocks == 0 ? 0.0 : static_cast<double>(count) / static_cast<double>(clocks);
+        };
+        if (cycles != 0) {
+            host_cpu_text += fmt::format(
+                ", runnable but not running {:.0f}% (of one core), clock: performance cores "
+                "{:.2f} GHz ({:.2f} IPC), efficiency cores {:.2f} GHz ({:.2f} IPC)",
+                static_cast<double>(runnable_ns) / 1e7 / seconds, ghz(p_cycles, performance_ns),
+                ipc(p_instructions, p_cycles), ghz(e_cycles, e_ns),
+                ipc(instructions - (std::min)(instructions, p_instructions), e_cycles));
+        }
     }
     const auto placement = Common::PerfReport::ReadPlacement();
     if (const u32 high_first = Common::PerfReport::HighCpuFirst(); high_first != 0) {
@@ -3901,7 +3930,17 @@ void RasterizerVulkan::TickPerfReport() {
         host_cpu_text += fmt::format(" | guest cores on CPU {}+ (performance):{}", high_first, cores);
     }
     if (const int thermal = Common::PerfReport::ThermalPressure(); thermal >= 0) {
-        host_cpu_text += fmt::format(" | thermal pressure {}", thermal);
+        // Who paces the game: Auto-Cool's cap and the frame workgroup (Experiments).
+        static const char* const workgroup = std::getenv("EDEN_NX2_APPLE_WORKGROUP");
+        const u32 cool_fps = Common::PlatformEvents::ThermalMaxFps();
+        const int workgroup_threads = Common::FrameWorkgroupThreads();
+        host_cpu_text += fmt::format(
+            " | thermal pressure {}, Auto-Cool {}, frame workgroup {}", thermal,
+            cool_fps != 0 ? fmt::format("caps at {} fps", cool_fps) : std::string{"no cap"},
+            workgroup_threads >= 0 ? fmt::format("{} fps deadlines, {} threads joined",
+                                                 workgroup != nullptr ? workgroup : "?",
+                                                 workgroup_threads)
+                                   : std::string{"off"});
     }
     std::array<u64, 256> svcs{};
     std::array<std::pair<u64, size_t>, 256> svc_rank{};

@@ -43,6 +43,11 @@ std::optional<ProcessCpu> ReadProcessCpu() {
         .cpu_ns = to_ns(info.ri_user_time + info.ri_system_time),
         .performance_ns = to_ns(info.ri_user_ptime + info.ri_system_ptime),
         .energy_nj = info.ri_energy_nj,
+        .runnable_ns = to_ns(info.ri_runnable_time),
+        .cycles = info.ri_cycles,
+        .instructions = info.ri_instructions,
+        .performance_cycles = info.ri_pcycles,
+        .performance_instructions = info.ri_pinstructions,
     };
 #else
     return std::nullopt;

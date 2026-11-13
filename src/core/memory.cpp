@@ -15,10 +15,13 @@
 #include <mutex>
 #include <set>
 #include <span>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include "common/assert.h"
 #include "common/atomic_ops.h"
@@ -47,6 +50,79 @@ u32& UnmappedReadFlag() {
     thread_local u32 flag{};
     return flag;
 }
+
+namespace {
+
+// Unmapped guest accesses: Ocarina of Time dereferences null about six times a frame, an Error
+// line each. The first ones of each kind and address in full, then one count line every 10 s.
+class UnmappedAccessLog {
+public:
+    /// kind: bits per access, + 0x100 for a write, + 0x200 for an exclusive write.
+    bool Note(u32 kind, u64 addr) {
+        constexpr u64 FullLines = 4;
+        const auto now = std::chrono::steady_clock::now();
+        std::string summary;
+        bool full{};
+        {
+            std::scoped_lock lock{mutex};
+            auto it = std::ranges::find_if(sites, [&](const Site& site) {
+                return site.kind == kind && site.addr == addr;
+            });
+            if (it == sites.end() && sites.size() < 64) {
+                it = sites.insert(sites.end(), Site{kind, addr});
+            }
+            if (it == sites.end()) {
+                ++others;
+            } else {
+                full = it->total++ < FullLines;
+                if (!full) {
+                    ++it->window;
+                }
+            }
+            if (now - last_report >= std::chrono::seconds{10}) {
+                last_report = now;
+                if (others != 0) {
+                    summary = fmt::format("{} at other addresses", std::exchange(others, 0));
+                }
+                for (Site& site : sites) {
+                    if (site.window == 0) {
+                        continue;
+                    }
+                    summary += fmt::format("{}{}{} @ {:#x} x{}", summary.empty() ? "" : ", ",
+                                           (site.kind & 0x200) != 0   ? "WriteExclusive"
+                                           : (site.kind & 0x100) != 0 ? "Write"
+                                                                      : "Read",
+                                           site.kind & 0xff, site.addr, site.window);
+                    site.window = 0;
+                }
+            }
+        }
+        if (!summary.empty()) {
+            LOG_ERROR(HW_Memory, "Unmapped accesses in the last 10 s, past the first {} of each: {}",
+                      FullLines, summary);
+        }
+        return full;
+    }
+
+private:
+    struct Site {
+        u32 kind;
+        u64 addr;
+        u64 total{};
+        u64 window{};
+    };
+    std::mutex mutex;
+    std::vector<Site> sites;
+    u64 others{};
+    std::chrono::steady_clock::time_point last_report{};
+};
+
+UnmappedAccessLog& UnmappedAccesses() {
+    static UnmappedAccessLog log;
+    return log;
+}
+
+} // Anonymous namespace
 
 static bool TrapFastpathEnabled() {
     static const bool enabled = [] {
@@ -1019,11 +1095,8 @@ struct Memory::Impl {
     inline T Read(Common::ProcessAddress vaddr) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
         if (auto const ptr = GetPointerImpl(addr, [addr]() {
-            // A guest spinning on a bad pointer reads unmapped memory tens of thousands of times
-            // a second: keep the first ones and then a sample.
-            static std::atomic<u64> unmapped_reads{};
-            if (const u64 count = unmapped_reads.fetch_add(1); count < 1000 || count % 100000 == 0) {
-                LOG_ERROR(HW_Memory, "Unmapped Read{} @ {:#016x} (#{})", sizeof(T) * 8, addr, count);
+            if (UnmappedAccesses().Note(sizeof(T) * 8, addr)) {
+                LOG_ERROR(HW_Memory, "Unmapped Read{} @ {:#016x}", sizeof(T) * 8, addr);
             }
             ++UnmappedReadFlag();
         }, [&](u8* host_ptr) {
@@ -1048,7 +1121,10 @@ struct Memory::Impl {
     inline void Write(Common::ProcessAddress vaddr, const T data) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
         if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
-            LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
+            if (UnmappedAccesses().Note(0x100 | (sizeof(T) * 8), addr)) {
+                LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr,
+                          u64(data));
+            }
         }, [&](u8* host_ptr) { HandleRasterizerWrite(addr, sizeof(T), host_ptr); }); ptr) [[likely]]
             std::memcpy(ptr, &data, sizeof(T));
     }
@@ -1058,8 +1134,10 @@ struct Memory::Impl {
         u8* const ptr = GetPointerImpl(
             GetInteger(vaddr),
             [vaddr, data]() {
-                LOG_ERROR(HW_Memory, "Unmapped WriteExclusive{} @ {:#016x} = {:#016x}",
-                          sizeof(T) * 8, GetInteger(vaddr), static_cast<u64>(data));
+                if (UnmappedAccesses().Note(0x200 | (sizeof(T) * 8), GetInteger(vaddr))) {
+                    LOG_ERROR(HW_Memory, "Unmapped WriteExclusive{} @ {:#016x} = {:#016x}",
+                              sizeof(T) * 8, GetInteger(vaddr), static_cast<u64>(data));
+                }
             },
             [&](u8* host_ptr) { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T), host_ptr); });
         if (ptr) {

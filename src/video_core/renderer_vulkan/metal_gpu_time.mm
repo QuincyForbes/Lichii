@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 
+#include <mach/mach_time.h>
 #import <Metal/Metal.h>
 #include <objc/runtime.h>
 
@@ -103,7 +104,7 @@ void Install() {
             names += names.empty() ? "" : ", ";
             names += class_getName(classes[i]);
         }
-        LOG_INFO(Render_Vulkan, "Perf: GPU time from Metal command buffers ({})",
+        LOG_INFO(Common_Memory, "Perf: GPU time from Metal command buffers ({})",
                  names.empty() ? "none found" : names);
     }
 }
@@ -119,6 +120,33 @@ void Start() {
         }
         Install();
     });
+}
+
+double TimestampNsPerTick() {
+    static std::mutex mutex;
+    static id<MTLDevice> device = nil;
+    static MTLTimestamp first_cpu{};
+    static MTLTimestamp first_gpu{};
+    std::scoped_lock lock{mutex};
+    if (device == nil) {
+        device = MTLCreateSystemDefaultDevice();
+        if (device == nil) {
+            return 0.0;
+        }
+        [device sampleTimestamps:&first_cpu gpuTimestamp:&first_gpu];
+        return 0.0;
+    }
+    MTLTimestamp cpu{};
+    MTLTimestamp gpu{};
+    [device sampleTimestamps:&cpu gpuTimestamp:&gpu];
+    mach_timebase_info_data_t timebase{};
+    mach_timebase_info(&timebase);
+    // The CPU value is in mach_absolute_time units.
+    const double cpu_ns = static_cast<double>(cpu - first_cpu) * timebase.numer / timebase.denom;
+    if (cpu_ns < 50e6 || gpu <= first_gpu) {
+        return 0.0;
+    }
+    return cpu_ns / static_cast<double>(gpu - first_gpu);
 }
 
 } // namespace Vulkan::MetalGpuTime
