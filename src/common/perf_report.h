@@ -3,12 +3,14 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <optional>
+#include <utility>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -64,6 +66,7 @@ enum Counter : std::size_t {
     JitCompileNs,        ///< Wall time translating them (inside guest code time)
     JitCacheFullFlushes, ///< Code caches emptied because they were full
     JitCacheClears,      ///< Code caches emptied on request (guest instruction cache ops)
+    JitCacheEvictions,   ///< Oldest slices of full code caches dropped (EDEN_NX2_JIT_EVICT)
     JitRangeInvalidations, ///< Ranges of translated code dropped on request
     JitFastmemFaults,    ///< Host faults in fastmem accesses (each recompiles its block)
     // Per guest core, added when the JIT returns (FlushGuestEvents), not one by one.
@@ -95,7 +98,27 @@ inline void Add(Counter counter, u64 amount = 1) {
 inline std::atomic<u64> g_jit_peak_used{};
 inline std::atomic<u64> g_jit_cache_size{};
 
-inline void NoteJitUse(u64 used, u64 cache_size) {
+/// Per guest core (the JIT's processor id): code in its cache now, the most since the last
+/// report, full flushes and partial evictions (EDEN_NX2_JIT_EVICT) with the bytes they dropped.
+constexpr std::size_t JitCores = 8;
+struct JitCore {
+    std::atomic<u64> live{};
+    std::atomic<u64> peak{};
+    std::atomic<u64> flushes{};
+    std::atomic<u64> evictions{};
+    std::atomic<u64> evicted_bytes{};
+    std::atomic<u64> blocks{};
+    std::atomic<u64> compile_ns{};
+    std::atomic<u64> faults{};      ///< Fastmem faults in this core's code
+    std::atomic<u64> dead_bytes{};  ///< Code of blocks invalidated in place (faults, range drops)
+};
+inline std::array<JitCore, JitCores> g_jit_cores{};
+
+inline JitCore* JitCoreOf(std::size_t core) {
+    return Enabled() && core < JitCores ? &g_jit_cores[core] : nullptr;
+}
+
+inline void NoteJitUse(std::size_t core, u64 used, u64 cache_size) {
     if (!Enabled()) {
         return;
     }
@@ -104,6 +127,73 @@ inline void NoteJitUse(u64 used, u64 cache_size) {
     while (used > peak &&
            !g_jit_peak_used.compare_exchange_weak(peak, used, std::memory_order_relaxed)) {
     }
+    if (JitCore* const jc = JitCoreOf(core)) {
+        jc->live.store(used, std::memory_order_relaxed);
+        if (used > jc->peak.load(std::memory_order_relaxed)) {
+            jc->peak.store(used, std::memory_order_relaxed);
+        }
+    }
+}
+
+inline void NoteJitCompile(std::size_t core, u64 ns) {
+    if (JitCore* const jc = JitCoreOf(core)) {
+        jc->blocks.fetch_add(1, std::memory_order_relaxed);
+        jc->compile_ns.fetch_add(ns, std::memory_order_relaxed);
+    }
+}
+
+inline void NoteJitFlush(std::size_t core) {
+    Add(JitCacheFullFlushes);
+    if (JitCore* const jc = JitCoreOf(core)) {
+        jc->flushes.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void NoteJitFault(std::size_t core) {
+    Add(JitFastmemFaults);
+    if (JitCore* const jc = JitCoreOf(core)) {
+        jc->faults.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void NoteJitDeadCode(std::size_t core, u64 bytes) {
+    if (JitCore* const jc = JitCoreOf(core)) {
+        jc->dead_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+
+inline void NoteJitEviction(std::size_t core, u64 bytes) {
+    Add(JitCacheEvictions);
+    if (JitCore* const jc = JitCoreOf(core)) {
+        jc->evictions.fetch_add(1, std::memory_order_relaxed);
+        jc->evicted_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+
+struct JitCoreCounts {
+    u64 flushes, evictions, evicted_bytes, blocks, compile_ns, faults, dead_bytes;
+};
+
+inline std::array<JitCoreCounts, JitCores> ReadJitCores() {
+    std::array<JitCoreCounts, JitCores> out{};
+    for (std::size_t i = 0; i < JitCores; ++i) {
+        const JitCore& jc = g_jit_cores[i];
+        out[i] = {jc.flushes.load(std::memory_order_relaxed),
+                  jc.evictions.load(std::memory_order_relaxed),
+                  jc.evicted_bytes.load(std::memory_order_relaxed),
+                  jc.blocks.load(std::memory_order_relaxed),
+                  jc.compile_ns.load(std::memory_order_relaxed),
+                  jc.faults.load(std::memory_order_relaxed),
+                  jc.dead_bytes.load(std::memory_order_relaxed)};
+    }
+    return out;
+}
+
+/// A core's code now and the most since the previous call.
+inline std::pair<u64, u64> TakeJitCoreUse(std::size_t core) {
+    JitCore& jc = g_jit_cores[core];
+    const u64 live = jc.live.load(std::memory_order_relaxed);
+    return {live, (std::max)(live, jc.peak.exchange(live, std::memory_order_relaxed))};
 }
 
 inline u64 TakeJitPeak() {

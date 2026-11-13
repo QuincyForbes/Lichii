@@ -3637,6 +3637,7 @@ void RasterizerVulkan::TickPerfReport() {
         perf_report_placement = Common::PerfReport::ReadPlacement();
         perf_report_events = Common::PlatformEvents::QueryProcessEvents();
         static_cast<void>(Common::PerfReport::TakeJitPeak());
+        perf_report_jit_cores = Common::PerfReport::ReadJitCores();
         perf_frame_max_ms = 0.0;
         return;
     }
@@ -3721,11 +3722,13 @@ void RasterizerVulkan::TickPerfReport() {
     const u64 jit_peak = Common::PerfReport::TakeJitPeak();
     const std::string jit_text = fmt::format(
         "JIT {:.0f} blocks/s ({:.2f} MiB/s), compiling {:.0f}%, {} "
-        "full-cache flushes, {} clears, {} ranges dropped, fullest code cache {:.1f} of {} MiB",
+        "full-cache flushes, {} evictions, {} clears, {} ranges dropped, fullest code cache "
+        "{:.1f} of {} MiB",
         per_second(delta(Common::PerfReport::JitBlocks)),
         mib_per_second(delta(Common::PerfReport::JitBytes)),
         static_cast<double>(delta(Common::PerfReport::JitCompileNs)) / 1e7 / seconds,
-        delta(Common::PerfReport::JitCacheFullFlushes), delta(Common::PerfReport::JitCacheClears),
+        delta(Common::PerfReport::JitCacheFullFlushes),
+        delta(Common::PerfReport::JitCacheEvictions), delta(Common::PerfReport::JitCacheClears),
         delta(Common::PerfReport::JitRangeInvalidations),
         static_cast<double>(jit_peak) / static_cast<double>(1 << 20),
         Common::PerfReport::g_jit_cache_size.load(std::memory_order_relaxed) >> 20);
@@ -3870,6 +3873,34 @@ void RasterizerVulkan::TickPerfReport() {
              per_second(delta(Common::PerfReport::GuestClockWaits)),
              static_cast<double>(delta(Common::PerfReport::GuestClockWaitNs)) / 1e6 / seconds,
              host_cpu_text);
+    // Each guest core's code cache: which cores need how much, and what refills them.
+    const auto jit_cores = Common::PerfReport::ReadJitCores();
+    std::string jit_core_text;
+    for (size_t core = 0; core < Common::PerfReport::JitCores; ++core) {
+        const auto& now_counts = jit_cores[core];
+        const auto& then = perf_report_jit_cores[core];
+        const auto [live, peak] = Common::PerfReport::TakeJitCoreUse(core);
+        if (now_counts.blocks == 0 && live == 0) {
+            continue;
+        }
+        const u64 evictions = now_counts.evictions - then.evictions;
+        jit_core_text += fmt::format(
+            "{}core {}: {:.1f} MiB (most {:.1f}), {:.0f} blocks/s, compiling {:.0f}%, {} flushes, "
+            "{} evictions ({:.1f} MiB), {:.0f} faults/s, {:.2f} MiB/s dropped in place",
+            jit_core_text.empty() ? "" : " | ", core, static_cast<double>(live) / (1 << 20),
+            static_cast<double>(peak) / (1 << 20), per_second(now_counts.blocks - then.blocks),
+            static_cast<double>(now_counts.compile_ns - then.compile_ns) / 1e7 / seconds,
+            now_counts.flushes - then.flushes, evictions,
+            static_cast<double>(now_counts.evicted_bytes - then.evicted_bytes) / (1 << 20),
+            per_second(now_counts.faults - then.faults),
+            mib_per_second(now_counts.dead_bytes - then.dead_bytes));
+    }
+    perf_report_jit_cores = jit_cores;
+    if (!jit_core_text.empty()) {
+        LOG_INFO(Common_Memory, "Perf JIT ({} MiB per core): {}",
+                 Common::PerfReport::g_jit_cache_size.load(std::memory_order_relaxed) >> 20,
+                 jit_core_text);
+    }
     perf_report_process_cpu = process_cpu;
     perf_report_placement = placement;
     perf_report_start = now;
