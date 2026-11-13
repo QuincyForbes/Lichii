@@ -65,9 +65,10 @@ class PipelineBuild {
     struct State {
         explicit State(std::function<void()> task_) : task{std::move(task_)} {}
 
-        void Run() noexcept {
+        /// False when another thread had claimed the task.
+        bool Run() noexcept {
             if (claimed.exchange(true)) {
-                return;
+                return false;
             }
             try {
                 task();
@@ -83,6 +84,7 @@ class PipelineBuild {
             std::scoped_lock lock{mutex};
             complete.store(true, std::memory_order_release);
             condition.notify_all();
+            return true;
         }
 
         std::function<void()> task;
@@ -97,9 +99,9 @@ public:
     PipelineBuild(Common::ThreadWorker* workers, std::function<void()> task)
         : state{std::make_shared<State>(std::move(task))} {
         if (workers) {
-            workers->QueueWork([state = state] { state->Run(); });
+            workers->QueueWork([state = state] { (void)state->Run(); });
         } else {
-            state->Run();
+            (void)state->Run();
         }
     }
 
@@ -115,14 +117,16 @@ public:
         return IsBuilt() && state->failed;
     }
 
-    void Wait(bool may_build = false) const {
+    /// True when this call ran the build itself.
+    bool Wait(bool may_build = false) const {
         const auto shared = state;
-        if (may_build) {
-            shared->Run();
+        if (may_build && shared->Run()) {
+            return true;
         }
         std::unique_lock lock{shared->mutex};
         shared->condition.wait(lock,
                                [&] { return shared->complete.load(std::memory_order_acquire); });
+        return false;
     }
 
     PipelineBuild(const PipelineBuild&) = delete;

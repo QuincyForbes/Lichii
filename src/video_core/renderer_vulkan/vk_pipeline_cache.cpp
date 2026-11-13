@@ -376,6 +376,7 @@ void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point be
 std::atomic<u64> skipped_lookups{};
 
 void NoteSkippedLookup() {
+    Common::PerfReport::Add(Common::PerfReport::DrawsSkippedBuilding);
     if ((skipped_lookups.fetch_add(1, std::memory_order_relaxed) & 255) == 0) {
         // Counts lookups, not draws: a draw state can look its pipeline up more than once.
         LOG_INFO(Render_Vulkan, "Async shaders: {} pipeline lookups skipped for unbuilt pipelines",
@@ -1281,6 +1282,18 @@ bool MeshDirectOutputs(const Device& device) {
     return device.IsMoltenVK() && Settings::values.mesh_direct_outputs.GetValue();
 }
 
+/// Fragment inputs written per primitive are also Flat (RuntimeInfo::flat_per_primitive_inputs):
+/// on MoltenVK, EDEN_NX2_FLAT_PER_PRIMITIVE=0 off, =1 on every driver. Pipeline bbfd9d39350cdaaa
+/// (Kokiri) failed on the iPhone with VK_ERROR_INITIALIZATION_FAILED: its pixel program reads
+/// three per-primitive generics, which SPIRV-Cross e99dc7a3 declared interpolated.
+bool FlatPerPrimitiveInputs(const Device& device) {
+    static const int flat = [] {
+        const char* value = std::getenv("EDEN_NX2_FLAT_PER_PRIMITIVE");
+        return value == nullptr ? -1 : (value[0] != '0' ? 1 : 0);
+    }();
+    return flat >= 0 ? flat != 0 : device.IsMoltenVK();
+}
+
 /// Destroys the pipelines of `pipelines` (a map or a deque of pairs holding unique_ptrs), telling
 /// the frontend every few hundred that the teardown still moves: tens of thousands of them took
 /// longer than the frontend waited for the emulation thread.
@@ -1763,6 +1776,48 @@ void PipelineCache::RefreshGraphicsKey() {
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
+    GraphicsPipeline* const pipeline = CurrentGraphicsPipelineLookup();
+    if (pipeline != nullptr && pipeline->IsMeshPipeline() && !pipeline->IsEmulatedMesh() &&
+        pipeline->Failed()) [[unlikely]] {
+        return EmulateFailedNativeMesh(pipeline);
+    }
+    return pipeline;
+}
+
+GraphicsPipeline* PipelineCache::EmulateFailedNativeMesh(GraphicsPipeline* failed) {
+    const auto it = graphics_cache.find(graphics_key);
+    if (it == graphics_cache.end() || it->second.get() != failed) {
+        return failed;
+    }
+    const u64 hash = graphics_key.Hash();
+    {
+        std::scoped_lock lock{failed_native_mesh_mutex};
+        failed_native_mesh.insert(hash);
+    }
+    std::unique_ptr<GraphicsPipeline> emulated = CreateGraphicsPipeline();
+    // Warning: the iOS log shows Render.Vulkan only from there.
+    LOG_WARNING(Render_Vulkan, "Native mesh pipeline {:016x} failed to build: {}", hash,
+                emulated ? "its draws take the compute emulation instead"
+                         : "the compute emulation cannot take it either, its draws are skipped");
+    used_this_session.erase(failed);
+    RetireTranslatedPipeline(std::move(it->second));
+    it->second = std::move(emulated);
+    // Other pipelines' transitions may name the one retired.
+    for (auto& [key, pipeline] : graphics_cache) {
+        if (pipeline) {
+            pipeline->ClearTransitions();
+        }
+    }
+    clean.pipeline = nullptr;
+    current_pipeline = it->second.get();
+    if (current_pipeline == nullptr) {
+        return nullptr;
+    }
+    current_pipeline->MarkUsed(frame_count);
+    return BuiltPipeline(current_pipeline);
+}
+
+GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineLookup() {
     ++lookup_serial;
     if (const int clean_mode = PipelineCleanMode(); clean_mode != 0) {
         return CurrentGraphicsPipelineClean(clean_mode == 2);
@@ -3283,6 +3338,10 @@ void PipelineCache::StopBackgroundPipelines() {
     background_workers.reset();
 }
 
+u64 PipelineCache::SkippedLookups() noexcept {
+    return skipped_lookups.load(std::memory_order_relaxed);
+}
+
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
     if (pipeline->IsBuilt()) {
         return pipeline;
@@ -3618,7 +3677,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
     }
     if (!mesh_unsupported && device.IsExtMeshShaderSupported()) {
-        if (const auto reason{NativeMeshLimitExceeded(device, key, programs)}) {
+        bool driver_failed{};
+        {
+            std::scoped_lock lock{failed_native_mesh_mutex};
+            driver_failed = failed_native_mesh.contains(hash);
+        }
+        if (driver_failed) {
+            mesh_unsupported = true;
+        } else if (const auto reason{NativeMeshLimitExceeded(device, key, programs)}) {
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
                 LOG_WARNING(Render_Vulkan,
@@ -3893,6 +3959,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         } else if (program.stage == Shader::Stage::Mesh && MeshDirectOutputs(device)) {
             runtime_info.mesh_direct_outputs = true;
+        }
+        if (program.stage == Shader::Stage::Fragment) {
+            runtime_info.flat_per_primitive_inputs = FlatPerPrimitiveInputs(device);
         }
         ConvertLegacyToGeneric(program, runtime_info);
         // EDEN_NX2_MESH_EMULATION_DUMP=<dir>: write the emulation's vertex shader for spirv-val.

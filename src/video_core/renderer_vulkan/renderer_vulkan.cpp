@@ -146,7 +146,11 @@ try
                             Settings::values.renderer_debug.GetValue()))
     // Create debug messenger if debug is enabled
     , debug_messenger(Settings::values.renderer_debug ? CreateDebugUtilsCallback(instance)
-                                                    : vk::DebugUtilsMessenger{})
+#ifdef __APPLE__
+                      : dld.vkCreateDebugUtilsMessengerEXT != nullptr
+                          ? CreateDriverErrorCallback(instance)
+#endif
+                          : vk::DebugUtilsMessenger{})
     // Create surface
     , surface(CreateSurface(instance, render_window.GetWindowInfo()))
     , device(CreateDevice(instance, dld, *surface))

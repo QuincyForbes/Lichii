@@ -1991,7 +1991,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             AddExtension("SPV_EXT_mesh_shader");
             AddCapability(spv::Capability::MeshShadingEXT);
             Decorate(id, spv::Decoration::PerPrimitiveEXT);
-            if (is_integer) {
+            if (is_integer || runtime_info.flat_per_primitive_inputs) {
                 Decorate(id, spv::Decoration::Flat);
             }
             continue;

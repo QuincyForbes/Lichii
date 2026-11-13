@@ -144,6 +144,9 @@ public:
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
 
+    /// Lookups skipped this session because their pipeline was still being built or translated.
+    [[nodiscard]] static u64 SkippedLookups() noexcept;
+
     /// Whether a task/mesh pipeline was emulated although the device has VK_EXT_mesh_shader (it
     /// was over the native limits).
     [[nodiscard]] bool HasEmulatedNativeMeshPipelines() const noexcept {
@@ -185,6 +188,10 @@ public:
 
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
+    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineLookup();
+    /// A native mesh pipeline whose driver build failed (MoltenVK refusing the Metal mesh
+    /// function): replaced in the cache by the same draw through the compute emulation.
+    [[nodiscard]] GraphicsPipeline* EmulateFailedNativeMesh(GraphicsPipeline* failed);
 
     /// FixedPipelineState::Refresh of graphics_key, keeping only the vertex attribute types the
     /// bound programs read (see VideoCommon::KeyedAttributeTypes).
@@ -394,6 +401,9 @@ private:
     /// GPU thread builds them.
     std::unordered_set<u64> failed_disk_pipelines;
     std::mutex failed_disk_pipelines_mutex;
+    /// Keys of native mesh pipelines the driver refused: built with the compute emulation.
+    std::unordered_set<u64> failed_native_mesh;
+    std::mutex failed_native_mesh_mutex;
     std::atomic<bool> emulated_native_mesh{};
     std::unordered_map<u64, u8> used_pipelines; ///< Key hash -> sessions since it was last used
     std::unordered_set<const GraphicsPipeline*> used_this_session;

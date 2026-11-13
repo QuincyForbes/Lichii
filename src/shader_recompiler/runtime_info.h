@@ -137,6 +137,10 @@ struct RuntimeInfo {
     /// a workgroup copy of the attribute region. MoltenVK keeps the outputs in threadgroup memory
     /// already, so the copy doubled the program's threadgroup memory past Metal's 32 KiB.
     bool mesh_direct_outputs{};
+    /// Fragment program: inputs a mesh program writes per primitive are also decorated Flat.
+    /// SPIRV-Cross (MoltenVK) ignores PerPrimitiveEXT on fragment inputs and declares them
+    /// interpolated, which Metal's mesh pipelines refuse.
+    bool flat_per_primitive_inputs{};
 };
 
 } // namespace Shader

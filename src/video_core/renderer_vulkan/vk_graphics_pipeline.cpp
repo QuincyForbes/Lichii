@@ -613,6 +613,15 @@ GraphicsPipeline::GraphicsPipeline(
             }
             const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
             Validate();
+            // EDEN_NX2_FAIL_NATIVE_MESH=<pipeline hash>|all: that native mesh pipeline fails to
+            // build, as one did on MoltenVK (tests the emulated fallback on other drivers).
+            if (IsMeshPipeline() && !mesh_emulation) {
+                static const char* const fail = std::getenv("EDEN_NX2_FAIL_NATIVE_MESH");
+                if (fail != nullptr && (std::string_view{fail} == "all" ||
+                                        std::strtoull(fail, nullptr, 16) == key.Hash())) {
+                    throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+                }
+            }
             if (library_cache) {
                 bool made{};
                 try {
@@ -1448,11 +1457,25 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
             const auto begin = std::chrono::steady_clock::now();
-            build->Wait(!worker_only_build);
+            const bool built_here = build->Wait(!worker_only_build);
             const auto held = std::chrono::steady_clock::now() - begin;
-            hold_time_ns.fetch_add(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(held).count(),
-                std::memory_order::relaxed);
+            const auto held_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(held).count();
+            hold_time_ns.fetch_add(held_ns, std::memory_order::relaxed);
+            Common::PerfReport::Add(Common::PerfReport::DrawHoldNs, static_cast<u64>(held_ns));
+            if (held >= std::chrono::milliseconds{100}) {
+                // Warning: the iOS log shows Render.Vulkan only from there. The GPU thread waits
+                // for this worker at its next submission, so this is a frame hitch.
+                LOG_WARNING(Render_Vulkan,
+                            "Draw held {:.0f} ms for its pipeline {:016x} ({}, built {}); shaders "
+                            "{:016x} {:016x}",
+                            std::chrono::duration<double, std::milli>(held).count(), key.Hash(),
+                            key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0 ? "tessellation"
+                            : mesh_emulation               ? "mesh emulated"
+                            : IsMeshPipeline()             ? "native mesh"
+                                                           : "vertex",
+                            built_here ? "on the Vulkan worker" : "by a pipeline worker",
+                            key.unique_hashes[1], key.unique_hashes[5]);
+            }
             if (library_cache) {
                 library_cache->RecordHeldDraw(held);
             }

@@ -727,13 +727,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                         regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
         }
     };
+    const u64 skipped_lookups = PipelineCache::SkippedLookups();
     GraphicsPipeline* const pipeline{[&] {
         Profile::Scope scope{Profile::Zone::PipelineLookup};
         return pipeline_cache.CurrentGraphicsPipeline();
     }()};
     if (!pipeline) {
         Common::PerfReport::Add(Common::PerfReport::DrawsSkipped);
-        report_failure("no pipeline");
+        // A pipeline still being built is skipped only into targets cleared every frame (the
+        // draw comes back next frame); one that could not be made at all is skipped for good.
+        report_failure(PipelineCache::SkippedLookups() != skipped_lookups
+                           ? "pipeline still building"
+                           : "no pipeline");
         TraceRenderState(is_indexed, "no-pipeline", nullptr);
         // Mesh emulation survey: how many task/mesh draws a device without
         // VK_EXT_mesh_shader drops, how many are indirect and how many groups they launch.

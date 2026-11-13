@@ -9,4 +9,7 @@ namespace Vulkan {
 
 vk::DebugUtilsMessenger CreateDebugUtilsCallback(const vk::Instance& instance);
 
+/// Errors and warnings of the driver itself (MoltenVK: failed Metal compiles and pipelines).
+vk::DebugUtilsMessenger CreateDriverErrorCallback(const vk::Instance& instance);
+
 } // namespace Vulkan
