@@ -37,11 +37,66 @@ void PollMemoryPressure();
 void SetGuestInFile(bool in_file);
 bool GuestInFile();
 /// What the caches leave to a guest memory file on top of their own reserve: 0 unless the guest
-/// is in a file. It grows while the process pages the file back in (the caches crowd it out),
-/// signalling memory pressure, and shrinks back when that stops. EDEN_NX2_GUEST_FILE_RESERVE_MIB
+/// is in a file. It grows while the process keeps paging the file back in (the caches crowd it
+/// out), signalling memory pressure, and shrinks back when that stops. EDEN_NX2_GUEST_FILE_RESERVE_MIB
 /// (base, default 1024 on iOS; 0 off), _MAX_MIB (default 3072), EDEN_NX2_PAGEIN_PRESSURE (page
-/// -ins a second that count as thrashing, default 1500; 0 off).
+/// -ins a second that count as thrashing, default 1500; 0 off); the rest in GuestReserveTracker.
 u64 GuestFileReserve();
+/// The part of `reserve` the caches give up with `left` bytes left to the process and `own` of
+/// it kept for themselves: at most EDEN_NX2_GUEST_RESERVE_SHARE percent (default 50; 100 = all:
+/// the caches see only their own part left, no room, as with the unbounded reserve)
+/// of the room past `own`. An iPhone whose reserve had grown to 3072 MiB saw "1 MiB left" with
+/// 1.4-4 GiB left and collected textures and buffers every frame.
+u64 BoundedGuestFileReserve(u64 reserve, u64 left, u64 own);
+
+/// When the guest memory file is being thrashed, from the process's page-in counter and the
+/// file pages it holds. Loading pages the file in too (boot and the title screen: 1,500-21,000
+/// page-ins a second on an iPhone, which grew the reserve to its maximum in 10 s and kept it
+/// there all session), but what it pages in stays: the file's resident pages grow. Thrashing
+/// pages in what was taken away, with the resident pages flat or falling. The reserve grows one
+/// step per `sustain` seconds of that, and gives a step back per `decay` seconds under half the
+/// threshold (EDEN_NX2_PAGEIN_SUSTAIN_S, default 5; EDEN_NX2_RESERVE_DECAY_S, default 10;
+/// EDEN_NX2_RESERVE_RATCHET=1: the earlier rule, a step per second over the threshold and back
+/// after 30 s under a quarter of it).
+class GuestReserveTracker {
+public:
+    struct Config {
+        u64 base;              ///< Bytes
+        u64 max;               ///< Bytes
+        u64 threshold;         ///< Page-ins a second
+        u32 sustain_seconds;
+        u32 decay_seconds;
+        u64 step;              ///< Bytes a change moves the reserve
+        /// The file's resident pages growing this fast (bytes a second) is loading, not thrashing
+        u64 loading_growth;
+        bool ratchet;          ///< The earlier rule
+    };
+    enum class Change { None, Grew, Shrank };
+
+    explicit GuestReserveTracker(const Config& config_) : config{config_} {}
+
+    /// One sample of the counters (only ever growing, but for `file_resident`), at least a
+    /// second after the last; the first only sets the start.
+    Change Sample(long long now_ns, u64 pageins, u64 file_resident);
+    void Reset();
+
+    u64 Extra() const {
+        return extra;
+    }
+    double LastRate() const {
+        return last_rate;
+    }
+
+private:
+    Config config;
+    u64 extra{};
+    u64 last_pageins{};
+    u64 last_resident{};
+    long long last_ns{};
+    long long thrash_since_ns{};
+    long long quiet_since_ns{};
+    double last_rate{};
+};
 
 struct ProcessMemory {
     u64 footprint;      ///< What jetsam compares with the limit (phys_footprint)

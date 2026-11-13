@@ -355,6 +355,7 @@ private:
     void EvictUnusedPipelines();
     u64 frame_count{};
     u32 evict_pressure_generation{}; ///< MoltenVK: memory pressure last evicted for
+    u32 pressure_evictions_skipped{}; ///< MoltenVK: signals with enough memory left to keep them
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     /// Pipelines the translate queue did not use (discarded, stale, abandoned), handed over on the
     /// GPU thread: destroyed by TickFrame once the GPU and their queued build are done with them,

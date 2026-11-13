@@ -376,6 +376,8 @@ void lichii_platform_init(void) {
         @autoreleasepool {
             GatherDeviceInfo();
             Settings::DeviceProfile::SetHostDetails(LichiiPlatform::DeviceOf(g_info));
+            LOG_INFO(Frontend, "iOS platform: device profile switches: {}",
+                     Settings::DeviceProfile::ApplyTuning(Settings::DeviceProfile::ForHost()));
             g_initialized.store(true);
             const LichiiDeviceDefaults defaults = LichiiPlatform::ComputeDefaults(g_info);
             LichiiPlatform::ApplyMemoryBudgets(defaults);

@@ -26,8 +26,9 @@ Settings::DeviceProfile::Device HostDevice(const std::vector<VkDeviceInfo::Recor
 bool ConfirmAndApply(QWidget* parent, const ConfigurationShared::Builder& builder,
                      const std::vector<VkDeviceInfo::Record>& records);
 
-/// Lists the game's overrides and removes them when confirmed (the per-game config must be the
-/// one loaded). True when reset.
-bool ConfirmAndResetGame(QWidget* parent, const ConfigurationShared::Builder& builder);
+/// Lists what giving the game the recommended settings changes and does it when confirmed (the
+/// per-game config must be the one loaded). True when reset.
+bool ConfirmAndResetGame(QWidget* parent, const ConfigurationShared::Builder& builder,
+                         const std::vector<VkDeviceInfo::Record>& records);
 
 } // namespace RecommendedSettings

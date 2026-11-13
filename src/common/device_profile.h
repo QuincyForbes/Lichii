@@ -65,11 +65,17 @@ struct Profile {
     /// guest core, sized at app start); 0 = Common::IosJit's default.
     u32 jit_cache_mib = 0;
     std::string jit_cache_reason;
+    /// Engine switches (EDEN_NX2_* environment variables) this device runs with; a variable set
+    /// in the environment wins. Applied once at app start (ApplyTuning).
+    std::vector<Value> tuning;
 };
 
 Profile Recommend(const Device& device);
 /// Recommend(DetectHost()).
 Profile ForHost();
+/// Sets the profile's tuning variables that the environment doesn't set; returns them as
+/// "NAME=value" for the log.
+std::string ApplyTuning(const Profile& profile);
 
 /// A setting's or app item's value in the profile, nullptr when it has none.
 const Value* Find(const Profile& profile, std::string_view key);
@@ -86,6 +92,13 @@ std::vector<Change> Differences(const Profile& profile);
 std::vector<Change> Apply(const Profile& profile);
 /// Inside a per-game scope: every setting the game overrides follows the global value again.
 std::vector<Change> ResetGameOverrides();
+/// Inside a per-game scope: the game gets the profile's value of every setting it can override
+/// and that applies to it (an override where the global value differs, the global value where
+/// it is the same); its other overrides are removed. Clearing the overrides alone left Ocarina
+/// of Time at a global config's full textures and game resolution on an iPhone. `dry_run`: only
+/// what would change.
+std::vector<Change> ResetGameToRecommended(const Profile& profile, u64 program_id,
+                                           bool dry_run = false);
 
 std::string FormatChanges(std::span<const Change> changes);
 std::string_view TierName(Tier tier);

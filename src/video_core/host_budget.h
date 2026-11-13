@@ -56,13 +56,18 @@ inline bool FollowsHeadroom() {
     return follows;
 }
 
+/// Room past this is the caches' to use.
+inline constexpr u64 Reserve = 768_MiB;
+
 /// Memory left to the caches (0: not known): what the process may still allocate, less what a
 /// guest memory file needs of the RAM (Common::PlatformEvents::GuestFileReserve). The file is
 /// outside the footprint, so the footprint's limit left the caches room that iOS then took from
 /// the guest's pages: an iPhone grew graphics to 2.9 GiB while the file fell from 3235 to 1253 MiB
-/// resident.
+/// resident. The file gets at most half the room past the caches' own Reserve
+/// (Common::PlatformEvents::BoundedGuestFileReserve), so what they see left never falls to
+/// nothing while the process has room.
 inline u64 Available([[maybe_unused]] u64 device_usage) {
-    const u64 reserve = Common::PlatformEvents::GuestFileReserve();
+    const u64 wanted = Common::PlatformEvents::GuestFileReserve();
 #if defined(__APPLE__) && TARGET_OS_IPHONE
     const u64 left = Common::PlatformEvents::AvailableProcessMemory();
     if (left == 0) {
@@ -79,6 +84,7 @@ inline u64 Available([[maybe_unused]] u64 device_usage) {
     }();
     const u64 left = limit > device_usage ? limit - device_usage : 0;
 #endif
+    const u64 reserve = Common::PlatformEvents::BoundedGuestFileReserve(wanted, left, Reserve);
     // Never 0, which means not known.
     return left > reserve + 1_MiB ? left - reserve : 1_MiB;
 }
@@ -90,8 +96,5 @@ inline constexpr u64 SimulatedTextureCritical = 2391_MiB;
 inline u64 SimulatedBufferCollect() {
     return FollowsHeadroom() ? 414_MiB : 207_MiB;
 }
-
-/// Room past this is the caches' to use.
-inline constexpr u64 Reserve = 768_MiB;
 
 } // namespace VideoCommon::HostBudget
