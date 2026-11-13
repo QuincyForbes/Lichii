@@ -382,6 +382,15 @@ private:
     bool oot_live_failed{};
     const char* oot_fallback_reason{};
     u32 oot_fallback_repeats{};
+    VkExtent2D oot_logged_extent{}; ///< the scene and upscale sizes last logged
+    VkExtent2D oot_logged_target{};
+    u64 oot_extent_changes{};
+    /// Upscale passes the temporal upscaler replaced / left to the game, logged every 600.
+    u32 oot_upscaled_passes{};
+    u32 oot_game_passes{};
+    u32 oot_switches{}; ///< between the two, in those 600
+    bool oot_last_upscaled{};
+    void CountOcarinaUpscale(bool upscaled);
     std::optional<u64> oot_dlss_frame;
     std::array<f32, 2> oot_jitter_applied{}; ///< in the viewport state now (render pixels)
     std::array<f32, 2> oot_jitter_offset{};  ///< what oot_jitter_frame's scene draws used
