@@ -5,6 +5,7 @@
 
 #ifdef __APPLE__
 #include <mach/mach_time.h>
+#include <notify.h>
 #include <pthread.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
@@ -66,6 +67,25 @@ u32 HighCpuFirst() {
     return first;
 #else
     return 0;
+#endif
+}
+
+int ThermalPressure() {
+#ifdef __APPLE__
+    static const int token = [] {
+        int value = 0;
+        return notify_register_check("com.apple.system.thermalpressurelevel", &value) ==
+                       NOTIFY_STATUS_OK
+                   ? value
+                   : -1;
+    }();
+    u64 state = 0;
+    if (token < 0 || notify_get_state(token, &state) != NOTIFY_STATUS_OK) {
+        return -1;
+    }
+    return static_cast<int>(state);
+#else
+    return -1;
 #endif
 }
 

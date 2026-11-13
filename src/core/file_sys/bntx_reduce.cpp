@@ -15,16 +15,20 @@ struct BlockSize {
     u8 type;
     u8 width;
     u8 height;
+    u8 bytes;
 };
 
-// BNTX/NVN format type (high byte of the format) -> block size, as in oot_texture_mod.py FORMATS.
+// BNTX/NVN format type (high byte of the format) -> block size and bytes per block, as in
+// oot_texture_mod.py FORMATS.
 constexpr std::array<BlockSize, 31> Formats{{
-    {0x02, 1, 1},   {0x07, 1, 1},  {0x09, 1, 1},  {0x0A, 1, 1},  {0x0B, 1, 1},   {0x0C, 1, 1},
-    {0x0E, 1, 1},   {0x0F, 1, 1},  {0x12, 1, 1},  {0x14, 1, 1},  {0x1A, 4, 4},   {0x1B, 4, 4},
-    {0x1C, 4, 4},   {0x1D, 4, 4},  {0x1E, 4, 4},  {0x1F, 4, 4},  {0x20, 4, 4},   {0x2D, 4, 4},
-    {0x2E, 5, 4},   {0x2F, 5, 5},  {0x30, 6, 5},  {0x31, 6, 6},  {0x32, 8, 5},   {0x33, 8, 6},
-    {0x34, 8, 8},   {0x35, 10, 5}, {0x36, 10, 6}, {0x37, 10, 8}, {0x38, 10, 10}, {0x39, 12, 10},
-    {0x3A, 12, 12},
+    {0x02, 1, 1, 1},    {0x07, 1, 1, 2},   {0x09, 1, 1, 2},   {0x0A, 1, 1, 2},
+    {0x0B, 1, 1, 4},    {0x0C, 1, 1, 4},   {0x0E, 1, 1, 4},   {0x0F, 1, 1, 4},
+    {0x12, 1, 1, 8},    {0x14, 1, 1, 4},   {0x1A, 4, 4, 8},   {0x1B, 4, 4, 16},
+    {0x1C, 4, 4, 16},   {0x1D, 4, 4, 8},   {0x1E, 4, 4, 16},  {0x1F, 4, 4, 16},
+    {0x20, 4, 4, 16},   {0x2D, 4, 4, 16},  {0x2E, 5, 4, 16},  {0x2F, 5, 5, 16},
+    {0x30, 6, 5, 16},   {0x31, 6, 6, 16},  {0x32, 8, 5, 16},  {0x33, 8, 6, 16},
+    {0x34, 8, 8, 16},   {0x35, 10, 5, 16}, {0x36, 10, 6, 16}, {0x37, 10, 8, 16},
+    {0x38, 10, 10, 16}, {0x39, 12, 10, 16}, {0x3A, 12, 12, 16},
 }};
 
 constexpr u32 MaxMips = 32;
@@ -68,9 +72,9 @@ struct Texture {
     u64 mip_ptr{};
     std::array<u64, MaxMips> mip_offsets{};
 
-    bool Reducible() const {
-        return mips >= 2 && dim == 2 && depth == 1 && layers == 1 && tile == 0 &&
-               FindFormat(format) != nullptr;
+    bool Reducible(bool arrays) const {
+        return mips >= 2 && dim == 2 && depth == 1 && (layers == 1 || (arrays && layers > 1)) &&
+               tile == 0 && FindFormat(format) != nullptr;
     }
 };
 
@@ -114,6 +118,27 @@ u32 BlockHeightFor(u64 height_in_gobs, u32 block_height) {
     return block_height;
 }
 
+/// Bytes of mip level `level` of a block-linear 2D texture whose level 0 has blocks
+/// 2^`block_height_log2` GOBs high.
+u64 LevelBytes(const Texture& tex, const BlockSize& block, u32 level, s32 block_height_log2) {
+    const u64 width = std::max<u64>(1, u64(tex.width) >> level);
+    const u64 height = std::max<u64>(1, u64(tex.height) >> level);
+    const u64 gobs_wide = ((width + block.width - 1) / block.width * block.bytes + 63) / 64;
+    const u64 gobs_high = ((height + block.height - 1) / block.height + 7) / 8;
+    const u32 block_height = BlockHeightFor(gobs_high, 1u << block_height_log2);
+    return gobs_wide * ((gobs_high + block_height - 1) / block_height * block_height) * 512;
+}
+
+/// Bytes of one array layer from mip level `first` on. Arrays are only reduced with one-GOB
+/// blocks (every OoT array texture), whose layers need no alignment past the GOB.
+u64 LayerBytes(const Texture& tex, const BlockSize& block, u32 first) {
+    u64 bytes = 0;
+    for (u32 level = first; level < tex.mips; ++level) {
+        bytes += LevelBytes(tex, block, level, tex.block_height_log2);
+    }
+    return bytes;
+}
+
 enum class Mode {
     /// oot_texture_mod.py drop_top_mip: nullopt for anything it would not write.
     Strict,
@@ -124,9 +149,9 @@ enum class Mode {
     Plan,
 };
 
-std::optional<std::vector<u8>> Drop(std::span<const u8> data, u64& size, Mode mode) {
+std::optional<std::vector<u8>> Drop(std::span<const u8> data, u64& size, Mode mode, bool arrays) {
     const auto parsed = ParseSingle(data);
-    if (!parsed || !parsed->Reducible()) {
+    if (!parsed || !parsed->Reducible(arrays)) {
         return std::nullopt;
     }
     const Texture& tex = *parsed;
@@ -137,7 +162,31 @@ std::optional<std::vector<u8>> Drop(std::span<const u8> data, u64& size, Mode mo
         tex.block_height_log2 > 5) {
         return std::nullopt;
     }
-    const u64 removed = tex.mip_offsets[1] - start;
+    // Level 0 of each layer goes; an array keeps its layers one after another.
+    const u64 cut = tex.mip_offsets[1] - start;
+    const u64 layers = static_cast<u64>(tex.layers);
+    u64 old_layer = cut;
+    u64 new_layer = 0;
+    if (layers > 1) {
+        // Only the layout recomputed here byte for byte: one-GOB blocks, level offsets and image
+        // size as the file gives them.
+        if (tex.block_height_log2 != 0) {
+            return std::nullopt;
+        }
+        for (u32 i = 0; i + 1 < tex.mips; ++i) {
+            if (tex.mip_offsets[i + 1] - tex.mip_offsets[i] !=
+                LevelBytes(tex, block, i, tex.block_height_log2)) {
+                return std::nullopt;
+            }
+        }
+        old_layer = LayerBytes(tex, block, 0);
+        new_layer = LayerBytes(tex, block, 1);
+        if (old_layer * layers != tex.image_size || new_layer + cut != old_layer ||
+            (mode != Mode::Plan && start + tex.image_size > data.size())) {
+            return std::nullopt;
+        }
+    }
+    const u64 removed = cut * layers;
     // The headers keep their offsets: everything rewritten below must sit before the cut.
     if (tex.brti + 0x78 > start || tex.mip_ptr + 8 * u64{tex.mips} > start ||
         tex.image_size < removed) {
@@ -154,7 +203,15 @@ std::optional<std::vector<u8>> Drop(std::span<const u8> data, u64& size, Mode mo
 
     std::vector<u8> out(mode == Mode::Plan ? start : data.size() - removed);
     std::memcpy(out.data(), data.data(), start);
-    if (mode != Mode::Plan) {
+    if (mode != Mode::Plan && layers > 1) {
+        for (u64 layer = 0; layer < layers; ++layer) {
+            std::memcpy(out.data() + start + layer * new_layer,
+                        data.data() + start + layer * old_layer + cut, new_layer);
+        }
+        const u64 tail = start + tex.image_size;
+        std::memcpy(out.data() + start + layers * new_layer, data.data() + tail,
+                    data.size() - tail);
+    } else if (mode != Mode::Plan) {
         std::memcpy(out.data() + start, data.data() + start + removed,
                     data.size() - start - removed);
     }
@@ -166,7 +223,7 @@ std::optional<std::vector<u8>> Drop(std::span<const u8> data, u64& size, Mode mo
     Store(o, tex.brti + 0x50, static_cast<u32>(tex.image_size - removed));
     Store(o, tex.mip_ptr, start);
     for (u32 i = 2; i < tex.mips; ++i) {
-        Store(o, tex.mip_ptr + 8 * u64{i - 1}, tex.mip_offsets[i] - removed);
+        Store(o, tex.mip_ptr + 8 * u64{i - 1}, tex.mip_offsets[i] - cut);
     }
     Store(o, tex.mip_ptr + 8 * (u64{tex.mips} - 1), u64{0});
 
@@ -180,8 +237,8 @@ std::optional<std::vector<u8>> Drop(std::span<const u8> data, u64& size, Mode mo
 
     u32 rlt{};
     u32 file_size{};
-    if (!Load(data, 0x18, rlt) || !Load(data, 0x1C, file_size) || rlt < start + removed ||
-        file_size < removed) {
+    if (!Load(data, 0x18, rlt) || !Load(data, 0x1C, file_size) ||
+        rlt < start + (layers > 1 ? u64{tex.image_size} : removed) || file_size < removed) {
         return std::nullopt;
     }
     if (mode == Mode::Plan && (file_size != size || u64{rlt} + 16 > size)) {
@@ -248,11 +305,11 @@ bool LargeEnough(std::span<const u8> data, u32 min_size) {
 
 std::optional<std::vector<u8>> DropTopMip(std::span<const u8> data) {
     u64 size = data.size();
-    return Drop(data, size, Mode::Strict);
+    return Drop(data, size, Mode::Strict, false);
 }
 
 std::optional<std::vector<u8>> Reduce(std::span<const u8> data, u32 levels, u32 min_size,
-                                      bool lenient) {
+                                      bool lenient, bool arrays) {
     if (!LargeEnough(data, min_size)) {
         return std::nullopt;
     }
@@ -260,7 +317,7 @@ std::optional<std::vector<u8>> Reduce(std::span<const u8> data, u32 levels, u32 
     for (u32 i = 0; i < levels; ++i) {
         const std::span<const u8> current = reduced ? std::span<const u8>{*reduced} : data;
         u64 size = current.size();
-        auto smaller = Drop(current, size, lenient ? Mode::Lenient : Mode::Strict);
+        auto smaller = Drop(current, size, lenient ? Mode::Lenient : Mode::Strict, arrays);
         if (!smaller) {
             break;
         }
@@ -269,7 +326,8 @@ std::optional<std::vector<u8>> Reduce(std::span<const u8> data, u32 levels, u32 
     return reduced;
 }
 
-std::optional<u64> PlanReduce(std::span<const u8> head, u64 size, u32 levels, u32 min_size) {
+std::optional<u64> PlanReduce(std::span<const u8> head, u64 size, u32 levels, u32 min_size,
+                             bool arrays) {
     if (!LargeEnough(head, min_size)) {
         return std::nullopt;
     }
@@ -277,7 +335,8 @@ std::optional<u64> PlanReduce(std::span<const u8> head, u64 size, u32 levels, u3
     u64 current_size = size;
     for (u32 i = 0; i < levels; ++i) {
         u64 next_size = current_size;
-        auto next = Drop(current ? std::span<const u8>{*current} : head, next_size, Mode::Plan);
+        auto next = Drop(current ? std::span<const u8>{*current} : head, next_size, Mode::Plan,
+                         arrays);
         if (!next) {
             break;
         }

@@ -109,7 +109,7 @@ std::vector<u8> MakeRawZstdFrame(std::span<const u8> content) {
     return out;
 }
 
-std::optional<u64> PlanZstdTexture(const VfsFile& file, u32 levels) {
+std::optional<u64> PlanZstdTexture(const VfsFile& file, u32 levels, bool arrays) {
     if (levels == 0) {
         return std::nullopt;
     }
@@ -150,14 +150,15 @@ std::optional<u64> PlanZstdTexture(const VfsFile& file, u32 levels) {
         decoded.resize(result);
     }
     const auto reduced =
-        Bntx::PlanReduce(decoded, header.frameContentSize, levels, TextureQualityMinSize);
+        Bntx::PlanReduce(decoded, header.frameContentSize, levels, TextureQualityMinSize, arrays);
     if (!reduced) {
         return std::nullopt;
     }
     return RawZstdFrameSize(*reduced);
 }
 
-std::optional<ReducedTexture> ReduceZstdTexture(std::span<const u8> file, u32 levels) {
+std::optional<ReducedTexture> ReduceZstdTexture(std::span<const u8> file, u32 levels,
+                                                bool arrays) {
     const auto content_size = SingleFrameContentSize(file);
     if (levels == 0 || !content_size ||
         ZSTD_findFrameCompressedSize(file.data(), file.size()) != file.size()) {
@@ -173,11 +174,11 @@ std::optional<ReducedTexture> ReduceZstdTexture(std::span<const u8> file, u32 le
     if (ZSTD_isError(result) || result != bntx.size()) {
         return std::nullopt;
     }
-    auto reduced = Bntx::Reduce(bntx, levels, TextureQualityMinSize);
+    auto reduced = Bntx::Reduce(bntx, levels, TextureQualityMinSize, false, arrays);
     if (!reduced) {
         // PlanZstdTexture checks the start of the file only: drop the levels it planned for even
         // when the relocation table at the end can't follow.
-        reduced = Bntx::Reduce(bntx, levels, TextureQualityMinSize, true);
+        reduced = Bntx::Reduce(bntx, levels, TextureQualityMinSize, true, arrays);
         if (!reduced) {
             return std::nullopt;
         }
@@ -193,7 +194,7 @@ std::optional<ReducedTexture> ReduceZstdTexture(std::span<const u8> file, u32 le
 namespace {
 
 struct TextureQualityState {
-    explicit TextureQualityState(u32 levels_) : levels{levels_} {
+    TextureQualityState(u32 levels_, bool arrays_) : levels{levels_}, arrays{arrays_} {
         pressure_listener = Common::PlatformEvents::AddMemoryPressureListener([this] {
             std::scoped_lock lock{mutex};
             lru.clear();
@@ -255,6 +256,7 @@ struct TextureQualityState {
     }
 
     const u32 levels;
+    const bool arrays;
     std::size_t pressure_listener{};
     std::mutex mutex;
     std::list<std::pair<const void*, std::vector<u8>>> lru;
@@ -316,7 +318,7 @@ public:
         }
 
         const auto begin = std::chrono::steady_clock::now();
-        auto reduced = ReduceZstdTexture(base->ReadAllBytes(), state->levels);
+        auto reduced = ReduceZstdTexture(base->ReadAllBytes(), state->levels, state->arrays);
         const auto time = std::chrono::steady_clock::now() - begin;
         if (!reduced || reduced->file.size() != size) {
             LOG_ERROR(Common_Memory, "Texture quality: {} could not be reduced as planned",
@@ -449,7 +451,7 @@ void SavePlan(const std::filesystem::path& path, u32 levels, const std::vector<u
 } // namespace
 
 VirtualDir ApplyTextureQuality(const VirtualDir& root, u32 levels,
-                               const std::filesystem::path& plan_cache) {
+                               const std::filesystem::path& plan_cache, bool arrays) {
     if (root == nullptr || levels == 0) {
         return root;
     }
@@ -471,7 +473,7 @@ VirtualDir ApplyTextureQuality(const VirtualDir& root, u32 levels,
         std::atomic<std::size_t> next{};
         const auto work = [&] {
             for (std::size_t i = next.fetch_add(1); i < textures.size(); i = next.fetch_add(1)) {
-                sizes[i] = PlanZstdTexture(*textures[i], levels).value_or(0);
+                sizes[i] = PlanZstdTexture(*textures[i], levels, arrays).value_or(0);
             }
         };
         threads = std::clamp(std::thread::hardware_concurrency(), 1u, 8u);
@@ -496,7 +498,7 @@ VirtualDir ApplyTextureQuality(const VirtualDir& root, u32 levels,
             after += sizes[i];
         }
     }
-    const auto state = std::make_shared<TextureQualityState>(levels);
+    const auto state = std::make_shared<TextureQualityState>(levels, arrays);
     auto wrapped = planned.empty() ? root : Wrap(root, state, planned);
     LOG_INFO(Common_Memory,
              "Texture quality {}: {} of {} .bntx.zs files get {} top mip level(s) dropped when "

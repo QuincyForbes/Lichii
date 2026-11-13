@@ -134,6 +134,12 @@ void SetCurrentThreadName(const char* name);
 void SetCurrentThreadToPerformanceCores(bool frame_critical = true);
 /// The iOS device profile's choice; EDEN_NX2_APPLE_HELPER_QOS overrides it.
 void SetAppleHelperQos(bool demote);
+/// Apple, EDEN_NX2_APPLE_WORKGROUP=<fps> (iOS Experiments "Frame Deadlines"; off by default): the
+/// frame-critical threads join one interval workgroup and each call (the GPU thread, once a
+/// frame) closes the last frame's interval and opens the next with a 1/fps deadline, so the
+/// performance controller sees missed frames instead of one busy thread group it may move to
+/// the efficiency cores. No-op elsewhere.
+void TickFrameWorkgroup();
 
 /// Windows: one physical performance core each for the split GPU thread's halves, and the guest
 /// cores and background workers kept off them, so an SMT sibling never shares the GPU threads'
