@@ -79,13 +79,8 @@ std::function<std::string()> g_graphics_report;
 
 std::atomic<bool> g_guest_in_file{};
 std::atomic<u64> g_guest_reserve_extra{};
-// Only the PollMemoryPressure caller that won its 250 ms slot touches these.
-u64 g_pagein_last{};
-long long g_pagein_last_ns{};
-long long g_pagein_quiet_since_ns{};
 
 constexpr u64 ReserveStep = u64{256} << 20;
-constexpr u64 ReserveDecay = u64{128} << 20;
 
 u64 EnvMiB(const char* name, u64 fallback) {
     const char* const value = std::getenv(name);
@@ -112,62 +107,151 @@ u64 PageInThreshold() {
     return threshold;
 }
 
+GuestReserveTracker::Config TrackerConfig() {
+    const char* const ratchet = std::getenv("EDEN_NX2_RESERVE_RATCHET");
+    return {
+        .base = GuestReserveBase(),
+        .max = GuestReserveMax(),
+        .threshold = PageInThreshold(),
+        .sustain_seconds = static_cast<u32>(EnvMiB("EDEN_NX2_PAGEIN_SUSTAIN_S", 5)),
+        .decay_seconds = static_cast<u32>(EnvMiB("EDEN_NX2_RESERVE_DECAY_S", 10)),
+        .step = ReserveStep,
+        .loading_growth = EnvMiB("EDEN_NX2_PAGEIN_LOADING_MIB_S", 32) << 20,
+        .ratchet = ratchet != nullptr && ratchet[0] == '1',
+    };
+}
+
+// Only the PollMemoryPressure caller that won its 250 ms slot touches it.
+GuestReserveTracker& Tracker() {
+    static GuestReserveTracker tracker{TrackerConfig()};
+    return tracker;
+}
+
 // A guest memory file paged back in faster than the threshold: the rest of the process took its
-// RAM. The caches then leave it 256 MiB more and collect now; after 30 s below a quarter of the
-// threshold they get 128 MiB of it back.
+// RAM. The caches then leave it more and collect now (GuestReserveTracker).
 void TrackGuestPageIns(long long now) {
     if (!g_guest_in_file.load(std::memory_order_relaxed) || GuestReserveBase() == 0 ||
         PageInThreshold() == 0) {
         return;
     }
     const ProcessEvents events = QueryProcessEvents();
-    if (g_pagein_last_ns == 0) {
-        g_pagein_last = events.pageins;
-        g_pagein_last_ns = now;
+    GuestReserveTracker& tracker = Tracker();
+    const u64 before = tracker.Extra();
+    const auto change = tracker.Sample(now, events.pageins, events.file_resident);
+    if (change == GuestReserveTracker::Change::None) {
         return;
     }
-    const double seconds = static_cast<double>(now - g_pagein_last_ns) / 1e9;
-    if (seconds < 1.0) {
-        return;
-    }
-    const double rate =
-        static_cast<double>(events.pageins - (std::min)(events.pageins, g_pagein_last)) / seconds;
-    g_pagein_last = events.pageins;
-    g_pagein_last_ns = now;
-    const double threshold = static_cast<double>(PageInThreshold());
-    const u64 extra = g_guest_reserve_extra.load(std::memory_order_relaxed);
-    const u64 room_to_grow = GuestReserveMax() > GuestReserveBase() + extra
-                                 ? GuestReserveMax() - GuestReserveBase() - extra
-                                 : 0;
-    if (rate >= threshold) {
-        g_pagein_quiet_since_ns = 0;
-        if (room_to_grow == 0) {
-            return;
-        }
-        const u64 grown = extra + (std::min)(ReserveStep, room_to_grow);
-        g_guest_reserve_extra.store(grown, std::memory_order_relaxed);
+    const u64 extra = tracker.Extra();
+    g_guest_reserve_extra.store(extra, std::memory_order_relaxed);
+    if (change == GuestReserveTracker::Change::Grew) {
         LOG_WARNING(Common_Memory,
-                    "Guest memory file: {:.0f} page-ins/s: the caches leave it {} MiB (was {}) "
-                    "and collect",
-                    rate, (GuestReserveBase() + grown) >> 20, (GuestReserveBase() + extra) >> 20);
+                    "Guest memory file: {:.0f} page-ins/s with its resident pages not growing "
+                    "({} MiB): the caches leave it {} MiB (was {}) and collect",
+                    tracker.LastRate(), events.file_resident >> 20,
+                    (GuestReserveBase() + extra) >> 20, (GuestReserveBase() + before) >> 20);
         SignalMemoryPressure();
-        return;
-    }
-    if (rate >= threshold / 4 || extra == 0) {
-        g_pagein_quiet_since_ns = 0;
-        return;
-    }
-    if (g_pagein_quiet_since_ns == 0) {
-        g_pagein_quiet_since_ns = now;
-    } else if (now - g_pagein_quiet_since_ns >= 30'000'000'000LL) {
-        const u64 shrunk = extra - (std::min)(extra, ReserveDecay);
-        g_guest_reserve_extra.store(shrunk, std::memory_order_relaxed);
-        g_pagein_quiet_since_ns = now;
+    } else {
         LOG_INFO(Common_Memory, "Guest memory file: {:.0f} page-ins/s: the caches leave it {} MiB",
-                 rate, (GuestReserveBase() + shrunk) >> 20);
+                 tracker.LastRate(), (GuestReserveBase() + extra) >> 20);
     }
 }
+
+u32 GuestReserveShare() {
+    static const u32 share =
+        static_cast<u32>((std::min)(EnvMiB("EDEN_NX2_GUEST_RESERVE_SHARE", 50), u64{100}));
+    return share;
+}
 } // Anonymous namespace
+
+GuestReserveTracker::Change GuestReserveTracker::Sample(long long now, u64 pageins,
+                                                        u64 file_resident) {
+    if (last_ns == 0) {
+        last_pageins = pageins;
+        last_resident = file_resident;
+        last_ns = now;
+        return Change::None;
+    }
+    const double seconds = static_cast<double>(now - last_ns) / 1e9;
+    if (seconds < 1.0) {
+        return Change::None;
+    }
+    const long long window_start = last_ns;
+    last_rate = static_cast<double>(pageins - (std::min)(pageins, last_pageins)) / seconds;
+    const double growth =
+        (static_cast<double>(file_resident) - static_cast<double>(last_resident)) / seconds;
+    last_pageins = pageins;
+    last_resident = file_resident;
+    last_ns = now;
+    const double threshold = static_cast<double>(config.threshold);
+    const u64 room = config.max > config.base + extra ? config.max - config.base - extra : 0;
+    const auto grow = [&] {
+        if (room == 0) {
+            return Change::None;
+        }
+        extra += (std::min)(config.step, room);
+        return Change::Grew;
+    };
+    const auto shrink = [&](u64 step) {
+        extra -= (std::min)(extra, step);
+        quiet_since_ns = now;
+        return Change::Shrank;
+    };
+    if (config.ratchet) {
+        if (last_rate >= threshold) {
+            quiet_since_ns = 0;
+            return grow();
+        }
+        if (last_rate >= threshold / 4 || extra == 0) {
+            quiet_since_ns = 0;
+            return Change::None;
+        }
+        if (quiet_since_ns == 0) {
+            quiet_since_ns = now;
+        } else if (now - quiet_since_ns >= 30'000'000'000LL) {
+            return shrink(config.step / 2);
+        }
+        return Change::None;
+    }
+    if (last_rate >= threshold && growth < static_cast<double>(config.loading_growth)) {
+        quiet_since_ns = 0;
+        if (thrash_since_ns == 0) {
+            thrash_since_ns = window_start;
+        }
+        if (now - thrash_since_ns < static_cast<long long>(config.sustain_seconds) * 1'000'000'000LL) {
+            return Change::None;
+        }
+        // The next step needs as long again.
+        thrash_since_ns = now;
+        return grow();
+    }
+    thrash_since_ns = 0;
+    if (last_rate >= threshold / 2 || extra == 0) {
+        quiet_since_ns = 0;
+        return Change::None;
+    }
+    if (quiet_since_ns == 0) {
+        quiet_since_ns = window_start;
+    }
+    if (now - quiet_since_ns >= static_cast<long long>(config.decay_seconds) * 1'000'000'000LL) {
+        return shrink(config.step);
+    }
+    return Change::None;
+}
+
+void GuestReserveTracker::Reset() {
+    extra = 0;
+    last_pageins = 0;
+    last_resident = 0;
+    last_ns = 0;
+    thrash_since_ns = 0;
+    quiet_since_ns = 0;
+    last_rate = 0;
+}
+
+u64 BoundedGuestFileReserve(u64 reserve, u64 left, u64 own) {
+    const u64 room = left > own ? left - own : 0;
+    return (std::min)(reserve, room * GuestReserveShare() / 100);
+}
 
 void SignalMemoryPressure() {
     // iOS sends warnings in bursts (an iPhone: 10 in 2 s, from the UIKit warning and the
@@ -241,7 +325,7 @@ u64 MemoryLowWater() {
 void SetGuestInFile(bool in_file) {
     g_guest_in_file.store(in_file, std::memory_order_relaxed);
     g_guest_reserve_extra.store(0, std::memory_order_relaxed);
-    g_pagein_last_ns = 0;
+    Tracker().Reset();
 }
 
 bool GuestInFile() {
