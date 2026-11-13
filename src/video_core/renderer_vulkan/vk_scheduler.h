@@ -95,6 +95,9 @@ public:
     /// EDEN_NX2_PASS_TIMES=<seconds>: every that many seconds, one frame's render passes get GPU
     /// timestamps, logged as "Perf passes:" (the passes by size and format that took the most).
     void MarkPassTimesFrame();
+    /// Logs "Perf sites:", the callers behind submissions, render pass ends and reopened passes
+    /// per frame since the last call, and starts counting again.
+    static void ReportPerfSites(u64 frames);
     /// A draw was recorded in the open render pass (for "Perf passes:").
     void NotePassDraw() noexcept {
         ++pass_draws;

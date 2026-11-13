@@ -638,10 +638,18 @@ GraphicsPipeline::GraphicsPipeline(
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan,
                          "Graphics pipeline build failed: {} (stages: tcs={} tes={} geom={}, "
-                         "patch control points {}, device max patch size {})",
+                         "patch control points {}, device max patch size {}); pipeline {:016x}, "
+                         "{}, guest topology {}, shaders {:016x} {:016x} {:016x} {:016x} {:016x} "
+                         "{:016x}",
                          exception.what(), spv_modules[1] ? 1 : 0, spv_modules[2] ? 1 : 0,
                          spv_modules[3] ? 1 : 0, key.state.patch_control_points_minus_one.Value() + 1,
-                         device.GetMaxTessellationPatchSize());
+                         device.GetMaxTessellationPatchSize(), key.Hash(),
+                         mesh_emulation ? "mesh emulated"
+                         : IsMeshPipeline() ? "native mesh"
+                                            : "vertex",
+                         static_cast<u32>(key.state.topology.Value()), key.unique_hashes[0],
+                         key.unique_hashes[1], key.unique_hashes[2], key.unique_hashes[3],
+                         key.unique_hashes[4], key.unique_hashes[5]);
             throw;
         }
         if (pipeline_statistics && pipeline) {

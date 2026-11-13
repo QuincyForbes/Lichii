@@ -426,7 +426,7 @@ struct ExperimentsView: View {
     @State private var helperQosOff = lichii_platform_experiment("helper_qos_off") != 0
     @State private var frameDeadlines = lichii_platform_experiment("frame_deadlines") != 0
     @State private var jitOldTables = lichii_platform_experiment("jit_old_tables") != 0
-    @State private var batchFenceSubmits = lichii_platform_experiment("batch_fence_submits") != 0
+    @State private var fenceSubmitEach = lichii_platform_experiment("fence_submit_each") != 0
 
     var body: some View {
         List {
@@ -498,14 +498,14 @@ struct ExperimentsView: View {
                     .onChange(of: jitOldTables) { value in
                         lichii_platform_set_experiment("jit_old_tables", value ? 1 : 0)
                     }
-                Toggle("Fewer GPU Submissions", isOn: $batchFenceSubmits)
-                    .onChange(of: batchFenceSubmits) { value in
-                        lichii_platform_set_experiment("batch_fence_submits", value ? 1 : 0)
+                Toggle("Submit at Every Fence", isOn: $fenceSubmitEach)
+                    .onChange(of: fenceSubmitEach) { value in
+                        lichii_platform_set_experiment("fence_submit_each", value ? 1 : 0)
                     }
             } header: {
                 Text("Performance")
             } footer: {
-                Text("For comparing builds. Old Texture Eviction reads textures the GPU drew back from the GPU before freeing them, a wait for the GPU each time, even when the game draws them again anyway. Helper Threads at Full Priority gives the timing and present threads the same priority as the game's. Frame Deadlines for the CPU tells iOS each frame's deadline, which may keep the game on the performance cores; untested on a device. Old JIT Tables keeps the translated code's bookkeeping as it was (about 0.3 GB more memory in Ocarina of Time); turn it on if a game that used to run crashes. Fewer GPU Submissions hands the GPU the game's work in batches of up to 2 ms instead of at every game fence (about 60 command buffers a frame in Ocarina of Time, 21 with it on a computer); an older build made Ocarina of Time's screen flash white with it, so turn it off if the screen flashes.\n\nAll five apply the next time Lichii starts.")
+                Text("For comparing builds. Old Texture Eviction reads textures the GPU drew back from the GPU before freeing them, a wait for the GPU each time, even when the game draws them again anyway. Helper Threads at Full Priority gives the timing and present threads the same priority as the game's. Frame Deadlines for the CPU tells iOS each frame's deadline, which may keep the game on the performance cores; untested on a device. Old JIT Tables keeps the translated code's bookkeeping as it was (about 0.3 GB more memory in Ocarina of Time); turn it on if a game that used to run crashes. Submit at Every Fence hands the GPU the game's work at every game fence, as before, instead of in batches of up to 2 ms (76-95 command buffers a frame in Ocarina of Time's Kokiri Forest on an iPhone); turn it on if the screen flashes white.\n\nAll five apply the next time Lichii starts.")
             }
 
             Section {

@@ -3682,6 +3682,7 @@ void RasterizerVulkan::TickPerfReport() {
         perf_report_events = Common::PlatformEvents::QueryProcessEvents();
         static_cast<void>(Common::PerfReport::TakeJitPeak());
         perf_report_jit_cores = Common::PerfReport::ReadJitCores();
+        Scheduler::ReportPerfSites(0);
         perf_frame_max_ms = 0.0;
         return;
     }
@@ -3964,6 +3965,7 @@ void RasterizerVulkan::TickPerfReport() {
                               static_cast<double>(now_counts.table_bytes) / (1 << 20),
                               static_cast<double>(now_counts.list_bytes) / (1 << 20)));
     }
+    Scheduler::ReportPerfSites(frames);
     perf_report_jit_cores = jit_cores;
     if (!jit_core_text.empty()) {
         LOG_INFO(Common_Memory, "Perf JIT ({} MiB per core, {} shared fault markers + {} blocks): {}",

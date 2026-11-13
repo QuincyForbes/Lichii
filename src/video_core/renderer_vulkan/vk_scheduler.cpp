@@ -56,7 +56,37 @@ std::map<std::string, u64> g_profile_ends;
 std::map<std::string, u64> g_profile_flushes;
 std::map<std::string, u64> g_profile_reopens;
 
+// "Perf sites:" (EDEN_NX2_PERF_REPORT): submissions, render pass ends and reopens by caller.
+enum PerfSiteKind : size_t { SiteSubmit, SitePassEnd, SiteReopen, SiteKinds };
+struct PerfSite {
+    const char* file;
+    u32 line;
+    u64 count;
+};
+std::mutex g_perf_site_mutex;
+std::array<std::vector<PerfSite>, SiteKinds> g_perf_sites;
+
+void CountPerfSite(PerfSiteKind kind, const char* file, u32 line) {
+    if (!Common::PerfReport::Enabled()) {
+        return;
+    }
+    std::scoped_lock lock{g_perf_site_mutex};
+    auto& sites = g_perf_sites[kind];
+    const auto it = std::ranges::find_if(
+        sites, [&](const PerfSite& site) { return site.file == file && site.line == line; });
+    if (it != sites.end()) {
+        ++it->count;
+    } else {
+        sites.push_back({file, line, 1});
+    }
+}
+
 void CountSite(std::map<std::string, u64>& sites, const char* file, u32 line) {
+    if (&sites == &g_profile_flushes) {
+        CountPerfSite(SiteSubmit, file, line);
+    } else if (&sites == &g_profile_ends) {
+        CountPerfSite(SitePassEnd, file, line);
+    }
     if (!VideoCommon::Nx2Profile::Enabled()) {
         return;
     }
@@ -74,6 +104,7 @@ void CountRenderPassEnd(const char* file, u32 line) {
 
 // Passes that began on the framebuffer the last one ended on, by the caller that ended that one.
 void CountReopen(const char* file, u32 line, VkExtent2D area) {
+    CountPerfSite(SiteReopen, file, line);
     if (!VideoCommon::Nx2Profile::Enabled()) {
         return;
     }
@@ -465,6 +496,46 @@ void Scheduler::MarkFrameEnd(u64 frame) {
     if (Common::DkbFrameTrace::Enabled()) {
         Record([this, frame](vk::CommandBuffer) { trace_frame_end = frame; });
     }
+}
+
+void Scheduler::ReportPerfSites(u64 frames) {
+    std::array<std::vector<PerfSite>, SiteKinds> sites;
+    {
+        std::scoped_lock lock{g_perf_site_mutex};
+        for (size_t kind = 0; kind < SiteKinds; ++kind) {
+            sites[kind] = std::move(g_perf_sites[kind]);
+            g_perf_sites[kind].clear();
+        }
+    }
+    if (frames == 0) {
+        return;
+    }
+    const auto top = [frames](std::vector<PerfSite>& list) {
+        std::ranges::sort(list, std::greater{}, &PerfSite::count);
+        std::string text;
+        u64 rest{};
+        for (size_t i = 0; i < list.size(); ++i) {
+            if (i >= 8) {
+                rest += list[i].count;
+                continue;
+            }
+            std::string_view file{list[i].file != nullptr ? list[i].file : "elsewhere"};
+            if (const size_t slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+                file.remove_prefix(slash + 1);
+            }
+            text += fmt::format("{}{}:{} {:.1f}", text.empty() ? "" : ", ", file, list[i].line,
+                                static_cast<double>(list[i].count) / static_cast<double>(frames));
+        }
+        if (rest != 0) {
+            text += fmt::format(", others {:.1f}",
+                                static_cast<double>(rest) / static_cast<double>(frames));
+        }
+        return text.empty() ? std::string{"none"} : text;
+    };
+    LOG_INFO(Render_Vulkan,
+             "Perf sites per frame: submits by caller: {} | render pass ends by caller: {} | "
+             "passes reopened on the target the last one left, after: {}",
+             top(sites[SiteSubmit]), top(sites[SitePassEnd]), top(sites[SiteReopen]));
 }
 
 void Scheduler::NotePassEnd(const std::source_location& location) {

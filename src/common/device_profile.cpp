@@ -260,6 +260,12 @@ void RecommendApple(const Device& device, Profile& p) {
          "was four to six small blocks each, 237 MiB of 16-64 byte blocks plus 155 MiB of tables "
          "in Kokiri (iPhone18,2 malloc census, build 71)."});
     p.tuning.push_back(
+        {"EDEN_NX2_FENCE_FLUSH_US", "2000", "2 ms",
+         "The game's fences are submitted together within 2 ms instead of each in a command "
+         "buffer of its own: an iPhone18,2 ran 76-95 command buffers a frame in Kokiri (IPA "
+         "138), the title screen 7. PC phone sim: 59 -> 21 a frame, no more flashes in Kokiri "
+         "(flash watch). Experiments > Submit at Every Fence turns it off."});
+    p.tuning.push_back(
         {"EDEN_NX2_PASS_TIMES", "10", "Every 10 s",
          "One frame in 10 s gets GPU timestamps around each render pass (\"Perf passes:\" log "
          "line): build 71 spent 84-103 ms of GPU time per frame on the phone with the Legacy and "
