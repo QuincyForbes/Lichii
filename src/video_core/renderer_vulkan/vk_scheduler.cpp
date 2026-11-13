@@ -54,6 +54,7 @@ std::atomic<u64> g_profile_window_start{};
 std::mutex g_profile_end_mutex;
 std::map<std::string, u64> g_profile_ends;
 std::map<std::string, u64> g_profile_flushes;
+std::map<std::string, u64> g_profile_reopens;
 
 void CountSite(std::map<std::string, u64>& sites, const char* file, u32 line) {
     if (!VideoCommon::Nx2Profile::Enabled()) {
@@ -69,6 +70,19 @@ void CountSite(std::map<std::string, u64>& sites, const char* file, u32 line) {
 
 void CountRenderPassEnd(const char* file, u32 line) {
     CountSite(g_profile_ends, file, line);
+}
+
+// Passes that began on the framebuffer the last one ended on, by the caller that ended that one.
+void CountReopen(const char* file, u32 line, VkExtent2D area) {
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        return;
+    }
+    std::string_view name{file != nullptr ? file : "elsewhere"};
+    if (const auto slash = name.find_last_of("/\\"); slash != std::string_view::npos) {
+        name.remove_prefix(slash + 1);
+    }
+    std::scoped_lock lock{g_profile_end_mutex};
+    ++g_profile_reopens[fmt::format("{}:{} ({}x{})", name, line, area.width, area.height)];
 }
 
 // The callers of Flush and Finish: who asks for the queue submissions.
@@ -111,6 +125,7 @@ void ReportSubmitCounts() {
         }
     };
     report(g_profile_ends, "Render pass ends");
+    report(g_profile_reopens, "Render passes reopened on the target they left");
     report(g_profile_flushes, "Submits asked");
 }
 }
@@ -323,7 +338,7 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                      std::source_location location) {
     CountFlush(location.file_name(), location.line());
     if (state.renderpass) {
-        CountRenderPassEnd(location.file_name(), location.line());
+        NotePassEnd(location);
     }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
@@ -408,7 +423,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                        std::source_location location) {
     CountFlush(location.file_name(), location.line());
     if (state.renderpass) {
-        CountRenderPassEnd(location.file_name(), location.line());
+        NotePassEnd(location);
     }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
@@ -452,6 +467,12 @@ void Scheduler::MarkFrameEnd(u64 frame) {
     }
 }
 
+void Scheduler::NotePassEnd(const std::source_location& location) {
+    CountRenderPassEnd(location.file_name(), location.line());
+    pass_end_file = location.file_name();
+    pass_end_line = location.line();
+}
+
 void Scheduler::MarkPassTimesFrame() {
     if (!pass_time_pool) {
         return;
@@ -461,9 +482,15 @@ void Scheduler::MarkPassTimesFrame() {
     if (start) {
         pass_time_last = now;
     }
+    std::vector<PassReopen> reopens;
+    if (pass_time_host_sampling) {
+        reopens = std::move(pass_time_reopens);
+    }
+    pass_time_reopens.clear();
     pass_time_host_sampling = start;
-    Record([this, start](vk::CommandBuffer cmdbuf) {
+    Record([this, start, reopens = std::move(reopens)](vk::CommandBuffer cmdbuf) {
         if (pass_time_sampling) {
+            pass_time_reopen_report = reopens;
             // The frame's last commands go with the next submission; its results come after it.
             PassTimeCloseLabel(cmdbuf);
             pass_time_sampling = false;
@@ -736,6 +763,78 @@ void Scheduler::ReportPassTimes() {
         top_labels += fmt::format("{}{}: {}x, {:.2f} ms", i == 0 ? "" : " | ", labels[i].name,
                                   labels[i].passes, labels[i].ms);
     }
+    std::ranges::sort(pass_time_reopen_report, std::greater{}, &PassReopen::count);
+    std::string top_reopens;
+    u32 num_reopens{};
+    for (size_t i = 0; i < pass_time_reopen_report.size(); ++i) {
+        const PassReopen& reopen = pass_time_reopen_report[i];
+        num_reopens += reopen.count;
+        if (i >= 10) {
+            continue;
+        }
+        std::string_view file{reopen.file != nullptr ? reopen.file : "elsewhere"};
+        if (const size_t slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+            file.remove_prefix(slash + 1);
+        }
+        top_reopens += fmt::format("{}{}:{} on {}x{}: {}x", i == 0 ? "" : " | ", file, reopen.line,
+                                   reopen.width, reopen.height, reopen.count);
+    }
+    static const bool list_passes = [] {
+        const char* const value = std::getenv("EDEN_NX2_PASS_LIST");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (list_passes) {
+        // The frame in order: P<target> passes, D dispatches, O other work, / a new submission.
+        std::vector<u64> targets;
+        std::string line;
+        u32 part{};
+        u32 submission{};
+        const auto flush = [&] {
+            if (!line.empty()) {
+                LOG_INFO(Render_Vulkan, "Perf pass list {}: {}", part++, line);
+                line.clear();
+            }
+        };
+        for (const PassTimeRecord& record : pass_time_records) {
+            if (record.end_query == ~0U) {
+                continue;
+            }
+            if (record.submission != submission) {
+                submission = record.submission;
+                line += "/ ";
+            }
+            const double ms = ms_between(record.begin_query, record.end_query);
+            if (record.site_file != nullptr) {
+                std::string_view file{record.site_file};
+                if (const size_t slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+                    file.remove_prefix(slash + 1);
+                }
+                line += fmt::format("O {}:{} {:.3f}, ", file, record.site_line, ms);
+            } else if (record.dispatch) {
+                line += fmt::format("D {:016x} {:.3f}, ", record.hash, ms);
+            } else {
+                const PassShape& s = record.shape;
+                auto it = std::ranges::find(targets, s.framebuffer);
+                if (it == targets.end()) {
+                    it = targets.insert(targets.end(), s.framebuffer);
+                }
+                line += fmt::format("P{} {}x{}", it - targets.begin(), s.width, s.height);
+                for (u32 slot = 0; slot < s.num_colors; ++slot) {
+                    line += fmt::format(" {}{}", static_cast<PixelFormat>(s.color_formats[slot]),
+                                        (s.color_clear_mask & (1U << slot)) != 0 ? " (clear)" : "");
+                }
+                if (bytes_of(s.depth_format) != 0) {
+                    line += fmt::format(" + {}{}", static_cast<PixelFormat>(s.depth_format),
+                                        s.depth_clear ? " (clear)" : "");
+                }
+                line += fmt::format(" {} draws {:.3f}, ", record.draws, ms);
+            }
+            if (line.size() > 1500) {
+                flush();
+            }
+        }
+        flush();
+    }
     double submitted{};
     for (const u32 span : pass_time_spans) {
         submitted += ms_between(span, span + 1);
@@ -751,11 +850,11 @@ void Scheduler::ReportPassTimes() {
              "Perf passes: {} submissions take {:.2f} ms of GPU time: {} render passes {:.2f} ms, "
              "{} guest dispatches {:.2f} ms, other work after leaving a pass {:.2f} ms, the rest "
              "{:.2f} ms; attachments load {} MiB, store {} MiB | passes: {} | dispatches: {} | "
-             "other work by caller: {}",
+             "other work by caller: {} | {} passes reopened the target the last one left, after: {}",
              pass_time_spans.size(), submitted, num_passes, in_passes, num_dispatches,
              in_dispatches, in_labels,
              (std::max)(submitted - in_passes - in_dispatches - in_labels, 0.0), load_bytes >> 20,
-             store_bytes >> 20, top, top_dispatches, top_labels);
+             store_bytes >> 20, top, top_dispatches, top_labels, num_reopens, top_reopens);
 }
 
 void Scheduler::DispatchWork(bool lazy) {
@@ -840,6 +939,26 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
     pass_draws = 0;
+    if (framebuffer_handle == last_pass_framebuffer && clear_value_count == 0) {
+        // This pass loads back what the last one stored: on a tiler that is the whole target, twice.
+        Common::PerfReport::Add(Common::PerfReport::RenderPassReopens);
+        CountReopen(last_pass_end_file, last_pass_end_line, render_area);
+        if (pass_time_host_sampling) [[unlikely]] {
+            auto it = std::ranges::find_if(pass_time_reopens, [&](const PassReopen& reopen) {
+                return reopen.file == last_pass_end_file && reopen.line == last_pass_end_line &&
+                       reopen.width == render_area.width && reopen.height == render_area.height;
+            });
+            if (it == pass_time_reopens.end()) {
+                it = pass_time_reopens.insert(
+                    pass_time_reopens.end(),
+                    PassReopen{.file = last_pass_end_file,
+                               .line = last_pass_end_line,
+                               .width = static_cast<u16>((std::min)(render_area.width, 0xffffU)),
+                               .height = static_cast<u16>((std::min)(render_area.height, 0xffffU))});
+            }
+            ++it->count;
+        }
+    }
     const bool time_pass = static_cast<bool>(pass_time_pool);
     PassShape shape{};
     if (time_pass || Common::PerfReport::Enabled()) {
@@ -855,6 +974,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
             .color_discard_mask = static_cast<u8>(color_discard_mask | key.color_discard_mask),
             .depth_clear = depth_clear || key.depth_stencil_clear,
             .depth_discard = depth_discard || key.depth_stencil_discard,
+            .framebuffer = (u64)framebuffer_handle,
         };
         // The render pass's attachments are the valid formats, in slot order.
         u32 clear_mask{};
@@ -1021,6 +1141,8 @@ void Scheduler::FlushDeferredClear() {
         return;
     }
     RealizeDeferredClear();
+    pass_end_file = "deferred clear before a copy";
+    pass_end_line = 0;
     EndRenderPass();
 }
 
@@ -1038,7 +1160,7 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
         return;
     }
     if (state.renderpass) {
-        CountRenderPassEnd(location.file_name(), location.line());
+        NotePassEnd(location);
     }
     // Ends any active pass and realizes a deferred clear
     EndRenderPass();
@@ -1047,7 +1169,7 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
 
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
     if (state.renderpass) {
-        CountRenderPassEnd(location.file_name(), location.line());
+        NotePassEnd(location);
     }
     EndRenderPass();
     if (pass_time_host_sampling) [[unlikely]] {
@@ -1532,6 +1654,9 @@ void Scheduler::EndRenderPass()
         ++recording_epoch;
         fragment_barrier.Reset();
         render_pass_has_stores = false;
+        last_pass_framebuffer = state.framebuffer;
+        last_pass_end_file = std::exchange(pass_end_file, nullptr);
+        last_pass_end_line = std::exchange(pass_end_line, 0U);
 
         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
 

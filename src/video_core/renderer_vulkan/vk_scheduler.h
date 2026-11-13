@@ -516,6 +516,7 @@ private:
         u8 color_discard_mask = 0;
         bool depth_clear = false;
         bool depth_discard = false;
+        u64 framebuffer = 0; ///< Handle, to tell the targets of a frame apart
     };
 
     /// Begins a render pass for the given framebuffer, optionally with clear values.
@@ -532,6 +533,7 @@ private:
     u32 PassTimeWorkBegin(vk::CommandBuffer cmdbuf, u64 hash, std::array<u32, 3> size);
     void PassTimeWorkEnd(vk::CommandBuffer cmdbuf, u32 record);
     void ReportPassTimes();
+    void NotePassEnd(const std::source_location& location);
 
     /// If a deferred clear is pending.
     void RealizeDeferredClear();
@@ -647,6 +649,20 @@ private:
     u32 pass_draws{}; ///< Draws in the open render pass
     std::chrono::steady_clock::time_point pass_time_last{};
     bool pass_time_host_sampling{}; ///< This frame may be timed: label the work outside passes
+    /// A render pass that began on the framebuffer the last one ended on, loading what that stored.
+    struct PassReopen {
+        const char* file{}; ///< Caller that ended the pass before; null when it gave no place
+        u32 line{};
+        u16 width{};
+        u16 height{};
+        u32 count{};
+    };
+    VkFramebuffer last_pass_framebuffer{}; ///< Framebuffer of the render pass that ended last
+    const char* pass_end_file{}; ///< Caller about to end the open pass
+    u32 pass_end_line{};
+    const char* last_pass_end_file{};
+    u32 last_pass_end_line{};
+    std::vector<PassReopen> pass_time_reopens; ///< Of the frame being timed
     // Worker thread:
     u32 pass_time_open_label{~0U};
     std::vector<PassTimeRecord> pass_time_records;
@@ -660,6 +676,7 @@ private:
     bool pass_time_reset{};
     bool pass_time_closing{};
     bool pass_time_pending{};
+    std::vector<PassReopen> pass_time_reopen_report;
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 
