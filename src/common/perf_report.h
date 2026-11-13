@@ -47,6 +47,8 @@ enum Counter : std::size_t {
     CapWaits,            ///< Waits for the GPU at the pooled upload cap
     TextureCollected,    ///< Images the texture collector deleted
     TextureCollectorDownloads, ///< Of them, downloaded first (a wait for the GPU each)
+    TextureCollectorRedrawnDrops, ///< Of them, GPU-written but redrawn: no download
+                                  ///< (EDEN_NX2_TC_REDRAWN_FRAMES)
     BufferCollected,     ///< Buffers the buffer collector deleted
     MeshArenaWaits,      ///< Waits for a submission's mesh emulation arena
     UniformStreamBytes,  ///< Of StagingUploadBytes: uniform buffers streamed per draw
@@ -111,6 +113,9 @@ struct JitCore {
     std::atomic<u64> compile_ns{};
     std::atomic<u64> faults{};      ///< Fastmem faults in this core's code
     std::atomic<u64> dead_bytes{};  ///< Code of blocks invalidated in place (faults, range drops)
+    std::atomic<u64> live_blocks{}; ///< Blocks the cache keeps bookkeeping for
+    std::atomic<u64> table_bytes{}; ///< Heap bytes of the per-block tables
+    std::atomic<u64> list_bytes{};  ///< Heap bytes of the blocks' link and fastmem lists
 };
 inline std::array<JitCore, JitCores> g_jit_cores{};
 
@@ -133,6 +138,23 @@ inline void NoteJitUse(std::size_t core, u64 used, u64 cache_size) {
             jc->peak.store(used, std::memory_order_relaxed);
         }
     }
+}
+
+/// The heap a core's cache keeps beside its code (arm64 backend).
+inline void NoteJitTables(std::size_t core, u64 blocks, u64 table_bytes, u64 list_bytes) {
+    if (JitCore* const jc = JitCoreOf(core)) {
+        jc->live_blocks.store(blocks, std::memory_order_relaxed);
+        jc->table_bytes.store(table_bytes, std::memory_order_relaxed);
+        jc->list_bytes.store(list_bytes, std::memory_order_relaxed);
+    }
+}
+
+/// The fastmem markers all guest cores share: accesses, and blocks that gave up fastmem.
+inline std::atomic<u64> g_jit_markers{};
+inline std::atomic<u64> g_jit_marker_blocks{};
+inline void NoteJitMarkers(u64 markers, u64 blocks) {
+    g_jit_markers.store(markers, std::memory_order_relaxed);
+    g_jit_marker_blocks.store(blocks, std::memory_order_relaxed);
 }
 
 inline void NoteJitCompile(std::size_t core, u64 ns) {
@@ -172,6 +194,7 @@ inline void NoteJitEviction(std::size_t core, u64 bytes) {
 
 struct JitCoreCounts {
     u64 flushes, evictions, evicted_bytes, blocks, compile_ns, faults, dead_bytes;
+    u64 live_blocks, table_bytes, list_bytes;
 };
 
 inline std::array<JitCoreCounts, JitCores> ReadJitCores() {
@@ -184,7 +207,10 @@ inline std::array<JitCoreCounts, JitCores> ReadJitCores() {
                   jc.blocks.load(std::memory_order_relaxed),
                   jc.compile_ns.load(std::memory_order_relaxed),
                   jc.faults.load(std::memory_order_relaxed),
-                  jc.dead_bytes.load(std::memory_order_relaxed)};
+                  jc.dead_bytes.load(std::memory_order_relaxed),
+                  jc.live_blocks.load(std::memory_order_relaxed),
+                  jc.table_bytes.load(std::memory_order_relaxed),
+                  jc.list_bytes.load(std::memory_order_relaxed)};
     }
     return out;
 }
@@ -242,6 +268,9 @@ Placement ReadPlacement();
 /// The first CPU id counted as "high" (Apple: the number of efficiency cores, which come first);
 /// 0 when unknown.
 u32 HighCpuFirst();
+/// Apple: the OS thermal pressure level (0 nominal, 10 moderate, 20 heavy, 30 trapping, 40
+/// sleeping), finer than the thermal state apps are told; -1 where unknown.
+int ThermalPressure();
 
 inline std::array<u64, Count> Read() {
     std::array<u64, Count> values{};

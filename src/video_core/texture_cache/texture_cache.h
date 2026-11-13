@@ -157,6 +157,25 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
         const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
         return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
     }();
+    // EDEN_NX2_TC_REDRAWN_FRAMES=<n> (iOS device profile; 0 = off): a GPU-written image the GPU
+    // wrote in at least n frames is a target the game draws again before it reads it, so it goes
+    // without a download (a full wait for the GPU each: 63-78 per 10 s on an iPhone18,2 in Kokiri).
+    static const u32 redrawn_frames = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_REDRAWN_FRAMES");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+    }();
+    // EDEN_NX2_TC_REUPLOAD_FIRST=1 (iOS device profile): images made again from guest memory go
+    // first; images that need a download only once the cache is past its critical size or an
+    // allocation failed (host memory pressure alone no longer downloads).
+    static const bool reupload_first = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_REUPLOAD_FIRST");
+        return value != nullptr && value[0] == '1';
+    }();
+    bool defer_downloads = reupload_first && !out_of_memory;
+    const auto NeedsDownload = [this](const ImageBase& image) {
+        return IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap) &&
+               (redrawn_frames == 0 || image.written_frames < redrawn_frames);
+    };
     const auto Configure = [&](bool allow_aggressive) {
         high_priority_mode = urgent || total_used_memory >= expected_memory;
         aggressive_mode =
@@ -166,7 +185,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly, out_of_memory](ImageId image_id) {
+                          &evict_old_costly, &defer_downloads, &NeedsDownload,
+                          out_of_memory](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -175,10 +195,14 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
         if (True(image.flags & ImageFlagBits::IsDecoding)) {
             return false;
         }
-        const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+        const bool must_download = NeedsDownload(image);
         if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
-            (!high_priority_mode && must_download)) {
+            (!high_priority_mode && must_download) || (defer_downloads && must_download)) {
             return false;
+        }
+        if (!must_download && IsDownloadable(image) &&
+            False(image.flags & ImageFlagBits::BadOverlap)) {
+            Common::PerfReport::Add(Common::PerfReport::TextureCollectorRedrawnDrops);
         }
         // EDEN_NX2_EXP57 (live, 0 = off): at most one download with a full wait for the GPU per
         // frame unless an allocation failed. A player's first high-priority pass downloaded
@@ -250,11 +274,11 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
                     if (True(image.flags & ImageFlagBits::IsDecoding)) {
                         return false;
                     }
-                    const bool must_download =
-                        IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+                    const bool must_download = NeedsDownload(image);
                     return !((!aggressive_mode && !evict_old_costly &&
                               True(image.flags & ImageFlagBits::CostlyLoad)) ||
-                             (!high_priority_mode && must_download));
+                             (!high_priority_mode && must_download) ||
+                             (defer_downloads && must_download));
                 })) {
                 return;
             }
@@ -344,6 +368,11 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
     }
     Collect();
     if (urgent || total_used_memory >= critical_memory) {
+        Configure(true);
+        Collect();
+    }
+    if (defer_downloads && total_used_memory >= critical_memory) {
+        defer_downloads = false;
         Configure(true);
         Collect();
     }
@@ -631,6 +660,7 @@ template <class P>
 std::string TextureCache<P>::ImageCensus() {
     struct Shape {
         u64 bytes;
+        u64 host_bytes;
         u32 count;
         u32 cold;
     };
@@ -638,6 +668,7 @@ std::string TextureCache<P>::ImageCensus() {
     std::vector<std::pair<VAddr, std::pair<VAddr, u64>>> ranges;
     u64 cold_written = 0;
     u64 written = 0;
+    u64 redrawn = 0;
     // Not touched (bound, sampled, prepared) for 600 frames.
     std::array<u64, 2> unused{};
     for (const auto [image_id, image] : slot_images) {
@@ -653,6 +684,7 @@ std::string TextureCache<P>::ImageCensus() {
         if (gpu) {
             written += bytes;
             cold_written += cold ? bytes : 0;
+            redrawn += image->written_frames >= 8 ? bytes : 0;
         }
         Shape& shape = shapes[{gpu, image->info.size.width, image->info.size.height,
                                static_cast<u32>(image->info.format),
@@ -660,6 +692,9 @@ std::string TextureCache<P>::ImageCensus() {
                                static_cast<u32>(image->info.resources.levels),
                                image->info.num_samples}];
         shape.bytes += bytes;
+        if constexpr (requires { image->MemoryBlock(); }) {
+            shape.host_bytes += image->MemoryBlock().size;
+        }
         ++shape.count;
         shape.cold += cold ? 1 : 0;
         if (True(image->flags & ImageFlagBits::Registered)) {
@@ -683,19 +718,19 @@ std::string TextureCache<P>::ImageCensus() {
     for (const auto& [key, shape] : shapes) {
         const auto& [gpu, width, height, format, layers, levels, samples] = key;
         top.emplace_back(shape.bytes,
-                         fmt::format("{} {}x{} fmt {} L{} M{}{} x{} {} MiB{}",
+                         fmt::format("{} {}x{} fmt {} L{} M{}{} x{} {} MiB (host {}){}",
                                      gpu ? "written" : "texture", width, height, format, layers,
                                      levels, samples > 1 ? fmt::format(" S{}", samples) : "",
-                                     shape.count, shape.bytes >> 20,
+                                     shape.count, shape.bytes >> 20, shape.host_bytes >> 20,
                                      shape.cold != 0 ? fmt::format(" ({} cold)", shape.cold)
                                                      : std::string{}));
     }
     std::sort(top.rbegin(), top.rend());
     std::string text = fmt::format(
-        "GPU-written {} MiB ({} MiB not written for 600 frames), unused for 600 frames: "
-        "textures {} MiB, GPU-written {} MiB, overlapping registered images {} ({} MiB), idle "
-        "sweep deleted {} | largest shapes:",
-        written >> 20, cold_written >> 20, unused[0] >> 20, unused[1] >> 20, overlapped_count,
+        "GPU-written {} MiB ({} MiB not written for 600 frames, {} MiB written in 8+ frames), "
+        "unused for 600 frames: textures {} MiB, GPU-written {} MiB, overlapping registered "
+        "images {} ({} MiB), idle sweep deleted {} | largest shapes:",
+        written >> 20, cold_written >> 20, redrawn >> 20, unused[0] >> 20, unused[1] >> 20, overlapped_count,
         overlapped >> 20, idle_deleted);
     for (size_t i = 0; i < (std::min<size_t>)(16, top.size()); ++i) {
         text += fmt::format("{} {}", i == 0 ? "" : ";", top[i].second);
@@ -5838,6 +5873,7 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
     image.flags |= ImageFlagBits::CpuModified;
     image.last_write_frame = ~u64{0};
     image.relocation_guard_noted = 0;
+    image.written_frames = 0;
     image.last_clear_frame = ~u64{0};
     image.previous_clear_frame = ~u64{0};
     image.drawn_since_clear = false;
@@ -5863,6 +5899,9 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     NoteGpuModified(image);
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
+    if (image.last_write_frame != RenderFrame() && image.written_frames != 0xFFFF) {
+        ++image.written_frames;
+    }
     image.last_write_frame = RenderFrame();
     if (!clearing_render_targets) {
         image.drawn_since_clear = true;

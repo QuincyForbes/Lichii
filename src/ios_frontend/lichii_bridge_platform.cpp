@@ -231,6 +231,26 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_UINT8_INDICES", "1", 0);
         LOG_WARNING(Frontend, "iOS: experiment mvk_uint8_indices on");
     }
+    // These replace device profile switches (ApplyTuning ran first), so they overwrite.
+    if (lichii_platform_experiment("tc_old_eviction")) {
+        setenv("EDEN_NX2_TC_REDRAWN_FRAMES", "0", 1);
+        setenv("EDEN_NX2_TC_REUPLOAD_FIRST", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment tc_old_eviction on");
+    }
+    if (lichii_platform_experiment("helper_qos_off")) {
+        setenv("EDEN_NX2_APPLE_HELPER_QOS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment helper_qos_off on");
+    }
+    if (lichii_platform_experiment("jit_old_tables")) {
+        setenv("EDEN_NX2_JIT_PACKED_LISTS", "0", 1);
+        setenv("EDEN_NX2_JIT_FAULT_LOCAL", "1", 1);
+        setenv("EDEN_NX2_JIT_RANGE_COMPACT", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment jit_old_tables on");
+    }
+    if (lichii_platform_experiment("frame_deadlines")) {
+        setenv("EDEN_NX2_APPLE_WORKGROUP", "30", 0);
+        LOG_WARNING(Frontend, "iOS: experiment frame_deadlines on");
+    }
 }
 
 LichiiThermalAdvice ComputeThermalAdvice(int thermal_state, int low_power_mode) {

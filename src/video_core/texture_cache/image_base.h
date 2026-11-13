@@ -136,6 +136,8 @@ struct ImageBase {
     /// never, or contents discarded), and the guard reasons this image already reported.
     u64 last_write_frame = ~u64{0};
     u8 relocation_guard_noted = 0;
+    /// Render frames the GPU wrote the image in (saturating), for the collector's redrawn rule.
+    u16 written_frames = 0;
 
     /// Asynchronous shaders' skip rule (EDEN_NX2_ASYNC_DISCARD=2, ClassifyClearedTarget): the
     /// render frames of the image's last two full clears that had a write between them (~0 =
