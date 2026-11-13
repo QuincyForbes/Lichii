@@ -54,6 +54,21 @@ public:
 
     virtual void ClearCache();
 protected:
+    // What a block keeps after it is linked: a 32-byte table slot, the link and fastmem lists
+    // apart and only when there are any. EmittedBlockInfo in block_infos was 96 bytes a slot
+    // (45.5 MiB tables per guest core in the iPhone malloc census).
+    struct StoredBlockInfo {
+        struct Lists {
+            decltype(EmittedBlockInfo::block_relocations) block_relocations;
+            decltype(EmittedBlockInfo::fastmem_patch_info) fastmem_patch_info;
+        };
+        CodePtr entry_point;
+        std::size_t size;
+        std::unique_ptr<Lists> lists;
+
+        const std::vector<BlockRelocation>* RelocationsTo(IR::LocationDescriptor target) const;
+    };
+
     struct BlockReferences {
         std::array<CodePtr, 2> first{};
         std::unique_ptr<std::vector<CodePtr>> rest;
@@ -110,7 +125,7 @@ protected:
     std::vector<std::pair<CodePtr, IR::LocationDescriptor>> old_reverse_entries;
     std::size_t old_reverse_head = 0;
     ::Common::unordered_map<IR::LocationDescriptor, CodePtr> block_entries;
-    ::Common::unordered_map<CodePtr, EmittedBlockInfo> block_infos;
+    ::Common::unordered_map<CodePtr, StoredBlockInfo> block_infos;
     ::Common::unordered_map<IR::LocationDescriptor, BlockReferences> block_references;
 
     ExceptionHandler exception_handler;

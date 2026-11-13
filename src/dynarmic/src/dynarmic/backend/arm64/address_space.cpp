@@ -352,11 +352,13 @@ void AddressSpace::EvictBlock(CodePtr entry_point, IR::LocationDescriptor descri
         return;
     }
     // This block no longer links to anything: forget it as a referrer.
-    for (const auto& [target, list] : info->second.block_relocations) {
-        if (const auto refs = block_references.find(target); refs != block_references.end()) {
-            refs->second.Remove(entry_point);
-            if (refs->second.Empty()) {
-                block_references.erase(refs);
+    if (info->second.lists) {
+        for (const auto& [target, list] : info->second.lists->block_relocations) {
+            if (const auto refs = block_references.find(target); refs != block_references.end()) {
+                refs->second.Remove(entry_point);
+                if (refs->second.Empty()) {
+                    block_references.erase(refs);
+                }
             }
         }
     }
@@ -381,15 +383,17 @@ CodePtr AddressSpace::Emit(IR::Block block) {
     ASSERT(block_entries.insert({block.Location(), entry_point}).second);
     ASSERT(reverse_block_entries.empty() || reverse_block_entries.back().first < entry_point);
     reverse_block_entries.emplace_back(entry_point, block.Location());
-    const auto [info_iter, inserted] = block_infos.emplace(entry_point, std::move(block_info));
-    ASSERT(inserted);
-    EmittedBlockInfo& stored_info = info_iter->second;
-
-    Link(stored_info);
-    std::vector<Relocation>{}.swap(stored_info.relocations);
+    Link(block_info);
+    StoredBlockInfo stored_info{entry_point, block_info.size, nullptr};
+    if (!block_info.block_relocations.empty() || !block_info.fastmem_patch_info.empty()) {
+        stored_info.lists = std::make_unique<StoredBlockInfo::Lists>();
+        stored_info.lists->block_relocations = std::move(block_info.block_relocations);
+        stored_info.lists->fastmem_patch_info = std::move(block_info.fastmem_patch_info);
+    }
+    ASSERT(block_infos.emplace(entry_point, std::move(stored_info)).second);
     RelinkForDescriptor(block.Location(), entry_point);
 
-    mem.invalidate(reinterpret_cast<u32*>(entry_point), stored_info.size);
+    mem.invalidate(reinterpret_cast<u32*>(entry_point), block_info.size);
     ProtectCodeMemory();
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -407,7 +411,7 @@ CodePtr AddressSpace::Emit(IR::Block block) {
     }
 #endif
 
-    RegisterNewBasicBlock(block, stored_info);
+    RegisterNewBasicBlock(block, block_info);
 
     return entry_point;
 }
@@ -632,6 +636,14 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
     }
 }
 
+const std::vector<BlockRelocation>* AddressSpace::StoredBlockInfo::RelocationsTo(IR::LocationDescriptor target) const {
+    if (!lists) {
+        return nullptr;
+    }
+    const auto iter = lists->block_relocations.find(target);
+    return iter != lists->block_relocations.end() ? &iter->second : nullptr;
+}
+
 void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr) {
     const auto refs_iter = block_references.find(target_descriptor);
     if (refs_iter == block_references.end()) {
@@ -640,11 +652,10 @@ void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor,
 
     const auto relink_one = [&](CodePtr code_ptr) {
         if (auto block_iter = block_infos.find(code_ptr); block_iter != block_infos.end()) {
-            const EmittedBlockInfo& block_info = block_iter->second;
+            const StoredBlockInfo& block_info = block_iter->second;
 
-            if (auto relocation_iter = block_info.block_relocations.find(target_descriptor);
-                relocation_iter != block_info.block_relocations.end()) {
-                LinkBlockLinks(block_info.entry_point, target_ptr, relocation_iter->second);
+            if (const auto* list = block_info.RelocationsTo(target_descriptor)) {
+                LinkBlockLinks(block_info.entry_point, target_ptr, *list);
             }
 
             mem.invalidate(reinterpret_cast<u32*>(block_info.entry_point), block_info.size);
@@ -674,12 +685,13 @@ FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
         }
 
         const auto block_info = block_infos.find(entry_point);
-        if (block_info == block_infos.end()) {
+        if (block_info == block_infos.end() || !block_info->second.lists) {
             goto fail;
         }
 
-        const auto patch_entry = block_info->second.fastmem_patch_info.find(host_ptr - entry_point);
-        if (patch_entry == block_info->second.fastmem_patch_info.end()) {
+        const auto& patches = block_info->second.lists->fastmem_patch_info;
+        const auto patch_entry = patches.find(host_ptr - entry_point);
+        if (patch_entry == patches.end()) {
             goto fail;
         }
 
