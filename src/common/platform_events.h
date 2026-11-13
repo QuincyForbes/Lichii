@@ -43,7 +43,8 @@ bool GuestInFile();
 /// -ins a second that count as thrashing, default 1500; 0 off); the rest in GuestReserveTracker.
 u64 GuestFileReserve();
 /// The part of `reserve` the caches give up with `left` bytes left to the process and `own` of
-/// it kept for themselves: at most EDEN_NX2_GUEST_RESERVE_SHARE percent (default 50, 100 = all)
+/// it kept for themselves: at most EDEN_NX2_GUEST_RESERVE_SHARE percent (default 50; 100 = all:
+/// the caches see only their own part left, no room, as with the unbounded reserve)
 /// of the room past `own`. An iPhone whose reserve had grown to 3072 MiB saw "1 MiB left" with
 /// 1.4-4 GiB left and collected textures and buffers every frame.
 u64 BoundedGuestFileReserve(u64 reserve, u64 left, u64 own);
