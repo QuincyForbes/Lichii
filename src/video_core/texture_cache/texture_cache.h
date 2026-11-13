@@ -664,7 +664,7 @@ std::string TextureCache<P>::ImageCensus() {
         u32 count;
         u32 cold;
     };
-    std::map<std::tuple<bool, u32, u32, u32, u32, u32, u32>, Shape> shapes;
+    std::map<std::tuple<bool, u32, u32, u32, u32, u32, u32, u32>, Shape> shapes;
     std::vector<std::pair<VAddr, std::pair<VAddr, u64>>> ranges;
     u64 cold_written = 0;
     u64 written = 0;
@@ -687,6 +687,7 @@ std::string TextureCache<P>::ImageCensus() {
             redrawn += image->written_frames >= 8 ? bytes : 0;
         }
         Shape& shape = shapes[{gpu, image->info.size.width, image->info.size.height,
+                               image->info.size.depth,
                                static_cast<u32>(image->info.format),
                                static_cast<u32>(image->info.resources.layers),
                                static_cast<u32>(image->info.resources.levels),
@@ -716,10 +717,11 @@ std::string TextureCache<P>::ImageCensus() {
     }
     std::vector<std::pair<u64, std::string>> top;
     for (const auto& [key, shape] : shapes) {
-        const auto& [gpu, width, height, format, layers, levels, samples] = key;
+        const auto& [gpu, width, height, depth, format, layers, levels, samples] = key;
         top.emplace_back(shape.bytes,
-                         fmt::format("{} {}x{} fmt {} L{} M{}{} x{} {} MiB (host {}){}",
-                                     gpu ? "written" : "texture", width, height, format, layers,
+                         fmt::format("{} {}x{}{} fmt {} L{} M{}{} x{} {} MiB (host {}){}",
+                                     gpu ? "written" : "texture", width, height,
+                                     depth > 1 ? fmt::format("x{}", depth) : "", format, layers,
                                      levels, samples > 1 ? fmt::format(" S{}", samples) : "",
                                      shape.count, shape.bytes >> 20, shape.host_bytes >> 20,
                                      shape.cold != 0 ? fmt::format(" ({} cold)", shape.cold)
