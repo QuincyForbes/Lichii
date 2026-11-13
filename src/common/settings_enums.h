@@ -168,6 +168,9 @@ ENUM(TextureQuality, Full, Half, Quarter);
 // Above 100 % it is Full with the emulator's resolution scale (EffectiveResolutionSetup).
 ENUM(OotResolution, Game, Full, Percent87, Percent75, Percent56, Percent50, Percent150, Percent200,
      Percent300);
+// Ocarina of Time's graphics: edits of the game's own parameter files (Settings
+// oot_graphics_preset, core/file_sys/oot_game_params.cpp).
+ENUM(OotGraphicsPreset, PhoneLow, PhoneMedium, Console, High);
 // Ocarina of Time's frame rate (Settings oot_frame_rate).
 ENUM(OotFrameRate, Fps30, Fps60, Unlocked);
 // Mario Kart World's frame rate mode (Settings mkw_frame_rate, loader/nso.cpp).

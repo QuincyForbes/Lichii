@@ -208,7 +208,7 @@ enum SettingsCatalog {
 
     /// Shown first, in this order.
     static let essentials = [
-        "resolution_setup", "oot_resolution", "texture_quality", "upscaler", "scaling_filter",
+        "resolution_setup", "oot_graphics_preset", "oot_resolution", "texture_quality", "upscaler", "scaling_filter",
         "fsr_sharpening_slider", "anti_aliasing", "oot_frame_rate", "mkw_frame_rate", "frame_gen", "frame_gen_type", "frame_gen_multiplier", "use_vsync", "frame_pacing_mode",
         "use_speed_limit", "speed_limit", "use_docked_mode", "gpu_accuracy", "cpu_accuracy",
         "use_asynchronous_shaders", "use_disk_shader_cache", "aspect_ratio", "volume", "audio_muted",
@@ -324,6 +324,7 @@ enum SettingsCatalog {
         "cpuopt_compact_jit_code": "About half as much translated CPU code, so the code cache holds twice as much. Applies the next time the game starts.",
         "texture_quality": "Half or Quarter loads the game's large textures with less detail: softer up close, much less memory (about 1.2 GB less in Ocarina of Time). Applies the next time the game starts.",
         "resolution_setup": "The size games draw at. Games with their own Resolution (Ocarina of Time) use that instead. Higher is sharper and costs GPU time, memory and battery.",
+        "oot_graphics_preset": "Shadows, reflections and effects as the game sets them. Phone Low: a small reflection probe, no bloom or depth of field, one small sun shadow, thinner grass, 50 % resolution and Quarter textures (about a third fewer render passes). Phone Medium: a small reflection probe and two small sun shadows, 56 % and Half. Console: the game as shipped. High: sharper sun shadows. Picking one sets Resolution and Texture Quality too; applies the next time the game starts.",
         "oot_resolution": "The size the game draws at, the one resolution setting for it. Dynamic: the game's own, lower when it thinks the GPU is busy. A percentage: a fixed share of full size (handheld 100% 1920x1080, 75% 1440x810, 56% 1080x608, 50% 960x540): less GPU work and memory, softer picture. Above 100% the emulator scales it up. With MetalFX Temporal or AMD FSR 3.1 as the Upscaler, Dynamic draws at 75% handheld (100% docked): they take only that size every frame. Applies the next time the game starts.",
         "oot_frame_rate": "30 FPS saves power and heat; Unlocked follows the frame rate limit. The game keeps its normal speed at each.",
         "mkw_frame_rate": "The game's native 30 FPS mode, or dynamic 30-60 FPS (experimental). Applies the next time the game starts.",
@@ -366,6 +367,7 @@ enum SettingsCatalog {
         "patch_image": enhancementsCategory,
         "resolution_setup": resolutionCategory,
         "texture_quality": resolutionCategory,
+        "oot_graphics_preset": resolutionCategory,
         "max_anisotropy": resolutionCategory,
         "upscaler": upscalingCategory,
         "scaling_filter": upscalingCategory,
@@ -544,6 +546,7 @@ enum SettingLabels {
         "oot_anti_aliasing": "Sharpening",
         "oot_movie_upscale": "Movies",
         "texture_quality": "Texture Quality",
+        "oot_graphics_preset": "Graphics Preset",
         "oot_resolution": "Resolution",
         "oot_frame_rate": "Frame Rate",
         "mkw_frame_rate": "Frame Rate",
@@ -591,6 +594,9 @@ enum SettingLabels {
             "MetalFx": "MetalFX Temporal",
         ],
         "oot_anti_aliasing": ["Game": "Game's own", "NoSharpening": "No sharpening"],
+        "oot_graphics_preset": [
+            "PhoneLow": "Phone Low", "PhoneMedium": "Phone Medium", "Console": "Console", "High": "High",
+        ],
         "oot_frame_rate": ["Fps30": "30 FPS", "Fps60": "60 FPS", "Unlocked": "Unlocked (frame rate limit)"],
         "mkw_frame_rate": ["Game": "Game's own", "Fps30": "30 FPS", "Dynamic": "Dynamic 30-60 FPS"],
         "moltenvk_driver": ["Legacy": "Legacy MoltenVK", "Mesh": "New MoltenVK (native mesh shaders)"],

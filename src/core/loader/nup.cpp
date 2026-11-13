@@ -18,6 +18,7 @@
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/romfs.h"
+#include "core/file_sys/oot_game_params.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/texture_quality.h"
 #include "core/file_sys/vfs/vfs_vector.h"
@@ -293,6 +294,9 @@ ResultStatus AppLoader_NUP::ReadRomFS(FileSys::VirtualFile& out_file) {
                 fmt::format("{:016X}-{}-{}{}.bin", base_title_id, file->GetSize(), levels,
                             arrays ? "a" : ""),
             arrays);
+    }
+    if (patch_system != nullptr) {
+        merged = FileSys::ApplyOotGameParams(merged, FileSys::OotGameParamsFor(base_title_id));
     }
     // Mods go into the tree before the RomFS is built: layering them over the built RomFS
     // unpacks all of its files again and keeps both RomFS tables alive.

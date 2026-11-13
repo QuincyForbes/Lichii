@@ -246,6 +246,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     std::vector<QWidget*> hold_api;
     QCheckBox* frame_gen_checkbox = nullptr;
     QCheckBox* flow_scale_auto_checkbox = nullptr;
+    QComboBox* oot_preset_combobox = nullptr;
+    QComboBox* texture_quality_combobox = nullptr;
     QComboBox* frame_gen_motion_combobox = nullptr;
     const bool runtime_lock = !system.IsPoweredOn();
     const auto make_enum_row = [&](Settings::BasicSetting* s, const QString& label_text,
@@ -405,6 +407,10 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             flow_scale_auto_checkbox = widget->checkbox;
         } else if (setting->Id() == Settings::values.oot_resolution.Id()) {
             oot_resolution_combobox = widget->combobox;
+        } else if (setting->Id() == Settings::values.oot_graphics_preset.Id()) {
+            oot_preset_combobox = widget->combobox;
+        } else if (setting->Id() == Settings::values.texture_quality.Id()) {
+            texture_quality_combobox = widget->combobox;
         }
 
         if (setting->Id() == Settings::values.renderer_backend.Id()) {
@@ -587,6 +593,31 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                 graphics_layout.addWidget(widget);
             }
         }
+    }
+
+    // A phone preset of Ocarina of Time's graphics also picks its resolution and texture quality.
+    if (oot_preset_combobox != nullptr) {
+        const auto pick = [](QComboBox* box, u32 value) {
+            if (box == nullptr) {
+                return;
+            }
+            if (const int index = box->findData(value); index >= 0) {
+                box->setCurrentIndex(index);
+            }
+        };
+        QComboBox* const preset_box = oot_preset_combobox;
+        connect(preset_box, &QComboBox::activated, this,
+                [this, pick, preset_box, texture_quality_combobox](int index) {
+                    const auto companions = Settings::OotGraphicsPresetCompanions(
+                        static_cast<Settings::OotGraphicsPreset>(
+                            preset_box->itemData(index).toUInt()));
+                    if (companions.resolution) {
+                        pick(oot_resolution_combobox, static_cast<u32>(*companions.resolution));
+                    }
+                    if (companions.textures) {
+                        pick(texture_quality_combobox, static_cast<u32>(*companions.textures));
+                    }
+                });
     }
 
     // The manual flow scale is only read while Auto Flow Scale is off.

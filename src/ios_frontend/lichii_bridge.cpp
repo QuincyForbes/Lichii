@@ -534,6 +534,7 @@ const std::map<u32, std::vector<EnumChoice>>& EnumTable() {
         AddEnum<OotMovieUpscale>(t);
         AddEnum<TextureQuality>(t);
         AddEnum<OotResolution>(t);
+        AddEnum<OotGraphicsPreset>(t);
         AddEnum<OotFrameRate>(t);
         AddEnum<MkwFrameRate>(t);
         AddEnum<GamePatchMode>(t);
@@ -764,6 +765,36 @@ char* lichii_settings_get_default(const char* key) {
     return Dup(setting ? setting->DefaultToString() : std::string{});
 }
 
+// Picking an Ocarina graphics preset also picks its resolution and texture quality, in the same
+// scope (this game, or the global values).
+static void ApplyOotPresetCompanions() {
+    auto& v = Settings::values;
+    const bool game = InGameScope();
+    const auto companions =
+        Settings::OotGraphicsPresetCompanions(v.oot_graphics_preset.GetValue(!game));
+    const auto set = [game](auto& setting, auto value) {
+        if (game) {
+            setting.SetGlobal(false);
+            setting.SetValue(value);
+            return;
+        }
+        const bool custom = !setting.UsingGlobal();
+        if (custom) {
+            setting.SetGlobal(true);
+        }
+        setting.SetValue(value);
+        if (custom) {
+            setting.SetGlobal(false);
+        }
+    };
+    if (companions.resolution) {
+        set(v.oot_resolution, *companions.resolution);
+    }
+    if (companions.textures) {
+        set(v.texture_quality, *companions.textures);
+    }
+}
+
 bool lichii_settings_set(const char* key, const char* value) {
     auto* setting = FindSetting(key);
     if (setting == nullptr || value == nullptr) {
@@ -775,6 +806,9 @@ bool lichii_settings_set(const char* key, const char* value) {
         }
         setting->SetGlobal(false);
         setting->LoadString(value);
+        if (std::string_view{key} == "oot_graphics_preset") {
+            ApplyOotPresetCompanions();
+        }
         return true;
     }
     // A running game may use its own value; the global one is written underneath.
@@ -785,6 +819,9 @@ bool lichii_settings_set(const char* key, const char* value) {
     setting->LoadString(value);
     if (custom) {
         setting->SetGlobal(false);
+    }
+    if (std::string_view{key} == "oot_graphics_preset") {
+        ApplyOotPresetCompanions();
     }
     return true;
 }

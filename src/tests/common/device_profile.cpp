@@ -48,9 +48,10 @@ TEST_CASE("iPhone 17 Pro Max gets the phone profile", "[device_profile]") {
     CHECK(profile.device_name == "iPhone 17 Pro Max (A19 Pro, 12 GB)");
     CHECK(Value(profile, "resolution_setup") == "Res1X");
     CHECK(Value(profile, "use_docked_mode") == "Handheld");
-    CHECK(Value(profile, "oot_resolution") == "Percent56");
+    CHECK(Value(profile, "oot_resolution") == "Percent50");
+    CHECK(Value(profile, "oot_graphics_preset") == "PhoneLow");
     CHECK(Value(profile, "oot_frame_rate") == "Fps30");
-    CHECK(Value(profile, "texture_quality") == "Half");
+    CHECK(Value(profile, "texture_quality") == "Quarter");
     CHECK(Value(profile, "scaling_filter") == "MetalFxSpatial");
     CHECK(Value(profile, "anti_aliasing") == "None");
     CHECK(Value(profile, "upscaler") == "Auto");
@@ -137,24 +138,25 @@ TEST_CASE("Applying the profile sets the global values and reports changes", "[d
     bool texture = false;
     for (const auto& change : before) {
         if (change.key == "texture_quality") {
-            texture = change.from == "Full" && change.to == "Half";
+            texture = change.from == "Full" && change.to == "Quarter";
         }
     }
     CHECK(texture);
     const auto applied = Profile::Apply(profile);
     CHECK(applied.size() == before.size());
-    CHECK(values.texture_quality.GetValue() == Settings::TextureQuality::Half);
-    CHECK(values.oot_resolution.GetValue() == Settings::OotResolution::Percent56);
+    CHECK(values.texture_quality.GetValue() == Settings::TextureQuality::Quarter);
+    CHECK(values.oot_resolution.GetValue() == Settings::OotResolution::Percent50);
+    CHECK(values.oot_graphics_preset.GetValue() == Settings::OotGraphicsPreset::PhoneLow);
     CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::MetalFxSpatial);
     CHECK(Profile::Differences(profile).empty());
 
     // A game's own value is kept; the global one underneath changes.
     values.texture_quality.SetValue(Settings::TextureQuality::Full);
     values.texture_quality.SetGlobal(false);
-    values.texture_quality.SetValue(Settings::TextureQuality::Quarter);
+    values.texture_quality.SetValue(Settings::TextureQuality::Half);
     Profile::Apply(profile);
-    CHECK(values.texture_quality.GetValue() == Settings::TextureQuality::Quarter);
-    CHECK(values.texture_quality.GetValue(true) == Settings::TextureQuality::Half);
+    CHECK(values.texture_quality.GetValue() == Settings::TextureQuality::Half);
+    CHECK(values.texture_quality.GetValue(true) == Settings::TextureQuality::Quarter);
     const auto reset = Profile::ResetGameOverrides();
     CHECK_FALSE(reset.empty());
     CHECK(values.texture_quality.UsingGlobal());
@@ -171,9 +173,9 @@ TEST_CASE("Resetting a game to recommended writes the profile's values for it",
     values.oot_resolution.SetValue(Settings::OotResolution::Game);
     values.gpu_accuracy.SetValue(Settings::GpuAccuracy::Low);
     values.texture_quality.SetGlobal(false);
-    values.texture_quality.SetValue(Settings::TextureQuality::Quarter);
+    values.texture_quality.SetValue(Settings::TextureQuality::Half);
     values.oot_resolution.SetGlobal(false);
-    values.oot_resolution.SetValue(Settings::OotResolution::Percent50);
+    values.oot_resolution.SetValue(Settings::OotResolution::Percent56);
     values.resolution_setup.SetGlobal(false);
     values.resolution_setup.SetValue(Settings::ResolutionSetup::Res3_4X);
     values.frame_rate_limit.SetGlobal(false);
@@ -181,14 +183,14 @@ TEST_CASE("Resetting a game to recommended writes the profile's values for it",
 
     constexpr u64 Ocarina = Settings::OcarinaOfTimeProgramId;
     const auto planned = Profile::ResetGameToRecommended(profile, Ocarina, true);
-    CHECK(values.texture_quality.GetValue() == Settings::TextureQuality::Quarter);
+    CHECK(values.texture_quality.GetValue() == Settings::TextureQuality::Half);
     const auto changes = Profile::ResetGameToRecommended(profile, Ocarina);
     CHECK(planned.size() == changes.size());
 
     CHECK_FALSE(values.texture_quality.UsingGlobal());
-    CHECK(values.texture_quality.GetValue() == Settings::TextureQuality::Half);
+    CHECK(values.texture_quality.GetValue() == Settings::TextureQuality::Quarter);
     CHECK(values.texture_quality.GetValue(true) == Settings::TextureQuality::Full);
-    CHECK(values.oot_resolution.GetValue() == Settings::OotResolution::Percent56);
+    CHECK(values.oot_resolution.GetValue() == Settings::OotResolution::Percent50);
     CHECK(values.oot_frame_rate.GetValue() == Settings::OotFrameRate::Fps30);
     // Replaced by Ocarina's own resolution, and not in the profile: back to global.
     CHECK(values.resolution_setup.UsingGlobal());
@@ -198,7 +200,7 @@ TEST_CASE("Resetting a game to recommended writes the profile's values for it",
     bool texture = false;
     for (const auto& change : changes) {
         if (change.key == "texture_quality") {
-            texture = change.from == "Quarter" && change.to == "Half";
+            texture = change.from == "Half" && change.to == "Quarter";
         }
     }
     CHECK(texture);

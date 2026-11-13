@@ -144,7 +144,6 @@ void RecommendApple(const Device& device, Profile& p) {
     }
     p.tier = row != nullptr ? row->tier : Tier::Unsupported;
     const bool phone = !device.is_ipad;
-    const bool small = p.tier == Tier::Low || p.tier == Tier::Unsupported;
     if (p.tier == Tier::Unsupported) {
         p.note = "Under 6 GB of memory or older than A15: Switch 2 games will likely be closed by "
                  "iOS.";
@@ -162,24 +161,31 @@ void RecommendApple(const Device& device, Profile& p) {
         Add(p, v.oot_resolution, OotResolution::Game,
             "No iPad run yet: the game's own dynamic resolution.");
     } else {
-        Add(p, v.oot_resolution, small ? OotResolution::Percent50 : OotResolution::Percent56,
-            small ? "960x540: the smallest fixed size, for 6 GB devices."
-                  : "1080x608, the size HookLink runs the game at on iPhones. A fixed size: the "
-                    "game's dynamic resolution reads emulated GPU time and doesn't drop on a "
-                    "busy phone GPU; 56 % cut GPU power 15 % and render targets ~100 MiB on PC "
-                    "(oot-mods).");
+        Add(p, v.oot_resolution, OotResolution::Percent50,
+            "960x540, with the Phone Low graphics preset: a fixed size, as the game's dynamic "
+            "resolution reads emulated GPU time and doesn't drop on a busy phone GPU. 56 -> 50 % "
+            "cut GPU time 11 % and draws 20 % on the PC phone simulation (oot-presets).");
     }
+    Add(p, v.oot_graphics_preset,
+        p.tier == Tier::Ultra ? OotGraphicsPreset::Console : OotGraphicsPreset::PhoneLow,
+        p.tier == Tier::Ultra
+            ? "Console: no iPad run yet."
+            : "Phone Low: an iPhone18,2 spent 84-119 ms of GPU time per frame in Kokiri (builds "
+              "71, 138) with 152-216 render passes. A small reflection probe, no bloom or depth "
+              "of field, one small sun shadow cascade: with 50 % and Quarter, render passes 175 -> "
+              "105, draws -31 % and GPU time -24 % against 56 % Console "
+              "on the PC phone simulation (oot-presets).");
     Add(p, v.oot_frame_rate, phone ? OotFrameRate::Fps30 : OotFrameRate::Fps60,
         phone ? "30 FPS: half the GPU work and heat per second; the phone was hot at 1-3 fps "
                 "(ios-gpu-time) and Auto-Cool caps at 45/30 anyway. The game keeps its speed."
               : "60 FPS: the game's own rate.");
     Add(p, v.texture_quality,
-        small ? TextureQuality::Quarter
-              : (p.tier == Tier::Ultra ? TextureQuality::Full : TextureQuality::Half),
+        p.tier == Tier::Ultra ? TextureQuality::Full : TextureQuality::Quarter,
         p.tier == Tier::Ultra
             ? "Full: 16 GB has room for the game's textures."
-            : "Half: ~1.2 GB less guest and GPU memory in Ocarina of Time (Kokiri 4544 -> 3340 "
-              "MiB); builds 57-59 reached the game with it on an iPhone18,2.");
+            : "Quarter, with the Phone Low graphics preset: ~1.5 GB less guest and GPU memory "
+              "in Ocarina of Time than Full; an iPhone18,2 was at its memory limit in Kokiri at "
+              "Quarter (build 71: 5932 of 6656 MiB).");
     Add(p, v.scaling_filter, ScalingFilter::MetalFxSpatial,
         "MetalFX Spatial: one cheap pass to the screen; FSR 3 costs a phone GPU too much.");
     Add(p, v.anti_aliasing, AntiAliasing::None, "None: games anti-alias themselves.");

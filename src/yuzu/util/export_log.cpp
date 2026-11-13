@@ -236,7 +236,7 @@ QString SystemSummary(const std::vector<VkDeviceInfo::Record>& vk_device_records
         &values.renderer_backend,  &values.vulkan_device,     &values.oot_frame_rate,
         &values.frame_rate_limit,  &values.use_speed_limit,   &values.speed_limit,
         &values.upscaler,          &values.oot_resolution,    &values.oot_anti_aliasing,
-        &values.oot_movie_upscale, &values.frame_gen,         &values.frame_gen_type,
+        &values.oot_movie_upscale, &values.oot_graphics_preset, &values.frame_gen,         &values.frame_gen_type,
         &values.precache_shaders,  &values.accelerate_astc,   &values.astc_recompression,
         &values.texture_quality,   &values.mkw_frame_rate,
     };

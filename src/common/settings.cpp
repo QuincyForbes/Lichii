@@ -51,6 +51,7 @@ SWITCHABLE(Upscaler, false);
 SWITCHABLE(OotMovieUpscale, false);
 SWITCHABLE(TextureQuality, false);
 SWITCHABLE(OotResolution, false);
+SWITCHABLE(OotGraphicsPreset, false);
 SWITCHABLE(OotFrameRate, false);
 SWITCHABLE(MkwFrameRate, false);
 SWITCHABLE(AspectRatio, true);
@@ -527,6 +528,17 @@ OotResolution OcarinaUpscaledResolution(OotResolution resolution, Upscaler upsca
         return docked ? OotResolution::Full : OotResolution::Percent75;
     default:
         return resolution;
+    }
+}
+
+OotPresetCompanions OotGraphicsPresetCompanions(OotGraphicsPreset preset) {
+    switch (preset) {
+    case OotGraphicsPreset::PhoneLow:
+        return {OotResolution::Percent50, TextureQuality::Quarter};
+    case OotGraphicsPreset::PhoneMedium:
+        return {OotResolution::Percent56, TextureQuality::Half};
+    default:
+        return {};
     }
 }
 

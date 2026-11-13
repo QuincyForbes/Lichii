@@ -73,6 +73,7 @@ SWITCHABLE(Upscaler, false);
 SWITCHABLE(OotMovieUpscale, false);
 SWITCHABLE(TextureQuality, false);
 SWITCHABLE(OotResolution, false);
+SWITCHABLE(OotGraphicsPreset, false);
 SWITCHABLE(OotFrameRate, false);
 SWITCHABLE(MkwFrameRate, false);
 SWITCHABLE(AspectRatio, true);
@@ -479,6 +480,11 @@ struct Values {
                                                     OotResolution::Full,
 #endif
                                                     "oot_resolution", Category::Renderer};
+    // Ocarina of Time's shadows, ambient occlusion, effects and foliage, set in the game's own
+    // parameter files as it reads them (core/file_sys/oot_game_params.cpp): Console is the game
+    // as shipped. Phones get a lighter one from the device profile. Read when the game starts.
+    SwitchableSetting<OotGraphicsPreset> oot_graphics_preset{
+        linkage, OotGraphicsPreset::Console, "oot_graphics_preset", Category::Renderer};
     // Ocarina of Time: 30 FPS (two vblanks a frame, nx2_gsv.h PaceToVblank), 60 FPS, or the
     // frame rate limit. The game's step follows real time (built-in FPS Unlock), so it keeps full
     // speed at each. The first desktop launch asks (oot_fps_asked). Takes effect at once.
@@ -1190,6 +1196,14 @@ OotResolution OcarinaGameResolution(OotResolution resolution);
 // between it and the game's own pass. Docked it takes every size, but each new size starts its
 // history again. Game becomes Full docked and 75 % handheld (1440x810 to 1920x1080).
 OotResolution OcarinaUpscaledResolution(OotResolution resolution, Upscaler upscaler, bool docked);
+
+// The resolution and texture quality a phone preset of oot_graphics_preset goes with: frontends set
+// them when the preset is picked. Nothing for Console and High.
+struct OotPresetCompanions {
+    std::optional<OotResolution> resolution;
+    std::optional<TextureQuality> textures;
+};
+OotPresetCompanions OotGraphicsPresetCompanions(OotGraphicsPreset preset);
 // The emulator's resolution scale for the running program. Ocarina of Time takes it from
 // oot_resolution (1x up to 100 %, and always with a temporal upscaler, which needs 1x); every
 // other program from resolution_setup.

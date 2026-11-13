@@ -197,6 +197,14 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "stretch.\nGame's own upscaler: the game's video upscaler, which removes banding and "
               "sharpens. Fast on NVIDIA RTX, slow on GPUs that emulate its math.\nAutomatic: the "
               "game's upscaler where the GPU runs it natively, bilinear elsewhere."));
+    INSERT(Settings, oot_graphics_preset, tr("Graphics preset:"),
+           tr("Shadows, reflections and effects, set in the game's own parameter files.\nPhone "
+              "Low: a small reflection probe, no bloom or depth of field, one small sun shadow, "
+              "thinner grass (about a third fewer render passes). Phone Medium: a small "
+              "reflection probe, two small sun shadows. Console: the game as shipped. High: "
+              "sharper sun shadows.\n"
+              "The phone presets also set Resolution (50 % / 56 %) and Texture quality (Quarter / "
+              "Half). Applies the next time the game starts."));
     INSERT(Settings, oot_resolution, tr("Resolution:"),
            tr("The one resolution setting for this game (the Resolution for other games doesn't "
               "apply to it).\nDynamic: the game's own, which drops toward 480p when the GPU is "
@@ -685,6 +693,13 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(OotResolution, Percent150, tr("150% (2160p)")),
                               PAIR(OotResolution, Percent200, tr("200% (2880p)")),
                               PAIR(OotResolution, Percent300, tr("300% (4320p)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::OotGraphicsPreset>::Index(),
+                          {
+                              PAIR(OotGraphicsPreset, PhoneLow, tr("Phone Low")),
+                              PAIR(OotGraphicsPreset, PhoneMedium, tr("Phone Medium")),
+                              PAIR(OotGraphicsPreset, Console, tr("Console (the game's own)")),
+                              PAIR(OotGraphicsPreset, High, tr("High")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::Upscaler>::Index(),
                           {

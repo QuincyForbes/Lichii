@@ -10,7 +10,8 @@
 namespace Settings {
 
 namespace {
-constexpr std::array<std::string_view, 4> OcarinaKeys{
+constexpr std::array<std::string_view, 5> OcarinaKeys{
+    "oot_graphics_preset",
     "oot_resolution",
     "oot_frame_rate",
     "oot_anti_aliasing",

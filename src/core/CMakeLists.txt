@@ -178,6 +178,8 @@ add_library(core STATIC
     file_sys/system_archive/system_version.h
     file_sys/system_archive/time_zone_binary.cpp
     file_sys/system_archive/time_zone_binary.h
+    file_sys/oot_game_params.cpp
+    file_sys/oot_game_params.h
     file_sys/texture_quality.cpp
     file_sys/texture_quality.h
     file_sys/vfs/vfs.cpp
