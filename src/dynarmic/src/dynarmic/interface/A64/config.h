@@ -284,6 +284,10 @@ struct UserConfig {
     /// instead: about 8-10 fewer instructions of cold code per memory access.
     bool inline_page_table_fallback = true;
 
+    /// arm64 host. Loads and stores that do not use fastmem (faulted there, or no arena) call one
+    /// shared page table walk instead of emitting it inline: 4 instructions instead of ~12.
+    bool page_table_lookup_calls = false;
+
     /// Determines if we should use the above fastmem_pointer for exclusive reads and
     /// writes. On x64, dynarmic currently relies on x64 cmpxchg semantics which may not
     /// provide fully accurate emulation.

@@ -175,6 +175,12 @@ protected:
         void* get_cntpct;
         void* add_ticks;
         void* get_ticks_remaining;
+
+        void* page_table_lookup_8 = nullptr;
+        void* page_table_lookup_16 = nullptr;
+        void* page_table_lookup_32 = nullptr;
+        void* page_table_lookup_64 = nullptr;
+        void* page_table_lookup_128 = nullptr;
     } prelude_info;
 };
 

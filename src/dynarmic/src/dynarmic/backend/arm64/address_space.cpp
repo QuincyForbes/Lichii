@@ -577,6 +577,21 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
         case LinkTarget::GetTicksRemaining:
             c.BL(prelude_info.get_ticks_remaining);
             break;
+        case LinkTarget::PageTableLookup8:
+            c.BL(prelude_info.page_table_lookup_8);
+            break;
+        case LinkTarget::PageTableLookup16:
+            c.BL(prelude_info.page_table_lookup_16);
+            break;
+        case LinkTarget::PageTableLookup32:
+            c.BL(prelude_info.page_table_lookup_32);
+            break;
+        case LinkTarget::PageTableLookup64:
+            c.BL(prelude_info.page_table_lookup_64);
+            break;
+        case LinkTarget::PageTableLookup128:
+            c.BL(prelude_info.page_table_lookup_128);
+            break;
         default:
             UNREACHABLE();
         }
