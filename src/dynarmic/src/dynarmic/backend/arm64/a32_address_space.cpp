@@ -459,6 +459,7 @@ void A32AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const Emitte
     const A32::LocationDescriptor end_location{block.EndLocation()};
     const auto range = boost::icl::discrete_interval<u32>::closed(descriptor.PC(), end_location.PC() - 1);
     block_ranges.AddRange(range, descriptor);
+    RangeAdded(block_ranges);
 }
 
 }  // namespace Dynarmic::Backend::Arm64

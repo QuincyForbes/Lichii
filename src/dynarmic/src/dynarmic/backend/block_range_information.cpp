@@ -26,6 +26,7 @@ void BlockRangeInformation<P>::AddRange(boost::icl::discrete_interval<P> range, 
 template<typename P>
 void BlockRangeInformation<P>::ClearCache() {
     ranges.clear();
+    compact_at = MinCompactSize;
 }
 
 template<typename P>

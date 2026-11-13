@@ -85,6 +85,7 @@ add_library(
     host_memory.h
     input.h
     intrusive_red_black_tree.h
+    jit_block_lists.h
     literals.h
     logging.cpp
     logging.h

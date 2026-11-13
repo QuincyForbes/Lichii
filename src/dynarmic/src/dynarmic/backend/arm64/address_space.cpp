@@ -10,8 +10,12 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
+
+#include <boost/container/small_vector.hpp>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -44,11 +48,32 @@ struct SharedFastmemMarkers {
     std::shared_mutex mutex;
     ::Common::unordered_set<DoNotFastmemMarker, DoNotFastmemMarkerHash> markers;
     ::Common::unordered_set<IR::LocationDescriptor> blocks;
+    ::Common::unordered_map<IR::LocationDescriptor, unsigned> faults_per_block;
 };
 
 SharedFastmemMarkers& SharedMarkers() {
     static SharedFastmemMarkers shared;
     return shared;
+}
+
+bool EnvIs(const char* name, char wanted) {
+    const char* const value = std::getenv(name);
+    return value != nullptr && value[0] == wanted;
+}
+
+// EDEN_NX2_JIT_PACKED_LISTS=1 (the iOS device profile sets it): StoredBlockInfo keeps a block's
+// lists in one packed heap block.
+bool PackedListsOn() {
+    static const bool on = EnvIs("EDEN_NX2_JIT_PACKED_LISTS", '1');
+    return on;
+}
+
+// With shared markers a core kept its own copy of every marker it set, and counted a block's
+// faults by itself (six cores: up to six times the translations before the block gives up
+// fastmem). EDEN_NX2_JIT_FAULT_LOCAL=1 restores that.
+bool LocalFaultMarkersOn() {
+    static const bool on = EnvIs("EDEN_NX2_JIT_FAULT_LOCAL", '1');
+    return on;
 }
 }  // namespace
 
@@ -67,6 +92,18 @@ bool FastmemManager::ShouldFastmem(DoNotFastmemMarker marker) const {
 
 void FastmemManager::MarkDoNotFastmem(DoNotFastmemMarker marker) {
     const IR::LocationDescriptor block = std::get<0>(marker);
+    if (shared_markers && !LocalFaultMarkersOn()) {
+        SharedFastmemMarkers& shared = SharedMarkers();
+        std::unique_lock lock{shared.mutex};
+        // A marker another core set meanwhile is the same fault, not a second one.
+        if (shared.markers.insert(marker).second && faults_per_block_limit != 0 &&
+            ++shared.faults_per_block[block] >= faults_per_block_limit) {
+            shared.blocks.insert(block);
+            shared.faults_per_block.erase(block);
+        }
+        ::Common::PerfReport::NoteJitMarkers(shared.markers.size(), shared.blocks.size());
+        return;
+    }
     do_not_fastmem.insert(marker);
     const bool whole_block = faults_per_block_limit != 0 && ++faults_per_block[block] >= faults_per_block_limit;
     if (whole_block) {
@@ -91,6 +128,8 @@ AddressSpace::AddressSpace(std::size_t code_cache_size, std::size_t evict_slice,
     , free_end(code_cache_size)
     , mem(code_cache_size)
     , code(mem.wptr(), mem.ptr())
+    , packed_lists(PackedListsOn())
+    , compact_ranges(!EnvIs("EDEN_NX2_JIT_RANGE_COMPACT", '0'))
     , fastmem_manager(exception_handler)
 {
     ASSERT(code_cache_size <= 128 * 1024 * 1024 && "code_cache_size > 128 MiB not currently supported");
@@ -199,10 +238,11 @@ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
         const u64 compile_ns = ::Common::PerfReport::NowNs() - start_ns;
         ::Common::PerfReport::Add(::Common::PerfReport::JitBlocks);
         ::Common::PerfReport::Add(::Common::PerfReport::JitBytes,
-                                  end_offset > start_offset ? end_offset - start_offset : block_infos.find(entry_point)->second.size);
+                                  end_offset > start_offset ? end_offset - start_offset : block_infos.find(entry_point)->second.Size());
         ::Common::PerfReport::Add(::Common::PerfReport::JitCompileNs, compile_ns);
         ::Common::PerfReport::NoteJitCompile(processor_id, compile_ns);
         ::Common::PerfReport::NoteJitUse(processor_id, LiveBytes(), code_cache_size);
+        ::Common::PerfReport::NoteJitTables(processor_id, block_infos.size(), TableBytes(), list_bytes);
     }
     return entry_point;
 }
@@ -229,7 +269,7 @@ void AddressSpace::InvalidateBasicBlocks(const ::Common::unordered_set<IR::Locat
         }
         if (::Common::PerfReport::Enabled()) {
             if (const auto info = block_infos.find(iter->second); info != block_infos.end()) {
-                ::Common::PerfReport::NoteJitDeadCode(processor_id, info->second.size);
+                ::Common::PerfReport::NoteJitDeadCode(processor_id, info->second.Size());
             }
         }
 
@@ -254,6 +294,7 @@ void AddressSpace::ClearCache() {
     old_reverse_entries.clear();
     old_reverse_head = 0;
     block_infos.clear();
+    list_bytes = 0;
     block_references.clear();
     code.set_offset(prelude_info.end_of_prelude);
     free_end = code_cache_size;
@@ -352,16 +393,14 @@ void AddressSpace::EvictBlock(CodePtr entry_point, IR::LocationDescriptor descri
         return;
     }
     // This block no longer links to anything: forget it as a referrer.
-    if (info->second.lists) {
-        for (const auto& [target, list] : info->second.lists->block_relocations) {
-            if (const auto refs = block_references.find(target); refs != block_references.end()) {
-                refs->second.Remove(entry_point);
-                if (refs->second.Empty()) {
-                    block_references.erase(refs);
-                }
+    info->second.ForEachTarget([this, entry_point](IR::LocationDescriptor target) {
+        if (const auto refs = block_references.find(target); refs != block_references.end()) {
+            refs->second.Remove(entry_point);
+            if (refs->second.Empty()) {
+                block_references.erase(refs);
             }
         }
-    }
+    });
     // Still the live translation of its location (not one InvalidateBasicBlocks dropped and
     // that was translated again elsewhere): the blocks that branch to it go to the dispatcher.
     if (const auto live = block_entries.find(descriptor); live != block_entries.end() && live->second == entry_point) {
@@ -369,6 +408,7 @@ void AddressSpace::EvictBlock(CodePtr entry_point, IR::LocationDescriptor descri
         RelinkForDescriptor(descriptor, nullptr);
         OnInvalidateBasicBlock(descriptor);
     }
+    list_bytes -= info->second.Bytes();
     block_infos.erase(info);
 }
 
@@ -384,12 +424,8 @@ CodePtr AddressSpace::Emit(IR::Block block) {
     ASSERT(reverse_block_entries.empty() || reverse_block_entries.back().first < entry_point);
     reverse_block_entries.emplace_back(entry_point, block.Location());
     Link(block_info);
-    StoredBlockInfo stored_info{entry_point, block_info.size, nullptr};
-    if (!block_info.block_relocations.empty() || !block_info.fastmem_patch_info.empty()) {
-        stored_info.lists = std::make_unique<StoredBlockInfo::Lists>();
-        stored_info.lists->block_relocations = std::move(block_info.block_relocations);
-        stored_info.lists->fastmem_patch_info = std::move(block_info.fastmem_patch_info);
-    }
+    StoredBlockInfo stored_info{block_info, packed_lists};
+    list_bytes += stored_info.Bytes();
     ASSERT(block_infos.emplace(entry_point, std::move(stored_info)).second);
     RelinkForDescriptor(block.Location(), entry_point);
 
@@ -607,41 +643,142 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
     }
 }
 
-void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr target_ptr, const std::vector<BlockRelocation>& block_relocations_list) {
+void AddressSpace::LinkBlockLink(const CodePtr entry_point, const CodePtr target_ptr, BlockRelocation relocation) {
     using namespace oaknut;
     using namespace oaknut::util;
 
-    for (auto [ptr_offset, type] : block_relocations_list) {
-        CodeGenerator c{mem.wptr(), mem.ptr()};
-        c.set_xptr(reinterpret_cast<u32*>(entry_point + ptr_offset));
+    CodeGenerator c{mem.wptr(), mem.ptr()};
+    c.set_xptr(reinterpret_cast<u32*>(entry_point + relocation.code_offset));
 
-        switch (type) {
-        case BlockRelocationType::Branch:
-            if (target_ptr) {
-                c.B((void*)target_ptr);
-            } else {
-                c.NOP();
-            }
-            break;
-        case BlockRelocationType::MoveToScratch1:
-            if (target_ptr) {
-                c.ADRL(Xscratch1, (void*)target_ptr);
-            } else {
-                c.ADRL(Xscratch1, prelude_info.return_to_dispatcher);
-            }
-            break;
-        default:
-            UNREACHABLE();
+    switch (relocation.type) {
+    case BlockRelocationType::Branch:
+        if (target_ptr) {
+            c.B((void*)target_ptr);
+        } else {
+            c.NOP();
         }
+        break;
+    case BlockRelocationType::MoveToScratch1:
+        if (target_ptr) {
+            c.ADRL(Xscratch1, (void*)target_ptr);
+        } else {
+            c.ADRL(Xscratch1, prelude_info.return_to_dispatcher);
+        }
+        break;
+    default:
+        UNREACHABLE();
     }
 }
 
-const std::vector<BlockRelocation>* AddressSpace::StoredBlockInfo::RelocationsTo(IR::LocationDescriptor target) const {
-    if (!lists) {
-        return nullptr;
+void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr target_ptr, const std::vector<BlockRelocation>& block_relocations_list) {
+    for (const BlockRelocation& relocation : block_relocations_list) {
+        LinkBlockLink(entry_point, target_ptr, relocation);
     }
-    const auto iter = lists->block_relocations.find(target);
-    return iter != lists->block_relocations.end() ? &iter->second : nullptr;
+}
+
+AddressSpace::StoredBlockInfo::StoredBlockInfo(EmittedBlockInfo& block_info, bool packed) {
+    using ::Common::JitBlockLists;
+    if (packed) {
+        boost::container::small_vector<JitBlockLists::Relocation, 8> relocations;
+        boost::container::small_vector<JitBlockLists::Target, 4> targets;
+        boost::container::small_vector<JitBlockLists::Patch, 16> patches;
+        const auto fits = [](std::ptrdiff_t offset) { return offset >= 0 && offset <= 0x7FFF'FFFF; };
+        bool all_fit = true;
+        std::size_t relocation_count = 0;
+        for (const auto& [target, list] : block_info.block_relocations) {
+            relocation_count += list.size();
+        }
+        // Reserved up front: the targets point into it.
+        relocations.reserve(relocation_count);
+        for (const auto& [target, list] : block_info.block_relocations) {
+            const std::size_t first = relocations.size();
+            for (const BlockRelocation& relocation : list) {
+                all_fit = all_fit && fits(relocation.code_offset);
+                relocations.push_back(JitBlockLists::Relocation{static_cast<u32>(relocation.code_offset), static_cast<u32>(relocation.type)});
+            }
+            targets.push_back(JitBlockLists::Target{target.Value(), std::span<const JitBlockLists::Relocation>{relocations.data() + first, list.size()}});
+        }
+        for (const auto& [code_offset, patch] : block_info.fastmem_patch_info) {
+            all_fit = all_fit && fits(code_offset);
+            patches.push_back(JitBlockLists::Patch{
+                .code_offset = static_cast<u32>(code_offset),
+                .marker_location = std::get<0>(patch.marker).Value(),
+                .marker_offset = std::get<1>(patch.marker),
+                .call_pc = patch.fc.call_pc,
+                .recompile = patch.recompile,
+            });
+        }
+        if (all_fit) {
+            if (auto data = JitBlockLists::Build(block_info.size, std::span<const JitBlockLists::Target>{targets.data(), targets.size()},
+                                                 std::span<const JitBlockLists::Patch>{patches.data(), patches.size()})) {
+                value = reinterpret_cast<std::uintptr_t>(data.release());
+                return;
+            }
+        }
+    }
+    auto lists = std::make_unique<Lists>();
+    lists->size = block_info.size;
+    lists->block_relocations = std::move(block_info.block_relocations);
+    lists->fastmem_patch_info = std::move(block_info.fastmem_patch_info);
+    value = reinterpret_cast<std::uintptr_t>(lists.release()) | 1;
+}
+
+void AddressSpace::StoredBlockInfo::Reset() {
+    if (const Lists* const lists = Unpacked()) {
+        delete lists;
+    } else {
+        delete[] reinterpret_cast<const u64*>(value);
+    }
+    value = 0;
+}
+
+std::size_t AddressSpace::StoredBlockInfo::Size() const {
+    if (const Lists* const lists = Unpacked()) {
+        return lists->size;
+    }
+    return Packed().CodeSize();
+}
+
+std::size_t AddressSpace::StoredBlockInfo::Bytes() const {
+    if (const Lists* const lists = Unpacked()) {
+        std::size_t bytes = sizeof(Lists) + lists->block_relocations.size() * sizeof(*lists->block_relocations.begin()) +
+                            lists->fastmem_patch_info.size() * sizeof(*lists->fastmem_patch_info.begin());
+        for (const auto& [target, list] : lists->block_relocations) {
+            bytes += list.size() * sizeof(BlockRelocation);
+        }
+        return bytes;
+    }
+    return Packed().Bytes();
+}
+
+std::optional<FastmemPatchInfo> AddressSpace::StoredBlockInfo::FindPatch(std::ptrdiff_t code_offset) const {
+    if (const Lists* const lists = Unpacked()) {
+        const auto iter = lists->fastmem_patch_info.find(code_offset);
+        return iter != lists->fastmem_patch_info.end() ? std::optional{iter->second} : std::nullopt;
+    }
+    if (code_offset < 0) {
+        return std::nullopt;
+    }
+    const auto patch = Packed().FindPatch(static_cast<u64>(code_offset));
+    if (!patch) {
+        return std::nullopt;
+    }
+    return FastmemPatchInfo{
+        .marker = DoNotFastmemMarker{IR::LocationDescriptor{patch->marker_location}, patch->marker_offset},
+        .fc = FakeCall{.call_pc = patch->call_pc},
+        .recompile = patch->recompile,
+    };
+}
+
+// What the tables of this cache hold in heap bytes (boost's flat tables: 15 slots and 16
+// bytes of metadata a group).
+std::size_t AddressSpace::TableBytes() const {
+    const auto table = [](const auto& map) {
+        return map.bucket_count() * (sizeof(*map.begin()) * 15 + 16) / 15;
+    };
+    return table(block_entries) + table(block_infos) + table(block_references) +
+           (reverse_block_entries.capacity() + old_reverse_entries.capacity()) * sizeof(reverse_block_entries[0]) +
+           range_table_bytes;
 }
 
 void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr) {
@@ -654,11 +791,11 @@ void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor,
         if (auto block_iter = block_infos.find(code_ptr); block_iter != block_infos.end()) {
             const StoredBlockInfo& block_info = block_iter->second;
 
-            if (const auto* list = block_info.RelocationsTo(target_descriptor)) {
-                LinkBlockLinks(block_info.entry_point, target_ptr, *list);
-            }
+            block_info.ForEachRelocationTo(target_descriptor, [&](BlockRelocation relocation) {
+                LinkBlockLink(code_ptr, target_ptr, relocation);
+            });
 
-            mem.invalidate(reinterpret_cast<u32*>(block_info.entry_point), block_info.size);
+            mem.invalidate(reinterpret_cast<u32*>(code_ptr), block_info.Size());
         }
     };
 
@@ -685,25 +822,22 @@ FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
         }
 
         const auto block_info = block_infos.find(entry_point);
-        if (block_info == block_infos.end() || !block_info->second.lists) {
+        if (block_info == block_infos.end()) {
             goto fail;
         }
 
-        const auto& patches = block_info->second.lists->fastmem_patch_info;
-        const auto patch_entry = patches.find(host_ptr - entry_point);
-        if (patch_entry == patches.end()) {
+        // A copy: InvalidateBasicBlocks below must not find it gone.
+        const std::optional<FastmemPatchInfo> patch = block_info->second.FindPatch(host_ptr - entry_point);
+        if (!patch) {
             goto fail;
         }
 
-        const auto fc = patch_entry->second.fc;
-
-        if (patch_entry->second.recompile) {
-            const auto marker = patch_entry->second.marker;
-            fastmem_manager.MarkDoNotFastmem(marker);
-            InvalidateBasicBlocks({std::get<0>(marker)});
+        if (patch->recompile) {
+            fastmem_manager.MarkDoNotFastmem(patch->marker);
+            InvalidateBasicBlocks({std::get<0>(patch->marker)});
         }
 
-        return fc;
+        return patch->fc;
     }
 
 fail:

@@ -9,6 +9,8 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -19,6 +21,7 @@
 #include <oaknut/oaknut.hpp>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
+#include "common/jit_block_lists.h"
 
 #include "dynarmic/backend/arm64/emit_arm64.h"
 #include "dynarmic/backend/arm64/fastmem.h"
@@ -54,19 +57,59 @@ public:
 
     virtual void ClearCache();
 protected:
-    // What a block keeps after it is linked: a 32-byte table slot, the link and fastmem lists
-    // apart and only when there are any. EmittedBlockInfo in block_infos was 96 bytes a slot
-    // (45.5 MiB tables per guest core in the iPhone malloc census).
-    struct StoredBlockInfo {
+    // What a block keeps after it is linked, behind one pointer (a 16-byte table slot): its
+    // size, link lists and fastmem patch points in one packed heap block
+    // (Common::JitBlockLists), or the lists as the emitter made them (EDEN_NX2_JIT_PACKED_LISTS
+    // off, and blocks the packed layout cannot hold). EmittedBlockInfo in block_infos was 96
+    // bytes a slot (45.5 MiB tables per guest core in the iPhone malloc census), then 32 bytes
+    // plus four to six small heap blocks a block (15.5 MiB tables per core and 237 MiB of
+    // 16-64 byte blocks).
+    class StoredBlockInfo {
+    public:
         struct Lists {
+            std::size_t size;
             decltype(EmittedBlockInfo::block_relocations) block_relocations;
             decltype(EmittedBlockInfo::fastmem_patch_info) fastmem_patch_info;
         };
-        CodePtr entry_point;
-        std::size_t size;
-        std::unique_ptr<Lists> lists;
 
-        const std::vector<BlockRelocation>* RelocationsTo(IR::LocationDescriptor target) const;
+        StoredBlockInfo() = default;
+        /// Takes block_info's lists when it keeps them unpacked.
+        StoredBlockInfo(EmittedBlockInfo& block_info, bool packed);
+        StoredBlockInfo(StoredBlockInfo&& other) noexcept
+                : value{std::exchange(other.value, 0)} {}
+        StoredBlockInfo& operator=(StoredBlockInfo&& other) noexcept {
+            if (this != &other) {
+                Reset();
+                value = std::exchange(other.value, 0);
+            }
+            return *this;
+        }
+        ~StoredBlockInfo() {
+            Reset();
+        }
+
+        std::size_t Size() const;
+        /// Heap bytes behind the pointer (an estimate for unpacked lists).
+        std::size_t Bytes() const;
+        /// func(IR::LocationDescriptor) for each block this one branches to.
+        template<typename Func>
+        void ForEachTarget(Func&& func) const;
+        /// func(BlockRelocation) for each place in this block that branches to target.
+        template<typename Func>
+        void ForEachRelocationTo(IR::LocationDescriptor target, Func&& func) const;
+        std::optional<FastmemPatchInfo> FindPatch(std::ptrdiff_t code_offset) const;
+
+    private:
+        void Reset();
+        const Lists* Unpacked() const {
+            return (value & 1) != 0 ? reinterpret_cast<const Lists*>(value - 1) : nullptr;
+        }
+        ::Common::JitBlockLists Packed() const {
+            return ::Common::JitBlockLists{reinterpret_cast<const u64*>(value)};
+        }
+
+        /// A JitBlockLists heap block, or with the low bit set a Lists.
+        std::uintptr_t value = 0;
     };
 
     struct BlockReferences {
@@ -102,7 +145,17 @@ protected:
     std::size_t LiveBytes() const;
     CodePtr Emit(IR::Block ir_block);
     void Link(EmittedBlockInfo& block);
+    void LinkBlockLink(const CodePtr entry_point, const CodePtr target_ptr, BlockRelocation relocation);
     void LinkBlockLinks(const CodePtr entry_point, const CodePtr target_ptr, const std::vector<BlockRelocation>& block_relocations_list);
+    std::size_t TableBytes() const;
+    /// For RegisterNewBasicBlock, after it added a block to its range list (BlockRangeInformation).
+    template<typename Ranges>
+    void RangeAdded(Ranges& ranges) {
+        if (compact_ranges) {
+            ranges.CompactIfGrown([this](IR::LocationDescriptor location) { return block_entries.contains(location); });
+        }
+        range_table_bytes = ranges.Bytes();
+    }
     void RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr);
 
     FakeCall FastmemCallback(u64 host_pc);
@@ -127,6 +180,13 @@ protected:
     ::Common::unordered_map<IR::LocationDescriptor, CodePtr> block_entries;
     ::Common::unordered_map<CodePtr, StoredBlockInfo> block_infos;
     ::Common::unordered_map<IR::LocationDescriptor, BlockReferences> block_references;
+    const bool packed_lists;
+    /// EDEN_NX2_JIT_RANGE_COMPACT (on unless 0): the range list forgets blocks that left the cache.
+    const bool compact_ranges;
+    /// Heap bytes behind block_infos' pointers.
+    std::size_t list_bytes = 0;
+    /// What the derived class keeps for each block (its guest ranges), for the Perf report.
+    std::size_t range_table_bytes = 0;
 
     ExceptionHandler exception_handler;
     FastmemManager fastmem_manager;
@@ -198,5 +258,38 @@ protected:
         void* page_table_lookup_128 = nullptr;
     } prelude_info;
 };
+
+template<typename Func>
+void AddressSpace::StoredBlockInfo::ForEachTarget(Func&& func) const {
+    if (const Lists* const lists = Unpacked()) {
+        for (const auto& [target, list] : lists->block_relocations) {
+            func(target);
+        }
+        return;
+    }
+    const ::Common::JitBlockLists packed = Packed();
+    for (std::size_t index = 0; index < packed.Targets(); ++index) {
+        func(IR::LocationDescriptor{packed.TargetLocation(index)});
+    }
+}
+
+template<typename Func>
+void AddressSpace::StoredBlockInfo::ForEachRelocationTo(IR::LocationDescriptor target, Func&& func) const {
+    if (const Lists* const lists = Unpacked()) {
+        if (const auto iter = lists->block_relocations.find(target); iter != lists->block_relocations.end()) {
+            for (const BlockRelocation& relocation : iter->second) {
+                func(relocation);
+            }
+        }
+        return;
+    }
+    const ::Common::JitBlockLists packed = Packed();
+    if (const std::size_t index = packed.FindTarget(target.Value()); index != packed.Targets()) {
+        packed.ForEachRelocation(index, [&func](::Common::JitBlockLists::Relocation relocation) {
+            func(BlockRelocation{static_cast<std::ptrdiff_t>(relocation.code_offset),
+                                 static_cast<BlockRelocationType>(relocation.type)});
+        });
+    }
+}
 
 }  // namespace Dynarmic::Backend::Arm64

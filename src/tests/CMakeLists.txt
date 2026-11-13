@@ -133,6 +133,7 @@ add_executable(tests
     common/game_presets.cpp
     common/guest_chunks.cpp
     common/host_memory.cpp
+    common/jit_block_lists.cpp
     common/multi_level_page_table.cpp
     common/page_table.cpp
     common/param_package.cpp
