@@ -328,7 +328,7 @@ private:
     void ReleaseThreadFunc(std::stop_token stop_token) {
         Common::SetCurrentThreadName("GPUFencingThread");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
-        Common::SetCurrentThreadToPerformanceCores();
+        Common::SetCurrentThreadToPerformanceCores(false);
 
         // Every fence the host GPU has already passed is released together: Switch 2 titles
         // signal thousands a second and the host GPU completes them in bursts, so each cache's

@@ -126,7 +126,12 @@ static std::size_t IosJitPoolBytes() {
         if (profile.jit_cache_mib != 0) {
             Common::IosJit::SetCodeCacheBytes(std::size_t{profile.jit_cache_mib} << 20);
         }
-        LOG_INFO(Frontend, "iOS JIT: {} ({})", profile.jit_cache_reason, profile.device_name);
+        Common::IosJit::SetEvictSliceBytes(std::size_t{profile.jit_evict_mib} << 20);
+        Common::IosJit::SetFaultPolicy(profile.jit_fault_shared, profile.jit_fault_block_after);
+        Common::SetAppleHelperQos(profile.helper_qos);
+        LOG_INFO(Frontend, "iOS JIT: {} {} {} ({})", profile.jit_cache_reason,
+                 profile.jit_evict_reason, profile.jit_fault_reason, profile.device_name);
+        LOG_INFO(Frontend, "iOS threads: {}", profile.helper_qos_reason);
         return Core::Hardware::NUM_CPU_CORES * Common::IosJit::CodeCacheBytes();
     }();
     return bytes;

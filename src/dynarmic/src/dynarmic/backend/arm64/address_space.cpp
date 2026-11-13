@@ -10,6 +10,8 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <mutex>
+#include <shared_mutex>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -33,9 +35,60 @@
 
 namespace Dynarmic::Backend::Arm64 {
 
-AddressSpace::AddressSpace(std::size_t code_cache_size)
+namespace {
+// Blocks are assumed to be smaller than this (as the full-flush check always did).
+constexpr std::size_t kBlockHeadroom = 1024 * 1024;
+
+// Fastmem markers every guest core sees (FastmemManager::Configure).
+struct SharedFastmemMarkers {
+    std::shared_mutex mutex;
+    ::Common::unordered_set<DoNotFastmemMarker, DoNotFastmemMarkerHash> markers;
+    ::Common::unordered_set<IR::LocationDescriptor> blocks;
+};
+
+SharedFastmemMarkers& SharedMarkers() {
+    static SharedFastmemMarkers shared;
+    return shared;
+}
+}  // namespace
+
+bool FastmemManager::ShouldFastmem(DoNotFastmemMarker marker) const {
+    const IR::LocationDescriptor block = std::get<0>(marker);
+    if (do_not_fastmem.count(marker) != 0 || do_not_fastmem_blocks.count(block) != 0) {
+        return false;
+    }
+    if (shared_markers) {
+        SharedFastmemMarkers& shared = SharedMarkers();
+        std::shared_lock lock{shared.mutex};
+        return shared.markers.count(marker) == 0 && shared.blocks.count(block) == 0;
+    }
+    return true;
+}
+
+void FastmemManager::MarkDoNotFastmem(DoNotFastmemMarker marker) {
+    const IR::LocationDescriptor block = std::get<0>(marker);
+    do_not_fastmem.insert(marker);
+    const bool whole_block = faults_per_block_limit != 0 && ++faults_per_block[block] >= faults_per_block_limit;
+    if (whole_block) {
+        do_not_fastmem_blocks.insert(block);
+        faults_per_block.erase(block);
+    }
+    if (shared_markers) {
+        SharedFastmemMarkers& shared = SharedMarkers();
+        std::unique_lock lock{shared.mutex};
+        shared.markers.insert(marker);
+        if (whole_block) {
+            shared.blocks.insert(block);
+        }
+    }
+}
+
+AddressSpace::AddressSpace(std::size_t code_cache_size, std::size_t evict_slice, std::size_t processor_id)
     : ir_block{IR::LocationDescriptor{0}}
     , code_cache_size(code_cache_size)
+    , evict_slice(evict_slice != 0 && evict_slice + 2 * kBlockHeadroom < code_cache_size ? std::max(evict_slice, kBlockHeadroom) : 0)
+    , processor_id(processor_id)
+    , free_end(code_cache_size)
     , mem(code_cache_size)
     , code(mem.wptr(), mem.ptr())
     , fastmem_manager(exception_handler)
@@ -68,6 +121,33 @@ void AddressSpace::BlockReferences::Add(CodePtr ptr) {
     rest->push_back(ptr);
 }
 
+// Keeps Add's order: `first` fills before `rest`, with no gaps.
+void AddressSpace::BlockReferences::Remove(CodePtr ptr) {
+    const auto take_last = [this]() -> CodePtr {
+        if (rest && !rest->empty()) {
+            const CodePtr last = rest->back();
+            rest->pop_back();
+            return last;
+        }
+        return nullptr;
+    };
+    if (first[0] == ptr) {
+        first[0] = first[1];
+        first[1] = take_last();
+    } else if (first[1] == ptr) {
+        first[1] = take_last();
+    } else if (rest) {
+        if (const auto iter = std::find(rest->begin(), rest->end(), ptr); iter != rest->end()) {
+            *iter = rest->back();
+            rest->pop_back();
+        }
+    }
+}
+
+bool AddressSpace::BlockReferences::Empty() const {
+    return first[0] == nullptr && first[1] == nullptr && (!rest || rest->empty());
+}
+
 CodePtr AddressSpace::Get(IR::LocationDescriptor descriptor) {
     if (const auto iter = block_entries.find(descriptor); iter != block_entries.end()) {
         return iter->second;
@@ -75,24 +155,34 @@ CodePtr AddressSpace::Get(IR::LocationDescriptor descriptor) {
     return nullptr;
 }
 
-std::optional<IR::LocationDescriptor> AddressSpace::ReverseGetLocation(CodePtr host_pc) {
+namespace {
+using ReverseEntries = std::vector<std::pair<CodePtr, IR::LocationDescriptor>>;
+
+// The last entry at or below host_pc in [first, entries.end()), or nullptr.
+const std::pair<CodePtr, IR::LocationDescriptor>* FindReverse(const ReverseEntries& entries, std::size_t first, CodePtr host_pc) {
     const auto cmp = [](CodePtr pc, const auto& entry) { return pc < entry.first; };
-    if (auto iter = std::upper_bound(reverse_block_entries.begin(), reverse_block_entries.end(), host_pc, cmp);
-        iter != reverse_block_entries.begin()) {
-        --iter;
-        return iter->second;
+    const auto begin = entries.begin() + static_cast<std::ptrdiff_t>(first);
+    if (auto iter = std::upper_bound(begin, entries.end(), host_pc, cmp); iter != begin) {
+        return &*--iter;
     }
-    return std::nullopt;
+    return nullptr;
+}
+}  // namespace
+
+std::optional<IR::LocationDescriptor> AddressSpace::ReverseGetLocation(CodePtr host_pc) {
+    const auto* entry = FindReverse(reverse_block_entries, 0, host_pc);
+    if (const auto* old = FindReverse(old_reverse_entries, old_reverse_head, host_pc); old && (!entry || old->first > entry->first)) {
+        entry = old;
+    }
+    return entry ? std::optional{entry->second} : std::nullopt;
 }
 
 CodePtr AddressSpace::ReverseGetEntryPoint(CodePtr host_pc) {
-    const auto cmp = [](CodePtr pc, const auto& entry) { return pc < entry.first; };
-    if (auto iter = std::upper_bound(reverse_block_entries.begin(), reverse_block_entries.end(), host_pc, cmp);
-        iter != reverse_block_entries.begin()) {
-        --iter;
-        return iter->first;
+    const auto* entry = FindReverse(reverse_block_entries, 0, host_pc);
+    if (const auto* old = FindReverse(old_reverse_entries, old_reverse_head, host_pc); old && (!entry || old->first > entry->first)) {
+        entry = old;
     }
-    return nullptr;
+    return entry ? entry->first : nullptr;
 }
 
 CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
@@ -106,12 +196,13 @@ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
     const CodePtr entry_point = Emit(std::move(ir_block));
     if (counted) {
         const std::size_t end_offset = static_cast<std::size_t>(code.offset());
+        const u64 compile_ns = ::Common::PerfReport::NowNs() - start_ns;
         ::Common::PerfReport::Add(::Common::PerfReport::JitBlocks);
         ::Common::PerfReport::Add(::Common::PerfReport::JitBytes,
-                                  end_offset > start_offset ? end_offset - start_offset : end_offset);
-        ::Common::PerfReport::Add(::Common::PerfReport::JitCompileNs,
-                                  ::Common::PerfReport::NowNs() - start_ns);
-        ::Common::PerfReport::NoteJitUse(end_offset, code_cache_size);
+                                  end_offset > start_offset ? end_offset - start_offset : block_infos.find(entry_point)->second.size);
+        ::Common::PerfReport::Add(::Common::PerfReport::JitCompileNs, compile_ns);
+        ::Common::PerfReport::NoteJitCompile(processor_id, compile_ns);
+        ::Common::PerfReport::NoteJitUse(processor_id, LiveBytes(), code_cache_size);
     }
     return entry_point;
 }
@@ -136,6 +227,11 @@ void AddressSpace::InvalidateBasicBlocks(const ::Common::unordered_set<IR::Locat
         if (iter == block_entries.end()) {
             continue;
         }
+        if (::Common::PerfReport::Enabled()) {
+            if (const auto info = block_infos.find(iter->second); info != block_infos.end()) {
+                ::Common::PerfReport::NoteJitDeadCode(processor_id, info->second.size);
+            }
+        }
 
         // Unlink before removal because InvalidateBasicBlocks can be called within a fastmem callback,
         // and the currently executing block may have references to itself which need to be unlinked.
@@ -155,9 +251,12 @@ void AddressSpace::InvalidateBasicBlocks(const ::Common::unordered_set<IR::Locat
 void AddressSpace::ClearCache() {
     block_entries.clear();
     reverse_block_entries.clear();
+    old_reverse_entries.clear();
+    old_reverse_head = 0;
     block_infos.clear();
     block_references.clear();
     code.set_offset(prelude_info.end_of_prelude);
+    free_end = code_cache_size;
 #if defined(__APPLE__) && TARGET_OS_IPHONE
     ::Common::IosJit::DropWritablePtes(mem.wptr(), code_cache_size);
     dropped_writable_offset = 0;
@@ -169,18 +268,110 @@ std::size_t AddressSpace::GetRemainingSize() {
     return code_cache_size - static_cast<std::size_t>(code.offset());
 }
 
-CodePtr AddressSpace::Emit(IR::Block block) {
-    if (GetRemainingSize() < 1024 * 1024) {
+std::size_t AddressSpace::LiveBytes() const {
+    // This lap's code plus what is left of the previous lap's.
+    return static_cast<std::size_t>(code.offset()) + (code_cache_size - free_end);
+}
+
+void AddressSpace::MakeRoomForBlock() {
+    if (evict_slice == 0) {
+        if (GetRemainingSize() < kBlockHeadroom) {
 #ifdef __APPLE__
-        // The iOS caches are small (debugger-prepared pool): every full flush translates the hot
-        // code again, so count them (iOS: Documents/console.txt).
-        static std::atomic<unsigned> full_flushes{};
-        std::fprintf(stderr, "dynarmic: code cache full (%zu MiB), flushed; %u full flushes so far\n",
-                     code_cache_size >> 20, full_flushes.fetch_add(1, std::memory_order_relaxed) + 1);
+            // The iOS caches are small (debugger-prepared pool): every full flush translates the
+            // hot code again, so count them (iOS: Documents/console.txt).
+            static std::atomic<unsigned> full_flushes{};
+            std::fprintf(stderr, "dynarmic: code cache full (%zu MiB), flushed; %u full flushes so far\n",
+                         code_cache_size >> 20, full_flushes.fetch_add(1, std::memory_order_relaxed) + 1);
 #endif
-        ::Common::PerfReport::Add(::Common::PerfReport::JitCacheFullFlushes);
-        ClearCache();
+            ::Common::PerfReport::NoteJitFlush(processor_id);
+            ClearCache();
+        }
+        return;
     }
+    if (static_cast<std::size_t>(code.offset()) + kBlockHeadroom > code_cache_size) {
+        WrapRing();
+    }
+    while (static_cast<std::size_t>(code.offset()) + kBlockHeadroom > free_end) {
+        EvictOldest((std::min)(free_end + evict_slice, code_cache_size));
+    }
+}
+
+// The write position reached the end: what is left of the previous lap goes, this lap becomes
+// the previous one and writing starts again after the prelude.
+void AddressSpace::WrapRing() {
+    EvictOldest(code_cache_size);
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    if (dropped_writable_offset < code_cache_size) {
+        ::Common::IosJit::DropWritablePtes(reinterpret_cast<std::uint8_t*>(mem.wptr()) + dropped_writable_offset,
+                                           code_cache_size - dropped_writable_offset);
+    }
+    dropped_writable_offset = static_cast<std::size_t>(prelude_info.end_of_prelude);
+#endif
+    old_reverse_entries.swap(reverse_block_entries);
+    reverse_block_entries.clear();
+    old_reverse_head = 0;
+    code.set_offset(prelude_info.end_of_prelude);
+    free_end = static_cast<std::size_t>(prelude_info.end_of_prelude);
+}
+
+// Drops the previous lap's blocks that start below end_offset; free_end moves up to the first
+// block left (or the end of the cache).
+void AddressSpace::EvictOldest(std::size_t end_offset) {
+    const std::byte* const base = std::bit_cast<const std::byte*>(mem.ptr());
+    const std::size_t before = free_end;
+    std::size_t evicted = 0;
+    UnprotectCodeMemory();
+    while (old_reverse_head < old_reverse_entries.size()) {
+        const auto [entry_point, descriptor] = old_reverse_entries[old_reverse_head];
+        if (static_cast<std::size_t>(std::bit_cast<const std::byte*>(entry_point) - base) >= end_offset) {
+            break;
+        }
+        EvictBlock(entry_point, descriptor);
+        ++old_reverse_head;
+        ++evicted;
+    }
+    ProtectCodeMemory();
+    if (old_reverse_head == old_reverse_entries.size()) {
+        old_reverse_entries.clear();
+        old_reverse_head = 0;
+        free_end = code_cache_size;
+    } else {
+        free_end = static_cast<std::size_t>(std::bit_cast<const std::byte*>(old_reverse_entries[old_reverse_head].first) - base);
+    }
+    if (evicted != 0) {
+        ++cache_generation;
+    }
+    if (free_end > before) {
+        ::Common::PerfReport::NoteJitEviction(processor_id, free_end - before);
+    }
+}
+
+void AddressSpace::EvictBlock(CodePtr entry_point, IR::LocationDescriptor descriptor) {
+    const auto info = block_infos.find(entry_point);
+    if (info == block_infos.end()) {
+        return;
+    }
+    // This block no longer links to anything: forget it as a referrer.
+    for (const auto& [target, list] : info->second.block_relocations) {
+        if (const auto refs = block_references.find(target); refs != block_references.end()) {
+            refs->second.Remove(entry_point);
+            if (refs->second.Empty()) {
+                block_references.erase(refs);
+            }
+        }
+    }
+    // Still the live translation of its location (not one InvalidateBasicBlocks dropped and
+    // that was translated again elsewhere): the blocks that branch to it go to the dispatcher.
+    if (const auto live = block_entries.find(descriptor); live != block_entries.end() && live->second == entry_point) {
+        block_entries.erase(live);
+        RelinkForDescriptor(descriptor, nullptr);
+        OnInvalidateBasicBlock(descriptor);
+    }
+    block_infos.erase(info);
+}
+
+CodePtr AddressSpace::Emit(IR::Block block) {
+    MakeRoomForBlock();
 
     UnprotectCodeMemory();
 
@@ -458,7 +649,7 @@ void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor,
 }
 
 FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
-    ::Common::PerfReport::Add(::Common::PerfReport::JitFastmemFaults);
+    ::Common::PerfReport::NoteJitFault(processor_id);
     {
         const auto host_ptr = std::bit_cast<CodePtr>(host_pc);
 

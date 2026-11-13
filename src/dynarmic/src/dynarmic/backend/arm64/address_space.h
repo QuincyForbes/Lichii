@@ -32,7 +32,9 @@ struct StackLayout;
 
 class AddressSpace {
 public:
-    explicit AddressSpace(std::size_t code_cache_size);
+    /// evict_slice != 0: a full cache drops its oldest evict_slice bytes of blocks and goes on
+    /// writing there (a ring), instead of being emptied. processor_id: whose cache (Perf report).
+    AddressSpace(std::size_t code_cache_size, std::size_t evict_slice, std::size_t processor_id);
     virtual ~AddressSpace();
 
     virtual void GenerateIR(IR::Block& ir_block, IR::LocationDescriptor) const = 0;
@@ -57,6 +59,8 @@ protected:
         std::unique_ptr<std::vector<CodePtr>> rest;
 
         void Add(CodePtr ptr);
+        void Remove(CodePtr ptr);
+        bool Empty() const;
     };
 
     virtual EmitConfig GetEmitConfig() = 0;
@@ -76,6 +80,11 @@ protected:
     }
 
     std::size_t GetRemainingSize();
+    void MakeRoomForBlock();
+    void WrapRing();
+    void EvictOldest(std::size_t end_offset);
+    void EvictBlock(CodePtr entry_point, IR::LocationDescriptor descriptor);
+    std::size_t LiveBytes() const;
     CodePtr Emit(IR::Block ir_block);
     void Link(EmittedBlockInfo& block);
     void LinkBlockLinks(const CodePtr entry_point, const CodePtr target_ptr, const std::vector<BlockRelocation>& block_relocations_list);
@@ -85,13 +94,21 @@ protected:
 
     IR::Block ir_block;
     const std::size_t code_cache_size;
+    const std::size_t evict_slice;
+    const std::size_t processor_id;
     u64 cache_generation = 0;
     std::size_t dropped_writable_offset = 0;
+    /// Ring mode: [code.offset(), free_end) may be written; blocks of the previous lap start at
+    /// free_end and above.
+    std::size_t free_end;
     oaknut::CodeBlock mem;
     oaknut::CodeGenerator code;
 
-    // CodePtr entries are appended monotonically between ClearCache() calls.
+    // CodePtr entries are appended monotonically between ClearCache() calls (ring mode: within
+    // a lap; the previous lap's survivors are old_reverse_entries[old_reverse_head...]).
     std::vector<std::pair<CodePtr, IR::LocationDescriptor>> reverse_block_entries;
+    std::vector<std::pair<CodePtr, IR::LocationDescriptor>> old_reverse_entries;
+    std::size_t old_reverse_head = 0;
     ::Common::unordered_map<IR::LocationDescriptor, CodePtr> block_entries;
     ::Common::unordered_map<CodePtr, EmittedBlockInfo> block_infos;
     ::Common::unordered_map<IR::LocationDescriptor, BlockReferences> block_references;

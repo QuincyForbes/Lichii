@@ -209,6 +209,23 @@ void RecommendApple(const Device& device, Profile& p) {
         "{} MiB of JIT code per guest core ({} MiB for six): Ocarina of Time in Kokiri needs "
         "40-75 MiB of code per core and recompiled everything several times a second at 32 MiB.",
         p.jit_cache_mib, p.jit_cache_mib * 6);
+    p.jit_evict_mib = p.jit_cache_mib / 8;
+    p.jit_evict_reason = fmt::format(
+        "A full code cache drops its oldest {} MiB and goes on: build 7707654e51 still filled 64 "
+        "MiB per core (1-4 full flushes per 10 s, compiling 65-131 % in Kokiri), and each flush "
+        "translated all of the hot code again at once.",
+        p.jit_evict_mib);
+    p.jit_fault_shared = true;
+    p.jit_fault_block_after = 2;
+    p.jit_fault_reason =
+        "Fastmem faults: 2.7k-71k a second on the phone (16 KiB pages: one GPU-tracked or "
+        "unmapped 4 KiB page takes three neighbours along) against 1-38 on a PC, and each "
+        "translated its block again and left the old copy in the cache. A site found by one core "
+        "applies to all six, and a block that faulted twice translates without fastmem.";
+    p.helper_qos = true;
+    p.helper_qos_reason =
+        "Timing, fence and present threads at user-initiated QoS: 12 user-interactive threads "
+        "shared two performance cores and the guest cores ran 15-56 % of the time on them.";
 }
 
 void RecommendDesktop(const Device& device, Profile& p) {

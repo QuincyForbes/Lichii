@@ -501,9 +501,10 @@ void* EmitWrappedAtomicCallTrampoline(
 } // namespace
 
 A64AddressSpace::A64AddressSpace(const A64::UserConfig& conf)
-        : AddressSpace(conf.code_cache_size)
+        : AddressSpace(conf.code_cache_size, conf.code_cache_evict_slice, conf.processor_id)
         , conf(conf) {
     atomic_ctx.conf = &this->conf;
+    fastmem_manager.Configure(conf.fastmem_shared_markers, conf.fastmem_block_after_faults);
     if (this->conf.HasOptimization(OptimizationFlag::FastDispatch) && Arm64EnvOn("EDEN_NX2_JIT_DISPATCH")) {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         constexpr std::size_t default_bits = 15;

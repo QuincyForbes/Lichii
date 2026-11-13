@@ -32,6 +32,14 @@ inline constexpr std::size_t DefaultCodeCacheBytes = 32 * 1024 * 1024;
 /// The device profile's size (Settings::DeviceProfile, jit_cache_mib); set before StartAcquire.
 void SetCodeCacheBytes(std::size_t bytes);
 std::size_t CodeCacheBytes();
+/// The device profile's jit_evict_mib: a full cache drops this much of its oldest code (0: all).
+void SetEvictSliceBytes(std::size_t bytes);
+std::size_t EvictSliceBytes();
+/// The device profile's fastmem fault policy (dynarmic fastmem_shared_markers and
+/// fastmem_block_after_faults).
+void SetFaultPolicy(bool shared_markers, unsigned block_after_faults);
+bool FaultSharedMarkers();
+unsigned FaultBlockAfter();
 
 enum class State {
     Waiting,   ///< no debugger yet

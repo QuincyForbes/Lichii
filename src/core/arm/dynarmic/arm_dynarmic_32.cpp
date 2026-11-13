@@ -204,6 +204,9 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
 #else
     config.code_cache_size = std::uint32_t(512_MiB);
 #endif
+    config.code_cache_evict_slice = JitEvictSliceBytes();
+    config.fastmem_shared_markers = GetJitFaultPolicy().shared_markers;
+    config.fastmem_block_after_faults = GetJitFaultPolicy().block_after_faults;
 
     // Allow memory fault handling to work
     if (m_system.DebuggerEnabled()) {
