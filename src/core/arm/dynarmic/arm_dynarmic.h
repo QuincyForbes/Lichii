@@ -29,4 +29,17 @@ constexpr HaltReason TranslateHaltReason(Dynarmic::HaltReason hr) {
     return HaltReason(hr);
 }
 
+/// dynarmic's code_cache_evict_slice (arm64 hosts): EDEN_NX2_JIT_EVICT=<MiB> (0 empties a full
+/// cache), otherwise the iOS device profile's jit_evict_mib.
+u32 JitEvictSliceBytes();
+
+/// dynarmic's fastmem_shared_markers / fastmem_block_after_faults (arm64 hosts):
+/// EDEN_NX2_JIT_FAULT_SHARE=0/1 and EDEN_NX2_JIT_FAULT_BLOCK=<n> (0 off), otherwise the iOS
+/// device profile's.
+struct JitFaultPolicy {
+    bool shared_markers;
+    u8 block_after_faults;
+};
+JitFaultPolicy GetJitFaultPolicy();
+
 } // namespace Core

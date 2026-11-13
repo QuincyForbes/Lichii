@@ -94,6 +94,11 @@ enum class LinkTarget {
     GetCNTPCT,
     AddTicks,
     GetTicksRemaining,
+    PageTableLookup8,
+    PageTableLookup16,
+    PageTableLookup32,
+    PageTableLookup64,
+    PageTableLookup128,
 };
 
 struct Relocation {
@@ -154,6 +159,9 @@ struct EmitConfig {
     std::size_t fastmem_address_space_bits;
     bool silently_mirror_fastmem;
     bool inline_page_table_fallback = true;
+    /// Loads and stores without fastmem call a shared page table walk in the prelude
+    /// (PageTableLookup*) instead of emitting it inline.
+    bool page_table_lookup_calls = false;
 
     // Timing & control flow
     bool wall_clock_cntpct;

@@ -65,6 +65,19 @@ struct Profile {
     /// guest core, sized at app start); 0 = Common::IosJit's default.
     u32 jit_cache_mib = 0;
     std::string jit_cache_reason;
+    /// iOS: a full code cache drops this many MiB of its oldest code and goes on (0: empties
+    /// itself); EDEN_NX2_JIT_EVICT overrides.
+    u32 jit_evict_mib = 0;
+    std::string jit_evict_reason;
+    /// iOS: fastmem faults found on one guest core apply to all, and a block whose accesses
+    /// faulted this many times translates without fastmem (0: per access); EDEN_NX2_JIT_FAULT_*.
+    bool jit_fault_shared = false;
+    u32 jit_fault_block_after = 0;
+    std::string jit_fault_reason;
+    /// iOS: timing, fence and present helper threads at user-initiated QoS instead of
+    /// user-interactive; EDEN_NX2_APPLE_HELPER_QOS overrides.
+    bool helper_qos = false;
+    std::string helper_qos_reason;
     /// Engine switches (EDEN_NX2_* environment variables) this device runs with; a variable set
     /// in the environment wins. Applied once at app start (ApplyTuning).
     std::vector<Value> tuning;

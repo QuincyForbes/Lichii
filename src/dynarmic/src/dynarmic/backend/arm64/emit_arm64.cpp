@@ -205,7 +205,26 @@ static void EmitAddCycles(oaknut::CodeGenerator& code, EmitContext& ctx, std::si
     }
 }
 
+#ifdef DYNARMIC_EMIT_STATS
+// Offline code size study only (built with -DDYNARMIC_EMIT_STATS): host bytes per IR opcode,
+// inline (deferred = false) and in the block's out-of-line tail (deferred = true); opcode ~0u is
+// the condition check, ~1u the terminal.
+void (*g_emit_stats)(unsigned opcode, bool deferred, std::size_t bytes) = nullptr;
+#endif
+
 EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const EmitConfig& conf, FastmemManager& fastmem_manager) {
+#ifdef DYNARMIC_EMIT_STATS
+    const auto stat_offset = [&] { return reinterpret_cast<std::uintptr_t>(code.xptr<CodePtr>()); };
+    std::size_t stat_mark = stat_offset();
+    std::vector<unsigned> deferred_opcodes;
+    const auto stat = [&](unsigned opcode, bool deferred) {
+        const std::size_t now = stat_offset();
+        if (g_emit_stats != nullptr) {
+            g_emit_stats(opcode, deferred, now - stat_mark);
+        }
+        stat_mark = now;
+    };
+#endif
     if (conf.very_verbose_debugging_output) {
         std::puts(IR::DumpBlock(block).c_str());
     }
@@ -230,6 +249,9 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
 
         code.l(pass);
     }
+#ifdef DYNARMIC_EMIT_STATS
+    stat(~0u, false);
+#endif
 
     for (auto iter = block.instructions.begin(); iter != block.instructions.end(); ++iter) {
         IR::Inst* inst = &*iter;
@@ -261,6 +283,10 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
         if (conf.very_verbose_debugging_output) {
             EmitVerboseDebuggingOutput(code, ctx);
         }
+#ifdef DYNARMIC_EMIT_STATS
+        stat(static_cast<unsigned>(inst->GetOpcode()), false);
+        deferred_opcodes.resize(ctx.deferred_emits.size(), static_cast<unsigned>(inst->GetOpcode()));
+#endif
     }
 
     fpsr_manager.Spill();
@@ -270,9 +296,15 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
     EmitAddCycles(code, ctx, block.CycleCount());
     conf.emit_terminal(code, ctx);
     code.BRK(0);
+#ifdef DYNARMIC_EMIT_STATS
+    stat(~1u, false);
+#endif
 
-    for (const auto& deferred_emit : ctx.deferred_emits) {
-        deferred_emit();
+    for (std::size_t i = 0; i < ctx.deferred_emits.size(); ++i) {
+        ctx.deferred_emits[i]();
+#ifdef DYNARMIC_EMIT_STATS
+        stat(i < deferred_opcodes.size() ? deferred_opcodes[i] : ~1u, true);
+#endif
     }
     code.BRK(0);
 
