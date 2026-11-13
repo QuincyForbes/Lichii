@@ -3717,7 +3717,16 @@ void RasterizerVulkan::TickPerfReport() {
                 : std::string{});
     }
     if (const u64 reserve = Common::PlatformEvents::GuestFileReserve(); reserve != 0) {
-        memory_events += fmt::format(", caches leave the guest file {} MiB", reserve >> 20);
+        // Of the reserve the caches give up at most half their room (BoundedGuestFileReserve).
+        const u64 process_left = Common::PlatformEvents::AvailableProcessMemory();
+        memory_events += fmt::format(
+            ", caches leave the guest file {} of {} MiB",
+            process_left != 0
+                ? Common::PlatformEvents::BoundedGuestFileReserve(
+                      reserve, process_left, VideoCommon::HostBudget::Reserve) >>
+                      20
+                : reserve >> 20,
+            reserve >> 20);
     }
     const u64 jit_peak = Common::PerfReport::TakeJitPeak();
     const std::string jit_text = fmt::format(

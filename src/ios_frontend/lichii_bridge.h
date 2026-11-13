@@ -141,9 +141,13 @@ uint64_t lichii_settings_game(const char* key);
 bool lichii_settings_applies(const char* key, uint64_t program_id);
 /// The name of a game with settings of its own, "" otherwise.
 const char* lichii_settings_game_name(uint64_t program_id);
-/// Inside a per-game scope: every override goes back to the global value. Returns how many, -1
+/// Inside a per-game scope: the game gets this device's recommended value of every setting that
+/// applies to it, its other overrides go back to the global value. Returns how many changed, -1
 /// outside a scope.
 int lichii_settings_reset_game(void);
+/// What lichii_settings_reset_game would change, one "key\tfrom\tto" line each ("global" for an
+/// override removed). Free with lichii_free.
+char* lichii_settings_reset_game_preview(void);
 
 /* ----------------------------------------------------------------------- recommended settings */
 
@@ -165,6 +169,8 @@ char* lichii_recommended_device(void);
 /// Writes the recommended settings to the global config and saves it. Returns how many changed,
 /// -1 while a game runs or a per-game scope is open.
 int lichii_recommended_apply(void);
+/// How many global settings differ from this device's recommendation (0 inside a per-game scope).
+size_t lichii_recommended_differences(void);
 
 /* ------------------------------------------------------------------------------------ emulation */
 
