@@ -172,7 +172,9 @@ enum SettingsGroup: String, CaseIterable, Identifiable {
                 SettingsCatalog.gameCategories + ["RendererAdvanced", SettingsCatalog.enhancementsCategory]
         case .audio: return ["Audio", "SystemAudio"]
         case .system: return ["Core", "Cpu", "System", "Controls", "LibraryApplet", "DataStorage", "Overlay"]
-        case .advanced: return Array(SettingsCatalog.advancedCategories).sorted()
+        case .advanced:
+            return [SettingsCatalog.experimentsCategory] +
+                SettingsCatalog.advancedCategories.subtracting([SettingsCatalog.experimentsCategory]).sorted()
         }
     }
 
@@ -257,8 +259,11 @@ enum SettingsCatalog {
     /// Kept off the main page: debug switches and hacks that can stop games from starting.
     static let advancedCategories: Set<String> = [
         "RendererHacks", "RendererExtensions", "RendererDebug", "CpuDebug", "CpuUnsafe", "Debugging",
-        "DebuggingGraphics", "Miscellaneous",
+        "DebuggingGraphics", "Miscellaneous", experimentsCategory,
     ]
+
+    /// Switches to compare two ways of doing something on the device (Settings > Advanced).
+    static let experimentsCategory = "Experiments"
 
     @MainActor
     static func availability(of item: SettingItem) -> SettingAvailability {
@@ -280,7 +285,7 @@ enum SettingsCatalog {
         if item.key.hasPrefix("post_shader"), !platform.postShadersBuilt {
             return .unavailable("ReShade post-processing isn't part of the iOS app.")
         }
-        if item.key == "moltenvk_driver", !platform.meshMoltenVkBundled {
+        if item.key == "moltenvk_driver" || item.key == "mesh_direct_outputs", !platform.meshMoltenVkBundled {
             return .unavailable("This build has only the legacy MoltenVK.")
         }
         return .available
@@ -308,7 +313,7 @@ enum SettingsCatalog {
     static let descriptions: [String: String] = [
         "scaling_filter": "The last step: how the finished picture is scaled to the screen.",
         "anti_aliasing": "Smooths jagged edges after the game has drawn its frame.",
-        "upscaler": "What takes the place of a game's own upscaler. Automatic: Ocarina of Time's own, AMD FSR 3.1 in games that call DLSS. Game's Own also runs those games' translated DLSS network. AMD FSR 3.1 and MetalFX replace both and draw at 1x. Applies the next time the game starts.",
+        "upscaler": "What takes the place of a game's own upscaler. Automatic: Ocarina of Time's own, AMD FSR 3.1 in games that call DLSS. Game's Own also runs those games' translated DLSS network. AMD FSR 3.1 and MetalFX replace both and draw at 1x; in Ocarina of Time they need a fixed Resolution, so Dynamic draws at 75% handheld (100% docked) with them. Applies the next time the game starts.",
         "frame_gen": "Adds generated frames between the game's own: smoother motion, more GPU work and slightly more input lag.",
         "use_docked_mode": "Docked renders games at their TV resolution, which costs more GPU time and memory than Handheld.",
         "gpu_accuracy": "Higher fixes graphics in some games and is slower.",
@@ -319,10 +324,11 @@ enum SettingsCatalog {
         "cpuopt_compact_jit_code": "About half as much translated CPU code, so the code cache holds twice as much. Applies the next time the game starts.",
         "texture_quality": "Half or Quarter loads the game's large textures with less detail: softer up close, much less memory (about 1.2 GB less in Ocarina of Time). Applies the next time the game starts.",
         "resolution_setup": "The size games draw at. Games with their own Resolution (Ocarina of Time) use that instead. Higher is sharper and costs GPU time, memory and battery.",
-        "oot_resolution": "The size the game draws at, the one resolution setting for it. Dynamic: the game's own, lower when it thinks the GPU is busy. A percentage: a fixed share of full size (handheld 100% 1920x1080, 75% 1440x810, 56% 1080x608, 50% 960x540): less GPU work and memory, softer picture. Above 100% the emulator scales it up. Applies the next time the game starts.",
+        "oot_resolution": "The size the game draws at, the one resolution setting for it. Dynamic: the game's own, lower when it thinks the GPU is busy. A percentage: a fixed share of full size (handheld 100% 1920x1080, 75% 1440x810, 56% 1080x608, 50% 960x540): less GPU work and memory, softer picture. Above 100% the emulator scales it up. With MetalFX Temporal or AMD FSR 3.1 as the Upscaler, Dynamic draws at 75% handheld (100% docked): they take only that size every frame. Applies the next time the game starts.",
         "oot_frame_rate": "30 FPS saves power and heat; Unlocked follows the frame rate limit. The game keeps its normal speed at each.",
         "mkw_frame_rate": "The game's native 30 FPS mode, or dynamic 30-60 FPS (experimental). Applies the next time the game starts.",
         "moltenvk_driver": "Which MoltenVK runs Vulkan on Metal. The new one draws mesh shaders (Ocarina of Time's foliage) with the GPU's own mesh shaders; the legacy one emulates them with compute. Lichii uses the legacy one when the new one doesn't load. Applies the next time Lichii starts.",
+        "mesh_direct_outputs": "New MoltenVK only. On: mesh shaders write their vertices straight to Metal's outputs, which keeps Ocarina of Time's foliage within Metal's limits. Off: they copy them at the end, as builds before November 13 did (some foliage is then drawn with compute). Applies the next time the game starts.",
     ]
 
     /// The settings a search finds that do nothing here, as one footer naming each and why.
@@ -349,7 +355,7 @@ enum SettingsCatalog {
         "Miscellaneous": "Miscellaneous", "Services": "Services", "LibraryApplet": "System Applets",
         "Overlay": "Overlay", "GpuDriver": "GPU Driver", "AddOns": "Add-ons",
         "GameEnhancements": "Game Enhancements", "Resolution": "Resolution & Textures",
-        "Upscaling": "Upscaling",
+        "Upscaling": "Upscaling", "Experiments": "Experiments",
     ]
 
     /// Settings shown with another group than their own: shader building is a hack in the core
@@ -365,6 +371,7 @@ enum SettingsCatalog {
         "scaling_filter": upscalingCategory,
         "fsr_sharpening_slider": upscalingCategory,
         "anti_aliasing": upscalingCategory,
+        "mesh_direct_outputs": experimentsCategory,
     ]
 
     static let resolutionCategory = "Resolution"
@@ -451,6 +458,8 @@ enum SettingsCatalog {
             return games.isEmpty ? nil : "\(games.joined(separator: ", ")) has its own Resolution in its section below."
         case upscalingCategory:
             return "The game's picture goes through the upscaler, then the screen filter."
+        case experimentsCategory:
+            return "To compare upscalers: Graphics > Upscaling > Upscaler (MetalFX Temporal or Automatic) and Screen Filter (MetalFX Spatial). The log's \"Ocarina upscaler:\" lines count the frames MetalFX Temporal drew."
         default:
             return nil
         }
@@ -539,6 +548,7 @@ enum SettingLabels {
         "oot_frame_rate": "Frame Rate",
         "mkw_frame_rate": "Frame Rate",
         "moltenvk_driver": "Graphics Driver",
+        "mesh_direct_outputs": "Mesh Shader Direct Outputs",
         "nx2_frame_rate_limit": "Frame Rate Limit (Switch 2)",
         "accelerate_astc": "ASTC Decoding",
         "astc_recompression": "ASTC Recompression",

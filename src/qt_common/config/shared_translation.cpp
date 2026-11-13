@@ -179,6 +179,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "Time's foliage) with Metal's own mesh shaders; the legacy one emulates them with "
               "compute. Lichii falls back to the legacy one when the new one doesn't load.\n"
               "Takes effect the next time Lichii starts."));
+    INSERT(Settings, mesh_direct_outputs, tr("Mesh shader outputs written directly"),
+           tr("New MoltenVK only: mesh shaders write their vertices straight to Metal's outputs, "
+              "which keeps Ocarina of Time's foliage within Metal's limits. Off copies them at "
+              "the end as before (some foliage is then emulated with compute).\nTakes effect "
+              "the next time a game starts."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
@@ -199,8 +204,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "percentage: a fixed share of that, less GPU work and graphics memory, a softer "
               "picture. 150-300%: full size scaled up by the emulator.\nWith NVIDIA DLSS as the "
               "upscaler it is DLSS's input to 4K: 100% Quality, 87% Balanced, 75% Performance, "
-              "50% Ultra Performance (above 100% counts as 100%).\nTakes effect when the game "
-              "starts."));
+              "50% Ultra Performance (above 100% counts as 100%).\nWith AMD FSR 3.1, NVIDIA DLSS or "
+              "MetalFX as the upscaler, Dynamic draws at 100% docked and 75% handheld: the "
+              "upscaler needs a fixed size.\nTakes effect when the game starts."));
     INSERT(Settings, oot_frame_rate, tr("Frame rate:"),
            tr("30 FPS: for lower-end PCs. 60 FPS: the game's normal rate. Unlocked: up to the "
               "Frame rate limit (Switch 2) below.\nThe game keeps its normal speed at each (its "

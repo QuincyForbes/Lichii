@@ -1234,14 +1234,17 @@ bool PreloadAllPipelines(const Device& device) {
 }
 
 /// Native mesh programs write their outputs directly (RuntimeInfo::mesh_direct_outputs): on
-/// MoltenVK by default, EDEN_NX2_MESH_DIRECT_OUTPUTS=0 keeps the workgroup attribute region, =1
-/// uses direct outputs on every driver.
+/// MoltenVK with Settings mesh_direct_outputs (on by default), EDEN_NX2_MESH_DIRECT_OUTPUTS=0
+/// keeps the workgroup attribute region, =1 uses direct outputs on every driver.
 bool MeshDirectOutputs(const Device& device) {
     static const int direct = [] {
         const char* value = std::getenv("EDEN_NX2_MESH_DIRECT_OUTPUTS");
         return value == nullptr ? -1 : (value[0] != '0' ? 1 : 0);
     }();
-    return direct < 0 ? device.IsMoltenVK() : direct != 0;
+    if (direct >= 0) {
+        return direct != 0;
+    }
+    return device.IsMoltenVK() && Settings::values.mesh_direct_outputs.GetValue();
 }
 
 /// Destroys the pipelines of `pipelines` (a map or a deque of pairs holding unique_ptrs), telling
