@@ -25,7 +25,10 @@
 #include "common/thread_pinning.h"
 #ifdef __APPLE__
 #include <TargetConditionals.h>
+#include <dlfcn.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <os/workgroup.h>
 #include <pthread/qos.h>
 #elif defined(__HAIKU__)
 #include <kernel/OS.h>
@@ -732,10 +735,97 @@ void SetCurrentThreadName(const char* name) {
 
 namespace {
 std::atomic<bool> g_apple_helper_qos{false};
+
+#ifdef __APPLE__
+struct FrameWorkgroup {
+    os_workgroup_interval_t group{};
+    u64 period_ticks{};
+};
+
+const FrameWorkgroup& AppleFrameWorkgroup() {
+    static const FrameWorkgroup workgroup = [] {
+        FrameWorkgroup out;
+        const char* const value = std::getenv("EDEN_NX2_APPLE_WORKGROUP");
+        const unsigned long fps = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+        if (fps == 0 || fps > 240) {
+            return out;
+        }
+        // The only public way to make an interval workgroup (iOS 17, macOS 14); AudioToolbox is
+        // loaded by the audio backend anyway.
+        using Create = os_workgroup_interval_t (*)(const char*, os_clockid_t, os_workgroup_attr_t);
+        void* const toolbox = dlopen(
+            "/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox", RTLD_LAZY);
+        const auto create = reinterpret_cast<Create>(
+            dlsym(toolbox != nullptr ? toolbox : RTLD_DEFAULT, "AudioWorkIntervalCreate"));
+        if (create == nullptr) {
+            LOG_WARNING(Common, "Frame workgroup: AudioWorkIntervalCreate is not available");
+            return out;
+        }
+        out.group = create("Lichii frame", OS_CLOCK_MACH_ABSOLUTE_TIME, nullptr);
+        mach_timebase_info_data_t timebase{};
+        mach_timebase_info(&timebase);
+        const u64 period_ns = 1'000'000'000ULL / fps;
+        out.period_ticks = timebase.numer == 0 ? period_ns
+                                               : period_ns * timebase.denom / timebase.numer;
+        LOG_INFO(Common, "Frame workgroup: {}, {} fps deadlines",
+                 out.group != nullptr ? "made" : "could not be made", fps);
+        return out;
+    }();
+    return workgroup;
 }
+
+struct FrameWorkgroupMember {
+    os_workgroup_join_token_s token{};
+    bool joined{};
+    bool interval_open{};
+    ~FrameWorkgroupMember() {
+        const FrameWorkgroup& workgroup = AppleFrameWorkgroup();
+        if (interval_open) {
+            os_workgroup_interval_finish(workgroup.group, nullptr);
+        }
+        if (joined) {
+            os_workgroup_leave(workgroup.group, &token);
+        }
+    }
+};
+thread_local FrameWorkgroupMember t_frame_workgroup;
+
+void JoinAppleFrameWorkgroup() {
+    const FrameWorkgroup& workgroup = AppleFrameWorkgroup();
+    if (workgroup.group == nullptr || t_frame_workgroup.joined) {
+        return;
+    }
+    const int result = os_workgroup_join(workgroup.group, &t_frame_workgroup.token);
+    t_frame_workgroup.joined = result == 0;
+    if (result != 0) {
+        LOG_WARNING(Common, "Frame workgroup: a thread could not join ({})", result);
+    }
+}
+#endif
+} // Anonymous namespace
 
 void SetAppleHelperQos(bool demote) {
     g_apple_helper_qos.store(demote, std::memory_order_relaxed);
+}
+
+void TickFrameWorkgroup() {
+#ifdef __APPLE__
+    const FrameWorkgroup& workgroup = AppleFrameWorkgroup();
+    if (workgroup.group == nullptr) {
+        return;
+    }
+    JoinAppleFrameWorkgroup();
+    if (!t_frame_workgroup.joined) {
+        return;
+    }
+    if (t_frame_workgroup.interval_open) {
+        os_workgroup_interval_finish(workgroup.group, nullptr);
+    }
+    const u64 now = mach_absolute_time();
+    t_frame_workgroup.interval_open =
+        os_workgroup_interval_start(workgroup.group, now, now + workgroup.period_ticks,
+                                    nullptr) == 0;
+#endif
 }
 
 void SetCurrentThreadToPerformanceCores(bool frame_critical) {
@@ -762,6 +852,7 @@ void SetCurrentThreadToPerformanceCores(bool frame_critical) {
     SetCurrentThreadCoreGroup(CoreGroup::Performance);
 #elif defined(__APPLE__)
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    JoinAppleFrameWorkgroup();
 #elif defined(_WIN32)
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
         SelectCurrentThreadCpuSets(sets.performance);

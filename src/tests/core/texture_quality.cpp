@@ -39,7 +39,16 @@ struct Params {
     u32 format = 0x1D01;
     s32 block_height_log2 = 4;
     bool random_data = false;
+    /// Above 1: a BC4 array with one-GOB blocks, its levels sized as the hardware lays them out.
+    s32 layers = 1;
 };
+
+/// Bytes of a BC4 level with one-GOB blocks: 64-byte GOB columns, 8-row GOBs of 4x4 blocks.
+u64 ArrayLevelBytes(s64 width, s64 height) {
+    const u64 gobs_wide = (u64((width + 3) / 4) * 8 + 63) / 64;
+    const u64 gobs_high = (u64((height + 3) / 4) + 7) / 8;
+    return gobs_wide * gobs_high * 512;
+}
 
 /// tools/nx2/test_oot_texture_mod.py make_bntx, byte for byte.
 std::vector<u8> MakeBntx(const Params& p) {
@@ -66,14 +75,16 @@ std::vector<u8> MakeBntx(const Params& p) {
     Put<s32>(out, Brti + 0x24, p.width);
     Put<s32>(out, Brti + 0x28, p.height);
     Put<s32>(out, Brti + 0x2C, 1);
-    Put<s32>(out, Brti + 0x30, 1);
+    Put<s32>(out, Brti + 0x30, p.layers);
     Put<s32>(out, Brti + 0x34, p.block_height_log2);
     Put<s32>(out, Brti + 0x38, 0x100C9);
     std::vector<u64> sizes;
     s64 w = p.width;
     s64 h = p.height;
     for (u32 i = 0; i < p.mips; ++i) {
-        sizes.push_back(std::max<u64>(512, u64((w + 3) / 4) * u64((h + 3) / 4) * 8));
+        sizes.push_back(p.layers > 1
+                            ? ArrayLevelBytes(w, h)
+                            : std::max<u64>(512, u64((w + 3) / 4) * u64((h + 3) / 4) * 8));
         w = std::max<s64>(1, w / 2);
         h = std::max<s64>(1, h / 2);
     }
@@ -85,6 +96,7 @@ std::vector<u8> MakeBntx(const Params& p) {
     for (const u64 size : sizes) {
         image_size += size;
     }
+    image_size *= static_cast<u64>(p.layers);
     Put<u32>(out, Brti + 0x50, static_cast<u32>(image_size));
     Put<u32>(out, Brti + 0x54, 512);
     Put<u64>(out, Brti + 0x60, NamePtr);
@@ -295,6 +307,52 @@ TEST_CASE("Planning from the header gives the size of a lenient drop", "[texture
     REQUIRE(!FileSys::Bntx::PlanReduce({data.data(), 0x800}, data.size(), 1, 512).has_value());
 }
 
+TEST_CASE("BNTX arrays lose the top levels of every layer", "[texture_quality]") {
+    Params params;
+    params.width = 1365;
+    params.height = 1365;
+    params.mips = 11;
+    params.block_height_log2 = 0;
+    params.layers = 3;
+    const auto data = MakeBntx(params);
+    const std::span<const u8> head{data.data(), 0x1000};
+    const u64 old_layer = (data.size() - 0x1000 - (16 + 2 * 0x18 + 2 * 8)) / 3;
+    REQUIRE(!FileSys::Bntx::Reduce(data, 1, FileSys::TextureQualityMinSize).has_value());
+    for (u32 levels : {1u, 2u}) {
+        const auto reduced =
+            FileSys::Bntx::Reduce(data, levels, FileSys::TextureQualityMinSize, false, true);
+        REQUIRE(reduced.has_value());
+        REQUIRE(FileSys::Bntx::PlanReduce(head, data.size(), levels,
+                                          FileSys::TextureQualityMinSize, true) == reduced->size());
+        u64 cut = 0;
+        for (u32 level = 0; level < levels; ++level) {
+            cut += ArrayLevelBytes(std::max(1, 1365 >> level), std::max(1, 1365 >> level));
+        }
+        const u64 new_layer = old_layer - cut;
+        REQUIRE(reduced->size() == data.size() - 3 * cut);
+        s32 width{};
+        u16 mips{};
+        u32 image_size{};
+        std::memcpy(&width, reduced->data() + Brti + 0x24, sizeof(width));
+        std::memcpy(&mips, reduced->data() + Brti + 0x16, sizeof(mips));
+        std::memcpy(&image_size, reduced->data() + Brti + 0x50, sizeof(image_size));
+        REQUIRE(width == (1365 >> levels));
+        REQUIRE(mips == 11 - levels);
+        REQUIRE(image_size == 3 * new_layer);
+        for (u64 layer = 0; layer < 3; ++layer) {
+            REQUIRE(std::memcmp(reduced->data() + 0x1000 + layer * new_layer,
+                                data.data() + 0x1000 + layer * old_layer + cut, new_layer) == 0);
+        }
+        // The relocation table follows the image as before.
+        REQUIRE(std::memcmp(reduced->data() + 0x1000 + 3 * new_layer, "_RLT", 4) == 0);
+    }
+    // A layout this does not recompute (blocks taller than a GOB) stays as it is.
+    params.block_height_log2 = 4;
+    REQUIRE(!FileSys::Bntx::Reduce(MakeBntx(params), 1, FileSys::TextureQualityMinSize, false,
+                                   true)
+                 .has_value());
+}
+
 TEST_CASE("Raw zstd frames have the size they promise", "[texture_quality]") {
     for (std::size_t size :
          {std::size_t{1}, std::size_t{255}, std::size_t{256}, std::size_t{65791},
@@ -437,11 +495,12 @@ TEST_CASE("Texture quality plans are kept for the next start", "[texture_quality
 // Hidden: LICHII_TEXQ_IN=<dir of .bntx.zs files> [LICHII_TEXQ_OUT=<dir>] plans and reduces real
 // files, checks each plan against the result, times both, and writes each decompressed original
 // (<name>.bntx) and reduced BNTX (<name>.l1, .l2) for tools/nx2/texture_quality_vectors.py
-// --compare.
+// --compare. LICHII_TEXQ_ARRAYS=1 reduces 2D arrays too.
 TEST_CASE("Texture quality on a directory of game files", "[.texture_quality_files]") {
     const char* in = std::getenv("LICHII_TEXQ_IN");
     const char* out = std::getenv("LICHII_TEXQ_OUT");
     REQUIRE(in != nullptr);
+    const bool arrays = std::getenv("LICHII_TEXQ_ARRAYS") != nullptr;
     const auto write = [out](const std::filesystem::path& name, const std::vector<u8>& bytes) {
         if (out != nullptr) {
             Common::FS::IOFile dest{std::filesystem::path{out} / name,
@@ -474,9 +533,9 @@ TEST_CASE("Texture quality on a directory of game files", "[.texture_quality_fil
             }
             const FileSys::VectorVfsFile vfs_file{file, name};
             const auto plan_begin = std::chrono::steady_clock::now();
-            const auto planned = FileSys::PlanZstdTexture(vfs_file, levels);
+            const auto planned = FileSys::PlanZstdTexture(vfs_file, levels, arrays);
             const auto begin = std::chrono::steady_clock::now();
-            const auto reduced = FileSys::ReduceZstdTexture(file, levels);
+            const auto reduced = FileSys::ReduceZstdTexture(file, levels, arrays);
             const auto end = std::chrono::steady_clock::now();
             plan_ms += std::chrono::duration<double, std::milli>(begin - plan_begin).count();
             const double ms = std::chrono::duration<double, std::milli>(end - begin).count();

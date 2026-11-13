@@ -422,6 +422,11 @@ struct ExperimentsView: View {
     @State private var noEarlySubmits = lichii_platform_experiment("no_early_submits") != 0
     @State private var noMeshEmulation = lichii_platform_experiment("no_mesh_emulation") != 0
     @State private var mvkUint8Indices = lichii_platform_experiment("mvk_uint8_indices") != 0
+    @State private var tcOldEviction = lichii_platform_experiment("tc_old_eviction") != 0
+    @State private var helperQosOff = lichii_platform_experiment("helper_qos_off") != 0
+    @State private var frameDeadlines = lichii_platform_experiment("frame_deadlines") != 0
+    @State private var jitOldTables = lichii_platform_experiment("jit_old_tables") != 0
+    @State private var batchFenceSubmits = lichii_platform_experiment("batch_fence_submits") != 0
 
     var body: some View {
         List {
@@ -474,6 +479,33 @@ struct ExperimentsView: View {
                 Text("Graphics")
             } footer: {
                 Text("For tracking down crashes. Early submits hand the GPU a scene load's texture uploads in parts, which keeps graphics memory down while a level loads; off, a large load can run out of memory. Mesh shader emulation draws some of Ocarina of Time's foliage and walls; off, they are missing. MoltenVK Converts 8-bit Indices is the old way of drawing models stored with 8-bit indices, which crashed Ocarina of Time entering Kokiri Forest; Lichii now converts them itself.\n\nAll three apply the next time Lichii starts.")
+            }
+
+            Section {
+                Toggle("Old Texture Eviction", isOn: $tcOldEviction)
+                    .onChange(of: tcOldEviction) { value in
+                        lichii_platform_set_experiment("tc_old_eviction", value ? 1 : 0)
+                    }
+                Toggle("Helper Threads at Full Priority", isOn: $helperQosOff)
+                    .onChange(of: helperQosOff) { value in
+                        lichii_platform_set_experiment("helper_qos_off", value ? 1 : 0)
+                    }
+                Toggle("Frame Deadlines for the CPU", isOn: $frameDeadlines)
+                    .onChange(of: frameDeadlines) { value in
+                        lichii_platform_set_experiment("frame_deadlines", value ? 1 : 0)
+                    }
+                Toggle("Old JIT Tables", isOn: $jitOldTables)
+                    .onChange(of: jitOldTables) { value in
+                        lichii_platform_set_experiment("jit_old_tables", value ? 1 : 0)
+                    }
+                Toggle("Fewer GPU Submissions", isOn: $batchFenceSubmits)
+                    .onChange(of: batchFenceSubmits) { value in
+                        lichii_platform_set_experiment("batch_fence_submits", value ? 1 : 0)
+                    }
+            } header: {
+                Text("Performance")
+            } footer: {
+                Text("For comparing builds. Old Texture Eviction reads textures the GPU drew back from the GPU before freeing them, a wait for the GPU each time, even when the game draws them again anyway. Helper Threads at Full Priority gives the timing and present threads the same priority as the game's. Frame Deadlines for the CPU tells iOS each frame's deadline, which may keep the game on the performance cores; untested on a device. Old JIT Tables keeps the translated code's bookkeeping as it was (about 0.3 GB more memory in Ocarina of Time); turn it on if a game that used to run crashes. Fewer GPU Submissions hands the GPU the game's work in batches of up to 2 ms instead of at every game fence (about 60 command buffers a frame in Ocarina of Time, 21 with it on a computer); an older build made Ocarina of Time's screen flash white with it, so turn it off if the screen flashes.\n\nAll five apply the next time Lichii starts.")
             }
 
             Section {

@@ -945,6 +945,7 @@ void A64AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const Emitte
     }
     const auto range = boost::icl::discrete_interval<u64>::closed(descriptor.PC(), end_location.PC() - 1);
     block_ranges.AddRange(range, descriptor);
+    RangeAdded(block_ranges);
 }
 
 }  // namespace Dynarmic::Backend::Arm64

@@ -239,6 +239,27 @@ void RecommendApple(const Device& device, Profile& p) {
          "256 frames: two 64 MiB malloc blocks in Kokiri (iPhone18,2 malloc census); a large "
          "texture allocates it again."});
     p.tuning.push_back(
+        {"EDEN_NX2_TQ_ARRAYS", "1", "on",
+         "Texture quality also reduces array textures: Ocarina of Time's two 90-layer terrain "
+         "material arrays were 56 MiB each in Kokiri at Quarter (iPhone18,2 census, build 71); "
+         "Half leaves 15 MiB, Quarter 4 MiB each."});
+    p.tuning.push_back(
+        {"EDEN_NX2_TC_REDRAWN_FRAMES", "8", "8 frames",
+         "A render target the game drew in 8 or more frames is freed without reading it back "
+         "from the GPU: the game draws it again before it uses it. An iPhone18,2 read 63-78 "
+         "images back per 10 s in Kokiri (build 71), each a full wait for the GPU."});
+    p.tuning.push_back(
+        {"EDEN_NX2_TC_REUPLOAD_FIRST", "1", "on",
+         "Under memory pressure textures that upload again from guest memory are freed first; "
+         "images that must be read back from the GPU only once the cache is past its critical "
+         "size or an allocation failed."});
+    p.tuning.push_back(
+        {"EDEN_NX2_JIT_PACKED_LISTS", "1", "on",
+         "What the JIT keeps for each translated block (links to other blocks, fastmem patch "
+         "points) in one packed heap block behind a 16-byte table entry: as maps and vectors it "
+         "was four to six small blocks each, 237 MiB of 16-64 byte blocks plus 155 MiB of tables "
+         "in Kokiri (iPhone18,2 malloc census, build 71)."});
+    p.tuning.push_back(
         {"EDEN_NX2_PASS_TIMES", "10", "Every 10 s",
          "One frame in 10 s gets GPU timestamps around each render pass (\"Perf passes:\" log "
          "line): build 71 spent 84-103 ms of GPU time per frame on the phone with the Legacy and "

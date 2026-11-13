@@ -40,6 +40,7 @@
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "common/thread.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
@@ -3657,6 +3658,7 @@ void RasterizerVulkan::TickFrame() {
     TickMemoryReport();
     TickPerfReport();
     scheduler.MarkPassTimesFrame();
+    Common::TickFrameWorkgroup();
 }
 
 void RasterizerVulkan::TickPerfReport() {
@@ -3830,7 +3832,8 @@ void RasterizerVulkan::TickPerfReport() {
              "other {:.1f}, past the stream buffer {:.1f} | other: uniforms {:.1f} (padding "
              "{:.1f}), 8-bit indices {:.1f} | GPU scratch (mesh emulation) {:.1f} MiB/s | {} "
              "early submits, {} waits at the cap, {} mesh "
-             "arena waits | textures {:.1f} collected/s ({} downloaded), {:.1f} made/s, {} MiB "
+             "arena waits | textures {:.1f} collected/s ({} downloaded, {} redrawn not "
+             "downloaded), {:.1f} made/s, {} MiB "
              "(collect {} / {} MiB) | buffers {:.1f} collected/s, {:.1f} made/s, {} MiB (collect "
              "{} MiB) | {} MiB left",
              frame_count / seconds, seconds * 1000.0 / frame_count, perf_frame_max_ms, gpu_text,
@@ -3861,6 +3864,7 @@ void RasterizerVulkan::TickPerfReport() {
              delta(Common::PerfReport::MeshArenaWaits),
              per_second(delta(Common::PerfReport::TextureCollected)),
              delta(Common::PerfReport::TextureCollectorDownloads),
+             delta(Common::PerfReport::TextureCollectorRedrawnDrops),
              per_second(churned(VideoCommon::Churn::ImagesCreated)), collector[0] >> 20,
              collector[1] >> 20, collector[2] >> 20,
              per_second(delta(Common::PerfReport::BufferCollected)),
@@ -3894,6 +3898,9 @@ void RasterizerVulkan::TickPerfReport() {
                                                                 static_cast<double>(samples));
         }
         host_cpu_text += fmt::format(" | guest cores on CPU {}+ (performance):{}", high_first, cores);
+    }
+    if (const int thermal = Common::PerfReport::ThermalPressure(); thermal >= 0) {
+        host_cpu_text += fmt::format(" | thermal pressure {}", thermal);
     }
     std::array<u64, 256> svcs{};
     std::array<std::pair<u64, size_t>, 256> svc_rank{};
@@ -3942,19 +3949,27 @@ void RasterizerVulkan::TickPerfReport() {
         const u64 evictions = now_counts.evictions - then.evictions;
         jit_core_text += fmt::format(
             "{}core {}: {:.1f} MiB (most {:.1f}), {:.0f} blocks/s, compiling {:.0f}%, {} flushes, "
-            "{} evictions ({:.1f} MiB), {:.0f} faults/s, {:.2f} MiB/s dropped in place",
+            "{} evictions ({:.1f} MiB), {:.0f} faults/s, {:.2f} MiB/s dropped in place{}",
             jit_core_text.empty() ? "" : " | ", core, static_cast<double>(live) / (1 << 20),
             static_cast<double>(peak) / (1 << 20), per_second(now_counts.blocks - then.blocks),
             static_cast<double>(now_counts.compile_ns - then.compile_ns) / 1e7 / seconds,
             now_counts.flushes - then.flushes, evictions,
             static_cast<double>(now_counts.evicted_bytes - then.evicted_bytes) / (1 << 20),
             per_second(now_counts.faults - then.faults),
-            mib_per_second(now_counts.dead_bytes - then.dead_bytes));
+            mib_per_second(now_counts.dead_bytes - then.dead_bytes),
+            now_counts.live_blocks == 0
+                ? std::string{}
+                : fmt::format(", {} blocks with {:.1f} MiB of tables + {:.1f} MiB of lists",
+                              now_counts.live_blocks,
+                              static_cast<double>(now_counts.table_bytes) / (1 << 20),
+                              static_cast<double>(now_counts.list_bytes) / (1 << 20)));
     }
     perf_report_jit_cores = jit_cores;
     if (!jit_core_text.empty()) {
-        LOG_INFO(Common_Memory, "Perf JIT ({} MiB per core): {}",
+        LOG_INFO(Common_Memory, "Perf JIT ({} MiB per core, {} shared fault markers + {} blocks): {}",
                  Common::PerfReport::g_jit_cache_size.load(std::memory_order_relaxed) >> 20,
+                 Common::PerfReport::g_jit_markers.load(std::memory_order_relaxed),
+                 Common::PerfReport::g_jit_marker_blocks.load(std::memory_order_relaxed),
                  jit_core_text);
     }
     perf_report_process_cpu = process_cpu;
