@@ -516,6 +516,20 @@ OotResolution OcarinaGameResolution(OotResolution resolution) {
     }
 }
 
+OotResolution OcarinaUpscaledResolution(OotResolution resolution, Upscaler upscaler, bool docked) {
+    if (resolution != OotResolution::Game) {
+        return resolution;
+    }
+    switch (upscaler) {
+    case Upscaler::Fsr3:
+    case Upscaler::Dlss:
+    case Upscaler::MetalFx:
+        return docked ? OotResolution::Full : OotResolution::Percent75;
+    default:
+        return resolution;
+    }
+}
+
 ResolutionSetup EffectiveResolutionSetup() {
     if (GetCurrentProgramID() != OcarinaOfTimeId) {
         return values.resolution_setup.GetValue();

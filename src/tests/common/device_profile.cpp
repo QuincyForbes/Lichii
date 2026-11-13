@@ -259,3 +259,23 @@ TEST_CASE("Ocarina's resolution sets its scale; other games keep resolution_setu
     values.upscaler.SetValue(Settings::Upscaler::Dlss);
     CHECK(Settings::EffectiveResolutionSetup() == ResolutionSetup::Res1X);
 }
+
+TEST_CASE("Ocarina of Time's dynamic resolution is fixed under a temporal upscaler",
+          "[device_profile]") {
+    using Settings::OotResolution;
+    using Settings::Upscaler;
+    // The upscaler takes only a scene 3/4 of the output: 1080p docked, 810p handheld.
+    CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::MetalFx, false) ==
+          OotResolution::Percent75);
+    CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Dlss, true) ==
+          OotResolution::Full);
+    CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Fsr3, false) ==
+          OotResolution::Percent75);
+    CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Auto, false) ==
+          OotResolution::Game);
+    CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Game, true) ==
+          OotResolution::Game);
+    // A resolution the player picked stays.
+    CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Percent56, Upscaler::MetalFx, false) ==
+          OotResolution::Percent56);
+}
