@@ -212,6 +212,10 @@ struct UserConfig {
     // Maximum size is limited by the maximum length of a x86_64 / arm64 jump.
     std::uint32_t code_cache_size = 128 * 1024 * 1024;  // bytes
 
+    /// arm64 host: a full code cache drops its oldest this many bytes of blocks and reuses the
+    /// space (a ring) instead of emptying itself. 0 = empty the whole cache.
+    std::uint32_t code_cache_evict_slice = 0;  // bytes
+
     /// Determines if we should detect memory accesses via page_table that straddle are
     /// misaligned. Accesses that straddle page boundaries will fallback to the relevant
     /// memory callback.
@@ -280,6 +284,10 @@ struct UserConfig {
     /// instead: about 8-10 fewer instructions of cold code per memory access.
     bool inline_page_table_fallback = true;
 
+    /// arm64 host. Loads and stores that do not use fastmem (faulted there, or no arena) call one
+    /// shared page table walk instead of emitting it inline: 4 instructions instead of ~12.
+    bool page_table_lookup_calls = false;
+
     /// Determines if we should use the above fastmem_pointer for exclusive reads and
     /// writes. On x64, dynarmic currently relies on x64 cmpxchg semantics which may not
     /// provide fully accurate emulation.
@@ -288,6 +296,13 @@ struct UserConfig {
     /// recompilation of that block with fastmem disabled. Recompiled code will use memory
     /// callbacks.
     bool recompile_on_exclusive_fastmem_failure = true;
+
+    /// arm64 host. Accesses that faulted in fastmem on one guest core translate without fastmem
+    /// on every core.
+    bool fastmem_shared_markers = false;
+    /// arm64 host. Once this many accesses of one block faulted (each a translation of the block
+    /// again), the whole block translates without fastmem. 0 = per access only.
+    std::uint8_t fastmem_block_after_faults = 0;
 
     /// x64 only. The host is TSO, so ordered (acquire) loads are emitted as plain loads instead
     /// of LOCK XADD. Ordered stores keep XCHG, which keeps STLR followed by LDAR ordered.

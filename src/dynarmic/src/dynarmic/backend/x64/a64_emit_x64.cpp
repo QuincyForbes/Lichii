@@ -78,7 +78,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
 
     if (conf.fastmem_pointer.has_value()) {
         exception_handler.SetFastmemCallback([this](u64 rip_) {
-            ::Common::PerfReport::Add(::Common::PerfReport::JitFastmemFaults);
+            ::Common::PerfReport::NoteJitFault(this->conf.processor_id);
             return FastmemCallback(rip_);
         });
     }

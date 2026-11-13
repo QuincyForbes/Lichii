@@ -86,7 +86,7 @@ void Conductor::ProcessVsync() {
 void Conductor::VsyncThread(std::stop_token token) {
     Common::SetCurrentThreadName("VSyncThread");
     Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
-    Common::SetCurrentThreadToPerformanceCores();
+    Common::SetCurrentThreadToPerformanceCores(false);
 
     while (!token.stop_requested()) {
         m_signal.Wait();

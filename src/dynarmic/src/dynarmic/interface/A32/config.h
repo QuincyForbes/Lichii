@@ -155,6 +155,10 @@ struct UserConfig {
     /// Maximum size is limited by the maximum length of a x86_64 / arm64 jump.
     std::uint32_t code_cache_size = 128 * 1024 * 1024;  // bytes
 
+    /// arm64 host: a full code cache drops its oldest this many bytes of blocks and reuses the
+    /// space (a ring) instead of emptying itself. 0 = empty the whole cache.
+    std::uint32_t code_cache_evict_slice = 0;  // bytes
+
     /// Applies a bit mask to the bits in host pointers from the page table.
     /// The intention behind this is to allow users of Dynarmic to pack attributes in the
     /// same integer and update the pointer attribute pair atomically.
@@ -219,6 +223,13 @@ struct UserConfig {
     /// recompilation of that block with fastmem disabled. Recompiled code will use memory
     /// callbacks.
     bool recompile_on_exclusive_fastmem_failure = true;
+
+    /// arm64 host. Accesses that faulted in fastmem on one guest core translate without fastmem
+    /// on every core.
+    bool fastmem_shared_markers = false;
+    /// arm64 host. Once this many accesses of one block faulted (each a translation of the block
+    /// again), the whole block translates without fastmem. 0 = per access only.
+    std::uint8_t fastmem_block_after_faults = 0;
 
     /// x64 only. See A64::UserConfig::tso_ordered_loads.
     bool tso_ordered_loads = false;

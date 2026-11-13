@@ -22,6 +22,7 @@
 #include "dynarmic/backend/arm64/abi.h"
 #include "dynarmic/backend/arm64/devirtualize.h"
 #include "dynarmic/backend/arm64/emit_arm64.h"
+#include "dynarmic/backend/arm64/emit_arm64_memory.h"
 #include "dynarmic/backend/arm64/stack_layout.h"
 #include "dynarmic/common/cast_util.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
@@ -501,9 +502,10 @@ void* EmitWrappedAtomicCallTrampoline(
 } // namespace
 
 A64AddressSpace::A64AddressSpace(const A64::UserConfig& conf)
-        : AddressSpace(conf.code_cache_size)
+        : AddressSpace(conf.code_cache_size, conf.code_cache_evict_slice, conf.processor_id)
         , conf(conf) {
     atomic_ctx.conf = &this->conf;
+    fastmem_manager.Configure(conf.fastmem_shared_markers, conf.fastmem_block_after_faults);
     if (this->conf.HasOptimization(OptimizationFlag::FastDispatch) && Arm64EnvOn("EDEN_NX2_JIT_DISPATCH")) {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         constexpr std::size_t default_bits = 15;
@@ -627,6 +629,13 @@ void A64AddressSpace::EmitPrelude() {
     prelude_info.get_cntpct = EmitCallTrampoline<&A64::UserCallbacks::GetCNTPCT>(code, conf.callbacks);
     prelude_info.add_ticks = EmitCallTrampoline<&A64::UserCallbacks::AddTicks>(code, conf.callbacks);
     prelude_info.get_ticks_remaining = EmitCallTrampoline<&A64::UserCallbacks::GetTicksRemaining>(code, conf.callbacks);
+    if (const EmitConfig emit_conf = GetEmitConfig(); emit_conf.page_table_lookup_calls) {
+        prelude_info.page_table_lookup_8 = EmitPageTableLookupThunk(code, emit_conf, 8);
+        prelude_info.page_table_lookup_16 = EmitPageTableLookupThunk(code, emit_conf, 16);
+        prelude_info.page_table_lookup_32 = EmitPageTableLookupThunk(code, emit_conf, 32);
+        prelude_info.page_table_lookup_64 = EmitPageTableLookupThunk(code, emit_conf, 64);
+        prelude_info.page_table_lookup_128 = EmitPageTableLookupThunk(code, emit_conf, 128);
+    }
 
     oaknut::Label return_from_run_code, return_to_dispatcher_label, rsb_miss;
     const bool use_fast_dispatch = !fast_dispatch_table.empty();
@@ -890,6 +899,7 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
         .fastmem_address_space_bits = conf.fastmem_address_space_bits,
         .silently_mirror_fastmem = conf.silently_mirror_fastmem,
         .inline_page_table_fallback = conf.inline_page_table_fallback,
+        .page_table_lookup_calls = conf.page_table != nullptr && conf.page_table_lookup_calls,
 
         .wall_clock_cntpct = conf.wall_clock_cntpct,
         .enable_cycle_counting = conf.enable_cycle_counting,
