@@ -38,6 +38,8 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/surface.h"
+#include "video_core/texture_cache/formatter.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -189,18 +191,50 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
         }
     }
 
+    if (const char* const value = std::getenv("EDEN_NX2_PASS_TIMES");
+        value != nullptr && std::atof(value) > 0.0) {
+        const auto physical = device.GetPhysical();
+        const u32 bits =
+            physical.GetQueueFamilyProperties()[device.GetGraphicsFamily()].timestampValidBits;
+        pass_time_period = physical.GetProperties().limits.timestampPeriod;
+        pass_time_mask = bits >= 64 ? ~u64{0} : (u64{1} << bits) - 1;
+        pass_time_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(std::atof(value)));
+        if (bits >= 32 && pass_time_period > 0.0) {
+            try {
+                pass_time_pool = device.GetLogical().CreateQueryPool({
+                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                    .queryCount = PassTimeQueries,
+                    .pipelineStatistics = 0,
+                });
+                pass_time_records.reserve(PassTimeQueries / 2);
+                LOG_INFO(Render_Vulkan, "Perf passes: one frame timed every {} s", value);
+            } catch (const vk::Exception& error) {
+                LOG_WARNING(Render_Vulkan, "Perf passes: no timestamp queries: {}", error.what());
+            }
+        } else {
+            LOG_WARNING(Render_Vulkan, "Perf passes: timestamps not supported ({} bits)", bits);
+        }
+    }
+
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
 }
 
 Scheduler::~Scheduler() {
-    if (trace_query_pool || gpu_time_pool) {
+    if (trace_query_pool || gpu_time_pool || pass_time_pool) {
         WaitWorker();
         worker_thread.request_stop();
         worker_thread.join();
         if (trace_gpu_tick != 0) {
             master_semaphore->Wait(trace_gpu_tick);
+        }
+        if (pass_time_pending) {
+            master_semaphore->Wait(pass_time_wait_tick);
         }
         if (gpu_time_count != 0) {
             master_semaphore->Wait(
@@ -418,6 +452,245 @@ void Scheduler::MarkFrameEnd(u64 frame) {
     }
 }
 
+void Scheduler::MarkPassTimesFrame() {
+    if (!pass_time_pool) {
+        return;
+    }
+    Record([this](vk::CommandBuffer) {
+        if (pass_time_sampling) {
+            // The frame's last commands go with the next submission; its results come after it.
+            pass_time_sampling = false;
+            pass_time_closing = true;
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (pass_time_closing || pass_time_pending || now - pass_time_last < pass_time_interval) {
+            return;
+        }
+        pass_time_last = now;
+        pass_time_sampling = true;
+        pass_time_reset = true;
+        pass_time_next_query = 0;
+        pass_time_submissions = 0;
+        pass_time_records.clear();
+        pass_time_spans.clear();
+    });
+}
+
+void Scheduler::PassTimestamp(vk::CommandBuffer cmdbuf, bool begin, const PassShape* shape,
+                              u32 draws) {
+    pass_time_in_pass = begin;
+    if (begin) {
+        if (!pass_time_sampling || pass_time_next_query + 4 > PassTimeQueries) {
+            return;
+        }
+        if (std::exchange(pass_time_reset, false)) {
+            // The upload command buffer runs before this one in the same submission.
+            current_upload_cmdbuf.ResetQueryPool(*pass_time_pool, 0, PassTimeQueries);
+        }
+        const u32 query = pass_time_next_query;
+        pass_time_next_query += 2;
+        cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *pass_time_pool, query);
+        pass_time_records.push_back({
+            .shape = *shape,
+            .begin_query = query,
+            .submission = pass_time_submissions,
+        });
+        return;
+    }
+    if (pass_time_records.empty() || pass_time_records.back().end_query != ~0U) {
+        return;
+    }
+    PassTimeRecord& record = pass_time_records.back();
+    record.end_query = record.begin_query + 1;
+    record.draws = draws;
+    cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *pass_time_pool,
+                          record.end_query);
+}
+
+u32 Scheduler::PassTimeWorkBegin(vk::CommandBuffer cmdbuf, u64 hash, std::array<u32, 3> size) {
+    if (pass_time_next_query + 4 > PassTimeQueries) {
+        return ~0U;
+    }
+    if (std::exchange(pass_time_reset, false)) {
+        current_upload_cmdbuf.ResetQueryPool(*pass_time_pool, 0, PassTimeQueries);
+    }
+    const u32 query = pass_time_next_query;
+    pass_time_next_query += 2;
+    cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *pass_time_pool, query);
+    pass_time_records.push_back({
+        .begin_query = query,
+        .submission = pass_time_submissions,
+        .dispatch = true,
+        .hash = hash,
+        .groups = size,
+    });
+    return static_cast<u32>(pass_time_records.size() - 1);
+}
+
+void Scheduler::PassTimeWorkEnd(vk::CommandBuffer cmdbuf, u32 record) {
+    if (record == ~0U) {
+        return;
+    }
+    PassTimeRecord& work = pass_time_records[record];
+    work.end_query = work.begin_query + 1;
+    cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *pass_time_pool, work.end_query);
+}
+
+void Scheduler::PassTimesSubmitted(u64 tick) {
+    if (pass_time_open_span != ~0U || ((pass_time_sampling || pass_time_closing) &&
+                                       pass_time_next_query + 2 <= PassTimeQueries)) {
+        // The whole submission, from the start of its upload command buffer (the first one of
+        // the frame: from the end of its uploads) to the end of this one.
+        if (pass_time_open_span == ~0U) {
+            if (std::exchange(pass_time_reset, false)) {
+                current_upload_cmdbuf.ResetQueryPool(*pass_time_pool, 0, PassTimeQueries);
+            }
+            pass_time_open_span = pass_time_next_query;
+            pass_time_next_query += 2;
+            current_upload_cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                                 *pass_time_pool, pass_time_open_span);
+        }
+        current_cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *pass_time_pool,
+                                      pass_time_open_span + 1);
+        pass_time_spans.push_back(pass_time_open_span);
+    }
+    pass_time_open_span = ~0U;
+    if (pass_time_sampling) {
+        ++pass_time_submissions;
+    } else if (pass_time_closing) {
+        pass_time_closing = false;
+        pass_time_pending = !pass_time_records.empty() || !pass_time_spans.empty();
+        pass_time_wait_tick = tick;
+    } else if (pass_time_pending && master_semaphore->IsFree(pass_time_wait_tick)) {
+        pass_time_pending = false;
+        ReportPassTimes();
+    }
+}
+
+void Scheduler::ReportPassTimes() {
+    std::vector<u64> stamps(pass_time_next_query);
+    if (stamps.empty() ||
+        device.GetLogical().GetQueryResults(*pass_time_pool, 0, pass_time_next_query,
+                                            stamps.size() * sizeof(u64), stamps.data(),
+                                            sizeof(u64), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+        return;
+    }
+    const auto ms_between = [&](u32 first, u32 second) {
+        const u64 a = stamps[first] & pass_time_mask;
+        const u64 b = stamps[second] & pass_time_mask;
+        return b > a ? static_cast<double>(b - a) * pass_time_period / 1e6 : 0.0;
+    };
+    using VideoCore::Surface::PixelFormat;
+    const auto bytes_of = [](u8 format) -> u64 {
+        const auto pixel_format = static_cast<PixelFormat>(format);
+        return pixel_format == PixelFormat::Invalid ? 0
+                                                    : VideoCore::Surface::BytesPerBlock(pixel_format);
+    };
+    struct Group {
+        std::string name;
+        u32 passes{};
+        u32 draws{};
+        double ms{};
+        u64 load_bytes{};
+        u64 store_bytes{};
+    };
+    std::vector<Group> groups;
+    struct DispatchGroup {
+        u64 hash{};
+        u32 count{};
+        double ms{};
+        u64 groups{}; ///< Workgroups; 0 for indirect dispatches
+    };
+    std::vector<DispatchGroup> dispatches;
+    double in_dispatches{};
+    double in_passes{};
+    u64 load_bytes{};
+    u64 store_bytes{};
+    for (const PassTimeRecord& record : pass_time_records) {
+        if (record.end_query == ~0U) {
+            continue;
+        }
+        const double ms = ms_between(record.begin_query, record.end_query);
+        if (record.dispatch) {
+            in_dispatches += ms;
+            auto it = std::ranges::find(dispatches, record.hash, &DispatchGroup::hash);
+            if (it == dispatches.end()) {
+                it = dispatches.insert(dispatches.end(), DispatchGroup{.hash = record.hash});
+            }
+            ++it->count;
+            it->ms += ms;
+            it->groups += u64{record.groups[0]} * record.groups[1] * record.groups[2];
+            continue;
+        }
+        in_passes += ms;
+        const PassShape& s = record.shape;
+        const u64 pixels = u64{s.width} * s.height * (std::max)(u16{1}, s.layers) *
+                           (std::max)(u8{1}, s.samples);
+        u64 loads{};
+        u64 stores{};
+        std::string name = fmt::format("{}x{}", s.width, s.height);
+        if (s.layers > 1) {
+            name += fmt::format("x{}", s.layers);
+        }
+        if (s.samples > 1) {
+            name += fmt::format(" {}x MSAA", s.samples);
+        }
+        for (u32 slot = 0; slot < s.num_colors; ++slot) {
+            const u64 bytes = pixels * bytes_of(s.color_formats[slot]);
+            loads += (s.color_clear_mask & (1U << slot)) != 0 ? 0 : bytes;
+            stores += (s.color_discard_mask & (1U << slot)) != 0 ? 0 : bytes;
+            name += fmt::format(" {}", static_cast<PixelFormat>(s.color_formats[slot]));
+        }
+        if (bytes_of(s.depth_format) != 0) {
+            const u64 bytes = pixels * bytes_of(s.depth_format);
+            loads += s.depth_clear ? 0 : bytes;
+            stores += s.depth_discard ? 0 : bytes;
+            name += fmt::format(" + {}", static_cast<PixelFormat>(s.depth_format));
+        }
+        load_bytes += loads;
+        store_bytes += stores;
+        auto it = std::ranges::find(groups, name, &Group::name);
+        if (it == groups.end()) {
+            it = groups.insert(groups.end(), Group{.name = std::move(name)});
+        }
+        ++it->passes;
+        it->draws += record.draws;
+        it->ms += ms;
+        it->load_bytes += loads;
+        it->store_bytes += stores;
+    }
+    std::ranges::sort(groups, std::greater{}, &Group::ms);
+    std::string top;
+    for (size_t i = 0; i < groups.size() && i < 10; ++i) {
+        const Group& g = groups[i];
+        top += fmt::format("{}{}: {} passes, {:.2f} ms, {} draws, loads {} MiB, stores {} MiB",
+                           i == 0 ? "" : " | ", g.name, g.passes, g.ms, g.draws,
+                           g.load_bytes >> 20, g.store_bytes >> 20);
+    }
+    std::ranges::sort(dispatches, std::greater{}, &DispatchGroup::ms);
+    std::string top_dispatches;
+    for (size_t i = 0; i < dispatches.size() && i < 10; ++i) {
+        const DispatchGroup& d = dispatches[i];
+        top_dispatches += fmt::format("{}{:016x}: {}x, {:.2f} ms, {} groups", i == 0 ? "" : " | ",
+                                      d.hash, d.count, d.ms, d.groups);
+    }
+    double submitted{};
+    for (const u32 span : pass_time_spans) {
+        submitted += ms_between(span, span + 1);
+    }
+    const size_t num_passes = static_cast<size_t>(std::ranges::count_if(
+        pass_time_records, [](const PassTimeRecord& record) { return !record.dispatch; }));
+    LOG_INFO(Render_Vulkan,
+             "Perf passes: {} submissions take {:.2f} ms of GPU time: {} render passes {:.2f} ms, "
+             "{} guest dispatches {:.2f} ms, the rest (copies, barriers, emulator compute) {:.2f} "
+             "ms; attachments load {} MiB, store {} MiB | passes: {} | dispatches: {}",
+             pass_time_spans.size(), submitted, num_passes, in_passes,
+             pass_time_records.size() - num_passes, in_dispatches,
+             (std::max)(submitted - in_passes - in_dispatches, 0.0), load_bytes >> 20,
+             store_bytes >> 20, top, top_dispatches);
+}
+
 void Scheduler::DispatchWork(bool lazy) {
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
@@ -490,13 +763,66 @@ bool Scheduler::RenderPassMatches(const Framebuffer* framebuffer) const {
 }
 
 void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass renderpass,
-                                    const VkClearValue* clear_values, u32 clear_value_count) {
+                                    const VkClearValue* clear_values, u32 clear_value_count,
+                                    u32 color_clear_mask, bool depth_clear,
+                                    u32 color_discard_mask, bool depth_discard) {
     if (VideoCommon::Nx2Profile::Enabled()) {
         g_profile_renderpasses.fetch_add(1, std::memory_order_relaxed);
     }
     Common::PerfReport::Add(Common::PerfReport::RenderPasses);
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
+    pass_draws = 0;
+    const bool time_pass = static_cast<bool>(pass_time_pool);
+    PassShape shape{};
+    if (time_pass || Common::PerfReport::Enabled()) {
+        using VideoCore::Surface::PixelFormat;
+        const RenderPassKey& key = framebuffer->RenderPassKeyBase();
+        shape = {
+            .width = static_cast<u16>((std::min)(render_area.width, 0xffffU)),
+            .height = static_cast<u16>((std::min)(render_area.height, 0xffffU)),
+            .layers = static_cast<u16>((std::min)(framebuffer->Layers(), 0xffffU)),
+            .samples = static_cast<u8>(key.samples),
+            .depth_format = static_cast<u8>(key.depth_format),
+            .color_clear_mask = static_cast<u8>(color_clear_mask | key.color_clear_mask),
+            .color_discard_mask = static_cast<u8>(color_discard_mask | key.color_discard_mask),
+            .depth_clear = depth_clear || key.depth_stencil_clear,
+            .depth_discard = depth_discard || key.depth_stencil_discard,
+        };
+        // The render pass's attachments are the valid formats, in slot order.
+        u32 clear_mask{};
+        u32 discard_mask{};
+        for (u32 slot = 0; slot < key.color_formats.size(); ++slot) {
+            if (key.color_formats[slot] == PixelFormat::Invalid) {
+                continue;
+            }
+            clear_mask |= ((shape.color_clear_mask >> slot) & 1U) << shape.num_colors;
+            discard_mask |= ((shape.color_discard_mask >> slot) & 1U) << shape.num_colors;
+            shape.color_formats[shape.num_colors++] = static_cast<u8>(key.color_formats[slot]);
+        }
+        shape.color_clear_mask = static_cast<u8>(clear_mask);
+        shape.color_discard_mask = static_cast<u8>(discard_mask);
+        if (Common::PerfReport::Enabled()) {
+            const u64 pixels = u64{render_area.width} * render_area.height *
+                               (std::max)(framebuffer->Layers(), 1U) *
+                               (std::max)(static_cast<u32>(key.samples), 1U);
+            u64 loads{};
+            u64 stores{};
+            for (u32 index = 0; index < shape.num_colors; ++index) {
+                const u64 bytes = pixels * VideoCore::Surface::BytesPerBlock(
+                                               static_cast<PixelFormat>(shape.color_formats[index]));
+                loads += (shape.color_clear_mask >> index) & 1U ? 0 : bytes;
+                stores += (shape.color_discard_mask >> index) & 1U ? 0 : bytes;
+            }
+            if (key.depth_format != PixelFormat::Invalid) {
+                const u64 bytes = pixels * VideoCore::Surface::BytesPerBlock(key.depth_format);
+                loads += shape.depth_clear ? 0 : bytes;
+                stores += shape.depth_discard ? 0 : bytes;
+            }
+            Common::PerfReport::Add(Common::PerfReport::AttachmentLoadBytes, loads);
+            Common::PerfReport::Add(Common::PerfReport::AttachmentStoreBytes, stores);
+        }
+    }
     state.renderpass = renderpass;
     state.clear_variant = false;
     state.framebuffer = framebuffer_handle;
@@ -516,8 +842,11 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
         values[i] = clear_values[i];
     }
     const bool after_compute = std::exchange(compute_writes_pending, false);
-    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,
-            after_compute](vk::CommandBuffer cmdbuf) {
+    Record([this, renderpass, framebuffer_handle, render_area, values, clear_value_count,
+            after_compute, time_pass, shape](vk::CommandBuffer cmdbuf) {
+        if (time_pass) {
+            PassTimestamp(cmdbuf, true, &shape, 0);
+        }
         const VkRenderPassBeginInfo renderpass_bi{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             .pNext = nullptr,
@@ -577,7 +906,9 @@ void Scheduler::RealizeDeferredClear() {
     const VkRenderPass renderpass = dc.framebuffer->RenderPassVariant(
         dc.color_clear_mask, dc.depth_stencil, color_discard_mask, depth_stencil_discard);
     EndRenderPass();
-    BeginRenderPassImpl(dc.framebuffer, renderpass, clear_values.data(), count);
+    BeginRenderPassImpl(dc.framebuffer, renderpass, clear_values.data(), count,
+                        dc.color_clear_mask, dc.depth_stencil, color_discard_mask,
+                        depth_stencil_discard);
     // Without discards, the variant only clears instead of loading: its store ops, layouts and
     // attachments are the framebuffer's own.
     state.clear_variant = color_discard_mask == 0 && !depth_stencil_discard;
@@ -805,6 +1136,12 @@ void Scheduler::AllocateWorkerCommandBuffer() {
         TraceGpuSubmission();
     }
     BeginGpuTime();
+    if (pass_time_sampling && !pass_time_reset && pass_time_next_query + 2 <= PassTimeQueries) {
+        pass_time_open_span = pass_time_next_query;
+        pass_time_next_query += 2;
+        current_upload_cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                             *pass_time_pool, pass_time_open_span);
+    }
 }
 
 void Scheduler::TraceShader(u64 hash, u32 stage) {
@@ -1027,6 +1364,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
         };
+        if (pass_time_pool) {
+            PassTimesSubmitted(signal_value);
+        }
         upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WRITE_BARRIER);
         upload_cmdbuf.End();
         if (trace_gpu_recording) {
@@ -1131,10 +1471,11 @@ void Scheduler::EndRenderPass()
         query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
         query_cache->NotifySegment(false);
 
-        Record([num_images = num_renderpass_images,
+        Record([this, num_images = num_renderpass_images,
                        images = renderpass_images,
                        ranges = renderpass_image_ranges,
-                       has_transform_feedback = device.IsExtTransformFeedbackSupported()](
+                       has_transform_feedback = device.IsExtTransformFeedbackSupported(),
+                       time_pass = static_cast<bool>(pass_time_pool), draws = pass_draws](
                           vk::CommandBuffer cmdbuf) {
             std::array<VkImageMemoryBarrier, 9> barriers;
             for (size_t i = 0; i < num_images; ++i) {
@@ -1172,6 +1513,9 @@ void Scheduler::EndRenderPass()
                 };
             }
             cmdbuf.EndRenderPass();
+            if (time_pass) {
+                PassTimestamp(cmdbuf, false, nullptr, draws);
+            }
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
                                    0, nullptr, nullptr, vk::Span(barriers.data(), num_images));

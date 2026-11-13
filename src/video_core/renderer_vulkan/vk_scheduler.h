@@ -92,6 +92,13 @@ public:
     }
 
     void MarkFrameEnd(u64 frame);
+    /// EDEN_NX2_PASS_TIMES=<seconds>: every that many seconds, one frame's render passes get GPU
+    /// timestamps, logged as "Perf passes:" (the passes by size and format that took the most).
+    void MarkPassTimesFrame();
+    /// A draw was recorded in the open render pass (for "Perf passes:").
+    void NotePassDraw() noexcept {
+        ++pass_draws;
+    }
     void TraceGraphicsPipeline(const std::array<u64, 6>& hashes);
     void TraceComputePipeline(u64 hash);
     /// Worker thread, inside a recorded command: timestamps one draw or dispatch of a sampled
@@ -99,6 +106,19 @@ public:
     template <typename Func>
     void TraceGpuWork(vk::CommandBuffer cmdbuf, u64 hash, u64 fragment_hash,
                       std::array<u32, 3> size, Func&& work) {
+        if (pass_time_sampling && !pass_time_in_pass) [[unlikely]] {
+            // A guest dispatch of a frame "Perf passes:" times.
+            const u32 record = PassTimeWorkBegin(cmdbuf, hash, size);
+            TraceGpuWorkImpl(cmdbuf, hash, fragment_hash, size, work);
+            PassTimeWorkEnd(cmdbuf, record);
+            return;
+        }
+        TraceGpuWorkImpl(cmdbuf, hash, fragment_hash, size, work);
+    }
+
+    template <typename Func>
+    void TraceGpuWorkImpl(vk::CommandBuffer cmdbuf, u64 hash, u64 fragment_hash,
+                          std::array<u32, 3> size, Func& work) {
         if (!trace_gpu_recording || !trace_work_pool || trace_work_count == TraceMaxWork) {
             work();
             return;
@@ -483,9 +503,33 @@ private:
         VkClearValue depth_stencil_value{};
     };
 
+    /// What one render pass loads and stores: its attachments, clears and discards.
+    struct PassShape {
+        u16 width = 0;
+        u16 height = 0;
+        u16 layers = 0;
+        u8 samples = 0;
+        u8 num_colors = 0;
+        std::array<u8, 8> color_formats{};
+        u8 depth_format = 0; ///< PixelFormat::Invalid's value when there is none
+        u8 color_clear_mask = 0;
+        u8 color_discard_mask = 0;
+        bool depth_clear = false;
+        bool depth_discard = false;
+    };
+
     /// Begins a render pass for the given framebuffer, optionally with clear values.
     void BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass renderpass,
-                             const VkClearValue* clear_values, u32 clear_value_count);
+                             const VkClearValue* clear_values, u32 clear_value_count,
+                             u32 color_clear_mask = 0, bool depth_clear = false,
+                             u32 color_discard_mask = 0, bool depth_discard = false);
+
+    /// Worker thread: "Perf passes:" sampling (see MarkPassTimesFrame).
+    void PassTimestamp(vk::CommandBuffer cmdbuf, bool begin, const PassShape* shape, u32 draws);
+    void PassTimesSubmitted(u64 tick);
+    u32 PassTimeWorkBegin(vk::CommandBuffer cmdbuf, u64 hash, std::array<u32, 3> size);
+    void PassTimeWorkEnd(vk::CommandBuffer cmdbuf, u32 record);
+    void ReportPassTimes();
 
     /// If a deferred clear is pending.
     void RealizeDeferredClear();
@@ -579,6 +623,36 @@ private:
     u32 gpu_time_bits{};
     double gpu_time_period{};
     u64 gpu_time_last_end{};
+
+    static constexpr u32 PassTimeQueries = 4096;
+    struct PassTimeRecord {
+        PassShape shape;
+        u32 begin_query{};
+        u32 end_query{~0U};
+        u32 draws{};
+        u32 submission{};
+        bool dispatch{};
+        u64 hash{};               ///< Dispatches: the compute shader
+        std::array<u32, 3> groups{};
+    };
+    vk::QueryPool pass_time_pool;
+    double pass_time_period{};
+    u64 pass_time_mask{};
+    std::chrono::steady_clock::duration pass_time_interval{};
+    u32 pass_draws{}; ///< Recording thread: draws in the open render pass
+    // Worker thread:
+    std::chrono::steady_clock::time_point pass_time_last{};
+    std::vector<PassTimeRecord> pass_time_records;
+    std::vector<u32> pass_time_spans; ///< First query of each timed submission
+    u32 pass_time_open_span{~0U};
+    u32 pass_time_next_query{};
+    u32 pass_time_submissions{};
+    u64 pass_time_wait_tick{};
+    bool pass_time_sampling{};
+    bool pass_time_in_pass{};
+    bool pass_time_reset{};
+    bool pass_time_closing{};
+    bool pass_time_pending{};
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 

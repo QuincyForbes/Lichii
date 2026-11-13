@@ -238,6 +238,11 @@ void RecommendApple(const Device& device, Profile& p) {
          "Texture upload scratch over 16 MiB is freed at the next frame instead of kept for up to "
          "256 frames: two 64 MiB malloc blocks in Kokiri (iPhone18,2 malloc census); a large "
          "texture allocates it again."});
+    p.tuning.push_back(
+        {"EDEN_NX2_PASS_TIMES", "10", "Every 10 s",
+         "One frame in 10 s gets GPU timestamps around each render pass (\"Perf passes:\" log "
+         "line): build 71 spent 84-103 ms of GPU time per frame on the phone with the Legacy and "
+         "the New driver alike, ~15x a PC's, and the log has to say which passes take it."});
 }
 
 void RecommendDesktop(const Device& device, Profile& p) {

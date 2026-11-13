@@ -3656,6 +3656,7 @@ void RasterizerVulkan::TickFrame() {
     }
     TickMemoryReport();
     TickPerfReport();
+    scheduler.MarkPassTimesFrame();
 }
 
 void RasterizerVulkan::TickPerfReport() {
@@ -3822,7 +3823,8 @@ void RasterizerVulkan::TickPerfReport() {
              "back {}, Vulkan worker {}, guest cores {} (max {}, in the host kernel {}) | guest "
              "cores' time: guest code {:.0f}%, kernel {:.0f}%, idle {:.0f}% ({:.0f} waits/s) | {} "
              "| memory: {} | draws {:.0f}/frame, {:.1f} "
-             "skipped (no pipeline), {:.1f} render passes/frame, {:.1f} mesh emulated/frame "
+             "skipped (no pipeline), {:.1f} render passes/frame (attachments load {:.0f}, store "
+             "{:.0f} MiB/frame), {:.1f} mesh emulated/frame "
              "({:.1f} ended a render pass) | uploads MiB/s: textures {:.1f}, buffers {:.1f}, "
              "other {:.1f}, past the stream buffer {:.1f} | other: uniforms {:.1f} (padding "
              "{:.1f}), 8-bit indices {:.1f} | GPU scratch (mesh emulation) {:.1f} MiB/s | {} "
@@ -3843,6 +3845,8 @@ void RasterizerVulkan::TickPerfReport() {
              per_second(delta(Common::PerfReport::GuestIdles)), jit_text, memory_events,
              per_frame(Common::PerfReport::Draws), per_frame(Common::PerfReport::DrawsSkipped),
              per_frame(Common::PerfReport::RenderPasses),
+             per_frame(Common::PerfReport::AttachmentLoadBytes) / (1 << 20),
+             per_frame(Common::PerfReport::AttachmentStoreBytes) / (1 << 20),
              per_frame(Common::PerfReport::MeshEmulatedDraws),
              per_frame(Common::PerfReport::MeshPassBreaks), mib_per_second(texture_bytes),
              mib_per_second(buffer_bytes), mib_per_second(other_bytes),

@@ -1415,6 +1415,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         });
     }
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    scheduler.NotePassDraw();
     if (writes_storage) {
         scheduler.NoteRenderPassStores();
     }

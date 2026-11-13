@@ -57,6 +57,8 @@ enum Counter : std::size_t {
     RenderPasses,        ///< Render passes begun
     MeshEmulatedDraws,   ///< Mesh draws run as compute + a vertex draw
     MeshPassBreaks,      ///< Of them, ones that ended a render pass for their compute
+    AttachmentLoadBytes, ///< Attachment bytes render passes load (neither cleared nor don't-care)
+    AttachmentStoreBytes, ///< Attachment bytes render passes store
     GuestRunNs,          ///< Guest cores: wall time in guest code (the JIT)
     GuestKernelNs,       ///< Guest cores: wall time in SVCs, the scheduler and fiber switches
     GuestIdleNs,         ///< Guest cores: wall time waiting with nothing to run
