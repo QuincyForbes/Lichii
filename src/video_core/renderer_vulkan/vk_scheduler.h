@@ -527,6 +527,8 @@ private:
     /// Worker thread: "Perf passes:" sampling (see MarkPassTimesFrame).
     void PassTimestamp(vk::CommandBuffer cmdbuf, bool begin, const PassShape* shape, u32 draws);
     void PassTimesSubmitted(u64 tick);
+    void PassTimeLabel(vk::CommandBuffer cmdbuf, const char* file, u32 line);
+    void PassTimeCloseLabel(vk::CommandBuffer cmdbuf);
     u32 PassTimeWorkBegin(vk::CommandBuffer cmdbuf, u64 hash, std::array<u32, 3> size);
     void PassTimeWorkEnd(vk::CommandBuffer cmdbuf, u32 record);
     void ReportPassTimes();
@@ -634,14 +636,19 @@ private:
         bool dispatch{};
         u64 hash{};               ///< Dispatches: the compute shader
         std::array<u32, 3> groups{};
+        const char* site_file = nullptr; ///< Labels: the caller that left the render pass
+        u32 site_line{};
     };
     vk::QueryPool pass_time_pool;
     double pass_time_period{};
     u64 pass_time_mask{};
     std::chrono::steady_clock::duration pass_time_interval{};
-    u32 pass_draws{}; ///< Recording thread: draws in the open render pass
-    // Worker thread:
+    // Recording thread:
+    u32 pass_draws{}; ///< Draws in the open render pass
     std::chrono::steady_clock::time_point pass_time_last{};
+    bool pass_time_host_sampling{}; ///< This frame may be timed: label the work outside passes
+    // Worker thread:
+    u32 pass_time_open_label{~0U};
     std::vector<PassTimeRecord> pass_time_records;
     std::vector<u32> pass_time_spans; ///< First query of each timed submission
     u32 pass_time_open_span{~0U};

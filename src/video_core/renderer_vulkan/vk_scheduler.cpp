@@ -456,18 +456,23 @@ void Scheduler::MarkPassTimesFrame() {
     if (!pass_time_pool) {
         return;
     }
-    Record([this](vk::CommandBuffer) {
+    const auto now = std::chrono::steady_clock::now();
+    const bool start = now - pass_time_last >= pass_time_interval;
+    if (start) {
+        pass_time_last = now;
+    }
+    pass_time_host_sampling = start;
+    Record([this, start](vk::CommandBuffer cmdbuf) {
         if (pass_time_sampling) {
             // The frame's last commands go with the next submission; its results come after it.
+            PassTimeCloseLabel(cmdbuf);
             pass_time_sampling = false;
             pass_time_closing = true;
             return;
         }
-        const auto now = std::chrono::steady_clock::now();
-        if (pass_time_closing || pass_time_pending || now - pass_time_last < pass_time_interval) {
+        if (!start || pass_time_closing || pass_time_pending) {
             return;
         }
-        pass_time_last = now;
         pass_time_sampling = true;
         pass_time_reset = true;
         pass_time_next_query = 0;
@@ -481,6 +486,7 @@ void Scheduler::PassTimestamp(vk::CommandBuffer cmdbuf, bool begin, const PassSh
                               u32 draws) {
     pass_time_in_pass = begin;
     if (begin) {
+        PassTimeCloseLabel(cmdbuf);
         if (!pass_time_sampling || pass_time_next_query + 4 > PassTimeQueries) {
             return;
         }
@@ -508,7 +514,38 @@ void Scheduler::PassTimestamp(vk::CommandBuffer cmdbuf, bool begin, const PassSh
                           record.end_query);
 }
 
+void Scheduler::PassTimeLabel(vk::CommandBuffer cmdbuf, const char* file, u32 line) {
+    PassTimeCloseLabel(cmdbuf);
+    if (!pass_time_sampling || pass_time_in_pass || pass_time_next_query + 4 > PassTimeQueries) {
+        return;
+    }
+    if (std::exchange(pass_time_reset, false)) {
+        current_upload_cmdbuf.ResetQueryPool(*pass_time_pool, 0, PassTimeQueries);
+    }
+    const u32 query = pass_time_next_query;
+    pass_time_next_query += 2;
+    cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *pass_time_pool, query);
+    pass_time_records.push_back({
+        .begin_query = query,
+        .submission = pass_time_submissions,
+        .site_file = file,
+        .site_line = line,
+    });
+    pass_time_open_label = static_cast<u32>(pass_time_records.size() - 1);
+}
+
+void Scheduler::PassTimeCloseLabel(vk::CommandBuffer cmdbuf) {
+    if (pass_time_open_label == ~0U) {
+        return;
+    }
+    PassTimeRecord& label = pass_time_records[pass_time_open_label];
+    pass_time_open_label = ~0U;
+    label.end_query = label.begin_query + 1;
+    cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *pass_time_pool, label.end_query);
+}
+
 u32 Scheduler::PassTimeWorkBegin(vk::CommandBuffer cmdbuf, u64 hash, std::array<u32, 3> size) {
+    PassTimeCloseLabel(cmdbuf);
     if (pass_time_next_query + 4 > PassTimeQueries) {
         return ~0U;
     }
@@ -538,6 +575,7 @@ void Scheduler::PassTimeWorkEnd(vk::CommandBuffer cmdbuf, u32 record) {
 }
 
 void Scheduler::PassTimesSubmitted(u64 tick) {
+    PassTimeCloseLabel(current_cmdbuf);
     if (pass_time_open_span != ~0U || ((pass_time_sampling || pass_time_closing) &&
                                        pass_time_next_query + 2 <= PassTimeQueries)) {
         // The whole submission, from the start of its upload command buffer (the first one of
@@ -603,7 +641,9 @@ void Scheduler::ReportPassTimes() {
         u64 groups{}; ///< Workgroups; 0 for indirect dispatches
     };
     std::vector<DispatchGroup> dispatches;
+    std::vector<Group> labels; ///< Work after leaving a render pass, by the caller that left it
     double in_dispatches{};
+    double in_labels{};
     double in_passes{};
     u64 load_bytes{};
     u64 store_bytes{};
@@ -612,6 +652,21 @@ void Scheduler::ReportPassTimes() {
             continue;
         }
         const double ms = ms_between(record.begin_query, record.end_query);
+        if (record.site_file != nullptr) {
+            in_labels += ms;
+            std::string_view file{record.site_file};
+            if (const size_t slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+                file.remove_prefix(slash + 1);
+            }
+            std::string site = fmt::format("{}:{}", file, record.site_line);
+            auto it = std::ranges::find(labels, site, &Group::name);
+            if (it == labels.end()) {
+                it = labels.insert(labels.end(), Group{.name = std::move(site)});
+            }
+            ++it->passes;
+            it->ms += ms;
+            continue;
+        }
         if (record.dispatch) {
             in_dispatches += ms;
             auto it = std::ranges::find(dispatches, record.hash, &DispatchGroup::hash);
@@ -675,20 +730,32 @@ void Scheduler::ReportPassTimes() {
         top_dispatches += fmt::format("{}{:016x}: {}x, {:.2f} ms, {} groups", i == 0 ? "" : " | ",
                                       d.hash, d.count, d.ms, d.groups);
     }
+    std::ranges::sort(labels, std::greater{}, &Group::ms);
+    std::string top_labels;
+    for (size_t i = 0; i < labels.size() && i < 10; ++i) {
+        top_labels += fmt::format("{}{}: {}x, {:.2f} ms", i == 0 ? "" : " | ", labels[i].name,
+                                  labels[i].passes, labels[i].ms);
+    }
     double submitted{};
     for (const u32 span : pass_time_spans) {
         submitted += ms_between(span, span + 1);
     }
-    const size_t num_passes = static_cast<size_t>(std::ranges::count_if(
-        pass_time_records, [](const PassTimeRecord& record) { return !record.dispatch; }));
+    const auto count = [&](auto&& pred) {
+        return static_cast<size_t>(std::ranges::count_if(pass_time_records, pred));
+    };
+    const size_t num_passes = count([](const PassTimeRecord& record) {
+        return !record.dispatch && record.site_file == nullptr;
+    });
+    const size_t num_dispatches = count([](const PassTimeRecord& record) { return record.dispatch; });
     LOG_INFO(Render_Vulkan,
              "Perf passes: {} submissions take {:.2f} ms of GPU time: {} render passes {:.2f} ms, "
-             "{} guest dispatches {:.2f} ms, the rest (copies, barriers, emulator compute) {:.2f} "
-             "ms; attachments load {} MiB, store {} MiB | passes: {} | dispatches: {}",
-             pass_time_spans.size(), submitted, num_passes, in_passes,
-             pass_time_records.size() - num_passes, in_dispatches,
-             (std::max)(submitted - in_passes - in_dispatches, 0.0), load_bytes >> 20,
-             store_bytes >> 20, top, top_dispatches);
+             "{} guest dispatches {:.2f} ms, other work after leaving a pass {:.2f} ms, the rest "
+             "{:.2f} ms; attachments load {} MiB, store {} MiB | passes: {} | dispatches: {} | "
+             "other work by caller: {}",
+             pass_time_spans.size(), submitted, num_passes, in_passes, num_dispatches,
+             in_dispatches, in_labels,
+             (std::max)(submitted - in_passes - in_dispatches - in_labels, 0.0), load_bytes >> 20,
+             store_bytes >> 20, top, top_dispatches, top_labels);
 }
 
 void Scheduler::DispatchWork(bool lazy) {
@@ -983,6 +1050,12 @@ void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location lo
         CountRenderPassEnd(location.file_name(), location.line());
     }
     EndRenderPass();
+    if (pass_time_host_sampling) [[unlikely]] {
+        // "Perf passes:" names the GPU time up to the next timestamp after the caller.
+        Record([this, file = location.file_name(), line = location.line()](vk::CommandBuffer cmdbuf) {
+            PassTimeLabel(cmdbuf, file, line);
+        });
+    }
 }
 
 bool Scheduler::UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
