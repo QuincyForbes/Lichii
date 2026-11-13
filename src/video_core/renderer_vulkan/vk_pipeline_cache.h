@@ -305,19 +305,23 @@ private:
 
     /// One build of the shader precache: builds a pipeline and destroys it, true when it built.
     struct PrecacheJob {
-        u64 graphics_hash{}; ///< The cached graphics pipeline it builds, 0 for a compute program
+        u64 hash{};    ///< Key hash of the cached pipeline it builds, 0 for a precache file program
+        bool record{}; ///< Once built, kept in precache-graphics.bin so later precaches skip it
+        std::string label; ///< Its shaders, for the log when it is slow
         Common::UniqueFunction<bool> build;
     };
 
-    /// Shader precache before the game starts (precache_shaders), on every CPU thread: the cached
-    /// graphics pipelines this boot skipped (`jobs`; `precached` holds those built by earlier
-    /// precaches) and the compute programs of the title's precache file (made from the game files,
-    /// missing reads guessed) are built, then thrown away. They only fill the driver's shader
-    /// cache, so a later build of the same pipeline finds the driver's work done. Reports progress
-    /// through `callback` and returns when it is done, skipped from the loading screen or the load
-    /// is stopped. False when it was skipped or stopped.
+    /// Shader precache before the game starts (precache_shaders, or a Build Shaders launch), on
+    /// every CPU thread: the cached pipelines in `jobs` (`precached` holds those built by earlier
+    /// precaches, `already_built` how many of `jobs` they left out) and the compute programs of the
+    /// title's precache file (made from the game files, missing reads guessed) are built, then
+    /// thrown away. They only fill the driver's shader cache, so a later build of the same pipeline
+    /// finds the driver's work done. Reports progress through `callback` and returns when it is
+    /// done, skipped from the loading screen or the load is stopped; a build that never returns is
+    /// left to its thread (see PrecacheGiveUp). False when it was skipped or stopped.
     bool PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
-                         std::unordered_set<u64> precached, std::stop_token stop_loading,
+                         std::unordered_set<u64> precached, size_t already_built,
+                         std::stop_token stop_loading,
                          const VideoCore::DiskResourceLoadCallback& callback);
 
     /// EDEN_NX2_GRAPHICS_PRECACHE with graphics pipeline libraries (EDEN_NX2_GPL): builds each
@@ -406,6 +410,9 @@ private:
     std::size_t background_listener{};
     std::atomic_bool save_used_requested{};
     std::atomic_bool save_again{};
+    /// Shader precache threads left building a pipeline that never returned (PrecacheShaders);
+    /// the destructor gives them a few seconds.
+    std::shared_ptr<std::atomic<int>> precache_threads_left = std::make_shared<std::atomic<int>>(0);
 
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;

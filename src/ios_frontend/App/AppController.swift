@@ -28,6 +28,8 @@ final class AppController: ObservableObject {
     @Published private(set) var jit = JitStatus()
     /// A boot was cancelled: the launch screen stays up until the game is shut down again (IDLE).
     @Published private(set) var cancellingBoot = false
+    /// The launch is a Build Shaders run: the game does not start after it.
+    @Published private(set) var buildingShaders = false
     /// False while the library window is hidden behind the game render window, allowing LibraryView
     /// to unmount off-screen icon cells so decoded UIImages are not pinned during gameplay.
     @Published private(set) var libraryVisible = true
@@ -128,6 +130,7 @@ final class AppController: ObservableObject {
             buildShaders ? lichii_emu_build_shaders($0) : lichii_emu_launch($0)
         }
         guard launched else { return }
+        buildingShaders = buildShaders
         showLaunch = true
         if Bridge.jitState == .waiting {
             jitRequested = false
@@ -207,7 +210,12 @@ final class AppController: ObservableObject {
             if previous.inGame {
                 currentGame = nil
             }
+            if buildingShaders {
+                buildingShaders = false
+                reportBuiltShaders(game: currentGame)
+            }
         case .failed:
+            buildingShaders = false
             showLibrary()
             showLaunch = true
         case .waitingForJit, .booting:
@@ -215,6 +223,25 @@ final class AppController: ObservableObject {
         case .running, .paused:
             break
         }
+    }
+
+    /// After a Build Shaders run: what it built, as the log's "Build shaders:" line says it.
+    private func reportBuiltShaders(game: Game?) {
+        var status = LichiiBuildShadersStatus()
+        lichii_emu_build_shaders_status(&status)
+        // Cancelled before the shader cache loaded.
+        guard status.total > 0 || status.skipped > 0 else { return }
+        let seconds = Int(status.elapsed_ms / 1000)
+        var lines = ["\(status.built) built, \(status.failed) failed in \(seconds / 60):"
+                     + String(format: "%02d", seconds % 60) + " on \(status.threads) threads."]
+        if status.skipped > 0 {
+            lines.append("\(status.skipped) were already built and skipped.")
+        }
+        if status.done < status.total {
+            lines.append("Stopped with \(status.total - status.done) not built; Build Shaders again continues.")
+        }
+        library.notice = LibraryNotice(title: "Shaders for \(game?.title ?? "the game")",
+                                       message: lines.joined(separator: " "))
     }
 
     private func showLibrary() {

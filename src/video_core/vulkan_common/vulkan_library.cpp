@@ -154,6 +154,11 @@ std::shared_ptr<Common::DynamicLibrary> OpenLibrary(
         setenv("MVK_CONFIG_SHADER_COMPRESSION_ALGORITHM", "1", 0);
         setenv("MVK_CONFIG_LOG_LEVEL", "2", 0);
         setenv("MVK_CONFIG_PERFORMANCE_TRACKING", "0", 0);
+        // MoltenVK waits for each Metal library and pipeline compile without a limit by default,
+        // and every compile's submission holds a lock on the MTLDevice: one stuck in Metal's
+        // compiler (MoltenVK's docs: 30 s and more on an internal compiler error) held up every
+        // build behind it. 30 s, then the pipeline fails (nanoseconds).
+        setenv("MVK_CONFIG_METAL_COMPILE_TIMEOUT", "30000000000", 0);
 #if TARGET_OS_IPHONE
         setenv("MVK_CONFIG_MAX_ACTIVE_METAL_COMMAND_BUFFERS_PER_QUEUE", "32", 0);
 #endif

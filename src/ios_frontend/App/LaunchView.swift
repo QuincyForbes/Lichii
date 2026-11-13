@@ -63,7 +63,9 @@ struct LaunchView: View {
         case .booting, .running, .paused:
             VStack(spacing: 12) {
                 ProgressView().controlSize(.large).tint(.white)
-                Text(app.cancellingBoot ? "Cancelling..." : "Starting...").foregroundStyle(.secondary)
+                Text(app.cancellingBoot ? "Cancelling..."
+                     : app.buildingShaders ? "Building Shaders" : "Starting...")
+                    .foregroundStyle(.secondary)
                 if !app.cancellingBoot {
                     ShaderProgressView()
                     if app.emuState == .booting {

@@ -158,17 +158,59 @@ struct ShaderProgressView: View {
                     .font(.footnote.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-        case Int32(LICHII_SHADER_WARM.rawValue) where platform.shaderTotal > 0:
-            VStack(spacing: 6) {
-                ProgressView(value: Double(min(platform.shaderDone, platform.shaderTotal)),
-                             total: Double(platform.shaderTotal))
-                    .tint(Theme.accent)
-                Text("Building shaders \(platform.shaderDone) / \(platform.shaderTotal)")
-                    .font(.footnote.monospacedDigit())
-                    .foregroundStyle(.secondary)
+        case Int32(LICHII_SHADER_WARM.rawValue):
+            // Read every second, so the time moves on while a slow shader builds.
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                BuildShadersProgress(status: Self.buildStatus)
             }
         default:
             EmptyView()
+        }
+    }
+
+    private static var buildStatus: LichiiBuildShadersStatus {
+        var status = LichiiBuildShadersStatus()
+        lichii_emu_build_shaders_status(&status)
+        return status
+    }
+}
+
+/// The shader precache (Build Shaders): done / total, built, failed, skipped and the time taken.
+private struct BuildShadersProgress: View {
+    let status: LichiiBuildShadersStatus
+
+    private static func time(_ milliseconds: UInt64) -> String {
+        let seconds = milliseconds / 1000
+        return "\(seconds / 60):" + String(format: "%02d", seconds % 60)
+    }
+
+    var body: some View {
+        VStack(spacing: 6) {
+            if status.total > 0 {
+                ProgressView(value: Double(min(status.done, status.total)), total: Double(status.total))
+                    .tint(Theme.accent)
+                Text("Building shaders \(status.done) / \(status.total)")
+                    .font(.footnote.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Text("\(status.built) built · \(status.failed) failed · \(Self.time(status.elapsed_ms))"
+                     + (status.skipped > 0 ? " · \(status.skipped) already built" : ""))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                if status.slowest_ms >= 20_000 {
+                    Text("One shader has been building for \(status.slowest_ms / 1000) s; it is given up after 90 s.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .multilineTextAlignment(.center)
+                }
+            } else if status.skipped > 0 {
+                Text("All \(status.skipped) shaders are already built")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Preparing the shader build...")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }

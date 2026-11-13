@@ -972,7 +972,29 @@ bool lichii_emu_launch(const char* path) {
 }
 
 bool lichii_emu_build_shaders(const char* path) {
-    return Launch(path, true);
+    if (Launch(path, true)) {
+        VideoCommon::ShaderWarm::SetBuildStatus({});
+        return true;
+    }
+    return false;
+}
+
+void lichii_emu_build_shaders_status(LichiiBuildShadersStatus* out) {
+    if (out == nullptr) {
+        return;
+    }
+    const auto status = VideoCommon::ShaderWarm::GetBuildStatus();
+    *out = {
+        .total = status.total,
+        .done = status.done,
+        .built = status.built,
+        .failed = status.failed,
+        .skipped = status.skipped,
+        .threads = status.threads,
+        .elapsed_ms = status.elapsed_ms,
+        .slowest_ms = status.slowest_ms,
+        .running = status.running,
+    };
 }
 
 void lichii_emu_cancel_launch(void) {
