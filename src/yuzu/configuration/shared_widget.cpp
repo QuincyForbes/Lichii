@@ -817,7 +817,7 @@ bool AppliesToThisPlatform(const Settings::BasicSetting& setting) {
     }
 #ifndef __APPLE__
     // MoltenVK runs on macOS and iOS only.
-    if (id == values.moltenvk_driver.Id()) {
+    if (id == values.moltenvk_driver.Id() || id == values.mesh_direct_outputs.Id()) {
         return false;
     }
 #endif

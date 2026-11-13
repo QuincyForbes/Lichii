@@ -878,6 +878,11 @@ struct Values {
                                                     linkage, false, "disable_shader_loop_safety_checks", Category::RendererDebug};
     Setting<bool> enable_renderdoc_hotkey{linkage, false, "renderdoc_hotkey",
                                           Category::RendererDebug};
+    // MoltenVK with native mesh shaders: a mesh program stores its outputs as it writes them,
+    // without a workgroup copy (Ocarina's foliage fits Metal's 32 KiB). Off = the copy, as before
+    // 3899948f8d. EDEN_NX2_MESH_DIRECT_OUTPUTS=0/1 overrides it (=1 on every driver).
+    Setting<bool> mesh_direct_outputs{linkage, true, "mesh_direct_outputs",
+                                      Category::RendererDebug};
 #if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
     // Debug override for automatic BCn patching detection
     Setting<bool> patch_old_qcom_drivers{linkage, false, "patch_old_qcom_drivers",
@@ -1179,6 +1184,12 @@ OcarinaDlssMode OcarinaDlssModeFor(OotResolution resolution);
 // The size Ocarina of Time itself draws at: the shares above 100 % draw at Full and get the rest
 // from the resolution scale.
 OotResolution OcarinaGameResolution(OotResolution resolution);
+// The resolution Ocarina of Time draws at with that upscaler. Handheld, a temporal upscaler
+// replaces the game's upscale pass only where the scene is 3/4 of the output: with the game's
+// dynamic resolution it declines the full size (1:1) and most sizes in between, so frames switch
+// between it and the game's own pass. Docked it takes every size, but each new size starts its
+// history again. Game becomes Full docked and 75 % handheld (1440x810 to 1920x1080).
+OotResolution OcarinaUpscaledResolution(OotResolution resolution, Upscaler upscaler, bool docked);
 // The emulator's resolution scale for the running program. Ocarina of Time takes it from
 // oot_resolution (1x up to 100 %, and always with a temporal upscaler, which needs 1x); every
 // other program from resolution_setup.

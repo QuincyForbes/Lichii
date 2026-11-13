@@ -3271,6 +3271,25 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
     };
 }
 
+// A frame the game's pass draws between upscaled ones shows its own anti-aliasing and the
+// upscaler's history starts again: the log shows how often that happens.
+void RasterizerVulkan::CountOcarinaUpscale(bool upscaled) {
+    if (oot_upscaled_passes + oot_game_passes != 0 && upscaled != oot_last_upscaled) {
+        ++oot_switches;
+    }
+    oot_last_upscaled = upscaled;
+    ++(upscaled ? oot_upscaled_passes : oot_game_passes);
+    if (oot_upscaled_passes + oot_game_passes < 600) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Ocarina upscaler: {} of {} upscale passes replaced, {} switches to or from the "
+             "game's own; scene {}x{}",
+             oot_upscaled_passes, oot_upscaled_passes + oot_game_passes, oot_switches,
+             oot_motion.extent.width, oot_motion.extent.height);
+    oot_upscaled_passes = oot_game_passes = oot_switches = 0;
+}
+
 /// Track the scene depth on its reader dispatch, or try to replace a recognized upscale dispatch.
 bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace) {
     constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
@@ -3315,6 +3334,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     }
     // Logs why the game's own upscale draws, when the reason changes and every 120th repeat.
     const auto fail = [this](const char* reason) {
+        CountOcarinaUpscale(false);
         if (reason != oot_fallback_reason || ++oot_fallback_repeats % 120 == 0) {
             LOG_INFO(Render_Vulkan, "Ocarina DLSS: the game's upscale draws frame {} ({})",
                      render_trace_frame, reason);
@@ -3362,6 +3382,16 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     auto& target = texture_cache.GetImageView(written[0]);
     using VideoCore::Surface::PixelFormat;
     const auto extent = oot_motion.extent;
+    if (extent.width != oot_logged_extent.width || extent.height != oot_logged_extent.height ||
+        target.size.width != oot_logged_target.width) {
+        if (++oot_extent_changes <= 20 || oot_extent_changes % 100 == 0) {
+            LOG_INFO(Render_Vulkan, "Ocarina scene {}x{} -> {}x{} by pass {:016x} (change {})",
+                     extent.width, extent.height, target.size.width, target.size.height,
+                     upscale_hash, oot_extent_changes);
+        }
+        oot_logged_extent = extent;
+        oot_logged_target = {target.size.width, target.size.height};
+    }
     const bool native_size = pipeline.ShaderHash() == ComputePipeline::OcarinaFullSizeShader;
     // At the Performance render scale (1920x1080) the game runs its 3/4 pass to 2560x1440.
     constexpr u64 three_quarter_pass = 0xe40f5efb5480e692ULL;
@@ -3388,7 +3418,17 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         color.format != PixelFormat::E5B9G9R9_FLOAT || target.format != PixelFormat::B10G11R11_FLOAT ||
         !oot_motion.SceneSized(color.size.width, color.size.height) ||
         color.ImageHandle() == target.ImageHandle() || depth.ImageHandle() == target.ImageHandle()) {
-        return fail("unexpected upscale images");
+        static constexpr const char* unexpected = "unexpected upscale images";
+        if (oot_fallback_reason != unexpected || (oot_fallback_repeats + 1) % 120 == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Ocarina DLSS: scene {}x{} in {}x{} images, colour {}x{} {}, target {}x{} {}, "
+                     "pass {:016x}",
+                     extent.width, extent.height, oot_motion.image_extent.width,
+                     oot_motion.image_extent.height, color.size.width, color.size.height,
+                     static_cast<int>(color.format), target.size.width, target.size.height,
+                     static_cast<int>(target.format), upscale_hash);
+        }
+        return fail(unexpected);
     }
 
     constexpr VkFormat output_format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
@@ -3446,6 +3486,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
             oot_4k_guest_present = VK_NULL_HANDLE;
         }
         oot_dlss_frame = render_trace_frame;
+        CountOcarinaUpscale(true);
         oot_jitter_phases = VideoCommon::OcarinaJitterPhases(extent.width, output_extent.width);
         oot_fallback_reason = nullptr;
         return true;

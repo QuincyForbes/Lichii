@@ -135,17 +135,16 @@ Settings::OotResolution OotResolution() {
                                     OotResolution::Percent50};
         return scales[v[0] - '1'];
     }
-    const auto resolution =
-        Settings::OcarinaGameResolution(Settings::values.oot_resolution.GetValue());
+    auto resolution = Settings::OcarinaGameResolution(Settings::values.oot_resolution.GetValue());
     if (const char* v = std::getenv("EDEN_NX2_OOT_MAX_RESOLUTION"); v != nullptr && v[0] != 0) {
         if (v[0] == '0' && resolution == OotResolution::Full) {
-            return OotResolution::Game;
-        }
-        if (v[0] != '0' && resolution == OotResolution::Game) {
-            return OotResolution::Full;
+            resolution = OotResolution::Game;
+        } else if (v[0] != '0' && resolution == OotResolution::Game) {
+            resolution = OotResolution::Full;
         }
     }
-    return resolution;
+    return Settings::OcarinaUpscaledResolution(resolution, Settings::values.upscaler.GetValue(),
+                                               Settings::IsDockedMode());
 }
 
 template <Settings::OotResolution Resolution>
