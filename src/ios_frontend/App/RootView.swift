@@ -7,6 +7,9 @@ import SwiftUI
 struct RootView: View {
     @EnvironmentObject private var app: AppController
     @ObservedObject private var platform = PlatformCenter.shared
+    /// The device the "Use recommended settings?" prompt was last shown for: once per device.
+    @AppStorage("recommendedPromptDevice") private var promptedDevice = ""
+    @State private var recommendedPrompt: RecommendedPrompt?
 
     var body: some View {
         TabView {
@@ -53,7 +56,40 @@ struct RootView: View {
         } message: { warning in
             Text("Keep Guest Memory in a File needs \(GuestMemoryFile.size(warning.storage.needed_mib)) of free storage; \(GuestMemoryFile.size(warning.storage.free_mib)) is free. \(warning.game.title) would start with its memory in RAM, and iOS may close Lichii in a large game. Free up storage in the Settings app > General > iPhone Storage, or start anyway.")
         }
+        .alert("Use Recommended Settings?", isPresented: Binding(get: { recommendedPrompt != nil },
+                                                                 set: { if !$0 { recommendedPrompt = nil } }),
+               presenting: recommendedPrompt) { prompt in
+            Button("Use Recommended") {
+                _ = RecommendedSettings.apply(prompt.values)
+            }
+            Button("Not Now", role: .cancel) {}
+        } message: { prompt in
+            Text("These settings differ from what \(prompt.device) should use:\n\n\(prompt.summary)\n\nSettings > Recommended Settings has the reasons and the button for later.")
+        }
+        .onAppear(perform: offerRecommended)
     }
+
+    /// Once per device: an earlier install's settings (or a config migrated from them) can be far
+    /// from what the phone needs; one iPhone ran Ocarina of Time at full textures and the game's
+    /// resolution that way and reached critical memory pressure.
+    private func offerRecommended() {
+        guard recommendedPrompt == nil, !Bridge.emuState.inGame, lichii_recommended_differences() > 0 else { return }
+        let loaded = RecommendedSettings.load()
+        guard !loaded.device.isEmpty, promptedDevice != loaded.device else { return }
+        let changes = loaded.values.filter(\.differs)
+        guard !changes.isEmpty else { return }
+        promptedDevice = loaded.device
+        recommendedPrompt = RecommendedPrompt(
+            device: loaded.device, values: loaded.values,
+            summary: changes.map { "\($0.label): \($0.currentText) → \($0.recommendedText)" }.joined(separator: "\n"))
+    }
+}
+
+private struct RecommendedPrompt: Identifiable {
+    let device: String
+    let values: [RecommendedValue]
+    let summary: String
+    var id: String { device }
 }
 
 private extension View {

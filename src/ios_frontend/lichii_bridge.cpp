@@ -909,10 +909,42 @@ int lichii_settings_reset_game(void) {
     if (!InGameScope()) {
         return -1;
     }
-    const auto changes = Settings::DeviceProfile::ResetGameOverrides();
-    LOG_INFO(Frontend, "iOS app: {:016X} reset to the global settings ({} overrides): {}",
-             g_game_scope, changes.size(), Settings::DeviceProfile::FormatChanges(changes));
+    const auto profile = Settings::DeviceProfile::ForHost();
+    const auto changes = Settings::DeviceProfile::ResetGameToRecommended(profile, g_game_scope);
+    LOG_INFO(Frontend, "iOS app: {:016X} reset to the recommended settings for {} ({} changes): {}",
+             g_game_scope, profile.device_name, changes.size(),
+             Settings::DeviceProfile::FormatChanges(changes));
     return static_cast<int>(changes.size());
+}
+
+char* lichii_settings_reset_game_preview(void) {
+    if (!InGameScope()) {
+        return Dup(std::string{});
+    }
+    const auto profile = Settings::DeviceProfile::ForHost();
+    const auto changes =
+        Settings::DeviceProfile::ResetGameToRecommended(profile, g_game_scope, true);
+    std::string text;
+    for (const auto& change : changes) {
+        const auto* setting = FindSetting(change.key.c_str());
+        if (setting == nullptr || !setting->Save()) {
+            continue;
+        }
+        // Values as lichii_settings_get gives them, for the app's own names.
+        const auto* recommended = Settings::DeviceProfile::Find(profile, change.key);
+        const std::string from = setting->UsingGlobal() ? "global" : setting->ToString();
+        const std::string to =
+            change.to == "global" || recommended == nullptr ? "global" : recommended->value;
+        text += fmt::format("{}{}\t{}\t{}", text.empty() ? "" : "\n", change.key, from, to);
+    }
+    return Dup(text);
+}
+
+size_t lichii_recommended_differences(void) {
+    if (InGameScope()) {
+        return 0;
+    }
+    return Settings::DeviceProfile::Differences(Settings::DeviceProfile::ForHost()).size();
 }
 
 size_t lichii_recommended_load(void) {

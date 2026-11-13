@@ -479,13 +479,14 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
                 &ConfigurePerGame::HandleApplyButtonClicked);
     }
 
-    // Saves the game's config without its overrides, then closes so the tabs don't write them
-    // back.
+    // Saves the game's config with the recommended values, then closes so the tabs don't write
+    // the old ones back.
     QPushButton* reset = ui->buttonBox->addButton(tr("Reset to Recommended..."),
                                                   QDialogButtonBox::ResetRole);
-    reset->setToolTip(tr("Removes this game's overrides, so it uses the global settings."));
-    connect(reset, &QAbstractButton::clicked, this, [this] {
-        if (RecommendedSettings::ConfirmAndResetGame(this, *builder)) {
+    reset->setToolTip(tr("Gives this game the recommended settings for this device and removes "
+                         "its other overrides."));
+    connect(reset, &QAbstractButton::clicked, this, [this, &vk_device_records] {
+        if (RecommendedSettings::ConfirmAndResetGame(this, *builder, vk_device_records)) {
             game_config->SaveAllValues();
             if (system.IsPoweredOn()) {
                 system.ApplySettings();
