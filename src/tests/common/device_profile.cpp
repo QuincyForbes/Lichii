@@ -157,6 +157,63 @@ TEST_CASE("Applying the profile sets the global values and reports changes", "[d
     CHECK(values.texture_quality.UsingGlobal());
 }
 
+TEST_CASE("Resetting a game to recommended writes the profile's values for it",
+          "[device_profile]") {
+    DefaultsScope scope;
+    auto& values = Settings::values;
+    const auto profile = Profile::Recommend(IPhone17ProMax());
+    // The owner's iPhone: a migrated global config at full textures and the game's own
+    // resolution, and Ocarina of Time's own overrides.
+    values.texture_quality.SetValue(Settings::TextureQuality::Full);
+    values.oot_resolution.SetValue(Settings::OotResolution::Game);
+    values.gpu_accuracy.SetValue(Settings::GpuAccuracy::Low);
+    values.texture_quality.SetGlobal(false);
+    values.texture_quality.SetValue(Settings::TextureQuality::Quarter);
+    values.oot_resolution.SetGlobal(false);
+    values.oot_resolution.SetValue(Settings::OotResolution::Percent50);
+    values.resolution_setup.SetGlobal(false);
+    values.resolution_setup.SetValue(Settings::ResolutionSetup::Res3_4X);
+    values.frame_rate_limit.SetGlobal(false);
+    values.frame_rate_limit.SetValue(30);
+
+    constexpr u64 Ocarina = Settings::OcarinaOfTimeProgramId;
+    const auto planned = Profile::ResetGameToRecommended(profile, Ocarina, true);
+    CHECK(values.texture_quality.GetValue() == Settings::TextureQuality::Quarter);
+    const auto changes = Profile::ResetGameToRecommended(profile, Ocarina);
+    CHECK(planned.size() == changes.size());
+
+    CHECK_FALSE(values.texture_quality.UsingGlobal());
+    CHECK(values.texture_quality.GetValue() == Settings::TextureQuality::Half);
+    CHECK(values.texture_quality.GetValue(true) == Settings::TextureQuality::Full);
+    CHECK(values.oot_resolution.GetValue() == Settings::OotResolution::Percent56);
+    CHECK(values.oot_frame_rate.GetValue() == Settings::OotFrameRate::Fps30);
+    // Replaced by Ocarina's own resolution, and not in the profile: back to global.
+    CHECK(values.resolution_setup.UsingGlobal());
+    CHECK(values.frame_rate_limit.UsingGlobal());
+    // Already the global value: no override needed.
+    CHECK(values.gpu_accuracy.UsingGlobal());
+    bool texture = false;
+    for (const auto& change : changes) {
+        if (change.key == "texture_quality") {
+            texture = change.from == "Quarter" && change.to == "Half";
+        }
+    }
+    CHECK(texture);
+    // Nothing more to do the second time.
+    CHECK(Profile::ResetGameToRecommended(profile, Ocarina, true).empty());
+    Settings::RestoreGlobalState(true);
+}
+
+TEST_CASE("Phones carry engine switches with reasons", "[device_profile]") {
+    const auto profile = Profile::Recommend(IPhone17ProMax());
+    REQUIRE_FALSE(profile.tuning.empty());
+    CHECK(profile.tuning[0].key == "EDEN_NX2_PIPELINE_EVICT_LEFT_MIB");
+    CHECK_FALSE(profile.tuning[0].reason.empty());
+    Profile::Device desktop;
+    desktop.os = Profile::Os::Windows;
+    CHECK(Profile::Recommend(desktop).tuning.empty());
+}
+
 TEST_CASE("Game-specific settings show only for their game", "[device_profile]") {
     using Settings::AppliesToGame;
     constexpr u64 Ocarina = Settings::OcarinaOfTimeProgramId;

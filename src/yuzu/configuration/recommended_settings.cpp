@@ -148,31 +148,42 @@ bool ConfirmAndApply(QWidget* parent, const ConfigurationShared::Builder& builde
     return true;
 }
 
-bool ConfirmAndResetGame(QWidget* parent, const ConfigurationShared::Builder& builder) {
-    QStringList overrides;
-    for (const auto& [key, setting] : Settings::values.linkage.by_key) {
-        if (setting->Switchable() && !setting->UsingGlobal() && setting->Save()) {
-            overrides << QStringLiteral("%1: %2").arg(
-                Label(builder, *setting), ValueText(builder, *setting, setting->ToString(),
-                                                     setting->Canonicalize()));
+bool ConfirmAndResetGame(QWidget* parent, const ConfigurationShared::Builder& builder,
+                         const std::vector<VkDeviceInfo::Record>& records) {
+    const auto profile = Profile::Recommend(HostDevice(records));
+    const u64 program_id = Settings::ConfiguringProgramId();
+    QStringList lines;
+    for (const auto& change : Profile::ResetGameToRecommended(profile, program_id, true)) {
+        const auto* setting = Find(change.key);
+        if (setting == nullptr || !setting->Save()) {
+            continue;
         }
+        const QString to = change.to == "global"
+                               ? QObject::tr("global (%1)").arg(ValueText(
+                                     builder, *setting, setting->ToStringGlobal(),
+                                     setting->ToStringGlobal()))
+                               : QString::fromStdString(change.to);
+        lines << QStringLiteral("%1: %2 -> %3")
+                     .arg(Label(builder, *setting), QString::fromStdString(change.from), to);
     }
-    if (overrides.isEmpty()) {
+    if (lines.isEmpty()) {
         QMessageBox::information(parent, QObject::tr("Reset to Recommended"),
-                                 QObject::tr("This game has no overrides: it already uses the "
-                                             "global settings."));
+                                 QObject::tr("This game already has the recommended settings for "
+                                             "%1.")
+                                     .arg(QString::fromStdString(profile.device_name)));
         return false;
     }
     if (QMessageBox::question(
             parent, QObject::tr("Reset to Recommended"),
-            QObject::tr("Remove this game's overrides, so it uses the global settings (Configure "
-                        "> Use Recommended Settings sets those for this device)?\n\n%1")
-                .arg(overrides.join(QLatin1Char('\n')))) != QMessageBox::Yes) {
+            QObject::tr("Give this game the recommended settings for %1? Its other overrides "
+                        "are removed.\n\n%2")
+                .arg(QString::fromStdString(profile.device_name),
+                     lines.join(QLatin1Char('\n')))) != QMessageBox::Yes) {
         return false;
     }
-    const auto changes = Profile::ResetGameOverrides();
-    LOG_INFO(Frontend, "{:016X} reset to the global settings: {}",
-             Settings::ConfiguringProgramId(), Profile::FormatChanges(changes));
+    const auto changes = Profile::ResetGameToRecommended(profile, program_id);
+    LOG_INFO(Frontend, "{:016X} reset to the recommended settings for {} ({} changes): {}",
+             program_id, profile.device_name, changes.size(), Profile::FormatChanges(changes));
     return true;
 }
 

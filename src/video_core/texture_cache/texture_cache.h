@@ -708,8 +708,15 @@ void TextureCache<P>::TickFrame() {
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session, and smaller ones now and then: they stay
     // as large as the largest image since boot, all of it written to.
+    // EDEN_NX2_TC_SCRATCH_KEEP_MIB lowers the large limit (the iOS device profile: 16): an
+    // iPhone's malloc census had two 64 MiB blocks in Kokiri, the size these reach on a PC there.
+    static const size_t large_scratch = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_SCRATCH_KEEP_MIB");
+        const size_t mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+        return mib != 0 ? (std::max)(mib << 20, SmallScratchCapacity) : LargeScratchCapacity;
+    }();
     const size_t scratch_limit =
-        frame_tick % ScratchTrimFrames == 0 ? SmallScratchCapacity : LargeScratchCapacity;
+        frame_tick % ScratchTrimFrames == 0 ? SmallScratchCapacity : large_scratch;
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
         if (scratch->capacity() > scratch_limit) {
             scratch->release();

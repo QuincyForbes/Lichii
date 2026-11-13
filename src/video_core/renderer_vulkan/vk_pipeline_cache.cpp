@@ -1129,6 +1129,28 @@ size_t EvictAbovePipelines() {
     return evict_above;
 }
 
+/// MoltenVK: pipelines are evicted on memory pressure only with less than this left to the
+/// process (EDEN_NX2_PIPELINE_EVICT_LEFT_MIB; 0 or unset: on every pressure signal; the iOS
+/// device profile sets it). An iPhone evicted 985 of them with 1.3 GiB left, ~60 draws were
+/// skipped right after, and 1,041 evicted earlier gave back at most ~28 MiB of Metal memory.
+u64 PressureEvictLeftBytes() {
+    static const u64 bytes = [] {
+        const char* value = std::getenv("EDEN_NX2_PIPELINE_EVICT_LEFT_MIB");
+        return value != nullptr ? u64{std::strtoull(value, nullptr, 10)} << 20 : u64{0};
+    }();
+    return bytes;
+}
+
+/// With that limit set, the most evicted per pressure signal (EDEN_NX2_PIPELINE_EVICT_MAX).
+size_t PressureEvictMax() {
+    static const size_t max = [] {
+        const char* value = std::getenv("EDEN_NX2_PIPELINE_EVICT_MAX");
+        return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
+                                : size_t{256};
+    }();
+    return max;
+}
+
 /// How many of the cached graphics pipelines boot skipped the background builds, newest first;
 /// the rest are built when a draw first needs them. A cache merged from a community pack held
 /// 60k pipelines: building all of them took 15 minutes on 6 threads and, at ~0.45 MB each, held
@@ -3115,6 +3137,8 @@ void PipelineCache::EvictUnusedPipelines() {
     // 2-3 ms below, so none are evicted there unless the OS reports memory pressure: then every
     // one unused for ~10 s goes, ahead of a jetsam kill.
     bool under_pressure = false;
+    // Only near the limit (PressureEvictLeftBytes): fewer, older ones, boot-built ones kept.
+    bool critical_only = false;
     if (device.IsMoltenVK()) {
         const u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
         if (pressure == evict_pressure_generation) {
@@ -3122,6 +3146,14 @@ void PipelineCache::EvictUnusedPipelines() {
         }
         evict_pressure_generation = pressure;
         under_pressure = true;
+        if (const u64 limit = PressureEvictLeftBytes(); limit != 0) {
+            const u64 left = Common::PlatformEvents::AvailableProcessMemory();
+            if (left != 0 && left >= limit) {
+                ++pressure_evictions_skipped;
+                return;
+            }
+            critical_only = true;
+        }
     }
     // EDEN_NX2_PRELOAD_ALL_PIPELINES asked for every cached pipeline built: evicting the ones not
     // used yet threw the preload away after 9000 frames (Ocarina: 22,510 of 24,285, then rebuilt
@@ -3132,7 +3164,7 @@ void PipelineCache::EvictUnusedPipelines() {
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
-    const u64 evict_after_frames = under_pressure ? 600 : 9000;
+    const u64 evict_after_frames = critical_only ? 3600 : under_pressure ? 600 : 9000;
     if (frame_count <= evict_after_frames) {
         return;
     }
@@ -3148,7 +3180,9 @@ void PipelineCache::EvictUnusedPipelines() {
     // -> 3) next to nothing, each one rebuilt with a Metal compile when its place came back.
     constexpr size_t PressureKeptPipelines = 256;
     constexpr size_t PressureMinEvicted = 128;
-    const size_t evict_above = under_pressure ? PressureKeptPipelines : EvictAbovePipelines();
+    const size_t evict_above = critical_only    ? PressureKeptPipelines * 2
+                               : under_pressure ? PressureKeptPipelines
+                                                : EvictAbovePipelines();
     if (graphics_cache.size() <= evict_above) {
         return;
     }
@@ -3157,7 +3191,7 @@ void PipelineCache::EvictUnusedPipelines() {
     // (from zortos293/Lichii#550): evicting it throws the prebuild away, and the game translates it
     // again on the GPU thread when it reaches that content. Past the budget (~0.9 GB of driver
     // memory) they go like the rest, so a large cache can't hold their memory all session.
-    const size_t max_unused_prebuilt = under_pressure ? 0 : 2000;
+    const size_t max_unused_prebuilt = under_pressure && !critical_only ? 0 : 2000;
     size_t kept_prebuilt = 0;
     std::vector<std::pair<u64, GraphicsPipelineCacheKey>> candidates;
     for (const auto& [key, pipeline] : graphics_cache) {
@@ -3171,12 +3205,15 @@ void PipelineCache::EvictUnusedPipelines() {
         }
         candidates.emplace_back(pipeline->LastUse(), key);
     }
-    const size_t evicted =
+    size_t evicted =
         under_pressure
             ? VideoCommon::PressurePipelinesToEvict(graphics_cache.size(), candidates.size(),
                                                     evict_above, PressureMinEvicted)
             : VideoCommon::GraphicsPipelinesToEvict(graphics_cache.size(), candidates.size(),
                                                     evict_above);
+    if (critical_only) {
+        evicted = (std::min)(evicted, PressureEvictMax());
+    }
     if (evicted == 0) {
         return;
     }
@@ -3197,8 +3234,15 @@ void PipelineCache::EvictUnusedPipelines() {
         }
     }
     // Common.Memory: the iOS log filter drops Render.Vulkan below Warning.
-    LOG_INFO(Common_Memory, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
-             evict_after_frames, graphics_cache.size());
+    LOG_INFO(Common_Memory,
+             "Evicted {} graphics pipelines unused for {} frames, {} left{}", evicted,
+             evict_after_frames, graphics_cache.size(),
+             critical_only
+                 ? fmt::format(" ({} MiB left to the process; {} pressure signals before passed "
+                               "with more than {} MiB left)",
+                               Common::PlatformEvents::AvailableProcessMemory() >> 20,
+                               pressure_evictions_skipped, PressureEvictLeftBytes() >> 20)
+                 : std::string{});
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::TakeBackgroundPipeline(

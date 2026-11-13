@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <string_view>
@@ -16,6 +17,7 @@
 #endif
 
 #include "common/device_profile.h"
+#include "common/game_settings.h"
 #include "common/memory_detect.h"
 #include "common/settings.h"
 
@@ -209,6 +211,16 @@ void RecommendApple(const Device& device, Profile& p) {
         "{} MiB of JIT code per guest core ({} MiB for six): Ocarina of Time in Kokiri needs "
         "40-75 MiB of code per core and recompiled everything several times a second at 32 MiB.",
         p.jit_cache_mib, p.jit_cache_mib * 6);
+    p.tuning.push_back(
+        {"EDEN_NX2_PIPELINE_EVICT_LEFT_MIB", "384", "384 MiB",
+         "Pipelines are evicted on memory pressure only with under 384 MiB left: an iPhone "
+         "18,2 evicted 985 with 1.3 GiB left and skipped ~60 draws while they were built again; "
+         "1,041 evicted earlier gave back at most ~28 MiB of Metal memory."});
+    p.tuning.push_back(
+        {"EDEN_NX2_TC_SCRATCH_KEEP_MIB", "16", "16 MiB",
+         "Texture upload scratch over 16 MiB is freed at the next frame instead of kept for up to "
+         "256 frames: two 64 MiB malloc blocks in Kokiri (iPhone18,2 malloc census); a large "
+         "texture allocates it again."});
 }
 
 void RecommendDesktop(const Device& device, Profile& p) {
@@ -359,6 +371,24 @@ Profile ForHost() {
     return Recommend(DetectHost());
 }
 
+std::string ApplyTuning(const Profile& profile) {
+    std::string text;
+    for (const Value& value : profile.tuning) {
+        const char* const set = std::getenv(value.key.c_str());
+        if (set == nullptr) {
+#ifdef _WIN32
+            _putenv_s(value.key.c_str(), value.value.c_str());
+#else
+            setenv(value.key.c_str(), value.value.c_str(), 0);
+#endif
+        }
+        text += fmt::format("{}{}={}{}", text.empty() ? "" : ", ", value.key,
+                            set != nullptr ? set : value.value.c_str(),
+                            set != nullptr ? " (from the environment)" : "");
+    }
+    return text;
+}
+
 const Value* Find(const Profile& profile, std::string_view key) {
     for (const auto* list : {&profile.settings, &profile.app}) {
         for (const Value& value : *list) {
@@ -411,6 +441,37 @@ std::vector<Change> ResetGameOverrides() {
         if (setting->Switchable() && !setting->UsingGlobal()) {
             changes.push_back({key, setting->Canonicalize(), "global"});
             setting->SetGlobal(true);
+        }
+    }
+    return changes;
+}
+
+std::vector<Change> ResetGameToRecommended(const Profile& profile, u64 program_id,
+                                           bool dry_run) {
+    std::vector<Change> changes;
+    for (const auto& [key, setting] : values.linkage.by_key) {
+        if (!setting->Switchable()) {
+            continue;
+        }
+        const Value* const recommended = Find(profile, key);
+        const bool applies = recommended != nullptr && AppliesToGame(key, program_id);
+        const bool was_global = setting->UsingGlobal();
+        const std::string before = was_global ? std::string{"global"} : setting->Canonicalize();
+        if (!applies || setting->ToStringGlobal() == recommended->value) {
+            if (!was_global) {
+                changes.push_back({key, before, "global"});
+                if (!dry_run) {
+                    setting->SetGlobal(true);
+                }
+            }
+            continue;
+        }
+        if (was_global || setting->ToString() != recommended->value) {
+            changes.push_back({key, before, recommended->display});
+        }
+        if (!dry_run) {
+            setting->SetGlobal(false);
+            setting->LoadString(recommended->value);
         }
     }
     return changes;

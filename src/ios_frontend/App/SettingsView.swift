@@ -65,7 +65,7 @@ struct SettingsView: View {
                     Section {
                         Button("Reset This Game to Recommended", role: .destructive) { showReset = true }
                     } footer: {
-                        Text("Removes this game's overrides, so it uses the global settings (Settings > Recommended Settings sets those for this device).")
+                        Text("Gives this game the recommended settings for this device (Settings > Recommended Settings lists them with reasons) and removes its other overrides.")
                     }
                 } else if !query.isEmpty {
                     SettingSectionsList(sections: SettingsCatalog.sections(group: .graphics, query: query),
@@ -84,7 +84,7 @@ struct SettingsView: View {
                 }
             }
         }
-        .confirmationDialog("Remove this game's overrides?", isPresented: $showReset,
+        .confirmationDialog("Use the recommended settings for this game?", isPresented: $showReset,
                             titleVisibility: .visible) {
             Button("Reset to Recommended", role: .destructive) {
                 lichii_settings_reset_game()
@@ -103,13 +103,23 @@ struct SettingsView: View {
         }
     }
 
-    /// The overrides a reset removes, one per line.
+    /// What the reset changes, one setting per line.
     private var overrideSummary: String {
-        let overridden = SettingsCatalog.all.filter { $0.switchable && !$0.usesGlobal }
-        if overridden.isEmpty {
-            return "This game has no overrides."
+        let lines = Bridge.string(lichii_settings_reset_game_preview())
+            .split(separator: "\n")
+            .compactMap { line -> String? in
+                let parts = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+                guard parts.count == 3 else { return nil }
+                let item = SettingsCatalog.all.first { $0.key == parts[0] }
+                let name = { (value: String) -> String in
+                    value == "global" ? "Global" : (item?.displayName(of: value) ?? value)
+                }
+                return "\(item?.label ?? parts[0]): \(name(parts[1])) → \(name(parts[2]))"
+            }
+        if lines.isEmpty {
+            return "This game already has the recommended settings."
         }
-        return overridden.map { "\($0.label): \($0.displayName(of: $0.value()))" }.joined(separator: "\n")
+        return lines.joined(separator: "\n")
     }
 
     private func open() {
