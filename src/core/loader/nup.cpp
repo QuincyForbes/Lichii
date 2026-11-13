@@ -283,10 +283,16 @@ ResultStatus AppLoader_NUP::ReadRomFS(FileSys::VirtualFile& out_file) {
         levels = static_cast<u32>(v[0] - '0');
     }
     if (patch_system != nullptr && levels != 0) {
+        // EDEN_NX2_TQ_ARRAYS=1 (the iOS device profile): 2D arrays lose their top levels too
+        // (Ocarina of Time's 90-layer terrain materials, 56 MiB each in Kokiri Forest).
+        const char* arrays_value = std::getenv("EDEN_NX2_TQ_ARRAYS");
+        const bool arrays = arrays_value != nullptr && arrays_value[0] == '1';
         merged = FileSys::ApplyTextureQuality(
             merged, levels,
             Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "texture_quality" /
-                fmt::format("{:016X}-{}-{}.bin", base_title_id, file->GetSize(), levels));
+                fmt::format("{:016X}-{}-{}{}.bin", base_title_id, file->GetSize(), levels,
+                            arrays ? "a" : ""),
+            arrays);
     }
     // Mods go into the tree before the RomFS is built: layering them over the built RomFS
     // unpacks all of its files again and keeps both RomFS tables alive.

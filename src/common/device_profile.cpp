@@ -238,6 +238,11 @@ void RecommendApple(const Device& device, Profile& p) {
          "Texture upload scratch over 16 MiB is freed at the next frame instead of kept for up to "
          "256 frames: two 64 MiB malloc blocks in Kokiri (iPhone18,2 malloc census); a large "
          "texture allocates it again."});
+    p.tuning.push_back(
+        {"EDEN_NX2_TQ_ARRAYS", "1", "on",
+         "Texture quality also reduces array textures: Ocarina of Time's two 90-layer terrain "
+         "material arrays were 56 MiB each in Kokiri at Quarter (iPhone18,2 census, build 71); "
+         "Half leaves 15 MiB, Quarter 4 MiB each."});
 }
 
 void RecommendDesktop(const Device& device, Profile& p) {
