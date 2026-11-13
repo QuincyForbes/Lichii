@@ -9,8 +9,8 @@ Log line: `Ocarina graphics preset <name>: N values in the game's parameter file
 
 | Preset | Game files | Resolution / textures |
 |---|---|---|
-| Phone Low | `gsys/ModelSceneConfigParam/Main`: `CubeMapMaxTexNum=1`, `CubeMapMaxTexWidth=64`, `CreateDof=false`, `CreateXluZPrePass=false`, `DepthShadowCascadeNum0=1`, `DepthShadowTexWidth/Height=512`, `StaticSdwWidth=1024`; `agl/BloomParam/MainField`: `Enable=false`; foliage level 1 (half grass density and plant distances) | 50 %, Quarter |
-| Phone Medium | `CubeMapMaxTexNum=1`, `CubeMapMaxTexWidth=64`, `CreateDof=false`, `CreateXluZPrePass=false`, `DepthShadowCascadeNum0=2`, `DepthShadowTexWidth/Height=512`, `StaticSdwWidth=2048` | 56 %, Half |
+| Phone Low | `gsys/ModelSceneConfigParam/Main`: `CubeMapMaxTexNum=1`, `CubeMapMaxTexWidth=64`, `CreateXluZPrePass=false`, `DepthShadowCascadeNum0=1`, `DepthShadowTexWidth/Height=512`, `StaticSdwWidth=1024`; `agl/BloomParam/MainField` and `agl/DepthOfFieldParam/MainField`: `Enable=false`; foliage level 1 (half grass density and plant distances) | 50 %, Quarter |
+| Phone Medium | `CubeMapMaxTexNum=1`, `CubeMapMaxTexWidth=64`, `CreateXluZPrePass=false`, `DepthShadowCascadeNum0=2`, `DepthShadowTexWidth/Height=512`, `StaticSdwWidth=2048`; `agl/DepthOfFieldParam/MainField`: `Enable=false` | 56 %, Half |
 | Console | none (the game as shipped) | unchanged |
 | High | `DepthShadowTexWidth/Height=2048` | unchanged |
 
@@ -38,7 +38,8 @@ identical runs differ by about 1 pass, 0.1 ms and 50-100 MiB of images.
 | reflection probe off | -18 | -20 | -0.2 | -110..-200 | no change seen, but 8 texture cache asserts (zero layer stride): left out |
 | probe 1 x 64 px | -19 | -70 | -0.2 | -60 | none seen |
 | bloom off (`agl` Enable) | -21 | 0 | -0.1 | ~0 | glow around lights weaker |
-| depth of field off | -4.5 | 0 | 0 | -40 | none in gameplay |
+| depth of field off (`CreateDof=false`) | -4.5 | 0 | 0 | -40 | none in gameplay, but the game then reads and writes through a null pointer every frame (Write32 @ 0x7c0, Read @ 0x5c8/0x5d0/0x148): not used |
+| depth of field off (`agl/DepthOfFieldParam/MainField` Enable) | -1.5 (Phone Low, mesh emulated) | 0 | 0 | ~0 (attachments -10 MiB/frame) | none seen; used by both phone presets |
 | translucent z-prepass off | -1.5 | 0 | 0 | -35 | none seen |
 | 1 cascade / 512 px cascades | -2 / 0 | 0 | 0 | -30 / -50 | shadows softer up close |
 | static shadow 1024 | 0 | 0 | 0 | -64 | none seen |

@@ -457,19 +457,22 @@ struct Preset {
 // Phone Low: one 64x64 reflection probe instead of three of 128 (~19 fewer passes a frame; off
 // saves no more passes and makes the texture cache assert on a zero layer stride), no bloom
 // (~20 passes), no depth of field or translucent depth prepass, one 512x512 sun shadow cascade
-// instead of three of 1024, a 1024 static shadow map instead of 4096, thinner grass.
+// instead of three of 1024, a 1024 static shadow map instead of 4096, thinner grass. Depth of
+// field is turned off in its agl parameters: without the object (CreateDof=false) the game reads
+// and writes through a null pointer every frame.
 // Phone Medium: one 64x64 probe, bloom kept, two 512x512 cascades, a 2048 static shadow map.
 // High: sun shadow cascades of 2048x2048.
 constexpr std::array<Preset, 4> Presets{{
     {"Phone Low",
-     "gsys/ModelSceneConfigParam/Main:CubeMapMaxTexNum=1,CubeMapMaxTexWidth=64,CreateDof=false,"
+     "gsys/ModelSceneConfigParam/Main:CubeMapMaxTexNum=1,CubeMapMaxTexWidth=64,"
      "CreateXluZPrePass=false,DepthShadowCascadeNum0=1,DepthShadowTexWidth=512,"
-     "DepthShadowTexHeight=512,StaticSdwWidth=1024;agl/BloomParam/MainField:Enable=false",
+     "DepthShadowTexHeight=512,StaticSdwWidth=1024;agl/BloomParam/MainField:Enable=false;"
+     "agl/DepthOfFieldParam/MainField:Enable=false",
      1},
     {"Phone Medium",
-     "gsys/ModelSceneConfigParam/Main:CubeMapMaxTexNum=1,CubeMapMaxTexWidth=64,CreateDof=false,"
+     "gsys/ModelSceneConfigParam/Main:CubeMapMaxTexNum=1,CubeMapMaxTexWidth=64,"
      "CreateXluZPrePass=false,DepthShadowCascadeNum0=2,DepthShadowTexWidth=512,"
-     "DepthShadowTexHeight=512,StaticSdwWidth=2048",
+     "DepthShadowTexHeight=512,StaticSdwWidth=2048;agl/DepthOfFieldParam/MainField:Enable=false",
      0},
     {"Console", "", 0},
     {"High", "gsys/ModelSceneConfigParam/Main:DepthShadowTexWidth=2048,DepthShadowTexHeight=2048",
