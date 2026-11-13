@@ -730,7 +730,30 @@ void SetCurrentThreadName(const char* name) {
 #endif
 }
 
-void SetCurrentThreadToPerformanceCores() {
+namespace {
+std::atomic<bool> g_apple_helper_qos{false};
+}
+
+void SetAppleHelperQos(bool demote) {
+    g_apple_helper_qos.store(demote, std::memory_order_relaxed);
+}
+
+void SetCurrentThreadToPerformanceCores(bool frame_critical) {
+#if defined(__APPLE__)
+    if (!frame_critical) {
+        static const bool demote = [] {
+            const char* const value = std::getenv("EDEN_NX2_APPLE_HELPER_QOS");
+            return value != nullptr && value[0] != '\0' ? value[0] != '0'
+                                                         : g_apple_helper_qos.load(std::memory_order_relaxed);
+        }();
+        if (demote) {
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+            return;
+        }
+    }
+#else
+    static_cast<void>(frame_critical);
+#endif
 #if defined(__ANDROID__)
     if (ADPF::AddCurrentThread(ADPF::Session::Render)) {
         SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);

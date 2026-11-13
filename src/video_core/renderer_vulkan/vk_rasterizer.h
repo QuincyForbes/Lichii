@@ -554,6 +554,7 @@ private:
     std::optional<Common::PerfReport::ProcessCpu> perf_report_process_cpu;
     Common::PerfReport::Placement perf_report_placement{};
     std::array<u64, 256> perf_report_svcs{};
+    std::array<Common::PerfReport::JitCoreCounts, Common::PerfReport::JitCores> perf_report_jit_cores{};
     std::array<u64, VideoCommon::Churn::Count> perf_report_churn{};
     Common::PlatformEvents::ProcessEvents perf_report_events{};
     u64 perf_report_frames{};

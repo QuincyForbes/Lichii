@@ -280,6 +280,39 @@ void LogUnmappedReadContext(Core::Memory::Memory& memory, const Dynarmic::A64::J
 
 } // Anonymous namespace
 
+u32 JitEvictSliceBytes() {
+    static const u32 bytes = [] {
+        if (const char* const value = std::getenv("EDEN_NX2_JIT_EVICT"); value && value[0] != '\0') {
+            return u32(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 64) << 20);
+        }
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        return u32(Common::IosJit::EvictSliceBytes());
+#else
+        return u32{0};
+#endif
+    }();
+    return bytes;
+}
+
+JitFaultPolicy GetJitFaultPolicy() {
+    static const JitFaultPolicy policy = [] {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        JitFaultPolicy result{Common::IosJit::FaultSharedMarkers(),
+                              u8((std::min)(Common::IosJit::FaultBlockAfter(), 255U))};
+#else
+        JitFaultPolicy result{false, 0};
+#endif
+        if (const char* const value = std::getenv("EDEN_NX2_JIT_FAULT_SHARE"); value && value[0] != '\0') {
+            result.shared_markers = value[0] != '0';
+        }
+        if (const char* const value = std::getenv("EDEN_NX2_JIT_FAULT_BLOCK"); value && value[0] != '\0') {
+            result.block_after_faults = u8(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 255));
+        }
+        return result;
+    }();
+    return policy;
+}
+
 DynarmicCallbacks64::DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess* process)
     : m_parent{parent}, m_memory(process->GetMemory())
     , m_process(process), m_debugger_enabled{parent.m_system.DebuggerEnabled()}
@@ -701,6 +734,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         }
     }
 #endif
+    config.code_cache_evict_slice = JitEvictSliceBytes();
+    config.fastmem_shared_markers = GetJitFaultPolicy().shared_markers;
+    config.fastmem_block_after_faults = GetJitFaultPolicy().block_after_faults;
 
     // Allow memory fault handling to work
     if (m_system.DebuggerEnabled()) {
@@ -839,6 +875,14 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         pt_fallback != nullptr
             ? pt_fallback[0] != '0'
             : !(Settings::values.cpuopt_compact_jit_code.GetValue() && alias_in_arena);
+    // arm64 hosts, also cpuopt_compact_jit_code (EDEN_NX2_JIT_PT_CALLS=1/0 overrides): loads and
+    // stores that left fastmem (after a fault: 2.7k-71k a second on the phone) call one shared
+    // page table walk instead of emitting it inline (65 bytes per access, against 29 with
+    // fastmem, over the PC run's Kokiri blocks translated for arm64 offline).
+    static const char* const pt_calls = std::getenv("EDEN_NX2_JIT_PT_CALLS");
+    config.page_table_lookup_calls = pt_calls != nullptr
+                                         ? pt_calls[0] != '0'
+                                         : Settings::values.cpuopt_compact_jit_code.GetValue();
 #if defined(ARCHITECTURE_x86_64)
     // x86-64 is TSO: LDAPR/LDAR/LDAXR need no locked RMW (STLR keeps XCHG), and DMB xxLD/xxST
     // order nothing TSO does not already order. Ocarina of Time has ~68k LDAPRB sites (static

@@ -22,7 +22,12 @@ class Inst;
 namespace Dynarmic::Backend::Arm64 {
 
 struct EmitContext;
+struct EmitConfig;
 enum class LinkTarget;
+
+/// The shared page table walk (EmitConfig::page_table_lookup_calls): Xscratch0 = guest address
+/// in, host address out (0: the access takes the memory callbacks). Clobbers Xscratch1 and NZCV.
+void* EmitPageTableLookupThunk(oaknut::CodeGenerator& code, const EmitConfig& conf, std::size_t bitsize);
 
 template<std::size_t bitsize>
 void EmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst);

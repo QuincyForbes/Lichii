@@ -128,7 +128,12 @@ enum class ThreadPlacement : u32 {
 
 void SetCurrentThreadPriority(ThreadPriority new_priority);
 void SetCurrentThreadName(const char* name);
-void SetCurrentThreadToPerformanceCores();
+/// `frame_critical` false: a helper that wakes often but works little (timing, fences, present).
+/// Apple with helper QoS on (SetAppleHelperQos, EDEN_NX2_APPLE_HELPER_QOS=0/1): user-initiated
+/// instead of user-interactive, leaving the performance cores to the guest cores and GPU threads.
+void SetCurrentThreadToPerformanceCores(bool frame_critical = true);
+/// The iOS device profile's choice; EDEN_NX2_APPLE_HELPER_QOS overrides it.
+void SetAppleHelperQos(bool demote);
 
 /// Windows: one physical performance core each for the split GPU thread's halves, and the guest
 /// cores and background workers kept off them, so an SMT sibling never shares the GPU threads'

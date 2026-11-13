@@ -439,6 +439,78 @@ CodePtr EmitMemoryStr(oaknut::CodeGenerator& code, int value_idx, oaknut::XReg X
     return fastmem_location;
 }
 
+LinkTarget PageTableLookupLinkTarget(std::size_t bitsize) {
+    switch (bitsize) {
+    case 8:
+        return LinkTarget::PageTableLookup8;
+    case 16:
+        return LinkTarget::PageTableLookup16;
+    case 32:
+        return LinkTarget::PageTableLookup32;
+    case 64:
+        return LinkTarget::PageTableLookup64;
+    case 128:
+        return LinkTarget::PageTableLookup128;
+    }
+    UNREACHABLE();
+}
+
+// [Xptr] with nothing added (the shared page table walk returned the host address).
+template<std::size_t bitsize>
+void EmitLoadAt(oaknut::CodeGenerator& code, int value_idx, oaknut::XReg Xptr, bool ordered) {
+    switch (bitsize) {
+    case 8:
+        ordered ? code.LDARB(oaknut::WReg{value_idx}, Xptr) : code.LDRB(oaknut::WReg{value_idx}, Xptr);
+        break;
+    case 16:
+        ordered ? code.LDARH(oaknut::WReg{value_idx}, Xptr) : code.LDRH(oaknut::WReg{value_idx}, Xptr);
+        break;
+    case 32:
+        ordered ? code.LDAR(oaknut::WReg{value_idx}, Xptr) : code.LDR(oaknut::WReg{value_idx}, Xptr);
+        break;
+    case 64:
+        ordered ? code.LDAR(oaknut::XReg{value_idx}, Xptr) : code.LDR(oaknut::XReg{value_idx}, Xptr);
+        break;
+    case 128:
+        code.LDR(oaknut::QReg{value_idx}, Xptr);
+        if (ordered) {
+            code.DMB(oaknut::BarrierOp::ISH);
+        }
+        break;
+    default:
+        UNREACHABLE();
+    }
+}
+
+template<std::size_t bitsize>
+void EmitStoreAt(oaknut::CodeGenerator& code, int value_idx, oaknut::XReg Xptr, bool ordered) {
+    switch (bitsize) {
+    case 8:
+        ordered ? code.STLRB(oaknut::WReg{value_idx}, Xptr) : code.STRB(oaknut::WReg{value_idx}, Xptr);
+        break;
+    case 16:
+        ordered ? code.STLRH(oaknut::WReg{value_idx}, Xptr) : code.STRH(oaknut::WReg{value_idx}, Xptr);
+        break;
+    case 32:
+        ordered ? code.STLR(oaknut::WReg{value_idx}, Xptr) : code.STR(oaknut::WReg{value_idx}, Xptr);
+        break;
+    case 64:
+        ordered ? code.STLR(oaknut::XReg{value_idx}, Xptr) : code.STR(oaknut::XReg{value_idx}, Xptr);
+        break;
+    case 128:
+        if (ordered) {
+            code.DMB(oaknut::BarrierOp::ISH);
+        }
+        code.STR(oaknut::QReg{value_idx}, Xptr);
+        if (ordered) {
+            code.DMB(oaknut::BarrierOp::ISH);
+        }
+        break;
+    default:
+        UNREACHABLE();
+    }
+}
+
 template<std::size_t bitsize>
 void InlinePageTableEmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
@@ -457,8 +529,15 @@ void InlinePageTableEmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx
 
     SharedLabel fallback = GenSharedLabel(), end = GenSharedLabel();
 
-    const auto [Xbase, Xoffset] = InlinePageTableEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
-    EmitMemoryLdr<bitsize>(code, Rvalue->index(), Xbase, Xoffset, ordered);
+    if (ctx.conf.page_table_lookup_calls) {
+        code.MOV(Xscratch0, *Xaddr);
+        EmitRelocation(code, ctx, PageTableLookupLinkTarget(bitsize));
+        code.CBZ(Xscratch0, *fallback);
+        EmitLoadAt<bitsize>(code, Rvalue->index(), Xscratch0, ordered);
+    } else {
+        const auto [Xbase, Xoffset] = InlinePageTableEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
+        EmitMemoryLdr<bitsize>(code, Rvalue->index(), Xbase, Xoffset, ordered);
+    }
 
     ctx.deferred_emits.emplace_back([&code, &ctx, inst, Xaddr = *Xaddr, Rvalue = *Rvalue, ordered, fallback, end] {
         code.l(*fallback);
@@ -497,8 +576,15 @@ void InlinePageTableEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ct
 
     SharedLabel fallback = GenSharedLabel(), end = GenSharedLabel();
 
-    const auto [Xbase, Xoffset] = InlinePageTableEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
-    EmitMemoryStr<bitsize>(code, Rvalue->index(), Xbase, Xoffset, ordered);
+    if (ctx.conf.page_table_lookup_calls) {
+        code.MOV(Xscratch0, *Xaddr);
+        EmitRelocation(code, ctx, PageTableLookupLinkTarget(bitsize));
+        code.CBZ(Xscratch0, *fallback);
+        EmitStoreAt<bitsize>(code, Rvalue->index(), Xscratch0, ordered);
+    } else {
+        const auto [Xbase, Xoffset] = InlinePageTableEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
+        EmitMemoryStr<bitsize>(code, Rvalue->index(), Xbase, Xoffset, ordered);
+    }
 
     ctx.deferred_emits.emplace_back([&code, &ctx, inst, Xaddr = *Xaddr, Rvalue = *Rvalue, ordered, fallback, end] {
         code.l(*fallback);
@@ -786,6 +872,62 @@ CodePtr EmitLseCasAt(oaknut::CodeGenerator& code, int expected_idx, int desired_
 }
 
 }  // namespace
+
+// The inline walk of InlinePageTableEmitVAddrLookup, once: it was ~12 instructions at every
+// access that faulted out of fastmem (65 bytes per load or store against 29 with fastmem).
+void* EmitPageTableLookupThunk(oaknut::CodeGenerator& code, const EmitConfig& conf, std::size_t bitsize) {
+    void* const entry = code.xptr<void*>();
+    oaknut::Label miss;
+    const std::size_t valid_page_index_bits = conf.page_table_address_space_bits - page_table_const_bits;
+    const std::size_t unused_top_bits = 64 - conf.page_table_address_space_bits;
+
+    if (bitsize != 8 && (conf.detect_misaligned_access_via_page_table & bitsize) != 0) {
+        if (!conf.only_detect_misalignment_via_page_table_on_page_boundary) {
+            code.TST(Xscratch0, u64(bitsize / 8 - 1));
+            code.B(NE, miss);
+        } else {
+            code.AND(Wscratch1, Wscratch0, u32(page_table_const_mask));
+            code.CMP(Wscratch1, u32(page_table_const_size - bitsize / 8));
+            code.B(HI, miss);
+        }
+    }
+    if (conf.silently_mirror_page_table || unused_top_bits == 0) {
+        code.UBFX(Xscratch1, Xscratch0, page_table_const_bits, valid_page_index_bits);
+    } else {
+        code.LSR(Xscratch1, Xscratch0, page_table_const_bits);
+        code.TST(Xscratch1, u64(~u64(0)) << valid_page_index_bits);
+        code.B(NE, miss);
+    }
+    if (conf.page_table_log2_stride == 3) {
+        code.LDR(Xscratch1, Xpagetable, Xscratch1, oaknut::IndexExt::LSL, 3);
+    } else {
+        if (conf.page_table_log2_stride != 0) {
+            code.LSL(Xscratch1, Xscratch1, conf.page_table_log2_stride);
+        }
+        code.LDR(Xscratch1, Xpagetable, Xscratch1);
+    }
+    if (conf.page_table_marked_bit) {
+        code.TBNZ(Xscratch1, *conf.page_table_marked_bit, miss);
+    }
+    if (conf.page_table_pointer_mask != 0) {
+        code.AND(Xscratch1, Xscratch1, conf.page_table_pointer_mask);
+    }
+    if (conf.page_table_sign_extension) {
+        code.SBFM(Xscratch1, Xscratch1, 0, *conf.page_table_sign_extension);
+    }
+    code.CBZ(Xscratch1, miss);
+    if (conf.absolute_offset_page_table) {
+        code.ADD(Xscratch0, Xscratch1, Xscratch0);
+    } else {
+        code.AND(Xscratch0, Xscratch0, page_table_const_mask);
+        code.ADD(Xscratch0, Xscratch1, Xscratch0);
+    }
+    code.RET();
+    code.l(miss);
+    code.MOV(Xscratch0, 0);
+    code.RET();
+    return entry;
+}
 
 template<std::size_t bitsize>
 void EmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {

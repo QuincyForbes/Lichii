@@ -45,6 +45,9 @@ std::mutex g_pool_mutex;
 std::atomic<bool> g_pool_ready{false};
 std::atomic<std::size_t> g_prepared{0};
 std::atomic<std::size_t> g_code_cache_bytes{DefaultCodeCacheBytes};
+std::atomic<std::size_t> g_evict_slice_bytes{0};
+std::atomic<bool> g_fault_shared{false};
+std::atomic<unsigned> g_fault_block_after{0};
 std::atomic<State> g_state{State::Waiting};
 std::mutex g_error_mutex;
 std::string g_error;
@@ -314,6 +317,27 @@ void SetCodeCacheBytes(std::size_t bytes) {
 
 std::size_t CodeCacheBytes() {
     return g_code_cache_bytes.load(std::memory_order_relaxed);
+}
+
+void SetEvictSliceBytes(std::size_t bytes) {
+    g_evict_slice_bytes = bytes;
+}
+
+std::size_t EvictSliceBytes() {
+    return g_evict_slice_bytes.load(std::memory_order_relaxed);
+}
+
+void SetFaultPolicy(bool shared_markers, unsigned block_after_faults) {
+    g_fault_shared = shared_markers;
+    g_fault_block_after = block_after_faults;
+}
+
+bool FaultSharedMarkers() {
+    return g_fault_shared.load(std::memory_order_relaxed);
+}
+
+unsigned FaultBlockAfter() {
+    return g_fault_block_after.load(std::memory_order_relaxed);
 }
 
 void StartAcquire(std::size_t bytes, bool txm) {

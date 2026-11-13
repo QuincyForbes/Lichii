@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <tuple>
+#include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 
 #include "dynarmic/mcl/bit.hpp"
@@ -45,21 +46,28 @@ public:
     explicit FastmemManager(ExceptionHandler& eh)
             : exception_handler(eh) {}
 
+    /// shared: markers any guest core sets apply to every core's translations (they all run the
+    /// same code). block_after_faults != 0: once that many accesses of one block faulted, the
+    /// whole block translates without fastmem, so it is translated again at most that many times.
+    void Configure(bool shared, unsigned block_after_faults) {
+        shared_markers = shared;
+        faults_per_block_limit = block_after_faults;
+    }
+
     bool SupportsFastmem() const {
         return exception_handler.SupportsFastmem();
     }
 
-    bool ShouldFastmem(DoNotFastmemMarker marker) const {
-        return do_not_fastmem.count(marker) == 0;
-    }
-
-    void MarkDoNotFastmem(DoNotFastmemMarker marker) {
-        do_not_fastmem.insert(marker);
-    }
+    bool ShouldFastmem(DoNotFastmemMarker marker) const;
+    void MarkDoNotFastmem(DoNotFastmemMarker marker);
 
 private:
     ExceptionHandler& exception_handler;
     ::Common::unordered_set<DoNotFastmemMarker, DoNotFastmemMarkerHash> do_not_fastmem;
+    ::Common::unordered_set<IR::LocationDescriptor> do_not_fastmem_blocks;
+    ::Common::unordered_map<IR::LocationDescriptor, unsigned> faults_per_block;
+    bool shared_markers = false;
+    unsigned faults_per_block_limit = 0;
 };
 
 }  // namespace Dynarmic::Backend::Arm64

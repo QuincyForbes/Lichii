@@ -8,9 +8,12 @@
 
 #include <array>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 #include <boost/icl/interval_set.hpp>
 #include "common/assert.h"
@@ -271,6 +274,34 @@ private:
         return GetBlock(A64::LocationDescriptor{GetCurrentLocation()}.SetSingleStepping(true));
     }
 
+    // EDEN_NX2_JIT_BLOCK_DUMP=<file>: every translated block's location, guest instructions and
+    // host code size, to translate the same blocks offline with another backend (arm64 code size).
+    // Records: u64 location, u64 end pc, u32 host bytes, u32 core, u32 count, count x u32 words.
+    template<typename GetCode>
+    void DumpBlock(const A64::LocationDescriptor& location, u64 end_pc, size_t start_used, const GetCode& get_code) {
+        static std::FILE* const file = [] {
+            const char* const path = std::getenv("EDEN_NX2_JIT_BLOCK_DUMP");
+            return path != nullptr && path[0] != '\0' ? std::fopen(path, "wb") : nullptr;
+        }();
+        if (file == nullptr) {
+            return;
+        }
+        static std::mutex mutex;
+        const u64 pc = location.PC();
+        const u32 count = end_pc > pc ? u32((end_pc - pc) / 4) : 0;
+        std::vector<u32> words(count);
+        for (u32 i = 0; i < count; ++i) {
+            words[i] = get_code(pc + u64(i) * 4).value_or(0);
+        }
+        const size_t used = block_of_code.UsedBytes();
+        const u64 header[2]{location.UniqueHash(), end_pc};
+        const u32 info[3]{u32(used > start_used ? used - start_used : 0), u32(conf.processor_id), count};
+        std::scoped_lock lock{mutex};
+        std::fwrite(header, sizeof(header), 1, file);
+        std::fwrite(info, sizeof(info), 1, file);
+        std::fwrite(words.data(), sizeof(u32), count, file);
+    }
+
     CodePtr GetBlock(IR::LocationDescriptor descriptor) {
         if (auto block = emitter.GetBasicBlock(descriptor))
             return block->entrypoint;
@@ -278,7 +309,7 @@ private:
         constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
             // Immediately evacuate cache
-            ::Common::PerfReport::Add(::Common::PerfReport::JitCacheFullFlushes);
+            ::Common::PerfReport::NoteJitFlush(conf.processor_id);
             invalidate_entire_cache = true;
             full_flush = true;
             PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
@@ -297,12 +328,15 @@ private:
         A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, true, conf.elide_ld_st_barriers, conf.native_lse_atomics});
         Optimization::Optimize(ir_block, conf, polyfill_options);
         const CodePtr entrypoint = emitter.Emit(ir_block).entrypoint;
+        DumpBlock(arch_descriptor, A64::LocationDescriptor{ir_block.EndLocation()}.PC(), start_used, get_code);
         if (counted) {
             const size_t used = block_of_code.UsedBytes();
             ::Common::PerfReport::Add(::Common::PerfReport::JitBlocks);
             ::Common::PerfReport::Add(::Common::PerfReport::JitBytes, used > start_used ? used - start_used : 0);
-            ::Common::PerfReport::Add(::Common::PerfReport::JitCompileNs, ::Common::PerfReport::NowNs() - start_ns);
-            ::Common::PerfReport::NoteJitUse(used, block_of_code.CacheSize());
+            const u64 compile_ns = ::Common::PerfReport::NowNs() - start_ns;
+            ::Common::PerfReport::Add(::Common::PerfReport::JitCompileNs, compile_ns);
+            ::Common::PerfReport::NoteJitCompile(conf.processor_id, compile_ns);
+            ::Common::PerfReport::NoteJitUse(conf.processor_id, used, block_of_code.CacheSize());
         }
         return entrypoint;
     }
