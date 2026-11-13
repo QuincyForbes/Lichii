@@ -188,6 +188,20 @@ bool lichii_emu_launch(const char* path);
 /// Like lichii_emu_launch, but the boot builds every cached pipeline of the game (the shader
 /// precache, whatever precache_shaders says) and returns to the library instead of starting it.
 bool lichii_emu_build_shaders(const char* path);
+
+/// The running (or last) shader build: Build Shaders, or the precache before a game starts.
+typedef struct LichiiBuildShadersStatus {
+    uint64_t total;      ///< pipelines to build this run
+    uint64_t done;       ///< built, failed or given up
+    uint64_t built;
+    uint64_t failed;     ///< includes builds given up (that never returned)
+    uint64_t skipped;    ///< already built for this driver by an earlier run
+    uint64_t threads;
+    uint64_t elapsed_ms;
+    uint64_t slowest_ms; ///< the longest build still running
+    bool running;
+} LichiiBuildShadersStatus;
+void lichii_emu_build_shaders_status(LichiiBuildShadersStatus* out);
 /// Drops a queued launch, or stops a boot once the game has loaded (the shader cache load ends
 /// early); the state returns to IDLE.
 void lichii_emu_cancel_launch(void);

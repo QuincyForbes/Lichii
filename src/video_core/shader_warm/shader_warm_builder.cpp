@@ -434,6 +434,21 @@ bool TakeBuildOnly() {
     return build_only.exchange(false, std::memory_order_relaxed);
 }
 
+namespace {
+std::mutex build_status_mutex;
+BuildStatus build_status;
+} // Anonymous namespace
+
+void SetBuildStatus(const BuildStatus& status) {
+    std::scoped_lock lock{build_status_mutex};
+    build_status = status;
+}
+
+BuildStatus GetBuildStatus() {
+    std::scoped_lock lock{build_status_mutex};
+    return build_status;
+}
+
 fs::path PrecachedPipelinesPath(u64 title_id) {
     return TitleDir(title_id) / "precache-graphics.bin";
 }

@@ -104,6 +104,21 @@ void RequestBuildOnly(bool only);
 bool BuildOnlyRequested();
 bool TakeBuildOnly();
 
+/// The running (or last) shader precache, for the loading screen.
+struct BuildStatus {
+    u64 total{};      ///< Pipelines to build this run
+    u64 done{};       ///< Built, failed or given up
+    u64 built{};
+    u64 failed{};     ///< Includes those given up (a build that never returned)
+    u64 skipped{};    ///< Left out: an earlier precache built them for this driver
+    u64 threads{};
+    u64 elapsed_ms{};
+    u64 slowest_ms{}; ///< The longest build still running
+    bool running{};
+};
+void SetBuildStatus(const BuildStatus& status);
+BuildStatus GetBuildStatus();
+
 /// The GPU driver, device and pipeline cache version pipelines were precached for.
 struct DriverStamp {
     u32 driver{};

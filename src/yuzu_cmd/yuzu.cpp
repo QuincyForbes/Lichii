@@ -1393,9 +1393,18 @@ static SDL_AppResult SDL_AppInitRest(SdlState* state, Core::LaunchParams lp) {
         return SDL_APP_FAILURE;
     }
 
+    // EDEN_NX2_BUILD_SHADERS=1: what the iOS game menu's Build Shaders does (the load builds the
+    // cached pipelines), then quit instead of starting the game.
+    if (const char* const build = std::getenv("EDEN_NX2_BUILD_SHADERS"); build && build[0] == '1') {
+        VideoCommon::ShaderWarm::RequestBuildOnly(true);
+    }
     if (const SDL_AppResult result = LoadGame(state, lp, false, std::stop_token{});
         result != SDL_APP_CONTINUE) {
         return result;
+    }
+    if (VideoCommon::ShaderWarm::TakeBuildOnly()) {
+        LOG_INFO(Frontend, "Shaders built, quitting");
+        return SDL_APP_SUCCESS;
     }
     StartGame(state, lp, false, true);
     return SDL_APP_CONTINUE;
@@ -1531,6 +1540,13 @@ static SDL_AppResult LoadGame(SdlState* state, Core::LaunchParams& lp,
     IOS_MARK("GPU start");
     state->system.GPU().Start();
     state->system.GetCpuManager().OnGpuReady();
+    if (VideoCommon::ShaderWarm::BuildOnlyRequested()) {
+        // A Build Shaders launch never calls Run(), which is what starts core timing. Without it
+        // a service thread on guest core 3 waits on a timing event for good, the sm: server
+        // behind it never sees its stop, and the shutdown after the build hangs in
+        // ~ServerManager. The game's own threads stay unstarted.
+        state->system.CoreTiming().SyncPause(false);
+    }
 
     if (Settings::values.use_disk_shader_cache.GetValue() && !stop.stop_requested()) {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
