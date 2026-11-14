@@ -1,0 +1,9 @@
+{
+  "note": "PLACEHOLDER: the right stick held right turns the camera; how long one full turn takes must be timed once on the device (a recorded pan, or adjust s until the view comes back to where it started).",
+  "steps": [
+    {"mark": "pan_start"},
+    {"stick": "right", "x": 1.0, "y": 0.0, "s": 8},
+    {"wait_ms": 500},
+    {"mark": "pan_end"}
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "note": "Baseline against each CPU scheduling experiment of main 5fef69a3a0, one setup per run, interleaved, 3 repeats, 4 minutes between runs.",
+  "request": "../stage/profiles/kokiri.json",
+  "repeats": 3,
+  "cooldown_s": 240,
+  "hot_retries": 3,
+  "jit": "stikdebug",
+  "trace_first": false,
+  "timeout_s": 3600,
+  "cells": [
+    {"name": "baseline"},
+    {"name": "guest_cores_first", "experiments": ["guest_cores_first"]},
+    {"name": "oot_ideal_affinity", "experiments": ["oot_ideal_affinity"]},
+    {"name": "guest_idle_spin", "experiments": ["guest_idle_spin"]},
+    {"name": "targetless_full", "experiments": ["targetless_full"]}
+  ]
+}

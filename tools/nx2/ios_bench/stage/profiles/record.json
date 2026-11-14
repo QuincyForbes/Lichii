@@ -1,0 +1,7 @@
+{
+  "mode": "record",
+  "run": "record-kokiri",
+  "game": "0400486024DEC000",
+  "save": {"name": "kokiri", "slot": 1},
+  "record_s": 900
+}

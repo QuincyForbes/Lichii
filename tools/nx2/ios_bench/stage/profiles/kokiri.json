@@ -1,0 +1,15 @@
+{
+  "run": "kokiri",
+  "game": "0400486024DEC000",
+  "save": {"name": "kokiri", "slot": 1},
+  "experiments": [],
+  "env": {},
+  "settings": {},
+  "jit": {"provider": "stikdebug", "timeout_s": 180},
+  "thermal": {"max_state": 1, "wait_s": 600},
+  "boot_timeout_s": 600,
+  "script": "scripts/oot-title-to-kokiri.json",
+  "script_timeout_s": 900,
+  "steady": {"jit_percent_max": 5, "upload_mib_s_max": 8, "hold_s": 10, "timeout_s": 300, "min_fps": 1},
+  "measure": {"stand_s": 75, "pan": "scripts/oot-pan.json", "pan_settle_s": 2}
+}
