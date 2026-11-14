@@ -23,6 +23,7 @@
 #include "shader_recompiler/object_pool.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_object.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
 #include "video_core/shader_cache.h"
@@ -45,6 +46,8 @@ struct ShaderPools {
 
 struct GraphicsPipelineKey {
     std::array<u64, 6> unique_hashes{};
+    /// Two bits per generic attribute (FixedPipelineState::DynamicAttributeTypes).
+    u64 attribute_types{};
     u32 topology{}; ///< Maxwell PrimitiveTopology of the draw
     u32 early_z{};
 
@@ -114,10 +117,15 @@ public:
     /// Builds the stages' functions; false (logged once) when Metal rejects one.
     bool BuildFunctions(const Device& device);
 
+    /// The MTLRenderPipelineState for these targets, blending and vertex layout (desc's function
+    /// fields are filled in here), made on first use; null when Metal refuses it.
+    [[nodiscard]] void* RenderState(const Device& device, RenderPipelineDesc& desc);
+
 private:
     GraphicsPipelineKey key;
     StageProgram vertex;
     StageProgram fragment;
+    ::Common::unordered_map<u64, Object> render_states;
 };
 
 class ComputePipeline {

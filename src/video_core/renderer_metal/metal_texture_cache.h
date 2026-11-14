@@ -243,8 +243,13 @@ public:
         return buffer_size;
     }
 
+    [[nodiscard]] u32 Samples() const noexcept {
+        return samples;
+    }
+
 private:
     TextureHandle image_texture{};
+    u32 samples{1};
     TextureKind image_kind{TextureKind::e2D};
     u32 host_format{};
     std::array<u8, 4> swizzle{IdentitySwizzle};
@@ -294,6 +299,14 @@ public:
         return depth;
     }
 
+    [[nodiscard]] u32 DepthFormat() const noexcept {
+        return depth_format;
+    }
+
+    [[nodiscard]] u32 Samples() const noexcept {
+        return samples;
+    }
+
     [[nodiscard]] bool HasDepth() const noexcept {
         return has_depth;
     }
@@ -314,6 +327,8 @@ private:
     std::array<Attachment, NUM_RT> colors{};
     std::array<u32, NUM_RT> color_formats{};
     Attachment depth{};
+    u32 depth_format{};
+    u32 samples{1};
     bool has_depth{};
     bool has_stencil{};
     u32 width{};

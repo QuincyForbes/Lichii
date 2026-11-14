@@ -422,7 +422,7 @@ void Image::DownloadMemory(const StagingBufferRef& map,
 ImageView::ImageView(TextureCacheRuntime& runtime, const ImageViewInfo& info, ImageId image_id_,
                      Image& image, const SlotVector<Image>&)
     : VideoCommon::ImageViewBase{info, image.info, image_id_, image.gpu_addr},
-      image_texture{image.Handle()}, image_kind{image.Kind()} {
+      image_texture{image.Handle()}, samples{image.info.num_samples}, image_kind{image.Kind()} {
     const bool converted = True(image.flags & ImageFlagBits::Converted);
     const FormatInfo host = SurfaceFormat(runtime.device, format, converted);
     host_format = host.format;
@@ -539,9 +539,12 @@ Framebuffer::Framebuffer(TextureCacheRuntime&, std::span<ImageView*, NUM_RT> col
         }
         colors[index] = color_buffers[index]->RenderTarget();
         color_formats[index] = color_buffers[index]->HostFormat();
+        samples = color_buffers[index]->Samples();
     }
     if (depth_buffer != nullptr) {
         depth = depth_buffer->RenderTarget();
+        depth_format = depth_buffer->HostFormat();
+        samples = depth_buffer->Samples();
         const FormatClass format_class = depth_buffer->HostClass();
         has_depth = format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil;
         has_stencil =

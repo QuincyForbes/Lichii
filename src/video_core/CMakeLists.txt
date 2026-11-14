@@ -653,6 +653,7 @@ endif()
 if (ENABLE_METAL)
     set(METAL_RENDERER_SOURCES
         renderer_metal/metal_device.mm
+        renderer_metal/metal_graphics.mm
         renderer_metal/metal_object.mm
         renderer_metal/metal_resources.mm
         renderer_metal/metal_scheduler.mm
@@ -666,6 +667,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_buffer_cache.h
         renderer_metal/metal_device.h
         renderer_metal/metal_fence_manager.h
+        renderer_metal/metal_graphics.h
         renderer_metal/metal_object.h
         renderer_metal/metal_pipeline_cache.h
         renderer_metal/metal_rasterizer.h

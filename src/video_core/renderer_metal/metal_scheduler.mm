@@ -93,10 +93,15 @@ struct Scheduler::Impl {
             [blit endEncoding];
             blit = nil;
         }
+        if (render != nil) {
+            [render endEncoding];
+            render = nil;
+        }
     }
 
     id<MTLBlitCommandEncoder> BlitEncoder() {
         if (blit == nil) {
+            EndEncoder();
             blit = [Commands() blitCommandEncoder];
             ++encoders;
         }
@@ -145,6 +150,9 @@ struct Scheduler::Impl {
     id<MTLCommandQueue> queue;
     id<MTLCommandBuffer> command_buffer = nil;
     id<MTLBlitCommandEncoder> blit = nil;
+    /// The render encoder draws go to, open until other work needs the command buffer.
+    id<MTLRenderCommandEncoder> render = nil;
+    RenderTargetSet render_targets{};
     id<MTLLibrary> library = nil;
     id<MTLSamplerState> nearest = nil;
     id<MTLSamplerState> linear = nil;
@@ -158,6 +166,7 @@ struct Scheduler::Impl {
     u64 command_buffers{};
     u64 blit_commands{};
     u64 render_passes{};
+    u64 draws{};
 };
 
 Scheduler::Scheduler(const Device& device) : impl{std::make_unique<Impl>(device)} {}
@@ -387,6 +396,148 @@ bool Scheduler::Blit(const BlitPass& blit) {
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];
     return true;
+}
+
+void Scheduler::BeginRendering(const RenderTargetSet& targets) {
+    if (impl->render != nil && impl->render_targets == targets) {
+        return;
+    }
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    for (size_t index = 0; index < targets.color.size(); ++index) {
+        if (targets.color[index].texture == nullptr) {
+            continue;
+        }
+        ApplyAttachment(pass.colorAttachments[index], targets.color[index]);
+        pass.colorAttachments[index].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[index].storeAction = MTLStoreActionStore;
+    }
+    if (targets.has_depth) {
+        ApplyAttachment(pass.depthAttachment, targets.depth);
+        pass.depthAttachment.loadAction = MTLLoadActionLoad;
+        pass.depthAttachment.storeAction = MTLStoreActionStore;
+    }
+    if (targets.has_stencil) {
+        ApplyAttachment(pass.stencilAttachment, targets.depth);
+        pass.stencilAttachment.loadAction = MTLLoadActionLoad;
+        pass.stencilAttachment.storeAction = MTLStoreActionStore;
+    }
+    // Draws without attachments (occlusion queries) still need a size.
+    pass.renderTargetWidth = (std::max)(targets.width, 1U);
+    pass.renderTargetHeight = (std::max)(targets.height, 1U);
+    impl->render = impl->RenderEncoder(pass);
+    impl->render_targets = targets;
+}
+
+void Scheduler::SetDrawState(const DrawState& state) {
+    const id<MTLRenderCommandEncoder> encoder = impl->render;
+    if (encoder == nil) {
+        return;
+    }
+    [encoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)state.pipeline];
+    if (state.depth_stencil != nullptr) {
+        [encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)state.depth_stencil];
+    }
+    [encoder setViewport:MTLViewport{state.viewport.x, state.viewport.y, state.viewport.width,
+                                     state.viewport.height, state.viewport.znear,
+                                     state.viewport.zfar}];
+    // Metal rejects scissors past the attachments.
+    const auto& targets = impl->render_targets;
+    const u32 x = (std::min)(state.scissor.x, targets.width);
+    const u32 y = (std::min)(state.scissor.y, targets.height);
+    const u32 width = (std::min)(state.scissor.width, targets.width - x);
+    const u32 height = (std::min)(state.scissor.height, targets.height - y);
+    [encoder setScissorRect:MTLScissorRect{x, y, (std::max)(width, 1U), (std::max)(height, 1U)}];
+    [encoder setCullMode:static_cast<MTLCullMode>(state.cull_mode)];
+    [encoder setFrontFacingWinding:state.front_ccw ? MTLWindingCounterClockwise
+                                                   : MTLWindingClockwise];
+    [encoder setDepthClipMode:state.depth_clamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
+    [encoder setDepthBias:state.depth_bias slopeScale:state.slope_scale clamp:state.bias_clamp];
+    [encoder setStencilFrontReferenceValue:state.stencil_front_ref
+                        backReferenceValue:state.stencil_back_ref];
+    [encoder setBlendColorRed:state.blend_color[0]
+                        green:state.blend_color[1]
+                         blue:state.blend_color[2]
+                        alpha:state.blend_color[3]];
+}
+
+void Scheduler::BindVertexBuffer(u32 slot, BufferHandle buffer, u32 offset) {
+    if (impl->render != nil) {
+        [impl->render setVertexBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
+    }
+}
+
+void Scheduler::BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset) {
+    if (impl->render == nil) {
+        return;
+    }
+    if (stage == ShaderStage::Vertex) {
+        [impl->render setVertexBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
+    } else {
+        [impl->render setFragmentBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
+    }
+}
+
+void Scheduler::BindBytes(ShaderStage stage, u32 slot, const void* data, u32 size) {
+    if (impl->render == nil) {
+        return;
+    }
+    if (stage == ShaderStage::Vertex) {
+        [impl->render setVertexBytes:data length:size atIndex:slot];
+    } else {
+        [impl->render setFragmentBytes:data length:size atIndex:slot];
+    }
+}
+
+void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture) {
+    if (impl->render == nil) {
+        return;
+    }
+    if (stage == ShaderStage::Vertex) {
+        [impl->render setVertexTexture:AsTexture(texture) atIndex:slot];
+    } else {
+        [impl->render setFragmentTexture:AsTexture(texture) atIndex:slot];
+    }
+}
+
+void Scheduler::BindSampler(ShaderStage stage, u32 slot, void* sampler) {
+    if (impl->render == nil) {
+        return;
+    }
+    if (stage == ShaderStage::Vertex) {
+        [impl->render setVertexSamplerState:AsSampler(sampler) atIndex:slot];
+    } else {
+        [impl->render setFragmentSamplerState:AsSampler(sampler) atIndex:slot];
+    }
+}
+
+void Scheduler::Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 instance_count,
+                     u32 base_instance) {
+    if (impl->render == nil || vertex_count == 0 || instance_count == 0) {
+        return;
+    }
+    [impl->render drawPrimitives:static_cast<MTLPrimitiveType>(primitive)
+                     vertexStart:first_vertex
+                     vertexCount:vertex_count
+                   instanceCount:instance_count
+                    baseInstance:base_instance];
+    ++impl->draws;
+}
+
+void Scheduler::DrawIndexed(u32 primitive, u32 index_count, u32 index_size,
+                            BufferHandle index_buffer, u64 index_offset, u32 instance_count,
+                            s32 base_vertex, u32 base_instance) {
+    if (impl->render == nil || index_count == 0 || instance_count == 0 || index_buffer == nullptr) {
+        return;
+    }
+    [impl->render drawIndexedPrimitives:static_cast<MTLPrimitiveType>(primitive)
+                             indexCount:index_count
+                              indexType:index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+                            indexBuffer:AsBuffer(index_buffer)
+                      indexBufferOffset:index_offset
+                          instanceCount:instance_count
+                             baseVertex:base_vertex
+                           baseInstance:base_instance];
+    ++impl->draws;
 }
 
 void* Scheduler::CommandBuffer() {

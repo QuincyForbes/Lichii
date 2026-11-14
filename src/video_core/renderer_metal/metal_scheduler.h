@@ -64,6 +64,56 @@ struct BlitPass {
     bool keep_dst{true};
 };
 
+/// The attachments draws render into. Equal sets share one render encoder.
+struct RenderTargetSet {
+    std::array<Attachment, 8> color{};
+    Attachment depth{};
+    bool has_depth{};
+    bool has_stencil{};
+    u32 width{};
+    u32 height{};
+
+    bool operator==(const RenderTargetSet&) const noexcept = default;
+};
+
+struct Viewport {
+    f32 x{};
+    f32 y{};
+    f32 width{};
+    f32 height{};
+    f32 znear{};
+    f32 zfar{1.0f};
+};
+
+struct Scissor {
+    u32 x{};
+    u32 y{};
+    u32 width{};
+    u32 height{};
+};
+
+enum class ShaderStage : u8 {
+    Vertex,
+    Fragment,
+};
+
+/// Encoder state of a draw besides its bindings.
+struct DrawState {
+    void* pipeline{};      ///< id<MTLRenderPipelineState>
+    void* depth_stencil{}; ///< id<MTLDepthStencilState>
+    Viewport viewport{};
+    Scissor scissor{};
+    u8 cull_mode{};        ///< MTLCullMode
+    bool front_ccw{};
+    bool depth_clamp{};
+    f32 depth_bias{};
+    f32 slope_scale{};
+    f32 bias_clamp{};
+    u32 stencil_front_ref{};
+    u32 stencil_back_ref{};
+    std::array<f32, 4> blend_color{};
+};
+
 /// Records Metal work in submission order on one command queue. Copies go to one blit encoder
 /// until a render pass needs the command buffer, instead of an encoder per command; a command
 /// buffer is committed by Flush. Ticks number the command buffers: a resource used in tick N is
@@ -117,6 +167,27 @@ public:
 
     /// False when no pipeline can draw into dst's format (the blit is dropped).
     bool Blit(const BlitPass& pass);
+
+    /// Opens a render encoder on the targets (loading their contents), or keeps the open one
+    /// when they are the same.
+    void BeginRendering(const RenderTargetSet& targets);
+
+    /// The state of the next draws on the open render encoder.
+    void SetDrawState(const DrawState& state);
+
+    void BindVertexBuffer(u32 slot, BufferHandle buffer, u32 offset);
+    void BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset);
+    void BindBytes(ShaderStage stage, u32 slot, const void* data, u32 size);
+    void BindTexture(ShaderStage stage, u32 slot, TextureHandle texture);
+    void BindSampler(ShaderStage stage, u32 slot, void* sampler);
+
+    /// primitive: MTLPrimitiveType.
+    void Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 instance_count,
+              u32 base_instance);
+
+    /// index_size: 2 or 4 bytes.
+    void DrawIndexed(u32 primitive, u32 index_count, u32 index_size, BufferHandle index_buffer,
+                     u64 index_offset, u32 instance_count, s32 base_vertex, u32 base_instance);
 
     /// Ends the open encoder and returns the command buffer being recorded (an
     /// id<MTLCommandBuffer>, for presentDrawable and MetalFX).

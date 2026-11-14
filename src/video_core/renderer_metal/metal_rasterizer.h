@@ -119,6 +119,7 @@ public:
     struct WorkCounts {
         u64 draws;
         u64 draws_with_pipeline; ///< Their pipeline translated and built by Metal
+        u64 draws_encoded;       ///< Recorded on a render encoder
         u64 dispatches;
         u64 dispatches_with_pipeline;
         u64 clears;
@@ -127,6 +128,7 @@ public:
     /// Work taken since the last call (the renderer's 10 s report).
     [[nodiscard]] WorkCounts TakeWorkCounts() noexcept {
         return {std::exchange(draws, 0), std::exchange(draws_with_pipeline, 0),
+                std::exchange(draws_encoded, 0),
                 std::exchange(dispatches, 0), std::exchange(dispatches_with_pipeline, 0),
                 std::exchange(clears, 0)};
     }
@@ -144,6 +146,9 @@ public:
     }
 
 private:
+    /// Binds everything the draw needs and opens its render pass; false to skip it.
+    bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed);
+
     void QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                        VideoCommon::QueryPropertiesFlags flags, u32 payload);
 
@@ -161,8 +166,12 @@ private:
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
 
+    VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
+    ::Common::unordered_map<u64, Object> depth_stencil_states;
+
     u64 draws{};
     u64 draws_with_pipeline{};
+    u64 draws_encoded{};
     u64 dispatches{};
     u64 dispatches_with_pipeline{};
     u64 clears{};

@@ -26,6 +26,10 @@ enum class ResourceKind : u8 {
     Sampler, ///< [[sampler(n)]]
 };
 
+/// ResourceSlot::set of the push constant block (Shader::Backend::SPIRV::RescalingLayout or
+/// RenderAreaLayout, set with BindBytes).
+inline constexpr u32 PushConstantSet = ~0U;
+
 /// Where a SPIR-V (set, binding) went. A combined image sampler gets a texture and a sampler
 /// entry with the same set and binding.
 struct ResourceSlot {

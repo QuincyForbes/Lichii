@@ -121,6 +121,16 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
             }
             compiler.add_msl_resource_binding(binding);
         }
+        // The recompiler's push constants (rescaling, render area): one buffer after the rest.
+        if (!resources.push_constant_buffers.empty()) {
+            spirv_cross::MSLResourceBinding binding{};
+            binding.stage = model;
+            binding.desc_set = spirv_cross::kPushConstDescSet;
+            binding.binding = spirv_cross::kPushConstBinding;
+            binding.msl_buffer = buffers;
+            compiler.add_msl_resource_binding(binding);
+            result.slots.push_back({PushConstantSet, 0, ResourceKind::Buffer, buffers++, 1});
+        }
         if (buffers > options.first_vertex_buffer_slot && stage == Stage::Vertex) {
             result.error = "too many buffers for the vertex buffer slots";
             return result;

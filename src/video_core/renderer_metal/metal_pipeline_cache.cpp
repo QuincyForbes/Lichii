@@ -21,6 +21,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_metal/metal_pipeline_cache.h"
 #include "video_core/renderer_metal/metal_resources.h"
+#include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/shader_environment.h"
 
 namespace Metal {
@@ -99,6 +100,25 @@ bool GraphicsPipeline::BuildFunctions(const Device& device) {
         }
     }
     return true;
+}
+
+void* GraphicsPipeline::RenderState(const Device& device, RenderPipelineDesc& desc) {
+    desc.vertex_function = vertex.function.Get();
+    desc.fragment_function = fragment.function.Get();
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(&desc), sizeof(desc));
+    const auto [it, is_new] = render_states.try_emplace(hash);
+    if (is_new) {
+        std::string error;
+        it->second = CreateRenderPipelineState(device, desc, error);
+        if (!it->second) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(Render_Metal, "Metal: render pipeline {:016x} refused: {}",
+                          key.unique_hashes[1], error);
+            }
+        }
+    }
+    return it->second.Get();
 }
 
 ComputePipeline::ComputePipeline(const ComputePipelineKey& key_, StageProgram program_)
@@ -212,6 +232,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     const auto& regs = maxwell3d->regs;
     graphics_key.topology = static_cast<u32>(maxwell3d->draw_manager.draw_state.topology);
     graphics_key.early_z = regs.mandated_early_z != 0 ? 1 : 0;
+    graphics_key.attribute_types = Vulkan::FixedPipelineState::DynamicAttributeTypes(regs);
     if (current_pipeline != nullptr && current_pipeline->Key() == graphics_key) {
         return current_pipeline;
     }
@@ -292,6 +313,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() try {
     Shader::RuntimeInfo vertex_info;
     vertex_info.previous_stage_stores.mask.set();
     vertex_info.input_topology = InputTopology(static_cast<Maxwell::PrimitiveTopology>(key.topology));
+    for (size_t attribute = 0; attribute < vertex_info.generic_input_types.size(); ++attribute) {
+        constexpr std::array types{Shader::AttributeType::Disabled, Shader::AttributeType::Float,
+                                   Shader::AttributeType::SignedInt,
+                                   Shader::AttributeType::UnsignedInt};
+        vertex_info.generic_input_types[attribute] = types[(key.attribute_types >> (attribute * 2)) & 3];
+    }
     auto vertex = Translate(programs[1], ShaderTranslate::Stage::Vertex, bindings, vertex_info);
     if (!vertex) {
         return nullptr;
