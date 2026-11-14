@@ -10,6 +10,7 @@
 #include "common/alignment.h"
 #include "common/cityhash.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/control/channel_state.h"
@@ -677,6 +678,63 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed) {
                            targets.height);
     }
     return true;
+}
+
+void RasterizerMetal::DrawIndirect() {
+    ++draws;
+    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
+    if (pipeline == nullptr || !pipeline->BuildFunctions(device)) {
+        return;
+    }
+    ++draws_with_pipeline;
+    const auto& params = maxwell3d->draw_manager.indirect_state;
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (params.is_byte_count) {
+        LOG_ONCE(warned_byte_count, "Metal: transform feedback draws are not drawn yet");
+        return;
+    }
+    const bool u8_indices = params.is_indexed && maxwell3d->regs.index_buffer.format ==
+                                                     Maxwell::IndexFormat::UnsignedByte;
+    const std::optional<u32> primitive = PrimitiveType(draw_state.topology);
+    if (!primitive || u8_indices) {
+        // The arguments are on the GPU: rewriting their indices needs a compute pass.
+        LOG_ONCE(warned_indirect, "Metal: indirect draws of topology {} or 8-bit indices are not "
+                                  "drawn yet",
+                 static_cast<u32>(draw_state.topology));
+        return;
+    }
+    gpu_memory->FlushCaching();
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    buffer_cache.SetDrawIndirect(&params);
+    SCOPE_EXIT {
+        buffer_cache.SetDrawIndirect(nullptr);
+    };
+    if (!PrepareDraw(*pipeline, params.is_indexed)) {
+        return;
+    }
+    CountOcclusion();
+    const auto [indirect, indirect_offset] = buffer_cache.GetDrawIndirectBuffer();
+    size_t count = params.max_draw_counts;
+    if (params.include_count) {
+        // Metal has no draw count from a buffer: the guest's count as it is in memory.
+        count = (std::min)(count, size_t{gpu_memory->Read<u32>(params.count_start_address)});
+        ++indirect_counts_read;
+    }
+    const size_t stride = params.stride != 0
+                              ? params.stride
+                              : (params.is_indexed ? 5 : 4) * sizeof(u32);
+    const BufferCacheRuntime::IndexState& index = buffer_cache_runtime.Index();
+    const u32 index_size = index.format == Maxwell::IndexFormat::UnsignedShort ? 2U : 4U;
+    for (size_t draw = 0; draw < count; ++draw) {
+        const u64 offset = u64{indirect_offset} + draw * stride;
+        if (params.is_indexed) {
+            scheduler.DrawIndexedIndirect(*primitive, index_size, index.buffer, index.offset,
+                                          indirect->Handle(), offset);
+        } else {
+            scheduler.DrawIndirect(*primitive, indirect->Handle(), offset);
+        }
+    }
+    ++draws_encoded;
 }
 
 void RasterizerMetal::DrawTexture() {

@@ -71,6 +71,7 @@ public:
     ~RasterizerMetal() override;
 
     void Draw(bool is_indexed, u32 instance_count) override;
+    void DrawIndirect() override;
     void DrawTexture() override;
     void Clear(u32 layer_count) override;
     void DispatchCompute() override;
@@ -221,6 +222,8 @@ private:
     u32 next_visibility_slot{};
     std::array<u64, Scheduler::VisibilitySlots> visibility_ticks{};
     u64 occlusion_queries{};
+    /// Indirect draws whose count was read from guest memory (Metal has no count buffer).
+    u64 indirect_counts_read{};
     ::Common::unordered_map<u64, Object> depth_stencil_states;
 
     u64 draws{};

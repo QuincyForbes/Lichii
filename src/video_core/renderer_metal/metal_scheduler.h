@@ -210,6 +210,15 @@ public:
     void Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 instance_count,
               u32 base_instance);
 
+    /// One draw whose arguments (MTLDrawPrimitivesIndirectArguments, the guest's layout) are in
+    /// `buffer` at `offset`.
+    void DrawIndirect(u32 primitive, BufferHandle buffer, u64 offset);
+
+    /// The same with MTLDrawIndexedPrimitivesIndirectArguments; indexStart counts from
+    /// `index_offset`.
+    void DrawIndexedIndirect(u32 primitive, u32 index_size, BufferHandle index_buffer,
+                             u64 index_offset, BufferHandle buffer, u64 offset);
+
     /// Opens a compute encoder (or keeps the open one) running pipeline`n    /// (an id<MTLComputePipelineState>).
     void BeginCompute(void* pipeline);
 

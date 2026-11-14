@@ -580,6 +580,30 @@ void Scheduler::BindSampler(ShaderStage stage, u32 slot, void* sampler) {
     }
 }
 
+void Scheduler::DrawIndirect(u32 primitive, BufferHandle buffer, u64 offset) {
+    if (impl->render == nil || buffer == nullptr) {
+        return;
+    }
+    [impl->render drawPrimitives:static_cast<MTLPrimitiveType>(primitive)
+                  indirectBuffer:AsBuffer(buffer)
+            indirectBufferOffset:offset];
+    ++impl->draws;
+}
+
+void Scheduler::DrawIndexedIndirect(u32 primitive, u32 index_size, BufferHandle index_buffer,
+                                    u64 index_offset, BufferHandle buffer, u64 offset) {
+    if (impl->render == nil || buffer == nullptr || index_buffer == nullptr) {
+        return;
+    }
+    [impl->render drawIndexedPrimitives:static_cast<MTLPrimitiveType>(primitive)
+                              indexType:index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+                            indexBuffer:AsBuffer(index_buffer)
+                      indexBufferOffset:index_offset
+                         indirectBuffer:AsBuffer(buffer)
+                   indirectBufferOffset:offset];
+    ++impl->draws;
+}
+
 void Scheduler::BeginCompute(void* pipeline) {
     if (impl->compute == nil) {
         impl->EndEncoder();
