@@ -5,9 +5,14 @@
 # (yuzu-cmd). Other areas append their bridge sources to this list.
 
 add_library(lichii_ios_bridge STATIC
+    bench_core.cpp
+    bench_core.h
     bridge_host.h
+    lichii_bench.cpp
+    lichii_bench.h
     lichii_bridge.cpp
     lichii_bridge.h
+    lichii_bridge_bench.h
     lichii_bridge_content.cpp
     lichii_bridge_content.h
     lichii_bridge_content_applets.cpp

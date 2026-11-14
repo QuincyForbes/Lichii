@@ -46,6 +46,7 @@
 #include "input_common/drivers/virtual_gamepad.h"
 #include "input_common/main.h"
 #include "ios_frontend/bridge_host.h"
+#include "ios_frontend/lichii_bench.h"
 #include "ios_frontend/lichii_bridge_platform.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
@@ -240,6 +241,7 @@ void ApplyGameConfig(u64 program_id) {
     LOG_INFO(Frontend, "iOS: applying per-game settings for {:016X}", program_id);
     GameConfig config{program_id};
     KeepIosOverrides();
+    LichiiBench::ReapplySettings();
 }
 
 void RestoreGlobal() {

@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -59,6 +60,10 @@ bool ValidExperimentName(const char* name) {
     }
     return true;
 }
+
+/// lichii_platform_override_experiments: set once before other threads start, then only read.
+std::optional<std::vector<std::string>> g_experiment_override;
+bool g_experiment_keep_saved{};
 
 std::atomic<int> g_shader_stage{LICHII_SHADER_IDLE};
 std::atomic<u64> g_shader_done{};
@@ -520,9 +525,28 @@ void lichii_platform_set_experiment(const char* name, int enabled) {
     }
 }
 
+void lichii_platform_override_experiments(const char* const* names, int count, int keep_saved) {
+    std::vector<std::string> list;
+    for (int i = 0; i < count; ++i) {
+        if (LichiiPlatform::ValidExperimentName(names[i])) {
+            list.emplace_back(names[i]);
+        }
+    }
+    LichiiPlatform::g_experiment_override = std::move(list);
+    LichiiPlatform::g_experiment_keep_saved = keep_saved != 0;
+}
+
 int lichii_platform_experiment(const char* name) {
     if (!LichiiPlatform::ValidExperimentName(name)) {
         return 0;
+    }
+    if (const auto& forced = LichiiPlatform::g_experiment_override) {
+        if (std::find(forced->begin(), forced->end(), name) != forced->end()) {
+            return 1;
+        }
+        if (!LichiiPlatform::g_experiment_keep_saved) {
+            return 0;
+        }
     }
     std::error_code error;
     return std::filesystem::exists(LichiiPlatform::ConfigPath("experiments") / name, error) ? 1

@@ -139,9 +139,18 @@ void RecordGameFrameInterval() {
     v.clear();
     log.window_start = now;
 }
+
+std::atomic<PerfStats::GameFrameObserver> game_frame_observer{nullptr};
 } // namespace
 
+void PerfStats::SetGameFrameObserver(GameFrameObserver observer) {
+    game_frame_observer.store(observer, std::memory_order_release);
+}
+
 void PerfStats::EndGameFrame(u32 generated_count) {
+    if (const GameFrameObserver observer = game_frame_observer.load(std::memory_order_acquire)) {
+        observer();
+    }
     game_frames.fetch_add(1, std::memory_order_relaxed);
     total_game_frames.fetch_add(1, std::memory_order_relaxed);
     if (generated_count > 0) {

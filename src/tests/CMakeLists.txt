@@ -195,6 +195,8 @@ add_executable(tests
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
     input_common/calibration_configuration_job.cpp
+    ios_frontend/bench_core.cpp
+    ../ios_frontend/bench_core.cpp
 )
 
 create_target_directory_groups(tests)
