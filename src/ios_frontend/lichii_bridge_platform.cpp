@@ -304,6 +304,10 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_TARGETLESS_REACH", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment targetless_full on");
     }
+    if (lichii_platform_experiment("dispatch_deps")) {
+        setenv("EDEN_NX2_DISPATCH_DEPS", "1", 1);
+        LOG_WARNING(Frontend, "iOS: experiment dispatch_deps on");
+    }
     ApplyCpuExperiments();
 }
 

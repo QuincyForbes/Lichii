@@ -2148,6 +2148,53 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     }
 }
 
+void RasterizerVulkan::NoteDispatchDeps(const ComputePipeline& pipeline) {
+    if (!DispatchDepsTrace() || !scheduler.IsRenderPassActive()) {
+        return;
+    }
+    struct Deps {
+        u64 hash{};
+        u32 ends{};          ///< Open passes it ended
+        u32 split{};         ///< Of them, passes that could take work before them
+        u32 targets{};       ///< Bound one of the pass's attachments
+        u32 stores{};        ///< Came after storage writes in the pass
+        u32 writes{};        ///< Writes storage buffers, global memory or images
+    };
+    static std::vector<Deps> deps;
+    static auto window_start = std::chrono::steady_clock::now();
+    const Shader::Info& info = pipeline.Info();
+    const auto written = [](const auto& descriptors) {
+        return std::ranges::any_of(descriptors, [](const auto& desc) { return desc.is_written; });
+    };
+    auto it = std::ranges::find(deps, pipeline.ShaderHash(), &Deps::hash);
+    if (it == deps.end()) {
+        it = deps.insert(deps.end(), Deps{.hash = pipeline.ShaderHash()});
+    }
+    ++it->ends;
+    it->split += scheduler.CanRecordBeforePass() ? 1 : 0;
+    it->targets += texture_cache.SamplesRenderTarget(pipeline.BoundImages()) ? 1 : 0;
+    it->stores += scheduler.RenderPassHasStores() ? 1 : 0;
+    it->writes += info.stores_global_memory || written(info.storage_buffers_descriptors) ||
+                          written(info.image_descriptors) || written(info.image_buffer_descriptors)
+                      ? 1
+                      : 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window_start < std::chrono::seconds{10}) {
+        return;
+    }
+    window_start = now;
+    std::ranges::sort(deps, std::greater{}, &Deps::ends);
+    std::string text;
+    for (const Deps& d : deps) {
+        text += fmt::format("{}{:016x}: {} ends ({} after a split, {} bind its targets, {} after "
+                            "storage writes, {} write storage)",
+                            text.empty() ? "" : " | ", d.hash, d.ends, d.split, d.targets, d.stores,
+                            d.writes);
+    }
+    LOG_INFO(Common_Memory, "Dispatch deps (10 s): {}", text);
+    deps.clear();
+}
+
 void RasterizerVulkan::DispatchCompute() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     ++nx2_dispatch_serial;
@@ -2298,6 +2345,7 @@ void RasterizerVulkan::DispatchCompute() {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         buffer->MarkUsage(offset, 12);
+        NoteDispatchDeps(*pipeline);
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.NoteComputeWrites();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
@@ -2327,6 +2375,7 @@ void RasterizerVulkan::DispatchCompute() {
     if (dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2]) {
         return;
     }
+    NoteDispatchDeps(*pipeline);
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.NoteComputeWrites();
     if (can_replace || can_bilinear) {
@@ -3979,7 +4028,8 @@ void RasterizerVulkan::TickPerfReport() {
              "| memory: {} | draws {:.0f}/frame, {:.1f} "
              "skipped (no pipeline; {:.1f} while it was built, held {:.0f} ms/s for builds), {:.1f} "
              "render passes/frame ({:.1f} reopened the target the "
-             "last one left; attachments load {:.0f}, store {:.0f} MiB/frame; {:.1f} copies "
+             "last one left, {:.1f} its views through another framebuffer, {:.1f} its images "
+             "through other views, {:.1f} shared some of its images; attachments load {:.0f}, store {:.0f} MiB/frame; {:.1f} copies "
              "before their pass, {:.1f} clears kept), {:.1f} mesh "
              "emulated/frame "
              "({:.1f} ended a render pass) | uploads MiB/s: textures {:.1f}, buffers {:.1f}, "
@@ -4006,6 +4056,9 @@ void RasterizerVulkan::TickPerfReport() {
              static_cast<double>(delta(Common::PerfReport::DrawHoldNs)) / 1e6 / seconds,
              per_frame(Common::PerfReport::RenderPasses),
              per_frame(Common::PerfReport::RenderPassReopens),
+             per_frame(Common::PerfReport::RenderPassSameViewReopens),
+             per_frame(Common::PerfReport::RenderPassSameImageReopens),
+             per_frame(Common::PerfReport::RenderPassSharedImageSwitches),
              per_frame(Common::PerfReport::AttachmentLoadBytes) / (1 << 20),
              per_frame(Common::PerfReport::AttachmentStoreBytes) / (1 << 20),
              per_frame(Common::PerfReport::BeforePassCommands),

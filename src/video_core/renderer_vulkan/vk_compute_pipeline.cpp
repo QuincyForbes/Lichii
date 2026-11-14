@@ -39,6 +39,14 @@ using Shader::ImageBufferDescriptor;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
 using Tegra::Texture::TexturePair;
 
+bool DispatchDepsTrace() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_DISPATCH_DEPS");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
 namespace {
 std::vector<ByteAddressedRange> ByteAddressedMappedRanges(Tegra::MemoryManager& memory,
                                                         GPUVAddr address, u64 size) {
@@ -551,6 +559,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
         return value && *value != '\0' && *value != '0';
     }();
+    if (DispatchDepsTrace()) {
+        bound_images.assign(views.begin(), views.end());
+    }
     if (record_sampled || deferred_bind) {
         sampled_images.clear();
         const size_t first = Shader::NumDescriptors(info.texture_buffer_descriptors) +

@@ -532,6 +532,8 @@ private:
         /// The pass is a deferred clear's variant of the framebuffer's render pass that differs
         /// from it only in load ops, so later draws on that framebuffer can stay in it.
         bool clear_variant = false;
+        u32 num_views = 0; ///< The framebuffer's image views
+        std::array<VkImageView, 18> views{};
         GraphicsPipeline* graphics_pipeline = nullptr;
         bool is_rescaling = false;
         bool rescaling_defined = false;
@@ -708,6 +710,11 @@ private:
         u32 count{};
     };
     VkFramebuffer last_pass_framebuffer{}; ///< Framebuffer of the render pass that ended last
+    u32 last_pass_num_views{};                    ///< Its image views
+    std::array<VkImageView, 18> last_pass_views{};
+    u32 last_pass_num_images{};                   ///< Its images and subresources
+    std::array<VkImage, 9> last_pass_images{};
+    std::array<VkImageSubresourceRange, 9> last_pass_image_ranges{};
     const char* pass_end_file{}; ///< Caller about to end the open pass
     u32 pass_end_line{};
     const char* last_pass_end_file{};

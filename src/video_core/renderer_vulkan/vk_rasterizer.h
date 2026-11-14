@@ -327,6 +327,8 @@ private:
     bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
     void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
+    /// EDEN_NX2_DISPATCH_DEPS: what ties a dispatch about to end the open render pass to it.
+    void NoteDispatchDeps(const ComputePipeline& pipeline);
 
     Tegra::GPU& gpu;
     Tegra::MaxwellDeviceMemoryManager& device_memory;

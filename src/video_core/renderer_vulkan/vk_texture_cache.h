@@ -513,6 +513,11 @@ public:
         return image_ranges;
     }
 
+    /// The image views it was made with, resolve attachments included, in attachment order.
+    [[nodiscard]] std::span<const VkImageView> AttachmentViews() const noexcept {
+        return {attachment_views.data(), num_attachment_views};
+    }
+
     [[nodiscard]] bool HasAspectColorBit(size_t index) const noexcept {
         return (image_ranges.at(rt_map[index]).aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
     }
@@ -553,6 +558,8 @@ private:
     u32 num_images = 0;
     std::array<VkImage, 9> images{};
     std::array<VkImageSubresourceRange, 9> image_ranges{};
+    std::array<VkImageView, NUM_RT * 2 + 2> attachment_views{};
+    u32 num_attachment_views = 0;
     std::array<size_t, NUM_RT> rt_map{};
     bool has_depth{};
     bool has_stencil{};

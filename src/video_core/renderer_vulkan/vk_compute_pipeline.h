@@ -35,6 +35,10 @@ class Device;
 class PipelineStatistics;
 class Scheduler;
 
+/// EDEN_NX2_DISPATCH_DEPS=1: dispatches that end an open render pass are counted by what ties
+/// them to it (its attachments bound, storage writes in it), every 10 s.
+bool DispatchDepsTrace();
+
 class ComputePipeline {
 public:
     explicit ComputePipeline(const Device& device, Scheduler& scheduler, vk::PipelineCache& pipeline_cache,
@@ -93,6 +97,15 @@ public:
         return sampled_images;
     }
 
+    [[nodiscard]] const Shader::Info& Info() const noexcept {
+        return info;
+    }
+
+    /// Every image view the last configured dispatch bound, kept while EDEN_NX2_DISPATCH_DEPS runs.
+    [[nodiscard]] std::span<const VideoCommon::ImageViewInOut> BoundImages() const noexcept {
+        return bound_images;
+    }
+
     /// Advances the frame window of EDEN_NX2_UPSCALER_TRACE
     static void TickUpscalerTrace();
 
@@ -123,6 +136,7 @@ private:
     u32 num_descriptor_entries{};
     boost::container::small_vector<VideoCommon::ImageViewId, 8> written_images;
     std::vector<SampledImage> sampled_images;
+    std::vector<VideoCommon::ImageViewInOut> bound_images;
     boost::container::small_vector<u8, 64> texture_is_storage_ptr;
     bool has_storage_ptr_textures{};
 
