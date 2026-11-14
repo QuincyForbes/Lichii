@@ -19,6 +19,9 @@
 #ifdef HAS_OPENGL
 #include "video_core/renderer_opengl/renderer_opengl.h"
 #endif
+#ifdef LICHII_METAL_RENDERER
+#include "video_core/renderer_metal/renderer_metal.h"
+#endif
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/video_core.h"
 
@@ -37,6 +40,16 @@ std::unique_ptr<VideoCore::RendererBase> CreateRenderer(Core::System& system, Co
         return std::make_unique<Vulkan::RendererVulkan>(emu_window, device_memory, gpu, std::move(context));
     case Settings::RendererBackend::Null:
         return std::make_unique<Null::RendererNull>(emu_window, gpu, std::move(context));
+#ifdef LICHII_METAL_RENDERER
+    case Settings::RendererBackend::Metal:
+        return std::make_unique<Metal::RendererMetal>(emu_window, device_memory, gpu,
+                                                      std::move(context));
+#else
+    case Settings::RendererBackend::Metal:
+        LOG_WARNING(HW_GPU, "This build has no Metal renderer, using Vulkan");
+        return std::make_unique<Vulkan::RendererVulkan>(emu_window, device_memory, gpu,
+                                                        std::move(context));
+#endif
     default:
         return nullptr;
     }

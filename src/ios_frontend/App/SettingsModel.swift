@@ -242,7 +242,6 @@ enum SettingsCatalog {
     /// Settings that do nothing in the iOS app: not listed, and a search that finds one says why.
     static let unavailableReasons: [String: String] = [
         "nvidia_dlss_preset": "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.",
-        "backend": "iOS has one graphics API: Vulkan through MoltenVK.",
         "cpu_backend": "iOS runs games with the Dynarmic JIT only.",
         "nvdec_emulation": "Lichii decodes game videos on the CPU on iOS and sets this at every start.",
         "force_max_clock": "Only works with AMD, NVIDIA, Intel and Qualcomm drivers.",
@@ -328,6 +327,7 @@ enum SettingsCatalog {
         "oot_resolution": "The size the game draws at, the one resolution setting for it. Dynamic: the game's own, lower when it thinks the GPU is busy. A percentage: a fixed share of full size (handheld 100% 1920x1080, 75% 1440x810, 56% 1080x608, 50% 960x540): less GPU work and memory, softer picture. Above 100% the emulator scales it up. With MetalFX Temporal or AMD FSR 3.1 as the Upscaler, Dynamic draws at 75% handheld (100% docked): they take only that size every frame. Applies the next time the game starts.",
         "oot_frame_rate": "30 FPS saves power and heat; Unlocked follows the frame rate limit. The game keeps its normal speed at each.",
         "mkw_frame_rate": "The game's native 30 FPS mode, or dynamic 30-60 FPS (experimental). Applies the next time the game starts.",
+        "backend": "Vulkan (MoltenVK) is the renderer games are made to work with. Metal (experimental) is Lichii's own Metal renderer, still being built: for now it only shows a dark-blue screen while the game runs. Applies the next time a game starts.",
         "moltenvk_driver": "Which MoltenVK runs Vulkan on Metal. The new one draws mesh shaders (Ocarina of Time's foliage) with the GPU's own mesh shaders; the legacy one emulates them with compute. Lichii uses the legacy one when the new one doesn't load. Applies the next time Lichii starts.",
         "mesh_direct_outputs": "New MoltenVK only. On: mesh shaders write their vertices straight to Metal's outputs, which keeps Ocarina of Time's foliage within Metal's limits. Off: they copy them at the end, as builds before November 13 did (some foliage is then drawn with compute). Applies the next time the game starts.",
     ]
@@ -600,6 +600,7 @@ enum SettingLabels {
         "oot_frame_rate": ["Fps30": "30 FPS", "Fps60": "60 FPS", "Unlocked": "Unlocked (frame rate limit)"],
         "mkw_frame_rate": ["Game": "Game's own", "Fps30": "30 FPS", "Dynamic": "Dynamic 30-60 FPS"],
         "moltenvk_driver": ["Legacy": "Legacy MoltenVK", "Mesh": "New MoltenVK (native mesh shaders)"],
+        "backend": ["Vulkan": "Vulkan (MoltenVK)", "Metal": "Metal (experimental)"],
         "use_vsync": [
             "Immediate": "Off (Immediate)", "Mailbox": "Mailbox", "Fifo": "On (FIFO)",
             "FifoRelaxed": "Relaxed FIFO",
@@ -625,6 +626,7 @@ enum SettingLabels {
     /// Values that do nothing on iOS, by their enum name; not offered.
     static let hiddenChoices: [String: Set<String>] = [
         "upscaler": ["Dlss"],
+        "backend": ["OpenGL_GLSL", "OpenGL_GLASM", "OpenGL_SPIRV", "Null"],
     ]
 
     /// Lists shown in another order than the enum's.

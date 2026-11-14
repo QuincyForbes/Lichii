@@ -630,6 +630,42 @@ if (APPLE)
     target_compile_definitions(video_core PUBLIC LICHII_METALFX)
 endif()
 
+# The native Metal renderer (docs/nx2/metal-renderer.md), selectable next to Vulkan on Apple.
+cmake_dependent_option(ENABLE_METAL "Build the native Metal renderer (experimental)" ON "APPLE" OFF)
+if (ENABLE_METAL)
+    set(METAL_RENDERER_SOURCES
+        renderer_metal/metal_device.mm
+        renderer_metal/metal_swapchain.mm
+        renderer_metal/renderer_metal.mm
+    )
+    target_sources(video_core PRIVATE
+        ${METAL_RENDERER_SOURCES}
+        renderer_metal/metal_device.h
+        renderer_metal/metal_rasterizer.cpp
+        renderer_metal/metal_rasterizer.h
+        renderer_metal/metal_swapchain.h
+        renderer_metal/renderer_metal.h
+    )
+    # Objective-C++ through clang's C++ rule, as the MetalFX sources above.
+    set_source_files_properties(${METAL_RENDERER_SOURCES} PROPERTIES
+        LANGUAGE CXX
+        COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc"
+        SKIP_PRECOMPILE_HEADERS ON
+        SKIP_UNITY_BUILD_INCLUSION ON)
+    target_link_libraries(video_core PRIVATE "-framework Metal" "-framework QuartzCore"
+                                             "-framework Foundation")
+    target_compile_definitions(video_core PUBLIC LICHII_METAL_RENDERER)
+
+    # Offscreen check for machines without a window (the macOS CI runner).
+    if (NOT IOS)
+        add_executable(lichii-metal-smoke renderer_metal/metal_smoke.mm)
+        set_source_files_properties(renderer_metal/metal_smoke.mm PROPERTIES
+            LANGUAGE CXX
+            COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
+        target_link_libraries(lichii-metal-smoke PRIVATE "-framework Metal" "-framework Foundation")
+    endif()
+endif()
+
 # Ocarina of Time's upscaler replaced live by NVIDIA DLSS or Apple MetalFX temporal upscaling
 # (vk_ocarina_camera_motion.cpp).
 if (ENABLE_NVIDIA_DLSS OR APPLE)

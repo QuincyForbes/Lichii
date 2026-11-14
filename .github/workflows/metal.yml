@@ -1,0 +1,172 @@
+name: Metal renderer (macOS)
+
+# The native Metal renderer (docs/nx2/metal-renderer.md): the macOS arm64 app with it, and the
+# offscreen smoke test on the runner's Metal device. The iOS app builds in ios.yml.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat-metal-renderer
+    paths:
+      - "src/video_core/renderer_metal/**"
+      - "src/video_core/CMakeLists.txt"
+      - ".github/workflows/metal.yml"
+
+concurrency:
+  group: metal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS arm64 (Metal renderer)
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3000M
+      CCACHE_COMPILERCHECK: content
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install macOS dependencies
+        env:
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew install autoconf automake boost ffmpeg fmt glslang hidapi libtool libusb lz4 ninja \
+            nlohmann-json openssl pkg-config qt@6 sdl3 speexdsp zlib zstd cmake catch2 molten-vk \
+            vulkan-loader spirv-tools vulkan-utility-libraries ccache
+
+      # The release build's caches (main), so a branch build starts warm.
+      - name: Restore CPM downloads
+        uses: actions/cache/restore@v5
+        with:
+          path: .cache/cpm
+          key: cpm-macos-arm64-v2-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'CMakeModules/CPM*.cmake', 'externals/**/CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          restore-keys: |
+            cpm-macos-arm64-v2-
+            cpm-macOS-
+
+      - name: Restore compiler objects
+        uses: actions/cache/restore@v5
+        with:
+          path: .ccache
+          key: objects-metal-macos-arm64-v2-${{ github.sha }}
+          restore-keys: |
+            objects-metal-macos-arm64-v2-
+            objects-macos-arm64-v2-
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_TESTS=OFF \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            "-DCMAKE_PREFIX_PATH=$(brew --prefix qt@6);$(brew --prefix zlib)" \
+            "-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" \
+            -DVulkanHeaders_FORCE_BUNDLED=ON \
+            -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DENABLE_METAL=ON \
+            -DLICHII_BUILD_TAG=metal-${{ github.run_number }} \
+            -DLICHII_BUILD_PLATFORM=macos-arm64 \
+            -DLICHII_UPDATE_REPO=${{ github.repository }} \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DUSE_CCACHE=ON 2>&1 | tee configure.log
+          grep -E 'ENABLE_METAL' build/release/CMakeCache.txt
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          ccache --zero-stats
+          cmake --build build/release --target lichii-metal-smoke yuzu yuzu-cmd --parallel -- -k 0 2>&1 | tee build.log
+          ccache --show-stats
+
+      - name: Save compiler objects
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: .ccache
+          key: objects-metal-macos-arm64-v2-${{ github.sha }}-${{ github.run_attempt }}
+
+      - name: Summarize build errors
+        if: failure()
+        run: |
+          for log in build.log configure.log; do
+            [ -f "$log" ] || continue
+            grep -E 'error:|CMake Error|FAILED:|Undefined symbols|ld: ' -A 3 "$log" | head -c 30000 | split -b 3500 - "ann-$log-" || true
+          done
+          for part in ann-*; do
+            [ -f "$part" ] || continue
+            printf '::error title=%s::%s\n' "$part" "$(awk 'BEGIN{ORS="%0A"}{gsub(/%/,"%25");gsub(/\r/,"");print}' "$part")"
+          done
+
+      # Exit 2: the runner has no Metal device, which is a skip, not a failure.
+      - name: Metal smoke test
+        run: |
+          set -uo pipefail
+          out=$(build/release/bin/lichii-metal-smoke 2>&1)
+          rc=$?
+          echo "$out"
+          printf '::notice title=Metal smoke test (exit %s)::%s\n' "$rc" "$(printf '%s' "$out" | awk 'BEGIN{ORS="%0A"}{print}')"
+          if [ "$rc" = 2 ]; then
+            echo "::warning title=Metal smoke test::no Metal device on this runner"
+            exit 0
+          fi
+          exit "$rc"
+
+      - name: Check the renderer is linked
+        run: |
+          set -uo pipefail
+          app=build/release/bin/lichii.app
+          nm "$app/Contents/MacOS/lichii" > symbols.txt
+          grep -c 'RendererMetal' symbols.txt
+          printf '::notice title=Metal renderer symbols::%s\n' "$(grep -c 'RendererMetal' symbols.txt)"
+
+      # As release-binaries.yml packages it: Qt and Homebrew libraries copied into the bundle.
+      - name: Package macOS app
+        run: |
+          set -euo pipefail
+          app=build/release/bin/lichii.app
+          cp build/release/bin/eden-cli "$app/Contents/MacOS/eden-cli"
+          "$(brew --prefix qt@6)/bin/macdeployqt" "$app" \
+            -executable="$app/Contents/MacOS/eden-cli" -libpath="$(brew --prefix)/lib" \
+            -always-overwrite -verbose=1
+          rm -f "$app/Contents/PlugIns/platforminputcontexts/libqtvirtualkeyboardplugin.dylib"
+          binaries=$(find "$app/Contents" -type f \( -perm -u+x -o -name '*.dylib' \) \
+            -exec sh -c 'file -b "$1" | grep -q Mach-O' _ {} \; -print)
+          for binary in $binaries; do
+            otool -l "$binary" | awk '/cmd LC_RPATH/ {getline; getline; print $2}' |
+              { grep -E '^/(opt/homebrew|usr/local)/' || true; } | while read -r rpath; do
+                install_name_tool -delete_rpath "$rpath" "$binary" 2> /dev/null
+              done
+          done
+          for program in lichii eden-cli; do
+            install_name_tool -add_rpath @executable_path/../Frameworks \
+              "$app/Contents/MacOS/$program" 2> /dev/null
+          done
+          codesign --force --deep --sign - "$app"
+          if [ -f dist/eglantine.entitlements ]; then
+            codesign --force --sign - --entitlements dist/eglantine.entitlements \
+              "$app/Contents/MacOS/eden-cli"
+            codesign --force --sign - --entitlements dist/eglantine.entitlements "$app"
+          fi
+          cp build/release/bin/lichii-metal-smoke .
+          ditto -c -k --keepParent "$app" lichii-metal-macos-arm64.zip
+          ls -la lichii-metal-macos-arm64.zip
+
+      - name: Upload macOS app
+        uses: actions/upload-artifact@v4
+        with:
+          name: lichii-metal-macos-arm64-${{ github.run_number }}
+          path: |
+            lichii-metal-macos-arm64.zip
+            lichii-metal-smoke
+          if-no-files-found: error
+          compression-level: 0

@@ -1402,6 +1402,11 @@ void MainWindow::InitializeWidgets() {
                     if (renderer_backend_pair.first == Settings::RendererBackend::Null) {
                         continue;
                     }
+#ifndef LICHII_METAL_RENDERER
+                    if (renderer_backend_pair.first == Settings::RendererBackend::Metal) {
+                        continue;
+                    }
+#endif
                     context_menu.addAction(
                         renderer_backend_pair.second, [this, renderer_backend_pair] {
                             Settings::values.renderer_backend.SetValue(renderer_backend_pair.first);
