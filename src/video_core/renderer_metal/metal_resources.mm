@@ -307,6 +307,31 @@ Object CreateTextureView(TextureHandle texture, u32 format, TextureKind kind, u3
                                               swizzle:channels]);
 }
 
+u32 TextureBufferAlignment(const Device& device, u32 format) {
+    return static_cast<u32>([device.GetDevice()
+        minimumTextureBufferAlignmentForPixelFormat:static_cast<MTLPixelFormat>(format)]);
+}
+
+Object CreateTextureBufferView(BufferHandle buffer, u64 offset, u32 elements, u32 bytes_per_texel,
+                               u32 format, bool writable) {
+    const id<MTLBuffer> object = AsBuffer(buffer);
+    if (object == nil || elements == 0) {
+        return {};
+    }
+    MTLTextureUsage usage = MTLTextureUsageShaderRead;
+    if (writable) {
+        usage |= MTLTextureUsageShaderWrite;
+    }
+    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor
+        textureBufferDescriptorWithPixelFormat:static_cast<MTLPixelFormat>(format)
+                                         width:elements
+                               resourceOptions:object.resourceOptions
+                                         usage:usage];
+    return Retain([object newTextureWithDescriptor:descriptor
+                                            offset:offset
+                                       bytesPerRow:u64{elements} * bytes_per_texel]);
+}
+
 Object CreateBuffer(const Device& device, u64 size, bool shared, u8** contents) {
     const MTLResourceOptions options =
         shared ? (MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache)

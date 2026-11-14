@@ -20,6 +20,7 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_metal/metal_graphics.h"
+#include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_rasterizer.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/shader_handle_program.h"
@@ -124,7 +125,11 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         return;
     }
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    const std::optional<u32> primitive = PrimitiveType(draw_state.topology);
+    const bool u8_indices =
+        is_indexed && draw_state.index_buffer.format == Maxwell::IndexFormat::UnsignedByte;
+    const bool convert = IndexConvert::NeedsConversion(draw_state.topology) || u8_indices;
+    const std::optional<u32> primitive =
+        PrimitiveType(IndexConvert::ConvertedTopology(draw_state.topology));
     if (!primitive) {
         LOG_ONCE(warned_topology, "Metal: topology {} is not drawn yet",
                  static_cast<u32>(draw_state.topology));
@@ -135,13 +140,41 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     if (!PrepareDraw(*pipeline, is_indexed)) {
         return;
     }
-    if (is_indexed) {
-        const BufferCacheRuntime::IndexState& index = buffer_cache_runtime.Index();
-        if (index.format == Maxwell::IndexFormat::UnsignedByte) {
-            // Metal has no 8-bit indices: they need widening on the GPU first.
-            LOG_ONCE(warned_u8, "Metal: 8-bit index buffers are not drawn yet");
+    if (convert) {
+        // Rewritten on the CPU from the guest's indices (or the vertex range) into 32-bit
+        // indices in the stream ring. Index data the GPU wrote and never flushed is not seen.
+        const u32 count =
+            is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+        const u32 index_size =
+            is_indexed ? static_cast<u32>(draw_state.index_buffer.FormatSizeInBytes()) : 0U;
+        std::span<const u8> source;
+        if (is_indexed) {
+            if (!draw_state.inline_index_draw_indexes.empty()) {
+                source = draw_state.inline_index_draw_indexes;
+            } else {
+                converted_source.resize(size_t{count} * index_size);
+                gpu_memory->ReadBlockUnsafe(draw_state.index_buffer.StartAddress() +
+                                                GPUVAddr{draw_state.index_buffer.first} * index_size,
+                                            converted_source.data(), converted_source.size());
+                source = converted_source;
+            }
+        }
+        const u32 converted = IndexConvert::ConvertedCount(draw_state.topology, count);
+        if (converted == 0) {
             return;
         }
+        const StagingBufferRef indices = staging_pool.Stream(size_t{converted} * sizeof(u32), 4);
+        const std::span<u32> out(reinterpret_cast<u32*>(indices.mapped_span.data()), converted);
+        IndexConvert::Convert(draw_state.topology, source, index_size,
+                              is_indexed ? 0U : draw_state.vertex_buffer.first, count,
+                              maxwell3d->regs.primitive_restart.enabled != 0, out);
+        scheduler.DrawIndexed(*primitive, converted, 4, indices.buffer, indices.offset,
+                              instance_count,
+                              is_indexed ? static_cast<s32>(draw_state.base_index) : 0,
+                              draw_state.base_instance);
+        ++draws_converted;
+    } else if (is_indexed) {
+        const BufferCacheRuntime::IndexState& index = buffer_cache_runtime.Index();
         const u32 index_size = index.format == Maxwell::IndexFormat::UnsignedShort ? 2U : 4U;
         scheduler.DrawIndexed(*primitive, draw_state.index_buffer.count, index_size, index.buffer,
                               u64{index.offset} + u64{draw_state.index_buffer.first} * index_size,
@@ -154,12 +187,64 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     ++draws_encoded;
 }
 
+std::vector<TextureHandle> RasterizerMetal::PrepareTexelBuffers(std::span<const Binding> bindings,
+                                                                const Shader::Info& info) {
+    // The buffer cache appends a stage's texture buffers, then its image buffers.
+    const size_t read_only = Shader::NumDescriptors(info.texture_buffer_descriptors);
+    std::vector<TextureHandle> result;
+    for (const Binding& binding : bindings) {
+        if (binding.kind != Binding::Kind::TexelBuffer) {
+            continue;
+        }
+        const bool writable = result.size() >= read_only;
+        const VideoCore::Surface::PixelFormat guest_format =
+            binding.format == VideoCore::Surface::PixelFormat::Invalid
+                ? VideoCore::Surface::PixelFormat::R8_UNORM
+                : binding.format;
+        const FormatInfo format = SurfaceFormat(device, guest_format, false);
+        const u32 bytes_per_texel = VideoCore::Surface::BytesPerBlock(guest_format);
+        const u32 elements = bytes_per_texel != 0 ? binding.size / bytes_per_texel : 0;
+        if (format.format == 0 || elements == 0 || binding.buffer == nullptr) {
+            result.push_back(nullptr);
+            continue;
+        }
+        const u32 alignment = (std::max)(TextureBufferAlignment(device, format.format), 1U);
+        BufferHandle buffer = binding.buffer;
+        u64 offset = binding.offset;
+        if (offset % alignment != 0) {
+            if (writable) {
+                // A copy would not carry the shader's writes back.
+                LOG_ONCE(warned_written, "Metal: written texel buffers at unaligned offsets are "
+                                         "not bound yet");
+                result.push_back(nullptr);
+                continue;
+            }
+            // Read through an aligned copy (ends an open render pass: counted as a texel copy).
+            const StagingBufferRef copy = staging_pool.Stream(binding.size, alignment);
+            scheduler.CopyBuffer(binding.buffer, binding.offset, copy.buffer, copy.offset,
+                                 binding.size);
+            buffer = copy.buffer;
+            offset = copy.offset;
+            ++texel_copies;
+        }
+        const TexelViewKey key{buffer, offset, elements, format.format, writable};
+        Object& view = texel_view_cache[key];
+        if (!view) {
+            view = CreateTextureBufferView(buffer, offset, elements, bytes_per_texel, format.format,
+                                           writable);
+        }
+        result.push_back(view.Get());
+    }
+    return result;
+}
+
 void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage metal_stage,
+                                         std::span<const Binding> pending,
+                                         std::span<const TextureHandle> texel_buffer_views,
                                          std::span<const VideoCommon::ImageViewInOut> views,
                                          std::span<const VideoCommon::SamplerId> samplers,
                                          u32 render_width, u32 render_height) {
     const Shader::Info& info = program.info;
-    std::vector<Binding>& pending = buffer_cache_runtime.PendingBindings();
     std::vector<u32> texture_slots;
     std::vector<u32> sampler_slots;
     size_t next_buffer = 0;
@@ -205,8 +290,10 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     // Texture slots in binding order: texel buffers, image buffers, textures, images.
     const size_t texel_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors) +
                                  Shader::NumDescriptors(info.image_buffer_descriptors);
-    if (texel_buffers != 0) {
-        LOG_ONCE(warned_texel, "Metal: texel buffers are not bound yet");
+    for (size_t element = 0; element < texel_buffers && element < texture_slots.size(); ++element) {
+        scheduler.BindTexture(metal_stage, texture_slots[element],
+                              element < texel_buffer_views.size() ? texel_buffer_views[element]
+                                                                  : nullptr);
     }
     size_t texture_slot = texel_buffers;
     size_t view = texel_buffers;
@@ -372,6 +459,20 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed) {
     }
     buffer_cache.UpdateGraphicsBuffers(is_indexed);
     buffer_cache.BindHostGeometryBuffers(is_indexed);
+
+    // Each stage's buffer bindings, and texel buffer views (copies of misaligned ranges go
+    // before the render pass).
+    std::array<std::vector<Binding>, 2> stage_bindings;
+    std::array<std::vector<TextureHandle>, 2> texel_views;
+    for (size_t index = 0; index < stages.size(); ++index) {
+        if (programs[index]->msl.empty()) {
+            continue;
+        }
+        buffer_cache_runtime.PendingBindings().clear();
+        buffer_cache.BindHostStageBuffers(stages[index]);
+        stage_bindings[index] = buffer_cache_runtime.PendingBindings();
+        texel_views[index] = PrepareTexelBuffers(stage_bindings[index], programs[index]->info);
+    }
 
     // The render pipeline state: targets, blending, vertex layout.
     RenderTargetSet targets{};
@@ -569,10 +670,8 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed) {
         }
         const size_t stage = stages[index];
         const ShaderStage metal_stage = index == 0 ? ShaderStage::Vertex : ShaderStage::Fragment;
-        buffer_cache_runtime.PendingBindings().clear();
-        buffer_cache.BindHostStageBuffers(stage);
-
-        BindStageResources(program, metal_stage, std::span(views).subspan(first_view[index]),
+        BindStageResources(program, metal_stage, stage_bindings[index], texel_views[index],
+                           std::span(views).subspan(first_view[index]),
                            std::span(samplers).subspan(first_sampler[index]), targets.width,
                            targets.height);
     }
@@ -752,9 +851,12 @@ void RasterizerMetal::DispatchCompute() {
     buffer_cache.UpdateComputeBuffers();
     buffer_cache_runtime.PendingBindings().clear();
     buffer_cache.BindHostComputeBuffers();
+    const std::vector<Binding> bindings = buffer_cache_runtime.PendingBindings();
+    const std::vector<TextureHandle> texel_views = PrepareTexelBuffers(bindings, info);
 
     scheduler.BeginCompute(state);
-    BindStageResources(program, ShaderStage::Compute, views, samplers, 0, 0);
+    BindStageResources(program, ShaderStage::Compute, bindings, texel_views, views, samplers, 0,
+                       0);
     const std::array<u32, 3> group_size{qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z};
     if (const auto indirect = kepler_compute->GetIndirectComputeAddress()) {
         const auto [buffer, offset] = buffer_cache.ObtainBuffer(
@@ -972,6 +1074,7 @@ void RasterizerMetal::FlushCommands() {
 }
 
 void RasterizerMetal::TickFrame() {
+    texel_view_cache.clear();
     fence_manager.TickFrame();
     {
         std::scoped_lock lock{texture_cache.mutex};

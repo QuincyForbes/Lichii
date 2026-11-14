@@ -1,0 +1,35 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Index lists Metal can draw: quads, quad strips, fans, polygons and line loops rewritten, and
+// 8-bit indices widened (Metal draws 16- and 32-bit indices only). Plain C++, no Metal.
+
+#pragma once
+
+#include <span>
+
+#include "common/common_types.h"
+#include "video_core/engines/maxwell_3d.h"
+
+namespace Metal::IndexConvert {
+
+using Topology = Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology;
+
+/// Whether Metal can't draw the topology from the guest's own vertices or indices.
+[[nodiscard]] bool NeedsConversion(Topology topology) noexcept;
+
+/// What the rewritten list is drawn as: Triangles for quads, quad strips, fans and polygons,
+/// LineStrip for line loops, the topology itself otherwise.
+[[nodiscard]] Topology ConvertedTopology(Topology topology) noexcept;
+
+/// Indices the rewritten list of `count` guest vertices holds.
+[[nodiscard]] u32 ConvertedCount(Topology topology, u32 count) noexcept;
+
+/// Writes ConvertedCount(topology, count) 32-bit indices to `out`. The guest's indices come
+/// from `source` (`index_size` bytes each), or are first, first + 1, ... when it is empty. With
+/// `restart`, an 8-bit 0xFF becomes 0xFFFFFFFF (Metal's restart value for 32-bit indices).
+/// Returns the indices written.
+u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 first, u32 count,
+            bool restart, std::span<u32> out) noexcept;
+
+} // namespace Metal::IndexConvert

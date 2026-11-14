@@ -88,6 +88,14 @@ struct FormatInfo {
                                        u32 base_level, u32 levels, u32 base_layer, u32 layers,
                                        std::array<u8, 4> swizzle);
 
+/// Bytes a texture buffer view's offset must be a multiple of, for the format.
+[[nodiscard]] u32 TextureBufferAlignment(const Device& device, u32 format);
+
+/// A texture_buffer view of `elements` texels of `buffer` from `offset` (TextureBufferAlignment
+/// aligned); empty on failure.
+[[nodiscard]] Object CreateTextureBufferView(BufferHandle buffer, u64 offset, u32 elements,
+                                             u32 bytes_per_texel, u32 format, bool writable);
+
 /// A buffer in shared (CPU-visible, `contents` set) or private storage.
 [[nodiscard]] Object CreateBuffer(const Device& device, u64 size, bool shared, u8** contents);
 

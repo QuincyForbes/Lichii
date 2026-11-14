@@ -4,7 +4,11 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <optional>
+#include <span>
+#include <unordered_map>
+#include <vector>
 #include <utility>
 
 #include "common/common_types.h"
@@ -120,6 +124,8 @@ public:
         u64 draws;
         u64 draws_with_pipeline; ///< Their pipeline translated and built by Metal
         u64 draws_encoded;       ///< Recorded on a render encoder
+        u64 draws_converted;     ///< Of them, with indices rewritten (quads, fans, 8-bit)
+        u64 texel_copies;        ///< Texel buffers read through an aligned copy
         u64 dispatches;
         u64 dispatches_with_pipeline;
         u64 clears;
@@ -128,7 +134,8 @@ public:
     /// Work taken since the last call (the renderer's 10 s report).
     [[nodiscard]] WorkCounts TakeWorkCounts() noexcept {
         return {std::exchange(draws, 0), std::exchange(draws_with_pipeline, 0),
-                std::exchange(draws_encoded, 0),
+                std::exchange(draws_encoded, 0), std::exchange(draws_converted, 0),
+                std::exchange(texel_copies, 0),
                 std::exchange(dispatches, 0), std::exchange(dispatches_with_pipeline, 0),
                 std::exchange(clears, 0)};
     }
@@ -149,10 +156,17 @@ private:
     /// Binds everything the draw needs and opens its render pass; false to skip it.
     bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed);
 
+    /// texture_buffer views of a stage's texel buffer bindings, in order (null where none can be
+    /// made). Ranges at offsets Metal can't view are read through an aligned copy.
+    [[nodiscard]] std::vector<TextureHandle> PrepareTexelBuffers(std::span<const Binding> bindings,
+                                                                 const Shader::Info& info);
+
     /// Binds a stage's buffers (the buffer cache's pending bindings for it), textures, samplers,
     /// images and push constants into the slots the translator gave them. iews and
     /// samplers start at the stage's first.
     void BindStageResources(StageProgram& program, ShaderStage metal_stage,
+                            std::span<const Binding> pending,
+                            std::span<const TextureHandle> texel_buffer_views,
                             std::span<const VideoCommon::ImageViewInOut> views,
                             std::span<const VideoCommon::SamplerId> samplers, u32 render_width,
                             u32 render_height);
@@ -174,12 +188,34 @@ private:
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
 
+    struct TexelViewKey {
+        BufferHandle buffer;
+        u64 offset;
+        u32 elements;
+        u32 format;
+        bool writable;
+
+        bool operator==(const TexelViewKey&) const noexcept = default;
+    };
+    struct TexelViewHash {
+        size_t operator()(const TexelViewKey& key) const noexcept {
+            return std::hash<const void*>{}(key.buffer) ^ (key.offset * 0x9E3779B97F4A7C15ULL) ^
+                   (u64{key.elements} << 20) ^ (u64{key.format} << 8) ^ (key.writable ? 1U : 0U);
+        }
+    };
+
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
+    /// Cleared every frame: views of deleted buffers must not live on.
+    std::unordered_map<TexelViewKey, Object, TexelViewHash> texel_view_cache;
+    u64 texel_copies{};
     ::Common::unordered_map<u64, Object> depth_stencil_states;
 
     u64 draws{};
     u64 draws_with_pipeline{};
     u64 draws_encoded{};
+    u64 draws_converted{};
+    /// Guest index data read for draws whose indices are rewritten.
+    std::vector<u8> converted_source;
     u64 dispatches{};
     u64 dispatches_with_pipeline{};
     u64 clears{};

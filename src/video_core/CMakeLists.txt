@@ -639,6 +639,7 @@ set(METAL_RENDERER_CXX_SOURCES
     renderer_metal/metal_buffer_cache.cpp
     renderer_metal/metal_buffer_cache_base.cpp
     renderer_metal/metal_fence_manager.cpp
+    renderer_metal/metal_index_convert.cpp
     renderer_metal/metal_pipeline_cache.cpp
     renderer_metal/metal_rasterizer.cpp
     renderer_metal/metal_shader_translate.cpp
@@ -668,6 +669,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_device.h
         renderer_metal/metal_fence_manager.h
         renderer_metal/metal_graphics.h
+        renderer_metal/metal_index_convert.h
         renderer_metal/metal_object.h
         renderer_metal/metal_pipeline_cache.h
         renderer_metal/metal_rasterizer.h

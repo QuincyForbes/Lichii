@@ -236,15 +236,16 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
             impl->rasterizer.Pipelines().TakeCounts();
         LOG_INFO(Render_Metal,
                  "Metal: {} frames presented ({} from the texture cache, {} from guest memory), "
-                 "{} without a drawable; {} draws ({} with a built pipeline, {} drawn) and {} "
-                 "dispatches ({} with a pipeline); {} clears; pipelines made {} graphics, {} "
-                 "compute, {} refused; {} command buffers, {} encoders ({} render passes), {} "
-                 "blit commands; textures {} MiB, buffers {} MiB",
+                 "{} without a drawable; {} draws ({} with a built pipeline, {} drawn, {} with "
+                 "rewritten indices) and {} dispatches ({} with a pipeline); {} clears, {} texel "
+                 "buffer copies; pipelines made {} graphics, {} compute, {} refused; {} command "
+                 "buffers, {} encoders ({} render passes), {} blit commands; textures {} MiB, "
+                 "buffers {} MiB",
                  impl->presented, impl->from_cache, impl->from_memory, impl->skipped, work.draws,
-                 work.draws_with_pipeline, work.draws_encoded, work.dispatches,
-                 work.dispatches_with_pipeline,
-                 work.clears, graphics_made, compute_made, refused, command_buffers, encoders,
-                 passes, blits, impl->rasterizer.TextureRuntime().allocated_bytes >> 20,
+                 work.draws_with_pipeline, work.draws_encoded, work.draws_converted,
+                 work.dispatches, work.dispatches_with_pipeline, work.clears, work.texel_copies,
+                 graphics_made, compute_made, refused, command_buffers, encoders, passes, blits,
+                 impl->rasterizer.TextureRuntime().allocated_bytes >> 20,
                  impl->rasterizer.BufferRuntime().GetDeviceMemoryUsage() >> 20);
         // Per frame, to set against MoltenVK's Perf: and Perf passes: lines.
         const f64 seconds = std::chrono::duration<f64>(now - impl->report_start).count();

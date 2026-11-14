@@ -55,6 +55,8 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
         msl.argument_buffers = false;
         msl.pad_fragment_output_components = true;
         msl.enable_decoration_binding = false;
+        // Texel buffers as MSL texture_buffer (MSL 2.1+), not emulated with 2D textures.
+        msl.texture_buffer_native = true;
         compiler.set_msl_options(msl);
         auto common = compiler.get_common_options();
         common.vertex.flip_vert_y = stage == Stage::Vertex && options.flip_vertex_y;
