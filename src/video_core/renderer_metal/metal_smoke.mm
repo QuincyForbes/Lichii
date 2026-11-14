@@ -16,7 +16,11 @@
 #include <cstring>
 #include <span>
 #include <string>
+#include <vector>
 
+#include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/frontend/ir/attribute.h"
+#include "shader_recompiler/shader_info.h"
 #include "texel_buffer_smoke_comp_spv.h"
 #include "translate_smoke_comp_spv.h"
 #include "video_core/renderer_metal/metal_bridge.h"
@@ -430,7 +434,155 @@ int RunTexelBuffer() {
     return wrong == 0 ? 0 : 1;
 }
 
+constexpr const char* MeshColorSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct MeshColorIn {
+    float4 color [[user(locn0)]];
+};
+
+fragment float4 mesh_color_fragment(MeshColorIn in [[stage_in]]) {
+    return in.color;
+}
+)";
+
+/// Mesh emulation's draw side: two output blocks in the layout of EmitMeshEmulationVertex (four
+/// vertices with a position and generic 0 each, three triangles of which the last is unused),
+/// drawn by its vertex shader through the translator; the left half green, the right half blue.
+int RunMeshEmulation() {
+    using Shader::IR::Attribute;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Shader::MeshInfo mesh{};
+    mesh.max_vertices = 4;
+    mesh.max_primitives = 3;
+    mesh.topology = 4;
+    for (const Attribute attribute :
+         {Attribute::PositionX, Attribute::PositionY, Attribute::PositionZ, Attribute::PositionW,
+          Attribute::Generic0X, Attribute::Generic0Y, Attribute::Generic0Z, Attribute::Generic0W}) {
+        mesh.vertex_lines.push_back(static_cast<uint32_t>(attribute));
+    }
+    const Shader::Profile profile{.supported_spirv = 0x00010300,
+                                  .unified_descriptor_binding = true};
+    constexpr uint32_t OutputBinding = 3;
+    const std::vector<uint32_t> spirv = Shader::Backend::SPIRV::EmitMeshEmulationVertex(
+        profile, mesh, OutputBinding, ~0U, false);
+    namespace Translate = Metal::ShaderTranslate;
+    const Translate::Result msl =
+        Translate::SpirvToMsl(spirv, Translate::Stage::Vertex, Translate::Options{});
+    if (msl.source.empty()) {
+        std::printf("metal-smoke: FAIL mesh emulation vertex SPIR-V -> MSL: %s\n",
+                    msl.error.c_str());
+        return 1;
+    }
+    uint32_t output_slot = UINT32_MAX;
+    for (const Translate::ResourceSlot& slot : msl.slots) {
+        if (slot.kind == Translate::ResourceKind::Buffer && slot.binding == OutputBinding) {
+            output_slot = slot.index;
+        }
+    }
+    std::string error;
+    const Metal::Object vertex_library = Metal::CreateLibrary(device, msl.source, error);
+    const Metal::Object vertex = vertex_library
+                                     ? Metal::CreateFunction(vertex_library.Get(), msl.entry_point)
+                                     : Metal::Object{};
+    const Metal::Object fragment_library = Metal::CreateLibrary(device, MeshColorSource, error);
+    const Metal::Object fragment =
+        fragment_library ? Metal::CreateFunction(fragment_library.Get(), "mesh_color_fragment")
+                         : Metal::Object{};
+    if (!vertex || !fragment || output_slot == UINT32_MAX) {
+        std::printf("metal-smoke: FAIL mesh emulation shaders (output slot %u): %s\n%s\n",
+                    output_slot, error.c_str(), msl.source.c_str());
+        return 1;
+    }
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = vertex.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
+    const Metal::Object depth_stencil =
+        Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+    if (!pipeline || !depth_stencil) {
+        std::printf("metal-smoke: FAIL mesh emulation render pipeline: %s\n", error.c_str());
+        return 1;
+    }
+
+    // Per block: vertex v line l at v * 8 + l, then the triangles' indices.
+    const uint32_t block_words = Shader::Backend::SPIRV::MeshEmulationBlockWords(mesh);
+    constexpr uint32_t Groups = 2;
+    uint8_t* output_data = nullptr;
+    const Metal::Object output =
+        Metal::CreateBuffer(device, Groups * block_words * sizeof(uint32_t), true, &output_data);
+    auto* const words = reinterpret_cast<uint32_t*>(output_data);
+    std::memset(words, 0, Groups * block_words * sizeof(uint32_t));
+    const std::array<std::array<float, 4>, Groups> colors{{{0, 1, 0, 1}, {0, 0, 1, 1}}};
+    for (uint32_t group = 0; group < Groups; ++group) {
+        uint32_t* const block = words + group * block_words;
+        const float left = group == 0 ? -1.0f : 0.0f;
+        const std::array<std::array<float, 2>, 4> corners{
+            {{left, -1.0f}, {left + 1.0f, -1.0f}, {left + 1.0f, 1.0f}, {left, 1.0f}}};
+        for (uint32_t index = 0; index < 4; ++index) {
+            const std::array<float, 8> lines{corners[index][0], corners[index][1], 0.0f, 1.0f,
+                                             colors[group][0],  colors[group][1],  colors[group][2],
+                                             colors[group][3]};
+            std::memcpy(block + index * 8, lines.data(), sizeof(lines));
+        }
+        const std::array<uint32_t, 9> triangles{0, 1, 2, 0, 2, 3, 0, 0, 0};
+        std::memcpy(block + 4 * 8, triangles.data(), sizeof(triangles));
+    }
+
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm),
+                 .width = Size,
+                 .height = Size,
+                 .render_target = true});
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Size * Size * 4, true, &readback);
+    Metal::ClearPass clear{};
+    clear.color[0] = {.texture = target.Get()};
+    clear.clear_color[0] = true;
+    clear.color_value[0] = {1.0, 0.0, 0.0, 1.0};
+    clear.width = Size;
+    clear.height = Size;
+    scheduler.Clear(clear);
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = Size;
+    targets.height = Size;
+    scheduler.BeginRendering(targets);
+    Metal::DrawState state{};
+    state.pipeline = pipeline.Get();
+    state.depth_stencil = depth_stencil.Get();
+    state.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+    state.scissor = {0, 0, Size, Size};
+    scheduler.SetDrawState(state);
+    scheduler.BindBuffer(Metal::ShaderStage::Vertex, output_slot, output.Get(), 0);
+    const uint32_t vertices = Groups * mesh.max_primitives * mesh.PrimitiveVertices();
+    scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, vertices, 1, 0);
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Size, Size, 1}, readback_buffer.Get(),
+                                  0, Size * 4, 0);
+    scheduler.Finish();
+
+    const auto* texels = reinterpret_cast<const Texel*>(readback);
+    const Texel left = texels[(Size / 2) * Size + 4];
+    const Texel right = texels[(Size / 2) * Size + Size - 4];
+    const bool drawn = Near(left, {0, 255, 0, 255}) && Near(right, {0, 0, 255, 255});
+    std::printf("metal-smoke: mesh emulation draw (%u blocks of %u words, %u vertices, output "
+                "slot %u): left %u,%u,%u right %u,%u,%u: %s\n",
+                Groups, block_words, vertices, output_slot, left.r, left.g, left.b, right.r,
+                right.g, right.b, drawn ? "PASS" : "FAIL");
+    return drawn ? 0 : 1;
+}
+
 } // Anonymous namespace
+
 int main() {
     @autoreleasepool {
         const int draw = Run();
@@ -438,7 +590,7 @@ int main() {
             return 2;
         }
         int result = draw;
-        for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer}) {
+        for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer, RunMeshEmulation}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }
