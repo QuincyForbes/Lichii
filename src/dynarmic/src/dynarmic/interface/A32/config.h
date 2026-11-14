@@ -215,6 +215,11 @@ struct UserConfig {
     /// accesses will hit the memory callbacks.
     bool recompile_on_fastmem_failure = true;
 
+    /// A plain load that faults in fastmem recompiles without fastmem only on its Nth fault (0 or
+    /// 1: the first); the faults before go through the callbacks and the fastmem code stays. Most
+    /// load faults are one-shot (a read trap that the callback then disarms).
+    std::uint32_t fastmem_load_fault_limit = 0;
+
     /// Determines if we should use the above fastmem_pointer for exclusive reads and
     /// writes. On x64, dynarmic currently relies on x64 cmpxchg semantics which may not
     /// provide fully accurate emulation.

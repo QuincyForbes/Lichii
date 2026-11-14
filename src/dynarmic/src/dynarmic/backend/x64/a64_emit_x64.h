@@ -90,12 +90,13 @@ public:
         u32 rip;
         u32 resume_rip;
         u32 callback;
-        u32 inst_name : 31;
+        u32 inst_name : 30;
         u32 recompile : 1;
+        u32 load : 1; ///< A plain load (fastmem_load_fault_limit)
         IR::LocationDescriptor location;
     };
     std::optional<DoNotFastmemMarker> ShouldFastmem(A64EmitContext& ctx, IR::Inst* inst) const;
-    void AddFastmemPatch(CodePtr location, CodePtr resume_location, void (*callback)(), const DoNotFastmemMarker& marker, bool recompile);
+    void AddFastmemPatch(CodePtr location, CodePtr resume_location, void (*callback)(), const DoNotFastmemMarker& marker, bool recompile, bool load = false);
     FakeCall FastmemCallback(u64 rip);
 
     // Memory access helpers
@@ -156,6 +157,7 @@ public:
     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;
     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> exclusive_write_fallbacks;
     ::Common::unordered_set<DoNotFastmemMarker> do_not_fastmem;
+    ::Common::unordered_map<DoNotFastmemMarker, u32> load_faults;
     boost::container::stable_vector<Xbyak::Label> shared_labels;
     const void* terminal_handler_pop_rsb_hint = nullptr;
     const void* terminal_handler_fast_dispatch_hint = nullptr;

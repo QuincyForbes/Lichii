@@ -42,7 +42,7 @@ TEST_CASE("JitBlockLists: targets, relocations and patches read back", "[common]
     }};
     const std::array<JitBlockLists::Patch, 3> patches{{
         {0x20, 0x8000'1000ULL, 3, 0x1234'5678'9ABC'DEF0ULL, true},
-        {0x24, 0x8000'1000ULL, 0x7FFF'FFFF, 0x11ULL, false},
+        {0x24, 0x8000'1000ULL, 0x3FFF'FFFF, 0x11ULL, false, true},
         {0x7FFF'FFFF, 0xFFFF'FFFF'FFFF'FFFFULL, 0, 0xFFFF'FFFF'FFFF'FFFFULL, true},
     }};
     const auto data = JitBlockLists::Build(0xFFFF'FFFFULL, targets, patches);
@@ -77,6 +77,7 @@ TEST_CASE("JitBlockLists: targets, relocations and patches read back", "[common]
         REQUIRE(found->marker_offset == patch.marker_offset);
         REQUIRE(found->call_pc == patch.call_pc);
         REQUIRE(found->recompile == patch.recompile);
+        REQUIRE(found->load == patch.load);
     }
     REQUIRE(!lists.FindPatch(0));
     REQUIRE(!lists.FindPatch(0x22));
@@ -101,7 +102,7 @@ TEST_CASE("JitBlockLists: many blocks of every shape read back", "[common]") {
             }
             std::vector<JitBlockLists::Patch> patches;
             for (u32 p = 0; p < patch_count; ++p) {
-                patches.push_back({offset += 8, 0x7100'0000'00ULL + p, p, 0xABC0ULL + p, (p & 1) != 0});
+                patches.push_back({offset += 8, 0x7100'0000'00ULL + p, p, 0xABC0ULL + p, (p & 1) != 0, (p & 2) != 0});
             }
             const auto data = JitBlockLists::Build(offset + 4, targets, patches);
             REQUIRE(data != nullptr);
@@ -127,6 +128,7 @@ TEST_CASE("JitBlockLists: many blocks of every shape read back", "[common]") {
                 REQUIRE(found->marker_offset == patch.marker_offset);
                 REQUIRE(found->call_pc == patch.call_pc);
                 REQUIRE(found->recompile == patch.recompile);
+                REQUIRE(found->load == patch.load);
             }
         }
     }

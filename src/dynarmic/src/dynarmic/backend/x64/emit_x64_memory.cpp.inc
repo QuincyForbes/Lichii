@@ -30,7 +30,7 @@ std::optional<AxxEmitX64::DoNotFastmemMarker> AxxEmitX64::ShouldFastmem(AxxEmitC
     return marker;
 }
 
-void AxxEmitX64::AddFastmemPatch(CodePtr location, CodePtr resume_location, void (*callback)(), const DoNotFastmemMarker& marker, bool recompile) {
+void AxxEmitX64::AddFastmemPatch(CodePtr location, CodePtr resume_location, void (*callback)(), const DoNotFastmemMarker& marker, bool recompile, bool load) {
     const u64 base = std::bit_cast<u64>(code.getCode());
     const auto offset = [base](u64 address) {
         ASSERT(address >= base && address - base <= UINT32_MAX);
@@ -42,10 +42,12 @@ void AxxEmitX64::AddFastmemPatch(CodePtr location, CodePtr resume_location, void
         .callback = offset(std::bit_cast<u64>(callback)),
         .inst_name = 0,
         .recompile = 0,
+        .load = 0,
         .location = std::get<0>(marker),
     };
     info.inst_name = std::get<1>(marker);
     info.recompile = recompile ? 1 : 0;
+    info.load = load ? 1 : 0;
     // Code is emitted in address order; only a block's deferred fallbacks can come after a later
     // access of the same block.
     auto it = fastmem_patch_info.end();
@@ -72,6 +74,11 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
         };
         if (iter->recompile) {
             const DoNotFastmemMarker marker{iter->location, static_cast<unsigned>(iter->inst_name)};
+            if (iter->load && conf.fastmem_load_fault_limit > 1 &&
+                ++load_faults[marker] < conf.fastmem_load_fault_limit) {
+                return result;
+            }
+            load_faults.erase(marker);
             do_not_fastmem.insert(marker);
             InvalidateBasicBlocks({std::get<0>(marker)});
         }
@@ -157,13 +164,13 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
                 const auto stub = code.getCurr<void (*)()>();
                 code.lea(vaddr, code.ptr[vaddr + FoldedDisp(*disp)]);
                 code.jmp(reinterpret_cast<const void*>(wrapped_fn), code.T_NEAR);
-                AddFastmemPatch(location, resume, stub, *fastmem_marker, conf.recompile_on_fastmem_failure);
+                AddFastmemPatch(location, resume, stub, *fastmem_marker, conf.recompile_on_fastmem_failure, true);
                 return;
             }
             code.L(*abort);
             code.call(wrapped_fn);
 
-            AddFastmemPatch(location, code.getCurr(), wrapped_fn, *fastmem_marker, conf.recompile_on_fastmem_failure);
+            AddFastmemPatch(location, code.getCurr(), wrapped_fn, *fastmem_marker, conf.recompile_on_fastmem_failure, true);
 
             EmitCheckMemoryAbort(ctx, inst, end);
             code.jmp(*end, code.T_NEAR);

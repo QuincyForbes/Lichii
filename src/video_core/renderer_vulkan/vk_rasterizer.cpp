@@ -3812,6 +3812,100 @@ void RasterizerVulkan::TickFrame() {
     Common::TickFrameWorkgroup();
 }
 
+void RasterizerVulkan::ReportSlowAccesses(double seconds) {
+    namespace PR = Common::PerfReport;
+    auto& counts = PR::g_slow_access;
+    std::array<std::array<std::array<u64, PR::SlowAccessCount>, 2>, 3> now{};
+    for (size_t store = 0; store < 2; ++store) {
+        for (size_t reason = 0; reason < PR::SlowAccessCount; ++reason) {
+            now[0][store][reason] = counts.calls[store][reason].load(std::memory_order_relaxed);
+            now[1][store][reason] = counts.timed[store][reason].load(std::memory_order_relaxed);
+            now[2][store][reason] = counts.timed_ns[store][reason].load(std::memory_order_relaxed);
+        }
+    }
+    const auto then = perf_report_slow;
+    perf_report_slow = now;
+    const std::array<u64, 2> runs_now{counts.tracked_page_runs[0].load(std::memory_order_relaxed),
+                                      counts.tracked_page_runs[1].load(std::memory_order_relaxed)};
+    const auto runs_then = perf_report_slow_runs;
+    perf_report_slow_runs = runs_now;
+    if (seconds <= 0.0) {
+        PR::g_slow_site_epoch.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    std::array<std::string, 2> text;
+    std::array<double, 2> total_us{};
+    for (size_t store = 0; store < 2; ++store) {
+        u64 calls = 0;
+        for (size_t reason = 0; reason < PR::SlowAccessCount; ++reason) {
+            const u64 n = now[0][store][reason] - then[0][store][reason];
+            if (n == 0) {
+                continue;
+            }
+            calls += n;
+            const u64 timed = now[1][store][reason] - then[1][store][reason];
+            const double ns = timed == 0 ? 0.0
+                                         : static_cast<double>(now[2][store][reason] -
+                                                               then[2][store][reason]) /
+                                               static_cast<double>(timed);
+            total_us[store] += ns * static_cast<double>(n) / 1e3;
+            text[store] += fmt::format(", {} {:.0f} ({:.0f} ns)",
+                                       PR::SlowAccessName(static_cast<PR::SlowAccess>(reason)),
+                                       static_cast<double>(n) / seconds, ns);
+        }
+        const auto tracked = static_cast<size_t>(PR::SlowAccess::GpuTracked);
+        const u64 tracked_calls = now[0][store][tracked] - then[0][store][tracked];
+        const u64 runs = runs_now[store] - runs_then[store];
+        if (tracked_calls != 0 && runs != 0) {
+            text[store] += fmt::format(" (GPU-tracked: {:.0f} page changes/s, {:.1f} in a row)",
+                                       static_cast<double>(runs) / seconds,
+                                       static_cast<double>(tracked_calls) / static_cast<double>(runs));
+        }
+        text[store] = fmt::format("{:.0f}/s{}", static_cast<double>(calls) / seconds, text[store]);
+    }
+    // The busiest sampled guest blocks over all cores.
+    struct Site {
+        u64 key;
+        u64 count;
+        u64 vaddr;
+    };
+    std::vector<Site> sites;
+    u64 sampled = 0;
+    for (const auto& core_sites : PR::g_slow_sites) {
+        for (const auto& site : core_sites) {
+            const u64 key = site.key.load(std::memory_order_relaxed);
+            const u64 count = site.count.load(std::memory_order_relaxed);
+            if (key == 0 || count == 0) {
+                continue;
+            }
+            sampled += count;
+            const auto it = std::ranges::find(sites, key, &Site::key);
+            if (it != sites.end()) {
+                it->count += count;
+            } else {
+                sites.push_back({key, count, site.vaddr.load(std::memory_order_relaxed)});
+            }
+        }
+    }
+    PR::g_slow_site_epoch.fetch_add(1, std::memory_order_relaxed);
+    std::ranges::sort(sites, [](const Site& a, const Site& b) { return a.count > b.count; });
+    std::string site_text;
+    for (size_t i = 0; i < (std::min<size_t>)(sites.size(), 8); ++i) {
+        const Site& site = sites[i];
+        site_text += fmt::format(
+            "{}block {:#x} {} {} {:.0f}% (at {:#x})", i == 0 ? "" : ", ", site.key >> 8,
+            (site.key & 1) != 0 ? "store" : "load",
+            PR::SlowAccessName(static_cast<PR::SlowAccess>((site.key >> 1) & 0x7F)),
+            100.0 * static_cast<double>(site.count) / static_cast<double>((std::max)(sampled, u64{1})),
+            site.vaddr);
+    }
+    LOG_INFO(Common_Memory,
+             "Perf memory callbacks: loads {} | stores {} | ~{:.1f} ms/s of guest core time | "
+             "sampled blocks (1 in {}): {}",
+             text[0], text[1], (total_us[0] + total_us[1]) / 1e3 / seconds, PR::SlowSampleEvery,
+             site_text.empty() ? std::string{"none"} : site_text);
+}
+
 void RasterizerVulkan::TickPerfReport() {
     if (!Common::PerfReport::Enabled()) {
         return;
@@ -3833,6 +3927,7 @@ void RasterizerVulkan::TickPerfReport() {
         perf_report_events = Common::PlatformEvents::QueryProcessEvents();
         static_cast<void>(Common::PerfReport::TakeJitPeak());
         perf_report_jit_cores = Common::PerfReport::ReadJitCores();
+        ReportSlowAccesses(0.0);
         Scheduler::ReportPerfSites(0);
         perf_frame_max_ms = 0.0;
         return;
@@ -4133,6 +4228,7 @@ void RasterizerVulkan::TickPerfReport() {
              per_second(delta(Common::PerfReport::GuestClockWaits)),
              static_cast<double>(delta(Common::PerfReport::GuestClockWaitNs)) / 1e6 / seconds,
              host_cpu_text);
+    ReportSlowAccesses(seconds);
     // Each guest core's code cache: which cores need how much, and what refills them.
     const auto jit_cores = Common::PerfReport::ReadJitCores();
     std::string jit_core_text;

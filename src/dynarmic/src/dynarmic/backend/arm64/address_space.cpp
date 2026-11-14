@@ -49,6 +49,7 @@ struct SharedFastmemMarkers {
     ::Common::unordered_set<DoNotFastmemMarker, DoNotFastmemMarkerHash> markers;
     ::Common::unordered_set<IR::LocationDescriptor> blocks;
     ::Common::unordered_map<IR::LocationDescriptor, unsigned> faults_per_block;
+    ::Common::unordered_map<DoNotFastmemMarker, unsigned, DoNotFastmemMarkerHash> load_faults;
 };
 
 SharedFastmemMarkers& SharedMarkers() {
@@ -118,6 +119,26 @@ void FastmemManager::MarkDoNotFastmem(DoNotFastmemMarker marker) {
             shared.blocks.insert(block);
         }
     }
+}
+
+bool FastmemManager::LoadFaultRecompiles(DoNotFastmemMarker marker) {
+    if (load_faults_limit <= 1) {
+        return true;
+    }
+    if (shared_markers && !LocalFaultMarkersOn()) {
+        SharedFastmemMarkers& shared = SharedMarkers();
+        std::unique_lock lock{shared.mutex};
+        if (++shared.load_faults[marker] < load_faults_limit) {
+            return false;
+        }
+        shared.load_faults.erase(marker);
+        return true;
+    }
+    if (++load_faults[marker] < load_faults_limit) {
+        return false;
+    }
+    load_faults.erase(marker);
+    return true;
 }
 
 AddressSpace::AddressSpace(std::size_t code_cache_size, std::size_t evict_slice, std::size_t processor_id)
@@ -706,6 +727,7 @@ AddressSpace::StoredBlockInfo::StoredBlockInfo(EmittedBlockInfo& block_info, boo
                 .marker_offset = std::get<1>(patch.marker),
                 .call_pc = patch.fc.call_pc,
                 .recompile = patch.recompile,
+                .load = patch.load,
             });
         }
         if (all_fit) {
@@ -767,6 +789,7 @@ std::optional<FastmemPatchInfo> AddressSpace::StoredBlockInfo::FindPatch(std::pt
         .marker = DoNotFastmemMarker{IR::LocationDescriptor{patch->marker_location}, patch->marker_offset},
         .fc = FakeCall{.call_pc = patch->call_pc},
         .recompile = patch->recompile,
+        .load = patch->load,
     };
 }
 
@@ -832,7 +855,7 @@ FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
             goto fail;
         }
 
-        if (patch->recompile) {
+        if (patch->recompile && (!patch->load || fastmem_manager.LoadFaultRecompiles(patch->marker))) {
             fastmem_manager.MarkDoNotFastmem(patch->marker);
             InvalidateBasicBlocks({std::get<0>(patch->marker)});
         }

@@ -203,7 +203,9 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// user-initiated (EDEN_NX2_GUEST_CORE_FIRST=03). "oot_narrow_affinity": Ocarina of Time keeps its
 /// own thread core masks (EDEN_NX2_OOT_WIDE_AFFINITY=0); "oot_ideal_affinity": each narrowed to
 /// the thread's ideal core (=2), wins over narrow. "guest_idle_spin": an idle guest core polls
-/// 20 us before it blocks (EDEN_NX2_IDLE_SPIN_US=20).
+/// 20 us before it blocks (EDEN_NX2_IDLE_SPIN_US=20). "jit_inline_exclusives": LDXR/STXR run in
+/// fastmem instead of through the memory callbacks (EDEN_NX2_JIT_INLINE_EXCLUSIVES=1). "jit_load_faults": a
+/// load that faults in fastmem gives it up only at its 8th fault (EDEN_NX2_JIT_LOAD_FAULTS=8).
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
 /// Guest memory in a file: as set in Experiments ("file_guest" / "file_guest_off"), else the

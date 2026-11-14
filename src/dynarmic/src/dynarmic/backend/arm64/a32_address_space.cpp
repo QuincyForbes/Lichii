@@ -196,7 +196,8 @@ static void* EmitExclusiveWriteCallTrampoline(oaknut::CodeGenerator& code, const
 A32AddressSpace::A32AddressSpace(const A32::UserConfig& conf)
         : AddressSpace(conf.code_cache_size, conf.code_cache_evict_slice, conf.processor_id)
         , conf(conf) {
-    fastmem_manager.Configure(conf.fastmem_shared_markers, conf.fastmem_block_after_faults);
+    fastmem_manager.Configure(conf.fastmem_shared_markers, conf.fastmem_block_after_faults,
+                              conf.fastmem_load_fault_limit);
     EmitPrelude();
 }
 

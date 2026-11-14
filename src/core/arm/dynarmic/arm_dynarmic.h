@@ -35,10 +35,12 @@ u32 JitEvictSliceBytes();
 
 /// dynarmic's fastmem_shared_markers / fastmem_block_after_faults (arm64 hosts):
 /// EDEN_NX2_JIT_FAULT_SHARE=0/1 and EDEN_NX2_JIT_FAULT_BLOCK=<n> (0 off), otherwise the iOS
-/// device profile's.
+/// device profile's. fastmem_load_fault_limit: EDEN_NX2_JIT_LOAD_FAULTS=<n> (0 or 1: a load
+/// gives up fastmem at its first fault).
 struct JitFaultPolicy {
     bool shared_markers;
     u8 block_after_faults;
+    u32 load_fault_limit;
 };
 JitFaultPolicy GetJitFaultPolicy();
 

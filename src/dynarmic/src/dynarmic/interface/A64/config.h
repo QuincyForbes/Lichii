@@ -97,6 +97,10 @@ struct UserCallbacks {
     virtual std::uint64_t MemoryRead(VAddr vaddr, std::size_t size) = 0;
     virtual Vector MemoryRead128(VAddr vaddr) = 0;
 
+    // The load of an exclusive pair (LDXR/LDAXR) where the JIT has no inline path for it.
+    virtual std::uint64_t MemoryReadExclusive(VAddr vaddr, std::size_t size) { return MemoryRead(vaddr, size); }
+    virtual Vector MemoryReadExclusive128(VAddr vaddr) { return MemoryRead128(vaddr); }
+
     // Writes through these callbacks may not be aligned.
     virtual void MemoryWrite(VAddr vaddr, std::uint64_t value, std::size_t size) = 0;
     virtual void MemoryWrite128(VAddr vaddr, Vector value) = 0;
@@ -272,6 +276,11 @@ struct UserConfig {
     /// accesses will hit the memory callbacks.
     bool recompile_on_fastmem_failure = true;
 
+    /// A plain load that faults in fastmem recompiles without fastmem only on its Nth fault (0 or
+    /// 1: the first); the faults before go through the callbacks and the fastmem code stays. Most
+    /// load faults are one-shot (a read trap that the callback then disarms).
+    std::uint32_t fastmem_load_fault_limit = 0;
+
     /// Determines what happens if the guest accesses an entry that is off the end of the
     /// fastmem arena. If true, Dynarmic will silently mirror fastmem's address space. If
     /// false, accessing memory outside of fastmem bounds will result in a call to the
@@ -361,6 +370,11 @@ struct UserConfig {
     /// and friends, SWP, CAS) become one host atomic instruction (or a host CAS loop) instead
     /// of an exclusive load/store pair that ends the block.
     bool native_lse_atomics = false;
+
+    /// arm64 backend, with fastmem exclusives and Unsafe_IgnoreGlobalMonitor: LDXR/STXR (up to
+    /// 64 bits) in fastmem, a load and a host CAS as the x64 backend does them, instead of a call
+    /// through the global monitor and the memory callbacks for each.
+    bool inline_exclusives = false;
 
     /// Test switch for native_lse_atomics. Every LSE atomic goes through the memory callbacks,
     /// the slow path otherwise taken only by an instruction that faulted in fastmem.

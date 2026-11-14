@@ -449,6 +449,14 @@ struct System::Impl {
             Settings::values.memory_layout_mode.SetGlobal(false);
             Settings::values.memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_12Gb);
         }
+        // EDEN_NX2_REACTIVE_FLUSHING=0/1 (diagnostic): the setting for this session, e.g. off as
+        // on iOS and macOS (read traps instead of read-protecting every cached page).
+        if (const char* value = std::getenv("EDEN_NX2_REACTIVE_FLUSHING"); value != nullptr) {
+            LOG_INFO(Core, "EDEN_NX2_REACTIVE_FLUSHING: reactive flushing {}",
+                     value[0] != '0' ? "on" : "off");
+            Settings::values.use_reactive_flushing.SetGlobal(false);
+            Settings::values.use_reactive_flushing.SetValue(value[0] != '0');
+        }
 
         // The Switch 2 counter runs at 31.25 MHz and its SDK converts ticks with that constant
         // (nn::os::GetSystemTickFrequency, TickManager::ConvertToTimeSpan/ConvertToTick). At 19.2 MHz

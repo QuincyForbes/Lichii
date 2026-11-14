@@ -59,6 +59,16 @@ u32 Nx2DispatchBits() {
     return bits >= 8 && bits <= 24 ? u32(bits) : 0;
 }
 
+// arm64 hosts: LDXR/STXR in fastmem (dynarmic inline_exclusives) instead of a memory callback
+// each. EDEN_NX2_JIT_INLINE_EXCLUSIVES=0/1.
+bool InlineExclusives() {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_NX2_JIT_INLINE_EXCLUSIVES");
+        return value != nullptr && value[0] == '1';
+    }();
+    return on;
+}
+
 struct ClockPollSleep {
     std::optional<bool> forced; ///< From the environment; otherwise the guest_wait_backoff setting
     u64 gate_us; ///< Polling this long before the first sleep
@@ -298,10 +308,13 @@ JitFaultPolicy GetJitFaultPolicy() {
     static const JitFaultPolicy policy = [] {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         JitFaultPolicy result{Common::IosJit::FaultSharedMarkers(),
-                              u8((std::min)(Common::IosJit::FaultBlockAfter(), 255U))};
+                              u8((std::min)(Common::IosJit::FaultBlockAfter(), 255U)), 0};
 #else
-        JitFaultPolicy result{false, 0};
+        JitFaultPolicy result{false, 0, 0};
 #endif
+        if (const char* const value = std::getenv("EDEN_NX2_JIT_LOAD_FAULTS"); value && value[0] != '\0') {
+            result.load_fault_limit = u32(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 1U << 20));
+        }
         if (const char* const value = std::getenv("EDEN_NX2_JIT_FAULT_SHARE"); value && value[0] != '\0') {
             result.shared_markers = value[0] != '0';
         }
@@ -319,8 +332,71 @@ DynarmicCallbacks64::DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess
     , m_check_memory_access{m_debugger_enabled || !Settings::values.cpuopt_ignore_memory_aborts.GetValue()}
 {}
 
+Common::PerfReport::SlowAccess DynarmicCallbacks64::ClassifySlowAccess(u64 vaddr, size_t size) const {
+    using Common::PerfReport::SlowAccess;
+    if ((vaddr & Core::Memory::YUZU_PAGEMASK) + size > Core::Memory::YUZU_PAGESIZE) {
+        return SlowAccess::PageCross;
+    }
+    if (m_page_table == nullptr || (m_page_table_bits < 64 && (vaddr >> m_page_table_bits) != 0)) {
+        return SlowAccess::Unmapped;
+    }
+    switch (m_page_table->entries[vaddr >> Core::Memory::YUZU_PAGEBITS].Type()) {
+    case Common::PageType::Unmapped:
+        return SlowAccess::Unmapped;
+    case Common::PageType::RasterizerCachedMemory:
+        return SlowAccess::GpuTracked;
+    case Common::PageType::DebugMemory:
+        return SlowAccess::Debug;
+    case Common::PageType::Memory:
+        break;
+    }
+    if (m_fastmem_bits != 0 && m_fastmem_bits < 64 && (vaddr >> m_fastmem_bits) != 0) {
+        return SlowAccess::PastArena;
+    }
+    return SlowAccess::Plain;
+}
+
+template <typename F>
+auto DynarmicCallbacks64::SlowAccessCall(Common::PerfReport::SlowAccess reason, bool store, u64 vaddr,
+                                         F&& access) {
+    const auto index = static_cast<size_t>(reason);
+    ++m_slow_calls[store][index];
+    if (reason == Common::PerfReport::SlowAccess::GpuTracked) {
+        const u64 page = vaddr >> Core::Memory::YUZU_PAGEBITS;
+        m_slow_page_runs[store] += page != m_slow_last_page[store] ? 1 : 0;
+        m_slow_last_page[store] = page;
+    }
+    if (++m_slow_tick % Common::PerfReport::SlowSampleEvery != 0) {
+        return access();
+    }
+    const u64 start = Common::PerfReport::NowNs();
+    auto result = access();
+    ++m_slow_timed[store][index];
+    m_slow_timed_ns[store][index] += Common::PerfReport::NowNs() - start;
+    Common::PerfReport::NoteSlowSite(m_parent.m_core_index, m_slow_site_epoch, m_parent.m_jit->GetPC(),
+                                     reason, store, vaddr);
+    return result;
+}
+
 u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {
     ++m_slow_reads;
+    if (m_slow_breakdown) [[unlikely]] {
+        return SlowAccessCall(ClassifySlowAccess(vaddr, size), false, vaddr,
+                              [&] { return ReadValue(vaddr, size); });
+    }
+    return ReadValue(vaddr, size);
+}
+
+u64 DynarmicCallbacks64::MemoryReadExclusive(u64 vaddr, size_t size) {
+    ++m_slow_reads;
+    if (m_slow_breakdown) [[unlikely]] {
+        return SlowAccessCall(Common::PerfReport::SlowAccess::Exclusive, false, vaddr,
+                              [&] { return ReadValue(vaddr, size); });
+    }
+    return ReadValue(vaddr, size);
+}
+
+u64 DynarmicCallbacks64::ReadValue(u64 vaddr, size_t size) {
     CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Read);
     u64 value{};
     switch (size) {
@@ -348,8 +424,26 @@ u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {
 }
 Dynarmic::A64::Vector DynarmicCallbacks64::MemoryRead128(u64 vaddr) {
     ++m_slow_reads;
-    CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Read);
-    return {m_memory.Read64(vaddr), m_memory.Read64(vaddr + 8)};
+    const auto read = [&]() -> Dynarmic::A64::Vector {
+        CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Read);
+        return {m_memory.Read64(vaddr), m_memory.Read64(vaddr + 8)};
+    };
+    if (m_slow_breakdown) [[unlikely]] {
+        return SlowAccessCall(ClassifySlowAccess(vaddr, 16), false, vaddr, read);
+    }
+    return read();
+}
+
+Dynarmic::A64::Vector DynarmicCallbacks64::MemoryReadExclusive128(u64 vaddr) {
+    ++m_slow_reads;
+    const auto read = [&]() -> Dynarmic::A64::Vector {
+        CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Read);
+        return {m_memory.Read64(vaddr), m_memory.Read64(vaddr + 8)};
+    };
+    if (m_slow_breakdown) [[unlikely]] {
+        return SlowAccessCall(Common::PerfReport::SlowAccess::Exclusive, false, vaddr, read);
+    }
+    return read();
 }
 
 std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
@@ -374,45 +468,79 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
 
 void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) {
     ++m_slow_writes;
-    if (CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Write)) {
-        switch (size) {
-        case sizeof(u64): return m_memory.Write64(vaddr, u64(value));
-        case sizeof(u32): return m_memory.Write32(vaddr, u32(value));
-        case sizeof(u16): return m_memory.Write16(vaddr, u16(value));
-        case sizeof(u8): return m_memory.Write8(vaddr, u8(value));
-        default: UNREACHABLE();
+    const auto write = [&] {
+        if (CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Write)) {
+            switch (size) {
+            case sizeof(u64): m_memory.Write64(vaddr, u64(value)); break;
+            case sizeof(u32): m_memory.Write32(vaddr, u32(value)); break;
+            case sizeof(u16): m_memory.Write16(vaddr, u16(value)); break;
+            case sizeof(u8): m_memory.Write8(vaddr, u8(value)); break;
+            default: UNREACHABLE();
+            }
         }
+        return true;
+    };
+    if (m_slow_breakdown) [[unlikely]] {
+        SlowAccessCall(ClassifySlowAccess(vaddr, size), true, vaddr, write);
+        return;
     }
+    write();
 }
 void DynarmicCallbacks64::MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value) {
     ++m_slow_writes;
-    if (CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Write)) {
-        m_memory.Write64(vaddr, value[0]);
-        m_memory.Write64(vaddr + 8, value[1]);
+    const auto write = [&] {
+        if (CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Write)) {
+            m_memory.Write64(vaddr, value[0]);
+            m_memory.Write64(vaddr + 8, value[1]);
+        }
+        return true;
+    };
+    if (m_slow_breakdown) [[unlikely]] {
+        SlowAccessCall(ClassifySlowAccess(vaddr, 16), true, vaddr, write);
+        return;
     }
+    write();
 }
 
 // false is reserved for "memory did not hold `expected`", which the caller retries. An access that
 // CheckMemoryAccess refused has already halted the core and is not written; it is not a lost race.
+template <typename T>
+bool DynarmicCallbacks64::WriteExclusive(u64 vaddr, T value, T expected) {
+    const auto write = [&] {
+        if (!CheckMemoryAccess(vaddr, sizeof(T), Kernel::DebugWatchpointType::Write)) {
+            return true;
+        }
+        if constexpr (sizeof(T) == 16) {
+            return m_memory.WriteExclusive128(vaddr, value, expected);
+        } else if constexpr (sizeof(T) == 8) {
+            return m_memory.WriteExclusive64(vaddr, value, expected);
+        } else if constexpr (sizeof(T) == 4) {
+            return m_memory.WriteExclusive32(vaddr, value, expected);
+        } else if constexpr (sizeof(T) == 2) {
+            return m_memory.WriteExclusive16(vaddr, value, expected);
+        } else {
+            return m_memory.WriteExclusive8(vaddr, value, expected);
+        }
+    };
+    if (m_slow_breakdown) [[unlikely]] {
+        return SlowAccessCall(Common::PerfReport::SlowAccess::Exclusive, true, vaddr, write);
+    }
+    return write();
+}
 bool DynarmicCallbacks64::MemoryWriteExclusive8(u64 vaddr, std::uint8_t value, std::uint8_t expected) {
-    return !CheckMemoryAccess(vaddr, 1, Kernel::DebugWatchpointType::Write) ||
-            m_memory.WriteExclusive8(vaddr, value, expected);
+    return WriteExclusive(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive16(u64 vaddr, std::uint16_t value, std::uint16_t expected) {
-    return !CheckMemoryAccess(vaddr, 2, Kernel::DebugWatchpointType::Write) ||
-            m_memory.WriteExclusive16(vaddr, value, expected);
+    return WriteExclusive(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive32(u64 vaddr, std::uint32_t value, std::uint32_t expected) {
-    return !CheckMemoryAccess(vaddr, 4, Kernel::DebugWatchpointType::Write) ||
-            m_memory.WriteExclusive32(vaddr, value, expected);
+    return WriteExclusive(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive64(u64 vaddr, std::uint64_t value, std::uint64_t expected) {
-    return !CheckMemoryAccess(vaddr, 8, Kernel::DebugWatchpointType::Write) ||
-            m_memory.WriteExclusive64(vaddr, value, expected);
+    return WriteExclusive(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive128(u64 vaddr, Dynarmic::A64::Vector value, Dynarmic::A64::Vector expected) {
-    return !CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Write) ||
-            m_memory.WriteExclusive128(vaddr, value, expected);
+    return WriteExclusive(vaddr, value, expected);
 }
 
 void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op, u64 value) {
@@ -737,6 +865,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     config.code_cache_evict_slice = JitEvictSliceBytes();
     config.fastmem_shared_markers = GetJitFaultPolicy().shared_markers;
     config.fastmem_block_after_faults = GetJitFaultPolicy().block_after_faults;
+    config.fastmem_load_fault_limit = GetJitFaultPolicy().load_fault_limit;
+    config.inline_exclusives = InlineExclusives();
 
     // Allow memory fault handling to work
     if (m_system.DebuggerEnabled()) {
@@ -959,7 +1089,20 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         return value != nullptr && value[0] != 0 && !(value[0] == '0' && value[1] == 0);
     }();
     config.jit_counters = jit_map;
+    // Diagnostic, x64: EDEN_NX2_JIT_EXCLUSIVE_CALLBACKS=1 sends LDXR/STXR through the memory
+    // callbacks and the global monitor as the arm64 backend does (LSE atomics stay native).
+    static const bool exclusive_callbacks = [] {
+        const char* value = std::getenv("EDEN_NX2_JIT_EXCLUSIVE_CALLBACKS");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (exclusive_callbacks) {
+        config.fastmem_exclusive_access = false;
+    }
 #endif
+    m_cb->m_slow_breakdown = Common::PerfReport::Enabled();
+    m_cb->m_page_table = page_table;
+    m_cb->m_page_table_bits = std::uint32_t(address_space_bits);
+    m_cb->m_fastmem_bits = config.fastmem_pointer ? config.fastmem_address_space_bits : 0;
     m_jit.emplace(config);
 }
 
@@ -986,6 +1129,26 @@ void ArmDynarmic64::FlushGuestEvents() {
     }
     flush(cb.m_slow_reads, Common::PerfReport::GuestSlowReads);
     flush(cb.m_slow_writes, Common::PerfReport::GuestSlowWrites);
+    auto& slow = Common::PerfReport::g_slow_access;
+    for (size_t store = 0; store < 2; ++store) {
+        if (u64& runs = cb.m_slow_page_runs[store]; runs != 0) {
+            slow.tracked_page_runs[store].fetch_add(runs, std::memory_order_relaxed);
+            runs = 0;
+        }
+        for (size_t reason = 0; reason < Common::PerfReport::SlowAccessCount; ++reason) {
+            if (u64& calls = cb.m_slow_calls[store][reason]; calls != 0) {
+                slow.calls[store][reason].fetch_add(calls, std::memory_order_relaxed);
+                calls = 0;
+            }
+            if (u64& timed = cb.m_slow_timed[store][reason]; timed != 0) {
+                slow.timed[store][reason].fetch_add(timed, std::memory_order_relaxed);
+                slow.timed_ns[store][reason].fetch_add(cb.m_slow_timed_ns[store][reason],
+                                                       std::memory_order_relaxed);
+                timed = 0;
+                cb.m_slow_timed_ns[store][reason] = 0;
+            }
+        }
+    }
     flush(cb.m_clock_reads, Common::PerfReport::GuestClockReads);
     flush(cb.m_spin_hints, Common::PerfReport::GuestSpinHints);
     flush(cb.m_clock_waits, Common::PerfReport::GuestClockWaits);

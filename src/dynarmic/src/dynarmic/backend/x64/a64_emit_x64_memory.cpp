@@ -334,7 +334,7 @@ void A64EmitX64::EmitA64ExclusiveReadMemory8(A64EmitContext& ctx, IR::Inst* inst
     if (conf.fastmem_exclusive_access) {
         EmitExclusiveReadMemoryInline<8, &A64::UserCallbacks::MemoryRead>(ctx, inst);
     } else {
-        EmitExclusiveReadMemory<8, &A64::UserCallbacks::MemoryRead>(ctx, inst);
+        EmitExclusiveReadMemory<8, &A64::UserCallbacks::MemoryReadExclusive>(ctx, inst);
     }
 }
 
@@ -342,7 +342,7 @@ void A64EmitX64::EmitA64ExclusiveReadMemory16(A64EmitContext& ctx, IR::Inst* ins
     if (conf.fastmem_exclusive_access) {
         EmitExclusiveReadMemoryInline<16, &A64::UserCallbacks::MemoryRead>(ctx, inst);
     } else {
-        EmitExclusiveReadMemory<16, &A64::UserCallbacks::MemoryRead>(ctx, inst);
+        EmitExclusiveReadMemory<16, &A64::UserCallbacks::MemoryReadExclusive>(ctx, inst);
     }
 }
 
@@ -350,7 +350,7 @@ void A64EmitX64::EmitA64ExclusiveReadMemory32(A64EmitContext& ctx, IR::Inst* ins
     if (conf.fastmem_exclusive_access) {
         EmitExclusiveReadMemoryInline<32, &A64::UserCallbacks::MemoryRead>(ctx, inst);
     } else {
-        EmitExclusiveReadMemory<32, &A64::UserCallbacks::MemoryRead>(ctx, inst);
+        EmitExclusiveReadMemory<32, &A64::UserCallbacks::MemoryReadExclusive>(ctx, inst);
     }
 }
 
@@ -358,7 +358,7 @@ void A64EmitX64::EmitA64ExclusiveReadMemory64(A64EmitContext& ctx, IR::Inst* ins
     if (conf.fastmem_exclusive_access) {
         EmitExclusiveReadMemoryInline<64, &A64::UserCallbacks::MemoryRead>(ctx, inst);
     } else {
-        EmitExclusiveReadMemory<64, &A64::UserCallbacks::MemoryRead>(ctx, inst);
+        EmitExclusiveReadMemory<64, &A64::UserCallbacks::MemoryReadExclusive>(ctx, inst);
     }
 }
 
@@ -366,7 +366,7 @@ void A64EmitX64::EmitA64ExclusiveReadMemory128(A64EmitContext& ctx, IR::Inst* in
     if (conf.fastmem_exclusive_access) {
         EmitExclusiveReadMemoryInline<128, &A64::UserCallbacks::MemoryRead128>(ctx, inst);
     } else {
-        EmitExclusiveReadMemory<128, &A64::UserCallbacks::MemoryRead128>(ctx, inst);
+        EmitExclusiveReadMemory<128, &A64::UserCallbacks::MemoryReadExclusive128>(ctx, inst);
     }
 }
 

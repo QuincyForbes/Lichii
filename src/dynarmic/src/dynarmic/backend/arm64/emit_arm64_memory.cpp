@@ -691,6 +691,7 @@ void FastmemEmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::In
                     .call_pc = std::bit_cast<u64>(code.xptr<void*>()),
                 },
                 .recompile = ctx.conf.recompile_on_fastmem_failure,
+                .load = true,
             });
 
         code.l(*fallback);
@@ -940,8 +941,148 @@ void EmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* ins
     }
 }
 
+// LDXR in fastmem with the global monitor ignored (EmitConfig::exclusive_address_pointer), as the
+// x64 backend does it: load, then note address and value in this core's monitor slots. A fault or
+// an address past the arena reads through the plain read callback and notes the same.
+template<std::size_t bitsize>
+void FastmemEmitExclusiveReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst, DoNotFastmemMarker marker) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    auto Xaddr = ctx.reg_alloc.ReadX(args[1]);
+    auto Rvalue = ctx.reg_alloc.WriteReg<std::max<std::size_t>(bitsize, 32)>(inst);
+    const bool ordered = IsOrdered(args[2].GetImmediateAccType());
+    ctx.fpsr.Spill();
+    ctx.reg_alloc.SpillFlags();
+    RegAlloc::Realize(Xaddr, Rvalue);
+
+    SharedLabel fallback = GenSharedLabel(), loaded = GenSharedLabel();
+
+    const auto [Xbase, Xoffset] = FastmemEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
+    const auto fastmem_location = EmitMemoryLdr<bitsize>(code, Rvalue->index(), Xbase, Xoffset, ordered, ShouldExt32(ctx));
+
+    code.l(*loaded);
+    code.MOV(Xscratch0, ctx.conf.exclusive_value_pointer);
+    code.STR(Rvalue->toX(), Xscratch0);
+    code.MOV(Xscratch0, ctx.conf.exclusive_address_pointer);
+    code.STR(*Xaddr, Xscratch0);
+    code.MOV(Wscratch0, 1);
+    code.STRB(Wscratch0, Xstate, ctx.conf.state_exclusive_state_offset);
+
+    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, ordered, fallback, loaded, fastmem_location] {
+        ctx.ebi.fastmem_patch_info.emplace(
+            fastmem_location - ctx.ebi.entry_point,
+            FastmemPatchInfo{
+                .marker = marker,
+                .fc = FakeCall{
+                    .call_pc = std::bit_cast<u64>(code.xptr<void*>()),
+                },
+                .recompile = ctx.conf.recompile_on_exclusive_fastmem_failure,
+            });
+
+        code.l(*fallback);
+        code.MOV(Xscratch0, Xaddr);
+        EmitRelocation(code, ctx, WrappedReadMemoryLinkTarget(bitsize));
+        if (ordered) {
+            code.DMB(oaknut::BarrierOp::ISH);
+        }
+        code.MOV(Rvalue.toX(), Xscratch0);
+        ctx.conf.emit_check_memory_abort(code, ctx, inst, *loaded);
+        code.B(*loaded);
+    });
+}
+
+// STXR in fastmem with the global monitor ignored: if this core holds the reservation for the
+// address, a CAS from the value its LDXR saw (CASAL: release and acquire). A fault or an address
+// past the arena does the CAS through the callbacks (the LSE atomics' fallback).
+template<std::size_t bitsize>
+void FastmemEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst, DoNotFastmemMarker marker) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    auto Xaddr = ctx.reg_alloc.ReadX(args[1]);
+    auto Rvalue = ctx.reg_alloc.ReadReg<std::max<std::size_t>(bitsize, 32)>(args[2]);
+    auto Wstatus = ctx.reg_alloc.WriteW(inst);
+    ctx.fpsr.Spill();
+    ctx.reg_alloc.SpillFlags();
+    RegAlloc::Realize(Xaddr, Rvalue, Wstatus);
+
+    SharedLabel fallback = GenSharedLabel(), end = GenSharedLabel();
+
+    const auto compare = [&code](oaknut::XReg a, oaknut::XReg b) {
+        if constexpr (bitsize == 64) {
+            code.CMP(a, b);
+        } else {
+            code.CMP(a.toW(), b.toW());
+        }
+    };
+    // Xscratch1 = the value this core's LDXR saw (Xscratch0 is used).
+    const u64 value_pointer = ctx.conf.exclusive_value_pointer;
+    const auto load_expected = [&code, value_pointer] {
+        code.MOV(Xscratch1, value_pointer);
+        if constexpr (bitsize == 8) {
+            code.LDRB(Wscratch1, Xscratch1);
+        } else if constexpr (bitsize == 16) {
+            code.LDRH(Wscratch1, Xscratch1);
+        } else if constexpr (bitsize == 32) {
+            code.LDR(Wscratch1, Xscratch1);
+        } else {
+            code.LDR(Xscratch1, Xscratch1);
+        }
+    };
+
+    code.MOV(Wstatus, 1);
+    code.LDRB(Wscratch0, Xstate, ctx.conf.state_exclusive_state_offset);
+    code.CBZ(Wscratch0, *end);
+    code.STRB(WZR, Xstate, ctx.conf.state_exclusive_state_offset);
+    code.MOV(Xscratch0, ctx.conf.exclusive_address_pointer);
+    code.LDR(Xscratch1, Xscratch0);
+    code.CMP(Xscratch1, *Xaddr);
+    code.B(NE, *end);
+    load_expected();
+    // The expected value, kept for the compare after the CAS (and for the fallback).
+    code.MOV(Xscratch2, Xscratch1);
+    const auto [Xbase, Xoffset] = FastmemEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
+    const CodePtr fastmem_location = EmitLseCasAt<bitsize>(
+        code, Xscratch1.index(), Rvalue->index(), Xscratch1.index(), Xbase, Xoffset, ShouldExt32(ctx));
+    compare(Xscratch1, Xscratch2);
+    code.CSET(Wstatus, NE);
+
+    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, Wstatus = *Wstatus, compare, load_expected, fallback, end, fastmem_location] {
+        ctx.ebi.fastmem_patch_info.emplace(
+            fastmem_location - ctx.ebi.entry_point,
+            FastmemPatchInfo{
+                .marker = marker,
+                .fc = FakeCall{
+                    .call_pc = std::bit_cast<u64>(code.xptr<void*>()),
+                },
+                .recompile = ctx.conf.recompile_on_exclusive_fastmem_failure,
+            });
+
+        code.l(*fallback);
+        code.MOV(Xscratch0, Xaddr);
+        code.MOV(Xscratch1, Xscratch2);
+        code.STR(Rvalue.toX(), Xstate, ctx.conf.state_atomic_scratch_offset);
+        EmitRelocation(code, ctx, WrappedAtomicCasLinkTarget(bitsize));
+        code.DMB(oaknut::BarrierOp::ISH);
+        // Xscratch0 is the old value; the call kept neither scratch register, so the expected
+        // value is read from the monitor slot again (the callbacks do not touch it).
+        load_expected();
+        compare(Xscratch0, Xscratch1);
+        code.CSET(Wstatus, NE);
+        ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
+        code.B(*end);
+    });
+
+    code.l(*end);
+}
+
 template<std::size_t bitsize>
 void EmitExclusiveReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    if constexpr (bitsize != 128) {
+        if (ctx.conf.exclusive_address_pointer != 0) {
+            if (const auto marker = ShouldFastmem(ctx, inst)) {
+                FastmemEmitExclusiveReadMemory<bitsize>(code, ctx, inst, *marker);
+                return;
+            }
+        }
+    }
     CallbackOnlyEmitExclusiveReadMemory<bitsize>(code, ctx, inst);
 }
 
@@ -958,6 +1099,14 @@ void EmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* in
 
 template<std::size_t bitsize>
 void EmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    if constexpr (bitsize != 128) {
+        if (ctx.conf.exclusive_address_pointer != 0) {
+            if (const auto marker = ShouldFastmem(ctx, inst)) {
+                FastmemEmitExclusiveWriteMemory<bitsize>(code, ctx, inst, *marker);
+                return;
+            }
+        }
+    }
     CallbackOnlyEmitExclusiveWriteMemory<bitsize>(code, ctx, inst);
 }
 

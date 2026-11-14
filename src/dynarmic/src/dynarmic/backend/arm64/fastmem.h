@@ -39,6 +39,7 @@ struct FastmemPatchInfo {
     DoNotFastmemMarker marker;
     FakeCall fc;
     bool recompile;
+    bool load = false; ///< A plain load (fastmem_load_fault_limit)
 };
 
 class FastmemManager {
@@ -49,9 +50,11 @@ public:
     /// shared: markers any guest core sets apply to every core's translations (they all run the
     /// same code). block_after_faults != 0: once that many accesses of one block faulted, the
     /// whole block translates without fastmem, so it is translated again at most that many times.
-    void Configure(bool shared, unsigned block_after_faults) {
+    /// load_fault_limit > 1: a plain load gives up fastmem only on its load_fault_limit-th fault.
+    void Configure(bool shared, unsigned block_after_faults, unsigned load_fault_limit) {
         shared_markers = shared;
         faults_per_block_limit = block_after_faults;
+        load_faults_limit = load_fault_limit;
     }
 
     bool SupportsFastmem() const {
@@ -60,6 +63,8 @@ public:
 
     bool ShouldFastmem(DoNotFastmemMarker marker) const;
     void MarkDoNotFastmem(DoNotFastmemMarker marker);
+    /// A fault of a plain load: whether it is the one that makes the load give up fastmem.
+    bool LoadFaultRecompiles(DoNotFastmemMarker marker);
 
 private:
     ExceptionHandler& exception_handler;
@@ -68,6 +73,8 @@ private:
     ::Common::unordered_map<IR::LocationDescriptor, unsigned> faults_per_block;
     bool shared_markers = false;
     unsigned faults_per_block_limit = 0;
+    ::Common::unordered_map<DoNotFastmemMarker, unsigned, DoNotFastmemMarkerHash> load_faults;
+    unsigned load_faults_limit = 0;
 };
 
 }  // namespace Dynarmic::Backend::Arm64

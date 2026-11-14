@@ -560,6 +560,8 @@ private:
     u32 malloc_relief_frames{};
     /// "Perf:" line every 10 s (Common::PerfReport): frame rate, thread load, cache churn.
     void TickPerfReport();
+    /// "Perf memory callbacks:" line: why guest accesses left fastmem, their cost and sites.
+    void ReportSlowAccesses(double seconds);
     std::chrono::steady_clock::time_point perf_report_start{};
     std::chrono::steady_clock::time_point perf_frame_last{};
     std::array<u64, Common::PerfReport::Count> perf_report_counters{};
@@ -567,6 +569,10 @@ private:
     std::optional<Common::PerfReport::ProcessCpu> perf_report_process_cpu;
     Common::PerfReport::Placement perf_report_placement{};
     std::array<u64, 256> perf_report_svcs{};
+    /// g_slow_access as of the last report: [calls, timed, timed ns][store][reason].
+    std::array<std::array<std::array<u64, Common::PerfReport::SlowAccessCount>, 2>, 3>
+        perf_report_slow{};
+    std::array<u64, 2> perf_report_slow_runs{};
     std::array<Common::PerfReport::JitCoreCounts, Common::PerfReport::JitCores> perf_report_jit_cores{};
     std::array<u64, VideoCommon::Churn::Count> perf_report_churn{};
     Common::PlatformEvents::ProcessEvents perf_report_events{};

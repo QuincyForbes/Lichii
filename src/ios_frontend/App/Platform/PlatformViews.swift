@@ -438,6 +438,8 @@ struct ExperimentsView: View {
     @State private var guestIdleSpin = lichii_platform_experiment("guest_idle_spin") != 0
     @State private var perfSchedOff = lichii_platform_experiment("perf_sched_off") != 0
     @State private var targetlessFull = lichii_platform_experiment("targetless_full") != 0
+    @State private var jitInlineExclusives = lichii_platform_experiment("jit_inline_exclusives") != 0
+    @State private var jitLoadFaults = lichii_platform_experiment("jit_load_faults") != 0
 
     var body: some View {
         List {
@@ -568,6 +570,21 @@ struct ExperimentsView: View {
                 Text("CPU Scheduling")
             } footer: {
                 Text("For finding out why the game's CPU threads run on the efficiency cores. Two Guest Cores First leaves the top priority to two of the six emulated CPU cores and the graphics threads, and runs the other four one step lower, so iOS has fewer threads asking for its two performance cores (on a computer limited to four CPUs this gave Ocarina of Time 25 % more frames). Game's Own Thread Cores lets Ocarina of Time's main threads run only on the cores the game asks for, instead of on any core. One Core per Game Thread keeps each such thread on one core, so one host thread does its work; wins over Game's Own Thread Cores. Idle Guest Cores Wait Briefly keeps an emulated core that runs out of work polling for 20 µs before it sleeps, as on a computer, which saves a wake-up per hand-off but keeps a CPU busy. No CPU Scheduling Log Lines stops the \"Perf threads:\" and \"Perf sched:\" log lines and the counting behind them (thread listing every 10 s, a 20 Hz thread sampler, timestamps at each guest thread switch).\n\nAll five apply the next time Lichii starts.")
+            }
+
+            Section {
+                Toggle("Exclusive Accesses in Fastmem", isOn: $jitInlineExclusives)
+                    .onChange(of: jitInlineExclusives) { value in
+                        lichii_platform_set_experiment("jit_inline_exclusives", value ? 1 : 0)
+                    }
+                Toggle("Loads Keep Fastmem After a Fault", isOn: $jitLoadFaults)
+                    .onChange(of: jitLoadFaults) { value in
+                        lichii_platform_set_experiment("jit_load_faults", value ? 1 : 0)
+                    }
+            } header: {
+                Text("Guest Memory Access")
+            } footer: {
+                Text("Exclusive Accesses in Fastmem runs the game's exclusive loads and stores (LDXR/STXR, for locks and counters) directly on guest memory, as on a computer, instead of a call into the emulator each; Ocarina of Time uses none on a computer, other games may. Loads Keep Fastmem After a Fault lets a game load that hit protected memory (a page the GPU wrote) keep reading guest memory directly, and take the slow path only after its eighth such fault instead of the first; on a computer it cut Ocarina of Time's slow loads of GPU pages by 70 % but saved little time. Both are off by default. The \"Perf memory callbacks:\" log line counts both.\n\nBoth apply the next time Lichii starts.")
             }
 
             Section {

@@ -24,6 +24,7 @@
 #include "dynarmic/backend/arm64/emit_arm64.h"
 #include "dynarmic/backend/arm64/emit_arm64_memory.h"
 #include "dynarmic/backend/arm64/stack_layout.h"
+#include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #include "dynarmic/common/cast_util.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
 #include "dynarmic/frontend/A64/translate/a64_translate.h"
@@ -264,7 +265,7 @@ static void* EmitExclusiveRead128CallTrampoline(oaknut::CodeGenerator& code, con
 
     auto fn = [](const A64::UserConfig& conf, A64::VAddr vaddr) -> Vector {
         return conf.global_monitor->ReadAndMark<Vector>(conf.processor_id, vaddr, [&]() -> Vector {
-            return conf.callbacks->MemoryRead128(vaddr);
+            return conf.callbacks->MemoryReadExclusive128(vaddr);
         });
     };
 
@@ -505,7 +506,8 @@ A64AddressSpace::A64AddressSpace(const A64::UserConfig& conf)
         : AddressSpace(conf.code_cache_size, conf.code_cache_evict_slice, conf.processor_id)
         , conf(conf) {
     atomic_ctx.conf = &this->conf;
-    fastmem_manager.Configure(conf.fastmem_shared_markers, conf.fastmem_block_after_faults);
+    fastmem_manager.Configure(conf.fastmem_shared_markers, conf.fastmem_block_after_faults,
+                              conf.fastmem_load_fault_limit);
     if (this->conf.HasOptimization(OptimizationFlag::FastDispatch) && Arm64EnvOn("EDEN_NX2_JIT_DISPATCH")) {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         constexpr std::size_t default_bits = 15;
@@ -593,10 +595,10 @@ void A64AddressSpace::EmitPrelude() {
     prelude_info.wrapped_read_memory_32 = EmitWrappedReadCallTrampoline<&A64::UserCallbacks::MemoryRead>(code, conf.callbacks, sizeof(u32));
     prelude_info.wrapped_read_memory_64 = EmitWrappedReadCallTrampoline<&A64::UserCallbacks::MemoryRead>(code, conf.callbacks, sizeof(u64));
     prelude_info.wrapped_read_memory_128 = EmitWrappedRead128CallTrampoline(code, conf.callbacks);
-    prelude_info.exclusive_read_memory_8 = EmitExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryRead, u8>(code, conf);
-    prelude_info.exclusive_read_memory_16 = EmitExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryRead, u16>(code, conf);
-    prelude_info.exclusive_read_memory_32 = EmitExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryRead, u32>(code, conf);
-    prelude_info.exclusive_read_memory_64 = EmitExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryRead, u64>(code, conf);
+    prelude_info.exclusive_read_memory_8 = EmitExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryReadExclusive, u8>(code, conf);
+    prelude_info.exclusive_read_memory_16 = EmitExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryReadExclusive, u16>(code, conf);
+    prelude_info.exclusive_read_memory_32 = EmitExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryReadExclusive, u32>(code, conf);
+    prelude_info.exclusive_read_memory_64 = EmitExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryReadExclusive, u64>(code, conf);
     prelude_info.exclusive_read_memory_128 = EmitExclusiveRead128CallTrampoline(code, conf);
     prelude_info.write_memory_8 = EmitCallWriteTrampoline<&A64::UserCallbacks::MemoryWrite>(code, conf.callbacks, sizeof(u8));
     prelude_info.write_memory_16 = EmitCallWriteTrampoline<&A64::UserCallbacks::MemoryWrite>(code, conf.callbacks, sizeof(u16));
@@ -868,6 +870,9 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
     const bool backedge_halt =
         !conf.enable_cycle_counting && !conf.check_halt_on_memory_access &&
         (conf.halt_check_on_back_edges || (conf.unsafe_optimizations && env_backedge_halt));
+    const bool inline_exclusives =
+        conf.inline_exclusives && conf.fastmem_pointer && conf.fastmem_exclusive_access &&
+        conf.global_monitor != nullptr && (active_opts & OptimizationFlag::Unsafe_IgnoreGlobalMonitor) != no_optimizations;
 
     return EmitConfig{
         .optimizations = active_opts,
@@ -900,6 +905,8 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
         .silently_mirror_fastmem = conf.silently_mirror_fastmem,
         .inline_page_table_fallback = conf.inline_page_table_fallback,
         .page_table_lookup_calls = conf.page_table != nullptr && conf.page_table_lookup_calls,
+        .exclusive_address_pointer = inline_exclusives ? std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)) : 0,
+        .exclusive_value_pointer = inline_exclusives ? std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)) : 0,
 
         .wall_clock_cntpct = conf.wall_clock_cntpct,
         .enable_cycle_counting = conf.enable_cycle_counting,

@@ -162,6 +162,10 @@ struct EmitConfig {
     /// Loads and stores without fastmem call a shared page table walk in the prelude
     /// (PageTableLookup*) instead of emitting it inline.
     bool page_table_lookup_calls = false;
+    /// LDXR/STXR in fastmem (UserConfig::inline_exclusives): this core's global monitor slots
+    /// (address, value); 0 = through the callbacks.
+    u64 exclusive_address_pointer = 0;
+    u64 exclusive_value_pointer = 0;
 
     // Timing & control flow
     bool wall_clock_cntpct;

@@ -41,6 +41,7 @@ public:
         u32 marker_offset;
         u64 call_pc;
         bool recompile;
+        bool load{};
     };
 
     /// nullptr when a count or an offset does not fit the layout; the caller then keeps the
@@ -57,7 +58,7 @@ public:
             relocations += target.relocations.size();
         }
         for (const Patch& patch : patches) {
-            if (patch.code_offset > MaxOffset || patch.marker_offset > MaxOffset) {
+            if (patch.code_offset > MaxOffset || patch.marker_offset > (MaxOffset >> 1)) {
                 return nullptr;
             }
         }
@@ -78,7 +79,9 @@ public:
             *out++ = patch.marker_location;
             *out++ = patch.call_pc;
             *out++ = static_cast<u64>(patch.code_offset) |
-                     static_cast<u64>(patch.marker_offset << 1 | (patch.recompile ? 1U : 0U)) << 32;
+                     static_cast<u64>(patch.marker_offset << 2 | (patch.load ? 2U : 0U) |
+                                           (patch.recompile ? 1U : 0U))
+                         << 32;
         }
         // The u32 tail; an odd count leaves half a word unused.
         if (out != data.get() + words) {
@@ -160,9 +163,10 @@ public:
         return Patch{
             .code_offset = static_cast<u32>(patch[2]),
             .marker_location = patch[0],
-            .marker_offset = marker >> 1,
+            .marker_offset = marker >> 2,
             .call_pc = patch[1],
             .recompile = (marker & 1) != 0,
+            .load = (marker & 2) != 0,
         };
     }
 

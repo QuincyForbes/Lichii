@@ -284,6 +284,83 @@ u32 HighCpuFirst();
 /// sleeping), finer than the thermal state apps are told; -1 where unknown.
 int ThermalPressure();
 
+/// Why a guest load or store took the JIT's memory callbacks ("Perf memory callbacks:").
+enum class SlowAccess : u8 {
+    Exclusive,  ///< LDXR/LDAXR and STXR/STLXR (the arm64 JIT has no inline path for them)
+    GpuTracked, ///< Page marked for the rasterizer caches (writes collected, reads may flush)
+    Debug,      ///< Debug memory page
+    Unmapped,
+    PageCross,  ///< Crosses a 4 KiB page (the page table path's misalignment check)
+    PastArena,  ///< Plain page above the fastmem arena (compact JIT code calls back there)
+    Plain,      ///< Plain page in the arena: none of the above
+    Count,
+};
+constexpr std::size_t SlowAccessCount = static_cast<std::size_t>(SlowAccess::Count);
+
+inline const char* SlowAccessName(SlowAccess reason) {
+    constexpr std::array<const char*, SlowAccessCount> names{
+        "exclusive", "GPU-tracked", "debug", "unmapped", "page-crossing", "past the arena", "plain"};
+    return names[static_cast<std::size_t>(reason)];
+}
+
+/// [store][reason]: calls, and of them the 1 in SlowSampleEvery that were timed, with their time.
+struct SlowAccessCounts {
+    std::array<std::array<std::atomic<u64>, SlowAccessCount>, 2> calls{};
+    std::array<std::array<std::atomic<u64>, SlowAccessCount>, 2> timed{};
+    std::array<std::array<std::atomic<u64>, SlowAccessCount>, 2> timed_ns{};
+    /// [store]: GPU-tracked accesses that went to another 4 KiB page than the core's last one
+    std::array<std::atomic<u64>, 2> tracked_page_runs{};
+};
+inline SlowAccessCounts g_slow_access{};
+constexpr u32 SlowSampleEvery = 64;
+
+/// Per guest core, the guest blocks the timed calls came from (space-saving top list, written
+/// only by that core; cleared by it when the report moves g_slow_site_epoch on).
+constexpr std::size_t SlowSites = 32;
+struct SlowSite {
+    std::atomic<u64> key{}; ///< block pc << 8 | reason << 1 | store; 0 = empty
+    std::atomic<u64> count{};
+    std::atomic<u64> vaddr{}; ///< Last address it accessed
+};
+inline std::array<std::array<SlowSite, SlowSites>, JitCores> g_slow_sites{};
+inline std::atomic<u64> g_slow_site_epoch{};
+
+inline u64 SlowSiteKey(u64 pc, SlowAccess reason, bool store) {
+    return (pc << 8) | (u64(reason) << 1) | u64(store);
+}
+
+inline void NoteSlowSite(std::size_t core, u64& epoch, u64 pc, SlowAccess reason, bool store,
+                         u64 vaddr) {
+    if (core >= JitCores) {
+        return;
+    }
+    auto& sites = g_slow_sites[core];
+    if (const u64 now = g_slow_site_epoch.load(std::memory_order_relaxed); now != epoch) {
+        epoch = now;
+        for (SlowSite& site : sites) {
+            site.key.store(0, std::memory_order_relaxed);
+            site.count.store(0, std::memory_order_relaxed);
+        }
+    }
+    const u64 key = SlowSiteKey(pc, reason, store);
+    SlowSite* least = &sites[0];
+    for (SlowSite& site : sites) {
+        const u64 site_key = site.key.load(std::memory_order_relaxed);
+        if (site_key == key || site_key == 0) {
+            site.key.store(key, std::memory_order_relaxed);
+            site.count.store(site.count.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+            site.vaddr.store(vaddr, std::memory_order_relaxed);
+            return;
+        }
+        if (site.count.load(std::memory_order_relaxed) < least->count.load(std::memory_order_relaxed)) {
+            least = &site;
+        }
+    }
+    least->key.store(key, std::memory_order_relaxed);
+    least->count.store(least->count.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    least->vaddr.store(vaddr, std::memory_order_relaxed);
+}
+
 inline std::array<u64, Count> Read() {
     std::array<u64, Count> values{};
     for (std::size_t i = 0; i < Count; ++i) {

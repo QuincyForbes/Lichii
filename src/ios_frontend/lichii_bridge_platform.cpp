@@ -210,6 +210,15 @@ void ApplyCpuExperiments() {
         setenv("EDEN_NX2_IDLE_SPIN_US", "20", 1);
         LOG_WARNING(Frontend, "iOS: experiment guest_idle_spin on");
     }
+    // Guest loads and stores (dynarmic glue): kept when a launch environment sets them.
+    if (lichii_platform_experiment("jit_inline_exclusives")) {
+        setenv("EDEN_NX2_JIT_INLINE_EXCLUSIVES", "1", 1);
+        LOG_WARNING(Frontend, "iOS: experiment jit_inline_exclusives on");
+    }
+    if (lichii_platform_experiment("jit_load_faults")) {
+        setenv("EDEN_NX2_JIT_LOAD_FAULTS", "8", 1);
+        LOG_WARNING(Frontend, "iOS: experiment jit_load_faults on");
+    }
     if (lichii_platform_experiment("perf_sched_off")) {
         setenv("EDEN_NX2_PERF_SCHED", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment perf_sched_off on");

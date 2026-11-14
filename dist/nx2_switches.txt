@@ -96,3 +96,16 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_PERF_SCHED_THREADS=5
 # 0 drops the "Perf threads:" and "Perf sched:" lines and the counting behind them.
 #EDEN_NX2_PERF_SCHED=0
+
+# Guest loads/stores that take the JIT's memory callbacks ("Perf memory callbacks:" line).
+# arm64 hosts: 1 runs LDXR/STXR in fastmem (a load and a host CAS) instead of a callback each
+# (off by default: Ocarina of Time runs none on the PC; iOS Experiments turns it on).
+#EDEN_NX2_JIT_INLINE_EXCLUSIVES=1
+# A plain load that faults in fastmem gives fastmem up only at its nth fault (default 0 or 1: at
+# the first). Read traps fault once and are then disarmed; on the PC phone sim 8 cut Ocarina of
+# Time's GPU-tracked slow loads 14k -> 4k/s, but those left are the flushing reads.
+#EDEN_NX2_JIT_LOAD_FAULTS=8
+# x64, diagnostic: 1 sends LDXR/STXR through the callbacks and the global monitor, as arm64 did.
+#EDEN_NX2_JIT_EXCLUSIVE_CALLBACKS=1
+# The reactive flushing setting for this session (0 = read traps, as on iOS and macOS).
+#EDEN_NX2_REACTIVE_FLUSHING=0

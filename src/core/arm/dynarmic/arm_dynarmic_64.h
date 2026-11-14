@@ -14,6 +14,8 @@
 #include <dynarmic/interface/code_page.h>
 #include "common/common_types.h"
 #include "common/hash.h"
+#include "common/page_table.h"
+#include "common/perf_report.h"
 #include "core/arm/arm_interface.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "dynarmic/interface/A64/config.h"
@@ -43,6 +45,8 @@ public:
 
     u64 MemoryRead(u64 vaddr, size_t size) override;
     Dynarmic::A64::Vector MemoryRead128(u64 vaddr) override;
+    u64 MemoryReadExclusive(u64 vaddr, size_t size) override;
+    Dynarmic::A64::Vector MemoryReadExclusive128(u64 vaddr) override;
     std::optional<u32> MemoryReadCode(u64 vaddr) override;
     void InstructionSynchronizationBarrierRaised() override {
         last_code_addr = u64(-1); //reset back, force refetch
@@ -62,6 +66,13 @@ public:
     u64 GetCNTPCT() override;
     bool CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type);
     void ReturnException(u64 pc, Dynarmic::HaltReason hr);
+    u64 ReadValue(u64 vaddr, size_t size);
+    template <typename T>
+    bool WriteExclusive(u64 vaddr, T value, T expected);
+    Common::PerfReport::SlowAccess ClassifySlowAccess(u64 vaddr, size_t size) const;
+    /// Counts a callback access by reason; times one in SlowSampleEvery and notes its block.
+    template <typename F>
+    auto SlowAccessCall(Common::PerfReport::SlowAccess reason, bool store, u64 vaddr, F&& access);
 
     Dynarmic::CodePage cached_code_page;
     u64 last_code_addr = u64(-1);
@@ -77,6 +88,18 @@ public:
     std::array<u32, 256> m_svc_counts{};
     u64 m_slow_reads{};
     u64 m_slow_writes{};
+    /// Breakdown of the slow accesses (perf report on): [store][reason] calls, timed, timed ns.
+    bool m_slow_breakdown{};
+    u32 m_slow_tick{};
+    u64 m_slow_site_epoch{~u64{0}};
+    std::array<std::array<u64, Common::PerfReport::SlowAccessCount>, 2> m_slow_calls{};
+    std::array<std::array<u64, Common::PerfReport::SlowAccessCount>, 2> m_slow_timed{};
+    std::array<std::array<u64, Common::PerfReport::SlowAccessCount>, 2> m_slow_timed_ns{};
+    std::array<u64, 2> m_slow_page_runs{};
+    std::array<u64, 2> m_slow_last_page{~u64{0}, ~u64{0}};
+    const Common::PageTable* m_page_table{};
+    u32 m_page_table_bits{};
+    u32 m_fastmem_bits{}; ///< 0 = no fastmem
     u64 m_clock_reads{};
     u64 m_spin_hints{};
     u64 m_clock_waits{};
