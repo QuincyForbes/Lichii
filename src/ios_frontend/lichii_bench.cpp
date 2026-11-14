@@ -877,7 +877,7 @@ void Record(const std::string& path, std::uint64_t program_id) {
     WriteJson(g.dir / "scripts" / name,
               {{"program_id", fmt::format("{:016X}", program_id)},
                {"recorded", g.stamp},
-               {"build", Common::g_scm_rev},
+               {"build", std::string{Common::g_scm_rev}},
                {"steps", StepsToJson(steps)}});
     g_result["recorded_script"] = "scripts/" + name;
     Finish("ok", fmt::format("{} input changes recorded to scripts/{}", events, name));
@@ -894,10 +894,10 @@ void Run() {
         {"request_file", g.source.string()},
         {"request", g.request.raw},
         {"build",
-         {{"sha", Common::g_scm_rev},
-          {"branch", Common::g_scm_branch},
-          {"describe", Common::g_scm_desc},
-          {"name", Common::g_build_name},
+         {{"sha", std::string{Common::g_scm_rev}},
+          {"branch", std::string{Common::g_scm_branch}},
+          {"describe", std::string{Common::g_scm_desc}},
+          {"name", std::string{Common::g_build_name}},
           {"version", Take(lichii_build_version())}}},
         {"device", DeviceJson()},
         {"experiments", g.request.experiments},
