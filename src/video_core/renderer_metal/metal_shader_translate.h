@@ -33,6 +33,7 @@ struct ResourceSlot {
     u32 binding{};
     ResourceKind kind{};
     u32 index{};
+    u32 count{1}; ///< Slots from index on (descriptor arrays)
 };
 
 struct Options {
@@ -41,6 +42,9 @@ struct Options {
     u32 msl_minor{0};
     /// Vertex buffers take buffer slots from this one down (stage_in), so resources stay below.
     u32 first_vertex_buffer_slot{30};
+    /// Vertex stage: Vulkan's clip space has y down, Metal's y up; flipping in the shader keeps
+    /// the viewports Vulkan's.
+    bool flip_vertex_y{true};
 };
 
 struct Result {

@@ -77,12 +77,12 @@ bool AccelerateDMA::BufferToImage(const Tegra::DMA::ImageCopy& copy_info,
 }
 
 RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_, Tegra::MaxwellDeviceMemoryManager& device_memory,
-                                 const Device& device, Scheduler& scheduler_)
-    : gpu{gpu_}, scheduler{scheduler_}, staging_pool{device, scheduler_},
-      texture_cache_runtime{device, scheduler_, staging_pool},
+                                 const Device& device_, Scheduler& scheduler_)
+    : gpu{gpu_}, device{device_}, scheduler{scheduler_}, staging_pool{device_, scheduler_},
+      texture_cache_runtime{device_, scheduler_, staging_pool},
       texture_cache{texture_cache_runtime, device_memory},
-      buffer_cache_runtime{device, scheduler_, staging_pool},
-      buffer_cache{device_memory, buffer_cache_runtime},
+      buffer_cache_runtime{device_, scheduler_, staging_pool},
+      buffer_cache{device_memory, buffer_cache_runtime}, pipeline_cache{device_memory, device_},
       accelerate_dma{buffer_cache, texture_cache},
       fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_} {}
 
@@ -90,6 +90,11 @@ RasterizerMetal::~RasterizerMetal() = default;
 
 void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     ++draws;
+    // Milestone 3 step: the pipeline is translated and built, the draw is not encoded yet.
+    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
+    if (pipeline != nullptr && pipeline->BuildFunctions(device)) {
+        ++draws_with_pipeline;
+    }
 }
 
 void RasterizerMetal::DrawTexture() {
@@ -149,6 +154,10 @@ void RasterizerMetal::Clear(u32 layer_count) {
 
 void RasterizerMetal::DispatchCompute() {
     ++dispatches;
+    ComputePipeline* const pipeline = pipeline_cache.CurrentComputePipeline();
+    if (pipeline != nullptr && pipeline->State(device) != nullptr) {
+        ++dispatches_with_pipeline;
+    }
 }
 
 void RasterizerMetal::ResetCounter(VideoCommon::QueryType) {}
@@ -258,6 +267,9 @@ void RasterizerMetal::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheT
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.WriteMemory(addr, size);
     }
+    if (True(which & VideoCommon::CacheType::ShaderCache)) {
+        pipeline_cache.InvalidateRegion(addr, size);
+    }
 }
 
 bool RasterizerMetal::OnCPUWrite(DAddr addr, u64 size) {
@@ -267,8 +279,11 @@ bool RasterizerMetal::OnCPUWrite(DAddr addr, u64 size) {
             return true;
         }
     }
-    std::scoped_lock lock{texture_cache.mutex};
-    texture_cache.WriteMemory(addr, size);
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        texture_cache.WriteMemory(addr, size);
+    }
+    pipeline_cache.InvalidateRegion(addr, size);
     return false;
 }
 
@@ -280,8 +295,11 @@ void RasterizerMetal::OnCacheInvalidation(DAddr addr, u64 size) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
     }
-    std::scoped_lock lock{buffer_cache.mutex};
-    buffer_cache.WriteMemory(addr, size);
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.WriteMemory(addr, size);
+    }
+    pipeline_cache.InvalidateRegion(addr, size);
 }
 
 void RasterizerMetal::InvalidateGPUCache() {
@@ -293,8 +311,11 @@ void RasterizerMetal::UnmapMemory(DAddr addr, u64 size) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.UnmapMemory(addr, size);
     }
-    std::scoped_lock lock{buffer_cache.mutex};
-    buffer_cache.WriteMemory(addr, size, false);
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.WriteMemory(addr, size, false);
+    }
+    pipeline_cache.OnCacheInvalidation(addr, size);
 }
 
 void RasterizerMetal::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
@@ -382,8 +403,11 @@ void RasterizerMetal::AccelerateInlineToMemory(GPUVAddr address, size_t copy_siz
             buffer_cache.WriteMemory(*cpu_addr, copy_size);
         }
     }
-    std::scoped_lock lock{texture_cache.mutex};
-    texture_cache.WriteMemory(*cpu_addr, copy_size);
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        texture_cache.WriteMemory(*cpu_addr, copy_size);
+    }
+    pipeline_cache.InvalidateRegion(*cpu_addr, copy_size);
 }
 
 void RasterizerMetal::LoadDiskResources(u64, std::stop_token,
@@ -394,6 +418,7 @@ void RasterizerMetal::InitializeChannel(Tegra::Control::ChannelState& channel) {
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     texture_cache.CreateChannel(channel);
     buffer_cache.CreateChannel(channel);
+    pipeline_cache.CreateChannel(channel);
 }
 
 void RasterizerMetal::BindChannel(Tegra::Control::ChannelState& channel) {
@@ -402,6 +427,7 @@ void RasterizerMetal::BindChannel(Tegra::Control::ChannelState& channel) {
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     texture_cache.BindToChannel(channel_id);
     buffer_cache.BindToChannel(channel_id);
+    pipeline_cache.BindToChannel(channel_id);
 }
 
 void RasterizerMetal::ReleaseChannel(s32 channel_id) {
@@ -409,6 +435,7 @@ void RasterizerMetal::ReleaseChannel(s32 channel_id) {
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     texture_cache.EraseChannel(channel_id);
     buffer_cache.EraseChannel(channel_id);
+    pipeline_cache.EraseChannel(channel_id);
 }
 
 std::optional<DisplayTexture> RasterizerMetal::AccelerateDisplay(

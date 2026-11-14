@@ -24,11 +24,22 @@ namespace {
     return spv::ExecutionModelGLCompute;
 }
 
+[[nodiscard]] u32 ArrayCount(const spirv_cross::CompilerMSL& compiler,
+                           const spirv_cross::Resource& resource) {
+    const spirv_cross::SPIRType& type = compiler.get_type(resource.type_id);
+    u32 count = 1;
+    for (const u32 size : type.array) {
+        count *= (std::max)(size, 1U);
+    }
+    return count;
+}
+
 struct Declared {
     u32 set;
     u32 binding;
     bool combined; ///< Takes a texture and a sampler
     ResourceKind kind;
+    u32 count; ///< Array elements, each a slot
 };
 
 } // Anonymous namespace
@@ -45,6 +56,9 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
         msl.pad_fragment_output_components = true;
         msl.enable_decoration_binding = false;
         compiler.set_msl_options(msl);
+        auto common = compiler.get_common_options();
+        common.vertex.flip_vert_y = stage == Stage::Vertex && options.flip_vertex_y;
+        compiler.set_common_options(common);
 
         const spv::ExecutionModel model = Model(stage);
         const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
@@ -56,6 +70,7 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
                     .binding = compiler.get_decoration(resource.id, spv::DecorationBinding),
                     .combined = combined,
                     .kind = kind,
+                    .count = ArrayCount(compiler, resource),
                 });
             }
         };
@@ -77,23 +92,31 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
             binding.stage = model;
             binding.desc_set = resource.set;
             binding.binding = resource.binding;
+            binding.count = resource.count;
             switch (resource.kind) {
             case ResourceKind::Buffer:
                 binding.msl_buffer = buffers;
-                result.slots.push_back({resource.set, resource.binding, resource.kind, buffers++});
+                result.slots.push_back(
+                    {resource.set, resource.binding, resource.kind, buffers, resource.count});
+                buffers += resource.count;
                 break;
             case ResourceKind::Texture:
                 binding.msl_texture = textures;
-                result.slots.push_back({resource.set, resource.binding, resource.kind, textures++});
+                result.slots.push_back(
+                    {resource.set, resource.binding, resource.kind, textures, resource.count});
+                textures += resource.count;
                 if (resource.combined) {
                     binding.msl_sampler = samplers;
-                    result.slots.push_back(
-                        {resource.set, resource.binding, ResourceKind::Sampler, samplers++});
+                    result.slots.push_back({resource.set, resource.binding, ResourceKind::Sampler,
+                                            samplers, resource.count});
+                    samplers += resource.count;
                 }
                 break;
             case ResourceKind::Sampler:
                 binding.msl_sampler = samplers;
-                result.slots.push_back({resource.set, resource.binding, resource.kind, samplers++});
+                result.slots.push_back(
+                    {resource.set, resource.binding, resource.kind, samplers, resource.count});
+                samplers += resource.count;
                 break;
             }
             compiler.add_msl_resource_binding(binding);

@@ -373,6 +373,45 @@ Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc) 
     return Retain([device.GetDevice() newSamplerStateWithDescriptor:descriptor]);
 }
 
+namespace {
+[[nodiscard]] NSString* ToNSString(std::string_view text) {
+    return [[NSString alloc] initWithBytes:text.data()
+                                    length:text.size()
+                                  encoding:NSUTF8StringEncoding];
+}
+} // Anonymous namespace
+
+Object CreateLibrary(const Device& device, std::string_view source, std::string& error) {
+    MTLCompileOptions* options = [MTLCompileOptions new];
+    // The recompiler marks what must stay exact (NoContraction); the rest may use fast math.
+    options.fastMathEnabled = YES;
+    NSError* ns_error = nil;
+    const id<MTLLibrary> library = [device.GetDevice() newLibraryWithSource:ToNSString(source)
+                                                                    options:options
+                                                                      error:&ns_error];
+    if (library == nil) {
+        error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
+    }
+    return Retain(library);
+}
+
+Object CreateFunction(const void* library, std::string_view name) {
+    const id<MTLLibrary> object = (__bridge id<MTLLibrary>)library;
+    return object != nil ? Retain([object newFunctionWithName:ToNSString(name)]) : Object{};
+}
+
+Object CreateComputePipelineState(const Device& device, const void* function,
+                                  std::string& error) {
+    NSError* ns_error = nil;
+    const id<MTLComputePipelineState> state = [device.GetDevice()
+        newComputePipelineStateWithFunction:(__bridge id<MTLFunction>)function
+                                      error:&ns_error];
+    if (state == nil) {
+        error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
+    }
+    return Retain(state);
+}
+
 u64 AllocatedSize(const void* resource) {
     const id<MTLResource> object = (__bridge id<MTLResource>)resource;
     return object != nil ? object.allocatedSize : 0;

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <string>
 #include <string_view>
 
 #include "common/common_types.h"
@@ -92,6 +93,18 @@ struct FormatInfo {
 
 /// A sampler for a guest sampler descriptor (TSC entry).
 [[nodiscard]] Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc);
+
+/// An MTLLibrary built from MSL source (Metal's compiler, at run time); empty with `error` set
+/// on failure.
+[[nodiscard]] Object CreateLibrary(const Device& device, std::string_view source,
+                                   std::string& error);
+
+/// An MTLFunction of a library; empty when it has none of that name.
+[[nodiscard]] Object CreateFunction(const void* library, std::string_view name);
+
+/// An MTLComputePipelineState; empty with `error` set on failure.
+[[nodiscard]] Object CreateComputePipelineState(const Device& device, const void* function,
+                                                std::string& error);
 
 /// Bytes the resource (texture or buffer) holds on the GPU.
 [[nodiscard]] u64 AllocatedSize(const void* resource);

@@ -13,6 +13,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_metal/metal_buffer_cache.h"
 #include "video_core/renderer_metal/metal_fence_manager.h"
+#include "video_core/renderer_metal/metal_pipeline_cache.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
 #include "video_core/renderer_metal/metal_texture_cache.h"
 
@@ -115,9 +116,23 @@ public:
     [[nodiscard]] std::optional<DisplayTexture> AccelerateDisplay(
         const Tegra::FramebufferConfig& config, DAddr framebuffer_addr);
 
-    /// Draws, dispatches and clears taken since the last call (the renderer's 10 s report).
-    [[nodiscard]] std::array<u64, 3> TakeWorkCounts() noexcept {
-        return {std::exchange(draws, 0), std::exchange(dispatches, 0), std::exchange(clears, 0)};
+    struct WorkCounts {
+        u64 draws;
+        u64 draws_with_pipeline; ///< Their pipeline translated and built by Metal
+        u64 dispatches;
+        u64 dispatches_with_pipeline;
+        u64 clears;
+    };
+
+    /// Work taken since the last call (the renderer's 10 s report).
+    [[nodiscard]] WorkCounts TakeWorkCounts() noexcept {
+        return {std::exchange(draws, 0), std::exchange(draws_with_pipeline, 0),
+                std::exchange(dispatches, 0), std::exchange(dispatches_with_pipeline, 0),
+                std::exchange(clears, 0)};
+    }
+
+    [[nodiscard]] PipelineCache& Pipelines() noexcept {
+        return pipeline_cache;
     }
 
     [[nodiscard]] const TextureCacheRuntime& TextureRuntime() const noexcept {
@@ -133,6 +148,7 @@ private:
                        VideoCommon::QueryPropertiesFlags flags, u32 payload);
 
     Tegra::GPU& gpu;
+    const Device& device;
     Scheduler& scheduler;
 
     StagingBufferPool staging_pool;
@@ -140,12 +156,15 @@ private:
     TextureCache texture_cache;
     BufferCacheRuntime buffer_cache_runtime;
     BufferCache buffer_cache;
+    PipelineCache pipeline_cache;
     QueryCache query_cache;
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
 
     u64 draws{};
+    u64 draws_with_pipeline{};
     u64 dispatches{};
+    u64 dispatches_with_pipeline{};
     u64 clears{};
 };
 

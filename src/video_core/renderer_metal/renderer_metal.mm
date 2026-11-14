@@ -228,16 +228,20 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
 
     const auto now = std::chrono::steady_clock::now();
     if (now - impl->report_start >= std::chrono::seconds{10}) {
-        const auto [draws, dispatches, clears] = impl->rasterizer.TakeWorkCounts();
+        const auto work = impl->rasterizer.TakeWorkCounts();
         const auto [encoders, command_buffers, blits, passes] = impl->scheduler.TakeCounts();
+        const auto [graphics_made, compute_made, refused] =
+            impl->rasterizer.Pipelines().TakeCounts();
         LOG_INFO(Render_Metal,
                  "Metal: {} frames presented ({} from the texture cache, {} from guest memory), "
-                 "{} without a drawable; {} draws and {} dispatches taken (not drawn yet), {} "
-                 "clears; {} command buffers, {} encoders ({} render passes), {} blit commands; "
-                 "textures {} MiB, buffers {} MiB",
-                 impl->presented, impl->from_cache, impl->from_memory, impl->skipped, draws,
-                 dispatches, clears, command_buffers, encoders, passes, blits,
-                 impl->rasterizer.TextureRuntime().allocated_bytes >> 20,
+                 "{} without a drawable; {} draws ({} with a built pipeline) and {} dispatches ({} "
+                 "with one) taken, not drawn yet; {} clears; pipelines made {} graphics, {} "
+                 "compute, {} refused; {} command buffers, {} encoders ({} render passes), {} "
+                 "blit commands; textures {} MiB, buffers {} MiB",
+                 impl->presented, impl->from_cache, impl->from_memory, impl->skipped, work.draws,
+                 work.draws_with_pipeline, work.dispatches, work.dispatches_with_pipeline,
+                 work.clears, graphics_made, compute_made, refused, command_buffers, encoders,
+                 passes, blits, impl->rasterizer.TextureRuntime().allocated_bytes >> 20,
                  impl->rasterizer.BufferRuntime().GetDeviceMemoryUsage() >> 20);
         impl->report_start = now;
         impl->presented = 0;
