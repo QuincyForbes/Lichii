@@ -5,6 +5,7 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 
 #include "common/common_types.h"
 #include "video_core/renderer_metal/metal_object.h"
@@ -174,6 +175,19 @@ public:
     /// Opens a render encoder on the targets (loading their contents), or keeps the open one
     /// when they are the same.
     void BeginRendering(const RenderTargetSet& targets);
+
+    /// Slots of the visibility result buffer every draw render pass carries (occlusion queries).
+    static constexpr u32 VisibilitySlots = 16384;
+
+    /// Counts the next draws' passing samples into `slot` (adding to it within one render pass),
+    /// or stops counting with nullopt.
+    void SetVisibility(std::optional<u32> slot);
+
+    /// The visibility results (one u64 per slot), readable once the GPU is done with them.
+    [[nodiscard]] u64* VisibilityResults() noexcept;
+
+    /// Changes whenever BeginRendering opens a new render encoder.
+    [[nodiscard]] u64 RenderPassSerial() const noexcept;
 
     /// The state of the next draws on the open render encoder.
     void SetDrawState(const DrawState& state);

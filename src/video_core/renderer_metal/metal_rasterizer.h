@@ -126,6 +126,7 @@ public:
         u64 draws_encoded;       ///< Recorded on a render encoder
         u64 draws_converted;     ///< Of them, with indices rewritten (quads, fans, 8-bit)
         u64 texel_copies;        ///< Texel buffers read through an aligned copy
+        u64 occlusion_queries;   ///< Sample counts written back
         u64 dispatches;
         u64 dispatches_with_pipeline;
         u64 clears;
@@ -135,7 +136,7 @@ public:
     [[nodiscard]] WorkCounts TakeWorkCounts() noexcept {
         return {std::exchange(draws, 0), std::exchange(draws_with_pipeline, 0),
                 std::exchange(draws_encoded, 0), std::exchange(draws_converted, 0),
-                std::exchange(texel_copies, 0),
+                std::exchange(texel_copies, 0), std::exchange(occlusion_queries, 0),
                 std::exchange(dispatches, 0), std::exchange(dispatches_with_pipeline, 0),
                 std::exchange(clears, 0)};
     }
@@ -170,6 +171,11 @@ private:
                             std::span<const VideoCommon::ImageViewInOut> views,
                             std::span<const VideoCommon::SamplerId> samplers, u32 render_width,
                             u32 render_height);
+
+    /// Sets the open render pass's occlusion counting for the next draw.
+    void CountOcclusion();
+
+    [[nodiscard]] u32 AllocateVisibilitySlot();
 
     void QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                        VideoCommon::QueryPropertiesFlags flags, u32 payload);
@@ -208,6 +214,13 @@ private:
     /// Cleared every frame: views of deleted buffers must not live on.
     std::unordered_map<TexelViewKey, Object, TexelViewHash> texel_view_cache;
     u64 texel_copies{};
+
+    /// The visibility slots of the occlusion counter since its last reset, one per render pass.
+    std::vector<u32> occlusion_slots;
+    u64 occlusion_pass{~u64{0}};
+    u32 next_visibility_slot{};
+    std::array<u64, Scheduler::VisibilitySlots> visibility_ticks{};
+    u64 occlusion_queries{};
     ::Common::unordered_map<u64, Object> depth_stencil_states;
 
     u64 draws{};

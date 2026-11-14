@@ -140,6 +140,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     if (!PrepareDraw(*pipeline, is_indexed)) {
         return;
     }
+    CountOcclusion();
     if (convert) {
         // Rewritten on the CPU from the guest's indices (or the vertex range) into 32-bit
         // indices in the stream ring. Index data the GPU wrote and never flushed is not seen.
@@ -868,11 +869,66 @@ void RasterizerMetal::DispatchCompute() {
     }
 }
 
-void RasterizerMetal::ResetCounter(VideoCommon::QueryType) {}
+void RasterizerMetal::ResetCounter(VideoCommon::QueryType type) {
+    if (type == VideoCommon::QueryType::ZPassPixelCount64 ||
+        type == VideoCommon::QueryType::ZPassPixelCount) {
+        occlusion_slots.clear();
+        occlusion_pass = ~u64{0};
+    }
+}
+
+u32 RasterizerMetal::AllocateVisibilitySlot() {
+    const u32 slot = next_visibility_slot;
+    next_visibility_slot = (next_visibility_slot + 1) % Scheduler::VisibilitySlots;
+    // A lap later: the GPU wrote the slot long ago, but make sure.
+    if (!scheduler.IsFree(visibility_ticks[slot])) {
+        scheduler.Wait(visibility_ticks[slot]);
+    }
+    visibility_ticks[slot] = scheduler.CurrentTick();
+    scheduler.VisibilityResults()[slot] = 0;
+    return slot;
+}
+
+void RasterizerMetal::CountOcclusion() {
+    if (maxwell3d->regs.zpass_pixel_count_enable == 0) {
+        scheduler.SetVisibility(std::nullopt);
+        return;
+    }
+    // A slot per render pass of the counting segment: results are summed at the query.
+    if (occlusion_pass != scheduler.RenderPassSerial()) {
+        occlusion_slots.push_back(AllocateVisibilitySlot());
+        occlusion_pass = scheduler.RenderPassSerial();
+    }
+    scheduler.SetVisibility(occlusion_slots.back());
+}
 
 void RasterizerMetal::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                             VideoCommon::QueryPropertiesFlags flags, u32 payload, u32) {
-    QueryFallback(gpu_addr, type, flags, payload);
+    if (type != VideoCommon::QueryType::ZPassPixelCount64 &&
+        type != VideoCommon::QueryType::ZPassPixelCount) {
+        QueryFallback(gpu_addr, type, flags, payload);
+        return;
+    }
+    if (!gpu_memory) {
+        return;
+    }
+    ++occlusion_queries;
+    // Written once the GPU has finished the draws counted so far (the fence's command buffer
+    // ends their render pass, so later draws count into new slots).
+    SignalFence([this, gpu_addr, flags, memory_manager = gpu_memory,
+                 slots = occlusion_slots] {
+        const u64* const results = scheduler.VisibilityResults();
+        u64 samples = 0;
+        for (const u32 slot : slots) {
+            samples += results[slot];
+        }
+        if (True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)) {
+            memory_manager->Write<u64>(gpu_addr + 8, gpu.GetTicks());
+            memory_manager->Write<u64>(gpu_addr, samples);
+        } else {
+            memory_manager->Write<u32>(gpu_addr, static_cast<u32>(samples));
+        }
+    });
 }
 
 void RasterizerMetal::QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType type,

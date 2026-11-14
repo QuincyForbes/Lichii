@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <unordered_map>
 #include <utility>
@@ -78,6 +79,9 @@ struct Scheduler::Impl {
         sampler_desc.minFilter = MTLSamplerMinMagFilterLinear;
         sampler_desc.magFilter = MTLSamplerMinMagFilterLinear;
         linear = [device.GetDevice() newSamplerStateWithDescriptor:sampler_desc];
+        visibility = [device.GetDevice() newBufferWithLength:VisibilitySlots * sizeof(u64)
+                                                     options:MTLResourceStorageModeShared];
+        std::memset(visibility.contents, 0, VisibilitySlots * sizeof(u64));
     }
 
     id<MTLCommandBuffer> Commands() {
@@ -158,6 +162,10 @@ struct Scheduler::Impl {
     id<MTLRenderCommandEncoder> render = nil;
     RenderTargetSet render_targets{};
     id<MTLComputeCommandEncoder> compute = nil;
+    id<MTLBuffer> visibility = nil;
+    u64 render_pass_serial{};
+    /// The open render encoder's counting slot (-1: not counting).
+    s64 visibility_slot{-1};
     id<MTLLibrary> library = nil;
     id<MTLSamplerState> nearest = nil;
     id<MTLSamplerState> linear = nil;
@@ -437,8 +445,33 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
     // Draws without attachments (occlusion queries) still need a size.
     pass.renderTargetWidth = (std::max)(targets.width, 1U);
     pass.renderTargetHeight = (std::max)(targets.height, 1U);
+    pass.visibilityResultBuffer = impl->visibility;
     impl->render = impl->RenderEncoder(pass);
     impl->render_targets = targets;
+    impl->visibility_slot = -1;
+    ++impl->render_pass_serial;
+}
+
+void Scheduler::SetVisibility(std::optional<u32> slot) {
+    const s64 wanted = slot ? static_cast<s64>(*slot) : -1;
+    if (impl->render == nil || wanted == impl->visibility_slot) {
+        return;
+    }
+    impl->visibility_slot = wanted;
+    if (slot) {
+        [impl->render setVisibilityResultMode:MTLVisibilityResultModeCounting
+                                       offset:*slot * sizeof(u64)];
+    } else {
+        [impl->render setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+    }
+}
+
+u64* Scheduler::VisibilityResults() noexcept {
+    return static_cast<u64*>(impl->visibility.contents);
+}
+
+u64 Scheduler::RenderPassSerial() const noexcept {
+    return impl->render_pass_serial;
 }
 
 void Scheduler::SetDrawState(const DrawState& state) {
