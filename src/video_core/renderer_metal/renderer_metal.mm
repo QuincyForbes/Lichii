@@ -149,8 +149,9 @@ RendererMetal::RendererMetal(Core::Frontend::EmuWindow& emu_window,
     : RendererBase(emu_window, std::move(context_)), gpu{gpu_},
       impl{std::make_unique<Impl>(emu_window, gpu_, device_memory)} {
     LOG_WARNING(Render_Metal,
-                "Metal renderer (experimental): milestone 2, the texture and buffer caches, "
-                "copies, clears and the guest framebuffer run on Metal; draws are not drawn yet");
+                "Metal renderer (experimental): milestone 3, draws with vertex and pixel "
+                "shaders run on Metal; compute, queries, tessellation, geometry and mesh "
+                "shaders do not yet");
 }
 
 RendererMetal::~RendererMetal() = default;
@@ -234,12 +235,13 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
             impl->rasterizer.Pipelines().TakeCounts();
         LOG_INFO(Render_Metal,
                  "Metal: {} frames presented ({} from the texture cache, {} from guest memory), "
-                 "{} without a drawable; {} draws ({} with a built pipeline) and {} dispatches ({} "
-                 "with one) taken, not drawn yet; {} clears; pipelines made {} graphics, {} "
+                 "{} without a drawable; {} draws ({} with a built pipeline, {} drawn) and {} "
+                 "dispatches ({} with a pipeline, not run yet); {} clears; pipelines made {} graphics, {} "
                  "compute, {} refused; {} command buffers, {} encoders ({} render passes), {} "
                  "blit commands; textures {} MiB, buffers {} MiB",
                  impl->presented, impl->from_cache, impl->from_memory, impl->skipped, work.draws,
-                 work.draws_with_pipeline, work.dispatches, work.dispatches_with_pipeline,
+                 work.draws_with_pipeline, work.draws_encoded, work.dispatches,
+                 work.dispatches_with_pipeline,
                  work.clears, graphics_made, compute_made, refused, command_buffers, encoders,
                  passes, blits, impl->rasterizer.TextureRuntime().allocated_bytes >> 20,
                  impl->rasterizer.BufferRuntime().GetDeviceMemoryUsage() >> 20);
