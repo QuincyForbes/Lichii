@@ -734,7 +734,7 @@ private:
     vk::CommandBuffer current_upload_cmdbuf;
     /// Worker thread: runs before the last render pass that began on a command buffer of its
     /// own (RecordBeforePass); null when there is none in this submission.
-    vk::CommandBuffer before_pass_cmdbuf;
+    vk::CommandBuffer before_pass_cmdbuf{};
     /// Worker thread: finished command buffers of this submission, in order, between the upload
     /// command buffer and current_cmdbuf (before_pass_cmdbuf among them, still open).
     std::vector<VkCommandBuffer> segment_cmdbufs;
