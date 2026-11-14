@@ -58,6 +58,7 @@
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/framebuffer_clear_layers.h"
+#include "video_core/renderer_vulkan/framebuffer_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
@@ -325,6 +326,34 @@ void AppendWords(u32*& out, const T& value) {
     out += sizeof(T) / sizeof(u32);
 }
 } // Anonymous namespace
+
+VideoCommon::Extent2D TargetlessDrawReach(const Maxwell& regs, bool all_viewports,
+                                          bool is_rescaling) {
+    u32 up_scale = 1;
+    u32 down_shift = 0;
+    if (is_rescaling) {
+        up_scale = Settings::values.resolution_info.up_scale;
+        down_shift = Settings::values.resolution_info.down_shift;
+    }
+    const VideoCommon::Extent2D size{
+        (regs.surface_clip.width * up_scale) >> down_shift,
+        (regs.surface_clip.height * up_scale) >> down_shift,
+    };
+    if (!regs.viewport_scale_offset_enabled) {
+        // The scissor is the surface clip then (UpdateScissorsState)
+        return size;
+    }
+    VideoCommon::Extent2D reach{};
+    const size_t num_scissors = all_viewports ? Maxwell::NumViewports : 1;
+    for (size_t index = 0; index < num_scissors; ++index) {
+        const VkRect2D scissor = GetScissorState(regs, index, up_scale, down_shift);
+        reach.width = (std::max)(
+            reach.width, ScissorReach(scissor.offset.x, scissor.extent.width, size.width));
+        reach.height = (std::max)(
+            reach.height, ScissorReach(scissor.offset.y, scissor.extent.height, size.height));
+    }
+    return reach;
+}
 
 void RasterizerVulkan::ReadMeshEmulationProbe() {
     const MeshEmulationProbe probe{mesh_probe};

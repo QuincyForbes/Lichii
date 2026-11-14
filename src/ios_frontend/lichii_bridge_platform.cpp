@@ -278,6 +278,10 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_OOT_BILINEAR_UPSCALE", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment oot_game_upscale on");
     }
+    if (lichii_platform_experiment("targetless_full")) {
+        setenv("EDEN_NX2_TARGETLESS_REACH", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment targetless_full on");
+    }
 }
 
 LichiiThermalAdvice ComputeThermalAdvice(int thermal_state, int low_power_mode) {

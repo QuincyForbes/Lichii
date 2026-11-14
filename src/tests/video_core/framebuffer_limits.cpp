@@ -37,3 +37,25 @@ TEST_CASE("Framebuffers keep at least one pixel and one layer",
     REQUIRE(size.height == 1);
     REQUIRE(size.layers == 1);
 }
+
+TEST_CASE("A framebuffer without attachments ends where the scissor does",
+          "[video_core][framebuffer_limits]") {
+    REQUIRE(Vulkan::ScissorReach(0, 1, 32768) == 1);
+    REQUIRE(Vulkan::ScissorReach(0, 256, 32768) == 256);
+    REQUIRE(Vulkan::ScissorReach(100, 200, 32768) == 512);
+    REQUIRE(Vulkan::ScissorReach(-8, 24, 32768) == 16);
+}
+
+TEST_CASE("A scissor that is off or past the surface clip leaves the framebuffer its size",
+          "[video_core][framebuffer_limits]") {
+    REQUIRE(Vulkan::ScissorReach(0, 0x7fffffff, 32768) == 32768);
+    REQUIRE(Vulkan::ScissorReach(0x7fffffff, 0x7fffffff, 32768) == 32768);
+    REQUIRE(Vulkan::ScissorReach(0, 1200, 1000) == 1000);
+    REQUIRE(Vulkan::ScissorReach(0, 600, 1000) == 1000);
+}
+
+TEST_CASE("An empty scissor keeps one pixel", "[video_core][framebuffer_limits]") {
+    REQUIRE(Vulkan::ScissorReach(0, 0, 32768) == 1);
+    REQUIRE(Vulkan::ScissorReach(-64, 32, 32768) == 1);
+    REQUIRE(Vulkan::ScissorReach(0, 16, 0) == 1);
+}

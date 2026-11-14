@@ -2244,6 +2244,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         }
     } clearing_scope{clearing_render_targets};
     clearing_render_targets = is_clear;
+    targetless_size = {};
     auto& flags = maxwell3d->dirty.flags;
     const auto& regs = maxwell3d->regs;
     const auto color_modified = [&](size_t index) {
@@ -2465,6 +2466,12 @@ void TextureCache<P>::NoteRenderTargetsPrepared() {
 
 template <class P>
 typename P::Framebuffer* TextureCache<P>::GetFramebuffer() {
+    if (rt_active_mask == 0 && targetless_size != Extent2D{}) {
+        // This size follows the draw, not the render targets: looked up each time.
+        RenderTargets key = render_targets;
+        key.size = targetless_size;
+        return &slot_framebuffers[GetFramebufferId(key)];
+    }
     if (last_framebuffer_id && last_framebuffer_serial == render_targets_serial) {
         return &slot_framebuffers[last_framebuffer_id];
     }

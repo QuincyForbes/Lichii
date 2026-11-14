@@ -55,6 +55,11 @@ EDEN_NX2_FENCE_BATCH=1
 # 1920x1080 (on by default on Apple for MetalFX temporal, 0 turns it off).
 #EDEN_NX2_OOT_TEMPORAL_HANDHELD=1
 
+# A draw without render targets (it writes buffers or counts samples only) gets a render pass as
+# large as its scissors reach instead of the surface clip (Ocarina of Time leaves that at
+# 32768x32768). On by default on Apple, where the GPU prepares every tile of it; 0 turns it off.
+#EDEN_NX2_TARGETLESS_REACH=1
+
 #EDEN_NX2_MME_JIT=0
 #EDEN_NX2_PBFLUSH=0
 #EDEN_NX2_SKIP_SAME=0

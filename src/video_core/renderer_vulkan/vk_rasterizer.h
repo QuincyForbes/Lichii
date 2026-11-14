@@ -66,6 +66,11 @@ struct FramebufferTextureInfo;
 
 class StateTracker;
 
+/// Size of the framebuffer a draw without render targets needs: where its scissors end, within
+/// the surface clip. all_viewports when a shader of the draw picks the viewport, scissor 0 if not.
+[[nodiscard]] VideoCommon::Extent2D TargetlessDrawReach(
+    const Tegra::Engines::Maxwell3D::Regs& regs, bool all_viewports, bool is_rescaling);
+
 class AccelerateDMA : public Tegra::Engines::AccelerateDMAInterface {
 public:
     explicit AccelerateDMA(BufferCache& buffer_cache, TextureCache& texture_cache,

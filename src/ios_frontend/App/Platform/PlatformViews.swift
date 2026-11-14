@@ -432,6 +432,7 @@ struct ExperimentsView: View {
     @State private var fenceSubmitEach = lichii_platform_experiment("fence_submit_each") != 0
     @State private var renderPassesOld = lichii_platform_experiment("render_passes_old") != 0
     @State private var ootGameUpscale = lichii_platform_experiment("oot_game_upscale") != 0
+    @State private var targetlessFull = lichii_platform_experiment("targetless_full") != 0
 
     var body: some View {
         List {
@@ -527,10 +528,14 @@ struct ExperimentsView: View {
                     .onChange(of: ootGameUpscale) { value in
                         lichii_platform_set_experiment("oot_game_upscale", value ? 1 : 0)
                     }
+                Toggle("Full-Size Passes Without Targets", isOn: $targetlessFull)
+                    .onChange(of: targetlessFull) { value in
+                        lichii_platform_set_experiment("targetless_full", value ? 1 : 0)
+                    }
             } header: {
                 Text("Performance")
             } footer: {
-                Text("For comparing builds. Old Texture Eviction reads textures the GPU drew back from the GPU before freeing them, a wait for the GPU each time, even when the game draws them again anyway. Helper Threads at Full Priority gives the timing and present threads the same priority as the game's. Frame Deadlines for the CPU tells iOS each frame's deadline, which may keep the game on the performance cores; untested on a device. Old JIT Tables keeps the translated code's bookkeeping as it was (about 0.3 GB more memory in Ocarina of Time); turn it on if a game that used to run crashes. Submit at Every Fence hands the GPU the game's work at every game fence, as before, instead of in batches of up to 2 ms (76-95 command buffers a frame in Ocarina of Time's Kokiri Forest on an iPhone); turn it on if the screen flashes white. Render Passes as Before ends the GPU's render pass for every buffer copy and parked clear, as before, instead of moving copies ahead of the pass (each ended pass stores and loads the whole screen again); turn it on if parts of the picture show stale or wrong data. Game's Own Upscale Pass runs Ocarina of Time's own upscale from its scene to the screen size, as before, instead of one bilinear tap whenever MetalFX Temporal doesn't take the frame (the game's pass was about 40 % of the phone's GPU time in Kokiri Forest); turn it on if the picture looks wrong.\n\nAll seven apply the next time Lichii starts.")
+                Text("For comparing builds. Old Texture Eviction reads textures the GPU drew back from the GPU before freeing them, a wait for the GPU each time, even when the game draws them again anyway. Helper Threads at Full Priority gives the timing and present threads the same priority as the game's. Frame Deadlines for the CPU tells iOS each frame's deadline, which may keep the game on the performance cores; untested on a device. Old JIT Tables keeps the translated code's bookkeeping as it was (about 0.3 GB more memory in Ocarina of Time); turn it on if a game that used to run crashes. Submit at Every Fence hands the GPU the game's work at every game fence, as before, instead of in batches of up to 2 ms (76-95 command buffers a frame in Ocarina of Time's Kokiri Forest on an iPhone); turn it on if the screen flashes white. Render Passes as Before ends the GPU's render pass for every buffer copy and parked clear, as before, instead of moving copies ahead of the pass (each ended pass stores and loads the whole screen again); turn it on if parts of the picture show stale or wrong data. Game's Own Upscale Pass runs Ocarina of Time's own upscale from its scene to the screen size, as before, instead of one bilinear tap whenever MetalFX Temporal doesn't take the frame (the game's pass was about 40 % of the phone's GPU time in Kokiri Forest); turn it on if the picture looks wrong. Full-Size Passes Without Targets gives a draw that writes no image a render pass of the game's full surface size, as before (32768x32768 in Ocarina of Time, about 6-7 % of the phone's GPU time), instead of only the pixels it can reach; turn it on if lens flares or glows behave differently.\n\nAll eight apply the next time Lichii starts.")
             }
 
             Section {

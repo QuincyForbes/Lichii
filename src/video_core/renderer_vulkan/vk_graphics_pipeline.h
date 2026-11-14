@@ -422,6 +422,7 @@ private:
     u32 color_output_mask{};
     u32 zero_texture_handles{};
     bool writes_storage{};
+    bool selects_viewport{};
 
     /// Graphics pipeline libraries (EDEN_NX2_GPL): one descriptor set per stage (set index =
     /// stage index), the shader libraries, and this pipeline's own vertex input and fragment

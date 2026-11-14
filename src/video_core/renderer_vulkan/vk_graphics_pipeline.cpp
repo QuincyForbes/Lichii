@@ -32,6 +32,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -62,6 +63,21 @@ bool PushConstantReuseEnabled() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_PUSH_CONSTANT_REUSE");
         return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// A draw without render targets gets a framebuffer of the surface clip's size, which a game may
+// leave at 32768x32768: a tile-based GPU pays for every tile of it. It is sized by the draw's
+// scissors instead. EDEN_NX2_TARGETLESS_REACH (boot): on by default on Apple only.
+bool TargetlessReachEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_TARGETLESS_REACH");
+#ifdef __APPLE__
+        return value == nullptr || value[0] != '0';
+#else
+        return value != nullptr && value[0] == '1';
+#endif
     }();
     return enabled;
 }
@@ -479,6 +495,11 @@ GraphicsPipeline::GraphicsPipeline(
     writes_storage = std::ranges::any_of(stage_infos, [&](const Shader::Info& info) {
         return info.stores_global_memory || any_written(info.storage_buffers_descriptors) ||
                any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
+    });
+    selects_viewport = std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
+        return info.stores_indexed_attributes ||
+               info.stores[Shader::IR::Attribute::ViewportIndex] ||
+               info.stores[Shader::IR::Attribute::ViewportMask];
     });
 
     if (library_cache) {
@@ -1189,6 +1210,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
         texture_cache.UpdateRenderTargets(false);
+        if (TargetlessReachEnabled() && texture_cache.HasNoRenderTargets()) {
+            texture_cache.BoundTargetlessFramebuffer(TargetlessDrawReach(
+                maxwell3d->regs, selects_viewport, texture_cache.IsRescaling()));
+        }
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
         if (scheduler.HasFragmentBarrier() &&
