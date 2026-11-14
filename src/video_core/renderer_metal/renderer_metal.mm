@@ -2,15 +2,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <vector>
 
 #import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
 #import <QuartzCore/CAMetalLayer.h>
 
 #include "common/logging.h"
+#include "common/settings.h"
 #include "common/scope_exit.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
@@ -44,6 +48,127 @@ namespace {
     }
 }
 
+/// MetalFX spatial upscaling of the first layer (the MetalFxSpatial scaling filter), on the
+/// renderer's own textures and command buffer.
+class SpatialUpscaler {
+public:
+    /// The upscaled picture (output_width x output_height, the drawable's format), or nullptr
+    /// when MetalFX can't run (the layer is presented as it is).
+    TextureHandle Upscale(const Device& device, Scheduler& scheduler, TextureHandle source,
+                          const std::array<s32, 4>& source_rect, u32 output_width,
+                          u32 output_height) {
+        if (failed || output_width == 0 || output_height == 0) {
+            return nullptr;
+        }
+        if (@available(iOS 16.0, macOS 13.0, *)) {
+            const u32 input_width = static_cast<u32>(std::abs(source_rect[2] - source_rect[0]));
+            const u32 input_height = static_cast<u32>(std::abs(source_rect[3] - source_rect[1]));
+            const MTLPixelFormat format = AsTexture(source).pixelFormat;
+            if (input_width == 0 || input_height == 0) {
+                return nullptr;
+            }
+            if (scaler == nil || input_width != in_width || input_height != in_height ||
+                output_width != out_width || output_height != out_height ||
+                format != in_format) {
+                if (!Prepare(device, format, input_width, input_height, output_width,
+                             output_height)) {
+                    failed = true;
+                    return nullptr;
+                }
+            }
+            // The crop (with its flips) into an input of exactly its size.
+            const bool copied = scheduler.Blit(BlitPass{
+                .src = source,
+                .src_rect = source_rect,
+                .dst = {.texture = (__bridge void*)input},
+                .dst_format = static_cast<u32>(format),
+                .dst_rect = {0, 0, static_cast<s32>(input_width), static_cast<s32>(input_height)},
+                .dst_width = input_width,
+                .dst_height = input_height,
+                .linear = false,
+                .keep_dst = false,
+            });
+            if (!copied) {
+                return nullptr;
+            }
+            const id<MTLCommandBuffer> command_buffer =
+                (__bridge id<MTLCommandBuffer>)scheduler.CommandBuffer();
+            id<MTLFXSpatialScaler> spatial = scaler;
+            spatial.colorTexture = input;
+            spatial.outputTexture = output;
+            spatial.inputContentWidth = input_width;
+            spatial.inputContentHeight = input_height;
+            [spatial encodeToCommandBuffer:command_buffer];
+            return (__bridge void*)output;
+        }
+        failed = true;
+        return nullptr;
+    }
+
+private:
+    bool Prepare(const Device& device, MTLPixelFormat format, u32 input_width, u32 input_height,
+                 u32 output_width, u32 output_height) API_AVAILABLE(ios(16.0), macos(13.0)) {
+        if (![MTLFXSpatialScalerDescriptor supportsDevice:device.GetDevice()]) {
+            LOG_WARNING(Render_Metal, "MetalFX spatial: not supported on this GPU");
+            return false;
+        }
+        MTLFXSpatialScalerDescriptor* descriptor = [[MTLFXSpatialScalerDescriptor alloc] init];
+        descriptor.inputWidth = input_width;
+        descriptor.inputHeight = input_height;
+        descriptor.outputWidth = output_width;
+        descriptor.outputHeight = output_height;
+        descriptor.colorTextureFormat = format;
+        descriptor.outputTextureFormat = static_cast<MTLPixelFormat>(DrawableFormat());
+        // The present chain is in display (gamma) space.
+        descriptor.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+        id<MTLFXSpatialScaler> spatial = [descriptor newSpatialScalerWithDevice:device.GetDevice()];
+        if (spatial == nil) {
+            LOG_WARNING(Render_Metal, "MetalFX spatial: no scaler for {}x{} -> {}x{}", input_width,
+                        input_height, output_width, output_height);
+            return false;
+        }
+        const auto make = [&](u32 width, u32 height, MTLPixelFormat texture_format,
+                              MTLTextureUsage usage) {
+            MTLTextureDescriptor* texture = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:texture_format
+                                             width:width
+                                            height:height
+                                         mipmapped:NO];
+            texture.storageMode = MTLStorageModePrivate;
+            texture.usage = usage;
+            return [device.GetDevice() newTextureWithDescriptor:texture];
+        };
+        input = make(input_width, input_height, format,
+                     spatial.colorTextureUsage | MTLTextureUsageRenderTarget |
+                         MTLTextureUsageShaderRead);
+        output = make(output_width, output_height,
+                      static_cast<MTLPixelFormat>(DrawableFormat()),
+                      spatial.outputTextureUsage | MTLTextureUsageShaderRead);
+        if (input == nil || output == nil) {
+            return false;
+        }
+        scaler = spatial;
+        in_width = input_width;
+        in_height = input_height;
+        out_width = output_width;
+        out_height = output_height;
+        in_format = format;
+        LOG_INFO(Render_Metal, "MetalFX spatial: {}x{} -> {}x{}", input_width, input_height,
+                 output_width, output_height);
+        return true;
+    }
+
+    id scaler = nil;
+    id<MTLTexture> input = nil;
+    id<MTLTexture> output = nil;
+    u32 in_width{};
+    u32 in_height{};
+    u32 out_width{};
+    u32 out_height{};
+    MTLPixelFormat in_format{MTLPixelFormatInvalid};
+    bool failed{};
+};
+
 } // Anonymous namespace
 
 struct RendererMetal::Impl {
@@ -76,6 +201,7 @@ struct RendererMetal::Impl {
         Service::android::PixelFormat format{};
     };
     std::vector<MemoryLayer> memory_layers;
+    SpatialUpscaler spatial;
     std::vector<u8> unswizzled;
 
     std::chrono::steady_clock::time_point report_start = std::chrono::steady_clock::now();
@@ -214,19 +340,35 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                         break;
                     }
                 }
+                std::array<s32, 4> src_rect{static_cast<s32>(crop.left * width),
+                                            static_cast<s32>(crop.top * height),
+                                            static_cast<s32>(crop.right * width),
+                                            static_cast<s32>(crop.bottom * height)};
+                TextureHandle texture = source.texture;
+                bool linear = true;
+                if (!drawn && Settings::values.scaling_filter.GetValue() ==
+                                  Settings::ScalingFilter::MetalFxSpatial) {
+                    const u32 out_width = screen.right - screen.left;
+                    const u32 out_height = screen.bottom - screen.top;
+                    if (TextureHandle upscaled = impl->spatial.Upscale(
+                            impl->device, impl->scheduler, texture, src_rect, out_width,
+                            out_height)) {
+                        texture = upscaled;
+                        src_rect = {0, 0, static_cast<s32>(out_width),
+                                    static_cast<s32>(out_height)};
+                        linear = false;
+                    }
+                }
                 const bool layer_drawn = impl->scheduler.Blit(BlitPass{
-                    .src = source.texture,
-                    .src_rect = {static_cast<s32>(crop.left * width),
-                                 static_cast<s32>(crop.top * height),
-                                 static_cast<s32>(crop.right * width),
-                                 static_cast<s32>(crop.bottom * height)},
+                    .src = texture,
+                    .src_rect = src_rect,
                     .dst = target,
                     .dst_format = DrawableFormat(),
                     .dst_rect = {static_cast<s32>(screen.left), static_cast<s32>(screen.top),
                                  static_cast<s32>(screen.right), static_cast<s32>(screen.bottom)},
                     .dst_width = layout.width,
                     .dst_height = layout.height,
-                    .linear = true,
+                    .linear = linear,
                     .keep_dst = drawn,
                     .blend = blend,
                 });
