@@ -268,7 +268,7 @@ void CoreTiming::WaitForEvent(s64 next_time, void* hires_timer) {
     if (!signalled && next_time > now) {
         signalled = event.WaitFor(std::chrono::nanoseconds{next_time - now});
     }
-    if (!signalled && Common::PerfReport::Enabled()) {
+    if (!signalled && Common::PerfSched::Enabled()) {
         Common::PerfSched::g_timer_late.Add(
             static_cast<u64>((std::max)(s64{0}, GetGlobalTimeNs().count() - next_time)));
     }

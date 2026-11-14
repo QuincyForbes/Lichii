@@ -573,7 +573,7 @@ std::string GuestThreadsText(State& state, double seconds) {
 } // Anonymous namespace
 
 void TickFrame() {
-    if (!PerfReport::Enabled()) {
+    if (!Enabled()) {
         return;
     }
     static State state;

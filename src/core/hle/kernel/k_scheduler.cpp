@@ -578,7 +578,7 @@ void KScheduler::OnThreadStateChanged(KernelCore& kernel, KThread* thread, Threa
             GetPriorityQueue(kernel).PushBack(thread);
             IncrementScheduledCount(thread);
             SetSchedulerUpdateNeeded(kernel);
-            if (Common::PerfReport::Enabled() && !thread->IsDummyThread()) {
+            if (Common::PerfSched::Enabled() && !thread->IsDummyThread()) {
                 if (thread->m_nx2_perf_slot == -2) {
                     const KProcess* const owner = thread->GetOwnerProcess();
                     thread->m_nx2_perf_slot = Common::PerfSched::AllocateGuestThread(

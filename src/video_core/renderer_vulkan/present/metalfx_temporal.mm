@@ -189,7 +189,7 @@ bool MetalFxTemporalUpscaler::Impl::Prepare(const ScalerKey& wanted) {
         return false;
     }
     first_evaluation = true;
-    LOG_INFO(Render_Vulkan, "MetalFX temporal: scaler for {}", setup);
+    LOG_INFO(Common_Memory, "MetalFX temporal: scaler for {}", setup);
     return true;
 }
 

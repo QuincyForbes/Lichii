@@ -210,6 +210,10 @@ void ApplyCpuExperiments() {
         setenv("EDEN_NX2_IDLE_SPIN_US", "20", 1);
         LOG_WARNING(Frontend, "iOS: experiment guest_idle_spin on");
     }
+    if (lichii_platform_experiment("perf_sched_off")) {
+        setenv("EDEN_NX2_PERF_SCHED", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment perf_sched_off on");
+    }
 }
 
 void ApplyExperiments() {
@@ -295,6 +299,10 @@ void ApplyExperiments() {
     if (lichii_platform_experiment("oot_game_upscale")) {
         setenv("EDEN_NX2_OOT_BILINEAR_UPSCALE", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment oot_game_upscale on");
+    }
+    if (lichii_platform_experiment("targetless_full")) {
+        setenv("EDEN_NX2_TARGETLESS_REACH", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment targetless_full on");
     }
     ApplyCpuExperiments();
 }

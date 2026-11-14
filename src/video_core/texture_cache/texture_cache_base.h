@@ -516,6 +516,17 @@ public:
     /// UpdateRenderTargets should be called before this
     Framebuffer* GetFramebuffer();
 
+    /// True when the bound render targets hold no image: the draw writes buffers or queries only
+    [[nodiscard]] bool HasNoRenderTargets() const noexcept {
+        return rt_active_mask == 0;
+    }
+
+    /// Sizes the framebuffer of a draw without render targets, which is the surface clip's size
+    /// otherwise. Holds until the next UpdateRenderTargets.
+    void BoundTargetlessFramebuffer(Extent2D size) noexcept {
+        targetless_size = size;
+    }
+
     [[nodiscard]] const RenderTargets& GetRenderTargets() const noexcept {
         return render_targets;
     }
@@ -966,6 +977,7 @@ private:
         std::array<ImageViewId, NUM_RT + 1> views{};
     } rt_prepared;
     u32 rt_active_mask = 0;
+    Extent2D targetless_size{};
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};
     u64 texture_bindings_serial = 0;

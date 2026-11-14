@@ -365,7 +365,7 @@ void PhysicalCore::Idle(KernelCore& kernel) {
 
 void PhysicalCore::NoteWakeAsked() {
     if (m_nx2_idle_sleeping.load(std::memory_order_relaxed) != 0 &&
-        m_nx2_wake_asked.load(std::memory_order_relaxed) == 0 && Common::PerfReport::Enabled()) {
+        m_nx2_wake_asked.load(std::memory_order_relaxed) == 0 && Common::PerfSched::Enabled()) {
         u64 expected = 0;
         m_nx2_wake_asked.compare_exchange_strong(expected, Common::PerfReport::NowNs(),
                                                  std::memory_order_relaxed);

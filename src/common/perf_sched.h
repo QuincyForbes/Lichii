@@ -7,6 +7,7 @@
 #include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstdlib>
 
 #include "common/common_types.h"
 #include "common/perf_report.h"
@@ -15,6 +16,15 @@
 /// (host threads by CPU time) and the "Perf sched:" line (guest threads, wake latency, waits on
 /// the GPU, yield backoff).
 namespace Common::PerfSched {
+
+/// With the 10 s report, unless EDEN_NX2_PERF_SCHED=0.
+inline bool Enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_PERF_SCHED");
+        return PerfReport::Enabled() && (value == nullptr || value[0] != '0');
+    }();
+    return enabled;
+}
 
 enum Counter : u32 {
     YieldRealYields,  ///< Yields that let another thread run
@@ -34,7 +44,7 @@ enum Counter : u32 {
 inline std::array<std::atomic<u64>, Counter::Count> g_counters{};
 
 inline void Add(Counter counter, u64 amount = 1) {
-    if (PerfReport::Enabled()) {
+    if (Enabled()) {
         g_counters[counter].fetch_add(amount, std::memory_order_relaxed);
     }
 }
