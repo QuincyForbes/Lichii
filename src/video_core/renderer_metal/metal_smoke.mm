@@ -12,6 +12,10 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <span>
+
+#include "translate_smoke_comp_spv.h"
+#include "video_core/renderer_metal/metal_shader_translate.h"
 
 namespace {
 
@@ -137,10 +141,81 @@ int Run() {
     return passed ? 0 : 1;
 }
 
+/// The renderer's shader path: SPIR-V through metal_shader_translate, built by Metal, run.
+int RunTranslate() {
+    namespace Translate = Metal::ShaderTranslate;
+    const Translate::Result msl = Translate::SpirvToMsl(
+        std::span<const uint32_t>(TRANSLATE_SMOKE_SPV), Translate::Stage::Compute, {});
+    if (msl.source.empty()) {
+        std::printf("metal-smoke: FAIL SPIR-V -> MSL: %s\n", msl.error.c_str());
+        return 1;
+    }
+    uint32_t params_slot = UINT32_MAX;
+    uint32_t data_slot = UINT32_MAX;
+    for (const Translate::ResourceSlot& slot : msl.slots) {
+        if (slot.kind == Translate::ResourceKind::Buffer) {
+            (slot.binding == 0 ? params_slot : data_slot) = slot.index;
+        }
+    }
+    if (params_slot == UINT32_MAX || data_slot == UINT32_MAX) {
+        std::printf("metal-smoke: FAIL translated shader has no buffer slots\n");
+        return 1;
+    }
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    NSError* error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:@(msl.source.c_str())
+                                                  options:[MTLCompileOptions new]
+                                                    error:&error];
+    if (library == nil) {
+        std::printf("metal-smoke: FAIL translated MSL does not build: %s\n%s\n",
+                    error.localizedDescription.UTF8String, msl.source.c_str());
+        return 1;
+    }
+    id<MTLFunction> function = [library newFunctionWithName:@(msl.entry_point.c_str())];
+    id<MTLComputePipelineState> pipeline =
+        function != nil ? [device newComputePipelineStateWithFunction:function error:&error]
+                        : nil;
+    if (pipeline == nil) {
+        std::printf("metal-smoke: FAIL compute pipeline (entry %s): %s\n", msl.entry_point.c_str(),
+                    error != nil ? error.localizedDescription.UTF8String : "no function");
+        return 1;
+    }
+    constexpr uint32_t Count = 256;
+    id<MTLBuffer> data = [device newBufferWithLength:Count * sizeof(uint32_t)
+                                             options:MTLResourceStorageModeShared];
+    const uint32_t params[4]{7, 3, 0, 0};
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBytes:params length:sizeof(params) atIndex:params_slot];
+    [encoder setBuffer:data offset:0 atIndex:data_slot];
+    [encoder dispatchThreadgroups:MTLSizeMake(Count / 64, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [encoder endEncoding];
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+    const auto* values = static_cast<const uint32_t*>(data.contents);
+    uint32_t wrong = 0;
+    for (uint32_t index = 0; index < Count; ++index) {
+        wrong += values[index] != index * 7 + 3 ? 1 : 0;
+    }
+    std::printf("metal-smoke: SPIR-V -> MSL compute (%zu bytes of MSL, entry %s, buffers %u/%u): "
+                "%u of %u wrong: %s\n",
+                msl.source.size(), msl.entry_point.c_str(), params_slot, data_slot, wrong, Count,
+                wrong == 0 ? "PASS" : "FAIL");
+    return wrong == 0 ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main() {
     @autoreleasepool {
-        return Run();
+        const int draw = Run();
+        if (draw == 2) {
+            return 2;
+        }
+        const int translate = RunTranslate();
+        return draw != 0 ? draw : translate;
     }
 }

@@ -640,10 +640,15 @@ set(METAL_RENDERER_CXX_SOURCES
     renderer_metal/metal_buffer_cache_base.cpp
     renderer_metal/metal_fence_manager.cpp
     renderer_metal/metal_rasterizer.cpp
+    renderer_metal/metal_shader_translate.cpp
     renderer_metal/metal_staging_buffer_pool.cpp
     renderer_metal/metal_texture_cache.cpp
     renderer_metal/metal_texture_cache_base.cpp
 )
+if (ENABLE_METAL OR LICHII_METAL_COMPILE_CHECK)
+    # SPIR-V -> MSL (metal_shader_translate.cpp).
+    AddJsonPackage(spirv-cross)
+endif()
 if (ENABLE_METAL)
     set(METAL_RENDERER_SOURCES
         renderer_metal/metal_device.mm
@@ -664,6 +669,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_rasterizer.h
         renderer_metal/metal_resources.h
         renderer_metal/metal_scheduler.h
+        renderer_metal/metal_shader_translate.h
         renderer_metal/metal_staging_buffer_pool.h
         renderer_metal/metal_swapchain.h
         renderer_metal/metal_texture_cache.h
@@ -675,23 +681,36 @@ if (ENABLE_METAL)
         COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc"
         SKIP_PRECOMPILE_HEADERS ON
         SKIP_UNITY_BUILD_INCLUSION ON)
-    target_link_libraries(video_core PRIVATE "-framework Metal" "-framework QuartzCore"
-                                             "-framework Foundation")
+    target_link_libraries(video_core PRIVATE spirv-cross-msl "-framework Metal"
+                                             "-framework QuartzCore" "-framework Foundation")
     target_compile_definitions(video_core PUBLIC LICHII_METAL_RENDERER)
 
-    # Offscreen check for machines without a window (the macOS CI runner).
+    # Offscreen check for machines without a window (the macOS CI runner): a clear and a draw,
+    # and a compute shader taken from GLSL through SPIR-V and metal_shader_translate.
     if (NOT IOS)
-        add_executable(lichii-metal-smoke renderer_metal/metal_smoke.mm)
+        set(METAL_SMOKE_SPIRV ${CMAKE_CURRENT_BINARY_DIR}/metal_smoke/translate_smoke_comp_spv.h)
+        add_custom_command(
+            OUTPUT ${METAL_SMOKE_SPIRV}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/metal_smoke
+            COMMAND ${GLSLANGVALIDATOR} -V --target-env spirv1.3 --variable-name TRANSLATE_SMOKE_SPV
+                    -o ${METAL_SMOKE_SPIRV}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/renderer_metal/smoke/translate_smoke.comp
+            MAIN_DEPENDENCY ${CMAKE_CURRENT_SOURCE_DIR}/renderer_metal/smoke/translate_smoke.comp)
+        add_executable(lichii-metal-smoke renderer_metal/metal_smoke.mm
+                       renderer_metal/metal_shader_translate.cpp ${METAL_SMOKE_SPIRV})
         set_source_files_properties(renderer_metal/metal_smoke.mm PROPERTIES
             LANGUAGE CXX
             COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
-        target_link_libraries(lichii-metal-smoke PRIVATE "-framework Metal" "-framework Foundation")
+        target_include_directories(lichii-metal-smoke PRIVATE ${CMAKE_SOURCE_DIR}/src
+                                   ${CMAKE_CURRENT_BINARY_DIR}/metal_smoke)
+        target_link_libraries(lichii-metal-smoke PRIVATE spirv-cross-msl "-framework Metal"
+                              "-framework Foundation")
     endif()
 elseif (LICHII_METAL_COMPILE_CHECK)
     # Off by default: compiles (does not link) the plain C++ part on machines without Metal, to
     # catch template errors before an Apple CI run.
     add_library(video_core_metal_check OBJECT ${METAL_RENDERER_CXX_SOURCES})
-    target_link_libraries(video_core_metal_check PRIVATE video_core)
+    target_link_libraries(video_core_metal_check PRIVATE video_core spirv-cross-msl)
 endif()
 
 # Ocarina of Time's upscaler replaced live by NVIDIA DLSS or Apple MetalFX temporal upscaling
