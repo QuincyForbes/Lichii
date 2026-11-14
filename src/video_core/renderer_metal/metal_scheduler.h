@@ -31,6 +31,8 @@ struct Attachment {
     u32 level{};
     u32 slice{};
     u32 depth_plane{};
+
+    bool operator==(const Attachment&) const noexcept = default;
 };
 
 /// A pass whose only work is clearing attachments (Maxwell clears; M3 folds them into the next
