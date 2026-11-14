@@ -126,6 +126,26 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         return;
     }
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (const MeshEmulation* const mesh = pipeline->Mesh()) {
+        // The draw's count is its mesh workgroups (the index count for indexed draws).
+        const u32 groups = is_indexed ? draw_state.index_buffer.count
+                                      : draw_state.vertex_buffer.count;
+        if (groups == 0) {
+            return;
+        }
+        gpu_memory->FlushCaching();
+        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+        if (!PrepareDraw(*pipeline, is_indexed, groups)) {
+            return;
+        }
+        CountOcclusion();
+        const auto topology = static_cast<Maxwell::PrimitiveTopology>(mesh->topology);
+        scheduler.Draw(*PrimitiveType(topology), 0, groups * mesh->vertices_per_group, 1, 0);
+        ++draws_encoded;
+        ++mesh_draws;
+        mesh_groups += groups;
+        return;
+    }
     const bool u8_indices =
         is_indexed && draw_state.index_buffer.format == Maxwell::IndexFormat::UnsignedByte;
     const bool convert = IndexConvert::NeedsConversion(draw_state.topology) || u8_indices;
@@ -240,6 +260,17 @@ std::vector<TextureHandle> RasterizerMetal::PrepareTexelBuffers(std::span<const 
     return result;
 }
 
+void RasterizerMetal::BindMeshOutput(const StageProgram& program, ShaderStage metal_stage,
+                                     u32 binding, const StagingBufferRef& output) {
+    for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
+        if (slot.kind == ShaderTranslate::ResourceKind::Buffer && slot.binding == binding &&
+            slot.set != ShaderTranslate::PushConstantSet) {
+            scheduler.BindBuffer(metal_stage, slot.index, output.buffer,
+                                 static_cast<u32>(output.offset));
+        }
+    }
+}
+
 void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage metal_stage,
                                          std::span<const Binding> pending,
                                          std::span<const TextureHandle> texel_buffer_views,
@@ -332,11 +363,17 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     }
 }
 
-bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed) {
-    // Buffer cache stage indices (vertex B, pixel) and the translated programs.
+bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups) {
+    // Buffer cache stage indices (vertex B, pixel) and the translated programs. An emulated mesh
+    // pipeline's stage 0 is its mesh kernel, dispatched before the render pass.
     constexpr std::array<size_t, 2> stages{0, 4};
-    const std::array<StageProgram*, 2> programs{&pipeline.Vertex(), &pipeline.Fragment()};
+    MeshEmulation* const mesh = pipeline.Mesh();
+    const std::array<StageProgram*, 2> programs{mesh != nullptr ? &mesh->compute : &pipeline.Vertex(),
+                                                &pipeline.Fragment()};
     const auto& regs = maxwell3d->regs;
+    const Maxwell::PrimitiveTopology topology =
+        mesh != nullptr ? static_cast<Maxwell::PrimitiveTopology>(mesh->topology)
+                        : maxwell3d->draw_manager.draw_state.topology;
 
     std::array<u32, VideoCommon::NUM_STAGES> uniform_masks{};
     for (size_t index = 0; index < stages.size(); ++index) {
@@ -515,13 +552,14 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed) {
     state_desc.depth_format = targets.has_depth ? framebuffer->DepthFormat() : 0U;
     state_desc.stencil_format = targets.has_stencil ? framebuffer->DepthFormat() : 0U;
     state_desc.samples = framebuffer->Samples();
-    state_desc.topology_class = TopologyClass(maxwell3d->draw_manager.draw_state.topology);
+    state_desc.topology_class = TopologyClass(topology);
     state_desc.rasterize = regs.rasterize_enable != 0 ? 1U : 0U;
     state_desc.alpha_to_coverage = regs.anti_alias_alpha_control.alpha_to_coverage != 0 ? 1U : 0U;
     for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
         const auto& input = regs.vertex_attrib_format[index];
         VertexAttributeState& attribute = state_desc.attributes[index];
-        attribute.enabled = input.constant != 0 ? 0U : 1U;
+        // The mesh emulation's vertex shader reads its output buffer, no vertex streams.
+        attribute.enabled = input.constant != 0 || mesh != nullptr ? 0U : 1U;
         attribute.stream = input.buffer;
         attribute.offset = input.offset;
         attribute.type = input.type;
@@ -530,7 +568,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed) {
     const auto& vertex_states = buffer_cache_runtime.Vertices();
     for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
         VertexStreamState& stream = state_desc.streams[index];
-        stream.enabled = vertex_states[index].buffer != nullptr ? 1U : 0U;
+        stream.enabled = vertex_states[index].buffer != nullptr && mesh == nullptr ? 1U : 0U;
         stream.stride = vertex_states[index].stride;
         stream.divisor = regs.vertex_stream_instances.IsInstancingEnabled(index)
                              ? regs.vertex_streams[index].frequency
@@ -562,6 +600,23 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed) {
     Object& depth_stencil_state = depth_stencil_states[depth_stencil_hash];
     if (!depth_stencil_state) {
         depth_stencil_state = CreateDepthStencilState(device, depth_stencil);
+    }
+
+    StagingBufferRef mesh_output{};
+    if (mesh != nullptr) {
+        void* const kernel = pipeline.MeshState(device);
+        if (kernel == nullptr || mesh_workgroups == 0) {
+            return false;
+        }
+        mesh_output = staging_pool.Stream(
+            (std::max)(u64{mesh_workgroups} * mesh->block_words * sizeof(u32), u64{16}), 16);
+        scheduler.BeginCompute(kernel);
+        BindStageResources(mesh->compute, ShaderStage::Compute, stage_bindings[0], texel_views[0],
+                           std::span(views).subspan(first_view[0]),
+                           std::span(samplers).subspan(first_sampler[0]), targets.width,
+                           targets.height);
+        BindMeshOutput(mesh->compute, ShaderStage::Compute, mesh->output_binding, mesh_output);
+        scheduler.Dispatch({mesh_workgroups, 1, 1}, mesh->workgroup_size);
     }
 
     scheduler.BeginRendering(targets);
@@ -624,7 +679,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed) {
             break;
         case Maxwell::CullFace::FrontAndBack:
             // Nothing is drawn but points and lines.
-            if (TopologyClass(maxwell3d->draw_manager.draw_state.topology) == 2) {
+            if (TopologyClass(topology) == 2) {
                 return false;
             }
             break;
@@ -656,7 +711,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed) {
                         regs.blend_color.a};
     scheduler.SetDrawState(draw);
 
-    for (size_t index = 0; index < vertex_states.size(); ++index) {
+    for (size_t index = 0; index < vertex_states.size() && mesh == nullptr; ++index) {
         if (vertex_states[index].buffer != nullptr) {
             scheduler.BindVertexBuffer(VertexBufferSlot(static_cast<u32>(index)),
                                        vertex_states[index].buffer, vertex_states[index].offset);
@@ -672,6 +727,10 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed) {
         }
         const size_t stage = stages[index];
         const ShaderStage metal_stage = index == 0 ? ShaderStage::Vertex : ShaderStage::Fragment;
+        if (index == 0 && mesh != nullptr) {
+            BindMeshOutput(pipeline.Vertex(), metal_stage, mesh->output_binding, mesh_output);
+            continue;
+        }
         BindStageResources(program, metal_stage, stage_bindings[index], texel_views[index],
                            std::span(views).subspan(first_view[index]),
                            std::span(samplers).subspan(first_sampler[index]), targets.width,
@@ -691,6 +750,12 @@ void RasterizerMetal::DrawIndirect() {
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     if (params.is_byte_count) {
         LOG_ONCE(warned_byte_count, "Metal: transform feedback draws are not drawn yet");
+        return;
+    }
+    if (pipeline->Mesh() != nullptr) {
+        // As on Vulkan: the emulation needs the workgroup count on the CPU (mesh draws whose
+        // count the GPU wrote come through Draw, DrawMeshTasksFromGpu being false).
+        LOG_ONCE(warned_mesh_indirect, "Metal: indirect emulated mesh draws are skipped");
         return;
     }
     const bool u8_indices = params.is_indexed && maxwell3d->regs.index_buffer.format ==

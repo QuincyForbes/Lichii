@@ -128,6 +128,8 @@ public:
         u64 draws_converted;     ///< Of them, with indices rewritten (quads, fans, 8-bit)
         u64 texel_copies;        ///< Texel buffers read through an aligned copy
         u64 occlusion_queries;   ///< Sample counts written back
+        u64 mesh_draws;          ///< Task/mesh draws through the compute emulation
+        u64 mesh_groups;         ///< Their mesh workgroups
         u64 dispatches;
         u64 dispatches_with_pipeline;
         u64 clears;
@@ -138,6 +140,7 @@ public:
         return {std::exchange(draws, 0), std::exchange(draws_with_pipeline, 0),
                 std::exchange(draws_encoded, 0), std::exchange(draws_converted, 0),
                 std::exchange(texel_copies, 0), std::exchange(occlusion_queries, 0),
+                std::exchange(mesh_draws, 0), std::exchange(mesh_groups, 0),
                 std::exchange(dispatches, 0), std::exchange(dispatches_with_pipeline, 0),
                 std::exchange(clears, 0)};
     }
@@ -156,7 +159,11 @@ public:
 
 private:
     /// Binds everything the draw needs and opens its render pass; false to skip it.
-    bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed);
+    bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups = 0);
+
+    /// Binds the mesh emulation's output buffer to the program's slot of inding.
+    void BindMeshOutput(const StageProgram& program, ShaderStage metal_stage, u32 binding,
+                        const StagingBufferRef& output);
 
     /// texture_buffer views of a stage's texel buffer bindings, in order (null where none can be
     /// made). Ranges at offsets Metal can't view are read through an aligned copy.
@@ -230,6 +237,8 @@ private:
     u64 draws_with_pipeline{};
     u64 draws_encoded{};
     u64 draws_converted{};
+    u64 mesh_draws{};
+    u64 mesh_groups{};
     /// Guest index data read for draws whose indices are rewritten.
     std::vector<u8> converted_source;
     u64 dispatches{};

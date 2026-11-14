@@ -9,6 +9,7 @@
 #include <array>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -97,10 +98,35 @@ struct StageProgram {
     bool build_failed{};
 };
 
+/// A task/mesh pipeline drawn through Vulkan's mesh emulation: the mesh program runs as a compute
+/// kernel (RuntimeInfo::mesh_as_compute) writing block_words words per workgroup to an output
+/// buffer, which the pipeline's vertex shader (EmitMeshEmulationVertex) draws as a list.
+struct MeshEmulation {
+    /// The mesh program as a kernel; its resources are the buffer cache's stage 0.
+    StageProgram compute;
+    Object state;
+    bool failed{};
+    u32 output_binding{};
+    u32 block_words{};
+    u32 vertices_per_group{};
+    std::array<u32, 3> workgroup_size{};
+    /// Maxwell PrimitiveTopology of the list: Points, Lines or Triangles.
+    u32 topology{};
+};
+
 class GraphicsPipeline {
 public:
     explicit GraphicsPipeline(const GraphicsPipelineKey& key, StageProgram vertex,
-                              StageProgram fragment);
+                              StageProgram fragment,
+                              std::optional<MeshEmulation> mesh = std::nullopt);
+
+    /// The mesh emulation of a task/mesh pipeline, or null.
+    [[nodiscard]] MeshEmulation* Mesh() noexcept {
+        return mesh ? &*mesh : nullptr;
+    }
+
+    /// The mesh kernel's MTLComputePipelineState, made on first use; null when it fails.
+    [[nodiscard]] void* MeshState(const Device& device);
 
     [[nodiscard]] const GraphicsPipelineKey& Key() const noexcept {
         return key;
@@ -125,6 +151,7 @@ private:
     GraphicsPipelineKey key;
     StageProgram vertex;
     StageProgram fragment;
+    std::optional<MeshEmulation> mesh;
     ::Common::unordered_map<u64, Object> render_states;
 };
 
@@ -166,6 +193,10 @@ public:
 
 private:
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
+
+    /// A pipeline whose program 1 is a mesh program (no task program), through the emulation.
+    std::unique_ptr<GraphicsPipeline> CreateMeshPipeline(
+        std::span<Shader::IR::Program> programs);
 
     std::unique_ptr<ComputePipeline> CreateComputePipeline(const ComputePipelineKey& key,
                                                            const VideoCommon::ShaderInfo* shader);

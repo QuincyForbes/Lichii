@@ -409,13 +409,14 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                  "Metal: {} frames presented ({} from the texture cache, {} from guest memory), "
                  "{} without a drawable; {} draws ({} with a built pipeline, {} drawn, {} with "
                  "rewritten indices) and {} dispatches ({} with a pipeline); {} clears, {} texel "
-                 "buffer copies, {} occlusion queries; pipelines made {} graphics, {} compute, {} refused; {} command "
+                 "buffer copies, {} occlusion queries, {} emulated mesh draws ({} workgroups); "
+                 "pipelines made {} graphics, {} compute, {} refused; {} command "
                  "buffers, {} encoders ({} render passes), {} blit commands; textures {} MiB, "
                  "buffers {} MiB",
                  impl->presented, impl->from_cache, impl->from_memory, impl->skipped, work.draws,
                  work.draws_with_pipeline, work.draws_encoded, work.draws_converted,
                  work.dispatches, work.dispatches_with_pipeline, work.clears, work.texel_copies,
-                 work.occlusion_queries,
+                 work.occlusion_queries, work.mesh_draws, work.mesh_groups,
                  graphics_made, compute_made, refused, command_buffers, encoders, passes, blits,
                  impl->rasterizer.TextureRuntime().allocated_bytes >> 20,
                  impl->rasterizer.BufferRuntime().GetDeviceMemoryUsage() >> 20);
