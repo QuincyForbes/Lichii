@@ -58,7 +58,12 @@ enum Counter : std::size_t {
     GpuTimedBuffers,     ///< Command buffers that GpuBusyNs covers
     RenderPasses,        ///< Render passes begun
     MeshEmulatedDraws,   ///< Mesh draws run as compute + a vertex draw
-    MeshPassBreaks,      ///< Of them, ones that ended a render pass for their compute
+    MeshPassBreaks,      ///< Of them, ones that ended their own render pass for their compute
+    MeshPassLeaves,      ///< Of them, ones that ended a pass on another target (left anyway)
+    MeshBeforePass,      ///< Of them, ones whose compute ran before their open render pass
+    Dispatches,          ///< Guest compute dispatches recorded
+    DispatchesChained,   ///< Of them, recorded right after another with only bindings between
+    DispatchBarriersSkipped, ///< Of those, recorded without their barrier (EDEN_NX2_DISPATCH_CHAIN)
     AttachmentLoadBytes, ///< Attachment bytes render passes load (neither cleared nor don't-care)
     AttachmentStoreBytes, ///< Attachment bytes render passes store
     RenderPassReopens,   ///< Render passes begun on the framebuffer the last one ended on, no clear

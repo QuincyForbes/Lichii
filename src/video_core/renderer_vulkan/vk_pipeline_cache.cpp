@@ -1311,6 +1311,38 @@ bool NativePerPrimitiveMesh(const Device& device) {
     return native >= 0 ? native != 0 : !device.IsMoltenVK();
 }
 
+/// EDEN_NX2_MESH_EMULATE=all|<pipeline hash>,...: those mesh pipelines take the compute emulation
+/// though the driver could build them natively (when the emulation can take them), to compare the
+/// two. On Apple GPUs a translated mesh threadgroup holds its outputs in threadgroup memory, which
+/// limits how many run at once; the emulation's compute writes them to a device buffer.
+bool MeshEmulatedByChoice(u64 pipeline_hash) {
+    static const std::vector<u64> hashes = [] {
+        std::vector<u64> parsed;
+        const char* const value = std::getenv("EDEN_NX2_MESH_EMULATE");
+        if (value == nullptr || value[0] == '\0' || value[0] == '0') {
+            return parsed;
+        }
+        if (std::string_view{value} == "all") {
+            parsed.push_back(0);
+            return parsed;
+        }
+        for (const char* it = value; *it != '\0';) {
+            char* end{};
+            const u64 hash{std::strtoull(it, &end, 16)};
+            if (end == it) {
+                break;
+            }
+            if (hash != 0) {
+                parsed.push_back(hash);
+            }
+            it = *end == ',' ? end + 1 : end;
+        }
+        return parsed;
+    }();
+    return !hashes.empty() &&
+           (hashes.front() == 0 || std::ranges::find(hashes, pipeline_hash) != hashes.end());
+}
+
 /// " mesh <hash> pixel <hash>" (with " task <hash>" first when there is one) of a task/mesh
 /// pipeline, for log lines: the task and mesh programs come first, the pixel program last.
 std::string MeshPipelineShaders(const GraphicsPipelineCacheKey& key) {
@@ -3579,6 +3611,15 @@ std::optional<std::string> NativeMeshLimitExceeded(const Device& device,
     if (bytes > available) {
         return fmt::format("threadgroup memory {} B, device {} B", bytes, available);
     }
+    // How many of its threadgroups can share a GPU core's threadgroup memory (occupancy).
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+        LOG_WARNING(Render_Vulkan,
+                    "Mesh pipeline {:016x} native: {} B of threadgroup memory per mesh threadgroup "
+                    "({} vertices, {} primitives, {} B shared), device {} B",
+                    key.Hash(), bytes, info.max_vertices, info.max_primitives,
+                    mesh->shared_memory_size, available);
+    }
     return std::nullopt;
 }
 } // Anonymous namespace
@@ -3717,6 +3758,68 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         }
     }
+    // What the compute emulation (below) can take: a mesh program, after an optional task program,
+    // drawing triangles, points or lines, before a pixel program only.
+    const bool has_task{key.unique_hashes[1] != 0 && programs[1].stage == Shader::Stage::Task};
+    size_t mesh_index{};
+    for (size_t index = 1; index < Maxwell::MaxShaderProgram; ++index) {
+        if (key.unique_hashes[index] != 0 && programs[index].stage == Shader::Stage::Mesh) {
+            mesh_index = index;
+            break;
+        }
+    }
+    bool eligible{mesh_index != 0 && (mesh_index == 1 || has_task) &&
+                  layer_source_program == nullptr};
+    if (eligible) {
+        const Shader::IR::Program& mesh{programs[mesh_index]};
+        // Points (0), lines (1) and triangles (4).
+        const u32 topology{mesh.mesh.topology};
+        eligible = (topology == 0 || topology == 1 || topology == 4) &&
+                   Shader::Backend::SPIRV::MeshEmulationTakesPrimitiveLines(mesh.mesh) &&
+                   !mesh.mesh.vertex_lines.empty() && mesh.mesh.max_vertices != 0 &&
+                   mesh.mesh.max_primitives != 0;
+    }
+    for (size_t index = 1; index < Maxwell::MaxShaderProgram && eligible; ++index) {
+        const bool emulated{index == mesh_index || (has_task && index == 1)};
+        eligible = emulated || key.unique_hashes[index] == 0 ||
+                   programs[index].stage == Shader::Stage::Fragment;
+    }
+    // The output buffer's binding follows every program's (unified bindings, one per descriptor
+    // element, as the SPIR-V backend numbers them). The task and mesh programs share the compute
+    // stage, so their descriptors and the emulation's own buffers count against one set of
+    // per-stage limits.
+    u32 output_binding{};
+    u32 compute_storage_buffers{has_task ? 4U : 1U};
+    u32 compute_sampled_images{};
+    u32 compute_resources{compute_storage_buffers};
+    for (size_t index = 1; index < Maxwell::MaxShaderProgram && mesh_index != 0; ++index) {
+        if (key.unique_hashes[index] == 0) {
+            continue;
+        }
+        const Shader::Info& info{programs[index].info};
+        const bool emulated{index == mesh_index || (has_task && index == 1)};
+        const auto add = [&](const auto& descriptors, u32* category) {
+            const u32 count{Shader::NumDescriptors(descriptors)};
+            output_binding += count;
+            if (emulated) {
+                compute_resources += count;
+                if (category) {
+                    *category += count;
+                }
+            }
+        };
+        add(info.constant_buffer_descriptors, nullptr);
+        add(info.storage_buffers_descriptors, &compute_storage_buffers);
+        add(info.texture_buffer_descriptors, &compute_sampled_images);
+        add(info.image_buffer_descriptors, nullptr);
+        add(info.texture_descriptors, &compute_sampled_images);
+        add(info.image_descriptors, nullptr);
+    }
+    const bool fits_compute{compute_storage_buffers <=
+                                device.GetMaxPerStageDescriptorStorageBuffers() &&
+                            compute_sampled_images <=
+                                device.GetMaxPerStageDescriptorSampledImages() &&
+                            compute_resources <= device.GetMaxPerStageResources()};
     // A pipeline the device could build natively but that takes the emulation.
     bool routed_from_native{};
     if (!mesh_unsupported && device.IsExtMeshShaderSupported()) {
@@ -3756,6 +3859,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
             mesh_unsupported = true;
             routed_from_native = true;
+        } else if (eligible && fits_compute && MeshEmulatedByChoice(hash)) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+                LOG_WARNING(Render_Vulkan,
+                            "Mesh pipeline {:016x} (shaders{}) emulated by choice "
+                            "(EDEN_NX2_MESH_EMULATE)",
+                            hash, MeshPipelineShaders(key));
+            }
+            mesh_unsupported = true;
+            routed_from_native = true;
         }
         if (routed_from_native) {
             // Its indirect draws read their count on the CPU (DrawMeshTasksFromGpu).
@@ -3766,31 +3879,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // task program, drawing triangles, points or lines, before a pixel program only. Its
     // per-primitive generics are taken, a per-primitive id, layer or viewport index is not.
     std::optional<MeshEmulationSetup> mesh_emulation;
-    size_t mesh_index{};
     if (mesh_unsupported) {
         ReportUnsupportedMeshPipeline(key, programs);
-        const bool has_task{key.unique_hashes[1] != 0 &&
-                            programs[1].stage == Shader::Stage::Task};
-        for (size_t index = 1; index < Maxwell::MaxShaderProgram; ++index) {
-            if (key.unique_hashes[index] != 0 && programs[index].stage == Shader::Stage::Mesh) {
-                mesh_index = index;
-                break;
-            }
-        }
-        bool eligible{mesh_index != 0 && (mesh_index == 1 || has_task) &&
-                      layer_source_program == nullptr};
         const Shader::IR::Program& mesh{programs[mesh_index]};
-        // Points (0), lines (1) and triangles (4).
-        const u32 topology{mesh.mesh.topology};
-        eligible = eligible && (topology == 0 || topology == 1 || topology == 4) &&
-                   Shader::Backend::SPIRV::MeshEmulationTakesPrimitiveLines(mesh.mesh) &&
-                   !mesh.mesh.vertex_lines.empty() && mesh.mesh.max_vertices != 0 &&
-                   mesh.mesh.max_primitives != 0;
-        for (size_t index = 1; index < Maxwell::MaxShaderProgram && eligible; ++index) {
-            const bool emulated{index == mesh_index || (has_task && index == 1)};
-            eligible = emulated || key.unique_hashes[index] == 0 ||
-                       programs[index].stage == Shader::Stage::Fragment;
-        }
         // EDEN_NX2_NO_MESH_EMULATION=1: skip them all, as before mesh emulation.
         static const bool no_emulation{std::getenv("EDEN_NX2_NO_MESH_EMULATION") != nullptr};
         if (no_emulation) {
@@ -3814,40 +3905,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
             return nullptr;
         }
-        // The output buffer's binding follows every program's (unified bindings, one per
-        // descriptor element, as the SPIR-V backend numbers them). The task and mesh programs
-        // share the compute stage, so their descriptors and the emulation's own buffers count
-        // against one set of per-stage limits.
-        u32 output_binding{};
-        u32 compute_storage_buffers{has_task ? 4U : 1U};
-        u32 compute_sampled_images{};
-        u32 compute_resources{compute_storage_buffers};
-        for (size_t index = 1; index < Maxwell::MaxShaderProgram; ++index) {
-            if (key.unique_hashes[index] == 0) {
-                continue;
-            }
-            const Shader::Info& info{programs[index].info};
-            const bool emulated{index == mesh_index || (has_task && index == 1)};
-            const auto add = [&](const auto& descriptors, u32* category) {
-                const u32 count{Shader::NumDescriptors(descriptors)};
-                output_binding += count;
-                if (emulated) {
-                    compute_resources += count;
-                    if (category) {
-                        *category += count;
-                    }
-                }
-            };
-            add(info.constant_buffer_descriptors, nullptr);
-            add(info.storage_buffers_descriptors, &compute_storage_buffers);
-            add(info.texture_buffer_descriptors, &compute_sampled_images);
-            add(info.image_buffer_descriptors, nullptr);
-            add(info.texture_descriptors, &compute_sampled_images);
-            add(info.image_descriptors, nullptr);
-        }
-        if (compute_storage_buffers > device.GetMaxPerStageDescriptorStorageBuffers() ||
-            compute_sampled_images > device.GetMaxPerStageDescriptorSampledImages() ||
-            compute_resources > device.GetMaxPerStageResources()) {
+        if (!fits_compute) {
             LOG_WARNING(Render_Vulkan,
                         "Mesh emulation skipped for pipeline {:016x} (shaders{}): {} storage "
                         "buffers, {} sampled images and {} resources exceed the compute stage "

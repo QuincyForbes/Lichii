@@ -718,7 +718,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
 
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
-        scheduler.Record([this](vk::CommandBuffer) {
+        scheduler.RecordState([this](vk::CommandBuffer) {
             RunBuild();
             std::unique_lock lock{build_mutex};
             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
@@ -819,7 +819,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     if (deferred_bind) {
         *deferred_bind = std::move(bind);
     } else {
-        scheduler.Record(std::move(bind));
+        scheduler.RecordState(std::move(bind));
     }
     return true;
 }

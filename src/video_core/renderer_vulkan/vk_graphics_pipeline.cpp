@@ -82,6 +82,19 @@ bool TargetlessReachEnabled() {
     return enabled;
 }
 
+// A mesh emulation draw inside a render pass that began on a command buffer of its own runs its
+// compute on the command buffer before that pass (Scheduler::RecordBeforePass) instead of ending
+// and reopening it, when nothing in the pass so far can have changed what the compute reads: no
+// draw stored to memory, it samples none of the pass's targets, and it writes no guest memory.
+// EDEN_NX2_MESH_BEFORE_PASS=0 ends the pass as before.
+bool MeshBeforePassEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_MESH_BEFORE_PASS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 // EDEN_NX2_DRAW_REUSE_PROBE=1: how often a draw's setup (pipeline, texture handles and samplers,
 // constant buffer addresses, vertex streams, render targets) repeats, from frame to frame and
 // from the previous draw of the same pipeline: whether caching it can pay. Logged every 120 frames.
@@ -1216,6 +1229,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
+        mesh_samples_targets = mesh_emulation && texture_cache.SamplesRenderTarget(view_span);
         if (scheduler.HasFragmentBarrier() &&
             (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
             scheduler.RequestOutsideRenderPassOperationContext();
@@ -1303,10 +1317,20 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         // The mesh program runs as a compute dispatch outside the render pass and writes the
         // triangles the draw then reads; both use the descriptor set committed here.
         Common::PerfReport::Add(Common::PerfReport::MeshEmulatedDraws);
-        if (scheduler.IsRenderPassActive()) {
-            Common::PerfReport::Add(Common::PerfReport::MeshPassBreaks);
+        const Framebuffer* const framebuffer{texture_cache.GetFramebuffer()};
+        const bool own_pass{framebuffer != nullptr && scheduler.RenderPassMatches(framebuffer)};
+        const bool before_pass{own_pass && MeshBeforePassEnabled() &&
+                               scheduler.CanRecordBeforePass() &&
+                               !scheduler.RenderPassHasStores() && !writes_storage &&
+                               !mesh_samples_targets};
+        if (!before_pass) {
+            if (own_pass) {
+                Common::PerfReport::Add(Common::PerfReport::MeshPassBreaks);
+            } else if (scheduler.IsRenderPassActive()) {
+                Common::PerfReport::Add(Common::PerfReport::MeshPassLeaves);
+            }
+            scheduler.RequestOutsideRenderPassOperationContext();
         }
-        scheduler.RequestOutsideRenderPassOperationContext();
         if (!IsBuilt()) {
             scheduler.Record([this](vk::CommandBuffer) { build->Wait(!worker_only_build); });
         }
@@ -1336,7 +1360,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             const u32 first{maxwell3d->draw_manager.draw_state.vertex_buffer.first};
             (stage_infos[0].is_task ? draw_base.task : draw_base.mesh) = first;
         }
-        scheduler.Record([this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
+        auto emulate = [this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
                           task_buffers = mesh_task_buffers, reuse_mesh_descriptors,
                           reuse_distribution_set,
                           rescaling_data = rescaling.Data(), is_rescaling = texture_cache.IsRescaling(),
@@ -1470,7 +1494,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
-        });
+        };
+        if (before_pass) {
+            scheduler.RecordBeforePass(std::move(emulate), Common::PerfReport::MeshBeforePass);
+        } else {
+            scheduler.Record(std::move(emulate));
+        }
     }
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     scheduler.NotePassDraw();

@@ -1528,7 +1528,7 @@ void Scheduler::TraceComputePipeline(u64 hash) {
     if (!trace_query_pool) {
         return;
     }
-    Record([this, hash](vk::CommandBuffer) {
+    RecordState([this, hash](vk::CommandBuffer) {
         if (!trace_gpu_recording) {
             return;
         }

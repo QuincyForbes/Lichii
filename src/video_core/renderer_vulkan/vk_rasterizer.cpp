@@ -304,6 +304,38 @@ void RecordDispatchBarrier(vk::CommandBuffer cmdbuf) {
                            0, READ_BARRIER);
 }
 
+/// EDEN_NX2_DISPATCH_CHAIN: a guest dispatch recorded right after another one with only bindings
+/// between them (Scheduler::FollowsDispatch) records no barrier. Valid on MoltenVK only: both
+/// land in one serial Metal compute encoder, which runs its dispatches in order with the writes of
+/// each visible to the next, while any barrier ends that encoder (argument buffers with a
+/// residency set, MVKCmdPipelineBarrier::encode). =1 on MoltenVK, =force on every driver (tests
+/// only, not valid Vulkan), unset or 0 off.
+bool DispatchChainEnabled(const Device& device) {
+    static const int mode = [] {
+        const char* value = std::getenv("EDEN_NX2_DISPATCH_CHAIN");
+        if (value == nullptr || value[0] == '0') {
+            return 0;
+        }
+        return std::string_view{value} == "force" ? 2 : 1;
+    }();
+    return mode == 2 || (mode == 1 && device.IsMoltenVK());
+}
+
+/// Counts a guest dispatch about to be recorded; true when it may go without its barrier (it
+/// follows a dispatch, needs no copies of its own, and EDEN_NX2_DISPATCH_CHAIN allows it).
+bool CountDispatch(const Scheduler& scheduler, const Device& device, bool may_chain) {
+    Common::PerfReport::Add(Common::PerfReport::Dispatches);
+    if (!may_chain || !scheduler.FollowsDispatch()) {
+        return false;
+    }
+    Common::PerfReport::Add(Common::PerfReport::DispatchesChained);
+    if (!DispatchChainEnabled(device)) {
+        return false;
+    }
+    Common::PerfReport::Add(Common::PerfReport::DispatchBarriersSkipped);
+    return true;
+}
+
 bool DynamicStateCacheEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_DYNSTATE_CACHE");
@@ -2301,10 +2333,13 @@ void RasterizerVulkan::DispatchCompute() {
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.NoteComputeWrites();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
-        scheduler.Record([this, pipeline, byte_addressed_shadow,
+        const bool skip_barrier{CountDispatch(scheduler, device, !byte_addressed_shadow)};
+        scheduler.Record([this, pipeline, byte_addressed_shadow, skip_barrier,
                           indirect_buffer = buffer->Handle(),
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
-            RecordDispatchBarrier(cmdbuf);
+            if (!skip_barrier) {
+                RecordDispatchBarrier(cmdbuf);
+            }
             if (!pipeline->IsBound()) {
                 return;
             }
@@ -2318,6 +2353,9 @@ void RasterizerVulkan::DispatchCompute() {
                 TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
             }
         });
+        if (!byte_addressed_shadow) {
+            scheduler.NoteDispatchRecorded();
+        }
         compute_since_count_barrier = true;
         SubmitNx2ListCopies(pipeline->ShaderHash());
         return;
@@ -2368,8 +2406,10 @@ void RasterizerVulkan::DispatchCompute() {
                      hash);
         }
     }
+    const bool plain_dispatch{!can_replace && !can_bilinear && !byte_addressed_shadow};
+    const bool skip_barrier{CountDispatch(scheduler, device, plain_dispatch)};
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind),
-                      barrier_recorded = can_replace || can_bilinear, replacement,
+                      barrier_recorded = can_replace || can_bilinear || skip_barrier, replacement,
                       bilinear](vk::CommandBuffer cmdbuf) {
         if (!barrier_recorded) {
             RecordDispatchBarrier(cmdbuf);
@@ -2398,6 +2438,9 @@ void RasterizerVulkan::DispatchCompute() {
     if (can_replace || can_bilinear || marking_effects) {
         // The deferred native binding may follow DLSS's command buffer bindings.
         scheduler.InvalidateState();
+    }
+    if (plain_dispatch) {
+        scheduler.NoteDispatchRecorded();
     }
     compute_since_count_barrier = true;
     SubmitNx2ListCopies(pipeline->ShaderHash());
@@ -3982,7 +4025,9 @@ void RasterizerVulkan::TickPerfReport() {
              "last one left; attachments load {:.0f}, store {:.0f} MiB/frame; {:.1f} copies "
              "before their pass, {:.1f} clears kept), {:.1f} mesh "
              "emulated/frame "
-             "({:.1f} ended a render pass) | uploads MiB/s: textures {:.1f}, buffers {:.1f}, "
+             "({:.1f} ended a render pass, {:.1f} left one for another target, {:.1f} ran "
+             "before their pass), {:.1f} dispatches/frame ({:.1f} right after another, {:.1f} "
+             "without a barrier) | uploads MiB/s: textures {:.1f}, buffers {:.1f}, "
              "other {:.1f}, past the stream buffer {:.1f} | other: uniforms {:.1f} (padding "
              "{:.1f}), 8-bit indices {:.1f} | GPU scratch (mesh emulation) {:.1f} MiB/s | {} "
              "early submits, {} waits at the cap, {} mesh "
@@ -4011,7 +4056,12 @@ void RasterizerVulkan::TickPerfReport() {
              per_frame(Common::PerfReport::BeforePassCommands),
              per_frame(Common::PerfReport::DeferredClearsKept),
              per_frame(Common::PerfReport::MeshEmulatedDraws),
-             per_frame(Common::PerfReport::MeshPassBreaks), mib_per_second(texture_bytes),
+             per_frame(Common::PerfReport::MeshPassBreaks),
+             per_frame(Common::PerfReport::MeshPassLeaves),
+             per_frame(Common::PerfReport::MeshBeforePass),
+             per_frame(Common::PerfReport::Dispatches),
+             per_frame(Common::PerfReport::DispatchesChained),
+             per_frame(Common::PerfReport::DispatchBarriersSkipped), mib_per_second(texture_bytes),
              mib_per_second(buffer_bytes), mib_per_second(other_bytes),
              mib_per_second(delta(Common::PerfReport::StagingPooledBytes)),
              mib_per_second(delta(Common::PerfReport::UniformStreamBytes)),
