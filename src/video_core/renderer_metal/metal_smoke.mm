@@ -324,6 +324,22 @@ int RunRendererDraw() {
     const auto primitive =
         Metal::PrimitiveType(Metal::IndexConvert::ConvertedTopology(topology));
     scheduler.DrawIndexed(*primitive, count, 4, index_buffer.Get(), 0, 1, 0, 0);
+
+    // The right half: six vertices drawn from indirect arguments in the guest's layout
+    // (vertex count, instance count, first vertex, first instance).
+    uint8_t* right_vertices = nullptr;
+    const Metal::Object right_buffer = Metal::CreateBuffer(device, 48, true, &right_vertices);
+    const float right_positions[12]{0.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f,
+                                    0.0f, -1.0f, 1.0f, 1.0f,  0.0f, 1.0f};
+    std::memcpy(right_vertices, right_positions, sizeof(right_positions));
+    uint8_t* arguments = nullptr;
+    const Metal::Object argument_buffer = Metal::CreateBuffer(device, 16, true, &arguments);
+    const uint32_t draw_arguments[4]{6, 1, 0, 0};
+    std::memcpy(arguments, draw_arguments, sizeof(draw_arguments));
+    scheduler.BindVertexBuffer(Metal::VertexBufferSlot(0), right_buffer.Get(), 0);
+    scheduler.VisibilityResults()[1] = 0;
+    scheduler.SetVisibility(1);
+    scheduler.DrawIndirect(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), argument_buffer.Get(), 0);
     scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Size, Size, 1}, readback_buffer.Get(),
                                   0, Size * 4, 0);
     scheduler.Finish();
@@ -332,13 +348,17 @@ int RunRendererDraw() {
     const Texel left = texels[(Size / 2) * Size + 4];
     const Texel right = texels[(Size / 2) * Size + Size - 4];
     const uint64_t samples = scheduler.VisibilityResults()[0];
-    const bool drawn = Near(left, {0, 255, 0, 255}) && Near(right, {255, 0, 0, 255});
-    const bool counted = samples == uint64_t{Size} * Size / 2;
-    std::printf("metal-smoke: renderer quad (8-bit indices -> %u rewritten): left %u,%u,%u right "
-                "%u,%u,%u: %s; occlusion %llu samples (expected %u): %s\n",
+    const uint64_t indirect_samples = scheduler.VisibilityResults()[1];
+    const bool drawn = Near(left, {0, 255, 0, 255}) && Near(right, {0, 255, 0, 255});
+    const bool counted = samples == uint64_t{Size} * Size / 2 &&
+                         indirect_samples == uint64_t{Size} * Size / 2;
+    std::printf("metal-smoke: renderer quad (8-bit indices -> %u rewritten) + indirect draw: left "
+                "%u,%u,%u right %u,%u,%u: %s; occlusion %llu + %llu samples (expected %u each): "
+                "%s\n",
                 count, left.r, left.g, left.b, right.r, right.g, right.b,
                 drawn ? "PASS" : "FAIL", static_cast<unsigned long long>(samples),
-                Size * Size / 2, counted ? "PASS" : "FAIL");
+                static_cast<unsigned long long>(indirect_samples), Size * Size / 2,
+                counted ? "PASS" : "FAIL");
     return drawn && counted ? 0 : 1;
 }
 
