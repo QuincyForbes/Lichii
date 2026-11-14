@@ -177,6 +177,12 @@ draws the guest layers into the drawable and calls `presentDrawable:`.
 | M4 | Compute, queries, transform feedback, mesh emulation, OoT upscale replacement, MetalFX direct, frame gen, `Perf:`/`Perf passes:` | Kokiri at full quality; GPU ms comparable with MoltenVK |
 | M5 | Binary archive + ahead-of-time pack, MoltenVK-vs-Metal comparison on device | No compile stalls; the comparison table |
 
+State (2026-11-15, 3014c31ff2): M0-M2 done; M3 done for vertex + pixel pipelines (SPIR-V -> MSL
+run-verified on the macOS CI runner, draws compile-verified only); from M4, compute dispatches and
+the `Metal perf:` line. Open: queries, texel buffers, 8-bit indices, quads/fans/loops,
+tessellation/geometry/mesh, overlays in present, MetalFX direct, resolution scaling, M5.
+Switches: `EDEN_NX2_METAL_DRAW=0` (build pipelines, draw nothing), `EDEN_NX2_METAL_DISPATCH=0`.
+
 ## What can be checked where
 
 - Windows/Linux CI: nothing of Metal is compiled; the enum value and frontend hooks are.
