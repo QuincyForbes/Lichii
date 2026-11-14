@@ -632,18 +632,41 @@ endif()
 
 # The native Metal renderer (docs/nx2/metal-renderer.md), selectable next to Vulkan on Apple.
 cmake_dependent_option(ENABLE_METAL "Build the native Metal renderer (experimental)" ON "APPLE" OFF)
+option(LICHII_METAL_COMPILE_CHECK "Compile the Metal renderer's C++ part without Metal (check)" OFF)
+# The renderer's plain C++ part (caches, rasterizer) talks to Metal only through
+# metal_resources.h and metal_scheduler.h, so it compiles anywhere.
+set(METAL_RENDERER_CXX_SOURCES
+    renderer_metal/metal_buffer_cache.cpp
+    renderer_metal/metal_buffer_cache_base.cpp
+    renderer_metal/metal_fence_manager.cpp
+    renderer_metal/metal_rasterizer.cpp
+    renderer_metal/metal_staging_buffer_pool.cpp
+    renderer_metal/metal_texture_cache.cpp
+    renderer_metal/metal_texture_cache_base.cpp
+)
 if (ENABLE_METAL)
     set(METAL_RENDERER_SOURCES
         renderer_metal/metal_device.mm
+        renderer_metal/metal_object.mm
+        renderer_metal/metal_resources.mm
+        renderer_metal/metal_scheduler.mm
         renderer_metal/metal_swapchain.mm
         renderer_metal/renderer_metal.mm
     )
     target_sources(video_core PRIVATE
         ${METAL_RENDERER_SOURCES}
+        ${METAL_RENDERER_CXX_SOURCES}
+        renderer_metal/metal_bridge.h
+        renderer_metal/metal_buffer_cache.h
         renderer_metal/metal_device.h
-        renderer_metal/metal_rasterizer.cpp
+        renderer_metal/metal_fence_manager.h
+        renderer_metal/metal_object.h
         renderer_metal/metal_rasterizer.h
+        renderer_metal/metal_resources.h
+        renderer_metal/metal_scheduler.h
+        renderer_metal/metal_staging_buffer_pool.h
         renderer_metal/metal_swapchain.h
+        renderer_metal/metal_texture_cache.h
         renderer_metal/renderer_metal.h
     )
     # Objective-C++ through clang's C++ rule, as the MetalFX sources above.
@@ -664,6 +687,11 @@ if (ENABLE_METAL)
             COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
         target_link_libraries(lichii-metal-smoke PRIVATE "-framework Metal" "-framework Foundation")
     endif()
+elseif (LICHII_METAL_COMPILE_CHECK)
+    # Off by default: compiles (does not link) the plain C++ part on machines without Metal, to
+    # catch template errors before an Apple CI run.
+    add_library(video_core_metal_check OBJECT ${METAL_RENDERER_CXX_SOURCES})
+    target_link_libraries(video_core_metal_check PRIVATE video_core)
 endif()
 
 # Ocarina of Time's upscaler replaced live by NVIDIA DLSS or Apple MetalFX temporal upscaling

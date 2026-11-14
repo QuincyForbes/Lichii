@@ -3,39 +3,66 @@
 
 #pragma once
 
+#include <array>
+#include <optional>
 #include <utility>
 
 #include "common/common_types.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/renderer_metal/metal_buffer_cache.h"
+#include "video_core/renderer_metal/metal_fence_manager.h"
+#include "video_core/renderer_metal/metal_staging_buffer_pool.h"
+#include "video_core/renderer_metal/metal_texture_cache.h"
 
 namespace Tegra {
 class GPU;
-}
+struct FramebufferConfig;
+} // namespace Tegra
 
 namespace Metal {
 
+class Device;
+class Scheduler;
+
 class AccelerateDMA : public Tegra::Engines::AccelerateDMAInterface {
 public:
+    explicit AccelerateDMA(BufferCache& buffer_cache, TextureCache& texture_cache);
+
     bool BufferCopy(GPUVAddr start_address, GPUVAddr end_address, u64 amount) override;
     bool BufferClear(GPUVAddr src_address, u64 amount, u32 value) override;
     bool ImageToBuffer(const Tegra::DMA::ImageCopy& copy_info, const Tegra::DMA::ImageOperand& src,
-                       const Tegra::DMA::BufferOperand& dst) override {
-        return false;
-    }
+                       const Tegra::DMA::BufferOperand& dst) override;
     bool BufferToImage(const Tegra::DMA::ImageCopy& copy_info, const Tegra::DMA::BufferOperand& src,
-                       const Tegra::DMA::ImageOperand& dst) override {
-        return false;
-    }
+                       const Tegra::DMA::ImageOperand& dst) override;
+
+private:
+    template <bool IS_IMAGE_UPLOAD>
+    bool DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
+                            const Tegra::DMA::BufferOperand& buffer_operand,
+                            const Tegra::DMA::ImageOperand& image_operand);
+
+    BufferCache& buffer_cache;
+    TextureCache& texture_cache;
 };
 
-/// Takes the GPU's work. Milestone 1: like the null rasterizer, draws nothing and completes
-/// queries, fences and syncpoints at once, so games run while the renderer is brought up.
+/// The guest framebuffer a present shows, found in the texture cache.
+struct DisplayTexture {
+    TextureHandle texture{};
+    u32 width{};
+    u32 height{};
+    u32 scaled_width{};
+    u32 scaled_height{};
+};
+
+/// Takes the GPU's work into the texture and buffer caches. Milestone 2: memory, copies, blits,
+/// clears and DMA run on Metal; draws and dispatches are counted, not drawn (milestone 3).
 class RasterizerMetal final : public VideoCore::RasterizerInterface,
                               protected VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
 public:
-    explicit RasterizerMetal(Tegra::GPU& gpu);
+    explicit RasterizerMetal(Tegra::GPU& gpu, Tegra::MaxwellDeviceMemoryManager& device_memory,
+                             const Device& device, Scheduler& scheduler);
     ~RasterizerMetal() override;
 
     void Draw(bool is_indexed, u32 instance_count) override;
@@ -84,16 +111,42 @@ public:
     void BindChannel(Tegra::Control::ChannelState& channel) override;
     void ReleaseChannel(s32 channel_id) override;
 
-    /// Draws and dispatches taken since the last call (the renderer's 10 s report).
-    [[nodiscard]] std::pair<u64, u64> TakeWorkCounts() noexcept {
-        return {std::exchange(draws, 0), std::exchange(dispatches, 0)};
+    /// The texture cache's image at the framebuffer's address, if it has one.
+    [[nodiscard]] std::optional<DisplayTexture> AccelerateDisplay(
+        const Tegra::FramebufferConfig& config, DAddr framebuffer_addr);
+
+    /// Draws, dispatches and clears taken since the last call (the renderer's 10 s report).
+    [[nodiscard]] std::array<u64, 3> TakeWorkCounts() noexcept {
+        return {std::exchange(draws, 0), std::exchange(dispatches, 0), std::exchange(clears, 0)};
+    }
+
+    [[nodiscard]] const TextureCacheRuntime& TextureRuntime() const noexcept {
+        return texture_cache_runtime;
+    }
+
+    [[nodiscard]] const BufferCacheRuntime& BufferRuntime() const noexcept {
+        return buffer_cache_runtime;
     }
 
 private:
+    void QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType type,
+                       VideoCommon::QueryPropertiesFlags flags, u32 payload);
+
     Tegra::GPU& gpu;
+    Scheduler& scheduler;
+
+    StagingBufferPool staging_pool;
+    TextureCacheRuntime texture_cache_runtime;
+    TextureCache texture_cache;
+    BufferCacheRuntime buffer_cache_runtime;
+    BufferCache buffer_cache;
+    QueryCache query_cache;
     AccelerateDMA accelerate_dma;
+    FenceManager fence_manager;
+
     u64 draws{};
     u64 dispatches{};
+    u64 clears{};
 };
 
 } // namespace Metal

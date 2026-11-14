@@ -68,6 +68,20 @@ VideoCore::CreateRenderer (video_core.cpp)  -- RendererBackend::Metal
       FenceManager                       MTLSharedEvent ticks
 ```
 
+Code layout: only `metal_*.mm` files touch Metal. The caches, rasterizer, staging pool and the
+SPIR-V -> MSL translator are plain C++ that hold Metal objects as opaque retained handles
+(`metal_object.h`) and call Metal through `metal_resources.h` (textures, views, buffers,
+samplers, formats) and `metal_scheduler.h` (recording). With `-DLICHII_METAL_COMPILE_CHECK=ON`
+that C++ part compiles on Linux and Windows (`video_core_metal_check`), so template errors
+show before an Apple CI run.
+
+Bindings: the buffer cache runs in its Vulkan shape (`IS_OPENGL=false`): uniform, storage and
+texel buffers are appended in the order the recompiler declares them
+(`BufferCacheRuntime::PendingBindings`). The translator numbers MSL `[[buffer]]`, `[[texture]]`
+and `[[sampler]]` slots per kind in the same (set, binding) order and returns that table, so a
+pipeline binds the list in sequence. Streamed uniforms come from a 32 MiB ring in 16 regions
+(`StagingBufferPool::Stream`) with no padding past the used size.
+
 The frontends already hand a `CAMetalLayer` to the renderer for MoltenVK
 (`EmuWindow_SDL3_VK`, `QtCommon::GetWindowSystemInfo`), so Metal reuses those windows.
 
