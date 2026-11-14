@@ -1491,6 +1491,15 @@ bool RasterizerMetal::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surfa
     return texture_cache.BlitImage(dst, src, copy_config);
 }
 
+bool RasterizerMetal::AccelerateTemporalUpscale(
+    const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
+    const Tegra::Engines::Fermi2D::Surface& motion_vectors, const Tegra::Texture::TICEntry* depth,
+    std::array<f32, 2> jitter, std::array<f32, 2> motion_scale, bool use_history) {
+    std::scoped_lock lock{texture_cache.mutex};
+    return texture_cache.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
+                                          use_history);
+}
+
 Tegra::Engines::AccelerateDMAInterface& RasterizerMetal::AccessAccelerateDMA() {
     return accelerate_dma;
 }

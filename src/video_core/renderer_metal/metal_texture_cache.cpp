@@ -8,6 +8,8 @@
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "common/logging.h"
+#include "common/settings.h"
+#include "video_core/dlss_contract.h"
 #include "video_core/renderer_metal/metal_texture_cache.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/decode_bc.h"
@@ -251,6 +253,95 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
     if (!scheduler.Blit(pass)) {
         LOG_ONCE(warned_format, "Metal: a blit into format {} was dropped", dst.format);
     }
+}
+
+bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
+    return Settings::MetalFxTemporalChosen() && !temporal_unsupported;
+}
+
+bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst,
+                                          ImageView& input_color, ImageView& motion_vectors,
+                                          ImageView* depth, std::array<u32, 2> render_size,
+                                          std::array<f32, 2> jitter,
+                                          std::array<f32, 2> motion_scale, bool use_history) {
+    using PixelFormat = VideoCore::Surface::PixelFormat;
+    namespace DlssContract = VideoCommon::DlssContract;
+    if (!use_history || depth == nullptr || dst_framebuffer == nullptr ||
+        !WantsTemporalUpscaleDepth()) {
+        return false;
+    }
+    // Images are never rescaled on Metal: each view's size is its texture's.
+    const auto plain = [](const ImageView& view) {
+        return view.range.base.level == 0 && view.range.base.layer == 0;
+    };
+    const auto fits = [](const ImageView& view, std::array<u32, 2> requested) {
+        return DlssContract::FitsExtent(requested, {view.size.width, view.size.height});
+    };
+    const std::array<u32, 2> output_size{dst_framebuffer->Width(), dst_framebuffer->Height()};
+    if (!plain(dst) || !plain(input_color) || !plain(motion_vectors) || !plain(*depth) ||
+        dst_framebuffer->Samples() != 1 || !IsColor(dst.HostClass()) ||
+        !fits(input_color, render_size) || !fits(dst, output_size) ||
+        !fits(motion_vectors, render_size) || !fits(*depth, render_size) ||
+        motion_vectors.format != PixelFormat::R16G16_FLOAT ||
+        depth->format != PixelFormat::D32_FLOAT ||
+        input_color.ImageHandle() == dst.ImageHandle() ||
+        !DlssContract::ValidColorFormats(input_color.format, dst.format, use_history) ||
+        !DlssContract::ValidGeometry(render_size, output_size, jitter, motion_scale)) {
+        return false;
+    }
+    if (!temporal) {
+        if (!TemporalUpscaler::IsSupported(device)) {
+            LOG_WARNING(Render_Metal, "MetalFX temporal: not supported on this GPU");
+            temporal_unsupported = true;
+            return false;
+        }
+        temporal = std::make_unique<TemporalUpscaler>();
+    }
+    // A gap in the evaluations (a menu, a movie, a load) starts the history again.
+    const auto now = std::chrono::steady_clock::now();
+    const bool reset = !temporal_last_evaluation ||
+                       now - *temporal_last_evaluation > std::chrono::milliseconds{250};
+    temporal_last_evaluation = now;
+    const TextureHandle output = temporal->Upscale(
+        device, scheduler,
+        {
+            .color = input_color.Handle(Shader::TextureType::Color2D),
+            .depth = depth->Handle(Shader::TextureType::Color2D),
+            .motion = motion_vectors.Handle(Shader::TextureType::Color2D),
+            .render_size = render_size,
+            .output_size = output_size,
+            .jitter = jitter,
+            .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
+                                    motion_scale[1] * static_cast<f32>(render_size[1])},
+            .reset = reset,
+        });
+    if (output == nullptr) {
+        temporal_unsupported = true;
+        return false;
+    }
+    const s32 width = static_cast<s32>(output_size[0]);
+    const s32 height = static_cast<s32>(output_size[1]);
+    if (!scheduler.Blit(BlitPass{
+            .src = output,
+            .src_rect = {0, 0, width, height},
+            .dst = dst.RenderTarget(),
+            .dst_format = dst.HostFormat(),
+            .dst_rect = {0, 0, width, height},
+            .dst_width = output_size[0],
+            .dst_height = output_size[1],
+            .linear = false,
+            .keep_dst = true,
+        })) {
+        temporal_unsupported = true;
+        return false;
+    }
+    static bool logged{};
+    if (!logged) {
+        logged = true;
+        LOG_INFO(Render_Metal, "Metal: DLSS replaced by MetalFX temporal: {}x{} -> {}x{}",
+                 render_size[0], render_size[1], output_size[0], output_size[1]);
+    }
+    return true;
 }
 
 void TextureCacheRuntime::AccelerateImageUpload(Image&, const StagingBufferRef&,

@@ -659,6 +659,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_resources.mm
         renderer_metal/metal_scheduler.mm
         renderer_metal/metal_swapchain.mm
+        renderer_metal/metal_temporal.mm
         renderer_metal/renderer_metal.mm
     )
     target_sources(video_core PRIVATE
@@ -678,6 +679,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_shader_translate.h
         renderer_metal/metal_staging_buffer_pool.h
         renderer_metal/metal_swapchain.h
+        renderer_metal/metal_temporal.h
         renderer_metal/metal_texture_cache.h
         renderer_metal/renderer_metal.h
     )

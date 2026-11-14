@@ -7,6 +7,8 @@
 #pragma once
 
 #include <array>
+#include <chrono>
+#include <memory>
 #include <optional>
 #include <span>
 
@@ -16,6 +18,7 @@
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
+#include "video_core/renderer_metal/metal_temporal.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 
@@ -78,16 +81,14 @@ public:
                    Tegra::Engines::Fermi2D::Filter filter,
                    Tegra::Engines::Fermi2D::Operation operation);
 
-    /// The DLSS stand-ins (MetalFX temporal comes with milestone 4): the game keeps its own
-    /// upscaler.
-    bool TemporalUpscale(Framebuffer*, ImageView&, ImageView&, ImageView&, ImageView*,
-                         std::array<u32, 2>, std::array<f32, 2>, std::array<f32, 2>, bool) {
-        return false;
-    }
+    /// MetalFX temporal upscaling in place of the game's DLSS (the MetalFX Temporal scaling
+    /// filter); false leaves the game's own upscaler.
+    bool TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& input_color,
+                         ImageView& motion_vectors, ImageView* depth,
+                         std::array<u32, 2> render_size, std::array<f32, 2> jitter,
+                         std::array<f32, 2> motion_scale, bool use_history);
 
-    [[nodiscard]] bool WantsTemporalUpscaleDepth() const noexcept {
-        return false;
-    }
+    [[nodiscard]] bool WantsTemporalUpscaleDepth() const;
 
     [[nodiscard]] std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(ImageView&,
                                                                               ImageView&) {
@@ -122,6 +123,10 @@ public:
 
     /// GPU bytes the texture cache's textures hold.
     u64 allocated_bytes{};
+    std::unique_ptr<TemporalUpscaler> temporal;
+    bool temporal_unsupported{};
+    std::optional<std::chrono::steady_clock::time_point> temporal_last_evaluation;
+
     /// Shared buffer for reinterpreting copies, grown as needed.
     Object reinterpret_buffer;
     u64 reinterpret_buffer_size{};
