@@ -177,11 +177,15 @@ draws the guest layers into the drawable and calls `presentDrawable:`.
 | M4 | Compute, queries, transform feedback, mesh emulation, OoT upscale replacement, MetalFX direct, frame gen, `Perf:`/`Perf passes:` | Kokiri at full quality; GPU ms comparable with MoltenVK |
 | M5 | Binary archive + ahead-of-time pack, MoltenVK-vs-Metal comparison on device | No compile stalls; the comparison table |
 
-State (2026-11-15, 3014c31ff2): M0-M2 done; M3 done for vertex + pixel pipelines (SPIR-V -> MSL
-run-verified on the macOS CI runner, draws compile-verified only); from M4, compute dispatches and
-the `Metal perf:` line. Open: queries, texel buffers, 8-bit indices, quads/fans/loops,
-tessellation/geometry/mesh, overlays in present, MetalFX direct, resolution scaling, M5.
-Switches: `EDEN_NX2_METAL_DRAW=0` (build pipelines, draw nothing), `EDEN_NX2_METAL_DISPATCH=0`.
+State (2026-11-15, f4c5c10178): M0-M3 done (vertex + pixel pipelines); from M4: compute
+dispatches, indirect draws, texel buffers, index rewriting (quads, quad strips, fans, polygons,
+line loops, 8-bit indices), occlusion queries, all presented layers with blending, the GPU thread
+split, MetalFX spatial, the `Metal perf:` line. The macOS CI smoke test runs the translator, a
+rewritten-index draw and an indirect draw through the renderer's pipeline builder and render
+pass with occlusion counts, and a texel buffer read. Open: resolution scaling (games render at
+native size), tessellation/geometry/mesh, MetalFX temporal and frame generation, M5.
+Switches: `EDEN_NX2_METAL_DRAW=0` (build pipelines, draw nothing), `EDEN_NX2_METAL_DISPATCH=0`,
+`EDEN_NX2_METAL_SPLIT=0` (one GPU thread).
 
 ## What can be checked where
 
