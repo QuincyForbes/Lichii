@@ -581,6 +581,142 @@ int RunMeshEmulation() {
     return drawn ? 0 : 1;
 }
 
+constexpr const char* GroupMarkSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void mark_groups(device uint* marks [[buffer(0)]],
+                        uint group [[threadgroup_position_in_grid]]) {
+    marks[group] = 1;
+}
+)";
+
+/// Mesh emulation with a task program: the distribution pass through the translator, twice on
+/// one arena counter (the second limited by the arena's room), then an indirect dispatch from
+/// the arguments it wrote.
+int RunMeshDistribution() {
+    namespace SPIRV = Shader::Backend::SPIRV;
+    namespace Translate = Metal::ShaderTranslate;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const Shader::Profile profile{.supported_spirv = 0x00010300,
+                                  .unified_descriptor_binding = true};
+    const Translate::Result msl = Translate::SpirvToMsl(
+        SPIRV::EmitMeshEmulationDistribution(profile), Translate::Stage::Compute, {});
+    std::string error;
+    const Metal::Object library =
+        msl.source.empty() ? Metal::Object{} : Metal::CreateLibrary(device, msl.source, error);
+    const Metal::Object function =
+        library ? Metal::CreateFunction(library.Get(), msl.entry_point) : Metal::Object{};
+    const Metal::Object state =
+        function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                 : Metal::Object{};
+    const Metal::Object mark_library = Metal::CreateLibrary(device, GroupMarkSource, error);
+    const Metal::Object mark_function =
+        mark_library ? Metal::CreateFunction(mark_library.Get(), "mark_groups") : Metal::Object{};
+    const Metal::Object mark_state =
+        mark_function ? Metal::CreateComputePipelineState(device, mark_function.Get(), error)
+                      : Metal::Object{};
+    if (!state || !mark_state) {
+        std::printf("metal-smoke: FAIL distribution pipeline: %s %s\n%s\n", msl.error.c_str(),
+                    error.c_str(), msl.source.c_str());
+        return 1;
+    }
+    constexpr uint32_t PayloadWords = 4;
+    constexpr uint32_t BlockWords = 10;
+    constexpr uint32_t VerticesPerGroup = 6;
+    const auto buffer = [&](uint32_t words, uint8_t** contents) {
+        Metal::Object object = Metal::CreateBuffer(device, words * 4, true, contents);
+        std::memset(*contents, 0, words * 4);
+        return object;
+    };
+    struct Draw {
+        std::vector<uint32_t> requests;
+        uint8_t* payload{};
+        uint8_t* offsets{};
+        uint8_t* args{};
+        Metal::Object payload_buffer;
+        Metal::Object offsets_buffer;
+        Metal::Object args_buffer;
+    };
+    std::array<Draw, 2> draws{};
+    draws[0].requests = {3, 2};
+    draws[1].requests = {4};
+    uint8_t* counter = nullptr;
+    const Metal::Object counter_buffer = buffer(1, &counter);
+    uint8_t* marks = nullptr;
+    const Metal::Object marks_buffer = buffer(64, &marks);
+    // Room for seven blocks: the second draw gets two of the four it asks for.
+    constexpr uint32_t CapacityWords = 7 * BlockWords;
+    scheduler.BeginCompute(state.Get());
+    for (Draw& draw : draws) {
+        const uint32_t tasks = static_cast<uint32_t>(draw.requests.size());
+        draw.payload_buffer = buffer(tasks * PayloadWords, &draw.payload);
+        draw.offsets_buffer = buffer(tasks, &draw.offsets);
+        draw.args_buffer = buffer(SPIRV::MESH_EMULATION_ARGS_WORDS, &draw.args);
+        for (uint32_t task = 0; task < tasks; ++task) {
+            std::memcpy(draw.payload + (task * PayloadWords + 1) * 4, &draw.requests[task], 4);
+        }
+        const SPIRV::MeshEmulationDistributionConstants constants{
+            .tasks = tasks,
+            .payload_words = PayloadWords,
+            .capacity_words = CapacityWords,
+            .block_words = BlockWords,
+            .vertices_per_group = VerticesPerGroup,
+            .max_groups = 65535,
+        };
+        const std::array<void*, 4> buffers{draw.payload_buffer.Get(), draw.offsets_buffer.Get(),
+                                           draw.args_buffer.Get(), counter_buffer.Get()};
+        for (const Translate::ResourceSlot& slot : msl.slots) {
+            if (slot.kind != Translate::ResourceKind::Buffer) {
+                continue;
+            }
+            if (slot.set == Translate::PushConstantSet) {
+                scheduler.BindBytes(Metal::ShaderStage::Compute, slot.index, &constants,
+                                    sizeof(constants));
+            } else if (slot.binding < buffers.size()) {
+                scheduler.BindBuffer(Metal::ShaderStage::Compute, slot.index,
+                                     buffers[slot.binding], 0);
+            }
+        }
+        scheduler.Dispatch({1, 1, 1}, {1, 1, 1});
+    }
+    // The first draw's mesh dispatch, from its arguments.
+    scheduler.BeginCompute(mark_state.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, marks_buffer.Get(), 0);
+    scheduler.DispatchIndirect(draws[0].args_buffer.Get(), 0, {1, 1, 1});
+    scheduler.Finish();
+
+    const auto word = [](const uint8_t* data, uint32_t index) {
+        uint32_t value;
+        std::memcpy(&value, data + index * 4, 4);
+        return value;
+    };
+    const uint32_t draw_words = SPIRV::MESH_EMULATION_DRAW_ARGS_OFFSET / 4;
+    uint32_t marked = 0;
+    for (uint32_t group = 0; group < 64; ++group) {
+        marked += word(marks, group);
+    }
+    const bool first = word(draws[0].args, 0) == 5 && word(draws[0].args, draw_words) == 30 &&
+                       word(draws[0].args, SPIRV::MESH_EMULATION_ARGS_BASE) == 0 &&
+                       word(draws[0].offsets, 0) == 0 && word(draws[0].offsets, 1) == 3;
+    const bool second = word(draws[1].args, 0) == 2 &&
+                        word(draws[1].args, SPIRV::MESH_EMULATION_ARGS_REQUESTED) == 4 &&
+                        word(draws[1].args, draw_words) == 12 &&
+                        word(draws[1].args, SPIRV::MESH_EMULATION_ARGS_BASE) == 5 * BlockWords;
+    const bool counted = word(counter, 0) == 9 * BlockWords && marked == 5;
+    std::printf("metal-smoke: mesh distribution: draw 1 %u groups (%u vertices, base %u, offsets "
+                "%u %u), draw 2 %u of %u groups (base %u), counter %u words, %u groups "
+                "dispatched indirectly: %s\n",
+                word(draws[0].args, 0), word(draws[0].args, draw_words),
+                word(draws[0].args, SPIRV::MESH_EMULATION_ARGS_BASE), word(draws[0].offsets, 0),
+                word(draws[0].offsets, 1), word(draws[1].args, 0),
+                word(draws[1].args, SPIRV::MESH_EMULATION_ARGS_REQUESTED),
+                word(draws[1].args, SPIRV::MESH_EMULATION_ARGS_BASE), word(counter, 0), marked,
+                first && second && counted ? "PASS" : "FAIL");
+    return first && second && counted ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main() {
@@ -590,7 +726,8 @@ int main() {
             return 2;
         }
         int result = draw;
-        for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer, RunMeshEmulation}) {
+        for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer, RunMeshEmulation,
+                                 RunMeshDistribution}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }
