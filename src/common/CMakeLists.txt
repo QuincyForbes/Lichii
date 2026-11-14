@@ -106,6 +106,8 @@ add_library(
     parent_of_member.h
     perf_report.cpp
     perf_report.h
+    perf_sched.cpp
+    perf_sched.h
     platform_events.cpp
     platform_events.h
     point.h

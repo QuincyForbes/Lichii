@@ -17,6 +17,7 @@
 #include <fmt/format.h>
 #include "common/cpu_features.h"
 #include "common/logging.h"
+#include "common/perf_sched.h"
 #include "common/thread_cpu_clock.h"
 
 #ifdef _WIN32
@@ -266,6 +267,10 @@ void CoreTiming::WaitForEvent(s64 next_time, void* hires_timer) {
     const s64 sleep_ns = now - start;
     if (!signalled && next_time > now) {
         signalled = event.WaitFor(std::chrono::nanoseconds{next_time - now});
+    }
+    if (!signalled && Common::PerfReport::Enabled()) {
+        Common::PerfSched::g_timer_late.Add(
+            static_cast<u64>((std::max)(s64{0}, GetGlobalTimeNs().count() - next_time)));
     }
     if (!host_wait_stats.load(std::memory_order_relaxed)) {
         return;

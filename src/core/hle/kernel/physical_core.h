@@ -68,6 +68,8 @@ public:
     }
 
 private:
+    void NoteWakeAsked();
+
     const std::size_t m_core_index;
     std::mutex m_guard;
     // EDEN_NX2_CORE_LOCK: m_fast_guard replaces m_guard, and Idle sleeps on m_is_interrupted
@@ -77,6 +79,10 @@ private:
     Core::ArmInterface* m_arm_interface{};
     KThread* m_current_thread{};
     std::atomic<u32> m_is_interrupted{};
+    // "Perf sched:" wake latency: whether Idle sleeps, and when Interrupt first asked it to wake
+    // (host steady clock ns, 0 for not yet).
+    std::atomic<u32> m_nx2_idle_sleeping{};
+    std::atomic<u64> m_nx2_wake_asked{};
     bool m_is_single_core{};
 };
 

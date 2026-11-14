@@ -13,6 +13,7 @@
 #include "common/nx2_timeline.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/perf_sched.h"
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_event.h"
@@ -122,12 +123,14 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
 
     if (syncpoint_manager.IsFenceSignalled(params.fence)) {
         params.value.raw = syncpoint_manager.ReadSyncpointMinValue(fence_id);
+        Common::PerfSched::Add(Common::PerfSched::SyncptReached);
         return NvResult::Success;
     }
 
     if (const auto new_value = syncpoint_manager.UpdateMin(fence_id);
         syncpoint_manager.IsFenceSignalled(params.fence)) {
         params.value.raw = new_value;
+        Common::PerfSched::Add(Common::PerfSched::SyncptReached);
         return NvResult::Success;
     }
 
@@ -200,14 +203,20 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
     }
     params.value.raw |= slot;
 
-    event.wait_handle =
-        host1x_syncpoint_manager.RegisterHostAction(fence_id, target_value, [this, slot]() {
+    Common::PerfSched::Add(Common::PerfSched::SyncptArmed);
+    const u64 armed_ns = Common::PerfReport::Enabled() ? Common::PerfReport::NowNs() : 0;
+    event.wait_handle = host1x_syncpoint_manager.RegisterHostAction(
+        fence_id, target_value, [this, slot, armed_ns]() {
             auto& event_ = events[slot];
             if (event_.status.exchange(EventState::Signalling, std::memory_order_acq_rel) ==
                 EventState::Waiting) {
                 event_.kevent->Signal(system.Kernel());
             }
             event_.status.store(EventState::Signalled, std::memory_order_release);
+            if (armed_ns != 0) {
+                Common::PerfSched::Add(Common::PerfSched::SyncptWaitNs,
+                                       Common::PerfReport::NowNs() - armed_ns);
+            }
         });
     return NvResult::Timeout;
 }

@@ -10,6 +10,7 @@
 #include "common/bit_util.h"
 #include "common/fiber.h"
 #include "common/logging.h"
+#include "common/perf_sched.h"
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -498,6 +499,19 @@ void KScheduler::ScheduleImplFiber(KernelCore& kernel) {
 void KScheduler::Unload(KernelCore& kernel, KThread* thread) {
     kernel.PhysicalCore(m_core_id).SaveContext(thread);
 
+    // Before the context is unlocked: another core may take the thread right after.
+    if (thread->m_nx2_perf_slot >= 0) {
+        auto& perf = Common::PerfSched::g_guest_threads[static_cast<size_t>(thread->m_nx2_perf_slot)];
+        const u64 now = Common::PerfReport::NowNs();
+        if (thread->m_nx2_perf_run_since != 0) {
+            perf.run_ns.fetch_add(now - thread->m_nx2_perf_run_since, std::memory_order_relaxed);
+            thread->m_nx2_perf_run_since = 0;
+        }
+        if (thread->GetRawState() == ThreadState::Runnable) {
+            thread->m_nx2_perf_ready_since.store(now, std::memory_order_relaxed);
+        }
+    }
+
     // Check if the thread is terminated by checking the DPC flags.
     if ((thread->GetStackParameters().dpc_flags & static_cast<u32>(DpcFlag::Terminated)) == 0) {
         // Some libc++ lazily init mutex
@@ -510,6 +524,26 @@ void KScheduler::Unload(KernelCore& kernel, KThread* thread) {
 }
 
 void KScheduler::Reload(KernelCore& kernel, KThread* thread) {
+    if (thread->m_nx2_perf_slot >= 0) {
+        auto& perf = Common::PerfSched::g_guest_threads[static_cast<size_t>(thread->m_nx2_perf_slot)];
+        const u64 now = Common::PerfReport::NowNs();
+        if (const u64 since = thread->m_nx2_perf_ready_since.exchange(0, std::memory_order_relaxed);
+            since != 0 && now > since) {
+            const u64 waited = now - since;
+            perf.ready_ns.fetch_add(waited, std::memory_order_relaxed);
+            if (waited > perf.ready_max_ns.load(std::memory_order_relaxed)) {
+                perf.ready_max_ns.store(waited, std::memory_order_relaxed);
+            }
+        }
+        perf.switches.fetch_add(1, std::memory_order_relaxed);
+        if (thread->m_nx2_perf_core >= 0 && thread->m_nx2_perf_core != m_core_id) {
+            perf.core_changes.fetch_add(1, std::memory_order_relaxed);
+        }
+        perf.cores.fetch_or(1U << m_core_id, std::memory_order_relaxed);
+        perf.priority.store(thread->GetPriority(), std::memory_order_relaxed);
+        thread->m_nx2_perf_core = m_core_id;
+        thread->m_nx2_perf_run_since = now;
+    }
     kernel.PhysicalCore(m_core_id).LoadContext(thread);
 }
 
@@ -544,6 +578,16 @@ void KScheduler::OnThreadStateChanged(KernelCore& kernel, KThread* thread, Threa
             GetPriorityQueue(kernel).PushBack(thread);
             IncrementScheduledCount(thread);
             SetSchedulerUpdateNeeded(kernel);
+            if (Common::PerfReport::Enabled() && !thread->IsDummyThread()) {
+                if (thread->m_nx2_perf_slot == -2) {
+                    const KProcess* const owner = thread->GetOwnerProcess();
+                    thread->m_nx2_perf_slot = Common::PerfSched::AllocateGuestThread(
+                        thread->GetThreadId(),
+                        owner != nullptr && owner == kernel.ApplicationProcess());
+                }
+                thread->m_nx2_perf_ready_since.store(Common::PerfReport::NowNs(),
+                                                     std::memory_order_relaxed);
+            }
             // HACK: if this is a dummy thread, it should wake up when the scheduler
             // lock is released.
             if (thread->IsDummyThread())

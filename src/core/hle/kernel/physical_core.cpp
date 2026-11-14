@@ -17,6 +17,7 @@
 #endif
 #endif
 #include "common/perf_report.h"
+#include "common/perf_sched.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -344,6 +345,14 @@ void PhysicalCore::Idle(KernelCore& kernel) {
             }
         }
     }
+    m_nx2_idle_sleeping.store(1, std::memory_order_seq_cst);
+    SCOPE_EXIT {
+        m_nx2_idle_sleeping.store(0, std::memory_order_relaxed);
+        if (const u64 asked = m_nx2_wake_asked.exchange(0, std::memory_order_relaxed); asked != 0) {
+            const u64 now = Common::PerfReport::NowNs();
+            Common::PerfSched::g_core_wakes.Add(now > asked ? now - asked : 0);
+        }
+    };
     if (CoreLockEnabled()) {
         while (m_is_interrupted.load(std::memory_order_acquire) == 0) {
             Nx2Wait::Wait(m_is_interrupted, 0);
@@ -354,11 +363,21 @@ void PhysicalCore::Idle(KernelCore& kernel) {
     m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load() != 0; });
 }
 
+void PhysicalCore::NoteWakeAsked() {
+    if (m_nx2_idle_sleeping.load(std::memory_order_relaxed) != 0 &&
+        m_nx2_wake_asked.load(std::memory_order_relaxed) == 0 && Common::PerfReport::Enabled()) {
+        u64 expected = 0;
+        m_nx2_wake_asked.compare_exchange_strong(expected, Common::PerfReport::NowNs(),
+                                                 std::memory_order_relaxed);
+    }
+}
+
 bool PhysicalCore::IsInterrupted() const {
     return m_is_interrupted.load() != 0;
 }
 
 void PhysicalCore::Interrupt() {
+    NoteWakeAsked();
     if (CoreLockEnabled()) {
         Core::ArmInterface* arm_interface{};
         KThread* thread{};

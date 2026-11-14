@@ -1031,6 +1031,14 @@ public:
     u64 m_nx2_yield_run_start{};
     u64 m_nx2_yield_last{};
     u64 m_nx2_yield_regs{};
+
+    /// "Perf sched:" (KScheduler): the thread's slot in Common::PerfSched (-2 not asked for yet,
+    /// -1 none), the core it last ran on, and when it got that core and when it became ready
+    /// for one (host steady clock ns, 0 while not).
+    s32 m_nx2_perf_slot{-2};
+    s32 m_nx2_perf_core{-1};
+    u64 m_nx2_perf_run_since{};
+    std::atomic<u64> m_nx2_perf_ready_since{};
 };
 
 class KScopedDisableDispatch {

@@ -70,3 +70,22 @@ EDEN_NX2_FENCE_BATCH=1
 
 # Cap the texture cache's device memory (MiB) below what the graphics driver's budget allows.
 #EDEN_NX2_TC_CEILING_MIB=7680
+
+# --- CPU scheduling ---
+# Hex mask of guest cores whose host threads keep the top priority (and on Apple the performance
+# cores); the others run one class lower. On a 4-CPU host (2 fast + 2 slow, no pinning) Kokiri
+# Forest went from 52-53 to 66-70 fps with 03; no change with all 24 CPUs.
+#EDEN_NX2_GUEST_CORE_FIRST=03
+
+# Ocarina of Time: 0 keeps the game's own multi-core masks, 2 narrows each to the thread's ideal
+# core (default: widened to every core).
+#EDEN_NX2_OOT_WIDE_AFFINITY=0
+
+# Yield backoff: a gap between two yields longer than this (us, default 100) starts a new run;
+# with 0, changed callee-saved registers no longer start one. Ocarina of Time changes them at
+# every yield, so its backoff never sleeps; making it sleep cost about 60 % of the frame rate.
+#EDEN_NX2_YIELD_BACKOFF_GAP_US=100
+#EDEN_NX2_YIELD_BACKOFF_REGS=0
+
+# "Perf sched:" line (with EDEN_NX2_PERF_REPORT=1): list the busiest n guest threads (default 5).
+#EDEN_NX2_PERF_SCHED_THREADS=5

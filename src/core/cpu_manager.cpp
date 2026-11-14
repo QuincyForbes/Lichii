@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "common/dkb_cpu_trace.h"
 #include "common/fiber.h"
 #include "common/scope_exit.h"
@@ -178,8 +180,19 @@ void CpuManager::RunThread(std::stop_token token, std::size_t core) {
     system.RegisterCoreThread(core);
     std::string name = is_multicore ? ("CPUCore_" + std::to_string(core)) : std::string{"CPUThread"};
     Common::SetCurrentThreadName(name.c_str());
-    Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
-    Common::SetCurrentThreadToPerformanceCores();
+    // EDEN_NX2_GUEST_CORE_FIRST=<hex mask of guest cores>: only these cores' host threads get
+    // the top priority and the performance cores; the others run one class lower. On a phone
+    // with two performance cores, six equal host threads leave the choice to the OS.
+    static const unsigned long first_cores = [] {
+        const char* value = std::getenv("EDEN_NX2_GUEST_CORE_FIRST");
+        return value != nullptr && value[0] != '\0' ? std::strtoul(value, nullptr, 16) : ~0UL;
+    }();
+    if ((first_cores >> core & 1) != 0 || !is_multicore) {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+        Common::SetCurrentThreadToPerformanceCores();
+    } else {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+    }
     Common::PinCurrentThread(Common::PinnedRole::GuestCore);
     auto& data = core_data[core];
     data.host_context = Common::Fiber::ThreadToFiber();

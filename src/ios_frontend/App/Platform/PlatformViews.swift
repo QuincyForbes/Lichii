@@ -432,6 +432,10 @@ struct ExperimentsView: View {
     @State private var fenceSubmitEach = lichii_platform_experiment("fence_submit_each") != 0
     @State private var renderPassesOld = lichii_platform_experiment("render_passes_old") != 0
     @State private var ootGameUpscale = lichii_platform_experiment("oot_game_upscale") != 0
+    @State private var guestCoresFirst = lichii_platform_experiment("guest_cores_first") != 0
+    @State private var ootNarrowAffinity = lichii_platform_experiment("oot_narrow_affinity") != 0
+    @State private var ootIdealAffinity = lichii_platform_experiment("oot_ideal_affinity") != 0
+    @State private var guestIdleSpin = lichii_platform_experiment("guest_idle_spin") != 0
 
     var body: some View {
         List {
@@ -531,6 +535,29 @@ struct ExperimentsView: View {
                 Text("Performance")
             } footer: {
                 Text("For comparing builds. Old Texture Eviction reads textures the GPU drew back from the GPU before freeing them, a wait for the GPU each time, even when the game draws them again anyway. Helper Threads at Full Priority gives the timing and present threads the same priority as the game's. Frame Deadlines for the CPU tells iOS each frame's deadline, which may keep the game on the performance cores; untested on a device. Old JIT Tables keeps the translated code's bookkeeping as it was (about 0.3 GB more memory in Ocarina of Time); turn it on if a game that used to run crashes. Submit at Every Fence hands the GPU the game's work at every game fence, as before, instead of in batches of up to 2 ms (76-95 command buffers a frame in Ocarina of Time's Kokiri Forest on an iPhone); turn it on if the screen flashes white. Render Passes as Before ends the GPU's render pass for every buffer copy and parked clear, as before, instead of moving copies ahead of the pass (each ended pass stores and loads the whole screen again); turn it on if parts of the picture show stale or wrong data. Game's Own Upscale Pass runs Ocarina of Time's own upscale from its scene to the screen size, as before, instead of one bilinear tap whenever MetalFX Temporal doesn't take the frame (the game's pass was about 40 % of the phone's GPU time in Kokiri Forest); turn it on if the picture looks wrong.\n\nAll seven apply the next time Lichii starts.")
+            }
+
+            Section {
+                Toggle("Two Guest Cores First", isOn: $guestCoresFirst)
+                    .onChange(of: guestCoresFirst) { value in
+                        lichii_platform_set_experiment("guest_cores_first", value ? 1 : 0)
+                    }
+                Toggle("Game's Own Thread Cores", isOn: $ootNarrowAffinity)
+                    .onChange(of: ootNarrowAffinity) { value in
+                        lichii_platform_set_experiment("oot_narrow_affinity", value ? 1 : 0)
+                    }
+                Toggle("One Core per Game Thread", isOn: $ootIdealAffinity)
+                    .onChange(of: ootIdealAffinity) { value in
+                        lichii_platform_set_experiment("oot_ideal_affinity", value ? 1 : 0)
+                    }
+                Toggle("Idle Guest Cores Wait Briefly", isOn: $guestIdleSpin)
+                    .onChange(of: guestIdleSpin) { value in
+                        lichii_platform_set_experiment("guest_idle_spin", value ? 1 : 0)
+                    }
+            } header: {
+                Text("CPU Scheduling")
+            } footer: {
+                Text("For finding out why the game's CPU threads run on the efficiency cores. Two Guest Cores First leaves the top priority to two of the six emulated CPU cores and the graphics threads, and runs the other four one step lower, so iOS has fewer threads asking for its two performance cores (on a computer limited to four CPUs this gave Ocarina of Time 25 % more frames). Game's Own Thread Cores lets Ocarina of Time's main threads run only on the cores the game asks for, instead of on any core. One Core per Game Thread keeps each such thread on one core, so one host thread does its work; wins over Game's Own Thread Cores. Idle Guest Cores Wait Briefly keeps an emulated core that runs out of work polling for 20 µs before it sleeps, as on a computer, which saves a wake-up per hand-off but keeps a CPU busy.\n\nAll four apply the next time Lichii starts.")
             }
 
             Section {

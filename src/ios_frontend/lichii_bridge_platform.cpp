@@ -194,6 +194,24 @@ void ApplyMemoryBudgets(const LichiiDeviceDefaults& defaults) {
     RemoveLeftoverNupFiles();
 }
 
+void ApplyCpuExperiments() {
+    if (lichii_platform_experiment("guest_cores_first")) {
+        setenv("EDEN_NX2_GUEST_CORE_FIRST", "03", 1);
+        LOG_WARNING(Frontend, "iOS: experiment guest_cores_first on");
+    }
+    if (lichii_platform_experiment("oot_ideal_affinity")) {
+        setenv("EDEN_NX2_OOT_WIDE_AFFINITY", "2", 1);
+        LOG_WARNING(Frontend, "iOS: experiment oot_ideal_affinity on");
+    } else if (lichii_platform_experiment("oot_narrow_affinity")) {
+        setenv("EDEN_NX2_OOT_WIDE_AFFINITY", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment oot_narrow_affinity on");
+    }
+    if (lichii_platform_experiment("guest_idle_spin")) {
+        setenv("EDEN_NX2_IDLE_SPIN_US", "20", 1);
+        LOG_WARNING(Frontend, "iOS: experiment guest_idle_spin on");
+    }
+}
+
 void ApplyExperiments() {
     if (lichii_platform_experiment("untagged_guest")) {
         setenv("LICHII_IOS_UNTAGGED_GUEST", "1", 0);
@@ -278,6 +296,7 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_OOT_BILINEAR_UPSCALE", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment oot_game_upscale on");
     }
+    ApplyCpuExperiments();
 }
 
 LichiiThermalAdvice ComputeThermalAdvice(int thermal_state, int low_power_mode) {

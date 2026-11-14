@@ -34,6 +34,7 @@
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
 #include "common/host_memory.h"
+#include "common/perf_sched.h"
 #include "common/platform_events.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
@@ -3777,6 +3778,7 @@ void RasterizerVulkan::TickFrame() {
     }
     TickMemoryReport();
     TickPerfReport();
+    Common::PerfSched::TickFrame();
     scheduler.MarkPassTimesFrame();
     Common::TickFrameWorkgroup();
 }

@@ -33,6 +33,7 @@
 #include "common/div_ceil.h"
 #include "common/dkb_frame_trace.h"
 #include "common/game_presets.h"
+#include "common/perf_sched.h"
 #include "common/platform_events.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -295,17 +296,29 @@ private:
                                              static_cast<u32>(value),
                                              manager.GetGuestSyncpointValue(syncpoint));
         }
+        // "Perf sched:": how long the game's events wait for the GPU thread.
+        u64 armed_ns = 0;
+        if (Common::PerfReport::Enabled()) {
+            const bool reached = manager.IsReadyGuest(syncpoint, static_cast<u32>(value));
+            Common::PerfSched::Add(reached ? Common::PerfSched::SyncptReached
+                                           : Common::PerfSched::SyncptArmed);
+            armed_ns = reached ? 0 : Common::PerfReport::NowNs();
+        }
         // The action runs on the GPU thread under the manager's lock, or inline if the value is
         // already reached.
         request.handle = manager.RegisterGuestAction(
             syncpoint, static_cast<u32>(value),
-            [shared = m_shared, &kernel = system.Kernel(), &request, event] {
+            [shared = m_shared, &kernel = system.Kernel(), &request, event, armed_ns] {
                 std::scoped_lock lk{shared->mutex};
                 if (!shared->alive) {
                     return;
                 }
                 request.pending = false;
                 event->Signal(kernel);
+                if (armed_ns != 0) {
+                    Common::PerfSched::Add(Common::PerfSched::SyncptWaitNs,
+                                           Common::PerfReport::NowNs() - armed_ns);
+                }
             });
         TipcReplyWords(ctx, {});
     }
@@ -1909,6 +1922,13 @@ private:
             const auto to_us = [](auto d) -> long long {
                 return std::chrono::duration_cast<us>(d).count();
             };
+            const auto to_ns = [](auto d) {
+                return static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
+            };
+            Common::PerfSched::Add(Common::PerfSched::Presents);
+            Common::PerfSched::Add(Common::PerfSched::PresentFenceNs, to_ns(waited - entered));
+            Common::PerfSched::Add(Common::PerfSched::PresentPaceNs, to_ns(paced - composited));
             m_stats.fence_us += to_us(waited - entered);
             m_stats.composite_us += to_us(composited - waited);
             m_stats.pace_us += to_us(paced - composited);

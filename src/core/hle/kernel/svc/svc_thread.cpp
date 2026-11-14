@@ -14,6 +14,7 @@
 #include <thread>
 
 #include "common/perf_report.h"
+#include "common/perf_sched.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/arm/arm_interface.h"
@@ -51,12 +52,27 @@ struct YieldBackoff {
     u64 gate_ns; ///< Yielding to nobody this long before the first sleep
     u64 min_ns;
     u64 cap_ns;
+    u64 gap_ns; ///< A longer pause between two yields starts a new run
+    bool same_regs; ///< Changed callee-saved registers start a new run
 };
 
 /// EDEN_NX2_YIELD_BACKOFF: 0 off, 1 on, or <gate us>:<cap us>; unset follows guest_wait_backoff.
+/// EDEN_NX2_YIELD_BACKOFF_GAP_US=<n>: the pause between two yields that still counts as the same
+/// run (100). A host thread that lost its CPU between two yields exceeds it, so a loaded host
+/// needs a larger one for the backoff to ever sleep.
+/// EDEN_NX2_YIELD_BACKOFF_REGS=0: changed callee-saved registers no longer start a new run.
+/// Ocarina of Time changes them at every one of its ~100,000 yields to nobody per second (its
+/// job workers do work between yields), so the backoff never sleeps there; forced to (REGS=0 and
+/// a 100 us gate), Kokiri Forest fell from ~105 to ~38 fps on the PC.
 const YieldBackoff& YieldBackoffSetting() {
     static const YieldBackoff setting = [] {
-        YieldBackoff result{std::nullopt, 2'000'000, 10'000, 200'000};
+        YieldBackoff result{std::nullopt, 2'000'000, 10'000, 200'000, 100'000, true};
+        if (const char* regs = std::getenv("EDEN_NX2_YIELD_BACKOFF_REGS"); regs != nullptr) {
+            result.same_regs = regs[0] != '0';
+        }
+        if (const char* gap = std::getenv("EDEN_NX2_YIELD_BACKOFF_GAP_US"); gap != nullptr) {
+            result.gap_ns = static_cast<u64>(std::strtoull(gap, nullptr, 10)) * 1000;
+        }
         const char* value = std::getenv("EDEN_NX2_YIELD_BACKOFF");
         if (value == nullptr || value[0] == '\0') {
             return result;
@@ -66,9 +82,11 @@ const YieldBackoff& YieldBackoffSetting() {
             result.gate_ns = static_cast<u64>(std::strtoull(value, nullptr, 10)) * 1000;
             result.cap_ns = (std::max)(u64{10}, static_cast<u64>(std::strtoull(colon + 1, nullptr, 10))) * 1000;
         }
-        LOG_INFO(Kernel_SVC, "Yield backoff: {} (after {} us of yields to nobody, {}-{} us)",
+        LOG_INFO(Kernel_SVC,
+                 "Yield backoff: {} (after {} us of yields to nobody, {}-{} us, gaps to {} us, {})",
                  *result.forced ? "on" : "off", result.gate_ns / 1000, result.min_ns / 1000,
-                 result.cap_ns / 1000);
+                 result.cap_ns / 1000, result.gap_ns / 1000,
+                 result.same_regs ? "same registers" : "any registers");
         return result;
     }();
     return setting;
@@ -87,12 +105,15 @@ void YieldBackoffAfterYield(Core::System& system) {
     if (thread.GetYieldScheduleCount() != process.GetScheduledCount()) {
         // Another thread runs next: a real yield.
         thread.m_nx2_yield_run_start = 0;
+        Common::PerfSched::Add(Common::PerfSched::YieldRealYields);
         return;
     }
     Common::PerfReport::Add(Common::PerfReport::GuestFutileYields);
     if (!YieldBackoffEnabled()) {
+        Common::PerfSched::g_yield_backoff.store(0, std::memory_order_relaxed);
         return;
     }
+    Common::PerfSched::g_yield_backoff.store(1, std::memory_order_relaxed);
     const YieldBackoff& setting = YieldBackoffSetting();
     const auto steady_ns = [] {
         return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -108,9 +129,14 @@ void YieldBackoffAfterYield(Core::System& system) {
     for (size_t i = 19; i <= 28; ++i) {
         regs = (regs ^ context.r[i]) * 0x100000001B3ULL;
     }
-    constexpr u64 MaxGapNs = 100'000;
-    if (thread.m_nx2_yield_run_start == 0 || now - thread.m_nx2_yield_last > MaxGapNs ||
-        regs != thread.m_nx2_yield_regs) {
+    const bool regs_changed = setting.same_regs && regs != thread.m_nx2_yield_regs;
+    if (thread.m_nx2_yield_run_start == 0 || now - thread.m_nx2_yield_last > setting.gap_ns ||
+        regs_changed) {
+        Common::PerfSched::Add(thread.m_nx2_yield_run_start == 0
+                                   ? Common::PerfSched::YieldRunStarts
+                                   : regs_changed
+                                         ? Common::PerfSched::YieldRegResets
+                                         : Common::PerfSched::YieldGapResets);
         thread.m_nx2_yield_run_start = now;
         thread.m_nx2_yield_last = now;
         thread.m_nx2_yield_regs = regs;
@@ -119,6 +145,7 @@ void YieldBackoffAfterYield(Core::System& system) {
     thread.m_nx2_yield_last = now;
     const u64 run = now - thread.m_nx2_yield_run_start;
     if (run < setting.gate_ns) {
+        Common::PerfSched::Add(Common::PerfSched::YieldUnderGate);
         return;
     }
     const u64 sleep_ns = std::clamp(run / 8, setting.min_ns, setting.cap_ns);
@@ -137,14 +164,21 @@ void YieldBackoffAfterYield(Core::System& system) {
 // where the per-core job workers (priority 44) keep preempting them while cores 0-2 sit idle
 // about 30% of the time. Any mask of more than one core is widened to all of the process's cores,
 // so an idle core can take a preempted main thread. Pinned (single-core) threads are unchanged.
-// EDEN_NX2_OOT_WIDE_AFFINITY=0 turns it off.
-bool WidenAffinity(const KProcess& process, u64 affinity_mask) {
-    static const bool enabled = [] {
+// EDEN_NX2_OOT_WIDE_AFFINITY=0 turns it off; 2 narrows such a mask to the thread's ideal core
+// instead, so each thread stays on one host thread.
+enum class OotAffinity { Game, Wide, Ideal };
+
+OotAffinity OotAffinityMode(const KProcess& process, u64 affinity_mask) {
+    static const OotAffinity mode = [] {
         const char* value = std::getenv("EDEN_NX2_OOT_WIDE_AFFINITY");
-        return value == nullptr || value[0] != '0';
+        return value == nullptr ? OotAffinity::Wide
+               : value[0] == '0' ? OotAffinity::Game
+               : value[0] == '2' ? OotAffinity::Ideal
+                                 : OotAffinity::Wide;
     }();
-    return enabled && std::popcount(affinity_mask) > 1 &&
-           process.GetProgramId() == 0x0400486024DEC000ULL;
+    return std::popcount(affinity_mask) > 1 && process.GetProgramId() == 0x0400486024DEC000ULL
+               ? mode
+               : OotAffinity::Game;
 }
 
 } // Anonymous namespace
@@ -438,8 +472,12 @@ Result SetThreadCoreMask(Core::System& system, Handle thread_handle, s32 core_id
         // Validated against the real mask above; fold to the emulated cores from here on.
         affinity_mask = FoldExtraCoreMask(affinity_mask);
         core_id = FoldExtraCoreId(core_id);
-        if (WidenAffinity(GetCurrentProcess(system.Kernel()), affinity_mask)) {
+        const OotAffinity mode = OotAffinityMode(GetCurrentProcess(system.Kernel()), affinity_mask);
+        if (mode == OotAffinity::Wide) {
             affinity_mask = FoldExtraCoreMask(process_core_mask);
+        } else if (mode == OotAffinity::Ideal && IsValidVirtualCoreId(core_id) &&
+                   ((1ULL << core_id) & affinity_mask) != 0) {
+            affinity_mask = 1ULL << core_id;
         }
 
         // Validate the core id.

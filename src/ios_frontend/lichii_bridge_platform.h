@@ -199,6 +199,11 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// programs writing per-primitive attributes are built natively instead of emulated
 /// (EDEN_NX2_NATIVE_PER_PRIMITIVE=1). "mvk_shader_dump": MoltenVK writes each shader it converts
 /// (SPIR-V and Metal source) to dump/mvk-shaders (MVK_CONFIG_SHADER_DUMP_DIR).
+/// "guest_cores_first": only guest cores 0 and 1 run user-interactive, the other four
+/// user-initiated (EDEN_NX2_GUEST_CORE_FIRST=03). "oot_narrow_affinity": Ocarina of Time keeps its
+/// own thread core masks (EDEN_NX2_OOT_WIDE_AFFINITY=0); "oot_ideal_affinity": each narrowed to
+/// the thread's ideal core (=2), wins over narrow. "guest_idle_spin": an idle guest core polls
+/// 20 us before it blocks (EDEN_NX2_IDLE_SPIN_US=20).
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
 /// Guest memory in a file: as set in Experiments ("file_guest" / "file_guest_off"), else the
