@@ -98,18 +98,36 @@ struct StageProgram {
     bool build_failed{};
 };
 
-/// A task/mesh pipeline drawn through Vulkan's mesh emulation: the mesh program runs as a compute
-/// kernel (RuntimeInfo::mesh_as_compute) writing block_words words per workgroup to an output
-/// buffer, which the pipeline's vertex shader (EmitMeshEmulationVertex) draws as a list.
-struct MeshEmulation {
-    /// The mesh program as a kernel; its resources are the buffer cache's stage 0.
-    StageProgram compute;
+/// A compute kernel of the mesh emulation.
+struct MeshKernel {
+    StageProgram program;
     Object state;
     bool failed{};
+    std::array<u32, 3> workgroup_size{};
+};
+
+/// A task/mesh pipeline drawn through Vulkan's mesh emulation: the mesh program runs as a compute
+/// kernel (RuntimeInfo::mesh_as_compute) writing block_words words per workgroup to an output
+/// buffer, which the pipeline's vertex shader (EmitMeshEmulationVertex) draws as a list. With a
+/// task program, its kernel runs first, the distribution pass places the mesh workgroups the
+/// tasks asked for in the command buffer's output arena, and both the mesh dispatch and the draw
+/// are indirect.
+struct MeshEmulation {
+    /// The task program's kernel with a task program, else the mesh program's; its resources
+    /// are the buffer cache's stage 0.
+    MeshKernel first;
+    /// With a task program: the mesh program's kernel (buffer cache stage mesh_stage) and the
+    /// distribution pass (Shader::Backend::SPIRV::EmitMeshEmulationDistribution).
+    MeshKernel mesh;
+    MeshKernel distribution;
+    bool has_task{};
+    u32 mesh_stage{};
+    u32 payload_stride{}; ///< payload words per task workgroup
+    /// The output buffer's binding; with a task program the payload, offsets and arguments
+    /// buffers follow it.
     u32 output_binding{};
     u32 block_words{};
     u32 vertices_per_group{};
-    std::array<u32, 3> workgroup_size{};
     /// Maxwell PrimitiveTopology of the list: Points, Lines or Triangles.
     u32 topology{};
 };
@@ -125,8 +143,8 @@ public:
         return mesh ? &*mesh : nullptr;
     }
 
-    /// The mesh kernel's MTLComputePipelineState, made on first use; null when it fails.
-    [[nodiscard]] void* MeshState(const Device& device);
+    /// A mesh emulation kernel's MTLComputePipelineState, made on first use; null when it fails.
+    [[nodiscard]] void* KernelState(const Device& device, MeshKernel& kernel);
 
     [[nodiscard]] const GraphicsPipelineKey& Key() const noexcept {
         return key;
@@ -194,9 +212,10 @@ public:
 private:
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 
-    /// A pipeline whose program 1 is a mesh program (no task program), through the emulation.
-    std::unique_ptr<GraphicsPipeline> CreateMeshPipeline(
-        std::span<Shader::IR::Program> programs);
+    /// A pipeline whose program 1 is a mesh program, or a task program with the mesh program at
+    /// `mesh_index`, through the emulation.
+    std::unique_ptr<GraphicsPipeline> CreateMeshPipeline(std::span<Shader::IR::Program> programs,
+                                                         size_t mesh_index);
 
     std::unique_ptr<ComputePipeline> CreateComputePipeline(const ComputePipelineKey& key,
                                                            const VideoCommon::ShaderInfo* shader);

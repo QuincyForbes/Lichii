@@ -5,6 +5,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 #include "common/alignment.h"
@@ -12,6 +13,7 @@
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
@@ -140,7 +142,14 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         }
         CountOcclusion();
         const auto topology = static_cast<Maxwell::PrimitiveTopology>(mesh->topology);
-        scheduler.Draw(*PrimitiveType(topology), 0, groups * mesh->vertices_per_group, 1, 0);
+        if (mesh->has_task) {
+            // The distribution pass wrote the vertex count.
+            scheduler.DrawIndirect(*PrimitiveType(topology), mesh_buffers.args.buffer,
+                                   mesh_buffers.args.offset +
+                                       Shader::Backend::SPIRV::MESH_EMULATION_DRAW_ARGS_OFFSET);
+        } else {
+            scheduler.Draw(*PrimitiveType(topology), 0, groups * mesh->vertices_per_group, 1, 0);
+        }
         ++draws_encoded;
         ++mesh_draws;
         mesh_groups += groups;
@@ -260,15 +269,72 @@ std::vector<TextureHandle> RasterizerMetal::PrepareTexelBuffers(std::span<const 
     return result;
 }
 
-void RasterizerMetal::BindMeshOutput(const StageProgram& program, ShaderStage metal_stage,
-                                     u32 binding, const StagingBufferRef& output) {
+void RasterizerMetal::BindMeshBuffers(const StageProgram& program, ShaderStage metal_stage,
+                                      const MeshEmulation& mesh) {
+    // The output buffer's binding, then (with a task program) payload, offsets and arguments.
+    const std::array<const StagingBufferRef*, 4> buffers{
+        &mesh_buffers.output, &mesh_buffers.payload, &mesh_buffers.offsets, &mesh_buffers.args};
+    const size_t count = mesh.has_task ? buffers.size() : 1;
     for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
-        if (slot.kind == ShaderTranslate::ResourceKind::Buffer && slot.binding == binding &&
-            slot.set != ShaderTranslate::PushConstantSet) {
-            scheduler.BindBuffer(metal_stage, slot.index, output.buffer,
-                                 static_cast<u32>(output.offset));
+        if (slot.kind != ShaderTranslate::ResourceKind::Buffer ||
+            slot.set == ShaderTranslate::PushConstantSet || slot.binding < mesh.output_binding ||
+            slot.binding - mesh.output_binding >= count) {
+            continue;
+        }
+        const StagingBufferRef& buffer = *buffers[slot.binding - mesh.output_binding];
+        scheduler.BindBuffer(metal_stage, slot.index, buffer.buffer,
+                             static_cast<u32>(buffer.offset));
+    }
+}
+
+RasterizerMetal::MeshArena& RasterizerMetal::AcquireMeshArena() {
+    const u64 tick = scheduler.CurrentTick();
+    if (mesh_arena_current < mesh_arenas.size() && mesh_arenas[mesh_arena_current].tick == tick) {
+        return mesh_arenas[mesh_arena_current];
+    }
+    // At most four command buffers in flight hold one: past that, wait for the oldest.
+    constexpr size_t MaxMeshArenas = 4;
+    const auto reusable = [this](const MeshArena& arena) {
+        return arena.counted || scheduler.IsFree(arena.tick);
+    };
+    if (mesh_arenas.size() >= MaxMeshArenas && std::ranges::none_of(mesh_arenas, reusable)) {
+        scheduler.Wait(std::ranges::min_element(mesh_arenas, {}, &MeshArena::tick)->tick);
+    }
+    // A finished command buffer's counter holds the words its draws asked for, including those
+    // that did not fit: later arenas grow to hold them.
+    constexpr u64 MaxArenaSize = u64{1} << 30;
+    for (MeshArena& arena : mesh_arenas) {
+        if (arena.counted || !scheduler.IsFree(arena.tick)) {
+            continue;
+        }
+        arena.counted = true;
+        u32 words;
+        std::memcpy(&words, arena.counter_contents, sizeof(words));
+        const u64 needed = u64{words} * sizeof(u32);
+        if (needed > arena.size && mesh_arena_size < MaxArenaSize) {
+            mesh_arena_size = (std::min)(std::bit_ceil(needed + needed / 4), MaxArenaSize);
+            LOG_INFO(Render_Metal,
+                     "Metal: mesh emulation output of a command buffer needed {} MiB, arenas grow "
+                     "to {} MiB",
+                     needed >> 20, mesh_arena_size >> 20);
         }
     }
+    std::erase_if(mesh_arenas, [this](const MeshArena& arena) {
+        return arena.counted && arena.size != mesh_arena_size;
+    });
+    auto it = std::ranges::find_if(mesh_arenas, &MeshArena::counted);
+    if (it == mesh_arenas.end()) {
+        MeshArena arena{.size = mesh_arena_size};
+        arena.buffer = CreateBuffer(device, mesh_arena_size, false, nullptr);
+        arena.counter = CreateBuffer(device, sizeof(u32), true, &arena.counter_contents);
+        it = mesh_arenas.insert(mesh_arenas.end(), std::move(arena));
+    }
+    // The GPU is done with it, and this command buffer has not been committed.
+    std::memset(it->counter_contents, 0, sizeof(u32));
+    it->tick = tick;
+    it->counted = false;
+    mesh_arena_current = static_cast<size_t>(std::distance(mesh_arenas.begin(), it));
+    return *it;
 }
 
 void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage metal_stage,
@@ -364,12 +430,18 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
 }
 
 bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups) {
-    // Buffer cache stage indices (vertex B, pixel) and the translated programs. An emulated mesh
-    // pipeline's stage 0 is its mesh kernel, dispatched before the render pass.
-    constexpr std::array<size_t, 2> stages{0, 4};
+    // Buffer cache stage indices (vertex B, the mesh program after a task program, pixel) and
+    // the translated programs. An emulated mesh pipeline's stage 0 is its task or mesh kernel,
+    // dispatched before the render pass.
     MeshEmulation* const mesh = pipeline.Mesh();
-    const std::array<StageProgram*, 2> programs{mesh != nullptr ? &mesh->compute : &pipeline.Vertex(),
-                                                &pipeline.Fragment()};
+    const bool has_task = mesh != nullptr && mesh->has_task;
+    const std::array<size_t, 3> stages{0, has_task ? size_t{mesh->mesh_stage} : 0, 4};
+    const std::array<StageProgram*, 3> programs{
+        mesh != nullptr ? &mesh->first.program : &pipeline.Vertex(),
+        has_task ? &mesh->mesh.program : nullptr, &pipeline.Fragment()};
+    const auto absent = [&](size_t index) {
+        return programs[index] == nullptr || programs[index]->msl.empty();
+    };
     const auto& regs = maxwell3d->regs;
     const Maxwell::PrimitiveTopology topology =
         mesh != nullptr ? static_cast<Maxwell::PrimitiveTopology>(mesh->topology)
@@ -377,7 +449,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
 
     std::array<u32, VideoCommon::NUM_STAGES> uniform_masks{};
     for (size_t index = 0; index < stages.size(); ++index) {
-        if (programs[index]->msl.empty()) {
+        if (absent(index)) {
             continue;
         }
         const Shader::Info& info = programs[index]->info;
@@ -392,13 +464,13 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     // Storage buffers, and every texture and image handle, as OpenGL's ConfigureImpl reads them.
     std::vector<VideoCommon::ImageViewInOut> views;
     std::vector<VideoCommon::SamplerId> samplers;
-    std::array<size_t, 2> first_view{};
-    std::array<size_t, 2> first_sampler{};
+    std::array<size_t, 3> first_view{};
+    std::array<size_t, 3> first_sampler{};
     const bool via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
     for (size_t index = 0; index < stages.size(); ++index) {
         first_view[index] = views.size();
         first_sampler[index] = samplers.size();
-        if (programs[index]->msl.empty()) {
+        if (absent(index)) {
             continue;
         }
         const size_t stage = stages[index];
@@ -469,7 +541,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
 
     // Texel buffers come from the buffer cache.
     for (size_t index = 0; index < stages.size(); ++index) {
-        if (programs[index]->msl.empty()) {
+        if (absent(index)) {
             continue;
         }
         const size_t stage = stages[index];
@@ -501,10 +573,10 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
 
     // Each stage's buffer bindings, and texel buffer views (copies of misaligned ranges go
     // before the render pass).
-    std::array<std::vector<Binding>, 2> stage_bindings;
-    std::array<std::vector<TextureHandle>, 2> texel_views;
+    std::array<std::vector<Binding>, 3> stage_bindings;
+    std::array<std::vector<TextureHandle>, 3> texel_views;
     for (size_t index = 0; index < stages.size(); ++index) {
-        if (programs[index]->msl.empty()) {
+        if (absent(index)) {
             continue;
         }
         buffer_cache_runtime.PendingBindings().clear();
@@ -602,21 +674,79 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         depth_stencil_state = CreateDepthStencilState(device, depth_stencil);
     }
 
-    StagingBufferRef mesh_output{};
     if (mesh != nullptr) {
-        void* const kernel = pipeline.MeshState(device);
-        if (kernel == nullptr || mesh_workgroups == 0) {
+        void* const first = pipeline.KernelState(device, mesh->first);
+        void* const mesh_kernel = has_task ? pipeline.KernelState(device, mesh->mesh) : nullptr;
+        void* const distribution =
+            has_task ? pipeline.KernelState(device, mesh->distribution) : nullptr;
+        if (first == nullptr || mesh_workgroups == 0 ||
+            (has_task && (mesh_kernel == nullptr || distribution == nullptr))) {
             return false;
         }
-        mesh_output = staging_pool.Stream(
-            (std::max)(u64{mesh_workgroups} * mesh->block_words * sizeof(u32), u64{16}), 16);
-        scheduler.BeginCompute(kernel);
-        BindStageResources(mesh->compute, ShaderStage::Compute, stage_bindings[0], texel_views[0],
-                           std::span(views).subspan(first_view[0]),
-                           std::span(samplers).subspan(first_sampler[0]), targets.width,
-                           targets.height);
-        BindMeshOutput(mesh->compute, ShaderStage::Compute, mesh->output_binding, mesh_output);
-        scheduler.Dispatch({mesh_workgroups, 1, 1}, mesh->workgroup_size);
+        namespace SPIRV = Shader::Backend::SPIRV;
+        mesh_buffers = {};
+        u32 capacity_words = 0;
+        if (has_task) {
+            // The mesh workgroups the tasks ask for are only known on the GPU: their output goes
+            // to the command buffer's arena.
+            MeshArena& arena = AcquireMeshArena();
+            mesh_buffers.output = {.buffer = arena.buffer.Get()};
+            mesh_buffers.counter = {.buffer = arena.counter.Get()};
+            capacity_words = static_cast<u32>(arena.size / sizeof(u32));
+            const auto stream = [&](u64 size) {
+                return staging_pool.Stream((std::max)(size, u64{16}), 16);
+            };
+            mesh_buffers.payload = stream(u64{mesh_workgroups} * mesh->payload_stride * 4);
+            mesh_buffers.offsets = stream(u64{mesh_workgroups} * 4);
+            mesh_buffers.args = stream(SPIRV::MESH_EMULATION_ARGS_WORDS * 4);
+        } else {
+            mesh_buffers.output = staging_pool.Stream(
+                (std::max)(u64{mesh_workgroups} * mesh->block_words * sizeof(u32), u64{16}), 16);
+        }
+        const auto begin_kernel = [&](size_t index, MeshKernel& kernel, void* kernel_state) {
+            scheduler.BeginCompute(kernel_state);
+            BindStageResources(kernel.program, ShaderStage::Compute, stage_bindings[index],
+                               texel_views[index], std::span(views).subspan(first_view[index]),
+                               std::span(samplers).subspan(first_sampler[index]), targets.width,
+                               targets.height);
+            BindMeshBuffers(kernel.program, ShaderStage::Compute, *mesh);
+        };
+        begin_kernel(0, mesh->first, first);
+        scheduler.Dispatch({mesh_workgroups, 1, 1}, mesh->first.workgroup_size);
+        if (has_task) {
+            // The distribution pass: payload, offsets, arguments and the arena counter at
+            // bindings 0-3, and its constants.
+            const SPIRV::MeshEmulationDistributionConstants constants{
+                .tasks = mesh_workgroups,
+                .payload_words = mesh->payload_stride,
+                .capacity_words = capacity_words,
+                .block_words = mesh->block_words,
+                .vertices_per_group = mesh->vertices_per_group,
+                // Vulkan's guaranteed maxComputeWorkGroupCount[0].
+                .max_groups = 65535,
+            };
+            const std::array<const StagingBufferRef*, 4> distribution_buffers{
+                &mesh_buffers.payload, &mesh_buffers.offsets, &mesh_buffers.args,
+                &mesh_buffers.counter};
+            scheduler.BeginCompute(distribution);
+            for (const ShaderTranslate::ResourceSlot& slot : mesh->distribution.program.slots) {
+                if (slot.kind != ShaderTranslate::ResourceKind::Buffer) {
+                    continue;
+                }
+                if (slot.set == ShaderTranslate::PushConstantSet) {
+                    scheduler.BindBytes(ShaderStage::Compute, slot.index, &constants,
+                                        static_cast<u32>(sizeof(constants)));
+                } else if (slot.binding < distribution_buffers.size()) {
+                    const StagingBufferRef& buffer = *distribution_buffers[slot.binding];
+                    scheduler.BindBuffer(ShaderStage::Compute, slot.index, buffer.buffer,
+                                         static_cast<u32>(buffer.offset));
+                }
+            }
+            scheduler.Dispatch({1, 1, 1}, {1, 1, 1});
+            begin_kernel(1, mesh->mesh, mesh_kernel);
+            scheduler.DispatchIndirect(mesh_buffers.args.buffer, mesh_buffers.args.offset,
+                                       mesh->mesh.workgroup_size);
+        }
     }
 
     scheduler.BeginRendering(targets);
@@ -721,17 +851,15 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     // Each stage's buffers (appended by the buffer cache in binding order), textures, samplers
     // and images, into the slots the translator gave them.
     for (size_t index = 0; index < stages.size(); ++index) {
-        StageProgram& program = *programs[index];
-        if (program.msl.empty()) {
+        if (absent(index) || index == 1) {
             continue;
         }
-        const size_t stage = stages[index];
         const ShaderStage metal_stage = index == 0 ? ShaderStage::Vertex : ShaderStage::Fragment;
         if (index == 0 && mesh != nullptr) {
-            BindMeshOutput(pipeline.Vertex(), metal_stage, mesh->output_binding, mesh_output);
+            BindMeshBuffers(pipeline.Vertex(), metal_stage, *mesh);
             continue;
         }
-        BindStageResources(program, metal_stage, stage_bindings[index], texel_views[index],
+        BindStageResources(*programs[index], metal_stage, stage_bindings[index], texel_views[index],
                            std::span(views).subspan(first_view[index]),
                            std::span(samplers).subspan(first_sampler[index]), targets.width,
                            targets.height);

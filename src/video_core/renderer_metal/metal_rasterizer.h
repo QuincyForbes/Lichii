@@ -161,9 +161,21 @@ private:
     /// Binds everything the draw needs and opens its render pass; false to skip it.
     bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups = 0);
 
-    /// Binds the mesh emulation's output buffer to the program's slot of inding.
-    void BindMeshOutput(const StageProgram& program, ShaderStage metal_stage, u32 binding,
-                        const StagingBufferRef& output);
+    /// Binds mesh_buffers to the program's slots of the emulation's bindings.
+    void BindMeshBuffers(const StageProgram& program, ShaderStage metal_stage,
+                         const MeshEmulation& mesh);
+
+    struct MeshArena {
+        Object buffer;
+        Object counter;
+        u8* counter_contents{};
+        u64 size{};
+        u64 tick{};
+        bool counted{}; ///< the counter of its last command buffer was read
+    };
+
+    /// The output arena of the command buffer being recorded (task programs' mesh output).
+    [[nodiscard]] MeshArena& AcquireMeshArena();
 
     /// texture_buffer views of a stage's texel buffer bindings, in order (null where none can be
     /// made). Ranges at offsets Metal can't view are read through an aligned copy.
@@ -239,6 +251,18 @@ private:
     u64 draws_converted{};
     u64 mesh_draws{};
     u64 mesh_groups{};
+
+    /// The mesh emulation buffers of the draw being prepared.
+    struct MeshBuffers {
+        StagingBufferRef output;
+        StagingBufferRef payload;
+        StagingBufferRef offsets;
+        StagingBufferRef args;
+        StagingBufferRef counter;
+    } mesh_buffers;
+    std::vector<MeshArena> mesh_arenas;
+    size_t mesh_arena_current{~size_t{}};
+    u64 mesh_arena_size{u64{32} << 20};
     /// Guest index data read for draws whose indices are rewritten.
     std::vector<u8> converted_source;
     u64 dispatches{};

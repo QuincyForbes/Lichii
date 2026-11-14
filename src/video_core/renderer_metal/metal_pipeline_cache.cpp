@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <atomic>
 
 #ifdef __APPLE__
@@ -79,27 +80,27 @@ GraphicsPipeline::GraphicsPipeline(const GraphicsPipelineKey& key_, StageProgram
     : key{key_}, vertex{std::move(vertex_)}, fragment{std::move(fragment_)},
       mesh{std::move(mesh_)} {}
 
-void* GraphicsPipeline::MeshState(const Device& device) {
-    if (!mesh || mesh->state || mesh->failed) {
-        return mesh ? mesh->state.Get() : nullptr;
+void* GraphicsPipeline::KernelState(const Device& device, MeshKernel& kernel) {
+    if (kernel.state || kernel.failed) {
+        return kernel.state.Get();
     }
-    StageProgram& program = mesh->compute;
+    StageProgram& program = kernel.program;
     std::string error;
     program.library = CreateLibrary(device, program.msl, error);
     program.function =
         program.library ? CreateFunction(program.library.Get(), program.entry_point) : Object{};
     if (program.function) {
-        mesh->state = CreateComputePipelineState(device, program.function.Get(), error);
+        kernel.state = CreateComputePipelineState(device, program.function.Get(), error);
     }
-    if (!mesh->state) {
-        mesh->failed = true;
+    if (!kernel.state) {
+        kernel.failed = true;
         static std::atomic<u32> logged{};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-            LOG_ERROR(Render_Metal, "Metal: mesh kernel {:016x} failed to build: {}",
+            LOG_ERROR(Render_Metal, "Metal: mesh emulation kernel of {:016x} failed to build: {}",
                       key.unique_hashes[1], error);
         }
     }
-    return mesh->state.Get();
+    return kernel.state.Get();
 }
 
 bool GraphicsPipeline::BuildFunctions(const Device& device) {
@@ -304,23 +305,21 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() try {
     const bool uses_vertex_a = key.unique_hashes[0] != 0;
     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
     size_t env_index = 0;
-    bool mesh = false;
+    bool task = false;
+    size_t mesh_index = 0;
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
         if (key.unique_hashes[index] == 0) {
             continue;
         }
         Shader::Environment& env = *environments.Span()[env_index++];
         const Shader::Stage stage = env.ShaderStage();
-        if (stage == Shader::Stage::Task) {
-            LogRefusal(unsupported_logged, hash, "task program (not emulated yet)");
+        if (stage == Shader::Stage::Task && index == 1) {
+            task = true;
+        } else if (stage == Shader::Stage::Mesh && (index == 1 || task) && mesh_index == 0) {
+            mesh_index = index;
+        } else if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
+            LogRefusal(unsupported_logged, hash, "task or mesh program out of place");
             return nullptr;
-        }
-        if (stage == Shader::Stage::Mesh) {
-            if (index != 1) {
-                LogRefusal(unsupported_logged, hash, "mesh program after a task program");
-                return nullptr;
-            }
-            mesh = true;
         } else if (index >= 2 && index <= 4) {
             // Metal draws with a vertex and a fragment stage; tessellation and geometry need
             // emulation.
@@ -340,8 +339,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() try {
         LogRefusal(unsupported_logged, hash, "no vertex program");
         return nullptr;
     }
-    if (mesh) {
-        return CreateMeshPipeline(programs);
+    if (task && mesh_index == 0) {
+        LogRefusal(unsupported_logged, hash, "task program without a mesh program");
+        return nullptr;
+    }
+    if (mesh_index != 0) {
+        return CreateMeshPipeline(programs, mesh_index);
     }
 
     Shader::Backend::Bindings bindings;
@@ -379,11 +382,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() try {
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateMeshPipeline(
-    std::span<Shader::IR::Program> programs) {
+    std::span<Shader::IR::Program> programs, size_t mesh_index) {
     const GraphicsPipelineKey& key = graphics_key;
     const u64 hash = key.Hash();
     static std::atomic<u32> refused_logged{};
-    Shader::IR::Program& mesh = programs[1];
+    const bool has_task = mesh_index != 1;
+    Shader::IR::Program& mesh = programs[mesh_index];
     // As Vulkan's emulation takes them: points, lines or triangles, before a pixel program only.
     const u32 topology = mesh.mesh.topology;
     if ((topology != 0 && topology != 1 && topology != 4) ||
@@ -395,7 +399,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateMeshPipeline(
     }
     // The output buffer's binding follows every program's (unified bindings).
     u32 output_binding = 0;
-    for (const size_t index : {1, 5}) {
+    for (size_t index = 1; index < Maxwell::MaxShaderProgram; ++index) {
         if (key.unique_hashes[index] == 0) {
             continue;
         }
@@ -407,17 +411,58 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateMeshPipeline(
                           Shader::NumDescriptors(info.texture_descriptors) +
                           Shader::NumDescriptors(info.image_descriptors);
     }
+    const u32 payload_stride = has_task ? (std::max)(programs[1].mesh.payload_words, 2U) : 0U;
     Shader::Backend::Bindings bindings;
-    Shader::RuntimeInfo mesh_info;
-    mesh_info.previous_stage_stores.mask.set();
-    mesh_info.mesh_as_compute = true;
-    mesh_info.mesh_output_binding = output_binding;
-    auto compute = Translate(mesh, ShaderTranslate::Stage::Compute, bindings, mesh_info);
-    if (!compute) {
-        return nullptr;
+    Shader::RuntimeInfo kernel_info;
+    kernel_info.previous_stage_stores.mask.set();
+    kernel_info.mesh_as_compute = true;
+    kernel_info.mesh_output_binding = output_binding;
+    if (has_task) {
+        kernel_info.mesh_task_payload_binding = output_binding + 1;
+        kernel_info.mesh_task_offsets_binding = output_binding + 2;
+        kernel_info.mesh_task_args_binding = output_binding + 3;
+        kernel_info.mesh_task_payload_stride = payload_stride;
+    }
+    MeshEmulation emulation{
+        .has_task = has_task,
+        .mesh_stage = static_cast<u32>(mesh_index - 1),
+        .payload_stride = payload_stride,
+        .output_binding = output_binding,
+        .block_words = Shader::Backend::SPIRV::MeshEmulationBlockWords(mesh.mesh),
+        .vertices_per_group = mesh.mesh.max_primitives * mesh.mesh.PrimitiveVertices(),
+        .topology = topology,
+    };
+    // Task, then mesh, then pixel program: the bindings count up in that order.
+    const std::array<size_t, 2> kernel_programs{1, mesh_index};
+    for (size_t kernel = 0; kernel < (has_task ? 2U : 1U); ++kernel) {
+        const size_t index = kernel_programs[kernel];
+        auto translated =
+            Translate(programs[index], ShaderTranslate::Stage::Compute, bindings, kernel_info);
+        if (!translated) {
+            return nullptr;
+        }
+        MeshKernel& target = kernel == 0 ? emulation.first : emulation.mesh;
+        target.program = std::move(*translated);
+        target.workgroup_size = programs[index].workgroup_size;
+    }
+    if (has_task) {
+        ShaderTranslate::Result distribution = ShaderTranslate::SpirvToMsl(
+            Shader::Backend::SPIRV::EmitMeshEmulationDistribution(profile),
+            ShaderTranslate::Stage::Compute, translate_options);
+        if (distribution.source.empty()) {
+            LogRefusal(refused_logged, hash, distribution.error);
+            return nullptr;
+        }
+        emulation.distribution.program = StageProgram{
+            .stage = ShaderTranslate::Stage::Compute,
+            .msl = std::move(distribution.source),
+            .entry_point = std::move(distribution.entry_point),
+            .slots = std::move(distribution.slots),
+        };
+        emulation.distribution.workgroup_size = {1, 1, 1};
     }
     const std::vector<u32> vertex_spirv = Shader::Backend::SPIRV::EmitMeshEmulationVertex(
-        profile, mesh.mesh, output_binding, ~0U, false);
+        profile, mesh.mesh, output_binding, has_task ? output_binding + 3 : ~0U, false);
     ShaderTranslate::Result vertex =
         ShaderTranslate::SpirvToMsl(vertex_spirv, ShaderTranslate::Stage::Vertex, translate_options);
     if (vertex.source.empty()) {
@@ -445,21 +490,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateMeshPipeline(
         }
         fragment = std::move(*translated);
     }
-    MeshEmulation emulation{
-        .compute = std::move(*compute),
-        .output_binding = output_binding,
-        .block_words = Shader::Backend::SPIRV::MeshEmulationBlockWords(mesh.mesh),
-        .vertices_per_group = mesh.mesh.max_primitives * mesh.mesh.PrimitiveVertices(),
-        .workgroup_size = mesh.workgroup_size,
-        .topology = topology,
-    };
     static std::atomic<u32> logged{};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
         LOG_INFO(Render_Metal,
-                 "Metal: mesh pipeline {:016x} (mesh {:016x}) emulated: {} vertices x {} lines, {} "
-                 "primitives per workgroup, {} output words",
-                 hash, key.unique_hashes[1], mesh.mesh.max_vertices, mesh.mesh.vertex_lines.size(),
-                 mesh.mesh.max_primitives, emulation.block_words);
+                 "Metal: mesh pipeline {:016x} (mesh {:016x}, task {}) emulated: {} vertices x {} "
+                 "lines, {} primitives per workgroup, {} output words",
+                 hash, key.unique_hashes[mesh_index], has_task, mesh.mesh.max_vertices,
+                 mesh.mesh.vertex_lines.size(), mesh.mesh.max_primitives, emulation.block_words);
     }
     StageProgram vertex_program{
         .stage = ShaderTranslate::Stage::Vertex,
