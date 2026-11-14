@@ -276,6 +276,12 @@ void RecommendApple(const Device& device, Profile& p) {
          "One frame in 10 s gets GPU timestamps around each render pass (\"Perf passes:\" log "
          "line): build 71 spent 84-103 ms of GPU time per frame on the phone with the Legacy and "
          "the New driver alike, ~15x a PC's, and the log has to say which passes take it."});
+    p.tuning.push_back(
+        {"EDEN_NX2_OOT_BILINEAR_UPSCALE", "1", "on",
+         "Ocarina of Time's upscale pass is one bilinear tap whenever MetalFX Temporal doesn't "
+         "take the frame: the game's own pass 9302bc0d6d1d9bc1 took ~40 % of an iPhone18,2's "
+         "GPU time in Kokiri (IPA 150, Perf passes). Experiments > Game's Own Upscale Pass turns "
+         "it off."});
 }
 
 void RecommendDesktop(const Device& device, Profile& p) {

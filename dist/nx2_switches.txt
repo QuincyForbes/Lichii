@@ -47,6 +47,14 @@ EDEN_NX2_FENCE_BATCH=1
 # 2 with the vertical sign flipped. Experiment, off by default.
 #EDEN_NX2_DLSS_JITTER=1
 
+# Ocarina of Time: 1 draws the game's upscale pass as one bilinear tap whenever no temporal
+# upscaler takes the frame (phones get it from their device profile; 0 turns it off there).
+#EDEN_NX2_OOT_BILINEAR_UPSCALE=1
+
+# Ocarina of Time handheld: 1 lets DLSS / FSR 3.1 take the upscale from the lower scales to
+# 1920x1080 (on by default on Apple for MetalFX temporal, 0 turns it off).
+#EDEN_NX2_OOT_TEMPORAL_HANDHELD=1
+
 #EDEN_NX2_MME_JIT=0
 #EDEN_NX2_PBFLUSH=0
 #EDEN_NX2_SKIP_SAME=0

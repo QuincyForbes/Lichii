@@ -73,4 +73,24 @@ private:
     std::unique_ptr<Impl> impl;
 };
 
+/// EDEN_NX2_OOT_BILINEAR_UPSCALE (boot, 1 = on; phones get it from their device profile): the
+/// game's upscale pass becomes one bilinear tap whenever no temporal upscaler takes the frame.
+[[nodiscard]] bool OcarinaBilinearUpscaleEnabled();
+
+/// The game's upscale pass as one bilinear tap of the scene, squared as the game's pass writes it.
+class OcarinaBilinearUpscale {
+public:
+    OcarinaBilinearUpscale(const Device& device, Scheduler& scheduler, DescriptorPool& pool,
+                           ComputePassDescriptorQueue& queue);
+    ~OcarinaBilinearUpscale();
+
+    /// Queues the pass: the scene image's top-left extent (padded images included) to target.
+    void Record(VkImageView color, VkExtent2D color_size, VkExtent2D extent, VkImageView target,
+                VkExtent2D target_extent);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
+
 } // namespace Vulkan

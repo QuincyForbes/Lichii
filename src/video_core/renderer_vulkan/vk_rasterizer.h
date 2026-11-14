@@ -315,6 +315,8 @@ private:
     void UpdateOcarinaJitter();
     void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect);
     bool TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace);
+    /// The recognized upscale dispatch as one bilinear tap (EDEN_NX2_OOT_BILINEAR_UPSCALE).
+    bool TryOcarinaBilinear(const ComputePipeline& pipeline);
     void ReadOcarinaActor(struct OcarinaActorMesh& mesh);
     /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
     bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
@@ -390,7 +392,13 @@ private:
     u32 oot_game_passes{};
     u32 oot_switches{}; ///< between the two, in those 600
     bool oot_last_upscaled{};
-    void CountOcarinaUpscale(bool upscaled);
+    /// Why the game's pass drew, per reason, in those 600 (the first 8 reasons seen).
+    std::array<std::pair<const char*, u32>, 8> oot_decline_reasons{};
+    u32 oot_bilinear_passes{}; ///< of the declined ones, drawn bilinear instead of the game's
+    std::unique_ptr<class OcarinaBilinearUpscale> oot_bilinear;
+    bool oot_bilinear_failed{};
+    VkExtent2D oot_bilinear_extent{}; ///< the scene of the last bilinear pass
+    void CountOcarinaUpscale(bool upscaled, const char* reason = nullptr);
     std::optional<u64> oot_dlss_frame;
     std::array<f32, 2> oot_jitter_applied{}; ///< in the viewport state now (render pixels)
     std::array<f32, 2> oot_jitter_offset{};  ///< what oot_jitter_frame's scene draws used

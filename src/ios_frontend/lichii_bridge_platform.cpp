@@ -274,6 +274,10 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_KEEP_DEFERRED_CLEAR", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment render_passes_old on");
     }
+    if (lichii_platform_experiment("oot_game_upscale")) {
+        setenv("EDEN_NX2_OOT_BILINEAR_UPSCALE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment oot_game_upscale on");
+    }
 }
 
 LichiiThermalAdvice ComputeThermalAdvice(int thermal_state, int low_power_mode) {

@@ -2181,13 +2181,18 @@ void RasterizerVulkan::DispatchCompute() {
                              (!fsr_only_pass ||
                               oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr) &&
                              !frame_dump.Capturing();
+    const bool can_bilinear = OcarinaBilinearUpscaleEnabled() &&
+                              pipeline->CanReplaceOcarinaUpscale() && !indirect_address &&
+                              program_id == VideoCommon::OotNetwork::ProgramId &&
+                              !frame_dump.Capturing();
     const bool marking_effects = oot_effects_frame == render_trace_frame &&
                                  OcarinaTemporalEnabled() && !indirect_address &&
                                  !frame_dump.Capturing();
     ComputePipeline::BindCommand deferred_bind;
     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
                              texture_cache, texture_cache_runtime, byte_addressed_shadow,
-                             can_replace || marking_effects ? &deferred_bind : nullptr)) {
+                             can_replace || can_bilinear || marking_effects ? &deferred_bind
+                                                                            : nullptr)) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
@@ -2294,7 +2299,7 @@ void RasterizerVulkan::DispatchCompute() {
     }
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.NoteComputeWrites();
-    if (can_replace) {
+    if (can_replace || can_bilinear) {
         // Upscaler evaluation may be recorded next, before the dispatch: the barrier goes first.
         scheduler.Record([](vk::CommandBuffer cmdbuf) { RecordDispatchBarrier(cmdbuf); });
     }
@@ -2311,9 +2316,15 @@ void RasterizerVulkan::DispatchCompute() {
         can_replace && !byte_addressed_shadow && TryOcarinaUpscale(*pipeline, true)
             ? oot_live_dlss.get()
             : nullptr;
-    if (!replacement) {
+    if (can_bilinear && !can_replace) {
+        CountOcarinaUpscale(false, OcarinaTemporalEnabled() ? "a pass only FSR 3.1 replaces"
+                                                            : "no temporal upscaler chosen");
+    }
+    const bool bilinear =
+        !replacement && can_bilinear && !byte_addressed_shadow && TryOcarinaBilinear(*pipeline);
+    if (!replacement && !bilinear) {
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
-    } else {
+    } else if (replacement) {
         // Once per pass: which of the game's upscale passes the upscaler took, and with what.
         static std::array<u64, 8> logged{};
         const u64 hash = pipeline->ShaderHash();
@@ -2328,11 +2339,12 @@ void RasterizerVulkan::DispatchCompute() {
         }
     }
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind),
-                      barrier_recorded = can_replace, replacement](vk::CommandBuffer cmdbuf) {
+                      barrier_recorded = can_replace || can_bilinear, replacement,
+                      bilinear](vk::CommandBuffer cmdbuf) {
         if (!barrier_recorded) {
             RecordDispatchBarrier(cmdbuf);
         }
-        if (replacement && !replacement->EvaluationFailed()) {
+        if (bilinear || (replacement && !replacement->EvaluationFailed())) {
             return;
         }
         if (replacement) {
@@ -2353,7 +2365,7 @@ void RasterizerVulkan::DispatchCompute() {
             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
         }
     });
-    if (can_replace || marking_effects) {
+    if (can_replace || can_bilinear || marking_effects) {
         // The deferred native binding may follow DLSS's command buffer bindings.
         scheduler.InvalidateState();
     }
@@ -3279,21 +3291,42 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
 
 // A frame the game's pass draws between upscaled ones shows its own anti-aliasing and the
 // upscaler's history starts again: the log shows how often that happens.
-void RasterizerVulkan::CountOcarinaUpscale(bool upscaled) {
+void RasterizerVulkan::CountOcarinaUpscale(bool upscaled, const char* reason) {
     if (oot_upscaled_passes + oot_game_passes != 0 && upscaled != oot_last_upscaled) {
         ++oot_switches;
     }
     oot_last_upscaled = upscaled;
     ++(upscaled ? oot_upscaled_passes : oot_game_passes);
+    if (reason) {
+        for (auto& [name, count] : oot_decline_reasons) {
+            if (name == nullptr || name == reason) {
+                name = reason;
+                ++count;
+                break;
+            }
+        }
+    }
     if (oot_upscaled_passes + oot_game_passes < 600) {
         return;
     }
+    std::string reasons;
+    for (const auto& [name, count] : oot_decline_reasons) {
+        if (name != nullptr) {
+            reasons += fmt::format("{}{} {}", reasons.empty() ? "; declined: " : ", ", name, count);
+        }
+    }
+    if (OcarinaBilinearUpscaleEnabled()) {
+        reasons += fmt::format("; {} of the declined drawn bilinear instead of the game's pass",
+                               oot_bilinear_passes);
+    }
+    const VkExtent2D scene = oot_motion.extent.width != 0 ? oot_motion.extent : oot_bilinear_extent;
     LOG_INFO(Common_Memory,
              "Ocarina upscaler: {} of {} upscale passes replaced, {} switches to or from the "
-             "game's own; scene {}x{}",
+             "game's own; scene {}x{}{}",
              oot_upscaled_passes, oot_upscaled_passes + oot_game_passes, oot_switches,
-             oot_motion.extent.width, oot_motion.extent.height);
-    oot_upscaled_passes = oot_game_passes = oot_switches = 0;
+             scene.width, scene.height, reasons);
+    oot_upscaled_passes = oot_game_passes = oot_switches = oot_bilinear_passes = 0;
+    oot_decline_reasons = {};
 }
 
 /// Track the scene depth on its reader dispatch, or try to replace a recognized upscale dispatch.
@@ -3340,7 +3373,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     }
     // Logs why the game's own upscale draws, when the reason changes and every 120th repeat.
     const auto fail = [this](const char* reason) {
-        CountOcarinaUpscale(false);
+        CountOcarinaUpscale(false, reason);
         if (reason != oot_fallback_reason || ++oot_fallback_repeats % 120 == 0) {
             LOG_INFO(Render_Vulkan, "Ocarina DLSS: the game's upscale draws frame {} ({})",
                      render_trace_frame, reason);
@@ -3399,6 +3432,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         oot_logged_target = {target.size.width, target.size.height};
     }
     const bool native_size = pipeline.ShaderHash() == ComputePipeline::OcarinaFullSizeShader;
+    bool handheld_scaled = false;
     // At the Performance render scale (1920x1080) the game runs its 3/4 pass to 2560x1440.
     constexpr u64 three_quarter_pass = 0xe40f5efb5480e692ULL;
     if (upscale_hash == three_quarter_pass && target.size.width == 2560 &&
@@ -3408,10 +3442,28 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
             Settings::OcarinaDlssMode::Performance) {
         upscale_4k = true;
     }
+    const bool sixteen_by_nine =
+        std::abs(static_cast<int>(extent.width * 9) - static_cast<int>(extent.height * 16)) <= 32;
+    // Handheld the scaled passes write 1920x1080 from the lower scales (50 %: 960x540, 2x).
+    // EDEN_NX2_OOT_TEMPORAL_HANDHELD (boot): on by default on Apple only, where MetalFX takes them.
+    static const bool temporal_handheld = [] {
+        const char* const value = std::getenv("EDEN_NX2_OOT_TEMPORAL_HANDHELD");
+#ifdef __APPLE__
+        return value == nullptr || value[0] != '0';
+#else
+        return value != nullptr && value[0] == '1';
+#endif
+    }();
+    if (upscale_4k && temporal_handheld && target.size.width == 1920 &&
+        target.size.height == 1080 && upscale_hash != ComputePipeline::Ocarina1440pShader &&
+        extent.width < 1920 && sixteen_by_nine) {
+        upscale_4k = false;
+        handheld_scaled = true;
+    }
     // 4K: any 16:9 scene up to 2560x1440 (the lower oot_resolution scales).
-    const bool valid_extents = upscale_4k
-        ? extent.width <= 2560 &&
-            std::abs(static_cast<int>(extent.width * 9) - static_cast<int>(extent.height * 16)) <= 32 &&
+    const bool valid_extents = handheld_scaled ? true
+        : upscale_4k
+        ? extent.width <= 2560 && sixteen_by_nine &&
             target.size.width == 2560 && target.size.height == 1440
         : native_size
         ? target.size.width == extent.width && target.size.height == extent.height
@@ -3502,6 +3554,69 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         texture_cache_runtime.ocarina_fsr_failed = true; // samplers drop the FSR LOD bias
         return false;
     }
+}
+
+/// The game's scaled upscale passes cost a phone GPU ~30 ms a frame (IPA 150); where no temporal
+/// upscaler takes the frame, one bilinear tap of the same scene writes the same target instead.
+bool RasterizerVulkan::TryOcarinaBilinear(const ComputePipeline& pipeline) {
+    const u64 hash = pipeline.ShaderHash();
+    if (oot_bilinear_failed || (hash != ComputePipeline::Ocarina1440pScaledShader &&
+                                hash != ComputePipeline::Ocarina1440pScaledFieldShader &&
+                                hash != 0xe40f5efb5480e692ULL)) {
+        return false;
+    }
+    const auto sampled = pipeline.SampledImages();
+    const auto written = pipeline.WrittenImages();
+    if (sampled.size() != 1 || written.size() != 1 || !sampled[0].id || !written[0]) {
+        return false;
+    }
+    using VideoCore::Surface::PixelFormat;
+    const auto& color = texture_cache.GetImageView(sampled[0].id);
+    auto& target = texture_cache.GetImageView(written[0]);
+    // A padded scene (oot_resolution 87 %) is only known from this frame's camera.
+    const bool camera = oot_camera_sample_frame == render_trace_frame &&
+                        oot_motion.SceneSized(color.size.width, color.size.height);
+    const VkExtent2D extent = camera ? oot_motion.extent
+                                     : VkExtent2D{color.size.width, color.size.height};
+    if (!color.BackingImage() || !target.BackingImage() || color.IsRescaled() ||
+        target.IsRescaled() || color.Samples() != VK_SAMPLE_COUNT_1_BIT ||
+        target.Samples() != VK_SAMPLE_COUNT_1_BIT || color.range != VideoCommon::SubresourceRange{} ||
+        target.range != VideoCommon::SubresourceRange{} ||
+        color.format != PixelFormat::E5B9G9R9_FLOAT || target.format != PixelFormat::B10G11R11_FLOAT ||
+        target.size.width <= extent.width || target.size.height <= extent.height ||
+        color.ImageHandle() == target.ImageHandle()) {
+        return false;
+    }
+    constexpr VkFormat output_format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    const auto color_view = color.Handle(Shader::TextureType::Color2D);
+    if (!color_view || !device.IsStorageImageExtendedFormatsSupported() ||
+        !device.IsFormatSupported(output_format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,
+                                  FormatType::Optimal) ||
+        (target.BackingImage()->UsageFlags() & VK_IMAGE_USAGE_STORAGE_BIT) == 0 ||
+        MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, target.format).format !=
+            output_format) {
+        return false;
+    }
+    try {
+        const auto target_view =
+            target.StorageView(Shader::TextureType::Color2D, Shader::ImageFormat::Typeless, false);
+        if (!target_view) {
+            return false;
+        }
+        if (!oot_bilinear) {
+            oot_bilinear = std::make_unique<OcarinaBilinearUpscale>(
+                device, scheduler, descriptor_pool, compute_pass_descriptor_queue);
+        }
+        oot_bilinear->Record(color_view, {color.size.width, color.size.height}, extent,
+                             target_view, {target.size.width, target.size.height});
+    } catch (const vk::Exception& error) {
+        LOG_WARNING(Render_Vulkan, "Ocarina bilinear upscale unavailable: {}", error.what());
+        oot_bilinear_failed = true;
+        return false;
+    }
+    ++oot_bilinear_passes;
+    oot_bilinear_extent = extent;
+    return true;
 }
 
 bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {

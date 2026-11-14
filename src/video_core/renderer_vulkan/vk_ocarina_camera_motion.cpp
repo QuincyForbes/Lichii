@@ -31,6 +31,7 @@
 #include "video_core/host_shaders/ocarina_camera_motion_comp_spv.h"
 #include "video_core/host_shaders/ocarina_actor_motion_frag_spv.h"
 #include "video_core/host_shaders/ocarina_actor_motion_vert_spv.h"
+#include "video_core/host_shaders/ocarina_bilinear_upscale_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -1108,6 +1109,98 @@ VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device) 
         return VideoCommon::OcarinaUpscaleBackend::Native;
     }
     return backend;
+}
+
+bool OcarinaBilinearUpscaleEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_OOT_BILINEAR_UPSCALE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+namespace {
+
+constexpr std::array BILINEAR_PUSH_CONSTANTS{
+    VkPushConstantRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(std::array<f32, 2>)},
+};
+
+class OcarinaBilinearPass final : public ComputePass {
+public:
+    OcarinaBilinearPass(const Device& device_, Scheduler& scheduler, DescriptorPool& pool)
+        : ComputePass(device_, scheduler, pool, BINDINGS, TEMPLATES, BANK, BILINEAR_PUSH_CONSTANTS,
+                      OCARINA_BILINEAR_UPSCALE_COMP_SPV) {}
+
+    void Record(Scheduler& scheduler, const void* descriptors, std::array<f32, 2> scene_scale,
+                VkExtent2D extent) {
+        scheduler.Record([this, descriptors, scene_scale, extent](vk::CommandBuffer cmd) {
+            const VkMemoryBarrier before{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, before);
+            const VkDescriptorSet set = descriptor_allocator.Commit();
+            device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptors);
+            cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+            cmd.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+            cmd.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, scene_scale);
+            cmd.Dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 1);
+            const VkMemoryBarrier after{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, after);
+        });
+    }
+};
+
+} // namespace
+
+struct OcarinaBilinearUpscale::Impl {
+    Impl(const Device& device, Scheduler& scheduler_, DescriptorPool& pool,
+         ComputePassDescriptorQueue& queue_)
+        : scheduler{scheduler_}, queue{queue_}, pass{device, scheduler, pool},
+          sampler{device.GetLogical().CreateSampler(VkSamplerCreateInfo{
+              .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+              .magFilter = VK_FILTER_LINEAR,
+              .minFilter = VK_FILTER_LINEAR,
+              .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+              .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+              .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+              .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+              .maxAnisotropy = 1.0f,
+          })} {}
+
+    Scheduler& scheduler;
+    ComputePassDescriptorQueue& queue;
+    OcarinaBilinearPass pass;
+    vk::Sampler sampler;
+};
+
+OcarinaBilinearUpscale::OcarinaBilinearUpscale(const Device& device, Scheduler& scheduler,
+                                               DescriptorPool& pool,
+                                               ComputePassDescriptorQueue& queue)
+    : impl{std::make_unique<Impl>(device, scheduler, pool, queue)} {}
+
+OcarinaBilinearUpscale::~OcarinaBilinearUpscale() = default;
+
+void OcarinaBilinearUpscale::Record(VkImageView color, VkExtent2D color_size, VkExtent2D extent,
+                                    VkImageView target, VkExtent2D target_extent) {
+    auto& state = *impl;
+    state.scheduler.RequestOutsideRenderPassOperationContext();
+    state.queue.Acquire(state.scheduler, 2);
+    state.queue.AddSampledImage(color, *state.sampler);
+    state.queue.AddImage(target);
+    const std::array<f32, 2> scene_scale{
+        static_cast<f32>(extent.width) / static_cast<f32>(color_size.width),
+        static_cast<f32>(extent.height) / static_cast<f32>(color_size.height),
+    };
+    state.pass.Record(state.scheduler, state.queue.UpdateData(), scene_scale, target_extent);
+    state.scheduler.InvalidateState();
 }
 
 } // namespace Vulkan
