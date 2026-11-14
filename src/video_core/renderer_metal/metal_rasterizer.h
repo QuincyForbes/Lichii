@@ -149,6 +149,14 @@ private:
     /// Binds everything the draw needs and opens its render pass; false to skip it.
     bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed);
 
+    /// Binds a stage's buffers (the buffer cache's pending bindings for it), textures, samplers,
+    /// images and push constants into the slots the translator gave them. iews and
+    /// samplers start at the stage's first.
+    void BindStageResources(StageProgram& program, ShaderStage metal_stage,
+                            std::span<const VideoCommon::ImageViewInOut> views,
+                            std::span<const VideoCommon::SamplerId> samplers, u32 render_width,
+                            u32 render_height);
+
     void QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                        VideoCommon::QueryPropertiesFlags flags, u32 payload);
 

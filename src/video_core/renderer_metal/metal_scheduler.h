@@ -97,6 +97,7 @@ struct Scissor {
 enum class ShaderStage : u8 {
     Vertex,
     Fragment,
+    Compute,
 };
 
 /// Encoder state of a draw besides its bindings.
@@ -186,6 +187,14 @@ public:
     /// primitive: MTLPrimitiveType.
     void Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 instance_count,
               u32 base_instance);
+
+    /// Opens a compute encoder (or keeps the open one) running pipeline`n    /// (an id<MTLComputePipelineState>).
+    void BeginCompute(void* pipeline);
+
+    void Dispatch(std::array<u32, 3> groups, std::array<u32, 3> group_size);
+
+    /// The group counts are three u32 at offset of uffer.
+    void DispatchIndirect(BufferHandle buffer, u64 offset, std::array<u32, 3> group_size);
 
     /// index_size: 2 or 4 bytes.
     void DrawIndexed(u32 primitive, u32 index_count, u32 index_size, BufferHandle index_buffer,

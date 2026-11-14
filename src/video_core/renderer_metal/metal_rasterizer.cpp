@@ -11,7 +11,9 @@
 #include "common/cityhash.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "shader_recompiler/exception.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/framebuffer_config.h"
 #include "video_core/gpu.h"
@@ -150,6 +152,95 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
                        instance_count, draw_state.base_instance);
     }
     ++draws_encoded;
+}
+
+void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage metal_stage,
+                                         std::span<const VideoCommon::ImageViewInOut> views,
+                                         std::span<const VideoCommon::SamplerId> samplers,
+                                         u32 render_width, u32 render_height) {
+    const Shader::Info& info = program.info;
+    std::vector<Binding>& pending = buffer_cache_runtime.PendingBindings();
+    std::vector<u32> texture_slots;
+    std::vector<u32> sampler_slots;
+    size_t next_buffer = 0;
+    for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
+        for (u32 element = 0; element < slot.count; ++element) {
+            const u32 slot_index = slot.index + element;
+            switch (slot.kind) {
+            case ShaderTranslate::ResourceKind::Buffer:
+                if (slot.set == ShaderTranslate::PushConstantSet) {
+                    // Shader::Backend::SPIRV::RescalingLayout (no rescaling, down factor 1)
+                    // or RenderAreaLayout.
+                    std::array<u32, 8> words{};
+                    if (info.uses_render_area && !info.uses_rescaling_uniform) {
+                        words[0] = std::bit_cast<u32>(static_cast<f32>(render_width));
+                        words[1] = std::bit_cast<u32>(static_cast<f32>(render_height));
+                    } else {
+                        words[6] = std::bit_cast<u32>(1.0f);
+                    }
+                    scheduler.BindBytes(metal_stage, slot_index, words.data(),
+                                        static_cast<u32>(sizeof(words)));
+                    break;
+                }
+                while (next_buffer < pending.size() &&
+                       pending[next_buffer].kind != Binding::Kind::Buffer) {
+                    ++next_buffer;
+                }
+                if (next_buffer < pending.size()) {
+                    scheduler.BindBuffer(metal_stage, slot_index, pending[next_buffer].buffer,
+                                         pending[next_buffer].offset);
+                    ++next_buffer;
+                }
+                break;
+            case ShaderTranslate::ResourceKind::Texture:
+                texture_slots.push_back(slot_index);
+                break;
+            case ShaderTranslate::ResourceKind::Sampler:
+                sampler_slots.push_back(slot_index);
+                break;
+            }
+        }
+    }
+
+    // Texture slots in binding order: texel buffers, image buffers, textures, images.
+    const size_t texel_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                                 Shader::NumDescriptors(info.image_buffer_descriptors);
+    if (texel_buffers != 0) {
+        LOG_ONCE(warned_texel, "Metal: texel buffers are not bound yet");
+    }
+    size_t texture_slot = texel_buffers;
+    size_t view = texel_buffers;
+    size_t sampler = 0;
+    for (const auto& desc : info.texture_descriptors) {
+        for (u32 element = 0; element < desc.count; ++element) {
+            ImageView& image_view = texture_cache.GetImageView(views[view++].id);
+            if (texture_slot < texture_slots.size()) {
+                scheduler.BindTexture(metal_stage, texture_slots[texture_slot],
+                                      image_view.Handle(desc.type));
+            }
+            ++texture_slot;
+            if (sampler < sampler_slots.size()) {
+                scheduler.BindSampler(
+                    metal_stage, sampler_slots[sampler],
+                    texture_cache.GetSampler(samplers[sampler])
+                        .Handle());
+            }
+            ++sampler;
+        }
+    }
+    for (const auto& desc : info.image_descriptors) {
+        for (u32 element = 0; element < desc.count; ++element) {
+            ImageView& image_view = texture_cache.GetImageView(views[view++].id);
+            if (desc.is_written) {
+                texture_cache.MarkModification(image_view.image_id);
+            }
+            if (texture_slot < texture_slots.size()) {
+                scheduler.BindTexture(metal_stage, texture_slots[texture_slot],
+                                      image_view.Handle(desc.type));
+            }
+            ++texture_slot;
+        }
+    }
 }
 
 bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed) {
@@ -478,92 +569,12 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed) {
         }
         const size_t stage = stages[index];
         const ShaderStage metal_stage = index == 0 ? ShaderStage::Vertex : ShaderStage::Fragment;
-        const Shader::Info& info = program.info;
-        std::vector<Binding>& pending = buffer_cache_runtime.PendingBindings();
-        pending.clear();
+        buffer_cache_runtime.PendingBindings().clear();
         buffer_cache.BindHostStageBuffers(stage);
 
-        std::vector<u32> texture_slots;
-        std::vector<u32> sampler_slots;
-        size_t next_buffer = 0;
-        for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
-            for (u32 element = 0; element < slot.count; ++element) {
-                const u32 slot_index = slot.index + element;
-                switch (slot.kind) {
-                case ShaderTranslate::ResourceKind::Buffer:
-                    if (slot.set == ShaderTranslate::PushConstantSet) {
-                        // Shader::Backend::SPIRV::RescalingLayout (no rescaling, down factor 1)
-                        // or RenderAreaLayout.
-                        std::array<u32, 8> words{};
-                        if (info.uses_render_area && !info.uses_rescaling_uniform) {
-                            words[0] = std::bit_cast<u32>(static_cast<f32>(targets.width));
-                            words[1] = std::bit_cast<u32>(static_cast<f32>(targets.height));
-                        } else {
-                            words[6] = std::bit_cast<u32>(1.0f);
-                        }
-                        scheduler.BindBytes(metal_stage, slot_index, words.data(),
-                                            static_cast<u32>(sizeof(words)));
-                        break;
-                    }
-                    while (next_buffer < pending.size() &&
-                           pending[next_buffer].kind != Binding::Kind::Buffer) {
-                        ++next_buffer;
-                    }
-                    if (next_buffer < pending.size()) {
-                        scheduler.BindBuffer(metal_stage, slot_index, pending[next_buffer].buffer,
-                                             pending[next_buffer].offset);
-                        ++next_buffer;
-                    }
-                    break;
-                case ShaderTranslate::ResourceKind::Texture:
-                    texture_slots.push_back(slot_index);
-                    break;
-                case ShaderTranslate::ResourceKind::Sampler:
-                    sampler_slots.push_back(slot_index);
-                    break;
-                }
-            }
-        }
-
-        // Texture slots in binding order: texel buffers, image buffers, textures, images.
-        const size_t texel_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors) +
-                                     Shader::NumDescriptors(info.image_buffer_descriptors);
-        if (texel_buffers != 0) {
-            LOG_ONCE(warned_texel, "Metal: texel buffers are not bound yet");
-        }
-        size_t texture_slot = texel_buffers;
-        size_t view = first_view[index] + texel_buffers;
-        size_t sampler = 0;
-        for (const auto& desc : info.texture_descriptors) {
-            for (u32 element = 0; element < desc.count; ++element) {
-                ImageView& image_view = texture_cache.GetImageView(views[view++].id);
-                if (texture_slot < texture_slots.size()) {
-                    scheduler.BindTexture(metal_stage, texture_slots[texture_slot],
-                                          image_view.Handle(desc.type));
-                }
-                ++texture_slot;
-                if (sampler < sampler_slots.size()) {
-                    scheduler.BindSampler(
-                        metal_stage, sampler_slots[sampler],
-                        texture_cache.GetSampler(samplers[first_sampler[index] + sampler])
-                            .Handle());
-                }
-                ++sampler;
-            }
-        }
-        for (const auto& desc : info.image_descriptors) {
-            for (u32 element = 0; element < desc.count; ++element) {
-                ImageView& image_view = texture_cache.GetImageView(views[view++].id);
-                if (desc.is_written) {
-                    texture_cache.MarkModification(image_view.image_id);
-                }
-                if (texture_slot < texture_slots.size()) {
-                    scheduler.BindTexture(metal_stage, texture_slots[texture_slot],
-                                          image_view.Handle(desc.type));
-                }
-                ++texture_slot;
-            }
-        }
+        BindStageResources(program, metal_stage, std::span(views).subspan(first_view[index]),
+                           std::span(samplers).subspan(first_sampler[index]), targets.width,
+                           targets.height);
     }
     return true;
 }
@@ -625,9 +636,133 @@ void RasterizerMetal::Clear(u32 layer_count) {
 
 void RasterizerMetal::DispatchCompute() {
     ++dispatches;
+    gpu_memory->FlushCaching();
     ComputePipeline* const pipeline = pipeline_cache.CurrentComputePipeline();
-    if (pipeline != nullptr && pipeline->State(device) != nullptr) {
-        ++dispatches_with_pipeline;
+    void* const state = pipeline != nullptr ? pipeline->State(device) : nullptr;
+    if (state == nullptr) {
+        // As OpenGL and Vulkan report it: KeplerCompute::DispatchNativeCompute takes a silent
+        // return for a successful dispatch.
+        if (kepler_compute->IsNativeMode()) {
+            throw Shader::RuntimeError("Native compute pipeline unavailable");
+        }
+        return;
+    }
+    ++dispatches_with_pipeline;
+    static const bool encode = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_DISPATCH");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!encode) {
+        return;
+    }
+    StageProgram& program = pipeline->Program();
+    const Shader::Info& info = program.info;
+    const auto& qmd = kepler_compute->launch_description;
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+
+    VideoCommon::ComputeUniformBufferSizes uniform_sizes{};
+    std::ranges::copy_n(info.constant_buffer_used_sizes.begin(), uniform_sizes.size(),
+                        uniform_sizes.begin());
+    buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_sizes);
+    buffer_cache.UnbindComputeStorageBuffers();
+    size_t ssbo_index = 0;
+    for (const auto& desc : info.storage_buffers_descriptors) {
+        buffer_cache.BindComputeStorageBuffer(ssbo_index++, desc.cbuf_index, desc.cbuf_offset,
+                                              desc.is_written, desc.indirect_offset,
+                                              desc.write_extent);
+    }
+    texture_cache.SynchronizeDescriptors(true);
+
+    const auto& cbufs = qmd.const_buffer_config;
+    const bool via_header_index = qmd.linked_tsc != 0;
+    const auto read_handle = [&](const auto& desc, u32 element) {
+        if (desc.handle_program != ~0U) {
+            return Tegra::Texture::TexturePair(
+                VideoCommon::EvaluateTextureHandle(
+                    info, desc.handle_program, *gpu_memory,
+                    [&](u32 cbuf) -> GPUVAddr {
+                        return cbuf < cbufs.size() && ((qmd.const_buffer_enable_mask >> cbuf) & 1)
+                                   ? cbufs[cbuf].Address()
+                                   : GPUVAddr{};
+                    },
+                    buffer_cache_runtime.GetStorageBufferAlignment()),
+                via_header_index);
+        }
+        const GPUVAddr addr =
+            cbufs[desc.cbuf_index].Address() + desc.cbuf_offset + (element << desc.size_shift);
+        if constexpr (requires { desc.has_secondary; }) {
+            if (desc.has_secondary) {
+                const GPUVAddr second =
+                    cbufs[desc.secondary_cbuf_index].Address() + desc.secondary_cbuf_offset;
+                const u32 raw = (gpu_memory->Read<u32>(addr) << desc.shift_left) |
+                                (gpu_memory->Read<u32>(second) << desc.secondary_shift_left);
+                return Tegra::Texture::TexturePair(raw, via_header_index);
+            }
+        }
+        return Tegra::Texture::TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
+    };
+    std::vector<VideoCommon::ImageViewInOut> views;
+    std::vector<VideoCommon::SamplerId> samplers;
+    for (const auto& desc : info.texture_buffer_descriptors) {
+        for (u32 element = 0; element < desc.count; ++element) {
+            views.push_back({.index = read_handle(desc, element).first});
+        }
+    }
+    for (const auto& desc : info.image_buffer_descriptors) {
+        for (u32 element = 0; element < desc.count; ++element) {
+            views.push_back({.index = read_handle(desc, element).first});
+        }
+    }
+    for (const auto& desc : info.texture_descriptors) {
+        for (u32 element = 0; element < desc.count; ++element) {
+            const auto handle = read_handle(desc, element);
+            views.push_back({.index = handle.first});
+            samplers.push_back(texture_cache.GetSamplerId(handle.second, true));
+        }
+    }
+    for (const auto& desc : info.image_descriptors) {
+        for (u32 element = 0; element < desc.count; ++element) {
+            views.push_back(
+                {.index = read_handle(desc, element).first, .blacklist = desc.is_written});
+        }
+    }
+    texture_cache.FillImageViews(views, true);
+
+    buffer_cache.UnbindComputeTextureBuffers();
+    size_t view = 0;
+    size_t tbo_index = 0;
+    const auto add_buffer = [&](const auto& desc, bool is_image) {
+        for (u32 element = 0; element < desc.count; ++element) {
+            ImageView& image_view = texture_cache.GetImageView(views[view++].id);
+            bool is_written = false;
+            if constexpr (requires { desc.is_written; }) {
+                is_written = desc.is_written;
+            }
+            buffer_cache.BindComputeTextureBuffer(tbo_index++, image_view.GpuAddr(),
+                                                  image_view.BufferSize(), image_view.format,
+                                                  is_written, is_image);
+        }
+    };
+    for (const auto& desc : info.texture_buffer_descriptors) {
+        add_buffer(desc, false);
+    }
+    for (const auto& desc : info.image_buffer_descriptors) {
+        add_buffer(desc, true);
+    }
+    buffer_cache.UpdateComputeBuffers();
+    buffer_cache_runtime.PendingBindings().clear();
+    buffer_cache.BindHostComputeBuffers();
+
+    scheduler.BeginCompute(state);
+    BindStageResources(program, ShaderStage::Compute, views, samplers, 0, 0);
+    const std::array<u32, 3> group_size{qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z};
+    if (const auto indirect = kepler_compute->GetIndirectComputeAddress()) {
+        const auto [buffer, offset] = buffer_cache.ObtainBuffer(
+            *indirect, 12, VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+            VideoCommon::ObtainBufferOperation::DiscardWrite);
+        scheduler.DispatchIndirect(buffer->Handle(), offset, group_size);
+    } else {
+        scheduler.Dispatch({qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z}, group_size);
     }
 }
 

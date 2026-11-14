@@ -97,6 +97,10 @@ struct Scheduler::Impl {
             [render endEncoding];
             render = nil;
         }
+        if (compute != nil) {
+            [compute endEncoding];
+            compute = nil;
+        }
     }
 
     id<MTLBlitCommandEncoder> BlitEncoder() {
@@ -153,6 +157,7 @@ struct Scheduler::Impl {
     /// The render encoder draws go to, open until other work needs the command buffer.
     id<MTLRenderCommandEncoder> render = nil;
     RenderTargetSet render_targets{};
+    id<MTLComputeCommandEncoder> compute = nil;
     id<MTLLibrary> library = nil;
     id<MTLSamplerState> nearest = nil;
     id<MTLSamplerState> linear = nil;
@@ -167,6 +172,7 @@ struct Scheduler::Impl {
     u64 blit_commands{};
     u64 render_passes{};
     u64 draws{};
+    u64 dispatches{};
 };
 
 Scheduler::Scheduler(const Device& device) : impl{std::make_unique<Impl>(device)} {}
@@ -467,47 +473,88 @@ void Scheduler::BindVertexBuffer(u32 slot, BufferHandle buffer, u32 offset) {
 }
 
 void Scheduler::BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset) {
-    if (impl->render == nil) {
-        return;
-    }
-    if (stage == ShaderStage::Vertex) {
+    switch (stage) {
+    case ShaderStage::Vertex:
         [impl->render setVertexBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
-    } else {
+        break;
+    case ShaderStage::Fragment:
         [impl->render setFragmentBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
+        break;
+    case ShaderStage::Compute:
+        [impl->compute setBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
+        break;
     }
 }
 
 void Scheduler::BindBytes(ShaderStage stage, u32 slot, const void* data, u32 size) {
-    if (impl->render == nil) {
-        return;
-    }
-    if (stage == ShaderStage::Vertex) {
+    switch (stage) {
+    case ShaderStage::Vertex:
         [impl->render setVertexBytes:data length:size atIndex:slot];
-    } else {
+        break;
+    case ShaderStage::Fragment:
         [impl->render setFragmentBytes:data length:size atIndex:slot];
+        break;
+    case ShaderStage::Compute:
+        [impl->compute setBytes:data length:size atIndex:slot];
+        break;
     }
 }
 
 void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture) {
-    if (impl->render == nil) {
-        return;
-    }
-    if (stage == ShaderStage::Vertex) {
+    switch (stage) {
+    case ShaderStage::Vertex:
         [impl->render setVertexTexture:AsTexture(texture) atIndex:slot];
-    } else {
+        break;
+    case ShaderStage::Fragment:
         [impl->render setFragmentTexture:AsTexture(texture) atIndex:slot];
+        break;
+    case ShaderStage::Compute:
+        [impl->compute setTexture:AsTexture(texture) atIndex:slot];
+        break;
     }
 }
 
 void Scheduler::BindSampler(ShaderStage stage, u32 slot, void* sampler) {
-    if (impl->render == nil) {
+    switch (stage) {
+    case ShaderStage::Vertex:
+        [impl->render setVertexSamplerState:AsSampler(sampler) atIndex:slot];
+        break;
+    case ShaderStage::Fragment:
+        [impl->render setFragmentSamplerState:AsSampler(sampler) atIndex:slot];
+        break;
+    case ShaderStage::Compute:
+        [impl->compute setSamplerState:AsSampler(sampler) atIndex:slot];
+        break;
+    }
+}
+
+void Scheduler::BeginCompute(void* pipeline) {
+    if (impl->compute == nil) {
+        impl->EndEncoder();
+        impl->compute = [impl->Commands() computeCommandEncoder];
+        ++impl->encoders;
+    }
+    [impl->compute setComputePipelineState:(__bridge id<MTLComputePipelineState>)pipeline];
+}
+
+void Scheduler::Dispatch(std::array<u32, 3> groups, std::array<u32, 3> group_size) {
+    if (impl->compute == nil || groups[0] == 0 || groups[1] == 0 || groups[2] == 0) {
         return;
     }
-    if (stage == ShaderStage::Vertex) {
-        [impl->render setVertexSamplerState:AsSampler(sampler) atIndex:slot];
-    } else {
-        [impl->render setFragmentSamplerState:AsSampler(sampler) atIndex:slot];
+    [impl->compute dispatchThreadgroups:MTLSizeMake(groups[0], groups[1], groups[2])
+                  threadsPerThreadgroup:MTLSizeMake(group_size[0], group_size[1], group_size[2])];
+    ++impl->dispatches;
+}
+
+void Scheduler::DispatchIndirect(BufferHandle buffer, u64 offset, std::array<u32, 3> group_size) {
+    if (impl->compute == nil || buffer == nullptr) {
+        return;
     }
+    [impl->compute dispatchThreadgroupsWithIndirectBuffer:AsBuffer(buffer)
+                                     indirectBufferOffset:offset
+                                    threadsPerThreadgroup:MTLSizeMake(group_size[0], group_size[1],
+                                                                      group_size[2])];
+    ++impl->dispatches;
 }
 
 void Scheduler::Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 instance_count,

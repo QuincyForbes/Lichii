@@ -149,8 +149,8 @@ RendererMetal::RendererMetal(Core::Frontend::EmuWindow& emu_window,
     : RendererBase(emu_window, std::move(context_)), gpu{gpu_},
       impl{std::make_unique<Impl>(emu_window, gpu_, device_memory)} {
     LOG_WARNING(Render_Metal,
-                "Metal renderer (experimental): milestone 3, draws with vertex and pixel "
-                "shaders run on Metal; compute, queries, tessellation, geometry and mesh "
+                "Metal renderer (experimental): draws with vertex and pixel shaders and "
+                "compute dispatches run on Metal; queries, tessellation, geometry and mesh "
                 "shaders do not yet");
 }
 
@@ -236,7 +236,7 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
         LOG_INFO(Render_Metal,
                  "Metal: {} frames presented ({} from the texture cache, {} from guest memory), "
                  "{} without a drawable; {} draws ({} with a built pipeline, {} drawn) and {} "
-                 "dispatches ({} with a pipeline, not run yet); {} clears; pipelines made {} graphics, {} "
+                 "dispatches ({} with a pipeline); {} clears; pipelines made {} graphics, {} "
                  "compute, {} refused; {} command buffers, {} encoders ({} render passes), {} "
                  "blit commands; textures {} MiB, buffers {} MiB",
                  impl->presented, impl->from_cache, impl->from_memory, impl->skipped, work.draws,
