@@ -111,8 +111,9 @@ jobs:
       - name: Metal smoke test
         run: |
           set -uo pipefail
-          out=$(build/release/bin/lichii-metal-smoke 2>&1)
-          rc=$?
+          # The step's shell has -e: a failing run must still print its output.
+          rc=0
+          out=$(build/release/bin/lichii-metal-smoke 2>&1) || rc=$?
           echo "$out"
           printf '::notice title=Metal smoke test (exit %s)::%s\n' "$rc" "$(printf '%s' "$out" | awk 'BEGIN{ORS="%0A"}{print}')"
           if [ "$rc" = 2 ]; then
