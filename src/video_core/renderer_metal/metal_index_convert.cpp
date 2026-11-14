@@ -131,4 +131,86 @@ u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 f
     return written;
 }
 
+u32 RewriteMode(Topology topology) noexcept {
+    switch (topology) {
+    case Topology::Quads:
+        return 1;
+    case Topology::QuadStrip:
+        return 2;
+    case Topology::TriangleFan:
+    case Topology::Polygon:
+        return 3;
+    case Topology::LineLoop:
+        return 4;
+    default:
+        return 0;
+    }
+}
+
+const char* RewriteKernelSource() noexcept {
+    // Convert's orders, per index written.
+    return R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct RewriteParams {
+    uint mode;
+    uint index_size;
+    uint count;
+    uint restart;
+    uint converted;
+    uint source_offset;
+};
+
+constant uint quad_order[6] = {0, 1, 2, 0, 2, 3};
+constant uint quad_strip_order[6] = {0, 3, 1, 0, 2, 3};
+
+kernel void rewrite_indices(device const uchar* source [[buffer(0)]],
+                            device uint* indices [[buffer(1)]],
+                            constant RewriteParams& params [[buffer(2)]],
+                            uint index [[thread_position_in_grid]]) {
+    if (index >= params.converted) {
+        return;
+    }
+    uint vertex;
+    switch (params.mode) {
+    case 1:
+        vertex = index / 6 * 4 + quad_order[index % 6];
+        break;
+    case 2:
+        vertex = index / 6 * 2 + quad_strip_order[index % 6];
+        break;
+    case 3:
+        vertex = index % 3 == 0 ? 0 : index / 3 + index % 3;
+        break;
+    case 4:
+        vertex = index < params.count ? index : 0;
+        break;
+    default:
+        vertex = index;
+        break;
+    }
+    uint value = 0;
+    if (vertex < params.count) {
+        const uint at = params.source_offset + vertex * params.index_size;
+        switch (params.index_size) {
+        case 1:
+            value = source[at];
+            value = params.restart != 0 && value == 0xFFu ? 0xFFFFFFFFu : value;
+            break;
+        case 2:
+            value = uint(source[at]) | (uint(source[at + 1]) << 8);
+            value = params.restart != 0 && value == 0xFFFFu ? 0xFFFFFFFFu : value;
+            break;
+        default:
+            value = uint(source[at]) | (uint(source[at + 1]) << 8) |
+                    (uint(source[at + 2]) << 16) | (uint(source[at + 3]) << 24);
+            break;
+        }
+    }
+    indices[index] = value;
+}
+)";
+}
+
 } // namespace Metal::IndexConvert

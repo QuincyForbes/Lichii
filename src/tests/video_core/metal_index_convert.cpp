@@ -46,6 +46,9 @@ TEST_CASE("MetalIndexConvert[FanAndPolygon]", "[video_core]") {
 }
 
 TEST_CASE("MetalIndexConvert[LineLoop]", "[video_core]") {
+    REQUIRE(Metal::IndexConvert::RewriteMode(Topology::LineLoop) == 4);
+    REQUIRE(Metal::IndexConvert::RewriteMode(Topology::Polygon) == 3);
+    REQUIRE(Metal::IndexConvert::RewriteMode(Topology::Triangles) == 0);
     REQUIRE(Metal::IndexConvert::ConvertedTopology(Topology::LineLoop) == Topology::LineStrip);
     REQUIRE(Convert(Topology::LineLoop, {}, 0, 2, 3) == std::vector<u32>{2, 3, 4, 2});
 }

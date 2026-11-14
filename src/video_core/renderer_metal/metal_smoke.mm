@@ -717,6 +717,88 @@ int RunMeshDistribution() {
     return first && second && counted ? 0 : 1;
 }
 
+/// The GPU index rewrite (indices the GPU wrote) against IndexConvert's CPU rewrite: quads,
+/// quad strips, fans, line loops and lists, with 8-, 16- and 32-bit indices and restarts, read
+/// from an odd byte offset.
+int RunIndexRewrite() {
+    namespace IndexConvert = Metal::IndexConvert;
+    using Topology = IndexConvert::Topology;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    std::string error;
+    const Metal::Object library =
+        Metal::CreateLibrary(device, IndexConvert::RewriteKernelSource(), error);
+    const Metal::Object function =
+        library ? Metal::CreateFunction(library.Get(), "rewrite_indices") : Metal::Object{};
+    const Metal::Object state =
+        function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                 : Metal::Object{};
+    if (!state) {
+        std::printf("metal-smoke: FAIL index rewrite kernel: %s\n", error.c_str());
+        return 1;
+    }
+    constexpr uint32_t Count = 23;
+    constexpr uint32_t SourceOffset = 3;
+    uint8_t* source = nullptr;
+    const Metal::Object source_buffer =
+        Metal::CreateBuffer(device, SourceOffset + Count * 4, true, &source);
+    struct Case {
+        Topology topology;
+        uint32_t index_size;
+        bool restart;
+        Metal::Object output;
+        uint8_t* contents{};
+        uint32_t converted{};
+    };
+    std::vector<Case> cases;
+    for (const Topology topology : {Topology::Quads, Topology::QuadStrip, Topology::TriangleFan,
+                                    Topology::LineLoop, Topology::TriangleStrip}) {
+        for (const uint32_t index_size : {1U, 2U, 4U}) {
+            cases.push_back({topology, index_size, topology == Topology::TriangleStrip});
+        }
+    }
+    // One source for all: bytes that make different values at each size, with restart values.
+    for (uint32_t byte = 0; byte < Count * 4; ++byte) {
+        source[SourceOffset + byte] = static_cast<uint8_t>(byte * 37 + 5);
+    }
+    std::memset(source + SourceOffset + 4 * 2, 0xFF, 4);
+    scheduler.BeginCompute(state.Get());
+    for (Case& test : cases) {
+        test.converted = IndexConvert::ConvertedCount(test.topology, Count);
+        test.output = Metal::CreateBuffer(device, test.converted * 4, true, &test.contents);
+        const IndexConvert::RewriteParams params{
+            .mode = IndexConvert::RewriteMode(test.topology),
+            .index_size = test.index_size,
+            .count = Count,
+            .restart = test.restart ? 1U : 0U,
+            .converted = test.converted,
+            .source_offset = SourceOffset,
+        };
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, source_buffer.Get(), 0);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, test.output.Get(), 0);
+        scheduler.BindBytes(Metal::ShaderStage::Compute, 2, &params, sizeof(params));
+        scheduler.Dispatch({(test.converted + 63) / 64, 1, 1}, {64, 1, 1});
+    }
+    scheduler.Finish();
+    uint32_t wrong = 0;
+    uint32_t total = 0;
+    for (const Case& test : cases) {
+        std::vector<uint32_t> expected(test.converted);
+        IndexConvert::Convert(test.topology,
+                              std::span<const uint8_t>(source + SourceOffset, Count * 4),
+                              test.index_size, 0, Count, test.restart, expected);
+        for (uint32_t index = 0; index < test.converted; ++index) {
+            uint32_t value;
+            std::memcpy(&value, test.contents + index * 4, 4);
+            wrong += value != expected[index] ? 1 : 0;
+        }
+        total += test.converted;
+    }
+    std::printf("metal-smoke: index rewrite kernel vs CPU (%zu cases, %u indices): %u wrong: %s\n",
+                cases.size(), total, wrong, wrong == 0 ? "PASS" : "FAIL");
+    return wrong == 0 ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main() {
@@ -727,7 +809,7 @@ int main() {
         }
         int result = draw;
         for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer, RunMeshEmulation,
-                                 RunMeshDistribution}) {
+                                 RunMeshDistribution, RunIndexRewrite}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }

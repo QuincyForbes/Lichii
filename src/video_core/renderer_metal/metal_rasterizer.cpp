@@ -128,6 +128,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         return;
     }
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    index_rewrite = {};
     if (const MeshEmulation* const mesh = pipeline->Mesh()) {
         // The draw's count is its mesh workgroups (the index count for indexed draws).
         const u32 groups = is_indexed ? draw_state.index_buffer.count
@@ -165,40 +166,72 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
                  static_cast<u32>(draw_state.topology));
         return;
     }
+    const u32 count = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+    const u32 index_size =
+        is_indexed ? static_cast<u32>(draw_state.index_buffer.FormatSizeInBytes()) : 0U;
+    const u32 converted = convert ? IndexConvert::ConvertedCount(draw_state.topology, count) : 0U;
+    const bool restart = maxwell3d->regs.primitive_restart.enabled != 0;
+    if (convert && converted == 0) {
+        return;
+    }
     gpu_memory->FlushCaching();
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // Indices the GPU wrote are not in guest memory yet: a kernel rewrites them from the bound
+    // index buffer before the render pass (EDEN_NX2_METAL_GPU_INDICES=1 for every indexed
+    // rewrite, =0 never).
+    static const char gpu_indices = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_GPU_INDICES");
+        return value != nullptr ? value[0] : 'a';
+    }();
+    if (convert && is_indexed && draw_state.inline_index_draw_indexes.empty() &&
+        gpu_indices != '0') {
+        const GPUVAddr start = draw_state.index_buffer.StartAddress() +
+                               GPUVAddr{draw_state.index_buffer.first} * index_size;
+        const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(start);
+        index_rewrite.wanted =
+            gpu_indices == '1' ||
+            (device_addr && buffer_cache.IsRegionGpuModified(*device_addr,
+                                                             size_t{count} * index_size));
+        index_rewrite.params = {
+            .mode = IndexConvert::RewriteMode(draw_state.topology),
+            .index_size = index_size,
+            .count = count,
+            .restart = restart ? 1U : 0U,
+            .converted = converted,
+            .source_offset = draw_state.index_buffer.first * index_size,
+        };
+    }
     if (!PrepareDraw(*pipeline, is_indexed)) {
         return;
     }
     CountOcclusion();
     if (convert) {
-        // Rewritten on the CPU from the guest's indices (or the vertex range) into 32-bit
-        // indices in the stream ring. Index data the GPU wrote and never flushed is not seen.
-        const u32 count =
-            is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
-        const u32 index_size =
-            is_indexed ? static_cast<u32>(draw_state.index_buffer.FormatSizeInBytes()) : 0U;
-        std::span<const u8> source;
-        if (is_indexed) {
-            if (!draw_state.inline_index_draw_indexes.empty()) {
-                source = draw_state.inline_index_draw_indexes;
-            } else {
-                converted_source.resize(size_t{count} * index_size);
-                gpu_memory->ReadBlockUnsafe(draw_state.index_buffer.StartAddress() +
-                                                GPUVAddr{draw_state.index_buffer.first} * index_size,
-                                            converted_source.data(), converted_source.size());
-                source = converted_source;
+        // 32-bit indices in the stream ring: from the GPU rewrite, or rewritten on the CPU from
+        // the guest's indices (or the vertex range).
+        StagingBufferRef indices = index_rewrite.output;
+        if (indices.buffer != nullptr) {
+            ++indices_rewritten_on_gpu;
+        } else {
+            std::span<const u8> source;
+            if (is_indexed) {
+                if (!draw_state.inline_index_draw_indexes.empty()) {
+                    source = draw_state.inline_index_draw_indexes;
+                } else {
+                    converted_source.resize(size_t{count} * index_size);
+                    gpu_memory->ReadBlockUnsafe(
+                        draw_state.index_buffer.StartAddress() +
+                            GPUVAddr{draw_state.index_buffer.first} * index_size,
+                        converted_source.data(), converted_source.size());
+                    source = converted_source;
+                }
             }
+            indices = staging_pool.Stream(size_t{converted} * sizeof(u32), 4);
+            const std::span<u32> out(reinterpret_cast<u32*>(indices.mapped_span.data()),
+                                     converted);
+            IndexConvert::Convert(draw_state.topology, source, index_size,
+                                  is_indexed ? 0U : draw_state.vertex_buffer.first, count, restart,
+                                  out);
         }
-        const u32 converted = IndexConvert::ConvertedCount(draw_state.topology, count);
-        if (converted == 0) {
-            return;
-        }
-        const StagingBufferRef indices = staging_pool.Stream(size_t{converted} * sizeof(u32), 4);
-        const std::span<u32> out(reinterpret_cast<u32*>(indices.mapped_span.data()), converted);
-        IndexConvert::Convert(draw_state.topology, source, index_size,
-                              is_indexed ? 0U : draw_state.vertex_buffer.first, count,
-                              maxwell3d->regs.primitive_restart.enabled != 0, out);
         scheduler.DrawIndexed(*primitive, converted, 4, indices.buffer, indices.offset,
                               instance_count,
                               is_indexed ? static_cast<s32>(draw_state.base_index) : 0,
@@ -206,7 +239,6 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         ++draws_converted;
     } else if (is_indexed) {
         const BufferCacheRuntime::IndexState& index = buffer_cache_runtime.Index();
-        const u32 index_size = index.format == Maxwell::IndexFormat::UnsignedShort ? 2U : 4U;
         scheduler.DrawIndexed(*primitive, draw_state.index_buffer.count, index_size, index.buffer,
                               u64{index.offset} + u64{draw_state.index_buffer.first} * index_size,
                               instance_count, static_cast<s32>(draw_state.base_index),
@@ -267,6 +299,38 @@ std::vector<TextureHandle> RasterizerMetal::PrepareTexelBuffers(std::span<const 
         result.push_back(view.Get());
     }
     return result;
+}
+
+void RasterizerMetal::RewriteIndices() {
+    const BufferCacheRuntime::IndexState& index = buffer_cache_runtime.Index();
+    if (!index_kernel && !index_kernel_failed) {
+        std::string error;
+        index_kernel_library =
+            CreateLibrary(device, IndexConvert::RewriteKernelSource(), error);
+        const Object function = index_kernel_library
+                                    ? CreateFunction(index_kernel_library.Get(), "rewrite_indices")
+                                    : Object{};
+        index_kernel =
+            function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
+        if (!index_kernel) {
+            index_kernel_failed = true;
+            LOG_ERROR(Render_Metal, "Metal: index rewrite kernel failed to build: {}", error);
+        }
+    }
+    if (!index_kernel || index.buffer == nullptr) {
+        // The CPU rewrites them from guest memory instead.
+        return;
+    }
+    IndexConvert::RewriteParams params = index_rewrite.params;
+    params.source_offset += index.offset;
+    index_rewrite.output = staging_pool.Stream(size_t{params.converted} * sizeof(u32), 4);
+    scheduler.BeginCompute(index_kernel.Get());
+    scheduler.BindBuffer(ShaderStage::Compute, 0, index.buffer, 0);
+    scheduler.BindBuffer(ShaderStage::Compute, 1, index_rewrite.output.buffer,
+                         static_cast<u32>(index_rewrite.output.offset));
+    scheduler.BindBytes(ShaderStage::Compute, 2, &params, static_cast<u32>(sizeof(params)));
+    constexpr u32 GroupSize = 64;
+    scheduler.Dispatch({(params.converted + GroupSize - 1) / GroupSize, 1, 1}, {GroupSize, 1, 1});
 }
 
 void RasterizerMetal::BindMeshBuffers(const StageProgram& program, ShaderStage metal_stage,
@@ -674,6 +738,9 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         depth_stencil_state = CreateDepthStencilState(device, depth_stencil);
     }
 
+    if (index_rewrite.wanted) {
+        RewriteIndices();
+    }
     if (mesh != nullptr) {
         void* const first = pipeline.KernelState(device, mesh->first);
         void* const mesh_kernel = has_task ? pipeline.KernelState(device, mesh->mesh) : nullptr;
@@ -898,6 +965,7 @@ void RasterizerMetal::DrawIndirect() {
     }
     gpu_memory->FlushCaching();
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    index_rewrite = {};
     buffer_cache.SetDrawIndirect(&params);
     SCOPE_EXIT {
         buffer_cache.SetDrawIndirect(nullptr);

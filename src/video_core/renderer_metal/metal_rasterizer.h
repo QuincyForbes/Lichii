@@ -17,6 +17,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_metal/metal_buffer_cache.h"
 #include "video_core/renderer_metal/metal_fence_manager.h"
+#include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_pipeline_cache.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
 #include "video_core/renderer_metal/metal_texture_cache.h"
@@ -128,6 +129,7 @@ public:
         u64 draws_converted;     ///< Of them, with indices rewritten (quads, fans, 8-bit)
         u64 texel_copies;        ///< Texel buffers read through an aligned copy
         u64 occlusion_queries;   ///< Sample counts written back
+        u64 indices_rewritten_on_gpu; ///< Of the rewritten, by a kernel (GPU-written indices)
         u64 mesh_draws;          ///< Task/mesh draws through the compute emulation
         u64 mesh_groups;         ///< Their mesh workgroups
         u64 dispatches;
@@ -140,7 +142,8 @@ public:
         return {std::exchange(draws, 0), std::exchange(draws_with_pipeline, 0),
                 std::exchange(draws_encoded, 0), std::exchange(draws_converted, 0),
                 std::exchange(texel_copies, 0), std::exchange(occlusion_queries, 0),
-                std::exchange(mesh_draws, 0), std::exchange(mesh_groups, 0),
+                std::exchange(indices_rewritten_on_gpu, 0), std::exchange(mesh_draws, 0),
+                std::exchange(mesh_groups, 0),
                 std::exchange(dispatches, 0), std::exchange(dispatches_with_pipeline, 0),
                 std::exchange(clears, 0)};
     }
@@ -160,6 +163,9 @@ public:
 private:
     /// Binds everything the draw needs and opens its render pass; false to skip it.
     bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups = 0);
+
+    /// Encodes the GPU rewrite of index_rewrite (fills its output; left empty when it can't).
+    void RewriteIndices();
 
     /// Binds mesh_buffers to the program's slots of the emulation's bindings.
     void BindMeshBuffers(const StageProgram& program, ShaderStage metal_stage,
@@ -251,6 +257,17 @@ private:
     u64 draws_converted{};
     u64 mesh_draws{};
     u64 mesh_groups{};
+
+    /// The GPU index rewrite of the draw being prepared.
+    struct IndexRewrite {
+        bool wanted{};
+        IndexConvert::RewriteParams params{};
+        StagingBufferRef output;
+    } index_rewrite;
+    Object index_kernel_library;
+    Object index_kernel;
+    bool index_kernel_failed{};
+    u64 indices_rewritten_on_gpu{};
 
     /// The mesh emulation buffers of the draw being prepared.
     struct MeshBuffers {

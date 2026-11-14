@@ -32,4 +32,24 @@ using Topology = Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology;
 u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 first, u32 count,
             bool restart, std::span<u32> out) noexcept;
 
+/// Constants of the GPU rewrite (RewriteKernelSource's RewriteParams), for indices the GPU wrote:
+/// Convert's result for `count` indices of `index_size` bytes at byte `source_offset` of the
+/// source buffer, one thread per index written.
+struct RewriteParams {
+    u32 mode; ///< RewriteMode
+    u32 index_size;
+    u32 count;
+    u32 restart;
+    u32 converted; ///< ConvertedCount
+    u32 source_offset;
+};
+
+/// RewriteParams::mode of a topology: 0 as it is, 1 quads, 2 quad strip, 3 fan or polygon,
+/// 4 line loop.
+[[nodiscard]] u32 RewriteMode(Topology topology) noexcept;
+
+/// MSL of the kernel `rewrite_indices`: source bytes at buffer 0, the u32 indices at buffer 1,
+/// RewriteParams at buffer 2.
+[[nodiscard]] const char* RewriteKernelSource() noexcept;
+
 } // namespace Metal::IndexConvert
