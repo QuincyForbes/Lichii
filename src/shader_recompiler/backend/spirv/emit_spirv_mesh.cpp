@@ -10,7 +10,9 @@
 // epilogue (reached by every invocation, see structured_control_flow.cpp) hands them to Vulkan.
 
 #include <algorithm>
+#include <array>
 #include <span>
+#include <utility>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -231,6 +233,37 @@ void ComputeMeshEpilogue(EmitContext& ctx) {
             If(ctx, ctx.OpULessThan(ctx.U1, primitive, ctx.Const(mesh.max_primitives)), write);
         } else {
             write();
+        }
+    }
+    // Primitive p, line l: output word p * primitive_lines + l after the indices, from the
+    // primitives' line groups of the stage buffer.
+    const u32 primitive_lines{static_cast<u32>(mesh.primitive_lines.size())};
+    const Id primitive_base{
+        ctx.OpIAdd(ctx.U32[1], index_base, ctx.Const(mesh.max_primitives * corners))};
+    for (u32 first = 0; primitive_lines != 0 && first < mesh.max_primitives; first += threads) {
+        const Id primitive{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
+        const auto copy = [&] {
+            const Id group{ctx.OpShiftRightLogical(ctx.U32[1], primitive, ctx.Const(5U))};
+            const Id slot{ctx.OpBitwiseAnd(ctx.U32[1], primitive, ctx.Const(31U))};
+            const Id source{ctx.OpIAdd(
+                ctx.U32[1], ctx.OpIMul(ctx.U32[1], group, ctx.Const(primitive_lines * 32)),
+                ctx.OpIAdd(ctx.U32[1], slot, ctx.Const(ctx.mesh_primitive_base)))};
+            const Id destination{ctx.OpIAdd(
+                ctx.U32[1], primitive_base,
+                ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(primitive_lines)))};
+            for (u32 line = 0; line < primitive_lines; ++line) {
+                const Id word{ctx.OpLoad(
+                    ctx.U32[1],
+                    SharedWord(ctx, ctx.mesh_attributes,
+                               ctx.OpIAdd(ctx.U32[1], source, ctx.Const(line * 32))))};
+                ctx.OpStore(OutputWord(ctx, ctx.OpIAdd(ctx.U32[1], destination, ctx.Const(line))),
+                            word);
+            }
+        };
+        if (first + threads > mesh.max_primitives) {
+            If(ctx, ctx.OpULessThan(ctx.U1, primitive, ctx.Const(mesh.max_primitives)), copy);
+        } else {
+            copy();
         }
     }
 }
@@ -496,6 +529,24 @@ void EmitMeshEpilogue(EmitContext& ctx) {
     }
 }
 
+bool MeshEmulationTakesPrimitiveLines(const MeshInfo& mesh) {
+    std::array<bool, IR::NUM_GENERICS> per_vertex{};
+    for (const u32 line : mesh.vertex_lines) {
+        if (const IR::Attribute attribute{line}; IR::IsGeneric(attribute)) {
+            per_vertex[IR::GenericAttributeIndex(attribute)] = true;
+        }
+    }
+    return std::ranges::none_of(mesh.primitive_lines, [&](u32 line) {
+        const IR::Attribute attribute{line};
+        if (IR::IsGeneric(attribute)) {
+            // One location is Flat as a whole or not at all.
+            return per_vertex[IR::GenericAttributeIndex(attribute)];
+        }
+        return attribute == IR::Attribute::PrimitiveId || attribute == IR::Attribute::Layer ||
+               attribute == IR::Attribute::ViewportIndex;
+    });
+}
+
 std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo& mesh, u32 binding,
                                          u32 args_binding, bool convert_depth, float point_size) {
     Sirit::Module module{profile.supported_spirv};
@@ -570,6 +621,7 @@ std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo&
         interfaces.push_back(clip_distance);
     }
     std::array<Id, IR::NUM_GENERICS> generics{};
+    std::array<bool, IR::NUM_GENERICS> flat_generics{};
     for (const u32 line : mesh.vertex_lines) {
         const IR::Attribute attribute{line};
         if (!IR::IsGeneric(attribute)) {
@@ -580,6 +632,23 @@ std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo&
             generics[index] = module.AddGlobalVariable(output_vec4, spv::StorageClass::Output);
             module.Decorate(generics[index], spv::Decoration::Location, index);
             interfaces.push_back(generics[index]);
+        }
+    }
+    // Per-primitive generics: Flat, with the primitive's value at each of its corners. The pixel
+    // program of an emulated pipeline declares them Flat too (RuntimeInfo::mesh_emulation_inputs).
+    for (const u32 line : mesh.primitive_lines) {
+        const IR::Attribute attribute{line};
+        if (!IR::IsGeneric(attribute)) {
+            continue;
+        }
+        const u32 index{IR::GenericAttributeIndex(attribute)};
+        if (!Sirit::ValidId(generics[index])) {
+            generics[index] = module.AddGlobalVariable(output_vec4, spv::StorageClass::Output);
+            module.Decorate(generics[index], spv::Decoration::Location, index);
+            interfaces.push_back(generics[index]);
+        }
+        if (!std::exchange(flat_generics[index], true)) {
+            module.Decorate(generics[index], spv::Decoration::Flat);
         }
     }
     if (profile.supported_spirv >= 0x00010400) {
@@ -652,6 +721,28 @@ std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo&
         } else if (attribute == IR::Attribute::PointSize && Sirit::ValidId(point_size_output)) {
             module.OpStore(point_size_output, value);
         }
+    }
+    // The primitive's own lines follow the block's indices.
+    const u32 primitive_lines{static_cast<u32>(mesh.primitive_lines.size())};
+    const Id primitive_base{
+        primitive_lines == 0
+            ? Id{}
+            : module.OpIAdd(u32_type,
+                            module.OpIAdd(u32_type, block,
+                                          constant(mesh.max_vertices * vertex_lines +
+                                                   mesh.max_primitives * corners)),
+                            module.OpIMul(u32_type, primitive, constant(primitive_lines)))};
+    for (u32 line = 0; line < primitive_lines; ++line) {
+        const IR::Attribute attribute{mesh.primitive_lines[line]};
+        if (!IR::IsGeneric(attribute)) {
+            continue;
+        }
+        const Id value{module.OpBitcast(
+            f32_type, load(module.OpIAdd(u32_type, primitive_base, constant(line))))};
+        module.OpStore(module.OpAccessChain(output_f32,
+                                            generics[IR::GenericAttributeIndex(attribute)],
+                                            constant(IR::GenericAttributeElement(attribute))),
+                       value);
     }
     // OpenGL-style clip space, as the mesh epilogue's ConvertDepth: z = (z + w) / 2.
     if (convert_depth && Sirit::ValidId(position_z) && Sirit::ValidId(position_w)) {

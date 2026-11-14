@@ -137,10 +137,14 @@ struct RuntimeInfo {
     /// a workgroup copy of the attribute region. MoltenVK keeps the outputs in threadgroup memory
     /// already, so the copy doubled the program's threadgroup memory past Metal's 32 KiB.
     bool mesh_direct_outputs{};
-    /// Fragment program: inputs a mesh program writes per primitive are also decorated Flat.
-    /// SPIRV-Cross (MoltenVK) ignores PerPrimitiveEXT on fragment inputs and declares them
-    /// interpolated, which Metal's mesh pipelines refuse.
+    /// Fragment program after a native mesh program: inputs it writes per primitive are also
+    /// decorated Flat. SPIRV-Cross (MoltenVK) ignores PerPrimitiveEXT on fragment inputs, so
+    /// without this Metal interpolates them; Apple's compiler builds both forms.
     bool flat_per_primitive_inputs{};
+    /// Fragment program of an emulated mesh pipeline: its per-primitive inputs come from the
+    /// emulation's vertex shader as plain Flat varyings (EmitMeshEmulationVertex), so they are
+    /// declared Flat without PerPrimitiveEXT and the module needs no mesh shading capability.
+    bool mesh_emulation_inputs{};
 };
 
 } // namespace Shader

@@ -133,7 +133,7 @@ Profile MakeProfile() {
 // With lane_id the mesh program writes its lane as the vertex's first attribute word.
 std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
                              Profile profile = MakeProfile(), bool lane_id = false,
-                             bool direct_outputs = false) {
+                             bool direct_outputs = false, const MeshInfo& mesh = TriangleMesh()) {
     ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     IR::Program program;
@@ -143,7 +143,7 @@ std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
     program.post_order_blocks = {&block};
     program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
                            {{}, IR::AbstractSyntaxNode::Type::Return}};
-    program.mesh = TriangleMesh();
+    program.mesh = mesh;
     program.info.is_task = stage == Stage::Task;
     program.info.is_mesh = stage == Stage::Mesh;
     program.info.uses_workgroup_id = true;
@@ -296,6 +296,140 @@ TEST_CASE("Mesh fallback blocks hold one index per point and two per line",
     REQUIRE(SPIRV::MeshEmulationBlockWords(mesh) == vertex_words + 8 * 2);
     mesh.topology = 0;
     REQUIRE(SPIRV::MeshEmulationBlockWords(mesh) == vertex_words + 8);
+}
+
+namespace {
+// TriangleMesh() with generic 1's x and generic 3's x and y written per primitive.
+MeshInfo PerPrimitiveMesh() {
+    MeshInfo mesh{TriangleMesh()};
+    mesh.max_primitives = 8;
+    for (const IR::Attribute attribute :
+         {IR::Attribute::Generic1X, IR::Attribute::Generic3X, IR::Attribute::Generic3Y}) {
+        mesh.primitive_lines.push_back(static_cast<u32>(attribute));
+    }
+    return mesh;
+}
+
+// The ids decorated with `decoration`.
+std::vector<u32> Decorated(const std::vector<u32>& code, spv::Decoration decoration) {
+    std::vector<u32> ids;
+    for (const Instruction& inst : Instructions(code)) {
+        if (inst.op == spv::Op::OpDecorate && inst.operands[1] == static_cast<u32>(decoration)) {
+            ids.push_back(inst.operands[0]);
+        }
+    }
+    std::ranges::sort(ids);
+    return ids;
+}
+
+// The locations of the variables decorated with `decoration`.
+std::vector<u32> LocationsDecorated(const std::vector<u32>& code, spv::Decoration decoration) {
+    const std::vector<u32> ids{Decorated(code, decoration)};
+    std::vector<u32> locations;
+    for (const Instruction& inst : Instructions(code)) {
+        if (inst.op == spv::Op::OpDecorate &&
+            inst.operands[1] == static_cast<u32>(spv::Decoration::Location) &&
+            std::ranges::binary_search(ids, inst.operands[0])) {
+            locations.push_back(inst.operands[2]);
+        }
+    }
+    std::ranges::sort(locations);
+    return locations;
+}
+
+// A pixel program reading generics 1 and 3 after a mesh program that writes them per primitive.
+std::vector<u32> EmitPerPrimitivePixel(bool emulated, bool flat) {
+    ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::Program program;
+    program.stage = Stage::Fragment;
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
+                           {{}, IR::AbstractSyntaxNode::Type::Return}};
+    RuntimeInfo runtime_info;
+    for (const IR::Attribute attribute : {IR::Attribute::Generic1X, IR::Attribute::Generic3X}) {
+        program.info.loads.Set(attribute);
+        runtime_info.previous_stage_stores.Set(attribute);
+        runtime_info.per_primitive_generics.set(IR::GenericAttributeIndex(attribute));
+    }
+    runtime_info.mesh_emulation_inputs = emulated;
+    runtime_info.flat_per_primitive_inputs = flat;
+    Backend::Bindings bindings;
+    return SPIRV::EmitSPIRV(MakeProfile(), runtime_info, program, bindings);
+}
+} // Anonymous namespace
+
+TEST_CASE("Mesh fallback blocks end with the primitives' own lines",
+          "[video_core][spirv][mesh_fallback]") {
+    const MeshInfo mesh{PerPrimitiveMesh()};
+    const u32 vertex_words{mesh.max_vertices * static_cast<u32>(mesh.vertex_lines.size())};
+    REQUIRE(SPIRV::MeshEmulationBlockWords(mesh) == vertex_words + 8 * 3 + 8 * 3);
+}
+
+TEST_CASE("Mesh fallback takes per-primitive generics only",
+          "[video_core][spirv][mesh_fallback]") {
+    REQUIRE(SPIRV::MeshEmulationTakesPrimitiveLines(TriangleMesh()));
+    REQUIRE(SPIRV::MeshEmulationTakesPrimitiveLines(PerPrimitiveMesh()));
+    for (const IR::Attribute attribute :
+         {IR::Attribute::PrimitiveId, IR::Attribute::Layer, IR::Attribute::ViewportIndex}) {
+        MeshInfo mesh{PerPrimitiveMesh()};
+        mesh.primitive_lines.push_back(static_cast<u32>(attribute));
+        REQUIRE_FALSE(SPIRV::MeshEmulationTakesPrimitiveLines(mesh));
+    }
+    // A location is Flat as a whole: not one written per vertex and per primitive.
+    MeshInfo mixed{PerPrimitiveMesh()};
+    mixed.vertex_lines.push_back(static_cast<u32>(IR::Attribute::Generic3Z));
+    REQUIRE_FALSE(SPIRV::MeshEmulationTakesPrimitiveLines(mixed));
+}
+
+TEST_CASE("Mesh fallback draws per-primitive generics as Flat varyings",
+          "[video_core][spirv][mesh_fallback]") {
+    MeshInfo mesh{PerPrimitiveMesh()};
+    mesh.vertex_lines.push_back(static_cast<u32>(IR::Attribute::Generic2X));
+
+    const std::vector<u32> compute{
+        EmitProgram(Stage::Mesh, true, false, MakeProfile(), false, false, mesh)};
+    Dump(compute, "fallback-mesh-per-primitive");
+    RequireNoMeshShading(compute);
+    REQUIRE(Bindings(compute) == std::vector<u32>{OUTPUT_BINDING});
+
+    const std::vector<u32> vertex{
+        SPIRV::EmitMeshEmulationVertex(MakeProfile(), mesh, OUTPUT_BINDING, ~0U, false)};
+    Dump(vertex, "fallback-vertex-per-primitive");
+    REQUIRE(Model(vertex) == spv::ExecutionModel::Vertex);
+    // Generic 2 is written per vertex and stays interpolated.
+    REQUIRE(LocationsDecorated(vertex, spv::Decoration::Flat) == std::vector<u32>{1, 3});
+    REQUIRE(Decorated(vertex, spv::Decoration::PerPrimitiveEXT).empty());
+
+    // Without primitive lines the vertex shader is the one it was.
+    REQUIRE(Decorated(SPIRV::EmitMeshEmulationVertex(MakeProfile(), TriangleMesh(),
+                                                     OUTPUT_BINDING, ~0U, false),
+                      spv::Decoration::Flat)
+                .empty());
+}
+
+TEST_CASE("Pixel programs read per-primitive generics Flat after an emulated mesh program",
+          "[video_core][spirv][mesh_fallback]") {
+    const std::vector<u32> native{EmitPerPrimitivePixel(false, false)};
+    Dump(native, "native-pixel-per-primitive");
+    REQUIRE(HasCapability(native, spv::Capability::MeshShadingEXT));
+    REQUIRE(LocationsDecorated(native, spv::Decoration::PerPrimitiveEXT) ==
+            std::vector<u32>{1, 3});
+    REQUIRE(Decorated(native, spv::Decoration::Flat).empty());
+
+    const std::vector<u32> native_flat{EmitPerPrimitivePixel(false, true)};
+    REQUIRE(LocationsDecorated(native_flat, spv::Decoration::PerPrimitiveEXT) ==
+            std::vector<u32>{1, 3});
+    REQUIRE(LocationsDecorated(native_flat, spv::Decoration::Flat) == std::vector<u32>{1, 3});
+
+    const std::vector<u32> emulated{EmitPerPrimitivePixel(true, true)};
+    Dump(emulated, "fallback-pixel-per-primitive");
+    REQUIRE(Model(emulated) == spv::ExecutionModel::Fragment);
+    REQUIRE_FALSE(HasCapability(emulated, spv::Capability::MeshShadingEXT));
+    REQUIRE_FALSE(HasExtension(emulated, "SPV_EXT_mesh_shader"));
+    REQUIRE(Decorated(emulated, spv::Decoration::PerPrimitiveEXT).empty());
+    REQUIRE(LocationsDecorated(emulated, spv::Decoration::Flat) == std::vector<u32>{1, 3});
 }
 
 TEST_CASE("Mesh fallback vertex shader gives points a size and culls unused points and lines",

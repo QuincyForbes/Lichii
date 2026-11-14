@@ -72,16 +72,25 @@ constexpr u32 MESH_EMULATION_UNUSED_VERTEX = ~0U;
 /// (RuntimeInfo::mesh_as_compute) that writes one block per workgroup to a u32 storage buffer:
 /// max_vertices * vertex_lines words (vertex v, line l at v * vertex_lines + l), then
 /// max_primitives * PrimitiveVertices() vertex indices (1 for points, 2 for lines, 3 for
-/// triangles).
+/// triangles), then max_primitives * primitive_lines words (primitive p, line l at
+/// p * primitive_lines + l) when the program writes per-primitive attributes.
 [[nodiscard]] inline u32 MeshEmulationBlockWords(const MeshInfo& mesh) {
     return mesh.max_vertices * static_cast<u32>(mesh.vertex_lines.size()) +
-           mesh.max_primitives * mesh.PrimitiveVertices();
+           mesh.max_primitives *
+               (mesh.PrimitiveVertices() + static_cast<u32>(mesh.primitive_lines.size()));
 }
+
+/// Whether the emulation can draw the mesh program's per-primitive lines: generics reach the
+/// pixel program as Flat outputs of the vertex shader, the same value at every corner. A
+/// primitive id, layer or viewport index has no such route, nor has a generic whose other
+/// components are written per vertex.
+[[nodiscard]] bool MeshEmulationTakesPrimitiveLines(const MeshInfo& mesh);
 
 /// Vertex shader drawing the emulation's output as a point, line or triangle list of
 /// groups * max_primitives * PrimitiveVertices() vertices, with the mesh program's vertex
-/// outputs. Points get point_size unless the program writes its own. With a task program
-/// (args_binding != ~0) the blocks start at the arguments' MESH_EMULATION_ARGS_BASE.
+/// outputs and, Flat, its per-primitive generics. Points get point_size unless the program
+/// writes its own. With a task program (args_binding != ~0) the blocks start at the arguments'
+/// MESH_EMULATION_ARGS_BASE.
 [[nodiscard]] std::vector<u32> EmitMeshEmulationVertex(const Profile& profile,
                                                        const MeshInfo& mesh, u32 binding,
                                                        u32 args_binding, bool convert_depth,

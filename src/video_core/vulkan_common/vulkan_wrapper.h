@@ -1816,8 +1816,10 @@ public:
     }
 
 private:
-    VkCommandBuffer handle;
-    const DeviceDispatch* dld;
+    // Null until assigned: a default-constructed member used to hold whatever its memory held
+    // (Scheduler::before_pass_cmdbuf crashed the iPhone's first frame that way).
+    VkCommandBuffer handle = nullptr;
+    const DeviceDispatch* dld = nullptr;
 };
 
 u32 AvailableVersion(const InstanceDispatch& dld) noexcept;

@@ -17,9 +17,11 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include <bit>
 #include <cstring>
@@ -1283,15 +1285,52 @@ bool MeshDirectOutputs(const Device& device) {
 }
 
 /// Fragment inputs written per primitive are also Flat (RuntimeInfo::flat_per_primitive_inputs):
-/// on MoltenVK, EDEN_NX2_FLAT_PER_PRIMITIVE=0 off, =1 on every driver. Pipeline bbfd9d39350cdaaa
-/// (Kokiri) failed on the iPhone with VK_ERROR_INITIALIZATION_FAILED: its pixel program reads
-/// three per-primitive generics, which SPIRV-Cross e99dc7a3 declared interpolated.
+/// on MoltenVK, EDEN_NX2_FLAT_PER_PRIMITIVE=0 off, =1 on every driver. SPIRV-Cross e99dc7a3
+/// declares such inputs interpolated, and the pixel program of pipeline bbfd9d39350cdaaa (Kokiri)
+/// compares them bit for bit. It is not what made that pipeline fail on the iPhone: Apple's
+/// compiler builds both forms, see NativePerPrimitiveMesh.
 bool FlatPerPrimitiveInputs(const Device& device) {
     static const int flat = [] {
         const char* value = std::getenv("EDEN_NX2_FLAT_PER_PRIMITIVE");
         return value == nullptr ? -1 : (value[0] != '0' ? 1 : 0);
     }();
     return flat >= 0 ? flat != 0 : device.IsMoltenVK();
+}
+
+/// Whether a mesh program that writes per-primitive generics is built as a native mesh pipeline:
+/// everywhere but on MoltenVK, where it takes the compute emulation. EDEN_NX2_NATIVE_PER_PRIMITIVE
+/// =1 native on every driver, =0 emulated on every driver. The iPhone refuses pipeline
+/// bbfd9d39350cdaaa at every boot ("Fragment input(s) user(locn1),user(locn3) mismatching mesh
+/// shader output type(s) or not written by mesh shader"), though the same interface builds with
+/// Apple's offline compiler for that GPU in every form tried.
+bool NativePerPrimitiveMesh(const Device& device) {
+    static const int native = [] {
+        const char* value = std::getenv("EDEN_NX2_NATIVE_PER_PRIMITIVE");
+        return value == nullptr ? -1 : (value[0] != '0' ? 1 : 0);
+    }();
+    return native >= 0 ? native != 0 : !device.IsMoltenVK();
+}
+
+/// " mesh <hash> pixel <hash>" (with " task <hash>" first when there is one) of a task/mesh
+/// pipeline, for log lines: the task and mesh programs come first, the pixel program last.
+std::string MeshPipelineShaders(const GraphicsPipelineCacheKey& key) {
+    const size_t pixel_index{key.unique_hashes.size() - 1};
+    size_t before_pixel{};
+    for (size_t index = 1; index < pixel_index; ++index) {
+        before_pixel += key.unique_hashes[index] != 0;
+    }
+    std::string shaders;
+    bool task{before_pixel > 1};
+    for (size_t index = 1; index < pixel_index; ++index) {
+        if (key.unique_hashes[index] != 0) {
+            shaders += fmt::format(" {} {:016x}", std::exchange(task, false) ? "task" : "mesh",
+                                   key.unique_hashes[index]);
+        }
+    }
+    if (key.unique_hashes[pixel_index] != 0) {
+        shaders += fmt::format(" pixel {:016x}", key.unique_hashes[pixel_index]);
+    }
+    return shaders;
 }
 
 /// Destroys the pipelines of `pipelines` (a map or a deque of pairs holding unique_ptrs), telling
@@ -1796,7 +1835,9 @@ GraphicsPipeline* PipelineCache::EmulateFailedNativeMesh(GraphicsPipeline* faile
     }
     std::unique_ptr<GraphicsPipeline> emulated = CreateGraphicsPipeline();
     // Warning: the iOS log shows Render.Vulkan only from there.
-    LOG_WARNING(Render_Vulkan, "Native mesh pipeline {:016x} failed to build: {}", hash,
+    LOG_WARNING(Render_Vulkan,
+                "Native mesh pipeline {:016x} (shaders{}) failed to build: {}", hash,
+                MeshPipelineShaders(graphics_key),
                 emulated ? "its draws take the compute emulation instead"
                          : "the compute emulation cannot take it either, its draws are skipped");
     used_this_session.erase(failed);
@@ -3676,14 +3717,25 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         }
     }
+    // A pipeline the device could build natively but that takes the emulation.
+    bool routed_from_native{};
     if (!mesh_unsupported && device.IsExtMeshShaderSupported()) {
         bool driver_failed{};
         {
             std::scoped_lock lock{failed_native_mesh_mutex};
             driver_failed = failed_native_mesh.contains(hash);
         }
+        const auto per_primitive_generics = [&] {
+            return std::ranges::any_of(programs, [](const Shader::IR::Program& program) {
+                return program.stage == Shader::Stage::Mesh &&
+                       std::ranges::any_of(program.mesh.primitive_lines, [](u32 line) {
+                           return Shader::IR::IsGeneric(static_cast<Shader::IR::Attribute>(line));
+                       });
+            });
+        };
         if (driver_failed) {
             mesh_unsupported = true;
+            routed_from_native = true;
         } else if (const auto reason{NativeMeshLimitExceeded(device, key, programs)}) {
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -3692,11 +3744,27 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                             hash, *reason);
             }
             mesh_unsupported = true;
+            routed_from_native = true;
+        } else if (!NativePerPrimitiveMesh(device) && per_primitive_generics()) {
+            // Warning: the iOS log shows Render.Vulkan only from there.
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+                LOG_WARNING(Render_Vulkan,
+                            "Mesh pipeline {:016x} (shaders{}) writes per-primitive attributes: "
+                            "emulated instead of built natively",
+                            hash, MeshPipelineShaders(key));
+            }
+            mesh_unsupported = true;
+            routed_from_native = true;
+        }
+        if (routed_from_native) {
+            // Its indirect draws read their count on the CPU (DrawMeshTasksFromGpu).
             emulated_native_mesh.store(true, std::memory_order_relaxed);
         }
     }
     // Mesh emulation without VK_EXT_mesh_shader (prototype): a mesh program, after an optional
-    // task program, drawing triangles without per-primitive outputs, before a pixel program only.
+    // task program, drawing triangles, points or lines, before a pixel program only. Its
+    // per-primitive generics are taken, a per-primitive id, layer or viewport index is not.
     std::optional<MeshEmulationSetup> mesh_emulation;
     size_t mesh_index{};
     if (mesh_unsupported) {
@@ -3715,7 +3783,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         // Points (0), lines (1) and triangles (4).
         const u32 topology{mesh.mesh.topology};
         eligible = eligible && (topology == 0 || topology == 1 || topology == 4) &&
-                   mesh.mesh.primitive_lines.empty() &&
+                   Shader::Backend::SPIRV::MeshEmulationTakesPrimitiveLines(mesh.mesh) &&
                    !mesh.mesh.vertex_lines.empty() && mesh.mesh.max_vertices != 0 &&
                    mesh.mesh.max_primitives != 0;
         for (size_t index = 1; index < Maxwell::MaxShaderProgram && eligible; ++index) {
@@ -3735,6 +3803,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             return nullptr;
         }
         if (!eligible) {
+            if (routed_from_native) {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Mesh pipeline {:016x} (shaders{}) cannot be emulated: its draws "
+                                "are skipped",
+                                hash, MeshPipelineShaders(key));
+                }
+            }
             return nullptr;
         }
         // The output buffer's binding follows every program's (unified bindings, one per
@@ -3772,9 +3849,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             compute_sampled_images > device.GetMaxPerStageDescriptorSampledImages() ||
             compute_resources > device.GetMaxPerStageResources()) {
             LOG_WARNING(Render_Vulkan,
-                        "Mesh emulation skipped: {} storage buffers, {} sampled images and {} "
-                        "resources exceed the compute stage limits",
-                        compute_storage_buffers, compute_sampled_images, compute_resources);
+                        "Mesh emulation skipped for pipeline {:016x} (shaders{}): {} storage "
+                        "buffers, {} sampled images and {} resources exceed the compute stage "
+                        "limits",
+                        hash, MeshPipelineShaders(key), compute_storage_buffers,
+                        compute_sampled_images, compute_resources);
             return nullptr;
         }
         mesh_emulation.emplace();
@@ -3962,6 +4041,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         if (program.stage == Shader::Stage::Fragment) {
             runtime_info.flat_per_primitive_inputs = FlatPerPrimitiveInputs(device);
+            runtime_info.mesh_emulation_inputs = mesh_emulation.has_value();
         }
         ConvertLegacyToGeneric(program, runtime_info);
         // EDEN_NX2_MESH_EMULATION_DUMP=<dir>: write the emulation's vertex shader for spirv-val.

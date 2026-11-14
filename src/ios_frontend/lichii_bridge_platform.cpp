@@ -231,6 +231,16 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_UINT8_INDICES", "1", 0);
         LOG_WARNING(Frontend, "iOS: experiment mvk_uint8_indices on");
     }
+    if (lichii_platform_experiment("native_per_primitive")) {
+        setenv("EDEN_NX2_NATIVE_PER_PRIMITIVE", "1", 0);
+        LOG_WARNING(Frontend, "iOS: experiment native_per_primitive on");
+    }
+    if (lichii_platform_experiment("mvk_shader_dump")) {
+        // MoltenVK writes every shader it converts there, as it hands it to Metal.
+        const auto dir = Common::FS::GetEdenPath(Common::FS::EdenPath::DumpDir) / "mvk-shaders";
+        setenv("MVK_CONFIG_SHADER_DUMP_DIR", dir.string().c_str(), 0);
+        LOG_WARNING(Frontend, "iOS: experiment mvk_shader_dump on, {}", dir.string());
+    }
     // These replace device profile switches (ApplyTuning ran first), so they overwrite.
     if (lichii_platform_experiment("tc_old_eviction")) {
         setenv("EDEN_NX2_TC_REDRAWN_FRAMES", "0", 1);

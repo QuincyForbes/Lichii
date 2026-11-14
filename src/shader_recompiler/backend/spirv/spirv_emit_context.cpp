@@ -1987,6 +1987,11 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         const bool is_integer = input_type == AttributeType::SignedInt ||
                                 input_type == AttributeType::UnsignedInt;
         if (runtime_info.per_primitive_generics.test(index)) {
+            if (runtime_info.mesh_emulation_inputs) {
+                // The emulation's vertex shader repeats the primitive's value at every corner.
+                Decorate(id, spv::Decoration::Flat);
+                continue;
+            }
             // Written per primitive by a mesh program: constant over the primitive.
             AddExtension("SPV_EXT_mesh_shader");
             AddCapability(spv::Capability::MeshShadingEXT);
