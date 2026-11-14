@@ -124,8 +124,9 @@ struct Scheduler::Impl {
         return [Commands() renderCommandEncoderWithDescriptor:pass];
     }
 
-    id<MTLRenderPipelineState> BlitPipeline(MTLPixelFormat format) {
-        if (const auto it = blit_pipelines.find(format); it != blit_pipelines.end()) {
+    id<MTLRenderPipelineState> BlitPipeline(MTLPixelFormat format, BlitBlend blend) {
+        const u64 key = (static_cast<u64>(format) << 8) | static_cast<u64>(blend);
+        if (const auto it = blit_pipelines.find(key); it != blit_pipelines.end()) {
             return it->second;
         }
         id<MTLRenderPipelineState> pipeline = nil;
@@ -143,6 +144,16 @@ struct Scheduler::Impl {
             desc.vertexFunction = [library newFunctionWithName:@"blit_vertex"];
             desc.fragmentFunction = [library newFunctionWithName:fragment];
             desc.colorAttachments[0].pixelFormat = format;
+            if (blend != BlitBlend::None && format_class == FormatClass::Float) {
+                MTLRenderPipelineColorAttachmentDescriptor* color = desc.colorAttachments[0];
+                color.blendingEnabled = YES;
+                color.sourceRGBBlendFactor = blend == BlitBlend::Premultiplied
+                                                 ? MTLBlendFactorOne
+                                                 : MTLBlendFactorSourceAlpha;
+                color.sourceAlphaBlendFactor = color.sourceRGBBlendFactor;
+                color.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                color.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            }
             NSError* error = nil;
             pipeline = [device.GetDevice() newRenderPipelineStateWithDescriptor:desc error:&error];
             if (pipeline == nil) {
@@ -150,7 +161,7 @@ struct Scheduler::Impl {
                           static_cast<u32>(format), error.localizedDescription.UTF8String);
             }
         }
-        blit_pipelines.emplace(format, pipeline);
+        blit_pipelines.emplace(key, pipeline);
         return pipeline;
     }
 
@@ -169,7 +180,8 @@ struct Scheduler::Impl {
     id<MTLLibrary> library = nil;
     id<MTLSamplerState> nearest = nil;
     id<MTLSamplerState> linear = nil;
-    std::unordered_map<MTLPixelFormat, id<MTLRenderPipelineState>> blit_pipelines;
+    /// By format << 8 | BlitBlend.
+    std::unordered_map<u64, id<MTLRenderPipelineState>> blit_pipelines;
 
     u64 current_tick{1};
     std::atomic<u64> completed_tick{0};
@@ -364,7 +376,7 @@ bool Scheduler::Blit(const BlitPass& blit) {
         return false;
     }
     const MTLPixelFormat format = static_cast<MTLPixelFormat>(blit.dst_format);
-    const id<MTLRenderPipelineState> pipeline = impl->BlitPipeline(format);
+    const id<MTLRenderPipelineState> pipeline = impl->BlitPipeline(format, blit.blend);
     if (pipeline == nil) {
         return false;
     }

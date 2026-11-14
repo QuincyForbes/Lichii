@@ -55,7 +55,8 @@ struct RendererMetal::Impl {
 
     /// The guest framebuffer as a texture: the texture cache's image, else read from guest
     /// memory (block linear) into a texture of our own.
-    std::optional<DisplayTexture> PrepareLayer(const Tegra::FramebufferConfig& framebuffer);
+    std::optional<DisplayTexture> PrepareLayer(const Tegra::FramebufferConfig& framebuffer,
+                                               size_t layer);
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     Device device;
@@ -63,14 +64,18 @@ struct RendererMetal::Impl {
     Swapchain swapchain;
     RasterizerMetal rasterizer;
 
-    Object cpu_texture;
-    Object cpu_upload;
-    u8* cpu_upload_contents{};
-    u64 cpu_upload_size{};
-    u64 cpu_upload_tick{};
-    u32 cpu_width{};
-    u32 cpu_height{};
-    Service::android::PixelFormat cpu_format{};
+    /// A layer read from guest memory (no texture cache image at its address).
+    struct MemoryLayer {
+        Object texture;
+        Object upload;
+        u8* upload_contents{};
+        u64 upload_size{};
+        u64 upload_tick{};
+        u32 width{};
+        u32 height{};
+        Service::android::PixelFormat format{};
+    };
+    std::vector<MemoryLayer> memory_layers;
     std::vector<u8> unswizzled;
 
     std::chrono::steady_clock::time_point report_start = std::chrono::steady_clock::now();
@@ -81,7 +86,7 @@ struct RendererMetal::Impl {
 };
 
 std::optional<DisplayTexture> RendererMetal::Impl::PrepareLayer(
-    const Tegra::FramebufferConfig& framebuffer) {
+    const Tegra::FramebufferConfig& framebuffer, size_t layer) {
     const DAddr framebuffer_addr = framebuffer.address + framebuffer.offset;
     if (auto accelerated = rasterizer.AccelerateDisplay(framebuffer, framebuffer_addr)) {
         ++from_cache;
@@ -90,18 +95,22 @@ std::optional<DisplayTexture> RendererMetal::Impl::PrepareLayer(
     if (framebuffer.width == 0 || framebuffer.height == 0) {
         return std::nullopt;
     }
-    if (!cpu_texture || cpu_width != framebuffer.width || cpu_height != framebuffer.height ||
-        cpu_format != framebuffer.pixel_format) {
-        cpu_texture = CreateTexture(device, TextureDesc{
-                                                .kind = TextureKind::e2D,
-                                                .format = static_cast<u32>(
-                                                    FramebufferFormat(framebuffer.pixel_format)),
-                                                .width = framebuffer.width,
-                                                .height = framebuffer.height,
-                                            });
-        cpu_width = framebuffer.width;
-        cpu_height = framebuffer.height;
-        cpu_format = framebuffer.pixel_format;
+    if (memory_layers.size() <= layer) {
+        memory_layers.resize(layer + 1);
+    }
+    MemoryLayer& state = memory_layers[layer];
+    if (!state.texture || state.width != framebuffer.width || state.height != framebuffer.height ||
+        state.format != framebuffer.pixel_format) {
+        state.texture = CreateTexture(device, TextureDesc{
+                                                  .kind = TextureKind::e2D,
+                                                  .format = static_cast<u32>(
+                                                      FramebufferFormat(framebuffer.pixel_format)),
+                                                  .width = framebuffer.width,
+                                                  .height = framebuffer.height,
+                                              });
+        state.width = framebuffer.width;
+        state.height = framebuffer.height;
+        state.format = framebuffer.pixel_format;
     }
     // The guest's framebuffers are block linear with 16-GOB blocks (as OpenGL reads them).
     constexpr u32 block_height_log2 = 4;
@@ -111,7 +120,7 @@ std::optional<DisplayTexture> RendererMetal::Impl::PrepareLayer(
     const u64 size_in_bytes = Tegra::Texture::CalculateSize(
         true, bytes_per_pixel, framebuffer.stride, framebuffer.height, 1, block_height_log2, 0);
     const u8* const host_ptr = device_memory.GetPointer<u8>(framebuffer_addr);
-    if (host_ptr == nullptr || !cpu_texture) {
+    if (host_ptr == nullptr || !state.texture) {
         return std::nullopt;
     }
     const u64 bytes_per_row = u64{framebuffer.stride} * bytes_per_pixel;
@@ -120,23 +129,23 @@ std::optional<DisplayTexture> RendererMetal::Impl::PrepareLayer(
     Tegra::Texture::UnswizzleTexture(unswizzled, std::span<const u8>(host_ptr, size_in_bytes),
                                      bytes_per_pixel, framebuffer.stride, framebuffer.height, 1,
                                      block_height_log2, 0);
-    // One upload buffer: the previous frame's copy must be done before it is written again.
-    scheduler.Wait(cpu_upload_tick);
-    if (linear_size > cpu_upload_size) {
-        cpu_upload = CreateBuffer(device, linear_size, true, &cpu_upload_contents);
-        cpu_upload_size = cpu_upload_contents != nullptr ? linear_size : 0;
+    // One upload buffer a layer: the previous frame's copy must be done before it is written.
+    scheduler.Wait(state.upload_tick);
+    if (linear_size > state.upload_size) {
+        state.upload = CreateBuffer(device, linear_size, true, &state.upload_contents);
+        state.upload_size = state.upload_contents != nullptr ? linear_size : 0;
     }
-    if (cpu_upload_contents == nullptr) {
+    if (state.upload_contents == nullptr) {
         return std::nullopt;
     }
-    std::memcpy(cpu_upload_contents, unswizzled.data(), linear_size);
-    scheduler.CopyBufferToTexture(cpu_upload.Get(), 0, static_cast<u32>(bytes_per_row), 0,
-                                  cpu_texture.Get(), 0, 0, Offset3D{},
+    std::memcpy(state.upload_contents, unswizzled.data(), linear_size);
+    scheduler.CopyBufferToTexture(state.upload.Get(), 0, static_cast<u32>(bytes_per_row), 0,
+                                  state.texture.Get(), 0, 0, Offset3D{},
                                   Extent3D{framebuffer.width, framebuffer.height, 1});
-    cpu_upload_tick = scheduler.CurrentTick();
+    state.upload_tick = scheduler.CurrentTick();
     ++from_memory;
     return DisplayTexture{
-        .texture = cpu_texture.Get(),
+        .texture = state.texture.Get(),
         .width = framebuffer.width,
         .height = framebuffer.height,
         .scaled_width = framebuffer.width,
@@ -173,22 +182,40 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
 
     @autoreleasepool {
         const auto& layout = render_window.GetFramebufferLayout();
-        // Only the bottom layer for now: overlays need blending (milestone 4).
-        const std::optional<DisplayTexture> source =
-            framebuffers.empty() ? std::nullopt : impl->PrepareLayer(framebuffers.front());
+        // The guest's layers in order: the first replaces the picture, the others are blended
+        // over it as their own blend mode says.
+        std::vector<std::pair<DisplayTexture, size_t>> sources;
+        for (size_t layer = 0; layer < framebuffers.size(); ++layer) {
+            if (auto texture = impl->PrepareLayer(framebuffers[layer], layer)) {
+                sources.emplace_back(*texture, layer);
+            }
+        }
         const id<CAMetalDrawable> drawable =
             impl->swapchain.NextDrawable(layout.width, layout.height);
         if (drawable != nil) {
             const Attachment target{.texture = (__bridge void*)drawable.texture};
             bool drawn = false;
-            if (source) {
-                const auto crop =
-                    Tegra::NormalizeCrop(framebuffers.front(), source->width, source->height);
-                const f32 width = static_cast<f32>(source->scaled_width);
-                const f32 height = static_cast<f32>(source->scaled_height);
+            for (const auto& [source, layer] : sources) {
+                const Tegra::FramebufferConfig& framebuffer = framebuffers[layer];
+                const auto crop = Tegra::NormalizeCrop(framebuffer, source.width, source.height);
+                const f32 width = static_cast<f32>(source.scaled_width);
+                const f32 height = static_cast<f32>(source.scaled_height);
                 const auto& screen = layout.screen;
-                drawn = impl->scheduler.Blit(BlitPass{
-                    .src = source->texture,
+                BlitBlend blend = BlitBlend::None;
+                if (drawn) {
+                    switch (framebuffer.blending) {
+                    case Tegra::BlendMode::Premultiplied:
+                        blend = BlitBlend::Premultiplied;
+                        break;
+                    case Tegra::BlendMode::Coverage:
+                        blend = BlitBlend::Coverage;
+                        break;
+                    default:
+                        break;
+                    }
+                }
+                const bool layer_drawn = impl->scheduler.Blit(BlitPass{
+                    .src = source.texture,
                     .src_rect = {static_cast<s32>(crop.left * width),
                                  static_cast<s32>(crop.top * height),
                                  static_cast<s32>(crop.right * width),
@@ -200,8 +227,10 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                     .dst_width = layout.width,
                     .dst_height = layout.height,
                     .linear = true,
-                    .keep_dst = false,
+                    .keep_dst = drawn,
+                    .blend = blend,
                 });
+                drawn = drawn || layer_drawn;
             }
             if (!drawn) {
                 // Dark blue: the renderer runs, the guest has no framebuffer to show.

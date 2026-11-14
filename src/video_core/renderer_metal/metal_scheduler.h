@@ -52,6 +52,12 @@ struct ClearPass {
     u32 height{};
 };
 
+enum class BlitBlend : u8 {
+    None,
+    Premultiplied, ///< src + dst * (1 - src alpha)
+    Coverage,      ///< src * src alpha + dst * (1 - src alpha)
+};
+
 /// A scaled copy of a rectangle of a 2D texture view into a render target, drawn with a
 /// triangle (Fermi2D blits, presentation). A mirrored rectangle (end before start) flips.
 struct BlitPass {
@@ -65,6 +71,8 @@ struct BlitPass {
     bool linear{};
     /// Keep what dst holds outside dst_rect; else it is cleared to black first.
     bool keep_dst{true};
+    /// How the source is put over dst (presented layers above the first).
+    BlitBlend blend{BlitBlend::None};
 };
 
 /// The attachments draws render into. Equal sets share one render encoder.
