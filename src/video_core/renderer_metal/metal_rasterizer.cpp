@@ -138,6 +138,10 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         }
         gpu_memory->FlushCaching();
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+        // Written texel buffers read through aligned copies go back once the work is encoded.
+        SCOPE_EXIT {
+            FinishTexelWritebacks();
+        };
         if (!PrepareDraw(*pipeline, is_indexed, groups)) {
             return;
         }
@@ -176,6 +180,10 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     }
     gpu_memory->FlushCaching();
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // Written texel buffers read through aligned copies go back once the work is encoded.
+    SCOPE_EXIT {
+        FinishTexelWritebacks();
+    };
     // Indices the GPU wrote are not in guest memory yet: a kernel rewrites them from the bound
     // index buffer before the render pass (EDEN_NX2_METAL_GPU_INDICES=1 for every indexed
     // rewrite, =0 never).
@@ -275,17 +283,15 @@ std::vector<TextureHandle> RasterizerMetal::PrepareTexelBuffers(std::span<const 
         BufferHandle buffer = binding.buffer;
         u64 offset = binding.offset;
         if (offset % alignment != 0) {
-            if (writable) {
-                // A copy would not carry the shader's writes back.
-                LOG_ONCE(warned_written, "Metal: written texel buffers at unaligned offsets are "
-                                         "not bound yet");
-                result.push_back(nullptr);
-                continue;
-            }
-            // Read through an aligned copy (ends an open render pass: counted as a texel copy).
+            // Through an aligned copy (ends an open render pass: counted as a texel copy). A
+            // written one is copied back after the draw or dispatch (FinishTexelWritebacks).
             const StagingBufferRef copy = staging_pool.Stream(binding.size, alignment);
             scheduler.CopyBuffer(binding.buffer, binding.offset, copy.buffer, copy.offset,
                                  binding.size);
+            if (writable) {
+                texel_writebacks.push_back({copy.buffer, copy.offset, binding.buffer,
+                                            binding.offset, binding.size});
+            }
             buffer = copy.buffer;
             offset = copy.offset;
             ++texel_copies;
@@ -399,6 +405,14 @@ RasterizerMetal::MeshArena& RasterizerMetal::AcquireMeshArena() {
     it->counted = false;
     mesh_arena_current = static_cast<size_t>(std::distance(mesh_arenas.begin(), it));
     return *it;
+}
+
+void RasterizerMetal::FinishTexelWritebacks() {
+    for (const TexelWriteback& writeback : texel_writebacks) {
+        scheduler.CopyBuffer(writeback.copy, writeback.copy_offset, writeback.buffer,
+                             writeback.offset, writeback.size);
+    }
+    texel_writebacks.clear();
 }
 
 void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage metal_stage,
@@ -965,6 +979,10 @@ void RasterizerMetal::DrawIndirect() {
     }
     gpu_memory->FlushCaching();
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // Written texel buffers read through aligned copies go back once the work is encoded.
+    SCOPE_EXIT {
+        FinishTexelWritebacks();
+    };
     index_rewrite = {};
     buffer_cache.SetDrawIndirect(&params);
     SCOPE_EXIT {
@@ -1078,6 +1096,10 @@ void RasterizerMetal::DispatchCompute() {
     const Shader::Info& info = program.info;
     const auto& qmd = kepler_compute->launch_description;
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // Written texel buffers read through aligned copies go back once the work is encoded.
+    SCOPE_EXIT {
+        FinishTexelWritebacks();
+    };
 
     VideoCommon::ComputeUniformBufferSizes uniform_sizes{};
     std::ranges::copy_n(info.constant_buffer_used_sizes.begin(), uniform_sizes.size(),

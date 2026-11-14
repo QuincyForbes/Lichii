@@ -164,6 +164,9 @@ private:
     /// Binds everything the draw needs and opens its render pass; false to skip it.
     bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups = 0);
 
+    /// Copies written texel buffers read through aligned copies back (ends the open encoder).
+    void FinishTexelWritebacks();
+
     /// Encodes the GPU rewrite of index_rewrite (fills its output; left empty when it can't).
     void RewriteIndices();
 
@@ -240,6 +243,14 @@ private:
     /// Cleared every frame: views of deleted buffers must not live on.
     std::unordered_map<TexelViewKey, Object, TexelViewHash> texel_view_cache;
     u64 texel_copies{};
+    struct TexelWriteback {
+        BufferHandle copy;
+        u64 copy_offset;
+        BufferHandle buffer;
+        u64 offset;
+        u64 size;
+    };
+    std::vector<TexelWriteback> texel_writebacks;
 
     /// The visibility slots of the occlusion counter since its last reset, one per render pass.
     std::vector<u32> occlusion_slots;
