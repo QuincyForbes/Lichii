@@ -204,6 +204,10 @@ public:
     /// id<MTLCommandBuffer>, for presentDrawable and MetalFX).
     [[nodiscard]] void* CommandBuffer();
 
+    /// GPU time (MTLCommandBuffer GPUStartTime..GPUEndTime) of the command buffers completed
+    /// since the last call.
+    [[nodiscard]] u64 TakeGpuNanoseconds() noexcept;
+
     /// Encoders and command buffers since the last call (the renderer's 10 s report).
     [[nodiscard]] std::array<u64, 4> TakeCounts() noexcept;
 

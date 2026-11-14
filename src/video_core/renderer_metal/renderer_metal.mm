@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <optional>
@@ -245,6 +246,16 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                  work.clears, graphics_made, compute_made, refused, command_buffers, encoders,
                  passes, blits, impl->rasterizer.TextureRuntime().allocated_bytes >> 20,
                  impl->rasterizer.BufferRuntime().GetDeviceMemoryUsage() >> 20);
+        // Per frame, to set against MoltenVK's Perf: and Perf passes: lines.
+        const f64 seconds = std::chrono::duration<f64>(now - impl->report_start).count();
+        const f64 frames = static_cast<f64>((std::max)(impl->presented, u64{1}));
+        LOG_INFO(Render_Metal,
+                 "Metal perf: {:.1f} fps, GPU {:.2f} ms/frame, {:.1f} command buffers, {:.1f} "
+                 "encoders and {:.1f} render passes per frame, {:.0f} draws per frame",
+                 static_cast<f64>(impl->presented) / seconds,
+                 static_cast<f64>(impl->scheduler.TakeGpuNanoseconds()) / 1e6 / frames,
+                 static_cast<f64>(command_buffers) / frames, static_cast<f64>(encoders) / frames,
+                 static_cast<f64>(passes) / frames, static_cast<f64>(work.draws_encoded) / frames);
         impl->report_start = now;
         impl->presented = 0;
         impl->skipped = 0;

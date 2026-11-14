@@ -165,6 +165,8 @@ struct Scheduler::Impl {
 
     u64 current_tick{1};
     std::atomic<u64> completed_tick{0};
+    /// GPU time of the command buffers completed since TakeGpuNanoseconds.
+    std::atomic<u64> gpu_ns{0};
     std::deque<std::pair<u64, id<MTLCommandBuffer>>> in_flight;
 
     u64 encoders{};
@@ -208,7 +210,12 @@ u64 Scheduler::Flush() {
     const id<MTLCommandBuffer> command_buffer = impl->Commands();
     const u64 tick = impl->current_tick++;
     std::atomic<u64>* const completed = &impl->completed_tick;
+    std::atomic<u64>* const gpu_ns = &impl->gpu_ns;
     [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+        const CFTimeInterval busy = finished.GPUEndTime - finished.GPUStartTime;
+        if (busy > 0.0) {
+            gpu_ns->fetch_add(static_cast<u64>(busy * 1e9), std::memory_order_relaxed);
+        }
         if (finished.status == MTLCommandBufferStatusError) {
             LOG_ERROR(Render_Metal, "Metal: command buffer {} failed: {}", tick,
                       finished.error.localizedDescription.UTF8String);
@@ -590,6 +597,10 @@ void Scheduler::DrawIndexed(u32 primitive, u32 index_count, u32 index_size,
 void* Scheduler::CommandBuffer() {
     impl->EndEncoder();
     return (__bridge void*)impl->Commands();
+}
+
+u64 Scheduler::TakeGpuNanoseconds() noexcept {
+    return impl->gpu_ns.exchange(0, std::memory_order_relaxed);
 }
 
 std::array<u64, 4> Scheduler::TakeCounts() noexcept {
