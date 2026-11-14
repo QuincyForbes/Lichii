@@ -691,25 +691,29 @@ if (ENABLE_METAL)
                                              "-framework QuartzCore" "-framework Foundation")
     target_compile_definitions(video_core PUBLIC LICHII_METAL_RENDERER)
 
-    # Offscreen check for machines without a window (the macOS CI runner): a clear and a draw,
-    # and a compute shader taken from GLSL through SPIR-V and metal_shader_translate.
+    # Offscreen check for machines without a window (the macOS CI runner): raw Metal, then the
+    # renderer's own pieces (it links video_core) with compute shaders taken from GLSL.
     if (NOT IOS)
-        set(METAL_SMOKE_SPIRV ${CMAKE_CURRENT_BINARY_DIR}/metal_smoke/translate_smoke_comp_spv.h)
-        add_custom_command(
-            OUTPUT ${METAL_SMOKE_SPIRV}
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/metal_smoke
-            COMMAND ${GLSLANGVALIDATOR} -V --target-env spirv1.3 --variable-name TRANSLATE_SMOKE_SPV
-                    -o ${METAL_SMOKE_SPIRV}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/renderer_metal/smoke/translate_smoke.comp
-            MAIN_DEPENDENCY ${CMAKE_CURRENT_SOURCE_DIR}/renderer_metal/smoke/translate_smoke.comp)
-        add_executable(lichii-metal-smoke renderer_metal/metal_smoke.mm
-                       renderer_metal/metal_shader_translate.cpp ${METAL_SMOKE_SPIRV})
+        set(METAL_SMOKE_DIR ${CMAKE_CURRENT_BINARY_DIR}/metal_smoke)
+        set(METAL_SMOKE_HEADERS)
+        foreach (SMOKE_SHADER translate_smoke texel_buffer_smoke)
+            string(TOUPPER "${SMOKE_SHADER}_SPV" SMOKE_VARIABLE)
+            set(SMOKE_HEADER ${METAL_SMOKE_DIR}/${SMOKE_SHADER}_comp_spv.h)
+            set(SMOKE_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/renderer_metal/smoke/${SMOKE_SHADER}.comp)
+            add_custom_command(
+                OUTPUT ${SMOKE_HEADER}
+                COMMAND ${CMAKE_COMMAND} -E make_directory ${METAL_SMOKE_DIR}
+                COMMAND ${GLSLANGVALIDATOR} -V --target-env spirv1.3
+                        --variable-name ${SMOKE_VARIABLE} -o ${SMOKE_HEADER} ${SMOKE_SOURCE}
+                MAIN_DEPENDENCY ${SMOKE_SOURCE})
+            list(APPEND METAL_SMOKE_HEADERS ${SMOKE_HEADER})
+        endforeach()
+        add_executable(lichii-metal-smoke renderer_metal/metal_smoke.mm ${METAL_SMOKE_HEADERS})
         set_source_files_properties(renderer_metal/metal_smoke.mm PROPERTIES
             LANGUAGE CXX
             COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
-        target_include_directories(lichii-metal-smoke PRIVATE ${CMAKE_SOURCE_DIR}/src
-                                   ${CMAKE_CURRENT_BINARY_DIR}/metal_smoke)
-        target_link_libraries(lichii-metal-smoke PRIVATE spirv-cross-msl "-framework Metal"
+        target_include_directories(lichii-metal-smoke PRIVATE ${METAL_SMOKE_DIR})
+        target_link_libraries(lichii-metal-smoke PRIVATE video_core "-framework Metal"
                               "-framework Foundation")
     endif()
 elseif (LICHII_METAL_COMPILE_CHECK)

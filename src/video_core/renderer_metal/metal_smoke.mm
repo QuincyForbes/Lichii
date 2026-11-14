@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // lichii-metal-smoke: an offscreen check of the Metal paths the renderer uses, for machines
-// without a window (CI). Clears a texture, draws a triangle with a shader compiled at run time,
-// copies the texture to a shared buffer and compares texels. Exit 0 passed, 1 failed, 2 no
-// Metal device.
+// without a window (CI): a clear and a draw in raw Metal, then the renderer's own pieces (SPIR-V
+// -> MSL, the scheduler's render passes and compute, render pipeline states from Maxwell state,
+// rewritten quad indices, occlusion counting, texel buffer views), each read back and compared.
+// Exit 0 passed, 1 failed, 2 no Metal device.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -12,9 +13,18 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <span>
+#include <string>
 
+#include "texel_buffer_smoke_comp_spv.h"
 #include "translate_smoke_comp_spv.h"
+#include "video_core/renderer_metal/metal_bridge.h"
+#include "video_core/renderer_metal/metal_device.h"
+#include "video_core/renderer_metal/metal_graphics.h"
+#include "video_core/renderer_metal/metal_index_convert.h"
+#include "video_core/renderer_metal/metal_resources.h"
+#include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
 
 namespace {
@@ -207,15 +217,211 @@ int RunTranslate() {
     return wrong == 0 ? 0 : 1;
 }
 
-} // Anonymous namespace
+constexpr const char* QuadSource = R"(
+#include <metal_stdlib>
+using namespace metal;
 
+struct QuadIn {
+    float2 position [[attribute(0)]];
+};
+
+struct QuadOut {
+    float4 position [[position]];
+};
+
+vertex QuadOut quad_vertex(QuadIn in [[stage_in]]) {
+    QuadOut out;
+    out.position = float4(in.position, 0.0, 1.0);
+    return out;
+}
+
+fragment float4 quad_fragment() {
+    return float4(0.0, 1.0, 0.0, 1.0);
+}
+)";
+
+/// A Maxwell quad with 8-bit indices: IndexConvert, a render pipeline state built from Maxwell
+/// state (vertex stream at the renderer's slot), the scheduler's render pass, occlusion counting.
+int RunRendererDraw() {
+    using Maxwell = Metal::Maxwell;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, QuadSource, error);
+    const Metal::Object vertex = library ? Metal::CreateFunction(library.Get(), "quad_vertex")
+                                         : Metal::Object{};
+    const Metal::Object fragment =
+        library ? Metal::CreateFunction(library.Get(), "quad_fragment") : Metal::Object{};
+    if (!vertex || !fragment) {
+        std::printf("metal-smoke: FAIL quad shaders: %s\n", error.c_str());
+        return 1;
+    }
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = vertex.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    desc.attributes[0] = {1, 0, 0, Maxwell::VertexAttribute::Type::Float,
+                          Maxwell::VertexAttribute::Size::Size_R32_G32};
+    desc.streams[0] = {1, 8, 0};
+    const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
+    const Metal::Object depth_stencil =
+        Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+    if (!pipeline || !depth_stencil) {
+        std::printf("metal-smoke: FAIL render pipeline from Maxwell state: %s\n", error.c_str());
+        return 1;
+    }
+
+    // The left half of the target, as one quad of four vertices.
+    uint8_t* vertices = nullptr;
+    const Metal::Object vertex_buffer = Metal::CreateBuffer(device, 32, true, &vertices);
+    const float positions[8]{-1.0f, -1.0f, 0.0f, -1.0f, 0.0f, 1.0f, -1.0f, 1.0f};
+    std::memcpy(vertices, positions, sizeof(positions));
+    const std::array<uint8_t, 4> guest_indices{0, 1, 2, 3};
+    const auto topology = Maxwell::PrimitiveTopology::Quads;
+    const uint32_t count = Metal::IndexConvert::ConvertedCount(topology, 4);
+    uint8_t* index_data = nullptr;
+    const Metal::Object index_buffer =
+        Metal::CreateBuffer(device, count * sizeof(uint32_t), true, &index_data);
+    Metal::IndexConvert::Convert(topology, guest_indices, 1, 0, 4, false,
+                                 std::span(reinterpret_cast<uint32_t*>(index_data), count));
+
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm),
+                 .width = Size,
+                 .height = Size,
+                 .render_target = true});
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer = Metal::CreateBuffer(device, Size * Size * 4, true, &readback);
+
+    Metal::ClearPass clear{};
+    clear.color[0] = {.texture = target.Get()};
+    clear.clear_color[0] = true;
+    clear.color_value[0] = {1.0, 0.0, 0.0, 1.0};
+    clear.width = Size;
+    clear.height = Size;
+    scheduler.Clear(clear);
+
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = Size;
+    targets.height = Size;
+    scheduler.BeginRendering(targets);
+    Metal::DrawState state{};
+    state.pipeline = pipeline.Get();
+    state.depth_stencil = depth_stencil.Get();
+    state.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+    state.scissor = {0, 0, Size, Size};
+    scheduler.SetDrawState(state);
+    scheduler.BindVertexBuffer(Metal::VertexBufferSlot(0), vertex_buffer.Get(), 0);
+    scheduler.VisibilityResults()[0] = 0;
+    scheduler.SetVisibility(0);
+    const auto primitive =
+        Metal::PrimitiveType(Metal::IndexConvert::ConvertedTopology(topology));
+    scheduler.DrawIndexed(*primitive, count, 4, index_buffer.Get(), 0, 1, 0, 0);
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Size, Size, 1}, readback_buffer.Get(),
+                                  0, Size * 4, 0);
+    scheduler.Finish();
+
+    const auto* texels = reinterpret_cast<const Texel*>(readback);
+    const Texel left = texels[(Size / 2) * Size + 4];
+    const Texel right = texels[(Size / 2) * Size + Size - 4];
+    const uint64_t samples = scheduler.VisibilityResults()[0];
+    const bool drawn = Near(left, {0, 255, 0, 255}) && Near(right, {255, 0, 0, 255});
+    const bool counted = samples == uint64_t{Size} * Size / 2;
+    std::printf("metal-smoke: renderer quad (8-bit indices -> %u rewritten): left %u,%u,%u right "
+                "%u,%u,%u: %s; occlusion %llu samples (expected %u): %s\n",
+                count, left.r, left.g, left.b, right.r, right.g, right.b,
+                drawn ? "PASS" : "FAIL", static_cast<unsigned long long>(samples),
+                Size * Size / 2, counted ? "PASS" : "FAIL");
+    return drawn && counted ? 0 : 1;
+}
+
+/// A texel buffer read: GLSL samplerBuffer -> SPIR-V -> translator (native texture_buffer), the
+/// renderer's texture buffer view at an aligned offset, the scheduler's compute encoder.
+int RunTexelBuffer() {
+    namespace Translate = Metal::ShaderTranslate;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const Translate::Result msl = Translate::SpirvToMsl(
+        std::span<const uint32_t>(TEXEL_BUFFER_SMOKE_SPV), Translate::Stage::Compute, {});
+    if (msl.source.empty()) {
+        std::printf("metal-smoke: FAIL texel buffer SPIR-V -> MSL: %s\n", msl.error.c_str());
+        return 1;
+    }
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, msl.source, error);
+    const Metal::Object function =
+        library ? Metal::CreateFunction(library.Get(), msl.entry_point) : Metal::Object{};
+    const Metal::Object state =
+        function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                 : Metal::Object{};
+    if (!state) {
+        std::printf("metal-smoke: FAIL texel buffer pipeline: %s\n%s\n", error.c_str(),
+                    msl.source.c_str());
+        return 1;
+    }
+    uint32_t texture_slot = UINT32_MAX;
+    uint32_t data_slot = UINT32_MAX;
+    for (const Translate::ResourceSlot& slot : msl.slots) {
+        if (slot.kind == Translate::ResourceKind::Texture && slot.binding == 0) {
+            texture_slot = slot.index;
+        } else if (slot.kind == Translate::ResourceKind::Buffer && slot.binding == 1) {
+            data_slot = slot.index;
+        }
+    }
+    constexpr uint32_t Count = 64;
+    const uint32_t format = static_cast<uint32_t>(MTLPixelFormatR32Float);
+    const uint32_t offset = Metal::TextureBufferAlignment(device, format);
+    uint8_t* source_data = nullptr;
+    const Metal::Object source =
+        Metal::CreateBuffer(device, offset + Count * sizeof(float), true, &source_data);
+    for (uint32_t index = 0; index < Count; ++index) {
+        const float value = static_cast<float>(index) + 0.5f;
+        std::memcpy(source_data + offset + index * sizeof(float), &value, sizeof(value));
+    }
+    const Metal::Object view =
+        Metal::CreateTextureBufferView(source.Get(), offset, Count, 4, format, false);
+    uint8_t* out_data = nullptr;
+    const Metal::Object out = Metal::CreateBuffer(device, Count * sizeof(float), true, &out_data);
+    if (!view || texture_slot == UINT32_MAX || data_slot == UINT32_MAX) {
+        std::printf("metal-smoke: FAIL texel buffer view (offset %u) or slots\n", offset);
+        return 1;
+    }
+    scheduler.BeginCompute(state.Get());
+    scheduler.BindTexture(Metal::ShaderStage::Compute, texture_slot, view.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, data_slot, out.Get(), 0);
+    scheduler.Dispatch({1, 1, 1}, {Count, 1, 1});
+    scheduler.Finish();
+    uint32_t wrong = 0;
+    for (uint32_t index = 0; index < Count; ++index) {
+        float value;
+        std::memcpy(&value, out_data + index * sizeof(float), sizeof(value));
+        wrong += value != (static_cast<float>(index) + 0.5f) * 2.0f ? 1 : 0;
+    }
+    std::printf("metal-smoke: texel buffer (view at offset %u, texture slot %u): %u of %u wrong: "
+                "%s\n",
+                offset, texture_slot, wrong, Count, wrong == 0 ? "PASS" : "FAIL");
+    return wrong == 0 ? 0 : 1;
+}
+
+} // Anonymous namespace
 int main() {
     @autoreleasepool {
         const int draw = Run();
         if (draw == 2) {
             return 2;
         }
-        const int translate = RunTranslate();
-        return draw != 0 ? draw : translate;
+        int result = draw;
+        for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer}) {
+            const int outcome = test();
+            result = result != 0 ? result : outcome;
+        }
+        return result;
     }
 }
