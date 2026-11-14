@@ -60,7 +60,14 @@ std::map<std::string, u64> g_profile_flushes;
 std::map<std::string, u64> g_profile_reopens;
 
 // "Perf sites:" (EDEN_NX2_PERF_REPORT): submissions, render pass ends and reopens by caller.
-enum PerfSiteKind : size_t { SiteSubmit, SitePassEnd, SiteReopen, SiteKinds };
+enum PerfSiteKind : size_t {
+    SiteSubmit,
+    SitePassEnd,
+    SiteReopen,
+    SiteDefer,   ///< Flushes put off (DeferFlush) while none was pending
+    SiteRequest, ///< Other threads' waits for a deferred submission (WaitSubmitted)
+    SiteKinds
+};
 struct PerfSite {
     const char* file;
     u32 line;
@@ -68,6 +75,14 @@ struct PerfSite {
 };
 std::mutex g_perf_site_mutex;
 std::array<std::vector<PerfSite>, SiteKinds> g_perf_sites;
+// "Perf submits:": how long deferred flushes waited for their submission, and which ones ended
+// with the back's idle hook (idle, or asked between entries).
+std::atomic<u64> g_deferred_submits{};
+std::atomic<u64> g_deferred_wait_us{};
+std::atomic<u64> g_deferred_wait_max_us{};
+std::atomic<u64> g_idle_submits{};
+std::atomic<u64> g_requested_submits{};
+std::atomic<u64> g_submits_in_pass{};
 
 void CountPerfSite(PerfSiteKind kind, const char* file, u32 line) {
     if (!Common::PerfReport::Enabled()) {
@@ -397,6 +412,9 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (state.renderpass) {
         NotePassEnd(location);
     }
+    if (Common::PerfReport::Enabled()) {
+        NoteSubmitPerf();
+    }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
@@ -408,12 +426,30 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     return signal_value;
 }
 
-bool Scheduler::DeferFlush() {
-    // Fences come one per compute release: ~11,500 a second in Hyrule Warriors: Age of
-    // Imprisonment fights, each a queue submission (~22,000 a second with the others), which
-    // kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
-    // Command list copies after dispatches were ~9,000 more a second, of which the front waited
-    // for about 5%.
+void Scheduler::NoteSubmitPerf() {
+    if (state.renderpass) {
+        g_submits_in_pass.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!flush_pending) {
+        return;
+    }
+    const u64 us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - flush_pending_since)
+                                        .count());
+    g_deferred_submits.fetch_add(1, std::memory_order_relaxed);
+    g_deferred_wait_us.fetch_add(us, std::memory_order_relaxed);
+    if (us > g_deferred_wait_max_us.load(std::memory_order_relaxed)) {
+        g_deferred_wait_max_us.store(us, std::memory_order_relaxed);
+    }
+}
+
+namespace {
+// Fences come one per compute release: ~11,500 a second in Hyrule Warriors: Age of
+// Imprisonment fights, each a queue submission (~22,000 a second with the others), which
+// kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
+// Command list copies after dispatches were ~9,000 more a second, of which the front waited
+// for about 5%.
+s64 DeferFlushIntervalUs() {
     static const s64 interval_us = [] {
         const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
         if (value != nullptr) {
@@ -424,24 +460,54 @@ bool Scheduler::DeferFlush() {
         // faster without it (Lake Hylia 52.3 -> 55.4 fps). EDEN_NX2_FENCE_FLUSH_US=500 restores it.
         return VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush) ? s64{5000} : s64{0};
     }();
+    return interval_us;
+}
+} // Anonymous namespace
+
+bool Scheduler::DeferredFlushMayWait() const {
+    return flush_pending && std::chrono::steady_clock::now() - flush_pending_since <
+                                std::chrono::microseconds{DeferFlushIntervalUs()};
+}
+
+bool Scheduler::DeferFlush(std::source_location location) {
+    const s64 interval_us = DeferFlushIntervalUs();
     if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
         std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
         return false;
+    }
+    if (!flush_pending) {
+        flush_pending_since = std::chrono::steady_clock::now();
+        CountPerfSite(SiteDefer, location.file_name(), location.line());
     }
     flush_pending = true;
     return true;
 }
 
-void Scheduler::FlushDeferred() {
+void Scheduler::FlushDeferred(std::source_location location) {
     if (flush_pending) {
-        Flush();
+        Flush({}, {}, location);
     }
 }
 
-bool Scheduler::WaitSubmitted(u64 tick) {
+bool Scheduler::FlushDeferredFromIdle(bool requested) {
+    if (!flush_pending) {
+        return false;
+    }
+    if (requested) {
+        g_requested_submits.fetch_add(1, std::memory_order_relaxed);
+        FlushDeferred();
+    } else {
+        g_idle_submits.fetch_add(1, std::memory_order_relaxed);
+        FlushDeferred();
+    }
+    return true;
+}
+
+bool Scheduler::WaitSubmitted(u64 tick, std::source_location location) {
     if (IsSubmitted(tick)) {
         return true;
     }
+    CountPerfSite(SiteRequest, location.file_name(), location.line());
     auto& split = VideoCommon::GpuSplit::Get();
     split.RequestIdleHook();
     // No time limit: the back can spend seconds on one entry (a large shader's translation),
@@ -484,6 +550,9 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
+    }
+    if (Common::PerfReport::Enabled()) {
+        NoteSubmitPerf();
     }
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
@@ -533,6 +602,13 @@ void Scheduler::ReportPerfSites(u64 frames) {
             g_perf_sites[kind].clear();
         }
     }
+    const u64 deferred = g_deferred_submits.exchange(0, std::memory_order_relaxed);
+    const u64 deferred_us = g_deferred_wait_us.exchange(0, std::memory_order_relaxed);
+    const u64 deferred_max_us = g_deferred_wait_max_us.exchange(0, std::memory_order_relaxed);
+    const u64 idle = g_idle_submits.exchange(0, std::memory_order_relaxed);
+    const u64 requested = g_requested_submits.exchange(0, std::memory_order_relaxed);
+    const u64 in_pass = g_submits_in_pass.exchange(0, std::memory_order_relaxed);
+    const auto gaps = VideoCommon::GpuSplit::Get().TakeIdleGaps();
     if (frames == 0) {
         return;
     }
@@ -562,6 +638,25 @@ void Scheduler::ReportPerfSites(u64 frames) {
              "Perf sites per frame: submits by caller: {} | render pass ends by caller: {} | "
              "passes reopened on the target the last one left, after: {}",
              top(sites[SiteSubmit]), top(sites[SitePassEnd]), top(sites[SiteReopen]));
+    const double frame_count = static_cast<double>(frames);
+    const u64 gap_total = gaps[0] + gaps[1] + gaps[2] + gaps[3] + gaps[4];
+    const auto gap_share = [&](size_t bucket) {
+        return gap_total == 0 ? 0.0
+                              : 100.0 * static_cast<double>(gaps[bucket]) /
+                                    static_cast<double>(gap_total);
+    };
+    LOG_INFO(Common_Memory,
+             "Perf submits per frame: {:.1f} ended a render pass | deferred flushes by caller: {} "
+             "| {:.1f} deferred submissions, waited {:.0f} us avg, {} max; {:.1f} by the idle back, "
+             "{:.1f} asked between entries | waits for a deferred submission by caller: {} | the "
+             "back's next work after an idle submit: under 50 us {:.0f}%, 250 us {:.0f}%, 1 ms "
+             "{:.0f}%, 4 ms {:.0f}%, later {:.0f}%",
+             static_cast<double>(in_pass) / frame_count, top(sites[SiteDefer]),
+             static_cast<double>(deferred) / frame_count,
+             deferred == 0 ? 0.0 : static_cast<double>(deferred_us) / static_cast<double>(deferred),
+             deferred_max_us, static_cast<double>(idle) / frame_count,
+             static_cast<double>(requested) / frame_count, top(sites[SiteRequest]), gap_share(0),
+             gap_share(1), gap_share(2), gap_share(3), gap_share(4));
 }
 
 void Scheduler::NotePassEnd(const std::source_location& location) {

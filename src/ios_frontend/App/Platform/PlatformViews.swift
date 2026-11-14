@@ -438,6 +438,9 @@ struct ExperimentsView: View {
     @State private var guestIdleSpin = lichii_platform_experiment("guest_idle_spin") != 0
     @State private var perfSchedOff = lichii_platform_experiment("perf_sched_off") != 0
     @State private var targetlessFull = lichii_platform_experiment("targetless_full") != 0
+    @State private var uboZeroTails = lichii_platform_experiment("ubo_zero_tails") != 0
+    @State private var releaseSubmit = lichii_platform_experiment("release_submit") != 0
+    @State private var idleSubmitAtOnce = lichii_platform_experiment("idle_submit_at_once") != 0
 
     var body: some View {
         List {
@@ -537,10 +540,22 @@ struct ExperimentsView: View {
                     .onChange(of: targetlessFull) { value in
                         lichii_platform_set_experiment("targetless_full", value ? 1 : 0)
                     }
+                Toggle("Zero Uniform Buffer Tails", isOn: $uboZeroTails)
+                    .onChange(of: uboZeroTails) { value in
+                        lichii_platform_set_experiment("ubo_zero_tails", value ? 1 : 0)
+                    }
+                Toggle("Submit at Every Fence Release", isOn: $releaseSubmit)
+                    .onChange(of: releaseSubmit) { value in
+                        lichii_platform_set_experiment("release_submit", value ? 1 : 0)
+                    }
+                Toggle("Submit as Soon as the GPU Thread Idles", isOn: $idleSubmitAtOnce)
+                    .onChange(of: idleSubmitAtOnce) { value in
+                        lichii_platform_set_experiment("idle_submit_at_once", value ? 1 : 0)
+                    }
             } header: {
                 Text("Performance")
             } footer: {
-                Text("For comparing builds. Old Texture Eviction reads textures the GPU drew back from the GPU before freeing them, a wait for the GPU each time, even when the game draws them again anyway. Helper Threads at Full Priority gives the timing and present threads the same priority as the game's. Frame Deadlines for the CPU tells iOS each frame's deadline, which may keep the game on the performance cores; untested on a device. Old JIT Tables keeps the translated code's bookkeeping as it was (about 0.3 GB more memory in Ocarina of Time); turn it on if a game that used to run crashes. Submit at Every Fence hands the GPU the game's work at every game fence, as before, instead of in batches of up to 2 ms (76-95 command buffers a frame in Ocarina of Time's Kokiri Forest on an iPhone); turn it on if the screen flashes white. Render Passes as Before ends the GPU's render pass for every buffer copy and parked clear, as before, instead of moving copies ahead of the pass (each ended pass stores and loads the whole screen again); turn it on if parts of the picture show stale or wrong data. Game's Own Upscale Pass runs Ocarina of Time's own upscale from its scene to the screen size, as before, instead of one bilinear tap whenever MetalFX Temporal doesn't take the frame (the game's pass was about 40 % of the phone's GPU time in Kokiri Forest); turn it on if the picture looks wrong. Full-Size Passes Without Targets gives a draw that writes no image a render pass of the game's full surface size, as before (32768x32768 in Ocarina of Time, about 6-7 % of the phone's GPU time), instead of only the pixels it can reach; turn it on if lens flares or glows behave differently.\n\nAll eight apply the next time Lichii starts.")
+                Text("For comparing builds. Old Texture Eviction reads textures the GPU drew back from the GPU before freeing them, a wait for the GPU each time, even when the game draws them again anyway. Helper Threads at Full Priority gives the timing and present threads the same priority as the game's. Frame Deadlines for the CPU tells iOS each frame's deadline, which may keep the game on the performance cores; untested on a device. Old JIT Tables keeps the translated code's bookkeeping as it was (about 0.3 GB more memory in Ocarina of Time); turn it on if a game that used to run crashes. Submit at Every Fence hands the GPU the game's work at every game fence, as before, instead of in batches of up to 2 ms (76-95 command buffers a frame in Ocarina of Time's Kokiri Forest on an iPhone); turn it on if the screen flashes white. Render Passes as Before ends the GPU's render pass for every buffer copy and parked clear, as before, instead of moving copies ahead of the pass (each ended pass stores and loads the whole screen again); turn it on if parts of the picture show stale or wrong data. Game's Own Upscale Pass runs Ocarina of Time's own upscale from its scene to the screen size, as before, instead of one bilinear tap whenever MetalFX Temporal doesn't take the frame (the game's pass was about 40 % of the phone's GPU time in Kokiri Forest); turn it on if the picture looks wrong. Full-Size Passes Without Targets gives a draw that writes no image a render pass of the game's full surface size, as before (32768x32768 in Ocarina of Time, about 6-7 % of the phone's GPU time), instead of only the pixels it can reach; turn it on if lens flares or glows behave differently. Zero Uniform Buffer Tails fills the unused rest of each uniform buffer a shader indexes with zeros, as before (about 75 % of the uniform bytes Lichii wrote in Kokiri Forest); turn it on if models or effects look wrong. Submit at Every Fence Release hands the GPU its work every time the game waits on a GPU value, as before, even when nothing waits for that work (about 11 command buffers a frame in Kokiri Forest); turn it on if the screen flashes or stutters. Submit as Soon as the GPU Thread Idles hands the GPU its work the moment the GPU thread runs out of commands, as before, instead of waiting up to 0.25 ms for more; turn it on if the screen flashes.\n\nAll eleven apply the next time Lichii starts.")
             }
 
             Section {

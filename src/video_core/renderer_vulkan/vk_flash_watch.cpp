@@ -677,10 +677,17 @@ void FlashWatch::WorkerLoop() {
             next.keys.emplace(next.outputs[i].key, i);
         }
         if (next.frame % STATUS_FRAMES == 0 && !next.outputs.empty()) {
+            u64 bad_texels = 0;
+            u64 hot_texels = 0;
+            for (const Tile& tile : next.tiles) {
+                bad_texels += tile[2];
+                hot_texels += tile[3];
+            }
             LOG_INFO(Render_Vulkan,
-                     "Flash watch: frame {} has {} outputs in {} tiles; {} frames checked, {} "
-                     "flashes",
-                     next.frame, next.outputs.size(), next.tiles.size(), checked, flashes);
+                     "Flash watch: frame {} has {} outputs in {} tiles ({} NaN/Inf texels, {} "
+                     "hot); {} frames checked, {} flashes",
+                     next.frame, next.outputs.size(), next.tiles.size(), bad_texels, hot_texels,
+                     checked, flashes);
         }
         history.push_back(std::move(next));
         if (history.size() > WINDOW) {

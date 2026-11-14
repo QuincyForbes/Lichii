@@ -145,10 +145,27 @@ public:
     [[nodiscard]] u64 BackEntryPosition() const {
         return back_entry_position;
     }
-    /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).
-    void SetIdleHook(void (*hook)(void*), void* argument) {
+    /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work)
+    /// and between entries when another thread asks (RequestIdleHook; `requested` true). Returns
+    /// whether it submitted.
+    /// `pending`: whether the hook would submit (deferred work waits). With EDEN_NX2_IDLE_GRACE_US
+    /// the back waits that long for more work before it submits it.
+    using IdleHook = bool (*)(void* argument, bool requested);
+    using IdlePending = bool (*)(void* argument);
+    void SetIdleHook(IdleHook hook, IdlePending pending, void* argument) {
         idle_hook = hook;
+        idle_pending = pending;
         idle_argument = argument;
+    }
+    /// "Perf submits:": how long the back stayed idle after its idle hook submitted, in
+    /// IdleGapBuckets (under 50 us, 250 us, 1 ms, 4 ms, longer). Taken (reset) by the caller.
+    static constexpr size_t IdleGapBuckets = 5;
+    [[nodiscard]] std::array<u64, IdleGapBuckets> TakeIdleGaps() {
+        std::array<u64, IdleGapBuckets> gaps;
+        for (size_t i = 0; i < IdleGapBuckets; ++i) {
+            gaps[i] = idle_gaps[i].exchange(0, std::memory_order_relaxed);
+        }
+        return gaps;
     }
     /// Experiment(3): asked on the back whenever it has run everything published, whether a
     /// ReleaseFences there would only invalidate the GPU cache (RasterizerInterface::FencesQuiet).
@@ -1156,8 +1173,14 @@ private:
     static GpuSplit instance;
     static inline thread_local bool on_back_thread{};
     static inline thread_local bool on_gpu_thread{};
-    void (*idle_hook)(void*){};
+    IdleHook idle_hook{};
+    IdlePending idle_pending{};
     void* idle_argument{};
+    std::array<std::atomic<u64>, IdleGapBuckets> idle_gaps{};
+    /// Back: when its idle hook last submitted before it waited for work (0 = it did not).
+    u64 idle_submit_ns{};
+    void NoteIdleGap();
+    static u64 IdleGraceNs();
     FenceQuietCheck fence_quiet_check{};
     void* fence_quiet_argument{};
     /// Back: runs fence_quiet_check at `position` (everything published executed).

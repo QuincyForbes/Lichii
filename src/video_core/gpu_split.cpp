@@ -19,6 +19,7 @@
 
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
+#include "common/perf_report.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -1152,6 +1153,25 @@ void GpuSplit::CheckFencesQuiet(u64 position) {
     }
 }
 
+u64 GpuSplit::IdleGraceNs() {
+    static const u64 grace = [] {
+        const char* const value = std::getenv("EDEN_NX2_IDLE_GRACE_US");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) * 1000 : u64{0};
+    }();
+    return grace;
+}
+
+void GpuSplit::NoteIdleGap() {
+    const u64 gap = Common::PerfReport::NowNs() - idle_submit_ns;
+    idle_submit_ns = 0;
+    const size_t bucket = gap < 50'000      ? 0
+                          : gap < 250'000   ? 1
+                          : gap < 1'000'000 ? 2
+                          : gap < 4'000'000 ? 3
+                                            : 4;
+    idle_gaps[bucket].fetch_add(1, std::memory_order_relaxed);
+}
+
 void GpuSplit::BackLoop(std::stop_token stop_token) {
     const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuBack};
     Common::SetCurrentThreadName("GPUBack");
@@ -1177,6 +1197,30 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }
+            if (available == read_position && IdleGraceNs() != 0 &&
+                !back_quiet.load(std::memory_order_relaxed) && idle_pending != nullptr &&
+                idle_pending(idle_argument)) {
+                // Work usually comes back within 250 us (PC phone sim: 97 % of idle submits):
+                // the deferred submission waits for it, unless another thread asks for it.
+                const u64 until = Common::PerfReport::NowNs() + IdleGraceNs();
+                for (u32 spins = 0; available == read_position &&
+                                    !hook_requested.load(std::memory_order_relaxed) &&
+                                    !stop_token.stop_requested();
+                     ++spins) {
+                    if ((spins & 63) == 0 && Common::PerfReport::NowNs() >= until) {
+                        break;
+                    }
+                    if (spins < 1024) {
+                        Pause();
+                    } else {
+                        std::this_thread::yield();
+                    }
+                    available = published.load(std::memory_order_acquire);
+                }
+                if (available != read_position) {
+                    continue;
+                }
+            }
             if (available == read_position) {
                 hook_requested.store(false, std::memory_order_seq_cst);
                 // The front may already see everything consumed: Drain() waits for back_quiet
@@ -1184,7 +1228,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 if (!back_quiet.load(std::memory_order_relaxed)) {
                     if (idle_hook != nullptr) {
                         ForgetFencesQuiet();
-                        idle_hook(idle_argument);
+                        if (idle_hook(idle_argument, false) && Common::PerfReport::Enabled()) {
+                            idle_submit_ns = Common::PerfReport::NowNs();
+                        }
                     }
                     back_quiet.store(true, std::memory_order_release);
                 }
@@ -1209,6 +1255,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         u64 last_store = read_position;
+        if (idle_submit_ns != 0) [[unlikely]] {
+            NoteIdleGap();
+        }
         // Before any entry runs, so a front that sees these entries consumed also sees this.
         back_quiet.store(false, std::memory_order_seq_cst);
         // EDEN_NX2_RING_PREFETCH: the ring lines ahead of the entry, up to a line short of what
@@ -1234,7 +1283,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 idle_hook != nullptr) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);
                 ForgetFencesQuiet();
-                idle_hook(idle_argument);
+                idle_hook(idle_argument, true);
             }
             // Hand ring space back now and then while working through a long batch, and at once
             // when the front first crosses the position it waits for (WaitFor / Drain).

@@ -53,6 +53,8 @@ enum Counter : std::size_t {
     MeshArenaWaits,      ///< Waits for a submission's mesh emulation arena
     UniformStreamBytes,  ///< Of StagingUploadBytes: uniform buffers streamed per draw
     UniformPadBytes,     ///< Of them, zeroed padding past the bound size (MoltenVK)
+    UniformPadIndexedBytes, ///< Of the padding, for shaders that index the buffer (64 KiB used)
+    UniformIndexedBinds, ///< Streamed binds under 64 KiB whose shader indexes the buffer
     IndexStreamBytes,    ///< Of StagingUploadBytes: inline and widened index data
     GpuBusyNs,           ///< GPU time of finished command buffers, overlaps counted once
     GpuTimedBuffers,     ///< Command buffers that GpuBusyNs covers
