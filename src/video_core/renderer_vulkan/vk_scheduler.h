@@ -168,7 +168,11 @@ public:
     /// least EDEN_NX2_BEFORE_PASS pixels (default 256x256, 0 = off), what follows goes to a new
     /// command buffer after one that the next render pass can take copies into (RecordBeforePass).
     /// True when it split now.
-    bool SplitBeforeNextPass(u64 pixels);
+    bool SplitBeforeNextPass(u64 pixels, VkFramebuffer framebuffer = VK_NULL_HANDLE);
+
+    /// Passes on that framebuffer split as SplitBeforeNextPass whatever their size (an emulated
+    /// mesh draw ended one for its compute). The last few framebuffers asked for are kept.
+    void WantSplitBefore(VkFramebuffer framebuffer);
 
     /// A draw that will leave the open render pass for another framebuffer, after it bound its
     /// buffers: ends the pass and splits as SplitBeforeNextPass. True when it split; the draw's
@@ -774,6 +778,8 @@ private:
     u64 before_pass_serial = 0;
     bool before_pass_split = false; ///< SplitBeforeNextPass ran, no render pass began since
     bool before_pass_open = false;  ///< The open render pass began after a SplitBeforePass
+    std::array<VkFramebuffer, 8> split_wanted{};
+    size_t split_wanted_next = 0;
     u64 work_records = 0;           ///< Commands recorded, RecordState ones excepted
     u64 last_dispatch_record = ~0ULL;
     u64 last_dispatch_tick = 0;

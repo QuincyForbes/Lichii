@@ -1240,7 +1240,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         if (framebuffer != nullptr && (scheduler.SplitBeforeTargetSwitch(framebuffer) ||
             (!scheduler.IsRenderPassActive() &&
              scheduler.SplitBeforeNextPass(u64{framebuffer->RenderArea().width} *
-                                           framebuffer->RenderArea().height)))) {
+                                               framebuffer->RenderArea().height,
+                                           framebuffer->Handle())))) {
             buffer_cache.BindHostGeometryBuffers(is_indexed);
         }
     }
@@ -1326,6 +1327,10 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (!before_pass) {
             if (own_pass) {
                 Common::PerfReport::Add(Common::PerfReport::MeshPassBreaks);
+                if (MeshBeforePassEnabled()) {
+                    // Next time this target's pass begins on a command buffer of its own.
+                    scheduler.WantSplitBefore(framebuffer->Handle());
+                }
             } else if (scheduler.IsRenderPassActive()) {
                 Common::PerfReport::Add(Common::PerfReport::MeshPassLeaves);
             }

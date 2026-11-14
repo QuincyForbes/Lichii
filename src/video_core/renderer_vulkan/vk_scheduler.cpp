@@ -1901,12 +1901,22 @@ void Scheduler::EndRenderPass()
         num_renderpass_images = 0;
     }
 
-bool Scheduler::SplitBeforeNextPass(u64 pixels) {
+void Scheduler::WantSplitBefore(VkFramebuffer framebuffer) {
+    if (std::ranges::find(split_wanted, framebuffer) != split_wanted.end()) {
+        return;
+    }
+    split_wanted[split_wanted_next] = framebuffer;
+    split_wanted_next = (split_wanted_next + 1) % split_wanted.size();
+}
+
+bool Scheduler::SplitBeforeNextPass(u64 pixels, VkFramebuffer framebuffer) {
     if (state.renderpass || before_pass_split) {
         return false;
     }
     const u64 min_pixels = BeforePassMinPixels();
-    if (min_pixels == 0 || pixels < min_pixels) {
+    const bool wanted = framebuffer != VK_NULL_HANDLE &&
+                        std::ranges::find(split_wanted, framebuffer) != split_wanted.end();
+    if (min_pixels == 0 || (pixels < min_pixels && !wanted)) {
         return false;
     }
     ++before_pass_serial;
@@ -1925,12 +1935,14 @@ bool Scheduler::SplitBeforeTargetSwitch(const Framebuffer* framebuffer,
     }
     const VkExtent2D area = framebuffer->RenderArea();
     const u64 min_pixels = BeforePassMinPixels();
-    if (min_pixels == 0 || u64{area.width} * area.height < min_pixels) {
+    const bool wanted =
+        std::ranges::find(split_wanted, framebuffer->Handle()) != split_wanted.end();
+    if (min_pixels == 0 || (u64{area.width} * area.height < min_pixels && !wanted)) {
         return false;
     }
     NotePassEnd(location);
     EndRenderPass();
-    return SplitBeforeNextPass(u64{area.width} * area.height);
+    return SplitBeforeNextPass(u64{area.width} * area.height, framebuffer->Handle());
 }
 
 void Scheduler::SplitBeforePass() {
