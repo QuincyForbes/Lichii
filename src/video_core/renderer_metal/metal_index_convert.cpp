@@ -172,27 +172,27 @@ kernel void rewrite_indices(device const uchar* source [[buffer(0)]],
     if (index >= params.converted) {
         return;
     }
-    uint vertex;
+    uint element;
     switch (params.mode) {
     case 1:
-        vertex = index / 6 * 4 + quad_order[index % 6];
+        element = index / 6 * 4 + quad_order[index % 6];
         break;
     case 2:
-        vertex = index / 6 * 2 + quad_strip_order[index % 6];
+        element = index / 6 * 2 + quad_strip_order[index % 6];
         break;
     case 3:
-        vertex = index % 3 == 0 ? 0 : index / 3 + index % 3;
+        element = index % 3 == 0 ? 0 : index / 3 + index % 3;
         break;
     case 4:
-        vertex = index < params.count ? index : 0;
+        element = index < params.count ? index : 0;
         break;
     default:
-        vertex = index;
+        element = index;
         break;
     }
     uint value = 0;
-    if (vertex < params.count) {
-        const uint at = params.source_offset + vertex * params.index_size;
+    if (element < params.count) {
+        const uint at = params.source_offset + element * params.index_size;
         switch (params.index_size) {
         case 1:
             value = source[at];
