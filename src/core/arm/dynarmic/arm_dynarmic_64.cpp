@@ -1099,7 +1099,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_exclusive_access = false;
     }
 #endif
-    m_cb->m_slow_breakdown = Common::PerfReport::Enabled();
+    // EDEN_NX2_PERF_MEMCB=0 keeps the perf report but drops the callback breakdown.
+    static const bool slow_breakdown = Nx2EnvOn("EDEN_NX2_PERF_MEMCB");
+    m_cb->m_slow_breakdown = Common::PerfReport::Enabled() && slow_breakdown;
     m_cb->m_page_table = page_table;
     m_cb->m_page_table_bits = std::uint32_t(address_space_bits);
     m_cb->m_fastmem_bits = config.fastmem_pointer ? config.fastmem_address_space_bits : 0;
@@ -1129,8 +1131,9 @@ void ArmDynarmic64::FlushGuestEvents() {
     }
     flush(cb.m_slow_reads, Common::PerfReport::GuestSlowReads);
     flush(cb.m_slow_writes, Common::PerfReport::GuestSlowWrites);
+    // Like the SVC counts, the breakdown is added every 1024 SVCs, not at every return.
     auto& slow = Common::PerfReport::g_slow_access;
-    for (size_t store = 0; store < 2; ++store) {
+    for (size_t store = 0; store < 2 && cb.m_svcs_pending == 0; ++store) {
         if (u64& runs = cb.m_slow_page_runs[store]; runs != 0) {
             slow.tracked_page_runs[store].fetch_add(runs, std::memory_order_relaxed);
             runs = 0;
