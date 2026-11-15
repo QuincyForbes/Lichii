@@ -177,20 +177,22 @@ draws the guest layers into the drawable and calls `presentDrawable:`.
 | M4 | Compute, queries, transform feedback, mesh emulation, OoT upscale replacement, MetalFX direct, frame gen, `Perf:`/`Perf passes:` | Kokiri at full quality; GPU ms comparable with MoltenVK |
 | M5 | Binary archive + ahead-of-time pack, MoltenVK-vs-Metal comparison on device | No compile stalls; the comparison table |
 
-State (2026-11-15, 20cc084715): M0-M3 done (vertex + pixel pipelines); from M4: compute
+State (2026-11-15, d7bfa1971f): M0-M3 done (vertex + pixel pipelines); from M4: compute
 dispatches, indirect draws, texel buffers (unaligned ones through aligned copies, written ones
 copied back), index rewriting (quads, quad strips, fans, polygons, line loops, 8-bit indices; on
 the GPU when the GPU wrote them), occlusion queries, task and mesh pipelines through Vulkan's
 mesh emulation, all presented layers with blending, the GPU thread split, MetalFX spatial,
 MetalFX temporal in place of a game's DLSS, Ocarina's upscale dispatch as Vulkan's bilinear pass,
-resolution scaling (depth-stencil images keep depth only), the `Metal perf:` line; from M5 a
-per-game MTLBinaryArchive of the pipelines a run builds. The macOS CI smoke test runs the
-translator, a rewritten-index draw and an indirect draw through the renderer's pipeline builder
-and render pass with occlusion counts, a texel buffer read, the mesh emulation's draw side and
-distribution pass, the GPU index rewrite against the CPU one, the Ocarina bilinear pass, the
-pipeline archive across a reopen, and the depth blit. Geometry programs are refused as on
-MoltenVK. Open: tessellation, Ocarina's live MetalFX temporal path, frame generation, the M5
-AOT pack.
+resolution scaling (depth and stencil carried over), tessellation as MoltenVK runs it (vertex
+program as a stage-in kernel, control program as a multi-patch kernel, evaluation program as the
+post-tessellation vertex function), the `Metal perf:` line; from M5 a per-game MTLBinaryArchive
+of the pipelines a run builds. The macOS CI smoke test runs the translator, a rewritten-index draw
+and an indirect draw through the renderer's pipeline builder and render pass with occlusion
+counts, a texel buffer read, the mesh emulation's draw side and distribution pass, the GPU index
+rewrite against the CPU one, the Ocarina bilinear pass, the pipeline archive across a reopen, the
+depth and depth-stencil blits, and a tessellated triangle through all three stages. Geometry
+programs are refused as on MoltenVK. Open: indirect tessellated draws, Ocarina's live MetalFX
+temporal path, frame generation, the M5 AOT pack.
 Switches: `EDEN_NX2_METAL_DRAW=0` (build pipelines, draw nothing), `EDEN_NX2_METAL_DISPATCH=0`,
 `EDEN_NX2_METAL_SPLIT=0` (one GPU thread), `EDEN_NX2_METAL_GPU_INDICES=1|0` (every indexed
 rewrite on the GPU / none), `EDEN_NX2_METAL_ARCHIVE=0` (no pipeline archive).
