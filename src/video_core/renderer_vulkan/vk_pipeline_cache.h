@@ -155,6 +155,9 @@ public:
 
     void TickFrame();
 
+    /// Logs "Perf pipelines:" for the last `seconds` when a pipeline was built in them.
+    void ReportBuilds(double seconds);
+
     /// Graphics and compute pipelines in the cache.
     [[nodiscard]] std::pair<size_t, size_t> PipelineCounts() const noexcept {
         return {graphics_cache.size(), compute_cache.size()};
@@ -239,6 +242,8 @@ private:
     struct DiscardDecision {
         u64 serial{~u64{0}};
         bool skip{};
+        /// 1 + the DrawTargetClass that made a native draw wait, 0 when it was not asked.
+        u8 target_class{};
     };
     mutable DiscardDecision discard_decision;
 
@@ -272,7 +277,7 @@ private:
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
         std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr,
-        bool libraries_only = false);
+        bool libraries_only = false, bool held_build = false);
 
     /// Builds a disk-cached graphics pipeline from the first of its records (newest first) that
     /// loads. When none does, the GPU thread's build of it is stored again.
@@ -409,7 +414,21 @@ private:
     std::unordered_set<const GraphicsPipeline*> used_this_session;
     std::filesystem::path used_pipelines_filename;
     std::chrono::steady_clock::time_point used_pipelines_saved{};
-    void SaveUsedPipelines();
+    /// `in_background` (EDEN_NX2_USED_PIPELINES_SAVE_S): the file is written by the
+    /// serialization thread.
+    void SaveUsedPipelines(bool in_background = false);
+    bool used_pipelines_dirty{}; ///< A pipeline was first used since the last save
+
+    /// Counts for the "Perf pipelines:" line, GPU thread only.
+    struct BuildReport {
+        u32 new_keys{};        ///< Keys first asked for by a draw
+        u32 from_background{}; ///< ...found built by the background threads
+        u32 with_record{};     ///< ...in the disk cache, translated again at the draw
+        u32 held_builds{};     ///< Built for a draw that waits: by class of its targets
+        std::array<u32, 3> held_classes{};
+        u32 used_saves{};
+        u32 used_entries{};
+    } build_report;
 
     std::filesystem::path vulkan_pipeline_cache_filename;
     vk::PipelineCache vulkan_pipeline_cache;
@@ -427,6 +446,9 @@ private:
 
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;
+    /// EDEN_NX2_PIPELINE_HOLD_BOOST: builds the pipelines a draw waits for, at the waiter's
+    /// priority. Null with the switch at 0.
+    std::unique_ptr<Common::ThreadWorker> held_workers;
     DynamicFeatures dynamic_features;
 
     /// Cached graphics pipelines boot skipped (not in used_pipelines) are built on background

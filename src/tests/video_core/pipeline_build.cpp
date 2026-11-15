@@ -14,7 +14,8 @@ namespace {
 using Vulkan::EmissionBudget;
 using Vulkan::PipelineBuild;
 
-bool Pending(std::future<void>& result) {
+template <typename T>
+bool Pending(std::future<T>& result) {
     return result.wait_for(std::chrono::seconds{0}) != std::future_status::ready;
 }
 } // namespace
@@ -174,6 +175,116 @@ TEST_CASE("Pipeline destruction waits for a running callback and its cleanup",
     REQUIRE(destruction_held);
     REQUIRE(*resource == 42);
     REQUIRE(budget.Pending() == 0);
+}
+
+TEST_CASE("A held draw moves a build no worker has started to the held pool",
+          "[video_core][async_draw][pipeline_build]") {
+    Common::ThreadWorker workers{1, "PipelineTest"};
+    Common::ThreadWorker held{1, "PipelineHeldTest"};
+    std::promise<void> release, entered;
+    auto gate = release.get_future().share();
+    workers.QueueWork([gate, &entered] {
+        entered.set_value();
+        gate.wait();
+    });
+    entered.get_future().wait();
+    int builds = 0;
+    PipelineBuild build{&workers, [&] { ++builds; }};
+    const bool built_here = build.WaitHeld(false, &held);
+    const bool built_before_the_queue_moved = build.IsBuilt();
+    const auto builder = build.Builder();
+    release.set_value();
+    workers.WaitForRequests();
+    held.WaitForRequests();
+    REQUIRE_FALSE(built_here);
+    REQUIRE(built_before_the_queue_moved);
+    REQUIRE(builder == Vulkan::PipelineBuilder::Held);
+    REQUIRE(builds == 1);
+    REQUIRE(Vulkan::PipelineBuildStats::Get().holds_active.load() == 0);
+}
+
+TEST_CASE("A build for a waiting draw starts on the held pool and queues when it is busy",
+          "[video_core][async_draw][pipeline_build]") {
+    Common::ThreadWorker workers{1, "PipelineTest"};
+    Common::ThreadWorker held{1, "PipelineHeldTest"};
+    std::promise<void> release_workers, workers_entered, release_held, held_entered;
+    auto workers_gate = release_workers.get_future().share();
+    auto held_gate = release_held.get_future().share();
+    workers.QueueWork([workers_gate, &workers_entered] {
+        workers_entered.set_value();
+        workers_gate.wait();
+    });
+    workers_entered.get_future().wait();
+
+    int builds = 0;
+    PipelineBuild first{&workers, [&] { ++builds; }, &held};
+    first.Wait();
+    const auto first_builder = first.Builder();
+
+    held.QueueWork([held_gate, &held_entered] {
+        held_entered.set_value();
+        held_gate.wait();
+    });
+    held_entered.get_future().wait();
+    PipelineBuild second{&workers, [&] { ++builds; }, &held};
+    auto draw = std::async(std::launch::async, [&] { return second.WaitHeld(false, &held); });
+    const bool waits_for_a_held_thread = Pending(draw);
+    release_held.set_value();
+    const bool built_here = draw.get();
+    const auto second_builder = second.Builder();
+    release_workers.set_value();
+    workers.WaitForRequests();
+    held.WaitForRequests();
+    REQUIRE(first_builder == Vulkan::PipelineBuilder::Held);
+    REQUIRE(waits_for_a_held_thread);
+    REQUIRE_FALSE(built_here);
+    REQUIRE(second_builder == Vulkan::PipelineBuilder::Held);
+    REQUIRE(builds == 2);
+}
+
+TEST_CASE("A held draw waits for a build a worker is running",
+          "[video_core][async_draw][pipeline_build]") {
+    Common::ThreadWorker workers{1, "PipelineTest"};
+    Common::ThreadWorker held{1, "PipelineHeldTest"};
+    std::promise<void> release, entered;
+    auto gate = release.get_future().share();
+    int builds = 0;
+    PipelineBuild build{&workers, [&, gate] {
+                            entered.set_value();
+                            gate.wait();
+                            ++builds;
+                        }};
+    entered.get_future().wait();
+    auto draw = std::async(std::launch::async, [&] { return build.WaitHeld(true, &held); });
+    const bool draw_held = Pending(draw);
+    release.set_value();
+    const bool built_here = draw.get();
+    held.WaitForRequests();
+    REQUIRE(draw_held);
+    REQUIRE_FALSE(built_here);
+    REQUIRE(build.Builder() == Vulkan::PipelineBuilder::Worker);
+    REQUIRE(builds == 1);
+    REQUIRE(Vulkan::PipelineBuildStats::Get().holds_active.load() == 0);
+}
+
+TEST_CASE("Without a held pool a held draw waits as before",
+          "[video_core][async_draw][pipeline_build]") {
+    Common::ThreadWorker workers{1, "PipelineTest"};
+    std::promise<void> release, entered;
+    auto gate = release.get_future().share();
+    workers.QueueWork([gate, &entered] {
+        entered.set_value();
+        gate.wait();
+    });
+    entered.get_future().wait();
+    int builds = 0;
+    PipelineBuild build{&workers, [&] { ++builds; }};
+    const bool built_here = build.WaitHeld(true, nullptr);
+    release.set_value();
+    workers.WaitForRequests();
+    REQUIRE(built_here);
+    REQUIRE(build.Builder() == Vulkan::PipelineBuilder::GpuThread);
+    REQUIRE(builds == 1);
 }
 
 TEST_CASE("Emission reservations enforce the production fallback and survive budget teardown",

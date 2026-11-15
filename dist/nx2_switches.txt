@@ -118,6 +118,31 @@ EDEN_NX2_FENCE_BATCH=1
 # stencil format.
 #EDEN_NX2_METAL_PIPELINE_CHECK=0
 
+# Threads of a pool of their own ("VkPipelineHeld") for the graphics pipeline builds a draw waits
+# for: such a build starts there at once, at the waiting thread's priority (on Apple its QoS
+# class), instead of queueing behind the other builds on the low-priority builder pool; a build
+# already running there is lent the waiter's QoS (Apple), and the background prebuild pauses while
+# a draw waits. 2 by default on Apple, 0 (off, as before) elsewhere.
+#EDEN_NX2_PIPELINE_HOLD_BOOST=2
+
+# The list of pipelines a game really drew (what the loading screen builds) is written at most
+# this many seconds after a pipeline's first use and when the app leaves the foreground, off the
+# GPU thread and through a temporary file. 10 by default on MoltenVK; 0 elsewhere: as before, on a
+# first use 15 s after the last save and at shutdown.
+#EDEN_NX2_USED_PIPELINES_SAVE_S=10
+
+# Test: every graphics pipeline built at run time (not at boot or by the prebuild) takes this many
+# ms of CPU time longer, to stand in for a slow driver compiler.
+#EDEN_NX2_PIPELINE_BUILD_DELAY_MS=300
+
+# Test: threads of the pipeline builder pool, up to the default (logical CPUs - 1; an iPhone 17
+# Pro Max has 5).
+#EDEN_NX2_PIPELINE_WORKERS=5
+
+# MoltenVK times its compilation stages (SPIR-V to MSL, MSL compile, pipeline compile, ...) for
+# the "Perf pipelines:" line. 1 by default on iOS, 0 on macOS.
+#EDEN_NX2_MVK_STATS=1
+
 #EDEN_NX2_MME_JIT=0
 #EDEN_NX2_PBFLUSH=0
 #EDEN_NX2_SKIP_SAME=0

@@ -451,6 +451,9 @@ struct ExperimentsView: View {
     @State private var dispatchDeps = lichii_platform_experiment("dispatch_deps") != 0
     @State private var metalTraceOff = lichii_platform_experiment("metal_trace_off") != 0
     @State private var metalCheckOff = lichii_platform_experiment("metal_check_off") != 0
+    @State private var pipelineHoldsOld = lichii_platform_experiment("pipeline_holds_old") != 0
+    @State private var pipelineListOld = lichii_platform_experiment("pipeline_list_old") != 0
+    @State private var mvkStatsOff = lichii_platform_experiment("mvk_stats_off") != 0
 
     var body: some View {
         List {
@@ -640,6 +643,25 @@ struct ExperimentsView: View {
                 Text("Guest Memory Access")
             } footer: {
                 Text("Exclusive Accesses in Fastmem runs the game's exclusive loads and stores (LDXR/STXR, for locks and counters) directly on guest memory, as on a computer, instead of a call into the emulator each; Ocarina of Time uses none on a computer, other games may. Loads Keep Fastmem After a Fault lets a game load that hit protected memory (a page the GPU wrote) keep reading guest memory directly, and take the slow path only after its eighth such fault instead of the first; on a computer it cut Ocarina of Time's slow loads of GPU pages by 70 % but saved little time. Both are off by default. The \"Perf memory callbacks:\" log line counts both.\n\nWrites Next to GPU Data as Before keeps every game write to a memory page that also holds data the GPU wrote on the slow path until the next GPU sync, as before. Normally Lichii copies the GPU's data on such a page back first and then lets the game write the page directly (on a computer this halved Ocarina of Time's slow writes in Kokiri Forest); turn it on if objects flicker or show stale data. The \"Perf CPU writes:\" log line counts these pages.\n\nReads of GPU Data as Before: when the game reads data the GPU wrote and that data is still on its way back, the graphics thread copies that memory page again and waits until the GPU has finished everything, page after page, as before. Normally the game's thread waits only for the copy that is already under way and takes the data itself, so the graphics thread keeps working (on a computer this cut the time the graphics thread was held by such reads in Kokiri Forest by 93 %); turn it on if the picture's brightness jumps or objects show stale data. The \"Perf CPU reads:\" log line counts these reads and their waits.\n\nAll four apply the next time Lichii starts.")
+            }
+
+            Section {
+                Toggle("Held Draws Wait in the Queue", isOn: $pipelineHoldsOld)
+                    .onChange(of: pipelineHoldsOld) { value in
+                        lichii_platform_set_experiment("pipeline_holds_old", value ? 1 : 0)
+                    }
+                Toggle("Used Shader List Saved as Before", isOn: $pipelineListOld)
+                    .onChange(of: pipelineListOld) { value in
+                        lichii_platform_set_experiment("pipeline_list_old", value ? 1 : 0)
+                    }
+                Toggle("No MoltenVK Compile Times", isOn: $mvkStatsOff)
+                    .onChange(of: mvkStatsOff) { value in
+                        lichii_platform_set_experiment("mvk_stats_off", value ? 1 : 0)
+                    }
+            } header: {
+                Text("Shader Builds")
+            } footer: {
+                Text("A draw whose shaders are not built yet either is left out for a frame or waits. Normally the build a draw waits for runs at once on two threads of its own at the waiting thread's priority, and the background builds pause meanwhile. Held Draws Wait in the Queue leaves it in line behind the other builds on the low-priority build threads, as before (waits of 0.1-2.2 s each in Kokiri Forest on an iPhone); turn it on if the game stutters more than before.\n\nLichii keeps a list of the shaders a game really drew and builds those on the loading screen. Normally the list is saved within 10 s of a new shader's first use and when Lichii leaves the foreground. Used Shader List Saved as Before saves it only when a new shader is first drawn 15 s or more after the last save or the game is stopped from the menu, so the shaders first drawn since the last save are missing from it when Lichii is closed from the app switcher.\n\nNo MoltenVK Compile Times stops MoltenVK timing its work (a few timestamps per command buffer), which the \"Perf pipelines:\" log line reports per stage.\n\nAll three apply the next time Lichii starts.")
             }
 
             Section {
