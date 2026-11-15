@@ -695,7 +695,7 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(OotResolution, Percent56, tr("56% (810p)")),
                               PAIR(OotResolution, Percent50, tr("50% (720p)")),
                               PAIR(OotResolution, Percent40, tr("40% (576p)")),
-                              PAIR(OotResolution, Percent33, tr("33% (480p)")),
+                              PAIR(OotResolution, Percent33, tr("33% (handheld; 40% docked)")),
                               PAIR(OotResolution, Percent150, tr("150% (2160p)")),
                               PAIR(OotResolution, Percent200, tr("200% (2880p)")),
                               PAIR(OotResolution, Percent300, tr("300% (4320p)")),

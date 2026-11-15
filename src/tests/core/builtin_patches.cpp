@@ -425,10 +425,18 @@ TEST_CASE("Ocarina resolution below half loads its scale in executable padding",
     setting.SetValue(OotResolution::Percent40);
     CHECK(words(nso) ==
           std::array{BranchInstruction, CaveBranch, 0x529999A9U, 0x72A7D989U, ReturnBranch});
-    // mov w9, #0xaaab; movk w9, #0x3eaa, lsl #16: 1/3.
+    // mov w9, #0xaaab; movk w9, #0x3eaa, lsl #16: 1/3. Docked that is 854x480 with padding, so it
+    // gets 0.4.
+    auto& console = Settings::values.use_docked_mode;
+    const auto previous_console = console.GetValue();
     setting.SetValue(OotResolution::Percent33);
+    console.SetValue(Settings::ConsoleMode::Handheld);
     CHECK(words(nso) ==
           std::array{BranchInstruction, CaveBranch, 0x52955569U, 0x72A7D549U, ReturnBranch});
+    console.SetValue(Settings::ConsoleMode::Docked);
+    CHECK(words(nso) ==
+          std::array{BranchInstruction, CaveBranch, 0x529999A9U, 0x72A7D989U, ReturnBranch});
+    console.SetValue(previous_console);
     setting.SetValue(OotResolution::Percent50);
     CHECK(words(nso) == std::array{BranchInstruction, Scale50, 0U, 0U, 0U});
 

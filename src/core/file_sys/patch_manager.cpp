@@ -124,6 +124,14 @@ bool MetalFxReplacesNdsr() {
     return Settings::MetalFxTemporalChosen();
 }
 
+// A third of the docked 2560x1440 is not a whole size: the game pads the scene to 854x480 and
+// draws its meshes twice. Docked gets 40% (1024x576) for it.
+Settings::OotResolution WholeSized(Settings::OotResolution resolution) {
+    return resolution == Settings::OotResolution::Percent33 && Settings::IsDockedMode()
+               ? Settings::OotResolution::Percent40
+               : resolution;
+}
+
 // Settings oot_resolution. For tests, EDEN_NX2_OOT_RENDER_SCALE=1..5 picks 75/56/50/40/33%, and
 // EDEN_NX2_OOT_MAX_RESOLUTION=0 turns Full into the game's dynamic resolution (the phone's
 // default on a desktop run), =1 the other way round.
@@ -134,7 +142,7 @@ Settings::OotResolution OotResolution() {
         constexpr std::array scales{OotResolution::Percent75, OotResolution::Percent56,
                                     OotResolution::Percent50, OotResolution::Percent40,
                                     OotResolution::Percent33};
-        return scales[v[0] - '1'];
+        return WholeSized(scales[v[0] - '1']);
     }
     auto resolution = Settings::OcarinaGameResolution(Settings::values.oot_resolution.GetValue());
     if (const char* v = std::getenv("EDEN_NX2_OOT_MAX_RESOLUTION"); v != nullptr && v[0] != 0) {
@@ -144,8 +152,8 @@ Settings::OotResolution OotResolution() {
             resolution = OotResolution::Full;
         }
     }
-    return Settings::OcarinaUpscaledResolution(resolution, Settings::values.upscaler.GetValue(),
-                                               Settings::IsDockedMode());
+    return WholeSized(Settings::OcarinaUpscaledResolution(
+        resolution, Settings::values.upscaler.GetValue(), Settings::IsDockedMode()));
 }
 
 template <Settings::OotResolution Resolution>
