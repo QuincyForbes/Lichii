@@ -577,7 +577,10 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             gpu.ForEachPendingCpuWrite(callback);
         });
     VideoCommon::GpuSplit::Get().SetIdleHook(
-        [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
+        [](void* argument, bool requested) {
+            return static_cast<Scheduler*>(argument)->FlushDeferredFromIdle(requested);
+        },
+        [](void* argument) { return static_cast<Scheduler*>(argument)->DeferredFlushMayWait(); },
         &scheduler);
         VideoCommon::GpuSplit::Get().SetFenceQuietCheck(
             [](void* argument, bool strict, u64* epoch) {
@@ -608,7 +611,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 
 RasterizerVulkan::~RasterizerVulkan() {
     Common::PlatformEvents::SetGraphicsMemoryReport({});
-    VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
+    VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr, nullptr);
     VideoCommon::GpuSplit::Get().SetFenceQuietCheck(nullptr, nullptr);
     scheduler.WaitWorker();
     scheduler.Finish();
@@ -4140,7 +4143,8 @@ void RasterizerVulkan::TickPerfReport() {
              "emulated/frame "
              "({:.1f} ended a render pass) | uploads MiB/s: textures {:.1f}, buffers {:.1f}, "
              "other {:.1f}, past the stream buffer {:.1f} | other: uniforms {:.1f} (padding "
-             "{:.1f}), 8-bit indices {:.1f} | GPU scratch (mesh emulation) {:.1f} MiB/s | {} "
+             "{:.1f}, {:.1f} of it for indexed reads; {:.1f} indexed binds/frame), 8-bit indices "
+             "{:.1f} | GPU scratch (mesh emulation) {:.1f} MiB/s | {} "
              "early submits, {} waits at the cap, {} mesh "
              "arena waits | textures {:.1f} collected/s ({} downloaded, {} redrawn not "
              "downloaded), {:.1f} made/s, {} MiB "
@@ -4172,6 +4176,8 @@ void RasterizerVulkan::TickPerfReport() {
              mib_per_second(delta(Common::PerfReport::StagingPooledBytes)),
              mib_per_second(delta(Common::PerfReport::UniformStreamBytes)),
              mib_per_second(delta(Common::PerfReport::UniformPadBytes)),
+             mib_per_second(delta(Common::PerfReport::UniformPadIndexedBytes)),
+             per_frame(Common::PerfReport::UniformIndexedBinds),
              mib_per_second(delta(Common::PerfReport::IndexStreamBytes)),
              mib_per_second(delta(Common::PerfReport::StagingScratchBytes)),
              delta(Common::PerfReport::EarlySubmits), delta(Common::PerfReport::CapWaits),

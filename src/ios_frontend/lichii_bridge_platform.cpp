@@ -317,6 +317,18 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_TARGETLESS_REACH", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment targetless_full on");
     }
+    if (lichii_platform_experiment("ubo_zero_tails")) {
+        setenv("EDEN_NX2_UBO_PAD", "readable", 1);
+        LOG_WARNING(Frontend, "iOS: experiment ubo_zero_tails on");
+    }
+    if (lichii_platform_experiment("release_submit")) {
+        setenv("EDEN_NX2_RELEASE_SUBMIT", "1", 1);
+        LOG_WARNING(Frontend, "iOS: experiment release_submit on");
+    }
+    if (lichii_platform_experiment("idle_submit_grace")) {
+        setenv("EDEN_NX2_IDLE_GRACE_US", "250", 1);
+        LOG_WARNING(Frontend, "iOS: experiment idle_submit_grace on");
+    }
     ApplyCpuExperiments();
 }
 

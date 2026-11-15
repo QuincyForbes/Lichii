@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 
 #include "video_core/fence_manager.h"
@@ -37,6 +38,7 @@ public:
 private:
     Scheduler& scheduler;
     u64 wait_tick = 0;
+    std::chrono::steady_clock::time_point queued{};
 };
 using Fence = std::shared_ptr<InnerFence>;
 

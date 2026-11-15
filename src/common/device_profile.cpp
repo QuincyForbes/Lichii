@@ -272,6 +272,13 @@ void RecommendApple(const Device& device, Profile& p) {
          "138), the title screen 7. PC phone sim: 59 -> 21 a frame, no more flashes in Kokiri "
          "(flash watch). Experiments > Submit at Every Fence turns it off."});
     p.tuning.push_back(
+        {"EDEN_NX2_RELEASE_SUBMIT", "0", "Only when waited for",
+         "A fence release (the game waiting on a GPU value) submits the GPU's work only when "
+         "something waits for it: these submitted ~11 of 21 command buffers a frame in Ocarina "
+         "of Time's Kokiri Forest on the PC phone sim, with nothing waiting (iPhone18,2: 37-40 "
+         "a frame, IPA 152). PC: 22 -> 15 a frame. Experiments > Submit at Every Fence Release "
+         "turns it off."});
+    p.tuning.push_back(
         {"EDEN_NX2_PASS_TIMES", "10", "Every 10 s",
          "One frame in 10 s gets GPU timestamps around each render pass (\"Perf passes:\" log "
          "line): build 71 spent 84-103 ms of GPU time per frame on the phone with the Legacy and "

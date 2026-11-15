@@ -200,7 +200,13 @@ public:
             // The fence's commands can be held back by a deferred flush that only this thread
             // submits. The fencing thread waits for that submission before releasing the fence,
             // so waiting here without submitting deadlocks (Ocarina of Time entering gameplay).
-            SubmitDeferredWork();
+            // Without delayed fences the callback mostly ran in SignalFence already: nothing
+            // waits, and the deferred flush can wait for the next submission
+            // (EDEN_NX2_RELEASE_SUBMIT=0; puller fence releases, ~11 command buffers a frame in
+            // Ocarina of Time's Kokiri Forest).
+            if (!ReleaseSkipsSubmit() || !wait_finished.load(std::memory_order_acquire)) {
+                SubmitDeferredWork();
+            }
             BackWaitScope wait_scope{"FenceManager::WaitPendingFences (fencing thread callback)"};
             std::unique_lock lk(wait_mutex);
             wait_cv.wait(
@@ -244,6 +250,17 @@ public:
             }
         }
         return true;
+    }
+
+    /// EDEN_NX2_RELEASE_SUBMIT=0: WaitPendingFences submits deferred work only when the fence's
+    /// callback has not run yet (someone waits for it). Off (=1) by default; phones turn it on
+    /// (device profile).
+    static bool ReleaseSkipsSubmit() {
+        static const bool skips = [] {
+            const char* value = std::getenv("EDEN_NX2_RELEASE_SUBMIT");
+            return value != nullptr && value[0] == '0';
+        }();
+        return skips;
     }
 
     /// Any thread: changes whenever a fence or a fence operation is added.

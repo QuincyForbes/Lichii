@@ -243,12 +243,21 @@ public:
                                           [[maybe_unused]] u32 binding_index,
                                           u32 size) {
         const u32 readable = std::exchange(stream_uniform_readable, 0U);
+        // Indexed reads: the shader's used size is the whole bank.
+        const bool indexed = readable == 0 || readable >= 65536U;
+        if (indexed && size < 65536U) {
+            Common::PerfReport::Add(Common::PerfReport::UniformIndexedBinds);
+        }
         u32 allocation_size = size;
         switch (UniformPadMode()) {
         case UniformPad::None:
             break;
         case UniformPad::Readable:
+        case UniformPad::Poison:
             allocation_size = (std::max)(size, readable != 0 ? readable : 65536U);
+            break;
+        case UniformPad::Static:
+            allocation_size = indexed ? size : (std::max)(size, readable);
             break;
         case UniformPad::Bank:
             allocation_size = (std::max)(size, 65536U);
@@ -258,15 +267,21 @@ public:
         Common::PerfReport::Add(Common::PerfReport::UniformStreamBytes, allocation_size);
         if (allocation_size != size) {
             Common::PerfReport::Add(Common::PerfReport::UniformPadBytes, allocation_size - size);
+            if (indexed) {
+                Common::PerfReport::Add(Common::PerfReport::UniformPadIndexedBytes,
+                                        allocation_size - size);
+            }
             std::fill(ref.mapped_span.begin() + size, ref.mapped_span.begin() + allocation_size,
-                      u8{0});
+                      UniformPadMode() == UniformPad::Poison ? u8{0xff} : u8{0});
         }
         last_stream_uniform = StreamUniformRef{
             .buffer = ref.buffer,
             .device_address = ref.device_address,
             .offset = static_cast<u32>(ref.offset),
         };
-        RebindStreamUniform(last_stream_uniform, size);
+        // Poison: the shader sees the filled tail (not the robust zeros past `size`).
+        RebindStreamUniform(last_stream_uniform,
+                            UniformPadMode() == UniformPad::Poison ? allocation_size : size);
         return allocation_size != size ? ref.mapped_span.first(size) : ref.mapped_span;
     }
 
@@ -401,9 +416,13 @@ private:
 
     /// Shaders declare every uniform buffer as a 64 KiB array. MoltenVK streamed ones were padded
     /// to all of it (zeroed); the shader reads only below its used size, so that is enough.
-    /// EDEN_NX2_UBO_PAD=bank: the whole 64 KiB, =readable: the used size, =0: none.
-    /// Default: readable on MoltenVK, none elsewhere.
-    enum class UniformPad : u8 { None, Readable, Bank };
+    /// EDEN_NX2_UBO_PAD=bank: the whole 64 KiB, =readable: the used size, =static: the used size
+    /// unless the shader indexes the buffer (then the guest's bytes only; the stream buffer's
+    /// tail keeps the rest of the bank mapped), =poison: as readable with 0xff bytes the shader
+    /// can see (do indexed reads go past the guest's size?), =0: none.
+    /// Default: static on MoltenVK, none elsewhere. Ocarina of Time's indexed binds made all of
+    /// the padding (iPhone: ~75 % of the uniform bytes); with poison its frames showed no NaN.
+    enum class UniformPad : u8 { None, Readable, Bank, Static, Poison };
     UniformPad uniform_pad{UniformPad::None};
 
     UniformPad UniformPadMode() const noexcept {

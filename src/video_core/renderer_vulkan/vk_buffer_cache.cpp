@@ -438,16 +438,23 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                                                                      scheduler_, staging_pool_);
     quad_strip_index_buffer = std::make_shared<QuadStripIndexBuffer>(device_, memory_allocator_,
                                                                      scheduler_, staging_pool_);
-    uniform_pad = device.IsMoltenVK() ? UniformPad::Readable : UniformPad::None;
+    uniform_pad = device.IsMoltenVK() ? UniformPad::Static : UniformPad::None;
     if (const char* const pad = std::getenv("EDEN_NX2_UBO_PAD")) {
         const std::string_view value{pad};
         uniform_pad = value == "bank"       ? UniformPad::Bank
                       : value == "readable" ? UniformPad::Readable
+                      : value == "static"   ? UniformPad::Static
+                      : value == "poison"   ? UniformPad::Poison
                                             : UniformPad::None;
     }
     if (uniform_pad != UniformPad::None) {
         LOG_INFO(Render_Vulkan, "Streamed uniform buffers are zero-padded to {}",
-                 uniform_pad == UniformPad::Bank ? "64 KiB" : "their shader's used size");
+                 uniform_pad == UniformPad::Bank     ? "64 KiB"
+                 : uniform_pad == UniformPad::Static ? "their shader's used size, unless it "
+                                                       "indexes them (then their own size)"
+                 : uniform_pad == UniformPad::Poison ? "their shader's used size with 0xff, "
+                                                       "visible to it (diagnostic)"
+                                                     : "their shader's used size");
     }
 }
 

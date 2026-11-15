@@ -70,13 +70,19 @@ public:
     /// submission is older than a window (EDEN_NX2_FENCE_FLUSH_US, default 500 us, 0 submits at
     /// once); otherwise it goes with the next one. The back submits deferred work before it
     /// sleeps and when another thread asks (WaitSubmitted). True when the flush was deferred.
-    bool DeferFlush();
-    /// Submits deferred work (the split's back, from its idle hook).
-    void FlushDeferred();
+    bool DeferFlush(std::source_location location = std::source_location::current());
+    /// Submits deferred work (the split's back).
+    void FlushDeferred(std::source_location location = std::source_location::current());
+    /// The split's idle hook: before the back waits for work, or between entries when another
+    /// thread asked (`requested`). Returns whether it submitted.
+    bool FlushDeferredFromIdle(bool requested);
+    /// The split's back: whether a flush was deferred, not submitted yet, and may wait a little
+    /// longer for more work (deferred for less than the DeferFlush window).
+    [[nodiscard]] bool DeferredFlushMayWait() const;
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
     /// is not running, so nothing will submit it: the caller then submits it itself.
-    bool WaitSubmitted(u64 tick);
+    bool WaitSubmitted(u64 tick, std::source_location location = std::source_location::current());
     /// Whether everything up to tick has been handed to the worker for submission.
     [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept {
         return tick < master_semaphore->CurrentTick();
@@ -439,7 +445,11 @@ public:
     std::mutex submit_mutex;
 
 private:
+    /// "Perf submits:" counts for the submission about to be made.
+    void NoteSubmitPerf();
+
     std::chrono::steady_clock::time_point last_flush{};
+    std::chrono::steady_clock::time_point flush_pending_since{};
     bool flush_pending{};
 
     class Command {
