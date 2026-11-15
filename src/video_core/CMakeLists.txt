@@ -702,10 +702,12 @@ if (ENABLE_METAL)
     if (NOT IOS)
         set(METAL_SMOKE_DIR ${CMAKE_CURRENT_BINARY_DIR}/metal_smoke)
         set(METAL_SMOKE_HEADERS)
-        foreach (SMOKE_SHADER translate_smoke texel_buffer_smoke)
+        foreach (SMOKE_FILE translate_smoke.comp texel_buffer_smoke.comp tess_smoke.vert
+                            tess_smoke.tesc tess_smoke.tese)
+            string(REPLACE "." "_" SMOKE_SHADER "${SMOKE_FILE}")
             string(TOUPPER "${SMOKE_SHADER}_SPV" SMOKE_VARIABLE)
-            set(SMOKE_HEADER ${METAL_SMOKE_DIR}/${SMOKE_SHADER}_comp_spv.h)
-            set(SMOKE_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/renderer_metal/smoke/${SMOKE_SHADER}.comp)
+            set(SMOKE_HEADER ${METAL_SMOKE_DIR}/${SMOKE_SHADER}_spv.h)
+            set(SMOKE_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/renderer_metal/smoke/${SMOKE_FILE})
             add_custom_command(
                 OUTPUT ${SMOKE_HEADER}
                 COMMAND ${CMAKE_COMMAND} -E make_directory ${METAL_SMOKE_DIR}

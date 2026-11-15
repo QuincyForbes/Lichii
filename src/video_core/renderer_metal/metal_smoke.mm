@@ -10,6 +10,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -23,6 +24,9 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/attribute.h"
 #include "shader_recompiler/shader_info.h"
+#include "tess_smoke_tesc_spv.h"
+#include "tess_smoke_tese_spv.h"
+#include "tess_smoke_vert_spv.h"
 #include "texel_buffer_smoke_comp_spv.h"
 #include "translate_smoke_comp_spv.h"
 #include "video_core/renderer_metal/metal_archive.h"
@@ -163,7 +167,7 @@ int Run() {
 int RunTranslate() {
     namespace Translate = Metal::ShaderTranslate;
     const Translate::Result msl = Translate::SpirvToMsl(
-        std::span<const uint32_t>(TRANSLATE_SMOKE_SPV), Translate::Stage::Compute, {});
+        std::span<const uint32_t>(TRANSLATE_SMOKE_COMP_SPV), Translate::Stage::Compute, {});
     if (msl.source.empty()) {
         std::printf("metal-smoke: FAIL SPIR-V -> MSL: %s\n", msl.error.c_str());
         return 1;
@@ -377,7 +381,7 @@ int RunTexelBuffer() {
     Metal::Device device;
     Metal::Scheduler scheduler(device);
     const Translate::Result msl = Translate::SpirvToMsl(
-        std::span<const uint32_t>(TEXEL_BUFFER_SMOKE_SPV), Translate::Stage::Compute, {});
+        std::span<const uint32_t>(TEXEL_BUFFER_SMOKE_COMP_SPV), Translate::Stage::Compute, {});
     if (msl.source.empty()) {
         std::printf("metal-smoke: FAIL texel buffer SPIR-V -> MSL: %s\n", msl.error.c_str());
         return 1;
@@ -1032,6 +1036,184 @@ int RunDepthBlit() {
     return passed ? 0 : 1;
 }
 
+/// Tessellation as the renderer runs it: GLSL vertex, control and evaluation programs through the
+/// translator (stage outputs passed on, execution modes shared), the vertex program as a stage-in
+/// kernel over a vertex buffer, the control kernel writing control points and factors, and the
+/// evaluation program drawing the patch: a triangle over the top-left half, tessellation factors
+/// 4 (half precision) in the factor buffer, and the samples it covers counted.
+int RunTessellation() {
+    namespace Translate = Metal::ShaderTranslate;
+    using Maxwell = Metal::Maxwell;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Translate::Options options;
+    const Translate::Result vertex = Translate::SpirvToMsl(
+        std::span<const uint32_t>(TESS_SMOKE_VERT_SPV), Translate::Stage::VertexForTessellation,
+        options);
+    options.inputs = vertex.outputs;
+    options.tessellation.output_vertices = 3;
+    const Translate::Result control = Translate::SpirvToMsl(
+        std::span<const uint32_t>(TESS_SMOKE_TESC_SPV), Translate::Stage::TessellationControl,
+        options);
+    options.inputs = control.outputs;
+    const Translate::Result evaluation = Translate::SpirvToMsl(
+        std::span<const uint32_t>(TESS_SMOKE_TESE_SPV), Translate::Stage::TessellationEvaluation,
+        options);
+    if (vertex.source.empty() || control.source.empty() || evaluation.source.empty()) {
+        std::printf("metal-smoke: FAIL tessellation SPIR-V -> MSL: %s %s %s\n",
+                    vertex.error.c_str(), control.error.c_str(), evaluation.error.c_str());
+        return 1;
+    }
+    std::string error;
+    const auto function = [&](const Translate::Result& result, Metal::Object& library) {
+        library = Metal::CreateLibrary(device, result.source, error);
+        return library ? Metal::CreateFunction(library.Get(), result.entry_point)
+                       : Metal::Object{};
+    };
+    Metal::Object vertex_library, control_library, evaluation_library;
+    const Metal::Object vertex_function = function(vertex, vertex_library);
+    const Metal::Object control_function = function(control, control_library);
+    const Metal::Object evaluation_function = function(evaluation, evaluation_library);
+    const Metal::Object fragment_library = Metal::CreateLibrary(device, MeshColorSource, error);
+    const Metal::Object fragment =
+        fragment_library ? Metal::CreateFunction(fragment_library.Get(), "mesh_color_fragment")
+                         : Metal::Object{};
+    if (!vertex_function || !control_function || !evaluation_function || !fragment) {
+        std::printf("metal-smoke: FAIL tessellation functions: %s\n%s\n%s\n%s\n", error.c_str(),
+                    vertex.source.c_str(), control.source.c_str(), evaluation.source.c_str());
+        return 1;
+    }
+    // The vertex layout: one float2 position per vertex in stream 0.
+    auto layout = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    layout.attributes[0] = {1, 0, 0, Maxwell::VertexAttribute::Type::Float,
+                            Maxwell::VertexAttribute::Size::Size_R32_G32};
+    layout.streams[0] = {1, 8, 0};
+    const Metal::Object vertex_kernel = Metal::CreateStageInComputePipelineState(
+        device, vertex_function.Get(), layout, 0, vertex.tessellation_slots.index, error);
+    const Metal::Object control_kernel =
+        Metal::CreateComputePipelineState(device, control_function.Get(), error);
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = evaluation_function.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.rasterize = 1;
+    desc.tessellation = 1;
+    desc.tess_partition = static_cast<uint32_t>(MTLTessellationPartitionModeInteger);
+    desc.tess_winding = static_cast<uint32_t>(MTLWindingClockwise);
+    const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
+    const Metal::Object depth_stencil =
+        Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+    if (!vertex_kernel || !control_kernel || !pipeline || !depth_stencil) {
+        std::printf("metal-smoke: FAIL tessellation pipelines: %s\n", error.c_str());
+        return 1;
+    }
+
+    const auto buffer = [&](uint32_t bytes, uint8_t** contents) {
+        Metal::Object object = Metal::CreateBuffer(device, bytes, true, contents);
+        std::memset(*contents, 0, bytes);
+        return object;
+    };
+    uint8_t* positions = nullptr;
+    const Metal::Object position_buffer = buffer(24, &positions);
+    const float corners[6]{-1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f};
+    std::memcpy(positions, corners, sizeof(corners));
+    uint8_t* vertices = nullptr;
+    uint8_t* points = nullptr;
+    uint8_t* patch_constants = nullptr;
+    uint8_t* factors = nullptr;
+    const Metal::Object vertex_out = buffer(3 * 64, &vertices);
+    const Metal::Object points_out = buffer(32 * 64, &points);
+    const Metal::Object patch_out = buffer(64, &patch_constants);
+    const Metal::Object factors_out = buffer(64, &factors);
+    const auto bind = [&](uint32_t slot, const Metal::Object& object) {
+        if (slot != ~0U) {
+            scheduler.BindBuffer(Metal::ShaderStage::Compute, slot, object.Get(), 0);
+        }
+    };
+    scheduler.BeginCompute(vertex_kernel.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::VertexBufferSlot(0),
+                         position_buffer.Get(), 0);
+    bind(vertex.tessellation_slots.output, vertex_out);
+    scheduler.DispatchStageIn(0, 3, 0, 1);
+    scheduler.BeginCompute(control_kernel.Get());
+    bind(control.tessellation_slots.input, vertex_out);
+    bind(control.tessellation_slots.output, points_out);
+    bind(control.tessellation_slots.patch_output, patch_out);
+    bind(control.tessellation_slots.tess_factors, factors_out);
+    const std::array<uint32_t, 2> params{3, 1};
+    scheduler.BindBytes(Metal::ShaderStage::Compute, control.tessellation_slots.indirect_params,
+                        params.data(), sizeof(params));
+    scheduler.Dispatch({1, 1, 1}, {30, 1, 1});
+
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm),
+                 .width = Size,
+                 .height = Size,
+                 .render_target = true});
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer = buffer(Size * Size * 4, &readback);
+    Metal::ClearPass clear{};
+    clear.color[0] = {.texture = target.Get()};
+    clear.clear_color[0] = true;
+    clear.color_value[0] = {1.0, 0.0, 0.0, 1.0};
+    clear.width = Size;
+    clear.height = Size;
+    scheduler.Clear(clear);
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = Size;
+    targets.height = Size;
+    scheduler.BeginRendering(targets);
+    Metal::DrawState state{};
+    state.pipeline = pipeline.Get();
+    state.depth_stencil = depth_stencil.Get();
+    state.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+    state.scissor = {0, 0, Size, Size};
+    scheduler.SetDrawState(state);
+    if (evaluation.tessellation_slots.input != ~0U) {
+        scheduler.BindBuffer(Metal::ShaderStage::Vertex, evaluation.tessellation_slots.input,
+                             points_out.Get(), 0);
+    }
+    if (evaluation.tessellation_slots.patch_input != ~0U) {
+        scheduler.BindBuffer(Metal::ShaderStage::Vertex, evaluation.tessellation_slots.patch_input,
+                             patch_out.Get(), 0);
+    }
+    scheduler.VisibilityResults()[2] = 0;
+    scheduler.SetVisibility(2);
+    scheduler.SetTessellationFactorBuffer(factors_out.Get(), 0);
+    scheduler.DrawPatches(3, 1);
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Size, Size, 1}, readback_buffer.Get(),
+                                  0, Size * 4, 0);
+    scheduler.Finish();
+
+    // MTLTriangleTessellationFactorsHalf: three edge factors and the inside one, 4.0 each.
+    std::array<uint16_t, 4> halves{};
+    std::memcpy(halves.data(), factors, sizeof(halves));
+    const bool factors_ok = std::ranges::all_of(halves, [](uint16_t half) { return half == 0x4400; });
+    const auto* texels = reinterpret_cast<const Texel*>(readback);
+    const Texel inside = texels[4 * Size + 4];
+    const Texel outside = texels[(Size - 4) * Size + Size - 4];
+    const bool drawn = Near(inside, {0, 255, 0, 255}) && Near(outside, {255, 0, 0, 255});
+    const uint64_t samples = scheduler.VisibilityResults()[2];
+    // Half the target and the diagonal's pixels whose centres it covers.
+    const bool counted = samples >= Size * Size / 2 - Size && samples <= Size * Size / 2 + Size;
+    const bool passed = factors_ok && drawn && counted;
+    std::printf("metal-smoke: tessellation (vertex kernel -> control kernel -> patch draw): "
+                "factors %04x %04x %04x %04x, inside %u,%u,%u outside %u,%u,%u, %llu samples "
+                "(about %u): %s\n",
+                halves[0], halves[1], halves[2], halves[3], inside.r, inside.g, inside.b,
+                outside.r, outside.g, outside.b, static_cast<unsigned long long>(samples),
+                Size * Size / 2, passed ? "PASS" : "FAIL");
+    if (!passed) {
+        std::printf("%s\n%s\n%s\n", vertex.source.c_str(), control.source.c_str(),
+                    evaluation.source.c_str());
+    }
+    return passed ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main() {
@@ -1044,7 +1226,7 @@ int main() {
         for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer, RunMeshEmulation,
                                  RunMeshDistribution, RunIndexRewrite,
                                  RunOcarinaBilinear, RunPipelineArchive,
-                                 RunDepthBlit}) {
+                                 RunDepthBlit, RunTessellation}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }
