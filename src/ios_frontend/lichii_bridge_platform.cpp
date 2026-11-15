@@ -367,6 +367,10 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_METAL_FIXED_STATE", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment metal_fixed_state_off on");
     }
+    if (lichii_platform_experiment("metal_cache_plain")) {
+        setenv("EDEN_NX2_METAL_CACHE_PATHS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_cache_plain on");
+    }
     ApplyCpuExperiments();
 }
 

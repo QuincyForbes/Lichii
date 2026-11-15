@@ -147,6 +147,12 @@ public:
     /// Waits for `tick` on the CPU, committing it first when it is the one being recorded.
     void Wait(u64 tick);
 
+    /// Whether `tick` was committed. From any thread.
+    [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept;
+
+    /// Waits for a committed `tick` on the CPU. From any thread (Wait is the recording thread's).
+    void WaitSubmitted(u64 tick);
+
     /// Whether anything was recorded since the last Flush.
     [[nodiscard]] bool HasPendingWork() const noexcept;
 

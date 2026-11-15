@@ -5,8 +5,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -329,7 +331,11 @@ struct Scheduler::Impl {
     std::unordered_map<u64, id<MTLRenderPipelineState>> blit_pipelines;
 
     u64 current_tick{1};
+    std::atomic<u64> submitted_tick{0};
     std::atomic<u64> completed_tick{0};
+    /// Wakes WaitSubmitted when completed_tick moves.
+    std::mutex completed_mutex;
+    std::condition_variable completed_cv;
     /// GPU time of the command buffers completed since TakeGpuNanoseconds.
     std::atomic<u64> gpu_ns{0};
     std::deque<std::pair<u64, id<MTLCommandBuffer>>> in_flight;
@@ -375,6 +381,18 @@ void Scheduler::Wait(u64 tick) {
     }
 }
 
+bool Scheduler::IsSubmitted(u64 tick) const noexcept {
+    return impl->submitted_tick.load(std::memory_order_acquire) >= tick;
+}
+
+void Scheduler::WaitSubmitted(u64 tick) {
+    if (IsFree(tick)) {
+        return;
+    }
+    std::unique_lock lock{impl->completed_mutex};
+    impl->completed_cv.wait(lock, [&] { return IsFree(tick); });
+}
+
 bool Scheduler::HasPendingWork() const noexcept {
     return impl->command_buffer != nil;
 }
@@ -387,6 +405,8 @@ u64 Scheduler::Flush() {
     std::atomic<u64>* const gpu_ns = &impl->gpu_ns;
     std::atomic<bool>* const completed_logged = &impl->completed_logged;
     std::atomic<u32>* const errors_logged = &impl->errors_logged;
+    std::mutex* const completed_mutex = &impl->completed_mutex;
+    std::condition_variable* const completed_cv = &impl->completed_cv;
     [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> finished) {
         const CFTimeInterval busy = finished.GPUEndTime - finished.GPUStartTime;
         if (busy > 0.0) {
@@ -423,8 +443,13 @@ u64 Scheduler::Flush() {
         while (previous < tick &&
                !completed->compare_exchange_weak(previous, tick, std::memory_order_release)) {
         }
+        {
+            std::scoped_lock lock{*completed_mutex};
+        }
+        completed_cv->notify_all();
     }];
     [command_buffer commit];
+    impl->submitted_tick.store(tick, std::memory_order_release);
     ++impl->command_buffers;
     if (impl->committed++ == 0) {
         LOG_INFO(Render_Metal, "Metal: first command buffer committed (tick {})", tick);

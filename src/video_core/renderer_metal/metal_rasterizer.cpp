@@ -8,6 +8,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <tuple>
+
+#include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
 #include "common/cityhash.h"
@@ -16,15 +19,19 @@
 #include "common/settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
+#include "video_core/buffer_cache/cpu_read_stats.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/feature_census.h"
 #include "video_core/framebuffer_config.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_indirect_grid.h"
 #include "video_core/oot_network.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_draw_desc.h"
@@ -85,6 +92,40 @@ VideoCommon::Extent2D TargetlessReach(const Maxwell& regs, bool is_rescaling) {
     }
     return {std::clamp(scale(width), 1U, MaxRenderTargetSize),
             std::clamp(scale(height), 1U, MaxRenderTargetSize)};
+}
+
+bool EnvironmentOn(const char* name) {
+    const char* const value = std::getenv(name);
+    return value == nullptr || value[0] != '0';
+}
+
+// EDEN_NX2_METAL_CACHE_PATHS=0: guest reads, guest writes and inline writes take the plain
+// paths this backend started with (every question under the cache locks, collected writes
+// applied one at a time, reads landed by the GPU thread, no fence quiet check, every inline
+// write invalidating every cache at once). On, they are the Vulkan rasterizer's.
+bool CachePathsEnabled() {
+    static const bool enabled = EnvironmentOn("EDEN_NX2_METAL_CACHE_PATHS");
+    return enabled;
+}
+
+bool TextureReadFilter() {
+    static const bool enabled = EnvironmentOn("EDEN_NX2_TEXTURE_READ_FILTER");
+    return enabled;
+}
+
+/// False when no page of the range was ever written by the GPU (no lock needed to know).
+bool MayBeGpuModified(DAddr addr, u64 size) {
+    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
+        return true;
+    }
+    const DAddr last = addr + size - 1;
+    for (DAddr page = addr >> Tegra::Nx2WrittenPageBits;
+         page <= (last >> Tegra::Nx2WrittenPageBits); ++page) {
+        if (Tegra::Nx2IsGpuWritten(page << Tegra::Nx2WrittenPageBits)) {
+            return true;
+        }
+    }
+    return false;
 }
 } // Anonymous namespace
 
@@ -157,12 +198,53 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
       buffer_cache{device_memory_, buffer_cache_runtime}, pipeline_cache{device_memory_, device_},
       ocarina{device_, scheduler_},
       accelerate_dma{buffer_cache, texture_cache},
-      fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_} {}
+      fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_} {
+    if (!CachePathsEnabled()) {
+        LOG_WARNING(Render_Metal, "Metal: plain cache paths (EDEN_NX2_METAL_CACHE_PATHS=0)");
+        return;
+    }
+    // Guest writes collected but not applied yet, for downloads that must not land over them.
+    buffer_cache.SetPendingCpuWrites(
+        [this](const std::function<void(DAddr, size_t)>& callback) {
+            gpu.ForEachPendingCpuWrite(callback);
+        });
+    VideoCommon::GpuSplit::Get().SetFenceQuietCheck(
+        [](void* argument, bool strict, u64* epoch) {
+            return static_cast<RasterizerMetal*>(argument)->FencesQuiet(strict, *epoch);
+        },
+        this);
+    // Whoever takes the buffer cache's lock applies the guest writes handed off meanwhile.
+    buffer_cache.mutex.SetOwnerHook(
+        [](void* argument) {
+            auto& self = *static_cast<RasterizerMetal*>(argument);
+            self.write_handoff.Drain([&self](DAddr addr, u64 size) {
+                if (!self.buffer_cache.OnCPUWrite(addr, size)) {
+                    return;
+                }
+                constexpr u64 page_size = VideoCommon::Nx2WriteHandoff::PageSize;
+                for (DAddr page = addr; page < addr + size;) {
+                    const DAddr page_end =
+                        (std::min)(addr + size, Common::AlignDown(page, page_size) + page_size);
+                    if (self.buffer_cache.OnCPUWrite(page, page_end - page)) {
+                        self.gpu.CollectHandoffWrite(page, page_end - page);
+                    }
+                    page = page_end;
+                }
+            });
+        },
+        this);
+}
 
-RasterizerMetal::~RasterizerMetal() = default;
+RasterizerMetal::~RasterizerMetal() {
+    if (CachePathsEnabled()) {
+        VideoCommon::GpuSplit::Get().SetFenceQuietCheck(nullptr, nullptr);
+    }
+}
 
 void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     ++draws;
+    // Deferred inline writes reach the caches before anything of theirs is used.
+    gpu_memory->FlushCaching();
     GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
     if (VideoCommon::FeatureCensus::Enabled()) {
         VideoCommon::FeatureCensus::NoteDraw(*maxwell3d, pipeline_cache.LookupHashes());
@@ -1261,6 +1343,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
 
 void RasterizerMetal::DrawIndirect() {
     ++draws;
+    gpu_memory->FlushCaching();
     GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
     if (VideoCommon::FeatureCensus::Enabled()) {
         VideoCommon::FeatureCensus::NoteDraw(*maxwell3d, pipeline_cache.LookupHashes());
@@ -1773,6 +1856,11 @@ void RasterizerMetal::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType w
     if (addr == 0 || size == 0) {
         return;
     }
+    if (CachePathsEnabled() && True(which & (VideoCommon::CacheType::TextureCache |
+                                             VideoCommon::CacheType::BufferCache))) {
+        // Collected guest writes first: the download must not land over them.
+        gpu.InvalidateGPUCache();
+    }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.DownloadMemory(addr, size);
@@ -1784,16 +1872,21 @@ void RasterizerMetal::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType w
 }
 
 bool RasterizerMetal::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
-    if (True(which & VideoCommon::CacheType::BufferCache)) {
+    const bool fast = CachePathsEnabled();
+    if (True(which & VideoCommon::CacheType::BufferCache) &&
+        (!fast || MayBeGpuModified(addr, size))) {
         std::scoped_lock lock{buffer_cache.mutex};
         if (buffer_cache.IsRegionGpuModified(addr, size)) {
             return true;
         }
     }
-    if (!Settings::IsGPULevelHigh()) {
+    if (!VideoCore::Nx2Debug::AccuratePart(4)) {
         return false;
     }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
+        if (fast && TextureReadFilter() && !texture_cache.MayHaveGpuModifiedImages(addr, size)) {
+            return false;
+        }
         std::scoped_lock lock{texture_cache.mutex};
         return texture_cache.IsRegionGpuModified(addr, size);
     }
@@ -1801,15 +1894,35 @@ bool RasterizerMetal::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheTy
 }
 
 VideoCore::RasterizerDownloadArea RasterizerMetal::GetFlushArea(DAddr addr, u64 size) {
-    {
+    // A guest core, on every trapped load: a cache that can hold nothing of the range is not
+    // asked, so its lock (held by the GPU thread most of the time) is not waited for.
+    static const bool read_fast_path = EnvironmentOn("EDEN_NX2_READ_FASTPATH");
+    const bool fast = CachePathsEnabled() && read_fast_path;
+    const bool skip_textures =
+        fast && (!texture_cache.page_filter.Any(addr, size) ||
+                 (TextureReadFilter() && !texture_cache.MayHaveGpuModifiedImages(addr, size)));
+    const bool skip_buffers = fast && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+                              !device_memory.MayHaveArmedReadTraps(addr, size) &&
+                              !Tegra::Nx2MayBeGpuWritten(addr, size);
+    namespace ReadStats = VideoCommon::CpuReadStats;
+    if (!skip_textures) {
+        const u64 lock_begin = ReadStats::NowNs();
         std::scoped_lock lock{texture_cache.mutex};
-        if (const auto area = texture_cache.GetFlushArea(addr, size)) {
+        ReadStats::Add(ReadStats::g_counters.texture_lock_ns, ReadStats::NowNs() - lock_begin);
+        ReadStats::Add(ReadStats::g_counters.texture_asks, 1);
+        auto area = texture_cache.GetFlushArea(addr, size);
+        if (area) {
+            area->cause = static_cast<u8>(ReadStats::Cause::Image);
             return *area;
         }
     }
-    {
+    if (!skip_buffers && (!CachePathsEnabled() || buffer_cache.FlushesOnCpuRead())) {
+        const u64 lock_begin = ReadStats::NowNs();
         std::scoped_lock lock{buffer_cache.mutex};
-        if (const auto area = buffer_cache.GetFlushArea(addr, size)) {
+        ReadStats::Add(ReadStats::g_counters.buffer_lock_ns, ReadStats::NowNs() - lock_begin);
+        ReadStats::Add(ReadStats::g_counters.buffer_asks, 1);
+        auto area = buffer_cache.GetFlushArea(addr, size);
+        if (area) {
             return *area;
         }
     }
@@ -1818,6 +1931,26 @@ VideoCore::RasterizerDownloadArea RasterizerMetal::GetFlushArea(DAddr addr, u64 
         .end_address = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE),
         .preemtive = true,
     };
+}
+
+bool RasterizerMetal::LandDownloadForCpuRead(DAddr addr, u64 size, u64 tick) {
+    // The copy was recorded on the GPU thread; the read can only wait for a committed one.
+    if (!CachePathsEnabled() || !scheduler.IsSubmitted(tick)) {
+        return false;
+    }
+    scheduler.WaitSubmitted(tick);
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.LandInFlightForCpuRead(addr, size, false);
+    return !buffer_cache.IsRegionGpuModified(addr, size);
+}
+
+void RasterizerMetal::PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    if (!CachePathsEnabled() || addr == 0 || size == 0 ||
+        False(which & VideoCommon::CacheType::BufferCache)) {
+        return;
+    }
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.ClearDownload(addr, size);
 }
 
 void RasterizerMetal::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
@@ -1837,19 +1970,172 @@ void RasterizerMetal::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheT
     }
 }
 
-bool RasterizerMetal::OnCPUWrite(DAddr addr, u64 size) {
+void RasterizerMetal::InnerInvalidation(
+    std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    if (!CachePathsEnabled()) {
+        RasterizerInterface::InnerInvalidation(sequences);
+        return;
+    }
+    if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
+        return;
+    }
+    // Each lock once for the batch; the texture and shader caches only where they ever held
+    // something (page_filter).
+    const auto any = [&](const VideoCommon::PageFilter& filter) {
+        for (const auto& [addr, size] : sequences) {
+            if (filter.Any(addr, size)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (any(texture_cache.page_filter)) {
+        std::scoped_lock lock{texture_cache.mutex};
+        for (const auto& [addr, size] : sequences) {
+            texture_cache.WriteMemory(addr, size);
+        }
+    }
     {
         std::scoped_lock lock{buffer_cache.mutex};
+        for (const auto& [addr, size] : sequences) {
+            buffer_cache.WriteMemory(addr, size);
+        }
+    }
+    if (any(pipeline_cache.page_filter)) {
+        pipeline_cache.InvalidateRegions(sequences);
+    }
+}
+
+bool RasterizerMetal::OnCPUWrite(DAddr addr, u64 size) {
+    if (!CachePathsEnabled()) {
+        {
+            std::scoped_lock lock{buffer_cache.mutex};
+            if (buffer_cache.OnCPUWrite(addr, size)) {
+                return true;
+            }
+        }
+        {
+            std::scoped_lock lock{texture_cache.mutex};
+            texture_cache.WriteMemory(addr, size);
+        }
+        pipeline_cache.InvalidateRegion(addr, size);
+        return false;
+    }
+    // EDEN_NX2_EXP35: a write no cache can hold anything of is collected without the lock.
+    if (const int collect = VideoCore::Nx2Debug::Experiment(35);
+        collect != 0 && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+        (collect == 2 || !Tegra::Nx2MayBeGpuWritten(addr, size)) &&
+        !pipeline_cache.page_filter.Any(addr, size) &&
+        !texture_cache.page_filter.Any(addr, size)) {
+        return true;
+    }
+    static const bool fast_path = EnvironmentOn("EDEN_NX2_WRITE_FASTPATH");
+    // A guest core never waits for the buffer cache's lock with a write of plain memory: the
+    // lock's next owner applies it (the owner hook).
+    const bool handoff = fast_path && VideoCommon::Nx2WriteHandoff::Enabled() &&
+                         Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+                         !Tegra::Nx2MayBeGpuWritten(addr, size) &&
+                         !texture_cache.page_filter.Any(addr, size) &&
+                         !pipeline_cache.page_filter.Any(addr, size);
+    if (handoff && !buffer_cache.mutex.try_lock()) {
+        if (write_handoff.Push(addr, size)) {
+            if (Tegra::Nx2MayBeGpuWritten(addr, size)) {
+                // Marked GPU-written meanwhile: taking the lock applies the write now.
+                std::scoped_lock lock{buffer_cache.mutex};
+            }
+            return false;
+        }
+        buffer_cache.mutex.lock();
+    } else if (!handoff) {
+        buffer_cache.mutex.lock();
+    }
+    {
+        std::unique_lock lock{buffer_cache.mutex, std::adopt_lock};
         if (buffer_cache.OnCPUWrite(addr, size)) {
             return true;
         }
     }
-    {
+    if (!fast_path || texture_cache.page_filter.Any(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
     }
-    pipeline_cache.InvalidateRegion(addr, size);
+    if (!fast_path || pipeline_cache.page_filter.Any(addr, size)) {
+        pipeline_cache.InvalidateRegion(addr, size);
+    }
     return false;
+}
+
+void RasterizerMetal::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    if (!CachePathsEnabled()) {
+        RasterizerInterface::OnCacheInvalidations(ranges);
+        return;
+    }
+    {
+        // Out of the GPU-written ranges first: applying one write downloads the GPU's bytes
+        // elsewhere on its pages, which would write over the next collected write.
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ClaimCpuWrites(ranges);
+    }
+    const auto any = [&](const VideoCommon::PageFilter& filter) {
+        return std::ranges::any_of(ranges, [&](const std::pair<DAddr, u64>& range) {
+            return range.first != 0 && filter.Any(range.first, range.second);
+        });
+    };
+    if (any(texture_cache.page_filter)) {
+        std::scoped_lock lock{texture_cache.mutex};
+        for (const auto& [addr, size] : ranges) {
+            if (addr != 0 && size != 0) {
+                texture_cache.WriteMemory(addr, size);
+            }
+        }
+    }
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        for (const auto& [addr, size] : ranges) {
+            if (addr != 0 && size != 0) {
+                buffer_cache.WriteMemory(addr, size);
+            }
+        }
+    }
+    if (any(pipeline_cache.page_filter)) {
+        for (const auto& [addr, size] : ranges) {
+            if (addr != 0 && size != 0) {
+                pipeline_cache.InvalidateRegion(addr, size);
+            }
+        }
+    }
+}
+
+bool RasterizerMetal::TryCacheInvalidation(DAddr addr, u64 size) {
+    if (!CachePathsEnabled()) {
+        return RasterizerInterface::TryCacheInvalidation(addr, size);
+    }
+    if (addr == 0 || size == 0) {
+        return true;
+    }
+    {
+        // WriteMemory downloads GPU-written bytes elsewhere on the written pages, which only
+        // the GPU thread may do: those pages are left to the fallback.
+        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+        const DAddr page_begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+        const DAddr page_end = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
+        if (buffer_cache.IsRegionGpuModified(page_begin, page_end - page_begin)) {
+            return false;
+        }
+        texture_cache.WriteMemory(addr, size);
+        buffer_cache.WriteMemory(addr, size);
+    }
+    pipeline_cache.InvalidateRegion(addr, size);
+    return true;
+}
+
+bool RasterizerMetal::FencesQuiet(bool, u64& epoch) {
+    // Always strict: this backend's fences are only released by ReleaseFences.
+    return CachePathsEnabled() && fence_manager.FencesQuiet(true, epoch);
+}
+
+u64 RasterizerMetal::FenceWorkEpoch() const {
+    return CachePathsEnabled() ? fence_manager.FenceWorkEpoch() : 0;
 }
 
 void RasterizerMetal::OnCacheInvalidation(DAddr addr, u64 size) {
@@ -1884,8 +2170,12 @@ void RasterizerMetal::UnmapMemory(DAddr addr, u64 size) {
 }
 
 void RasterizerMetal::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
-    std::scoped_lock lock{texture_cache.mutex};
-    texture_cache.UnmapGPUMemory(as_id, addr, size);
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        texture_cache.UnmapGPUMemory(as_id, addr, size);
+    }
+    // Nothing yet: the buffer cache keeps virtual ranges only for runtimes that bind them.
+    buffer_cache.UnmapGPUMemory(as_id, addr, size);
 }
 
 void RasterizerMetal::SignalFence(std::function<void()>&& func) {
@@ -1973,17 +2263,166 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerMetal::AccessAccelerateDMA() {
 
 void RasterizerMetal::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                std::span<const u8> memory) {
+    // Grid placeholders among the words (a compute macro's constant buffer of its dispatch's
+    // size, EDEN_NX2_INDIRECT_GRID): the GPU copies the words they stand for over them once the
+    // write is done.
+    if (Tegra::Nx2IndirectGrid::AnyLive() && !Tegra::Nx2IndirectGrid::g_writing_qmd &&
+        copy_size >= 4) {
+        // (source, destination, words): x alone, or x, y and z when all three are placeholders.
+        boost::container::small_vector<std::tuple<GPUVAddr, GPUVAddr, u32>, 2> grids;
+        const size_t words = (std::min)(copy_size, memory.size()) / sizeof(u32);
+        const auto word = [&](size_t i) {
+            u32 value;
+            std::memcpy(&value, memory.data() + i * sizeof(u32), sizeof(value));
+            return value;
+        };
+        for (size_t i = 0; i < words; ++i) {
+            const auto source = Tegra::Nx2IndirectGrid::MatchWord(word(i));
+            if (!source) {
+                continue;
+            }
+            u32 count = 1;
+            while (i + count < words && count < 3 &&
+                   Tegra::Nx2IndirectGrid::MatchWord(word(i + count)) ==
+                       *source + count * sizeof(u32)) {
+                ++count;
+            }
+            grids.emplace_back(*source, address + i * sizeof(u32), count);
+            i += count - 1;
+        }
+        if (!grids.empty()) {
+            InlineToMemory(address, copy_size, memory);
+            // The write's own invalidation first: it would upload the placeholders over the copy.
+            gpu_memory->FlushCaching();
+            std::scoped_lock lock{buffer_cache.mutex};
+            for (const auto& [source, destination, count] : grids) {
+                Tegra::Nx2IndirectGrid::Get().copied.fetch_add(1, std::memory_order_relaxed);
+                if (!buffer_cache.DMACopy(source, destination, count * sizeof(u32), true)) {
+                    static std::atomic<u32> logged{};
+                    if (logged.fetch_add(1) < 8) {
+                        LOG_WARNING(Render_Metal,
+                                    "GPU-sized dispatch: no host buffer to copy its size from "
+                                    "{:#x} to {:#x}",
+                                    source, destination);
+                    }
+                }
+            }
+            return;
+        }
+    }
+    InlineToMemory(address, copy_size, memory);
+}
+
+void RasterizerMetal::InlineToMemory(GPUVAddr address, size_t copy_size,
+                                     std::span<const u8> memory) {
     const auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
     if (!cpu_addr) {
         gpu_memory->WriteBlock(address, memory.data(), copy_size);
         return;
     }
-    gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
-    {
-        std::unique_lock lock{buffer_cache.mutex};
-        if (!buffer_cache.InlineMemory(*cpu_addr, copy_size, memory)) {
+    if (!CachePathsEnabled()) {
+        gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+        {
+            std::unique_lock lock{buffer_cache.mutex};
+            if (!buffer_cache.InlineMemory(*cpu_addr, copy_size, memory)) {
+                buffer_cache.WriteMemory(*cpu_addr, copy_size);
+            }
+        }
+        {
+            std::scoped_lock lock{texture_cache.mutex};
+            texture_cache.WriteMemory(*cpu_addr, copy_size);
+        }
+        pipeline_cache.InvalidateRegion(*cpu_addr, copy_size);
+        return;
+    }
+    // A write within one page mapped as a whole goes straight to guest memory.
+    static const bool inline_fast = EnvironmentOn("EDEN_NX2_INLINE_FAST");
+    bool written = false;
+    if (inline_fast && copy_size != 0 &&
+        (address & Core::DEVICE_PAGEMASK) + copy_size <= Core::DEVICE_PAGESIZE &&
+        (address + copy_size <= Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) ||
+         address >= Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed))) {
+        struct MappedPage {
+            const Tegra::MemoryManager* memory{};
+            size_t id{};
+            GPUVAddr page{~GPUVAddr{0}};
+            u64 serial{};
+            bool mapped{};
+        };
+        thread_local MappedPage last{};
+        const GPUVAddr page = address & ~static_cast<GPUVAddr>(Core::DEVICE_PAGEMASK);
+        const u64 serial = gpu_memory->MapSerial();
+        if (last.memory != gpu_memory || last.id != gpu_memory->GetID() || last.page != page ||
+            last.serial != serial) {
+            last = MappedPage{
+                .memory = gpu_memory,
+                .id = gpu_memory->GetID(),
+                .page = page,
+                .serial = serial,
+                .mapped = gpu_memory->MaxContinuousRange(page, Core::DEVICE_PAGESIZE) >=
+                          Core::DEVICE_PAGESIZE,
+            };
+        }
+        if (last.mapped) {
+            if (u8* const pointer = device_memory.GetPointer<u8>(*cpu_addr)) {
+                std::memcpy(pointer, memory.data(), copy_size);
+                written = true;
+            }
+        }
+    }
+    if (!written) {
+        gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+    }
+    // EDEN_NX2_INLINE_DEFER=0: invalidate every cache at once (for comparisons).
+    static const bool defer = EnvironmentOn("EDEN_NX2_INLINE_DEFER");
+    static const bool i2m_coalesce = EnvironmentOn("EDEN_NX2_I2M_COALESCE");
+    static const bool per_page_list = EnvironmentOn("EDEN_NX2_I2M_LIST_PAGE");
+    bool uploaded = false;
+    // The page of the last write, when the buffer cache held no GPU data of it: the next
+    // writes into it need not ask again (gpu_modified_serial tells when that changed).
+    struct CleanPage {
+        const void* cache{};
+        DAddr page{~DAddr{0}};
+        u64 serial{};
+    };
+    thread_local CleanPage clean{};
+    const DAddr device_page = *cpu_addr & ~static_cast<DAddr>(Core::DEVICE_PAGEMASK);
+    const bool one_page =
+        copy_size != 0 && (*cpu_addr & Core::DEVICE_PAGEMASK) + copy_size <= Core::DEVICE_PAGESIZE;
+    const bool known_clean =
+        i2m_coalesce && defer && one_page && clean.cache == &buffer_cache &&
+        clean.page == device_page &&
+        clean.serial == buffer_cache.gpu_modified_serial.load(std::memory_order_relaxed) &&
+        (per_page_list ? !Tegra::Nx2IsCommandListPage(device_page)
+                       : !Tegra::g_nx2_has_command_list_pages.load(std::memory_order_relaxed));
+    if (!known_clean) {
+        std::scoped_lock lock{buffer_cache.mutex};
+        // Guest memory has the words now: a command list copy of the page no longer does.
+        buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
+        bool page_clean = false;
+        uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory,
+                                             per_page_list ? &page_clean : nullptr);
+        if (!uploaded && !defer) {
             buffer_cache.WriteMemory(*cpu_addr, copy_size);
         }
+        clean.cache = nullptr;
+        if (i2m_coalesce && !uploaded && one_page &&
+            (per_page_list ? page_clean
+                           : !buffer_cache.IsRegionGpuModified(device_page,
+                                                               Core::DEVICE_PAGESIZE))) {
+            clean = CleanPage{
+                .cache = &buffer_cache,
+                .page = device_page,
+                .serial = buffer_cache.gpu_modified_serial.load(std::memory_order_relaxed),
+            };
+        }
+    }
+    if (!uploaded && defer) {
+        // Guest memory is written; the buffer, texture and shader caches see the merged ranges
+        // at the next FlushCaching, which runs before anything of theirs is used. Writes into
+        // GPU-written buffer data were uploaded in place above.
+        gpu_memory->AccumulateInvalidation(address, copy_size);
+        return;
     }
     {
         std::scoped_lock lock{texture_cache.mutex};

@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "common/common_types.h"
+#include "video_core/buffer_cache/nx2_write_handoff.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/rasterizer_interface.h"
@@ -95,6 +96,13 @@ public:
     void OnCacheInvalidation(DAddr addr, u64 size) override;
     bool OnCPUWrite(DAddr addr, u64 size) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+    bool LandDownloadForCpuRead(DAddr addr, u64 size, u64 tick) override;
+    void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
+    void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
+    void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
+    bool TryCacheInvalidation(DAddr addr, u64 size) override;
+    bool FencesQuiet(bool strict, u64& epoch) override;
+    u64 FenceWorkEpoch() const override;
     void InvalidateGPUCache() override;
     void UnmapMemory(DAddr addr, u64 size) override;
     void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) override;
@@ -260,6 +268,10 @@ private:
     void WriteQueryResult(DAddr address, bool wide, u64 value);
     void NoteUnmappedReport(GPUVAddr gpu_addr, VideoCommon::QueryType type);
 
+    /// The inline write itself: guest memory, then the caches (AccelerateInlineToMemory adds
+    /// the GPU-sized dispatches' copies).
+    void InlineToMemory(GPUVAddr address, size_t copy_size, std::span<const u8> memory);
+
     Tegra::GPU& gpu;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     const Device& device;
@@ -275,6 +287,8 @@ private:
     QueryCache query_cache;
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
+    /// Guest writes that found the buffer cache's lock held (EDEN_NX2_WRITE_HANDOFF).
+    VideoCommon::Nx2WriteHandoff write_handoff;
 
     struct TexelViewKey {
         BufferHandle buffer;

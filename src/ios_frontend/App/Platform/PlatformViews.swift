@@ -452,6 +452,7 @@ struct ExperimentsView: View {
     @State private var metalTraceOff = lichii_platform_experiment("metal_trace_off") != 0
     @State private var metalCheckOff = lichii_platform_experiment("metal_check_off") != 0
     @State private var metalFixedStateOff = lichii_platform_experiment("metal_fixed_state_off") != 0
+    @State private var metalCachePlain = lichii_platform_experiment("metal_cache_plain") != 0
 
     var body: some View {
         List {
@@ -648,10 +649,14 @@ struct ExperimentsView: View {
                     .onChange(of: metalFixedStateOff) { value in
                         lichii_platform_set_experiment("metal_fixed_state_off", value ? 1 : 0)
                     }
+                Toggle("Game Memory Access as Before", isOn: $metalCachePlain)
+                    .onChange(of: metalCachePlain) { value in
+                        lichii_platform_set_experiment("metal_cache_plain", value ? 1 : 0)
+                    }
             } header: {
                 Text("Metal Renderer")
             } footer: {
-                Text("Only for the Metal renderer (Graphics API). Shaders Without the Draw's State builds the game's shaders as before, without what the draw sets outside the shader: the depth range the game uses, the size of points, the alpha test, blending with two colours and whole-number colour targets. Turn it on if the picture got worse with a new build.\n\nApplies the next time Lichii starts.")
+                Text("Only for the Metal renderer (Graphics API). Shaders Without the Draw's State builds the game's shaders as before, without what the draw sets outside the shader: the depth range the game uses, the size of points, the alpha test, blending with two colours and whole-number colour targets. Turn it on if the picture got worse with a new build.\n\nGame Memory Access as Before: when the game reads or writes memory the graphics side also uses, the Metal renderer now handles it the way the Vulkan renderer does (the game's threads wait less for the graphics thread, and the switches under Guest Memory Access apply to it too). On, it handles every such read and write the slow way it did before; turn it on if objects flicker, show stale data or the game hangs with a new build.\n\nBoth apply the next time Lichii starts.")
             }
 
             Section {

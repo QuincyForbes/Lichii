@@ -220,7 +220,10 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// descriptions unchecked and keeps 1D images as 1D textures, as before
 /// (EDEN_NX2_METAL_PIPELINE_CHECK=0). "metal_fixed_state_off": the Metal renderer translates
 /// programs without the draw's fixed state (depth conversion, point size, alpha test, dual source
-/// blending, integer outputs), as before (EDEN_NX2_METAL_FIXED_STATE=0).
+/// blending, integer outputs), as before (EDEN_NX2_METAL_FIXED_STATE=0). "metal_cache_plain": the
+/// Metal renderer answers guest reads, guest writes and inline writes on its plain paths (both
+/// caches' locks every time, no hand-off, reads landed by the GPU thread, every fence release
+/// drained), as before (EDEN_NX2_METAL_CACHE_PATHS=0).
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
 /// Bench mode: for the rest of this process lichii_platform_experiment reports `names` as on and

@@ -660,6 +660,14 @@ set(METAL_RENDERER_CXX_SOURCES
 if (ENABLE_METAL OR LICHII_METAL_COMPILE_CHECK)
     # SPIR-V -> MSL (metal_shader_translate.cpp).
     AddJsonPackage(spirv-cross)
+    if (MSVC)
+        # Added below src/, so it inherits this tree's warnings-as-errors.
+        foreach (SPIRV_CROSS_TARGET spirv-cross-core spirv-cross-glsl spirv-cross-msl)
+            if (TARGET ${SPIRV_CROSS_TARGET})
+                target_compile_options(${SPIRV_CROSS_TARGET} PRIVATE /wd4245 /wd4388 /wd4389)
+            endif()
+        endforeach()
+    endif()
 endif()
 if (ENABLE_METAL)
     set(METAL_RENDERER_SOURCES

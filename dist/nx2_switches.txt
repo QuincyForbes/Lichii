@@ -130,6 +130,28 @@ EDEN_NX2_FENCE_BATCH=1
 # stencil format.
 #EDEN_NX2_METAL_PIPELINE_CHECK=0
 
+# Metal renderer: guest reads, guest writes and the GPU's inline writes take the paths the
+# Vulkan renderer takes: a cache that can hold nothing of a range is not asked (no wait for its
+# lock: EDEN_NX2_READ_FASTPATH, EDEN_NX2_TEXTURE_READ_FILTER, EDEN_NX2_WRITE_FASTPATH), a guest
+# write that finds the buffer cache's lock held is handed to the lock's owner
+# (EDEN_NX2_WRITE_HANDOFF), collected guest writes are applied in one batch and pages they
+# replace stop being held GPU-modified (EDEN_NX2_CPU_WRITE_RECLAIM), a guest read of GPU data
+# still on its way waits for the copy under way on its own core (EDEN_NX2_GPU_READ_LAND), a
+# fence release with nothing to release does not drain the GPU thread (EDEN_NX2_EXP3), and
+# inline writes go straight to guest memory with one invalidation before the next draw
+# (EDEN_NX2_INLINE_FAST, EDEN_NX2_INLINE_DEFER, EDEN_NX2_I2M_COALESCE, EDEN_NX2_I2M_LIST_PAGE);
+# each of those switches works as on Vulkan. 0 takes the plain paths this renderer had before:
+# every question under both caches' locks, writes applied one at a time, reads landed by the GPU
+# thread, every fence release drained, every inline write invalidating every cache at once.
+#EDEN_NX2_METAL_CACHE_PATHS=0
+
+# Either renderer: 0 makes the GPU thread's front wait for the GPU and read a compute dispatch's
+# size the GPU wrote (Ocarina of Time's light tiles, once a frame). By default it passes
+# placeholders on; the dispatch takes its size from the GPU's buffer, and the copy of the size
+# the game's macro writes into a constant buffer is made on the GPU (the Metal renderer made no
+# such copy before: the constant buffer kept the placeholders).
+#EDEN_NX2_INDIRECT_GRID=0
+
 #EDEN_NX2_MME_JIT=0
 #EDEN_NX2_PBFLUSH=0
 #EDEN_NX2_SKIP_SAME=0
