@@ -258,15 +258,10 @@ std::string CheckVertexLayout(const RenderPipelineDesc& desc) {
             return fmt::format("vertex attribute {} reads stream {}, Metal has {} buffer layouts",
                                index, attribute.stream, MaxVertexSlots);
         }
-        const VertexStreamState& stream = desc.streams[attribute.stream];
-        if (stream.enabled == 0) {
+        // An attribute past its stream's stride builds (metal-smoke's descriptor probe).
+        if (desc.streams[attribute.stream].enabled == 0) {
             return fmt::format("vertex attribute {} reads stream {}, which has no buffer", index,
                                attribute.stream);
-        }
-        const bool constant = stream.stride == 0 || stream.divisor == ConstantStep;
-        if (!constant && attribute.offset != 0 && attribute.offset + bytes > stream.stride) {
-            return fmt::format("vertex attribute {} ends at byte {} of stream {} with stride {}",
-                               index, attribute.offset + bytes, attribute.stream, stream.stride);
         }
     }
     return {};
@@ -293,8 +288,10 @@ std::string CheckPipeline(const RenderPipelineDesc& desc, const PipelineLimits& 
     if (desc.stencil_format != 0 && !HasStencil(desc.stencil_format)) {
         return fmt::format("stencil format {} has no stencil", desc.stencil_format);
     }
+    // Depth alone next to stencil alone builds; a format holding both has to be both.
     if (desc.depth_format != 0 && desc.stencil_format != 0 &&
-        desc.depth_format != desc.stencil_format) {
+        desc.depth_format != desc.stencil_format &&
+        (HasStencil(desc.depth_format) || HasDepth(desc.stencil_format))) {
         return fmt::format("depth format {} next to stencil format {}", desc.depth_format,
                            desc.stencil_format);
     }
@@ -302,9 +299,11 @@ std::string CheckPipeline(const RenderPipelineDesc& desc, const PipelineLimits& 
 }
 
 std::string CheckTexture(const TextureDesc& desc, const PipelineLimits& limits) {
-    // Every Apple GPU since the A9 and every Mac one: 16384 texels a side, 2048 for 3D.
+    // Every Apple GPU since the A9 and every Mac one: 16384 texels a side, 2048 for 3D, 2048
+    // layers.
     static constexpr u32 MaxSide = 16384;
     static constexpr u32 MaxVolumeSide = 2048;
+    static constexpr u32 MaxLayers = 2048;
     if (desc.format == 0) {
         return "no pixel format";
     }
@@ -324,6 +323,13 @@ std::string CheckTexture(const TextureDesc& desc, const PipelineLimits& limits) 
     if (desc.width > side || desc.height > side || depth > side) {
         return fmt::format("{}x{}x{} texels, Metal has {} a side", desc.width, desc.height, depth,
                            side);
+    }
+    const bool cube = desc.kind == TextureKind::Cube || desc.kind == TextureKind::CubeArray;
+    if (cube && desc.width != desc.height) {
+        return fmt::format("cube faces of {}x{} texels", desc.width, desc.height);
+    }
+    if ((cube ? desc.layers / 6 : desc.layers) > MaxLayers) {
+        return fmt::format("{} layers, Metal has {}", desc.layers, MaxLayers);
     }
     u32 levels = 1;
     for (u32 size = (std::max)({desc.width, desc.height, depth}); size > 1; size >>= 1) {

@@ -200,7 +200,9 @@ rewrite on the GPU / none), `EDEN_NX2_METAL_ARCHIVE=0` (no pipeline archive),
 `EDEN_NX2_METAL_ABORT_TRACE=0` (no log line for SIGABRT and uncaught Objective-C exceptions),
 `EDEN_NX2_METAL_PIPELINE_CHECK=0` (vertex layout, pipeline and texture descriptions go to Metal
 unchecked; by default `metal_pipeline_check.cpp` rewrites the vertex layout to what the vertex
-program reads and refuses in the log what Metal would abort the process on),
+program reads and refuses in the log what Metal would abort the process on; alpha to coverage
+stays off on an integer target, a pass without attachments gets `defaultRasterSampleCount` 1,
+slots past a stage's argument tables are not bound),
 `EDEN_NX2_TARGETLESS_REACH=0` (draws without render targets get the surface clip's size, as on
 Vulkan).
 
