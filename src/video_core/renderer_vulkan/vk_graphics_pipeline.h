@@ -423,6 +423,7 @@ private:
     u32 zero_texture_handles{};
     bool writes_storage{};
     bool selects_viewport{};
+    bool mesh_samples_targets{}; ///< Mesh emulation: this draw samples one of its render targets
 
     /// Graphics pipeline libraries (EDEN_NX2_GPL): one descriptor set per stage (set index =
     /// stage index), the shader libraries, and this pipeline's own vertex input and fragment

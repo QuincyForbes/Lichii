@@ -329,6 +329,18 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_IDLE_GRACE_US", "250", 1);
         LOG_WARNING(Frontend, "iOS: experiment idle_submit_grace on");
     }
+    if (lichii_platform_experiment("mesh_compute_in_pass")) {
+        setenv("EDEN_NX2_MESH_BEFORE_PASS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment mesh_compute_in_pass on");
+    }
+    if (lichii_platform_experiment("dispatch_chain")) {
+        setenv("EDEN_NX2_DISPATCH_CHAIN", "1", 1);
+        LOG_WARNING(Frontend, "iOS: experiment dispatch_chain on");
+    }
+    if (lichii_platform_experiment("emulate_all_mesh")) {
+        setenv("EDEN_NX2_MESH_EMULATE", "all", 1);
+        LOG_WARNING(Frontend, "iOS: experiment emulate_all_mesh on");
+    }
     ApplyCpuExperiments();
 }
 

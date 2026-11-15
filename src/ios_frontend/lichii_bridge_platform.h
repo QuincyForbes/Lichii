@@ -199,6 +199,10 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// programs writing per-primitive attributes are built natively instead of emulated
 /// (EDEN_NX2_NATIVE_PER_PRIMITIVE=1). "mvk_shader_dump": MoltenVK writes each shader it converts
 /// (SPIR-V and Metal source) to dump/mvk-shaders (MVK_CONFIG_SHADER_DUMP_DIR).
+/// "mesh_compute_in_pass": an emulated mesh draw's compute ends its render pass, as before
+/// (EDEN_NX2_MESH_BEFORE_PASS=0). "dispatch_chain": back-to-back guest dispatches go without a
+/// barrier on MoltenVK (EDEN_NX2_DISPATCH_CHAIN=1). "emulate_all_mesh": every mesh pipeline the
+/// emulation can take uses it instead of a Metal mesh shader (EDEN_NX2_MESH_EMULATE=all).
 /// "guest_cores_first": only guest cores 0 and 1 run user-interactive, the other four
 /// user-initiated (EDEN_NX2_GUEST_CORE_FIRST=03). "oot_narrow_affinity": Ocarina of Time keeps its
 /// own thread core masks (EDEN_NX2_OOT_WIDE_AFFINITY=0); "oot_ideal_affinity": each narrowed to

@@ -174,7 +174,11 @@ public:
     /// least EDEN_NX2_BEFORE_PASS pixels (default 256x256, 0 = off), what follows goes to a new
     /// command buffer after one that the next render pass can take copies into (RecordBeforePass).
     /// True when it split now.
-    bool SplitBeforeNextPass(u64 pixels);
+    bool SplitBeforeNextPass(u64 pixels, VkFramebuffer framebuffer = VK_NULL_HANDLE);
+
+    /// Passes on that framebuffer split as SplitBeforeNextPass whatever their size (an emulated
+    /// mesh draw ended one for its compute). The last few framebuffers asked for are kept.
+    void WantSplitBefore(VkFramebuffer framebuffer);
 
     /// A draw that will leave the open render pass for another framebuffer, after it bound its
     /// buffers: ends the pass and splits as SplitBeforeNextPass. True when it split; the draw's
@@ -198,8 +202,9 @@ public:
 
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer>
-    void RecordBeforePass(T&& c) {
-        Common::PerfReport::Add(Common::PerfReport::BeforePassCommands);
+    void RecordBeforePass(T&& c, Common::PerfReport::Counter counter =
+                                     Common::PerfReport::BeforePassCommands) {
+        Common::PerfReport::Add(counter);
         this->RecordWithUploadBuffer(
             [this, command = std::move(c)](vk::CommandBuffer, vk::CommandBuffer) {
                 command(before_pass_cmdbuf);
@@ -300,6 +305,7 @@ public:
         if (uploads_pending) {
             FlushUploads();
         }
+        ++work_records;
         has_pending_commands = true;
         if (chunk->Record(command)) {
             return;
@@ -315,6 +321,33 @@ public:
             [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
                 command(cmdbuf);
             });
+    }
+
+    /// As Record, for commands that only bind state (pipelines, descriptors, push constants) or
+    /// wait on the host: they leave FollowsDispatch as it was.
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void RecordState(T&& c) {
+        // Batched uploads are recorded first, as copies.
+        const bool keep = !uploads_pending;
+        const u64 records = work_records;
+        Record(std::forward<T>(c));
+        if (keep) {
+            work_records = records;
+        }
+    }
+
+    /// Guest dispatches: whether only RecordState commands were recorded since the last
+    /// NoteDispatchRecorded, in the same command buffer and outside a render pass. MoltenVK then
+    /// encodes both dispatches into one serial Metal compute encoder (a barrier would end it).
+    [[nodiscard]] bool FollowsDispatch() const noexcept {
+        return last_dispatch_record == work_records && last_dispatch_tick == CurrentTick() &&
+               state.renderpass == VK_NULL_HANDLE && !uploads_pending;
+    }
+
+    void NoteDispatchRecorded() noexcept {
+        last_dispatch_record = work_records;
+        last_dispatch_tick = CurrentTick();
     }
 
     [[nodiscard]] bool HasPendingCommands() const noexcept {
@@ -755,6 +788,11 @@ private:
     u64 before_pass_serial = 0;
     bool before_pass_split = false; ///< SplitBeforeNextPass ran, no render pass began since
     bool before_pass_open = false;  ///< The open render pass began after a SplitBeforePass
+    std::array<VkFramebuffer, 8> split_wanted{};
+    size_t split_wanted_next = 0;
+    u64 work_records = 0;           ///< Commands recorded, RecordState ones excepted
+    u64 last_dispatch_record = ~0ULL;
+    u64 last_dispatch_tick = 0;
 
     DeferredClear deferred_clear;
 
