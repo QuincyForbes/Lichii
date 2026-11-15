@@ -9,6 +9,8 @@
 
 #include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
+#include "common/frame_deadline.h"
+#include "common/nx2_poll.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -56,6 +58,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
         Common::PinCurrentThread(Common::PinnedRole::GpuFront);
         Common::SetCurrentThreadToPerformanceCores();
+        Common::FrameDeadline::Join(Common::FrameDeadline::Role::GpuFront);
         system.RegisterHostThread();
 
         auto current_context = context.Acquire();
@@ -68,6 +71,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         auto& split = VideoCommon::GpuSplit::Get();
         while (!stop_token.stop_requested()) {
             Profile::Report();
+            Common::FrameDeadline::Tick();
             split.MaybeStart(system);
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
@@ -87,10 +91,13 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // EDEN_NX2_EXP6 (zortos293/Lichii#446): 1 = 50 us sleeps (Ocarina waits here
                     // ~330 times a second and its present waits for the work behind them; on
                     // Windows a sleep still lasts one timer tick, ~0.5 ms), 2 = always yield.
+                    // EDEN_NX2_POLL_YIELD=0 (phones): 50 us sleeps from the start.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
                     const int poll = VideoCore::Nx2Debug::Experiment(6);
-                    if (poll == 2 || std::chrono::steady_clock::now() - last_progress <
-                                         std::chrono::microseconds{500}) {
+                    if (!Common::PollYield()) {
+                        std::this_thread::sleep_for(std::chrono::microseconds{50});
+                    } else if (poll == 2 || std::chrono::steady_clock::now() - last_progress <
+                                                std::chrono::microseconds{500}) {
                         std::this_thread::yield();
                     } else if (poll == 1) {
                         std::this_thread::sleep_for(std::chrono::microseconds{50});

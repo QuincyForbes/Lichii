@@ -18,6 +18,7 @@
 #include <string>
 
 #include "common/dkb_cpu_trace.h"
+#include "common/frame_deadline.h"
 #include "common/logging.h"
 #include "common/perf_report.h"
 #include "common/settings.h"
@@ -172,7 +173,7 @@ void GpuSplit::Stop() {
     }
     back_thread.request_stop();
     wake.fetch_add(1, std::memory_order_seq_cst);
-    wake.notify_one();
+    WakeOne(wake);
     back_thread.join();
     active = false;
     // The split is static and outlives the emulation session. The next session's back thread
@@ -276,7 +277,7 @@ void GpuSplit::Publish() {
     published.store(write_position, std::memory_order_seq_cst);
     if (back_waiting.load(std::memory_order_seq_cst)) {
         wake.fetch_add(1, std::memory_order_seq_cst);
-        wake.notify_one();
+        WakeOne(wake);
     }
     if (Nx2Profile::Enabled() && (macro_sink || compute_sink || ring_pairs) &&
         (++publishes & 0xfff) == 0) [[unlikely]] {
@@ -733,7 +734,7 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
         if (consumed.load(std::memory_order_seq_cst) >= target) {
             break;
         }
-        front_wake.wait(seen, std::memory_order_seq_cst);
+        SleepOn(front_wake, seen);
     }
     front_waiting.store(false, std::memory_order_relaxed);
 }
@@ -1169,6 +1170,30 @@ u64 GpuSplit::IdleGraceNs() {
     return grace;
 }
 
+u64 GpuSplit::IdleHoldNs() {
+    static const u64 hold = [] {
+        const char* const value = std::getenv("EDEN_NX2_IDLE_HOLD_US");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) * 1000 : u64{0};
+    }();
+    return hold;
+}
+
+bool GpuSplit::IdleHoldAny() {
+    static const bool any = [] {
+        const char* const value = std::getenv("EDEN_NX2_IDLE_HOLD_ANY");
+        return value != nullptr && value[0] == '1';
+    }();
+    return any;
+}
+
+bool GpuSplit::AddressWaits() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_SPLIT_ADDRESS_WAIT");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 void GpuSplit::NoteIdleGap() {
     const u64 gap = Common::PerfReport::NowNs() - idle_submit_ns;
     idle_submit_ns = 0;
@@ -1188,6 +1213,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::PinCurrentThread(Common::PinnedRole::GpuBack);
     Common::SetCurrentThreadToPerformanceCores();
+    Common::FrameDeadline::Join(Common::FrameDeadline::Role::GpuBack);
     system->RegisterHostThread();
 #ifdef _WIN32
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
@@ -1195,6 +1221,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     u64 read_position = 0;
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
+        Common::FrameDeadline::Tick();
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
@@ -1229,6 +1256,50 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                     continue;
                 }
             }
+            if (available == read_position && IdleHoldNs() != 0 &&
+                !back_quiet.load(std::memory_order_relaxed) && idle_busy != nullptr &&
+                idle_pending != nullptr) {
+                // The idea of nxnative PR #2645 (b2ae958): nothing is submitted while the GPU
+                // still has work. Asleep, unlike the grace above: the phone has no core to spin.
+                const u64 until = Common::PerfReport::NowNs() + IdleHoldNs();
+                bool held = false;
+                while (available == read_position && !stop_token.stop_requested() &&
+                       idle_pending(idle_argument) &&
+                       (IdleHoldAny() || idle_busy(idle_argument))) {
+                    const u64 now = Common::PerfReport::NowNs();
+                    if (now >= until) {
+                        break;
+                    }
+                    held = true;
+                    back_waiting.store(true, std::memory_order_seq_cst);
+                    const u32 seen = wake.load(std::memory_order_seq_cst);
+                    available = published.load(std::memory_order_seq_cst);
+                    const bool asked = hook_requested.load(std::memory_order_seq_cst);
+                    if (available == read_position && !asked) {
+                        // The GPU running dry wakes nobody: look again every 100 us.
+                        const u64 slice = (std::min<u64>)(until - now, 100'000);
+                        if (AddressWaits()) {
+                            Common::Nx2AddressWait::WaitFor(wake, seen, slice);
+                        } else {
+                            std::this_thread::sleep_for(std::chrono::nanoseconds{slice});
+                        }
+                    }
+                    back_waiting.store(false, std::memory_order_relaxed);
+                    if (asked || hook_requested.load(std::memory_order_relaxed)) {
+                        break;
+                    }
+                    available = published.load(std::memory_order_acquire);
+                }
+                if (held) {
+                    idle_holds.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (available != read_position) {
+                    if (held) {
+                        idle_holds_fed.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    continue;
+                }
+            }
             if (available == read_position) {
                 hook_requested.store(false, std::memory_order_seq_cst);
                 // The front may already see everything consumed: Drain() waits for back_quiet
@@ -1256,7 +1327,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // A request made after the hook ran (RequestIdleHook) runs it before sleeping.
                 if (available == read_position && !stop_token.stop_requested() &&
                     !hook_requested.load(std::memory_order_seq_cst)) {
-                    wake.wait(seen, std::memory_order_seq_cst);
+                    SleepOn(wake, seen);
                 }
                 back_waiting.store(false, std::memory_order_relaxed);
                 continue;
@@ -1313,7 +1384,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     }
     back_running.store(false, std::memory_order_seq_cst);
     front_wake.fetch_add(1, std::memory_order_seq_cst);
-    front_wake.notify_all();
+    WakeAll(front_wake);
 }
 
 } // namespace VideoCommon

@@ -289,6 +289,22 @@ void RecommendApple(const Device& device, Profile& p) {
          "take the frame: the game's own pass 9302bc0d6d1d9bc1 took ~40 % of an iPhone18,2's "
          "GPU time in Kokiri (IPA 150, Perf passes). Experiments > Game's Own Upscale Pass turns "
          "it off."});
+    p.tuning.push_back(
+        {"EDEN_NX2_POLL_YIELD", "0", "Sleep 50 us",
+         "The GPU thread polling its suspended channels (always a yield loop before) and threads "
+         "waiting for a deferred submission sleep 50 us between polls: iOS's sched_yield runs "
+         "the caller at priority 0 for up to 10 ms when anything else is runnable, and an "
+         "iPhone18,2 had 6-9 threads waiting for a CPU in Kokiri (IPA 179); with nothing "
+         "runnable the loop kept a performance core busy. Experiments > Polling Threads Yield "
+         "turns it off."});
+    p.tuning.push_back(
+        {"EDEN_NX2_IDLE_HOLD_US", "500", "0.5 ms",
+         "The GPU thread, out of commands, keeps deferred work asleep for up to 0.5 ms while the "
+         "GPU still runs what it was handed earlier, so the next commands share its command "
+         "buffer: 17-20 of an iPhone18,2's 34-37 command buffers a frame in Kokiri were handed "
+         "over by the idle thread (IPA 179). PC phone sim: those 3.0 -> 0.9 a frame, 21.1 -> "
+         "19.6 command buffers, frame rate unchanged. Experiments > GPU Thread Submits When "
+         "Idle turns it off."});
 }
 
 void RecommendDesktop(const Device& device, Profile& p) {
