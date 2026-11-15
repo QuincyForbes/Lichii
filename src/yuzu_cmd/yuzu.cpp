@@ -84,6 +84,7 @@
 #include <filesystem>
 #include <vector>
 #include <os/log.h>
+#include "common/console_capture.h"
 #include "common/device_profile.h"
 #include "common/ios_jit.h"
 #include "common/malloc_census.h"
@@ -176,11 +177,7 @@ static void IosMark(const char* what) {
     }
 }
 static void IosCaptureConsole() {
-    const std::string path = IosDocumentsDir() + "/console.txt";
-    std::freopen(path.c_str(), "a", stdout);
-    std::freopen(path.c_str(), "a", stderr);
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    Common::CaptureConsole(IosDocumentsDir() + "/console.txt");
 }
 namespace {
 struct IosStaticInitMark {

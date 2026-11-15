@@ -873,6 +873,70 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                              ? regs.vertex_streams[index].frequency
                              : 0U;
     }
+    // The guest's layout as Metal takes it: Metal's vertex descriptor has 31 attributes and 31
+    // buffer layouts and aborts the process when asked for more (Ocarina of Time's first draw has
+    // stream 31 bound), so only what the vertex function reads goes in, numbered from 0.
+    const bool checked = PipelineCheckEnabled();
+    VertexSources vertex_sources{};
+    if (checked) {
+        u32 loaded = 0;
+        u32 resource_slots = 0;
+        if (mesh == nullptr && !absent(0)) {
+            const StageProgram& program = *programs[0];
+            for (u32 index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+                loaded |= program.info.loads.Generic(index) ? 1U << index : 0U;
+            }
+            for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
+                if (slot.kind == ShaderTranslate::ResourceKind::Buffer) {
+                    resource_slots = (std::max)(resource_slots, slot.index + slot.count);
+                }
+            }
+            const ShaderTranslate::TessellationSlots& slots = program.tessellation_slots;
+            for (const u32 slot : {slots.output, slots.patch_output, slots.tess_factors,
+                                   slots.input, slots.patch_input, slots.indirect_params,
+                                   slots.index}) {
+                if (slot != ~0U) {
+                    resource_slots = (std::max)(resource_slots, slot + 1);
+                }
+            }
+        }
+        std::string reason;
+        if (!SanitizeVertexLayout(state_desc, loaded, resource_slots, vertex_sources, reason)) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_WARNING(Render_Metal,
+                            "Metal: render pipeline {:016x} refused: {}; fragment {:016x}, {}",
+                            pipeline.Key().unique_hashes[1], reason,
+                            pipeline.Key().unique_hashes[5], Describe(state_desc));
+            }
+            return false;
+        }
+    }
+    // The buffers of the layout's streams, at their slots.
+    const auto bind_vertex_streams = [&](const auto& bind) {
+        if (!checked) {
+            for (size_t index = 0; index < vertex_states.size(); ++index) {
+                if (vertex_states[index].buffer != nullptr) {
+                    bind(VertexBufferSlot(static_cast<u32>(index)), vertex_states[index].buffer,
+                         vertex_states[index].offset);
+                }
+            }
+            return;
+        }
+        for (u32 slot = 0; slot < vertex_sources.count; ++slot) {
+            const VertexSource& source = vertex_sources.streams[slot];
+            if (source.stream == VertexSource::Zeros) {
+                if (!zero_vertices) {
+                    // Metal hands out buffers zeroed.
+                    zero_vertices = CreateBuffer(device, 64, false, nullptr);
+                }
+                bind(VertexBufferSlot(slot), zero_vertices.Get(), 0U);
+            } else {
+                bind(VertexBufferSlot(slot), vertex_states[source.stream].buffer,
+                     vertex_states[source.stream].offset + source.shift);
+            }
+        }
+    };
     // A tessellation pipeline's vertex kernel reads the vertex layout as stage-in data; its
     // post-tessellation vertex function reads buffers.
     const RenderPipelineDesc layout_desc = state_desc;
@@ -1063,13 +1127,9 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                            std::span(views).subspan(first_view[0]),
                            std::span(samplers).subspan(first_sampler[0]), targets.width,
                            targets.height);
-        for (size_t index = 0; index < vertex_states.size(); ++index) {
-            if (vertex_states[index].buffer != nullptr) {
-                scheduler.BindBuffer(ShaderStage::Compute,
-                                     VertexBufferSlot(static_cast<u32>(index)),
-                                     vertex_states[index].buffer, vertex_states[index].offset);
-            }
-        }
+        bind_vertex_streams([&](u32 slot, BufferHandle buffer, u32 offset) {
+            scheduler.BindBuffer(ShaderStage::Compute, slot, buffer, offset);
+        });
         const ShaderTranslate::TessellationSlots& vertex_slots = programs[0]->tessellation_slots;
         bind(ShaderStage::Compute, vertex_slots.output, tess_buffers.vertices);
         if (tess_draw->index_size != 0 && vertex_slots.index != ~0U) {
@@ -1205,12 +1265,10 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                         regs.blend_color.a};
     scheduler.SetDrawState(draw);
 
-    for (size_t index = 0; index < vertex_states.size() && mesh == nullptr && tess == nullptr;
-         ++index) {
-        if (vertex_states[index].buffer != nullptr) {
-            scheduler.BindVertexBuffer(VertexBufferSlot(static_cast<u32>(index)),
-                                       vertex_states[index].buffer, vertex_states[index].offset);
-        }
+    if (mesh == nullptr && tess == nullptr) {
+        bind_vertex_streams([&](u32 slot, BufferHandle buffer, u32 offset) {
+            scheduler.BindVertexBuffer(slot, buffer, offset);
+        });
     }
 
     // Each stage's buffers (appended by the buffer cache in binding order), textures, samplers

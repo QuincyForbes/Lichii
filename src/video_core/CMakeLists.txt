@@ -643,6 +643,7 @@ set(METAL_RENDERER_CXX_SOURCES
     renderer_metal/metal_index_convert.cpp
     renderer_metal/metal_ocarina.cpp
     renderer_metal/metal_pipeline_cache.cpp
+    renderer_metal/metal_pipeline_check.cpp
     renderer_metal/metal_rasterizer.cpp
     renderer_metal/metal_shader_translate.cpp
     renderer_metal/metal_staging_buffer_pool.cpp
@@ -717,8 +718,11 @@ if (ENABLE_METAL)
                 MAIN_DEPENDENCY ${SMOKE_SOURCE})
             list(APPEND METAL_SMOKE_HEADERS ${SMOKE_HEADER})
         endforeach()
-        add_executable(lichii-metal-smoke renderer_metal/metal_smoke.mm ${METAL_SMOKE_HEADERS})
-        set_source_files_properties(renderer_metal/metal_smoke.mm PROPERTIES
+        add_executable(lichii-metal-smoke renderer_metal/metal_smoke.mm
+                       renderer_metal/metal_smoke_probe.h renderer_metal/metal_smoke_probe.mm
+                       ${METAL_SMOKE_HEADERS})
+        set_source_files_properties(renderer_metal/metal_smoke.mm
+                                    renderer_metal/metal_smoke_probe.mm PROPERTIES
             LANGUAGE CXX
             COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
         target_include_directories(lichii-metal-smoke PRIVATE ${METAL_SMOKE_DIR})
