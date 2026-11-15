@@ -18,6 +18,7 @@
 #include "video_core/renderer_metal/metal_buffer_cache.h"
 #include "video_core/renderer_metal/metal_fence_manager.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
+#include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_pipeline_cache.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
 #include "video_core/renderer_metal/metal_texture_cache.h"
@@ -138,6 +139,7 @@ public:
         u64 indices_rewritten_on_gpu; ///< Of the rewritten, by a kernel (GPU-written indices)
         u64 mesh_draws;          ///< Task/mesh draws through the compute emulation
         u64 mesh_groups;         ///< Their mesh workgroups
+        u64 ocarina_bilinear;    ///< Ocarina upscale passes replaced by the bilinear pass
         u64 dispatches;
         u64 dispatches_with_pipeline;
         u64 clears;
@@ -149,7 +151,7 @@ public:
                 std::exchange(draws_encoded, 0), std::exchange(draws_converted, 0),
                 std::exchange(texel_copies, 0), std::exchange(occlusion_queries, 0),
                 std::exchange(indices_rewritten_on_gpu, 0), std::exchange(mesh_draws, 0),
-                std::exchange(mesh_groups, 0),
+                std::exchange(mesh_groups, 0), ocarina.TakePasses(),
                 std::exchange(dispatches, 0), std::exchange(dispatches_with_pipeline, 0),
                 std::exchange(clears, 0)};
     }
@@ -225,6 +227,7 @@ private:
     BufferCacheRuntime buffer_cache_runtime;
     BufferCache buffer_cache;
     PipelineCache pipeline_cache;
+    OcarinaUpscale ocarina;
     QueryCache query_cache;
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;

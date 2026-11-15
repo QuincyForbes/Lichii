@@ -102,6 +102,9 @@ struct FormatInfo {
 /// A sampler for a guest sampler descriptor (TSC entry).
 [[nodiscard]] Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc);
 
+/// A bilinear sampler clamping to the edge, for the renderer's own passes.
+[[nodiscard]] Object CreateLinearClampSampler(const Device& device);
+
 /// An MTLLibrary built from MSL source (Metal's compiler, at run time); empty with `error` set
 /// on failure.
 [[nodiscard]] Object CreateLibrary(const Device& device, std::string_view source,

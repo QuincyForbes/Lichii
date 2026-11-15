@@ -344,6 +344,15 @@ Object CreateBuffer(const Device& device, u64 size, bool shared, u8** contents) 
     return Retain(buffer);
 }
 
+Object CreateLinearClampSampler(const Device& device) {
+    MTLSamplerDescriptor* descriptor = [[MTLSamplerDescriptor alloc] init];
+    descriptor.minFilter = MTLSamplerMinMagFilterLinear;
+    descriptor.magFilter = MTLSamplerMinMagFilterLinear;
+    descriptor.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    descriptor.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    return Retain([device.GetDevice() newSamplerStateWithDescriptor:descriptor]);
+}
+
 Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc) {
     using Tegra::Texture::TextureFilter;
     using Tegra::Texture::TextureMipmapFilter;

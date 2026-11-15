@@ -640,6 +640,7 @@ set(METAL_RENDERER_CXX_SOURCES
     renderer_metal/metal_buffer_cache_base.cpp
     renderer_metal/metal_fence_manager.cpp
     renderer_metal/metal_index_convert.cpp
+    renderer_metal/metal_ocarina.cpp
     renderer_metal/metal_pipeline_cache.cpp
     renderer_metal/metal_rasterizer.cpp
     renderer_metal/metal_shader_translate.cpp
@@ -672,6 +673,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_graphics.h
         renderer_metal/metal_index_convert.h
         renderer_metal/metal_object.h
+        renderer_metal/metal_ocarina.h
         renderer_metal/metal_pipeline_cache.h
         renderer_metal/metal_rasterizer.h
         renderer_metal/metal_resources.h
@@ -723,6 +725,8 @@ elseif (LICHII_METAL_COMPILE_CHECK)
     # catch template errors before an Apple CI run.
     add_library(video_core_metal_check OBJECT ${METAL_RENDERER_CXX_SOURCES})
     target_link_libraries(video_core_metal_check PRIVATE video_core spirv-cross-msl)
+    add_dependencies(video_core_metal_check host_shaders)
+    target_include_directories(video_core_metal_check PRIVATE ${HOST_SHADERS_INCLUDE})
 endif()
 
 # Ocarina of Time's upscaler replaced live by NVIDIA DLSS or Apple MetalFX temporal upscaling

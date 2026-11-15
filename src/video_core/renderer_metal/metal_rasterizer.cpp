@@ -22,8 +22,10 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/oot_network.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
+#include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_rasterizer.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/shader_handle_program.h"
@@ -107,6 +109,7 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_, Tegra::MaxwellDeviceMemoryMan
       texture_cache{texture_cache_runtime, device_memory},
       buffer_cache_runtime{device_, scheduler_, staging_pool},
       buffer_cache{device_memory, buffer_cache_runtime}, pipeline_cache{device_memory, device_},
+      ocarina{device_, scheduler_},
       accelerate_dma{buffer_cache, texture_cache},
       fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_} {}
 
@@ -1168,6 +1171,30 @@ void RasterizerMetal::DispatchCompute() {
         }
     }
     texture_cache.FillImageViews(views, true);
+    // EDEN_NX2_OOT_BILINEAR_UPSCALE: Ocarina's upscale dispatch as one bilinear tap, as Vulkan's
+    // TryOcarinaBilinear takes it (views: the sampled scene, then the written target).
+    if (OcarinaUpscale::BilinearEnabled() &&
+        Settings::GetCurrentProgramID() == VideoCommon::OotNetwork::ProgramId &&
+        !kepler_compute->GetIndirectComputeAddress() &&
+        OcarinaUpscale::IsBilinearPass(pipeline->Key().unique_hash, info)) {
+        using VideoCore::Surface::PixelFormat;
+        ImageView& color = texture_cache.GetImageView(views[0].id);
+        ImageView& target = texture_cache.GetImageView(views[1].id);
+        if (color.format == PixelFormat::E5B9G9R9_FLOAT &&
+            target.format == PixelFormat::B10G11R11_FLOAT && color.Samples() <= 1 &&
+            target.Samples() <= 1 && color.range == VideoCommon::SubresourceRange{} &&
+            target.range == VideoCommon::SubresourceRange{} &&
+            target.size.width > color.size.width && target.size.height > color.size.height &&
+            color.ImageHandle() != target.ImageHandle() &&
+            ocarina.Bilinear(color.Handle(Shader::TextureType::Color2D),
+                             {color.size.width, color.size.height},
+                             {color.size.width, color.size.height},
+                             target.Handle(Shader::TextureType::Color2D),
+                             {target.size.width, target.size.height})) {
+            texture_cache.MarkModification(target.image_id);
+            return;
+        }
+    }
 
     buffer_cache.UnbindComputeTextureBuffers();
     size_t view = 0;
