@@ -341,6 +341,10 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_MESH_EMULATE", "all", 1);
         LOG_WARNING(Frontend, "iOS: experiment emulate_all_mesh on");
     }
+    if (lichii_platform_experiment("dispatch_deps")) {
+        setenv("EDEN_NX2_DISPATCH_DEPS", "1", 1);
+        LOG_WARNING(Frontend, "iOS: experiment dispatch_deps on");
+    }
     ApplyCpuExperiments();
 }
 

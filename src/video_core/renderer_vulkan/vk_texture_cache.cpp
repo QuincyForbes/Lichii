@@ -5272,6 +5272,8 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
     }
 
     num_color_buffers = static_cast<u32>(num_colors);
+    num_attachment_views = static_cast<u32>(attachments.size());
+    std::ranges::copy(attachments, attachment_views.begin());
     framebuffer = runtime.device.GetLogical().CreateFramebuffer({
         .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
         .pNext = nullptr,

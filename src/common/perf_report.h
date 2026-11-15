@@ -69,6 +69,9 @@ enum Counter : std::size_t {
     AttachmentLoadBytes, ///< Attachment bytes render passes load (neither cleared nor don't-care)
     AttachmentStoreBytes, ///< Attachment bytes render passes store
     RenderPassReopens,   ///< Render passes begun on the framebuffer the last one ended on, no clear
+    RenderPassSameViewReopens, ///< Begun on another framebuffer of the views the last one ended on
+    RenderPassSameImageReopens, ///< Begun on other views of the images and subresources it ended on
+    RenderPassSharedImageSwitches, ///< Begun on a target set that shares some image with it
     BeforePassCommands,  ///< Copies recorded before the open render pass instead of ending it
     DeferredClearsKept,  ///< Work outside render passes that left a parked clear parked
     DrawsSkippedBuilding, ///< Of DrawsSkipped: the pipeline was still being built

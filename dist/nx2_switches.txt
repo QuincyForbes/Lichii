@@ -91,6 +91,11 @@ EDEN_NX2_FENCE_BATCH=1
 # comma list of pipeline hashes. To compare the two (Apple mesh shaders are occupancy bound).
 #EDEN_NX2_MESH_EMULATE=all
 
+# Diagnostic: every 10 s a "Dispatch deps" line names the compute dispatches that end an open
+# render pass, and whether they bind its images or follow storage writes in it. Draws nothing
+# differently.
+#EDEN_NX2_DISPATCH_DEPS=1
+
 #EDEN_NX2_MME_JIT=0
 #EDEN_NX2_PBFLUSH=0
 #EDEN_NX2_SKIP_SAME=0

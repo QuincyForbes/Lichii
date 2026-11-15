@@ -154,6 +154,21 @@ bool KeepDeferredClear() {
     return keep;
 }
 
+bool SameViews(std::span<const VkImageView> views, u32 num_views,
+               const std::array<VkImageView, 18>& other) {
+    return views.size() == num_views && std::ranges::equal(views, std::span{other.data(), num_views});
+}
+
+bool SameRanges(std::span<const VkImageSubresourceRange> a,
+                std::span<const VkImageSubresourceRange> b) {
+    return std::ranges::equal(a, b, [](const VkImageSubresourceRange& x,
+                                       const VkImageSubresourceRange& y) {
+        return x.aspectMask == y.aspectMask && x.baseMipLevel == y.baseMipLevel &&
+               x.levelCount == y.levelCount && x.baseArrayLayer == y.baseArrayLayer &&
+               x.layerCount == y.layerCount;
+    });
+}
+
 // The callers of Flush and Finish: who asks for the queue submissions.
 void CountFlush(const char* file, u32 line) {
     CountSite(g_profile_flushes, file, line);
@@ -1178,6 +1193,41 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
             }
             ++it->count;
         }
+    } else if (clear_value_count == 0 && Common::PerfReport::Enabled()) {
+        // Another framebuffer that loads what the last pass stored: made of the same views, of
+        // other views of the same images, or sharing only some of its images.
+        const std::span<const VkImage> images{framebuffer->Images().data(), framebuffer->NumImages()};
+        const std::span<const VkImage> last{last_pass_images.data(), last_pass_num_images};
+        if (SameViews(framebuffer->AttachmentViews(), last_pass_num_views, last_pass_views)) {
+            Common::PerfReport::Add(Common::PerfReport::RenderPassSameViewReopens);
+        } else if (std::ranges::equal(images, last) &&
+                   SameRanges({framebuffer->ImageRanges().data(), images.size()},
+                              {last_pass_image_ranges.data(), last.size()})) {
+            Common::PerfReport::Add(Common::PerfReport::RenderPassSameImageReopens);
+        } else if (std::ranges::any_of(images, [&](VkImage image) {
+                       return std::ranges::find(last, image) != last.end();
+                   })) {
+            Common::PerfReport::Add(Common::PerfReport::RenderPassSharedImageSwitches);
+            static u32 logged{};
+            if (logged++ < 20) {
+                std::string text;
+                for (size_t i = 0; i < images.size(); ++i) {
+                    const auto it = std::ranges::find(last, images[i]);
+                    text += it != last.end() ? fmt::format(" {}=last {}", i, it - last.begin())
+                                             : fmt::format(" {}=new", i);
+                }
+                std::string_view site{last_pass_end_file != nullptr ? last_pass_end_file
+                                                                    : "elsewhere"};
+                if (const size_t slash = site.find_last_of("/\\"); slash != std::string_view::npos) {
+                    site.remove_prefix(slash + 1);
+                }
+                LOG_INFO(Common_Memory,
+                         "Pass on {}x{} shares images with the last one ({} images, ended at "
+                         "{}:{}): {} images,{}",
+                         render_area.width, render_area.height, last.size(), site,
+                         last_pass_end_line, images.size(), text);
+            }
+        }
     }
     const bool time_pass = static_cast<bool>(pass_time_pool);
     PassShape shape{};
@@ -1234,6 +1284,9 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     state.clear_variant = false;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
+    const std::span<const VkImageView> views = framebuffer->AttachmentViews();
+    state.num_views = static_cast<u32>((std::min)(views.size(), state.views.size()));
+    std::copy_n(views.begin(), state.num_views, state.views.begin());
     state.pushed_rescaling_words.Forget();
     state.pushed_render_area.Forget();
 
@@ -1915,6 +1968,11 @@ void Scheduler::EndRenderPass()
         fragment_barrier.Reset();
         render_pass_has_stores = false;
         last_pass_framebuffer = state.framebuffer;
+        last_pass_num_views = state.num_views;
+        last_pass_views = state.views;
+        last_pass_num_images = num_renderpass_images;
+        last_pass_images = renderpass_images;
+        last_pass_image_ranges = renderpass_image_ranges;
         last_pass_end_file = std::exchange(pass_end_file, nullptr);
         last_pass_end_line = std::exchange(pass_end_line, 0U);
 
