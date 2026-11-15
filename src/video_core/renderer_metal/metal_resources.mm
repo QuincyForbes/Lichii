@@ -43,6 +43,141 @@ MTLTextureType TextureType(TextureKind kind) {
     return MTLTextureType2D;
 }
 
+TextureKind KindOf(MTLTextureType type) {
+    switch (type) {
+    case MTLTextureType1D: return TextureKind::e1D;
+    case MTLTextureType1DArray: return TextureKind::e1DArray;
+    case MTLTextureType2DArray: return TextureKind::e2DArray;
+    case MTLTextureType2DMultisample: return TextureKind::e2DMultisample;
+    case MTLTextureType2DMultisampleArray: return TextureKind::e2DMultisampleArray;
+    case MTLTextureType3D: return TextureKind::e3D;
+    case MTLTextureTypeCube: return TextureKind::Cube;
+    case MTLTextureTypeCubeArray: return TextureKind::CubeArray;
+    default: return TextureKind::e2D;
+    }
+}
+
+/// Bytes of a texel of a plain colour format, 0 for the others.
+u32 TexelBytes(MTLPixelFormat format) {
+    switch (format) {
+    case MTLPixelFormatA8Unorm:
+    case MTLPixelFormatR8Unorm:
+    case MTLPixelFormatR8Unorm_sRGB:
+    case MTLPixelFormatR8Snorm:
+    case MTLPixelFormatR8Uint:
+    case MTLPixelFormatR8Sint:
+        return 1;
+    case MTLPixelFormatR16Unorm:
+    case MTLPixelFormatR16Snorm:
+    case MTLPixelFormatR16Uint:
+    case MTLPixelFormatR16Sint:
+    case MTLPixelFormatR16Float:
+    case MTLPixelFormatRG8Unorm:
+    case MTLPixelFormatRG8Unorm_sRGB:
+    case MTLPixelFormatRG8Snorm:
+    case MTLPixelFormatRG8Uint:
+    case MTLPixelFormatRG8Sint:
+    case MTLPixelFormatB5G6R5Unorm:
+    case MTLPixelFormatA1BGR5Unorm:
+    case MTLPixelFormatABGR4Unorm:
+    case MTLPixelFormatBGR5A1Unorm:
+        return 2;
+    case MTLPixelFormatR32Uint:
+    case MTLPixelFormatR32Sint:
+    case MTLPixelFormatR32Float:
+    case MTLPixelFormatRG16Unorm:
+    case MTLPixelFormatRG16Snorm:
+    case MTLPixelFormatRG16Uint:
+    case MTLPixelFormatRG16Sint:
+    case MTLPixelFormatRG16Float:
+    case MTLPixelFormatRGBA8Unorm:
+    case MTLPixelFormatRGBA8Unorm_sRGB:
+    case MTLPixelFormatRGBA8Snorm:
+    case MTLPixelFormatRGBA8Uint:
+    case MTLPixelFormatRGBA8Sint:
+    case MTLPixelFormatBGRA8Unorm:
+    case MTLPixelFormatBGRA8Unorm_sRGB:
+    case MTLPixelFormatRGB10A2Unorm:
+    case MTLPixelFormatRGB10A2Uint:
+    case MTLPixelFormatBGR10A2Unorm:
+    case MTLPixelFormatRG11B10Float:
+    case MTLPixelFormatRGB9E5Float:
+        return 4;
+    case MTLPixelFormatRG32Uint:
+    case MTLPixelFormatRG32Sint:
+    case MTLPixelFormatRG32Float:
+    case MTLPixelFormatRGBA16Unorm:
+    case MTLPixelFormatRGBA16Snorm:
+    case MTLPixelFormatRGBA16Uint:
+    case MTLPixelFormatRGBA16Sint:
+    case MTLPixelFormatRGBA16Float:
+        return 8;
+    case MTLPixelFormatRGBA32Uint:
+    case MTLPixelFormatRGBA32Sint:
+    case MTLPixelFormatRGBA32Float:
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+/// MoltenVK's view classes, 0 for a format in none: plain colour formats by texel size, a
+/// compressed format with its sRGB, signed and HDR variants.
+u32 ViewClass(MTLPixelFormat format) {
+    constexpr u32 Compressed = 0x100;
+    if (const u32 bytes = TexelBytes(format)) {
+        return bytes;
+    }
+    const u32 raw = static_cast<u32>(format);
+    // Each of these is followed by its variant.
+    if ((format >= MTLPixelFormatBC1_RGBA && format <= MTLPixelFormatBC7_RGBAUnorm_sRGB) ||
+        (format >= MTLPixelFormatEAC_RGBA8 && format <= MTLPixelFormatETC2_RGB8A1_sRGB)) {
+        return Compressed + (raw & ~1U);
+    }
+    if (format == MTLPixelFormatEAC_R11Unorm || format == MTLPixelFormatEAC_R11Snorm) {
+        return Compressed + static_cast<u32>(MTLPixelFormatEAC_R11Unorm);
+    }
+    if (format == MTLPixelFormatEAC_RG11Unorm || format == MTLPixelFormatEAC_RG11Snorm) {
+        return Compressed + static_cast<u32>(MTLPixelFormatEAC_RG11Unorm);
+    }
+    // ASTC's sRGB, LDR and HDR formats list the block sizes in one order.
+    for (const MTLPixelFormat first : {MTLPixelFormatASTC_4x4_sRGB, MTLPixelFormatASTC_4x4_LDR,
+                                       MTLPixelFormatASTC_4x4_HDR}) {
+        const u32 last = static_cast<u32>(first) + static_cast<u32>(MTLPixelFormatASTC_12x12_LDR) -
+                         static_cast<u32>(MTLPixelFormatASTC_4x4_LDR);
+        if (raw >= static_cast<u32>(first) && raw <= last) {
+            return Compressed + raw - static_cast<u32>(first) +
+                   static_cast<u32>(MTLPixelFormatASTC_4x4_LDR);
+        }
+    }
+    return 0;
+}
+
+/// Why Metal would reject by assertion a view in format `to` of a texture in format `from`, or
+/// nil: it casts between colour formats of one texel size, between the variants of a compressed
+/// format and to the stencil half of a depth-stencil format, nothing else.
+const char* ViewFormatReason(MTLPixelFormat from, MTLPixelFormat to) {
+    if (from == to) {
+        return nullptr;
+    }
+    const auto depth_stencil = [](MTLPixelFormat format) {
+        const FormatClass format_class = ClassOf(static_cast<u32>(format));
+        return format_class == FormatClass::Depth || format_class == FormatClass::Stencil ||
+               format_class == FormatClass::DepthStencil || format == MTLPixelFormatX32_Stencil8;
+    };
+    if (depth_stencil(from) || depth_stencil(to)) {
+        return from == MTLPixelFormatDepth32Float_Stencil8 && to == MTLPixelFormatX32_Stencil8
+                   ? nullptr
+                   : "a depth or stencil format seen as another format";
+    }
+    const u32 from_class = ViewClass(from);
+    const u32 to_class = ViewClass(to);
+    if (from_class != 0 && to_class != 0 && from_class != to_class) {
+        return "formats of different texel sizes or compressions";
+    }
+    return nullptr;
+}
+
 } // Anonymous namespace
 
 u64 DeviceMemoryBudget(const Device& device) {
@@ -118,19 +253,32 @@ Object CreateTextureView(TextureHandle texture, u32 format, TextureKind kind, u3
         return {};
     }
     if (PipelineCheckEnabled()) {
-        // A range of levels or slices the texture doesn't have aborts the process.
+        // A range of levels or slices the texture doesn't have, a view of another family of
+        // texture types and a format Metal doesn't cast to abort the process.
         const bool cube = base.textureType == MTLTextureTypeCube ||
                           base.textureType == MTLTextureTypeCubeArray;
         const u64 slices =
             base.textureType == MTLTextureType3D ? 1 : u64{base.arrayLength} * (cube ? 6 : 1);
+        std::string reason;
         if (levels == 0 || layers == 0 || u64{base_level} + levels > base.mipmapLevelCount ||
             u64{base_layer} + layers > slices) {
+            reason = "levels or slices past the texture";
+        } else if (reason = CheckTextureView(KindOf(base.textureType), kind, layers);
+                   reason.empty()) {
+            if (const char* const cast = ViewFormatReason(
+                    base.pixelFormat, static_cast<MTLPixelFormat>(format))) {
+                reason = cast;
+            }
+        }
+        if (!reason.empty()) {
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_WARNING(Render_Metal, "Metal: texture view refused: levels {}+{} of {}, "
-                            "slices {}+{} of {}, kind {} format {}",
-                            base_level, levels, static_cast<u32>(base.mipmapLevelCount),
-                            base_layer, layers, slices, static_cast<u32>(kind), format);
+                LOG_WARNING(Render_Metal, "Metal: texture view refused: {}; levels {}+{} of {}, "
+                            "slices {}+{} of {}, kind {} of {}, format {} of {}",
+                            reason, base_level, levels, static_cast<u32>(base.mipmapLevelCount),
+                            base_layer, layers, slices, static_cast<u32>(kind),
+                            static_cast<u32>(KindOf(base.textureType)), format,
+                            static_cast<u32>(base.pixelFormat));
             }
             return {};
         }

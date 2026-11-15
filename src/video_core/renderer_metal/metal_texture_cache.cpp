@@ -10,6 +10,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/dlss_contract.h"
+#include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_texture_cache.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/decode_bc.h"
@@ -46,7 +47,9 @@ namespace {
 [[nodiscard]] TextureKind KindOf(const ImageInfo& info) {
     switch (info.type) {
     case ImageType::e1D:
-        return TextureKind::e1DArray;
+        // With the pipeline check a 2D texture a texel high, which the shaders read as one
+        // (SpirvToMsl): Metal aborts on a 1D texture with levels and on a 2D view of one.
+        return PipelineCheckEnabled() ? TextureKind::e2DArray : TextureKind::e1DArray;
     case ImageType::e3D:
         return TextureKind::e3D;
     case ImageType::e2D:
@@ -681,11 +684,11 @@ TextureHandle ImageView::Handle(Shader::TextureType texture_type) {
     u32 layers = static_cast<u32>(range.extent.layers);
     switch (texture_type) {
     case Shader::TextureType::Color1D:
-        view_kind = TextureKind::e1D;
+        view_kind = PipelineCheckEnabled() ? TextureKind::e2D : TextureKind::e1D;
         layers = 1;
         break;
     case Shader::TextureType::ColorArray1D:
-        view_kind = TextureKind::e1DArray;
+        view_kind = PipelineCheckEnabled() ? TextureKind::e2DArray : TextureKind::e1DArray;
         break;
     case Shader::TextureType::Color2D:
     case Shader::TextureType::Color2DRect:
@@ -715,6 +718,12 @@ TextureHandle ImageView::Handle(Shader::TextureType texture_type) {
     if ((image_kind == TextureKind::e3D) != (view_kind == TextureKind::e3D)) {
         view_kind = image_kind == TextureKind::e3D ? TextureKind::e3D : TextureKind::e2D;
         base_layer = image_kind == TextureKind::e3D ? 0 : base_layer;
+        layers = 1;
+    }
+    // Nor does Metal view a multisampled texture as anything else (it aborts).
+    if (multisample && PipelineCheckEnabled() && view_kind != TextureKind::e2DMultisample &&
+        view_kind != TextureKind::e2DMultisampleArray) {
+        view_kind = TextureKind::e2DMultisample;
         layers = 1;
     }
     view = CreateTextureView(image_texture, host_format, view_kind,

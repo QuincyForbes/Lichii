@@ -274,6 +274,25 @@ std::string View(const Context& context, MTLTextureType base_type, MTLTextureTyp
                : "error: no view";
 }
 
+/// A 2D view in format `to` of a 16x16 texture in format `from`.
+std::string Cast(const Context& context, MTLPixelFormat from, MTLPixelFormat to) {
+    if (from >= MTLPixelFormatBC1_RGBA && from <= MTLPixelFormatBC7_RGBAUnorm_sRGB &&
+        !context.device.supportsBCTextureCompression) {
+        return "error: no BC textures on this device";
+    }
+    const id<MTLTexture> base = Shape(context, MTLTextureType2D, from, 16, 16, 1, 1, 1,
+                                      MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView);
+    if (base == nil) {
+        return "error: no texture";
+    }
+    return [base newTextureViewWithPixelFormat:to
+                                   textureType:MTLTextureType2D
+                                        levels:NSMakeRange(0, 1)
+                                        slices:NSMakeRange(0, 1)] != nil
+               ? "built"
+               : "error: no view";
+}
+
 std::string Sampler(const Context& context, NSUInteger anisotropy, float min_lod, float max_lod) {
     MTLSamplerDescriptor* descriptor = [MTLSamplerDescriptor new];
     descriptor.maxAnisotropy = anisotropy;
@@ -699,6 +718,143 @@ const Suspect Suspects[] = {
      [](const Context& context) {
          return View(context, MTLTextureType2DArray, MTLTextureType2D, MTLPixelFormatDepth32Float,
                      NSMakeRange(0, 1), NSMakeRange(0, 1));
+     }},
+    {"view-2d-array-of-2d",
+     [](const Context& context) {
+         const id<MTLTexture> base =
+             Shape(context, MTLTextureType2D, MTLPixelFormatRGBA8Unorm, 16, 16, 1, 1, 1,
+                   MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView);
+         return [base newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                        textureType:MTLTextureType2DArray
+                                             levels:NSMakeRange(0, 1)
+                                             slices:NSMakeRange(0, 1)] != nil
+                    ? std::string{"built"}
+                    : std::string{"error: no view"};
+     }},
+    // Views in another format: which casts Metal takes.
+    {"view-rgba8-as-bgra8",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatRGBA8Unorm, MTLPixelFormatBGRA8Unorm);
+     }},
+    {"view-rgba8-as-rgba8-srgb",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGBA8Unorm_sRGB);
+     }},
+    {"view-rgba8-as-rgb10a2",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGB10A2Unorm);
+     }},
+    {"view-rgba8-as-rg11b10float",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatRGBA8Unorm, MTLPixelFormatRG11B10Float);
+     }},
+    {"view-r16-as-rg8",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatR16Unorm, MTLPixelFormatRG8Unorm);
+     }},
+    {"view-r16-as-r8",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatR16Unorm, MTLPixelFormatR8Unorm);
+     }},
+    {"view-rgba16float-as-rg32float",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatRGBA16Float, MTLPixelFormatRG32Float);
+     }},
+    {"view-rgba16float-as-rgba32float",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatRGBA16Float, MTLPixelFormatRGBA32Float);
+     }},
+    {"view-r32float-as-depth32float",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatR32Float, MTLPixelFormatDepth32Float);
+     }},
+    {"view-depth32float-as-r32float",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatDepth32Float, MTLPixelFormatR32Float);
+     }},
+    {"view-depth32float-as-depth16",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatDepth32Float, MTLPixelFormatDepth16Unorm);
+     }},
+    {"view-depth32float-stencil8-as-x32-stencil8",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatDepth32Float_Stencil8, MTLPixelFormatX32_Stencil8);
+     }},
+    {"view-depth32float-stencil8-as-depth32float",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatDepth32Float_Stencil8, MTLPixelFormatDepth32Float);
+     }},
+    {"view-depth32float-stencil8-as-stencil8",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatDepth32Float_Stencil8, MTLPixelFormatStencil8);
+     }},
+    {"view-stencil8-as-r8uint",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatStencil8, MTLPixelFormatR8Uint);
+     }},
+    {"view-b5g6r5-as-r16",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatB5G6R5Unorm, MTLPixelFormatR16Unorm);
+     }},
+    {"view-bc1-as-bc1-srgb",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC1_RGBA, MTLPixelFormatBC1_RGBA_sRGB);
+     }},
+    {"view-bc1-as-bc4",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC1_RGBA, MTLPixelFormatBC4_RUnorm);
+     }},
+    {"view-bc3-as-bc2",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC3_RGBA, MTLPixelFormatBC2_RGBA);
+     }},
+    {"view-bc4-as-bc4-snorm",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC4_RUnorm, MTLPixelFormatBC4_RSnorm);
+     }},
+    {"view-bc5-as-bc5-snorm",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC5_RGUnorm, MTLPixelFormatBC5_RGSnorm);
+     }},
+    {"view-bc6h-float-as-ufloat",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC6H_RGBFloat, MTLPixelFormatBC6H_RGBUfloat);
+     }},
+    {"view-bc7-as-bc7-srgb",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC7_RGBAUnorm, MTLPixelFormatBC7_RGBAUnorm_sRGB);
+     }},
+    {"view-bc7-as-rgba32float",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC7_RGBAUnorm, MTLPixelFormatRGBA32Float);
+     }},
+    {"view-astc-4x4-as-srgb",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatASTC_4x4_LDR, MTLPixelFormatASTC_4x4_sRGB);
+     }},
+    {"view-astc-4x4-as-hdr",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatASTC_4x4_LDR, MTLPixelFormatASTC_4x4_HDR);
+     }},
+    {"view-astc-4x4-as-8x8",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatASTC_4x4_LDR, MTLPixelFormatASTC_8x8_LDR);
+     }},
+    {"view-etc2-rgb8-as-srgb",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatETC2_RGB8, MTLPixelFormatETC2_RGB8_sRGB);
+     }},
+    {"view-eac-r11-as-snorm",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatEAC_R11Unorm, MTLPixelFormatEAC_R11Snorm);
+     }},
+    {"view-bc1-as-rgba8",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC1_RGBA, MTLPixelFormatRGBA8Unorm);
+     }},
+    {"view-bc1-as-rgba16",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC1_RGBA, MTLPixelFormatRGBA16Unorm);
      }},
     {"sampler-anisotropy-0", [](const Context& context) { return Sampler(context, 0, 0, 16); }},
     {"sampler-anisotropy-17", [](const Context& context) { return Sampler(context, 17, 0, 16); }},
