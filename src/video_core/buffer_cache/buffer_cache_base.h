@@ -38,6 +38,7 @@
 #include "core/gpu_dirty_memory_manager.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/cpu_read_stats.h"
 #include "video_core/buffer_cache/cpu_write_stats.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
@@ -304,6 +305,12 @@ public:
     void DownloadMemoryRanges(std::span<const std::pair<DAddr, u64>> ranges);
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
+
+    /// EDEN_NX2_GPU_READ_LAND: a guest read of [device_addr, device_addr + size) lands the fence
+    /// downloads in flight over it, up to the newest one that holds bytes of the read, and the
+    /// finished ones around it. wait: waits for that download's submission (the thread that
+    /// records); otherwise lands only what the GPU has finished. Any thread, under the mutex.
+    void LandInFlightForCpuRead(DAddr device_addr, u64 size, bool wait);
 
     /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
     /// data reaches guest memory, so reads must ask the buffer cache (GetFlushArea).
@@ -726,6 +733,10 @@ private:
 
     void DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges);
 
+    /// The submission of the newest fence download in flight over the range, or 0 when the range
+    /// has GPU-written bytes that none of them holds.
+    [[nodiscard]] u64 InFlightDownloadTick(DAddr device_addr, u64 size);
+
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
@@ -1015,6 +1026,8 @@ private:
     /// fence pops. A write to a range after a download was taken removes it from that download
     /// (and every other pending one): its bytes are older than the write.
     std::deque<Common::RangeSet<DAddr>> pending_download_ranges;
+    /// For each entry of pending_downloads: the tick its copies were recorded in.
+    std::deque<u64> pending_download_ticks;
     PendingCpuWrites pending_cpu_writes;
     std::optional<Async_Buffer> current_buffer;
 

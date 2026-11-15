@@ -2668,15 +2668,23 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
     const bool skip_buffers = fast_path && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
                               !device_memory.MayHaveArmedReadTraps(addr, size) &&
                               !Tegra::Nx2MayBeGpuWritten(addr, size);
+    namespace ReadStats = VideoCommon::CpuReadStats;
     if (!skip_textures) {
+        const u64 lock_begin = ReadStats::NowNs();
         std::scoped_lock lock{texture_cache.mutex};
+        ReadStats::Add(ReadStats::g_counters.texture_lock_ns, ReadStats::NowNs() - lock_begin);
+        ReadStats::Add(ReadStats::g_counters.texture_asks, 1);
         auto area = texture_cache.GetFlushArea(addr, size);
         if (area) {
+            area->cause = static_cast<u8>(ReadStats::Cause::Image);
             return *area;
         }
     }
     if (!skip_buffers && buffer_cache.FlushesOnCpuRead()) {
+        const u64 lock_begin = ReadStats::NowNs();
         std::scoped_lock lock{buffer_cache.mutex};
+        ReadStats::Add(ReadStats::g_counters.buffer_lock_ns, ReadStats::NowNs() - lock_begin);
+        ReadStats::Add(ReadStats::g_counters.buffer_asks, 1);
         auto area = buffer_cache.GetFlushArea(addr, size);
         if (area) {
             return *area;
@@ -2688,6 +2696,19 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         .preemtive = true,
     };
     return new_area;
+}
+
+bool RasterizerVulkan::LandDownloadForCpuRead(DAddr addr, u64 size, u64 tick) {
+    // Only the thread that records may submit: a download still to be submitted goes to it.
+    if (!scheduler.IsSubmitted(tick)) {
+        return false;
+    }
+    // As the fencing thread: wait for the submission, then land under the cache's lock.
+    scheduler.GetMasterSemaphore().Wait(tick);
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.LandInFlightForCpuRead(addr, size, false);
+    // The GPU may have written the range again meanwhile.
+    return !buffer_cache.IsRegionGpuModified(addr, size);
 }
 
 void RasterizerVulkan::PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) {
@@ -4000,6 +4021,7 @@ void RasterizerVulkan::ReportSlowAccesses(double seconds) {
              text[0], text[1], (total_us[0] + total_us[1]) / 1e3 / seconds, PR::SlowSampleEvery,
              site_text.empty() ? std::string{"none"} : site_text);
     ReportCpuWrites(seconds);
+    ReportCpuReads(seconds);
 }
 
 void RasterizerVulkan::ReportCpuWrites(double seconds) {
@@ -4060,6 +4082,71 @@ void RasterizerVulkan::ReportCpuWrites(double seconds) {
              "after {:.0f}{}",
              unregistered + gpu_page + already + marked - reclaimed, unregistered, gpu_page, gpu_bytes,
              reclaimed, queued, already, marked, still, detail);
+}
+
+void RasterizerVulkan::ReportCpuReads(double seconds) {
+    namespace Stats = VideoCommon::CpuReadStats;
+    auto& counters = Stats::g_counters;
+    static std::array<u64, 2> ask_then{};
+    static std::array<std::array<u64, Stats::CauseCount>, 3> cause_then{};
+    static std::array<u64, 7> download_then{};
+    const auto delta = [](const std::atomic<u64>& counter, u64& then) {
+        const u64 now = counter.load(std::memory_order_relaxed);
+        return static_cast<double>(now - std::exchange(then, now));
+    };
+    const double asks = delta(counters.asks, ask_then[0]);
+    const double ask_ns = delta(counters.ask_ns, ask_then[1]);
+    static std::array<u64, 4> lock_then{};
+    const double texture_asks = delta(counters.texture_asks, lock_then[0]);
+    const double texture_lock_ns = delta(counters.texture_lock_ns, lock_then[1]);
+    const double buffer_asks = delta(counters.buffer_asks, lock_then[2]);
+    const double buffer_lock_ns = delta(counters.buffer_lock_ns, lock_then[3]);
+    std::string causes;
+    double waits = 0.0;
+    double wait_ns = 0.0;
+    for (size_t cause = 0; cause < Stats::CauseCount; ++cause) {
+        const double n = delta(counters.waits[cause], cause_then[0][cause]);
+        const double queue = delta(counters.queue_ns[cause], cause_then[1][cause]);
+        const double flush = delta(counters.flush_ns[cause], cause_then[2][cause]);
+        if (n == 0.0) {
+            continue;
+        }
+        waits += n;
+        wait_ns += queue + flush;
+        causes += fmt::format("{}{} {:.0f} ({:.0f} us queued, {:.0f} us flush)",
+                              causes.empty() ? "" : ", ", Stats::CauseName(cause), n / seconds,
+                              queue / n / 1e3, flush / n / 1e3);
+    }
+    const double staged = delta(counters.staged, download_then[0]);
+    const double staged_ns = delta(counters.staged_ns, download_then[1]);
+    const double mapped = delta(counters.mapped, download_then[2]);
+    const double mapped_ns = delta(counters.mapped_ns, download_then[3]);
+    const double bytes = delta(counters.bytes, download_then[4]);
+    const double core_landed = delta(counters.core_landed, download_then[5]);
+    const double core_ns = delta(counters.core_ns, download_then[6]);
+    static std::array<u64, 4> land_then{};
+    const double core_refused = delta(counters.core_refused, land_then[0]);
+    const double landed = delta(counters.landed, land_then[1]);
+    const double landed_ns = delta(counters.landed_ns, land_then[2]);
+    const double landed_bytes = delta(counters.landed_bytes, land_then[3]);
+    LOG_INFO(Common_Memory,
+             "Perf CPU reads: asked {:.0f}/s ({:.1f} us each; texture cache lock {:.0f}/s "
+             "{:.1f} us, buffer cache lock {:.0f}/s {:.1f} us), waited for the GPU {:.0f}/s, "
+             "{:.1f} ms/s ({}) | downloads: staged {:.0f}/s ({:.2f} ms each), mapped {:.0f}/s "
+             "({:.2f} ms each), {:.0f} KiB/s | in-flight downloads landed {:.0f}/s ({:.2f} ms "
+             "each, {:.0f} KiB/s), by the reading core {:.0f}/s ({:.2f} ms each, {:.0f}/s went "
+             "to the GPU thread after all) (land mode {})",
+             asks / seconds, asks == 0.0 ? 0.0 : ask_ns / asks / 1e3, texture_asks / seconds,
+             texture_asks == 0.0 ? 0.0 : texture_lock_ns / texture_asks / 1e3,
+             buffer_asks / seconds, buffer_asks == 0.0 ? 0.0 : buffer_lock_ns / buffer_asks / 1e3,
+             waits / seconds,
+             wait_ns / 1e6 / seconds, causes.empty() ? std::string{"none"} : causes,
+             staged / seconds, staged == 0.0 ? 0.0 : staged_ns / staged / 1e6, mapped / seconds,
+             mapped == 0.0 ? 0.0 : mapped_ns / mapped / 1e6, bytes / 1024.0 / seconds,
+             landed / seconds, landed == 0.0 ? 0.0 : landed_ns / landed / 1e6,
+             landed_bytes / 1024.0 / seconds, core_landed / seconds,
+             core_landed == 0.0 ? 0.0 : core_ns / core_landed / 1e6, core_refused / seconds,
+             Stats::LandMode());
 }
 
 void RasterizerVulkan::TickPerfReport() {

@@ -127,6 +127,7 @@ public:
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+    bool LandDownloadForCpuRead(DAddr addr, u64 size, u64 tick) override;
     bool HasPendingQueries(DAddr addr, u64 size) override;
     bool HasCachedReports(DAddr addr, u64 size) override;
     void InvalidateRegion(DAddr addr, u64 size,
@@ -565,6 +566,7 @@ private:
     /// "Perf memory callbacks:" line: why guest accesses left fastmem, their cost and sites.
     void ReportSlowAccesses(double seconds);
     void ReportCpuWrites(double seconds);
+    void ReportCpuReads(double seconds);
     std::chrono::steady_clock::time_point perf_report_start{};
     std::chrono::steady_clock::time_point perf_frame_last{};
     std::array<u64, Common::PerfReport::Count> perf_report_counters{};

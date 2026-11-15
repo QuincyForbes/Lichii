@@ -211,7 +211,9 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// fastmem instead of through the memory callbacks (EDEN_NX2_JIT_INLINE_EXCLUSIVES=1). "jit_load_faults": a
 /// load that faults in fastmem gives it up only at its 8th fault (EDEN_NX2_JIT_LOAD_FAULTS=8).
 /// "cpu_writes_old": guest writes of pages holding GPU-written bytes stay trapped until the next
-/// fence, as before (EDEN_NX2_CPU_WRITE_RECLAIM=0). "metal_trace_off": the Metal renderer leaves
+/// fence, as before (EDEN_NX2_CPU_WRITE_RECLAIM=0). "gpu_reads_old": a guest read of GPU-written
+/// bytes still on their way makes the GPU thread copy the page again and wait for the GPU to go
+/// idle, as before (EDEN_NX2_GPU_READ_LAND=0). "metal_trace_off": the Metal renderer leaves
 /// SIGABRT and uncaught exceptions unlogged and asks for no per-encoder command buffer status
 /// (EDEN_NX2_METAL_ABORT_TRACE=0, EDEN_NX2_METAL_ENCODER_STATUS=0).
 void lichii_platform_set_experiment(const char* name, int enabled);

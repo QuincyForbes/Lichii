@@ -534,6 +534,18 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
         if (Nx2DownloadTrace::g_enabled) [[unlikely]] {
             Nx2DownloadTrace::PreflushedRead(!area->preemtive);
         }
+        if (!area->preemtive) {
+            const u64 page_bytes = device_addr_end_aligned - device_addr_start_aligned;
+            const bool in_flight = std::ranges::any_of(
+                pending_download_ranges, [&](const Common::RangeSet<DAddr>& ranges) {
+                    return ranges.Intersects(device_addr_start_aligned, page_bytes);
+                });
+            area->cause = static_cast<u8>(in_flight ? CpuReadStats::Cause::PreflushInFlight
+                                                    : CpuReadStats::Cause::PreflushQueued);
+            if (in_flight && CpuReadStats::LandMode() >= 2) {
+                area->download_tick = InFlightDownloadTick(device_addr_start_aligned, page_bytes);
+            }
+        }
         // The core consumed this trap, or keeps the area: the next GPU write must arm again.
         read_trapped_ranges.Subtract(device_addr_start_aligned,
                                      device_addr_end_aligned - device_addr_start_aligned);
@@ -556,6 +568,7 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     const bool preflush =
         forced_preflush.value_or(!Tegra::g_nx2_ampere.load(std::memory_order_relaxed));
     if (!area->preemtive) {
+        area->cause = static_cast<u8>(CpuReadStats::Cause::Trapped);
         if (Nx2DownloadTrace::g_enabled) [[unlikely]] {
             Nx2DownloadTrace::Marked(device_addr_start_aligned,
                                      device_addr_end_aligned - device_addr_start_aligned, preflush);
@@ -597,6 +610,10 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
             DownloadRangesMemory(ranges);
             return;
         }
+        if (CpuReadStats::t_in_read && CpuReadStats::LandMode() != 0) {
+            // What no download in flight holds is copied below.
+            LandInFlightForCpuRead(device_addr, size, true);
+        }
     }
     ForEachBufferInRange(device_addr, size, [&](BufferId, Buffer& buffer) {
         const DAddr start = (std::max)(device_addr, buffer.CpuAddr());
@@ -605,6 +622,101 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
             DownloadBufferMemory(buffer, start, end - start);
         }
     });
+}
+
+template <class P>
+u64 BufferCache<P>::InFlightDownloadTick(DAddr device_addr, u64 size) {
+    Common::RangeSet<DAddr> missing;
+    gpu_modified_ranges.ForEachInRange(
+        device_addr, size, [&](DAddr start, DAddr end) { missing.Add(start, end - start); });
+    u64 tick = 0;
+    for (size_t index = 0; index < pending_download_ranges.size(); ++index) {
+        const Common::RangeSet<DAddr>& ranges = pending_download_ranges[index];
+        if (!ranges.Intersects(device_addr, size)) {
+            continue;
+        }
+        tick = pending_download_ticks[index];
+        ranges.ForEachInRange(device_addr, size, [&](DAddr start, DAddr end) {
+            missing.Subtract(start, end - start);
+        });
+    }
+    return missing.Empty() ? tick : 0;
+}
+
+template <class P>
+void BufferCache<P>::LandInFlightForCpuRead(DAddr device_addr, u64 size, bool wait) {
+    // A Preflushable page read while its fence download is in flight: the copy is already
+    // recorded, so its own submission is all there is to wait for. A fresh copy waited for every
+    // later submission too (Scheduler::Finish), page after page.
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        const size_t count = pending_download_ranges.size();
+        size_t newest = count;
+        for (size_t index = 0; index < count; ++index) {
+            if (pending_download_ranges[index].Intersects(device_addr, size)) {
+                newest = index;
+            }
+        }
+        if (newest == count) {
+            return;
+        }
+        const u64 wait_begin = CpuReadStats::NowNs();
+        if (wait) {
+            runtime.Wait(pending_download_ticks[newest]);
+        } else if (!runtime.IsFree(pending_download_ticks[newest])) {
+            return;
+        }
+        const u64 wait_end = CpuReadStats::NowNs();
+        // The game reads the pages around this one next (Ocarina of Time reads a 128 KiB
+        // GPU-written region each frame): what the GPU has finished there lands along.
+        while (newest + 1 < count && runtime.IsFree(pending_download_ticks[newest + 1])) {
+            ++newest;
+        }
+        const u64 window = CpuReadStats::LandWindowBytes();
+        const DAddr lower = device_addr > window ? device_addr - window : 0;
+        const DAddr upper = device_addr + size + window;
+        const VideoCore::DownloadLanding landing{lower, upper};
+        const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+        u64 landed_bytes = 0;
+        size_t entry = 0;
+        for (const std::optional<Async_Buffer>& async_buffer : async_buffers) {
+            if (!async_buffer.has_value()) {
+                continue;
+            }
+            if (entry > newest) {
+                break;
+            }
+            Common::RangeSet<DAddr>& ranges = pending_download_ranges[entry];
+            const u8* const base = async_buffer->mapped_span.data();
+            const size_t base_offset = async_buffer->offset;
+            boost::container::small_vector<std::pair<DAddr, DAddr>, 8> landed;
+            for (const BufferCopy& copy : pending_downloads[entry]) {
+                const DAddr copy_begin = static_cast<DAddr>(copy.src_offset);
+                const DAddr begin = (std::max)(copy_begin, lower);
+                const DAddr end = (std::min)(copy_begin + copy.size, upper);
+                if (begin >= end) {
+                    continue;
+                }
+                const u8* const data = base + (copy.dst_offset - base_offset);
+                // As PopAsyncBuffers: only what no write replaced since the copy was taken.
+                ranges.ForEachInRange(begin, end - begin, [&](DAddr start, DAddr stop) {
+                    WriteDownloadedMemory(cpu_written, start, data + (start - copy_begin),
+                                          stop - start);
+                    gpu_modified_ranges.Subtract(start, stop - start);
+                    landed.emplace_back(start, stop);
+                    landed_bytes += stop - start;
+                });
+            }
+            // Its fence finds these gone and leaves them alone.
+            for (const auto& [start, stop] : landed) {
+                ranges.Subtract(start, stop - start);
+            }
+            ++entry;
+        }
+        auto& stats = CpuReadStats::g_counters;
+        CpuReadStats::Add(stats.landed, 1);
+        CpuReadStats::Add(stats.landed_ns, wait_end - wait_begin);
+        CpuReadStats::Add(stats.landed_bytes, landed_bytes);
+    }
 }
 
 template <class P>
@@ -649,7 +761,14 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
         buffer.MarkUsage(download.copy.src_offset, download.copy.size);
         runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
     }
+    const u64 finish_begin = CpuReadStats::t_in_read ? CpuReadStats::NowNs() : 0;
     runtime.Finish();
+    if (CpuReadStats::t_in_read) {
+        auto& stats = CpuReadStats::g_counters;
+        CpuReadStats::Add(stats.staged, 1);
+        CpuReadStats::Add(stats.staged_ns, CpuReadStats::NowNs() - finish_begin);
+        CpuReadStats::Add(stats.bytes, total_size_bytes);
+    }
     const u8* const mapped_memory = download_staging.mapped_span.data();
     // The CPU writes collected from now on store their bytes once this is in guest memory.
     DAddr landing_begin = ~DAddr{0};
@@ -1440,6 +1559,11 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
     }
     runtime.PostCopyBarrier();
     pending_downloads.emplace_back(std::move(normalized_copies));
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        pending_download_ticks.emplace_back(runtime.CurrentTick());
+    } else {
+        pending_download_ticks.emplace_back(0);
+    }
     pending_download_ranges.emplace_back(std::move(download_ranges));
     async_buffers.emplace_back(download_staging);
 }
@@ -1549,6 +1673,7 @@ void BufferCache<P>::PopAsyncBuffers() {
     async_buffers_death_ring.emplace_back(*async_buffer);
     async_buffers.pop_front();
     pending_downloads.pop_front();
+    pending_download_ticks.pop_front();
     pending_download_ranges.pop_front();
     if (CpuWriteStats::ReclaimMode() != 0) {
         // Pages collecting guest writes may have no GPU-written byte left: let the cores ask.
@@ -4164,7 +4289,14 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 
     if constexpr (requires { buffer.Mapped(); }) {
         if (const auto mapped = buffer.Mapped(); !mapped.empty()) {
+            const u64 wait_begin = CpuReadStats::t_in_read ? CpuReadStats::NowNs() : 0;
             runtime.Wait(buffer.LastUsageTick());
+            if (CpuReadStats::t_in_read) {
+                auto& read_stats = CpuReadStats::g_counters;
+                CpuReadStats::Add(read_stats.mapped, 1);
+                CpuReadStats::Add(read_stats.mapped_ns, CpuReadStats::NowNs() - wait_begin);
+                CpuReadStats::Add(read_stats.bytes, total_size_bytes);
+            }
             const VideoCore::DownloadLanding landing{landing_begin, landing_end};
             const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
             for (const BufferCopy& copy : copies) {
@@ -4185,7 +4317,14 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             buffer.MarkUsage(copy.src_offset, copy.size);
         }
         runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
+        const u64 finish_begin = CpuReadStats::t_in_read ? CpuReadStats::NowNs() : 0;
         runtime.Finish();
+        if (CpuReadStats::t_in_read) {
+            auto& read_stats = CpuReadStats::g_counters;
+            CpuReadStats::Add(read_stats.staged, 1);
+            CpuReadStats::Add(read_stats.staged_ns, CpuReadStats::NowNs() - finish_begin);
+            CpuReadStats::Add(read_stats.bytes, total_size_bytes);
+        }
         const VideoCore::DownloadLanding landing{landing_begin, landing_end};
         const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
         for (const BufferCopy& copy : copies) {
