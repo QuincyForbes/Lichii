@@ -422,6 +422,25 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                  graphics_made, compute_made, refused, command_buffers, encoders, passes, blits,
                  impl->rasterizer.TextureRuntime().allocated_bytes >> 20,
                  impl->rasterizer.BufferRuntime().GetDeviceMemoryUsage() >> 20);
+        // The pipeline archive: builds it served, and the build time that saved so far (each hit
+        // at the average miss's cost, less what the hit took).
+        PipelineArchive& archive = impl->rasterizer.Pipelines().Archive();
+        const PipelineArchive::Counts recent = archive.TakeCounts();
+        if (recent.hits + recent.misses != 0) {
+            const PipelineArchive::Counts total = archive.Totals();
+            const f64 miss_ms = total.misses != 0
+                                    ? static_cast<f64>(total.miss_ns) / total.misses / 1e6
+                                    : 0.0;
+            const f64 saved_ms = (std::max)(
+                miss_ms * static_cast<f64>(total.hits) - static_cast<f64>(total.hit_ns) / 1e6,
+                0.0);
+            LOG_INFO(Render_Metal,
+                     "Metal pipeline archive: {} hits ({:.1f} ms), {} misses ({:.1f} ms), {} added, "
+                     "{} not added; since boot {} hits, {} misses, ~{:.0f} ms of builds saved",
+                     recent.hits, static_cast<f64>(recent.hit_ns) / 1e6, recent.misses,
+                     static_cast<f64>(recent.miss_ns) / 1e6, recent.added, recent.add_failures,
+                     total.hits, total.misses, saved_ms);
+        }
         // Per frame, to set against MoltenVK's Perf: and Perf passes: lines.
         const f64 seconds = std::chrono::duration<f64>(now - impl->report_start).count();
         const f64 frames = static_cast<f64>((std::max)(impl->presented, u64{1}));

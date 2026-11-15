@@ -9,6 +9,7 @@
 #endif
 
 #include "common/cityhash.h"
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -90,7 +91,7 @@ void* GraphicsPipeline::KernelState(const Device& device, MeshKernel& kernel) {
     program.function =
         program.library ? CreateFunction(program.library.Get(), program.entry_point) : Object{};
     if (program.function) {
-        kernel.state = CreateComputePipelineState(device, program.function.Get(), error);
+        kernel.state = CreateComputePipelineState(device, program.function.Get(), error, archive);
     }
     if (!kernel.state) {
         kernel.failed = true;
@@ -135,7 +136,7 @@ void* GraphicsPipeline::RenderState(const Device& device, RenderPipelineDesc& de
     const auto [it, is_new] = render_states.try_emplace(hash);
     if (is_new) {
         std::string error;
-        it->second = CreateRenderPipelineState(device, desc, error);
+        it->second = CreateRenderPipelineState(device, desc, error, archive);
         if (!it->second) {
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -159,7 +160,7 @@ void* ComputePipeline::State(const Device& device) {
     program.function =
         program.library ? CreateFunction(program.library.Get(), program.entry_point) : Object{};
     if (program.function) {
-        state = CreateComputePipelineState(device, program.function.Get(), error);
+        state = CreateComputePipelineState(device, program.function.Get(), error, archive);
     }
     if (!state) {
         failed = true;
@@ -245,6 +246,14 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory,
 
 PipelineCache::~PipelineCache() = default;
 
+void PipelineCache::OpenArchive(u64 title_id) {
+    if (title_id == 0) {
+        return;
+    }
+    const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
+    archive.Open(device, shader_dir / fmt::format("{:016x}", title_id) / "metal_pipelines.bin");
+}
+
 std::array<u64, 3> PipelineCache::TakeCounts() noexcept {
     return {std::exchange(graphics_made, 0), std::exchange(compute_made, 0),
             std::exchange(refused, 0)};
@@ -266,6 +275,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     if (is_new) {
         it->second = CreateGraphicsPipeline();
         it->second ? ++graphics_made : ++refused;
+        if (it->second) {
+            it->second->SetArchive(&archive);
+        }
     }
     current_pipeline = it->second.get();
     return current_pipeline;
@@ -523,6 +535,9 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     if (is_new) {
         it->second = CreateComputePipeline(key, shader);
         it->second ? ++compute_made : ++refused;
+        if (it->second) {
+            it->second->SetArchive(&archive);
+        }
     }
     return it->second.get();
 }

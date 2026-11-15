@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -1509,6 +1510,12 @@ void RasterizerMetal::TickFrame() {
         buffer_cache.TickFrame();
     }
     staging_pool.TickFrame();
+    // New pipelines reach the archive file once a minute (and when the game stops).
+    const auto now = std::chrono::steady_clock::now();
+    if (now - archive_saved > std::chrono::minutes{1}) {
+        archive_saved = now;
+        pipeline_cache.Archive().Save();
+    }
 }
 
 bool RasterizerMetal::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
@@ -1552,8 +1559,11 @@ void RasterizerMetal::AccelerateInlineToMemory(GPUVAddr address, size_t copy_siz
     pipeline_cache.InvalidateRegion(*cpu_addr, copy_size);
 }
 
-void RasterizerMetal::LoadDiskResources(u64, std::stop_token,
-                                        const VideoCore::DiskResourceLoadCallback&) {}
+void RasterizerMetal::LoadDiskResources(u64 title_id, std::stop_token,
+                                        const VideoCore::DiskResourceLoadCallback&) {
+    pipeline_cache.OpenArchive(title_id);
+    archive_saved = std::chrono::steady_clock::now();
+}
 
 void RasterizerMetal::InitializeChannel(Tegra::Control::ChannelState& channel) {
     CreateChannel(channel);

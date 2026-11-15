@@ -18,6 +18,8 @@
 
 namespace Metal {
 
+class PipelineArchive;
+
 class Device;
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
@@ -93,8 +95,10 @@ struct DepthStencilDesc {
     StencilFaceState back;
 };
 
+/// With `archive`, the pipeline's GPU code is looked up there first and added on a miss.
 [[nodiscard]] Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc& desc,
-                                               std::string& error);
+                                               std::string& error,
+                                               PipelineArchive* archive = nullptr);
 
 [[nodiscard]] Object CreateDepthStencilState(const Device& device, const DepthStencilDesc& desc);
 

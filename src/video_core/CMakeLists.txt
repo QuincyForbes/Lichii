@@ -654,6 +654,7 @@ if (ENABLE_METAL OR LICHII_METAL_COMPILE_CHECK)
 endif()
 if (ENABLE_METAL)
     set(METAL_RENDERER_SOURCES
+        renderer_metal/metal_archive.mm
         renderer_metal/metal_device.mm
         renderer_metal/metal_graphics.mm
         renderer_metal/metal_object.mm
@@ -666,6 +667,7 @@ if (ENABLE_METAL)
     target_sources(video_core PRIVATE
         ${METAL_RENDERER_SOURCES}
         ${METAL_RENDERER_CXX_SOURCES}
+        renderer_metal/metal_archive.h
         renderer_metal/metal_bridge.h
         renderer_metal/metal_buffer_cache.h
         renderer_metal/metal_device.h

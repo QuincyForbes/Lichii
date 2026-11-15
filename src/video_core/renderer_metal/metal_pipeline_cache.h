@@ -24,6 +24,7 @@
 #include "shader_recompiler/object_pool.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/renderer_metal/metal_archive.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_object.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
@@ -161,6 +162,11 @@ public:
     /// Builds the stages' functions; false (logged once) when Metal rejects one.
     bool BuildFunctions(const Device& device);
 
+    /// The archive pipeline states are looked up in and added to (PipelineCache's).
+    void SetArchive(PipelineArchive* archive_) noexcept {
+        archive = archive_;
+    }
+
     /// The MTLRenderPipelineState for these targets, blending and vertex layout (desc's function
     /// fields are filled in here), made on first use; null when Metal refuses it.
     [[nodiscard]] void* RenderState(const Device& device, RenderPipelineDesc& desc);
@@ -170,6 +176,7 @@ private:
     StageProgram vertex;
     StageProgram fragment;
     std::optional<MeshEmulation> mesh;
+    PipelineArchive* archive{};
     ::Common::unordered_map<u64, Object> render_states;
 };
 
@@ -185,6 +192,10 @@ public:
         return key;
     }
 
+    void SetArchive(PipelineArchive* archive_) noexcept {
+        archive = archive_;
+    }
+
     /// The MTLComputePipelineState, made on first use; null (logged once) when it fails.
     [[nodiscard]] void* State(const Device& device);
 
@@ -192,6 +203,7 @@ private:
     ComputePipelineKey key;
     StageProgram program;
     Object state;
+    PipelineArchive* archive{};
     bool failed{};
 };
 
@@ -205,6 +217,13 @@ public:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
+
+    /// Opens the game's pipeline archive (EDEN_NX2_METAL_ARCHIVE=0: none).
+    void OpenArchive(u64 title_id);
+
+    [[nodiscard]] PipelineArchive& Archive() noexcept {
+        return archive;
+    }
 
     /// Pipelines made and refused since the last call (the renderer's 10 s report).
     [[nodiscard]] std::array<u64, 3> TakeCounts() noexcept;
@@ -236,6 +255,8 @@ private:
     GraphicsPipeline* current_pipeline{};
     ::Common::unordered_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
     ::Common::unordered_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_cache;
+
+    PipelineArchive archive;
 
     u64 graphics_made{};
     u64 compute_made{};

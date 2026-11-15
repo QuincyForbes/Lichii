@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <functional>
 #include <optional>
 #include <span>
@@ -277,6 +278,7 @@ private:
     u64 draws_converted{};
     u64 mesh_draws{};
     u64 mesh_groups{};
+    std::chrono::steady_clock::time_point archive_saved{};
 
     /// The GPU index rewrite of the draw being prepared.
     struct IndexRewrite {

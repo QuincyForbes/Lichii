@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 
 #import <Metal/Metal.h>
 
+#include "video_core/renderer_metal/metal_archive.h"
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_graphics.h"
@@ -259,7 +261,7 @@ u32 TopologyClass(Maxwell::PrimitiveTopology topology) {
 }
 
 Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc& desc,
-                                 std::string& error) {
+                                 std::string& error, PipelineArchive* archive) {
     MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
     descriptor.vertexFunction = (__bridge id<MTLFunction>)desc.vertex_function;
     descriptor.fragmentFunction = (__bridge id<MTLFunction>)desc.fragment_function;
@@ -333,11 +335,35 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
     }
     descriptor.vertexDescriptor = vertex;
 
+    const id<MTLBinaryArchive> binary =
+        archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
+    const auto start = std::chrono::steady_clock::now();
+    id<MTLRenderPipelineState> state = nil;
+    if (binary != nil) {
+        descriptor.binaryArchives = @[ binary ];
+        state = [device.GetDevice() newRenderPipelineStateWithDescriptor:descriptor
+                                                                 options:
+                                                                     MTLPipelineOptionFailOnBinaryArchiveMiss
+                                                              reflection:nil
+                                                                   error:nil];
+    }
+    const bool hit = state != nil;
     NSError* ns_error = nil;
-    const id<MTLRenderPipelineState> state =
-        [device.GetDevice() newRenderPipelineStateWithDescriptor:descriptor error:&ns_error];
+    if (!hit) {
+        state = [device.GetDevice() newRenderPipelineStateWithDescriptor:descriptor
+                                                                    error:&ns_error];
+    }
     if (state == nil) {
         error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
+    }
+    if (binary != nil && state != nil) {
+        archive->NoteBuild(hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     std::chrono::steady_clock::now() - start)
+                                                     .count()));
+        if (!hit) {
+            archive->NoteAdded([binary addRenderPipelineFunctionsWithDescriptor:descriptor
+                                                                          error:nil]);
+        }
     }
     return Retain(state);
 }

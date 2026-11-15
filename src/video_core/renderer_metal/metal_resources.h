@@ -18,6 +18,7 @@
 namespace Metal {
 
 class Device;
+class PipelineArchive;
 
 enum class TextureKind : u8 {
     e1D,
@@ -113,9 +114,11 @@ struct FormatInfo {
 /// An MTLFunction of a library; empty when it has none of that name.
 [[nodiscard]] Object CreateFunction(const void* library, std::string_view name);
 
-/// An MTLComputePipelineState; empty with `error` set on failure.
+/// An MTLComputePipelineState; empty with `error` set on failure. With `archive`, its GPU code
+/// is looked up there first and added on a miss.
 [[nodiscard]] Object CreateComputePipelineState(const Device& device, const void* function,
-                                                std::string& error);
+                                                std::string& error,
+                                                PipelineArchive* archive = nullptr);
 
 /// Bytes the resource (texture or buffer) holds on the GPU.
 [[nodiscard]] u64 AllocatedSize(const void* resource);
