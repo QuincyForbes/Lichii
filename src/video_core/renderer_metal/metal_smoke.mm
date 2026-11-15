@@ -4,7 +4,8 @@
 // lichii-metal-smoke: an offscreen check of the Metal paths the renderer uses, for machines
 // without a window (CI): a clear and a draw in raw Metal, then the renderer's own pieces (SPIR-V
 // -> MSL, the scheduler's render passes and compute, render pipeline states from Maxwell state,
-// rewritten quad indices, occlusion counting, texel buffer views), each read back and compared.
+// rewritten quad indices, occlusion counting, texel buffer views), each read back and compared,
+// and last the descriptor probe (metal_smoke_probe.mm; --probe <name> is its child's side).
 // Exit 0 passed, 1 failed, 2 no Metal device.
 
 #import <Foundation/Foundation.h>
@@ -38,6 +39,7 @@
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
+#include "video_core/renderer_metal/metal_smoke_probe.h"
 
 namespace {
 
@@ -1329,10 +1331,163 @@ int RunDepthStencilBlit() {
     return passed ? 0 : 1;
 }
 
+/// The pipeline check (metal_pipeline_check.cpp). The guest's layout here has what aborted the
+/// process in Ocarina of Time's first draw on the phone (vertex stream 31 has a buffer: the
+/// renderer asked Metal's vertex descriptor for buffer layout 30 - 31), an attribute past its
+/// stream's stride, one of a stream without a buffer and one the vertex function doesn't read. As
+/// it stands it is refused in words; sanitised it builds and draws.
+int RunPipelineCheck() {
+    using Maxwell = Metal::Maxwell;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, QuadSource, error);
+    const Metal::Object vertex = library ? Metal::CreateFunction(library.Get(), "quad_vertex")
+                                         : Metal::Object{};
+    const Metal::Object fragment =
+        library ? Metal::CreateFunction(library.Get(), "quad_fragment") : Metal::Object{};
+    if (!vertex || !fragment) {
+        std::printf("metal-smoke: FAIL pipeline check shaders: %s\n", error.c_str());
+        return 1;
+    }
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    auto guest = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    guest.vertex_function = vertex.Get();
+    guest.fragment_function = fragment.Get();
+    guest.color_formats[0] = rgba8;
+    guest.blend[0].write_mask = 0xF;
+    guest.samples = 1;
+    guest.topology_class = 2;
+    guest.rasterize = 1;
+    guest.attributes[0] = {1, 31, 16, Maxwell::VertexAttribute::Type::Float,
+                           Maxwell::VertexAttribute::Size::Size_R32_G32};
+    guest.attributes[3] = {1, 7, 0, Maxwell::VertexAttribute::Type::Float,
+                           Maxwell::VertexAttribute::Size::Size_R32_G32_B32_A32};
+    guest.attributes[9] = {1, 2, 0, Maxwell::VertexAttribute::Type::Float,
+                           Maxwell::VertexAttribute::Size::Size_R32};
+    guest.streams[2] = {1, 4, 0};
+    guest.streams[31] = {1, 8, 0};
+    // The vertex function loads generics 0 and 3 and has two buffers of its own.
+    constexpr uint32_t Loaded = 0b1001;
+    const Metal::PipelineLimits limits = Metal::DevicePipelineLimits(device);
+    const std::string refusal = Metal::CheckPipeline(guest, limits);
+    std::string build_error;
+    const bool refused = !refusal.empty() &&
+                         !Metal::CreateRenderPipelineState(device, guest, build_error) &&
+                         !build_error.empty();
+
+    Metal::RenderPipelineDesc desc = guest;
+    Metal::VertexSources sources{};
+    std::string reason;
+    const bool sanitised = Metal::SanitizeVertexLayout(desc, Loaded, 2, sources, reason) &&
+                           sources.count == 2 &&
+                           sources.streams[0] == Metal::VertexSource{31, 16} &&
+                           sources.streams[1] == Metal::VertexSource{} &&
+                           desc.attributes[0].stream == 0 && desc.attributes[0].offset == 0 &&
+                           desc.attributes[3].stream == 1 && desc.attributes[9].enabled == 0 &&
+                           desc.streams[31].enabled == 0 &&
+                           Metal::CheckPipeline(desc, limits).empty();
+    // What the function doesn't read leaves the description alone: one pipeline for both.
+    Metal::RenderPipelineDesc other = guest;
+    other.attributes[9].offset = 2;
+    other.streams[2].stride = 12;
+    Metal::VertexSources other_sources{};
+    const bool same = Metal::SanitizeVertexLayout(other, Loaded, 2, other_sources, reason) &&
+                      std::memcmp(&other, &desc, sizeof(desc)) == 0;
+    // No room next to 30 buffers of the function's own: refused, the description untouched.
+    Metal::RenderPipelineDesc crowded = guest;
+    reason.clear();
+    const bool crowded_refused =
+        !Metal::SanitizeVertexLayout(crowded, Loaded, 30, other_sources, reason) &&
+        !reason.empty() && std::memcmp(&crowded, &guest, sizeof(guest)) == 0;
+    Metal::RenderPipelineDesc odd = desc;
+    odd.samples = 3;
+    const bool samples_refused = !Metal::CheckPipeline(odd, limits).empty();
+    odd = desc;
+    odd.depth_format = rgba8;
+    const bool depth_refused = !Metal::CheckPipeline(odd, limits).empty();
+    const bool textures_refused =
+        !Metal::CreateTexture(device, {.format = rgba8, .width = 32768, .render_target = true}) &&
+        !Metal::CreateTexture(device, {.format = rgba8, .width = 16, .levels = 9});
+
+    const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
+    const Metal::Object depth_stencil =
+        Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+    if (!pipeline || !depth_stencil) {
+        std::printf("metal-smoke: FAIL pipeline check: sanitised layout (%s) does not build: %s\n",
+                    Metal::Describe(desc).c_str(), error.c_str());
+        return 1;
+    }
+    // 16 bytes the attribute's offset skips, then two triangles over the whole target.
+    uint8_t* vertices = nullptr;
+    const Metal::Object vertex_buffer = Metal::CreateBuffer(device, 64, true, &vertices);
+    const float positions[12]{-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1};
+    std::memset(vertices, 0, 64);
+    std::memcpy(vertices + 16, positions, sizeof(positions));
+    const Metal::Object zeros = Metal::CreateBuffer(device, 64, false, nullptr);
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = rgba8,
+                 .width = Size,
+                 .height = Size,
+                 .render_target = true});
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer = Metal::CreateBuffer(device, Size * Size * 4, true, &readback);
+
+    Metal::ClearPass clear{};
+    clear.color[0] = {.texture = target.Get()};
+    clear.clear_color[0] = true;
+    clear.color_value[0] = {1.0, 0.0, 0.0, 1.0};
+    clear.width = Size;
+    clear.height = Size;
+    scheduler.Clear(clear);
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = Size;
+    targets.height = Size;
+    scheduler.BeginRendering(targets);
+    Metal::DrawState state{};
+    state.pipeline = pipeline.Get();
+    state.depth_stencil = depth_stencil.Get();
+    state.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+    state.scissor = {0, 0, Size, Size};
+    scheduler.SetDrawState(state);
+    for (uint32_t slot = 0; slot < sources.count; ++slot) {
+        const Metal::VertexSource& source = sources.streams[slot];
+        const bool is_zeros = source.stream == Metal::VertexSource::Zeros;
+        scheduler.BindVertexBuffer(Metal::VertexBufferSlot(slot),
+                                   is_zeros ? zeros.Get() : vertex_buffer.Get(), source.shift);
+    }
+    scheduler.SetVisibility(std::nullopt);
+    scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 6, 1, 0);
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Size, Size, 1}, readback_buffer.Get(),
+                                  0, Size * 4, 0);
+    scheduler.Finish();
+
+    const auto* texels = reinterpret_cast<const Texel*>(readback);
+    const Texel first = texels[4 * Size + 4];
+    const Texel last = texels[(Size - 4) * Size + Size - 4];
+    const bool drawn = Near(first, {0, 255, 0, 255}) && Near(last, {0, 255, 0, 255});
+    const bool passed = refused && sanitised && same && crowded_refused && samples_refused &&
+                        depth_refused && textures_refused && drawn;
+    std::printf("metal-smoke: pipeline check: stream 31 %s (%s); sanitised to %u streams %s, "
+                "equal for unread state %d, crowded %d, 3 samples %d, colour as depth %d, "
+                "textures %d; drawn %u,%u,%u and %u,%u,%u: %s\n",
+                refused ? "refused" : "NOT refused", refusal.c_str(), sources.count,
+                sanitised ? "as expected" : "NOT as expected", same, crowded_refused,
+                samples_refused, depth_refused, textures_refused, first.r, first.g, first.b,
+                last.r, last.g, last.b, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 } // Anonymous namespace
 
-int main() {
+int main(int argc, char** argv) {
     @autoreleasepool {
+        if (argc == 3 && std::strcmp(argv[1], "--probe") == 0) {
+            return SmokeProbe::RunChild(argv[2]);
+        }
         const int draw = Run();
         if (draw == 2) {
             return 2;
@@ -1341,7 +1496,8 @@ int main() {
         for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer, RunMeshEmulation,
                                  RunMeshDistribution, RunIndexRewrite,
                                  RunOcarinaBilinear, RunPipelineArchive,
-                                 RunDepthBlit, RunTessellation, RunDepthStencilBlit}) {
+                                 RunDepthBlit, RunTessellation, RunDepthStencilBlit,
+                                 RunPipelineCheck, SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }

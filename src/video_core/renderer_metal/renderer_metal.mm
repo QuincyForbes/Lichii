@@ -22,6 +22,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #include <fmt/format.h>
 
+#include "common/console_capture.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/scope_exit.h"
@@ -198,6 +199,27 @@ std::string DescribeFrames(void* const* frames, int count) {
     return text;
 }
 
+/// What the process printed last, on one line (iOS: the end of console.txt; nothing where the
+/// console isn't captured). Metal names the descriptor or call it rejects there, then aborts.
+std::string ConsoleTail() {
+    static constexpr size_t MaxBytes = 2048;
+    std::string text = Common::ConsoleCaptureTail(2 * MaxBytes);
+    if (const size_t assertion = text.rfind("failed assertion"); assertion != std::string::npos) {
+        // From the assertion's own line on, without the log lines before it.
+        const size_t line = text.rfind('\n', assertion);
+        text.erase(0, line != std::string::npos ? line + 1 : 0);
+        text.resize((std::min)(text.size(), MaxBytes));
+    } else if (text.size() > MaxBytes) {
+        text.erase(0, text.size() - MaxBytes);
+    }
+    for (char& character : text) {
+        if (static_cast<unsigned char>(character) < 0x20 || character == 0x7f) {
+            character = ' ';
+        }
+    }
+    return text.empty() ? "nothing captured" : text;
+}
+
 struct sigaction previous_abort {};
 NSUncaughtExceptionHandler* previous_exception_handler = nullptr;
 
@@ -209,9 +231,9 @@ void OnAbort(int, siginfo_t*, void*) {
         void* frames[32];
         const int count = backtrace(frames, 32);
         LOG_CRITICAL(Render_Metal,
-                     "Process aborted (SIGABRT) on thread \"{}\"; a message Metal printed first "
-                     "is in console.txt; frames: {}",
-                     thread_name, DescribeFrames(frames, count));
+                     "Process aborted (SIGABRT) on thread \"{}\"; frames: {}; the end of "
+                     "console.txt, where Metal prints its reason first: {}",
+                     thread_name, DescribeFrames(frames, count), ConsoleTail());
     }
     // The abort goes on as it would have without this handler.
     sigaction(SIGABRT, &previous_abort, nullptr);
@@ -229,9 +251,10 @@ void OnUncaughtException(NSException* exception) {
     }
     const char* const name = exception.name.UTF8String;
     const char* const reason = exception.reason.UTF8String;
-    LOG_CRITICAL(Render_Metal, "Uncaught Objective-C exception {}: {}; frames: {}",
+    LOG_CRITICAL(Render_Metal,
+                 "Uncaught Objective-C exception {}: {}; frames: {}; the end of console.txt: {}",
                  name != nullptr ? name : "?", reason != nullptr ? reason : "no reason",
-                 DescribeFrames(frames, count));
+                 DescribeFrames(frames, count), ConsoleTail());
     if (previous_exception_handler != nullptr) {
         previous_exception_handler(exception);
     }

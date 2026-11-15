@@ -286,8 +286,8 @@ void* GraphicsPipeline::VertexKernelState(const Device& device, size_t variant,
         if (!it->second) {
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_ERROR(Render_Metal, "Metal: vertex kernel state of {:016x} refused: {}",
-                          key.unique_hashes[1], error);
+                LOG_ERROR(Render_Metal, "Metal: vertex kernel state of {:016x} refused: {}; {}",
+                          key.unique_hashes[1], error, Describe(layout));
             }
         }
     }
@@ -348,13 +348,20 @@ void* GraphicsPipeline::RenderState(const Device& device, RenderPipelineDesc& de
     const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(&desc), sizeof(desc));
     const auto [it, is_new] = render_states.try_emplace(hash);
     if (is_new) {
+        // The boot trace: what the first pipelines ask of Metal, written before Metal sees it.
+        static std::atomic<u32> traced{};
+        if (BootTraceEnabled() && traced.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_INFO(Render_Metal, "Metal: render pipeline {:016x} fragment {:016x}: {}",
+                     key.unique_hashes[1], key.unique_hashes[5], Describe(desc));
+        }
         std::string error;
         it->second = CreateRenderPipelineState(device, desc, error, archive);
         if (!it->second) {
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_ERROR(Render_Metal, "Metal: render pipeline {:016x} refused: {}",
-                          key.unique_hashes[1], error);
+                LOG_WARNING(Render_Metal,
+                            "Metal: render pipeline {:016x} refused: {}; fragment {:016x}, {}",
+                            key.unique_hashes[1], error, key.unique_hashes[5], Describe(desc));
             }
         }
     }

@@ -262,10 +262,27 @@ u32 TopologyClass(Maxwell::PrimitiveTopology topology) {
     }
 }
 
+PipelineLimits DevicePipelineLimits(const Device& device) {
+    PipelineLimits limits{.sample_counts = 0};
+    for (const u32 samples : {1U, 2U, 4U, 8U}) {
+        if ([device.GetDevice() supportsTextureSampleCount:samples]) {
+            limits.sample_counts |= 1U << samples;
+        }
+    }
+    return limits;
+}
+
 Object CreateStageInComputePipelineState(const Device& device, const void* function,
                                          const RenderPipelineDesc& layout, u32 index_size,
                                          u32 index_slot, std::string& error,
                                          PipelineArchive* archive) {
+    if (PipelineCheckEnabled()) {
+        // The descriptor's arrays abort the process past their ends.
+        error = CheckVertexLayout(layout);
+        if (!error.empty()) {
+            return {};
+        }
+    }
     // MTLAttributeFormat has MTLVertexFormat's values.
     MTLStageInputOutputDescriptor* stage_in = [MTLStageInputOutputDescriptor new];
     for (size_t index = 0; index < layout.attributes.size(); ++index) {
@@ -287,10 +304,10 @@ Object CreateStageInComputePipelineState(const Device& device, const void* funct
         }
         MTLBufferLayoutDescriptor* buffer =
             stage_in.layouts[VertexBufferSlot(static_cast<u32>(index))];
-        if (stream.stride == 0) {
+        if (stream.stride == 0 || stream.divisor == ConstantStep) {
             buffer.stepFunction = MTLStepFunctionConstant;
             buffer.stepRate = 0;
-            buffer.stride = 16;
+            buffer.stride = stream.stride != 0 ? stream.stride : 16;
         } else if (stream.divisor != 0) {
             buffer.stepFunction = MTLStepFunctionThreadPositionInGridY;
             buffer.stepRate = stream.divisor;
@@ -313,6 +330,13 @@ Object CreateStageInComputePipelineState(const Device& device, const void* funct
 
 Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc& desc,
                                  std::string& error, PipelineArchive* archive) {
+    if (PipelineCheckEnabled()) {
+        // What Metal answers with an assertion instead of an error (metal_pipeline_check.cpp).
+        error = CheckPipeline(desc, DevicePipelineLimits(device));
+        if (!error.empty()) {
+            return {};
+        }
+    }
     MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
     descriptor.vertexFunction = (__bridge id<MTLFunction>)desc.vertex_function;
     descriptor.fragmentFunction = (__bridge id<MTLFunction>)desc.fragment_function;
@@ -392,11 +416,11 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
         }
         MTLVertexBufferLayoutDescriptor* layout =
             vertex.layouts[VertexBufferSlot(static_cast<u32>(index))];
-        if (stream.stride == 0) {
+        if (stream.stride == 0 || stream.divisor == ConstantStep) {
             // One element for every vertex (Metal wants a non-zero stride otherwise).
             layout.stepFunction = MTLVertexStepFunctionConstant;
             layout.stepRate = 0;
-            layout.stride = 16;
+            layout.stride = stream.stride != 0 ? stream.stride : 16;
         } else if (stream.divisor != 0) {
             layout.stepFunction = MTLVertexStepFunctionPerInstance;
             layout.stepRate = stream.divisor;

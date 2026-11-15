@@ -359,6 +359,10 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_METAL_ENCODER_STATUS", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment metal_trace_off on");
     }
+    if (lichii_platform_experiment("metal_check_off")) {
+        setenv("EDEN_NX2_METAL_PIPELINE_CHECK", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_check_off on");
+    }
     if (lichii_platform_experiment("metal_fixed_state_off")) {
         setenv("EDEN_NX2_METAL_FIXED_STATE", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment metal_fixed_state_off on");

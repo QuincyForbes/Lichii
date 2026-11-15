@@ -37,6 +37,8 @@ add_library(
     common_funcs.h
     common_types.h
     concepts.h
+    console_capture.cpp
+    console_capture.h
     container_hash.h
     demangle.cpp
     demangle.h

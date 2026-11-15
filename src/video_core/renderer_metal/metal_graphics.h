@@ -22,6 +22,8 @@ class PipelineArchive;
 
 class Device;
 
+struct TextureDesc;
+
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 
 /// Vertex stream i is bound at buffer slot 30 - i (below the translator's
@@ -29,6 +31,13 @@ using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 [[nodiscard]] constexpr u32 VertexBufferSlot(u32 stream) noexcept {
     return 30 - stream;
 }
+
+/// Attributes and buffer layouts of a Metal vertex descriptor; asking the descriptor for one past
+/// them aborts the process.
+inline constexpr u32 MaxVertexSlots = 31;
+
+/// VertexStreamState::divisor of a stream read at the same place for every vertex and instance.
+inline constexpr u32 ConstantStep = ~0U;
 
 template <typename T>
 [[nodiscard]] T Zeroed() noexcept {
@@ -59,7 +68,7 @@ struct VertexAttributeState {
 struct VertexStreamState {
     u32 enabled;
     u32 stride;
-    u32 divisor; ///< 0: per vertex
+    u32 divisor; ///< 0: per vertex, ConstantStep: one element for all
 };
 
 struct RenderPipelineDesc {
@@ -81,6 +90,61 @@ struct RenderPipelineDesc {
     u32 tess_partition;
     u32 tess_winding;
 };
+
+/// Where the buffer of a sanitised vertex layout's stream comes from (SanitizeVertexLayout).
+struct VertexSource {
+    static constexpr u32 Zeros = ~0U;
+
+    u32 stream{Zeros}; ///< The guest's vertex stream, or Zeros: a buffer of zeros
+    u32 shift{};       ///< Added to the offset the stream's buffer is bound at
+
+    bool operator==(const VertexSource&) const noexcept = default;
+};
+
+struct VertexSources {
+    std::array<VertexSource, Maxwell::NumVertexArrays> streams{};
+    u32 count{};
+};
+
+/// What the device takes in a render pipeline descriptor.
+struct PipelineLimits {
+    u32 sample_counts{1U << 1}; ///< Bit n: n samples per pixel
+};
+
+/// EDEN_NX2_METAL_PIPELINE_CHECK (on by default; 0: descriptors go to Metal as the guest's state
+/// gives them, and one Metal rejects by assertion aborts the process).
+[[nodiscard]] bool PipelineCheckEnabled();
+
+/// EDEN_NX2_METAL_ABORT_TRACE (on by default): the renderer's boot trace.
+[[nodiscard]] bool BootTraceEnabled();
+
+/// Bytes of a vertex attribute in the stream, 0 when Metal has no vertex format for it.
+[[nodiscard]] u32 VertexFormatBytes(Maxwell::VertexAttribute::Type type,
+                                    Maxwell::VertexAttribute::Size size);
+
+/// Rewrites desc's vertex layout into one Metal takes, as Vulkan and MoltenVK present the same
+/// guest state: only the attributes the vertex function reads (bit n of `loaded`: generic n), only
+/// the streams those read, numbered from 0 in `sources`; an attribute of an unbound stream reads
+/// zeros; an attribute past its stream's stride moves to a copy of the stream bound further on.
+/// `resource_slots` buffer slots from 0 up belong to the function's resources. False (desc
+/// untouched, `reason` set) when the layout doesn't fit Metal's vertex descriptor.
+[[nodiscard]] bool SanitizeVertexLayout(RenderPipelineDesc& desc, u32 loaded, u32 resource_slots,
+                                        VertexSources& sources, std::string& reason);
+
+/// Why Metal would reject (by assertion, aborting the process) desc's vertex layout, or nothing.
+[[nodiscard]] std::string CheckVertexLayout(const RenderPipelineDesc& desc);
+
+/// Why Metal would reject desc by assertion, or nothing.
+[[nodiscard]] std::string CheckPipeline(const RenderPipelineDesc& desc,
+                                        const PipelineLimits& limits);
+
+/// Why Metal would reject the texture by assertion, or nothing.
+[[nodiscard]] std::string CheckTexture(const TextureDesc& desc, const PipelineLimits& limits);
+
+/// The whole description on one line, for the log.
+[[nodiscard]] std::string Describe(const RenderPipelineDesc& desc);
+
+[[nodiscard]] PipelineLimits DevicePipelineLimits(const Device& device);
 
 struct StencilFaceState {
     Maxwell::StencilOp::Op fail;
