@@ -7,6 +7,9 @@
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #include <dlfcn.h>
+#include <array>
+#include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <string_view>
 #endif
@@ -125,6 +128,81 @@ void DisableOverwolfLayers() {
 } // namespace
 #endif
 
+#ifdef __APPLE__
+namespace {
+
+// MVKPerformanceTracker and MVKPerformanceStatistics of MoltenVK's mvk_private_api.h
+// (MVK_PRIVATE_API_VERSION 43): shader compilation first, then pipeline cache, queue and device.
+struct MvkTracker {
+    uint32_t count;
+    double latest;
+    double previous;
+    double average;
+    double minimum;
+    double maximum;
+};
+struct MvkStatistics {
+    std::array<MvkTracker, 11> shader_compilation;
+    std::array<MvkTracker, 13> rest;
+};
+using MvkGetStatistics = int (*)(void* device, MvkStatistics* statistics, size_t* size);
+
+std::atomic<MvkGetStatistics> mvk_get_statistics{};
+
+// EDEN_NX2_MVK_STATS=0|1: MoltenVK times its compilation stages (default 1 on iOS, 0 on macOS).
+bool MoltenVKStatsWanted() {
+    static const bool wanted = [] {
+        if (const char* const env = std::getenv("EDEN_NX2_MVK_STATS"); env && env[0] != '\0') {
+            return env[0] != '0';
+        }
+        return TARGET_OS_IPHONE != 0;
+    }();
+    return wanted;
+}
+
+} // namespace
+#endif
+
+bool ReadMoltenVKStages([[maybe_unused]] void* device,
+                        [[maybe_unused]] std::array<MoltenVKStage, 11>& stages) {
+#ifdef __APPLE__
+    const MvkGetStatistics get = mvk_get_statistics.load(std::memory_order_relaxed);
+    if (get == nullptr || device == nullptr) {
+        return false;
+    }
+    // Another MoltenVK's statistics may be laid out differently: its size tells.
+    static const bool layout_known = [&] {
+        size_t size = 0;
+        const int result = get(device, nullptr, &size);
+        if (result == 0 && size == sizeof(MvkStatistics)) {
+            return true;
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "MoltenVK statistics are {} bytes ({} expected, result {}): no stage times",
+                    size, sizeof(MvkStatistics), result);
+        return false;
+    }();
+    if (!layout_known) {
+        return false;
+    }
+    MvkStatistics statistics{};
+    size_t size = sizeof(statistics);
+    if (get(device, &statistics, &size) != 0 || size != sizeof(statistics)) {
+        return false;
+    }
+    for (size_t index = 0; index < stages.size(); ++index) {
+        const MvkTracker& tracker = statistics.shader_compilation[index];
+        stages[index] = MoltenVKStage{
+            .count = tracker.count,
+            .total_ms = tracker.average * static_cast<double>(tracker.count),
+        };
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 std::shared_ptr<Common::DynamicLibrary> OpenLibrary(
     [[maybe_unused]] Core::Frontend::GraphicsContext* context) {
 #ifdef _WIN32
@@ -153,7 +231,8 @@ std::shared_ptr<Common::DynamicLibrary> OpenLibrary(
         setenv("MVK_CONFIG_RESUME_LOST_DEVICE", "1", 0);
         setenv("MVK_CONFIG_SHADER_COMPRESSION_ALGORITHM", "1", 0);
         setenv("MVK_CONFIG_LOG_LEVEL", "2", 0);
-        setenv("MVK_CONFIG_PERFORMANCE_TRACKING", "0", 0);
+        // Tracked (nothing is logged by MoltenVK) only for the "Perf pipelines:" stage times.
+        setenv("MVK_CONFIG_PERFORMANCE_TRACKING", MoltenVKStatsWanted() ? "1" : "0", 0);
         // MoltenVK waits for each Metal library and pipeline compile without a limit by default,
         // and every compile's submission holds a lock on the MTLDevice: one stuck in Metal's
         // compiler (MoltenVK's docs: 30 s and more on an internal compiler error) held up every
@@ -209,6 +288,12 @@ std::shared_ptr<Common::DynamicLibrary> OpenLibrary(
             library->Close();
             continue;
         }
+        mvk_get_statistics.store(
+            MoltenVKStatsWanted()
+                ? reinterpret_cast<MvkGetStatistics>(
+                      library->GetSymbolAddress("vkGetPerformanceStatisticsMVK"))
+                : nullptr,
+            std::memory_order_relaxed);
         // Warning level: iOS filters Render.Vulkan below it.
         if (want_mesh && !mesh && library_path != env_path) {
             LOG_WARNING(Render_Vulkan,

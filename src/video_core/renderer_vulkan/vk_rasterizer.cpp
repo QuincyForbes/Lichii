@@ -4428,6 +4428,7 @@ void RasterizerVulkan::TickPerfReport() {
                               static_cast<double>(now_counts.list_bytes) / (1 << 20)));
     }
     Scheduler::ReportPerfSites(frames);
+    pipeline_cache.ReportBuilds(seconds);
     perf_report_jit_cores = jit_cores;
     if (!jit_core_text.empty()) {
         LOG_INFO(Common_Memory, "Perf JIT ({} MiB per core, {} shared fault markers + {} blocks): {}",

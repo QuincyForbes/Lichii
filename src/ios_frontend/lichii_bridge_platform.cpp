@@ -350,6 +350,18 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_DISPATCH_DEPS", "1", 1);
         LOG_WARNING(Frontend, "iOS: experiment dispatch_deps on");
     }
+    if (lichii_platform_experiment("pipeline_holds_old")) {
+        setenv("EDEN_NX2_PIPELINE_HOLD_BOOST", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment pipeline_holds_old on");
+    }
+    if (lichii_platform_experiment("pipeline_list_old")) {
+        setenv("EDEN_NX2_USED_PIPELINES_SAVE_S", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment pipeline_list_old on");
+    }
+    if (lichii_platform_experiment("mvk_stats_off")) {
+        setenv("EDEN_NX2_MVK_STATS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment mvk_stats_off on");
+    }
     ApplyCpuExperiments();
 }
 

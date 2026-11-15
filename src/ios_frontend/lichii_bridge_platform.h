@@ -212,6 +212,11 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// load that faults in fastmem gives it up only at its 8th fault (EDEN_NX2_JIT_LOAD_FAULTS=8).
 /// "cpu_writes_old": guest writes of pages holding GPU-written bytes stay trapped until the next
 /// fence, as before (EDEN_NX2_CPU_WRITE_RECLAIM=0).
+/// "pipeline_holds_old": the pipeline build a draw waits for stays queued on the builder pool, as
+/// before (EDEN_NX2_PIPELINE_HOLD_BOOST=0). "pipeline_list_old": the used pipelines list is
+/// written only on a first use 15 s after the last save and at shutdown, as before
+/// (EDEN_NX2_USED_PIPELINES_SAVE_S=0). "mvk_stats_off": MoltenVK does not time its compilation
+/// stages (EDEN_NX2_MVK_STATS=0).
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
 /// Bench mode: for the rest of this process lichii_platform_experiment reports `names` as on and

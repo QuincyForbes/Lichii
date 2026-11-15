@@ -122,6 +122,8 @@ public:
     using EmitStagesFunc = std::function<std::array<vk::ShaderModule, NUM_STAGES>(
         std::array<u128, NUM_STAGES>& spirv_hashes)>;
 
+    /// `held_workers` (EDEN_NX2_PIPELINE_HOLD_BOOST): the pool a draw held for this pipeline
+    /// moves its build to; with `held_build` (the draw asking is known to wait) it starts there.
     /// Graphics pipeline libraries (EDEN_NX2_GPL): non-null `library_cache` builds the pipeline
     /// from per-stage libraries; the stages were emitted with one descriptor set per stage.
     /// `libraries_only` builds the shader libraries and nothing else (warm-up, no draw).
@@ -140,7 +142,8 @@ public:
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
         EmitStagesFunc emit_stages = {},
         std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt,
-        LibraryParams library_params = {});
+        LibraryParams library_params = {}, Common::ThreadWorker* held_workers = nullptr,
+        bool held_build = false);
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
 
@@ -457,6 +460,7 @@ private:
     std::vector<u32> binding_kinds; ///< EDEN_NX2_BINDMEMO: per texture/image view, in read order
 
     const bool worker_only_build;
+    Common::ThreadWorker* const held_workers;
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
 

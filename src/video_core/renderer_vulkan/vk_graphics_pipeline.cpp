@@ -12,6 +12,7 @@
 #include <cstring>
 #include <chrono>
 #include <string>
+#include <thread>
 #include <iostream>
 #include <set>
 #include <span>
@@ -27,6 +28,7 @@
 #include "common/bit_field.h"
 #include "common/perf_report.h"
 #include "common/scope_exit.h"
+#include "common/thread_cpu_clock.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -421,6 +423,29 @@ ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
 
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
 
+/// EDEN_NX2_PIPELINE_BUILD_DELAY_MS=<ms>: each pipeline built during play first burns that much
+/// CPU time on its builder, standing in for a slow driver compile when holds are measured.
+void SimulateSlowBuild() {
+    static const u64 delay_ns = [] {
+        const char* const value = std::getenv("EDEN_NX2_PIPELINE_BUILD_DELAY_MS");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) * 1'000'000 : u64{0};
+    }();
+    if (delay_ns == 0) [[likely]] {
+        return;
+    }
+    const PipelineBuilder who = CurrentPipelineBuilder();
+    if (who == PipelineBuilder::Boot || who == PipelineBuilder::Prebuild) {
+        return;
+    }
+    const auto start = Common::CurrentThreadCpuTimeNs();
+    if (!start) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds{delay_ns});
+        return;
+    }
+    while (Common::CurrentThreadCpuTimeNs().value_or(*start + delay_ns) - *start < delay_ns) {
+    }
+}
+
 const bool g_align_storage_handles = [] {
     const char* const value = std::getenv("EDEN_NX2_HANDLE_ALIGN");
     return value == nullptr || *value != '0';
@@ -457,7 +482,8 @@ GraphicsPipeline::GraphicsPipeline(
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
     const std::array<const Shader::Info*, NUM_STAGES>& infos, EmitStagesFunc emit_stages,
-    std::optional<MeshEmulationSetup> mesh_emulation_, LibraryParams library_params)
+    std::optional<MeshEmulationSetup> mesh_emulation_, LibraryParams library_params,
+    Common::ThreadWorker* held_workers_, bool held_build)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
@@ -466,7 +492,7 @@ GraphicsPipeline::GraphicsPipeline(
       libraries_only{library_params.library_cache && library_params.libraries_only},
       spirv_hashes{library_params.spirv_hashes},
       worker_only_build{worker_thread && static_cast<bool>(emit_stages)},
-      mesh_emulation{std::move(mesh_emulation_)} {
+      held_workers{held_workers_}, mesh_emulation{std::move(mesh_emulation_)} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -641,9 +667,16 @@ GraphicsPipeline::GraphicsPipeline(
                 shader_notify->MarkShaderComplete();
             }
         };
+        SimulateSlowBuild();
         try {
             if (emit_stages) {
+                const auto emit_begin = std::chrono::steady_clock::now();
                 spv_modules = emit_stages(spirv_hashes);
+                PipelineBuildStats::Get().emission_ns.fetch_add(
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - emit_begin)
+                                         .count()),
+                    std::memory_order_relaxed);
             }
             const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
             Validate();
@@ -725,7 +758,7 @@ GraphicsPipeline::GraphicsPipeline(
         present_stages[stage] = infos[stage] != nullptr;
     }
     configure_func = ConfigureFunc(present_stages, stage_infos);
-    build.emplace(worker_thread, std::move(func));
+    build.emplace(worker_thread, std::move(func), held_build ? held_workers : nullptr);
 }
 
 void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
@@ -1337,7 +1370,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             scheduler.RequestOutsideRenderPassOperationContext();
         }
         if (!IsBuilt()) {
-            scheduler.Record([this](vk::CommandBuffer) { build->Wait(!worker_only_build); });
+            scheduler.Record([this](vk::CommandBuffer) {
+                build->WaitHeld(!worker_only_build, held_workers);
+            });
         }
         const u64 current_tick = scheduler.CurrentTick();
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
@@ -1516,11 +1551,15 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
             const auto begin = std::chrono::steady_clock::now();
-            const bool built_here = build->Wait(!worker_only_build);
+            const bool built_here = build->WaitHeld(!worker_only_build, held_workers);
             const auto held = std::chrono::steady_clock::now() - begin;
             const auto held_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(held).count();
             hold_time_ns.fetch_add(held_ns, std::memory_order::relaxed);
             Common::PerfReport::Add(Common::PerfReport::DrawHoldNs, static_cast<u64>(held_ns));
+            PipelineBuildStats& stats = PipelineBuildStats::Get();
+            stats.held_draws.fetch_add(1, std::memory_order_relaxed);
+            stats.held_ns.fetch_add(static_cast<u64>(held_ns), std::memory_order_relaxed);
+            PipelineBuildStats::StoreMax(stats.held_max_ns, static_cast<u64>(held_ns));
             if (held >= std::chrono::milliseconds{100}) {
                 // Warning: the iOS log shows Render.Vulkan only from there. The GPU thread waits
                 // for this worker at its next submission, so this is a frame hitch.
@@ -1532,7 +1571,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                             : mesh_emulation               ? "mesh emulated"
                             : IsMeshPipeline()             ? "native mesh"
                                                            : "vertex",
-                            built_here ? "on the Vulkan worker" : "by a pipeline worker",
+                            built_here                                    ? "on the Vulkan worker"
+                            : build->Builder() == PipelineBuilder::Held ? "by a held-build worker"
+                                                                        : "by a pipeline worker",
                             key.unique_hashes[1], key.unique_hashes[5]);
             }
             if (library_cache) {
