@@ -16,15 +16,20 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <span>
 #include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/attribute.h"
 #include "shader_recompiler/shader_info.h"
+#include "device_msl_smoke_frag_spv.h"
+#include "device_msl_smoke_vert_spv.h"
 #include "tess_smoke_tesc_spv.h"
 #include "tess_smoke_tese_spv.h"
 #include "tess_smoke_vert_spv.h"
@@ -1646,6 +1651,231 @@ int RunPipelineCheck() {
     return passed ? 0 : 1;
 }
 
+/// EDEN_NX2_METAL_MSL_DEVICE: a vertex program that reads the base instance and a pixel program
+/// with subgroup operations, translated for iOS without the GPU's family (the first is refused)
+/// and with it, then built for this device and drawn: two instances from base instance 5.
+/// LICHII_SMOKE_IOS_MSL names a directory the iOS translations are written to, for the iOS Metal
+/// compiler (metal.yml).
+int RunDeviceMsl() {
+    namespace Translate = Metal::ShaderTranslate;
+    const std::span<const uint32_t> vertex_spirv{DEVICE_MSL_SMOKE_VERT_SPV};
+    const std::span<const uint32_t> fragment_spirv{DEVICE_MSL_SMOKE_FRAG_SPV};
+    Translate::Options plain;
+    plain.ios = true;
+    const Translate::Result plain_vertex =
+        Translate::SpirvToMsl(vertex_spirv, Translate::Stage::Vertex, plain);
+    const Translate::Result plain_fragment =
+        Translate::SpirvToMsl(fragment_spirv, Translate::Stage::Fragment, plain);
+    Translate::Options phone = plain;
+    phone.apple_family = 10;
+    const Translate::Result phone_vertex =
+        Translate::SpirvToMsl(vertex_spirv, Translate::Stage::Vertex, phone);
+    const Translate::Result phone_fragment =
+        Translate::SpirvToMsl(fragment_spirv, Translate::Stage::Fragment, phone);
+    const auto has = [](const Translate::Result& msl, const char* word) {
+        return msl.source.find(word) != std::string::npos;
+    };
+    const bool translated = plain_vertex.source.empty() && has(plain_fragment, "quad_shuffle") &&
+                            has(phone_vertex, "base_instance") &&
+                            has(phone_fragment, "simd_shuffle") &&
+                            has(phone_fragment, "simd_ballot") &&
+                            !has(phone_fragment, "quad_");
+    if (const char* const directory = std::getenv("LICHII_SMOKE_IOS_MSL")) {
+        const std::filesystem::path root{directory};
+        std::error_code code;
+        std::filesystem::create_directories(root, code);
+        for (const auto& [name, msl] : {std::pair{"device_msl_vertex.metal", &phone_vertex},
+                                        std::pair{"device_msl_fragment.metal", &phone_fragment}}) {
+            if (std::FILE* const file = std::fopen((root / name).c_str(), "wb")) {
+                std::fwrite(msl->source.data(), 1, msl->source.size(), file);
+                std::fclose(file);
+            }
+        }
+    }
+
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Translate::Options here;
+    here.apple_family = device.AppleFamily();
+    const Translate::Result vertex_msl =
+        Translate::SpirvToMsl(vertex_spirv, Translate::Stage::Vertex, here);
+    const Translate::Result fragment_msl =
+        Translate::SpirvToMsl(fragment_spirv, Translate::Stage::Fragment, here);
+    std::string error = vertex_msl.error + fragment_msl.error;
+    const Metal::Object vertex_library = Metal::CreateLibrary(device, vertex_msl.source, error);
+    const Metal::Object fragment_library =
+        Metal::CreateLibrary(device, fragment_msl.source, error);
+    const Metal::Object vertex = vertex_library ? Metal::CreateFunction(vertex_library.Get(),
+                                                                        vertex_msl.entry_point)
+                                                : Metal::Object{};
+    const Metal::Object fragment =
+        fragment_library ? Metal::CreateFunction(fragment_library.Get(), fragment_msl.entry_point)
+                         : Metal::Object{};
+    if (!vertex || !fragment) {
+        std::printf("metal-smoke: FAIL device MSL: the translation does not build: %s\n",
+                    error.c_str());
+        return 1;
+    }
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = vertex.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = rgba8;
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
+    const Metal::Object depth_stencil =
+        Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+    if (!pipeline || !depth_stencil) {
+        std::printf("metal-smoke: FAIL device MSL: pipeline: %s\n", error.c_str());
+        return 1;
+    }
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = rgba8,
+                 .width = Size,
+                 .height = Size,
+                 .render_target = true});
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Size * Size * 4, true, &readback);
+
+    Metal::ClearPass clear{};
+    clear.color[0] = {.texture = target.Get()};
+    clear.clear_color[0] = true;
+    clear.color_value[0] = {0.0, 0.0, 1.0, 1.0};
+    clear.width = Size;
+    clear.height = Size;
+    scheduler.Clear(clear);
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = Size;
+    targets.height = Size;
+    scheduler.BeginRendering(targets);
+    Metal::DrawState state{};
+    state.pipeline = pipeline.Get();
+    state.depth_stencil = depth_stencil.Get();
+    state.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+    state.scissor = {0, 0, Size, Size};
+    scheduler.SetDrawState(state);
+    scheduler.SetVisibility(std::nullopt);
+    scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangleStrip), 0, 4, 2, 5);
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Size, Size, 1}, readback_buffer.Get(),
+                                  0, Size * 4, 0);
+    scheduler.Finish();
+
+    const auto* texels = reinterpret_cast<const Texel*>(readback);
+    const Texel left = texels[(Size / 2) * Size + 4];
+    const Texel right = texels[(Size / 2) * Size + Size - 4];
+    const bool drawn = Near(left, {255, 0, 0, 255}) && Near(right, {0, 255, 0, 255});
+    const bool passed = translated && drawn;
+    std::printf("metal-smoke: device MSL: iOS without the GPU's family: vertex %s, pixel with "
+                "quad groups %d; with Apple10: base instance %d, SIMD groups %d; here (Apple%u) "
+                "left %u,%u,%u right %u,%u,%u: %s\n",
+                plain_vertex.source.empty() ? plain_vertex.error.c_str() : "NOT refused",
+                has(plain_fragment, "quad_shuffle"), has(phone_vertex, "base_instance"),
+                has(phone_fragment, "simd_shuffle") && !has(phone_fragment, "quad_"),
+                device.AppleFamily(), left.r, left.g, left.b, right.r, right.g, right.b,
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// A copy between a plain format and a block-compressed one, as the texture cache makes it
+/// (ReinterpretImage): four RGBA16Uint texels through a buffer into an 8x8 BC4 texture as its
+/// four blocks, each of one red value, then the blocks read back and the texture drawn.
+int RunBlockCopy() {
+    Metal::Device device;
+    if (!device.SupportsBCTextures()) {
+        std::printf("metal-smoke: block copy: no BC textures on this GPU: SKIP\n");
+        return 0;
+    }
+    Metal::Scheduler scheduler(device);
+    constexpr uint32_t Blocks = 2;
+    constexpr uint32_t Texels = Blocks * 4;
+    constexpr uint32_t BlockBytes = 8;
+    constexpr uint32_t BlockRow = Blocks * BlockBytes;
+    constexpr std::array<uint8_t, 4> Reds{40, 80, 160, 240};
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    const Metal::Object plain = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRGBA16Uint),
+                 .width = Blocks,
+                 .height = Blocks});
+    const Metal::Object compressed = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatBC4_RUnorm),
+                 .width = Texels,
+                 .height = Texels});
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = rgba8,
+                 .width = Texels,
+                 .height = Texels,
+                 .render_target = true});
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer =
+        Metal::CreateBuffer(device, BlockRow * Blocks, true, &upload);
+    const Metal::Object between = Metal::CreateBuffer(device, BlockRow * Blocks, false, nullptr);
+    uint8_t* blocks = nullptr;
+    const Metal::Object blocks_buffer =
+        Metal::CreateBuffer(device, BlockRow * Blocks, true, &blocks);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Texels * Texels * 4, true, &readback);
+    if (!plain || !compressed || !target || !between || upload == nullptr || blocks == nullptr ||
+        readback == nullptr) {
+        std::printf("metal-smoke: FAIL block copy textures\n");
+        return 1;
+    }
+    // A BC4 block: two red values, then sixteen 3-bit indices (all 0: the first value).
+    std::memset(upload, 0, BlockRow * Blocks);
+    for (uint32_t block = 0; block < Blocks * Blocks; ++block) {
+        upload[block * BlockBytes] = Reds[block];
+        upload[block * BlockBytes + 1] = Reds[block];
+    }
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, BlockRow, 0, plain.Get(), 0, 0, {},
+                                  {Blocks, Blocks, 1});
+    scheduler.CopyTextureToBuffer(plain.Get(), 0, 0, {}, {Blocks, Blocks, 1}, between.Get(), 0,
+                                  BlockRow, 0);
+    scheduler.BreakBlits();
+    scheduler.CopyBufferToTexture(between.Get(), 0, BlockRow, 0, compressed.Get(), 0, 0, {},
+                                  {Texels, Texels, 1});
+    scheduler.BreakBlits();
+    scheduler.CopyTextureToBuffer(compressed.Get(), 0, 0, {}, {Texels, Texels, 1},
+                                  blocks_buffer.Get(), 0, BlockRow, 0);
+    const bool blitted = scheduler.Blit(Metal::BlitPass{
+        .src = compressed.Get(),
+        .src_rect = {0, 0, static_cast<int32_t>(Texels), static_cast<int32_t>(Texels)},
+        .dst = {.texture = target.Get()},
+        .dst_format = rgba8,
+        .dst_rect = {0, 0, static_cast<int32_t>(Texels), static_cast<int32_t>(Texels)},
+        .dst_width = Texels,
+        .dst_height = Texels,
+        .linear = false,
+        .keep_dst = false,
+    });
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Texels, Texels, 1},
+                                  readback_buffer.Get(), 0, Texels * 4, 0);
+    scheduler.Finish();
+    const bool same_blocks = std::memcmp(upload, blocks, BlockRow * Blocks) == 0;
+    const auto* texels = reinterpret_cast<const Texel*>(readback);
+    uint32_t wrong = 0;
+    for (uint32_t y = 0; y < Texels; ++y) {
+        for (uint32_t x = 0; x < Texels; ++x) {
+            const uint8_t red = Reds[(y / 4) * Blocks + x / 4];
+            wrong += Near(texels[y * Texels + x], {red, 0, 0, 255}) ? 0 : 1;
+        }
+    }
+    const bool passed = blitted && same_blocks && wrong == 0;
+    std::printf("metal-smoke: block copy 2x2 RGBA16Uint -> 8x8 BC4: blocks %s, %u of %u texels "
+                "wrong: %s\n",
+                same_blocks ? "kept" : "CHANGED", wrong, Texels * Texels,
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main(int argc, char** argv) {
@@ -1662,7 +1892,8 @@ int main(int argc, char** argv) {
                                  RunMeshEmulation, RunMeshDistribution, RunIndexRewrite,
                                  RunOcarinaBilinear, RunPipelineArchive,
                                  RunDepthBlit, RunTessellation, RunDepthStencilBlit,
-                                 RunPipelineCheck, SmokeProbe::RunAll}) {
+                                 RunPipelineCheck, RunDeviceMsl, RunBlockCopy,
+                                 SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }

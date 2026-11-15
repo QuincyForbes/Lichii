@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 
 #include <spirv_msl.hpp>
@@ -98,6 +99,14 @@ struct Declared {
 
 } // Anonymous namespace
 
+bool DeviceMslEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_MSL_DEVICE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& options) {
     Result result;
     try {
@@ -114,6 +123,16 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
         // Metal's 1D textures take no levels and no views as 2D ones: with the pipeline check
         // the texture cache keeps 1D images as 2D ones a texel high, as MoltenVK does.
         msl.texture_1D_as_2D = PipelineCheckEnabled();
+        if (options.apple_family != 0 && DeviceMslEnabled()) {
+            // What MoltenVK tells SPIRV-Cross about Apple GPUs. Without the first an iOS program
+            // that reads the base instance (every one that reads the instance index) does not
+            // translate; without the second its subgroups are quads of four.
+            msl.ios_support_base_vertex_instance = options.apple_family >= 3;
+            msl.ios_use_simdgroup_functions = options.apple_family >= 6;
+            msl.agx_manual_cube_grad_fixup = true;
+            msl.check_discarded_frag_stores = stage == Stage::Fragment;
+            msl.replace_recursive_inputs = true;
+        }
         const bool tess_vertex = stage == Stage::VertexForTessellation;
         const bool tess_control = stage == Stage::TessellationControl;
         const bool tess_evaluation = stage == Stage::TessellationEvaluation;

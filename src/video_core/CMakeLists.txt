@@ -724,7 +724,8 @@ if (ENABLE_METAL)
         set(METAL_SMOKE_DIR ${CMAKE_CURRENT_BINARY_DIR}/metal_smoke)
         set(METAL_SMOKE_HEADERS)
         foreach (SMOKE_FILE translate_smoke.comp texel_buffer_smoke.comp texture_1d_smoke.comp
-                            tess_smoke.vert tess_smoke.tesc tess_smoke.tese)
+                            tess_smoke.vert tess_smoke.tesc tess_smoke.tese
+                            device_msl_smoke.vert device_msl_smoke.frag)
             string(REPLACE "." "_" SMOKE_SHADER "${SMOKE_FILE}")
             string(TOUPPER "${SMOKE_SHADER}_SPV" SMOKE_VARIABLE)
             set(SMOKE_HEADER ${METAL_SMOKE_DIR}/${SMOKE_SHADER}_spv.h)

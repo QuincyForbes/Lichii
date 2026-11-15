@@ -203,6 +203,14 @@ private:
     bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups = 0,
                      TessellationDraw* tess_draw = nullptr);
 
+    /// Draw's work ahead of the pipeline: a vertex count the GPU wrote is read into the draw
+    /// state, a draw past 16M vertices is refused, Bananza's reset draw is done as writes. False
+    /// when the draw is over.
+    bool BeginDraw(bool is_indexed, u32 instance_count);
+
+    /// Vulkan's TryNx2IndirectReset; true when the draw was done as writes to guest memory.
+    bool TryIndirectReset(bool is_indexed, u32 instance_count);
+
     /// Counts the draw PrepareDraw skipped.
     void NoteUnprepared();
 

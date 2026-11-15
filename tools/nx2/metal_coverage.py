@@ -4,6 +4,9 @@
     python -I tools/nx2/metal_coverage.py            totals + reference check
     python -I tools/nx2/metal_coverage.py --lines    also print the source line of every reference
     python -I tools/nx2/metal_coverage.py --open     list the rows that are missing
+    python -I tools/nx2/metal_coverage.py --moved <commit>
+                                                     move the line numbers for what the sources
+                                                     changed since the commit the matrix was true for
 
 Exit code 1 when a row is malformed or a reference names a file or line that does not exist.
 """
@@ -12,6 +15,7 @@ import argparse
 import collections
 import pathlib
 import re
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -26,6 +30,7 @@ APART = ("Q", "R")
 
 ROW = re.compile(r"^\|\s*([A-Z]\d{2})\s*\|")
 REFERENCE = re.compile(r"^([\w./-]+?)(?::(\d+))?$")
+HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
 
 
 def split_row(line):
@@ -108,6 +113,55 @@ def check_tests(rows):
     return problems
 
 
+def line_map(commit, path):
+    """Where the lines `path` had at `commit` are in the working tree."""
+    diff = subprocess.run(["git", "-C", str(ROOT), "diff", "-U0", commit, "--", str(path)],
+                          capture_output=True, text=True, check=True).stdout
+    hunks = []
+    for match in HUNK.finditer(diff):
+        old, old_count, new, new_count = (int(value) if value else 1 for value in match.groups())
+        hunks.append((old, old_count, new, new_count))
+
+    def moved(line):
+        shift = 0
+        for old, old_count, new, new_count in hunks:
+            old_end = old + old_count if old_count else old + 1
+            new_end = new + new_count if new_count else new + 1
+            if line >= old_end:
+                shift = new_end - old_end
+            elif old_count and line >= old:
+                # A changed line: the same place in what replaced it.
+                return new + min(line - old, max(new_count - 1, 0))
+        return line + shift
+
+    return moved
+
+
+def move_references(matrix, commit):
+    """Rewrites the line numbers of the matrix for sources changed since `commit`."""
+    maps, changed, lines = {}, 0, []
+    for line in matrix.read_text(encoding="utf-8").splitlines():
+        if ROW.match(line) and len(split_row(line)) == 7:
+            cells = split_row(line)
+            for index, base in ((2, VULKAN), (4, METAL)):
+                items = []
+                for item in (part.strip() for part in cells[index].split(",")):
+                    match = REFERENCE.match(item)
+                    path = (base / match.group(1)).resolve() if match else None
+                    if match and match.group(2) and path.is_file():
+                        if path not in maps:
+                            maps[path] = line_map(commit, path)
+                        number = maps[path](int(match.group(2)))
+                        changed += number != int(match.group(2))
+                        item = f"{match.group(1)}:{number}"
+                    items.append(item)
+                cells[index] = ", ".join(items)
+            line = "| " + " | ".join(cells) + " |"
+        lines.append(line)
+    matrix.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    print(f"{changed} references moved")
+
+
 def count(rows):
     counts = collections.Counter(row["kind"] for row in rows)
     return "  ".join(f"{status} {counts[status]}" for status in STATUSES) + f"  (rows {len(rows)})"
@@ -118,8 +172,12 @@ def main():
     parser.add_argument("--matrix", type=pathlib.Path, default=MATRIX)
     parser.add_argument("--lines", action="store_true", help="print the source line of every reference")
     parser.add_argument("--open", action="store_true", help="list the rows that are missing")
+    parser.add_argument("--moved", metavar="COMMIT",
+                        help="first move the line numbers for sources changed since COMMIT")
     args = parser.parse_args()
 
+    if args.moved:
+        move_references(args.matrix, args.moved)
     rows, problems = read_rows(args.matrix)
     more, shown = check_references(rows, args.lines)
     problems += more + check_tests(rows)

@@ -453,6 +453,8 @@ struct ExperimentsView: View {
     @State private var metalCheckOff = lichii_platform_experiment("metal_check_off") != 0
     @State private var metalFixedStateOff = lichii_platform_experiment("metal_fixed_state_off") != 0
     @State private var metalCachePlain = lichii_platform_experiment("metal_cache_plain") != 0
+    @State private var metalMslPlain = lichii_platform_experiment("metal_msl_plain") != 0
+    @State private var metalCopiesPlain = lichii_platform_experiment("metal_copies_plain") != 0
 
     var body: some View {
         List {
@@ -653,10 +655,18 @@ struct ExperimentsView: View {
                     .onChange(of: metalCachePlain) { value in
                         lichii_platform_set_experiment("metal_cache_plain", value ? 1 : 0)
                     }
+                Toggle("Shaders Translated as Before", isOn: $metalMslPlain)
+                    .onChange(of: metalMslPlain) { value in
+                        lichii_platform_set_experiment("metal_msl_plain", value ? 1 : 0)
+                    }
+                Toggle("Image Copies as Before", isOn: $metalCopiesPlain)
+                    .onChange(of: metalCopiesPlain) { value in
+                        lichii_platform_set_experiment("metal_copies_plain", value ? 1 : 0)
+                    }
             } header: {
                 Text("Metal Renderer")
             } footer: {
-                Text("Only for the Metal renderer (Graphics API). Shaders Without the Draw's State builds the game's shaders as before, without what the draw sets outside the shader: the depth range the game uses, the size of points, the alpha test, blending with two colours and whole-number colour targets. Turn it on if the picture got worse with a new build.\n\nGame Memory Access as Before: when the game reads or writes memory the graphics side also uses, the Metal renderer now handles it the way the Vulkan renderer does (the game's threads wait less for the graphics thread, and the switches under Guest Memory Access apply to it too). On, it handles every such read and write the slow way it did before; turn it on if objects flicker, show stale data or the game hangs with a new build.\n\nBoth apply the next time Lichii starts.")
+                Text("Only for the Metal renderer (Graphics API). Shaders Without the Draw's State builds the game's shaders as before, without what the draw sets outside the shader: the depth range the game uses, the size of points, the alpha test, blending with two colours and whole-number colour targets. Turn it on if the picture got worse with a new build.\n\nGame Memory Access as Before: when the game reads or writes memory the graphics side also uses, the Metal renderer now handles it the way the Vulkan renderer does (the game's threads wait less for the graphics thread, and the switches under Guest Memory Access apply to it too). On, it handles every such read and write the slow way it did before; turn it on if objects flicker, show stale data or the game hangs with a new build.\n\nShaders Translated as Before: the game's shaders are now turned into Metal shaders with what this iPhone's GPU can do, as the Vulkan renderer's MoltenVK does it. Before, every shader that reads which copy of a model it is drawing was refused (about a fifth of Ocarina of Time's, their draws skipped), and shaders that share values between neighbouring pixels did it in groups of four. On, they are translated as before; turn it on if shaders fail to build or the picture got worse with a new build.\n\nImage Copies as Before: the Metal renderer now copies one depth image into another when the game asks for it, and copies between a compressed image and a plain one whose pixels hold a compressed block each (Ocarina of Time does both). Before, both kinds of copy were skipped. On, they are skipped again; turn it on if the game stops with a new build.\n\nAll four apply the next time Lichii starts.")
             }
 
             Section {

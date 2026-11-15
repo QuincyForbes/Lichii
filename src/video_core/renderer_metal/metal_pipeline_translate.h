@@ -174,8 +174,9 @@ struct TranslatedPipeline {
 
 class PipelineTranslator {
 public:
-    /// `ios`: MSL for iOS (ShaderTranslate::Options::ios).
-    explicit PipelineTranslator(bool ios);
+    /// `ios`: MSL for iOS (ShaderTranslate::Options::ios). `apple_family`: the GPU's
+    /// MTLGPUFamilyApple number, 0 when it has none (Options::apple_family).
+    explicit PipelineTranslator(bool ios, u32 apple_family);
 
     /// Fills everything of the key but its programs from the registers and the draw's topology.
     static void RefreshKey(GraphicsPipelineKey& key, const Tegra::Engines::Maxwell3D::Regs& regs,

@@ -34,9 +34,16 @@ lichii-metal-replay --cache vulkan.fork-v53.bin --census nx2_feature_census.json
     --report replay.txt --msl-out msl
 ```
 
-`--macos` translates as the macOS renderer does (default: iOS), `--jobs <n>` sets the worker
-threads, `--msl-out <dir>` writes every distinct MSL function (`<hash>_<role>.metal`, and
+`--macos` translates as the macOS renderer does (default: iOS), `--apple-family <n>` names the
+GPU the MSL is for (`MTLGPUFamilyApple<n>`, default 10 = A19; 0 = not an Apple GPU; the
+environment's `EDEN_NX2_METAL_MSL_DEVICE=0` translates as if it were unknown), `--jobs <n>` sets
+the worker threads, `--msl-out <dir>` writes every distinct MSL function (`<hash>_<role>.metal`, and
 `index.txt` with each file's entry point).
+
+`--spirv <file>` (any number of them) translates plain SPIR-V files instead of a cache: the
+stage comes from the file's name (`.vert.spv`, `.frag.spv`, anything else is compute), and the
+MSL or the reason it was refused is printed. For looking at what a translation option does to a
+shader of one's own; the exit code is 1 when one was refused.
 
 ## What the report says
 

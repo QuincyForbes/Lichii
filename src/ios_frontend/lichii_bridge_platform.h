@@ -223,7 +223,11 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// blending, integer outputs), as before (EDEN_NX2_METAL_FIXED_STATE=0). "metal_cache_plain": the
 /// Metal renderer answers guest reads, guest writes and inline writes on its plain paths (both
 /// caches' locks every time, no hand-off, reads landed by the GPU thread, every fence release
-/// drained), as before (EDEN_NX2_METAL_CACHE_PATHS=0).
+/// drained), as before (EDEN_NX2_METAL_CACHE_PATHS=0). "metal_msl_plain": the Metal renderer
+/// translates programs without what the GPU has (no base instance, so a program that reads the
+/// instance index is refused; quad groups for subgroups), as before (EDEN_NX2_METAL_MSL_DEVICE=0).
+/// "metal_copies_plain": the Metal renderer skips blits between depth images and copies between
+/// block-compressed and plain formats, as before (EDEN_NX2_METAL_COPIES=0).
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
 /// Bench mode: for the rest of this process lichii_platform_experiment reports `names` as on and

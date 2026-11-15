@@ -83,6 +83,8 @@ struct TessellationSlots {
 
 struct Options {
     bool ios{};
+    /// MTLGPUFamilyApple number of the GPU the MSL is for, 0 when it is not an Apple GPU.
+    u32 apple_family{};
     u32 msl_major{3};
     u32 msl_minor{0};
     /// Vertex buffers take buffer slots from this one down (stage_in), so resources stay below.
@@ -111,5 +113,8 @@ struct Result {
 /// Resources are numbered per kind in (set, binding) order, which is the order the recompiler
 /// emits them and the buffer cache appends their bindings, so the pipeline binds in sequence.
 [[nodiscard]] Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& options);
+
+/// EDEN_NX2_METAL_MSL_DEVICE: the MSL uses what Options::apple_family has (default on).
+[[nodiscard]] bool DeviceMslEnabled();
 
 } // namespace Metal::ShaderTranslate

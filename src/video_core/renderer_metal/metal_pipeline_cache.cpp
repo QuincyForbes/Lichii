@@ -194,7 +194,7 @@ void* ComputePipeline::State(const Device& device) {
 
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory,
                              const Device& device_)
-    : VideoCommon::ShaderCache{device_memory}, device{device_}, translator{TranslateForIos} {}
+    : VideoCommon::ShaderCache{device_memory}, device{device_}, translator{TranslateForIos, device_.AppleFamily()} {}
 
 PipelineCache::~PipelineCache() = default;
 

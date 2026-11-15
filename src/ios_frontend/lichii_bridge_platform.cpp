@@ -371,6 +371,14 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_METAL_CACHE_PATHS", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment metal_cache_plain on");
     }
+    if (lichii_platform_experiment("metal_msl_plain")) {
+        setenv("EDEN_NX2_METAL_MSL_DEVICE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_msl_plain on");
+    }
+    if (lichii_platform_experiment("metal_copies_plain")) {
+        setenv("EDEN_NX2_METAL_COPIES", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_copies_plain on");
+    }
     ApplyCpuExperiments();
 }
 

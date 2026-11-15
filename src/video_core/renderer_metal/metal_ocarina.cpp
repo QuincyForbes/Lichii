@@ -16,9 +16,11 @@
 namespace Metal {
 
 namespace {
-// The passes Vulkan's TryOcarinaBilinear takes: 2560x1440 (menus, gameplay) and the
-// 0xe40f5efb5480e692 one.
-constexpr std::array<u64, 3> BilinearShaders{0x4c1ae2fe58f30a97ULL, 0x9302bc0d6d1d9bc1ULL,
+// The passes Vulkan's TryOcarinaBilinear takes: 2560x1440 (menus, gameplay), the gameplay one
+// when the scene is under half the target (above 0.4 of it, and 0.4 and below: oot_resolution
+// 40 % and 33 %) and the 0xe40f5efb5480e692 one.
+constexpr std::array<u64, 5> BilinearShaders{0x4c1ae2fe58f30a97ULL, 0x9302bc0d6d1d9bc1ULL,
+                                             0x03bf0ffc7d2d0bedULL, 0x31c0acb7c5e87c89ULL,
                                              0xe40f5efb5480e692ULL};
 constexpr u32 GroupSize = 8;
 } // Anonymous namespace

@@ -240,7 +240,7 @@ size_t ComputePipelineKey::Hash() const noexcept {
         Common::CityHash64(reinterpret_cast<const char*>(this), sizeof *this));
 }
 
-PipelineTranslator::PipelineTranslator(bool ios) {
+PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family) {
     // What Apple GPUs run through SPIRV-Cross (MoltenVK's defaults for Apple7+).
     profile = Shader::Profile{
         .supported_spirv = 0x00010300,
@@ -305,6 +305,7 @@ PipelineTranslator::PipelineTranslator(bool ios) {
     };
     host_info.ApplyDescriptorLimitPolicy();
     translate_options.ios = ios;
+    translate_options.apple_family = apple_family;
 }
 
 std::optional<StageProgram> PipelineTranslator::Translate(

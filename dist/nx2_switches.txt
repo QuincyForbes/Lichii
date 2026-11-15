@@ -143,7 +143,29 @@ EDEN_NX2_FENCE_BATCH=1
 # each of those switches works as on Vulkan. 0 takes the plain paths this renderer had before:
 # every question under both caches' locks, writes applied one at a time, reads landed by the GPU
 # thread, every fence release drained, every inline write invalidating every cache at once.
+# Under it, as on Vulkan: every draw serves the guest threads' waiting sync requests, a draw
+# whose native program failed marks the frame as such, and Donkey Kong Bananza's reset program
+# has its indirect records written on the host (EDEN_NX2_RESETFIX). A draw count the GPU wrote
+# (EDEN_NX2_INDIRECT_DRAWS=1) is read back before the draw, which waits for the GPU; a draw of
+# more than 16 million vertices is skipped with a log line under EDEN_NX2_METAL_PIPELINE_CHECK.
 #EDEN_NX2_METAL_CACHE_PATHS=0
+
+# Metal renderer: 0 translates programs with SPIRV-Cross's settings for any iOS device, as
+# before: a program that reads the base instance or base vertex (every vertex program that reads
+# the instance index) is refused and its draws skipped, and subgroup operations work on groups
+# of four pixels. By default the translation is told what the GPU has, as MoltenVK tells it:
+# base vertex and instance (Apple3 and later), SIMD groups for subgroup operations (Apple6 and
+# later), the cube map gradient fix, no stores from discarded fragments, and an input structure
+# that contains itself declared as a pointer (Metal 3.1's compiler does not return from it).
+#EDEN_NX2_METAL_MSL_DEVICE=0
+
+# Metal renderer: 0 skips two kinds of image copy, as before. By default a blit from a depth
+# image into a depth image is drawn (nearest; the stencil comes along between images of one
+# format), and a copy between a block-compressed image and a plain one whose texels are the
+# size of a block goes through a buffer, block for texel, as Vulkan copies them (Ocarina of
+# Time copies R16G16B16A16_UINT into BC4). A copy that starts inside a block is skipped with a
+# log line either way; images decoded on the CPU are not copied this way.
+#EDEN_NX2_METAL_COPIES=0
 
 # Either renderer: 0 makes the GPU thread's front wait for the GPU and read a compute dispatch's
 # size the GPU wrote (Ocarina of Time's light tiles, once a frame). By default it passes

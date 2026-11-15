@@ -12,6 +12,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -701,11 +702,11 @@ void RunCompute(ComputeJob& job, PipelineTranslator& translator, MslSink& sink) 
     }
 }
 
-void RunJobs(Jobs& jobs, bool ios, u32 threads, MslSink& sink) {
+void RunJobs(Jobs& jobs, bool ios, u32 apple_family, u32 threads, MslSink& sink) {
     const size_t total = jobs.graphics.size() + jobs.compute.size();
     std::atomic<size_t> next{0};
     const auto work = [&] {
-        PipelineTranslator translator{ios};
+        PipelineTranslator translator{ios, apple_family};
         for (;;) {
             const size_t index = next.fetch_add(1);
             if (index >= total) {
@@ -943,10 +944,13 @@ struct DepthTarget {
 };
 
 DepthTarget DepthFormatOf(Tegra::DepthFormat format, std::string& problem) {
-    const auto pixel_format = DepthPixelFormat(format);
+    auto pixel_format = DepthPixelFormat(format);
     if (!pixel_format) {
-        problem = fmt::format("depth format {:#x} is unknown", static_cast<u32>(format));
-        return {};
+        // PixelFormatFromDepthFormat's answer, which both backends get from the texture cache.
+        problem = fmt::format("depth format {:#x} is unknown: taken as S8_UINT_D24_UNORM, as "
+                              "Vulkan takes it",
+                              static_cast<u32>(format));
+        pixel_format = PixelFormat::S8_UINT_D24_UNORM;
     }
     const FormatInfo info = SurfaceFormat(*pixel_format, false);
     if (info.format == 0) {
@@ -1130,8 +1134,9 @@ void ReplayDraw(DrawResults& results, const Maxwell& regs, const DrawRow& row,
     }
     DepthTarget depth;
     if (row.zeta_target != 0) {
+        problem.clear();
         depth = DepthFormatOf(regs.zeta.format, problem);
-        if (depth.format == 0) {
+        if (!problem.empty()) {
             Count(results.findings, problem, row.count, example);
         }
     }
@@ -1197,10 +1202,12 @@ void CheckRecord(Tallies& findings, Tallies& paths, const Record& record,
             Count(findings, problem, 1, example);
         }
     }
-    if (state.depth_enabled != 0 &&
-        DepthFormatOf(static_cast<Tegra::DepthFormat>(state.depth_format.Value()), problem)
-                .format == 0) {
-        Count(findings, problem, 1, example);
+    if (state.depth_enabled != 0) {
+        problem.clear();
+        DepthFormatOf(static_cast<Tegra::DepthFormat>(state.depth_format.Value()), problem);
+        if (!problem.empty()) {
+            Count(findings, problem, 1, example);
+        }
     }
     const u32 samples = SampleCount(state.msaa_mode.Value());
     if ((LIMITS.sample_counts >> samples & 1) == 0) {
@@ -1300,9 +1307,11 @@ void ReplayImages(std::string& out, const CensusCategory& images) {
 struct Arguments {
     std::filesystem::path census;
     std::vector<std::filesystem::path> caches;
+    std::vector<std::filesystem::path> spirv;
     std::filesystem::path msl_out;
     std::filesystem::path report;
     bool ios{true};
+    u32 apple_family{10};
     u32 jobs{(std::max)(std::thread::hardware_concurrency() / 2, 1U)};
 };
 
@@ -1322,26 +1331,63 @@ std::optional<Arguments> ParseArguments(int argc, char** argv) {
             arguments.census = value;
         } else if (name == "--cache") {
             arguments.caches.emplace_back(value);
+        } else if (name == "--spirv") {
+            arguments.spirv.emplace_back(value);
         } else if (name == "--msl-out") {
             arguments.msl_out = value;
         } else if (name == "--report") {
             arguments.report = value;
+        } else if (name == "--apple-family") {
+            arguments.apple_family = static_cast<u32>((std::max)(std::atoi(value), 0));
         } else if (name == "--jobs") {
             arguments.jobs = static_cast<u32>((std::max)(std::atoi(value), 1));
         } else {
             return std::nullopt;
         }
     }
-    if (arguments.caches.empty()) {
+    if (arguments.caches.empty() && arguments.spirv.empty()) {
         return std::nullopt;
     }
     return arguments;
 }
 
+/// --spirv: SPIR-V files of any origin (<name>.vert.spv, .frag.spv or .comp.spv) through the
+/// renderer's translation, the MSL or the refusal printed. 1 when one was refused.
+int TranslateFiles(const Arguments& arguments) {
+    int result = 0;
+    for (const std::filesystem::path& path : arguments.spirv) {
+        const std::string stage_name = path.stem().extension().string();
+        const ShaderTranslate::Stage stage = stage_name == ".vert" ? ShaderTranslate::Stage::Vertex
+                                             : stage_name == ".frag"
+                                                 ? ShaderTranslate::Stage::Fragment
+                                                 : ShaderTranslate::Stage::Compute;
+        std::ifstream file{path, std::ios::binary};
+        const std::string bytes{std::istreambuf_iterator<char>{file},
+                                std::istreambuf_iterator<char>{}};
+        std::vector<u32> words(bytes.size() / sizeof(u32));
+        std::memcpy(words.data(), bytes.data(), words.size() * sizeof(u32));
+        ShaderTranslate::Options options;
+        options.ios = arguments.ios;
+        options.apple_family = arguments.apple_family;
+        const ShaderTranslate::Result msl = ShaderTranslate::SpirvToMsl(words, stage, options);
+        if (msl.source.empty()) {
+            fmt::print("// {}: refused: {}\n", path.filename().string(), msl.error);
+            result = 1;
+        } else {
+            fmt::print("// {}: entry point {}\n{}\n", path.filename().string(), msl.entry_point,
+                       msl.source);
+        }
+    }
+    return result;
+}
+
 int Run(const Arguments& arguments) {
     std::string out;
-    Line(out, "lichii-metal-replay: MSL for {}, default settings (no resolution scaling)",
-         arguments.ios ? "iOS" : "macOS");
+    Line(out,
+         "lichii-metal-replay: MSL for {}, GPU family Apple{}{}, default settings (no resolution "
+         "scaling)",
+         arguments.ios ? "iOS" : "macOS", arguments.apple_family,
+         ShaderTranslate::DeviceMslEnabled() ? "" : " (EDEN_NX2_METAL_MSL_DEVICE=0: not used)");
 
     Caches caches;
     for (const std::filesystem::path& path : arguments.caches) {
@@ -1414,7 +1460,7 @@ int Run(const Arguments& arguments) {
     fmt::print(stderr, "{} graphics keys, {} compute programs, {} threads\n", jobs.graphics.size(),
                jobs.compute.size(), arguments.jobs);
     MslSink sink{arguments.msl_out};
-    RunJobs(jobs, arguments.ios, arguments.jobs, sink);
+    RunJobs(jobs, arguments.ios, arguments.apple_family, arguments.jobs, sink);
 
     // The stored pipelines.
     {
@@ -1575,11 +1621,16 @@ int main(int argc, char** argv) {
     if (!arguments) {
         std::fputs("usage: lichii-metal-replay --cache <pipeline cache file> [--cache <newer "
                    "file> ...] [--census <nx2_feature_census.json>] [--msl-out <directory>] "
-                   "[--report <file>] [--macos] [--jobs <n>]\n",
+                   "[--report <file>] [--macos] [--apple-family <n>] [--jobs <n>]\n"
+                   "       lichii-metal-replay --spirv <file.vert.spv, .frag.spv or .comp.spv> "
+                   "[--spirv ...] [--macos] [--apple-family <n>]\n",
                    stderr);
         return 2;
     }
     try {
+        if (!arguments->spirv.empty()) {
+            return Metal::TranslateFiles(*arguments);
+        }
         return Metal::Run(*arguments);
     } catch (const std::exception& exception) {
         std::fprintf(stderr, "lichii-metal-replay: %s\n", exception.what());

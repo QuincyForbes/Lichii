@@ -7,8 +7,11 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <span>
 #include <tuple>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
@@ -28,7 +31,9 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/indirect_reset.h"
 #include "video_core/memory_manager.h"
+#include "video_core/native_indirect_reset.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_indirect_grid.h"
@@ -241,10 +246,140 @@ RasterizerMetal::~RasterizerMetal() {
     }
 }
 
+bool RasterizerMetal::BeginDraw(bool is_indexed, u32 instance_count) {
+    auto& draw_state = maxwell3d->draw_manager.draw_state;
+    // A vertex count GPU work wrote (nx2_indirect_grid.h, EDEN_NX2_INDIRECT_DRAWS=1). Vulkan
+    // draws most of them with the count read on the GPU; here the words are always read, which
+    // waits for the GPU on this thread.
+    if (!is_indexed && Tegra::Nx2IndirectGrid::AnyLive() &&
+        Tegra::Nx2IndirectGrid::LooksLikeDrawPlaceholder(draw_state.vertex_buffer.count)) {
+        const u32 count = draw_state.vertex_buffer.count;
+        auto& grid = Tegra::Nx2IndirectGrid::Get();
+        Tegra::Nx2IndirectGrid::LogCounts();
+        const auto source = Tegra::Nx2IndirectGrid::MatchDrawCount(count);
+        if (!source) {
+            grid.skipped.fetch_add(1, std::memory_order_relaxed);
+            RefuseDraw("GPU-counted draw that lost its source");
+            return false;
+        }
+        const bool first_placeholder =
+            draw_state.vertex_buffer.first ==
+            Tegra::Nx2IndirectGrid::DrawPlaceholder(count & (Tegra::Nx2IndirectGrid::Slots - 1), 1);
+        std::array<u32, 2> words{};
+        gpu_memory->ReadBlock(*source, words.data(), sizeof(words));
+        draw_state.vertex_buffer.count = words[0];
+        if (first_placeholder) {
+            draw_state.vertex_buffer.first = words[1];
+        }
+        grid.draws_refused.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (PipelineCheckEnabled()) {
+        // As Vulkan's Draw: past 16M vertices a first and count are what a rejected compute
+        // program should have written, and indexed ones read far out of bounds.
+        const u64 first = is_indexed ? draw_state.index_buffer.first
+                                     : draw_state.vertex_buffer.first;
+        const u64 count = is_indexed ? draw_state.index_buffer.count
+                                     : draw_state.vertex_buffer.count;
+        constexpr u64 MaxVertices = u64{1} << 24;
+        if (first + count > MaxVertices) {
+            RefuseDraw(is_indexed ? "index count past 16M" : "vertex count past 16M");
+            return false;
+        }
+    }
+    return !TryIndirectReset(is_indexed, instance_count);
+}
+
+bool RasterizerMetal::TryIndirectReset(bool is_indexed, u32 instance_count) {
+    // Vulkan's TryNx2IndirectReset (EDEN_NX2_RESETFIX): Donkey Kong Bananza's pointer-list reset
+    // draw, done as writes of the record to guest memory.
+    static const bool enabled = CachePathsEnabled() && EnvironmentOn("EDEN_NX2_RESETFIX");
+    const auto& regs = maxwell3d->regs;
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    if (!enabled || is_indexed || instance_count != 1 || regs.IsMeshEnabled() ||
+        draw.topology != Maxwell::PrimitiveTopology::Points ||
+        !maxwell3d->GetNativeMacroEngine().native_turing) {
+        return false;
+    }
+    const GPUVAddr program =
+        (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+    std::array<u32, VideoCommon::NativeIndirectReset::Program.size()> code{};
+    if (!gpu_memory->IsFullyMappedRange(program + 128, sizeof(code))) {
+        return false;
+    }
+    gpu_memory->ReadBlock(program + 128, code.data(), sizeof(code));
+    if (!VideoCommon::NativeIndirectReset::Matches(code)) {
+        return false;
+    }
+    gpu_memory->FlushCaching();
+    const auto reject = [](std::string_view reason) {
+        static std::atomic<u32> reported{};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Metal, "Indirect reset left to the draw: {}", reason);
+        }
+        return false;
+    };
+    const auto in_gpu_range = [this](u64 address, size_t size) {
+        return size != 0 && address <= (std::numeric_limits<u64>::max)() - size &&
+               gpu_memory->IsWithinGPUAddressRange(address) &&
+               gpu_memory->IsWithinGPUAddressRange(address + size - 1);
+    };
+    const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[0];
+    if (!cbuf.enabled || cbuf.size < 0x120 || !in_gpu_range(cbuf.address, 0x120) ||
+        !gpu_memory->IsFullyMappedRange(cbuf.address + 0x110, 16)) {
+        return reject("descriptor unavailable");
+    }
+    std::array<u64, 2> descriptor{};
+    gpu_memory->ReadBlock(cbuf.address + 0x110, descriptor.data(), sizeof(descriptor));
+    const u64 count = draw.vertex_buffer.count;
+    const auto range = VideoCommon::IndirectResetRange(
+        descriptor[0], static_cast<u32>(descriptor[1]), draw.vertex_buffer.first, count);
+    if (!range || !in_gpu_range(range->begin, range->size) ||
+        !gpu_memory->IsFullyMappedRange(range->begin, range->size)) {
+        return reject("list outside mapped descriptor");
+    }
+    std::vector<u64> pointers(count);
+    gpu_memory->ReadBlock(range->begin, pointers.data(), range->size);
+    static constexpr std::array<u32, 5> record{0, 1, 0, 0, 0};
+    for (const u64 pointer : pointers) {
+        if (pointer == 0) {
+            return reject("record is null");
+        }
+        if (!in_gpu_range(pointer, sizeof(record)) ||
+            !gpu_memory->IsFullyMappedRange(pointer, sizeof(record))) {
+            return reject("record not mapped");
+        }
+        if (pointer < range->begin + range->size && range->begin < pointer + sizeof(record)) {
+            return reject("record overlaps pointer list");
+        }
+        const auto segments = gpu_memory->GetSubmappedRange(pointer, sizeof(record));
+        if (segments.size() != 1 || segments[0].first != pointer ||
+            segments[0].second != sizeof(record)) {
+            return reject("record crosses a mapping boundary");
+        }
+    }
+    const std::span<const u8> bytes{reinterpret_cast<const u8*>(record.data()), sizeof(record)};
+    for (const u64 pointer : pointers) {
+        AccelerateInlineToMemory(pointer, bytes.size(), bytes);
+    }
+    LOG_ONCE(indirect_reset_done, "Metal: indirect reset done as {} record writes", count);
+    Coverage::Note(Coverage::Work::Draw, Coverage::Path::Replaced);
+    return true;
+}
+
 void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     ++draws;
+    // Cores waiting for a flush are served after each draw, as on Vulkan, not only when the
+    // command list ends.
+    SCOPE_EXIT {
+        if (CachePathsEnabled()) {
+            gpu.TickWork();
+        }
+    };
     // Deferred inline writes reach the caches before anything of theirs is used.
     gpu_memory->FlushCaching();
+    if (!BeginDraw(is_indexed, instance_count)) {
+        return;
+    }
     GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
     if (VideoCommon::FeatureCensus::Enabled()) {
         VideoCommon::FeatureCensus::NoteDraw(*maxwell3d, pipeline_cache.LookupHashes());
@@ -1343,6 +1478,11 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
 
 void RasterizerMetal::DrawIndirect() {
     ++draws;
+    SCOPE_EXIT {
+        if (CachePathsEnabled()) {
+            gpu.TickWork();
+        }
+    };
     gpu_memory->FlushCaching();
     GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
     if (VideoCommon::FeatureCensus::Enabled()) {
@@ -1441,6 +1581,11 @@ void RasterizerMetal::NoteUnprepared() {
 }
 
 void RasterizerMetal::RefuseDraw(std::string_view cause) {
+    // As Vulkan's PrepareDraw: a draw of the native macro engine that was not drawn ends the
+    // front's GPU-counted draws.
+    if (maxwell3d != nullptr && maxwell3d->GetNativeMacroEngine().native_turing) {
+        maxwell3d->GetNativeMacroEngine().native_execution_failed = true;
+    }
     Coverage::Refuse(Coverage::Work::Draw, cause, [this] { return DescribeDraw(); });
 }
 
