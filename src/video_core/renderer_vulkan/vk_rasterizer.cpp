@@ -599,6 +599,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       frame_dump(device, memory_allocator, scheduler),
       flash_watch(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
+    VideoCore::Probe::StoreScene(0, 0, 0, 0, nullptr);
 #ifdef LICHII_METALFX
     if (Common::PerfReport::Enabled()) {
         MetalGpuTime::Start();
@@ -2458,6 +2459,9 @@ void RasterizerVulkan::DispatchCompute() {
                      hash);
         }
     }
+    if (program_id == VideoCommon::OotNetwork::ProgramId && pipeline->CanReplaceOcarinaUpscale()) {
+        NoteOcarinaScene(*pipeline, replacement != nullptr, bilinear);
+    }
     const bool plain_dispatch{!can_replace && !can_bilinear && !byte_addressed_shadow};
     const bool skip_barrier{CountDispatch(scheduler, device, plain_dispatch)};
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind),
@@ -3461,7 +3465,9 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     bool upscale_4k =
         replace && (upscale_hash == ComputePipeline::Ocarina1440pShader ||
                     upscale_hash == ComputePipeline::Ocarina1440pScaledShader ||
-                    upscale_hash == ComputePipeline::Ocarina1440pScaledFieldShader);
+                    upscale_hash == ComputePipeline::Ocarina1440pScaledFieldShader ||
+                    upscale_hash == ComputePipeline::OcarinaScaledUnderHalfShader ||
+                    upscale_hash == ComputePipeline::OcarinaScaledLowShader);
     if ((!replace && pipeline.ShaderHash() != depth_reader) || !OcarinaTemporalEnabled()) {
         return false;
     }
@@ -3687,6 +3693,8 @@ bool RasterizerVulkan::TryOcarinaBilinear(const ComputePipeline& pipeline) {
     const u64 hash = pipeline.ShaderHash();
     if (oot_bilinear_failed || (hash != ComputePipeline::Ocarina1440pScaledShader &&
                                 hash != ComputePipeline::Ocarina1440pScaledFieldShader &&
+                                hash != ComputePipeline::OcarinaScaledUnderHalfShader &&
+                                hash != ComputePipeline::OcarinaScaledLowShader &&
                                 hash != 0xe40f5efb5480e692ULL)) {
         return false;
     }
@@ -3742,6 +3750,33 @@ bool RasterizerVulkan::TryOcarinaBilinear(const ComputePipeline& pipeline) {
     ++oot_bilinear_passes;
     oot_bilinear_extent = extent;
     return true;
+}
+
+/// For the overlay and the frame chain line: the scene an upscale pass reads, the size it writes
+/// and what drew it this frame.
+void RasterizerVulkan::NoteOcarinaScene(const ComputePipeline& pipeline, bool replaced,
+                                        bool bilinear) {
+    const auto sampled = pipeline.SampledImages();
+    const auto written = pipeline.WrittenImages();
+    if (sampled.size() != 1 || written.size() != 1 || !sampled[0].id || !written[0]) {
+        return;
+    }
+    const auto& color = texture_cache.GetImageView(sampled[0].id);
+    const auto& target = texture_cache.GetImageView(written[0]);
+    const bool camera = oot_camera_sample_frame == render_trace_frame &&
+                        oot_motion.SceneSized(color.size.width, color.size.height);
+    const VkExtent2D scene = camera ? oot_motion.extent
+                                    : VkExtent2D{color.size.width, color.size.height};
+#ifdef EGLANTINE_STREAMLINE
+    constexpr const char* live = "DLSS";
+#else
+    constexpr const char* live = "MetalFX Temporal";
+#endif
+    const char* const upscaler =
+        replaced ? oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr ? "FSR 3.1" : live
+                 : bilinear ? "bilinear" : "the game's pass";
+    VideoCore::Probe::StoreScene(scene.width, scene.height, target.size.width, target.size.height,
+                                 upscaler);
 }
 
 bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {

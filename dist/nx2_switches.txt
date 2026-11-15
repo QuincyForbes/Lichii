@@ -55,6 +55,11 @@ EDEN_NX2_FENCE_BATCH=1
 # 1920x1080 (on by default on Apple for MetalFX temporal, 0 turns it off).
 #EDEN_NX2_OOT_TEMPORAL_HANDHELD=1
 
+# Ocarina of Time: the 3D scene's size for tests, over the "Resolution" setting (oot_resolution):
+# 1 = 75%, 2 = 56%, 3 = 50%, 4 = 40% (768x432 handheld), 5 = 1/3 (640x360 handheld). The finished
+# picture stays 1920x1080 handheld. Each change of a frame's sizes writes one "Frame chain:" line.
+#EDEN_NX2_OOT_RENDER_SCALE=4
+
 # A draw without render targets (it writes buffers or counts samples only) gets a render pass as
 # large as its scissors reach instead of the surface clip (Ocarina of Time leaves that at
 # 32768x32768). On by default on Apple, where the GPU prepares every tile of it; 0 turns it off.

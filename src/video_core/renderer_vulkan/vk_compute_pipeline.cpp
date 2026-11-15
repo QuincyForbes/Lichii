@@ -371,7 +371,8 @@ bool ComputePipeline::CanReplaceOcarinaUpscale() const {
     const bool known_shader =
         shader_hash == 0xe40f5efb5480e692ULL || shader_hash == 0xef542df87cacfe9eULL ||
         shader_hash == Ocarina1440pShader || shader_hash == Ocarina1440pScaledShader ||
-        shader_hash == Ocarina1440pScaledFieldShader || shader_hash == OcarinaFullSizeShader;
+        shader_hash == Ocarina1440pScaledFieldShader || shader_hash == OcarinaFullSizeShader ||
+        shader_hash == OcarinaScaledUnderHalfShader || shader_hash == OcarinaScaledLowShader;
     return known_shader && !info.stores_global_memory &&
            info.image_buffer_descriptors.empty() && info.image_descriptors.size() == 1 &&
            info.image_descriptors.front().count == 1 && info.image_descriptors.front().is_written &&
@@ -562,7 +563,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     if (DispatchDepsTrace()) {
         bound_images.assign(views.begin(), views.end());
     }
-    if (record_sampled || deferred_bind) {
+    // An upscale pass's input is the scene the overlay names, also when the game's own pass draws.
+    if (record_sampled || deferred_bind || CanReplaceOcarinaUpscale()) {
         sampled_images.clear();
         const size_t first = Shader::NumDescriptors(info.texture_buffer_descriptors) +
                              Shader::NumDescriptors(info.image_buffer_descriptors);

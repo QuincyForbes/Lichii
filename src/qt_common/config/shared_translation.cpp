@@ -210,7 +210,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "apply to it).\nDynamic: the game's own, which drops toward 480p when the GPU is "
               "busy. 100%: always full size (1920x1080 handheld, 2560x1440 docked). A lower "
               "percentage: a fixed share of that, less GPU work and graphics memory, a softer "
-              "picture. 150-300%: full size scaled up by the emulator.\nWith NVIDIA DLSS as the "
+              "picture (40% and 33% are meant for phones; the HUD and menus stay full size). "
+              "150-300%: full size scaled up by the emulator.\nWith NVIDIA DLSS as the "
               "upscaler it is DLSS's input to 4K: 100% Quality, 87% Balanced, 75% Performance, "
               "50% Ultra Performance (above 100% counts as 100%).\nWith AMD FSR 3.1, NVIDIA DLSS or "
               "MetalFX as the upscaler, Dynamic draws at 100% docked and 75% handheld: the "
@@ -693,6 +694,8 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(OotResolution, Percent75, tr("75% (1080p)")),
                               PAIR(OotResolution, Percent56, tr("56% (810p)")),
                               PAIR(OotResolution, Percent50, tr("50% (720p)")),
+                              PAIR(OotResolution, Percent40, tr("40% (576p)")),
+                              PAIR(OotResolution, Percent33, tr("33% (480p)")),
                               PAIR(OotResolution, Percent150, tr("150% (2160p)")),
                               PAIR(OotResolution, Percent200, tr("200% (2880p)")),
                               PAIR(OotResolution, Percent300, tr("300% (4320p)")),

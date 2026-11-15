@@ -406,6 +406,7 @@ private:
     bool oot_bilinear_failed{};
     VkExtent2D oot_bilinear_extent{}; ///< the scene of the last bilinear pass
     void CountOcarinaUpscale(bool upscaled, const char* reason = nullptr);
+    void NoteOcarinaScene(const ComputePipeline& pipeline, bool replaced, bool bilinear);
     std::optional<u64> oot_dlss_frame;
     std::array<f32, 2> oot_jitter_applied{}; ///< in the viewport state now (render pixels)
     std::array<f32, 2> oot_jitter_offset{};  ///< what oot_jitter_frame's scene draws used
