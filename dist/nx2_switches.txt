@@ -111,7 +111,11 @@ EDEN_NX2_FENCE_BATCH=1
 # to what the vertex program reads and what is left over is refused with a "refused:" log line,
 # the draw skipped; alpha to coverage is left off on an integer target; a pass without
 # attachments says it has one sample per pixel; a buffer, texture or sampler slot past a stage's
-# tables is not bound.
+# tables is not bound; 1D images are kept as 2D textures a texel high and shaders read them as
+# such, as on MoltenVK (Metal's 1D textures take no mip levels and no 2D views); a texture view
+# of another family of texture types, with a slice count its type can't have or in a format Metal
+# doesn't cast to is refused with a "refused:" log line, as is a 1D or 3D texture in a depth or
+# stencil format.
 #EDEN_NX2_METAL_PIPELINE_CHECK=0
 
 #EDEN_NX2_MME_JIT=0

@@ -29,6 +29,7 @@
 #include "tess_smoke_tese_spv.h"
 #include "tess_smoke_vert_spv.h"
 #include "texel_buffer_smoke_comp_spv.h"
+#include "texture_1d_smoke_comp_spv.h"
 #include "translate_smoke_comp_spv.h"
 #include "video_core/renderer_metal/metal_archive.h"
 #include "video_core/renderer_metal/metal_bridge.h"
@@ -442,6 +443,125 @@ int RunTexelBuffer() {
                 "%s\n",
                 offset, texture_slot, wrong, Count, wrong == 0 ? "PASS" : "FAIL");
     return wrong == 0 ? 0 : 1;
+}
+
+/// A 1D image as the texture cache keeps it with the pipeline check: GLSL sampler1D -> SPIR-V ->
+/// translator (1D as 2D), a 2D array texture a texel high with two levels, a 2D view of its
+/// second layer. Then the views and the texture Metal would abort on, each refused.
+int RunTexture1D() {
+    namespace Translate = Metal::ShaderTranslate;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const Translate::Result msl = Translate::SpirvToMsl(
+        std::span<const uint32_t>(TEXTURE_1D_SMOKE_COMP_SPV), Translate::Stage::Compute, {});
+    if (msl.source.empty()) {
+        std::printf("metal-smoke: FAIL 1D texture SPIR-V -> MSL: %s\n", msl.error.c_str());
+        return 1;
+    }
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, msl.source, error);
+    const Metal::Object function =
+        library ? Metal::CreateFunction(library.Get(), msl.entry_point) : Metal::Object{};
+    const Metal::Object state =
+        function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                 : Metal::Object{};
+    if (!state) {
+        std::printf("metal-smoke: FAIL 1D texture pipeline: %s\n%s\n", error.c_str(),
+                    msl.source.c_str());
+        return 1;
+    }
+    uint32_t texture_slot = UINT32_MAX;
+    uint32_t sampler_slot = UINT32_MAX;
+    uint32_t data_slot = UINT32_MAX;
+    for (const Translate::ResourceSlot& slot : msl.slots) {
+        if (slot.kind == Translate::ResourceKind::Texture && slot.binding == 0) {
+            texture_slot = slot.index;
+        } else if (slot.kind == Translate::ResourceKind::Sampler && slot.binding == 0) {
+            sampler_slot = slot.index;
+        } else if (slot.kind == Translate::ResourceKind::Buffer && slot.binding == 1) {
+            data_slot = slot.index;
+        }
+    }
+    constexpr uint32_t Count = 64;
+    const uint32_t format = static_cast<uint32_t>(MTLPixelFormatR32Float);
+    const Metal::Object texture = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2DArray,
+                 .format = format,
+                 .width = Count,
+                 .levels = 2,
+                 .layers = 2});
+    const Metal::Object view =
+        texture ? Metal::CreateTextureView(texture.Get(), format, Metal::TextureKind::e2D, 0, 2, 1,
+                                           1, Metal::IdentitySwizzle)
+                : Metal::Object{};
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer =
+        Metal::CreateBuffer(device, (Count + Count / 2) * sizeof(float), true, &upload);
+    uint8_t* out_data = nullptr;
+    const Metal::Object out = Metal::CreateBuffer(device, Count * sizeof(float), true, &out_data);
+    if (!view || upload == nullptr || texture_slot == UINT32_MAX || data_slot == UINT32_MAX) {
+        std::printf("metal-smoke: FAIL 1D texture, its view or slots\n%s\n", msl.source.c_str());
+        return 1;
+    }
+    for (uint32_t index = 0; index < Count + Count / 2; ++index) {
+        const float value = index < Count ? static_cast<float>(index) + 0.5f
+                                          : 100.0f + static_cast<float>(index - Count);
+        std::memcpy(upload + index * sizeof(float), &value, sizeof(value));
+    }
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Count * 4, 0, texture.Get(), 0, 1, {},
+                                  {Count, 1, 1});
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), Count * 4, Count / 2 * 4, 0, texture.Get(),
+                                  1, 1, {}, {Count / 2, 1, 1});
+    const Metal::Object sampler = Metal::Retain(
+        [device.GetDevice() newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]]);
+    scheduler.BeginCompute(state.Get());
+    scheduler.BindTexture(Metal::ShaderStage::Compute, texture_slot, view.Get());
+    if (sampler_slot != UINT32_MAX) {
+        scheduler.BindSampler(Metal::ShaderStage::Compute, sampler_slot, sampler.Get());
+    }
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, data_slot, out.Get(), 0);
+    scheduler.Dispatch({1, 1, 1}, {Count, 1, 1});
+    scheduler.Finish();
+    uint32_t wrong = 0;
+    for (uint32_t index = 0; index < Count; ++index) {
+        float value;
+        std::memcpy(&value, out_data + index * sizeof(float), sizeof(value));
+        const float expected = (static_cast<float>(index) + 0.5f) * 2.0f + 100.0f +
+                               static_cast<float>(index / 2);
+        wrong += value != expected ? 1 : 0;
+    }
+    const auto refused = [&](uint32_t view_format, Metal::TextureKind kind, uint32_t layers) {
+        return !Metal::CreateTextureView(texture.Get(), view_format, kind, 0, 1, 0, layers,
+                                         Metal::IdentitySwizzle);
+    };
+    const bool kinds_refused = refused(format, Metal::TextureKind::e1D, 1) &&
+                               refused(format, Metal::TextureKind::e2D, 2) &&
+                               refused(format, Metal::TextureKind::Cube, 2) &&
+                               refused(format, Metal::TextureKind::e3D, 1) &&
+                               refused(format, Metal::TextureKind::e2DMultisample, 1);
+    const bool formats_refused =
+        refused(static_cast<uint32_t>(MTLPixelFormatRG8Unorm), Metal::TextureKind::e2D, 1) &&
+        refused(static_cast<uint32_t>(MTLPixelFormatDepth32Float), Metal::TextureKind::e2D, 1);
+    // What Metal does take: every layer in another format of the same texel size.
+    const bool cast = !refused(static_cast<uint32_t>(MTLPixelFormatR32Uint),
+                               Metal::TextureKind::e2DArray, 2);
+    const bool line_refused =
+        !Metal::CreateTexture(device, {.kind = Metal::TextureKind::e1DArray,
+                                       .format = format,
+                                       .width = Count,
+                                       .levels = 2,
+                                       .layers = 2}) &&
+        !Metal::CreateTexture(device, {.kind = Metal::TextureKind::e1DArray,
+                                       .format = format,
+                                       .width = Count,
+                                       .height = 2});
+    const bool passed = wrong == 0 && kinds_refused && formats_refused && cast && line_refused;
+    std::printf("metal-smoke: 1D texture as 2D (texture slot %u, sampler slot %d): %u of %u "
+                "wrong; views of other kinds refused %d, of other formats %d, R32Uint of "
+                "R32Float built %d, 1D textures with levels or height refused %d: %s\n",
+                texture_slot, static_cast<int>(sampler_slot), wrong, Count, kinds_refused,
+                formats_refused, cast, line_refused, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
 }
 
 constexpr const char* MeshColorSource = R"(
@@ -1537,8 +1657,8 @@ int main(int argc, char** argv) {
             return 2;
         }
         int result = draw;
-        for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer, RunMeshEmulation,
-                                 RunMeshDistribution, RunIndexRewrite,
+        for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer, RunTexture1D,
+                                 RunMeshEmulation, RunMeshDistribution, RunIndexRewrite,
                                  RunOcarinaBilinear, RunPipelineArchive,
                                  RunDepthBlit, RunTessellation, RunDepthStencilBlit,
                                  RunPipelineCheck, SmokeProbe::RunAll}) {
