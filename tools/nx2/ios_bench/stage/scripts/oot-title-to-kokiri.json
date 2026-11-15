@@ -1,0 +1,15 @@
+{
+  "note": "PLACEHOLDER, not yet recorded on the device: replace with scripts/recorded-<stamp>.json from a mode=record run (README.md, 'Recording the menu script'). The guess below waits for the title screen, presses A through the title and file select to load the first slot, then waits for Kokiri to finish loading.",
+  "steps": [
+    {"wait_running": true},
+    {"wait_quiet_s": 5},
+    {"wait_s": 5},
+    {"press": "A", "hold_ms": 120, "after_ms": 3000},
+    {"press": "A", "hold_ms": 120, "after_ms": 3000},
+    {"press": "A", "hold_ms": 120, "after_ms": 1500},
+    {"press": "A", "hold_ms": 120, "after_ms": 1500},
+    {"wait_s": 10},
+    {"wait_quiet_s": 5},
+    {"mark": "kokiri"}
+  ]
+}

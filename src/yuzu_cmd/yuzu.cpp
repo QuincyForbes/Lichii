@@ -104,6 +104,7 @@
 #include "ios_frontend/bridge_host.h"
 #include "ios_frontend/lichii_bridge_content_host.h"
 #include "ios_frontend/controls_host.h"
+#include "ios_frontend/lichii_bench.h"
 #endif
 
 // Code-signing status: dynarmic's code pages are only executable while the process is being
@@ -612,10 +613,16 @@ static SDL_AppResult IosStartApp(SdlState* state, Core::LaunchParams lp) {
     IosFrontend::Attach({
         .system = &state->system,
         .input = &state->input_subsystem,
-        .save_config = [state] { state->ios_config->SaveAllValues(); },
+        .save_config =
+            [state] {
+                if (!LichiiBench::BlocksConfigSave()) {
+                    state->ios_config->SaveAllValues();
+                }
+            },
     });
     LichiiControls::Attach(state->system, state->input_subsystem);
     IosFrontend::SetJitPoolBytes(IosJitPoolBytes());
+    LichiiBench::Start();
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
     IOS_MARK("showing the app");
     lichii_ui_main();
@@ -1205,6 +1212,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     Common::Log::SetColorConsoleBackendEnabled(true);
     Common::Log::Start();
     IOS_MARK("logging started");
+#ifdef LICHII_IOS_UI
+    // A host's bench run (tools/nx2/ios_bench): its arguments are not launch parameters.
+    LichiiBench::Configure(argc, argv);
+#endif
 
     if (argc > 1 && std::string_view{argv[1]} == "--build-warm") {
         return BuildWarm(state->system, argc, argv) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
@@ -1247,6 +1258,12 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     Settings::values.log_filter.SetValue(
         "*:Info HW.GPU:Warning Render.Vulkan:Warning Service:Warning Service.NVDRV:Error "
         "Service.AM:Error Debug:Error");
+#ifdef LICHII_IOS_UI
+    if (LichiiBench::Active() && LichiiBench::LogFilter()[0] != '\0') {
+        Settings::values.log_filter.SetValue(Settings::values.log_filter.GetValue() + " " +
+                                             LichiiBench::LogFilter());
+    }
+#endif
     {
         Common::Log::Filter filter;
         filter.ParseFilterString(Settings::values.log_filter.GetValue());

@@ -214,6 +214,9 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// fence, as before (EDEN_NX2_CPU_WRITE_RECLAIM=0).
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
+/// Bench mode: for the rest of this process lichii_platform_experiment reports `names` as on and
+/// the saved switches only with keep_saved (nothing saved changes). Before lichii_platform_init.
+void lichii_platform_override_experiments(const char* const* names, int count, int keep_saved);
 /// Guest memory in a file: as set in Experiments ("file_guest" / "file_guest_off"), else the
 /// default of common/host_memory.cpp.
 int lichii_platform_file_guest(void);

@@ -1,0 +1,5 @@
+# Copied to the Mac as they are checked out: bash and python need LF.
+*.sh text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf

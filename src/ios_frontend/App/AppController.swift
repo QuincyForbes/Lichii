@@ -91,6 +91,10 @@ final class AppController: ObservableObject {
     func requestJitIfNeeded(automatic: Bool) {
         let provider = JitProvider.current
         guard Bridge.jitState == .waiting, provider.installed else { return }
+        // A bench run asks for the JIT itself, or a debugger on the host provides it.
+        if automatic && lichii_bench_active() {
+            return
+        }
         if automatic {
             guard UserDefaults.standard.object(forKey: "autoRequestJit") as? Bool ?? true,
                   Onboarding.completed, !jitRequested else { return }

@@ -17,4 +17,10 @@ namespace LichiiControls {
 void Attach(Core::System& system, InputCommon::InputSubsystem& input);
 void Detach();
 
+/// Sees every button and stick change sent to the game (bench mode's input recorder); null
+/// removes it. Called on the thread that sent the input.
+using ButtonTap = void (*)(int player, int button, bool pressed);
+using StickTap = void (*)(int player, int stick, float x, float y);
+void SetInputTaps(ButtonTap button, StickTap stick);
+
 } // namespace LichiiControls

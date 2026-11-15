@@ -86,7 +86,13 @@ void LogFirstPress(int player, int button, bool have_gamepad) {
              static_cast<u32>(hid.GetSupportedStyleTag().raw));
 }
 
+std::atomic<ButtonTap> button_tap{nullptr};
+std::atomic<StickTap> stick_tap{nullptr};
+
 void SendButton(int player, int button, bool pressed) {
+    if (const ButtonTap tap = button_tap.load(std::memory_order_acquire)) {
+        tap(player, button, pressed);
+    }
     auto* pad = Gamepad();
     if (pad) {
         pad->SetButtonState(static_cast<std::size_t>(player), button, pressed);
@@ -100,6 +106,9 @@ void SendButton(int player, int button, bool pressed) {
 }
 
 void SendStick(int player, int stick, float x, float y) {
+    if (const StickTap tap = stick_tap.load(std::memory_order_acquire)) {
+        tap(player, stick, x, y);
+    }
     if (auto* pad = Gamepad()) {
         pad->SetStickPosition(static_cast<std::size_t>(player), stick, x, y);
         if (player == 0) {
@@ -156,6 +165,11 @@ void Detach() {
     std::scoped_lock lock{attach_mutex};
     attached_system = nullptr;
     attached_input = nullptr;
+}
+
+void SetInputTaps(ButtonTap button, StickTap stick) {
+    button_tap.store(button, std::memory_order_release);
+    stick_tap.store(stick, std::memory_order_release);
 }
 
 } // namespace LichiiControls

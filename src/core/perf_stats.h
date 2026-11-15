@@ -55,6 +55,11 @@ public:
     void EndSystemFrame();
     void EndGameFrame(u32 generated_count = 0);
 
+    /// Called at the end of every game frame of any game (iOS bench mode's frame times); null
+    /// removes it.
+    using GameFrameObserver = void (*)();
+    static void SetGameFrameObserver(GameFrameObserver observer);
+
     PerfStatsResults GetAndResetStats(std::chrono::microseconds current_system_time_us);
 
     PerfCounters GetCounters(std::chrono::microseconds current_system_time_us) const;
