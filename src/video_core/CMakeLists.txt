@@ -743,10 +743,31 @@ if (ENABLE_METAL)
 elseif (LICHII_METAL_COMPILE_CHECK)
     # Off by default: compiles (does not link) the plain C++ part on machines without Metal, to
     # catch template errors before an Apple CI run.
-    add_library(video_core_metal_check OBJECT ${METAL_RENDERER_CXX_SOURCES})
+    add_library(video_core_metal_check OBJECT ${METAL_RENDERER_CXX_SOURCES}
+                renderer_metal/metal_replay.cpp)
     target_link_libraries(video_core_metal_check PRIVATE video_core spirv-cross-msl)
     add_dependencies(video_core_metal_check host_shaders)
     target_include_directories(video_core_metal_check PRIVATE ${HOST_SHADERS_INCLUDE})
+
+    # A game's stored pipelines and census draws through the renderer's translation and
+    # descriptor checks, on a machine without Metal (tools/nx2/metal-replay.md).
+    add_executable(lichii-metal-replay
+        renderer_metal/metal_replay.cpp
+        renderer_metal/metal_replay_stubs.cpp
+        renderer_metal/metal_draw_desc.cpp
+        renderer_metal/metal_formats.cpp
+        renderer_metal/metal_index_convert.cpp
+        renderer_metal/metal_pipeline_check.cpp
+        renderer_metal/metal_pipeline_translate.cpp
+        renderer_metal/metal_shader_translate.cpp)
+    target_link_libraries(lichii-metal-replay PRIVATE common core video_core spirv-cross-msl
+                          ${PLATFORM_LIBRARIES})
+    add_dependencies(lichii-metal-replay host_shaders)
+    target_include_directories(lichii-metal-replay PRIVATE ${HOST_SHADERS_INCLUDE})
+    if (NOT MSVC)
+        set_source_files_properties(renderer_metal/metal_replay_stubs.cpp PROPERTIES
+            COMPILE_OPTIONS "-Wno-conversion;-Wno-unused-variable;-Wno-unused-parameter;-Wno-missing-field-initializers")
+    endif()
 endif()
 
 # Ocarina of Time's upscaler replaced live by NVIDIA DLSS or Apple MetalFX temporal upscaling

@@ -127,13 +127,7 @@ static_assert(sizeof(Maxwell::Regs::RenderTargetConfig) == 0x40);
 static_assert(offsetof(Maxwell::Regs::Zeta, format) == 0x8);
 static_assert(sizeof(Maxwell::Regs::ScissorTest) == 0x10);
 
-/// Registers a draw's record holds: `count` words from `first`, `step` words apart.
-struct Range {
-    const char* name;
-    u32 first;
-    u32 count{1};
-    u32 step{1};
-};
+using Range = DrawRange;
 
 const std::array DRAW_RANGES{
     Range{"rt.format", REG(rt) + 4, 8, 16},
@@ -355,6 +349,10 @@ void Write(State& state) {
 }
 
 } // Anonymous namespace
+
+std::span<const DrawRange> DrawRanges() noexcept {
+    return DRAW_RANGES;
+}
 
 void SetDrawKind(u32 flags, u32 instance_count) {
     draw_kind = flags | (instance_count > 1 ? DrawInstanced : 0U);

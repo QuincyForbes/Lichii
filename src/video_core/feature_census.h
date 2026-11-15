@@ -70,6 +70,17 @@ enum class Misc : u32 {
     CounterReset,
 };
 
+/// Registers a draw record holds after its fixed columns: `count` words from `first`, `step`
+/// words apart (the column is `name`, or `name[index]` when there are several).
+struct DrawRange {
+    const char* name;
+    u32 first;
+    u32 count{1};
+    u32 step{1};
+};
+
+[[nodiscard]] std::span<const DrawRange> DrawRanges() noexcept;
+
 /// The draw the engine is about to hand the rasterizer (Draw* flags), for the next NoteDraw of
 /// this thread.
 void SetDrawKind(u32 flags, u32 instance_count);
