@@ -141,7 +141,8 @@ enum class Pass {
 /// they are counted.
 std::string Draw(const Context& context, MTLRenderPipelineDescriptor* descriptor, Pass kind,
                  const std::function<void(id<MTLRenderCommandEncoder>)>& setup,
-                 bool counted = true) {
+                 bool counted = true,
+                 const std::function<void(MTLRenderPassDescriptor*)>& prepare = {}) {
     NSError* error = nil;
     const id<MTLRenderPipelineState> state =
         [context.device newRenderPipelineStateWithDescriptor:descriptor error:&error];
@@ -171,6 +172,9 @@ std::string Draw(const Context& context, MTLRenderPipelineDescriptor* descriptor
         [context.device newBufferWithLength:sizeof(uint64_t) options:MTLResourceStorageModeShared];
     if (counted) {
         pass.visibilityResultBuffer = visibility;
+    }
+    if (prepare) {
+        prepare(pass);
     }
     const id<MTLCommandQueue> queue = [context.device newCommandQueue];
     const id<MTLCommandBuffer> commands = [queue commandBuffer];
@@ -224,8 +228,9 @@ std::string Texture(const Context& context, NSUInteger width, NSUInteger levels,
                                                                        : "error: no texture";
 }
 
-std::string Shaped(const Context& context, MTLTextureType type, MTLPixelFormat format,
-                   NSUInteger width, NSUInteger height, NSUInteger depth, NSUInteger layers) {
+id<MTLTexture> Shape(const Context& context, MTLTextureType type, MTLPixelFormat format,
+                     NSUInteger width, NSUInteger height, NSUInteger depth, NSUInteger layers,
+                     NSUInteger levels, MTLTextureUsage usage) {
     MTLTextureDescriptor* descriptor = [MTLTextureDescriptor new];
     descriptor.textureType = type;
     descriptor.pixelFormat = format;
@@ -233,10 +238,40 @@ std::string Shaped(const Context& context, MTLTextureType type, MTLPixelFormat f
     descriptor.height = height;
     descriptor.depth = depth;
     descriptor.arrayLength = layers;
-    descriptor.usage = MTLTextureUsageShaderRead;
+    descriptor.mipmapLevelCount = levels;
+    descriptor.sampleCount = type == MTLTextureType2DMultisample ? 4 : 1;
+    descriptor.usage = usage;
     descriptor.storageMode = MTLStorageModePrivate;
-    return [context.device newTextureWithDescriptor:descriptor] != nil ? "built"
-                                                                       : "error: no texture";
+    return [context.device newTextureWithDescriptor:descriptor];
+}
+
+std::string Shaped(const Context& context, MTLTextureType type, MTLPixelFormat format,
+                   NSUInteger width, NSUInteger height, NSUInteger depth, NSUInteger layers,
+                   NSUInteger levels = 1, MTLTextureUsage usage = MTLTextureUsageShaderRead) {
+    return Shape(context, type, format, width, height, depth, layers, levels, usage) != nil
+               ? "built"
+               : "error: no texture";
+}
+
+/// A view of a 16x16 RGBA8 texture of 6 layers and 5 levels (1D: 16x1 with one level;
+/// multisampled and 3D: one layer and level), made with the usage the renderer's textures have.
+std::string View(const Context& context, MTLTextureType base_type, MTLTextureType type,
+                 MTLPixelFormat format, NSRange levels, NSRange slices) {
+    const bool flat = base_type == MTLTextureType2DMultisample || base_type == MTLTextureType3D;
+    const bool line = base_type == MTLTextureType1DArray;
+    const id<MTLTexture> base =
+        Shape(context, base_type, MTLPixelFormatRGBA8Unorm, 16, line ? 1 : 16,
+              base_type == MTLTextureType3D ? 16 : 1, flat ? 1 : 6, flat || line ? 1 : 5,
+              MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView);
+    if (base == nil) {
+        return "error: no texture";
+    }
+    return [base newTextureViewWithPixelFormat:format
+                                   textureType:type
+                                        levels:levels
+                                        slices:slices] != nil
+               ? "built"
+               : "error: no view";
 }
 
 std::string Sampler(const Context& context, NSUInteger anisotropy, float min_lod, float max_lod) {
@@ -551,6 +586,120 @@ const Suspect Suspects[] = {
      [](const Context& context) {
          return Shaped(context, MTLTextureType3D, MTLPixelFormatDepth32Float, 4, 4, 4, 1);
      }},
+    // 1D textures, which the texture cache makes for the guest's 1D images, as render targets
+    // when their format can be one.
+    {"texture-1d-array",
+     [](const Context& context) {
+         return Shaped(context, MTLTextureType1DArray, MTLPixelFormatRGBA8Unorm, 16, 1, 1, 2);
+     }},
+    {"texture-1d-array-as-render-target",
+     [](const Context& context) {
+         return Shaped(context, MTLTextureType1DArray, MTLPixelFormatRGBA8Unorm, 16, 1, 1, 2, 1,
+                       MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
+     }},
+    {"texture-1d-array-with-pixel-format-view",
+     [](const Context& context) {
+         return Shaped(context, MTLTextureType1DArray, MTLPixelFormatRGBA8Unorm, 16, 1, 1, 2, 1,
+                       MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView);
+     }},
+    {"texture-1d-array-with-shader-write",
+     [](const Context& context) {
+         return Shaped(context, MTLTextureType1DArray, MTLPixelFormatRGBA8Unorm, 16, 1, 1, 2, 1,
+                       MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+     }},
+    {"texture-1d-array-with-5-levels",
+     [](const Context& context) {
+         return Shaped(context, MTLTextureType1DArray, MTLPixelFormatRGBA8Unorm, 16, 1, 1, 2, 5);
+     }},
+    {"texture-1d-array-depth-format",
+     [](const Context& context) {
+         return Shaped(context, MTLTextureType1DArray, MTLPixelFormatDepth32Float, 16, 1, 1, 2);
+     }},
+    {"texture-1d-array-2-texels-high",
+     [](const Context& context) {
+         return Shaped(context, MTLTextureType1DArray, MTLPixelFormatRGBA8Unorm, 16, 2, 1, 2);
+     }},
+    {"texture-2d-array-depth-with-shader-write",
+     [](const Context& context) {
+         return Shaped(context, MTLTextureType2DArray, MTLPixelFormatDepth32Float, 16, 16, 1, 2, 1,
+                       MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+     }},
+    // Views, of the type the shader asks for.
+    {"view-2d-of-2d-array",
+     [](const Context& context) {
+         return View(context, MTLTextureType2DArray, MTLTextureType2D, MTLPixelFormatRGBA8Unorm,
+                     NSMakeRange(0, 5), NSMakeRange(1, 1));
+     }},
+    {"view-cube-of-2d-array",
+     [](const Context& context) {
+         return View(context, MTLTextureType2DArray, MTLTextureTypeCube, MTLPixelFormatRGBA8Unorm,
+                     NSMakeRange(0, 5), NSMakeRange(0, 6));
+     }},
+    {"view-cube-of-5-slices",
+     [](const Context& context) {
+         return View(context, MTLTextureType2DArray, MTLTextureTypeCube, MTLPixelFormatRGBA8Unorm,
+                     NSMakeRange(0, 5), NSMakeRange(0, 5));
+     }},
+    {"view-2d-of-2-slices",
+     [](const Context& context) {
+         return View(context, MTLTextureType2DArray, MTLTextureType2D, MTLPixelFormatRGBA8Unorm,
+                     NSMakeRange(0, 5), NSMakeRange(0, 2));
+     }},
+    {"view-1d-of-2d-array",
+     [](const Context& context) {
+         return View(context, MTLTextureType2DArray, MTLTextureType1D, MTLPixelFormatRGBA8Unorm,
+                     NSMakeRange(0, 1), NSMakeRange(0, 1));
+     }},
+    {"view-2d-of-1d-array",
+     [](const Context& context) {
+         return View(context, MTLTextureType1DArray, MTLTextureType2D, MTLPixelFormatRGBA8Unorm,
+                     NSMakeRange(0, 1), NSMakeRange(0, 1));
+     }},
+    {"view-1d-of-1d-array",
+     [](const Context& context) {
+         return View(context, MTLTextureType1DArray, MTLTextureType1D, MTLPixelFormatRGBA8Unorm,
+                     NSMakeRange(0, 1), NSMakeRange(0, 1));
+     }},
+    {"view-2d-of-3d",
+     [](const Context& context) {
+         return View(context, MTLTextureType3D, MTLTextureType2D, MTLPixelFormatRGBA8Unorm,
+                     NSMakeRange(0, 1), NSMakeRange(0, 1));
+     }},
+    {"view-2d-of-multisample",
+     [](const Context& context) {
+         return View(context, MTLTextureType2DMultisample, MTLTextureType2D,
+                     MTLPixelFormatRGBA8Unorm, NSMakeRange(0, 1), NSMakeRange(0, 1));
+     }},
+    {"view-levels-past-the-end",
+     [](const Context& context) {
+         return View(context, MTLTextureType2DArray, MTLTextureType2D, MTLPixelFormatRGBA8Unorm,
+                     NSMakeRange(4, 2), NSMakeRange(0, 1));
+     }},
+    {"view-slices-past-the-end",
+     [](const Context& context) {
+         return View(context, MTLTextureType2DArray, MTLTextureType2DArray,
+                     MTLPixelFormatRGBA8Unorm, NSMakeRange(0, 1), NSMakeRange(5, 2));
+     }},
+    {"view-rgba8-as-rgba8uint",
+     [](const Context& context) {
+         return View(context, MTLTextureType2DArray, MTLTextureType2D, MTLPixelFormatRGBA8Uint,
+                     NSMakeRange(0, 1), NSMakeRange(0, 1));
+     }},
+    {"view-rgba8-as-r32float",
+     [](const Context& context) {
+         return View(context, MTLTextureType2DArray, MTLTextureType2D, MTLPixelFormatR32Float,
+                     NSMakeRange(0, 1), NSMakeRange(0, 1));
+     }},
+    {"view-rgba8-as-rg8",
+     [](const Context& context) {
+         return View(context, MTLTextureType2DArray, MTLTextureType2D, MTLPixelFormatRG8Unorm,
+                     NSMakeRange(0, 1), NSMakeRange(0, 1));
+     }},
+    {"view-rgba8-as-depth32float",
+     [](const Context& context) {
+         return View(context, MTLTextureType2DArray, MTLTextureType2D, MTLPixelFormatDepth32Float,
+                     NSMakeRange(0, 1), NSMakeRange(0, 1));
+     }},
     {"sampler-anisotropy-0", [](const Context& context) { return Sampler(context, 0, 0, 16); }},
     {"sampler-anisotropy-17", [](const Context& context) { return Sampler(context, 17, 0, 16); }},
     {"sampler-min-lod-above-max",
@@ -588,6 +737,45 @@ const Suspect Suspects[] = {
      }},
     {"pipeline-without-target-in-pass-with",
      [](const Context& context) { return Draw(context, Targetless(context), Pass::Colour, {}); }},
+    {"pass-colour-64-with-depth-32",
+     [](const Context& context) {
+         MTLRenderPipelineDescriptor* descriptor = Targetless(context);
+         descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+         descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+         const id<MTLTexture> depth =
+             Shape(context, MTLTextureType2D, MTLPixelFormatDepth32Float, TargetSize / 2,
+                   TargetSize / 2, 1, 1, 1, MTLTextureUsageRenderTarget);
+         return Draw(context, descriptor, Pass::Colour, {}, true,
+                     [depth](MTLRenderPassDescriptor* pass) {
+                         pass.depthAttachment.texture = depth;
+                         pass.depthAttachment.loadAction = MTLLoadActionClear;
+                         pass.depthAttachment.clearDepth = 1.0;
+                     });
+     }},
+    {"pass-with-depth-the-pipeline-does-not-name",
+     [](const Context& context) {
+         MTLRenderPipelineDescriptor* descriptor = Targetless(context);
+         descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+         const id<MTLTexture> depth =
+             Shape(context, MTLTextureType2D, MTLPixelFormatDepth32Float, TargetSize, TargetSize,
+                   1, 1, 1, MTLTextureUsageRenderTarget);
+         return Draw(context, descriptor, Pass::Colour, {}, true,
+                     [depth](MTLRenderPassDescriptor* pass) {
+                         pass.depthAttachment.texture = depth;
+                         pass.depthAttachment.loadAction = MTLLoadActionClear;
+                         pass.depthAttachment.clearDepth = 1.0;
+                     });
+     }},
+    {"pass-with-level-and-slice-past-the-texture",
+     [](const Context& context) {
+         MTLRenderPipelineDescriptor* descriptor = Targetless(context);
+         descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+         return Draw(context, descriptor, Pass::Colour, {}, true,
+                     [](MTLRenderPassDescriptor* pass) {
+                         pass.colorAttachments[0].level = 3;
+                         pass.colorAttachments[0].slice = 2;
+                     });
+     }},
     {"scissor-past-the-target",
      [](const Context& context) {
          MTLRenderPipelineDescriptor* descriptor = Targetless(context);
