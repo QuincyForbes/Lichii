@@ -247,21 +247,6 @@ std::optional<u32> PrimitiveType(Maxwell::PrimitiveTopology topology) {
     }
 }
 
-u32 TopologyClass(Maxwell::PrimitiveTopology topology) {
-    switch (topology) {
-    case Maxwell::PrimitiveTopology::Points:
-        return 0;
-    case Maxwell::PrimitiveTopology::Lines:
-    case Maxwell::PrimitiveTopology::LineLoop:
-    case Maxwell::PrimitiveTopology::LineStrip:
-    case Maxwell::PrimitiveTopology::LinesAdjacency:
-    case Maxwell::PrimitiveTopology::LineStripAdjacency:
-        return 1;
-    default:
-        return 2;
-    }
-}
-
 PipelineLimits DevicePipelineLimits(const Device& device) {
     PipelineLimits limits{.sample_counts = 0};
     for (const u32 samples : {1U, 2U, 4U, 8U}) {

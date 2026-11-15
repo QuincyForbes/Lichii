@@ -27,6 +27,7 @@
 #include "video_core/nx2.h"
 #include "video_core/oot_network.h"
 #include "video_core/renderer_metal/metal_coverage.h"
+#include "video_core/renderer_metal/metal_draw_desc.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
@@ -845,28 +846,6 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         state_desc.color_formats[rt] = framebuffer->Colors()[rt].texture != nullptr
                                      ? framebuffer->ColorFormats()[rt]
                                      : 0U;
-        const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : rt];
-        BlendTargetState& blend = state_desc.blend[rt];
-        blend.write_mask = (mask.R != 0 ? 1U : 0U) | (mask.G != 0 ? 2U : 0U) |
-                           (mask.B != 0 ? 4U : 0U) | (mask.A != 0 ? 8U : 0U);
-        const bool per_target = regs.blend_per_target_enabled != 0;
-        blend.enable = regs.blend.enable[per_target ? rt : 0] != 0 ? 1U : 0U;
-        if (per_target) {
-            const auto& src = regs.blend_per_target[rt];
-            blend.color_op = src.color_op;
-            blend.alpha_op = src.alpha_op;
-            blend.color_source = src.color_source;
-            blend.color_dest = src.color_dest;
-            blend.alpha_source = src.alpha_source;
-            blend.alpha_dest = src.alpha_dest;
-        } else {
-            blend.color_op = regs.blend.color_op;
-            blend.alpha_op = regs.blend.alpha_op;
-            blend.color_source = regs.blend.color_source;
-            blend.color_dest = regs.blend.color_dest;
-            blend.alpha_source = regs.blend.alpha_source;
-            blend.alpha_dest = regs.blend.alpha_dest;
-        }
     }
     targets.depth = framebuffer->Depth();
     targets.has_depth = framebuffer->HasDepth();
@@ -876,27 +855,12 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     state_desc.depth_format = targets.has_depth ? framebuffer->DepthFormat() : 0U;
     state_desc.stencil_format = targets.has_stencil ? framebuffer->DepthFormat() : 0U;
     state_desc.samples = framebuffer->Samples();
-    state_desc.topology_class = TopologyClass(topology);
-    state_desc.rasterize = regs.rasterize_enable != 0 ? 1U : 0U;
-    state_desc.alpha_to_coverage = regs.anti_alias_alpha_control.alpha_to_coverage != 0 ? 1U : 0U;
-    for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
-        const auto& input = regs.vertex_attrib_format[index];
-        VertexAttributeState& attribute = state_desc.attributes[index];
-        // The mesh emulation's vertex shader reads its output buffer, no vertex streams.
-        attribute.enabled = input.constant != 0 || mesh != nullptr ? 0U : 1U;
-        attribute.stream = input.buffer;
-        attribute.offset = input.offset;
-        attribute.type = input.type;
-        attribute.size = input.size;
-    }
+    FillRegisterState(state_desc, regs, topology, mesh != nullptr);
     const auto& vertex_states = buffer_cache_runtime.Vertices();
     for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
-        VertexStreamState& stream = state_desc.streams[index];
-        stream.enabled = vertex_states[index].buffer != nullptr && mesh == nullptr ? 1U : 0U;
-        stream.stride = vertex_states[index].stride;
-        stream.divisor = regs.vertex_stream_instances.IsInstancingEnabled(index)
-                             ? regs.vertex_streams[index].frequency
-                             : 0U;
+        FillStream(state_desc, regs, index,
+                   vertex_states[index].buffer != nullptr && mesh == nullptr,
+                   vertex_states[index].stride);
     }
     // The guest's layout as Metal takes it: Metal's vertex descriptor has 31 attributes and 31
     // buffer layouts and aborts the process when asked for more (Ocarina of Time's first draw has
@@ -904,29 +868,11 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     const bool checked = PipelineCheckEnabled();
     VertexSources vertex_sources{};
     if (checked) {
-        u32 loaded = 0;
-        u32 resource_slots = 0;
-        if (mesh == nullptr && !absent(0)) {
-            const StageProgram& program = *programs[0];
-            for (u32 index = 0; index < Maxwell::NumVertexAttributes; ++index) {
-                loaded |= program.info.loads.Generic(index) ? 1U << index : 0U;
-            }
-            for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
-                if (slot.kind == ShaderTranslate::ResourceKind::Buffer) {
-                    resource_slots = (std::max)(resource_slots, slot.index + slot.count);
-                }
-            }
-            const ShaderTranslate::TessellationSlots& slots = program.tessellation_slots;
-            for (const u32 slot : {slots.output, slots.patch_output, slots.tess_factors,
-                                   slots.input, slots.patch_input, slots.indirect_params,
-                                   slots.index}) {
-                if (slot != ~0U) {
-                    resource_slots = (std::max)(resource_slots, slot + 1);
-                }
-            }
-        }
+        const VertexProgramUse use =
+            mesh == nullptr && !absent(0) ? VertexUse(*programs[0]) : VertexProgramUse{};
         std::string reason;
-        if (!SanitizeVertexLayout(state_desc, loaded, resource_slots, vertex_sources, reason)) {
+        if (!SanitizeVertexLayout(state_desc, use.loaded, use.resource_slots, vertex_sources,
+                                  reason)) {
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
                 LOG_WARNING(Render_Metal,
@@ -966,16 +912,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     // post-tessellation vertex function reads buffers.
     const RenderPipelineDesc layout_desc = state_desc;
     if (tess != nullptr) {
-        std::ranges::fill(state_desc.attributes, VertexAttributeState{});
-        std::ranges::fill(state_desc.streams, VertexStreamState{});
-        using Spacing = ShaderTranslate::TessellationModes::Spacing;
-        // MTLTessellationPartitionModeInteger, FractionalOdd, FractionalEven; MTLWinding
-        // reversed, as Vulkan's domain origin is the upper left (MoltenVK does the same).
-        state_desc.tessellation = 1;
-        state_desc.tess_partition = tess->modes.spacing == Spacing::FractionalOdd    ? 2U
-                                    : tess->modes.spacing == Spacing::FractionalEven ? 3U
-                                                                                     : 1U;
-        state_desc.tess_winding = tess->modes.clockwise ? 1U : 0U;
+        ApplyTessellation(state_desc, *tess);
     }
     void* const state = pipeline.RenderState(device, state_desc);
     if (state == nullptr) {
@@ -983,22 +920,8 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     }
     prepare_refusal = {};
 
-    auto depth_stencil = Zeroed<DepthStencilDesc>();
-    depth_stencil.depth_test = regs.depth_test_enable != 0 && targets.has_depth ? 1U : 0U;
-    depth_stencil.depth_write = regs.depth_write_enabled != 0 ? 1U : 0U;
-    depth_stencil.depth_func = regs.depth_test_func;
-    depth_stencil.stencil_test = regs.stencil_enable != 0 && targets.has_stencil ? 1U : 0U;
-    depth_stencil.front = {regs.stencil_front_op.fail, regs.stencil_front_op.zfail,
-                           regs.stencil_front_op.zpass, regs.stencil_front_op.func,
-                           regs.stencil_front_func_mask, regs.stencil_front_mask};
-    depth_stencil.back = regs.stencil_two_side_enable != 0
-                             ? StencilFaceState{regs.stencil_back_op.fail,
-                                                regs.stencil_back_op.zfail,
-                                                regs.stencil_back_op.zpass,
-                                                regs.stencil_back_op.func,
-                                                regs.stencil_back_func_mask,
-                                                regs.stencil_back_mask}
-                             : depth_stencil.front;
+    const DepthStencilDesc depth_stencil =
+        DepthStencilState(regs, targets.has_depth, targets.has_stencil);
     const u64 depth_stencil_hash = Common::CityHash64(
         reinterpret_cast<const char*>(&depth_stencil), sizeof(depth_stencil));
     Object& depth_stencil_state = depth_stencil_states[depth_stencil_hash];
