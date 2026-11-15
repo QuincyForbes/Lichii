@@ -3904,6 +3904,67 @@ void RasterizerVulkan::ReportSlowAccesses(double seconds) {
              "sampled blocks (1 in {}): {}",
              text[0], text[1], (total_us[0] + total_us[1]) / 1e3 / seconds, PR::SlowSampleEvery,
              site_text.empty() ? std::string{"none"} : site_text);
+    ReportCpuWrites(seconds);
+}
+
+void RasterizerVulkan::ReportCpuWrites(double seconds) {
+    namespace Stats = VideoCommon::CpuWriteStats;
+    static std::array<u64, static_cast<size_t>(Stats::Outcome::Count)> outcomes_then{};
+    static std::array<u64, 4> age_then{};
+    static std::array<u64, 3> source_then{};
+    const auto delta = [&](auto& counters, auto& then, size_t index) {
+        const u64 now = counters[index].load(std::memory_order_relaxed);
+        return static_cast<double>(now - std::exchange(then[index], now)) / seconds;
+    };
+    using O = Stats::Outcome;
+    const auto outcome = [&](O o) {
+        return delta(Stats::g_outcomes, outcomes_then, static_cast<size_t>(o));
+    };
+    const double unregistered = outcome(O::Unregistered);
+    const double gpu_page = outcome(O::GpuPage);
+    const double gpu_bytes = outcome(O::GpuBytes);
+    const double no_gpu_bytes = outcome(O::PageNoGpuBytes);
+    const double cpu_read = outcome(O::PageCpuRead);
+    const double preflushable = outcome(O::PagePreflushable);
+    const double already = outcome(O::AlreadyCpu);
+    const double marked = outcome(O::Marked);
+    const double still = outcome(O::StillProtected);
+    const double reclaimed = outcome(O::Reclaimed);
+    const double queued = outcome(O::DownloadQueued);
+    std::string detail;
+    if (Stats::Detailed()) {
+        detail = fmt::format(" | of those, pages without GPU-written bytes {:.0f}, read by the CPU "
+                             "{:.0f}, preflushable {:.0f}",
+                             no_gpu_bytes, cpu_read, preflushable);
+        detail += fmt::format(" | GPU marks of those: age 0 {:.0f}, 1 {:.0f}, 2-15 {:.0f}, 16+ {:.0f} "
+                             "frames; binding {:.0f}, DMA {:.0f}, unknown {:.0f} | pages:",
+                             delta(Stats::g_gpu_mark_age, age_then, 0),
+                             delta(Stats::g_gpu_mark_age, age_then, 1),
+                             delta(Stats::g_gpu_mark_age, age_then, 2),
+                             delta(Stats::g_gpu_mark_age, age_then, 3),
+                             delta(Stats::g_gpu_mark_source, source_then, 0),
+                             delta(Stats::g_gpu_mark_source, source_then, 1),
+                             delta(Stats::g_gpu_mark_source, source_then, 2));
+        auto samples = Stats::TakeSamples();
+        std::ranges::sort(samples, [](const auto& a, const auto& b) { return a.count > b.count; });
+        for (const auto& sample : samples) {
+            if (sample.count == 0) {
+                break;
+            }
+            detail += fmt::format(" {:#x} x{} (mark {:#x}+{:#x} {} frames ago {}, GPU bytes "
+                                  "{:#x}-{:#x})",
+                                  sample.addr, sample.count, sample.mark.begin, sample.mark.size,
+                                  sample.age, sample.mark.source == 0 ? "binding" : "DMA",
+                                  sample.gpu_first, sample.gpu_end);
+        }
+    }
+    LOG_INFO(Common_Memory,
+             "Perf CPU writes: buffer cache asked {:.0f}/s: no buffer {:.0f}, GPU-modified page "
+             "{:.0f} (written bytes GPU-written {:.0f}; reclaimed as CPU pages {:.0f}, downloads "
+             "queued {:.0f}), page already CPU-modified {:.0f}, marked {:.0f}, still protected "
+             "after {:.0f}{}",
+             unregistered + gpu_page + already + marked - reclaimed, unregistered, gpu_page, gpu_bytes,
+             reclaimed, queued, already, marked, still, detail);
 }
 
 void RasterizerVulkan::TickPerfReport() {

@@ -1257,11 +1257,13 @@ struct Memory::Impl {
         const auto on_device_address = [&](DAddr address) {
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
-            if (current_area.last_address != subaddress) {
+            const u64 epoch = Core::g_write_answer_epoch.load(std::memory_order_relaxed);
+            if (current_area.last_address != subaddress || current_area.epoch != epoch) {
                 auto const do_collection = (address != 0 && size != 0)
                     && system.GPU().OnCPUWrite(address, size);
                 if (do_collection) {
                     current_area.last_address = subaddress;
+                    current_area.epoch = epoch;
                 } else {
                     return;
                 }
@@ -1306,6 +1308,7 @@ struct Memory::Impl {
 
     struct GPUDirtyState {
         PAddr last_address;
+        u64 epoch;
     };
 
     void InvalidateGPUMemory(u8* p, size_t size) {

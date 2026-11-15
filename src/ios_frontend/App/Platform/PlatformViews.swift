@@ -440,6 +440,7 @@ struct ExperimentsView: View {
     @State private var targetlessFull = lichii_platform_experiment("targetless_full") != 0
     @State private var jitInlineExclusives = lichii_platform_experiment("jit_inline_exclusives") != 0
     @State private var jitLoadFaults = lichii_platform_experiment("jit_load_faults") != 0
+    @State private var cpuWritesOld = lichii_platform_experiment("cpu_writes_old") != 0
 
     var body: some View {
         List {
@@ -581,10 +582,14 @@ struct ExperimentsView: View {
                     .onChange(of: jitLoadFaults) { value in
                         lichii_platform_set_experiment("jit_load_faults", value ? 1 : 0)
                     }
+                Toggle("Writes Next to GPU Data as Before", isOn: $cpuWritesOld)
+                    .onChange(of: cpuWritesOld) { value in
+                        lichii_platform_set_experiment("cpu_writes_old", value ? 1 : 0)
+                    }
             } header: {
                 Text("Guest Memory Access")
             } footer: {
-                Text("Exclusive Accesses in Fastmem runs the game's exclusive loads and stores (LDXR/STXR, for locks and counters) directly on guest memory, as on a computer, instead of a call into the emulator each; Ocarina of Time uses none on a computer, other games may. Loads Keep Fastmem After a Fault lets a game load that hit protected memory (a page the GPU wrote) keep reading guest memory directly, and take the slow path only after its eighth such fault instead of the first; on a computer it cut Ocarina of Time's slow loads of GPU pages by 70 % but saved little time. Both are off by default. The \"Perf memory callbacks:\" log line counts both.\n\nBoth apply the next time Lichii starts.")
+                Text("Exclusive Accesses in Fastmem runs the game's exclusive loads and stores (LDXR/STXR, for locks and counters) directly on guest memory, as on a computer, instead of a call into the emulator each; Ocarina of Time uses none on a computer, other games may. Loads Keep Fastmem After a Fault lets a game load that hit protected memory (a page the GPU wrote) keep reading guest memory directly, and take the slow path only after its eighth such fault instead of the first; on a computer it cut Ocarina of Time's slow loads of GPU pages by 70 % but saved little time. Both are off by default. The \"Perf memory callbacks:\" log line counts both.\n\nWrites Next to GPU Data as Before keeps every game write to a memory page that also holds data the GPU wrote on the slow path until the next GPU sync, as before. Normally Lichii copies the GPU's data on such a page back first and then lets the game write the page directly (on a computer this halved Ocarina of Time's slow writes in Kokiri Forest); turn it on if objects flicker or show stale data. The \"Perf CPU writes:\" log line counts these pages.\n\nAll three apply the next time Lichii starts.")
             }
 
             Section {

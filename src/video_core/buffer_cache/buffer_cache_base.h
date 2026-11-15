@@ -38,6 +38,7 @@
 #include "core/gpu_dirty_memory_manager.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/cpu_write_stats.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
@@ -290,6 +291,12 @@ public:
                                const u8* data, u64 size);
 
     bool OnCPUWrite(DAddr device_addr, u64 size);
+
+    /// EDEN_NX2_CPU_WRITE_STATS (CpuWriteStats): the GPU mark behind a trapped CPU write.
+    void NoteCpuWriteOfGpuPage(DAddr device_addr, u64 size);
+    /// True when the write's pages may be written as CPU pages now (EDEN_NX2_CPU_WRITE_RECLAIM).
+    bool ReclaimGpuPagesForCpu(DAddr device_addr, u64 size);
+    void NoteGpuMark(DAddr device_addr, u64 size, u32 source);
 
     void DownloadMemory(DAddr device_addr, u64 size);
 

@@ -562,6 +562,7 @@ private:
     void TickPerfReport();
     /// "Perf memory callbacks:" line: why guest accesses left fastmem, their cost and sites.
     void ReportSlowAccesses(double seconds);
+    void ReportCpuWrites(double seconds);
     std::chrono::steady_clock::time_point perf_report_start{};
     std::chrono::steady_clock::time_point perf_frame_last{};
     std::array<u64, Common::PerfReport::Count> perf_report_counters{};

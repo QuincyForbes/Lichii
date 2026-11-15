@@ -170,6 +170,12 @@ public:
         return false;
     }
 
+    /// How many caches track the page holding `addr` (0: guest writes take fastmem).
+    [[nodiscard]] u32 PageCachedCount(DAddr addr) const {
+        const size_t page = addr >> page_bits;
+        return cached_pages->at(page >> subentries_shift).Count(page).load(std::memory_order_relaxed);
+    }
+
     /// Changes whenever Map or Unmap changed a translation.
     [[nodiscard]] u64 MappingGeneration() const {
         return translation_generation.load(std::memory_order_acquire);

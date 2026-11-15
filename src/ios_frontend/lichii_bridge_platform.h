@@ -206,6 +206,8 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// 20 us before it blocks (EDEN_NX2_IDLE_SPIN_US=20). "jit_inline_exclusives": LDXR/STXR run in
 /// fastmem instead of through the memory callbacks (EDEN_NX2_JIT_INLINE_EXCLUSIVES=1). "jit_load_faults": a
 /// load that faults in fastmem gives it up only at its 8th fault (EDEN_NX2_JIT_LOAD_FAULTS=8).
+/// "cpu_writes_old": guest writes of pages holding GPU-written bytes stay trapped until the next
+/// fence, as before (EDEN_NX2_CPU_WRITE_RECLAIM=0).
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
 /// Guest memory in a file: as set in Experiments ("file_guest" / "file_guest_off"), else the

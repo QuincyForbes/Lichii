@@ -294,5 +294,8 @@ inline DevicePageFlags g_collected_write_pages;
 /// Pages whose guest memory the buffer cache saw change (WriteMemory, uploads in place,
 /// downloads).
 inline DevicePageFlags g_buffer_write_pages;
+/// Bumped when the GPU's answer to a guest write of a collected page may have changed
+/// (EDEN_NX2_CPU_WRITE_RECLAIM): each core then asks again instead of collecting at once.
+inline std::atomic<u64> g_write_answer_epoch{};
 
 } // namespace Core

@@ -408,15 +408,110 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
 
 template <class P>
 bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
+    namespace Stats = CpuWriteStats;
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
+        Stats::Note(Stats::Outcome::Unregistered);
         return false;
     }
     if (memory_tracker.IsRegionGpuModified(device_addr, size)) {
+        Stats::Note(Stats::Outcome::GpuPage);
+        if (Stats::Detailed()) [[unlikely]] {
+            NoteCpuWriteOfGpuPage(device_addr, size);
+        }
+        if (!ReclaimGpuPagesForCpu(device_addr, size)) {
+            return true;
+        }
+    }
+    Stats::Note(memory_tracker.IsRegionCpuModified(device_addr, size) ? Stats::Outcome::AlreadyCpu
+                                                                     : Stats::Outcome::Marked);
+    WriteMemory(device_addr, size);
+    if (Stats::Detailed() && device_memory.PageCachedCount(device_addr) != 0) [[unlikely]] {
+        Stats::Note(Stats::Outcome::StillProtected);
+    }
+    return false;
+}
+
+template <class P>
+bool BufferCache<P>::ReclaimGpuPagesForCpu(DAddr device_addr, u64 size) {
+    // EDEN_NX2_CPU_WRITE_RECLAIM. A guest CPU write of a page the tracker holds GPU-modified is
+    // collected and the page stays write-protected, so each following store on it traps as well
+    // (Ocarina of Time: ~45 per page, ~21k a frame). 1: a page without any GPU-written byte left
+    // (its download landed, or the CPU wrote over them) loses the stale GPU mark and is written
+    // as a CPU page at once; the next upload protects it again. 2: also queue a fence download
+    // of the GPU-written bytes of the other pages, so the next write finds them gone.
+    const int mode = CpuWriteStats::ReclaimMode();
+    if (mode == 0) {
+        return false;
+    }
+    namespace Stats = CpuWriteStats;
+    const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
+    const u64 pages_size = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE) - page_begin;
+    if (!gpu_modified_ranges.Intersects(page_begin, pages_size)) {
+        memory_tracker.UnmarkRegionAsGpuModified(page_begin, pages_size);
+        Stats::Note(Stats::Outcome::Reclaimed);
         return true;
     }
-    WriteMemory(device_addr, size);
+    if (mode < 2 || uncommitted_gpu_modified_ranges.Intersects(page_begin, pages_size)) {
+        return false;
+    }
+    for (const auto& ranges : pending_download_ranges) {
+        if (ranges.Intersects(page_begin, pages_size)) {
+            return false;
+        }
+    }
+    gpu_modified_ranges.ForEachInRange(page_begin, pages_size, [&](DAddr begin, DAddr end) {
+        uncommitted_gpu_modified_ranges.Add(begin, end - begin);
+    });
+    Stats::Note(Stats::Outcome::DownloadQueued);
     return false;
+}
+
+template <class P>
+void BufferCache<P>::NoteCpuWriteOfGpuPage(DAddr device_addr, u64 size) {
+    namespace Stats = CpuWriteStats;
+    if (gpu_modified_ranges.Intersects(device_addr, size)) {
+        Stats::Note(Stats::Outcome::GpuBytes);
+    }
+    const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
+    if (!gpu_modified_ranges.Intersects(page_begin, DEVICE_PAGESIZE)) {
+        Stats::Note(Stats::Outcome::PageNoGpuBytes);
+    }
+    if (cpu_read_ranges.Intersects(page_begin, DEVICE_PAGESIZE)) {
+        Stats::Note(Stats::Outcome::PageCpuRead);
+    }
+    if (memory_tracker.IsRegionPreflushable(page_begin, DEVICE_PAGESIZE)) {
+        Stats::Note(Stats::Outcome::PagePreflushable);
+    }
+    const u64 page = device_addr >> Core::DEVICE_PAGEBITS;
+    const Stats::PageMark& mark = Stats::Slot(page);
+    if (mark.page != page) {
+        Stats::g_gpu_mark_source[2].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    Stats::g_gpu_mark_source[mark.source].fetch_add(1, std::memory_order_relaxed);
+    const u64 age = frame_tick - mark.frame;
+    Stats::g_gpu_mark_age[age == 0 ? 0 : age == 1 ? 1 : age < 16 ? 2 : 3].fetch_add(
+        1, std::memory_order_relaxed);
+    Stats::PageSample sample{.addr = device_addr, .mark = mark, .age = age, .gpu_first = ~u64{0}};
+    gpu_modified_ranges.ForEachInRange(page_begin, DEVICE_PAGESIZE, [&](DAddr begin, DAddr end) {
+        sample.gpu_first = (std::min<u64>)(sample.gpu_first, begin - page_begin);
+        sample.gpu_end = (std::max<u64>)(sample.gpu_end, end - page_begin);
+    });
+    Stats::NoteSample(sample);
+}
+
+template <class P>
+void BufferCache<P>::NoteGpuMark(DAddr device_addr, u64 size, u32 source) {
+    if (!CpuWriteStats::Detailed() || size == 0) [[likely]] {
+        return;
+    }
+    const u64 first = device_addr >> Core::DEVICE_PAGEBITS;
+    const u64 last = (std::min)((device_addr + size - 1) >> Core::DEVICE_PAGEBITS, first + 255);
+    for (u64 page = first; page <= last; ++page) {
+        CpuWriteStats::Slot(page) = {
+            .page = page, .frame = frame_tick, .begin = device_addr, .size = size, .source = source};
+    }
 }
 
 template <class P>
@@ -762,6 +857,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
     if (has_new_downloads && !inline_grid_copy) {
         memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount);
+        NoteGpuMark(*cpu_dest_address, amount, 1);
         const bool should_sync = Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         if (should_sync) {
             runtime.Finish();
@@ -1454,6 +1550,10 @@ void BufferCache<P>::PopAsyncBuffers() {
     async_buffers.pop_front();
     pending_downloads.pop_front();
     pending_download_ranges.pop_front();
+    if (CpuWriteStats::ReclaimMode() != 0) {
+        // Pages collecting guest writes may have no GPU-written byte left: let the cores ask.
+        Core::g_write_answer_epoch.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 template <class P>
@@ -3010,6 +3110,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
         ranges.Subtract(device_addr, size);
     }
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
+    NoteGpuMark(device_addr, size, 0);
     MarkVertexBuffersStale(device_addr, size);
     static const bool mark_guards = [] {
         const char* const value = std::getenv("EDEN_NX2_BUFCACHE_MARK");
