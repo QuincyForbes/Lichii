@@ -472,7 +472,7 @@ struct Values {
     // resolution scale, which otherwise doesn't apply to the game (EffectiveResolutionSetup). With
     // NVIDIA DLSS the fixed sizes are DLSS's input (OcarinaDlssModeFor). Phones get 56 % from the
     // device profile (common/device_profile.h). EDEN_NX2_OOT_MAX_RESOLUTION=0/1 and
-    // EDEN_NX2_OOT_RENDER_SCALE=1..3 override it for tests. Read when the game starts.
+    // EDEN_NX2_OOT_RENDER_SCALE=1..5 override it for tests. Read when the game starts.
     SwitchableSetting<OotResolution> oot_resolution{linkage,
 #if defined(__APPLE__) && TARGET_OS_IPHONE
                                                     OotResolution::Game,

@@ -109,6 +109,9 @@ bool lichii_perf_snapshot(LichiiPerfSnapshot* out) {
     out->output_height = static_cast<u32>((extents >> 48) & 0xFFFF);
     out->render_width = scaling.ScaleUp(out->guest_width);
     out->render_height = scaling.ScaleUp(out->guest_height);
+    const u64 scene = VideoCore::Probe::scene_extents.load(std::memory_order_relaxed);
+    out->scene_width = static_cast<u32>(scene & 0xFFFF);
+    out->scene_height = static_cast<u32>((scene >> 16) & 0xFFFF);
 
     out->texture_cache_bytes = VideoCore::Probe::texture_cache_bytes.load(std::memory_order_relaxed);
     out->texture_cache_expected =

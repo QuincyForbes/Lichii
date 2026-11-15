@@ -500,6 +500,8 @@ OcarinaDlssMode OcarinaDlssModeFor(OotResolution resolution) {
     case OotResolution::Percent75:
         return OcarinaDlssMode::Performance;
     case OotResolution::Percent50:
+    case OotResolution::Percent40:
+    case OotResolution::Percent33:
         return OcarinaDlssMode::UltraPerformance;
     default:
         return OcarinaDlssMode::Quality;

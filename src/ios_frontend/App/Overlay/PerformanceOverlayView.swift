@@ -119,10 +119,14 @@ struct PerformanceOverlayView: View {
 
     @ViewBuilder
     private func detailLines(_ r: OverlayReading) -> some View {
+        // The 3D scene, the game's finished picture (HUD and menus) and the screen.
+        if !r.sceneSize.isEmpty {
+            Text("3D \(r.sceneSize)")
+        }
         if !r.renderSize.isEmpty {
-            Text("Render \(r.renderSize)")
+            Text("Game \(r.renderSize)")
             if !r.outputSize.isEmpty {
-                Text("Output \(r.outputSize)")
+                Text("Screen \(r.outputSize)")
             }
         }
         if !r.gpuAccuracy.isEmpty {

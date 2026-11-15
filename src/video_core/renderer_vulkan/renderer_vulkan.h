@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <array>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <variant>
@@ -72,6 +74,11 @@ private:
     VkCommandBuffer BeginSingleTimeCommands();
     void EndSingleTimeCommands(VkCommandBuffer command_buffer);
     void Report() const;
+    /// One Info line naming every size a frame goes through, when one of them changes.
+    void LogFrameChain(u32 game_width, u32 game_height, u32 screen_width, u32 screen_height);
+    std::array<u64, 4> chain_key{};
+    std::chrono::steady_clock::time_point chain_logged{};
+    u32 chain_lines{};
 
     vk::Buffer RenderToBuffer(std::span<const Tegra::FramebufferConfig> framebuffers,
                               const Layout::FramebufferLayout& layout, VkFormat format,

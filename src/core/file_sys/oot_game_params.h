@@ -26,7 +26,8 @@ public:
         return valid;
     }
 
-    /// Dictionary keys and array indices (as decimal text) from the root.
+    /// Dictionary keys, array indices (as decimal text) and the keys of hash dictionaries ("#" and
+    /// the hash in hex) from the root.
     using Path = std::initializer_list<std::string_view>;
 
     std::optional<float> GetFloat(Path path) const;

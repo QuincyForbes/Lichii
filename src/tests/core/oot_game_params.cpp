@@ -87,6 +87,36 @@ std::vector<u8> MakeScene() {
     return out;
 }
 
+// A hash dictionary under the root, as the game's resolution parameters are stored: {hash, value}
+// entries, then one type byte each.
+std::vector<u8> MakeHashed() {
+    std::vector<u8> out(16);
+    out[0] = 'Y';
+    out[1] = 'B';
+    out[2] = 7;
+    const std::size_t key_table = out.size();
+    out.insert(out.end(), {0xC2, 1, 0, 0});
+    Append32(out, 8);
+    out.insert(out.end(), {'R', 'e', 's', 0});
+
+    const std::size_t hashed = out.size();
+    out.insert(out.end(), {0x20, 2, 0, 0});
+    Append32(out, 0x0b46e9da);
+    Append32(out, 1920);
+    Append32(out, 0x7f000001);
+    AppendFloat(out, 0.5f);
+    out.insert(out.end(), {0xD1, 0xD2, 0, 0});
+
+    const std::size_t root = out.size();
+    out.insert(out.end(), {0xC1, 1, 0, 0});
+    out.insert(out.end(), {0, 0, 0, 0x20});
+    Append32(out, static_cast<u32>(hashed));
+
+    Put32(out, 4, static_cast<u32>(key_table));
+    Put32(out, 12, static_cast<u32>(root));
+    return out;
+}
+
 std::vector<u8> MakeSarc(std::string_view name, const std::vector<u8>& member) {
     std::vector<u8> out{'S', 'A', 'R', 'C', 0x14, 0, 0xFF, 0xFE};
     out.resize(0x14);
@@ -133,6 +163,20 @@ TEST_CASE("BYML editor reads and writes values in place", "[file_sys]") {
 
     std::vector<u8> junk(32);
     CHECK_FALSE(FileSys::BymlEditor{junk}.IsValid());
+}
+
+TEST_CASE("BYML editor follows hash dictionaries", "[file_sys]") {
+    auto hashed = MakeHashed();
+    FileSys::BymlEditor byml{hashed};
+    REQUIRE(byml.IsValid());
+    CHECK(byml.GetInt({"Res", "#b46e9da"}) == 1920);
+    CHECK(byml.GetFloat({"Res", "#7f000001"}) == 0.5f);
+    CHECK_FALSE(byml.GetInt({"Res", "#1"}).has_value());
+    CHECK_FALSE(byml.GetInt({"Res", "b46e9da"}).has_value());
+    CHECK_FALSE(byml.GetInt({"Res", "#b46e9dax"}).has_value());
+    CHECK(byml.SetInt({"Res", "#b46e9da"}, 1280));
+    CHECK(byml.GetInt({"Res", "#b46e9da"}) == 1280);
+    CHECK(byml.GetFloat({"Res", "#7f000001"}) == 0.5f);
 }
 
 TEST_CASE("Foliage levels edit the foliage scenes of a pack", "[file_sys]") {
