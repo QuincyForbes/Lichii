@@ -31,6 +31,7 @@
 #include "video_core/framebuffer_config.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_metal/metal_bridge.h"
+#include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_rasterizer.h"
 #include "video_core/renderer_metal/metal_resources.h"
@@ -515,6 +516,9 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                  work.ocarina_bilinear, graphics_made, compute_made, refused, command_buffers, encoders, passes, blits,
                  impl->rasterizer.TextureRuntime().allocated_bytes >> 20,
                  impl->rasterizer.BufferRuntime().GetDeviceMemoryUsage() >> 20);
+        if (const std::string coverage = Coverage::TakeLine(); !coverage.empty()) {
+            LOG_INFO(Render_Metal, "Perf Metal coverage: {}", coverage);
+        }
         // The pipeline archive: builds it served, and the build time that saved so far (each hit
         // at the average miss's cost, less what the hit took).
         PipelineArchive& archive = impl->rasterizer.Pipelines().Archive();

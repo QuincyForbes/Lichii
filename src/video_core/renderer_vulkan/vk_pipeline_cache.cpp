@@ -49,6 +49,7 @@
 #include "video_core/async_translate.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/feature_census.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
@@ -3717,6 +3718,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
             programs[index] = MergeDualVertexPrograms(program_va, program_vb, env, host_info);
         }
+        if (VideoCommon::FeatureCensus::Enabled()) {
+            VideoCommon::FeatureCensus::NoteProgram(key.unique_hashes[index], programs[index]);
+        }
 
         if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
                 programs[index], program_id != 0 ? program_id : visual_workaround_title,
@@ -4649,6 +4653,9 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     }
 
     auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+    if (VideoCommon::FeatureCensus::Enabled()) {
+        VideoCommon::FeatureCensus::NoteProgram(key.unique_hash, program);
+    }
     if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
             program, program_id != 0 ? program_id : visual_workaround_title, key.unique_hash,
             oot_visual_workaround)) {

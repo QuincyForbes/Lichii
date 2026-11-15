@@ -105,6 +105,8 @@ add_library(video_core STATIC
     macro_hle_oot.h
     macro_memo.h
     macro_turing.h
+    feature_census.cpp
+    feature_census.h
     fence_manager.h
     gpu.cpp
     gpu.h
@@ -640,6 +642,7 @@ option(LICHII_METAL_COMPILE_CHECK "Compile the Metal renderer's C++ part without
 set(METAL_RENDERER_CXX_SOURCES
     renderer_metal/metal_buffer_cache.cpp
     renderer_metal/metal_buffer_cache_base.cpp
+    renderer_metal/metal_coverage.cpp
     renderer_metal/metal_fence_manager.cpp
     renderer_metal/metal_index_convert.cpp
     renderer_metal/metal_ocarina.cpp
@@ -672,6 +675,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_archive.h
         renderer_metal/metal_bridge.h
         renderer_metal/metal_buffer_cache.h
+        renderer_metal/metal_coverage.h
         renderer_metal/metal_device.h
         renderer_metal/metal_fence_manager.h
         renderer_metal/metal_graphics.h

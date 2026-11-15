@@ -7,10 +7,13 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/common_types.h"
@@ -54,6 +57,14 @@ struct GraphicsPipelineKey {
     u32 early_z{};
     /// Tessellation pipelines: domain | spacing << 2 | output primitives << 4 (Maxwell's).
     u32 tessellation{};
+    /// Fixed state the programs are translated with, as Vulkan's MakeRuntimeInfo takes it from
+    /// FixedPipelineState (EDEN_NX2_METAL_FIXED_STATE=0: all three stay zero). Bit 0: depth
+    /// -1..1, bit 1: lower left window origin, bit 2: dual source blending on target 0, bits
+    /// 4-7: alpha test (0 none, else Shader::CompareFunction + 1), bits 8-23: two bits per
+    /// colour target (Shader::AttributeType of what the pixel program writes).
+    u32 state{};
+    u32 alpha_test_ref{}; ///< float bits, zero unless the test compares with it
+    u32 point_size{};     ///< float bits, zero unless points are drawn
 
     bool operator==(const GraphicsPipelineKey&) const noexcept = default;
 
@@ -256,6 +267,11 @@ public:
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
 
+    /// The programs of the last graphics lookup (the feature census).
+    [[nodiscard]] const std::array<u64, 6>& LookupHashes() const noexcept {
+        return graphics_key.unique_hashes;
+    }
+
     /// Opens the game's pipeline archive (EDEN_NX2_METAL_ARCHIVE=0: none).
     void OpenArchive(u64 title_id);
 
@@ -266,7 +282,19 @@ public:
     /// Pipelines made and refused since the last call (the renderer's 10 s report).
     [[nodiscard]] std::array<u64, 3> TakeCounts() noexcept;
 
+    /// Why the last CurrentGraphicsPipeline or CurrentComputePipeline call gave no pipeline.
+    [[nodiscard]] std::string_view Refusal() const noexcept {
+        return refusal;
+    }
+
 private:
+    /// Notes why the pipeline being made is not, and logs one of the first 16 of `count`.
+    void Refuse(std::atomic<u32>& count, u64 hash, std::string_view cause,
+                std::string_view detail = {});
+
+    /// Keeps the cause of the pipeline just refused for its key, and returns the key's cause.
+    [[nodiscard]] std::string_view NoteRefusal(u64 key_hash);
+
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 
     /// A pipeline whose program 1 is a mesh program, or a task program with the mesh program at
@@ -300,6 +328,11 @@ private:
     ::Common::unordered_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_cache;
 
     PipelineArchive archive;
+
+    std::string creation_cause;
+    /// By key hash; the texts stay where they are (refusal points into them).
+    std::map<u64, std::string> refusal_causes;
+    std::string_view refusal;
 
     u64 graphics_made{};
     u64 compute_made{};

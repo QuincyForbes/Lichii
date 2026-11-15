@@ -144,6 +144,11 @@ public:
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
 
+    /// The programs of the last full lookup (the feature census, for a draw without a pipeline).
+    [[nodiscard]] const std::array<u64, 6>& LookupHashes() const noexcept {
+        return graphics_key.unique_hashes;
+    }
+
     /// Lookups skipped this session because their pipeline was still being built or translated.
     [[nodiscard]] static u64 SkippedLookups() noexcept;
 

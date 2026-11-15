@@ -450,6 +450,7 @@ struct ExperimentsView: View {
     @State private var emulateAllMesh = lichii_platform_experiment("emulate_all_mesh") != 0
     @State private var dispatchDeps = lichii_platform_experiment("dispatch_deps") != 0
     @State private var metalTraceOff = lichii_platform_experiment("metal_trace_off") != 0
+    @State private var metalFixedStateOff = lichii_platform_experiment("metal_fixed_state_off") != 0
 
     var body: some View {
         List {
@@ -635,6 +636,17 @@ struct ExperimentsView: View {
                 Text("Guest Memory Access")
             } footer: {
                 Text("Exclusive Accesses in Fastmem runs the game's exclusive loads and stores (LDXR/STXR, for locks and counters) directly on guest memory, as on a computer, instead of a call into the emulator each; Ocarina of Time uses none on a computer, other games may. Loads Keep Fastmem After a Fault lets a game load that hit protected memory (a page the GPU wrote) keep reading guest memory directly, and take the slow path only after its eighth such fault instead of the first; on a computer it cut Ocarina of Time's slow loads of GPU pages by 70 % but saved little time. Both are off by default. The \"Perf memory callbacks:\" log line counts both.\n\nWrites Next to GPU Data as Before keeps every game write to a memory page that also holds data the GPU wrote on the slow path until the next GPU sync, as before. Normally Lichii copies the GPU's data on such a page back first and then lets the game write the page directly (on a computer this halved Ocarina of Time's slow writes in Kokiri Forest); turn it on if objects flicker or show stale data. The \"Perf CPU writes:\" log line counts these pages.\n\nReads of GPU Data as Before: when the game reads data the GPU wrote and that data is still on its way back, the graphics thread copies that memory page again and waits until the GPU has finished everything, page after page, as before. Normally the game's thread waits only for the copy that is already under way and takes the data itself, so the graphics thread keeps working (on a computer this cut the time the graphics thread was held by such reads in Kokiri Forest by 93 %); turn it on if the picture's brightness jumps or objects show stale data. The \"Perf CPU reads:\" log line counts these reads and their waits.\n\nAll four apply the next time Lichii starts.")
+            }
+
+            Section {
+                Toggle("Shaders Without the Draw's State", isOn: $metalFixedStateOff)
+                    .onChange(of: metalFixedStateOff) { value in
+                        lichii_platform_set_experiment("metal_fixed_state_off", value ? 1 : 0)
+                    }
+            } header: {
+                Text("Metal Renderer")
+            } footer: {
+                Text("Only for the Metal renderer (Graphics API). Shaders Without the Draw's State builds the game's shaders as before, without what the draw sets outside the shader: the depth range the game uses, the size of points, the alpha test, blending with two colours and whole-number colour targets. Turn it on if the picture got worse with a new build.\n\nApplies the next time Lichii starts.")
             }
 
             Section {

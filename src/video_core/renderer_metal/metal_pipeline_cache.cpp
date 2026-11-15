@@ -3,6 +3,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <cmath>
+#include <cstdlib>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -21,11 +24,13 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/feature_census.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_metal/metal_pipeline_cache.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/shader_environment.h"
+#include "video_core/surface.h"
 
 namespace Metal {
 
@@ -57,14 +62,175 @@ namespace {
     }
 }
 
-/// Logs one of the first 16 refusals of a kind.
-void LogRefusal(std::atomic<u32>& count, u64 hash, std::string_view reason) {
-    if (count.fetch_add(1, std::memory_order_relaxed) < 16) {
-        LOG_WARNING(Render_Metal, "Metal: pipeline {:016x} not made: {}", hash, reason);
+// GraphicsPipelineKey::state.
+constexpr u32 StateDepthMinusOneToOne = 1U << 0;
+constexpr u32 StateLowerLeftOrigin = 1U << 1;
+constexpr u32 StateDualSourceBlend = 1U << 2;
+constexpr u32 StateAlphaTestShift = 4;
+constexpr u32 StateColorTypesShift = 8;
+
+[[nodiscard]] bool FixedStateEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_FIXED_STATE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// Zero for a test that passes everything, else Shader::CompareFunction + 1.
+[[nodiscard]] u32 AlphaTestState(const Maxwell& regs) {
+    if (regs.alpha_test_enabled == 0) {
+        return 0;
+    }
+    switch (regs.alpha_test_func) {
+    case Maxwell::ComparisonOp::Never_D3D:
+    case Maxwell::ComparisonOp::Never_GL:
+        return static_cast<u32>(Shader::CompareFunction::Never) + 1;
+    case Maxwell::ComparisonOp::Less_D3D:
+    case Maxwell::ComparisonOp::Less_GL:
+        return static_cast<u32>(Shader::CompareFunction::Less) + 1;
+    case Maxwell::ComparisonOp::Equal_D3D:
+    case Maxwell::ComparisonOp::Equal_GL:
+        return static_cast<u32>(Shader::CompareFunction::Equal) + 1;
+    case Maxwell::ComparisonOp::LessEqual_D3D:
+    case Maxwell::ComparisonOp::LessEqual_GL:
+        return static_cast<u32>(Shader::CompareFunction::LessThanEqual) + 1;
+    case Maxwell::ComparisonOp::Greater_D3D:
+    case Maxwell::ComparisonOp::Greater_GL:
+        return static_cast<u32>(Shader::CompareFunction::Greater) + 1;
+    case Maxwell::ComparisonOp::NotEqual_D3D:
+    case Maxwell::ComparisonOp::NotEqual_GL:
+        return static_cast<u32>(Shader::CompareFunction::NotEqual) + 1;
+    case Maxwell::ComparisonOp::GreaterEqual_D3D:
+    case Maxwell::ComparisonOp::GreaterEqual_GL:
+        return static_cast<u32>(Shader::CompareFunction::GreaterThanEqual) + 1;
+    case Maxwell::ComparisonOp::Always_D3D:
+    case Maxwell::ComparisonOp::Always_GL:
+        return 0;
+    }
+    return 0;
+}
+
+[[nodiscard]] bool IsSecondSourceFactor(Maxwell::Blend::Factor factor) {
+    using Factor = Maxwell::Blend::Factor;
+    switch (factor) {
+    case Factor::Source1Color_D3D:
+    case Factor::OneMinusSource1Color_D3D:
+    case Factor::Source1Alpha_D3D:
+    case Factor::OneMinusSource1Alpha_D3D:
+    case Factor::Source1Color_GL:
+    case Factor::OneMinusSource1Color_GL:
+    case Factor::Source1Alpha_GL:
+    case Factor::OneMinusSource1Alpha_GL:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Fills the key's fixed state from the registers (FixedPipelineState::Refresh's derivations).
+void RefreshFixedState(GraphicsPipelineKey& key, const Maxwell& regs) {
+    key.state = 0;
+    key.alpha_test_ref = 0;
+    key.point_size = 0;
+    if (!FixedStateEnabled()) {
+        return;
+    }
+    if (regs.depth_mode == Maxwell::DepthMode::MinusOneToOne) {
+        key.state |= StateDepthMinusOneToOne;
+    }
+    if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
+        key.state |= StateLowerLeftOrigin;
+    }
+    if (regs.blend.enable[0] != 0) {
+        const auto second_source = [](const auto& blend) {
+            return IsSecondSourceFactor(blend.color_source) ||
+                   IsSecondSourceFactor(blend.color_dest) ||
+                   IsSecondSourceFactor(blend.alpha_source) ||
+                   IsSecondSourceFactor(blend.alpha_dest);
+        };
+        if (regs.blend_per_target_enabled != 0 ? second_source(regs.blend_per_target[0])
+                                               : second_source(regs.blend)) {
+            key.state |= StateDualSourceBlend;
+        }
+    }
+    const u32 alpha_test = AlphaTestState(regs);
+    key.state |= alpha_test << StateAlphaTestShift;
+    if (alpha_test > static_cast<u32>(Shader::CompareFunction::Never) + 1) {
+        // Rounded to a step of 8-bit alpha, as Vulkan keys it.
+        key.alpha_test_ref = std::bit_cast<u32>(std::round(regs.alpha_test_ref * 255.0f) / 255.0f);
+    }
+    if (key.unique_hashes[5] != 0) {
+        for (size_t rt = 0; rt < Maxwell::NumRenderTargets; ++rt) {
+            const Tegra::RenderTargetFormat format = regs.rt[rt].format;
+            if (format == Tegra::RenderTargetFormat::NONE) {
+                continue;
+            }
+            const auto pixel_format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(format);
+            if (!VideoCore::Surface::IsPixelFormatInteger(pixel_format)) {
+                continue;
+            }
+            const Shader::AttributeType type =
+                VideoCore::Surface::IsPixelFormatSignedInteger(pixel_format)
+                    ? Shader::AttributeType::SignedInt
+                    : Shader::AttributeType::UnsignedInt;
+            key.state |= static_cast<u32>(type) << (StateColorTypesShift + rt * 2);
+        }
+    }
+    if (static_cast<Maxwell::PrimitiveTopology>(key.topology) ==
+            Maxwell::PrimitiveTopology::Points ||
+        regs.IsMeshEnabled()) {
+        key.point_size = std::bit_cast<u32>(regs.point_size);
+    }
+}
+
+/// The vertex program's share of it (also before tessellation programs: Vulkan converts the
+/// depth there too).
+void ApplyVertexState(Shader::RuntimeInfo& info, const GraphicsPipelineKey& key) {
+    info.y_negate = (key.state & StateLowerLeftOrigin) != 0;
+    info.convert_depth_mode = (key.state & StateDepthMinusOneToOne) != 0;
+    if (FixedStateEnabled() && static_cast<Maxwell::PrimitiveTopology>(key.topology) ==
+                                   Maxwell::PrimitiveTopology::Points) {
+        info.fixed_state_point_size = std::bit_cast<float>(key.point_size);
+    }
+}
+
+void ApplyFragmentState(Shader::RuntimeInfo& info, const GraphicsPipelineKey& key) {
+    info.force_early_z = key.early_z != 0;
+    info.y_negate = (key.state & StateLowerLeftOrigin) != 0;
+    info.dual_source_blend = (key.state & StateDualSourceBlend) != 0;
+    if (const u32 alpha_test = (key.state >> StateAlphaTestShift) & 15; alpha_test != 0) {
+        info.alpha_test_func = static_cast<Shader::CompareFunction>(alpha_test - 1);
+        info.alpha_test_reference = std::bit_cast<float>(key.alpha_test_ref);
+    }
+    for (size_t rt = 0; rt < info.color_output_types.size(); ++rt) {
+        info.color_output_types[rt] =
+            static_cast<Shader::AttributeType>((key.state >> (StateColorTypesShift + rt * 2)) & 3);
     }
 }
 
 } // Anonymous namespace
+
+void PipelineCache::Refuse(std::atomic<u32>& count, u64 hash, std::string_view cause,
+                           std::string_view detail) {
+    creation_cause = cause;
+    if (count.fetch_add(1, std::memory_order_relaxed) >= 16) {
+        return;
+    }
+    if (detail.empty()) {
+        LOG_WARNING(Render_Metal, "Metal: pipeline {:016x} not made: {}", hash, cause);
+    } else {
+        LOG_WARNING(Render_Metal, "Metal: pipeline {:016x} not made: {}: {}", hash, cause, detail);
+    }
+}
+
+std::string_view PipelineCache::NoteRefusal(u64 key_hash) {
+    const auto [it, is_new] = refusal_causes.try_emplace(key_hash);
+    if (is_new) {
+        it->second = creation_cause.empty() ? "pipeline not made" : creation_cause;
+    }
+    return it->second;
+}
 
 size_t GraphicsPipelineKey::Hash() const noexcept {
     return static_cast<size_t>(
@@ -309,6 +475,7 @@ std::array<u64, 3> PipelineCache::TakeCounts() noexcept {
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
+        refusal = "shader programs not in guest memory";
         return nullptr;
     }
     const auto& regs = maxwell3d->regs;
@@ -322,11 +489,13 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
                   (static_cast<u32>(tessellation.spacing.Value()) << 2) |
                   (static_cast<u32>(tessellation.output_primitives.Value()) << 4)
             : 0U;
+    RefreshFixedState(graphics_key, regs);
     if (current_pipeline != nullptr && current_pipeline->Key() == graphics_key) {
         return current_pipeline;
     }
     const auto [it, is_new] = graphics_cache.try_emplace(graphics_key);
     if (is_new) {
+        creation_cause.clear();
         it->second = CreateGraphicsPipeline();
         it->second ? ++graphics_made : ++refused;
         if (it->second) {
@@ -334,6 +503,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         }
     }
     current_pipeline = it->second.get();
+    if (current_pipeline == nullptr) {
+        refusal = NoteRefusal(graphics_key.Hash());
+    }
     return current_pipeline;
 }
 
@@ -351,6 +523,7 @@ std::optional<StageProgram> PipelineCache::Translate(Shader::IR::Program& progra
         if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
             LOG_ERROR(Render_Metal, "Metal: SPIR-V -> MSL failed: {}", result.error);
         }
+        creation_cause = "SPIR-V to MSL failed";
         return std::nullopt;
     }
     return StageProgram{
@@ -388,15 +561,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() try {
         } else if (stage == Shader::Stage::Mesh && (index == 1 || task) && mesh_index == 0) {
             mesh_index = index;
         } else if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
-            LogRefusal(unsupported_logged, hash, "task or mesh program out of place");
+            Refuse(unsupported_logged, hash, "task or mesh program out of place");
             return nullptr;
         } else if (index == 4) {
             // Apple GPUs have no geometry stage (MoltenVK skips these pipelines too).
-            LogRefusal(unsupported_logged, hash, "geometry stage");
+            Refuse(unsupported_logged, hash, "geometry stage");
             return nullptr;
         } else if ((index == 2 && stage != Shader::Stage::TessellationControl) ||
                    (index == 3 && stage != Shader::Stage::TessellationEval)) {
-            LogRefusal(unsupported_logged, hash, "unexpected stage in a tessellation slot");
+            Refuse(unsupported_logged, hash, "unexpected stage in a tessellation slot");
             return nullptr;
         }
         const u32 cfg_offset = static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader));
@@ -407,13 +580,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() try {
             auto program_vb = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
             programs[index] = MergeDualVertexPrograms(programs[0], program_vb, env, host_info);
         }
+        if (VideoCommon::FeatureCensus::Enabled()) {
+            VideoCommon::FeatureCensus::NoteProgram(key.unique_hashes[index], programs[index]);
+        }
     }
     if (key.unique_hashes[1] == 0) {
-        LogRefusal(unsupported_logged, hash, "no vertex program");
+        Refuse(unsupported_logged, hash, "no vertex program");
         return nullptr;
     }
     if (task && mesh_index == 0) {
-        LogRefusal(unsupported_logged, hash, "task program without a mesh program");
+        Refuse(unsupported_logged, hash, "task program without a mesh program");
         return nullptr;
     }
     if (mesh_index != 0) {
@@ -421,7 +597,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() try {
     }
     if (key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0) {
         if (key.unique_hashes[2] == 0 || key.unique_hashes[3] == 0) {
-            LogRefusal(unsupported_logged, hash, "only one of the tessellation programs");
+            Refuse(unsupported_logged, hash, "only one of the tessellation programs");
             return nullptr;
         }
         return CreateTessellationPipeline(programs);
@@ -437,6 +613,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() try {
                                    Shader::AttributeType::UnsignedInt};
         vertex_info.generic_input_types[attribute] = types[(key.attribute_types >> (attribute * 2)) & 3];
     }
+    ApplyVertexState(vertex_info, key);
     auto vertex = Translate(programs[1], ShaderTranslate::Stage::Vertex, bindings, vertex_info);
     if (!vertex) {
         return nullptr;
@@ -447,7 +624,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() try {
         fragment_info.previous_stage_stores = programs[1].info.stores;
         fragment_info.previous_stage_legacy_stores_mapping =
             programs[1].info.legacy_stores_mapping;
-        fragment_info.force_early_z = key.early_z != 0;
+        ApplyFragmentState(fragment_info, key);
         auto translated =
             Translate(programs[5], ShaderTranslate::Stage::Fragment, bindings, fragment_info);
         if (!translated) {
@@ -458,6 +635,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() try {
     return std::make_unique<GraphicsPipeline>(key, std::move(*vertex), std::move(fragment));
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Metal, "Metal: {}", exception.what());
+    creation_cause = "shader recompiler exception";
     return nullptr;
 }
 
@@ -474,7 +652,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateMeshPipeline(
         !Shader::Backend::SPIRV::MeshEmulationTakesPrimitiveLines(mesh.mesh) ||
         mesh.mesh.vertex_lines.empty() || mesh.mesh.max_vertices == 0 ||
         mesh.mesh.max_primitives == 0) {
-        LogRefusal(refused_logged, hash, "mesh program the emulation can't take");
+        Refuse(refused_logged, hash, "mesh program the emulation can't take");
         return nullptr;
     }
     // The output buffer's binding follows every program's (unified bindings).
@@ -495,6 +673,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateMeshPipeline(
     Shader::Backend::Bindings bindings;
     Shader::RuntimeInfo kernel_info;
     kernel_info.previous_stage_stores.mask.set();
+    kernel_info.y_negate = (key.state & StateLowerLeftOrigin) != 0;
     kernel_info.mesh_as_compute = true;
     kernel_info.mesh_output_binding = output_binding;
     if (has_task) {
@@ -530,7 +709,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateMeshPipeline(
             Shader::Backend::SPIRV::EmitMeshEmulationDistribution(profile),
             ShaderTranslate::Stage::Compute, translate_options);
         if (distribution.source.empty()) {
-            LogRefusal(refused_logged, hash, distribution.error);
+            Refuse(refused_logged, hash, "SPIR-V to MSL failed", distribution.error);
             return nullptr;
         }
         emulation.distribution.program = StageProgram{
@@ -541,12 +720,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateMeshPipeline(
         };
         emulation.distribution.workgroup_size = {1, 1, 1};
     }
+    // The emulation's vertex shader converts the depth and sizes the points.
     const std::vector<u32> vertex_spirv = Shader::Backend::SPIRV::EmitMeshEmulationVertex(
-        profile, mesh.mesh, output_binding, has_task ? output_binding + 3 : ~0U, false);
+        profile, mesh.mesh, output_binding, has_task ? output_binding + 3 : ~0U,
+        (key.state & StateDepthMinusOneToOne) != 0,
+        FixedStateEnabled() && topology == 0 ? std::bit_cast<float>(key.point_size) : 1.0f);
     ShaderTranslate::Result vertex =
         ShaderTranslate::SpirvToMsl(vertex_spirv, ShaderTranslate::Stage::Vertex, translate_options);
     if (vertex.source.empty()) {
-        LogRefusal(refused_logged, hash, vertex.error);
+        Refuse(refused_logged, hash, "SPIR-V to MSL failed", vertex.error);
         return nullptr;
     }
     StageProgram fragment{};
@@ -562,7 +744,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateMeshPipeline(
             }
         }
         fragment_info.mesh_emulation_inputs = true;
-        fragment_info.force_early_z = key.early_z != 0;
+        ApplyFragmentState(fragment_info, key);
         auto translated =
             Translate(programs[5], ShaderTranslate::Stage::Fragment, bindings, fragment_info);
         if (!translated) {
@@ -624,7 +806,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateTessellationPipeline(
     const auto output = static_cast<OutputPrimitives>((key.tessellation >> 4) & 3);
     Shader::IR::Program& control = programs[2];
     if (control.invocations == 0 || control.invocations > 32) {
-        LogRefusal(refused_logged, hash, "tessellation control program's output vertex count");
+        Refuse(refused_logged, hash, "tessellation control program's output vertex count");
         return nullptr;
     }
     using Modes = ShaderTranslate::TessellationModes;
@@ -654,6 +836,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateTessellationPipeline(
         vertex_info.generic_input_types[attribute] =
             types[(key.attribute_types >> (attribute * 2)) & 3];
     }
+    ApplyVertexState(vertex_info, key);
     ConvertLegacyToGeneric(programs[1], vertex_info);
     const std::vector<u32> vertex_spirv = EmitSPIRV(profile, vertex_info, programs[1], bindings);
     for (size_t variant = 0; variant < Tessellation::IndexSizes.size(); ++variant) {
@@ -662,7 +845,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateTessellationPipeline(
         ShaderTranslate::Result result = ShaderTranslate::SpirvToMsl(
             vertex_spirv, ShaderTranslate::Stage::VertexForTessellation, options);
         if (result.source.empty()) {
-            LogRefusal(refused_logged, hash, result.error);
+            Refuse(refused_logged, hash, "SPIR-V to MSL failed", result.error);
             return nullptr;
         }
         tessellation.vertex[variant] = StageProgram{
@@ -683,6 +866,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateTessellationPipeline(
     Shader::RuntimeInfo control_info;
     control_info.previous_stage_stores = programs[1].info.stores;
     control_info.previous_stage_legacy_stores_mapping = programs[1].info.legacy_stores_mapping;
+    control_info.y_negate = (key.state & StateLowerLeftOrigin) != 0;
     auto control_program = Translate(control, ShaderTranslate::Stage::TessellationControl,
                                      bindings, control_info, &control_options);
     if (!control_program) {
@@ -703,6 +887,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateTessellationPipeline(
                                        ? Shader::TessSpacing::FractionalEven
                                        : Shader::TessSpacing::Equal;
     evaluation_info.tess_clockwise = tessellation.modes.clockwise;
+    evaluation_info.y_negate = (key.state & StateLowerLeftOrigin) != 0;
     auto evaluation = Translate(programs[3], ShaderTranslate::Stage::TessellationEvaluation,
                                 bindings, evaluation_info, &evaluation_options);
     if (!evaluation) {
@@ -714,7 +899,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateTessellationPipeline(
         Shader::RuntimeInfo fragment_info;
         fragment_info.previous_stage_stores = programs[3].info.stores;
         fragment_info.previous_stage_legacy_stores_mapping = programs[3].info.legacy_stores_mapping;
-        fragment_info.force_early_z = key.early_z != 0;
+        ApplyFragmentState(fragment_info, key);
         auto translated =
             Translate(programs[5], ShaderTranslate::Stage::Fragment, bindings, fragment_info);
         if (!translated) {
@@ -750,6 +935,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateTessellationPipeline(
 ComputePipeline* PipelineCache::CurrentComputePipeline() {
     const VideoCommon::ShaderInfo* const shader = ComputeShader();
     if (shader == nullptr) {
+        refusal = "shader programs not in guest memory";
         return nullptr;
     }
     const auto& qmd = kepler_compute->launch_description;
@@ -760,11 +946,15 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     };
     const auto [it, is_new] = compute_cache.try_emplace(key);
     if (is_new) {
+        creation_cause.clear();
         it->second = CreateComputePipeline(key, shader);
         it->second ? ++compute_made : ++refused;
         if (it->second) {
             it->second->SetArchive(&archive);
         }
+    }
+    if (!it->second) {
+        refusal = NoteRefusal(key.Hash());
     }
     return it->second.get();
 }
@@ -779,12 +969,15 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     pools.ReleaseContents();
     Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
     auto program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+    if (VideoCommon::FeatureCensus::Enabled()) {
+        VideoCommon::FeatureCensus::NoteProgram(key.unique_hash, program);
+    }
     const std::vector<u32> spirv = EmitSPIRV(profile, program);
     ShaderTranslate::Result result =
         ShaderTranslate::SpirvToMsl(spirv, ShaderTranslate::Stage::Compute, translate_options);
     if (result.source.empty()) {
         static std::atomic<u32> logged{};
-        LogRefusal(logged, key.unique_hash, result.error);
+        Refuse(logged, key.unique_hash, "SPIR-V to MSL failed", result.error);
         return nullptr;
     }
     return std::make_unique<ComputePipeline>(key, StageProgram{
@@ -796,6 +989,7 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
                                                   });
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Metal, "Metal: {}", exception.what());
+    creation_cause = "shader recompiler exception";
     return nullptr;
 }
 

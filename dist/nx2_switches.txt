@@ -104,6 +104,18 @@ EDEN_NX2_FENCE_BATCH=1
 # error without the encoders that did not complete.
 #EDEN_NX2_METAL_ENCODER_STATUS=0
 
+# Metal renderer: programs are translated with the draw's fixed state as on Vulkan: depth -1..1
+# converted in the vertex program, point size written for point lists, the alpha test in the pixel
+# program, dual source blending outputs, pixel outputs typed after integer targets, lower left
+# window origin. 0 translates them without, as before.
+#EDEN_NX2_METAL_FIXED_STATE=0
+
+# Either renderer: counts what the game asks of the graphics backend (draw state by pipeline,
+# clears, dispatches, queries, translated programs, images, views, samplers, copies) and writes
+# it every 10 s to nx2_feature_census.json in the log folder. tools/nx2/feature_census.py prints
+# it; tools/nx2/metal_replay reads it. Draws nothing differently.
+#EDEN_NX2_FEATURE_CENSUS=1
+
 #EDEN_NX2_MME_JIT=0
 #EDEN_NX2_PBFLUSH=0
 #EDEN_NX2_SKIP_SAME=0

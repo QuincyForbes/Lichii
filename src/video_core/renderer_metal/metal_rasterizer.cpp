@@ -19,12 +19,14 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/feature_census.h"
 #include "video_core/framebuffer_config.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/oot_network.h"
+#include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
@@ -161,7 +163,15 @@ RasterizerMetal::~RasterizerMetal() = default;
 void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     ++draws;
     GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
-    if (pipeline == nullptr || !pipeline->BuildFunctions(device)) {
+    if (VideoCommon::FeatureCensus::Enabled()) {
+        VideoCommon::FeatureCensus::NoteDraw(*maxwell3d, pipeline_cache.LookupHashes());
+    }
+    if (pipeline == nullptr) {
+        RefuseDraw(pipeline_cache.Refusal());
+        return;
+    }
+    if (!pipeline->BuildFunctions(device)) {
+        RefuseDraw("program's MSL not compiled by Metal");
         return;
     }
     ++draws_with_pipeline;
@@ -171,6 +181,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         return value == nullptr || value[0] != '0';
     }();
     if (!encode) {
+        RefuseDraw("EDEN_NX2_METAL_DRAW=0");
         return;
     }
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
@@ -180,6 +191,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         const u32 groups = is_indexed ? draw_state.index_buffer.count
                                       : draw_state.vertex_buffer.count;
         if (groups == 0) {
+            Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
             return;
         }
         gpu_memory->FlushCaching();
@@ -189,6 +201,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
             FinishTexelWritebacks();
         };
         if (!PrepareDraw(*pipeline, is_indexed, groups)) {
+            NoteUnprepared();
             return;
         }
         CountOcclusion();
@@ -204,6 +217,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         ++draws_encoded;
         ++mesh_draws;
         mesh_groups += groups;
+        Coverage::Note(Coverage::Work::Draw, Coverage::Path::MeshCompute);
         return;
     }
     if (pipeline->Tess() != nullptr) {
@@ -223,6 +237,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
             .index_offset = 0,
         };
         if (tess_draw.count == 0 || instance_count == 0) {
+            Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
             return;
         }
         if (is_indexed && draw_state.base_index != 0) {
@@ -234,6 +249,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
             FinishTexelWritebacks();
         };
         if (!PrepareDraw(*pipeline, is_indexed, 0, &tess_draw)) {
+            NoteUnprepared();
             return;
         }
         CountOcclusion();
@@ -243,6 +259,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         ++draws_encoded;
         ++tessellated_draws;
         tessellated_patches += tess_buffers.patches;
+        Coverage::Note(Coverage::Work::Draw, Coverage::Path::TessellationKernels);
         return;
     }
     const bool u8_indices =
@@ -251,8 +268,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     const std::optional<u32> primitive =
         PrimitiveType(IndexConvert::ConvertedTopology(draw_state.topology));
     if (!primitive) {
-        LOG_ONCE(warned_topology, "Metal: topology {} is not drawn yet",
-                 static_cast<u32>(draw_state.topology));
+        RefuseDraw("topology Metal can't draw");
         return;
     }
     const u32 count = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
@@ -261,6 +277,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     const u32 converted = convert ? IndexConvert::ConvertedCount(draw_state.topology, count) : 0U;
     const bool restart = maxwell3d->regs.primitive_restart.enabled != 0;
     if (convert && converted == 0) {
+        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
         return;
     }
     gpu_memory->FlushCaching();
@@ -295,9 +312,12 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         };
     }
     if (!PrepareDraw(*pipeline, is_indexed)) {
+        NoteUnprepared();
         return;
     }
     CountOcclusion();
+    Coverage::Note(Coverage::Work::Draw, convert ? Coverage::Path::RewrittenIndices
+                                                 : Coverage::Path::Native);
     if (convert) {
         // 32-bit indices in the stream ring: from the GPU rewrite, or rewritten on the CPU from
         // the guest's indices (or the vertex range).
@@ -643,7 +663,9 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         : tess != nullptr ? &tess->control.program
                           : nullptr,
         tess != nullptr ? &pipeline.Vertex() : nullptr, &pipeline.Fragment()};
+    prepare_refusal = {};
     if (tess != nullptr && tess_draw == nullptr) {
+        prepare_refusal = "tessellated draw without its vertex count";
         return false;
     }
     const auto absent = [&](size_t index) {
@@ -747,6 +769,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     }
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     if (framebuffer == nullptr) {
+        prepare_refusal = "no framebuffer";
         return false;
     }
     // The stages' texture and image scaling indices count on through the pipeline, as their
@@ -811,6 +834,8 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         stage_bindings[index] = buffer_cache_runtime.PendingBindings();
         texel_views[index] = PrepareTexelBuffers(stage_bindings[index], programs[index]->info);
     }
+    // Until the state below is made.
+    prepare_refusal = "render pipeline state refused by Metal";
 
     // The render pipeline state: targets, blending, vertex layout.
     RenderTargetSet targets{};
@@ -892,6 +917,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     if (state == nullptr) {
         return false;
     }
+    prepare_refusal = {};
 
     auto depth_stencil = Zeroed<DepthStencilDesc>();
     depth_stencil.depth_test = regs.depth_test_enable != 0 && targets.has_depth ? 1U : 0U;
@@ -926,6 +952,9 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             has_task ? pipeline.KernelState(device, mesh->distribution) : nullptr;
         if (first == nullptr || mesh_workgroups == 0 ||
             (has_task && (mesh_kernel == nullptr || distribution == nullptr))) {
+            if (mesh_workgroups != 0) {
+                prepare_refusal = "mesh emulation kernel not built by Metal";
+            }
             return false;
         }
         namespace SPIRV = Shader::Backend::SPIRV;
@@ -1006,6 +1035,9 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             pipeline.VertexKernelState(device, vertex_variant, layout_desc);
         void* const control_kernel = pipeline.KernelState(device, tess->control);
         if (vertex_kernel == nullptr || control_kernel == nullptr || patches == 0) {
+            if (patches != 0) {
+                prepare_refusal = "tessellation kernel not built by Metal";
+            }
             return false;
         }
         const auto stream = [&](u64 size) {
@@ -1033,6 +1065,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                     u64{index.offset} + u64{tess_draw->first_index} * tess_draw->index_size;
             }
             if (tess_draw->index_buffer == nullptr) {
+                prepare_refusal = "tessellated draw without an index buffer";
                 return false;
             }
         }
@@ -1248,25 +1281,33 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
 void RasterizerMetal::DrawIndirect() {
     ++draws;
     GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
-    if (pipeline == nullptr || !pipeline->BuildFunctions(device)) {
+    if (VideoCommon::FeatureCensus::Enabled()) {
+        VideoCommon::FeatureCensus::NoteDraw(*maxwell3d, pipeline_cache.LookupHashes());
+    }
+    if (pipeline == nullptr) {
+        RefuseDraw(pipeline_cache.Refusal());
+        return;
+    }
+    if (!pipeline->BuildFunctions(device)) {
+        RefuseDraw("program's MSL not compiled by Metal");
         return;
     }
     ++draws_with_pipeline;
     const auto& params = maxwell3d->draw_manager.indirect_state;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     if (params.is_byte_count) {
-        LOG_ONCE(warned_byte_count, "Metal: transform feedback draws are not drawn yet");
+        RefuseDraw("transform feedback draw");
         return;
     }
     if (pipeline->Mesh() != nullptr) {
         // As on Vulkan: the emulation needs the workgroup count on the CPU (mesh draws whose
         // count the GPU wrote come through Draw, DrawMeshTasksFromGpu being false).
-        LOG_ONCE(warned_mesh_indirect, "Metal: indirect emulated mesh draws are skipped");
+        RefuseDraw("indirect draw of an emulated mesh pipeline");
         return;
     }
     if (pipeline->Tess() != nullptr) {
         // The kernels need the vertex count on the CPU.
-        LOG_ONCE(warned_tess_indirect, "Metal: indirect tessellated draws are skipped");
+        RefuseDraw("indirect tessellated draw");
         return;
     }
     const bool u8_indices = params.is_indexed && maxwell3d->regs.index_buffer.format ==
@@ -1274,9 +1315,8 @@ void RasterizerMetal::DrawIndirect() {
     const std::optional<u32> primitive = PrimitiveType(draw_state.topology);
     if (!primitive || u8_indices) {
         // The arguments are on the GPU: rewriting their indices needs a compute pass.
-        LOG_ONCE(warned_indirect, "Metal: indirect draws of topology {} or 8-bit indices are not "
-                                  "drawn yet",
-                 static_cast<u32>(draw_state.topology));
+        RefuseDraw(u8_indices ? "indirect draw with 8-bit indices"
+                              : "indirect draw of a topology Metal can't draw");
         return;
     }
     gpu_memory->FlushCaching();
@@ -1291,11 +1331,16 @@ void RasterizerMetal::DrawIndirect() {
         buffer_cache.SetDrawIndirect(nullptr);
     };
     if (!PrepareDraw(*pipeline, params.is_indexed)) {
+        NoteUnprepared();
         return;
     }
     CountOcclusion();
     const auto [indirect, indirect_offset] = buffer_cache.GetDrawIndirectBuffer();
     size_t count = params.max_draw_counts;
+    // Metal has no multi draw: one call per draw, and a count read on the CPU.
+    Coverage::Note(Coverage::Work::Draw, params.include_count || count > 1
+                                             ? Coverage::Path::IndirectLoop
+                                             : Coverage::Path::Native);
     if (params.include_count) {
         // Metal has no draw count from a buffer: the guest's count as it is in memory.
         count = (std::min)(count, size_t{gpu_memory->Read<u32>(params.count_start_address)});
@@ -1320,6 +1365,36 @@ void RasterizerMetal::DrawIndirect() {
 
 void RasterizerMetal::DrawTexture() {
     ++draws;
+    RefuseDraw("DrawTexture");
+}
+
+void RasterizerMetal::NoteUnprepared() {
+    if (prepare_refusal.empty()) {
+        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+    } else {
+        RefuseDraw(prepare_refusal);
+    }
+}
+
+void RasterizerMetal::RefuseDraw(std::string_view cause) {
+    Coverage::Refuse(Coverage::Work::Draw, cause, [this] { return DescribeDraw(); });
+}
+
+std::string RasterizerMetal::DescribeDraw() const {
+    const auto& regs = maxwell3d->regs;
+    const auto& hashes = pipeline_cache.LookupHashes();
+    std::string text = "programs";
+    for (const u64 hash : hashes) {
+        text += fmt::format(" {:016x}", hash);
+    }
+    text += fmt::format(", topology {}, colour formats",
+                        static_cast<u32>(maxwell3d->draw_manager.draw_state.topology));
+    for (u32 rt = 0; rt < regs.rt_control.count && rt < Maxwell::NumRenderTargets; ++rt) {
+        text += fmt::format(" {:#x}", static_cast<u32>(regs.rt[rt].format));
+    }
+    text += fmt::format(", depth format {:#x}",
+                        regs.zeta_enable != 0 ? static_cast<u32>(regs.zeta.format) : 0U);
+    return text;
 }
 
 void RasterizerMetal::Clear(u32 layer_count) {
@@ -1335,18 +1410,43 @@ void RasterizerMetal::Clear(u32 layer_count) {
     if (!any_color && !regs.clear_surface.Z && !regs.clear_surface.S) {
         return;
     }
+    const auto describe = [&] {
+        return fmt::format("surface {:#x}, scissor {}, layers {} from {}, stencil mask {:#x}",
+                           regs.clear_surface.raw, regs.clear_control.use_scissor != 0,
+                           layer_count, static_cast<u32>(regs.clear_surface.layer),
+                           regs.stencil_front_mask);
+    };
+    // What a load action can't do is a draw on Metal; until it is one, the parts that fit a load
+    // action are done and the rest is counted.
+    const char* partial = nullptr;
     if (any_color && !all_color) {
-        // A masked clear is a draw on Metal (milestone 3).
-        static std::atomic_bool warned{false};
-        if (!warned.exchange(true)) {
-            LOG_WARNING(Render_Metal, "Metal: clears of some colour channels are not done yet");
-        }
+        partial = "clear of some colour channels";
+    } else if (regs.clear_surface.S && regs.stencil_front_mask != 0xFF &&
+               regs.stencil_front_mask != 0) {
+        partial = "clear of some stencil bits";
     }
     std::scoped_lock lock{texture_cache.mutex};
     texture_cache.UpdateRenderTargets(true);
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     if (framebuffer == nullptr) {
+        Coverage::Refuse(Coverage::Work::Clear, "no framebuffer", describe);
         return;
+    }
+    if (const auto& scissor = regs.scissor_test[0];
+        partial == nullptr && regs.clear_control.use_scissor != 0 && scissor.enable != 0) {
+        const auto& resolution = Settings::values.resolution_info;
+        const bool scaled = texture_cache.IsRescaling();
+        const u32 max_x = scaled ? resolution.ScaleUp(scissor.max_x.Value()) : scissor.max_x.Value();
+        const u32 max_y = scaled ? resolution.ScaleUp(scissor.max_y.Value()) : scissor.max_y.Value();
+        if (scissor.min_x != 0 || scissor.min_y != 0 || max_x < framebuffer->Width() ||
+            max_y < framebuffer->Height()) {
+            partial = "clear of part of the target (scissor), whole target cleared";
+        }
+    }
+    if (partial != nullptr) {
+        Coverage::Refuse(Coverage::Work::Clear, partial, describe);
+    } else {
+        Coverage::Note(Coverage::Work::Clear, Coverage::Path::Native);
     }
     ClearPass pass{};
     pass.width = framebuffer->Width();
@@ -1377,8 +1477,23 @@ void RasterizerMetal::DispatchCompute() {
     ++dispatches;
     gpu_memory->FlushCaching();
     ComputePipeline* const pipeline = pipeline_cache.CurrentComputePipeline();
+    if (pipeline != nullptr && VideoCommon::FeatureCensus::Enabled()) {
+        VideoCommon::FeatureCensus::NoteDispatch(
+            pipeline->Key().unique_hash, kepler_compute->GetIndirectComputeAddress().has_value());
+    }
     void* const state = pipeline != nullptr ? pipeline->State(device) : nullptr;
     if (state == nullptr) {
+        Coverage::Refuse(Coverage::Work::Dispatch,
+                         pipeline == nullptr ? pipeline_cache.Refusal()
+                                             : std::string_view{"compute kernel not built by Metal"},
+                         [&] {
+                             const auto& qmd = kepler_compute->launch_description;
+                             return fmt::format(
+                                 "program {:016x}, grid {}x{}x{}",
+                                 pipeline != nullptr ? pipeline->Key().unique_hash : u64{0},
+                                 qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
+                                 qmd.grid_dim_z.Value());
+                         });
         // As OpenGL and Vulkan report it: KeplerCompute::DispatchNativeCompute takes a silent
         // return for a successful dispatch.
         if (kepler_compute->IsNativeMode()) {
@@ -1392,6 +1507,7 @@ void RasterizerMetal::DispatchCompute() {
         return value == nullptr || value[0] != '0';
     }();
     if (!encode) {
+        Coverage::Refuse(Coverage::Work::Dispatch, "EDEN_NX2_METAL_DISPATCH=0");
         return;
     }
     StageProgram& program = pipeline->Program();
@@ -1492,6 +1608,7 @@ void RasterizerMetal::DispatchCompute() {
                              target.Handle(Shader::TextureType::Color2D),
                              {target.size.width, target.size.height})) {
             texture_cache.MarkModification(target.image_id);
+            Coverage::Note(Coverage::Work::Dispatch, Coverage::Path::Replaced);
             return;
         }
     }
@@ -1540,6 +1657,7 @@ void RasterizerMetal::DispatchCompute() {
     } else {
         scheduler.Dispatch({qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z}, group_size);
     }
+    Coverage::Note(Coverage::Work::Dispatch, Coverage::Path::Native);
 }
 
 void RasterizerMetal::ResetCounter(VideoCommon::QueryType type) {
@@ -1832,6 +1950,7 @@ void RasterizerMetal::FlushCommands() {
 }
 
 void RasterizerMetal::TickFrame() {
+    VideoCommon::FeatureCensus::Tick();
     texel_view_cache.clear();
     fence_manager.TickFrame();
     {

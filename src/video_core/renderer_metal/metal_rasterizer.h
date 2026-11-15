@@ -8,6 +8,8 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 #include <utility>
@@ -188,9 +190,19 @@ private:
         u64 index_offset;
     };
 
-    /// Binds everything the draw needs and opens its render pass; false to skip it.
+    /// Binds everything the draw needs and opens its render pass; false to skip it
+    /// (prepare_refusal says why, empty for a draw of nothing).
     bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups = 0,
                      TessellationDraw* tess_draw = nullptr);
+
+    /// Counts the draw PrepareDraw skipped.
+    void NoteUnprepared();
+
+    /// Counts a draw not done, and logs the cause with the draw's state the first time.
+    void RefuseDraw(std::string_view cause);
+
+    /// The programs, topology and targets of the draw at hand, for the log.
+    [[nodiscard]] std::string DescribeDraw() const;
 
     /// Sets the rescaling_words bits of a stage's texture and image descriptors (views from the
     /// stage's first), counting on from texture_bit and image_bit.
@@ -310,6 +322,8 @@ private:
     u64 draws_converted{};
     u64 mesh_draws{};
     u64 mesh_groups{};
+    /// Why PrepareDraw skipped the draw; empty for a draw of nothing.
+    std::string_view prepare_refusal;
     std::chrono::steady_clock::time_point archive_saved{};
     /// Shader::Backend::SPIRV::RescalingLayout of the draw or dispatch being bound.
     std::array<u32, 8> rescaling_words{};
