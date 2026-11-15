@@ -461,12 +461,10 @@ bool Image::CopyScaled(bool scale_up) {
         kind == TextureKind::e3D || !host_format.attachable) {
         return false;
     }
-    if (host_format.format_class == FormatClass::DepthStencil ||
-        host_format.format_class == FormatClass::Stencil) {
-        LOG_ONCE(warned_stencil, "Metal: rescaled depth-stencil images keep their depth only");
-        if (host_format.format_class == FormatClass::Stencil) {
-            return false;
-        }
+    // Depth-stencil images carry both (the blit writes the stencil from the shader); stencil-only
+    // ones are not rescaled (CanRescaleImage).
+    if (host_format.format_class == FormatClass::Stencil) {
+        return false;
     }
     const auto& resolution = Settings::values.resolution_info;
     const bool is_2d = info.type == ImageType::e2D;

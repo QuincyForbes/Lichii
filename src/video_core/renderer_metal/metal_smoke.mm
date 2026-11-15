@@ -1214,6 +1214,121 @@ int RunTessellation() {
     return passed ? 0 : 1;
 }
 
+/// The depth blit of a depth-stencil target (rescaling): a 16x16 Depth32Float_Stencil8 cleared
+/// to stencil 0x5A, scaled to 32x32, then a full quad drawn with the stencil test "equal 0x5A"
+/// (every sample passes) and "equal 0" (none do).
+int RunDepthStencilBlit() {
+    using Maxwell = Metal::Maxwell;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr uint32_t Native = 16;
+    constexpr uint32_t Scaled = 32;
+    const uint32_t format = static_cast<uint32_t>(MTLPixelFormatDepth32Float_Stencil8);
+    const auto make = [&](uint32_t size, uint32_t texture_format) {
+        return Metal::CreateTexture(device, {.kind = Metal::TextureKind::e2D,
+                                             .format = texture_format,
+                                             .width = size,
+                                             .height = size,
+                                             .render_target = true});
+    };
+    const Metal::Object native = make(Native, format);
+    const Metal::Object scaled = make(Scaled, format);
+    const Metal::Object color = make(Scaled, static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm));
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, QuadSource, error);
+    const Metal::Object vertex =
+        library ? Metal::CreateFunction(library.Get(), "quad_vertex") : Metal::Object{};
+    const Metal::Object fragment =
+        library ? Metal::CreateFunction(library.Get(), "quad_fragment") : Metal::Object{};
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = vertex.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    desc.blend[0].write_mask = 0xF;
+    desc.depth_format = format;
+    desc.stencil_format = format;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    desc.attributes[0] = {1, 0, 0, Maxwell::VertexAttribute::Type::Float,
+                          Maxwell::VertexAttribute::Size::Size_R32_G32};
+    desc.streams[0] = {1, 8, 0};
+    const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
+    // The reference is the draw state's.
+    const Metal::Object equal_state = [&] {
+        auto depth_stencil = Metal::Zeroed<Metal::DepthStencilDesc>();
+        depth_stencil.stencil_test = 1;
+        depth_stencil.front = {Maxwell::StencilOp::Op::Keep_D3D, Maxwell::StencilOp::Op::Keep_D3D,
+                               Maxwell::StencilOp::Op::Keep_D3D,
+                               Maxwell::ComparisonOp::Equal_D3D, 0xFF, 0};
+        depth_stencil.back = depth_stencil.front;
+        return Metal::CreateDepthStencilState(device, depth_stencil);
+    }();
+    if (!native || !scaled || !color || !pipeline || !equal_state) {
+        std::printf("metal-smoke: FAIL depth-stencil blit setup: %s\n", error.c_str());
+        return 1;
+    }
+    uint8_t* vertices = nullptr;
+    const Metal::Object vertex_buffer = Metal::CreateBuffer(device, 48, true, &vertices);
+    const float positions[12]{-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1};
+    std::memcpy(vertices, positions, sizeof(positions));
+
+    Metal::ClearPass clear{};
+    clear.depth = {.texture = native.Get()};
+    clear.stencil = {.texture = native.Get()};
+    clear.clear_depth = true;
+    clear.clear_stencil = true;
+    clear.depth_value = 0.5;
+    clear.stencil_value = 0x5A;
+    clear.width = Native;
+    clear.height = Native;
+    scheduler.Clear(clear);
+    const bool blitted = scheduler.Blit(Metal::BlitPass{
+        .src = native.Get(),
+        .src_rect = {0, 0, static_cast<int32_t>(Native), static_cast<int32_t>(Native)},
+        .dst = {.texture = scaled.Get()},
+        .dst_format = format,
+        .dst_rect = {0, 0, static_cast<int32_t>(Scaled), static_cast<int32_t>(Scaled)},
+        .dst_width = Scaled,
+        .dst_height = Scaled,
+        .linear = false,
+        .keep_dst = false,
+    });
+    // Two draws counted apart in one pass: stencil reference 0x5A, then 0.
+    std::array<uint64_t, 2> samples{};
+    for (uint32_t pass = 0; pass < 2; ++pass) {
+        Metal::RenderTargetSet targets{};
+        targets.color[0] = {.texture = color.Get()};
+        targets.depth = {.texture = scaled.Get()};
+        targets.has_depth = true;
+        targets.has_stencil = true;
+        targets.width = Scaled;
+        targets.height = Scaled;
+        scheduler.BeginRendering(targets);
+        Metal::DrawState state{};
+        state.pipeline = pipeline.Get();
+        state.depth_stencil = equal_state.Get();
+        state.viewport = {0.0f, 0.0f, float(Scaled), float(Scaled), 0.0f, 1.0f};
+        state.scissor = {0, 0, Scaled, Scaled};
+        state.stencil_front_ref = pass == 0 ? 0x5A : 0;
+        state.stencil_back_ref = state.stencil_front_ref;
+        scheduler.SetDrawState(state);
+        scheduler.BindVertexBuffer(Metal::VertexBufferSlot(0), vertex_buffer.Get(), 0);
+        scheduler.VisibilityResults()[3 + pass] = 0;
+        scheduler.SetVisibility(3 + pass);
+        scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 6, 1, 0);
+    }
+    scheduler.Finish();
+    samples = {scheduler.VisibilityResults()[3], scheduler.VisibilityResults()[4]};
+    const bool passed = blitted && samples[0] == Scaled * Scaled && samples[1] == 0;
+    std::printf("metal-smoke: depth-stencil blit 16x16 -> 32x32 (%s): stencil 0x5A passes %llu "
+                "of %u samples, stencil 0 passes %llu: %s\n",
+                blitted ? "encoded" : "refused", static_cast<unsigned long long>(samples[0]),
+                Scaled * Scaled, static_cast<unsigned long long>(samples[1]),
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main() {
@@ -1226,7 +1341,7 @@ int main() {
         for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer, RunMeshEmulation,
                                  RunMeshDistribution, RunIndexRewrite,
                                  RunOcarinaBilinear, RunPipelineArchive,
-                                 RunDepthBlit, RunTessellation}) {
+                                 RunDepthBlit, RunTessellation, RunDepthStencilBlit}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }

@@ -10,6 +10,7 @@
 #include <utility>
 
 #import <Metal/Metal.h>
+#include <TargetConditionals.h>
 
 #include "common/logging.h"
 #include "video_core/renderer_metal/metal_bridge.h"
@@ -64,7 +65,38 @@ fragment DepthOut blit_depth(BlitOut in [[stage_in]], depth2d<float> src [[textu
     out.depth = src.read(uint2(clamp(in.uv * size, float2(0.0), size - 1.0)));
     return out;
 }
+
+struct DepthStencilOut {
+    float depth [[depth(any)]];
+    uint stencil [[stencil]];
+};
+
+// The stencil goes out as the reference value of a Replace stencil operation.
+fragment DepthStencilOut blit_depth_stencil(BlitOut in [[stage_in]],
+                                            depth2d<float> src [[texture(0)]],
+                                            texture2d<uint> src_stencil [[texture(1)]]) {
+    const float2 size = float2(src.get_width(), src.get_height());
+    const uint2 texel = uint2(clamp(in.uv * size, float2(0.0), size - 1.0));
+    DepthStencilOut out;
+    out.depth = src.read(texel);
+    out.stencil = src_stencil.read(texel).x;
+    return out;
+}
 )";
+
+/// The stencil-only view format of a depth-stencil format (invalid when it has none).
+MTLPixelFormat StencilViewFormat(MTLPixelFormat format) {
+    switch (format) {
+    case MTLPixelFormatDepth32Float_Stencil8:
+        return MTLPixelFormatX32_Stencil8;
+#if !TARGET_OS_IPHONE
+    case MTLPixelFormatDepth24Unorm_Stencil8:
+        return MTLPixelFormatX24_Stencil8;
+#endif
+    default:
+        return MTLPixelFormatInvalid;
+    }
+}
 
 void ApplyAttachment(MTLRenderPassAttachmentDescriptor* descriptor, const Attachment& attachment) {
     descriptor.texture = AsTexture(attachment.texture);
@@ -147,8 +179,11 @@ struct Scheduler::Impl {
         case FormatClass::Float: fragment = @"blit_float"; break;
         case FormatClass::Uint: fragment = @"blit_uint"; break;
         case FormatClass::Sint: fragment = @"blit_sint"; break;
-        case FormatClass::Depth:
-        case FormatClass::DepthStencil: fragment = @"blit_depth"; break;
+        case FormatClass::Depth: fragment = @"blit_depth"; break;
+        case FormatClass::DepthStencil:
+            fragment = StencilViewFormat(format) != MTLPixelFormatInvalid ? @"blit_depth_stencil"
+                                                                          : @"blit_depth";
+            break;
         default: break;
         }
         if (library != nil && fragment != nil) {
@@ -185,12 +220,19 @@ struct Scheduler::Impl {
         return pipeline;
     }
 
-    /// The depth blits' state: every fragment writes its depth.
+    /// The depth blits' state: every fragment writes its depth, and the stencil it outputs.
     id<MTLDepthStencilState> DepthWriteAlways() {
         if (depth_write_always == nil) {
             MTLDepthStencilDescriptor* desc = [MTLDepthStencilDescriptor new];
             desc.depthCompareFunction = MTLCompareFunctionAlways;
             desc.depthWriteEnabled = YES;
+            MTLStencilDescriptor* stencil = [MTLStencilDescriptor new];
+            stencil.stencilCompareFunction = MTLCompareFunctionAlways;
+            stencil.depthStencilPassOperation = MTLStencilOperationReplace;
+            stencil.readMask = 0xFF;
+            stencil.writeMask = 0xFF;
+            desc.frontFaceStencil = stencil;
+            desc.backFaceStencil = stencil;
             depth_write_always = [device.GetDevice() newDepthStencilStateWithDescriptor:desc];
         }
         return depth_write_always;
@@ -453,10 +495,20 @@ bool Scheduler::Blit(const BlitPass& blit) {
         pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     }
+    // A depth-stencil source's stencil, read through a stencil view.
+    id<MTLTexture> src_stencil = nil;
+    if (format_class == FormatClass::DepthStencil &&
+        StencilViewFormat(format) != MTLPixelFormatInvalid) {
+        src_stencil = [src newTextureViewWithPixelFormat:StencilViewFormat(src.pixelFormat)];
+        if (src_stencil == nil) {
+            return false;
+        }
+    }
     const id<MTLRenderCommandEncoder> encoder = impl->RenderEncoder(pass);
     [encoder setRenderPipelineState:pipeline];
     if (depth) {
         [encoder setDepthStencilState:impl->DepthWriteAlways()];
+        [encoder setFragmentTexture:src_stencil atIndex:1];
     }
     [encoder setViewport:MTLViewport{static_cast<f64>(x), static_cast<f64>(y),
                                      static_cast<f64>(w), static_cast<f64>(h), 0.0, 1.0}];
