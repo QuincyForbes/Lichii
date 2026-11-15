@@ -779,6 +779,8 @@ bool GRenderWindow::InitRenderTarget() {
             return false;
         break;
     case Settings::RendererBackend::Vulkan:
+    // A Vulkan surface is a CAMetalLayer-backed view on macOS, which the Metal renderer draws to.
+    case Settings::RendererBackend::Metal:
         if (!InitializeVulkan())
             return false;
         break;

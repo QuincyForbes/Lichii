@@ -102,6 +102,7 @@ static const std::map<Settings::RendererBackend, QString> renderer_backend_texts
      QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "OpenGL SPIRV"))},
     {Settings::RendererBackend::OpenGL_GLASM,
      QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "OpenGL GLASM"))},
+    {Settings::RendererBackend::Metal, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "Metal"))},
     {Settings::RendererBackend::Null, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "Null"))},
 };
 

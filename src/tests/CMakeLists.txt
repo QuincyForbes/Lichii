@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    video_core/metal_index_convert.cpp
     video_core/vulkan_overlay_filter.cpp
     common/addon_config.cpp
     common/settings_migration.cpp
@@ -202,6 +203,10 @@ add_executable(tests
 create_target_directory_groups(tests)
 
 target_link_libraries(tests PRIVATE common core audio_core input_common video_core frontend_common)
+# The Metal renderer's index rewriting is plain C++: tested everywhere (video_core has it on Apple).
+if (NOT ENABLE_METAL)
+    target_sources(tests PRIVATE ../video_core/renderer_metal/metal_index_convert.cpp)
+endif()
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 if (TARGET dynarmic::dynarmic)

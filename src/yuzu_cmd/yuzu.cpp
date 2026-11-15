@@ -1447,6 +1447,8 @@ static bool CreateEmuWindow(SdlState* state, bool fullscreen) {
         break;
 #endif
     case Settings::RendererBackend::Vulkan:
+    // The Vulkan window hands the renderer its view's CAMetalLayer on Apple.
+    case Settings::RendererBackend::Metal:
         state->emu_window = std::make_unique<EmuWindow_SDL3_VK>(&state->input_subsystem, state->system, fullscreen);
         break;
     case Settings::RendererBackend::Null:

@@ -123,8 +123,16 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     // mid-game: hand the engines back to the front (and start again when they allow it).
     const bool safe_reads = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh()
                                                           : Settings::IsDMALevelSafe();
+    // Metal records everything behind the engines on the back thread too (composites included);
+    // EDEN_NX2_METAL_SPLIT=0 keeps it on one thread.
+    static const bool metal_split = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_SPLIT");
+        return value == nullptr || value[0] != '0';
+    }();
+    const auto backend = Settings::values.renderer_backend.GetValue();
     const bool allowed = !safe_reads && !Settings::IsGPULevelHigh() &&
-                         Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
+                         (backend == Settings::RendererBackend::Vulkan ||
+                          (backend == Settings::RendererBackend::Metal && metal_split));
     if (active && !allowed) {
         Drain();
         Stop();
