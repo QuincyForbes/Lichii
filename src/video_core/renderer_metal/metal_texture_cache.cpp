@@ -370,7 +370,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     }
     kind = KindOf(info);
     const auto [samples_x, samples_y] = VideoCommon::SamplesLog2(info.num_samples);
-    const TextureDesc desc{
+    desc = TextureDesc{
         .kind = kind,
         .format = host_format.format,
         .width = info.size.width >> samples_x,
@@ -396,8 +396,123 @@ Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBas
 
 Image::~Image() {
     if (texture && runtime != nullptr) {
-        runtime->allocated_bytes -= bytes;
+        runtime->allocated_bytes -= bytes + scaled_bytes;
     }
+}
+
+bool TextureCacheRuntime::CanRescaleImage(const ImageInfo& info) const {
+    constexpr u32 MaxTextureSize = 16384;
+    const auto& resolution = Settings::values.resolution_info;
+    const FormatInfo host = SurfaceFormat(device, info.format, IsConverted(device, info.format));
+    return info.type == ImageType::e2D && info.num_samples == 1 && host.format != 0 &&
+           host.attachable && host.format_class != FormatClass::Stencil &&
+           resolution.ScaleUp(info.size.width) <= MaxTextureSize &&
+           resolution.ScaleUp(info.size.height) <= MaxTextureSize;
+}
+
+bool Image::ScaleUp(bool ignore) {
+    const auto& resolution = Settings::values.resolution_info;
+    if (!resolution.active || rescaled || !texture || runtime == nullptr) {
+        return false;
+    }
+    if (!scaled_texture) {
+        TextureDesc scaled = desc;
+        scaled.width = resolution.ScaleUp(desc.width);
+        if (info.type == ImageType::e2D) {
+            scaled.height = resolution.ScaleUp(desc.height);
+        }
+        scaled_texture = CreateTexture(runtime->device, scaled);
+        if (!scaled_texture) {
+            LOG_ONCE(warned_scaled, "Metal: a scaled {}x{} texture failed; images stay native",
+                     scaled.width, scaled.height);
+            return false;
+        }
+        scaled_bytes = AllocatedSize(scaled_texture.Get());
+        runtime->allocated_bytes += scaled_bytes;
+        has_scaled = true;
+        ignore = false;
+    }
+    rescaled = true;
+    flags |= ImageFlagBits::Rescaled;
+    if (!ignore && !CopyScaled(true)) {
+        rescaled = false;
+        flags &= ~ImageFlagBits::Rescaled;
+        return false;
+    }
+    return true;
+}
+
+bool Image::ScaleDown(bool ignore) {
+    if (!Settings::values.resolution_info.active || !rescaled) {
+        return false;
+    }
+    if (!ignore && !CopyScaled(false)) {
+        return false;
+    }
+    rescaled = false;
+    flags &= ~ImageFlagBits::Rescaled;
+    return true;
+}
+
+bool Image::CopyScaled(bool scale_up) {
+    const TextureHandle src = scale_up ? texture.Get() : scaled_texture.Get();
+    const TextureHandle dst = scale_up ? scaled_texture.Get() : texture.Get();
+    if (src == nullptr || dst == nullptr || info.num_samples != 1 ||
+        kind == TextureKind::e3D || !host_format.attachable) {
+        return false;
+    }
+    if (host_format.format_class == FormatClass::DepthStencil ||
+        host_format.format_class == FormatClass::Stencil) {
+        LOG_ONCE(warned_stencil, "Metal: rescaled depth-stencil images keep their depth only");
+        if (host_format.format_class == FormatClass::Stencil) {
+            return false;
+        }
+    }
+    const auto& resolution = Settings::values.resolution_info;
+    const bool is_2d = info.type == ImageType::e2D;
+    const bool depth = host_format.format_class == FormatClass::Depth ||
+                       host_format.format_class == FormatClass::DepthStencil;
+    const bool integer = host_format.format_class == FormatClass::Uint ||
+                         host_format.format_class == FormatClass::Sint;
+    for (u32 level = 0; level < desc.levels; ++level) {
+        const u32 width = (std::max)(desc.width >> level, 1U);
+        const u32 height = (std::max)(desc.height >> level, 1U);
+        const u32 scaled_width = (std::max)(resolution.ScaleUp(desc.width) >> level, 1U);
+        const u32 scaled_height =
+            is_2d ? (std::max)(resolution.ScaleUp(desc.height) >> level, 1U) : height;
+        const u32 src_width = scale_up ? width : scaled_width;
+        const u32 src_height = scale_up ? height : scaled_height;
+        const u32 dst_width = scale_up ? scaled_width : width;
+        const u32 dst_height = scale_up ? scaled_height : height;
+        for (u32 layer = 0; layer < desc.layers; ++layer) {
+            // The blit reads a 2D texture: a view of the level and layer unless that is all.
+            Object view;
+            TextureHandle source = src;
+            if (desc.levels != 1 || desc.layers != 1 || kind != TextureKind::e2D) {
+                view = CreateTextureView(src, host_format.format, TextureKind::e2D, level, 1,
+                                         layer, 1, IdentitySwizzle);
+                source = view.Get();
+            }
+            const bool copied = runtime->scheduler.Blit(BlitPass{
+                .src = source,
+                .src_rect = {0, 0, static_cast<s32>(src_width), static_cast<s32>(src_height)},
+                .dst = {.texture = dst, .level = level, .slice = layer},
+                .dst_format = host_format.format,
+                .dst_rect = {0, 0, static_cast<s32>(dst_width), static_cast<s32>(dst_height)},
+                .dst_width = dst_width,
+                .dst_height = dst_height,
+                // As Vulkan's BlitScale: colour filtered, depth and integers nearest.
+                .linear = !depth && !integer,
+                .keep_dst = false,
+            });
+            if (!copied) {
+                LOG_ONCE(warned_copy, "Metal: rescaling an image of format {} failed",
+                         info.format);
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 std::pair<u32, u32> Image::CopyPitches(const VideoCommon::BufferImageCopy& copy) const {
@@ -461,6 +576,10 @@ void Image::UploadMemory(BufferHandle buffer, size_t offset,
                 ToOffset(copy.image_offset), extent);
         }
     }
+    // Uploads go to the native texture; a rescaled image draws from the scaled one.
+    if (rescaled) {
+        CopyScaled(true);
+    }
 }
 
 void Image::UploadMemory(const StagingBufferRef& map,
@@ -479,6 +598,10 @@ void Image::DownloadMemory(std::span<BufferHandle> buffers, std::span<size_t> of
                            std::span<const VideoCommon::BufferImageCopy> copies) {
     if (!CanCopyWithBuffers()) {
         return;
+    }
+    // Downloads read the native texture: bring a rescaled image's drawing to it first.
+    if (rescaled) {
+        CopyScaled(false);
     }
     const bool is_3d = info.type == ImageType::e3D;
     for (size_t index = 0; index < buffers.size(); ++index) {

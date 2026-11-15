@@ -419,6 +419,35 @@ void RasterizerMetal::FinishTexelWritebacks() {
     texel_writebacks.clear();
 }
 
+void RasterizerMetal::AddRescalingBits(const Shader::Info& info,
+                                       std::span<const VideoCommon::ImageViewInOut> views,
+                                       u32& texture_bit, u32& image_bit) {
+    const auto rescaled = [&](size_t view, u32 count) {
+        bool any = false;
+        for (u32 element = 0; element < count && view + element < views.size(); ++element) {
+            const ImageView& image_view = texture_cache.GetImageView(views[view + element].id);
+            any = any || texture_cache.IsRescaling(image_view);
+        }
+        return any;
+    };
+    size_t view = Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                  Shader::NumDescriptors(info.image_buffer_descriptors);
+    for (const auto& desc : info.texture_descriptors) {
+        if (rescaled(view, desc.count) && texture_bit < 32 * 4) {
+            rescaling_words[texture_bit / 32] |= 1U << (texture_bit % 32);
+        }
+        view += desc.count;
+        ++texture_bit;
+    }
+    for (const auto& desc : info.image_descriptors) {
+        if (rescaled(view, desc.count) && image_bit < 32 * 2) {
+            rescaling_words[4 + image_bit / 32] |= 1U << (image_bit % 32);
+        }
+        view += desc.count;
+        ++image_bit;
+    }
+}
+
 void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage metal_stage,
                                          std::span<const Binding> pending,
                                          std::span<const TextureHandle> texel_buffer_views,
@@ -435,14 +464,13 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
             switch (slot.kind) {
             case ShaderTranslate::ResourceKind::Buffer:
                 if (slot.set == ShaderTranslate::PushConstantSet) {
-                    // Shader::Backend::SPIRV::RescalingLayout (no rescaling, down factor 1)
-                    // or RenderAreaLayout.
-                    std::array<u32, 8> words{};
+                    // Shader::Backend::SPIRV::RescalingLayout (rescaling_words) or
+                    // RenderAreaLayout.
+                    std::array<u32, 8> words = rescaling_words;
                     if (info.uses_render_area && !info.uses_rescaling_uniform) {
+                        words = {};
                         words[0] = std::bit_cast<u32>(static_cast<f32>(render_width));
                         words[1] = std::bit_cast<u32>(static_cast<f32>(render_height));
-                    } else {
-                        words[6] = std::bit_cast<u32>(1.0f);
                     }
                     scheduler.BindBytes(metal_stage, slot_index, words.data(),
                                         static_cast<u32>(sizeof(words)));
@@ -619,6 +647,22 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     if (framebuffer == nullptr) {
         return false;
+    }
+    // The stages' texture and image scaling indices count on through the pipeline, as their
+    // bindings do.
+    const bool is_rescaling = texture_cache.IsRescaling();
+    const auto& resolution = Settings::values.resolution_info;
+    rescaling_words = {};
+    rescaling_words[6] = std::bit_cast<u32>(is_rescaling ? resolution.down_factor : 1.0f);
+    {
+        u32 texture_bit = 0;
+        u32 image_bit = 0;
+        for (size_t index = 0; index < stages.size(); ++index) {
+            if (!absent(index)) {
+                AddRescalingBits(programs[index]->info, std::span(views).subspan(first_view[index]),
+                                 texture_bit, image_bit);
+            }
+        }
     }
 
     // Texel buffers come from the buffer cache.
@@ -862,6 +906,14 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         draw.viewport.width = static_cast<f32>(regs.surface_clip.width);
         draw.viewport.height = static_cast<f32>(regs.surface_clip.height);
     }
+    if (is_rescaling) {
+        // As Vulkan's GetViewportState: the guest's viewport in scaled pixels.
+        const f32 scale = resolution.up_factor;
+        draw.viewport.x *= scale;
+        draw.viewport.y *= scale;
+        draw.viewport.width *= scale;
+        draw.viewport.height *= scale;
+    }
     if (draw.viewport.width == 0.0f) {
         draw.viewport.width = 1.0f;
     }
@@ -878,9 +930,15 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         const s32 max_y = (std::max)(lower_left ? clip_height - static_cast<s32>(scissor.min_y)
                                                 : static_cast<s32>(scissor.max_y.Value()),
                                      0);
-        draw.scissor = {static_cast<u32>(scissor.min_x.Value()), static_cast<u32>(min_y),
-                        static_cast<u32>(scissor.max_x.Value() - scissor.min_x.Value()),
-                        static_cast<u32>((std::max)(max_y - min_y, 0))};
+        const auto scale = [&](u32 value) {
+            return is_rescaling ? resolution.ScaleUp(value) : value;
+        };
+        const u32 min_x = scale(static_cast<u32>(scissor.min_x.Value()));
+        const u32 max_x = scale(static_cast<u32>(scissor.max_x.Value()));
+        const u32 scaled_min_y = scale(static_cast<u32>(min_y));
+        const u32 scaled_max_y = scale(static_cast<u32>((std::max)(max_y, min_y)));
+        draw.scissor = {min_x, scaled_min_y, max_x > min_x ? max_x - min_x : 0U,
+                        scaled_max_y - scaled_min_y};
     } else {
         draw.scissor = {0, 0, targets.width, targets.height};
     }
@@ -1183,7 +1241,8 @@ void RasterizerMetal::DispatchCompute() {
         ImageView& target = texture_cache.GetImageView(views[1].id);
         if (color.format == PixelFormat::E5B9G9R9_FLOAT &&
             target.format == PixelFormat::B10G11R11_FLOAT && color.Samples() <= 1 &&
-            target.Samples() <= 1 && color.range == VideoCommon::SubresourceRange{} &&
+            target.Samples() <= 1 && !texture_cache.IsRescaling(color) &&
+            !texture_cache.IsRescaling(target) && color.range == VideoCommon::SubresourceRange{} &&
             target.range == VideoCommon::SubresourceRange{} &&
             target.size.width > color.size.width && target.size.height > color.size.height &&
             color.ImageHandle() != target.ImageHandle() &&
@@ -1224,6 +1283,11 @@ void RasterizerMetal::DispatchCompute() {
     const std::vector<Binding> bindings = buffer_cache_runtime.PendingBindings();
     const std::vector<TextureHandle> texel_views = PrepareTexelBuffers(bindings, info);
 
+    rescaling_words = {};
+    rescaling_words[6] = std::bit_cast<u32>(1.0f);
+    u32 texture_bit = 0;
+    u32 image_bit = 0;
+    AddRescalingBits(info, views, texture_bit, image_bit);
     scheduler.BeginCompute(state);
     BindStageResources(program, ShaderStage::Compute, bindings, texel_views, views, samplers, 0,
                        0);

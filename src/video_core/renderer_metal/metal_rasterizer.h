@@ -173,6 +173,12 @@ private:
     /// Binds everything the draw needs and opens its render pass; false to skip it.
     bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups = 0);
 
+    /// Sets the rescaling_words bits of a stage's texture and image descriptors (views from the
+    /// stage's first), counting on from texture_bit and image_bit.
+    void AddRescalingBits(const Shader::Info& info,
+                          std::span<const VideoCommon::ImageViewInOut> views, u32& texture_bit,
+                          u32& image_bit);
+
     /// Copies written texel buffers read through aligned copies back (ends the open encoder).
     void FinishTexelWritebacks();
 
@@ -279,6 +285,8 @@ private:
     u64 mesh_draws{};
     u64 mesh_groups{};
     std::chrono::steady_clock::time_point archive_saved{};
+    /// Shader::Backend::SPIRV::RescalingLayout of the draw or dispatch being bound.
+    std::array<u32, 8> rescaling_words{};
 
     /// The GPU index rewrite of the draw being prepared.
     struct IndexRewrite {

@@ -53,6 +53,17 @@ fragment int4 blit_sint(BlitOut in [[stage_in]], texture2d<int> src [[texture(0)
     const float2 size = float2(src.get_width(), src.get_height());
     return src.read(uint2(clamp(in.uv * size, float2(0.0), size - 1.0)));
 }
+
+struct DepthOut {
+    float depth [[depth(any)]];
+};
+
+fragment DepthOut blit_depth(BlitOut in [[stage_in]], depth2d<float> src [[texture(0)]]) {
+    const float2 size = float2(src.get_width(), src.get_height());
+    DepthOut out;
+    out.depth = src.read(uint2(clamp(in.uv * size, float2(0.0), size - 1.0)));
+    return out;
+}
 )";
 
 void ApplyAttachment(MTLRenderPassAttachmentDescriptor* descriptor, const Attachment& attachment) {
@@ -136,6 +147,8 @@ struct Scheduler::Impl {
         case FormatClass::Float: fragment = @"blit_float"; break;
         case FormatClass::Uint: fragment = @"blit_uint"; break;
         case FormatClass::Sint: fragment = @"blit_sint"; break;
+        case FormatClass::Depth:
+        case FormatClass::DepthStencil: fragment = @"blit_depth"; break;
         default: break;
         }
         if (library != nil && fragment != nil) {
@@ -143,7 +156,14 @@ struct Scheduler::Impl {
             desc.label = @"Blit";
             desc.vertexFunction = [library newFunctionWithName:@"blit_vertex"];
             desc.fragmentFunction = [library newFunctionWithName:fragment];
-            desc.colorAttachments[0].pixelFormat = format;
+            if (format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil) {
+                desc.depthAttachmentPixelFormat = format;
+                if (format_class == FormatClass::DepthStencil) {
+                    desc.stencilAttachmentPixelFormat = format;
+                }
+            } else {
+                desc.colorAttachments[0].pixelFormat = format;
+            }
             if (blend != BlitBlend::None && format_class == FormatClass::Float) {
                 MTLRenderPipelineColorAttachmentDescriptor* color = desc.colorAttachments[0];
                 color.blendingEnabled = YES;
@@ -165,8 +185,20 @@ struct Scheduler::Impl {
         return pipeline;
     }
 
+    /// The depth blits' state: every fragment writes its depth.
+    id<MTLDepthStencilState> DepthWriteAlways() {
+        if (depth_write_always == nil) {
+            MTLDepthStencilDescriptor* desc = [MTLDepthStencilDescriptor new];
+            desc.depthCompareFunction = MTLCompareFunctionAlways;
+            desc.depthWriteEnabled = YES;
+            depth_write_always = [device.GetDevice() newDepthStencilStateWithDescriptor:desc];
+        }
+        return depth_write_always;
+    }
+
     const Device& device;
     id<MTLCommandQueue> queue;
+    id<MTLDepthStencilState> depth_write_always = nil;
     id<MTLCommandBuffer> command_buffer = nil;
     id<MTLBlitCommandEncoder> blit = nil;
     /// The render encoder draws go to, open until other work needs the command buffer.
@@ -401,12 +433,31 @@ bool Scheduler::Blit(const BlitPass& blit) {
     }
 
     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-    ApplyAttachment(pass.colorAttachments[0], blit.dst);
-    pass.colorAttachments[0].loadAction = blit.keep_dst ? MTLLoadActionLoad : MTLLoadActionClear;
-    pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
-    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    const FormatClass format_class = ClassOf(blit.dst_format);
+    const bool depth = format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil;
+    if (depth) {
+        // Depth only: the fragment writes it; stencil keeps what it held or is cleared to 0.
+        ApplyAttachment(pass.depthAttachment, blit.dst);
+        pass.depthAttachment.loadAction = blit.keep_dst ? MTLLoadActionLoad : MTLLoadActionClear;
+        pass.depthAttachment.storeAction = MTLStoreActionStore;
+        if (format_class == FormatClass::DepthStencil) {
+            ApplyAttachment(pass.stencilAttachment, blit.dst);
+            pass.stencilAttachment.loadAction =
+                blit.keep_dst ? MTLLoadActionLoad : MTLLoadActionClear;
+            pass.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+    } else {
+        ApplyAttachment(pass.colorAttachments[0], blit.dst);
+        pass.colorAttachments[0].loadAction =
+            blit.keep_dst ? MTLLoadActionLoad : MTLLoadActionClear;
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
     const id<MTLRenderCommandEncoder> encoder = impl->RenderEncoder(pass);
     [encoder setRenderPipelineState:pipeline];
+    if (depth) {
+        [encoder setDepthStencilState:impl->DepthWriteAlways()];
+    }
     [encoder setViewport:MTLViewport{static_cast<f64>(x), static_cast<f64>(y),
                                      static_cast<f64>(w), static_cast<f64>(h), 0.0, 1.0}];
     const s32 limit_w = static_cast<s32>(blit.dst_width);

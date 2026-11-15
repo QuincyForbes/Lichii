@@ -61,6 +61,10 @@ public:
         return true;
     }
 
+    /// Resolution scaling takes single-sampled 2D render targets Metal can blit (no stencil-only
+    /// ones) whose scaled size fits a texture.
+    [[nodiscard]] bool CanRescaleImage(const VideoCommon::ImageInfo& info) const;
+
     /// Metal copies texels only between textures of one format: any other pair is reinterpreted.
     [[nodiscard]] bool ShouldReinterpret(Image& dst, Image& src) const noexcept;
 
@@ -161,8 +165,9 @@ public:
     void DownloadMemory(const StagingBufferRef& map,
                         std::span<const VideoCommon::BufferImageCopy> copies);
 
+    /// The texture draws and copies use: the scaled one while the image is rescaled.
     [[nodiscard]] TextureHandle Handle() const noexcept {
-        return texture.Get();
+        return rescaled ? scaled_texture.Get() : texture.Get();
     }
 
     /// The host format (MTLPixelFormat) and what it is.
@@ -175,21 +180,21 @@ public:
     }
 
     [[nodiscard]] bool IsRescaled() const noexcept {
-        return false;
+        return rescaled;
     }
 
-    /// Resolution scaling is not done on Metal yet.
-    bool ScaleUp(bool = false) {
-        return false;
-    }
+    /// Resolution scaling: draws go to a texture at the scaled size, which gets the native
+    /// texture's contents unless `ignore`.
+    bool ScaleUp(bool ignore = false);
 
-    bool ScaleDown(bool = false) {
-        return false;
-    }
+    bool ScaleDown(bool ignore = false);
 
     u64 allocation_tick{};
 
 private:
+    /// Copies every level and layer between the native and the scaled texture (scaled to fit).
+    bool CopyScaled(bool scale_up);
+
     /// Bytes a row of the copy holds in the buffer, and a layer (2D) or slice (3D).
     [[nodiscard]] std::pair<u32, u32> CopyPitches(const VideoCommon::BufferImageCopy& copy) const;
 
@@ -199,9 +204,14 @@ private:
 
     TextureCacheRuntime* runtime{};
     Object texture;
+    /// The texture at the scaled size, made on the first ScaleUp.
+    Object scaled_texture;
+    TextureDesc desc{};
     FormatInfo host_format{};
     TextureKind kind{TextureKind::e2D};
     u64 bytes{};
+    u64 scaled_bytes{};
+    bool rescaled{};
 };
 
 class ImageView : public VideoCommon::ImageViewBase {
