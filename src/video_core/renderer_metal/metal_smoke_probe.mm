@@ -804,6 +804,50 @@ const Suspect Suspects[] = {
      [](const Context& context) {
          return Cast(context, MTLPixelFormatBC1_RGBA, MTLPixelFormatBC4_RUnorm);
      }},
+    {"view-bc3-as-bc2",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC3_RGBA, MTLPixelFormatBC2_RGBA);
+     }},
+    {"view-bc4-as-bc4-snorm",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC4_RUnorm, MTLPixelFormatBC4_RSnorm);
+     }},
+    {"view-bc5-as-bc5-snorm",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC5_RGUnorm, MTLPixelFormatBC5_RGSnorm);
+     }},
+    {"view-bc6h-float-as-ufloat",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC6H_RGBFloat, MTLPixelFormatBC6H_RGBUfloat);
+     }},
+    {"view-bc7-as-bc7-srgb",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC7_RGBAUnorm, MTLPixelFormatBC7_RGBAUnorm_sRGB);
+     }},
+    {"view-bc7-as-rgba32float",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatBC7_RGBAUnorm, MTLPixelFormatRGBA32Float);
+     }},
+    {"view-astc-4x4-as-srgb",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatASTC_4x4_LDR, MTLPixelFormatASTC_4x4_sRGB);
+     }},
+    {"view-astc-4x4-as-hdr",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatASTC_4x4_LDR, MTLPixelFormatASTC_4x4_HDR);
+     }},
+    {"view-astc-4x4-as-8x8",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatASTC_4x4_LDR, MTLPixelFormatASTC_8x8_LDR);
+     }},
+    {"view-etc2-rgb8-as-srgb",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatETC2_RGB8, MTLPixelFormatETC2_RGB8_sRGB);
+     }},
+    {"view-eac-r11-as-snorm",
+     [](const Context& context) {
+         return Cast(context, MTLPixelFormatEAC_R11Unorm, MTLPixelFormatEAC_R11Snorm);
+     }},
     {"view-bc1-as-rgba8",
      [](const Context& context) {
          return Cast(context, MTLPixelFormatBC1_RGBA, MTLPixelFormatRGBA8Unorm);

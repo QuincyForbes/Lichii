@@ -541,6 +541,7 @@ int RunTexture1D() {
                                refused(format, Metal::TextureKind::e2DMultisample, 1);
     const bool formats_refused =
         refused(static_cast<uint32_t>(MTLPixelFormatRG8Unorm), Metal::TextureKind::e2D, 1) &&
+        refused(static_cast<uint32_t>(MTLPixelFormatBC1_RGBA), Metal::TextureKind::e2D, 1) &&
         refused(static_cast<uint32_t>(MTLPixelFormatDepth32Float), Metal::TextureKind::e2D, 1);
     // What Metal does take: every layer in another format of the same texel size.
     const bool cast = !refused(static_cast<uint32_t>(MTLPixelFormatR32Uint),

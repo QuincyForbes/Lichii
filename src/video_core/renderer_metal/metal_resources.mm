@@ -199,6 +199,7 @@ u32 TexelBytes(MTLPixelFormat format) {
     switch (format) {
     case MTLPixelFormatA8Unorm:
     case MTLPixelFormatR8Unorm:
+    case MTLPixelFormatR8Unorm_sRGB:
     case MTLPixelFormatR8Snorm:
     case MTLPixelFormatR8Uint:
     case MTLPixelFormatR8Sint:
@@ -209,9 +210,14 @@ u32 TexelBytes(MTLPixelFormat format) {
     case MTLPixelFormatR16Sint:
     case MTLPixelFormatR16Float:
     case MTLPixelFormatRG8Unorm:
+    case MTLPixelFormatRG8Unorm_sRGB:
     case MTLPixelFormatRG8Snorm:
     case MTLPixelFormatRG8Uint:
     case MTLPixelFormatRG8Sint:
+    case MTLPixelFormatB5G6R5Unorm:
+    case MTLPixelFormatA1BGR5Unorm:
+    case MTLPixelFormatABGR4Unorm:
+    case MTLPixelFormatBGR5A1Unorm:
         return 2;
     case MTLPixelFormatR32Uint:
     case MTLPixelFormatR32Sint:
@@ -252,9 +258,41 @@ u32 TexelBytes(MTLPixelFormat format) {
     }
 }
 
+/// MoltenVK's view classes, 0 for a format in none: plain colour formats by texel size, a
+/// compressed format with its sRGB, signed and HDR variants.
+u32 ViewClass(MTLPixelFormat format) {
+    constexpr u32 Compressed = 0x100;
+    if (const u32 bytes = TexelBytes(format)) {
+        return bytes;
+    }
+    const u32 raw = static_cast<u32>(format);
+    // Each of these is followed by its variant.
+    if ((format >= MTLPixelFormatBC1_RGBA && format <= MTLPixelFormatBC7_RGBAUnorm_sRGB) ||
+        (format >= MTLPixelFormatEAC_RGBA8 && format <= MTLPixelFormatETC2_RGB8A1_sRGB)) {
+        return Compressed + (raw & ~1U);
+    }
+    if (format == MTLPixelFormatEAC_R11Unorm || format == MTLPixelFormatEAC_R11Snorm) {
+        return Compressed + static_cast<u32>(MTLPixelFormatEAC_R11Unorm);
+    }
+    if (format == MTLPixelFormatEAC_RG11Unorm || format == MTLPixelFormatEAC_RG11Snorm) {
+        return Compressed + static_cast<u32>(MTLPixelFormatEAC_RG11Unorm);
+    }
+    // ASTC's sRGB, LDR and HDR formats list the block sizes in one order.
+    for (const MTLPixelFormat first : {MTLPixelFormatASTC_4x4_sRGB, MTLPixelFormatASTC_4x4_LDR,
+                                       MTLPixelFormatASTC_4x4_HDR}) {
+        const u32 last = static_cast<u32>(first) + static_cast<u32>(MTLPixelFormatASTC_12x12_LDR) -
+                         static_cast<u32>(MTLPixelFormatASTC_4x4_LDR);
+        if (raw >= static_cast<u32>(first) && raw <= last) {
+            return Compressed + raw - static_cast<u32>(first) +
+                   static_cast<u32>(MTLPixelFormatASTC_4x4_LDR);
+        }
+    }
+    return 0;
+}
+
 /// Why Metal would reject by assertion a view in format `to` of a texture in format `from`, or
-/// nil: it casts between colour formats of one texel size and to the stencil half of a
-/// depth-stencil format, nothing else.
+/// nil: it casts between colour formats of one texel size, between the variants of a compressed
+/// format and to the stencil half of a depth-stencil format, nothing else.
 const char* ViewFormatReason(MTLPixelFormat from, MTLPixelFormat to) {
     if (from == to) {
         return nullptr;
@@ -269,10 +307,10 @@ const char* ViewFormatReason(MTLPixelFormat from, MTLPixelFormat to) {
                    ? nullptr
                    : "a depth or stencil format seen as another format";
     }
-    const u32 from_bytes = TexelBytes(from);
-    const u32 to_bytes = TexelBytes(to);
-    if (from_bytes != 0 && to_bytes != 0 && from_bytes != to_bytes) {
-        return "formats of different texel sizes";
+    const u32 from_class = ViewClass(from);
+    const u32 to_class = ViewClass(to);
+    if (from_class != 0 && to_class != 0 && from_class != to_class) {
+        return "formats of different texel sizes or compressions";
     }
     return nullptr;
 }
