@@ -96,6 +96,14 @@ EDEN_NX2_FENCE_BATCH=1
 # differently.
 #EDEN_NX2_DISPATCH_DEPS=1
 
+# Metal renderer: 0 writes no log line for a SIGABRT or an uncaught Objective-C exception (Metal
+# aborts the process on a descriptor or call it rejects; the line names the thread and frames).
+#EDEN_NX2_METAL_ABORT_TRACE=0
+
+# Metal renderer: 0 makes command buffers without per-encoder status, so a failed one logs its
+# error without the encoders that did not complete.
+#EDEN_NX2_METAL_ENCODER_STATUS=0
+
 #EDEN_NX2_MME_JIT=0
 #EDEN_NX2_PBFLUSH=0
 #EDEN_NX2_SKIP_SAME=0

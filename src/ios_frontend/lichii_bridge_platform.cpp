@@ -350,6 +350,11 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_DISPATCH_DEPS", "1", 1);
         LOG_WARNING(Frontend, "iOS: experiment dispatch_deps on");
     }
+    if (lichii_platform_experiment("metal_trace_off")) {
+        setenv("EDEN_NX2_METAL_ABORT_TRACE", "0", 1);
+        setenv("EDEN_NX2_METAL_ENCODER_STATUS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_trace_off on");
+    }
     ApplyCpuExperiments();
 }
 

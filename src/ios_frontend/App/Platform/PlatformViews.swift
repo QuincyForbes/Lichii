@@ -448,6 +448,7 @@ struct ExperimentsView: View {
     @State private var dispatchChain = lichii_platform_experiment("dispatch_chain") != 0
     @State private var emulateAllMesh = lichii_platform_experiment("emulate_all_mesh") != 0
     @State private var dispatchDeps = lichii_platform_experiment("dispatch_deps") != 0
+    @State private var metalTraceOff = lichii_platform_experiment("metal_trace_off") != 0
 
     var body: some View {
         List {
@@ -508,10 +509,14 @@ struct ExperimentsView: View {
                     .onChange(of: mvkShaderDump) { value in
                         lichii_platform_set_experiment("mvk_shader_dump", value ? 1 : 0)
                     }
+                Toggle("No Metal Crash Log Lines", isOn: $metalTraceOff)
+                    .onChange(of: metalTraceOff) { value in
+                        lichii_platform_set_experiment("metal_trace_off", value ? 1 : 0)
+                    }
             } header: {
                 Text("Graphics")
             } footer: {
-                Text("For tracking down crashes. Early submits hand the GPU a scene load's texture uploads in parts, which keeps graphics memory down while a level loads; off, a large load can run out of memory. Mesh shader emulation draws some of Ocarina of Time's foliage and walls; off, they are missing. MoltenVK Converts 8-bit Indices is the old way of drawing models stored with 8-bit indices, which crashed Ocarina of Time entering Kokiri Forest; Lichii now converts them itself. Native Per-Primitive Mesh Attributes builds one of Ocarina of Time's mesh shaders the way it was built before, which the iPhone's shader compiler refused at every start; Lichii now draws it with the emulation. MoltenVK Writes Its Shaders to Storage saves every shader as MoltenVK hands it to Metal in dump/mvk-shaders (thousands of files, slower start), to find out why that one is refused; turn both on for that.\n\nAll five apply the next time Lichii starts.")
+                Text("For tracking down crashes. Early submits hand the GPU a scene load's texture uploads in parts, which keeps graphics memory down while a level loads; off, a large load can run out of memory. Mesh shader emulation draws some of Ocarina of Time's foliage and walls; off, they are missing. MoltenVK Converts 8-bit Indices is the old way of drawing models stored with 8-bit indices, which crashed Ocarina of Time entering Kokiri Forest; Lichii now converts them itself. Native Per-Primitive Mesh Attributes builds one of Ocarina of Time's mesh shaders the way it was built before, which the iPhone's shader compiler refused at every start; Lichii now draws it with the emulation. MoltenVK Writes Its Shaders to Storage saves every shader as MoltenVK hands it to Metal in dump/mvk-shaders (thousands of files, slower start), to find out why that one is refused; turn both on for that. No Metal Crash Log Lines is for the Metal renderer (Graphics API): normally Lichii writes a log line when the app aborts or an exception goes uncaught, and asks Metal which step of a failed command buffer failed; on, it does neither, as before.\n\nAll six apply the next time Lichii starts.")
             }
 
             Section {
