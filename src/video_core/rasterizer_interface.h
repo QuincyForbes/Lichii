@@ -160,6 +160,13 @@ public:
 
     virtual RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) = 0;
 
+    /// A guest core (EDEN_NX2_GPU_READ_LAND=2): waits for the fence download recorded in
+    /// submission tick and lands it over the range. False when the GPU thread has to do it.
+    virtual bool LandDownloadForCpuRead([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size,
+                                        [[maybe_unused]] u64 tick) {
+        return false;
+    }
+
     /// Whether reports in the range wait for host query results not yet in guest memory.
     [[nodiscard]] virtual bool HasPendingQueries([[maybe_unused]] DAddr addr,
                                                  [[maybe_unused]] u64 size) {

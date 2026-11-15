@@ -25,6 +25,7 @@
 #include "core/frontend/graphics_context.h"
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/perf_stats.h"
+#include "video_core/buffer_cache/cpu_read_stats.h"
 #include "video_core/cdma_pusher.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/control/scheduler.h"
@@ -299,7 +300,13 @@ struct GPU::Impl {
     }
 
     VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size) {
+        namespace ReadStats = VideoCommon::CpuReadStats;
+        auto& stats = ReadStats::g_counters;
+        const u64 ask_begin = ReadStats::NowNs();
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
+        const u64 ask_end = ReadStats::NowNs();
+        ReadStats::Add(stats.asks, 1);
+        ReadStats::Add(stats.ask_ns, ask_end - ask_begin);
         if (raster_area.preemtive) {
             return raster_area;
         }
@@ -314,13 +321,31 @@ struct GPU::Impl {
                          reads.load(std::memory_order_relaxed));
             }
         }
-        const u64 fence = RequestSyncOperation([this, raster_area]() {
+        if (raster_area.download_tick != 0) {
+            if (renderer->ReadRasterizer()->LandDownloadForCpuRead(
+                    raster_area.start_address,
+                    raster_area.end_address - raster_area.start_address,
+                    raster_area.download_tick)) {
+                ReadStats::Add(stats.core_landed, 1);
+                ReadStats::Add(stats.core_ns, ReadStats::NowNs() - ask_end);
+                return raster_area;
+            }
+            ReadStats::Add(stats.core_refused, 1);
+        }
+        const size_t cause = (std::min<size_t>)(raster_area.cause, ReadStats::CauseCount - 1);
+        const u64 fence = RequestSyncOperation([this, raster_area, ask_end, cause, &stats]() {
+            const u64 flush_begin = ReadStats::NowNs();
+            ReadStats::Add(stats.queue_ns[cause], flush_begin - ask_end);
             // Apply collected guest writes before downloading GPU data over guest memory.
             InvalidateGPUCache();
+            ReadStats::t_in_read = true;
             renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
+            ReadStats::t_in_read = false;
+            ReadStats::Add(stats.flush_ns[cause], ReadStats::NowNs() - flush_begin);
         });
         gpu_thread.TickGPU(is_async);
         WaitForSyncOperation(fence);
+        ReadStats::Add(stats.waits[cause], 1);
         return raster_area;
     }
 

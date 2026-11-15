@@ -228,6 +228,10 @@ void ApplyCpuExperiments() {
         setenv("EDEN_NX2_CPU_WRITE_RECLAIM", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment cpu_writes_old on");
     }
+    if (lichii_platform_experiment("gpu_reads_old")) {
+        setenv("EDEN_NX2_GPU_READ_LAND", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment gpu_reads_old on");
+    }
     if (lichii_platform_experiment("perf_sched_off")) {
         setenv("EDEN_NX2_PERF_SCHED", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment perf_sched_off on");

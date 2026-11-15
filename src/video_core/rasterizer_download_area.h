@@ -14,6 +14,11 @@ struct RasterizerDownloadArea {
     VAddr start_address;
     VAddr end_address;
     bool preemtive;
+    /// VideoCommon::CpuReadStats::Cause of a flush that isn't preemtive.
+    u8 cause{};
+    /// Not zero: every GPU byte of the area the guest lacks is in a fence download recorded in
+    /// this submission (EDEN_NX2_GPU_READ_LAND=2).
+    u64 download_tick{};
 };
 
 /// What DownloadLanding publishes.

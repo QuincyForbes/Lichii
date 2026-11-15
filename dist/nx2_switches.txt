@@ -145,3 +145,13 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_JIT_EXCLUSIVE_CALLBACKS=1
 # The reactive flushing setting for this session (0 = read traps, as on iOS and macOS).
 #EDEN_NX2_REACTIVE_FLUSHING=0
+# Guest reads of a page whose GPU-written bytes are not in guest memory yet ("Perf CPU reads:"
+# line: asks, cache lock time, waits by cause, who landed the bytes). 0: the GPU thread copies
+# the page again and waits for the GPU to go idle, page by page. 1: a fence download of those
+# bytes already in flight is waited for (its own submission only) and landed by the GPU thread,
+# with the finished downloads within EDEN_NX2_GPU_READ_LAND_KIB (default 256) of the read.
+# 2: also, when that download is already submitted, the reading core waits and lands it itself,
+# so the GPU thread keeps recording. Default 2 on Apple hosts, 0 elsewhere. PC phone sim, Ocarina
+# of Time in Kokiri: GPU thread held 79 -> 49 -> 5.5 ms/s, GPU-tracked load 13.2 -> 9.7 -> 8.2 us.
+#EDEN_NX2_GPU_READ_LAND=0
+#EDEN_NX2_GPU_READ_LAND_KIB=256
