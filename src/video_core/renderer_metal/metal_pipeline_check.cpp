@@ -324,6 +324,12 @@ std::string CheckTexture(const TextureDesc& desc, const PipelineLimits& limits) 
         return fmt::format("{}x{}x{} texels, Metal has {} a side", desc.width, desc.height, depth,
                            side);
     }
+    const bool line = desc.kind == TextureKind::e1D || desc.kind == TextureKind::e1DArray;
+    if ((line || desc.kind == TextureKind::e3D) &&
+        (HasDepth(desc.format) || HasStencil(desc.format))) {
+        return fmt::format("depth or stencil format {} in a {} texture", desc.format,
+                           line ? "1D" : "3D");
+    }
     const bool cube = desc.kind == TextureKind::Cube || desc.kind == TextureKind::CubeArray;
     if (cube && desc.width != desc.height) {
         return fmt::format("cube faces of {}x{} texels", desc.width, desc.height);

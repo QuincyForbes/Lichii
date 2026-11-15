@@ -1421,7 +1421,13 @@ int RunPipelineCheck() {
                                        .format = rgba8,
                                        .width = 16,
                                        .height = 8,
-                                       .layers = 6});
+                                       .layers = 6}) &&
+        !Metal::CreateTexture(device,
+                              {.kind = Metal::TextureKind::e3D,
+                               .format = static_cast<uint32_t>(MTLPixelFormatDepth32Float),
+                               .width = 16,
+                               .height = 16,
+                               .depth = 16});
 
     const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
     const Metal::Object depth_stencil =
@@ -1431,6 +1437,10 @@ int RunPipelineCheck() {
                     Metal::Describe(desc).c_str(), error.c_str());
         return 1;
     }
+    Metal::RenderPipelineDesc targetless = desc;
+    targetless.color_formats[0] = 0;
+    std::string bare_error;
+    const Metal::Object bare = Metal::CreateRenderPipelineState(device, targetless, bare_error);
     // 16 bytes the attribute's offset skips, then two triangles over the whole target.
     uint8_t* vertices = nullptr;
     const Metal::Object vertex_buffer = Metal::CreateBuffer(device, 64, true, &vertices);
@@ -1473,6 +1483,25 @@ int RunPipelineCheck() {
     }
     scheduler.SetVisibility(std::nullopt);
     scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 6, 1, 0);
+    // The same two triangles counted in a pass without attachments, as the game's occlusion
+    // queries draw.
+    if (bare) {
+        Metal::RenderTargetSet nothing{};
+        nothing.width = Size;
+        nothing.height = Size;
+        scheduler.BeginRendering(nothing);
+        state.pipeline = bare.Get();
+        scheduler.SetDrawState(state);
+        for (uint32_t slot = 0; slot < sources.count; ++slot) {
+            const Metal::VertexSource& source = sources.streams[slot];
+            const bool is_zeros = source.stream == Metal::VertexSource::Zeros;
+            scheduler.BindVertexBuffer(Metal::VertexBufferSlot(slot),
+                                       is_zeros ? zeros.Get() : vertex_buffer.Get(), source.shift);
+        }
+        scheduler.VisibilityResults()[5] = 0;
+        scheduler.SetVisibility(5);
+        scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 6, 1, 0);
+    }
     scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Size, Size, 1}, readback_buffer.Get(),
                                   0, Size * 4, 0);
     scheduler.Finish();
@@ -1481,15 +1510,18 @@ int RunPipelineCheck() {
     const Texel first = texels[4 * Size + 4];
     const Texel last = texels[(Size - 4) * Size + Size - 4];
     const bool drawn = Near(first, {0, 255, 0, 255}) && Near(last, {0, 255, 0, 255});
+    const uint64_t counted = bare ? scheduler.VisibilityResults()[5] : 0;
     const bool passed = refused && sanitised && same && crowded_refused && samples_refused &&
-                        depth_refused && textures_refused && drawn;
+                        depth_refused && textures_refused && drawn && counted == Size * Size;
     std::printf("metal-smoke: pipeline check: stream 31 %s (%s); sanitised to %u streams %s, "
                 "equal for unread state %d, crowded %d, 3 samples %d, colour as depth %d, "
-                "textures %d; drawn %u,%u,%u and %u,%u,%u: %s\n",
+                "textures %d; drawn %u,%u,%u and %u,%u,%u; without attachments %s, %llu of %u "
+                "samples: %s\n",
                 refused ? "refused" : "NOT refused", refusal.c_str(), sources.count,
                 sanitised ? "as expected" : "NOT as expected", same, crowded_refused,
                 samples_refused, depth_refused, textures_refused, first.r, first.g, first.b,
-                last.r, last.g, last.b, passed ? "PASS" : "FAIL");
+                last.r, last.g, last.b, bare ? "built" : bare_error.c_str(),
+                static_cast<unsigned long long>(counted), Size * Size, passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
 
