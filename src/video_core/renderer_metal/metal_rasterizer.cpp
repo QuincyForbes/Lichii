@@ -34,7 +34,7 @@
 namespace Metal {
 
 namespace {
-/// Logs a message the first time lag is seen unset.
+/// Logs a message the first time `flag` is seen unset.
 #define LOG_ONCE(flag, ...)                                                                        \
     do {                                                                                           \
         static std::atomic_bool flag{false};                                                       \

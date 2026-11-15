@@ -224,7 +224,7 @@ public:
 
     void Dispatch(std::array<u32, 3> groups, std::array<u32, 3> group_size);
 
-    /// The group counts are three u32 at offset of uffer.
+    /// The group counts are three u32 at `offset` of `buffer`.
     void DispatchIndirect(BufferHandle buffer, u64 offset, std::array<u32, 3> group_size);
 
     /// index_size: 2 or 4 bytes.

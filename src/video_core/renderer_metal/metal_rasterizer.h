@@ -200,7 +200,7 @@ private:
                                                                  const Shader::Info& info);
 
     /// Binds a stage's buffers (the buffer cache's pending bindings for it), textures, samplers,
-    /// images and push constants into the slots the translator gave them. iews and
+    /// images and push constants into the slots the translator gave them. `views` and
     /// samplers start at the stage's first.
     void BindStageResources(StageProgram& program, ShaderStage metal_stage,
                             std::span<const Binding> pending,
