@@ -214,8 +214,9 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// fence, as before (EDEN_NX2_CPU_WRITE_RECLAIM=0). "metal_trace_off": the Metal renderer leaves
 /// SIGABRT and uncaught exceptions unlogged and asks for no per-encoder command buffer status
 /// (EDEN_NX2_METAL_ABORT_TRACE=0, EDEN_NX2_METAL_ENCODER_STATUS=0). "metal_check_off": the Metal
-/// renderer hands Metal the guest's vertex layout, pipeline and texture descriptions unchecked,
-/// as before (EDEN_NX2_METAL_PIPELINE_CHECK=0).
+/// renderer hands Metal the guest's vertex layout, pipeline, texture and texture view
+/// descriptions unchecked and keeps 1D images as 1D textures, as before
+/// (EDEN_NX2_METAL_PIPELINE_CHECK=0).
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
 /// Bench mode: for the rest of this process lichii_platform_experiment reports `names` as on and

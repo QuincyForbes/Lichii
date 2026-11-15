@@ -202,7 +202,9 @@ rewrite on the GPU / none), `EDEN_NX2_METAL_ARCHIVE=0` (no pipeline archive),
 unchecked; by default `metal_pipeline_check.cpp` rewrites the vertex layout to what the vertex
 program reads and refuses in the log what Metal would abort the process on; alpha to coverage
 stays off on an integer target, a pass without attachments gets `defaultRasterSampleCount` 1,
-slots past a stage's argument tables are not bound),
+slots past a stage's argument tables are not bound, 1D images are 2D textures a texel high read
+through SPIRV-Cross's `texture_1D_as_2D` as on MoltenVK, texture views of another type family,
+slice count or uncastable format are refused in the log),
 `EDEN_NX2_TARGETLESS_REACH=0` (draws without render targets get the surface clip's size, as on
 Vulkan).
 

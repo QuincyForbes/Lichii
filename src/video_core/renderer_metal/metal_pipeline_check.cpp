@@ -330,6 +330,10 @@ std::string CheckTexture(const TextureDesc& desc, const PipelineLimits& limits) 
         return fmt::format("depth or stencil format {} in a {} texture", desc.format,
                            line ? "1D" : "3D");
     }
+    if (line && (desc.height > 1 || desc.levels > 1)) {
+        return fmt::format("a 1D texture {} texels high with {} levels, Metal has one of each",
+                           desc.height, desc.levels);
+    }
     const bool cube = desc.kind == TextureKind::Cube || desc.kind == TextureKind::CubeArray;
     if (cube && desc.width != desc.height) {
         return fmt::format("cube faces of {}x{} texels", desc.width, desc.height);
@@ -344,6 +348,49 @@ std::string CheckTexture(const TextureDesc& desc, const PipelineLimits& limits) 
     if (desc.levels > (multisample ? 1 : levels)) {
         return fmt::format("{} levels, {}x{}x{} texels have {}", desc.levels, desc.width,
                            desc.height, depth, multisample ? 1 : levels);
+    }
+    return {};
+}
+
+std::string CheckTextureView(TextureKind base, TextureKind view, u32 layers) {
+    // Views stay among 1D, among 2D and cube, among multisampled and among 3D textures.
+    const auto family = [](TextureKind kind) {
+        switch (kind) {
+        case TextureKind::e1D:
+        case TextureKind::e1DArray:
+            return 0;
+        case TextureKind::e2DMultisample:
+        case TextureKind::e2DMultisampleArray:
+            return 2;
+        case TextureKind::e3D:
+            return 3;
+        default:
+            return 1;
+        }
+    };
+    if (family(base) != family(view)) {
+        return fmt::format("kind {} seen as kind {}", static_cast<u32>(base),
+                           static_cast<u32>(view));
+    }
+    u32 wanted = layers;
+    switch (view) {
+    case TextureKind::e1D:
+    case TextureKind::e2D:
+    case TextureKind::e2DMultisample:
+    case TextureKind::e3D:
+        wanted = 1;
+        break;
+    case TextureKind::Cube:
+        wanted = 6;
+        break;
+    case TextureKind::CubeArray:
+        wanted = layers - layers % 6;
+        break;
+    default:
+        break;
+    }
+    if (layers != wanted || layers == 0) {
+        return fmt::format("{} slices in a view of kind {}", layers, static_cast<u32>(view));
     }
     return {};
 }

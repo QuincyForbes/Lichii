@@ -23,6 +23,7 @@ class PipelineArchive;
 class Device;
 
 struct TextureDesc;
+enum class TextureKind : u8;
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 
@@ -140,6 +141,10 @@ struct PipelineLimits {
 
 /// Why Metal would reject the texture by assertion, or nothing.
 [[nodiscard]] std::string CheckTexture(const TextureDesc& desc, const PipelineLimits& limits);
+
+/// Why Metal would reject by assertion a view of kind `view` with `layers` slices of a texture
+/// of kind `base`, or nothing.
+[[nodiscard]] std::string CheckTextureView(TextureKind base, TextureKind view, u32 layers);
 
 /// The whole description on one line, for the log.
 [[nodiscard]] std::string Describe(const RenderPipelineDesc& desc);

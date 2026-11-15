@@ -1,0 +1,21 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// lichii-metal-smoke: a 1D sampler read at two levels through the translator's 1D textures as 2D
+// ones (Metal's own 1D textures have one level).
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) uniform sampler1D source;
+
+layout(set = 0, binding = 1) buffer Data {
+    float values[];
+};
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    values[index] = texelFetch(source, int(index), 0).x * 2.0 +
+                    texelFetch(source, int(index) / 2, 1).x;
+}
