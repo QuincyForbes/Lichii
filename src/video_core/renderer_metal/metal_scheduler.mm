@@ -18,6 +18,7 @@
 #include "common/logging.h"
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_device.h"
+#include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 
@@ -27,6 +28,25 @@ namespace {
 
 /// Apple GPUs' largest render target side.
 constexpr u32 MaxRenderTargetSize = 16384;
+
+/// A stage's argument tables: buffers and samplers as every Apple GPU has them, textures as the
+/// largest has them.
+constexpr u32 BufferSlots = 31;
+constexpr u32 TextureSlots = 128;
+constexpr u32 SamplerSlots = 16;
+
+/// Metal checks a slot past a stage's tables in its validation layer only.
+bool SlotFits(u32 slot, u32 slots, const char* kind) {
+    if (slot < slots || !PipelineCheckEnabled()) {
+        return true;
+    }
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_WARNING(Render_Metal, "Metal: {} slot {} not bound, a stage has {}", kind, slot,
+                    slots);
+    }
+    return false;
+}
 
 constexpr const char* BlitSource = R"(
 #include <metal_stdlib>
@@ -723,12 +743,15 @@ void Scheduler::SetDrawState(const DrawState& state) {
 }
 
 void Scheduler::BindVertexBuffer(u32 slot, BufferHandle buffer, u32 offset) {
-    if (impl->render != nil) {
+    if (impl->render != nil && SlotFits(slot, BufferSlots, "vertex buffer")) {
         [impl->render setVertexBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
     }
 }
 
 void Scheduler::BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset) {
+    if (!SlotFits(slot, BufferSlots, "buffer")) {
+        return;
+    }
     switch (stage) {
     case ShaderStage::Vertex:
         [impl->render setVertexBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
@@ -743,6 +766,9 @@ void Scheduler::BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32
 }
 
 void Scheduler::BindBytes(ShaderStage stage, u32 slot, const void* data, u32 size) {
+    if (!SlotFits(slot, BufferSlots, "buffer")) {
+        return;
+    }
     switch (stage) {
     case ShaderStage::Vertex:
         [impl->render setVertexBytes:data length:size atIndex:slot];
@@ -757,6 +783,9 @@ void Scheduler::BindBytes(ShaderStage stage, u32 slot, const void* data, u32 siz
 }
 
 void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture) {
+    if (!SlotFits(slot, TextureSlots, "texture")) {
+        return;
+    }
     switch (stage) {
     case ShaderStage::Vertex:
         [impl->render setVertexTexture:AsTexture(texture) atIndex:slot];
@@ -771,6 +800,9 @@ void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture) 
 }
 
 void Scheduler::BindSampler(ShaderStage stage, u32 slot, void* sampler) {
+    if (!SlotFits(slot, SamplerSlots, "sampler")) {
+        return;
+    }
     switch (stage) {
     case ShaderStage::Vertex:
         [impl->render setVertexSamplerState:AsSampler(sampler) atIndex:slot];

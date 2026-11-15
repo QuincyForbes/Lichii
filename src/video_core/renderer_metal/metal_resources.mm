@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <string>
 
@@ -9,6 +10,7 @@
 #include "video_core/renderer_metal/metal_archive.h"
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_device.h"
+#include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_resources.h"
 
 namespace Metal {
@@ -265,6 +267,20 @@ u32 DrawableFormat() {
 }
 
 Object CreateTexture(const Device& device, const TextureDesc& desc) {
+    if (PipelineCheckEnabled()) {
+        // Metal aborts the process for a texture descriptor it rejects.
+        const std::string reason = CheckTexture(desc, DevicePipelineLimits(device));
+        if (!reason.empty()) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_WARNING(Render_Metal, "Metal: texture refused: {}; kind {} format {} "
+                            "{}x{}x{} levels {} layers {} samples {}",
+                            reason, static_cast<u32>(desc.kind), desc.format, desc.width,
+                            desc.height, desc.depth, desc.levels, desc.layers, desc.samples);
+            }
+            return {};
+        }
+    }
     MTLTextureDescriptor* descriptor = [MTLTextureDescriptor new];
     descriptor.textureType = TextureType(desc.kind);
     descriptor.pixelFormat = static_cast<MTLPixelFormat>(desc.format);
@@ -298,6 +314,24 @@ Object CreateTextureView(TextureHandle texture, u32 format, TextureKind kind, u3
     const id<MTLTexture> base = AsTexture(texture);
     if (base == nil) {
         return {};
+    }
+    if (PipelineCheckEnabled()) {
+        // A range of levels or slices the texture doesn't have aborts the process.
+        const bool cube = base.textureType == MTLTextureTypeCube ||
+                          base.textureType == MTLTextureTypeCubeArray;
+        const u64 slices =
+            base.textureType == MTLTextureType3D ? 1 : u64{base.arrayLength} * (cube ? 6 : 1);
+        if (levels == 0 || layers == 0 || u64{base_level} + levels > base.mipmapLevelCount ||
+            u64{base_layer} + layers > slices) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_WARNING(Render_Metal, "Metal: texture view refused: levels {}+{} of {}, "
+                            "slices {}+{} of {}, kind {} format {}",
+                            base_level, levels, static_cast<u32>(base.mipmapLevelCount),
+                            base_layer, layers, slices, static_cast<u32>(kind), format);
+            }
+            return {};
+        }
     }
     const MTLTextureSwizzleChannels channels = MTLTextureSwizzleChannelsMake(
         static_cast<MTLTextureSwizzle>(swizzle[0]), static_cast<MTLTextureSwizzle>(swizzle[1]),

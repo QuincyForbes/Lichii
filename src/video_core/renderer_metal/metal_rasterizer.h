@@ -303,6 +303,8 @@ private:
     /// Indirect draws whose count was read from guest memory (Metal has no count buffer).
     u64 indirect_counts_read{};
     ::Common::unordered_map<u64, Object> depth_stencil_states;
+    /// What an attribute of a vertex stream without a buffer reads, made on first use.
+    Object zero_vertices;
 
     u64 draws{};
     u64 draws_with_pipeline{};
