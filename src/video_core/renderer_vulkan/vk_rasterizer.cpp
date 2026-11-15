@@ -33,6 +33,7 @@
 
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
+#include "common/frame_deadline.h"
 #include "common/host_memory.h"
 #include "common/perf_sched.h"
 #include "common/platform_events.h"
@@ -614,6 +615,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
         },
         [](void* argument) { return static_cast<Scheduler*>(argument)->DeferredFlushMayWait(); },
         &scheduler);
+    VideoCommon::GpuSplit::Get().SetIdleBusy(
+        [](void* argument) { return static_cast<Scheduler*>(argument)->GpuBehind(); });
         VideoCommon::GpuSplit::Get().SetFenceQuietCheck(
             [](void* argument, bool strict, u64* epoch) {
                 return static_cast<RasterizerVulkan*>(argument)->FencesQuiet(strict, *epoch);
@@ -644,6 +647,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 RasterizerVulkan::~RasterizerVulkan() {
     Common::PlatformEvents::SetGraphicsMemoryReport({});
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr, nullptr);
+    VideoCommon::GpuSplit::Get().SetIdleBusy(nullptr);
     VideoCommon::GpuSplit::Get().SetFenceQuietCheck(nullptr, nullptr);
     scheduler.WaitWorker();
     scheduler.Finish();
@@ -3905,6 +3909,9 @@ void RasterizerVulkan::TickFrame() {
     Common::PerfSched::TickFrame();
     scheduler.MarkPassTimesFrame();
     Common::TickFrameWorkgroup();
+    Common::FrameDeadline::SetPeriodNs(static_cast<u64>((std::max)(
+        VideoCommon::Nx2Perf::g_guest_frame_interval_ns.load(std::memory_order_relaxed), 0LL)));
+    Common::FrameDeadline::NoteFrame();
 }
 
 void RasterizerVulkan::ReportSlowAccesses(double seconds) {
@@ -4364,6 +4371,7 @@ void RasterizerVulkan::TickPerfReport() {
                                                  workgroup_threads)
                                    : std::string{"off"});
     }
+    host_cpu_text += Common::FrameDeadline::TakeStatusText();
     std::array<u64, 256> svcs{};
     std::array<std::pair<u64, size_t>, 256> svc_rank{};
     for (size_t i = 0; i < svcs.size(); ++i) {

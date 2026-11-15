@@ -73,6 +73,32 @@ EDEN_NX2_FENCE_BATCH=1
 # EDEN_NX2_FENCE_FLUSH_US, waits up to this many us for more work first (it spins meanwhile).
 #EDEN_NX2_IDLE_GRACE_US=0
 
+# The same wait asleep, and only while the GPU still runs work submitted earlier (it has no use
+# for another command buffer yet): up to this many us, ended by new work, by a thread asking for
+# the submission or by the GPU running dry (the idea of nxnative PR #2645). 0 = off.
+# EDEN_NX2_IDLE_HOLD_ANY=1 holds whatever the GPU does, to measure it on a PC. Phones get 500
+# from their device profile (PC phone sim: idle submits 3.0 -> 0.9 a frame, 21.1 -> 19.6 command
+# buffers, frame rate unchanged).
+#EDEN_NX2_IDLE_HOLD_US=0
+
+# The two GPU threads sleep on each other in the OS's address wait (WaitOnAddress, Apple
+# os_sync_wait_on_address) instead of std::atomic::wait, which on Apple polls and yields for up
+# to 64 us before it sleeps. 0 = std::atomic::wait.
+#EDEN_NX2_SPLIT_ADDRESS_WAIT=1
+
+# 0: the GPU thread polling its suspended channels and a thread waiting for a deferred submission
+# sleep 50 us between polls instead of yielding. Phones get 0 from their device profile: Apple's
+# sched_yield (swtch_pri) runs the caller at priority 0 for up to 10 ms when anything else is
+# runnable, and spins on its core when nothing is. (On Windows a 50 us sleep lasts a timer tick.)
+#EDEN_NX2_POLL_YIELD=1
+
+# Apple: frame threads tell the kernel how much CPU time they need each frame
+# (THREAD_TIME_CONSTRAINT_POLICY, measured over 120 frames; port of nxnative PR #2569 / #2137).
+# A sum of 1 = GPUBack, 2 = GPU, 4 = VulkanWorker, 8 = the guest cores. iPhone and iPad: 7 by
+# default; macOS 0. "frame deadlines:" in the Perf host CPU line shows what each declared and how
+# often the kernel took it out of the real-time band.
+#EDEN_NX2_APPLE_FRAME_DEADLINE=0
+
 # The fencing thread lets a deferred fence submission wait this many us after the fence was
 # made before it asks the GPU thread for it (0 = at once).
 #EDEN_NX2_FENCE_PATIENCE_US=0

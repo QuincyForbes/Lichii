@@ -17,8 +17,10 @@
 #include <vector>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 
 #include "common/common_types.h"
+#include "common/nx2_address_wait.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/split_write_tracker.h"
 
@@ -157,6 +159,17 @@ public:
         idle_pending = pending;
         idle_argument = argument;
     }
+    /// `busy`: whether the GPU still runs work submitted earlier. With EDEN_NX2_IDLE_HOLD_US the
+    /// back then sleeps up to that long on deferred work: more work goes into the same command
+    /// buffer, and the GPU has no use for one of its own while it is behind.
+    void SetIdleBusy(IdlePending busy) {
+        idle_busy = busy;
+    }
+    /// "Perf submits:": how often the back held deferred work, and how often more work came.
+    [[nodiscard]] std::pair<u64, u64> TakeIdleHolds() {
+        return {idle_holds.exchange(0, std::memory_order_relaxed),
+                idle_holds_fed.exchange(0, std::memory_order_relaxed)};
+    }
     /// "Perf submits:": how long the back stayed idle after its idle hook submitted, in
     /// IdleGapBuckets (under 50 us, 250 us, 1 ms, 4 ms, longer). Taken (reset) by the caller.
     static constexpr size_t IdleGapBuckets = 5;
@@ -203,7 +216,7 @@ public:
     void RequestIdleHook() {
         hook_requested.store(true, std::memory_order_seq_cst);
         wake.fetch_add(1, std::memory_order_seq_cst);
-        wake.notify_one();
+        WakeOne(wake);
     }
 
     /// Starts the back thread once the split is wanted (EDEN_NX2_SPLIT=1, a Switch 2 title,
@@ -949,7 +962,7 @@ private:
         if (front_waiting.load(std::memory_order_seq_cst) &&
             position >= wait_target.load(std::memory_order_relaxed)) {
             front_wake.fetch_add(1, std::memory_order_seq_cst);
-            front_wake.notify_one();
+            WakeOne(front_wake);
         }
     }
 
@@ -1181,6 +1194,38 @@ private:
     u64 idle_submit_ns{};
     void NoteIdleGap();
     static u64 IdleGraceNs();
+    IdlePending idle_busy{};
+    std::atomic<u64> idle_holds{};
+    std::atomic<u64> idle_holds_fed{};
+    static u64 IdleHoldNs();
+    /// EDEN_NX2_IDLE_HOLD_ANY=1: the hold does not ask whether the GPU is behind (to measure it
+    /// on a PC, whose GPU rarely is).
+    static bool IdleHoldAny();
+    /// EDEN_NX2_SPLIT_ADDRESS_WAIT (default 1, 0 = std::atomic::wait): the two threads sleep on
+    /// `wake` and `front_wake` in the OS's address wait (Common::Nx2AddressWait). Apple's
+    /// std::atomic::wait polls and yields for up to 64 us before it sleeps.
+    static bool AddressWaits();
+    static void SleepOn(std::atomic<u32>& word, u32 seen) {
+        if (AddressWaits()) {
+            Common::Nx2AddressWait::Wait(word, seen);
+        } else {
+            word.wait(seen, std::memory_order_seq_cst);
+        }
+    }
+    static void WakeOne(std::atomic<u32>& word) {
+        if (AddressWaits()) {
+            Common::Nx2AddressWait::WakeOne(word);
+        } else {
+            word.notify_one();
+        }
+    }
+    static void WakeAll(std::atomic<u32>& word) {
+        if (AddressWaits()) {
+            Common::Nx2AddressWait::WakeAll(word);
+        } else {
+            word.notify_all();
+        }
+    }
     FenceQuietCheck fence_quiet_check{};
     void* fence_quiet_argument{};
     /// Back: runs fence_quiet_check at `position` (everything published executed).

@@ -8,6 +8,7 @@
 
 #include "common/dkb_cpu_trace.h"
 #include "common/fiber.h"
+#include "common/frame_deadline.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "common/settings.h"
@@ -81,6 +82,7 @@ void CpuManager::MultiCoreRunGuestThread(Kernel::KernelCore& kernel) {
     while (true) {
         auto* physical_core = &kernel.CurrentPhysicalCore();
         while (!physical_core->IsInterrupted()) {
+            Common::FrameDeadline::Tick();
             physical_core->RunThread(kernel, thread);
             physical_core = &kernel.CurrentPhysicalCore();
         }
@@ -190,6 +192,8 @@ void CpuManager::RunThread(std::stop_token token, std::size_t core) {
     if ((first_cores >> core & 1) != 0 || !is_multicore) {
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
         Common::SetCurrentThreadToPerformanceCores();
+        Common::FrameDeadline::Join(Common::FrameDeadline::Role::GuestCore,
+                                    static_cast<int>(core));
     } else {
         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     }

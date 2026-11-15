@@ -79,6 +79,8 @@ public:
     /// The split's back: whether a flush was deferred, not submitted yet, and may wait a little
     /// longer for more work (deferred for less than the DeferFlush window).
     [[nodiscard]] bool DeferredFlushMayWait() const;
+    /// The split's back: whether the GPU has not finished everything submitted so far.
+    [[nodiscard]] bool GpuBehind();
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
     /// is not running, so nothing will submit it: the caller then submits it itself.

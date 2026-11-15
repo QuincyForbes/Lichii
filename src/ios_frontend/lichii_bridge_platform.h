@@ -211,7 +211,15 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// fastmem instead of through the memory callbacks (EDEN_NX2_JIT_INLINE_EXCLUSIVES=1). "jit_load_faults": a
 /// load that faults in fastmem gives it up only at its 8th fault (EDEN_NX2_JIT_LOAD_FAULTS=8).
 /// "cpu_writes_old": guest writes of pages holding GPU-written bytes stay trapped until the next
-/// fence, as before (EDEN_NX2_CPU_WRITE_RECLAIM=0).
+/// fence, as before (EDEN_NX2_CPU_WRITE_RECLAIM=0). "frame_time_off": the graphics threads
+/// declare no frame time to the kernel, as before (EDEN_NX2_APPLE_FRAME_DEADLINE=0);
+/// "frame_time_guest": the guest cores declare theirs too (=15), off wins. "split_std_waits": the
+/// two GPU threads sleep on each other with std::atomic::wait, as before
+/// (EDEN_NX2_SPLIT_ADDRESS_WAIT=0). "poll_yield": the GPU thread polling its suspended channels
+/// and threads waiting for a deferred submission yield between polls, as before
+/// (EDEN_NX2_POLL_YIELD=1). "idle_hold_off": the GPU thread, out of commands, submits its
+/// deferred work at once, as before, instead of keeping it up to 0.5 ms while the GPU still runs
+/// earlier work (EDEN_NX2_IDLE_HOLD_US=0).
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
 /// Bench mode: for the rest of this process lichii_platform_experiment reports `names` as on and
