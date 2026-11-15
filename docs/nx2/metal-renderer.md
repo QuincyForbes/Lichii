@@ -177,15 +177,20 @@ draws the guest layers into the drawable and calls `presentDrawable:`.
 | M4 | Compute, queries, transform feedback, mesh emulation, OoT upscale replacement, MetalFX direct, frame gen, `Perf:`/`Perf passes:` | Kokiri at full quality; GPU ms comparable with MoltenVK |
 | M5 | Binary archive + ahead-of-time pack, MoltenVK-vs-Metal comparison on device | No compile stalls; the comparison table |
 
-State (2026-11-15, f4c5c10178): M0-M3 done (vertex + pixel pipelines); from M4: compute
-dispatches, indirect draws, texel buffers, index rewriting (quads, quad strips, fans, polygons,
-line loops, 8-bit indices), occlusion queries, all presented layers with blending, the GPU thread
-split, MetalFX spatial, the `Metal perf:` line. The macOS CI smoke test runs the translator, a
-rewritten-index draw and an indirect draw through the renderer's pipeline builder and render
-pass with occlusion counts, and a texel buffer read. Open: resolution scaling (games render at
-native size), tessellation/geometry/mesh, MetalFX temporal and frame generation, M5.
+State (2026-11-15, c138dcb7e9): M0-M3 done (vertex + pixel pipelines); from M4: compute
+dispatches, indirect draws, texel buffers (unaligned ones through aligned copies, written ones
+copied back), index rewriting (quads, quad strips, fans, polygons, line loops, 8-bit indices; on
+the GPU when the GPU wrote them), occlusion queries, task and mesh pipelines through Vulkan's
+mesh emulation, all presented layers with blending, the GPU thread split, MetalFX spatial,
+MetalFX temporal in place of a game's DLSS, the `Metal perf:` line. The macOS CI smoke test runs
+the translator, a rewritten-index draw and an indirect draw through the renderer's pipeline
+builder and render pass with occlusion counts, a texel buffer read, the mesh emulation's draw
+side and distribution pass, and the GPU index rewrite against the CPU one. Open: resolution
+scaling (games render at native size), tessellation/geometry, Ocarina's live MetalFX temporal
+path, frame generation, M5.
 Switches: `EDEN_NX2_METAL_DRAW=0` (build pipelines, draw nothing), `EDEN_NX2_METAL_DISPATCH=0`,
-`EDEN_NX2_METAL_SPLIT=0` (one GPU thread).
+`EDEN_NX2_METAL_SPLIT=0` (one GPU thread), `EDEN_NX2_METAL_GPU_INDICES=1|0` (every indexed
+rewrite on the GPU / none).
 
 ## What can be checked where
 
