@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <span>
 #include <string>
 #include <vector>
@@ -24,6 +25,7 @@
 #include "shader_recompiler/shader_info.h"
 #include "texel_buffer_smoke_comp_spv.h"
 #include "translate_smoke_comp_spv.h"
+#include "video_core/renderer_metal/metal_archive.h"
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_graphics.h"
@@ -886,6 +888,87 @@ int RunOcarinaBilinear() {
     return wrong == 0 ? 0 : 1;
 }
 
+/// The pipeline archive: a compute and a render pipeline built into a new archive file (misses,
+/// added), written, then the file opened again and both built once more (hits).
+int RunPipelineArchive() {
+    Metal::Device device;
+    std::string error;
+    const Metal::Object compute_library = Metal::CreateLibrary(device, GroupMarkSource, error);
+    const Metal::Object compute =
+        compute_library ? Metal::CreateFunction(compute_library.Get(), "mark_groups")
+                        : Metal::Object{};
+    const Metal::Object render_library = Metal::CreateLibrary(device, QuadSource, error);
+    const Metal::Object vertex =
+        render_library ? Metal::CreateFunction(render_library.Get(), "quad_vertex")
+                       : Metal::Object{};
+    const Metal::Object fragment =
+        render_library ? Metal::CreateFunction(render_library.Get(), "quad_fragment")
+                       : Metal::Object{};
+    if (!compute || !vertex || !fragment) {
+        std::printf("metal-smoke: FAIL archive shaders: %s\n", error.c_str());
+        return 1;
+    }
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = vertex.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    desc.attributes[0] = {1, 0, 0, Metal::Maxwell::VertexAttribute::Type::Float,
+                          Metal::Maxwell::VertexAttribute::Size::Size_R32_G32};
+    desc.streams[0] = {1, 8, 0};
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / "lichii-metal-smoke" / "metal_pipelines.bin";
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    const auto build = [&](Metal::PipelineArchive& archive) {
+        const bool compute_built =
+            static_cast<bool>(Metal::CreateComputePipelineState(device, compute.Get(), error,
+                                                                &archive));
+        const bool render_built =
+            static_cast<bool>(Metal::CreateRenderPipelineState(device, desc, error, &archive));
+        return compute_built && render_built;
+    };
+    Metal::PipelineArchive::Counts first{};
+    {
+        Metal::PipelineArchive archive;
+        if (!archive.Open(device, path)) {
+            std::printf("metal-smoke: SKIP pipeline archive: no MTLBinaryArchive on this device\n");
+            return 0;
+        }
+        if (!build(archive)) {
+            std::printf("metal-smoke: FAIL pipeline archive: build failed: %s\n", error.c_str());
+            return 1;
+        }
+        first = archive.Totals();
+        if (first.added == 0) {
+            std::printf("metal-smoke: SKIP pipeline archive: this device adds nothing to archives "
+                        "(%llu not added)\n",
+                        static_cast<unsigned long long>(first.add_failures));
+            return 0;
+        }
+        archive.Save();
+    }
+    const bool written = std::filesystem::exists(path, ec);
+    Metal::PipelineArchive reopened;
+    const bool opened = reopened.Open(device, path);
+    const bool built = opened && build(reopened);
+    const Metal::PipelineArchive::Counts second = reopened.Totals();
+    const bool passed = first.misses == 2 && first.added == 2 && written && built &&
+                        second.hits == 2 && second.misses == 0;
+    std::printf("metal-smoke: pipeline archive: first run %llu misses (%.2f ms), %llu added; "
+                "file %s (%llu bytes); second run %llu hits (%.2f ms), %llu misses: %s\n",
+                static_cast<unsigned long long>(first.misses), first.miss_ns / 1e6,
+                static_cast<unsigned long long>(first.added), written ? "written" : "missing",
+                static_cast<unsigned long long>(written ? std::filesystem::file_size(path, ec)
+                                                        : 0),
+                static_cast<unsigned long long>(second.hits), second.hit_ns / 1e6,
+                static_cast<unsigned long long>(second.misses), passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main() {
@@ -897,7 +980,7 @@ int main() {
         int result = draw;
         for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer, RunMeshEmulation,
                                  RunMeshDistribution, RunIndexRewrite,
-                                 RunOcarinaBilinear}) {
+                                 RunOcarinaBilinear, RunPipelineArchive}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }
