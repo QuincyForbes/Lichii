@@ -20,8 +20,61 @@ namespace {
         return spv::ExecutionModelFragment;
     case Stage::Compute:
         return spv::ExecutionModelGLCompute;
+    case Stage::VertexForTessellation:
+        return spv::ExecutionModelVertex;
+    case Stage::TessellationControl:
+        return spv::ExecutionModelTessellationControl;
+    case Stage::TessellationEvaluation:
+        return spv::ExecutionModelTessellationEvaluation;
     }
     return spv::ExecutionModelGLCompute;
+}
+
+/// The builtins a tessellation stage passes on in its buffer (tessellation levels go to the
+/// factor buffer instead).
+[[nodiscard]] bool PassedBuiltin(spv::BuiltIn builtin) {
+    switch (builtin) {
+    case spv::BuiltInPosition:
+    case spv::BuiltInPointSize:
+    case spv::BuiltInClipDistance:
+    case spv::BuiltInCullDistance:
+    case spv::BuiltInLayer:
+    case spv::BuiltInViewportIndex:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// What a vertex or tessellation control stage writes for the next stage.
+[[nodiscard]] std::vector<InterfaceVariable> StageOutputs(spirv_cross::CompilerMSL& compiler,
+                                                          const spirv_cross::ShaderResources& resources) {
+    std::vector<InterfaceVariable> outputs;
+    for (const spirv_cross::Resource& resource : resources.stage_outputs) {
+        const spirv_cross::SPIRType& type = compiler.get_type(resource.base_type_id);
+        outputs.push_back(InterfaceVariable{
+            .location = compiler.get_decoration(resource.id, spv::DecorationLocation),
+            .vecsize = (std::max)(type.vecsize, 1U),
+            .per_patch = compiler.has_decoration(resource.id, spv::DecorationPatch),
+        });
+    }
+    for (const spirv_cross::BuiltInResource& builtin : resources.builtin_outputs) {
+        if (!PassedBuiltin(builtin.builtin) ||
+            !compiler.has_active_builtin(builtin.builtin, spv::StorageClassOutput)) {
+            continue;
+        }
+        const spirv_cross::SPIRType& type = compiler.get_type(builtin.value_type_id);
+        u32 elements = 1;
+        for (const u32 size : type.array) {
+            elements *= (std::max)(size, 1U);
+        }
+        outputs.push_back(InterfaceVariable{
+            .builtin = static_cast<u32>(builtin.builtin),
+            .vecsize = (std::max)(type.vecsize, 1U) * elements,
+            .per_patch = compiler.has_decoration(builtin.resource.id, spv::DecorationPatch),
+        });
+    }
+    return outputs;
 }
 
 [[nodiscard]] u32 ArrayCount(const spirv_cross::CompilerMSL& compiler,
@@ -57,10 +110,65 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
         msl.enable_decoration_binding = false;
         // Texel buffers as MSL texture_buffer (MSL 2.1+), not emulated with 2D textures.
         msl.texture_buffer_native = true;
+        const bool tess_vertex = stage == Stage::VertexForTessellation;
+        const bool tess_control = stage == Stage::TessellationControl;
+        const bool tess_evaluation = stage == Stage::TessellationEvaluation;
+        msl.vertex_for_tessellation = tess_vertex;
+        msl.capture_output_to_buffer = tess_vertex || tess_control;
+        msl.multi_patch_workgroup = tess_vertex || tess_control || tess_evaluation;
+        msl.raw_buffer_tese_input = tess_evaluation;
+        switch (options.vertex_index_size) {
+        case 2:
+            msl.vertex_index_type = spirv_cross::CompilerMSL::Options::IndexType::UInt16;
+            break;
+        case 4:
+            msl.vertex_index_type = spirv_cross::CompilerMSL::Options::IndexType::UInt32;
+            break;
+        default:
+            break;
+        }
         compiler.set_msl_options(msl);
         auto common = compiler.get_common_options();
-        common.vertex.flip_vert_y = stage == Stage::Vertex && options.flip_vertex_y;
+        common.vertex.flip_vert_y =
+            (stage == Stage::Vertex || tess_evaluation) && options.flip_vertex_y;
         compiler.set_common_options(common);
+        if (tess_control || tess_evaluation) {
+            // Each program declares part of these (the domain, spacing and winding are the
+            // evaluation program's, the control points the control program's).
+            using Primitive = TessellationModes::Primitive;
+            using Spacing = TessellationModes::Spacing;
+            const TessellationModes& modes = options.tessellation;
+            compiler.set_execution_mode(modes.primitive == Primitive::Quads ? spv::ExecutionModeQuads
+                                        : modes.primitive == Primitive::Isolines
+                                            ? spv::ExecutionModeIsolines
+                                            : spv::ExecutionModeTriangles);
+            compiler.set_execution_mode(modes.spacing == Spacing::FractionalEven
+                                            ? spv::ExecutionModeSpacingFractionalEven
+                                        : modes.spacing == Spacing::FractionalOdd
+                                            ? spv::ExecutionModeSpacingFractionalOdd
+                                            : spv::ExecutionModeSpacingEqual);
+            compiler.set_execution_mode(modes.clockwise ? spv::ExecutionModeVertexOrderCw
+                                                        : spv::ExecutionModeVertexOrderCcw);
+            if (modes.point_mode) {
+                compiler.set_execution_mode(spv::ExecutionModePointMode);
+            }
+            if (modes.output_vertices != 0) {
+                compiler.set_execution_mode(spv::ExecutionModeOutputVertices,
+                                            modes.output_vertices);
+            }
+        }
+        for (const InterfaceVariable& input : options.inputs) {
+            spirv_cross::MSLShaderInterfaceVariable variable{};
+            variable.location = input.location;
+            variable.format = spirv_cross::MSL_SHADER_VARIABLE_FORMAT_ANY32;
+            variable.builtin = input.builtin == InterfaceVariable::NoBuiltin
+                                   ? spv::BuiltInMax
+                                   : static_cast<spv::BuiltIn>(input.builtin);
+            variable.vecsize = input.vecsize;
+            variable.rate = input.per_patch ? spirv_cross::MSL_SHADER_VARIABLE_RATE_PER_PATCH
+                                            : spirv_cross::MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
+            compiler.add_msl_shader_input(variable);
+        }
 
         const spv::ExecutionModel model = Model(stage);
         const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
@@ -133,12 +241,42 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
             compiler.add_msl_resource_binding(binding);
             result.slots.push_back({PushConstantSet, 0, ResourceKind::Buffer, buffers++, 1});
         }
-        if (buffers > options.first_vertex_buffer_slot && stage == Stage::Vertex) {
+        // The tessellation stages' own buffers, after their resources (the vertex kernel's
+        // vertex buffers take slots from first_vertex_buffer_slot down, as a vertex stage's).
+        TessellationSlots& tess_slots = result.tessellation_slots;
+        if (tess_vertex) {
+            tess_slots.output = buffers++;
+            tess_slots.index = buffers++;
+            msl.shader_output_buffer_index = tess_slots.output;
+            msl.shader_index_buffer_index = tess_slots.index;
+        } else if (tess_control) {
+            tess_slots.input = buffers++;
+            tess_slots.output = buffers++;
+            tess_slots.patch_output = buffers++;
+            tess_slots.tess_factors = buffers++;
+            tess_slots.indirect_params = buffers++;
+            msl.shader_input_buffer_index = tess_slots.input;
+            msl.shader_output_buffer_index = tess_slots.output;
+            msl.shader_patch_output_buffer_index = tess_slots.patch_output;
+            msl.shader_tess_factor_buffer_index = tess_slots.tess_factors;
+            msl.indirect_params_buffer_index = tess_slots.indirect_params;
+        } else if (tess_evaluation) {
+            tess_slots.input = buffers++;
+            tess_slots.patch_input = buffers++;
+            msl.shader_input_buffer_index = tess_slots.input;
+            msl.shader_patch_input_buffer_index = tess_slots.patch_input;
+        }
+        compiler.set_msl_options(msl);
+        if (buffers > options.first_vertex_buffer_slot &&
+            (stage == Stage::Vertex || tess_vertex)) {
             result.error = "too many buffers for the vertex buffer slots";
             return result;
         }
 
         result.source = compiler.compile();
+        if (tess_vertex || tess_control) {
+            result.outputs = StageOutputs(compiler, resources);
+        }
         const auto entry_points = compiler.get_entry_points_and_stages();
         if (!entry_points.empty()) {
             result.entry_point =
