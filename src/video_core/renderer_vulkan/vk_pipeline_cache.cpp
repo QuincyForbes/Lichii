@@ -80,6 +80,7 @@
 #include "video_core/shader_warm/warm_records.h"
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/vulkan_common/vulkan_library.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 
@@ -485,6 +486,11 @@ size_t GetTotalPipelineWorkers() {
     }
     return std::min(max_core_threads, desired);
 #else
+    // Test: EDEN_NX2_PIPELINE_WORKERS=<n> sizes the builder pool as on another machine.
+    if (const char* const value = std::getenv("EDEN_NX2_PIPELINE_WORKERS")) {
+        return std::clamp(static_cast<size_t>(std::strtoull(value, nullptr, 10)), size_t{1},
+                          max_core_threads);
+    }
     return max_core_threads;
 #endif
 }
@@ -560,6 +566,40 @@ bool DriverCachesPipelines(const Device& device) {
         return value == nullptr || value[0] == '0';
     }
     return false;
+}
+
+/// EDEN_NX2_PIPELINE_HOLD_BOOST=<threads>: a pipeline a draw waits for is built by this many
+/// threads of their own at the waiter's priority, ahead of what the builder pool has queued, and
+/// one a builder thread already runs is lent the waiter's QoS (0: as before, every build on the
+/// builder pool). Two on Apple: the Vulkan worker (user-interactive) slept on a condition variable
+/// for a utility thread, which hands no priority over, 126-2208 ms a pipeline with every core
+/// busy (iPhone 17 Pro Max, Kokiri Forest). Off elsewhere: the builder pool has idle cores there.
+size_t PipelineHoldBoostThreads() {
+    static const size_t threads = [] {
+        if (const char* const value = std::getenv("EDEN_NX2_PIPELINE_HOLD_BOOST")) {
+            return (std::min)(static_cast<size_t>(std::strtoull(value, nullptr, 10)), size_t{8});
+        }
+#ifdef __APPLE__
+        return size_t{2};
+#else
+        return size_t{0};
+#endif
+    }();
+    return threads;
+}
+
+/// EDEN_NX2_USED_PIPELINES_SAVE_S=<seconds>: the list of pipelines this session used (what the
+/// next boot builds) is written at most this often once a pipeline is first used, and when the
+/// app leaves the foreground, by the serialization thread through a temporary file (0: as before,
+/// written in place when a pipeline is first drawn with 15 s after the last save, and at
+/// shutdown). 10 on MoltenVK: an app the user swipes away or iOS kills never reaches the shutdown
+/// save, and a paused one draws nothing that would write it.
+std::chrono::seconds UsedPipelinesSaveInterval(const Device& device) {
+    static const long long seconds = [] {
+        const char* const value = std::getenv("EDEN_NX2_USED_PIPELINES_SAVE_S");
+        return value != nullptr ? (std::max)(0LL, std::atoll(value)) : -1LL;
+    }();
+    return std::chrono::seconds{seconds >= 0 ? seconds : device.IsMoltenVK() ? 10 : 0};
 }
 } // Anonymous namespace
 
@@ -808,10 +848,22 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     dynamic_features.has_provoking_vertex_tf_preserve =
         device.SupportsTransformFeedbackProvokingVertexPreservation();
 
+    if (const size_t threads = PipelineHoldBoostThreads(); threads != 0) {
+        held_workers = std::make_unique<Common::ThreadWorker>(threads, "VkPipelineHeld");
+    }
     // A suspended app may be killed without notice (iOS): write the driver's cache out when it
     // leaves the foreground, and the used list at the next draw.
     background_listener = Common::PlatformEvents::AddBackgroundListener([this] {
         save_used_requested.store(true, std::memory_order_relaxed);
+        if (UsedPipelinesSaveInterval(device).count() != 0) {
+            // The GPU thread hands the list to the serialization thread at its next frame, if
+            // the game still runs one.
+            for (int wait = 0;
+                 wait < 25 && save_used_requested.load(std::memory_order_relaxed); ++wait) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{10});
+            }
+            serialization_thread.WaitForRequests();
+        }
         if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
             return;
         }
@@ -1400,6 +1452,9 @@ PipelineCache::~PipelineCache() {
     }
     Common::NoteShutdownProgress();
     workers.WaitForRequests();
+    if (held_workers) {
+        held_workers->WaitForRequests();
+    }
     serialization_thread.WaitForRequests();
     Common::NoteShutdownProgress();
     // The caches are written before anything slow is torn down, so a teardown cut short still
@@ -1416,8 +1471,9 @@ PipelineCache::~PipelineCache() {
     DestroyPipelinesWithProgress(retired_translations);
 }
 
-void PipelineCache::SaveUsedPipelines() {
+void PipelineCache::SaveUsedPipelines(bool in_background) {
     used_pipelines_saved = std::chrono::steady_clock::now();
+    used_pipelines_dirty = false;
     // A session too short to say what the game uses (a boot to the menu) keeps the old list.
     constexpr size_t MinimumUsed = 64;
     if (used_pipelines_filename.empty() ||
@@ -1439,13 +1495,45 @@ void PipelineCache::SaveUsedPipelines() {
             next.try_emplace(hash, static_cast<u8>(age + 1));
         }
     }
-    std::ofstream file{used_pipelines_filename, std::ios::binary | std::ios::trunc};
-    const u32 count = static_cast<u32>(next.size());
-    file.write(reinterpret_cast<const char*>(&UsedPipelinesMagic), sizeof(UsedPipelinesMagic));
-    file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    for (const auto& [hash, age] : next) {
-        file.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
-        file.write(reinterpret_cast<const char*>(&age), sizeof(age));
+    ++build_report.used_saves;
+    build_report.used_entries = static_cast<u32>(next.size());
+    const auto write = [](const std::filesystem::path& path,
+                          const std::unordered_map<u64, u8>& entries) {
+        std::ofstream file{path, std::ios::binary | std::ios::trunc};
+        const u32 count = static_cast<u32>(entries.size());
+        file.write(reinterpret_cast<const char*>(&UsedPipelinesMagic), sizeof(UsedPipelinesMagic));
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        for (const auto& [hash, age] : entries) {
+            file.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
+            file.write(reinterpret_cast<const char*>(&age), sizeof(age));
+        }
+        return file.flush().good();
+    };
+    if (UsedPipelinesSaveInterval(device).count() == 0) {
+        write(used_pipelines_filename, next);
+        return;
+    }
+    // Through a temporary file: the process may be killed mid-write, and a list cut short would
+    // have the next boot build that much less.
+    auto save = [write, path = used_pipelines_filename, entries = std::move(next)] {
+        auto temporary = path;
+        temporary += ".tmp";
+        std::error_code error;
+        if (write(temporary, entries)) {
+            std::filesystem::rename(temporary, path, error);
+        } else {
+            error = std::make_error_code(std::errc::io_error);
+        }
+        if (error) {
+            LOG_WARNING(Render_Vulkan, "Failed to write the used pipelines list {}: {}",
+                        Common::FS::PathToUTF8String(path), error.message());
+            std::filesystem::remove(temporary, error);
+        }
+    };
+    if (in_background) {
+        serialization_thread.QueueWork(std::move(save));
+    } else {
+        save();
     }
 }
 
@@ -2366,6 +2454,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
         workers.QueueWork([this, key, records_ = std::move(records), &state, &callback]() mutable {
             [[maybe_unused]] BootBuildQos qos;
+            const PipelineBuilderScope builder{PipelineBuilder::Boot};
             auto pipeline{CreateCachedGraphicsPipeline(key, records_, state.statistics.get())};
 
             std::scoped_lock lock{state.mutex};
@@ -2425,11 +2514,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+    const auto boot_build_seconds = std::chrono::steady_clock::now() - boot_build_begin;
     LOG_INFO(Render_Vulkan,
              "Boot pipelines: {} built in {:.1f} s on {} threads ({} driver pipeline cache)",
-             state.total,
-             std::chrono::duration<double>(std::chrono::steady_clock::now() - boot_build_begin)
-                 .count(),
+             state.total, std::chrono::duration<double>(boot_build_seconds).count(),
              num_pipeline_workers, use_vulkan_pipeline_cache ? "with the" : "without a");
 
     // Built newest first (from the end): this driver's own records before those only another
@@ -2478,6 +2566,30 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         precache_capture_bytes += capture_bytes;
         precache_graphics_job(key, records);
     }
+    // Common.Memory: the iOS log filter drops Render.Vulkan below Warning.
+    LOG_INFO(Common_Memory,
+             "Perf pipelines boot: {} graphics pipelines in the disk cache, {}, {} built in "
+             "{:.1f} s on {} threads{}, {} left: {} to {} background threads, the rest built at "
+             "their first draw; held builds {}, used list saved {}",
+             disk_pipelines.size(),
+             used_pipelines.empty()
+                 ? std::string{"no used list (the first of the cache are built)"}
+                 : fmt::format("{} in the used list", used_pipelines.size()),
+             queued_graphics, std::chrono::duration<double>(boot_build_seconds).count(),
+             num_pipeline_workers,
+             PipelineBuildStats::Get().builders[static_cast<size_t>(PipelineBuilder::Boot)].qos.load(
+                 std::memory_order_relaxed)[0] != '\0'
+                 ? fmt::format(" at {}", PipelineBuildStats::Get()
+                                             .builders[static_cast<size_t>(PipelineBuilder::Boot)]
+                                             .qos.load(std::memory_order_relaxed))
+                 : std::string{},
+             skipped_pipelines, background_count,
+             background_count != 0 ? BackgroundPipelineThreads() : size_t{0},
+             held_workers ? fmt::format("on {} threads of their own", PipelineHoldBoostThreads())
+                          : std::string{"on the builder pool"},
+             UsedPipelinesSaveInterval(device).count() != 0
+                 ? fmt::format("{} s after a first use", UsedPipelinesSaveInterval(device).count())
+                 : std::string{"as before"});
     if (background_count != 0 && !stop_loading.stop_requested()) {
         const size_t threads = BackgroundPipelineThreads();
         LOG_INFO(Render_Vulkan,
@@ -2518,8 +2630,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                     std::scoped_lock claimed_lock{background_mutex};
                     build = !background_claimed.contains(key);
                 }
+                // A draw is waiting for its pipeline: no speculative build starts next to it.
+                for (int wait = 0;
+                     build && held_workers && wait < 500 &&
+                     PipelineBuildStats::Get().holds_active.load(std::memory_order_relaxed) != 0 &&
+                     !background_stop.load(std::memory_order_relaxed);
+                     ++wait) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                }
                 std::unique_ptr<GraphicsPipeline> pipeline;
                 if (build) {
+                    const PipelineBuilderScope builder{PipelineBuilder::Prebuild};
                     pipeline = CreateCachedGraphicsPipeline(key, records_, nullptr);
                 }
                 std::unique_lock ready_lock{background_mutex};
@@ -3181,6 +3302,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     if (is_new) {
         ReportNewPipelineKey(graphics_key);
         pipeline = TakeBackgroundPipeline(graphics_key);
+        ++build_report.new_keys;
+        build_report.from_background += pipeline != nullptr;
+        build_report.with_record += !pipeline && disk_pipelines.contains(graphics_key.Hash());
         if (!pipeline) {
             // EDEN_NX2_ASYNC_TRANSLATE=1/2: a draw that may be skipped has its new pipeline
             // translated on a translation thread, and is skipped (as for an unbuilt pipeline)
@@ -3205,9 +3329,12 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     const auto save_interval = VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::PipelineRetention)
                                    ? std::chrono::steady_clock::duration{std::chrono::seconds{15}}
                                    : std::chrono::steady_clock::duration{std::chrono::minutes{2}};
-    if ((used_this_session.insert(pipeline.get()).second &&
-         std::chrono::steady_clock::now() - used_pipelines_saved > save_interval) ||
-        save_used_requested.exchange(false, std::memory_order_relaxed)) {
+    const bool first_use = used_this_session.insert(pipeline.get()).second;
+    if (UsedPipelinesSaveInterval(device).count() != 0) {
+        used_pipelines_dirty |= first_use; // TickFrame writes it
+    } else if ((first_use &&
+                std::chrono::steady_clock::now() - used_pipelines_saved > save_interval) ||
+               save_used_requested.exchange(false, std::memory_order_relaxed)) {
         SaveUsedPipelines();
     }
     if (current_pipeline) {
@@ -3249,6 +3376,14 @@ void PipelineCache::TickFrame() {
            scheduler.IsFree(retired_compute_pipelines.front().first) &&
            retired_compute_pipelines.front().second->IsBuildTaskDone()) {
         retired_compute_pipelines.pop_front();
+    }
+    if (const auto interval = UsedPipelinesSaveInterval(device); interval.count() != 0) {
+        const bool requested = save_used_requested.load(std::memory_order_relaxed);
+        if (requested || (used_pipelines_dirty &&
+                          std::chrono::steady_clock::now() - used_pipelines_saved >= interval)) {
+            SaveUsedPipelines(true);
+            save_used_requested.store(false, std::memory_order_relaxed);
+        }
     }
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0 ||
@@ -3416,6 +3551,89 @@ u64 PipelineCache::SkippedLookups() noexcept {
     return skipped_lookups.load(std::memory_order_relaxed);
 }
 
+void PipelineCache::ReportBuilds(double seconds) {
+    static constexpr std::array<const char*, static_cast<size_t>(PipelineBuilder::Count)> NAMES{
+        "builder pool", "held pool", "waiting thread", "boot", "prebuild"};
+    // Process-wide like the counters they follow; GPU thread only.
+    static u64 skipped_reported{};
+    static std::array<MoltenVKStage, 11> stages_reported{};
+
+    PipelineBuildStats& stats = PipelineBuildStats::Get();
+    const auto take = [](std::atomic<u64>& counter) {
+        return counter.exchange(0, std::memory_order_relaxed);
+    };
+    const auto ms = [](u64 ns) { return static_cast<double>(ns) / 1e6; };
+    std::string built;
+    u64 built_total = 0;
+    for (size_t index = 0; index < stats.builders.size(); ++index) {
+        PipelineBuildStats::Builder& builder = stats.builders[index];
+        const u64 count = take(builder.built);
+        const u64 queue_ns = take(builder.queue_ns);
+        const u64 build_ns = take(builder.build_ns);
+        const u64 queue_max_ns = take(builder.queue_max_ns);
+        const u64 build_max_ns = take(builder.build_max_ns);
+        if (count == 0) {
+            continue;
+        }
+        built_total += count;
+        const char* const qos = builder.qos.load(std::memory_order_relaxed);
+        built += fmt::format("{}{} {} (queued {:.1f} ms avg {:.0f} max, built {:.1f} ms avg {:.0f} "
+                             "max{}{})",
+                             built.empty() ? "" : ", ", NAMES[index], count,
+                             ms(queue_ns) / static_cast<double>(count), ms(queue_max_ns),
+                             ms(build_ns) / static_cast<double>(count), ms(build_max_ns),
+                             qos[0] != '\0' ? ", " : "", qos);
+    }
+    const u64 emission_ns = take(stats.emission_ns);
+    const u64 handed_over = take(stats.handed_over);
+    const u64 boosted = take(stats.boosted);
+    const u64 held_draws = take(stats.held_draws);
+    const u64 held_ns = take(stats.held_ns);
+    const u64 held_max_ns = take(stats.held_max_ns);
+    const u64 skipped_now = SkippedLookups();
+    const u64 skipped = skipped_now - std::exchange(skipped_reported, skipped_now);
+    const BuildReport report = std::exchange(build_report, BuildReport{});
+
+    std::string moltenvk;
+    if (std::array<MoltenVKStage, 11> stages; ReadMoltenVKStages(*device.GetLogical(), stages)) {
+        for (size_t index = 0; index < stages.size(); ++index) {
+            // A new device starts its counts again.
+            const MoltenVKStage before =
+                stages[index].count >= stages_reported[index].count ? stages_reported[index]
+                                                                    : MoltenVKStage{};
+            const u32 count = stages[index].count - before.count;
+            if (count != 0) {
+                moltenvk += fmt::format("{}{} {} x {:.1f} ms", moltenvk.empty() ? "" : ", ",
+                                        MOLTENVK_STAGE_NAMES[index], count,
+                                        (stages[index].total_ms - before.total_ms) /
+                                            static_cast<double>(count));
+            }
+        }
+        stages_reported = stages;
+        if (moltenvk.empty()) {
+            moltenvk = "nothing compiled";
+        }
+    } else {
+        moltenvk = "no stage times";
+    }
+    if (built_total == 0 && held_draws == 0 && report.new_keys == 0 && report.used_saves == 0) {
+        return;
+    }
+    LOG_INFO(Common_Memory,
+             "Perf pipelines: {} first used in {:.0f} s ({} prebuilt in the background, {} from "
+             "their disk record, {} new to the cache) | built: {}; {:.0f} ms of it SPIR-V | draws "
+             "held {} for {:.0f} ms, max {:.0f} (builds asked for by a draw that waits {}, moved "
+             "to the held pool at the wait {}, lent the waiter's QoS {}; targets first-time {}, "
+             "persistent {}, recurring {}), skipped {} | used list written {} times, {} entries "
+             "| MoltenVK: {}",
+             report.new_keys, seconds, report.from_background, report.with_record,
+             report.new_keys - report.from_background - report.with_record,
+             built.empty() ? "none" : built, ms(emission_ns), held_draws, ms(held_ns),
+             ms(held_max_ns), report.held_builds, handed_over, boosted, report.held_classes[1],
+             report.held_classes[2], report.held_classes[0], skipped, report.used_saves,
+             report.used_entries, moltenvk);
+}
+
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
     if (pipeline->IsBuilt()) {
         return pipeline;
@@ -3458,14 +3676,17 @@ bool PipelineCache::DrawMayBeSkipped() const {
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     bool recurring = true;
+    u8 target_class = 0;
     if (mode == 2 && native) {
-        recurring = texture_cache.ClassifyDrawTargets().kind ==
-                    VideoCommon::DrawTargetClass::Recurring;
+        const auto kind = texture_cache.ClassifyDrawTargets().kind;
+        recurring = kind == VideoCommon::DrawTargetClass::Recurring;
+        target_class = static_cast<u8>(1 + static_cast<u32>(kind));
     }
     const bool skip = CanDiscardPendingDraw(native, maxwell3d->regs.zeta_enable != 0,
                                             draw_state.draw_element_count,
                                             draw_state.draw_element_count, mode != 0, recurring);
-    discard_decision = DiscardDecision{.serial = lookup_serial, .skip = skip};
+    discard_decision =
+        DiscardDecision{.serial = lookup_serial, .skip = skip, .target_class = target_class};
     return skip;
 }
 
@@ -3652,7 +3873,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
     bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools,
-    std::unique_ptr<EmissionBudget::Reservation> reservation, bool libraries_only) try {
+    std::unique_ptr<EmissionBudget::Reservation> reservation, bool libraries_only,
+    bool held_build) try {
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     size_t env_index{0};
@@ -4187,7 +4409,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         libraries_only ? nullptr : &shader_notify, device, descriptor_pool,
         guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
         render_pass_cache, key, std::move(modules), infos, std::move(emit_stages),
-        std::move(mesh_emulation), library_params);
+        std::move(mesh_emulation), library_params, held_workers.get(), held_build);
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
@@ -4330,8 +4552,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
         main_pools.ReleaseContents();
     }
     ShaderPools& pools = emit_pools ? *emit_pools : main_pools;
+    // The draw asking will wait for this build (BuiltPipeline skips it otherwise).
+    const bool held_build = !use_asynchronous_shaders || !DrawMayBeSkipped();
+    if (held_build) {
+        ++build_report.held_builds;
+        if (const u8 target_class = discard_decision.serial == lookup_serial
+                                        ? discard_decision.target_class
+                                        : u8{0};
+            target_class != 0) {
+            ++build_report.held_classes[target_class - 1];
+        }
+    }
     auto pipeline{CreateGraphicsPipeline(pools, graphics_key, environments.Span(), nullptr, true,
-                                         std::move(emit_pools), std::move(reservation))};
+                                         std::move(emit_pools), std::move(reservation), false,
+                                         held_build && held_workers)};
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }

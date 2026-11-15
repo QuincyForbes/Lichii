@@ -27,6 +27,7 @@ namespace FileSys {
 
 namespace {
 
+constexpr u8 BymlHashDict = 0x20;
 constexpr u8 BymlArray = 0xC0;
 constexpr u8 BymlDict = 0xC1;
 constexpr u8 BymlKeyTable = 0xC2;
@@ -105,7 +106,7 @@ std::optional<BymlEditor::Slot> BymlEditor::Find(std::span<const std::string_vie
     std::optional<Slot> slot;
     for (const std::string_view element : path) {
         if (slot) {
-            if (slot->type != BymlDict && slot->type != BymlArray) {
+            if (slot->type != BymlDict && slot->type != BymlArray && slot->type != BymlHashDict) {
                 return std::nullopt;
             }
             node = Read32(slot->offset);
@@ -114,7 +115,31 @@ std::optional<BymlEditor::Slot> BymlEditor::Find(std::span<const std::string_vie
             }
         }
         const u32 count = Read24(node + 1);
-        if (data[node] == BymlDict) {
+        if (data[node] == BymlHashDict) {
+            // Entries of {hash, value}, then one type byte each.
+            u32 hash{};
+            if (element.size() < 2 || element[0] != '#') {
+                return std::nullopt;
+            }
+            const auto [end, error] =
+                std::from_chars(element.data() + 1, element.data() + element.size(), hash, 16);
+            const std::size_t types = node + 4 + 8 * std::size_t{count};
+            if (error != std::errc{} || end != element.data() + element.size() ||
+                types + count > data.size()) {
+                return std::nullopt;
+            }
+            slot.reset();
+            for (u32 i = 0; i < count; ++i) {
+                const std::size_t entry = node + 4 + 8 * std::size_t{i};
+                if (Read32(entry) == hash) {
+                    slot = Slot{data[types + i], entry + 4};
+                    break;
+                }
+            }
+            if (!slot) {
+                return std::nullopt;
+            }
+        } else if (data[node] == BymlDict) {
             const auto key = KeyIndex(element);
             if (!key) {
                 return std::nullopt;

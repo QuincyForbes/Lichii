@@ -124,16 +124,25 @@ bool MetalFxReplacesNdsr() {
     return Settings::MetalFxTemporalChosen();
 }
 
-// Settings oot_resolution. For tests, EDEN_NX2_OOT_RENDER_SCALE=1..3 picks 75/56/50%, and
+// A third of the docked 2560x1440 is not a whole size: the game pads the scene to 854x480 and
+// draws its meshes twice. Docked gets 40% (1024x576) for it.
+Settings::OotResolution WholeSized(Settings::OotResolution resolution) {
+    return resolution == Settings::OotResolution::Percent33 && Settings::IsDockedMode()
+               ? Settings::OotResolution::Percent40
+               : resolution;
+}
+
+// Settings oot_resolution. For tests, EDEN_NX2_OOT_RENDER_SCALE=1..5 picks 75/56/50/40/33%, and
 // EDEN_NX2_OOT_MAX_RESOLUTION=0 turns Full into the game's dynamic resolution (the phone's
 // default on a desktop run), =1 the other way round.
 Settings::OotResolution OotResolution() {
     using Settings::OotResolution;
     if (const char* v = std::getenv("EDEN_NX2_OOT_RENDER_SCALE");
-        v != nullptr && v[0] >= '1' && v[0] <= '3' && v[1] == '\0') {
+        v != nullptr && v[0] >= '1' && v[0] <= '5' && v[1] == '\0') {
         constexpr std::array scales{OotResolution::Percent75, OotResolution::Percent56,
-                                    OotResolution::Percent50};
-        return scales[v[0] - '1'];
+                                    OotResolution::Percent50, OotResolution::Percent40,
+                                    OotResolution::Percent33};
+        return WholeSized(scales[v[0] - '1']);
     }
     auto resolution = Settings::OcarinaGameResolution(Settings::values.oot_resolution.GetValue());
     if (const char* v = std::getenv("EDEN_NX2_OOT_MAX_RESOLUTION"); v != nullptr && v[0] != 0) {
@@ -143,8 +152,8 @@ Settings::OotResolution OotResolution() {
             resolution = OotResolution::Full;
         }
     }
-    return Settings::OcarinaUpscaledResolution(resolution, Settings::values.upscaler.GetValue(),
-                                               Settings::IsDockedMode());
+    return WholeSized(Settings::OcarinaUpscaledResolution(
+        resolution, Settings::values.upscaler.GetValue(), Settings::IsDockedMode()));
 }
 
 template <Settings::OotResolution Resolution>
@@ -211,6 +220,30 @@ constexpr std::array OOT_RENDER_56_RECORDS{
 constexpr std::array OOT_RENDER_50_RECORDS{
     BuiltinPatchRecord{0x805BD0, MAX_RESOLUTION_BRANCH, MAX_RESOLUTION_ORIGINAL},
     BuiltinPatchRecord{0x806420, RENDER_SCALE_ULTRA, RENDER_SCALE_ONE},
+};
+// 0.4 and 1/3 do not fit one mov (the nearest that do give sizes the game pads, and a padded scene
+// draws its meshes twice), so the scale word becomes a branch to the padding at main+0x3C462D0:
+// movz/movk w9 with the float's bits, then the `b 0x806000` that followed the word.
+constexpr std::array<u8, 4> RENDER_SCALE_CAVE_BRANCH{0xAC, 0xFF, 0xD0, 0x14}; // b 0x3c462d0
+constexpr std::array<u8, 12> RENDER_SCALE_40_CAVE{
+    0xA9, 0x99, 0x99, 0x52, // mov w9, #0xcccd
+    0x89, 0xD9, 0xA7, 0x72, // movk w9, #0x3ecc, lsl #16
+    0x4A, 0xFF, 0x2E, 0x17, // b 0x806000
+};
+constexpr std::array<u8, 12> RENDER_SCALE_33_CAVE{
+    0x69, 0x55, 0x95, 0x52, // mov w9, #0xaaab
+    0x49, 0xD5, 0xA7, 0x72, // movk w9, #0x3eaa, lsl #16
+    0x4A, 0xFF, 0x2E, 0x17, // b 0x806000
+};
+constexpr std::array OOT_RENDER_40_RECORDS{
+    BuiltinPatchRecord{0x805BD0, MAX_RESOLUTION_BRANCH, MAX_RESOLUTION_ORIGINAL},
+    BuiltinPatchRecord{0x806420, RENDER_SCALE_CAVE_BRANCH, RENDER_SCALE_ONE},
+    BuiltinPatchRecord{0x3C462D0, RENDER_SCALE_40_CAVE, {}, true},
+};
+constexpr std::array OOT_RENDER_33_RECORDS{
+    BuiltinPatchRecord{0x805BD0, MAX_RESOLUTION_BRANCH, MAX_RESOLUTION_ORIGINAL},
+    BuiltinPatchRecord{0x806420, RENDER_SCALE_CAVE_BRANCH, RENDER_SCALE_ONE},
+    BuiltinPatchRecord{0x3C462D0, RENDER_SCALE_33_CAVE, {}, true},
 };
 
 constexpr std::array<u8, 4> DYNAMIC_FPS_ORIGINAL{0x28, 0x18, 0x20, 0x1E};
@@ -502,6 +535,28 @@ constexpr std::array BUILTIN_PATCHES{
         .kind = BuiltinPatchKind::Resolution,
         .game = OOT_GAME,
         .chosen = OotResolutionIs<Settings::OotResolution::Percent50>,
+        .chosen_by = "oot_resolution",
+    },
+    BuiltinPatch{
+        .name = "Render scale 40% (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = OOT_RENDER_40_RECORDS,
+        .kind = BuiltinPatchKind::Resolution,
+        .game = OOT_GAME,
+        .chosen = OotResolutionIs<Settings::OotResolution::Percent40>,
+        .chosen_by = "oot_resolution",
+    },
+    BuiltinPatch{
+        .name = "Render scale 33% (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = OOT_RENDER_33_RECORDS,
+        .kind = BuiltinPatchKind::Resolution,
+        .game = OOT_GAME,
+        .chosen = OotResolutionIs<Settings::OotResolution::Percent33>,
         .chosen_by = "oot_resolution",
     },
     // Dark's routine with a tail that also lowers the step above 60 fps, so the game keeps real

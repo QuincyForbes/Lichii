@@ -25,6 +25,9 @@
 #include "video_core/present.h"
 #include "video_core/render_probe.h"
 #include "video_core/render_trace.h"
+#ifdef LICHII_METALFX
+#include "video_core/renderer_vulkan/present/metalfx_spatial.h"
+#endif
 #include "video_core/renderer_vulkan/present/util.h"
 #ifdef HAS_RESHADE
 #include "video_core/post_processing/fx_chain.h"
@@ -216,6 +219,70 @@ RendererVulkan::~RendererVulkan() {
     void(device.GetLogical().WaitIdle());
 }
 
+void RendererVulkan::LogFrameChain(u32 game_width, u32 game_height, u32 screen_width,
+                                   u32 screen_height) {
+    const u64 scene = VideoCore::Probe::scene_extents.load(std::memory_order_relaxed);
+    const char* const upscaler = VideoCore::Probe::scene_upscaler.load(std::memory_order_relaxed);
+    const auto filter = Settings::values.scaling_filter.GetValue();
+    const auto anti_aliasing = Settings::values.anti_aliasing.GetValue();
+    const bool generating = Settings::values.frame_gen.GetValue();
+    const auto type = Settings::values.frame_gen_type.GetValue();
+    const u32 multiplier = Settings::FrameGenMultiplier();
+    const u32 target_rate = Settings::values.frame_gen_target_rate.GetValue();
+    const std::array<u64, 4> key{
+        scene,
+        reinterpret_cast<u64>(upscaler),
+        VideoCore::Probe::PackExtents(game_width, game_height, screen_width, screen_height),
+        static_cast<u64>(filter) | static_cast<u64>(anti_aliasing) << 8 | u64{generating} << 16 |
+            static_cast<u64>(type) << 24 | u64{multiplier} << 32 | u64{target_rate} << 40,
+    };
+    // A game that changes its scene size every frame would fill the log: at most one line in two
+    // seconds, and 40 in a session.
+    const auto now = std::chrono::steady_clock::now();
+    if (key == chain_key || chain_lines >= 40 || now - chain_logged < std::chrono::seconds{2}) {
+        return;
+    }
+    chain_key = key;
+    chain_logged = now;
+    ++chain_lines;
+
+    std::string line;
+    if (scene != 0 && upscaler != nullptr) {
+        line = fmt::format("3D {}x{} -> {} -> {}x{}; ", scene & 0xFFFF, (scene >> 16) & 0xFFFF,
+                           upscaler, (scene >> 32) & 0xFFFF, scene >> 48);
+    }
+    line += fmt::format("game image {}x{}", game_width, game_height);
+    if (anti_aliasing != Settings::AntiAliasing::None) {
+        line += fmt::format(" -> {}", Settings::CanonicalizeEnum(anti_aliasing));
+    }
+    line += fmt::format(" -> {}", Settings::CanonicalizeEnum(filter));
+    if (filter == Settings::ScalingFilter::MetalFxSpatial) {
+#ifdef LICHII_METALFX
+        if (!MetalFxSpatial::IsSupported(device)) {
+            line += " (unavailable: Fsr)";
+        }
+#else
+        line += " (unavailable: Fsr)";
+#endif
+    }
+    line += fmt::format(" -> screen {}x{}; frame generation ", screen_width, screen_height);
+#ifdef HAS_LSFG
+    if (generating) {
+        line += fmt::format("{} {}x at the screen's size", Settings::CanonicalizeEnum(type),
+                            multiplier);
+        if (target_rate != 0) {
+            line += fmt::format(", towards {} fps", target_rate);
+        }
+    } else {
+        line += "off";
+    }
+#else
+    line += "off";
+#endif
+    // Common_Memory: the phone's log keeps its Info lines.
+    LOG_INFO(Common_Memory, "Frame chain: {}", line);
+}
+
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
     const bool trace = Common::DkbFrameTrace::Enabled();
     const auto entered = trace ? std::chrono::steady_clock::now()
@@ -247,10 +314,11 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         const auto& guest = framebuffers.front();
         const bool cropped = !guest.crop_rect.IsEmpty();
         const auto& layout = render_window.GetFramebufferLayout();
-        VideoCore::Probe::StoreFrameExtents(
-            cropped ? static_cast<u32>(guest.crop_rect.GetWidth()) : guest.width,
-            cropped ? static_cast<u32>(guest.crop_rect.GetHeight()) : guest.height, layout.width,
-            layout.height);
+        const u32 game_width = cropped ? static_cast<u32>(guest.crop_rect.GetWidth()) : guest.width;
+        const u32 game_height = cropped ? static_cast<u32>(guest.crop_rect.GetHeight())
+                                        : guest.height;
+        VideoCore::Probe::StoreFrameExtents(game_width, game_height, layout.width, layout.height);
+        LogFrameChain(game_width, game_height, layout.width, layout.height);
     }
 
     size_t generated_frames = 0;

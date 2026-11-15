@@ -91,6 +91,7 @@ struct OverlayReading: Equatable {
     var frameGenMultiplier = 1.0
     var resolutionScale = 1.0
     var upscaler = ""
+    var sceneSize = ""
     var renderSize = ""
     var outputSize = ""
     var gpuAccuracy = ""
@@ -277,6 +278,7 @@ final class PerformanceOverlayMonitor: ObservableObject {
 
         next.resolutionScale = Double(snapshot.resolution_scale)
         next.upscaler = upscaler(snapshot)
+        next.sceneSize = Self.size(snapshot.scene_width, snapshot.scene_height)
         next.renderSize = Self.size(snapshot.render_width, snapshot.render_height)
         next.outputSize = Self.size(snapshot.output_width, snapshot.output_height)
         next.gpuAccuracy = OverlayNames.name("gpu_accuracy", snapshot.gpu_accuracy)

@@ -228,6 +228,20 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// instance index is refused; quad groups for subgroups), as before (EDEN_NX2_METAL_MSL_DEVICE=0).
 /// "metal_copies_plain": the Metal renderer skips blits between depth images and copies between
 /// block-compressed and plain formats, as before (EDEN_NX2_METAL_COPIES=0).
+/// "pipeline_holds_old": the pipeline build a draw waits for stays queued on the builder pool, as
+/// before (EDEN_NX2_PIPELINE_HOLD_BOOST=0). "pipeline_list_old": the used pipelines list is
+/// written only on a first use 15 s after the last save and at shutdown, as before
+/// (EDEN_NX2_USED_PIPELINES_SAVE_S=0). "mvk_stats_off": MoltenVK does not time its compilation
+/// stages (EDEN_NX2_MVK_STATS=0).
+/// "frame_time_off": the graphics threads
+/// declare no frame time to the kernel, as before (EDEN_NX2_APPLE_FRAME_DEADLINE=0);
+/// "frame_time_guest": the guest cores declare theirs too (=15), off wins. "split_std_waits": the
+/// two GPU threads sleep on each other with std::atomic::wait, as before
+/// (EDEN_NX2_SPLIT_ADDRESS_WAIT=0). "poll_yield": the GPU thread polling its suspended channels
+/// and threads waiting for a deferred submission yield between polls, as before
+/// (EDEN_NX2_POLL_YIELD=1). "idle_hold_off": the GPU thread, out of commands, submits its
+/// deferred work at once, as before, instead of keeping it up to 0.5 ms while the GPU still runs
+/// earlier work (EDEN_NX2_IDLE_HOLD_US=0).
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
 /// Bench mode: for the rest of this process lichii_platform_experiment reports `names` as on and

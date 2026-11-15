@@ -16,6 +16,9 @@ namespace Common::Nx2AddressWait {
 
 /// Sleeps while word holds expected; may return early.
 void Wait(std::atomic<u32>& word, u32 expected);
+/// The same for at most timeout_ns (Windows: whole milliseconds, at least one). Without an
+/// address wait of the OS it sleeps 100 us at most, so the caller loops either way.
+void WaitFor(std::atomic<u32>& word, u32 expected, u64 timeout_ns);
 void WakeOne(std::atomic<u32>& word);
 void WakeAll(std::atomic<u32>& word);
 

@@ -437,6 +437,10 @@ struct ExperimentsView: View {
     @State private var ootIdealAffinity = lichii_platform_experiment("oot_ideal_affinity") != 0
     @State private var guestIdleSpin = lichii_platform_experiment("guest_idle_spin") != 0
     @State private var perfSchedOff = lichii_platform_experiment("perf_sched_off") != 0
+    @State private var frameTimeOff = lichii_platform_experiment("frame_time_off") != 0
+    @State private var frameTimeGuest = lichii_platform_experiment("frame_time_guest") != 0
+    @State private var splitStdWaits = lichii_platform_experiment("split_std_waits") != 0
+    @State private var pollYield = lichii_platform_experiment("poll_yield") != 0
     @State private var targetlessFull = lichii_platform_experiment("targetless_full") != 0
     @State private var jitInlineExclusives = lichii_platform_experiment("jit_inline_exclusives") != 0
     @State private var jitLoadFaults = lichii_platform_experiment("jit_load_faults") != 0
@@ -445,6 +449,7 @@ struct ExperimentsView: View {
     @State private var uboZeroTails = lichii_platform_experiment("ubo_zero_tails") != 0
     @State private var releaseSubmit = lichii_platform_experiment("release_submit") != 0
     @State private var idleSubmitGrace = lichii_platform_experiment("idle_submit_grace") != 0
+    @State private var idleHoldOff = lichii_platform_experiment("idle_hold_off") != 0
     @State private var meshComputeInPass = lichii_platform_experiment("mesh_compute_in_pass") != 0
     @State private var dispatchChain = lichii_platform_experiment("dispatch_chain") != 0
     @State private var emulateAllMesh = lichii_platform_experiment("emulate_all_mesh") != 0
@@ -455,6 +460,9 @@ struct ExperimentsView: View {
     @State private var metalCachePlain = lichii_platform_experiment("metal_cache_plain") != 0
     @State private var metalMslPlain = lichii_platform_experiment("metal_msl_plain") != 0
     @State private var metalCopiesPlain = lichii_platform_experiment("metal_copies_plain") != 0
+    @State private var pipelineHoldsOld = lichii_platform_experiment("pipeline_holds_old") != 0
+    @State private var pipelineListOld = lichii_platform_experiment("pipeline_list_old") != 0
+    @State private var mvkStatsOff = lichii_platform_experiment("mvk_stats_off") != 0
 
     var body: some View {
         List {
@@ -574,6 +582,10 @@ struct ExperimentsView: View {
                     .onChange(of: idleSubmitGrace) { value in
                         lichii_platform_set_experiment("idle_submit_grace", value ? 1 : 0)
                     }
+                Toggle("GPU Thread Submits When Idle", isOn: $idleHoldOff)
+                    .onChange(of: idleHoldOff) { value in
+                        lichii_platform_set_experiment("idle_hold_off", value ? 1 : 0)
+                    }
                 Toggle("Mesh Emulation Ends Its Pass", isOn: $meshComputeInPass)
                     .onChange(of: meshComputeInPass) { value in
                         lichii_platform_set_experiment("mesh_compute_in_pass", value ? 1 : 0)
@@ -593,7 +605,7 @@ struct ExperimentsView: View {
             } header: {
                 Text("Performance")
             } footer: {
-                Text("For comparing builds. Old Texture Eviction reads textures the GPU drew back from the GPU before freeing them, a wait for the GPU each time, even when the game draws them again anyway. Helper Threads at Full Priority gives the timing and present threads the same priority as the game's. Frame Deadlines for the CPU tells iOS each frame's deadline, which may keep the game on the performance cores; untested on a device. Old JIT Tables keeps the translated code's bookkeeping as it was (about 0.3 GB more memory in Ocarina of Time); turn it on if a game that used to run crashes. Submit at Every Fence hands the GPU the game's work at every game fence, as before, instead of in batches of up to 2 ms (76-95 command buffers a frame in Ocarina of Time's Kokiri Forest on an iPhone); turn it on if the screen flashes white. Render Passes as Before ends the GPU's render pass for every buffer copy and parked clear, as before, instead of moving copies ahead of the pass (each ended pass stores and loads the whole screen again); turn it on if parts of the picture show stale or wrong data. Game's Own Upscale Pass runs Ocarina of Time's own upscale from its scene to the screen size, as before, instead of one bilinear tap whenever MetalFX Temporal doesn't take the frame (the game's pass was about 40 % of the phone's GPU time in Kokiri Forest); turn it on if the picture looks wrong. Full-Size Passes Without Targets gives a draw that writes no image a render pass of the game's full surface size, as before (32768x32768 in Ocarina of Time, about 6-7 % of the phone's GPU time), instead of only the pixels it can reach; turn it on if lens flares or glows behave differently. Zero Uniform Buffer Tails fills the unused rest of each uniform buffer a shader indexes with zeros, as before (about 75 % of the uniform bytes Lichii wrote in Kokiri Forest); turn it on if models or effects look wrong. Submit at Every Fence Release hands the GPU its work every time the game waits on a GPU value, as before, even when nothing waits for that work (about 11 command buffers a frame in Kokiri Forest); turn it on if the screen flashes or stutters. GPU Thread Waits for More Work lets the GPU thread, once it runs out of commands, wait up to 0.25 ms for more before it hands the GPU what it has (about 5 fewer command buffers a frame on a PC, but it keeps a CPU core busy meanwhile); untested on a device. Mesh Emulation Ends Its Pass ends the render pass for each emulated mesh draw's compute, as before, instead of running that compute just before the pass; turn it on if foliage looks wrong. Back-to-Back Dispatches Without Barriers lets the game's consecutive compute dispatches share one Metal compute pass (the ~150 dispatches a frame in Ocarina of Time otherwise get a pass each); untested on a device, turn it on to compare and off if effects flicker. Emulate Every Mesh Shader draws all mesh shaders (most foliage) through the compute emulation instead of Metal mesh shaders, which hold their outputs in scarce GPU tile memory; untested on a device, for comparing the two. Log What Ties Dispatches to Render Passes writes a \"Dispatch deps\" line every 10 s naming each compute dispatch that ends the screen's render pass and whether it reads that pass's images; it changes nothing that is drawn.\n\nAll fifteen apply the next time Lichii starts.")
+                Text("For comparing builds. Old Texture Eviction reads textures the GPU drew back from the GPU before freeing them, a wait for the GPU each time, even when the game draws them again anyway. Helper Threads at Full Priority gives the timing and present threads the same priority as the game's. Frame Deadlines for the CPU tells iOS each frame's deadline, which may keep the game on the performance cores; untested on a device. Old JIT Tables keeps the translated code's bookkeeping as it was (about 0.3 GB more memory in Ocarina of Time); turn it on if a game that used to run crashes. Submit at Every Fence hands the GPU the game's work at every game fence, as before, instead of in batches of up to 2 ms (76-95 command buffers a frame in Ocarina of Time's Kokiri Forest on an iPhone); turn it on if the screen flashes white. Render Passes as Before ends the GPU's render pass for every buffer copy and parked clear, as before, instead of moving copies ahead of the pass (each ended pass stores and loads the whole screen again); turn it on if parts of the picture show stale or wrong data. Game's Own Upscale Pass runs Ocarina of Time's own upscale from its scene to the screen size, as before, instead of one bilinear tap whenever MetalFX Temporal doesn't take the frame (the game's pass was about 40 % of the phone's GPU time in Kokiri Forest); turn it on if the picture looks wrong. Full-Size Passes Without Targets gives a draw that writes no image a render pass of the game's full surface size, as before (32768x32768 in Ocarina of Time, about 6-7 % of the phone's GPU time), instead of only the pixels it can reach; turn it on if lens flares or glows behave differently. Zero Uniform Buffer Tails fills the unused rest of each uniform buffer a shader indexes with zeros, as before (about 75 % of the uniform bytes Lichii wrote in Kokiri Forest); turn it on if models or effects look wrong. Submit at Every Fence Release hands the GPU its work every time the game waits on a GPU value, as before, even when nothing waits for that work (about 11 command buffers a frame in Kokiri Forest); turn it on if the screen flashes or stutters. GPU Thread Waits for More Work lets the GPU thread, once it runs out of commands, wait up to 0.25 ms for more before it hands the GPU what it has (about 5 fewer command buffers a frame on a PC, but it keeps a CPU core busy meanwhile); untested on a device. GPU Thread Submits When Idle hands the GPU what the GPU thread has as soon as it runs out of commands, as before, instead of keeping it, asleep, up to 0.5 ms while the GPU still runs what it was handed earlier (about half of the phone's command buffers a frame in Kokiri Forest were such hand-overs; on a PC 2 of 3 of them went away); turn it on if the game stutters or runs slower than before. Mesh Emulation Ends Its Pass ends the render pass for each emulated mesh draw's compute, as before, instead of running that compute just before the pass; turn it on if foliage looks wrong. Back-to-Back Dispatches Without Barriers lets the game's consecutive compute dispatches share one Metal compute pass (the ~150 dispatches a frame in Ocarina of Time otherwise get a pass each); untested on a device, turn it on to compare and off if effects flicker. Emulate Every Mesh Shader draws all mesh shaders (most foliage) through the compute emulation instead of Metal mesh shaders, which hold their outputs in scarce GPU tile memory; untested on a device, for comparing the two. Log What Ties Dispatches to Render Passes writes a \"Dispatch deps\" line every 10 s naming each compute dispatch that ends the screen's render pass and whether it reads that pass's images; it changes nothing that is drawn.\n\nAll sixteen apply the next time Lichii starts.")
             }
 
             Section {
@@ -617,10 +629,26 @@ struct ExperimentsView: View {
                     .onChange(of: perfSchedOff) { value in
                         lichii_platform_set_experiment("perf_sched_off", value ? 1 : 0)
                     }
+                Toggle("Graphics Threads Declare No Frame Time", isOn: $frameTimeOff)
+                    .onChange(of: frameTimeOff) { value in
+                        lichii_platform_set_experiment("frame_time_off", value ? 1 : 0)
+                    }
+                Toggle("Guest Cores Declare Frame Time Too", isOn: $frameTimeGuest)
+                    .onChange(of: frameTimeGuest) { value in
+                        lichii_platform_set_experiment("frame_time_guest", value ? 1 : 0)
+                    }
+                Toggle("Graphics Threads Poll Before Sleeping", isOn: $splitStdWaits)
+                    .onChange(of: splitStdWaits) { value in
+                        lichii_platform_set_experiment("split_std_waits", value ? 1 : 0)
+                    }
+                Toggle("Polling Threads Yield", isOn: $pollYield)
+                    .onChange(of: pollYield) { value in
+                        lichii_platform_set_experiment("poll_yield", value ? 1 : 0)
+                    }
             } header: {
                 Text("CPU Scheduling")
             } footer: {
-                Text("For finding out why the game's CPU threads run on the efficiency cores. Two Guest Cores First leaves the top priority to two of the six emulated CPU cores and the graphics threads, and runs the other four one step lower, so iOS has fewer threads asking for its two performance cores (on a computer limited to four CPUs this gave Ocarina of Time 25 % more frames). Game's Own Thread Cores lets Ocarina of Time's main threads run only on the cores the game asks for, instead of on any core. One Core per Game Thread keeps each such thread on one core, so one host thread does its work; wins over Game's Own Thread Cores. Idle Guest Cores Wait Briefly keeps an emulated core that runs out of work polling for 20 µs before it sleeps, as on a computer, which saves a wake-up per hand-off but keeps a CPU busy. No CPU Scheduling Log Lines stops the \"Perf threads:\" and \"Perf sched:\" log lines and the counting behind them (thread listing every 10 s, a 20 Hz thread sampler, timestamps at each guest thread switch).\n\nAll five apply the next time Lichii starts.")
+                Text("For finding out why the game's CPU threads run on the efficiency cores. Two Guest Cores First leaves the top priority to two of the six emulated CPU cores and the graphics threads, and runs the other four one step lower, so iOS has fewer threads asking for its two performance cores (on a computer limited to four CPUs this gave Ocarina of Time 25 % more frames). Game's Own Thread Cores lets Ocarina of Time's main threads run only on the cores the game asks for, instead of on any core. One Core per Game Thread keeps each such thread on one core, so one host thread does its work; wins over Game's Own Thread Cores. Idle Guest Cores Wait Briefly keeps an emulated core that runs out of work polling for 20 µs before it sleeps, as on a computer, which saves a wake-up per hand-off but keeps a CPU busy. No CPU Scheduling Log Lines stops the \"Perf threads:\" and \"Perf sched:\" log lines and the counting behind them (thread listing every 10 s, a 20 Hz thread sampler, timestamps at each guest thread switch). Graphics Threads Declare No Frame Time stops Lichii's three graphics threads from telling iOS how much CPU time they need each frame, as before; with it iOS schedules them like audio threads, which on another emulator kept the performance cores faster and busier (\"frame deadlines:\" in the log's Perf line shows what each declared). Turn it on if the game stutters or runs slower than before. Guest Cores Declare Frame Time Too does the same for the emulated CPU cores; untested, and iOS may take it back from a core that never rests. Graphics Threads Poll Before Sleeping lets the two graphics threads poll for up to 64 µs before they sleep waiting on each other, as before. Polling Threads Yield lets the graphics thread that waits for the game to release a GPU value, and threads waiting for the graphics thread to send its work, give up the CPU between checks instead of sleeping 50 µs, as before; when other threads are waiting for a CPU, iOS then runs the yielding thread last for up to 10 ms.\n\nAll nine apply the next time Lichii starts.")
             }
 
             Section {
@@ -667,6 +695,25 @@ struct ExperimentsView: View {
                 Text("Metal Renderer")
             } footer: {
                 Text("Only for the Metal renderer (Graphics API). Shaders Without the Draw's State builds the game's shaders as before, without what the draw sets outside the shader: the depth range the game uses, the size of points, the alpha test, blending with two colours and whole-number colour targets. Turn it on if the picture got worse with a new build.\n\nGame Memory Access as Before: when the game reads or writes memory the graphics side also uses, the Metal renderer now handles it the way the Vulkan renderer does (the game's threads wait less for the graphics thread, and the switches under Guest Memory Access apply to it too). On, it handles every such read and write the slow way it did before; turn it on if objects flicker, show stale data or the game hangs with a new build.\n\nShaders Translated as Before: the game's shaders are now turned into Metal shaders with what this iPhone's GPU can do, as the Vulkan renderer's MoltenVK does it. Before, every shader that reads which copy of a model it is drawing was refused (about a fifth of Ocarina of Time's, their draws skipped), and shaders that share values between neighbouring pixels did it in groups of four. On, they are translated as before; turn it on if shaders fail to build or the picture got worse with a new build.\n\nImage Copies as Before: the Metal renderer now copies one depth image into another when the game asks for it, and copies between a compressed image and a plain one whose pixels hold a compressed block each (Ocarina of Time does both). Before, both kinds of copy were skipped. On, they are skipped again; turn it on if the game stops with a new build.\n\nAll four apply the next time Lichii starts.")
+            }
+
+            Section {
+                Toggle("Held Draws Wait in the Queue", isOn: $pipelineHoldsOld)
+                    .onChange(of: pipelineHoldsOld) { value in
+                        lichii_platform_set_experiment("pipeline_holds_old", value ? 1 : 0)
+                    }
+                Toggle("Used Shader List Saved as Before", isOn: $pipelineListOld)
+                    .onChange(of: pipelineListOld) { value in
+                        lichii_platform_set_experiment("pipeline_list_old", value ? 1 : 0)
+                    }
+                Toggle("No MoltenVK Compile Times", isOn: $mvkStatsOff)
+                    .onChange(of: mvkStatsOff) { value in
+                        lichii_platform_set_experiment("mvk_stats_off", value ? 1 : 0)
+                    }
+            } header: {
+                Text("Shader Builds")
+            } footer: {
+                Text("A draw whose shaders are not built yet either is left out for a frame or waits. Normally the build a draw waits for runs at once on two threads of its own at the waiting thread's priority, and the background builds pause meanwhile. Held Draws Wait in the Queue leaves it in line behind the other builds on the low-priority build threads, as before (waits of 0.1-2.2 s each in Kokiri Forest on an iPhone); turn it on if the game stutters more than before.\n\nLichii keeps a list of the shaders a game really drew and builds those on the loading screen. Normally the list is saved within 10 s of a new shader's first use and when Lichii leaves the foreground. Used Shader List Saved as Before saves it only when a new shader is first drawn 15 s or more after the last save or the game is stopped from the menu, so the shaders first drawn since the last save are missing from it when Lichii is closed from the app switcher.\n\nNo MoltenVK Compile Times stops MoltenVK timing its work (a few timestamps per command buffer), which the \"Perf pipelines:\" log line reports per stage.\n\nAll three apply the next time Lichii starts.")
             }
 
             Section {

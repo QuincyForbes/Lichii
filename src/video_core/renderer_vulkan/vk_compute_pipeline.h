@@ -69,6 +69,10 @@ public:
     /// The same upscale to 2560x1440 when the scene renders below it (oot_resolution).
     static constexpr u64 Ocarina1440pScaledShader = 0x4c1ae2fe58f30a97ULL;      // menus
     static constexpr u64 Ocarina1440pScaledFieldShader = 0x9302bc0d6d1d9bc1ULL; // gameplay
+    /// The gameplay upscale when the scene is under half the target: above 0.4 of it, and 0.4 and
+    /// below (oot_resolution 40 % and 33 %).
+    static constexpr u64 OcarinaScaledUnderHalfShader = 0x03bf0ffc7d2d0bedULL;
+    static constexpr u64 OcarinaScaledLowShader = 0x31c0acb7c5e87c89ULL;
     /// The same output pass at 1:1, run at 1920x1080 in handheld with the Max Resolution add-on.
     static constexpr u64 OcarinaFullSizeShader = 0xc033c3ddc9f0897bULL;
     [[nodiscard]] bool CanReplaceOcarinaUpscale() const;

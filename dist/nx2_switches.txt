@@ -55,6 +55,12 @@ EDEN_NX2_FENCE_BATCH=1
 # 1920x1080 (on by default on Apple for MetalFX temporal, 0 turns it off).
 #EDEN_NX2_OOT_TEMPORAL_HANDHELD=1
 
+# Ocarina of Time: the 3D scene's size for tests, over the "Resolution" setting (oot_resolution):
+# 1 = 75%, 2 = 56%, 3 = 50%, 4 = 40% (768x432 handheld), 5 = 1/3 (640x360 handheld; docked it is
+# 40%, since a third of 2560x1440 is padded and drawn twice). The finished picture stays 1920x1080
+# handheld. Each change of a frame's sizes writes one "Frame chain:" line.
+#EDEN_NX2_OOT_RENDER_SCALE=4
+
 # A draw without render targets (it writes buffers or counts samples only) gets a render pass as
 # large as its scissors reach instead of the surface clip (Ocarina of Time leaves that at
 # 32768x32768). On by default on Apple, where the GPU prepares every tile of it; 0 turns it off.
@@ -72,6 +78,32 @@ EDEN_NX2_FENCE_BATCH=1
 # The split GPU thread, out of commands with a deferred submission younger than
 # EDEN_NX2_FENCE_FLUSH_US, waits up to this many us for more work first (it spins meanwhile).
 #EDEN_NX2_IDLE_GRACE_US=0
+
+# The same wait asleep, and only while the GPU still runs work submitted earlier (it has no use
+# for another command buffer yet): up to this many us, ended by new work, by a thread asking for
+# the submission or by the GPU running dry (the idea of nxnative PR #2645). 0 = off.
+# EDEN_NX2_IDLE_HOLD_ANY=1 holds whatever the GPU does, to measure it on a PC. Phones get 500
+# from their device profile (PC phone sim: idle submits 3.0 -> 0.9 a frame, 21.1 -> 19.6 command
+# buffers, frame rate unchanged).
+#EDEN_NX2_IDLE_HOLD_US=0
+
+# The two GPU threads sleep on each other in the OS's address wait (WaitOnAddress, Apple
+# os_sync_wait_on_address) instead of std::atomic::wait, which on Apple polls and yields for up
+# to 64 us before it sleeps. 0 = std::atomic::wait.
+#EDEN_NX2_SPLIT_ADDRESS_WAIT=1
+
+# 0: the GPU thread polling its suspended channels and a thread waiting for a deferred submission
+# sleep 50 us between polls instead of yielding. Phones get 0 from their device profile: Apple's
+# sched_yield (swtch_pri) runs the caller at priority 0 for up to 10 ms when anything else is
+# runnable, and spins on its core when nothing is. (On Windows a 50 us sleep lasts a timer tick.)
+#EDEN_NX2_POLL_YIELD=1
+
+# Apple: frame threads tell the kernel how much CPU time they need each frame
+# (THREAD_TIME_CONSTRAINT_POLICY, measured over 120 frames; port of nxnative PR #2569 / #2137).
+# A sum of 1 = GPUBack, 2 = GPU, 4 = VulkanWorker, 8 = the guest cores. iPhone and iPad: 7 by
+# default; macOS 0. "frame deadlines:" in the Perf host CPU line shows what each declared and how
+# often the kernel took it out of the real-time band.
+#EDEN_NX2_APPLE_FRAME_DEADLINE=0
 
 # The fencing thread lets a deferred fence submission wait this many us after the fence was
 # made before it asks the GPU thread for it (0 = at once).
@@ -173,6 +205,31 @@ EDEN_NX2_FENCE_BATCH=1
 # the game's macro writes into a constant buffer is made on the GPU (the Metal renderer made no
 # such copy before: the constant buffer kept the placeholders).
 #EDEN_NX2_INDIRECT_GRID=0
+
+# Threads of a pool of their own ("VkPipelineHeld") for the graphics pipeline builds a draw waits
+# for: such a build starts there at once, at the waiting thread's priority (on Apple its QoS
+# class), instead of queueing behind the other builds on the low-priority builder pool; a build
+# already running there is lent the waiter's QoS (Apple), and the background prebuild pauses while
+# a draw waits. 2 by default on Apple, 0 (off, as before) elsewhere.
+#EDEN_NX2_PIPELINE_HOLD_BOOST=2
+
+# The list of pipelines a game really drew (what the loading screen builds) is written at most
+# this many seconds after a pipeline's first use and when the app leaves the foreground, off the
+# GPU thread and through a temporary file. 10 by default on MoltenVK; 0 elsewhere: as before, on a
+# first use 15 s after the last save and at shutdown.
+#EDEN_NX2_USED_PIPELINES_SAVE_S=10
+
+# Test: every graphics pipeline built at run time (not at boot or by the prebuild) takes this many
+# ms of CPU time longer, to stand in for a slow driver compiler.
+#EDEN_NX2_PIPELINE_BUILD_DELAY_MS=300
+
+# Test: threads of the pipeline builder pool, up to the default (logical CPUs - 1; an iPhone 17
+# Pro Max has 5).
+#EDEN_NX2_PIPELINE_WORKERS=5
+
+# MoltenVK times its compilation stages (SPIR-V to MSL, MSL compile, pipeline compile, ...) for
+# the "Perf pipelines:" line. 1 by default on iOS, 0 on macOS.
+#EDEN_NX2_MVK_STATS=1
 
 #EDEN_NX2_MME_JIT=0
 #EDEN_NX2_PBFLUSH=0

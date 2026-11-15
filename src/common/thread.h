@@ -165,6 +165,31 @@ void SetCurrentThreadToEfficiencyCores();
 void SetCurrentThreadToBackgroundWork();
 void SetCurrentThreadToAllCores();
 
+/// Apple: the calling thread as ThreadQosBoost takes it. nullptr elsewhere.
+[[nodiscard]] void* CurrentThreadHandle();
+/// Apple: the calling thread's QoS class ("user-interactive", "utility", ...). "" elsewhere.
+[[nodiscard]] const char* CurrentThreadQosName();
+
+/// Apple: lends the calling thread's QoS class to `thread` until destroyed. A thread asleep on a
+/// condition variable hands nothing to the thread it waits for, unlike one blocked on a mutex.
+/// `thread` must be alive when this is made. No-op elsewhere and for nullptr.
+class ThreadQosBoost {
+public:
+    ThreadQosBoost() = default;
+    explicit ThreadQosBoost(void* thread);
+    ~ThreadQosBoost();
+
+    ThreadQosBoost(const ThreadQosBoost&) = delete;
+    ThreadQosBoost& operator=(const ThreadQosBoost&) = delete;
+
+    [[nodiscard]] bool Active() const {
+        return token != nullptr;
+    }
+
+private:
+    void* token{};
+};
+
 void RefreshThreadPolicies();
 void PollThreadPolicies();
 

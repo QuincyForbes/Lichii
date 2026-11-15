@@ -24,6 +24,8 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/dkb_cpu_trace.h"
+#include "common/frame_deadline.h"
+#include "common/nx2_poll.h"
 #include "common/perf_report.h"
 #include "common/thread.h"
 #include <boost/container/small_vector.hpp>
@@ -484,6 +486,11 @@ bool Scheduler::DeferredFlushMayWait() const {
                                 std::chrono::microseconds{DeferFlushIntervalUs()};
 }
 
+bool Scheduler::GpuBehind() {
+    master_semaphore->Refresh();
+    return master_semaphore->KnownGpuTick() + 1 < master_semaphore->CurrentTick();
+}
+
 bool Scheduler::DeferFlush(std::source_location location) {
     const s64 interval_us = DeferFlushIntervalUs();
     if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
@@ -548,7 +555,7 @@ bool Scheduler::WaitSubmitted(u64 tick, std::source_location location) {
                                                "a long entry)");
             split.RequestIdleHook();
         }
-        if (spins < 64) {
+        if (spins < 64 && Common::PollYield()) {
             std::this_thread::yield();
         } else {
             std::this_thread::sleep_for(std::chrono::microseconds{50});
@@ -624,6 +631,7 @@ void Scheduler::ReportPerfSites(u64 frames) {
     const u64 requested = g_requested_submits.exchange(0, std::memory_order_relaxed);
     const u64 in_pass = g_submits_in_pass.exchange(0, std::memory_order_relaxed);
     const auto gaps = VideoCommon::GpuSplit::Get().TakeIdleGaps();
+    const auto [holds, holds_fed] = VideoCommon::GpuSplit::Get().TakeIdleHolds();
     if (frames == 0) {
         return;
     }
@@ -665,13 +673,15 @@ void Scheduler::ReportPerfSites(u64 frames) {
              "| {:.1f} deferred submissions, waited {:.0f} us avg, {} max; {:.1f} by the idle back, "
              "{:.1f} asked between entries | waits for a deferred submission by caller: {} | the "
              "back's next work after an idle submit: under 50 us {:.0f}%, 250 us {:.0f}%, 1 ms "
-             "{:.0f}%, 4 ms {:.0f}%, later {:.0f}%",
+             "{:.0f}%, 4 ms {:.0f}%, later {:.0f}% | the idle back held deferred work {:.1f} times, "
+             "more work came in {:.1f}",
              static_cast<double>(in_pass) / frame_count, top(sites[SiteDefer]),
              static_cast<double>(deferred) / frame_count,
              deferred == 0 ? 0.0 : static_cast<double>(deferred_us) / static_cast<double>(deferred),
              deferred_max_us, static_cast<double>(idle) / frame_count,
              static_cast<double>(requested) / frame_count, top(sites[SiteRequest]), gap_share(0),
-             gap_share(1), gap_share(2), gap_share(3), gap_share(4));
+             gap_share(1), gap_share(2), gap_share(3), gap_share(4),
+             static_cast<double>(holds) / frame_count, static_cast<double>(holds_fed) / frame_count);
 }
 
 void Scheduler::NotePassEnd(const std::source_location& location) {
@@ -1533,6 +1543,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
     const Common::DkbCpuTrace::Registration trace_thread{Common::DkbCpuTrace::Role::VulkanWorker};
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
+    Common::FrameDeadline::Join(Common::FrameDeadline::Role::VulkanWorker);
 
     std::stop_callback stop_cb{stop_token, [this] {
         std::scoped_lock lk{queue_mutex};
@@ -1543,6 +1554,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
     batch.reserve(16);
 
     while (!stop_token.stop_requested()) {
+        Common::FrameDeadline::Tick();
         batch.clear();
         bool notify_waiter = false;
         {

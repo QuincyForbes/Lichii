@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <chrono>
+#include <thread>
+
 #include "common/nx2_address_wait.h"
 
 #ifdef _WIN32
@@ -112,6 +116,38 @@ void Wait(std::atomic<u32>& word, u32 expected) {
     }
 #endif
     word.wait(expected, std::memory_order_relaxed);
+}
+
+void WaitFor(std::atomic<u32>& word, u32 expected, u64 timeout_ns) {
+    if (timeout_ns == 0) {
+        return;
+    }
+#ifdef _WIN32
+    if (const AddressApi& api = Api(); api.wait != nullptr) {
+        api.wait(static_cast<void*>(&word), &expected, sizeof(u32),
+                 static_cast<DWORD>((std::clamp<u64>)((timeout_ns + 999'999) / 1'000'000, 1, 1000)));
+        return;
+    }
+#endif
+#ifdef LICHII_OS_SYNC_WAIT
+    if (UseOsSync()) {
+        if (__builtin_available(iOS 17.4, macOS 14.4, *)) {
+            std::atomic<u32>& sleepers = Sleepers(&word);
+            sleepers.fetch_add(1, std::memory_order_seq_cst);
+            if (word.load(std::memory_order_seq_cst) == expected) {
+                os_sync_wait_on_address_with_timeout(static_cast<void*>(&word), expected,
+                                                     sizeof(u32), OS_SYNC_WAIT_ON_ADDRESS_NONE,
+                                                     OS_CLOCK_MACH_ABSOLUTE_TIME, timeout_ns);
+            }
+            sleepers.fetch_sub(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+#endif
+    if (word.load(std::memory_order_seq_cst) == expected) {
+        std::this_thread::sleep_for(
+            std::chrono::nanoseconds{(std::min<u64>)(timeout_ns, 100'000)});
+    }
 }
 
 void WakeOne(std::atomic<u32>& word) {

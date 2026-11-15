@@ -400,6 +400,59 @@ std::vector<u8> MakeDynamicMain() {
 
 } // Anonymous namespace
 
+TEST_CASE("Ocarina resolution below half loads its scale in executable padding",
+          "[patch_manager]") {
+    constexpr size_t ScaleOffset = sizeof(Loader::NSOHeader) + 0x806420;
+    constexpr size_t CaveOffset = sizeof(Loader::NSOHeader) + 0x3C462D0;
+    constexpr u32 ScaleOne = 0x52A7F009;
+    constexpr u32 Scale50 = 0x52A7E009;
+    constexpr u32 CaveBranch = 0x14D0FFAC;   // b 0x3c462d0
+    constexpr u32 ReturnBranch = 0x172EFF4A; // b 0x806000
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+    using Settings::OotResolution;
+    auto& setting = Settings::values.oot_resolution;
+    const auto previous = setting.GetValue();
+    const auto words = [&](const std::vector<u8>& nso) {
+        const auto out = manager.PatchNSO(nso, "main");
+        return std::array{WordAt(out), WordAt(out, ScaleOffset), WordAt(out, CaveOffset),
+                          WordAt(out, CaveOffset + 4), WordAt(out, CaveOffset + 8)};
+    };
+    auto nso = MakeDynamicMain();
+    std::memcpy(nso.data() + ScaleOffset, &ScaleOne, sizeof(ScaleOne));
+
+    // mov w9, #0xcccd; movk w9, #0x3ecc, lsl #16: 0.4f.
+    setting.SetValue(OotResolution::Percent40);
+    CHECK(words(nso) ==
+          std::array{BranchInstruction, CaveBranch, 0x529999A9U, 0x72A7D989U, ReturnBranch});
+    // mov w9, #0xaaab; movk w9, #0x3eaa, lsl #16: 1/3. Docked that is 854x480 with padding, so it
+    // gets 0.4.
+    auto& console = Settings::values.use_docked_mode;
+    const auto previous_console = console.GetValue();
+    setting.SetValue(OotResolution::Percent33);
+    console.SetValue(Settings::ConsoleMode::Handheld);
+    CHECK(words(nso) ==
+          std::array{BranchInstruction, CaveBranch, 0x52955569U, 0x72A7D549U, ReturnBranch});
+    console.SetValue(Settings::ConsoleMode::Docked);
+    CHECK(words(nso) ==
+          std::array{BranchInstruction, CaveBranch, 0x529999A9U, 0x72A7D989U, ReturnBranch});
+    console.SetValue(previous_console);
+    setting.SetValue(OotResolution::Percent50);
+    CHECK(words(nso) == std::array{BranchInstruction, Scale50, 0U, 0U, 0U});
+
+    // Padding something else already uses: the game keeps its own resolution.
+    auto used = nso;
+    std::memcpy(used.data() + CaveOffset + 4, &NopInstruction, sizeof(NopInstruction));
+    setting.SetValue(OotResolution::Percent40);
+    CHECK(words(used) == std::array{TbzInstruction, ScaleOne, 0U, NopInstruction, 0U});
+
+    setting.SetValue(previous);
+    CHECK(Settings::OcarinaDlssModeFor(OotResolution::Percent40) ==
+          Settings::OcarinaDlssMode::UltraPerformance);
+    CHECK(Settings::OcarinaDlssModeFor(OotResolution::Percent33) ==
+          Settings::OcarinaDlssMode::UltraPerformance);
+}
+
 TEST_CASE("Ocarina frame timing: FPS Unlock at every frame rate, Dark's routine on request",
           "[patch_manager]") {
     PatchManagerTestContext context;

@@ -1052,6 +1052,54 @@ void SetCurrentThreadToAllCores() {
 #endif
 }
 
+void* CurrentThreadHandle() {
+#ifdef __APPLE__
+    return pthread_self();
+#else
+    return nullptr;
+#endif
+}
+
+const char* CurrentThreadQosName() {
+#ifdef __APPLE__
+    switch (qos_class_self()) {
+    case QOS_CLASS_USER_INTERACTIVE:
+        return "user-interactive";
+    case QOS_CLASS_USER_INITIATED:
+        return "user-initiated";
+    case QOS_CLASS_DEFAULT:
+        return "default";
+    case QOS_CLASS_UTILITY:
+        return "utility";
+    case QOS_CLASS_BACKGROUND:
+        return "background";
+    default:
+        return "unspecified";
+    }
+#else
+    return "";
+#endif
+}
+
+ThreadQosBoost::ThreadQosBoost(void* thread) {
+#ifdef __APPLE__
+    if (thread != nullptr && thread != pthread_self()) {
+        token = pthread_override_qos_class_start_np(static_cast<pthread_t>(thread),
+                                                    qos_class_self(), 0);
+    }
+#else
+    (void)thread;
+#endif
+}
+
+ThreadQosBoost::~ThreadQosBoost() {
+#ifdef __APPLE__
+    if (token != nullptr) {
+        pthread_override_qos_class_end_np(static_cast<pthread_override_t>(token));
+    }
+#endif
+}
+
 void RefreshThreadPolicies() {
 #if defined(__ANDROID__)
     CpuTopologyState& state = State();

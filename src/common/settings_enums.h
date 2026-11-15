@@ -166,8 +166,9 @@ ENUM(TextureQuality, Full, Half, Quarter);
 // Ocarina of Time's internal 3D resolution (Settings oot_resolution, built-in patches): the game's
 // dynamic resolution, or a fixed share of its full size (1920x1080 handheld, 2560x1440 docked).
 // Above 100 % it is Full with the emulator's resolution scale (EffectiveResolutionSetup).
+// Percent40 and Percent33 are 0.4 and 1/3 (768x432 and 640x360 handheld).
 ENUM(OotResolution, Game, Full, Percent87, Percent75, Percent56, Percent50, Percent150, Percent200,
-     Percent300);
+     Percent300, Percent40, Percent33);
 // Ocarina of Time's graphics: edits of the game's own parameter files (Settings
 // oot_graphics_preset, core/file_sys/oot_game_params.cpp).
 ENUM(OotGraphicsPreset, PhoneLow, PhoneMedium, Console, High);

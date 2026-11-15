@@ -38,6 +38,8 @@ typedef struct LichiiPerfSnapshot {
     uint32_t render_height;
     uint32_t output_width;  ///< the screen's pixels
     uint32_t output_height;
+    uint32_t scene_width;   ///< the 3D scene the game scales to its frame, 0 where unknown
+    uint32_t scene_height;
 
     uint64_t texture_cache_bytes;    ///< device memory the texture cache holds
     uint64_t texture_cache_expected; ///< where it starts collecting

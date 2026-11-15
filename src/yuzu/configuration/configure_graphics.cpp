@@ -975,6 +975,8 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
                     mode = tr("DLSS Performance");
                     break;
                 case Settings::OotResolution::Percent50:
+                case Settings::OotResolution::Percent40:
+                case Settings::OotResolution::Percent33:
                     mode = tr("DLSS Ultra Performance");
                     break;
                 default:

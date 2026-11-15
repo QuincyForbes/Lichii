@@ -236,6 +236,22 @@ void ApplyCpuExperiments() {
         setenv("EDEN_NX2_PERF_SCHED", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment perf_sched_off on");
     }
+    if (lichii_platform_experiment("frame_time_off")) {
+        setenv("EDEN_NX2_APPLE_FRAME_DEADLINE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment frame_time_off on");
+    } else if (lichii_platform_experiment("frame_time_guest")) {
+        setenv("EDEN_NX2_APPLE_FRAME_DEADLINE", "15", 1);
+        LOG_WARNING(Frontend, "iOS: experiment frame_time_guest on");
+    }
+    if (lichii_platform_experiment("split_std_waits")) {
+        setenv("EDEN_NX2_SPLIT_ADDRESS_WAIT", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment split_std_waits on");
+    }
+    // Replaces a device profile switch (ApplyTuning ran first).
+    if (lichii_platform_experiment("poll_yield")) {
+        setenv("EDEN_NX2_POLL_YIELD", "1", 1);
+        LOG_WARNING(Frontend, "iOS: experiment poll_yield on");
+    }
 }
 
 void ApplyExperiments() {
@@ -338,6 +354,10 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_IDLE_GRACE_US", "250", 1);
         LOG_WARNING(Frontend, "iOS: experiment idle_submit_grace on");
     }
+    if (lichii_platform_experiment("idle_hold_off")) {
+        setenv("EDEN_NX2_IDLE_HOLD_US", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment idle_hold_off on");
+    }
     if (lichii_platform_experiment("mesh_compute_in_pass")) {
         setenv("EDEN_NX2_MESH_BEFORE_PASS", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment mesh_compute_in_pass on");
@@ -378,6 +398,18 @@ void ApplyExperiments() {
     if (lichii_platform_experiment("metal_copies_plain")) {
         setenv("EDEN_NX2_METAL_COPIES", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment metal_copies_plain on");
+    }
+    if (lichii_platform_experiment("pipeline_holds_old")) {
+        setenv("EDEN_NX2_PIPELINE_HOLD_BOOST", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment pipeline_holds_old on");
+    }
+    if (lichii_platform_experiment("pipeline_list_old")) {
+        setenv("EDEN_NX2_USED_PIPELINES_SAVE_S", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment pipeline_list_old on");
+    }
+    if (lichii_platform_experiment("mvk_stats_off")) {
+        setenv("EDEN_NX2_MVK_STATS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment mvk_stats_off on");
     }
     ApplyCpuExperiments();
 }
