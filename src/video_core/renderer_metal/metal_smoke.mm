@@ -11,6 +11,7 @@
 #import <Metal/Metal.h>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -27,6 +28,7 @@
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
+#include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
@@ -799,6 +801,91 @@ int RunIndexRewrite() {
     return wrong == 0 ? 0 : 1;
 }
 
+/// A packed RG11B10 float channel (`mantissa_bits` 6 or 5, 5-bit exponent, no sign).
+float PackedFloat(uint32_t bits, uint32_t mantissa_bits) {
+    const uint32_t mantissa = bits & ((1U << mantissa_bits) - 1);
+    const int exponent = static_cast<int>(bits >> mantissa_bits);
+    const float fraction = static_cast<float>(mantissa) / static_cast<float>(1U << mantissa_bits);
+    return exponent == 0 ? std::ldexp(fraction, -14) : std::ldexp(1.0f + fraction, exponent - 15);
+}
+
+/// Ocarina's bilinear upscale (ocarina_bilinear_upscale.comp through the translator) from a
+/// 16x16 scene of which 8x8 is the content into a 32x32 RG11B10Float storage target (the format
+/// the game's pass writes): the squared colour everywhere.
+int RunOcarinaBilinear() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr uint32_t SceneSize = 16;
+    constexpr uint32_t TargetSize = 32;
+    const Metal::Object scene = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRGBA32Float),
+                 .width = SceneSize,
+                 .height = SceneSize});
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRG11B10Float),
+                 .width = TargetSize,
+                 .height = TargetSize,
+                 .shader_write = true});
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer =
+        Metal::CreateBuffer(device, SceneSize * SceneSize * 16, true, &upload);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, TargetSize * TargetSize * 4, true, &readback);
+    if (!scene || !target || upload == nullptr || readback == nullptr) {
+        std::printf("metal-smoke: FAIL Ocarina bilinear textures\n");
+        return 1;
+    }
+    // The content (top-left 8x8) is (0.5, 0.25, 1); the rest would show if it were sampled.
+    for (uint32_t y = 0; y < SceneSize; ++y) {
+        for (uint32_t x = 0; x < SceneSize; ++x) {
+            const bool content = x < SceneSize / 2 && y < SceneSize / 2;
+            const std::array<float, 4> texel = content ? std::array{0.5f, 0.25f, 1.0f, 1.0f}
+                                                       : std::array{4.0f, 4.0f, 4.0f, 1.0f};
+            std::memcpy(upload + (y * SceneSize + x) * 16, texel.data(), 16);
+        }
+    }
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, SceneSize * 16, 0, scene.Get(), 0, 0,
+                                  {}, {SceneSize, SceneSize, 1});
+    Metal::OcarinaUpscale ocarina(device, scheduler);
+    const bool encoded = ocarina.Bilinear(scene.Get(), {SceneSize, SceneSize},
+                                          {SceneSize / 2, SceneSize / 2}, target.Get(),
+                                          {TargetSize, TargetSize});
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {TargetSize, TargetSize, 1},
+                                  readback_buffer.Get(), 0, TargetSize * 4, 0);
+    scheduler.Finish();
+    if (!encoded) {
+        std::printf("metal-smoke: FAIL Ocarina bilinear pass not encoded (see the log)\n");
+        return 1;
+    }
+    // Texels well inside the content's footprint (the edge one blends with what follows it).
+    uint32_t wrong = 0;
+    std::array<float, 3> sample{};
+    for (uint32_t y = 0; y < TargetSize - 2; ++y) {
+        for (uint32_t x = 0; x < TargetSize - 2; ++x) {
+            uint32_t packed;
+            std::memcpy(&packed, readback + (y * TargetSize + x) * 4, 4);
+            const std::array<float, 3> rgb{PackedFloat(packed & 0x7FF, 6),
+                                           PackedFloat((packed >> 11) & 0x7FF, 6),
+                                           PackedFloat(packed >> 22, 5)};
+            const bool near = std::abs(rgb[0] - 0.25f) < 0.01f &&
+                              std::abs(rgb[1] - 0.0625f) < 0.003f &&
+                              std::abs(rgb[2] - 1.0f) < 0.04f;
+            wrong += near ? 0 : 1;
+            if (x == 4 && y == 4) {
+                sample = rgb;
+            }
+        }
+    }
+    std::printf("metal-smoke: Ocarina bilinear upscale 8x8 of 16x16 -> 32x32 RG11B10: texel "
+                "%.4f,%.4f,%.4f (expected 0.25,0.0625,1), %u of %u wrong: %s\n",
+                sample[0], sample[1], sample[2], wrong, (TargetSize - 2) * (TargetSize - 2),
+                wrong == 0 ? "PASS" : "FAIL");
+    return wrong == 0 ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main() {
@@ -809,7 +896,8 @@ int main() {
         }
         int result = draw;
         for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer, RunMeshEmulation,
-                                 RunMeshDistribution, RunIndexRewrite}) {
+                                 RunMeshDistribution, RunIndexRewrite,
+                                 RunOcarinaBilinear}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }
