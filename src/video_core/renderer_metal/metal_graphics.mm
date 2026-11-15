@@ -11,6 +11,7 @@
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_graphics.h"
+#include "video_core/renderer_metal/metal_resources.h"
 
 namespace Metal {
 
@@ -352,8 +353,13 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
         mask |= (blend.write_mask & 4) != 0 ? MTLColorWriteMaskBlue : MTLColorWriteMaskNone;
         mask |= (blend.write_mask & 8) != 0 ? MTLColorWriteMaskAlpha : MTLColorWriteMaskNone;
         color.writeMask = mask;
-        color.blendingEnabled = blend.enable != 0 ? YES : NO;
-        if (blend.enable != 0) {
+        // Metal's descriptor check aborts the process for blending on an integer target; the
+        // hardware ignores it there.
+        const FormatClass format_class = ClassOf(desc.color_formats[index]);
+        const bool blending = blend.enable != 0 && format_class != FormatClass::Uint &&
+                              format_class != FormatClass::Sint;
+        color.blendingEnabled = blending ? YES : NO;
+        if (blending) {
             color.rgbBlendOperation = BlendOperation(blend.color_op);
             color.alphaBlendOperation = BlendOperation(blend.alpha_op);
             color.sourceRGBBlendFactor = BlendFactor(blend.color_source);

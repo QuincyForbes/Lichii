@@ -23,6 +23,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/oot_network.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
@@ -43,6 +44,45 @@ namespace {
             LOG_WARNING(Render_Metal, __VA_ARGS__);                                                \
         }                                                                                          \
     } while (false)
+
+/// Apple GPUs' largest render target side (MTLRenderPassDescriptor.renderTargetWidth/Height).
+constexpr u32 MaxRenderTargetSize = 16384;
+
+// A draw without render targets gets a framebuffer of the surface clip's size, which Ocarina of
+// Time leaves at 32768x32768 for its occlusion draws: past Metal's render target limit, and a
+// tile-based GPU pays for every tile. Sized by scissor 0 instead, as Vulkan's
+// EDEN_NX2_TARGETLESS_REACH does on Apple (the same switch, on by default).
+bool TargetlessReachEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_TARGETLESS_REACH");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+VideoCommon::Extent2D TargetlessReach(const Maxwell& regs, bool is_rescaling) {
+    const auto& resolution = Settings::values.resolution_info;
+    const auto scale = [&](u32 value) { return is_rescaling ? resolution.ScaleUp(value) : value; };
+    u32 width = regs.surface_clip.width;
+    u32 height = regs.surface_clip.height;
+    const auto& scissor = regs.scissor_test[0];
+    if (regs.viewport_scale_offset_enabled && scissor.enable) {
+        const bool lower_left = regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft;
+        const u32 min_y = static_cast<u32>(scissor.min_y.Value());
+        const u32 max_y = lower_left ? (height > min_y ? height - min_y : 0U)
+                                     : static_cast<u32>(scissor.max_y.Value());
+        width = (std::min)(width, static_cast<u32>(scissor.max_x.Value()));
+        height = (std::min)(height, max_y);
+    }
+    if (scale(width) > MaxRenderTargetSize || scale(height) > MaxRenderTargetSize) {
+        LOG_ONCE(targetless_clamped,
+                 "Metal: draw without render targets reaches {}x{}, clamped to {} (its scissor "
+                 "may fall outside)",
+                 scale(width), scale(height), MaxRenderTargetSize);
+    }
+    return {std::clamp(scale(width), 1U, MaxRenderTargetSize),
+            std::clamp(scale(height), 1U, MaxRenderTargetSize)};
+}
 } // Anonymous namespace
 
 AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_cache_)
@@ -103,13 +143,15 @@ bool AccelerateDMA::BufferToImage(const Tegra::DMA::ImageCopy& copy_info,
     return DmaBufferImageCopy<true>(copy_info, buffer_operand, image_operand);
 }
 
-RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_, Tegra::MaxwellDeviceMemoryManager& device_memory,
+RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
+                                 Tegra::MaxwellDeviceMemoryManager& device_memory_,
                                  const Device& device_, Scheduler& scheduler_)
-    : gpu{gpu_}, device{device_}, scheduler{scheduler_}, staging_pool{device_, scheduler_},
+    : gpu{gpu_}, device_memory{device_memory_}, device{device_}, scheduler{scheduler_},
+      staging_pool{device_, scheduler_},
       texture_cache_runtime{device_, scheduler_, staging_pool},
-      texture_cache{texture_cache_runtime, device_memory},
+      texture_cache{texture_cache_runtime, device_memory_},
       buffer_cache_runtime{device_, scheduler_, staging_pool},
-      buffer_cache{device_memory, buffer_cache_runtime}, pipeline_cache{device_memory, device_},
+      buffer_cache{device_memory_, buffer_cache_runtime}, pipeline_cache{device_memory_, device_},
       ocarina{device_, scheduler_},
       accelerate_dma{buffer_cache, texture_cache},
       fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_} {}
@@ -699,6 +741,10 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     }
     texture_cache.FillImageViews(views, false, true);
     texture_cache.UpdateRenderTargets(false);
+    if (TargetlessReachEnabled() && texture_cache.HasNoRenderTargets()) {
+        texture_cache.BoundTargetlessFramebuffer(
+            TargetlessReach(regs, texture_cache.IsRescaling()));
+    }
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     if (framebuffer == nullptr) {
         return false;
@@ -1539,23 +1585,51 @@ void RasterizerMetal::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
     if (!gpu_memory) {
         return;
     }
+    // The address is resolved now, as Vulkan's query cache does: a report to an unmapped address
+    // is dropped there, and a later remap must not redirect a pending write.
+    const std::optional<DAddr> address = gpu_memory->GpuToCpuAddress(gpu_addr);
+    if (!address) {
+        NoteUnmappedReport(gpu_addr, type);
+        return;
+    }
     ++occlusion_queries;
+    const bool wide = True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
     // Written once the GPU has finished the draws counted so far (the fence's command buffer
     // ends their render pass, so later draws count into new slots).
-    SignalFence([this, gpu_addr, flags, memory_manager = gpu_memory,
-                 slots = occlusion_slots] {
+    SignalFence([this, address = *address, wide, slots = occlusion_slots] {
         const u64* const results = scheduler.VisibilityResults();
         u64 samples = 0;
         for (const u32 slot : slots) {
             samples += results[slot];
         }
-        if (True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)) {
-            memory_manager->Write<u64>(gpu_addr + 8, gpu.GetTicks());
-            memory_manager->Write<u64>(gpu_addr, samples);
-        } else {
-            memory_manager->Write<u32>(gpu_addr, static_cast<u32>(samples));
-        }
+        WriteQueryResult(address, wide, samples);
     });
+}
+
+void RasterizerMetal::NoteUnmappedReport(GPUVAddr gpu_addr, VideoCommon::QueryType type) {
+    if (unmapped_reports++ < 4) {
+        LOG_INFO(Render_Metal, "Metal: query report {} to unmapped GPU address {:#x} dropped",
+                 static_cast<u32>(type), gpu_addr);
+    }
+}
+
+void RasterizerMetal::WriteQueryResult(DAddr address, bool wide, u64 value) {
+    u8* const pointer = device_memory.GetPointer<u8>(address);
+    if (pointer == nullptr) {
+        return;
+    }
+    if (wide) {
+        const u64 timestamp = gpu.GetTicks();
+        if (u8* const timestamp_pointer = device_memory.GetPointer<u8>(address + 8)) {
+            std::memcpy(timestamp_pointer, &timestamp, sizeof(timestamp));
+        }
+        std::memcpy(pointer, &value, sizeof(value));
+    } else {
+        const u32 word = static_cast<u32>(value);
+        std::memcpy(pointer, &word, sizeof(word));
+    }
+    // A channel waiting on this semaphore resumes (the query cache does the same on Vulkan).
+    Tegra::Nx2SemaphoreWaiters::Get().OnWrite(address, static_cast<u32>(value));
 }
 
 void RasterizerMetal::QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType type,
@@ -1563,18 +1637,19 @@ void RasterizerMetal::QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType ty
     if (!gpu_memory) {
         return;
     }
+    const std::optional<DAddr> address = gpu_memory->GpuToCpuAddress(gpu_addr);
+    if (!address) {
+        NoteUnmappedReport(gpu_addr, type);
+        return;
+    }
     // Host queries come with milestone 4: counters read as 1 (something passed), as OpenGL's
     // fallback does.
     if (type != VideoCommon::QueryType::Payload) {
         payload = 1U;
     }
-    std::function<void()> func([this, gpu_addr, flags, memory_manager = gpu_memory, payload] {
-        if (True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)) {
-            memory_manager->Write<u64>(gpu_addr + 8, gpu.GetTicks());
-            memory_manager->Write<u64>(gpu_addr, static_cast<u64>(payload));
-        } else {
-            memory_manager->Write<u32>(gpu_addr, payload);
-        }
+    const bool wide = True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
+    std::function<void()> func([this, address = *address, wide, payload] {
+        WriteQueryResult(address, wide, payload);
     });
     if (True(flags & VideoCommon::QueryPropertiesFlags::IsAFence)) {
         SignalFence(std::move(func));

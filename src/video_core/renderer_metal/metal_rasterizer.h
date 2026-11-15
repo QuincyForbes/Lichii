@@ -243,7 +243,13 @@ private:
     void QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                        VideoCommon::QueryPropertiesFlags flags, u32 payload);
 
+    /// Writes a query result to the device address its report resolved to (as Vulkan's query
+    /// cache does): `wide` writes the 64-bit value and the timestamp after it.
+    void WriteQueryResult(DAddr address, bool wide, u64 value);
+    void NoteUnmappedReport(GPUVAddr gpu_addr, VideoCommon::QueryType type);
+
     Tegra::GPU& gpu;
+    Tegra::MaxwellDeviceMemoryManager& device_memory;
     const Device& device;
     Scheduler& scheduler;
 
@@ -293,6 +299,7 @@ private:
     u32 next_visibility_slot{};
     std::array<u64, Scheduler::VisibilitySlots> visibility_ticks{};
     u64 occlusion_queries{};
+    u64 unmapped_reports{};
     /// Indirect draws whose count was read from guest memory (Metal has no count buffer).
     u64 indirect_counts_read{};
     ::Common::unordered_map<u64, Object> depth_stencil_states;

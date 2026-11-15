@@ -3,14 +3,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <string>
 #include <unordered_map>
 #include <utility>
 
 #import <Metal/Metal.h>
 #include <TargetConditionals.h>
+#include <fmt/format.h>
 
 #include "common/logging.h"
 #include "video_core/renderer_metal/metal_bridge.h"
@@ -21,6 +24,9 @@
 namespace Metal {
 
 namespace {
+
+/// Apple GPUs' largest render target side.
+constexpr u32 MaxRenderTargetSize = 16384;
 
 constexpr const char* BlitSource = R"(
 #include <metal_stdlib>
@@ -129,10 +135,37 @@ struct Scheduler::Impl {
 
     id<MTLCommandBuffer> Commands() {
         if (command_buffer == nil) {
-            command_buffer = [queue commandBuffer];
-            command_buffer.label = @"Lichii";
+            // EDEN_NX2_METAL_ENCODER_STATUS=0: no per-encoder status in command buffer errors.
+            static const bool encoder_status = [] {
+                const char* const value = std::getenv("EDEN_NX2_METAL_ENCODER_STATUS");
+                return value == nullptr || value[0] != '0';
+            }();
+            if (encoder_status) {
+                MTLCommandBufferDescriptor* descriptor = [MTLCommandBufferDescriptor new];
+                descriptor.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+                command_buffer = [queue commandBufferWithDescriptor:descriptor];
+            } else {
+                command_buffer = [queue commandBuffer];
+            }
+            command_buffer.label = [NSString stringWithFormat:@"Lichii %llu", current_tick];
         }
         return command_buffer;
+    }
+
+    /// The progress trace: the first of each kind of work at Info, so a log that stops shows how
+    /// far the renderer got.
+    void CountDraw() {
+        if (draws++ == 0) {
+            LOG_INFO(Render_Metal, "Metal: first draw encoded (command buffer {}, render pass {})",
+                     current_tick, render_pass_serial);
+        }
+    }
+
+    void CountDispatch() {
+        if (dispatches++ == 0) {
+            LOG_INFO(Render_Metal, "Metal: first dispatch encoded (command buffer {})",
+                     current_tick);
+        }
     }
 
     void EndEncoder() {
@@ -154,6 +187,7 @@ struct Scheduler::Impl {
         if (blit == nil) {
             EndEncoder();
             blit = [Commands() blitCommandEncoder];
+            blit.label = @"Blit";
             ++encoders;
         }
         ++blit_commands;
@@ -164,7 +198,24 @@ struct Scheduler::Impl {
         EndEncoder();
         ++encoders;
         ++render_passes;
-        return [Commands() renderCommandEncoderWithDescriptor:pass];
+        const id<MTLRenderCommandEncoder> encoder =
+            [Commands() renderCommandEncoderWithDescriptor:pass];
+        if (encoder == nil) {
+            // Metal refused the pass (draws into it are dropped): name it once.
+            if (refused_passes++ < 4) {
+                LOG_ERROR(Render_Metal, "Metal: render pass refused ({}x{}, colour 0 {}, depth {})",
+                          pass.renderTargetWidth, pass.renderTargetHeight,
+                          pass.colorAttachments[0].texture != nil
+                              ? static_cast<u32>(pass.colorAttachments[0].texture.pixelFormat)
+                              : 0U,
+                          pass.depthAttachment.texture != nil
+                              ? static_cast<u32>(pass.depthAttachment.texture.pixelFormat)
+                              : 0U);
+            }
+            return nil;
+        }
+        encoder.label = [NSString stringWithFormat:@"Pass %llu", render_pass_serial + 1];
+        return encoder;
     }
 
     id<MTLRenderPipelineState> BlitPipeline(MTLPixelFormat format, BlitBlend blend) {
@@ -267,8 +318,17 @@ struct Scheduler::Impl {
     u64 command_buffers{};
     u64 blit_commands{};
     u64 render_passes{};
+    /// Since boot (the progress trace).
     u64 draws{};
     u64 dispatches{};
+    u64 committed{};
+    /// Presents showing a guest layer, and those that had none to show.
+    u64 presents{};
+    u64 blank_presents{};
+    u32 refused_passes{};
+    std::chrono::steady_clock::time_point heartbeat = std::chrono::steady_clock::now();
+    std::atomic<bool> completed_logged{false};
+    std::atomic<u32> errors_logged{0};
 };
 
 Scheduler::Scheduler(const Device& device) : impl{std::make_unique<Impl>(device)} {}
@@ -305,14 +365,39 @@ u64 Scheduler::Flush() {
     const u64 tick = impl->current_tick++;
     std::atomic<u64>* const completed = &impl->completed_tick;
     std::atomic<u64>* const gpu_ns = &impl->gpu_ns;
+    std::atomic<bool>* const completed_logged = &impl->completed_logged;
+    std::atomic<u32>* const errors_logged = &impl->errors_logged;
     [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> finished) {
         const CFTimeInterval busy = finished.GPUEndTime - finished.GPUStartTime;
         if (busy > 0.0) {
             gpu_ns->fetch_add(static_cast<u64>(busy * 1e9), std::memory_order_relaxed);
         }
-        if (finished.status == MTLCommandBufferStatusError) {
-            LOG_ERROR(Render_Metal, "Metal: command buffer {} failed: {}", tick,
-                      finished.error.localizedDescription.UTF8String);
+        if (!completed_logged->exchange(true)) {
+            LOG_INFO(Render_Metal, "Metal: first command buffer completed (tick {}, status {}, "
+                                   "GPU {:.2f} ms)",
+                     tick, static_cast<int>(finished.status), busy * 1e3);
+        }
+        if (finished.status == MTLCommandBufferStatusError &&
+            errors_logged->fetch_add(1) < 16) {
+            NSError* const error = finished.error;
+            std::string encoders;
+            NSArray* const infos = error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+            for (id<MTLCommandBufferEncoderInfo> info in infos) {
+                // MTLCommandEncoderErrorState: 0 unknown, 1 completed, 2 affected, 3 pending,
+                // 4 faulted.
+                if (info.errorState != MTLCommandEncoderErrorStateCompleted) {
+                    encoders += fmt::format("{}{} (state {})", encoders.empty() ? "" : ", ",
+                                            info.label.UTF8String != nullptr ? info.label.UTF8String
+                                                                             : "?",
+                                            static_cast<int>(info.errorState));
+                }
+            }
+            LOG_ERROR(Render_Metal, "Metal: command buffer {} failed: code {}: {}; encoders: {}",
+                      tick, static_cast<long>(error.code),
+                      error.localizedDescription.UTF8String != nullptr
+                          ? error.localizedDescription.UTF8String
+                          : "no description",
+                      encoders.empty() ? "none reported" : encoders);
         }
         u64 previous = completed->load(std::memory_order_relaxed);
         while (previous < tick &&
@@ -321,6 +406,21 @@ u64 Scheduler::Flush() {
     }];
     [command_buffer commit];
     ++impl->command_buffers;
+    if (impl->committed++ == 0) {
+        LOG_INFO(Render_Metal, "Metal: first command buffer committed (tick {})", tick);
+    }
+    // Until the first guest frame, a line every 5 s: where a boot that never shows one stands.
+    if (impl->presents == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - impl->heartbeat >= std::chrono::seconds{5}) {
+            impl->heartbeat = now;
+            LOG_INFO(Render_Metal,
+                     "Metal: no guest frame presented yet; {} command buffers committed, {} "
+                     "completed, {} draws, {} dispatches, {} presents without a guest picture",
+                     impl->committed, impl->completed_tick.load(std::memory_order_relaxed),
+                     impl->draws, impl->dispatches, impl->blank_presents);
+        }
+    }
     impl->command_buffer = nil;
     impl->in_flight.emplace_back(tick, command_buffer);
     while (!impl->in_flight.empty() && IsFree(impl->in_flight.front().first)) {
@@ -439,8 +539,8 @@ void Scheduler::Clear(const ClearPass& clear) {
     if (!any) {
         return;
     }
-    pass.renderTargetWidth = clear.width;
-    pass.renderTargetHeight = clear.height;
+    pass.renderTargetWidth = std::clamp(clear.width, 1U, MaxRenderTargetSize);
+    pass.renderTargetHeight = std::clamp(clear.height, 1U, MaxRenderTargetSize);
     [impl->RenderEncoder(pass) endEncoding];
 }
 
@@ -557,9 +657,9 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
         pass.stencilAttachment.loadAction = MTLLoadActionLoad;
         pass.stencilAttachment.storeAction = MTLStoreActionStore;
     }
-    // Draws without attachments (occlusion queries) still need a size.
-    pass.renderTargetWidth = (std::max)(targets.width, 1U);
-    pass.renderTargetHeight = (std::max)(targets.height, 1U);
+    // Draws without attachments (occlusion queries) still need a size, within Metal's limit.
+    pass.renderTargetWidth = std::clamp(targets.width, 1U, MaxRenderTargetSize);
+    pass.renderTargetHeight = std::clamp(targets.height, 1U, MaxRenderTargetSize);
     pass.visibilityResultBuffer = impl->visibility;
     impl->render = impl->RenderEncoder(pass);
     impl->render_targets = targets;
@@ -602,11 +702,12 @@ void Scheduler::SetDrawState(const DrawState& state) {
                                      state.viewport.height, state.viewport.znear,
                                      state.viewport.zfar}];
     // Metal rejects scissors past the attachments.
-    const auto& targets = impl->render_targets;
-    const u32 x = (std::min)(state.scissor.x, targets.width);
-    const u32 y = (std::min)(state.scissor.y, targets.height);
-    const u32 width = (std::min)(state.scissor.width, targets.width - x);
-    const u32 height = (std::min)(state.scissor.height, targets.height - y);
+    const u32 target_width = std::clamp(impl->render_targets.width, 1U, MaxRenderTargetSize);
+    const u32 target_height = std::clamp(impl->render_targets.height, 1U, MaxRenderTargetSize);
+    const u32 x = (std::min)(state.scissor.x, target_width - 1);
+    const u32 y = (std::min)(state.scissor.y, target_height - 1);
+    const u32 width = (std::min)(state.scissor.width, target_width - x);
+    const u32 height = (std::min)(state.scissor.height, target_height - y);
     [encoder setScissorRect:MTLScissorRect{x, y, (std::max)(width, 1U), (std::max)(height, 1U)}];
     [encoder setCullMode:static_cast<MTLCullMode>(state.cull_mode)];
     [encoder setFrontFacingWinding:state.front_ccw ? MTLWindingCounterClockwise
@@ -690,7 +791,7 @@ void Scheduler::DrawIndirect(u32 primitive, BufferHandle buffer, u64 offset) {
     [impl->render drawPrimitives:static_cast<MTLPrimitiveType>(primitive)
                   indirectBuffer:AsBuffer(buffer)
             indirectBufferOffset:offset];
-    ++impl->draws;
+    impl->CountDraw();
 }
 
 void Scheduler::DrawIndexedIndirect(u32 primitive, u32 index_size, BufferHandle index_buffer,
@@ -704,13 +805,14 @@ void Scheduler::DrawIndexedIndirect(u32 primitive, u32 index_size, BufferHandle 
                       indexBufferOffset:index_offset
                          indirectBuffer:AsBuffer(buffer)
                    indirectBufferOffset:offset];
-    ++impl->draws;
+    impl->CountDraw();
 }
 
 void Scheduler::BeginCompute(void* pipeline) {
     if (impl->compute == nil) {
         impl->EndEncoder();
         impl->compute = [impl->Commands() computeCommandEncoder];
+        impl->compute.label = @"Compute";
         ++impl->encoders;
     }
     [impl->compute setComputePipelineState:(__bridge id<MTLComputePipelineState>)pipeline];
@@ -722,7 +824,7 @@ void Scheduler::Dispatch(std::array<u32, 3> groups, std::array<u32, 3> group_siz
     }
     [impl->compute dispatchThreadgroups:MTLSizeMake(groups[0], groups[1], groups[2])
                   threadsPerThreadgroup:MTLSizeMake(group_size[0], group_size[1], group_size[2])];
-    ++impl->dispatches;
+    impl->CountDispatch();
 }
 
 void Scheduler::DispatchIndirect(BufferHandle buffer, u64 offset, std::array<u32, 3> group_size) {
@@ -733,7 +835,7 @@ void Scheduler::DispatchIndirect(BufferHandle buffer, u64 offset, std::array<u32
                                      indirectBufferOffset:offset
                                     threadsPerThreadgroup:MTLSizeMake(group_size[0], group_size[1],
                                                                       group_size[2])];
-    ++impl->dispatches;
+    impl->CountDispatch();
 }
 
 void Scheduler::DispatchStageIn(u32 first, u32 count, u32 first_instance, u32 instances) {
@@ -743,7 +845,7 @@ void Scheduler::DispatchStageIn(u32 first, u32 count, u32 first_instance, u32 in
     [impl->compute setStageInRegion:MTLRegionMake2D(first, first_instance, count, instances)];
     [impl->compute dispatchThreads:MTLSizeMake(count, instances, 1)
              threadsPerThreadgroup:MTLSizeMake((std::min)(count, 64U), 1, 1)];
-    ++impl->dispatches;
+    impl->CountDispatch();
 }
 
 void Scheduler::SetTessellationFactorBuffer(BufferHandle buffer, u64 offset) {
@@ -764,7 +866,7 @@ void Scheduler::DrawPatches(u32 control_points, u32 patch_count) {
        patchIndexBufferOffset:0
                 instanceCount:1
                  baseInstance:0];
-    ++impl->draws;
+    impl->CountDraw();
 }
 
 void Scheduler::Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 instance_count,
@@ -777,7 +879,7 @@ void Scheduler::Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 inst
                      vertexCount:vertex_count
                    instanceCount:instance_count
                     baseInstance:base_instance];
-    ++impl->draws;
+    impl->CountDraw();
 }
 
 void Scheduler::DrawIndexed(u32 primitive, u32 index_count, u32 index_size,
@@ -794,7 +896,7 @@ void Scheduler::DrawIndexed(u32 primitive, u32 index_count, u32 index_size,
                           instanceCount:instance_count
                              baseVertex:base_vertex
                            baseInstance:base_instance];
-    ++impl->draws;
+    impl->CountDraw();
 }
 
 void* Scheduler::CommandBuffer() {
@@ -804,6 +906,20 @@ void* Scheduler::CommandBuffer() {
 
 u64 Scheduler::TakeGpuNanoseconds() noexcept {
     return impl->gpu_ns.exchange(0, std::memory_order_relaxed);
+}
+
+void Scheduler::NotePresent(bool guest_picture) {
+    if (!guest_picture) {
+        if (impl->blank_presents++ == 0) {
+            LOG_INFO(Render_Metal, "Metal: first drawable presented, without a guest picture");
+        }
+        return;
+    }
+    if (impl->presents++ == 0) {
+        LOG_INFO(Render_Metal, "Metal: first guest frame presented ({} command buffers, {} draws, "
+                               "{} dispatches before it)",
+                 impl->committed, impl->draws, impl->dispatches);
+    }
 }
 
 std::array<u64, 4> Scheduler::TakeCounts() noexcept {

@@ -195,7 +195,17 @@ programs are refused as on MoltenVK. Open: indirect tessellated draws, Ocarina's
 temporal path, frame generation, the M5 AOT pack.
 Switches: `EDEN_NX2_METAL_DRAW=0` (build pipelines, draw nothing), `EDEN_NX2_METAL_DISPATCH=0`,
 `EDEN_NX2_METAL_SPLIT=0` (one GPU thread), `EDEN_NX2_METAL_GPU_INDICES=1|0` (every indexed
-rewrite on the GPU / none), `EDEN_NX2_METAL_ARCHIVE=0` (no pipeline archive).
+rewrite on the GPU / none), `EDEN_NX2_METAL_ARCHIVE=0` (no pipeline archive),
+`EDEN_NX2_METAL_ENCODER_STATUS=0` (command buffer errors without per-encoder status),
+`EDEN_NX2_METAL_ABORT_TRACE=0` (no log line for SIGABRT and uncaught Objective-C exceptions),
+`EDEN_NX2_TARGETLESS_REACH=0` (draws without render targets get the surface clip's size, as on
+Vulkan).
+
+Boot trace (Info, `Render_Metal`): `first dispatch encoded`, `first draw encoded`, `first command
+buffer committed` / `completed`, `first drawable presented, without a guest picture`, `first
+guest frame presented`, and until that one a line every 5 s (`no guest frame presented yet`) with
+the counts so far. A refused render pass, a failed command buffer (with the encoders that did not
+complete) and a process abort each leave a line.
 
 ## What can be checked where
 

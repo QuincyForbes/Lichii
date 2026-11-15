@@ -3,15 +3,24 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <optional>
+#include <string>
 #include <vector>
+
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <pthread.h>
 
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
 #import <QuartzCore/CAMetalLayer.h>
+#include <fmt/format.h>
 
 #include "common/logging.h"
 #include "common/settings.h"
@@ -169,6 +178,86 @@ private:
     bool failed{};
 };
 
+/// Host code addresses as "image+offset" (the offsets symbolicate against the image's dSYM).
+std::string DescribeFrames(void* const* frames, int count) {
+    std::string text;
+    for (int index = 0; index < count; ++index) {
+        const char* const separator = index != 0 ? " < " : "";
+        const auto address = reinterpret_cast<uintptr_t>(frames[index]);
+        Dl_info info{};
+        if (dladdr(frames[index], &info) != 0 && info.dli_fname != nullptr) {
+            const char* const slash = std::strrchr(info.dli_fname, '/');
+            text += fmt::format("{}{}+{:#x}", separator,
+                                slash != nullptr ? slash + 1 : info.dli_fname,
+                                address - reinterpret_cast<uintptr_t>(info.dli_fbase));
+        } else {
+            text += fmt::format("{}{:#x}", separator, address);
+        }
+    }
+    return text;
+}
+
+struct sigaction previous_abort {};
+NSUncaughtExceptionHandler* previous_exception_handler = nullptr;
+
+void OnAbort(int, siginfo_t*, void*) {
+    static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+    if (!logged.test_and_set()) {
+        char thread_name[64]{};
+        pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
+        void* frames[32];
+        const int count = backtrace(frames, 32);
+        LOG_CRITICAL(Render_Metal,
+                     "Process aborted (SIGABRT) on thread \"{}\"; a message Metal printed first "
+                     "is in console.txt; frames: {}",
+                     thread_name, DescribeFrames(frames, count));
+    }
+    // The abort goes on as it would have without this handler.
+    sigaction(SIGABRT, &previous_abort, nullptr);
+    raise(SIGABRT);
+}
+
+void OnUncaughtException(NSException* exception) {
+    void* frames[32];
+    int count = 0;
+    for (NSNumber* address in exception.callStackReturnAddresses) {
+        if (count == 32) {
+            break;
+        }
+        frames[count++] = reinterpret_cast<void*>(address.unsignedIntegerValue);
+    }
+    const char* const name = exception.name.UTF8String;
+    const char* const reason = exception.reason.UTF8String;
+    LOG_CRITICAL(Render_Metal, "Uncaught Objective-C exception {}: {}; frames: {}",
+                 name != nullptr ? name : "?", reason != nullptr ? reason : "no reason",
+                 DescribeFrames(frames, count));
+    if (previous_exception_handler != nullptr) {
+        previous_exception_handler(exception);
+    }
+}
+
+/// Metal answers a descriptor or call it rejects by aborting the process, and nothing names a
+/// SIGABRT or an uncaught Objective-C exception in the log otherwise: the log just stops. With
+/// the Metal renderer both leave a line first. EDEN_NX2_METAL_ABORT_TRACE=0 leaves them alone.
+struct AbortTrace {
+    AbortTrace() {
+        static std::once_flag installed;
+        std::call_once(installed, [] {
+            const char* const value = std::getenv("EDEN_NX2_METAL_ABORT_TRACE");
+            if (value != nullptr && value[0] == '0') {
+                return;
+            }
+            previous_exception_handler = NSGetUncaughtExceptionHandler();
+            NSSetUncaughtExceptionHandler(&OnUncaughtException);
+            struct sigaction action {};
+            action.sa_sigaction = &OnAbort;
+            action.sa_flags = SA_SIGINFO;
+            sigemptyset(&action.sa_mask);
+            sigaction(SIGABRT, &action, &previous_abort);
+        });
+    }
+};
+
 } // Anonymous namespace
 
 struct RendererMetal::Impl {
@@ -177,6 +266,9 @@ struct RendererMetal::Impl {
         : device_memory{device_memory_}, scheduler{device},
           swapchain{device, emu_window.GetWindowInfo().render_surface},
           rasterizer{gpu, device_memory_, device, scheduler} {}
+
+    /// First: the device and swapchain are created under it.
+    AbortTrace abort_trace;
 
     /// The guest framebuffer as a texture: the texture cache's image, else read from guest
     /// memory (block linear) into a texture of our own.
@@ -285,9 +377,9 @@ RendererMetal::RendererMetal(Core::Frontend::EmuWindow& emu_window,
     : RendererBase(emu_window, std::move(context_)), gpu{gpu_},
       impl{std::make_unique<Impl>(emu_window, gpu_, device_memory)} {
     LOG_WARNING(Render_Metal,
-                "Metal renderer (experimental): draws with vertex and pixel shaders and "
-                "compute dispatches run on Metal; queries, tessellation, geometry and mesh "
-                "shaders do not yet");
+                "Metal renderer (experimental): draws, compute dispatches, occlusion queries, "
+                "tessellation and mesh shaders (emulated) run on Metal; geometry shaders and "
+                "transform feedback do not yet");
 }
 
 RendererMetal::~RendererMetal() = default;
@@ -387,6 +479,7 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
             const id<MTLCommandBuffer> command_buffer =
                 (__bridge id<MTLCommandBuffer>)impl->scheduler.CommandBuffer();
             [command_buffer presentDrawable:drawable];
+            impl->scheduler.NotePresent(drawn);
             impl->scheduler.Flush();
             ++impl->presented;
         } else {

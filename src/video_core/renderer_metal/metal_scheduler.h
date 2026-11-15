@@ -219,7 +219,8 @@ public:
     void DrawIndexedIndirect(u32 primitive, u32 index_size, BufferHandle index_buffer,
                              u64 index_offset, BufferHandle buffer, u64 offset);
 
-    /// Opens a compute encoder (or keeps the open one) running pipeline`n    /// (an id<MTLComputePipelineState>).
+    /// Opens a compute encoder (or keeps the open one) running pipeline
+    /// (an id<MTLComputePipelineState>).
     void BeginCompute(void* pipeline);
 
     void Dispatch(std::array<u32, 3> groups, std::array<u32, 3> group_size);
@@ -252,6 +253,10 @@ public:
 
     /// Encoders and command buffers since the last call (the renderer's 10 s report).
     [[nodiscard]] std::array<u64, 4> TakeCounts() noexcept;
+
+    /// A drawable was presented, with a guest layer on it or not (the progress trace: the first
+    /// of each, and the heartbeat that runs until the first guest frame).
+    void NotePresent(bool guest_picture);
 
 private:
     struct Impl;
