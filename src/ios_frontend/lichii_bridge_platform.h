@@ -224,7 +224,7 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// written only on a first use 15 s after the last save and at shutdown, as before
 /// (EDEN_NX2_USED_PIPELINES_SAVE_S=0). "mvk_stats_off": MoltenVK does not time its compilation
 /// stages (EDEN_NX2_MVK_STATS=0).
-/// frame_time_off: the graphics threads
+/// "frame_time_off": the graphics threads
 /// declare no frame time to the kernel, as before (EDEN_NX2_APPLE_FRAME_DEADLINE=0);
 /// "frame_time_guest": the guest cores declare theirs too (=15), off wins. "split_std_waits": the
 /// two GPU threads sleep on each other with std::atomic::wait, as before
