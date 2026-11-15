@@ -279,12 +279,6 @@ void RecommendApple(const Device& device, Profile& p) {
          "a frame, IPA 152). PC: 22 -> 15 a frame. Experiments > Submit at Every Fence Release "
          "turns it off."});
     p.tuning.push_back(
-        {"EDEN_NX2_IDLE_GRACE_US", "250", "0.25 ms",
-         "When the GPU thread runs out of commands with work waiting to be submitted, it waits "
-         "up to 0.25 ms for more before submitting: on the PC phone sim 97 % of those submits "
-         "had more work within 0.25 ms. PC: 15 -> 10 command buffers a frame. Experiments > "
-         "Submit as Soon as the GPU Thread Idles turns it off."});
-    p.tuning.push_back(
         {"EDEN_NX2_PASS_TIMES", "10", "Every 10 s",
          "One frame in 10 s gets GPU timestamps around each render pass (\"Perf passes:\" log "
          "line): build 71 spent 84-103 ms of GPU time per frame on the phone with the Legacy and "

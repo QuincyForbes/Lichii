@@ -70,7 +70,7 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_RELEASE_SUBMIT=1
 
 # The split GPU thread, out of commands with a deferred submission younger than
-# EDEN_NX2_FENCE_FLUSH_US, waits up to this many us for more work first (phones: 250).
+# EDEN_NX2_FENCE_FLUSH_US, waits up to this many us for more work first (it spins meanwhile).
 #EDEN_NX2_IDLE_GRACE_US=0
 
 # The fencing thread lets a deferred fence submission wait this many us after the fence was

@@ -312,9 +312,9 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_RELEASE_SUBMIT", "1", 1);
         LOG_WARNING(Frontend, "iOS: experiment release_submit on");
     }
-    if (lichii_platform_experiment("idle_submit_at_once")) {
-        setenv("EDEN_NX2_IDLE_GRACE_US", "0", 1);
-        LOG_WARNING(Frontend, "iOS: experiment idle_submit_at_once on");
+    if (lichii_platform_experiment("idle_submit_grace")) {
+        setenv("EDEN_NX2_IDLE_GRACE_US", "250", 1);
+        LOG_WARNING(Frontend, "iOS: experiment idle_submit_grace on");
     }
     ApplyCpuExperiments();
 }
