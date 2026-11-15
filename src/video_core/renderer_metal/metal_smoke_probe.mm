@@ -65,6 +65,18 @@ fragment float4 probe_fragment() {
 fragment uint4 probe_fragment_uint() {
     return uint4(1, 2, 3, 4);
 }
+
+struct ProbeTwo {
+    float4 first [[color(0)]];
+    uint4 second [[color(1)]];
+};
+
+fragment ProbeTwo probe_fragment_two() {
+    ProbeTwo out;
+    out.first = float4(0.0, 1.0, 0.0, 1.0);
+    out.second = uint4(1, 2, 3, 4);
+    return out;
+}
 )";
 
 struct Context {
@@ -73,6 +85,7 @@ struct Context {
     id<MTLFunction> vertex_plain;
     id<MTLFunction> fragment;
     id<MTLFunction> fragment_uint;
+    id<MTLFunction> fragment_two;
 };
 
 /// Where the renderer puts vertex stream 0.
@@ -120,12 +133,15 @@ std::string Build(const Context& context, MTLRenderPipelineDescriptor* descripto
 enum class Pass {
     Colour,   ///< One 64x64 RGBA8 target
     Sized,    ///< No attachments, 64x64 by renderTargetWidth and Height
+    Sampled,  ///< The same with defaultRasterSampleCount 1
     Unsized,  ///< No attachments, no size
 };
 
-/// Builds the pipeline, draws three vertices with it and reports the samples that passed.
+/// Builds the pipeline, draws three vertices with it and reports the samples that passed, when
+/// they are counted.
 std::string Draw(const Context& context, MTLRenderPipelineDescriptor* descriptor, Pass kind,
-                 const std::function<void(id<MTLRenderCommandEncoder>)>& setup) {
+                 const std::function<void(id<MTLRenderCommandEncoder>)>& setup,
+                 bool counted = true) {
     NSError* error = nil;
     const id<MTLRenderPipelineState> state =
         [context.device newRenderPipelineStateWithDescriptor:descriptor error:&error];
@@ -144,13 +160,18 @@ std::string Draw(const Context& context, MTLRenderPipelineDescriptor* descriptor
         pass.colorAttachments[0].texture = [context.device newTextureWithDescriptor:target];
         pass.colorAttachments[0].loadAction = MTLLoadActionClear;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-    } else if (kind == Pass::Sized) {
+    } else if (kind != Pass::Unsized) {
         pass.renderTargetWidth = TargetSize;
         pass.renderTargetHeight = TargetSize;
+        if (kind == Pass::Sampled) {
+            pass.defaultRasterSampleCount = 1;
+        }
     }
     const id<MTLBuffer> visibility =
         [context.device newBufferWithLength:sizeof(uint64_t) options:MTLResourceStorageModeShared];
-    pass.visibilityResultBuffer = visibility;
+    if (counted) {
+        pass.visibilityResultBuffer = visibility;
+    }
     const id<MTLCommandQueue> queue = [context.device newCommandQueue];
     const id<MTLCommandBuffer> commands = [queue commandBuffer];
     const id<MTLRenderCommandEncoder> encoder =
@@ -159,7 +180,9 @@ std::string Draw(const Context& context, MTLRenderPipelineDescriptor* descriptor
         return "error: no render command encoder";
     }
     [encoder setRenderPipelineState:state];
-    [encoder setVisibilityResultMode:MTLVisibilityResultModeCounting offset:0];
+    if (counted) {
+        [encoder setVisibilityResultMode:MTLVisibilityResultModeCounting offset:0];
+    }
     if (setup) {
         setup(encoder);
     }
@@ -170,6 +193,9 @@ std::string Draw(const Context& context, MTLRenderPipelineDescriptor* descriptor
     if (commands.status != MTLCommandBufferStatusCompleted) {
         return std::string("error: command buffer: ") +
                (commands.error != nil ? commands.error.localizedDescription.UTF8String : "?");
+    }
+    if (!counted) {
+        return "built and drawn, samples not counted";
     }
     uint64_t samples = 0;
     std::memcpy(&samples, visibility.contents, sizeof(samples));
@@ -193,6 +219,21 @@ std::string Texture(const Context& context, NSUInteger width, NSUInteger levels,
     descriptor.mipmapLevelCount = levels;
     descriptor.sampleCount = samples;
     descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    descriptor.storageMode = MTLStorageModePrivate;
+    return [context.device newTextureWithDescriptor:descriptor] != nil ? "built"
+                                                                       : "error: no texture";
+}
+
+std::string Shaped(const Context& context, MTLTextureType type, MTLPixelFormat format,
+                   NSUInteger width, NSUInteger height, NSUInteger depth, NSUInteger layers) {
+    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor new];
+    descriptor.textureType = type;
+    descriptor.pixelFormat = format;
+    descriptor.width = width;
+    descriptor.height = height;
+    descriptor.depth = depth;
+    descriptor.arrayLength = layers;
+    descriptor.usage = MTLTextureUsageShaderRead;
     descriptor.storageMode = MTLStorageModePrivate;
     return [context.device newTextureWithDescriptor:descriptor] != nil ? "built"
                                                                        : "error: no texture";
@@ -420,6 +461,22 @@ const Suspect Suspects[] = {
          descriptor.alphaToCoverageEnabled = YES;
          return Build(context, descriptor);
      }},
+    {"alpha-to-coverage-without-targets",
+     [](const Context& context) {
+         MTLRenderPipelineDescriptor* descriptor = Quad(context);
+         descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatInvalid;
+         descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+         descriptor.alphaToCoverageEnabled = YES;
+         return Build(context, descriptor);
+     }},
+    {"alpha-to-coverage-with-rgba8uint-second-target",
+     [](const Context& context) {
+         MTLRenderPipelineDescriptor* descriptor = Quad(context);
+         descriptor.fragmentFunction = context.fragment_two;
+         descriptor.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA8Uint;
+         descriptor.alphaToCoverageEnabled = YES;
+         return Build(context, descriptor);
+     }},
     // Functions.
     {"no-vertex-function",
      [](const Context& context) {
@@ -474,6 +531,26 @@ const Suspect Suspects[] = {
                                 ? "built"
                                 : "error: no texture");
      }},
+    {"texture-cube-not-square",
+     [](const Context& context) {
+         return Shaped(context, MTLTextureTypeCube, MTLPixelFormatRGBA8Unorm, 16, 8, 1, 1);
+     }},
+    {"texture-array-2048-layers",
+     [](const Context& context) {
+         return Shaped(context, MTLTextureType2DArray, MTLPixelFormatRGBA8Unorm, 4, 4, 1, 2048);
+     }},
+    {"texture-array-4096-layers",
+     [](const Context& context) {
+         return Shaped(context, MTLTextureType2DArray, MTLPixelFormatRGBA8Unorm, 4, 4, 1, 4096);
+     }},
+    {"texture-3d-4096-deep",
+     [](const Context& context) {
+         return Shaped(context, MTLTextureType3D, MTLPixelFormatRGBA8Unorm, 4, 4, 4096, 1);
+     }},
+    {"texture-3d-depth-format",
+     [](const Context& context) {
+         return Shaped(context, MTLTextureType3D, MTLPixelFormatDepth32Float, 4, 4, 4, 1);
+     }},
     {"sampler-anisotropy-0", [](const Context& context) { return Sampler(context, 0, 0, 16); }},
     {"sampler-anisotropy-17", [](const Context& context) { return Sampler(context, 17, 0, 16); }},
     {"sampler-min-lod-above-max",
@@ -481,6 +558,18 @@ const Suspect Suspects[] = {
     // Passes and draws.
     {"draw-without-attachments",
      [](const Context& context) { return Draw(context, Targetless(context), Pass::Sized, {}); }},
+    {"draw-without-attachments-with-default-samples-1",
+     [](const Context& context) {
+         return Draw(context, Targetless(context), Pass::Sampled, {});
+     }},
+    {"draw-without-attachments-uncounted",
+     [](const Context& context) {
+         return Draw(context, Targetless(context), Pass::Sized, {}, false);
+     }},
+    {"draw-without-attachments-with-default-samples-1-uncounted",
+     [](const Context& context) {
+         return Draw(context, Targetless(context), Pass::Sampled, {}, false);
+     }},
     {"draw-without-attachments-or-fragment-function",
      [](const Context& context) {
          MTLRenderPipelineDescriptor* descriptor = Targetless(context);
@@ -712,6 +801,7 @@ int RunChild(const char* name) {
     context.vertex_plain = [library newFunctionWithName:@"probe_vertex_plain"];
     context.fragment = [library newFunctionWithName:@"probe_fragment"];
     context.fragment_uint = [library newFunctionWithName:@"probe_fragment_uint"];
+    context.fragment_two = [library newFunctionWithName:@"probe_fragment_two"];
     const std::string result = suspect->run(context);
     std::printf("%s%s\n", ResultPrefix, result.c_str());
     std::fflush(stdout);
@@ -744,14 +834,17 @@ int RunAll() {
             works = false;
         }
         std::printf("metal-smoke: probe %s: %s\n", suspect.name, outcome.text.c_str());
-        if (outcome.verdict != Verdict::Built) {
+        if (outcome.verdict == Verdict::Aborted) {
             continue;
         }
         // What Metal took may still be against its rules: the validation layer, which the app
         // doesn't run with, says so. What the GPU's driver does with it then is its own matter.
+        // An error may be one the layer names a rule for as well.
         const Outcome checked = RunSuspect(path, suspect, true);
-        if (checked.verdict != Verdict::Built) {
+        if (outcome.verdict == Verdict::Built && checked.verdict != Verdict::Built) {
             ++invalid;
+        }
+        if (checked.verdict != outcome.verdict || checked.text != outcome.text) {
             std::printf("metal-smoke: probe %s with MTL_DEBUG_LAYER=1: %s\n", suspect.name,
                         checked.text.c_str());
         }

@@ -118,10 +118,12 @@ EDEN_NX2_FENCE_BATCH=1
 
 # Metal renderer: 0 hands Metal the guest's vertex layout, pipeline and texture descriptions as
 # they are, as before. Metal aborts the process on some (a 32nd vertex stream or attribute, an
-# attribute past its stream's stride, a sample count the device lacks, a texture past its size
-# limit); by default the vertex layout is rewritten to what the vertex program reads and what is
-# left over is refused with a "refused:" log line, the draw skipped; a buffer, texture or sampler
-# slot past a stage's tables is not bound.
+# attribute of a stream without a buffer, a sample count a texture can't have, a texture past its
+# size limit, alpha to coverage on an integer target); by default the vertex layout is rewritten
+# to what the vertex program reads and what is left over is refused with a "refused:" log line,
+# the draw skipped; alpha to coverage is left off on an integer target; a pass without
+# attachments says it has one sample per pixel; a buffer, texture or sampler slot past a stage's
+# tables is not bound.
 #EDEN_NX2_METAL_PIPELINE_CHECK=0
 
 #EDEN_NX2_MME_JIT=0

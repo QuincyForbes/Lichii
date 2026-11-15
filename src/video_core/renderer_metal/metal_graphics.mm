@@ -342,7 +342,12 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
     descriptor.fragmentFunction = (__bridge id<MTLFunction>)desc.fragment_function;
     descriptor.rasterizationEnabled = desc.rasterize != 0 ? YES : NO;
     descriptor.rasterSampleCount = (std::max)(desc.samples, 1U);
-    descriptor.alphaToCoverageEnabled = desc.alpha_to_coverage != 0 ? YES : NO;
+    // Coverage comes from the alpha of target 0: Metal's descriptor check aborts the process when
+    // that target holds integers, where Vulkan leaves the coverage alone.
+    const FormatClass first_class = ClassOf(desc.color_formats[0]);
+    const bool integer_alpha = desc.color_formats[0] != 0 && PipelineCheckEnabled() &&
+                               (first_class == FormatClass::Uint || first_class == FormatClass::Sint);
+    descriptor.alphaToCoverageEnabled = desc.alpha_to_coverage != 0 && !integer_alpha ? YES : NO;
     if (desc.tessellation != 0) {
         // The control kernel writes half-precision factors, one set per patch.
         descriptor.tessellationPartitionMode =

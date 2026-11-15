@@ -1406,10 +1406,22 @@ int RunPipelineCheck() {
     const bool samples_refused = !Metal::CheckPipeline(odd, limits).empty();
     odd = desc;
     odd.depth_format = rgba8;
-    const bool depth_refused = !Metal::CheckPipeline(odd, limits).empty();
+    bool depth_refused = !Metal::CheckPipeline(odd, limits).empty();
+    // Depth alone next to stencil alone is taken, a format with both next to another is not.
+    odd = desc;
+    odd.depth_format = static_cast<uint32_t>(MTLPixelFormatDepth32Float);
+    odd.stencil_format = static_cast<uint32_t>(MTLPixelFormatStencil8);
+    depth_refused = depth_refused && Metal::CheckPipeline(odd, limits).empty();
+    odd.stencil_format = static_cast<uint32_t>(MTLPixelFormatDepth32Float_Stencil8);
+    depth_refused = depth_refused && !Metal::CheckPipeline(odd, limits).empty();
     const bool textures_refused =
         !Metal::CreateTexture(device, {.format = rgba8, .width = 32768, .render_target = true}) &&
-        !Metal::CreateTexture(device, {.format = rgba8, .width = 16, .levels = 9});
+        !Metal::CreateTexture(device, {.format = rgba8, .width = 16, .levels = 9}) &&
+        !Metal::CreateTexture(device, {.kind = Metal::TextureKind::Cube,
+                                       .format = rgba8,
+                                       .width = 16,
+                                       .height = 8,
+                                       .layers = 6});
 
     const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
     const Metal::Object depth_stencil =
