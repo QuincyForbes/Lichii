@@ -684,6 +684,37 @@ void Scheduler::DispatchIndirect(BufferHandle buffer, u64 offset, std::array<u32
     ++impl->dispatches;
 }
 
+void Scheduler::DispatchStageIn(u32 first, u32 count, u32 first_instance, u32 instances) {
+    if (impl->compute == nil || count == 0 || instances == 0) {
+        return;
+    }
+    [impl->compute setStageInRegion:MTLRegionMake2D(first, first_instance, count, instances)];
+    [impl->compute dispatchThreads:MTLSizeMake(count, instances, 1)
+             threadsPerThreadgroup:MTLSizeMake((std::min)(count, 64U), 1, 1)];
+    ++impl->dispatches;
+}
+
+void Scheduler::SetTessellationFactorBuffer(BufferHandle buffer, u64 offset) {
+    if (impl->render == nil || buffer == nullptr) {
+        return;
+    }
+    [impl->render setTessellationFactorBuffer:AsBuffer(buffer) offset:offset instanceStride:0];
+}
+
+void Scheduler::DrawPatches(u32 control_points, u32 patch_count) {
+    if (impl->render == nil || patch_count == 0) {
+        return;
+    }
+    [impl->render drawPatches:control_points
+                   patchStart:0
+                   patchCount:patch_count
+             patchIndexBuffer:nil
+       patchIndexBufferOffset:0
+                instanceCount:1
+                 baseInstance:0];
+    ++impl->draws;
+}
+
 void Scheduler::Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 instance_count,
                      u32 base_instance) {
     if (impl->render == nil || vertex_count == 0 || instance_count == 0) {

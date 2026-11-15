@@ -7,6 +7,8 @@
 
 #import <Metal/Metal.h>
 
+#include <string>
+
 #include "video_core/renderer_metal/metal_object.h"
 
 namespace Metal {
@@ -27,5 +29,14 @@ namespace Metal {
 [[nodiscard]] inline id<MTLSamplerState> AsSampler(const void* handle) {
     return (__bridge id<MTLSamplerState>)handle;
 }
+
+class Device;
+class PipelineArchive;
+
+/// A compute pipeline state from a descriptor, looked up in `archive` first and added to it on a
+/// miss (metal_resources.mm); empty with `error` set on failure.
+[[nodiscard]] Object CreateComputeState(const Device& device,
+                                        MTLComputePipelineDescriptor* descriptor,
+                                        std::string& error, PipelineArchive* archive);
 
 } // namespace Metal

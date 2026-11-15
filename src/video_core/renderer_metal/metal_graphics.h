@@ -75,6 +75,11 @@ struct RenderPipelineDesc {
     std::array<BlendTargetState, Maxwell::NumRenderTargets> blend;
     std::array<VertexAttributeState, Maxwell::NumVertexAttributes> attributes;
     std::array<VertexStreamState, Maxwell::NumVertexArrays> streams;
+    /// Tessellation pipelines (the vertex function is post-tessellation; no vertex layout):
+    /// MTLTessellationPartitionMode and MTLWinding.
+    u32 tessellation;
+    u32 tess_partition;
+    u32 tess_winding;
 };
 
 struct StencilFaceState {
@@ -94,6 +99,15 @@ struct DepthStencilDesc {
     StencilFaceState front;
     StencilFaceState back;
 };
+
+/// The vertex program of a tessellation pipeline as a compute kernel reading layout's vertex
+/// attributes and streams as stage-in data (one thread per vertex or, with index_size 2 or 4, per
+/// index of the buffer at index_slot; instances along y).
+[[nodiscard]] Object CreateStageInComputePipelineState(const Device& device, const void* function,
+                                                       const RenderPipelineDesc& layout,
+                                                       u32 index_size, u32 index_slot,
+                                                       std::string& error,
+                                                       PipelineArchive* archive = nullptr);
 
 /// With `archive`, the pipeline's GPU code is looked up there first and added on a miss.
 [[nodiscard]] Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc& desc,

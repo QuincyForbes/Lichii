@@ -52,6 +52,8 @@ struct GraphicsPipelineKey {
     u64 attribute_types{};
     u32 topology{}; ///< Maxwell PrimitiveTopology of the draw
     u32 early_z{};
+    /// Tessellation pipelines: domain | spacing << 2 | output primitives << 4 (Maxwell's).
+    u32 tessellation{};
 
     bool operator==(const GraphicsPipelineKey&) const noexcept = default;
 
@@ -93,6 +95,9 @@ struct StageProgram {
     std::string entry_point;
     std::vector<ShaderTranslate::ResourceSlot> slots;
     Shader::Info info;
+    /// Tessellation stages: what the stage writes for the next one, and its own buffer slots.
+    std::vector<ShaderTranslate::InterfaceVariable> outputs;
+    ShaderTranslate::TessellationSlots tessellation_slots{};
     /// The MTLLibrary and MTLFunction, made on first use (BuildFunctions).
     Object library;
     Object function;
@@ -133,11 +138,41 @@ struct MeshEmulation {
     u32 topology{};
 };
 
+/// A tessellation pipeline as MoltenVK runs one: the vertex program as a compute kernel writing
+/// its outputs to a buffer, the control program as a kernel writing control points, patch
+/// constants and tessellation factors, and the evaluation program as the post-tessellation
+/// vertex function (the pipeline's Vertex()) drawing the patches from those buffers.
+struct Tessellation {
+    /// Index sizes of the vertex kernel variants (VertexIndex reads the draw's indices).
+    static constexpr std::array<u32, 3> IndexSizes{0, 2, 4};
+
+    /// The vertex kernel by IndexSizes variant; its resources are the buffer cache's stage 0.
+    std::array<StageProgram, 3> vertex;
+    /// The control program's kernel; its resources are the buffer cache's stage 1.
+    MeshKernel control;
+    ShaderTranslate::TessellationModes modes{};
+    /// Upper bounds of the bytes per element of the buffers between the stages.
+    u32 vertex_stride{};
+    u32 control_point_stride{};
+    u32 patch_stride{};
+};
+
 class GraphicsPipeline {
 public:
     explicit GraphicsPipeline(const GraphicsPipelineKey& key, StageProgram vertex,
                               StageProgram fragment,
-                              std::optional<MeshEmulation> mesh = std::nullopt);
+                              std::optional<MeshEmulation> mesh = std::nullopt,
+                              std::optional<Tessellation> tessellation = std::nullopt);
+
+    /// The tessellation stages of a tessellation pipeline, or null.
+    [[nodiscard]] Tessellation* Tess() noexcept {
+        return tessellation ? &*tessellation : nullptr;
+    }
+
+    /// The vertex kernel's MTLComputePipelineState for an index size variant and the draw's
+    /// vertex layout (layout's attributes and streams), made on first use; null when it fails.
+    [[nodiscard]] void* VertexKernelState(const Device& device, size_t variant,
+                                          const RenderPipelineDesc& layout);
 
     /// The mesh emulation of a task/mesh pipeline, or null.
     [[nodiscard]] MeshEmulation* Mesh() noexcept {
@@ -176,8 +211,11 @@ private:
     StageProgram vertex;
     StageProgram fragment;
     std::optional<MeshEmulation> mesh;
+    std::optional<Tessellation> tessellation;
     PipelineArchive* archive{};
     ::Common::unordered_map<u64, Object> render_states;
+    /// Vertex kernel states by variant and vertex layout.
+    ::Common::unordered_map<u64, Object> vertex_kernel_states;
 };
 
 class ComputePipeline {
@@ -236,13 +274,18 @@ private:
     std::unique_ptr<GraphicsPipeline> CreateMeshPipeline(std::span<Shader::IR::Program> programs,
                                                          size_t mesh_index);
 
+    /// A pipeline with tessellation control (2) and evaluation (3) programs.
+    std::unique_ptr<GraphicsPipeline> CreateTessellationPipeline(
+        std::span<Shader::IR::Program> programs);
+
     std::unique_ptr<ComputePipeline> CreateComputePipeline(const ComputePipelineKey& key,
                                                            const VideoCommon::ShaderInfo* shader);
 
     [[nodiscard]] std::optional<StageProgram> Translate(Shader::IR::Program& program,
                                                         ShaderTranslate::Stage stage,
                                                         Shader::Backend::Bindings& bindings,
-                                                        const Shader::RuntimeInfo& runtime_info);
+                                                        const Shader::RuntimeInfo& runtime_info,
+                                                        const ShaderTranslate::Options* options = nullptr);
 
     const Device& device;
 

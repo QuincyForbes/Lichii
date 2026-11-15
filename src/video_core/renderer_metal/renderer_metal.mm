@@ -408,18 +408,18 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
         LOG_INFO(Render_Metal,
                  "Metal: {} frames presented ({} from the texture cache, {} from guest memory), "
                  "{} without a drawable; {} draws ({} with a built pipeline, {} drawn, {} with "
-                 "rewritten indices, {} of them by a kernel) and {} dispatches ({} with a pipeline); {} clears, {} texel "
-                 "buffer copies, {} occlusion queries, {} emulated mesh draws ({} workgroups), {} Ocarina upscales "
-                 "bilinear; "
-                 "pipelines made {} graphics, {} compute, {} refused; {} command "
+                 "rewritten indices, {} of them by a kernel) and {} dispatches ({} with a "
+                 "pipeline); {} clears, {} texel buffer copies, {} occlusion queries, {} emulated "
+                 "mesh draws ({} workgroups), {} tessellated draws ({} patches), {} Ocarina "
+                 "upscales bilinear; pipelines made {} graphics, {} compute, {} refused; {} command "
                  "buffers, {} encoders ({} render passes), {} blit commands; textures {} MiB, "
                  "buffers {} MiB",
                  impl->presented, impl->from_cache, impl->from_memory, impl->skipped, work.draws,
                  work.draws_with_pipeline, work.draws_encoded, work.draws_converted,
-                 work.indices_rewritten_on_gpu,
-                 work.dispatches, work.dispatches_with_pipeline, work.clears, work.texel_copies,
-                 work.occlusion_queries, work.mesh_draws, work.mesh_groups, work.ocarina_bilinear,
-                 graphics_made, compute_made, refused, command_buffers, encoders, passes, blits,
+                 work.indices_rewritten_on_gpu, work.dispatches, work.dispatches_with_pipeline,
+                 work.clears, work.texel_copies, work.occlusion_queries, work.mesh_draws,
+                 work.mesh_groups, work.tessellated_draws, work.tessellated_patches,
+                 work.ocarina_bilinear, graphics_made, compute_made, refused, command_buffers, encoders, passes, blits,
                  impl->rasterizer.TextureRuntime().allocated_bytes >> 20,
                  impl->rasterizer.BufferRuntime().GetDeviceMemoryUsage() >> 20);
         // The pipeline archive: builds it served, and the build time that saved so far (each hit

@@ -5,6 +5,7 @@
 #include <chrono>
 
 #import <Metal/Metal.h>
+#include <TargetConditionals.h>
 
 #include "video_core/renderer_metal/metal_archive.h"
 #include "video_core/renderer_metal/metal_bridge.h"
@@ -260,6 +261,55 @@ u32 TopologyClass(Maxwell::PrimitiveTopology topology) {
     }
 }
 
+Object CreateStageInComputePipelineState(const Device& device, const void* function,
+                                         const RenderPipelineDesc& layout, u32 index_size,
+                                         u32 index_slot, std::string& error,
+                                         PipelineArchive* archive) {
+    // MTLAttributeFormat has MTLVertexFormat's values.
+    MTLStageInputOutputDescriptor* stage_in = [MTLStageInputOutputDescriptor new];
+    for (size_t index = 0; index < layout.attributes.size(); ++index) {
+        const VertexAttributeState& attribute = layout.attributes[index];
+        const MTLVertexFormat format =
+            attribute.enabled != 0 ? VertexFormat(attribute.type, attribute.size)
+                                   : MTLVertexFormatInvalid;
+        if (format == MTLVertexFormatInvalid) {
+            continue;
+        }
+        stage_in.attributes[index].format = static_cast<MTLAttributeFormat>(format);
+        stage_in.attributes[index].offset = attribute.offset;
+        stage_in.attributes[index].bufferIndex = VertexBufferSlot(attribute.stream);
+    }
+    for (size_t index = 0; index < layout.streams.size(); ++index) {
+        const VertexStreamState& stream = layout.streams[index];
+        if (stream.enabled == 0) {
+            continue;
+        }
+        MTLBufferLayoutDescriptor* buffer =
+            stage_in.layouts[VertexBufferSlot(static_cast<u32>(index))];
+        if (stream.stride == 0) {
+            buffer.stepFunction = MTLStepFunctionConstant;
+            buffer.stepRate = 0;
+            buffer.stride = 16;
+        } else if (stream.divisor != 0) {
+            buffer.stepFunction = MTLStepFunctionThreadPositionInGridY;
+            buffer.stepRate = stream.divisor;
+            buffer.stride = stream.stride;
+        } else {
+            buffer.stepFunction = index_size != 0 ? MTLStepFunctionThreadPositionInGridXIndexed
+                                                  : MTLStepFunctionThreadPositionInGridX;
+            buffer.stride = stream.stride;
+        }
+    }
+    if (index_size != 0) {
+        stage_in.indexType = index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+        stage_in.indexBufferIndex = index_slot;
+    }
+    MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
+    descriptor.computeFunction = (__bridge id<MTLFunction>)function;
+    descriptor.stageInputDescriptor = stage_in;
+    return CreateComputeState(device, descriptor, error, archive);
+}
+
 Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc& desc,
                                  std::string& error, PipelineArchive* archive) {
     MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
@@ -268,10 +318,27 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
     descriptor.rasterizationEnabled = desc.rasterize != 0 ? YES : NO;
     descriptor.rasterSampleCount = (std::max)(desc.samples, 1U);
     descriptor.alphaToCoverageEnabled = desc.alpha_to_coverage != 0 ? YES : NO;
-    descriptor.inputPrimitiveTopology = desc.topology_class == 0 ? MTLPrimitiveTopologyClassPoint
-                                        : desc.topology_class == 1
-                                            ? MTLPrimitiveTopologyClassLine
-                                            : MTLPrimitiveTopologyClassTriangle;
+    if (desc.tessellation != 0) {
+        // The control kernel writes half-precision factors, one set per patch.
+        descriptor.tessellationPartitionMode =
+            static_cast<MTLTessellationPartitionMode>(desc.tess_partition);
+        descriptor.tessellationOutputWindingOrder = static_cast<MTLWinding>(desc.tess_winding);
+        descriptor.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+        descriptor.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
+        descriptor.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeNone;
+        descriptor.tessellationFactorScaleEnabled = NO;
+#if TARGET_OS_IPHONE
+        descriptor.maxTessellationFactor = 16;
+#else
+        descriptor.maxTessellationFactor = 64;
+#endif
+    } else {
+        descriptor.inputPrimitiveTopology = desc.topology_class == 0
+                                                ? MTLPrimitiveTopologyClassPoint
+                                            : desc.topology_class == 1
+                                                ? MTLPrimitiveTopologyClassLine
+                                                : MTLPrimitiveTopologyClassTriangle;
+    }
     for (size_t index = 0; index < desc.color_formats.size(); ++index) {
         MTLRenderPipelineColorAttachmentDescriptor* color = descriptor.colorAttachments[index];
         color.pixelFormat = static_cast<MTLPixelFormat>(desc.color_formats[index]);

@@ -164,6 +164,45 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         mesh_groups += groups;
         return;
     }
+    if (pipeline->Tess() != nullptr) {
+        // The vertex and control kernels before the render pass, then the patches.
+        const auto format = draw_state.index_buffer.format;
+        TessellationDraw tess_draw{
+            .first = draw_state.vertex_buffer.first,
+            .count = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count,
+            .first_instance = draw_state.base_instance,
+            .instances = instance_count,
+            .index_size = !is_indexed                                      ? 0U
+                          : format == Maxwell::IndexFormat::UnsignedShort ? 2U
+                                                                          : 4U,
+            .widen_indices = is_indexed && format == Maxwell::IndexFormat::UnsignedByte,
+            .first_index = draw_state.index_buffer.first,
+            .index_buffer = nullptr,
+            .index_offset = 0,
+        };
+        if (tess_draw.count == 0 || instance_count == 0) {
+            return;
+        }
+        if (is_indexed && draw_state.base_index != 0) {
+            LOG_ONCE(warned_tess_base, "Metal: tessellated draws ignore a base vertex");
+        }
+        gpu_memory->FlushCaching();
+        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+        SCOPE_EXIT {
+            FinishTexelWritebacks();
+        };
+        if (!PrepareDraw(*pipeline, is_indexed, 0, &tess_draw)) {
+            return;
+        }
+        CountOcclusion();
+        scheduler.SetTessellationFactorBuffer(tess_buffers.factors.buffer,
+                                              tess_buffers.factors.offset);
+        scheduler.DrawPatches(tess_buffers.output_points, tess_buffers.patches);
+        ++draws_encoded;
+        ++tessellated_draws;
+        tessellated_patches += tess_buffers.patches;
+        return;
+    }
     const bool u8_indices =
         is_indexed && draw_state.index_buffer.format == Maxwell::IndexFormat::UnsignedByte;
     const bool convert = IndexConvert::NeedsConversion(draw_state.topology) || u8_indices;
@@ -539,16 +578,32 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     }
 }
 
-bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups) {
-    // Buffer cache stage indices (vertex B, the mesh program after a task program, pixel) and
-    // the translated programs. An emulated mesh pipeline's stage 0 is its task or mesh kernel,
-    // dispatched before the render pass.
+bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups,
+                                  TessellationDraw* tess_draw) {
+    // Buffer cache stage indices and the translated programs: the vertex program (or a mesh
+    // pipeline's task or mesh kernel, or a tessellation pipeline's vertex kernel), a second kernel
+    // (the mesh program after a task program, the tessellation control program), the render
+    // vertex function where it is not the first (tessellation evaluation), and the pixel program.
+    // Kernels are dispatched before the render pass.
     MeshEmulation* const mesh = pipeline.Mesh();
+    Tessellation* const tess = pipeline.Tess();
     const bool has_task = mesh != nullptr && mesh->has_task;
-    const std::array<size_t, 3> stages{0, has_task ? size_t{mesh->mesh_stage} : 0, 4};
-    const std::array<StageProgram*, 3> programs{
-        mesh != nullptr ? &mesh->first.program : &pipeline.Vertex(),
-        has_task ? &mesh->mesh.program : nullptr, &pipeline.Fragment()};
+    const size_t vertex_variant =
+        tess_draw == nullptr || tess_draw->index_size == 0 ? 0 : tess_draw->index_size == 2 ? 1 : 2;
+    const std::array<size_t, 4> stages{
+        0, has_task ? size_t{mesh->mesh_stage} : tess != nullptr ? size_t{1} : 0,
+        tess != nullptr ? size_t{2} : 0, 4};
+    const std::array<StageProgram*, 4> programs{
+        mesh != nullptr   ? &mesh->first.program
+        : tess != nullptr ? &tess->vertex[vertex_variant]
+                          : &pipeline.Vertex(),
+        has_task          ? &mesh->mesh.program
+        : tess != nullptr ? &tess->control.program
+                          : nullptr,
+        tess != nullptr ? &pipeline.Vertex() : nullptr, &pipeline.Fragment()};
+    if (tess != nullptr && tess_draw == nullptr) {
+        return false;
+    }
     const auto absent = [&](size_t index) {
         return programs[index] == nullptr || programs[index]->msl.empty();
     };
@@ -574,8 +629,8 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     // Storage buffers, and every texture and image handle, as OpenGL's ConfigureImpl reads them.
     std::vector<VideoCommon::ImageViewInOut> views;
     std::vector<VideoCommon::SamplerId> samplers;
-    std::array<size_t, 3> first_view{};
-    std::array<size_t, 3> first_sampler{};
+    std::array<size_t, 4> first_view{};
+    std::array<size_t, 4> first_sampler{};
     const bool via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
     for (size_t index = 0; index < stages.size(); ++index) {
         first_view[index] = views.size();
@@ -699,8 +754,8 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
 
     // Each stage's buffer bindings, and texel buffer views (copies of misaligned ranges go
     // before the render pass).
-    std::array<std::vector<Binding>, 3> stage_bindings;
-    std::array<std::vector<TextureHandle>, 3> texel_views;
+    std::array<std::vector<Binding>, 4> stage_bindings;
+    std::array<std::vector<TextureHandle>, 4> texel_views;
     for (size_t index = 0; index < stages.size(); ++index) {
         if (absent(index)) {
             continue;
@@ -771,6 +826,21 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         stream.divisor = regs.vertex_stream_instances.IsInstancingEnabled(index)
                              ? regs.vertex_streams[index].frequency
                              : 0U;
+    }
+    // A tessellation pipeline's vertex kernel reads the vertex layout as stage-in data; its
+    // post-tessellation vertex function reads buffers.
+    const RenderPipelineDesc layout_desc = state_desc;
+    if (tess != nullptr) {
+        std::ranges::fill(state_desc.attributes, VertexAttributeState{});
+        std::ranges::fill(state_desc.streams, VertexStreamState{});
+        using Spacing = ShaderTranslate::TessellationModes::Spacing;
+        // MTLTessellationPartitionModeInteger, FractionalOdd, FractionalEven; MTLWinding
+        // reversed, as Vulkan's domain origin is the upper left (MoltenVK does the same).
+        state_desc.tessellation = 1;
+        state_desc.tess_partition = tess->modes.spacing == Spacing::FractionalOdd    ? 2U
+                                    : tess->modes.spacing == Spacing::FractionalEven ? 3U
+                                                                                     : 1U;
+        state_desc.tess_winding = tess->modes.clockwise ? 1U : 0U;
     }
     void* const state = pipeline.RenderState(device, state_desc);
     if (state == nullptr) {
@@ -876,6 +946,111 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             scheduler.DispatchIndirect(mesh_buffers.args.buffer, mesh_buffers.args.offset,
                                        mesh->mesh.workgroup_size);
         }
+    }
+
+    if (tess != nullptr) {
+        // 1. The vertex kernel: every vertex (or index) of every instance, in draw order.
+        // 2. The control kernel: patches of input_points of them, several patches a workgroup.
+        // The evaluation program then draws the patches from the control kernel's buffers.
+        const u32 input_points = std::clamp(regs.patch_vertices, 1U, 32U);
+        const u32 output_points = tess->modes.output_vertices;
+        const u32 vertices = tess_draw->count * tess_draw->instances;
+        const u32 patches = vertices / input_points;
+        void* const vertex_kernel =
+            pipeline.VertexKernelState(device, vertex_variant, layout_desc);
+        void* const control_kernel = pipeline.KernelState(device, tess->control);
+        if (vertex_kernel == nullptr || control_kernel == nullptr || patches == 0) {
+            return false;
+        }
+        const auto stream = [&](u64 size) {
+            return staging_pool.Stream((std::max)(size, u64{16}), 16);
+        };
+        if (tess_draw->index_size != 0) {
+            if (tess_draw->widen_indices) {
+                // 8-bit indices (Metal reads 16- and 32-bit ones), widened from guest memory.
+                const auto& draw_state = maxwell3d->draw_manager.draw_state;
+                converted_source.resize(tess_draw->count);
+                gpu_memory->ReadBlockUnsafe(draw_state.index_buffer.StartAddress() +
+                                                tess_draw->first_index,
+                                            converted_source.data(), converted_source.size());
+                const StagingBufferRef widened = stream(u64{tess_draw->count} * sizeof(u32));
+                IndexConvert::Convert(Maxwell::PrimitiveTopology::Patches, converted_source, 1, 0,
+                                      tess_draw->count, regs.primitive_restart.enabled != 0,
+                                      std::span(reinterpret_cast<u32*>(widened.mapped_span.data()),
+                                                tess_draw->count));
+                tess_draw->index_buffer = widened.buffer;
+                tess_draw->index_offset = widened.offset;
+            } else {
+                const BufferCacheRuntime::IndexState& index = buffer_cache_runtime.Index();
+                tess_draw->index_buffer = index.buffer;
+                tess_draw->index_offset =
+                    u64{index.offset} + u64{tess_draw->first_index} * tess_draw->index_size;
+            }
+            if (tess_draw->index_buffer == nullptr) {
+                return false;
+            }
+        }
+        const u32 patches_per_group = (std::max)(32U / output_points, 1U);
+        const u32 group_size = patches_per_group * output_points;
+        const u32 groups = (patches + patches_per_group - 1) / patches_per_group;
+        // The control kernel's threads past the last patch write past it too.
+        const u32 point_slots = groups * group_size;
+        const bool quads =
+            tess->modes.primitive != ShaderTranslate::TessellationModes::Primitive::Triangles;
+        tess_buffers = {
+            .vertices = stream(u64{vertices} * tess->vertex_stride),
+            .control_points = stream(u64{point_slots} * tess->control_point_stride),
+            .patch_constants = stream(u64{groups * patches_per_group} * tess->patch_stride),
+            // MTLQuadTessellationFactorsHalf (isolines too) or MTLTriangleTessellationFactorsHalf.
+            .factors = stream(u64{groups * patches_per_group} * (quads ? 12U : 8U)),
+            .patches = patches,
+            .output_points = output_points,
+        };
+        const auto bind = [&](ShaderStage metal_stage, u32 slot, const StagingBufferRef& buffer) {
+            if (slot != ~0U) {
+                scheduler.BindBuffer(metal_stage, slot, buffer.buffer,
+                                     static_cast<u32>(buffer.offset));
+            }
+        };
+        scheduler.BeginCompute(vertex_kernel);
+        BindStageResources(*programs[0], ShaderStage::Compute, stage_bindings[0], texel_views[0],
+                           std::span(views).subspan(first_view[0]),
+                           std::span(samplers).subspan(first_sampler[0]), targets.width,
+                           targets.height);
+        for (size_t index = 0; index < vertex_states.size(); ++index) {
+            if (vertex_states[index].buffer != nullptr) {
+                scheduler.BindBuffer(ShaderStage::Compute,
+                                     VertexBufferSlot(static_cast<u32>(index)),
+                                     vertex_states[index].buffer, vertex_states[index].offset);
+            }
+        }
+        const ShaderTranslate::TessellationSlots& vertex_slots = programs[0]->tessellation_slots;
+        bind(ShaderStage::Compute, vertex_slots.output, tess_buffers.vertices);
+        if (tess_draw->index_size != 0 && vertex_slots.index != ~0U) {
+            // Read from the draw's first index (the stage-in fetch and VertexIndex both).
+            scheduler.BindBuffer(ShaderStage::Compute, vertex_slots.index, tess_draw->index_buffer,
+                                 static_cast<u32>(tess_draw->index_offset));
+        }
+        scheduler.DispatchStageIn(tess_draw->index_size != 0 ? 0U : tess_draw->first,
+                                  tess_draw->count, tess_draw->first_instance,
+                                  tess_draw->instances);
+
+        scheduler.BeginCompute(control_kernel);
+        BindStageResources(*programs[1], ShaderStage::Compute, stage_bindings[1], texel_views[1],
+                           std::span(views).subspan(first_view[1]),
+                           std::span(samplers).subspan(first_sampler[1]), targets.width,
+                           targets.height);
+        const ShaderTranslate::TessellationSlots& control_slots = programs[1]->tessellation_slots;
+        bind(ShaderStage::Compute, control_slots.input, tess_buffers.vertices);
+        bind(ShaderStage::Compute, control_slots.output, tess_buffers.control_points);
+        bind(ShaderStage::Compute, control_slots.patch_output, tess_buffers.patch_constants);
+        bind(ShaderStage::Compute, control_slots.tess_factors, tess_buffers.factors);
+        if (control_slots.indirect_params != ~0U) {
+            const std::array<u32, 2> params{input_points, patches};
+            scheduler.BindBytes(ShaderStage::Compute, control_slots.indirect_params, params.data(),
+                                static_cast<u32>(sizeof(params)));
+        }
+        scheduler.Dispatch({groups, 1, 1}, {group_size, 1, 1});
     }
 
     scheduler.BeginRendering(targets);
@@ -984,7 +1159,8 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                         regs.blend_color.a};
     scheduler.SetDrawState(draw);
 
-    for (size_t index = 0; index < vertex_states.size() && mesh == nullptr; ++index) {
+    for (size_t index = 0; index < vertex_states.size() && mesh == nullptr && tess == nullptr;
+         ++index) {
         if (vertex_states[index].buffer != nullptr) {
             scheduler.BindVertexBuffer(VertexBufferSlot(static_cast<u32>(index)),
                                        vertex_states[index].buffer, vertex_states[index].offset);
@@ -994,13 +1170,26 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     // Each stage's buffers (appended by the buffer cache in binding order), textures, samplers
     // and images, into the slots the translator gave them.
     for (size_t index = 0; index < stages.size(); ++index) {
-        if (absent(index) || index == 1) {
+        // Kernels were bound when they were dispatched.
+        if (absent(index) || index == 1 || (index == 0 && tess != nullptr)) {
             continue;
         }
-        const ShaderStage metal_stage = index == 0 ? ShaderStage::Vertex : ShaderStage::Fragment;
+        const ShaderStage metal_stage = index == 3 ? ShaderStage::Fragment : ShaderStage::Vertex;
         if (index == 0 && mesh != nullptr) {
             BindMeshBuffers(pipeline.Vertex(), metal_stage, *mesh);
             continue;
+        }
+        if (index == 2) {
+            const ShaderTranslate::TessellationSlots& slots = programs[2]->tessellation_slots;
+            if (slots.input != ~0U) {
+                scheduler.BindBuffer(metal_stage, slots.input, tess_buffers.control_points.buffer,
+                                     static_cast<u32>(tess_buffers.control_points.offset));
+            }
+            if (slots.patch_input != ~0U) {
+                scheduler.BindBuffer(metal_stage, slots.patch_input,
+                                     tess_buffers.patch_constants.buffer,
+                                     static_cast<u32>(tess_buffers.patch_constants.offset));
+            }
         }
         BindStageResources(*programs[index], metal_stage, stage_bindings[index], texel_views[index],
                            std::span(views).subspan(first_view[index]),
@@ -1027,6 +1216,11 @@ void RasterizerMetal::DrawIndirect() {
         // As on Vulkan: the emulation needs the workgroup count on the CPU (mesh draws whose
         // count the GPU wrote come through Draw, DrawMeshTasksFromGpu being false).
         LOG_ONCE(warned_mesh_indirect, "Metal: indirect emulated mesh draws are skipped");
+        return;
+    }
+    if (pipeline->Tess() != nullptr) {
+        // The kernels need the vertex count on the CPU.
+        LOG_ONCE(warned_tess_indirect, "Metal: indirect tessellated draws are skipped");
         return;
     }
     const bool u8_indices = params.is_indexed && maxwell3d->regs.index_buffer.format ==

@@ -141,6 +141,8 @@ public:
         u64 mesh_draws;          ///< Task/mesh draws through the compute emulation
         u64 mesh_groups;         ///< Their mesh workgroups
         u64 ocarina_bilinear;    ///< Ocarina upscale passes replaced by the bilinear pass
+        u64 tessellated_draws;
+        u64 tessellated_patches;
         u64 dispatches;
         u64 dispatches_with_pipeline;
         u64 clears;
@@ -153,6 +155,7 @@ public:
                 std::exchange(texel_copies, 0), std::exchange(occlusion_queries, 0),
                 std::exchange(indices_rewritten_on_gpu, 0), std::exchange(mesh_draws, 0),
                 std::exchange(mesh_groups, 0), ocarina.TakePasses(),
+                std::exchange(tessellated_draws, 0), std::exchange(tessellated_patches, 0),
                 std::exchange(dispatches, 0), std::exchange(dispatches_with_pipeline, 0),
                 std::exchange(clears, 0)};
     }
@@ -170,8 +173,24 @@ public:
     }
 
 private:
+    /// What a tessellation pipeline's vertex kernel runs over: vertices from `first` or, with an
+    /// index_size (2 or 4; 8-bit indices are widened to 4), `count` indices from first_index;
+    /// and instances. PrepareDraw finds index_buffer and index_offset.
+    struct TessellationDraw {
+        u32 first;
+        u32 count;
+        u32 first_instance;
+        u32 instances;
+        u32 index_size;
+        bool widen_indices;
+        u32 first_index;
+        BufferHandle index_buffer;
+        u64 index_offset;
+    };
+
     /// Binds everything the draw needs and opens its render pass; false to skip it.
-    bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups = 0);
+    bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups = 0,
+                     TessellationDraw* tess_draw = nullptr);
 
     /// Sets the rescaling_words bits of a stage's texture and image descriptors (views from the
     /// stage's first), counting on from texture_bit and image_bit.
@@ -298,6 +317,18 @@ private:
     Object index_kernel;
     bool index_kernel_failed{};
     u64 indices_rewritten_on_gpu{};
+
+    /// The buffers between the tessellation stages of the draw being prepared.
+    struct TessellationBuffers {
+        StagingBufferRef vertices;
+        StagingBufferRef control_points;
+        StagingBufferRef patch_constants;
+        StagingBufferRef factors;
+        u32 patches{};
+        u32 output_points{};
+    } tess_buffers;
+    u64 tessellated_draws{};
+    u64 tessellated_patches{};
 
     /// The mesh emulation buffers of the draw being prepared.
     struct MeshBuffers {

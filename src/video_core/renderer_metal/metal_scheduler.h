@@ -227,6 +227,17 @@ public:
     /// The group counts are three u32 at `offset` of `buffer`.
     void DispatchIndirect(BufferHandle buffer, u64 offset, std::array<u32, 3> group_size);
 
+    /// One thread per vertex (x, from `first`) and instance (y, from `first_instance`) of the
+    /// open compute encoder's stage-in kernel (a tessellation pipeline's vertex program).
+    void DispatchStageIn(u32 first, u32 count, u32 first_instance, u32 instances);
+
+    /// The tessellation factors (one MTL*TessellationFactorsHalf per patch) of the next patches.
+    void SetTessellationFactorBuffer(BufferHandle buffer, u64 offset);
+
+    /// Tessellated patches of `control_points` control points each, read by the
+    /// post-tessellation vertex function from its buffers.
+    void DrawPatches(u32 control_points, u32 patch_count);
+
     /// index_size: 2 or 4 bytes.
     void DrawIndexed(u32 primitive, u32 index_count, u32 index_size, BufferHandle index_buffer,
                      u64 index_offset, u32 instance_count, s32 base_vertex, u32 base_instance);

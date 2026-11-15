@@ -77,9 +77,56 @@ size_t ComputePipelineKey::Hash() const noexcept {
 }
 
 GraphicsPipeline::GraphicsPipeline(const GraphicsPipelineKey& key_, StageProgram vertex_,
-                                   StageProgram fragment_, std::optional<MeshEmulation> mesh_)
+                                   StageProgram fragment_, std::optional<MeshEmulation> mesh_,
+                                   std::optional<Tessellation> tessellation_)
     : key{key_}, vertex{std::move(vertex_)}, fragment{std::move(fragment_)},
-      mesh{std::move(mesh_)} {}
+      mesh{std::move(mesh_)}, tessellation{std::move(tessellation_)} {}
+
+void* GraphicsPipeline::VertexKernelState(const Device& device, size_t variant,
+                                          const RenderPipelineDesc& layout) {
+    if (!tessellation || variant >= Tessellation::IndexSizes.size()) {
+        return nullptr;
+    }
+    StageProgram& program = tessellation->vertex[variant];
+    if (program.build_failed) {
+        return nullptr;
+    }
+    std::string error;
+    if (!program.function) {
+        program.library = CreateLibrary(device, program.msl, error);
+        program.function = program.library
+                               ? CreateFunction(program.library.Get(), program.entry_point)
+                               : Object{};
+        if (!program.function) {
+            program.build_failed = true;
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(Render_Metal, "Metal: vertex kernel of {:016x} failed to build: {}",
+                          key.unique_hashes[1], error);
+            }
+            return nullptr;
+        }
+    }
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(layout.attributes.data()),
+                                        sizeof(layout.attributes)) ^
+                     Common::CityHash64(reinterpret_cast<const char*>(layout.streams.data()),
+                                        sizeof(layout.streams)) ^
+                     (u64{variant} << 60);
+    const auto [it, is_new] = vertex_kernel_states.try_emplace(hash);
+    if (is_new) {
+        it->second = CreateStageInComputePipelineState(
+            device, program.function.Get(), layout, Tessellation::IndexSizes[variant],
+            program.tessellation_slots.index, error, archive);
+        if (!it->second) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(Render_Metal, "Metal: vertex kernel state of {:016x} refused: {}",
+                          key.unique_hashes[1], error);
+            }
+        }
+    }
+    return it->second.Get();
+}
 
 void* GraphicsPipeline::KernelState(const Device& device, MeshKernel& kernel) {
     if (kernel.state || kernel.failed) {
@@ -268,6 +315,13 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     graphics_key.topology = static_cast<u32>(maxwell3d->draw_manager.draw_state.topology);
     graphics_key.early_z = regs.mandated_early_z != 0 ? 1 : 0;
     graphics_key.attribute_types = Vulkan::FixedPipelineState::DynamicAttributeTypes(regs);
+    const auto& tessellation = regs.tessellation.params;
+    graphics_key.tessellation =
+        graphics_key.unique_hashes[2] != 0 || graphics_key.unique_hashes[3] != 0
+            ? static_cast<u32>(tessellation.domain_type.Value()) |
+                  (static_cast<u32>(tessellation.spacing.Value()) << 2) |
+                  (static_cast<u32>(tessellation.output_primitives.Value()) << 4)
+            : 0U;
     if (current_pipeline != nullptr && current_pipeline->Key() == graphics_key) {
         return current_pipeline;
     }
@@ -286,10 +340,12 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
 std::optional<StageProgram> PipelineCache::Translate(Shader::IR::Program& program,
                                                      ShaderTranslate::Stage stage,
                                                      Shader::Backend::Bindings& bindings,
-                                                     const Shader::RuntimeInfo& runtime_info) {
+                                                     const Shader::RuntimeInfo& runtime_info,
+                                                     const ShaderTranslate::Options* options) {
     ConvertLegacyToGeneric(program, runtime_info);
     const std::vector<u32> spirv = EmitSPIRV(profile, runtime_info, program, bindings);
-    ShaderTranslate::Result result = ShaderTranslate::SpirvToMsl(spirv, stage, translate_options);
+    ShaderTranslate::Result result = ShaderTranslate::SpirvToMsl(
+        spirv, stage, options != nullptr ? *options : translate_options);
     if (result.source.empty()) {
         static std::atomic<u32> logged{};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -303,6 +359,8 @@ std::optional<StageProgram> PipelineCache::Translate(Shader::IR::Program& progra
         .entry_point = std::move(result.entry_point),
         .slots = std::move(result.slots),
         .info = program.info,
+        .outputs = std::move(result.outputs),
+        .tessellation_slots = result.tessellation_slots,
     };
 }
 
@@ -332,10 +390,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() try {
         } else if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
             LogRefusal(unsupported_logged, hash, "task or mesh program out of place");
             return nullptr;
-        } else if (index >= 2 && index <= 4) {
-            // Metal draws with a vertex and a fragment stage; tessellation and geometry need
-            // emulation.
-            LogRefusal(unsupported_logged, hash, "tessellation or geometry stage");
+        } else if (index == 4) {
+            // Apple GPUs have no geometry stage (MoltenVK skips these pipelines too).
+            LogRefusal(unsupported_logged, hash, "geometry stage");
+            return nullptr;
+        } else if ((index == 2 && stage != Shader::Stage::TessellationControl) ||
+                   (index == 3 && stage != Shader::Stage::TessellationEval)) {
+            LogRefusal(unsupported_logged, hash, "unexpected stage in a tessellation slot");
             return nullptr;
         }
         const u32 cfg_offset = static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader));
@@ -357,6 +418,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() try {
     }
     if (mesh_index != 0) {
         return CreateMeshPipeline(programs, mesh_index);
+    }
+    if (key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0) {
+        if (key.unique_hashes[2] == 0 || key.unique_hashes[3] == 0) {
+            LogRefusal(unsupported_logged, hash, "only one of the tessellation programs");
+            return nullptr;
+        }
+        return CreateTessellationPipeline(programs);
     }
 
     Shader::Backend::Bindings bindings;
@@ -518,6 +586,165 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateMeshPipeline(
     };
     return std::make_unique<GraphicsPipeline>(key, std::move(vertex_program), std::move(fragment),
                                               std::move(emulation));
+}
+
+namespace {
+
+/// Bytes per element a buffer between tessellation stages needs at most for these variables
+/// (MSL lays them out in structs of 16-byte aligned vectors).
+[[nodiscard]] u32 InterfaceStride(std::span<const ShaderTranslate::InterfaceVariable> variables,
+                                  bool per_patch) {
+    u32 locations = 0;
+    u32 builtin_bytes = 0;
+    for (const ShaderTranslate::InterfaceVariable& variable : variables) {
+        if (variable.per_patch != per_patch) {
+            continue;
+        }
+        if (variable.builtin == ShaderTranslate::InterfaceVariable::NoBuiltin) {
+            locations = (std::max)(locations, variable.location + 1);
+        } else {
+            builtin_bytes += (variable.vecsize * 4 + 15) / 16 * 16;
+        }
+    }
+    return locations * 16 + builtin_bytes + 16;
+}
+
+} // Anonymous namespace
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::CreateTessellationPipeline(
+    std::span<Shader::IR::Program> programs) {
+    const GraphicsPipelineKey& key = graphics_key;
+    const u64 hash = key.Hash();
+    static std::atomic<u32> refused_logged{};
+    using Domain = Maxwell::Tessellation::DomainType;
+    using Spacing = Maxwell::Tessellation::Spacing;
+    using OutputPrimitives = Maxwell::Tessellation::OutputPrimitives;
+    const auto domain = static_cast<Domain>(key.tessellation & 3);
+    const auto spacing = static_cast<Spacing>((key.tessellation >> 2) & 3);
+    const auto output = static_cast<OutputPrimitives>((key.tessellation >> 4) & 3);
+    Shader::IR::Program& control = programs[2];
+    if (control.invocations == 0 || control.invocations > 32) {
+        LogRefusal(refused_logged, hash, "tessellation control program's output vertex count");
+        return nullptr;
+    }
+    using Modes = ShaderTranslate::TessellationModes;
+    Tessellation tessellation{
+        .modes =
+            {
+                .primitive = domain == Domain::Quads      ? Modes::Primitive::Quads
+                             : domain == Domain::Isolines ? Modes::Primitive::Isolines
+                                                          : Modes::Primitive::Triangles,
+                .spacing = spacing == Spacing::FractionalOdd    ? Modes::Spacing::FractionalOdd
+                           : spacing == Spacing::FractionalEven ? Modes::Spacing::FractionalEven
+                                                                : Modes::Spacing::Equal,
+                .clockwise = output == OutputPrimitives::Triangles_CW,
+                .point_mode = output == OutputPrimitives::Points,
+                .output_vertices = control.invocations,
+            },
+    };
+    Shader::Backend::Bindings bindings;
+
+    // The vertex program as a kernel, once per index size (the same SPIR-V and bindings).
+    Shader::RuntimeInfo vertex_info;
+    vertex_info.previous_stage_stores.mask.set();
+    for (size_t attribute = 0; attribute < vertex_info.generic_input_types.size(); ++attribute) {
+        constexpr std::array types{Shader::AttributeType::Disabled, Shader::AttributeType::Float,
+                                   Shader::AttributeType::SignedInt,
+                                   Shader::AttributeType::UnsignedInt};
+        vertex_info.generic_input_types[attribute] =
+            types[(key.attribute_types >> (attribute * 2)) & 3];
+    }
+    ConvertLegacyToGeneric(programs[1], vertex_info);
+    const std::vector<u32> vertex_spirv = EmitSPIRV(profile, vertex_info, programs[1], bindings);
+    for (size_t variant = 0; variant < Tessellation::IndexSizes.size(); ++variant) {
+        ShaderTranslate::Options options = translate_options;
+        options.vertex_index_size = Tessellation::IndexSizes[variant];
+        ShaderTranslate::Result result = ShaderTranslate::SpirvToMsl(
+            vertex_spirv, ShaderTranslate::Stage::VertexForTessellation, options);
+        if (result.source.empty()) {
+            LogRefusal(refused_logged, hash, result.error);
+            return nullptr;
+        }
+        tessellation.vertex[variant] = StageProgram{
+            .stage = ShaderTranslate::Stage::VertexForTessellation,
+            .msl = std::move(result.source),
+            .entry_point = std::move(result.entry_point),
+            .slots = std::move(result.slots),
+            .info = programs[1].info,
+            .outputs = std::move(result.outputs),
+            .tessellation_slots = result.tessellation_slots,
+        };
+    }
+    const StageProgram& vertex = tessellation.vertex[0];
+
+    ShaderTranslate::Options control_options = translate_options;
+    control_options.inputs = vertex.outputs;
+    control_options.tessellation = tessellation.modes;
+    Shader::RuntimeInfo control_info;
+    control_info.previous_stage_stores = programs[1].info.stores;
+    control_info.previous_stage_legacy_stores_mapping = programs[1].info.legacy_stores_mapping;
+    auto control_program = Translate(control, ShaderTranslate::Stage::TessellationControl,
+                                     bindings, control_info, &control_options);
+    if (!control_program) {
+        return nullptr;
+    }
+
+    ShaderTranslate::Options evaluation_options = translate_options;
+    evaluation_options.inputs = control_program->outputs;
+    evaluation_options.tessellation = tessellation.modes;
+    Shader::RuntimeInfo evaluation_info;
+    evaluation_info.previous_stage_stores = control.info.stores;
+    evaluation_info.previous_stage_legacy_stores_mapping = control.info.legacy_stores_mapping;
+    evaluation_info.tess_primitive = domain == Domain::Quads      ? Shader::TessPrimitive::Quads
+                                     : domain == Domain::Isolines ? Shader::TessPrimitive::Isolines
+                                                                  : Shader::TessPrimitive::Triangles;
+    evaluation_info.tess_spacing = spacing == Spacing::FractionalOdd ? Shader::TessSpacing::FractionalOdd
+                                   : spacing == Spacing::FractionalEven
+                                       ? Shader::TessSpacing::FractionalEven
+                                       : Shader::TessSpacing::Equal;
+    evaluation_info.tess_clockwise = tessellation.modes.clockwise;
+    auto evaluation = Translate(programs[3], ShaderTranslate::Stage::TessellationEvaluation,
+                                bindings, evaluation_info, &evaluation_options);
+    if (!evaluation) {
+        return nullptr;
+    }
+
+    StageProgram fragment{};
+    if (key.unique_hashes[5] != 0) {
+        Shader::RuntimeInfo fragment_info;
+        fragment_info.previous_stage_stores = programs[3].info.stores;
+        fragment_info.previous_stage_legacy_stores_mapping = programs[3].info.legacy_stores_mapping;
+        fragment_info.force_early_z = key.early_z != 0;
+        auto translated =
+            Translate(programs[5], ShaderTranslate::Stage::Fragment, bindings, fragment_info);
+        if (!translated) {
+            return nullptr;
+        }
+        fragment = std::move(*translated);
+    }
+    tessellation.vertex_stride = InterfaceStride(vertex.outputs, false);
+    tessellation.control_point_stride = InterfaceStride(control_program->outputs, false);
+    tessellation.patch_stride = InterfaceStride(control_program->outputs, true);
+    tessellation.control = MeshKernel{
+        .program = std::move(*control_program),
+        .workgroup_size = {control.invocations, 1, 1},
+    };
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+        LOG_INFO(Render_Metal,
+                 "Metal: tessellation pipeline {:016x} (control {:016x}, evaluation {:016x}): "
+                 "domain {}, spacing {}, output primitives {}, {} control points out",
+                 hash, key.unique_hashes[2], key.unique_hashes[3], static_cast<u32>(domain),
+                 static_cast<u32>(spacing), static_cast<u32>(output), control.invocations);
+    }
+    if (tessellation.modes.point_mode) {
+        static std::atomic<bool> warned{};
+        if (!warned.exchange(true)) {
+            LOG_WARNING(Render_Metal, "Metal: tessellation point mode is drawn as triangles");
+        }
+    }
+    return std::make_unique<GraphicsPipeline>(key, std::move(*evaluation), std::move(fragment),
+                                              std::nullopt, std::move(tessellation));
 }
 
 ComputePipeline* PipelineCache::CurrentComputePipeline() {

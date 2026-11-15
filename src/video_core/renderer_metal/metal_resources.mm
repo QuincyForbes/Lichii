@@ -436,30 +436,20 @@ Object CreateFunction(const void* library, std::string_view name) {
     return object != nil ? Retain([object newFunctionWithName:ToNSString(name)]) : Object{};
 }
 
-Object CreateComputePipelineState(const Device& device, const void* function, std::string& error,
-                                  PipelineArchive* archive) {
+Object CreateComputeState(const Device& device, MTLComputePipelineDescriptor* descriptor,
+                          std::string& error, PipelineArchive* archive) {
     const id<MTLBinaryArchive> binary =
         archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
-    if (binary == nil) {
-        NSError* ns_error = nil;
-        const id<MTLComputePipelineState> state = [device.GetDevice()
-            newComputePipelineStateWithFunction:(__bridge id<MTLFunction>)function
-                                          error:&ns_error];
-        if (state == nil) {
-            error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
-        }
-        return Retain(state);
-    }
-    MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
-    descriptor.computeFunction = (__bridge id<MTLFunction>)function;
-    descriptor.binaryArchives = @[ binary ];
     const auto start = std::chrono::steady_clock::now();
-    id<MTLComputePipelineState> state =
-        [device.GetDevice() newComputePipelineStateWithDescriptor:descriptor
-                                                          options:
-                                                              MTLPipelineOptionFailOnBinaryArchiveMiss
-                                                       reflection:nil
-                                                            error:nil];
+    id<MTLComputePipelineState> state = nil;
+    if (binary != nil) {
+        descriptor.binaryArchives = @[ binary ];
+        state = [device.GetDevice()
+            newComputePipelineStateWithDescriptor:descriptor
+                                          options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                       reflection:nil
+                                            error:nil];
+    }
     const bool hit = state != nil;
     NSError* ns_error = nil;
     if (!hit) {
@@ -472,14 +462,23 @@ Object CreateComputePipelineState(const Device& device, const void* function, st
         error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
         return {};
     }
-    archive->NoteBuild(hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                 std::chrono::steady_clock::now() - start)
-                                                 .count()));
-    if (!hit) {
-        archive->NoteAdded([binary addComputePipelineFunctionsWithDescriptor:descriptor
-                                                                       error:nil]);
+    if (binary != nil) {
+        archive->NoteBuild(hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     std::chrono::steady_clock::now() - start)
+                                                     .count()));
+        if (!hit) {
+            archive->NoteAdded([binary addComputePipelineFunctionsWithDescriptor:descriptor
+                                                                           error:nil]);
+        }
     }
     return Retain(state);
+}
+
+Object CreateComputePipelineState(const Device& device, const void* function, std::string& error,
+                                  PipelineArchive* archive) {
+    MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
+    descriptor.computeFunction = (__bridge id<MTLFunction>)function;
+    return CreateComputeState(device, descriptor, error, archive);
 }
 
 u64 AllocatedSize(const void* resource) {
