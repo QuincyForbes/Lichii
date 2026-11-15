@@ -184,6 +184,10 @@ u64 DeviceMemoryBudget(const Device& device) {
     return device.MemoryBudget();
 }
 
+u32 DeviceAppleFamily(const Device& device) {
+    return device.AppleFamily();
+}
+
 bool IsConverted(const Device& device, PixelFormat format) {
     if (VideoCore::Surface::IsPixelFormatASTC(format)) {
         // Apple GPUs (every Apple GPU family) read ASTC; Intel and AMD Macs don't.

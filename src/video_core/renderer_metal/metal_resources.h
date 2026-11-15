@@ -69,6 +69,9 @@ struct FormatInfo {
 /// Device::MemoryBudget for plain C++.
 [[nodiscard]] u64 DeviceMemoryBudget(const Device& device);
 
+/// Device::AppleFamily for plain C++.
+[[nodiscard]] u32 DeviceAppleFamily(const Device& device);
+
 /// The host format of a guest format. `converted` images hold the CPU-decoded data instead
 /// (RGBA8 / R8 / RG8 / RGBA16F, VideoCommon::ConvertImage).
 [[nodiscard]] FormatInfo SurfaceFormat(const Device& device, VideoCore::Surface::PixelFormat format,
