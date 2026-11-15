@@ -969,6 +969,69 @@ int RunPipelineArchive() {
     return passed ? 0 : 1;
 }
 
+/// The scheduler's depth blit (rescaling depth targets): a 16x16 Depth32Float holding 0.25 on
+/// the left and 0.75 on the right, scaled into a 32x32 depth target and read back.
+int RunDepthBlit() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr uint32_t Native = 16;
+    constexpr uint32_t Scaled = 32;
+    const uint32_t format = static_cast<uint32_t>(MTLPixelFormatDepth32Float);
+    const auto make = [&](uint32_t size) {
+        return Metal::CreateTexture(device, {.kind = Metal::TextureKind::e2D,
+                                             .format = format,
+                                             .width = size,
+                                             .height = size,
+                                             .render_target = true});
+    };
+    const Metal::Object native = make(Native);
+    const Metal::Object scaled = make(Scaled);
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer = Metal::CreateBuffer(device, Native * Native * 4, true, &upload);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Scaled * Scaled * 4, true, &readback);
+    if (!native || !scaled || upload == nullptr || readback == nullptr) {
+        std::printf("metal-smoke: FAIL depth blit textures\n");
+        return 1;
+    }
+    for (uint32_t y = 0; y < Native; ++y) {
+        for (uint32_t x = 0; x < Native; ++x) {
+            const float depth = x < Native / 2 ? 0.25f : 0.75f;
+            std::memcpy(upload + (y * Native + x) * 4, &depth, 4);
+        }
+    }
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Native * 4, 0, native.Get(), 0, 0, {},
+                                  {Native, Native, 1});
+    const bool blitted = scheduler.Blit(Metal::BlitPass{
+        .src = native.Get(),
+        .src_rect = {0, 0, static_cast<int32_t>(Native), static_cast<int32_t>(Native)},
+        .dst = {.texture = scaled.Get()},
+        .dst_format = format,
+        .dst_rect = {0, 0, static_cast<int32_t>(Scaled), static_cast<int32_t>(Scaled)},
+        .dst_width = Scaled,
+        .dst_height = Scaled,
+        .linear = false,
+        .keep_dst = false,
+    });
+    scheduler.CopyTextureToBuffer(scaled.Get(), 0, 0, {}, {Scaled, Scaled, 1},
+                                  readback_buffer.Get(), 0, Scaled * 4, 0);
+    scheduler.Finish();
+    uint32_t wrong = 0;
+    for (uint32_t y = 0; y < Scaled; ++y) {
+        for (uint32_t x = 0; x < Scaled; ++x) {
+            float depth;
+            std::memcpy(&depth, readback + (y * Scaled + x) * 4, 4);
+            wrong += depth == (x < Scaled / 2 ? 0.25f : 0.75f) ? 0 : 1;
+        }
+    }
+    const bool passed = blitted && wrong == 0;
+    std::printf("metal-smoke: depth blit 16x16 -> 32x32 Depth32Float (%s): %u of %u wrong: %s\n",
+                blitted ? "encoded" : "refused", wrong, Scaled * Scaled,
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main() {
@@ -980,7 +1043,8 @@ int main() {
         int result = draw;
         for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer, RunMeshEmulation,
                                  RunMeshDistribution, RunIndexRewrite,
-                                 RunOcarinaBilinear, RunPipelineArchive}) {
+                                 RunOcarinaBilinear, RunPipelineArchive,
+                                 RunDepthBlit}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }
