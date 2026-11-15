@@ -29,10 +29,10 @@ namespace {
 /// Apple GPUs' largest render target side.
 constexpr u32 MaxRenderTargetSize = 16384;
 
-/// A stage's argument tables: buffers and samplers as every Apple GPU has them, textures as the
-/// largest has them.
+/// A stage's argument tables as Metal's validation layer names them on Apple's own GPUs (a Mac's
+/// other GPUs take 128 textures).
 constexpr u32 BufferSlots = 31;
-constexpr u32 TextureSlots = 128;
+constexpr u32 TextureSlots = 96;
 constexpr u32 SamplerSlots = 16;
 
 /// Metal checks a slot past a stage's tables in its validation layer only.
@@ -680,6 +680,15 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
     // Draws without attachments (occlusion queries) still need a size, within Metal's limit.
     pass.renderTargetWidth = std::clamp(targets.width, 1U, MaxRenderTargetSize);
     pass.renderTargetHeight = std::clamp(targets.height, 1U, MaxRenderTargetSize);
+    const bool targetless = !targets.has_depth && !targets.has_stencil &&
+                            std::ranges::all_of(targets.color, [](const Attachment& color) {
+                                return color.texture == nullptr;
+                            });
+    if (targetless && PipelineCheckEnabled()) {
+        // Without attachments nothing else tells Metal the pass has one sample per pixel, as
+        // the pipelines drawn into it have (MoltenVK sets it for such a pass too).
+        pass.defaultRasterSampleCount = 1;
+    }
     pass.visibilityResultBuffer = impl->visibility;
     impl->render = impl->RenderEncoder(pass);
     impl->render_targets = targets;
