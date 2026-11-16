@@ -266,6 +266,9 @@ public:
     /// The visibility results (one u64 per slot), readable once the GPU is done with them.
     [[nodiscard]] u64* VisibilityResults() noexcept;
 
+    /// The visibility result buffer itself, for kernels reading the results in GPU order.
+    [[nodiscard]] BufferHandle VisibilityBuffer() const noexcept;
+
     /// Changes whenever BeginRendering opens a new render encoder.
     [[nodiscard]] u64 RenderPassSerial() const noexcept;
 

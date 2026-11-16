@@ -21,12 +21,33 @@ bool NeedsConversion(Topology topology) noexcept {
 }
 
 bool RotatesForProvokingVertex(Topology topology) noexcept {
-    return topology == Topology::Triangles || topology == Topology::TriangleStrip;
+    switch (topology) {
+    case Topology::Triangles:
+    case Topology::TriangleStrip:
+    case Topology::Quads:
+    case Topology::QuadStrip:
+    case Topology::TriangleFan:
+    case Topology::Polygon:
+    case Topology::Lines:
+    case Topology::LineStrip:
+    case Topology::LineLoop:
+        return true;
+    default:
+        return false;
+    }
 }
 
 Topology ConvertedTopology(Topology topology, bool provoking_last) noexcept {
     if (provoking_last && RotatesForProvokingVertex(topology)) {
-        return Topology::Triangles;
+        switch (topology) {
+        case Topology::Lines:
+            return Topology::Lines;
+        case Topology::LineStrip:
+        case Topology::LineLoop:
+            return Topology::LineStrip;
+        default:
+            return Topology::Triangles;
+        }
     }
     switch (topology) {
     case Topology::Quads:
@@ -42,11 +63,19 @@ Topology ConvertedTopology(Topology topology, bool provoking_last) noexcept {
 }
 
 u32 ConvertedCount(Topology topology, u32 count, bool provoking_last) noexcept {
-    if (provoking_last && topology == Topology::Triangles) {
-        return count / 3 * 3;
-    }
-    if (provoking_last && topology == Topology::TriangleStrip) {
-        return count >= 3 ? (count - 2) * 3 : 0;
+    if (provoking_last) {
+        switch (topology) {
+        case Topology::Triangles:
+            return count / 3 * 3;
+        case Topology::TriangleStrip:
+            return count >= 3 ? (count - 2) * 3 : 0;
+        case Topology::Lines:
+            return count / 2 * 2;
+        case Topology::LineStrip:
+            return count;
+        default:
+            break;
+        }
     }
     switch (topology) {
     case Topology::Quads:
@@ -90,110 +119,161 @@ u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 f
         }
         }
     };
+    provoking_last = provoking_last && RotatesForProvokingVertex(topology);
     const u32 total = ConvertedCount(topology, count, provoking_last);
     if (out.size() < total) {
         return 0;
     }
     u32 written = 0;
     const auto emit = [&](u32 vertex) { out[written++] = index(vertex); };
-    if (provoking_last && topology == Topology::Triangles) {
-        // The last vertex first; a rotation keeps the winding.
+    // Vulkan's last vertex convention, where Metal takes flat inputs from the first: a triangle
+    // (a, b, c) is written (c, a, b), which keeps its winding.
+    const auto triangle = [&](u32 a, u32 b, u32 c) {
+        if (provoking_last) {
+            emit(c);
+            emit(a);
+            emit(b);
+        } else {
+            emit(a);
+            emit(b);
+            emit(c);
+        }
+    };
+    switch (topology) {
+    case Topology::Triangles:
+        if (!provoking_last) {
+            break;
+        }
         for (u32 vertex = 0; vertex + 3 <= count; vertex += 3) {
-            emit(vertex + 2);
-            emit(vertex);
-            emit(vertex + 1);
+            triangle(vertex, vertex + 1, vertex + 2);
         }
         return written;
-    }
-    if (provoking_last && topology == Topology::TriangleStrip) {
-        // Triangle i of a strip is i, i+1, i+2 (even) or i, i+2, i+1 (odd), its last vertex
-        // i+2; each is written from that one on. A restart index begins a new strip.
+    case Topology::TriangleStrip: {
+        if (!provoking_last) {
+            break;
+        }
+        // Triangle i of a strip is i, i+1, i+2 (even) or i+1, i, i+2 (odd), its last vertex i+2,
+        // each at slot i. A restart index begins a new strip; the triangles across it are
+        // degenerate (0, 0, 0), as the GPU rewrite writes them.
         u32 start = 0;
         for (u32 vertex = 0; vertex < count; ++vertex) {
-            if (restart && index(vertex) == 0xFFFFFFFFU) {
+            const bool is_restart = restart && index(vertex) == 0xFFFFFFFFU;
+            if (is_restart) {
                 start = vertex + 1;
+            }
+            if (vertex < 2) {
                 continue;
             }
-            if (vertex < start + 2) {
-                continue;
-            }
-            const u32 triangle = vertex - 2;
-            emit(vertex);
-            if ((triangle - start) % 2 == 0) {
-                emit(triangle);
-                emit(triangle + 1);
+            const u32 first_vertex = vertex - 2;
+            if (is_restart || vertex < start + 2) {
+                out[written++] = 0;
+                out[written++] = 0;
+                out[written++] = 0;
+            } else if ((first_vertex - start) % 2 == 0) {
+                triangle(first_vertex, first_vertex + 1, vertex);
             } else {
-                emit(triangle + 1);
-                emit(triangle);
+                triangle(first_vertex + 1, first_vertex, vertex);
             }
         }
         return written;
     }
-    switch (topology) {
+    case Topology::Lines:
+        if (!provoking_last) {
+            break;
+        }
+        // Lines keep no winding: each pair swapped.
+        for (u32 vertex = 0; vertex + 2 <= count; vertex += 2) {
+            emit(vertex + 1);
+            emit(vertex);
+        }
+        return written;
+    case Topology::LineStrip:
+        if (!provoking_last) {
+            break;
+        }
+        // The strip backwards: line i starts at its last vertex, restarts stay where they split.
+        for (u32 vertex = 0; vertex < count; ++vertex) {
+            emit(count - 1 - vertex);
+        }
+        return written;
     case Topology::Quads:
         for (u32 quad = 0; quad + 4 <= count; quad += 4) {
-            emit(quad);
-            emit(quad + 1);
-            emit(quad + 2);
-            emit(quad);
-            emit(quad + 2);
-            emit(quad + 3);
+            triangle(quad, quad + 1, quad + 2);
+            triangle(quad, quad + 2, quad + 3);
         }
-        break;
+        return written;
     case Topology::QuadStrip:
         // Each new pair closes a quad with the pair before it, in Vulkan's order
         // (QuadStripIndexBuffer: 0 3 1, 0 2 3).
         for (u32 pair = 0; pair + 4 <= count; pair += 2) {
-            emit(pair);
-            emit(pair + 3);
-            emit(pair + 1);
-            emit(pair);
-            emit(pair + 2);
-            emit(pair + 3);
+            triangle(pair, pair + 3, pair + 1);
+            triangle(pair, pair + 2, pair + 3);
         }
-        break;
+        return written;
     case Topology::TriangleFan:
     case Topology::Polygon:
+        // Vulkan's fan triangle i is i+1, i+2, 0: the first convention takes i+1, the last i+2.
         for (u32 vertex = 1; vertex + 1 < count; ++vertex) {
-            emit(0);
-            emit(vertex);
-            emit(vertex + 1);
+            if (provoking_last) {
+                emit(vertex + 1);
+                emit(0);
+                emit(vertex);
+            } else {
+                emit(vertex);
+                emit(vertex + 1);
+                emit(0);
+            }
         }
-        break;
+        return written;
     case Topology::LineLoop:
+        if (provoking_last) {
+            // The closed loop backwards (0, n-1, ..., 1, 0).
+            for (u32 vertex = 0; vertex <= count && count >= 2; ++vertex) {
+                emit(vertex == 0 ? 0 : count - vertex);
+            }
+            if (count < 2) {
+                for (u32 vertex = 0; vertex < count; ++vertex) {
+                    emit(vertex);
+                }
+            }
+            return written;
+        }
         for (u32 vertex = 0; vertex < count; ++vertex) {
             emit(vertex);
         }
         if (count >= 2) {
             emit(0);
         }
-        break;
+        return written;
     default:
-        for (u32 vertex = 0; vertex < count; ++vertex) {
-            emit(vertex);
-        }
         break;
+    }
+    for (u32 vertex = 0; vertex < count; ++vertex) {
+        emit(vertex);
     }
     return written;
 }
 
-u32 RewriteMode(Topology topology, bool provoking_last) noexcept {
-    if (provoking_last && topology == Topology::Triangles) {
-        return 5;
-    }
-    if (provoking_last && topology == Topology::TriangleStrip) {
-        return 6;
-    }
+u32 RewriteMode(Topology topology, bool provoking_last, bool restart) noexcept {
+    provoking_last = provoking_last && RotatesForProvokingVertex(topology);
     switch (topology) {
     case Topology::Quads:
-        return 1;
+        return provoking_last ? 11 : 1;
     case Topology::QuadStrip:
-        return 2;
+        return provoking_last ? 12 : 2;
     case Topology::TriangleFan:
     case Topology::Polygon:
-        return 3;
+        return provoking_last ? 13 : 3;
     case Topology::LineLoop:
-        return 4;
+        return provoking_last ? 10 : 4;
+    case Topology::Triangles:
+        return provoking_last ? 5 : 0;
+    case Topology::TriangleStrip:
+        return !provoking_last ? 0 : restart ? StripRestartMode : 6;
+    case Topology::Lines:
+        return provoking_last ? 8 : 0;
+    case Topology::LineStrip:
+        return provoking_last ? 9 : 0;
     default:
         return 0;
     }
@@ -217,6 +297,29 @@ struct RewriteParams {
 constant uint quad_order[6] = {0, 1, 2, 0, 2, 3};
 constant uint quad_strip_order[6] = {0, 3, 1, 0, 2, 3};
 
+static uint read_index(device const uchar* source, constant RewriteParams& params, uint element) {
+    if (element >= params.count) {
+        return 0;
+    }
+    if (params.index_size == 0) {
+        // A plain draw: its vertices from the first (source_offset) are the indices.
+        return params.source_offset + element;
+    }
+    const uint at = params.source_offset + element * params.index_size;
+    uint value;
+    switch (params.index_size) {
+    case 1:
+        value = source[at];
+        return params.restart != 0 && value == 0xFFu ? 0xFFFFFFFFu : value;
+    case 2:
+        value = uint(source[at]) | (uint(source[at + 1]) << 8);
+        return params.restart != 0 && value == 0xFFFFu ? 0xFFFFFFFFu : value;
+    default:
+        return uint(source[at]) | (uint(source[at + 1]) << 8) | (uint(source[at + 2]) << 16) |
+               (uint(source[at + 3]) << 24);
+    }
+}
+
 kernel void rewrite_indices(device const uchar* source [[buffer(0)]],
                             device uint* indices [[buffer(1)]],
                             constant RewriteParams& params [[buffer(2)]],
@@ -224,8 +327,17 @@ kernel void rewrite_indices(device const uchar* source [[buffer(0)]],
     if (index >= params.converted) {
         return;
     }
+    uint mode = params.mode;
+    // 11-13: quads, quad strips and fans with the last vertex convention. The list's triangle
+    // (a, b, c) becomes (c, a, b) (fans: their own order).
+    if (mode == 11 || mode == 12) {
+        index = index / 3 * 3 + (index % 3 + 2) % 3;
+        mode -= 10;
+    }
+    const uint triangle = index / 3;
+    const uint corner = index % 3;
     uint element;
-    switch (params.mode) {
+    switch (mode) {
     case 1:
         element = index / 6 * 4 + quad_order[index % 6];
         break;
@@ -233,45 +345,85 @@ kernel void rewrite_indices(device const uchar* source [[buffer(0)]],
         element = index / 6 * 2 + quad_strip_order[index % 6];
         break;
     case 3:
-        element = index % 3 == 0 ? 0 : index / 3 + index % 3;
+        element = corner == 2 ? 0 : triangle + 1 + corner;
+        break;
+    case 13:
+        element = corner == 0 ? triangle + 2 : corner == 1 ? 0 : triangle + 1;
         break;
     case 4:
         element = index < params.count ? index : 0;
         break;
     case 5:
-        element = index / 3 * 3 + (index % 3 == 0 ? 2 : index % 3 - 1);
+        element = triangle * 3 + (corner == 0 ? 2 : corner - 1);
         break;
-    case 6: {
-        const uint triangle = index / 3;
-        const uint corner = index % 3;
+    case 6:
         element = corner == 0 ? triangle + 2
                   : (triangle % 2 == 0) == (corner == 1) ? triangle
                                                          : triangle + 1;
         break;
-    }
+    case 8:
+        element = index ^ 1u;
+        break;
+    case 9:
+        element = params.count - 1 - index;
+        break;
+    case 10:
+        element = index == 0 ? 0 : params.count - index;
+        break;
     default:
         element = index;
         break;
     }
-    uint value = 0;
-    if (element < params.count) {
-        const uint at = params.source_offset + element * params.index_size;
-        switch (params.index_size) {
-        case 1:
-            value = source[at];
-            value = params.restart != 0 && value == 0xFFu ? 0xFFFFFFFFu : value;
-            break;
-        case 2:
-            value = uint(source[at]) | (uint(source[at + 1]) << 8);
-            value = params.restart != 0 && value == 0xFFFFu ? 0xFFFFFFFFu : value;
-            break;
-        default:
-            value = uint(source[at]) | (uint(source[at + 1]) << 8) |
-                    (uint(source[at + 2]) << 16) | (uint(source[at + 3]) << 24);
-            break;
+    indices[index] = read_index(source, params, element);
+}
+
+// A triangle strip with restarts for the last vertex convention (mode 7), in one threadgroup:
+// each thread takes a run of the strip, finds where the strip last started before its run from
+// the other runs' last restarts, and writes triangle i at slot i, degenerate across a restart.
+kernel void rewrite_restart_strip(device const uchar* source [[buffer(0)]],
+                                  device uint* indices [[buffer(1)]],
+                                  constant RewriteParams& params [[buffer(2)]],
+                                  uint lane [[thread_position_in_threadgroup]],
+                                  uint lanes [[threads_per_threadgroup]]) {
+    threadgroup uint run_starts[256];
+    const uint count = params.count;
+    const uint run = (count + lanes - 1) / lanes;
+    const uint begin = min(lane * run, count);
+    const uint end = min(begin + run, count);
+    uint found = 0;
+    for (uint vertex = begin; vertex < end; ++vertex) {
+        if (read_index(source, params, vertex) == 0xFFFFFFFFu) {
+            found = vertex + 1;
         }
     }
-    indices[index] = value;
+    run_starts[lane] = found;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint start = 0;
+    for (uint other = 0; other < lane; ++other) {
+        start = max(start, run_starts[other]);
+    }
+    for (uint vertex = begin; vertex < end; ++vertex) {
+        const uint value = read_index(source, params, vertex);
+        const bool is_restart = value == 0xFFFFFFFFu;
+        if (is_restart) {
+            start = vertex + 1;
+        }
+        if (vertex < 2 || (vertex - 2) * 3 + 3 > params.converted) {
+            continue;
+        }
+        const uint at = (vertex - 2) * 3;
+        const uint first = vertex - 2;
+        if (is_restart || vertex < start + 2) {
+            indices[at] = 0;
+            indices[at + 1] = 0;
+            indices[at + 2] = 0;
+            continue;
+        }
+        const bool even = (first - start) % 2 == 0;
+        indices[at] = value;
+        indices[at + 1] = read_index(source, params, even ? first : first + 1);
+        indices[at + 2] = read_index(source, params, even ? first + 1 : first);
+    }
 }
 )";
 }

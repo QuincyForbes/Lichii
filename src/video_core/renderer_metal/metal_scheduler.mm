@@ -1519,6 +1519,10 @@ void Scheduler::SetVisibility(std::optional<u32> slot) {
     }
 }
 
+BufferHandle Scheduler::VisibilityBuffer() const noexcept {
+    return (__bridge void*)impl->visibility;
+}
+
 u64* Scheduler::VisibilityResults() noexcept {
     return static_cast<u64*>(impl->visibility.contents);
 }

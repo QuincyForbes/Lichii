@@ -819,10 +819,12 @@ Framebuffer::Framebuffer(TextureCacheRuntime&, std::span<ImageView*, NUM_RT> col
         }
         colors[index] = color_buffers[index]->RenderTarget();
         color_formats[index] = color_buffers[index]->HostFormat();
+        color_layers[index] = static_cast<u32>(color_buffers[index]->range.extent.layers);
         samples = color_buffers[index]->Samples();
     }
     if (depth_buffer != nullptr) {
         depth = depth_buffer->RenderTarget();
+        depth_layers = static_cast<u32>(depth_buffer->range.extent.layers);
         depth_format = depth_buffer->HostFormat();
         samples = depth_buffer->Samples();
         const FormatClass format_class = depth_buffer->HostClass();

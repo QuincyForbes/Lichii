@@ -556,6 +556,10 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
             !deadlines.empty()) {
             LOG_INFO(Render_Metal, "Perf Metal threads{}", deadlines);
         }
+        if (const std::string builds = impl->rasterizer.Pipelines().TakeBuildLine();
+            !builds.empty()) {
+            LOG_INFO(Render_Metal, "Perf Metal pipelines: {}", builds);
+        }
         // The pipeline archive: builds it served, and the build time that saved so far (each hit
         // at the average miss's cost, less what the hit took).
         PipelineArchive& archive = impl->rasterizer.Pipelines().Archive();

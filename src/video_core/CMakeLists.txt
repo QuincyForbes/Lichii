@@ -690,6 +690,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_archive.h
         renderer_metal/metal_bridge.h
         renderer_metal/metal_buffer_cache.h
+        renderer_metal/metal_condition.h
         renderer_metal/metal_coverage.h
         renderer_metal/metal_device.h
         renderer_metal/metal_draw_desc.h
@@ -697,6 +698,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_formats.h
         renderer_metal/metal_graphics.h
         renderer_metal/metal_index_convert.h
+        renderer_metal/metal_indirect.h
         renderer_metal/metal_object.h
         renderer_metal/metal_ocarina.h
         renderer_metal/metal_pipeline_cache.h
