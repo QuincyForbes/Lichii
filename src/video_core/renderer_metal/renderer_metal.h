@@ -32,6 +32,10 @@ public:
 private:
     struct Impl;
 
+    /// The screenshot the frontend asked for: the screenshot layer stack drawn at its layout into
+    /// a texture of our own and read back, as Vulkan's RenderScreenshot.
+    void RenderScreenshot(std::span<const Tegra::FramebufferConfig> framebuffers);
+
     Tegra::GPU& gpu;
     std::unique_ptr<Impl> impl;
 };

@@ -123,6 +123,19 @@ public:
         return std::exchange(used, true);
     }
 
+    [[nodiscard]] bool WasUsed() const noexcept {
+        return used;
+    }
+
+    /// The frame of the last draw that took it (pipeline eviction).
+    void SetLastUse(u64 frame) noexcept {
+        last_use = frame;
+    }
+
+    [[nodiscard]] u64 LastUse() const noexcept {
+        return last_use;
+    }
+
     /// The MTLRenderPipelineState for these targets, blending and vertex layout (desc's function
     /// fields are filled in here), made on first use; null when Metal refuses it. While Native()
     /// is there, its mesh pipeline state; when Metal refuses that, Native() becomes null.
@@ -155,6 +168,7 @@ private:
     PipelineFiles* recorder{};
     bool used{};
     bool flat_inputs{};
+    u64 last_use{};
     ::Common::unordered_map<u64, Object> render_states;
     /// Vertex kernel states by variant and vertex layout.
     ::Common::unordered_map<u64, Object> vertex_kernel_states;
@@ -314,6 +328,12 @@ private:
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 
+    /// Vulkan's EvictUnusedPipelines on Apple, from TickFrame (EDEN_NX2_METAL_PIPELINE_EVICT):
+    /// on a memory pressure signal, graphics pipelines no draw took for a while are destroyed
+    /// (their command buffers keep what they reference); EDEN_NX2_PIPELINE_EVICT_LEFT_MIB and
+    /// _MAX as on Vulkan.
+    void EvictUnusedPipelines();
+
     std::unique_ptr<ComputePipeline> CreateComputePipeline(const ComputePipelineKey& key,
                                                            const VideoCommon::ShaderInfo* shader);
 
@@ -344,6 +364,10 @@ private:
     u64 compute_made{};
     u64 refused{};
 
+    /// Frames ended (TickFrame), and the memory pressure signal eviction last answered.
+    u64 frame_count{};
+    u32 evict_pressure_generation{};
+    u64 pressure_evictions_skipped{};
     std::function<bool()> skip_check;
     bool building{};
     BuildStats build_stats;

@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <variant>
+#include "video_core/feature_census.h"
 #include "video_core/present.h"
 #include "video_core/renderer_vulkan/present/anti_alias_pass.h"
 /* X11 defines */
@@ -109,6 +110,10 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
     const u32 scaled_width = texture_info ? texture_info->scaled_width : texture_width;
     const u32 scaled_height = texture_info ? texture_info->scaled_height : texture_height;
     const bool use_accelerated = texture_info.has_value();
+    if (!use_accelerated && VideoCommon::FeatureCensus::Enabled()) [[unlikely]] {
+        VideoCommon::FeatureCensus::NoteMisc(
+            VideoCommon::FeatureCensus::Misc::LayerFromGuestMemory);
+    }
     const bool is_applet =
         (framebuffer.layer_stack_mask & Service::Nvnflinger::LayerStackBit(
                                             Service::Nvnflinger::LayerStackId::Recording)) == 0;

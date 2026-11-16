@@ -20,6 +20,7 @@
 #include "video_core/renderer_metal/metal_formats.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
+#include "video_core/renderer_metal/metal_present.h"
 #include "video_core/renderer_metal/metal_texture_cache.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/decode_bc.h"
@@ -559,12 +560,94 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                                           ImageView* depth, std::array<u32, 2> render_size,
                                           std::array<f32, 2> jitter,
                                           std::array<f32, 2> motion_scale, bool use_history) {
-    using PixelFormat = VideoCore::Surface::PixelFormat;
-    namespace DlssContract = VideoCommon::DlssContract;
-    if (!use_history || depth == nullptr || dst_framebuffer == nullptr ||
-        !WantsTemporalUpscaleDepth()) {
+    if (dst_framebuffer == nullptr) {
         return false;
     }
+    if (use_history && depth != nullptr && WantsTemporalUpscaleDepth() &&
+        MetalFxTemporalUpscale(dst_framebuffer, dst, input_color, motion_vectors, *depth,
+                               render_size, jitter, motion_scale)) {
+        return true;
+    }
+    return TemporalStandIn(dst_framebuffer, dst, input_color, motion_vectors, render_size, jitter,
+                           motion_scale, use_history);
+}
+
+bool TextureCacheRuntime::TemporalStandInEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_TEMPORAL_STANDIN");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool TextureCacheRuntime::TemporalStandIn(Framebuffer* dst_framebuffer, ImageView& dst,
+                                          ImageView& input_color, ImageView& motion_vectors,
+                                          std::array<u32, 2> render_size,
+                                          std::array<f32, 2> jitter,
+                                          std::array<f32, 2> motion_scale, bool use_history) {
+    using PixelFormat = VideoCore::Surface::PixelFormat;
+    namespace DlssContract = VideoCommon::DlssContract;
+    if (!TemporalStandInEnabled() || standin_failed) {
+        return false;
+    }
+    // Vulkan's checks for its stand-in (TextureCacheRuntime::TemporalUpscale).
+    const auto plain = [](const ImageView& view) {
+        return view.range.base.level == 0 && view.range.base.layer == 0;
+    };
+    const auto fits = [](const ImageView& view, std::array<u32, 2> requested) {
+        return DlssContract::FitsExtent(requested, {view.size.width, view.size.height});
+    };
+    const std::array<u32, 2> output_size{dst_framebuffer->Width(), dst_framebuffer->Height()};
+    if (!plain(dst) || !plain(input_color) || dst_framebuffer->Samples() != 1 ||
+        !IsColor(dst.HostClass()) || !fits(input_color, render_size) || !fits(dst, output_size) ||
+        input_color.ImageHandle() == dst.ImageHandle() ||
+        !DlssContract::ValidColorFormats(input_color.format, dst.format, use_history) ||
+        !DlssContract::ValidGeometry(render_size, output_size, jitter, motion_scale)) {
+        return false;
+    }
+    if (use_history && (!plain(motion_vectors) || !fits(motion_vectors, render_size) ||
+                        motion_vectors.format != PixelFormat::R16G16_FLOAT ||
+                        input_color.size.width != motion_vectors.size.width ||
+                        input_color.size.height != motion_vectors.size.height)) {
+        return false;
+    }
+    if (!present_passes) {
+        present_passes = std::make_unique<PresentPasses>(device, scheduler);
+    }
+    if (!present_passes->TemporalFilter({
+            .color = input_color.Handle(Shader::TextureType::Color2D),
+            .motion = use_history ? motion_vectors.Handle(Shader::TextureType::Color2D) : nullptr,
+            .target = dst.RenderTarget(),
+            .format = dst.HostFormat(),
+            .size = output_size,
+            .jitter = jitter,
+            .motion_scale = motion_scale,
+            .use_history = use_history,
+        })) {
+        LOG_WARNING(Render_Metal, "Metal: temporal stand-in unavailable; the game's DLSS runs");
+        standin_failed = true;
+        return false;
+    }
+    ++standin_frames;
+    static bool logged{};
+    if (!logged) {
+        logged = true;
+        LOG_INFO(Render_Metal, "Metal: DLSS replaced by the temporal stand-in: {}x{} -> {}x{}",
+                 render_size[0], render_size[1], output_size[0], output_size[1]);
+    }
+    return true;
+}
+
+bool TextureCacheRuntime::MetalFxTemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst,
+                                                 ImageView& input_color,
+                                                 ImageView& motion_vectors, ImageView& depth_view,
+                                                 std::array<u32, 2> render_size,
+                                                 std::array<f32, 2> jitter,
+                                                 std::array<f32, 2> motion_scale) {
+    using PixelFormat = VideoCore::Surface::PixelFormat;
+    namespace DlssContract = VideoCommon::DlssContract;
+    constexpr bool use_history = true;
+    ImageView* const depth = &depth_view;
     // Images are never rescaled on Metal: each view's size is its texture's.
     const auto plain = [](const ImageView& view) {
         return view.range.base.level == 0 && view.range.base.layer == 0;

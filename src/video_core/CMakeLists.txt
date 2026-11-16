@@ -654,6 +654,7 @@ set(METAL_RENDERER_CXX_SOURCES
     renderer_metal/metal_pipeline_check.cpp
     renderer_metal/metal_pipeline_files.cpp
     renderer_metal/metal_pipeline_translate.cpp
+    renderer_metal/metal_present.cpp
     renderer_metal/metal_rasterizer.cpp
     renderer_metal/metal_shader_translate.cpp
     renderer_metal/metal_staging_buffer_pool.cpp
@@ -704,6 +705,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_object.h
         renderer_metal/metal_ocarina.h
         renderer_metal/metal_pipeline_cache.h
+        renderer_metal/metal_present.h
         renderer_metal/metal_pipeline_files.h
         renderer_metal/metal_pipeline_translate.h
         renderer_metal/metal_rasterizer.h
@@ -712,7 +714,9 @@ if (ENABLE_METAL)
         renderer_metal/metal_shader_translate.h
         renderer_metal/metal_staging_buffer_pool.h
         renderer_metal/metal_swapchain.h
+        renderer_metal/metal_switches.h
         renderer_metal/metal_temporal.h
+        renderer_metal/metal_work_policy.h
         renderer_metal/metal_texture_cache.h
         renderer_metal/renderer_metal.h
     )
@@ -723,7 +727,7 @@ if (ENABLE_METAL)
         SKIP_PRECOMPILE_HEADERS ON
         SKIP_UNITY_BUILD_INCLUSION ON)
     target_link_libraries(video_core PRIVATE spirv-cross-msl "-framework Metal"
-                                             "-framework QuartzCore" "-framework Foundation")
+                                             "-framework QuartzCore" "-framework CoreGraphics" "-framework Foundation")
     target_compile_definitions(video_core PUBLIC LICHII_METAL_RENDERER)
 
     # Offscreen check for machines without a window (the macOS CI runner): raw Metal, then the

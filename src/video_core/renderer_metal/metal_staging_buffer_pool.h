@@ -42,8 +42,13 @@ public:
     void FreeDeferred(StagingBufferRef& ref);
 
     /// A slice of one ring buffer for data used by the command buffer being recorded (streamed
-    /// uniforms): no rounding to powers of two, no padding past `size`.
+    /// uniforms): no rounding to powers of two, no padding past `size`. A slice larger than a
+    /// sixteenth of the ring is a buffer of its own (Request).
     [[nodiscard]] StagingBufferRef Stream(size_t size, size_t alignment);
+
+    [[nodiscard]] u64 StreamSize() const noexcept {
+        return stream_size;
+    }
 
     /// Frees buffers unused for a while.
     void TickFrame();
@@ -79,9 +84,7 @@ private:
         bool deferred{};
     };
 
-    static constexpr u64 StreamSize = u64{32} << 20;
     static constexpr u64 StreamRegions = 16;
-    static constexpr u64 StreamRegionSize = StreamSize / StreamRegions;
 
     /// Takes entries[index] for the command buffer being recorded.
     StagingBufferRef Take(size_t index, size_t size, bool deferred);
@@ -91,6 +94,9 @@ private:
     const Device& device;
     Scheduler& scheduler;
     std::vector<Entry> entries;
+    /// The ring's size: 32 MiB as Vulkan's on iOS, or EDEN_NX2_STREAM_BUFFER_MIB (4 to 1024).
+    u64 stream_size{};
+    u64 stream_region_size{};
     Object stream;
     u8* stream_contents{};
     u64 stream_offset{};

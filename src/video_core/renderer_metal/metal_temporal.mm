@@ -22,6 +22,7 @@ struct ScalerKey {
     MTLPixelFormat color{};
     MTLPixelFormat depth{};
     MTLPixelFormat motion{};
+    MTLPixelFormat reactive{};
     NSUInteger input_width{};
     NSUInteger input_height{};
     std::array<u32, 2> render{};
@@ -56,6 +57,13 @@ bool TemporalUpscaler::IsSupported(const Device& device) {
     return false;
 }
 
+bool TemporalUpscaler::ReactiveMaskSupported() {
+    if (@available(iOS 18.0, macOS 15.0, *)) {
+        return true;
+    }
+    return false;
+}
+
 TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& scheduler,
                                         const Inputs& inputs) {
     Impl& state = *impl;
@@ -72,6 +80,8 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
         const id<MTLTexture> color = AsTexture(inputs.color);
         const id<MTLTexture> depth = AsTexture(inputs.depth);
         const id<MTLTexture> motion = AsTexture(inputs.motion);
+        const id<MTLTexture> reactive =
+            ReactiveMaskSupported() ? AsTexture(inputs.reactive) : nil;
         if (color == nil || depth == nil || motion == nil) {
             return decline("an input has no texture");
         }
@@ -84,6 +94,7 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
             .color = color.pixelFormat,
             .depth = depth.pixelFormat,
             .motion = motion.pixelFormat,
+            .reactive = reactive != nil ? reactive.pixelFormat : MTLPixelFormatInvalid,
             .input_width = color.width,
             .input_height = color.height,
             .render = inputs.render_size,
@@ -112,6 +123,12 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
                 descriptor.inputContentPropertiesEnabled = YES;
                 descriptor.inputContentMinScale = (std::min)(scale_x, scale_y);
                 descriptor.inputContentMaxScale = (std::max)(scale_x, scale_y);
+            }
+            if (key.reactive != MTLPixelFormatInvalid) {
+                if (@available(iOS 18.0, macOS 15.0, *)) {
+                    descriptor.reactiveMaskTextureEnabled = YES;
+                    descriptor.reactiveMaskTextureFormat = key.reactive;
+                }
             }
             id<MTLFXTemporalScaler> scaler = nil;
             // An exception MetalFX raises for a descriptor it rejects would end the app.
@@ -145,15 +162,25 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
             state.scaler = scaler;
             state.key = key;
             state.first_evaluation = true;
-            LOG_INFO(Render_Metal, "MetalFX temporal: {}x{} in {}x{} textures -> {}x{}",
+            LOG_INFO(Render_Metal,
+                     "MetalFX temporal: {}x{} in {}x{} textures -> {}x{}, reactive mask {}",
                      key.render[0], key.render[1], key.input_width, key.input_height,
-                     key.output[0], key.output[1]);
+                     key.output[0], key.output[1],
+                     key.reactive != MTLPixelFormatInvalid ? "on" : "off");
         }
         id<MTLFXTemporalScaler> scaler = state.scaler;
         if (!HasUsage(color, scaler.colorTextureUsage) ||
             !HasUsage(depth, scaler.depthTextureUsage) ||
             !HasUsage(motion, scaler.motionTextureUsage)) {
             return decline("an input lacks the usage MetalFX needs");
+        }
+        if (reactive != nil) {
+            if (@available(iOS 18.0, macOS 15.0, *)) {
+                if (!HasUsage(reactive, scaler.reactiveTextureUsage)) {
+                    return decline("the reactive mask lacks the usage MetalFX needs");
+                }
+                scaler.reactiveMaskTexture = reactive;
+            }
         }
         scaler.colorTexture = color;
         scaler.depthTexture = depth;

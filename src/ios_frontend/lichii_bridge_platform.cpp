@@ -516,6 +516,46 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_METAL_ALPHA_TO_ONE", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment metal_alpha_to_one_off on");
     }
+    if (lichii_platform_experiment("metal_actor_off")) {
+        setenv("EDEN_NX2_METAL_OOT_ACTOR", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_actor_off on");
+    }
+    if (lichii_platform_experiment("metal_effects_off")) {
+        setenv("EDEN_NX2_METAL_OOT_EFFECTS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_effects_off on");
+    }
+    if (lichii_platform_experiment("metal_vulkan_switches_off")) {
+        setenv("EDEN_NX2_METAL_VULKAN_SWITCHES", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_vulkan_switches_off on");
+    }
+    if (lichii_platform_experiment("metal_fence_batch_off")) {
+        setenv("EDEN_NX2_METAL_FENCE_BATCH", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_fence_batch_off on");
+    }
+    if (lichii_platform_experiment("metal_filters_off")) {
+        setenv("EDEN_NX2_METAL_PRESENT_FILTERS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_filters_off on");
+    }
+    if (lichii_platform_experiment("metal_standin_off")) {
+        setenv("EDEN_NX2_METAL_TEMPORAL_STANDIN", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_standin_off on");
+    }
+    if (lichii_platform_experiment("metal_bindmemo_off")) {
+        setenv("EDEN_NX2_METAL_BINDMEMO", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_bindmemo_off on");
+    }
+    if (lichii_platform_experiment("metal_pacing_off")) {
+        setenv("EDEN_NX2_METAL_HOST_PACE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_pacing_off on");
+    }
+    if (lichii_platform_experiment("metal_colorspace_off")) {
+        setenv("EDEN_NX2_METAL_COLORSPACE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_colorspace_off on");
+    }
+    if (lichii_platform_experiment("metal_evict_off")) {
+        setenv("EDEN_NX2_METAL_PIPELINE_EVICT", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_evict_off on");
+    }
     if (lichii_platform_experiment("pipeline_holds_old")) {
         setenv("EDEN_NX2_PIPELINE_HOLD_BOOST", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment pipeline_holds_old on");

@@ -103,6 +103,8 @@ def check_tests(rows):
     units = "".join(path.read_text(encoding="utf-8", errors="replace")
                     for path in (ROOT / "src" / "tests").rglob("*.cpp"))
     probes = (METAL / "metal_smoke_probe.mm").read_text(encoding="utf-8", errors="replace")
+    units = "".join(path.read_text(encoding="utf-8", errors="replace")
+                    for path in (ROOT / "src" / "tests").rglob("*.cpp"))
     problems = []
     for row in rows:
         for item in (part.strip() for part in row["tested"].split(",")):

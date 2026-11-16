@@ -68,6 +68,8 @@ enum class Misc : u32 {
     FragmentBarrier,
     TiledCacheBarrier,
     CounterReset,
+    LayerFromGuestMemory, ///< A display layer read from guest memory (no cached image)
+    AppletCaptureLayer,   ///< A frame with layers for the applet capture (LastFrame)
 };
 
 /// Registers a draw record holds after its fixed columns: `count` words from `first`, `step`

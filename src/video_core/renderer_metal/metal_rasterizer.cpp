@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -49,7 +50,10 @@
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_mesh_indirect.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
+#include "video_core/renderer_metal/metal_bind_memo.h"
 #include "video_core/renderer_metal/metal_rasterizer.h"
+#include "video_core/renderer_metal/metal_switches.h"
+#include "video_core/renderer_metal/metal_work_policy.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/shader_handle_program.h"
@@ -286,6 +290,17 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
       fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_} {
     pipeline_cache.SetSkipCheck([this] { return DrawMayBeSkipped(); });
     Common::PlatformEvents::SetGraphicsMemoryReport([this] { return GraphicsMemoryReport(); });
+    // Fence work left pending (EDEN_NX2_FENCE_FLUSH_US) is committed when the split's back goes
+    // idle, as Vulkan's deferred flushes; EDEN_NX2_IDLE_GRACE_US and EDEN_NX2_IDLE_HOLD_US work
+    // through the same hooks.
+    VideoCommon::GpuSplit::Get().SetIdleHook(
+        [](void* argument, bool requested) {
+            return static_cast<Scheduler*>(argument)->FlushDeferredFromIdle(requested);
+        },
+        [](void* argument) { return static_cast<Scheduler*>(argument)->DeferredFlushMayWait(); },
+        &scheduler);
+    VideoCommon::GpuSplit::Get().SetIdleBusy(
+        [](void* argument) { return static_cast<Scheduler*>(argument)->GpuBehind(); });
     if (!CachePathsEnabled()) {
         LOG_WARNING(Render_Metal, "Metal: plain cache paths (EDEN_NX2_METAL_CACHE_PATHS=0)");
         return;
@@ -324,6 +339,8 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
 
 RasterizerMetal::~RasterizerMetal() {
     Common::PlatformEvents::SetGraphicsMemoryReport({});
+    VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr, nullptr);
+    VideoCommon::GpuSplit::Get().SetIdleBusy(nullptr);
     if (CachePathsEnabled()) {
         VideoCommon::GpuSplit::Get().SetFenceQuietCheck(nullptr, nullptr);
     }
@@ -493,7 +510,33 @@ bool RasterizerMetal::TryIndirectReset(bool is_indexed, u32 instance_count) {
     return true;
 }
 
+bool RasterizerMetal::SkipMeshDraws(bool emulated) {
+    // Vulkan's EDEN_NX2_NO_MESH=1, EDEN_NX2_NO_MESH_EMULATION=1 (the draws through the compute
+    // emulation only) and EDEN_NX2_NO_MESH_FILE=<path> (while it exists, checked every 1024 mesh
+    // draws), read under EDEN_NX2_METAL_VULKAN_SWITCHES: mesh draws skipped for comparisons.
+    static const char* const file = VulkanSwitch("EDEN_NX2_NO_MESH_FILE");
+    static const bool no_emulation = VulkanSwitch("EDEN_NX2_NO_MESH_EMULATION") != nullptr;
+    if (!mesh_skip) {
+        mesh_skip = WorkPolicy::MeshSkip{
+            .always = VulkanSwitch("EDEN_NX2_NO_MESH") != nullptr,
+            .has_file = file != nullptr,
+        };
+    }
+    const bool skip = mesh_skip->Skip([] { return std::filesystem::exists(file); });
+    return skip || (emulated && no_emulation);
+}
+
 void RasterizerMetal::FlushWork() {
+    // Vulkan's EDEN_NX2_FLUSH_DRAWS=<n> (read under EDEN_NX2_METAL_VULKAN_SWITCHES): the work
+    // recorded is committed every n draws. Unset, Metal commits at fences, waits and frame ends.
+    static const u32 flush_draws =
+        WorkPolicy::ParseFlushDraws(VulkanSwitch("EDEN_NX2_FLUSH_DRAWS"));
+    draw_flush.budget = flush_draws;
+    if (draw_flush.Note()) {
+        ++draw_flushes;
+        scheduler.Flush();
+        return;
+    }
     if (!staging_pool.WantsFlush()) {
         return;
     }
@@ -566,6 +609,10 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         return;
     }
     if (pipeline->IsMeshPipeline()) {
+        if (SkipMeshDraws(pipeline->Native() == nullptr)) {
+            RefuseDraw("EDEN_NX2_NO_MESH");
+            return;
+        }
         // The draw's count is its mesh workgroups (the index count for indexed draws).
         const u32 groups = is_indexed ? draw_state.index_buffer.count
                                       : draw_state.vertex_buffer.count;
@@ -705,6 +752,11 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         }
         // The region's command buffer was committed in between: decided on the CPU.
         return !ConditionHoldsOnCpu();
+    };
+    TrackOcarinaActor(pipeline->Key().unique_hashes[1], is_indexed);
+    // After the draw is encoded: the fog's draw saves the scene for the effects mask.
+    SCOPE_EXIT {
+        NoteOcarinaEffectsDraw(pipeline->Key().unique_hashes[5]);
     };
 
     if (convert) {
@@ -1126,6 +1178,10 @@ bool RasterizerMetal::DrawMeshTasksFromGpu(DAddr count_addr) {
     // (the caller reads it and draws again).
     if (pipeline == nullptr || pipeline->Native() == nullptr || !pipeline->BuildFunctions(device) ||
         pipeline->Native() == nullptr) {
+        return false;
+    }
+    if (SkipMeshDraws(false)) {
+        // Draw skips it once the count is read.
         return false;
     }
     if (!ConditionHoldsOnCpu()) {
@@ -1625,6 +1681,11 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     std::vector<VideoCommon::SamplerId> samplers;
     std::array<size_t, 4> first_view{};
     std::array<size_t, 4> first_sampler{};
+    // EDEN_NX2_BINDMEMO: the sampler handles and binding kinds, to look the bindings up in the
+    // texture cache's memo.
+    const bool use_bind_memo = BindMemo::Enabled();
+    std::vector<u32> sampler_handles;
+    std::vector<u32> binding_kinds;
     const bool via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
     for (size_t index = 0; index < stages.size(); ++index) {
         first_view[index] = views.size();
@@ -1681,7 +1742,12 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             for (u32 element = 0; element < desc.count; ++element) {
                 const auto handle = read_handle(desc, element);
                 views.push_back({.index = handle.first});
-                samplers.push_back(texture_cache.GetSamplerId(handle.second, false));
+                if (use_bind_memo) {
+                    sampler_handles.push_back(handle.second);
+                    samplers.emplace_back();
+                } else {
+                    samplers.push_back(texture_cache.GetSamplerId(handle.second, false));
+                }
             }
         }
         for (const auto& desc : info.image_descriptors) {
@@ -1690,8 +1756,21 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                     {.index = read_handle(desc, element).first, .blacklist = desc.is_written});
             }
         }
+        if (use_bind_memo) {
+            BindMemo::AppendKinds(info, 0, binding_kinds);
+        }
     }
-    texture_cache.FillImageViews(views, false, true);
+    if (use_bind_memo && binding_kinds.size() == views.size()) {
+        BindMemo::Resolve(texture_cache, false, true, binding_kinds, views, sampler_handles,
+                          samplers, bind_memo_counts);
+    } else if (use_bind_memo) {
+        for (size_t index = 0; index < sampler_handles.size(); ++index) {
+            samplers[index] = texture_cache.GetSamplerId(sampler_handles[index], false);
+        }
+        texture_cache.FillImageViews(views, false, true);
+    } else {
+        texture_cache.FillImageViews(views, false, true);
+    }
     for (size_t index = 0; index < stages.size(); ++index) {
         if (!absent(index)) {
             PrepareSampleGrids(programs[index]->info, std::span(views).subspan(first_view[index]));
@@ -1699,6 +1778,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     }
     texture_cache.UpdateRenderTargets(false);
     TrackOcarinaCamera();
+    UpdateOcarinaJitter();
     if (TargetlessReachEnabled() && texture_cache.HasNoRenderTargets()) {
         texture_cache.BoundTargetlessFramebuffer(
             TargetlessReach(regs, texture_cache.IsRescaling()));
@@ -2232,6 +2312,9 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             viewport.width *= scale;
             viewport.height *= scale;
         }
+        // Ocarina's scene draws under EDEN_NX2_DLSS_JITTER (UpdateOcarinaJitter).
+        viewport.x += oot_jitter_applied[0];
+        viewport.y += oot_jitter_applied[1];
         if (viewport.width == 0.0f) {
             viewport.width = 1.0f;
         }
@@ -2408,6 +2491,10 @@ void RasterizerMetal::DrawIndirect() {
         return;
     }
     if (pipeline->IsMeshPipeline()) {
+        if (SkipMeshDraws(pipeline->Native() == nullptr)) {
+            RefuseDraw("EDEN_NX2_NO_MESH");
+            return;
+        }
         DrawMeshIndirect(*pipeline);
         return;
     }
@@ -2659,6 +2746,31 @@ bool RasterizerMetal::OcarinaTemporalEnabled() {
            ocarina_temporal.Available();
 }
 
+void RasterizerMetal::UpdateOcarinaJitter() {
+    std::array<f32, 2> want{};
+    // As Vulkan: only while MetalFX replaced the previous frame's upscale (a frame the game
+    // upscales itself would show the offset as a shake), and only for draws that depth-test
+    // against the scene depth at the scene size, so a depth pre-pass and the colour passes move
+    // together and shadow maps, half-size and full-screen passes stay put.
+    const auto& regs = maxwell3d->regs;
+    if (oot_temporal_frame && *oot_temporal_frame + 1 >= oot_frame && regs.depth_test_enable &&
+        oot_motion.extent[0] != 0 && VulkanSwitchesEnabled() &&
+        VideoCommon::OcarinaJitterEnabled(VideoCommon::OcarinaUpscaleBackend::Dlss)) {
+        const auto& targets = texture_cache.GetRenderTargets();
+        if (targets.depth_buffer_id) {
+            const ImageView& depth = texture_cache.GetImageView(targets.depth_buffer_id);
+            if (oot_motion.SceneSized(depth.size.width, depth.size.height) &&
+                !texture_cache.IsRescaling(depth)) {
+                // Halton (2, 3) with AMD's phase count for the last upscaled frame's scale.
+                want = WorkPolicy::OcarinaJitter(oot_frame, oot_jitter_phases);
+                oot_jitter_frame = oot_frame;
+                oot_jitter_offset = want;
+            }
+        }
+    }
+    oot_jitter_applied = want;
+}
+
 void RasterizerMetal::TrackOcarinaCamera() {
     if ((oot_motion.camera_frame == oot_frame && oot_motion.extent[0] >= 2560 &&
          oot_motion.extent[1] >= 1440) ||
@@ -2823,6 +2935,9 @@ bool RasterizerMetal::TryOcarinaTemporal(u64 shader_hash,
         color.ImageHandle() == target.ImageHandle() || depth.ImageHandle() == target.ImageHandle()) {
         return fail("unexpected upscale images");
     }
+    // Without Link's pose the motion comes from the camera alone.
+    OcarinaActorMesh actor{};
+    const bool has_actor = OcarinaTemporal::ActorEnabled() && ReadOcarinaActor(actor);
     const char* reason = nullptr;
     if (!ocarina_temporal.Record(
             {
@@ -2834,10 +2949,15 @@ bool RasterizerMetal::TryOcarinaTemporal(u64 shader_hash,
                 .current = oot_motion.current,
                 .previous = oot_motion.previous,
                 .frame = oot_frame,
+                .actor = has_actor ? &actor : nullptr,
+                .jitter = oot_jitter_frame == oot_frame ? oot_jitter_offset
+                                                        : std::array<f32, 2>{},
             },
             reason)) {
         return fail(reason != nullptr ? reason : "MetalFX declined the frame");
     }
+    oot_temporal_frame = oot_frame;
+    oot_jitter_phases = VideoCommon::OcarinaJitterPhases(extent[0], target.size.width);
     CountOcarinaTemporal(true);
     oot_decline = nullptr;
     return true;
@@ -2863,11 +2983,187 @@ void RasterizerMetal::CountOcarinaTemporal(bool replaced, const char* reason) {
             reasons += fmt::format("{}{} {}", reasons.empty() ? "; declined: " : ", ", name, count);
         }
     }
-    LOG_INFO(Render_Metal, "Ocarina MetalFX: {} of {} upscale passes replaced; scene {}x{}{}",
+    const auto [actor_frames, effects_frames] = ocarina_temporal.TakeExtras();
+    LOG_INFO(Render_Metal,
+             "Ocarina MetalFX: {} of {} upscale passes replaced; scene {}x{}; Link's motion {}, "
+             "effects mask {}{}",
              oot_replaced, oot_replaced + oot_declined, oot_motion.extent[0],
-             oot_motion.extent[1], reasons);
+             oot_motion.extent[1], actor_frames, effects_frames, reasons);
     oot_replaced = oot_declined = 0;
     oot_decline_reasons = {};
+}
+
+void RasterizerMetal::TrackOcarinaActor(u64 vertex_hash, bool is_indexed) {
+    if (vertex_hash != OcarinaTemporal::ActorVertexShader || !is_indexed ||
+        !OcarinaTemporal::ActorEnabled() || !OcarinaTemporalEnabled() ||
+        oot_actor_poses[oot_actor_pose_index].frame == oot_frame) {
+        return;
+    }
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    const auto& regs = maxwell3d->regs;
+    const auto& stream = regs.vertex_streams[0];
+    if (draw.index_buffer.count != 9702 || draw.index_buffer.FormatSizeInBytes() != 2 ||
+        !stream.IsEnabled() || stream.stride != OcarinaActorMesh::Stride ||
+        regs.vertex_stream_instances.IsInstancingEnabled(0)) {
+        return;
+    }
+    // The layout ocarina_actor_motion.vert reads (Vulkan compares the Vulkan formats).
+    using Attribute = Maxwell::VertexAttribute;
+    const auto attribute = [&](u32 location, Attribute::Type type, Attribute::Size size,
+                               Attribute::Size same_size, u32 offset) {
+        const auto& attrib = regs.vertex_attrib_format[location];
+        const Attribute::Size attrib_size = attrib.size.Value();
+        return attrib.buffer == 0 && attrib.constant == 0 && attrib.offset == offset &&
+               attrib.type.Value() == type && (attrib_size == size || attrib_size == same_size);
+    };
+    constexpr Attribute::Size rgb32 = Attribute::Size::Size_R32_G32_B32;
+    constexpr Attribute::Size rgba8 = Attribute::Size::Size_R8_G8_B8_A8;
+    constexpr Attribute::Size xbgr8 = Attribute::Size::Size_X8_B8_G8_R8;
+    constexpr Attribute::Size rgba16 = Attribute::Size::Size_R16_G16_B16_A16;
+    if (!attribute(0, Attribute::Type::Float, rgb32, rgb32, 0) ||
+        !attribute(4, Attribute::Type::UNorm, rgba8, xbgr8, 40) ||
+        !attribute(5, Attribute::Type::UNorm, rgba8, xbgr8, 44) ||
+        !attribute(6, Attribute::Type::UInt, rgba16, rgba16, 12) ||
+        !attribute(7, Attribute::Type::UInt, rgba16, rgba16, 20)) {
+        return;
+    }
+    const auto& cbufs = maxwell3d->state.shader_stages[0].const_buffers;
+    if (!cbufs[4].enabled || cbufs[4].size < 0x40 + 3 * sizeof(f32) || !cbufs[6].enabled ||
+        cbufs[6].size != 13568) {
+        return;
+    }
+    const auto origin_dev = gpu_memory->GpuToCpuAddress(cbufs[4].address);
+    const auto bones_dev = gpu_memory->GpuToCpuAddress(cbufs[6].address);
+    if (!origin_dev || !bones_dev || buffer_cache.IsRegionGpuModified(*origin_dev, cbufs[4].size) ||
+        buffer_cache.IsRegionGpuModified(*bones_dev, cbufs[6].size)) {
+        return;
+    }
+    oot_actor_pose_index ^= 1U;
+    auto& pose = oot_actor_poses[oot_actor_pose_index];
+    pose.frame = oot_frame;
+    pose.channel = gpu_memory;
+    pose.vertex = stream.Address();
+    pose.indices = draw.index_buffer.IndexStart();
+    pose.base_vertex = static_cast<s32>(draw.base_index);
+    pose.origin = {};
+    device_memory.ReadBlockUnsafe(*origin_dev + 0x40, pose.origin.data(), 3 * sizeof(f32));
+    device_memory.ReadBlockUnsafe(*bones_dev, pose.bones.data(), sizeof(pose.bones));
+}
+
+bool RasterizerMetal::ReadOcarinaActor(OcarinaActorMesh& mesh) {
+    const auto& now = oot_actor_poses[oot_actor_pose_index];
+    const auto& before = oot_actor_poses[oot_actor_pose_index ^ 1U];
+    if (now.frame != oot_frame || before.frame + 1 != now.frame || now.channel != gpu_memory ||
+        before.channel != now.channel || now.vertex != before.vertex ||
+        now.indices != before.indices || now.base_vertex != before.base_vertex) {
+        return false;
+    }
+    auto& cache = oot_actor_mesh_cache;
+    const auto can_stay_cached = [&](GPUVAddr address, size_t size) {
+        const auto device_address = gpu_memory->GpuToCpuAddress(address);
+        return device_address && !buffer_cache.IsRegionGpuModified(*device_address, size) &&
+               !gpu.HasPendingCPUWrites(*device_address, size);
+    };
+    constexpr size_t index_count = 9702;
+    constexpr size_t stride = OcarinaActorMesh::Stride;
+    if (cache.channel != now.channel || cache.vertex != now.vertex ||
+        cache.indices != now.indices || cache.base_vertex != now.base_vertex ||
+        cache.index_data.size() != index_count || cache.vertices.empty() ||
+        !can_stay_cached(now.indices, index_count * sizeof(u16))) {
+        const auto read = [&](GPUVAddr address, void* dst, size_t size) {
+            if (!gpu_memory->IsContinuousRange(address, size) ||
+                !gpu_memory->IsFullyMappedRange(address, size) ||
+                !can_stay_cached(address, size)) {
+                return false;
+            }
+            gpu_memory->ReadBlockUnsafe(address, dst, size);
+            return true;
+        };
+        cache.index_data.resize(index_count);
+        if (!read(now.indices, cache.index_data.data(), cache.index_data.size() * sizeof(u16))) {
+            cache.vertices.clear();
+            return false;
+        }
+        const auto [minimum, maximum] = std::ranges::minmax(cache.index_data);
+        const s64 first = static_cast<s64>(now.base_vertex) + minimum;
+        const u32 vertex_count = static_cast<u32>(maximum) - minimum + 1;
+        if (first < 0 || first > (1 << 20) || vertex_count > 16384) {
+            cache.vertices.clear();
+            return false;
+        }
+        cache.vertices.resize(vertex_count * stride);
+        if (!read(now.vertex + first * stride, cache.vertices.data(), cache.vertices.size())) {
+            cache.vertices.clear();
+            return false;
+        }
+        for (u16& index : cache.index_data) {
+            index = static_cast<u16>(index - minimum);
+        }
+        cache.channel = now.channel;
+        cache.vertex = now.vertex;
+        cache.indices = now.indices;
+        cache.base_vertex = now.base_vertex;
+        ++cache.key;
+    }
+    mesh = {
+        .vertices = cache.vertices,
+        .indices = cache.index_data,
+        .mesh_key = cache.key,
+        .current_origin = now.origin,
+        .previous_origin = before.origin,
+        .current_bones = now.bones,
+        .previous_bones = before.bones,
+    };
+    return true;
+}
+
+void RasterizerMetal::NoteOcarinaEffectsDraw(u64 fragment_hash) {
+    if (fragment_hash != OcarinaTemporal::FogFragmentShader || !OcarinaTemporal::EffectsEnabled() ||
+        !OcarinaTemporalEnabled() || oot_motion.camera_frame != oot_frame) {
+        return;
+    }
+    const auto scene_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
+    if (!scene_id) {
+        return;
+    }
+    ImageView& scene = texture_cache.GetImageView(scene_id);
+    if (scene.format != VideoCore::Surface::PixelFormat::B10G11R11_FLOAT ||
+        !oot_motion.SceneSized(scene.size.width, scene.size.height) ||
+        texture_cache.IsRescaling(scene) || scene.range != VideoCommon::SubresourceRange{}) {
+        return;
+    }
+    oot_effects_scene = scene.Handle(Shader::TextureType::Color2D);
+    oot_effects_address = scene.gpu_addr;
+    oot_effects_frame = oot_frame;
+    ocarina_temporal.SaveEffectsBase(oot_effects_scene, oot_motion.extent, oot_frame);
+}
+
+void RasterizerMetal::MarkOcarinaEffects(const Shader::Info& info,
+                                         std::span<const VideoCommon::ImageViewInOut> views) {
+    if (oot_effects_frame != oot_frame) {
+        return;
+    }
+    // Views: texel buffers, image buffers, textures, then the images.
+    size_t view = 0;
+    for (const auto& desc : info.texture_buffer_descriptors) {
+        view += desc.count;
+    }
+    for (const auto& desc : info.image_buffer_descriptors) {
+        view += desc.count;
+    }
+    for (const auto& desc : info.texture_descriptors) {
+        view += desc.count;
+    }
+    for (const auto& desc : info.image_descriptors) {
+        for (u32 element = 0; element < desc.count; ++element, ++view) {
+            if (desc.is_written && view < views.size() && views[view].id &&
+                texture_cache.GetImageView(views[view].id).gpu_addr == oot_effects_address) {
+                ocarina_temporal.MarkEffects(oot_effects_scene, oot_frame);
+                oot_effects_frame.reset();
+                return;
+            }
+        }
+    }
 }
 
 bool RasterizerMetal::ProvokingLastWanted(const GraphicsPipeline& pipeline) {
@@ -3234,6 +3530,8 @@ void RasterizerMetal::DispatchCompute() {
     };
     std::vector<VideoCommon::ImageViewInOut> views;
     std::vector<VideoCommon::SamplerId> samplers;
+    const bool use_bind_memo = BindMemo::Enabled();
+    std::vector<u32> sampler_handles;
     for (const auto& desc : info.texture_buffer_descriptors) {
         for (u32 element = 0; element < desc.count; ++element) {
             views.push_back({.index = read_handle(desc, element).first});
@@ -3248,7 +3546,12 @@ void RasterizerMetal::DispatchCompute() {
         for (u32 element = 0; element < desc.count; ++element) {
             const auto handle = read_handle(desc, element);
             views.push_back({.index = handle.first});
-            samplers.push_back(texture_cache.GetSamplerId(handle.second, true));
+            if (use_bind_memo) {
+                sampler_handles.push_back(handle.second);
+                samplers.emplace_back();
+            } else {
+                samplers.push_back(texture_cache.GetSamplerId(handle.second, true));
+            }
         }
     }
     for (const auto& desc : info.image_descriptors) {
@@ -3257,11 +3560,28 @@ void RasterizerMetal::DispatchCompute() {
                 {.index = read_handle(desc, element).first, .blacklist = desc.is_written});
         }
     }
-    texture_cache.FillImageViews(views, true);
+    if (use_bind_memo) {
+        std::vector<u32> binding_kinds;
+        BindMemo::AppendKinds(info, TextureCache::BINDING_KIND_COMPUTE, binding_kinds);
+        if (binding_kinds.size() == views.size()) {
+            BindMemo::Resolve(texture_cache, true, true, binding_kinds, views, sampler_handles,
+                              samplers, bind_memo_counts);
+        } else {
+            for (size_t index = 0; index < sampler_handles.size(); ++index) {
+                samplers[index] = texture_cache.GetSamplerId(sampler_handles[index], true);
+            }
+            texture_cache.FillImageViews(views, true);
+        }
+    } else {
+        texture_cache.FillImageViews(views, true);
+    }
     MakePlaceholders();
     PrepareSampleGrids(info, views);
     if (pipeline->Key().unique_hash == OcarinaTemporal::DepthReader) {
         TrackOcarinaDepth();
+    }
+    if (!kepler_compute->GetIndirectComputeAddress()) {
+        MarkOcarinaEffects(info, views);
     }
     // The upscale pass through MetalFX temporal upscaling when it is the chosen upscaler, as
     // Vulkan's TryOcarinaUpscale; declined, the bilinear pass or the game's own runs.

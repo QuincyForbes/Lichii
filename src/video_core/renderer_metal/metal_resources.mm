@@ -15,6 +15,7 @@
 #include "video_core/renderer_metal/metal_formats.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_resources.h"
+#include "video_core/renderer_metal/metal_switches.h"
 #include "video_core/texture_cache/decode_bc.h"
 
 // MTLSamplerDescriptor's lodBias and reductionMode came with the macOS / iOS 26 SDKs.
@@ -441,6 +442,13 @@ Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc,
     }
     descriptor.lodMinClamp = tsc.MinLod();
     descriptor.lodMaxClamp = (std::max)(tsc.MaxLod(), tsc.MinLod());
+    // Vulkan's EDEN_NX2_FORCE_LOD0 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): mipmapped
+    // samplers read the top level only (a debug aid for mip layout problems).
+    static const bool force_lod0 = VulkanSwitch("EDEN_NX2_FORCE_LOD0") != nullptr;
+    if (force_lod0 && tsc.mipmap_filter != TextureMipmapFilter::None) {
+        descriptor.lodMinClamp = 0.0f;
+        descriptor.lodMaxClamp = 0.25f;
+    }
     f32 anisotropy = std::clamp(tsc.MaxAnisotropy(), 1.0f, 16.0f);
     if (options.force_nearest) {
         anisotropy = 1.0f;

@@ -373,8 +373,7 @@ EDEN_NX2_FENCE_BATCH=1
 # before, also with the upscaler set to MetalFX Temporal. By default, with that setting (or
 # EDEN_NX2_DLSS_REPLACEMENT=dlss), the pass is replaced as on Vulkan: the camera is read from the
 # scene draws, motion is made from the scene depth, MetalFX upscales and the game's target is
-# written from its output; EDEN_NX2_OOT_TEMPORAL_HANDHELD applies as on Vulkan. Link's skinned
-# motion and the effects mask Vulkan adds are not made on Metal.
+# written from its output; EDEN_NX2_OOT_TEMPORAL_HANDHELD applies as on Vulkan.
 #EDEN_NX2_METAL_OOT_TEMPORAL=0
 
 # Metal renderer: 0 draws flat inputs from each primitive's first vertex, as Metal (it has no
@@ -477,6 +476,84 @@ EDEN_NX2_FENCE_BATCH=1
 # the draw (Metal has 31 buffer slots per stage); instanced and constant streams past the slots
 # are still refused.
 #EDEN_NX2_METAL_VERTEX_GATHER=0
+
+# Metal renderer: 0 gives Link's pixels the camera's motion only under the above, as before. By
+# default his skinned draw's pose is kept for this frame and the last (bones, origin, mesh), and
+# his mesh is drawn with both poses over the camera's motion where it lands on the scene depth,
+# as Vulkan's ActorOverlay does (ocarina_actor_motion.vert/.frag through the translator). The
+# "Ocarina MetalFX:" line counts the frames with "Link's motion".
+#EDEN_NX2_METAL_OOT_ACTOR=0
+
+# Metal renderer: 0 gives MetalFX no reactive mask under the above, as before. By default the
+# scene is copied once the fog is drawn, the pixels the glows and particles change after it are
+# marked when the game's next pass writes the scene, and the mark (with last frame's, moved) is
+# MetalFX's reactive mask, so those pixels take this frame's colour, as on Vulkan. MetalFX takes
+# a reactive mask from iOS 18 and macOS 15 on; before, none is made. The "Ocarina MetalFX:" line
+# counts the frames with an "effects mask".
+#EDEN_NX2_METAL_OOT_EFFECTS=0
+
+# Metal renderer: the bits of float depth Link's replayed pixels may differ from the scene depth
+# by under EDEN_NX2_METAL_OOT_ACTOR, 16 as on Vulkan. 4294967295 compares nothing (his whole
+# mesh gets his motion, also where the scene hides him).
+#EDEN_NX2_METAL_OOT_ACTOR_TOLERANCE=16
+
+# Metal renderer: 0 ignores the Vulkan renderer's switches Metal reads, as before. By default the
+# Metal renderer does what these do on Vulkan: EDEN_NX2_DYNSTATE_CACHE, EDEN_NX2_VERTEX_INPUT_CACHE,
+# EDEN_NX2_STREAM_BUFFER_MIB, EDEN_NX2_FENCE_FLUSH_US (2000 on phones from the device profile),
+# EDEN_NX2_FLUSH_DRAWS, EDEN_NX2_NO_MESH, EDEN_NX2_NO_MESH_FILE, EDEN_NX2_NO_MESH_EMULATION,
+# EDEN_NX2_FORCE_LOD0, EDEN_NX2_PASS_TIMES, EDEN_NX2_DLSS_JITTER, EDEN_NX2_OOT_VISUAL_WORKAROUND,
+# EDEN_NX2_TEMPORAL_WEIGHT, _KERNEL, _CLIP, _CLIP_MOTION, _KERNEL_MOTION and _SHARPEN,
+# EDEN_NX2_BINDMEMO, _BATCH and _PARTIAL, EDEN_NX2_HOST_PACE, EDEN_NX2_PIPELINE_EVICT_LEFT_MIB
+# and _MAX (docs/nx2/metal-coverage.md, section Q). Unset, the ones on by default on Vulkan
+# (binding memo, host pacing) are on, with the Metal switches below to turn them off alone, and
+# EDEN_NX2_FENCE_FLUSH_US and EDEN_NX2_PIPELINE_EVICT_LEFT_MIB take the phone profile's values.
+#EDEN_NX2_METAL_VULKAN_SWITCHES=0
+
+# Metal renderer: 0 resolves every texture and image binding of each draw and dispatch again
+# (FillImageViews, GetSamplerId), as before. By default they are looked up in the texture cache's
+# binding memo as Vulkan's EDEN_NX2_BINDMEMO does, and only the ones missed are resolved and
+# recorded. The 10 s "Metal binding memo:" line counts both.
+#EDEN_NX2_METAL_BINDMEMO=0
+
+# Metal renderer: 0 presents every frame as soon as it is ready, as before. By default, with vsync
+# and outside the Turbo speed mode, a guest frame is presented no earlier than the game's frame
+# period in whole refreshes after the one before (presentDrawable:afterMinimumDuration:), as
+# Vulkan's host pacer (EDEN_NX2_HOST_PACE) holds frames: a 30 fps game on a 120 Hz screen shows
+# each frame four refreshes. The 10 s "Metal pacing:" line counts the frames held.
+#EDEN_NX2_METAL_HOST_PACE=0
+
+# Metal renderer: 0 leaves the window's CAMetalLayer without a colour space, as before. By default
+# it is tagged sRGB, as MoltenVK tags it for Vulkan's B8G8R8A8_UNORM / SRGB_NONLINEAR swapchain,
+# so the display matches the picture's colours (neither renderer outputs HDR).
+#EDEN_NX2_METAL_COLORSPACE=0
+
+# Metal renderer: 0 never releases a graphics pipeline, as before. By default, on a memory
+# pressure signal from the OS, graphics pipelines no draw took in the last 600 frames are
+# destroyed down to the 256 most recent, as Vulkan does on Apple (with
+# EDEN_NX2_PIPELINE_EVICT_LEFT_MIB only below that much memory left, fewer and older ones,
+# at most EDEN_NX2_PIPELINE_EVICT_MAX). The "Metal: evicted" line says how many.
+#EDEN_NX2_METAL_PIPELINE_EVICT=0
+
+# Metal renderer: 0 commits a command buffer for every guest fence with work pending, as before.
+# By default, with EDEN_NX2_FENCE_FLUSH_US set (phones: 2000), a fence on the GPU thread within
+# that many microseconds of the last commit shares the command buffer being recorded: the next
+# commit, a fence wait or the GPU thread going idle sends it, as Vulkan's deferred flush. The 10 s
+# "Metal fences:" line counts the fences left pending and the idle thread's commits.
+#EDEN_NX2_METAL_FENCE_BATCH=0
+
+# Metal renderer: 0 draws the display layers with the bilinear or nearest blit whatever the
+# scaling filter and anti-aliasing settings say, as before. By default they are applied as on
+# Vulkan: FXAA or SMAA over the layer, FSR 1 or SGSR to the screen's size, and the window filters
+# (bicubic and its variants, Gaussian, Lanczos, ScaleForce, area, MMPX), with Vulkan's host
+# shaders through the translator. The 10 s "Metal present filters:" line counts their passes.
+#EDEN_NX2_METAL_PRESENT_FILTERS=0
+
+# Metal renderer: 0 lets the game's own DLSS network run where MetalFX does not replace it, as
+# before. By default, where the MetalFX Temporal filter is not chosen, MetalFX is unsupported or
+# it failed, the game's DLSS is replaced by the Vulkan renderer's temporal stand-in
+# (temporal_upscale.frag, then RCAS at the FSR sharpness setting; EDEN_NX2_TEMPORAL_* tune it as
+# on Vulkan), as Vulkan does where FSR 3.1 cannot run.
+#EDEN_NX2_METAL_TEMPORAL_STANDIN=0
 
 # Either renderer: 0 makes the GPU thread's front wait for the GPU and read a compute dispatch's
 # size the GPU wrote (Ocarina of Time's light tiles, once a frame). By default it passes

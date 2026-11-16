@@ -21,6 +21,7 @@
 #include "core/core_timing.h"
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
+#include "video_core/feature_census.h"
 #include "video_core/gpu.h"
 #include "video_core/present.h"
 #include "video_core/render_probe.h"
@@ -533,6 +534,9 @@ void RendererVulkan::RenderAppletCaptureLayer(
     const auto capture_layers = Tegra::FilterLayerStack(
         framebuffers, Service::Nvnflinger::LayerStackId::LastFrame, applet_capture_layers);
 
+    if (!capture_layers.empty() && VideoCommon::FeatureCensus::Enabled()) [[unlikely]] {
+        VideoCommon::FeatureCensus::NoteMisc(VideoCommon::FeatureCensus::Misc::AppletCaptureLayer);
+    }
     if (capture_layers.empty())
         return;
 

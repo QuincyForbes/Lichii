@@ -22,12 +22,15 @@
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "video_core/gpu_split.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
+#include "video_core/renderer_metal/metal_switches.h"
 
 namespace Metal {
 
@@ -472,6 +475,27 @@ bool StateCacheEnabled() {
     return enabled;
 }
 
+// Vulkan's EDEN_NX2_DYNSTATE_CACHE=0 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): every draw sets
+// its draw state (pipeline, depth-stencil state, viewport, scissor, culling, depth bias, stencil
+// references, blend colour) again, its bindings staying cached.
+bool DrawStateCacheEnabled() {
+    static const bool enabled = [] {
+        const char* const value = VulkanSwitch("EDEN_NX2_DYNSTATE_CACHE");
+        return StateCacheEnabled() && !(value != nullptr && value[0] == '0');
+    }();
+    return enabled;
+}
+
+// Vulkan's EDEN_NX2_VERTEX_INPUT_CACHE=0 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): every draw
+// binds its vertex buffers again.
+bool VertexInputCacheEnabled() {
+    static const bool enabled = [] {
+        const char* const value = VulkanSwitch("EDEN_NX2_VERTEX_INPUT_CACHE");
+        return StateCacheEnabled() && !(value != nullptr && value[0] == '0');
+    }();
+    return enabled;
+}
+
 // EDEN_NX2_METAL_AHEAD=0: uploads and kernels are recorded where they come, ending the open
 // render encoder.
 bool AheadEnabled() {
@@ -498,6 +522,36 @@ bool FenceIdleEnabled() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_FENCE_IDLE");
         return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// Vulkan's EDEN_NX2_FENCE_FLUSH_US (read under EDEN_NX2_METAL_VULKAN_SWITCHES; phones get 2000
+// from their device profile, else 0 unless the FenceFlush perf option is on); 0 with
+// EDEN_NX2_METAL_FENCE_BATCH=0, as before.
+s64 FenceFlushIntervalUs() {
+    static const s64 interval_us = [] {
+        const char* const batch = std::getenv("EDEN_NX2_METAL_FENCE_BATCH");
+        if (batch != nullptr && batch[0] == '0') {
+            return s64{0};
+        }
+        if (const char* const value = VulkanSwitch("EDEN_NX2_FENCE_FLUSH_US")) {
+            return static_cast<s64>(std::atoll(value));
+        }
+        return VulkanSwitchesEnabled() &&
+                       VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush)
+                   ? s64{5000}
+                   : s64{0};
+    }();
+    return interval_us;
+}
+
+// EDEN_NX2_METAL_FENCE_BATCH=2: fence work is left pending off the split's back too, where only
+// the caller commits it (the smoke test).
+bool FenceBatchAnyThread() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_FENCE_BATCH");
+        return value != nullptr && value[0] == '2';
     }();
     return enabled;
 }
@@ -914,6 +968,10 @@ struct Scheduler::Impl {
         if (render != nil) {
             [render endEncoding];
             render = nil;
+            if (pass_open) {
+                pass_open = false;
+                pass_records.back().draws = draws - pass_records.back().draws_begin;
+            }
         }
         if (compute != nil) {
             if (active_compute == compute) {
@@ -942,8 +1000,37 @@ struct Scheduler::Impl {
         ++encoders;
         ++segment_encoders;
         ++render_passes;
+        // A timed frame (EDEN_NX2_PASS_TIMES): the pass's start and end on the GPU's clock.
+        const size_t sample = pass_records.size() * 2;
+        const bool timed =
+            pass_timing && pass_samples != nil && sample + 2 <= pass_samples.sampleCount;
+        if (timed) {
+            MTLRenderPassSampleBufferAttachmentDescriptor* const attachment =
+                pass.sampleBufferAttachments[0];
+            attachment.sampleBuffer = pass_samples;
+            attachment.startOfVertexSampleIndex = sample;
+            attachment.endOfVertexSampleIndex = MTLCounterDontSample;
+            attachment.startOfFragmentSampleIndex = MTLCounterDontSample;
+            attachment.endOfFragmentSampleIndex = sample + 1;
+        }
         const id<MTLRenderCommandEncoder> encoder =
             [Commands() renderCommandEncoderWithDescriptor:pass];
+        if (timed) {
+            pass.sampleBufferAttachments[0].sampleBuffer = nil;
+            if (encoder != nil) {
+                const id<MTLTexture> color = pass.colorAttachments[0].texture;
+                const id<MTLTexture> depth = pass.depthAttachment.texture;
+                pass_records.push_back({
+                    .width = static_cast<u32>(pass.renderTargetWidth),
+                    .height = static_cast<u32>(pass.renderTargetHeight),
+                    .color_format = color != nil ? static_cast<u32>(color.pixelFormat) : 0U,
+                    .depth_format = depth != nil ? static_cast<u32>(depth.pixelFormat) : 0U,
+                    .draws_begin = draws,
+                    .draws = 0,
+                });
+                pass_open = true;
+            }
+        }
         if (encoder == nil) {
             // Metal refused the pass (draws into it are dropped): name it once.
             if (refused_passes++ < 4) {
@@ -1392,6 +1479,33 @@ struct Scheduler::Impl {
     u64 ahead_copies{};
     u64 ahead_kernels{};
     u64 idle_fences{};
+    /// EDEN_NX2_METAL_FENCE_BATCH: work a fence left pending, since when, and the last commit.
+    bool flush_pending{};
+    std::chrono::steady_clock::time_point flush_pending_since{};
+    std::chrono::steady_clock::time_point last_commit{};
+    u64 deferred_fences{};
+    u64 idle_commits{};
+    /// EDEN_NX2_PASS_TIMES: one frame's render passes timed at their stage boundaries.
+    struct PassRecord {
+        u32 width;
+        u32 height;
+        u32 color_format;
+        u32 depth_format;
+        u64 draws_begin;
+        u64 draws;
+    };
+    id<MTLCounterSampleBuffer> pass_samples = nil;
+    bool pass_times_unsupported{};
+    bool pass_timing{};
+    bool pass_open{};
+    std::optional<u64> pass_resolve_tick;
+    std::chrono::steady_clock::time_point pass_next{};
+    std::vector<PassRecord> pass_records;
+    u64 pass_gpu_ns_before{};
+    /// The GPU's clock and the CPU's steady clock read together when the timed frame began.
+    MTLTimestamp pass_clock_gpu{};
+    std::chrono::steady_clock::time_point pass_clock_steady{};
+    std::string pass_times_line;
     id<MTLBuffer> visibility = nil;
     u64 render_pass_serial{};
     /// The open render encoder's counting slot (-1: not counting).
@@ -1523,6 +1637,8 @@ u64 Scheduler::Flush() {
     impl->command_buffer = nil;
     impl->NextSegment();
     impl->tick_splits = 0;
+    impl->flush_pending = false;
+    impl->last_commit = std::chrono::steady_clock::now();
     impl->in_flight.emplace_back(tick, command_buffer);
     while (!impl->in_flight.empty() && IsFree(impl->in_flight.front().first)) {
         impl->in_flight.pop_front();
@@ -1540,7 +1656,49 @@ u64 Scheduler::FenceTick() {
         ++impl->idle_fences;
         return impl->current_tick - 1;
     }
+    const s64 interval_us = FenceFlushIntervalUs();
+    const auto now = std::chrono::steady_clock::now();
+    if (interval_us > 0 && (VideoCommon::GpuSplit::OnBackThread() || FenceBatchAnyThread()) &&
+        now - impl->last_commit < std::chrono::microseconds{interval_us}) {
+        // The tick being recorded: committed with whatever comes next, at the latest when the
+        // back goes idle.
+        if (!impl->flush_pending) {
+            impl->flush_pending = true;
+            impl->flush_pending_since = now;
+        }
+        ++impl->deferred_fences;
+        return impl->current_tick;
+    }
     return Flush();
+}
+
+bool Scheduler::FlushDeferredFromIdle(bool) {
+    if (!impl->flush_pending) {
+        return false;
+    }
+    ++impl->idle_commits;
+    Flush();
+    return true;
+}
+
+void Scheduler::FlushDeferred() {
+    if (impl->flush_pending) {
+        Flush();
+    }
+}
+
+bool Scheduler::DeferredFlushMayWait() const {
+    return impl->flush_pending &&
+           std::chrono::steady_clock::now() - impl->flush_pending_since <
+               std::chrono::microseconds{FenceFlushIntervalUs()};
+}
+
+bool Scheduler::GpuBehind() const noexcept {
+    return impl->completed_tick.load(std::memory_order_acquire) + 1 < impl->current_tick;
+}
+
+std::array<u64, 2> Scheduler::TakeDeferredFences() noexcept {
+    return {std::exchange(impl->deferred_fences, 0), std::exchange(impl->idle_commits, 0)};
 }
 
 void Scheduler::CopyBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u64 dst_offset,
@@ -2424,7 +2582,7 @@ void Scheduler::SetDrawState(const DrawState& state) {
         return;
     }
     // What the encoder has from the draw before stays as it is (EDEN_NX2_METAL_STATE_CACHE).
-    const bool cached = StateCacheEnabled() && impl->render_state_valid;
+    const bool cached = DrawStateCacheEnabled() && impl->render_state_valid;
     const DrawState& last = impl->render_state;
     const auto changed = [&](bool differs) {
         if (cached && !differs) {
@@ -2524,6 +2682,10 @@ void Scheduler::SetDrawState(const DrawState& state) {
 
 void Scheduler::BindVertexBuffer(u32 slot, BufferHandle buffer, u32 offset) {
     if (SlotFits(slot, BufferSlots, "vertex buffer")) {
+        if (!VertexInputCacheEnabled()) {
+            // Bound again whatever the encoder has.
+            impl->vertex_bound.buffers[slot] = &InlineBytes;
+        }
         impl->SetBuffer(ShaderStage::Vertex, slot, buffer, offset);
     }
 }
@@ -2832,6 +2994,138 @@ void Scheduler::NotePresent(bool guest_picture) {
                                "{} dispatches before it)",
                  impl->committed, impl->draws, impl->dispatches);
     }
+    PassTimesFrameEnd();
+}
+
+void Scheduler::PassTimesFrameEnd() {
+    static const f64 interval_s = [] {
+        const char* const value = VulkanSwitch("EDEN_NX2_PASS_TIMES");
+        return value != nullptr ? std::atof(value) : 0.0;
+    }();
+    if (interval_s <= 0.0 || impl->pass_times_unsupported) {
+        return;
+    }
+    Impl& state = *impl;
+    if (state.pass_timing) {
+        // The timed frame ends with the command buffer this present commits.
+        state.pass_timing = false;
+        state.pass_resolve_tick = state.current_tick;
+        return;
+    }
+    if (state.pass_resolve_tick && IsFree(*state.pass_resolve_tick)) {
+        state.pass_resolve_tick.reset();
+        ResolvePassTimes();
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (state.pass_resolve_tick || now < state.pass_next) {
+        return;
+    }
+    if (state.pass_samples == nil) {
+        const id<MTLDevice> mtl_device = state.device.GetDevice();
+        id<MTLCounterSet> timestamps = nil;
+        for (id<MTLCounterSet> set in mtl_device.counterSets) {
+            if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+                timestamps = set;
+            }
+        }
+        if (timestamps == nil ||
+            ![mtl_device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+            state.pass_times_unsupported = true;
+            LOG_WARNING(Render_Metal, "Perf Metal passes: this GPU takes no timestamps at render "
+                                      "pass boundaries");
+            return;
+        }
+        MTLCounterSampleBufferDescriptor* const descriptor = [MTLCounterSampleBufferDescriptor new];
+        descriptor.counterSet = timestamps;
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.sampleCount = 2 * 1024;
+        NSError* error = nil;
+        state.pass_samples = [mtl_device newCounterSampleBufferWithDescriptor:descriptor
+                                                                        error:&error];
+        if (state.pass_samples == nil) {
+            state.pass_times_unsupported = true;
+            LOG_WARNING(Render_Metal, "Perf Metal passes: no counter sample buffer: {}",
+                        error != nil ? error.localizedDescription.UTF8String : "unknown");
+            return;
+        }
+        LOG_INFO(Render_Metal, "Perf Metal passes: one frame timed every {} s", interval_s);
+    }
+    state.pass_next = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                std::chrono::duration<f64>(interval_s));
+    state.pass_records.clear();
+    state.pass_gpu_ns_before = state.gpu_ns.load(std::memory_order_relaxed);
+    MTLTimestamp cpu = 0;
+    [state.device.GetDevice() sampleTimestamps:&cpu gpuTimestamp:&state.pass_clock_gpu];
+    state.pass_clock_steady = std::chrono::steady_clock::now();
+    state.pass_timing = true;
+}
+
+void Scheduler::ResolvePassTimes() {
+    Impl& state = *impl;
+    const size_t passes = state.pass_records.size();
+    if (passes == 0) {
+        return;
+    }
+    NSData* const data = [state.pass_samples resolveCounterRange:NSMakeRange(0, passes * 2)];
+    if (data == nil || data.length < passes * 2 * sizeof(MTLCounterResultTimestamp)) {
+        state.pass_times_line = "no timestamps resolved";
+        LOG_WARNING(Render_Metal, "Perf Metal passes: no timestamps resolved");
+        return;
+    }
+    const auto* const stamps = static_cast<const MTLCounterResultTimestamp*>(data.bytes);
+    // The GPU clock against the steady clock since the timed frame began.
+    MTLTimestamp cpu = 0;
+    MTLTimestamp gpu = 0;
+    [state.device.GetDevice() sampleTimestamps:&cpu gpuTimestamp:&gpu];
+    const f64 steady_ns = static_cast<f64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             state.pass_clock_steady)
+            .count());
+    struct Timed {
+        size_t index;
+        f64 ms;
+    };
+    std::vector<Timed> timed;
+    f64 total_ms = 0.0;
+    for (size_t index = 0; index < passes; ++index) {
+        const u64 begin = stamps[index * 2].timestamp;
+        const u64 end = stamps[index * 2 + 1].timestamp;
+        if (begin == MTLCounterErrorValue || end == MTLCounterErrorValue || end < begin) {
+            continue;
+        }
+        timed.push_back({index, static_cast<f64>(end - begin)});
+    }
+    // The timestamps' unit: CPU nanoseconds per GPU tick, as Vulkan's timestampPeriod.
+    f64 ns_per_tick = 1.0;
+    if (gpu > state.pass_clock_gpu && steady_ns > 0.0) {
+        ns_per_tick = steady_ns / static_cast<f64>(gpu - state.pass_clock_gpu);
+    }
+    for (Timed& entry : timed) {
+        entry.ms *= ns_per_tick / 1e6;
+        total_ms += entry.ms;
+    }
+    std::ranges::sort(timed, [](const Timed& a, const Timed& b) { return a.ms > b.ms; });
+    std::string top;
+    for (size_t i = 0; i < (std::min)(timed.size(), size_t{8}); ++i) {
+        const Impl::PassRecord& record = state.pass_records[timed[i].index];
+        top += fmt::format("{}{}x{} format {}{} {} draws {:.3f} ms", i != 0 ? ", " : "",
+                           record.width, record.height, record.color_format,
+                           record.depth_format != 0 ? fmt::format(" + {}", record.depth_format)
+                                                    : std::string{},
+                           record.draws, timed[i].ms);
+    }
+    const f64 frame_ms =
+        static_cast<f64>(state.gpu_ns.load(std::memory_order_relaxed) - state.pass_gpu_ns_before) /
+        1e6;
+    state.pass_times_line =
+        fmt::format("{} render passes ({} timed) take {:.2f} ms of GPU time, the frame's command "
+                    "buffers {:.2f} ms | passes: {}",
+                    passes, timed.size(), total_ms, frame_ms, top);
+    LOG_INFO(Render_Metal, "Perf Metal passes: {}", state.pass_times_line);
+}
+
+std::string Scheduler::TakePassTimesLine() {
+    return std::exchange(impl->pass_times_line, std::string{});
 }
 
 std::array<u64, 11> Scheduler::TakeCounts() noexcept {

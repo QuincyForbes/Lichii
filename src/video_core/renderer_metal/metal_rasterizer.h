@@ -21,6 +21,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/oot_network.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/renderer_metal/metal_bind_memo.h"
 #include "video_core/renderer_metal/metal_buffer_cache.h"
 #include "video_core/renderer_metal/metal_condition.h"
 #include "video_core/renderer_metal/metal_fence_manager.h"
@@ -31,6 +32,7 @@
 #include "video_core/renderer_metal/metal_pipeline_cache.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
 #include "video_core/renderer_metal/metal_texture_cache.h"
+#include "video_core/renderer_metal/metal_work_policy.h"
 
 namespace Tegra {
 class GPU;
@@ -177,6 +179,16 @@ public:
         u64 staging_bytes;       ///< Held by the staging pool now
     };
 
+    /// The binding memo's hits and misses since the last call (EDEN_NX2_BINDMEMO).
+    [[nodiscard]] BindMemo::Counts TakeBindMemoCounts() noexcept {
+        return std::exchange(bind_memo_counts, BindMemo::Counts{});
+    }
+
+    /// Command buffers committed for EDEN_NX2_FLUSH_DRAWS since the last call.
+    [[nodiscard]] u64 TakeDrawFlushes() noexcept {
+        return std::exchange(draw_flushes, 0);
+    }
+
     /// Work taken since the last call (the renderer's 10 s report).
     [[nodiscard]] WorkCounts TakeWorkCounts() noexcept {
         return {std::exchange(draws, 0), std::exchange(draws_with_pipeline, 0),
@@ -242,6 +254,9 @@ private:
     /// staging buffers it took pass the pool's mark, and waits for it when the pool is over its
     /// cap (EDEN_NX2_METAL_STAGING_BOUND).
     void FlushWork();
+    /// Whether mesh draws are skipped for comparisons (EDEN_NX2_NO_MESH and its file;
+    /// EDEN_NX2_NO_MESH_EMULATION for `emulated` ones).
+    [[nodiscard]] bool SkipMeshDraws(bool emulated);
 
     /// Binds everything the draw needs and opens its render pass; false to skip it
     /// (prepare_refusal says why, empty for a draw of nothing).
@@ -266,6 +281,9 @@ private:
 
     /// Vulkan's TrackOcarinaCamera: the camera matrices of a draw into the scene's targets.
     void TrackOcarinaCamera();
+    /// Vulkan's UpdateOcarinaJitter: a Halton offset for the scene's depth-tested draws while
+    /// MetalFX replaces the upscale and EDEN_NX2_DLSS_JITTER is set.
+    void UpdateOcarinaJitter();
 
     /// Vulkan's TryOcarinaUpscale without `replace`: the scene depth its reader pass names.
     void TrackOcarinaDepth();
@@ -657,6 +675,12 @@ private:
     bool placeholders_made{};
     bool graphics_report_logged{};
     u64 staging_flushes{};
+    /// EDEN_NX2_FLUSH_DRAWS: draws since the last such commit, and the commits.
+    WorkPolicy::DrawFlushCounter draw_flush;
+    BindMemo::Counts bind_memo_counts;
+    u64 draw_flushes{};
+    /// EDEN_NX2_NO_MESH and its file.
+    std::optional<WorkPolicy::MeshSkip> mesh_skip;
     u64 staging_waits{};
     VideoCommon::OotNetwork::BypassState oot_network_bypass;
 
@@ -681,11 +705,62 @@ private:
                    (height == extent[1] || height == image_extent[1]);
         }
     } oot_motion;
+    /// EDEN_NX2_DLSS_JITTER as on Vulkan: the frame MetalFX last replaced the upscale in, the
+    /// phase count for its scale, the offset of this frame's scene draws and the one applied.
+    std::optional<u64> oot_temporal_frame;
+    u32 oot_jitter_phases{8};
+    u64 oot_jitter_frame{};
+    std::array<f32, 2> oot_jitter_offset{};
+    std::array<f32, 2> oot_jitter_applied{};
     const char* oot_decline{};
     u64 oot_decline_repeats{};
     u64 oot_replaced{};
     u64 oot_declined{};
     std::array<std::pair<const char*, u64>, 8> oot_decline_reasons{};
+
+    /// Vulkan's oot_actor_poses: Link's skinning pose of the last two frames.
+    struct OcarinaActorPose {
+        u64 frame{};
+        const Tegra::MemoryManager* channel{};
+        GPUVAddr vertex{};
+        GPUVAddr indices{};
+        s32 base_vertex{};
+        std::array<f32, 4> origin{};
+        std::array<f32, OcarinaActorMesh::Bones * 12> bones{};
+    };
+    std::array<OcarinaActorPose, 2> oot_actor_poses{};
+    u32 oot_actor_pose_index{};
+    /// Vulkan's oot_actor_mesh_cache: his vertices and indices, read again when they move.
+    struct OcarinaActorMeshCache {
+        const Tegra::MemoryManager* channel{};
+        GPUVAddr vertex{};
+        GPUVAddr indices{};
+        s32 base_vertex{};
+        u64 key{};
+        std::vector<u8> vertices;
+        std::vector<u16> index_data;
+    } oot_actor_mesh_cache;
+    /// The scene the glows and particles are drawn into after the fog (Vulkan's
+    /// oot_effects_*): its address, the frame, and the view the mark pass reads.
+    std::optional<u64> oot_effects_frame;
+    GPUVAddr oot_effects_address{};
+    TextureHandle oot_effects_scene{};
+
+    /// Vulkan's TrackOcarinaActor: the pose of the recognised Link draw
+    /// (EDEN_NX2_METAL_OOT_ACTOR).
+    void TrackOcarinaActor(u64 vertex_hash, bool is_indexed);
+
+    /// Vulkan's ReadOcarinaActor: `mesh` filled when both poses share one mesh; false otherwise.
+    bool ReadOcarinaActor(OcarinaActorMesh& mesh);
+
+    /// After a draw: the fog's draw saves the scene for the effects mask (Vulkan's
+    /// SaveEffectsBase call, EDEN_NX2_METAL_OOT_EFFECTS).
+    void NoteOcarinaEffectsDraw(u64 fragment_hash);
+
+    /// Before a dispatch: one that writes the scene after the effects marks what they drew
+    /// (Vulkan's MarkEffects call). `views` as DispatchCompute fills them.
+    void MarkOcarinaEffects(const Shader::Info& info,
+                            std::span<const VideoCommon::ImageViewInOut> views);
 };
 
 } // namespace Metal

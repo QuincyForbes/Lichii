@@ -226,6 +226,9 @@ public:
     explicit PipelineTranslator(bool ios, u32 apple_family, bool native_mesh = false);
 
     /// Fills everything of the key but its programs from the registers and the draw's topology.
+    /// Programs EDEN_NX2_OOT_VISUAL_WORKAROUND edited so far (the offline replay's report).
+    [[nodiscard]] static u64 VisualWorkaroundEdits() noexcept;
+
     static void RefreshKey(GraphicsPipelineKey& key, const Tegra::Engines::Maxwell3D::Regs& regs,
                            Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology topology);
 

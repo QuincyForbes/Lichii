@@ -6,6 +6,7 @@
 #include <array>
 #include <memory>
 #include <optional>
+#include <string>
 
 #include "common/common_types.h"
 #include "video_core/renderer_metal/metal_object.h"
@@ -252,7 +253,26 @@ public:
 
     /// The tick a guest fence queued now waits for. Pending work is committed for it; with none
     /// it is the last tick committed, and no command buffer is made (EDEN_NX2_METAL_FENCE_IDLE).
+    /// On the split's back within EDEN_NX2_FENCE_FLUSH_US of the last commit the work stays
+    /// pending (EDEN_NX2_METAL_FENCE_BATCH), as Vulkan's DeferFlush: the next commit, a fence
+    /// past the window or the back going idle (FlushDeferredFromIdle) sends it.
     u64 FenceTick();
+
+    /// The back's idle hook: commits work a fence left pending; whether it did.
+    bool FlushDeferredFromIdle(bool requested);
+
+    /// Commits work a fence left pending (FenceManager::SubmitDeferredWork).
+    void FlushDeferred();
+
+    /// The back's idle check: whether pending fence work may wait a little longer for more.
+    [[nodiscard]] bool DeferredFlushMayWait() const;
+
+    /// Whether the GPU has more than one command buffer of earlier work left to run.
+    [[nodiscard]] bool GpuBehind() const noexcept;
+
+    /// Since the last call: fences whose work was left pending, and the commits of such work by
+    /// the idle hook.
+    [[nodiscard]] std::array<u64, 2> TakeDeferredFences() noexcept;
 
     /// ahead: recorded before everything else of the segment (see CanUploadAhead), leaving the
     /// open encoder as it is.
@@ -441,7 +461,18 @@ public:
     /// of each, and the heartbeat that runs until the first guest frame).
     void NotePresent(bool guest_picture);
 
+    /// Vulkan's EDEN_NX2_PASS_TIMES=<s> (read under EDEN_NX2_METAL_VULKAN_SWITCHES): one frame
+    /// in that many seconds has each render pass timed at its stage boundaries (Metal's counter
+    /// sample buffers), resolved once the GPU is done with it ("Perf Metal passes:" line).
+    /// Called at each guest frame's present.
+    void PassTimesFrameEnd();
+
+    /// The last "Perf Metal passes:" text, empty when there was none since the last call.
+    [[nodiscard]] std::string TakePassTimesLine();
+
 private:
+    void ResolvePassTimes();
+
     struct Impl;
     std::unique_ptr<Impl> impl;
 };

@@ -37,6 +37,7 @@
 #include "common/cityhash.h"
 #include "common/common_types.h"
 #include "common/scope_exit.h"
+#include "common/settings.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/stage.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -1519,6 +1520,8 @@ struct Arguments {
     /// Task/mesh pipelines as Metal mesh functions, as on a GPU with Metal 3 mesh pipelines.
     bool native_mesh{true};
     u32 apple_family{10};
+    /// --title <hex>: the program id translation sees (title-specific edits, O07).
+    u64 title{};
     u32 jobs{(std::max)(std::thread::hardware_concurrency() / 2, 1U)};
 };
 
@@ -1550,6 +1553,8 @@ std::optional<Arguments> ParseArguments(int argc, char** argv) {
             arguments.report = value;
         } else if (name == "--apple-family") {
             arguments.apple_family = static_cast<u32>((std::max)(std::atoi(value), 0));
+        } else if (name == "--title") {
+            arguments.title = std::strtoull(value, nullptr, 16);
         } else if (name == "--jobs") {
             arguments.jobs = static_cast<u32>((std::max)(std::atoi(value), 1));
         } else {
@@ -1859,7 +1864,7 @@ int main(int argc, char** argv) {
         std::fputs("usage: lichii-metal-replay --cache <pipeline cache file> [--cache <newer "
                    "file> ...] [--census <nx2_feature_census.json>] [--msl-out <directory>] "
                    "[--report <file>] [--macos] [--no-native-mesh] [--apple-family <n>] "
-                   "[--jobs <n>]\n"
+                   "[--title <hex>] [--jobs <n>]\n"
                    "       lichii-metal-replay --spirv <file.vert.spv, .frag.spv, .comp.spv, "
                    ".task.spv or .mesh.spv> [--spirv ...] [--macos] [--apple-family <n>]\n",
                    stderr);
@@ -1869,7 +1874,14 @@ int main(int argc, char** argv) {
         if (!arguments->spirv.empty()) {
             return Metal::TranslateFiles(*arguments);
         }
-        return Metal::Run(*arguments);
+        Settings::SetCurrentProgramID(arguments->title);
+        const int result = Metal::Run(*arguments);
+        if (arguments->title != 0) {
+            fmt::print("programs edited by the Ocarina visual workaround "
+                       "(EDEN_NX2_OOT_VISUAL_WORKAROUND=1): {}\n",
+                       Metal::PipelineTranslator::VisualWorkaroundEdits());
+        }
+        return result;
     } catch (const std::exception& exception) {
         std::fprintf(stderr, "lichii-metal-replay: %s\n", exception.what());
         return 1;

@@ -19,7 +19,7 @@ COPIES = ("copy", "emulated copy", "reinterpret", "convert", "overlap copy", "ov
           "blit", "blit framebuffer")
 MISC = ("draw texture", "inline to memory", "conditional rendering", "transform feedback binding",
         "surface copy", "temporal upscale", "dma copy", "download memory", "fragment barrier",
-        "tiled cache barrier", "counter reset")
+        "tiled cache barrier", "counter reset", "layer from guest memory", "applet capture layer")
 ATTRIBUTE_SIZES = {1: "32x4", 2: "32x3", 4: "32x2", 0x12: "32", 3: "16x4", 5: "16x3", 0xf: "16x2",
                    0x1b: "16", 0xa: "8x4", 0x13: "8x3", 0x18: "8x2", 0x1d: "8", 0x30: "10_10_10_2",
                    0x31: "11_11_10"}

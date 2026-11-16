@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "video_core/gpu_split.h"
 #include "video_core/renderer_metal/metal_fence_manager.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 
@@ -45,6 +46,13 @@ bool FenceManager::IsFenceSignaled(Fence& fence) const {
 
 void FenceManager::WaitFence(Fence& fence) {
     fence->Wait();
+}
+
+void FenceManager::SubmitDeferredWork() {
+    // Only the split's back leaves fence work pending (Scheduler::FenceTick) and commits.
+    if (VideoCommon::GpuSplit::OnBackThread()) {
+        scheduler.FlushDeferred();
+    }
 }
 
 } // namespace Metal

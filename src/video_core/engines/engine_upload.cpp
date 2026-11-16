@@ -9,6 +9,7 @@
 #include "common/algorithm.h"
 #include "common/assert.h"
 #include "video_core/engines/engine_upload.h"
+#include "video_core/feature_census.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_indirect_grid.h"
@@ -32,6 +33,10 @@ void State::ProcessExec(const bool is_linear_) {
     copy_size = regs.line_length_in * regs.line_count;
     inner_buffer.resize_destructive(copy_size);
     is_linear = is_linear_;
+    if (VideoCommon::FeatureCensus::Enabled()) [[unlikely]] {
+        VideoCommon::FeatureCensus::NoteMisc(VideoCommon::FeatureCensus::Misc::InlineToMemory,
+                                             is_linear ? 1U : 0U);
+    }
 }
 
 void State::ProcessData(const u32 data, const bool is_last_call) {
