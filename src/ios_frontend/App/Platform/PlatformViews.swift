@@ -17,7 +17,7 @@ enum PlatformEntries {
 
     static var gameActions: [GameAction] {
         [
-            GameAction(id: "shaders", title: "Shader Cache", systemImage: "cpu",
+            GameAction(id: "shaders", title: "Shader Cache", systemImage: "archivebox",
                        view: { AnyView(ShaderCacheView(game: $0)) }),
         ]
     }
@@ -35,13 +35,13 @@ private func flag(_ value: Int32) -> String {
 struct DeviceInfoRows: View {
     var body: some View {
         if let info = PlatformCenter.deviceInfo {
-            LabeledContent("Device", value: "\(PlatformCenter.text(info.machine)), iOS \(info.os_major).\(info.os_minor)")
+            LabeledContent("Model", value: "\(PlatformCenter.text(info.machine)), iOS \(info.os_major).\(info.os_minor)")
             LabeledContent("GPU", value: PlatformCenter.text(info.gpu_name))
             LabeledContent("Memory", value: "\(mib(info.physical_memory_mib)), \(mib(info.available_memory_mib)) free for Lichii")
             LabeledContent("Increased Memory Limit", value: flag(info.increased_memory_limit))
             LabeledContent("Extended Virtual Addressing", value: flag(info.extended_virtual_addressing))
             if let defaults = PlatformCenter.deviceDefaults {
-                LabeledContent("Device Tier", value: PlatformCenter.text(defaults.tier_name))
+                LabeledContent("Performance Tier", value: PlatformCenter.text(defaults.tier_name))
                 let note = PlatformCenter.text(defaults.note)
                 if !note.isEmpty {
                     Text(note)
@@ -50,7 +50,7 @@ struct DeviceInfoRows: View {
                 }
             }
         } else {
-            LabeledContent("Device", value: "\(UIDevice.current.model), iOS \(UIDevice.current.systemVersion)")
+            LabeledContent("Model", value: "\(UIDevice.current.model), iOS \(UIDevice.current.systemVersion)")
             LabeledContent("Memory", value: UInt64(ProcessInfo.processInfo.physicalMemory).byteCount)
         }
     }

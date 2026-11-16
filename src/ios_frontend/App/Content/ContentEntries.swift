@@ -14,7 +14,7 @@ enum ContentEntries {
                          view: { AnyView(ProfilesView()) }),
             SettingsLink(id: "logs", title: "Logs", systemImage: "doc.text.magnifyingglass",
                          view: { AnyView(LogsView()) }),
-            SettingsLink(id: "setup", title: "Setup Assistant", systemImage: "wand.and.stars",
+            SettingsLink(id: "setup", title: "Setup Assistant", systemImage: "checklist",
                          view: { AnyView(SetupAssistantView()) }),
         ]
     }

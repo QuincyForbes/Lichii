@@ -26,7 +26,7 @@ enum OverlayPreset: String, CaseIterable, Identifiable {
         case .off: return "Nothing is drawn over the game."
         case .minimal: return "Frames per second only."
         case .standard: return "Real, generated and displayed FPS, frame time, 10% low, frame generation, resolution scale, speed."
-        case .detailed: return "Standard plus render and output resolution, GPU accuracy, CPU, memory, texture cache, shader builds, thermal state and battery."
+        case .detailed: return "Standard plus the 3D, game and screen sizes, GPU accuracy, CPU, memory, texture cache, shader builds, thermal state and battery."
         }
     }
 

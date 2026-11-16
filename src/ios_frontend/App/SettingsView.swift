@@ -341,7 +341,7 @@ struct DiagnosticsView: View {
                     LabeledContent("Model", value: "\(PlatformCenter.text(info.machine)), iOS \(info.os_major).\(info.os_minor)")
                     LabeledContent("GPU", value: PlatformCenter.text(info.gpu_name))
                     if let defaults {
-                        LabeledContent("Performance tier", value: PlatformCenter.text(defaults.tier_name))
+                        LabeledContent("Performance Tier", value: PlatformCenter.text(defaults.tier_name))
                     }
                 }
                 if let defaults, !PlatformCenter.text(defaults.note).isEmpty {

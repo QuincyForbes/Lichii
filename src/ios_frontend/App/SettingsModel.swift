@@ -348,10 +348,10 @@ enum SettingsCatalog {
     }
 
     static let categoryTitles: [String: String] = [
-        "Renderer": "Graphics", "RendererAdvanced": "Graphics (Advanced)", "RendererHacks": "Graphics Hacks",
+        "Renderer": "Image", "RendererAdvanced": "Performance", "RendererHacks": "Graphics Hacks",
         "RendererExtensions": "Vulkan Extensions", "RendererDebug": "Graphics Debug", "Core": "Emulation",
         "Cpu": "CPU", "CpuDebug": "CPU Debug", "CpuUnsafe": "CPU Unsafe Optimizations", "Audio": "Audio",
-        "System": "System", "SystemAudio": "System Audio", "DataStorage": "Storage", "Controls": "Input",
+        "System": "System", "SystemAudio": "System Audio", "DataStorage": "Storage", "Controls": "Controls",
         "Debugging": "Debugging", "DebuggingGraphics": "Graphics Debugging", "Network": "Network",
         "Miscellaneous": "Miscellaneous", "Services": "Services", "LibraryApplet": "System Applets",
         "Overlay": "Overlay", "GpuDriver": "GPU Driver", "AddOns": "Add-ons",
