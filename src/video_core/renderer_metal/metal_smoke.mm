@@ -24,6 +24,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -3128,6 +3129,28 @@ int RunOcarinaActorEffects() {
                 static_cast<unsigned long long>(actor_frames), actor_error.c_str(), left[0],
                 left[1], actor_wrong, Side * Side / 2, right[0], right[1], camera_wrong,
                 biased ? "made" : "NOT made", bias_wrong, Side * Side, passed ? "PASS" : "FAIL");
+    if (actor_wrong != 0) {
+        // What the translator made of the actor programs: inputs, bindings, the depth read.
+        const auto programs = Metal::OcarinaTemporal::ActorMsl(Metal::DeviceAppleFamily(device));
+        constexpr std::array<const char*, 2> Stages{"vertex", "fragment"};
+        constexpr std::array<std::string_view, 12> Wanted{
+            "attribute(", "[[buffer(", "[[texture(", "[[sampler(", "[[position", "user(locn",
+            ".read(",    "discard",   "bones",       "weights",    "// slot",    "error:"};
+        for (size_t stage = 0; stage < programs.size(); ++stage) {
+            std::string_view text = programs[stage];
+            while (!text.empty()) {
+                const size_t end = text.find('\n');
+                const std::string_view line = text.substr(0, end);
+                if (std::ranges::any_of(Wanted, [line](std::string_view word) {
+                        return line.find(word) != std::string_view::npos;
+                    })) {
+                    std::printf("metal-smoke: actor %s msl: %.*s\n", Stages[stage],
+                                static_cast<int>(line.size()), line.data());
+                }
+                text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
+            }
+        }
+    }
     return passed ? 0 : 1;
 }
 

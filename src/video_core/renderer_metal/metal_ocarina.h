@@ -176,6 +176,10 @@ public:
     /// Since the last call: frames with Link's motion drawn, frames with a reactive mask.
     [[nodiscard]] std::array<u64, 2> TakeExtras() noexcept;
 
+    /// The actor motion programs as the translator makes them (vertex, fragment), with their
+    /// resource slots appended; for the smoke test.
+    [[nodiscard]] static std::array<std::string, 2> ActorMsl(u32 apple_family);
+
     /// Why Link's motion was last not drawn (empty when it was), for the smoke test.
     [[nodiscard]] const std::string& ActorError() const noexcept {
         return actor_error;

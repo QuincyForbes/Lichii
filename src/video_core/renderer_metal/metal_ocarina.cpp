@@ -319,6 +319,26 @@ bool OcarinaTemporal::PrepareActor() {
     return true;
 }
 
+std::array<std::string, 2> OcarinaTemporal::ActorMsl(u32 apple_family) {
+    ShaderTranslate::Options options{};
+    options.ios = TranslateForIos;
+    options.apple_family = apple_family;
+    options.flip_vertex_y = false;
+    const auto translate = [&](std::span<const u32> code, ShaderTranslate::Stage stage) {
+        const ShaderTranslate::Result result = ShaderTranslate::SpirvToMsl(code, stage, options);
+        std::string text = result.source.empty() ? "error: " + result.error : result.source;
+        for (const ShaderTranslate::ResourceSlot& slot : result.slots) {
+            text += "\n// slot set " + std::to_string(slot.set) + " binding " +
+                    std::to_string(slot.binding) + " kind " +
+                    std::to_string(static_cast<int>(slot.kind)) + " index " +
+                    std::to_string(slot.index);
+        }
+        return text;
+    };
+    return {translate(OCARINA_ACTOR_MOTION_VERT_SPV, ShaderTranslate::Stage::Vertex),
+            translate(OCARINA_ACTOR_MOTION_FRAG_SPV, ShaderTranslate::Stage::Fragment)};
+}
+
 bool OcarinaTemporal::PrepareEffects() {
     if (effects_prepared || effects_failed) {
         return !effects_failed;
