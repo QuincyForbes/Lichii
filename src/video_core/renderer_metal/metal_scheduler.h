@@ -128,6 +128,9 @@ enum class ShaderStage : u8 {
     Vertex,
     Fragment,
     Compute,
+    /// The object and mesh functions of a mesh pipeline (on the render encoder).
+    Object,
+    Mesh,
 };
 
 /// Encoder state of a draw besides its bindings.
@@ -312,6 +315,15 @@ public:
     /// Tessellated patches of `control_points` control points each, read by the
     /// post-tessellation vertex function from its buffers.
     void DrawPatches(u32 control_points, u32 patch_count);
+
+    /// A mesh pipeline's draw: `groups` object threadgroups (mesh threadgroups without an object
+    /// function) along x.
+    void DrawMeshThreadgroups(u32 groups, u32 object_threads, u32 mesh_threads);
+
+    /// The same with the threadgroup counts (MTLDispatchThreadgroupsIndirectArguments: three u32)
+    /// at `offset` of `buffer`.
+    void DrawMeshThreadgroupsIndirect(BufferHandle buffer, u64 offset, u32 object_threads,
+                                      u32 mesh_threads);
 
     /// index_size: 2 or 4 bytes.
     void DrawIndexed(u32 primitive, u32 index_count, u32 index_size, BufferHandle index_buffer,

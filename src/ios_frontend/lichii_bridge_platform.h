@@ -247,7 +247,13 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// renderer records no pipelines and builds none before play, as before
 /// (EDEN_NX2_METAL_PIPELINE_FILE=0). "metal_temporal_off": on the Metal renderer Ocarina of
 /// Time's upscale pass is not replaced by MetalFX Temporal, as before
-/// (EDEN_NX2_METAL_OOT_TEMPORAL=0).
+/// (EDEN_NX2_METAL_OOT_TEMPORAL=0). "metal_mesh_emulated": the Metal renderer draws every
+/// task/mesh pipeline through the compute emulation and reads task counts the GPU wrote on the
+/// CPU, as before (EDEN_NX2_METAL_MESH_NATIVE=0, EDEN_NX2_METAL_MESH_FROM_GPU=0).
+/// "metal_vertex_plain": the Metal renderer refuses adjacency draws and draws with more vertex
+/// streams than buffer slots, and reads integer 10:10:10:2 attributes as normalized ones, as
+/// before (EDEN_NX2_METAL_ADJACENCY=0, EDEN_NX2_METAL_VERTEX_UNPACK=0,
+/// EDEN_NX2_METAL_VERTEX_GATHER=0).
 /// "pipeline_holds_old": the pipeline build a draw waits for stays queued on the builder pool, as
 /// before (EDEN_NX2_PIPELINE_HOLD_BOOST=0). "pipeline_list_old": the used pipelines list is
 /// written only on a first use 15 s after the last save and at shutdown, as before

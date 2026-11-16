@@ -190,6 +190,10 @@ u32 DeviceAppleFamily(const Device& device) {
     return device.AppleFamily();
 }
 
+bool DeviceSupportsMeshShaders(const Device& device) {
+    return device.SupportsMeshShaders();
+}
+
 void InAutoreleasePool(const std::function<void()>& work) {
     @autoreleasepool {
         work();

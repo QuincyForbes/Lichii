@@ -28,6 +28,10 @@ namespace {
         return spv::ExecutionModelTessellationControl;
     case Stage::TessellationEvaluation:
         return spv::ExecutionModelTessellationEvaluation;
+    case Stage::Object:
+        return spv::ExecutionModelTaskEXT;
+    case Stage::Mesh:
+        return spv::ExecutionModelMeshEXT;
     }
     return spv::ExecutionModelGLCompute;
 }
@@ -153,7 +157,8 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
         compiler.set_msl_options(msl);
         auto common = compiler.get_common_options();
         common.vertex.flip_vert_y =
-            (stage == Stage::Vertex || tess_evaluation) && options.flip_vertex_y;
+            (stage == Stage::Vertex || stage == Stage::Mesh || tess_evaluation) &&
+            options.flip_vertex_y;
         compiler.set_common_options(common);
         if (tess_control || tess_evaluation) {
             // Each program declares part of these (the domain, spacing and winding are the

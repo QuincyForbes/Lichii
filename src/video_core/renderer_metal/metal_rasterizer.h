@@ -22,6 +22,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_metal/metal_buffer_cache.h"
 #include "video_core/renderer_metal/metal_fence_manager.h"
+#include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_pipeline_cache.h"
@@ -79,6 +80,7 @@ public:
 
     void Draw(bool is_indexed, u32 instance_count) override;
     void DrawIndirect() override;
+    bool DrawMeshTasksFromGpu(DAddr count_addr) override;
     void DrawTexture() override;
     void Clear(u32 layer_count) override;
     void DispatchCompute() override;
@@ -180,6 +182,19 @@ public:
                 staging_pool.TakeFreed(), staging_pool.HeldBytes()};
     }
 
+    struct MeshCounts {
+        u64 native_draws;   ///< Task/mesh draws with Metal mesh functions
+        u64 from_gpu;       ///< Of them, with the task count the GPU wrote (DrawMeshTasksFromGpu)
+        u64 indirect;       ///< Of them, from guest indirect records (DrawIndirect)
+        u64 emulated_draws; ///< Through the compute emulation
+    };
+
+    /// Task/mesh draws since the last call (the renderer's 10 s "Perf Metal mesh:" line).
+    [[nodiscard]] MeshCounts TakeMeshCounts() noexcept {
+        return {std::exchange(native_mesh_draws, 0), std::exchange(native_mesh_from_gpu, 0),
+                std::exchange(native_mesh_indirect, 0), std::exchange(emulated_mesh_draws, 0)};
+    }
+
     [[nodiscard]] PipelineCache& Pipelines() noexcept {
         return pipeline_cache;
     }
@@ -277,6 +292,39 @@ private:
     /// Encodes the GPU rewrite of index_rewrite (fills its output; left empty when it can't).
     /// ahead: before the segment, leaving the open render pass as it is.
     void RewriteIndices(bool ahead);
+
+    /// The mesh threadgroups of a task/mesh draw: a count on the CPU, or (natively drawn only)
+    /// MTLDispatchThreadgroupsIndirectArguments in `buffer`, `draws` of them `stride` bytes apart.
+    /// With mesh_indirect.wanted, PrepareDraw writes them and they replace buffer and offset.
+    struct MeshGroups {
+        u32 count{};
+        BufferHandle buffer{};
+        u64 offset{};
+        u32 draws{1};
+        u32 stride{3 * sizeof(u32)};
+    };
+
+    /// A task/mesh draw: natively while the pipeline has Metal mesh functions, else through the
+    /// emulation (a CPU count only). False when nothing was encoded because neither can draw it
+    /// that way (DrawMeshTasksFromGpu's caller then reads the count).
+    bool DrawMesh(GraphicsPipeline& pipeline, bool is_indexed, const MeshGroups& groups);
+
+    /// DrawIndirect of a task/mesh pipeline: natively, the guest's records rewritten on the GPU
+    /// into Metal's threadgroup counts; emulated, the records read from guest memory.
+    void DrawMeshIndirect(GraphicsPipeline& pipeline);
+
+    /// Encodes mesh_indirect's rewrite of guest draw records into threadgroup counts (fills its
+    /// output; left empty when the kernel can't be made). ahead: as RewriteIndices.
+    void ConvertMeshIndirect(bool ahead);
+
+    /// Encodes the widening of a sanitised layout's 10:10:10:2 integer source (VertexSource::
+    /// unpack) into unpacked_vertices[slot]; left empty (zeros are bound) when it can't be made.
+    /// ahead: as RewriteIndices.
+    void UnpackVertices(u32 slot, const VertexSource& source, bool ahead);
+
+    /// Encodes the copies of the attributes VertexSources gathered into gathered_vertices (left
+    /// empty, zeros bound, when the kernel can't be made). ahead: as RewriteIndices.
+    void GatherVertices(const VertexSources& sources, bool ahead);
 
     /// Binds mesh_buffers to the program's slots of the emulation's bindings.
     void BindMeshBuffers(const StageProgram& program, ShaderStage metal_stage,
@@ -430,6 +478,35 @@ private:
         StagingBufferRef counter;
     } mesh_buffers;
     std::vector<MeshArena> mesh_arenas;
+    /// The rewrite of the guest's indirect records of a native task/mesh draw being prepared.
+    struct MeshIndirect {
+        bool wanted{};
+        bool has_count{}; ///< Else every record is drawn
+        BufferHandle records{};
+        u64 records_offset{};
+        BufferHandle count{};
+        u64 count_offset{};
+        u32 draws{};
+        u32 stride_words{};
+        StagingBufferRef output;
+    } mesh_indirect;
+    /// The draw's widened 10:10:10:2 integer attributes, by vertex buffer slot.
+    std::array<StagingBufferRef, Maxwell::NumVertexArrays> unpacked_vertices{};
+    Object vertex_unpack_library;
+    Object vertex_unpack_kernel;
+    bool vertex_unpack_failed{};
+    /// The draw's gathered attributes (VertexSources::gather_slot).
+    StagingBufferRef gathered_vertices;
+    Object vertex_gather_library;
+    Object vertex_gather_kernel;
+    bool vertex_gather_failed{};
+    Object mesh_indirect_library;
+    Object mesh_indirect_kernel;
+    bool mesh_indirect_failed{};
+    u64 native_mesh_draws{};
+    u64 native_mesh_from_gpu{};
+    u64 native_mesh_indirect{};
+    u64 emulated_mesh_draws{};
     size_t mesh_arena_current{~size_t{}};
     u64 mesh_arena_size{u64{32} << 20};
     /// Guest index data read for draws whose indices are rewritten.

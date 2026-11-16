@@ -552,6 +552,13 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
         if (const std::string coverage = Coverage::TakeLine(); !coverage.empty()) {
             LOG_INFO(Render_Metal, "Perf Metal coverage: {}", coverage);
         }
+        if (const auto mesh = impl->rasterizer.TakeMeshCounts();
+            mesh.native_draws + mesh.emulated_draws != 0) {
+            LOG_INFO(Render_Metal,
+                     "Perf Metal mesh: {} draws with mesh functions ({} with a task count the GPU "
+                     "wrote, {} from indirect records), {} through the compute emulation",
+                     mesh.native_draws, mesh.from_gpu, mesh.indirect, mesh.emulated_draws);
+        }
         if (const std::string deadlines = Common::FrameDeadline::TakeStatusText();
             !deadlines.empty()) {
             LOG_INFO(Render_Metal, "Perf Metal threads{}", deadlines);

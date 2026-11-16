@@ -36,11 +36,11 @@ file reference.
 | A03 | `DrawIndirect`: several draws from one buffer | vk_rasterizer.cpp:1635 | emulated (one Metal indirect draw per guest draw: Metal has no multi-draw) | metal_rasterizer.cpp:1684 | untested | no |
 | A04 | `DrawIndirect`: draw count from a buffer | vk_rasterizer.cpp:1635 | missing (the count is read from guest memory on the CPU: Metal has no count buffer; stale when the GPU wrote it and it was not downloaded) | metal_rasterizer.cpp:1687 | untested | no |
 | A05 | `DrawIndirect`: transform feedback byte count | vk_rasterizer.cpp:1635 | missing (draw refused: "transform feedback draw") | metal_rasterizer.cpp:1641 | untested | no |
-| A06 | `DrawIndirect` of a mesh pipeline | vk_rasterizer.cpp:1635 | missing (draw refused) | metal_rasterizer.cpp:1648 | untested | no |
+| A06 | `DrawIndirect` of a mesh pipeline | vk_rasterizer.cpp:1635 | native (natively drawn pipelines: a kernel rewrites the guest's records, and the count from a buffer, into Metal's threadgroup counts for `drawMeshThreadgroupsWithIndirectBuffer`; emulated ones read the records on the CPU, one emulated draw each; the draw is untested without a Metal 3 device) | metal_rasterizer.cpp:800, metal_rasterizer.cpp:951 | RunNativeMesh, replay | no |
 | A07 | `DrawIndirect` of a tessellated pipeline | vk_rasterizer.cpp:1635 | missing (draw refused) | metal_rasterizer.cpp:1653 | untested | no |
 | A08 | `DrawIndirect` with 8-bit indices | vk_rasterizer.cpp:1635 | missing (draw refused) | metal_rasterizer.cpp:1661 | untested | no |
 | A09 | `DrawIndirect` of quads, fans, loops and other rewritten topologies | vk_rasterizer.cpp:1635 | missing (draw refused) | metal_rasterizer.cpp:1661 | untested | no |
-| A10 | `DrawMeshTasksFromGpu`: mesh draws whose task count the GPU wrote, drawn without reading it back | vk_rasterizer.cpp:1593 | missing (interface default `false`: the count is read on the CPU and the draw comes through `Draw`) | - | untested | ? |
+| A10 | `DrawMeshTasksFromGpu`: mesh draws whose task count the GPU wrote, drawn without reading it back | vk_rasterizer.cpp:1593 | native (`EDEN_NX2_METAL_MESH_FROM_GPU`: a natively drawn pipeline takes the count from the buffer cache's mesh mirror with `drawMeshThreadgroupsWithIndirectBuffer`; the emulation still has the caller read it; untested without a Metal 3 device) | metal_rasterizer.cpp:994 | RunNativeMesh, replay | no |
 | A11 | `DrawTexture` | vk_rasterizer.cpp:1914 | missing (draw refused) | metal_rasterizer.cpp:1711 | untested | ? |
 | A12 | `Clear`: whole colour, depth and stencil attachments | vk_rasterizer.cpp:1967 | native (the load action of the next render pass when that pass is on the same attachments, under `EDEN_NX2_METAL_CLEAR_FOLD`; else a pass of its own) | metal_rasterizer.cpp:2048, metal_scheduler.mm:1206, metal_scheduler.mm:1427 | RunClearFold, replay | yes |
 | A13 | `Clear` inside a scissor rectangle | vk_rasterizer.cpp:1967 | emulated (a triangle over the rectangle, Metal has no clear of part of an attachment; under `EDEN_NX2_METAL_CLEAR_DRAWS`; without, the whole target is cleared and counted as refused) | metal_rasterizer.cpp:2048, metal_scheduler.mm:1253 | RunClearRect, replay | ? |
@@ -151,32 +151,32 @@ file reference.
 | ID | Capability | Vulkan | Status | Metal | Tested | OoT |
 |---|---|---|---|---|---|---|
 | C01 | Attributes, streams, strides, offsets, per-instance streams with divisors | vk_rasterizer.cpp:6166 | native | metal_rasterizer.cpp:1173, metal_graphics.mm:318 | RunRendererDraw, probe:constant-step-with-rate-1, replay | yes |
-| C02 | More than 31 attributes or streams in the guest's layout (Metal has 31) | vk_rasterizer.cpp:6166 | emulated (only what the vertex program reads is declared, renumbered from 0) | metal_pipeline_check.cpp:166 | RunPipelineCheck, probe:layout-index-31, replay | yes |
-| C03 | More read streams than Metal has free buffer slots next to the program's buffers | vk_rasterizer.cpp:6166 | missing (draw refused) | metal_pipeline_check.cpp:166, metal_shader_translate.cpp:295 | RunPipelineCheck, replay | no |
-| C04 | Attribute past its stream's stride | vk_rasterizer.cpp:6166 | emulated (the attribute moves into the stride and reads a copy of the stream bound that many bytes further on) | metal_pipeline_check.cpp:166 | RunPipelineCheck, probe:offset-past-stride | ? |
-| C05 | Attribute of a stream without a buffer, constant attributes | vk_buffer_cache.cpp | emulated (a zeroed buffer read at a constant step) | metal_rasterizer.cpp:1173 | probe:attribute-without-layout | yes |
-| C06 | Zero stride streams | vk_buffer_cache.cpp | emulated (constant step) | metal_pipeline_check.cpp:166 | probe:constant-step-with-rate-0 | yes |
+| C02 | More than 31 attributes or streams in the guest's layout (Metal has 31) | vk_rasterizer.cpp:6166 | emulated (only what the vertex program reads is declared, renumbered from 0: Metal has 31 vertex attributes and 31 buffer layouts) | metal_pipeline_check.cpp:241 | RunPipelineCheck, probe:layout-index-31, replay | yes |
+| C03 | More read streams than Metal has free buffer slots next to the program's buffers | vk_rasterizer.cpp:6166 | emulated (`EDEN_NX2_METAL_VERTEX_GATHER`: the last free slot holds a buffer the attributes of the remaining per-vertex streams are copied into by a kernel before the draw: Metal has 31 buffer slots per stage; instanced and constant streams past the slots are still refused) | metal_pipeline_check.cpp:241, metal_rasterizer.cpp:890 | RunVertexUnpack, replay | no |
+| C04 | Attribute past its stream's stride | vk_rasterizer.cpp:6166 | emulated (the attribute moves into the stride and reads a copy of the stream bound that many bytes further on: Metal wants an attribute's offset inside the stride) | metal_pipeline_check.cpp:241 | RunPipelineCheck, probe:offset-past-stride | no |
+| C05 | Attribute of a stream without a buffer, constant attributes | vk_buffer_cache.cpp | emulated (a zeroed buffer read at a constant step: Metal has no null vertex buffer) | metal_rasterizer.cpp:1233 | probe:attribute-without-layout | yes |
+| C06 | Zero stride streams | vk_buffer_cache.cpp | emulated (constant step: Metal takes no stride of 0) | metal_pipeline_check.cpp:241 | probe:constant-step-with-rate-0 | yes |
 | C07 | Float 16/32-bit 1-4 components, 11:11:10 float | maxwell_to_vk.cpp | native | metal_graphics.mm:171 | RunRendererDraw, replay | yes |
 | C08 | UNORM / SNORM 8 and 16-bit 1-4 components | maxwell_to_vk.cpp | native | metal_graphics.mm:171 | replay | yes |
 | C09 | UINT / SINT 8, 16 and 32-bit 1-4 components | maxwell_to_vk.cpp | native | metal_graphics.mm:171 | probe:attribute-format-uint-for-float-input, replay | yes |
-| C10 | USCALED / SSCALED 8, 16 and 32-bit | maxwell_to_vk.cpp | emulated (read as integers and converted by the vertex program: `support_scaled_attributes` off) | metal_graphics.mm:171 | untested | ? |
+| C10 | USCALED / SSCALED 8, 16 and 32-bit | maxwell_to_vk.cpp | emulated (read as integers and converted by the vertex program, `support_scaled_attributes` off, as MoltenVK: Metal has no scaled vertex formats) | metal_graphics.mm:171 | untested | no |
 | C11 | 10:10:10:2 UNORM / SNORM | maxwell_to_vk.cpp | native | metal_graphics.mm:171 | replay | yes |
-| C12 | 10:10:10:2 UINT / SINT / scaled | maxwell_to_vk.cpp | missing (Metal has it normalized only) | metal_graphics.mm:171 | untested | ? |
-| C13 | Attribute type the program reads differs from the format's (`attribute_types`) | fixed_pipeline_state.h | native (keyed and translated per type) | metal_pipeline_cache.cpp:464 | probe:attribute-format-uint-for-float-input | ? |
-| C14 | Vertex repacking for strides the host can't take | vk_rasterizer.cpp:6142, vk_compute_pass.cpp | missing (strides go to Metal as they are, nothing is repacked; whether Metal takes one that is not a multiple of 4 is what the probe reports) | metal_pipeline_check.cpp:166 | probe:stride-not-multiple-of-4 | ? |
+| C12 | 10:10:10:2 UINT / SINT / scaled | maxwell_to_vk.cpp | emulated (`EDEN_NX2_METAL_VERTEX_UNPACK`: a kernel widens the attribute into a buffer of its own as four 16-bit integers the program reads as the guest's: Metal has 10:10:10:2 vertex formats only normalized) | metal_pipeline_check.cpp:241, metal_rasterizer.cpp:848 | RunVertexUnpack | no |
+| C13 | Attribute type the program reads differs from the format's (`attribute_types`) | fixed_pipeline_state.h | native (keyed and translated per type) | metal_pipeline_cache.cpp:464 | probe:attribute-format-uint-for-float-input | yes |
+| C14 | Vertex repacking for strides the host can't take | vk_rasterizer.cpp:6142, vk_compute_pass.cpp | native (Metal takes strides that are not a multiple of 4 on the GPUs tested: nothing needs repacking) | metal_pipeline_check.cpp:241 | RunOddStride, probe:stride-not-multiple-of-4 | no |
 
 ## D. Topologies and index buffers
 
 | ID | Capability | Vulkan | Status | Metal | Tested | OoT |
 |---|---|---|---|---|---|---|
 | D01 | Points, lines, line strips, triangles, triangle strips | maxwell_to_vk.cpp | native | metal_graphics.mm:235 | RunRendererDraw | yes |
-| D02 | Triangle fans, line loops, polygons | maxwell_to_vk.cpp | emulated (indices rewritten to lists: Metal has no fans or loops) | metal_index_convert.cpp:66 | RunIndexRewrite | no |
-| D03 | Quads, quad strips | vk_buffer_cache.cpp, vk_compute_pass.cpp | emulated (indices rewritten to triangles, on the CPU or by a kernel for GPU-written indices) | metal_index_convert.cpp:66, metal_rasterizer.cpp:704 | RunIndexRewrite | no |
-| D04 | Lines and triangles with adjacency | maxwell_to_vk.cpp | missing (draw refused: "topology Metal can't draw"; only geometry programs read adjacency) | metal_rasterizer.cpp:555 | untested | no |
+| D02 | Triangle fans, line loops, polygons | maxwell_to_vk.cpp | emulated (indices rewritten to lists: Metal has no fans or loops) | metal_index_convert.cpp:108 | RunIndexRewrite | no |
+| D03 | Quads, quad strips | vk_buffer_cache.cpp, vk_compute_pass.cpp | emulated (indices rewritten to triangles, on the CPU or by a kernel for GPU-written indices: Metal has no quads) | metal_index_convert.cpp:108, metal_rasterizer.cpp:684 | RunIndexRewrite | no |
+| D04 | Lines and triangles with adjacency | maxwell_to_vk.cpp | emulated (`EDEN_NX2_METAL_ADJACENCY`: indices rewritten to lists without the adjacent vertices, as Vulkan draws them without a geometry program, on the CPU or by a kernel: Metal has no adjacency topologies; a geometry program reading them is section K's) | metal_index_convert.cpp:108, metal_index_convert.cpp:282 | RunIndexRewrite | no |
 | D05 | Patches | maxwell_to_vk.cpp | native (see section J) | metal_scheduler.mm:1786 | RunTessellation | yes |
 | D06 | 16 and 32-bit indices | maxwell_to_vk.cpp | native | metal_rasterizer.cpp:605, metal_scheduler.mm:1813 | RunRendererDraw | yes |
-| D07 | 8-bit indices | vk_buffer_cache.cpp:898, vk_compute_pass.cpp | emulated (widened, on the CPU or by a kernel) | metal_index_convert.cpp:10, metal_rasterizer.cpp:704 | RunIndexRewrite, replay | yes |
-| D08 | Inline index data | vk_rasterizer.cpp:1265 | native (copied into the stream ring) | metal_rasterizer.cpp:605 | untested | ? |
+| D07 | 8-bit indices | vk_buffer_cache.cpp:898, vk_compute_pass.cpp | emulated (widened, on the CPU or by a kernel: Metal draws 16- and 32-bit indices only) | metal_index_convert.cpp:108, metal_rasterizer.cpp:684 | RunIndexRewrite, replay | yes |
+| D08 | Inline index data | vk_rasterizer.cpp:1265 | native (copied into the stream ring) | metal_rasterizer.cpp:429 | untested | no |
 
 ## E. Texture formats
 
@@ -275,9 +275,9 @@ file reference.
 | ID | Capability | Vulkan | Status | Metal | Tested | OoT |
 |---|---|---|---|---|---|---|
 | I01 | Compute programs: uniform and storage buffers, textures, storage images, texel buffers | vk_compute_pipeline.cpp | native | metal_rasterizer.cpp:841, metal_pipeline_cache.cpp:493 | RunTranslate, RunTexelBuffer | yes |
-| I02 | Mesh programs without a task program | vk_rasterizer.cpp:1265, vk_graphics_pipeline.cpp | emulated (a compute kernel writes the vertices, a vertex function reads them: Metal mesh functions are not used yet) | metal_rasterizer.cpp:932, metal_pipeline_translate.cpp:449 | RunMeshEmulation, replay | yes |
-| I03 | Task + mesh programs | vk_rasterizer.cpp:1265, vk_graphics_pipeline.cpp | emulated (task kernel, distribution kernel, mesh kernel, indirect draw) | metal_rasterizer.cpp:932, metal_pipeline_translate.cpp:449 | RunMeshDistribution, replay | yes |
-| I04 | Mesh programs the emulation can't take | vk_pipeline_cache.cpp:4112 | missing (pipeline refused: "mesh program the emulation can't take"; none of the game's 241 stored mesh and task+mesh keys is one) | metal_pipeline_translate.cpp:449 | replay | no |
+| I02 | Mesh programs without a task program | vk_rasterizer.cpp:1265, vk_graphics_pipeline.cpp | native (`EDEN_NX2_METAL_MESH_NATIVE`: a Metal mesh function, `MTLMeshRenderPipelineDescriptor`, `drawMeshThreadgroups`, on GPUs with Metal 3 mesh pipelines; the compute emulation stays the fallback on older GPUs, for a pipeline Metal refuses and for one past Metal's mesh limits; the draw is untested without a Metal 3 device) | metal_pipeline_translate.cpp:755, metal_graphics.mm:475, metal_rasterizer.cpp:730 | RunNativeMesh, RunMeshEmulation, replay | yes |
+| I03 | Task + mesh programs | vk_rasterizer.cpp:1265, vk_graphics_pipeline.cpp | native (`EDEN_NX2_METAL_MESH_NATIVE`: the task program as an object function with its payload, the mesh program as a mesh function; the task, distribution and mesh kernels stay the fallback as for I02; the draw is untested without a Metal 3 device) | metal_pipeline_translate.cpp:755, metal_graphics.mm:475, metal_rasterizer.cpp:730 | RunNativeMesh, RunMeshDistribution, replay | yes |
+| I04 | Mesh programs the emulation can't take | vk_pipeline_cache.cpp:4112 | native (drawn as Metal mesh functions when they fit Metal's mesh limits; on a GPU without Metal 3 mesh pipelines still refused: Metal has no mesh stage there) | metal_pipeline_translate.cpp:441, metal_pipeline_translate.cpp:718 | replay | no |
 | I05 | Mesh kernels run ahead of the open render pass | vk_graphics_pipeline.cpp:94 | native (under `EDEN_NX2_METAL_AHEAD`, P02: when the draw's pass is the first thing of the segment and has not written storage, and the draw neither writes storage nor samples its targets; else the kernels end the pass as before) | metal_rasterizer.cpp:1263, metal_scheduler.mm:1718 | RunAhead | yes |
 | I06 | Consecutive dispatches share one compute encoder | vk_rasterizer.cpp:317 | native | metal_scheduler.mm:1716 | untested | yes |
 

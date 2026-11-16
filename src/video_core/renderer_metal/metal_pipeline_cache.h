@@ -39,7 +39,22 @@ public:
     explicit GraphicsPipeline(const GraphicsPipelineKey& key, StageProgram vertex,
                               StageProgram fragment,
                               std::optional<MeshEmulation> mesh = std::nullopt,
-                              std::optional<Tessellation> tessellation = std::nullopt);
+                              std::optional<Tessellation> tessellation = std::nullopt,
+                              std::optional<NativeMesh> native_mesh = std::nullopt);
+
+    /// The Metal mesh functions of a task/mesh pipeline while Metal takes them, else null (the
+    /// pipeline draws through Mesh(), when it has one).
+    [[nodiscard]] NativeMesh* Native() noexcept {
+        return native_mesh && !native_mesh->failed ? &*native_mesh : nullptr;
+    }
+
+    /// A task/mesh pipeline, drawn natively or emulated.
+    [[nodiscard]] bool IsMeshPipeline() const noexcept {
+        return mesh.has_value() || native_mesh.has_value();
+    }
+
+    /// Native() is null from now on: its functions or a render state were refused by Metal.
+    void FailNative(std::string_view reason);
 
     /// The tessellation stages of a tessellation pipeline, or null.
     [[nodiscard]] Tessellation* Tess() noexcept {
@@ -76,7 +91,8 @@ public:
         return flat_inputs;
     }
 
-    /// Builds the stages' functions; false (logged once) when Metal rejects one.
+    /// Builds the stages' functions (Native()'s while it has them); false (logged once) when Metal
+    /// rejects one.
     bool BuildFunctions(const Device& device);
 
     /// The archive pipeline states are looked up in and added to (PipelineCache's).
@@ -95,15 +111,19 @@ public:
     }
 
     /// The MTLRenderPipelineState for these targets, blending and vertex layout (desc's function
-    /// fields are filled in here), made on first use; null when Metal refuses it.
+    /// fields are filled in here), made on first use; null when Metal refuses it. While Native()
+    /// is there, its mesh pipeline state; when Metal refuses that, Native() becomes null.
     [[nodiscard]] void* RenderState(const Device& device, RenderPipelineDesc& desc);
 
 private:
+    bool BuildNativeFunctions(const Device& device);
+
     GraphicsPipelineKey key;
     StageProgram vertex;
     StageProgram fragment;
     std::optional<MeshEmulation> mesh;
     std::optional<Tessellation> tessellation;
+    std::optional<NativeMesh> native_mesh;
     PipelineArchive* archive{};
     PipelineFiles* recorder{};
     bool used{};
