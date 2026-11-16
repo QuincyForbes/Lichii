@@ -248,6 +248,10 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// (EDEN_NX2_METAL_PIPELINE_FILE=0). "metal_temporal_off": on the Metal renderer Ocarina of
 /// Time's upscale pass is not replaced by MetalFX Temporal, as before
 /// (EDEN_NX2_METAL_OOT_TEMPORAL=0).
+/// "metal_actor_off": on the Metal renderer Ocarina of Time's MetalFX Temporal gets the camera's
+/// motion for Link's pixels, as before (EDEN_NX2_METAL_OOT_ACTOR=0).
+/// "metal_effects_off": on the Metal renderer Ocarina of Time's MetalFX Temporal gets no reactive
+/// mask for the glows and particles drawn after the fog, as before (EDEN_NX2_METAL_OOT_EFFECTS=0).
 /// "pipeline_holds_old": the pipeline build a draw waits for stays queued on the builder pool, as
 /// before (EDEN_NX2_PIPELINE_HOLD_BOOST=0). "pipeline_list_old": the used pipelines list is
 /// written only on a first use 15 s after the last save and at shutdown, as before

@@ -314,9 +314,23 @@ EDEN_NX2_FENCE_BATCH=1
 # before, also with the upscaler set to MetalFX Temporal. By default, with that setting (or
 # EDEN_NX2_DLSS_REPLACEMENT=dlss), the pass is replaced as on Vulkan: the camera is read from the
 # scene draws, motion is made from the scene depth, MetalFX upscales and the game's target is
-# written from its output; EDEN_NX2_OOT_TEMPORAL_HANDHELD applies as on Vulkan. Link's skinned
-# motion and the effects mask Vulkan adds are not made on Metal.
+# written from its output; EDEN_NX2_OOT_TEMPORAL_HANDHELD applies as on Vulkan.
 #EDEN_NX2_METAL_OOT_TEMPORAL=0
+
+# Metal renderer: 0 gives Link's pixels the camera's motion only under the above, as before. By
+# default his skinned draw's pose is kept for this frame and the last (bones, origin, mesh), and
+# his mesh is drawn with both poses over the camera's motion where it lands on the scene depth,
+# as Vulkan's ActorOverlay does (ocarina_actor_motion.vert/.frag through the translator). The
+# "Ocarina MetalFX:" line counts the frames with "Link's motion".
+#EDEN_NX2_METAL_OOT_ACTOR=0
+
+# Metal renderer: 0 gives MetalFX no reactive mask under the above, as before. By default the
+# scene is copied once the fog is drawn, the pixels the glows and particles change after it are
+# marked when the game's next pass writes the scene, and the mark (with last frame's, moved) is
+# MetalFX's reactive mask, so those pixels take this frame's colour, as on Vulkan. MetalFX takes
+# a reactive mask from iOS 18 and macOS 15 on; before, none is made. The "Ocarina MetalFX:" line
+# counts the frames with an "effects mask".
+#EDEN_NX2_METAL_OOT_EFFECTS=0
 
 # Metal renderer: 1 rewrites the indices of triangle lists and strips drawn with a pixel program
 # that reads flat inputs while the game asks for the last vertex's values (the provoking vertex),

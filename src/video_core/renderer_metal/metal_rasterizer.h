@@ -472,6 +472,50 @@ private:
     u64 oot_replaced{};
     u64 oot_declined{};
     std::array<std::pair<const char*, u64>, 8> oot_decline_reasons{};
+
+    /// Vulkan's oot_actor_poses: Link's skinning pose of the last two frames.
+    struct OcarinaActorPose {
+        u64 frame{};
+        const Tegra::MemoryManager* channel{};
+        GPUVAddr vertex{};
+        GPUVAddr indices{};
+        s32 base_vertex{};
+        std::array<f32, 4> origin{};
+        std::array<f32, OcarinaActorMesh::Bones * 12> bones{};
+    };
+    std::array<OcarinaActorPose, 2> oot_actor_poses{};
+    u32 oot_actor_pose_index{};
+    /// Vulkan's oot_actor_mesh_cache: his vertices and indices, read again when they move.
+    struct OcarinaActorMeshCache {
+        const Tegra::MemoryManager* channel{};
+        GPUVAddr vertex{};
+        GPUVAddr indices{};
+        s32 base_vertex{};
+        u64 key{};
+        std::vector<u8> vertices;
+        std::vector<u16> index_data;
+    } oot_actor_mesh_cache;
+    /// The scene the glows and particles are drawn into after the fog (Vulkan's
+    /// oot_effects_*): its address, the frame, and the view the mark pass reads.
+    std::optional<u64> oot_effects_frame;
+    GPUVAddr oot_effects_address{};
+    TextureHandle oot_effects_scene{};
+
+    /// Vulkan's TrackOcarinaActor: the pose of the recognised Link draw
+    /// (EDEN_NX2_METAL_OOT_ACTOR).
+    void TrackOcarinaActor(u64 vertex_hash, bool is_indexed);
+
+    /// Vulkan's ReadOcarinaActor: `mesh` filled when both poses share one mesh; false otherwise.
+    bool ReadOcarinaActor(OcarinaActorMesh& mesh);
+
+    /// After a draw: the fog's draw saves the scene for the effects mask (Vulkan's
+    /// SaveEffectsBase call, EDEN_NX2_METAL_OOT_EFFECTS).
+    void NoteOcarinaEffectsDraw(u64 fragment_hash);
+
+    /// Before a dispatch: one that writes the scene after the effects marks what they drew
+    /// (Vulkan's MarkEffects call). `views` as DispatchCompute fills them.
+    void MarkOcarinaEffects(const Shader::Info& info,
+                            std::span<const VideoCommon::ImageViewInOut> views);
 };
 
 } // namespace Metal

@@ -2708,6 +2708,152 @@ int RunOcarinaTemporal() {
     return passed ? 0 : 1;
 }
 
+/// Ocarina's temporal inputs Vulkan adds over the camera motion, without MetalFX:
+/// - Link's skinned motion (EDEN_NX2_METAL_OOT_ACTOR, ocarina_actor_motion.vert/.frag through
+///   the translator): a triangle over a 16x16 scene at depth 0.5 whose previous pose was half
+///   of clip space to the right, over a camera that did not move. Where the scene depth is 0.5
+///   (the left half) his motion is 4 pixels right; where it is 0.25 the replay is hidden and the
+///   camera's motion (none) stays.
+/// - The effects mask (EDEN_NX2_METAL_OOT_EFFECTS): a scene saved at 0.2, then brightened to 1.0
+///   in a 4x4 block; the reactive mask is 1 over the block and one pixel around it, 0 elsewhere.
+int RunOcarinaActorEffects() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr uint32_t Size = 16;
+    const Metal::Object depth = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatDepth32Float),
+                 .width = Size,
+                 .height = Size,
+                 .render_target = true});
+    const Metal::Object scene = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRGBA16Float),
+                 .width = Size,
+                 .height = Size});
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer = Metal::CreateBuffer(device, Size * Size * 8, true, &upload);
+    uint8_t* bright = nullptr;
+    const Metal::Object bright_buffer = Metal::CreateBuffer(device, Size * Size * 8, true, &bright);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Size * Size * 4, true, &readback);
+    uint8_t* bias_readback = nullptr;
+    const Metal::Object bias_buffer = Metal::CreateBuffer(device, Size * Size * 2, true,
+                                                          &bias_readback);
+    if (!depth || !scene || upload == nullptr || bright == nullptr || readback == nullptr ||
+        bias_readback == nullptr) {
+        std::printf("metal-smoke: FAIL Ocarina actor/effects textures\n");
+        return 1;
+    }
+    for (uint32_t y = 0; y < Size; ++y) {
+        for (uint32_t x = 0; x < Size; ++x) {
+            const float value = x < Size / 2 ? 0.5f : 0.25f;
+            std::memcpy(upload + (y * Size + x) * 4, &value, 4);
+        }
+    }
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Size * 4, 0, depth.Get(), 0, 0, {},
+                                  {Size, Size, 1});
+    // One vertex layout of Link's: position, joints, extra joints, weights, extra weights.
+    std::vector<uint8_t> vertices(3 * Metal::OcarinaActorMesh::Stride);
+    const std::array<std::array<float, 3>, 3> positions{{{-1, -1, 0}, {3, -1, 0}, {-1, 3, 0}}};
+    for (size_t vertex = 0; vertex < 3; ++vertex) {
+        uint8_t* const base = vertices.data() + vertex * Metal::OcarinaActorMesh::Stride;
+        std::memcpy(base, positions[vertex].data(), 12);
+        base[40] = 255; // all of joint 0
+    }
+    const std::array<uint16_t, 3> indices{0, 1, 2};
+    std::vector<float> current_bones(Metal::OcarinaActorMesh::Bones * 12);
+    std::vector<float> previous_bones(current_bones.size());
+    const std::array<float, 12> identity_bone{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    std::copy(identity_bone.begin(), identity_bone.end(), current_bones.begin());
+    std::copy(identity_bone.begin(), identity_bone.end(), previous_bones.begin());
+    previous_bones[3] = 0.5f;
+    const Metal::OcarinaActorMesh mesh{
+        .vertices = vertices,
+        .indices = indices,
+        .mesh_key = 1,
+        .current_origin = {},
+        .previous_origin = {},
+        .current_bones = current_bones,
+        .previous_bones = previous_bones,
+    };
+    const VideoCommon::OcarinaMatrix identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    Metal::OcarinaTemporal temporal(device, scheduler);
+    const Metal::OcarinaTemporal::ActorMotion actor{mesh, identity, identity};
+    const bool encoded = temporal.EncodeMotion(depth.Get(), {Size, Size}, identity, &actor);
+    if (encoded) {
+        scheduler.CopyTextureToBuffer(temporal.Motion(), 0, 0, {}, {Size, Size, 1},
+                                      readback_buffer.Get(), 0, Size * 4, 0);
+    }
+    // The effects: the saved scene at 0.2, a 4x4 block at 1.0 after it.
+    const auto half = [](float value) {
+        // 0.2 and 1.0 only (the test's two values).
+        return static_cast<uint16_t>(value == 1.0f ? 0x3C00 : 0x3266);
+    };
+    for (uint32_t texel = 0; texel < Size * Size; ++texel) {
+        const uint16_t dim = half(0.2f);
+        const std::array<uint16_t, 4> pixel{dim, dim, dim, 0x3C00};
+        std::memcpy(upload + texel * 8, pixel.data(), 8);
+        const uint32_t x = texel % Size;
+        const uint32_t y = texel / Size;
+        const bool lit = x >= 4 && x < 8 && y >= 4 && y < 8;
+        const uint16_t value = lit ? half(1.0f) : dim;
+        const std::array<uint16_t, 4> after{value, value, value, 0x3C00};
+        std::memcpy(bright + texel * 8, after.data(), 8);
+    }
+    constexpr uint64_t Frame = 5;
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Size * 8, 0, scene.Get(), 0, 0, {},
+                                  {Size, Size, 1});
+    temporal.SaveEffectsBase(scene.Get(), {Size, Size}, Frame);
+    scheduler.CopyBufferToTexture(bright_buffer.Get(), 0, Size * 8, 0, scene.Get(), 0, 0, {},
+                                  {Size, Size, 1});
+    temporal.MarkEffects(scene.Get(), Frame);
+    const bool biased = temporal.EncodeEffectsBias(Frame, {Size, Size});
+    if (biased) {
+        scheduler.CopyTextureToBuffer(temporal.EffectsBias(), 0, 0, {}, {Size, Size, 1},
+                                      bias_buffer.Get(), 0, Size * 2, 0);
+    }
+    scheduler.Finish();
+    const auto to_float = [](uint16_t bits) {
+        const float magnitude = PackedFloat(bits & 0x7FFFU, 10);
+        return (bits & 0x8000U) != 0 ? -magnitude : magnitude;
+    };
+    uint32_t actor_wrong = 0;
+    uint32_t camera_wrong = 0;
+    std::array<float, 2> left{};
+    std::array<float, 2> right{};
+    for (uint32_t texel = 0; encoded && texel < Size * Size; ++texel) {
+        std::array<uint16_t, 2> bits{};
+        std::memcpy(bits.data(), readback + texel * 4, 4);
+        const std::array<float, 2> value{to_float(bits[0]), to_float(bits[1])};
+        const bool is_left = texel % Size < Size / 2;
+        const float expected = is_left ? 4.0f : 0.0f;
+        const bool right_value =
+            std::abs(value[0] - expected) < 0.05f && std::abs(value[1]) < 0.05f;
+        (is_left ? actor_wrong : camera_wrong) += right_value ? 0 : 1;
+        (is_left ? left : right) = value;
+    }
+    uint32_t bias_wrong = 0;
+    for (uint32_t texel = 0; biased && texel < Size * Size; ++texel) {
+        uint16_t bits;
+        std::memcpy(&bits, bias_readback + texel * 2, 2);
+        const uint32_t x = texel % Size;
+        const uint32_t y = texel / Size;
+        const bool near = x >= 3 && x < 9 && y >= 3 && y < 9;
+        bias_wrong += std::abs(to_float(bits) - (near ? 1.0f : 0.0f)) < 0.01f ? 0 : 1;
+    }
+    const bool passed =
+        encoded && biased && actor_wrong == 0 && camera_wrong == 0 && bias_wrong == 0;
+    std::printf("metal-smoke: Ocarina actor/effects: %s; Link's pixels %.3f,%.3f (expected 4,0) "
+                "%u of %u wrong, hidden pixels %.3f,%.3f (expected 0,0) %u wrong; effects mask "
+                "%s, %u of %u wrong: %s\n",
+                encoded ? "motion encoded" : "motion NOT encoded", left[0], left[1], actor_wrong,
+                Size * Size / 2, right[0], right[1], camera_wrong,
+                biased ? "made" : "NOT made", bias_wrong, Size * Size, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 /// The pipeline files (EDEN_NX2_METAL_PIPELINE_FILE): render states and the used list written
 /// and read back, the boot marker of a build that never finished, and render pipelines built on
 /// several threads against one archive (the boot build), then again from the written archive.
@@ -2854,7 +3000,7 @@ int main(int argc, char** argv) {
                                  RunPipelineCheck, RunDeviceMsl, RunBlockCopy, RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
                                  RunStagingBound, RunPipelineFiles, RunOcarinaTemporal,
-                                 SmokeProbe::RunAll}) {
+                                 RunOcarinaActorEffects, SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }
