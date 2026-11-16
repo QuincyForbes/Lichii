@@ -283,6 +283,14 @@ EDEN_NX2_FENCE_BATCH=1
 # build that did not finish (the process died in it) is skipped by the next run.
 #EDEN_NX2_METAL_PIPELINE_FILE=0
 
+# Metal renderer: 0 leaves Ocarina of Time's upscale pass to the bilinear pass or the game, as
+# before, also with the upscaler set to MetalFX Temporal. By default, with that setting (or
+# EDEN_NX2_DLSS_REPLACEMENT=dlss), the pass is replaced as on Vulkan: the camera is read from the
+# scene draws, motion is made from the scene depth, MetalFX upscales and the game's target is
+# written from its output; EDEN_NX2_OOT_TEMPORAL_HANDHELD applies as on Vulkan. Link's skinned
+# motion and the effects mask Vulkan adds are not made on Metal.
+#EDEN_NX2_METAL_OOT_TEMPORAL=0
+
 # Either renderer: 0 makes the GPU thread's front wait for the GPU and read a compute dispatch's
 # size the GPU wrote (Ocarina of Time's light tiles, once a frame). By default it passes
 # placeholders on; the dispatch takes its size from the GPU's buffer, and the copy of the size

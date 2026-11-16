@@ -2563,6 +2563,128 @@ int RunStagingBound() {
     return passed ? 0 : 1;
 }
 
+/// Ocarina's temporal upscale (EDEN_NX2_METAL_OOT_TEMPORAL): the camera motion pass
+/// (ocarina_camera_motion.comp through the translator) over a 16x16 Depth32Float scene at depth
+/// 0.5 with a camera that moved a quarter of clip space right: 2 pixels of motion everywhere.
+/// Where MetalFX temporal upscaling runs, the whole replacement of a flat scene into a 32x32
+/// RG11B10Float target too: the squared colour everywhere.
+int RunOcarinaTemporal() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr uint32_t SceneSize = 16;
+    constexpr uint32_t TargetSize = 32;
+    const Metal::Object depth = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatDepth32Float),
+                 .width = SceneSize,
+                 .height = SceneSize,
+                 .render_target = true});
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer =
+        Metal::CreateBuffer(device, SceneSize * SceneSize * 16, true, &upload);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, TargetSize * TargetSize * 4, true, &readback);
+    if (!depth || upload == nullptr || readback == nullptr) {
+        std::printf("metal-smoke: FAIL Ocarina temporal textures\n");
+        return 1;
+    }
+    for (uint32_t texel = 0; texel < SceneSize * SceneSize; ++texel) {
+        const float value = 0.5f;
+        std::memcpy(upload + texel * 4, &value, 4);
+    }
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, SceneSize * 4, 0, depth.Get(), 0, 0, {},
+                                  {SceneSize, SceneSize, 1});
+    // Row-major, as the shader's push constant block reads it: previous x = current x + 0.25.
+    VideoCommon::OcarinaMatrix moved{1, 0, 0, 0.25f, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    Metal::OcarinaTemporal temporal(device, scheduler);
+    const bool encoded = temporal.EncodeMotion(depth.Get(), {SceneSize, SceneSize}, moved);
+    if (encoded) {
+        scheduler.CopyTextureToBuffer(temporal.Motion(), 0, 0, {}, {SceneSize, SceneSize, 1},
+                                      readback_buffer.Get(), 0, SceneSize * 4, 0);
+    }
+    scheduler.Finish();
+    if (!encoded) {
+        std::printf("metal-smoke: FAIL Ocarina temporal motion pass not encoded (see the log)\n");
+        return 1;
+    }
+    const auto half = [](uint16_t bits) {
+        const float magnitude = PackedFloat(bits & 0x7FFFU, 10);
+        return (bits & 0x8000U) != 0 ? -magnitude : magnitude;
+    };
+    uint32_t motion_wrong = 0;
+    std::array<float, 2> sample{};
+    for (uint32_t texel = 0; texel < SceneSize * SceneSize; ++texel) {
+        std::array<uint16_t, 2> bits{};
+        std::memcpy(bits.data(), readback + texel * 4, 4);
+        const std::array<float, 2> value{half(bits[0]), half(bits[1])};
+        motion_wrong += std::abs(value[0] - 2.0f) < 0.01f && std::abs(value[1]) < 0.01f ? 0 : 1;
+        if (texel == 0) {
+            sample = value;
+        }
+    }
+    std::string upscale = "MetalFX temporal not on this device";
+    bool upscale_passed = true;
+    if (Metal::TemporalUpscaler::IsSupported(device)) {
+        const Metal::Object color = Metal::CreateTexture(
+            device, {.kind = Metal::TextureKind::e2D,
+                     .format = static_cast<uint32_t>(MTLPixelFormatRGBA32Float),
+                     .width = SceneSize,
+                     .height = SceneSize});
+        const Metal::Object target = Metal::CreateTexture(
+            device, {.kind = Metal::TextureKind::e2D,
+                     .format = static_cast<uint32_t>(MTLPixelFormatRG11B10Float),
+                     .width = TargetSize,
+                     .height = TargetSize,
+                     .shader_write = true});
+        for (uint32_t texel = 0; texel < SceneSize * SceneSize; ++texel) {
+            const std::array<float, 4> value{0.5f, 0.25f, 1.0f, 1.0f};
+            std::memcpy(upload + texel * 16, value.data(), 16);
+        }
+        scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, SceneSize * 16, 0, color.Get(), 0,
+                                      0, {}, {SceneSize, SceneSize, 1});
+        const VideoCommon::OcarinaMatrix identity{1, 0, 0, 0, 0, 1, 0, 0,
+                                                  0, 0, 1, 0, 0, 0, 0, 1};
+        const char* reason = nullptr;
+        bool recorded = true;
+        for (u64 frame = 1; frame <= 4 && recorded; ++frame) {
+            recorded = temporal.Record({.color = color.Get(),
+                                        .depth = depth.Get(),
+                                        .target = target.Get(),
+                                        .extent = {SceneSize, SceneSize},
+                                        .target_size = {TargetSize, TargetSize},
+                                        .current = identity,
+                                        .previous = identity,
+                                        .frame = frame},
+                                       reason);
+        }
+        if (recorded) {
+            scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {TargetSize, TargetSize, 1},
+                                          readback_buffer.Get(), 0, TargetSize * 4, 0);
+        }
+        scheduler.Finish();
+        uint32_t wrong = 0;
+        for (uint32_t texel = 0; recorded && texel < TargetSize * TargetSize; ++texel) {
+            uint32_t packed;
+            std::memcpy(&packed, readback + texel * 4, 4);
+            const float red = PackedFloat(packed & 0x7FF, 6);
+            const float green = PackedFloat((packed >> 11) & 0x7FF, 6);
+            wrong += std::abs(red - 0.25f) < 0.03f && std::abs(green - 0.0625f) < 0.01f ? 0 : 1;
+        }
+        upscale_passed = recorded && wrong == 0;
+        upscale = recorded ? "4 frames through MetalFX into 32x32 RG11B10, " +
+                                 std::to_string(wrong) + " of " +
+                                 std::to_string(TargetSize * TargetSize) + " wrong"
+                           : std::string{"declined: "} + (reason != nullptr ? reason : "?");
+    }
+    const bool passed = motion_wrong == 0 && upscale_passed;
+    std::printf("metal-smoke: Ocarina temporal: motion %.3f,%.3f (expected 2,0), %u of %u wrong; "
+                "%s: %s\n",
+                sample[0], sample[1], motion_wrong, SceneSize * SceneSize, upscale.c_str(),
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 /// The pipeline files (EDEN_NX2_METAL_PIPELINE_FILE): render states and the used list written
 /// and read back, the boot marker of a build that never finished, and render pipelines built on
 /// several threads against one archive (the boot build), then again from the written archive.
@@ -2708,7 +2830,8 @@ int main(int argc, char** argv) {
                                  RunDepthBlit, RunTessellation, RunDepthStencilBlit,
                                  RunPipelineCheck, RunDeviceMsl, RunBlockCopy, RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
-                                 RunStagingBound, RunPipelineFiles, SmokeProbe::RunAll}) {
+                                 RunStagingBound, RunPipelineFiles, RunOcarinaTemporal,
+                                 SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }

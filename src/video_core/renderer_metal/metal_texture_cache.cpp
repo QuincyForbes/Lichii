@@ -374,6 +374,8 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
             .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
             .reset = reset,
+            .depth_reversed = true,
+            .auto_exposure = true,
         });
     if (output == nullptr) {
         temporal_unsupported = true;

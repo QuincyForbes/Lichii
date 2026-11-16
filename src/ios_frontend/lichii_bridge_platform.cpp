@@ -433,6 +433,10 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_METAL_PIPELINE_FILE", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment metal_prebuild_off on");
     }
+    if (lichii_platform_experiment("metal_temporal_off")) {
+        setenv("EDEN_NX2_METAL_OOT_TEMPORAL", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_temporal_off on");
+    }
     if (lichii_platform_experiment("pipeline_holds_old")) {
         setenv("EDEN_NX2_PIPELINE_HOLD_BOOST", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment pipeline_holds_old on");

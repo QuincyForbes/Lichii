@@ -39,6 +39,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_indirect_grid.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/ocarina_upscale.h"
 #include "video_core/oot_network.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_draw_desc.h"
@@ -246,7 +247,7 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
       texture_cache{texture_cache_runtime, device_memory_},
       buffer_cache_runtime{device_, scheduler_, staging_pool},
       buffer_cache{device_memory_, buffer_cache_runtime}, pipeline_cache{device_memory_, device_},
-      ocarina{device_, scheduler_},
+      ocarina{device_, scheduler_}, ocarina_temporal{device_, scheduler_},
       accelerate_dma{buffer_cache, texture_cache},
       fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_} {
     if (!CachePathsEnabled()) {
@@ -1041,6 +1042,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     }
     texture_cache.FillImageViews(views, false, true);
     texture_cache.UpdateRenderTargets(false);
+    TrackOcarinaCamera();
     if (TargetlessReachEnabled() && texture_cache.HasNoRenderTargets()) {
         texture_cache.BoundTargetlessFramebuffer(
             TargetlessReach(regs, texture_cache.IsRescaling()));
@@ -1738,6 +1740,235 @@ void RasterizerMetal::TrackOotTonemappedImage() {
     oot_network_bypass.tonemapped = target;
 }
 
+bool RasterizerMetal::OcarinaTemporalEnabled() {
+    if (!OcarinaTemporal::Enabled() ||
+        Settings::GetCurrentProgramID() != VideoCommon::OotNetwork::ProgramId) {
+        return false;
+    }
+    static const std::string replacement = [] {
+        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        return std::string{value != nullptr ? value : ""};
+    }();
+    // MetalFX takes Vulkan's Dlss backend on Apple; FSR 3.1 has no Metal path (the game's pass,
+    // or the bilinear one, runs).
+    return VideoCommon::SelectOcarinaUpscaler(Settings::OcarinaFsrChosen(),
+                                              Settings::MetalFxTemporalChosen(), true,
+                                              replacement) ==
+               VideoCommon::OcarinaUpscaleBackend::Dlss &&
+           ocarina_temporal.Available();
+}
+
+void RasterizerMetal::TrackOcarinaCamera() {
+    if ((oot_motion.camera_frame == oot_frame && oot_motion.extent[0] >= 2560 &&
+         oot_motion.extent[1] >= 1440) ||
+        !OcarinaTemporalEnabled()) {
+        return;
+    }
+    const auto& targets = texture_cache.GetRenderTargets();
+    if (!targets.color_buffer_ids[0] || !targets.depth_buffer_id) {
+        return;
+    }
+    const ImageView& color = texture_cache.GetImageView(targets.color_buffer_ids[0]);
+    if (color.size.width < 640 || color.size.height < 360 ||
+        color.format != VideoCore::Surface::PixelFormat::B10G11R11_FLOAT) {
+        return;
+    }
+    // Reflections and half-size passes share the camera layout; the upscale reads the largest.
+    if (oot_motion.camera_frame == oot_frame &&
+        u64{color.size.width} * color.size.height <=
+            u64{oot_motion.image_extent[0]} * oot_motion.image_extent[1]) {
+        return;
+    }
+    const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[3];
+    constexpr size_t camera_bytes = 0x230;
+    if (!cbuf.enabled || cbuf.size < camera_bytes) {
+        return;
+    }
+    const auto device_addr = gpu_memory->GpuToCpuAddress(cbuf.address);
+    if (!device_addr || buffer_cache.IsRegionGpuModified(*device_addr, camera_bytes)) {
+        return;
+    }
+    std::array<f32, 2> extent_check{};
+    std::array<f32, 2> proj_check{};
+    device_memory.ReadBlockUnsafe(*device_addr + 0x120, extent_check.data(), sizeof(extent_check));
+    device_memory.ReadBlockUnsafe(*device_addr + 0xa8, proj_check.data(), sizeof(proj_check));
+    if (proj_check[0] != -1.0f || proj_check[1] != 0.0f || !(extent_check[0] >= 640.0f) ||
+        !(extent_check[1] >= 360.0f) || extent_check[0] > 16384.0f || extent_check[1] > 16384.0f) {
+        return;
+    }
+    // The camera's extent is the scene's; the images are that size or up to 15 pixels larger at
+    // a render scale the game pads (Vulkan takes those for its DLSS / MetalFX backend too).
+    const std::array<u32, 2> scene{static_cast<u32>(extent_check[0]),
+                                   static_cast<u32>(extent_check[1])};
+    if (static_cast<f32>(scene[0]) != extent_check[0] ||
+        static_cast<f32>(scene[1]) != extent_check[1] || color.size.width < scene[0] ||
+        color.size.height < scene[1] || color.size.width - scene[0] >= 16 ||
+        color.size.height - scene[1] >= 16) {
+        return;
+    }
+    oot_motion.camera_frame = oot_frame;
+    oot_motion.camera_channel = gpu_memory;
+    oot_motion.extent = scene;
+    oot_motion.image_extent = {color.size.width, color.size.height};
+    device_memory.ReadBlockUnsafe(*device_addr + 0x30, oot_motion.current.data(),
+                                  sizeof(oot_motion.current));
+    device_memory.ReadBlockUnsafe(*device_addr + 0x180, oot_motion.previous.data(),
+                                  sizeof(oot_motion.previous));
+}
+
+void RasterizerMetal::TrackOcarinaDepth() {
+    if (!OcarinaTemporalEnabled()) {
+        return;
+    }
+    constexpr u32 depth_handle_offset = 0x128;
+    const auto& qmd = kepler_compute->launch_description;
+    const auto& cbuf = qmd.const_buffer_config[0];
+    if (!(qmd.const_buffer_enable_mask & 1) || cbuf.size < depth_handle_offset + sizeof(u32) ||
+        !gpu_memory->IsFullyMappedRange(cbuf.Address(), depth_handle_offset + sizeof(u32))) {
+        return;
+    }
+    const u32 index = gpu_memory->Read<u32>(cbuf.Address() + depth_handle_offset) & 0xfffff;
+    const auto tic = ReadComputeTic(index);
+    const bool scene_size = oot_motion.camera_frame != oot_frame ||
+                            (tic && oot_motion.SceneSized(tic->Width(), tic->Height()));
+    if (tic && tic->Address() && scene_size) {
+        oot_motion.depth_channel = gpu_memory;
+        oot_motion.depth_frame = oot_frame;
+        oot_motion.depth_tic = index;
+        oot_motion.depth_address = tic->Address();
+    }
+}
+
+std::optional<Tegra::Texture::TICEntry> RasterizerMetal::ReadComputeTic(u32 index) {
+    const auto& table = kepler_compute->regs.tic;
+    using Entry = Tegra::Texture::TICEntry;
+    const GPUVAddr address = table.Address() + u64{index} * sizeof(Entry);
+    if (index > table.limit || !gpu_memory->IsFullyMappedRange(address, sizeof(Entry))) {
+        return std::nullopt;
+    }
+    Entry entry{};
+    gpu_memory->ReadBlockUnsafe(address, &entry, sizeof(entry));
+    return entry;
+}
+
+bool RasterizerMetal::TryOcarinaTemporal(u64 shader_hash,
+                                         std::span<const VideoCommon::ImageViewInOut> views) {
+    // Logs why the game's own upscale draws when the reason changes and every 120th repeat.
+    const auto fail = [this](const char* reason) {
+        CountOcarinaTemporal(false, reason);
+        if (reason != oot_decline || ++oot_decline_repeats % 120 == 0) {
+            LOG_INFO(Render_Metal, "Ocarina MetalFX: the game's upscale draws frame {} ({})",
+                     oot_frame, reason);
+        }
+        if (reason != oot_decline) {
+            oot_decline = reason;
+            oot_decline_repeats = 0;
+        }
+        return false;
+    };
+    if (oot_motion.camera_frame != oot_frame) {
+        return fail("no scene camera this frame");
+    }
+    if (oot_motion.depth_frame != oot_frame) {
+        return fail("no scene depth this frame");
+    }
+    if (oot_motion.camera_channel != gpu_memory || oot_motion.depth_channel != gpu_memory) {
+        return fail("camera and depth from another channel");
+    }
+    const auto tic = ReadComputeTic(oot_motion.depth_tic);
+    if (!tic || tic->Address() != oot_motion.depth_address ||
+        !oot_motion.SceneSized(tic->Width(), tic->Height())) {
+        return fail("scene depth descriptor changed");
+    }
+    std::array depth_views{VideoCommon::ImageViewInOut{.index = oot_motion.depth_tic}};
+    texture_cache.FillImageViews(depth_views, true);
+    if (!depth_views[0].id || views.size() < 2 || !views[0].id || !views[1].id) {
+        return fail("no scene depth image");
+    }
+    using VideoCore::Surface::PixelFormat;
+    ImageView& depth = texture_cache.GetImageView(depth_views[0].id);
+    if (texture_cache.IsRescaling(depth) || depth.format != PixelFormat::D32_FLOAT ||
+        depth.range != VideoCommon::SubresourceRange{} || depth.Samples() != 1) {
+        return fail("unsupported scene depth");
+    }
+    ImageView& color = texture_cache.GetImageView(views[0].id);
+    ImageView& target = texture_cache.GetImageView(views[1].id);
+    const auto extent = oot_motion.extent;
+    bool upscale_4k = OcarinaTemporal::IsScaledPass(shader_hash);
+    bool handheld_scaled = false;
+    const bool sixteen_by_nine =
+        std::abs(static_cast<int>(extent[0] * 9) - static_cast<int>(extent[1] * 16)) <= 32;
+    // Handheld the scaled passes write 1920x1080 from the lower scales (50 %: 960x540, 2x).
+    if (upscale_4k && OcarinaTemporal::HandheldEnabled() && target.size.width == 1920 &&
+        target.size.height == 1080 && shader_hash != OcarinaTemporal::Ocarina1440pShader &&
+        extent[0] < 1920 && sixteen_by_nine) {
+        upscale_4k = false;
+        handheld_scaled = true;
+    }
+    // 4K: any 16:9 scene up to 2560x1440; the 3/4 pass: a third larger.
+    const bool valid_extents =
+        handheld_scaled ? true
+        : upscale_4k    ? extent[0] <= 2560 && sixteen_by_nine && target.size.width == 2560 &&
+                           target.size.height == 1440
+                        : target.size.width == extent[0] * 4 / 3 &&
+                           target.size.height == extent[1] * 4 / 3;
+    if (!valid_extents || texture_cache.IsRescaling(color) || texture_cache.IsRescaling(target) ||
+        color.Samples() != 1 || target.Samples() != 1 ||
+        color.range != VideoCommon::SubresourceRange{} ||
+        target.range != VideoCommon::SubresourceRange{} ||
+        color.format != PixelFormat::E5B9G9R9_FLOAT ||
+        target.format != PixelFormat::B10G11R11_FLOAT ||
+        !oot_motion.SceneSized(color.size.width, color.size.height) ||
+        color.ImageHandle() == target.ImageHandle() || depth.ImageHandle() == target.ImageHandle()) {
+        return fail("unexpected upscale images");
+    }
+    const char* reason = nullptr;
+    if (!ocarina_temporal.Record(
+            {
+                .color = color.Handle(Shader::TextureType::Color2D),
+                .depth = depth.Handle(Shader::TextureType::Color2D),
+                .target = target.Handle(Shader::TextureType::Color2D),
+                .extent = extent,
+                .target_size = {target.size.width, target.size.height},
+                .current = oot_motion.current,
+                .previous = oot_motion.previous,
+                .frame = oot_frame,
+            },
+            reason)) {
+        return fail(reason != nullptr ? reason : "MetalFX declined the frame");
+    }
+    CountOcarinaTemporal(true);
+    oot_decline = nullptr;
+    return true;
+}
+
+void RasterizerMetal::CountOcarinaTemporal(bool replaced, const char* reason) {
+    ++(replaced ? oot_replaced : oot_declined);
+    if (reason != nullptr) {
+        for (auto& [name, count] : oot_decline_reasons) {
+            if (name == nullptr || name == reason) {
+                name = reason;
+                ++count;
+                break;
+            }
+        }
+    }
+    if (oot_replaced + oot_declined < 600) {
+        return;
+    }
+    std::string reasons;
+    for (const auto& [name, count] : oot_decline_reasons) {
+        if (name != nullptr) {
+            reasons += fmt::format("{}{} {}", reasons.empty() ? "; declined: " : ", ", name, count);
+        }
+    }
+    LOG_INFO(Render_Metal, "Ocarina MetalFX: {} of {} upscale passes replaced; scene {}x{}{}",
+             oot_replaced, oot_replaced + oot_declined, oot_motion.extent[0],
+             oot_motion.extent[1], reasons);
+    oot_replaced = oot_declined = 0;
+    oot_decline_reasons = {};
+}
+
 void RasterizerMetal::NoteUnprepared() {
     if (prepare_refusal.empty()) {
         Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
@@ -2019,6 +2250,20 @@ void RasterizerMetal::DispatchCompute() {
         }
     }
     texture_cache.FillImageViews(views, true);
+    if (pipeline->Key().unique_hash == OcarinaTemporal::DepthReader) {
+        TrackOcarinaDepth();
+    }
+    // The upscale pass through MetalFX temporal upscaling when it is the chosen upscaler, as
+    // Vulkan's TryOcarinaUpscale; declined, the bilinear pass or the game's own runs.
+    if (!kepler_compute->GetIndirectComputeAddress() &&
+        OcarinaTemporal::IsTemporalPass(pipeline->Key().unique_hash, info) &&
+        OcarinaTemporalEnabled()) {
+        if (TryOcarinaTemporal(pipeline->Key().unique_hash, views)) {
+            texture_cache.MarkModification(texture_cache.GetImageView(views[1].id).image_id);
+            Coverage::Note(Coverage::Work::Dispatch, Coverage::Path::Replaced);
+            return;
+        }
+    }
     // EDEN_NX2_OOT_BILINEAR_UPSCALE: Ocarina's upscale dispatch as one bilinear tap, as Vulkan's
     // TryOcarinaBilinear takes it (views: the sampled scene, then the written target).
     if (OcarinaUpscale::BilinearEnabled() &&
@@ -2623,6 +2868,7 @@ void RasterizerMetal::FlushCommands() {
 
 void RasterizerMetal::TickFrame() {
     VideoCommon::FeatureCensus::Tick();
+    ++oot_frame;
     texel_view_cache.clear();
     fence_manager.TickFrame();
     {

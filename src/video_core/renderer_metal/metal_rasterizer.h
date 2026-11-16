@@ -230,6 +230,27 @@ private:
     /// anti-aliasing network's output (oot_network.h).
     void TrackOotTonemappedImage();
 
+    /// Whether Ocarina's upscale pass goes to MetalFX temporal upscaling: the game, the
+    /// upscaler setting (MetalFX Temporal) or EDEN_NX2_DLSS_REPLACEMENT, and the GPU.
+    [[nodiscard]] bool OcarinaTemporalEnabled();
+
+    /// Vulkan's TrackOcarinaCamera: the camera matrices of a draw into the scene's targets.
+    void TrackOcarinaCamera();
+
+    /// Vulkan's TryOcarinaUpscale without `replace`: the scene depth its reader pass names.
+    void TrackOcarinaDepth();
+
+    /// A texture descriptor of the compute engine's table, if mapped and within its limit.
+    [[nodiscard]] std::optional<Tegra::Texture::TICEntry> ReadComputeTic(u32 index);
+
+    /// Vulkan's TryOcarinaUpscale: the upscale pass (views: the scene, then the target) replaced
+    /// by OcarinaTemporal; false when the game's pass (or the bilinear one) must run.
+    bool TryOcarinaTemporal(u64 shader_hash, std::span<const VideoCommon::ImageViewInOut> views);
+
+    /// Counts a replaced or declined upscale pass and logs the summary every 600 (Vulkan's
+    /// CountOcarinaUpscale).
+    void CountOcarinaTemporal(bool replaced, const char* reason = nullptr);
+
     /// Counts the draw PrepareDraw skipped.
     void NoteUnprepared();
 
@@ -312,6 +333,7 @@ private:
     BufferCache buffer_cache;
     PipelineCache pipeline_cache;
     OcarinaUpscale ocarina;
+    OcarinaTemporal ocarina_temporal;
     QueryCache query_cache;
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
@@ -419,6 +441,33 @@ private:
     u64 staging_flushes{};
     u64 staging_waits{};
     VideoCommon::OotNetwork::BypassState oot_network_bypass;
+
+    /// Frames ended (TickFrame), Vulkan's render_trace_frame for the Ocarina paths.
+    u64 oot_frame{1};
+    /// Vulkan's oot_motion: this frame's camera and scene depth.
+    struct OcarinaMotion {
+        const Tegra::MemoryManager* camera_channel{};
+        const Tegra::MemoryManager* depth_channel{};
+        u64 camera_frame{};
+        u64 depth_frame{};
+        GPUVAddr depth_address{};
+        u32 depth_tic{};
+        std::array<u32, 2> extent{};
+        /// The scene targets' size: wider than the extent at a render scale the game pads.
+        std::array<u32, 2> image_extent{};
+        VideoCommon::OcarinaMatrix current{};
+        VideoCommon::OcarinaMatrix previous{};
+
+        [[nodiscard]] bool SceneSized(u32 width, u32 height) const noexcept {
+            return (width == extent[0] || width == image_extent[0]) &&
+                   (height == extent[1] || height == image_extent[1]);
+        }
+    } oot_motion;
+    const char* oot_decline{};
+    u64 oot_decline_repeats{};
+    u64 oot_replaced{};
+    u64 oot_declined{};
+    std::array<std::pair<const char*, u64>, 8> oot_decline_reasons{};
 };
 
 } // namespace Metal
