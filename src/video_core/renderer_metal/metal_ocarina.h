@@ -102,6 +102,8 @@ public:
         u64 frame;
         /// Link's mesh and poses, null without them (dialogue, cutscenes, first person).
         const OcarinaActorMesh* actor{};
+        /// The scene draws' viewport offset this frame (render pixels; EDEN_NX2_DLSS_JITTER).
+        std::array<f32, 2> jitter{};
     };
 
     explicit OcarinaTemporal(const Device& device, Scheduler& scheduler);
@@ -148,7 +150,7 @@ public:
     /// smoke test runs this alone).
     bool EncodeMotion(TextureHandle depth, std::array<u32, 2> extent,
                       const VideoCommon::OcarinaMatrix& clip_to_previous_clip,
-                      const ActorMotion* actor = nullptr);
+                      const ActorMotion* actor = nullptr, std::array<f32, 2> jitter = {});
 
     /// Vulkan's SaveEffectsBase: the scene (B10G11R11, `extent` at its top left) copied once the
     /// fog is drawn, before the glows and particles.
@@ -230,7 +232,8 @@ private:
              std::span<const u8> push_constants, std::array<u32, 2> pass_size) {
         Run(pass, std::span(&input, 1), output, push_constants, pass_size);
     }
-    bool DrawActor(TextureHandle depth, std::array<u32, 2> extent, const ActorMotion& actor);
+    bool DrawActor(TextureHandle depth, std::array<u32, 2> extent, const ActorMotion& actor,
+                   std::array<f32, 2> jitter);
     [[nodiscard]] ActorSlot* AcquireActorSlot(const OcarinaActorMesh& mesh);
 
     const Device& device;

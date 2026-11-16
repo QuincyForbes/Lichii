@@ -712,6 +712,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_swapchain.h
         renderer_metal/metal_switches.h
         renderer_metal/metal_temporal.h
+        renderer_metal/metal_work_policy.h
         renderer_metal/metal_texture_cache.h
         renderer_metal/renderer_metal.h
     )

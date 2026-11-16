@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -47,6 +48,8 @@
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_rasterizer.h"
+#include "video_core/renderer_metal/metal_switches.h"
+#include "video_core/renderer_metal/metal_work_policy.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/shader_handle_program.h"
 #include "video_core/textures/texture.h"
@@ -425,7 +428,32 @@ bool RasterizerMetal::TryIndirectReset(bool is_indexed, u32 instance_count) {
     return true;
 }
 
+bool RasterizerMetal::SkipMeshDraws() {
+    // Vulkan's EDEN_NX2_NO_MESH=1, EDEN_NX2_NO_MESH_EMULATION=1 (Metal's task and mesh draws are
+    // emulated) and EDEN_NX2_NO_MESH_FILE=<path> (while it exists, checked every 1024 mesh draws),
+    // read under EDEN_NX2_METAL_VULKAN_SWITCHES: mesh draws skipped for comparisons.
+    static const char* const file = VulkanSwitch("EDEN_NX2_NO_MESH_FILE");
+    if (!mesh_skip) {
+        mesh_skip = WorkPolicy::MeshSkip{
+            .always = VulkanSwitch("EDEN_NX2_NO_MESH") != nullptr ||
+                      VulkanSwitch("EDEN_NX2_NO_MESH_EMULATION") != nullptr,
+            .has_file = file != nullptr,
+        };
+    }
+    return mesh_skip->Skip([] { return std::filesystem::exists(file); });
+}
+
 void RasterizerMetal::FlushWork() {
+    // Vulkan's EDEN_NX2_FLUSH_DRAWS=<n> (read under EDEN_NX2_METAL_VULKAN_SWITCHES): the work
+    // recorded is committed every n draws. Unset, Metal commits at fences, waits and frame ends.
+    static const u32 flush_draws =
+        WorkPolicy::ParseFlushDraws(VulkanSwitch("EDEN_NX2_FLUSH_DRAWS"));
+    draw_flush.budget = flush_draws;
+    if (draw_flush.Note()) {
+        ++draw_flushes;
+        scheduler.Flush();
+        return;
+    }
     if (!staging_pool.WantsFlush()) {
         return;
     }
@@ -479,6 +507,10 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     index_rewrite = {};
     if (const MeshEmulation* const mesh = pipeline->Mesh()) {
+        if (SkipMeshDraws()) {
+            RefuseDraw("EDEN_NX2_NO_MESH");
+            return;
+        }
         // The draw's count is its mesh workgroups (the index count for indexed draws).
         const u32 groups = is_indexed ? draw_state.index_buffer.count
                                       : draw_state.vertex_buffer.count;
@@ -1073,6 +1105,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     texture_cache.FillImageViews(views, false, true);
     texture_cache.UpdateRenderTargets(false);
     TrackOcarinaCamera();
+    UpdateOcarinaJitter();
     if (TargetlessReachEnabled() && texture_cache.HasNoRenderTargets()) {
         texture_cache.BoundTargetlessFramebuffer(
             TargetlessReach(regs, texture_cache.IsRescaling()));
@@ -1525,6 +1558,9 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         draw.viewport.width *= scale;
         draw.viewport.height *= scale;
     }
+    // Ocarina's scene draws under EDEN_NX2_DLSS_JITTER (UpdateOcarinaJitter).
+    draw.viewport.x += oot_jitter_applied[0];
+    draw.viewport.y += oot_jitter_applied[1];
     if (draw.viewport.width == 0.0f) {
         draw.viewport.width = 1.0f;
     }
@@ -1788,6 +1824,31 @@ bool RasterizerMetal::OcarinaTemporalEnabled() {
            ocarina_temporal.Available();
 }
 
+void RasterizerMetal::UpdateOcarinaJitter() {
+    std::array<f32, 2> want{};
+    // As Vulkan: only while MetalFX replaced the previous frame's upscale (a frame the game
+    // upscales itself would show the offset as a shake), and only for draws that depth-test
+    // against the scene depth at the scene size, so a depth pre-pass and the colour passes move
+    // together and shadow maps, half-size and full-screen passes stay put.
+    const auto& regs = maxwell3d->regs;
+    if (oot_temporal_frame && *oot_temporal_frame + 1 >= oot_frame && regs.depth_test_enable &&
+        oot_motion.extent[0] != 0 && VulkanSwitchesEnabled() &&
+        VideoCommon::OcarinaJitterEnabled(VideoCommon::OcarinaUpscaleBackend::Dlss)) {
+        const auto& targets = texture_cache.GetRenderTargets();
+        if (targets.depth_buffer_id) {
+            const ImageView& depth = texture_cache.GetImageView(targets.depth_buffer_id);
+            if (oot_motion.SceneSized(depth.size.width, depth.size.height) &&
+                !texture_cache.IsRescaling(depth)) {
+                // Halton (2, 3) with AMD's phase count for the last upscaled frame's scale.
+                want = WorkPolicy::OcarinaJitter(oot_frame, oot_jitter_phases);
+                oot_jitter_frame = oot_frame;
+                oot_jitter_offset = want;
+            }
+        }
+    }
+    oot_jitter_applied = want;
+}
+
 void RasterizerMetal::TrackOcarinaCamera() {
     if ((oot_motion.camera_frame == oot_frame && oot_motion.extent[0] >= 2560 &&
          oot_motion.extent[1] >= 1440) ||
@@ -1967,10 +2028,14 @@ bool RasterizerMetal::TryOcarinaTemporal(u64 shader_hash,
                 .previous = oot_motion.previous,
                 .frame = oot_frame,
                 .actor = has_actor ? &actor : nullptr,
+                .jitter = oot_jitter_frame == oot_frame ? oot_jitter_offset
+                                                        : std::array<f32, 2>{},
             },
             reason)) {
         return fail(reason != nullptr ? reason : "MetalFX declined the frame");
     }
+    oot_temporal_frame = oot_frame;
+    oot_jitter_phases = VideoCommon::OcarinaJitterPhases(extent[0], target.size.width);
     CountOcarinaTemporal(true);
     oot_decline = nullptr;
     return true;

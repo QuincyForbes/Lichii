@@ -9,17 +9,20 @@
 
 #include "common/cityhash.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/attribute.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
+#include "shader_recompiler/ir_opt/oot_visual_workaround.h"
 #include "shader_recompiler/program_header.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/feature_census.h"
 #include "video_core/renderer_metal/metal_pipeline_translate.h"
+#include "video_core/renderer_metal/metal_switches.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/surface.h"
 
@@ -196,6 +199,20 @@ void ApplyFragmentState(Shader::RuntimeInfo& info, const GraphicsPipelineKey& ke
     for (size_t rt = 0; rt < info.color_output_types.size(); ++rt) {
         info.color_output_types[rt] =
             static_cast<Shader::AttributeType>((key.state >> (StateColorTypesShift + rt * 2)) & 3);
+    }
+}
+
+/// Vulkan's EDEN_NX2_OOT_VISUAL_WORKAROUND=1 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): its
+/// opt-in edit of two of Ocarina of Time's programs (the fog dispatch, the exposure pass).
+void ApplyVisualWorkaround(Shader::IR::Program& program, u64 hash) {
+    static const bool enabled = [] {
+        const char* const value = VulkanSwitch("EDEN_NX2_OOT_VISUAL_WORKAROUND");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
+            program, Settings::GetCurrentProgramID(), hash, enabled)) {
+        LOG_WARNING(Render_Metal, "Metal: Ocarina visual workaround edited {} instructions of {:016x}",
+                    *edits, hash);
     }
 }
 
@@ -383,6 +400,7 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
             auto program_vb = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
             programs[index] = MergeDualVertexPrograms(programs[0], program_vb, env, host_info);
         }
+        ApplyVisualWorkaround(programs[index], key.unique_hashes[index]);
         if (VideoCommon::FeatureCensus::Enabled()) {
             VideoCommon::FeatureCensus::NoteProgram(key.unique_hashes[index], programs[index]);
         }
@@ -750,6 +768,7 @@ std::optional<StageProgram> PipelineTranslator::Compute(u64 unique_hash,
     pools.ReleaseContents();
     Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
     auto program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+    ApplyVisualWorkaround(program, unique_hash);
     if (VideoCommon::FeatureCensus::Enabled()) {
         VideoCommon::FeatureCensus::NoteProgram(unique_hash, program);
     }

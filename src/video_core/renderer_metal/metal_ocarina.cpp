@@ -14,6 +14,7 @@
 #endif
 
 #include "common/logging.h"
+#include "video_core/ocarina_upscale.h"
 #include "video_core/host_shaders/ocarina_actor_motion_frag_spv.h"
 #include "video_core/host_shaders/ocarina_actor_motion_vert_spv.h"
 #include "video_core/host_shaders/ocarina_bilinear_upscale_comp_spv.h"
@@ -471,7 +472,7 @@ OcarinaTemporal::ActorSlot* OcarinaTemporal::AcquireActorSlot(const OcarinaActor
 }
 
 bool OcarinaTemporal::DrawActor(TextureHandle depth, std::array<u32, 2> extent,
-                                const ActorMotion& actor) {
+                                const ActorMotion& actor, std::array<f32, 2> jitter) {
     const OcarinaActorMesh& mesh = actor.mesh;
     const size_t bone_floats = size_t{OcarinaActorMesh::Bones} * 12;
     if (mesh.indices.empty() || mesh.vertices.size() < OcarinaActorMesh::Stride ||
@@ -494,7 +495,7 @@ bool OcarinaTemporal::DrawActor(TextureHandle depth, std::array<u32, 2> extent,
         .current_origin = mesh.current_origin,
         .previous_origin = mesh.previous_origin,
         .extent = {static_cast<f32>(extent[0]), static_cast<f32>(extent[1])},
-        .jitter = {},
+        .jitter = jitter,
     };
     RenderTargetSet targets{};
     targets.color[0] = {.texture = motion.Get()};
@@ -503,8 +504,9 @@ bool OcarinaTemporal::DrawActor(TextureHandle depth, std::array<u32, 2> extent,
     scheduler.BeginRendering(targets);
     scheduler.SetDrawState({
         .pipeline = actor_state.Get(),
-        .viewport = {0.0f, 0.0f, static_cast<f32>(extent[0]), static_cast<f32>(extent[1]), 0.0f,
-                     1.0f},
+        // Offset like the scene's jittered draws, so the replay covers the same samples.
+        .viewport = {jitter[0], jitter[1], static_cast<f32>(extent[0]),
+                     static_cast<f32>(extent[1]), 0.0f, 1.0f},
         .scissor = {0, 0, extent[0], extent[1]},
         .cull_mode = 0, // MTLCullModeNone
         .front_ccw = true,
@@ -556,21 +558,21 @@ bool OcarinaTemporal::DrawActor(TextureHandle depth, std::array<u32, 2> extent,
 
 bool OcarinaTemporal::EncodeMotion(TextureHandle depth, std::array<u32, 2> extent,
                                    const VideoCommon::OcarinaMatrix& clip_to_previous_clip,
-                                   const ActorMotion* actor) {
+                                   const ActorMotion* actor, std::array<f32, 2> jitter) {
     if (depth == nullptr || extent[0] == 0 || extent[1] == 0 || !Prepare() || !Resize(extent)) {
         return false;
     }
-    // No jitter: Vulkan gives MetalFX none either unless EDEN_NX2_DLSS_JITTER is set.
+    // The scene's jitter (none unless EDEN_NX2_DLSS_JITTER is set, as on Vulkan's MetalFX path).
     const MotionParameters parameters{
         .clip_to_previous_clip = clip_to_previous_clip,
-        .jitter = {},
+        .jitter = jitter,
         .padding = {},
     };
     Run(motion_pass, depth, motion.Get(),
         std::span(reinterpret_cast<const u8*>(&parameters), sizeof(parameters)), extent);
     // Without Link's pose (dialogue, cutscenes, first person) the motion is the camera's alone.
     if (actor != nullptr && ActorEnabled()) {
-        DrawActor(depth, extent, *actor);
+        DrawActor(depth, extent, *actor, jitter);
     }
     return true;
 }
@@ -645,7 +647,8 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
     if (frame.actor != nullptr) {
         actor.emplace(ActorMotion{*frame.actor, frame.current, frame.previous});
     }
-    if (!EncodeMotion(frame.depth, frame.extent, *transform, actor ? &*actor : nullptr)) {
+    if (!EncodeMotion(frame.depth, frame.extent, *transform, actor ? &*actor : nullptr,
+                      frame.jitter)) {
         reason = "motion pass not made";
         return false;
     }
@@ -665,7 +668,11 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
                                                       .motion = motion.Get(),
                                                       .render_size = frame.extent,
                                                       .output_size = frame.target_size,
-                                                      .jitter = {},
+                                                      // EDEN_NX2_DLSS_JITTER=2: y flipped.
+                                                      .jitter = {frame.jitter[0],
+                                                                 VideoCommon::OcarinaDlssJitterMode() == 2
+                                                                     ? -frame.jitter[1]
+                                                                     : frame.jitter[1]},
                                                       .motion_vector_scale = {1.0f, 1.0f},
                                                       .reset = reset,
                                                       .depth_reversed = false,

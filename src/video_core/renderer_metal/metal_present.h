@@ -62,6 +62,21 @@ public:
                     u32 target_format, std::array<u32, 2> target_size, std::array<s32, 4> screen,
                     bool keep_target, BlitBlend blend);
 
+    /// Vulkan's temporal stand-in for the game's DLSS (TextureCacheRuntime::TemporalUpscale
+    /// without FSR 3.1): temporal_upscale.frag accumulates this frame into a history at the
+    /// output's size, then temporal_sharpen.frag (RCAS at the FSR sharpness setting) draws it.
+    struct TemporalInputs {
+        TextureHandle color{};
+        TextureHandle motion{};
+        Attachment target{};
+        u32 format{};
+        std::array<u32, 2> size{};
+        std::array<f32, 2> jitter{};
+        std::array<f32, 2> motion_scale{};
+        bool use_history{};
+    };
+    bool TemporalFilter(const TemporalInputs& inputs);
+
     /// Passes drawn since the last call.
     [[nodiscard]] u64 TakePasses() noexcept;
 
@@ -92,6 +107,9 @@ public:
         SmaaWeight,
         SmaaBlendVertex,
         SmaaBlend,
+        FullScreenVertex,
+        TemporalUpscale,
+        TemporalSharpen,
         Count,
     };
 
@@ -150,6 +168,10 @@ private:
     Object smaa_area;
     Object smaa_search;
     std::optional<bool> smaa_textures;
+    /// The stand-in's history: read from one, stored to the other.
+    std::array<Object, 2> history;
+    std::array<u32, 2> history_size{};
+    size_t history_current{};
     u64 passes{};
 };
 

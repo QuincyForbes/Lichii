@@ -9,6 +9,7 @@
 #include <array>
 #include <chrono>
 #include <memory>
+#include <utility>
 #include <optional>
 #include <span>
 
@@ -28,6 +29,7 @@ class Device;
 class Framebuffer;
 class Image;
 class ImageView;
+class PresentPasses;
 class Sampler;
 
 using Common::SlotVector;
@@ -86,11 +88,17 @@ public:
                    Tegra::Engines::Fermi2D::Operation operation);
 
     /// MetalFX temporal upscaling in place of the game's DLSS (the MetalFX Temporal scaling
-    /// filter); false leaves the game's own upscaler.
+    /// filter), else Vulkan's temporal stand-in (EDEN_NX2_METAL_TEMPORAL_STANDIN); false leaves
+    /// the game's own upscaler.
     bool TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& input_color,
                          ImageView& motion_vectors, ImageView* depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
                          std::array<f32, 2> motion_scale, bool use_history);
+
+    /// Frames the temporal stand-in drew since the last call.
+    [[nodiscard]] u64 TakeStandInFrames() noexcept {
+        return std::exchange(standin_frames, 0);
+    }
 
     [[nodiscard]] bool WantsTemporalUpscaleDepth() const;
 
@@ -130,6 +138,22 @@ public:
     std::unique_ptr<TemporalUpscaler> temporal;
     bool temporal_unsupported{};
     std::optional<std::chrono::steady_clock::time_point> temporal_last_evaluation;
+    std::unique_ptr<PresentPasses> present_passes;
+    bool standin_failed{};
+    u64 standin_frames{};
+
+private:
+    static bool TemporalStandInEnabled();
+    bool MetalFxTemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst,
+                                ImageView& input_color, ImageView& motion_vectors,
+                                ImageView& depth_view, std::array<u32, 2> render_size,
+                                std::array<f32, 2> jitter, std::array<f32, 2> motion_scale);
+    bool TemporalStandIn(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& input_color,
+                         ImageView& motion_vectors, std::array<u32, 2> render_size,
+                         std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
+                         bool use_history);
+
+public:
 
     /// Shared buffer for reinterpreting copies, grown as needed.
     Object reinterpret_buffer;

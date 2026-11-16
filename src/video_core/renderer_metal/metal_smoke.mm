@@ -34,6 +34,7 @@
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/attribute.h"
+#include "common/settings.h"
 #include "common/settings_enums.h"
 #include "shader_recompiler/shader_info.h"
 #include "device_msl_smoke_frag_spv.h"
@@ -57,6 +58,7 @@
 #include "video_core/renderer_metal/metal_shader_translate.h"
 #include "video_core/renderer_metal/metal_smoke_probe.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
+#include "video_core/textures/texture.h"
 
 extern char** environ;
 
@@ -2567,6 +2569,137 @@ int RunChildWith(const char* name, std::initializer_list<const char*> variables)
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+/// Vulkan's EDEN_NX2_PASS_TIMES on Metal (run in a child with it set by RunVulkanSwitches): a
+/// frame of two render passes is timed at their stage boundaries and the line names both, once
+/// the GPU is done with the frame. A GPU without timestamps at pass boundaries says so.
+int RunPassTimes() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const QuadScene scene(device);
+    if (!scene.valid) {
+        std::printf("metal-smoke: FAIL pass times setup: %s\n", scene.error.c_str());
+        return 1;
+    }
+    const bool supported =
+        [device.GetDevice() supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary];
+    scheduler.NotePresent(true); // starts the timed frame
+    scene.Clear(scheduler, 0, {1.0, 0.0, 0.0, 1.0});
+    scene.Draw(scheduler, 0, 0, Size);
+    scene.Clear(scheduler, 1, {0.0, 0.0, 1.0, 1.0});
+    scene.Draw(scheduler, 1, 0, Size);
+    scheduler.NotePresent(true); // ends it with the command buffer committed next
+    scheduler.Finish();
+    scheduler.NotePresent(true); // resolves it
+    const std::string line = scheduler.TakePassTimesLine();
+    const bool passed = supported ? line.starts_with("2 render passes (2 timed)") : line.empty();
+    std::printf("metal-smoke: pass times (EDEN_NX2_PASS_TIMES, %s): \"%s\": %s\n",
+                supported ? "timestamps at pass boundaries" : "no timestamps at pass boundaries",
+                line.c_str(), passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// A guest sampler with mipmaps (Metal::CreateSampler) read at level 1 of a texture whose level 0
+/// is red and level 1 green: green, and red with Vulkan's EDEN_NX2_FORCE_LOD0 (the top level
+/// only; run in a child by RunVulkanSwitches).
+int RunForceLod0() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr const char* Source = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct LodOut {
+    float4 position [[position]];
+};
+vertex LodOut lod_vertex(uint id [[vertex_id]]) {
+    const float2 positions[3] = {float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0)};
+    LodOut out;
+    out.position = float4(positions[id], 0.0, 1.0);
+    return out;
+}
+fragment float4 lod_fragment(LodOut in [[stage_in]], texture2d<float> tex [[texture(0)]],
+                             sampler smp [[sampler(0)]]) {
+    return tex.sample(smp, float2(0.5), level(1.0));
+}
+)";
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, Source, error);
+    const Metal::Object vertex =
+        library ? Metal::CreateFunction(library.Get(), "lod_vertex") : Metal::Object{};
+    const Metal::Object fragment =
+        library ? Metal::CreateFunction(library.Get(), "lod_fragment") : Metal::Object{};
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = vertex.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = rgba8;
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    const Metal::Object pipeline =
+        vertex && fragment ? Metal::CreateRenderPipelineState(device, desc, error) : Metal::Object{};
+    constexpr uint32_t Side = 8;
+    const Metal::Object texture = Metal::CreateTexture(device, {.kind = Metal::TextureKind::e2D,
+                                                                .format = rgba8,
+                                                                .width = Side,
+                                                                .height = Side,
+                                                                .levels = 2});
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D, .format = rgba8, .render_target = true});
+    Tegra::Texture::TSCEntry tsc{};
+    tsc.wrap_u.Assign(Tegra::Texture::WrapMode::ClampToEdge);
+    tsc.wrap_v.Assign(Tegra::Texture::WrapMode::ClampToEdge);
+    tsc.wrap_p.Assign(Tegra::Texture::WrapMode::ClampToEdge);
+    tsc.mag_filter.Assign(Tegra::Texture::TextureFilter::Nearest);
+    tsc.min_filter.Assign(Tegra::Texture::TextureFilter::Nearest);
+    tsc.mipmap_filter.Assign(Tegra::Texture::TextureMipmapFilter::Nearest);
+    tsc.max_lod_clamp.Assign(2 << 8);
+    const Metal::Object sampler = Metal::CreateSampler(device, tsc);
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer = Metal::CreateBuffer(device, Side * Side * 4, true, &upload);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer = Metal::CreateBuffer(device, 4, true, &readback);
+    if (!pipeline || !texture || !target || !sampler || upload == nullptr || readback == nullptr) {
+        std::printf("metal-smoke: FAIL force LOD 0 setup: %s\n", error.c_str());
+        return 1;
+    }
+    // Level 0 red, level 1 (4x4) green, uploaded one after the other.
+    for (uint32_t level = 0; level < 2; ++level) {
+        const uint32_t size = Side >> level;
+        const std::array<uint8_t, 4> texel =
+            level == 0 ? std::array<uint8_t, 4>{255, 0, 0, 255} : std::array<uint8_t, 4>{0, 255, 0, 255};
+        for (uint32_t i = 0; i < size * size; ++i) {
+            std::memcpy(upload + i * 4, texel.data(), 4);
+        }
+        scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, size * 4, 0, texture.Get(), level, 0,
+                                      {}, {size, size, 1});
+        scheduler.Finish();
+    }
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = 1;
+    targets.height = 1;
+    scheduler.BeginRendering(targets);
+    scheduler.SetDrawState({.pipeline = pipeline.Get(),
+                            .viewport = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f},
+                            .scissor = {0, 0, 1, 1}});
+    scheduler.BindTexture(Metal::ShaderStage::Fragment, 0, texture.Get());
+    scheduler.BindSampler(Metal::ShaderStage::Fragment, 0, sampler.Get());
+    scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 3, 1, 0);
+    scheduler.EndRendering();
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {1, 1, 1}, readback_buffer.Get(), 0, 4, 0);
+    scheduler.Finish();
+    Texel texel;
+    std::memcpy(&texel, readback, 4);
+    const bool forced = std::getenv("EDEN_NX2_FORCE_LOD0") != nullptr &&
+                        SwitchOn("EDEN_NX2_METAL_VULKAN_SWITCHES");
+    const bool passed = forced ? Near(texel, {255, 0, 0, 255}) : Near(texel, {0, 255, 0, 255});
+    std::printf("metal-smoke: sampler at level 1 (%s): %u,%u,%u (expected %s): %s\n",
+                forced ? "EDEN_NX2_FORCE_LOD0" : "as the guest asks", texel.r, texel.g, texel.b,
+                forced ? "level 0, red" : "level 1, green", passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 /// Vulkan's switches the Metal renderer reads (EDEN_NX2_METAL_VULKAN_SWITCHES), each read once
 /// per process: the state cache test in children with EDEN_NX2_DYNSTATE_CACHE=0,
 /// EDEN_NX2_VERTEX_INPUT_CACHE=0, and both with the Vulkan switches ignored.
@@ -2578,11 +2711,15 @@ int RunVulkanSwitches() {
                                      "EDEN_NX2_METAL_VULKAN_SWITCHES=0"});
     const int fence_batch = RunChildWith(
         "fence-batch", {"EDEN_NX2_FENCE_FLUSH_US=10000000", "EDEN_NX2_METAL_FENCE_BATCH=2"});
-    const bool passed = draw_state == 0 && vertex_input == 0 && ignored == 0 && fence_batch == 0;
+    const int force_lod0 = RunChildWith("force-lod0", {"EDEN_NX2_FORCE_LOD0=1"});
+    const int pass_times = RunChildWith("pass-times", {"EDEN_NX2_PASS_TIMES=0.001"});
+    const bool passed = draw_state == 0 && vertex_input == 0 && ignored == 0 &&
+                        fence_batch == 0 && force_lod0 == 0 && pass_times == 0;
     std::printf("metal-smoke: Vulkan switches in children: EDEN_NX2_DYNSTATE_CACHE=0 %d, "
-                "EDEN_NX2_VERTEX_INPUT_CACHE=0 %d, ignored %d, EDEN_NX2_FENCE_FLUSH_US %d (0 "
-                "each): %s\n",
-                draw_state, vertex_input, ignored, fence_batch, passed ? "PASS" : "FAIL");
+                "EDEN_NX2_VERTEX_INPUT_CACHE=0 %d, ignored %d, EDEN_NX2_FENCE_FLUSH_US %d, "
+                "EDEN_NX2_FORCE_LOD0 %d, EDEN_NX2_PASS_TIMES %d (0 each): %s\n",
+                draw_state, vertex_input, ignored, fence_batch, force_lod0, pass_times,
+                passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
 
@@ -2981,6 +3118,187 @@ int RunOcarinaTemporal() {
     return passed ? 0 : 1;
 }
 
+/// The camera motion pass reading the scene depth, and the jitter: a 16x16 Depth32Float scene
+/// whose depth grows across it ((x + 0.5) / 16), so a wrong depth read changes the result.
+/// - A camera whose previous x is the current x plus a quarter of the clip depth: the motion is
+///   2 (2 depth - 1) pixels in x, different for every column.
+/// - A camera whose previous x is twice the current x, with the scene drawn 0.5 pixels to the
+///   right (EDEN_NX2_DLSS_JITTER): from the unjittered position, x - 8 pixels in x.
+int RunOcarinaDepthJitter() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr uint32_t Side = 16;
+    const Metal::Object depth = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatDepth32Float),
+                 .width = Side,
+                 .height = Side,
+                 .render_target = true});
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer = Metal::CreateBuffer(device, Side * Side * 4, true, &upload);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Side * Side * 4, true, &readback);
+    if (!depth || upload == nullptr || readback == nullptr) {
+        std::printf("metal-smoke: FAIL Ocarina depth/jitter textures\n");
+        return 1;
+    }
+    for (uint32_t y = 0; y < Side; ++y) {
+        for (uint32_t x = 0; x < Side; ++x) {
+            const float value = (static_cast<float>(x) + 0.5f) / Side;
+            std::memcpy(upload + (y * Side + x) * 4, &value, 4);
+        }
+    }
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Side * 4, 0, depth.Get(), 0, 0, {},
+                                  {Side, Side, 1});
+    scheduler.Finish();
+    const auto half = [](uint16_t bits) {
+        const float magnitude = PackedFloat(bits & 0x7FFFU, 10);
+        return (bits & 0x8000U) != 0 ? -magnitude : magnitude;
+    };
+    Metal::OcarinaTemporal temporal(device, scheduler);
+    // Row-major, as the shader's push constant block reads it.
+    struct Case {
+        const char* name;
+        VideoCommon::OcarinaMatrix matrix;
+        std::array<float, 2> jitter;
+        float (*expected)(uint32_t x);
+    };
+    const std::array<Case, 2> cases{{
+        {"depth", {1, 0, 0.25f, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}, {0.0f, 0.0f},
+         [](uint32_t x) { return 2.0f * (2.0f * (static_cast<float>(x) + 0.5f) / 16.0f - 1.0f); }},
+        {"jitter", {2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}, {0.5f, 0.0f},
+         [](uint32_t x) { return static_cast<float>(x) - 8.0f; }},
+    }};
+    bool passed = true;
+    for (const Case& test : cases) {
+        const bool encoded =
+            temporal.EncodeMotion(depth.Get(), {Side, Side}, test.matrix, nullptr, test.jitter);
+        if (encoded) {
+            scheduler.CopyTextureToBuffer(temporal.Motion(), 0, 0, {}, {Side, Side, 1},
+                                          readback_buffer.Get(), 0, Side * 4, 0);
+        }
+        scheduler.Finish();
+        uint32_t wrong = 0;
+        std::array<float, 2> first{};
+        std::array<float, 2> last{};
+        for (uint32_t texel = 0; encoded && texel < Side * Side; ++texel) {
+            std::array<uint16_t, 2> bits{};
+            std::memcpy(bits.data(), readback + texel * 4, 4);
+            const std::array<float, 2> value{half(bits[0]), half(bits[1])};
+            const float want = test.expected(texel % Side);
+            wrong += std::abs(value[0] - want) < 0.02f && std::abs(value[1]) < 0.02f ? 0 : 1;
+            (texel == 0 ? first : last) = value;
+        }
+        const bool case_passed = encoded && wrong == 0;
+        passed = passed && case_passed;
+        std::printf("metal-smoke: Ocarina camera motion (%s): column 0 %.3f (expected %.3f), "
+                    "column 15 %.3f (expected %.3f), %u of %u wrong: %s\n",
+                    test.name, first[0], test.expected(0), last[0], test.expected(Side - 1), wrong,
+                    Side * Side, case_passed ? "PASS" : "FAIL");
+    }
+    return passed ? 0 : 1;
+}
+
+/// Vulkan's temporal stand-in for the game's DLSS on Metal (EDEN_NX2_METAL_TEMPORAL_STANDIN): a
+/// 32x32 picture of four quadrants, still (no motion), upscaled to 64x64 twice: the first frame
+/// starts the history, the second blends into it. Each quadrant's centre keeps its colour.
+int RunTemporalStandIn() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Metal::PresentPasses present(device, scheduler);
+    constexpr uint32_t Source = 32;
+    constexpr uint32_t Target = 64;
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    const Metal::Object picture = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D, .format = rgba8, .width = Source, .height = Source});
+    const Metal::Object motion = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRG16Float),
+                 .width = Source,
+                 .height = Source});
+    const Metal::Object target = Metal::CreateTexture(device, {.kind = Metal::TextureKind::e2D,
+                                                               .format = rgba8,
+                                                               .width = Target,
+                                                               .height = Target,
+                                                               .render_target = true});
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer =
+        Metal::CreateBuffer(device, Source * Source * 4, true, &upload);
+    uint8_t* zeros = nullptr;
+    const Metal::Object zero_buffer = Metal::CreateBuffer(device, Source * Source * 4, true, &zeros);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Target * Target * 4, true, &readback);
+    if (!picture || !motion || !target || upload == nullptr || zeros == nullptr ||
+        readback == nullptr) {
+        std::printf("metal-smoke: FAIL temporal stand-in textures\n");
+        return 1;
+    }
+    constexpr std::array<std::array<uint8_t, 4>, 4> Quadrants{{
+        {200, 40, 40, 255},
+        {40, 200, 40, 255},
+        {40, 40, 200, 255},
+        {200, 200, 200, 255},
+    }};
+    for (uint32_t y = 0; y < Source; ++y) {
+        for (uint32_t x = 0; x < Source; ++x) {
+            const size_t quadrant = (y >= Source / 2 ? 2 : 0) + (x >= Source / 2 ? 1 : 0);
+            std::memcpy(upload + (y * Source + x) * 4, Quadrants[quadrant].data(), 4);
+        }
+    }
+    std::memset(zeros, 0, Source * Source * 4);
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Source * 4, 0, picture.Get(), 0, 0, {},
+                                  {Source, Source, 1});
+    scheduler.CopyBufferToTexture(zero_buffer.Get(), 0, Source * 4, 0, motion.Get(), 0, 0, {},
+                                  {Source, Source, 1});
+    scheduler.Finish();
+    const bool sharpen = Settings::values.fsr_sharpening_slider.GetValue() < 200 &&
+                         std::getenv("EDEN_NX2_TEMPORAL_SHARPEN") == nullptr;
+    const auto within = [](uint8_t a, uint8_t b) { return (a > b ? a - b : b - a) <= 6; };
+    bool passed = true;
+    for (uint32_t frame = 0; frame < 2; ++frame) {
+        (void)present.TakePasses();
+        const bool drawn = present.TemporalFilter({
+            .color = picture.Get(),
+            .motion = motion.Get(),
+            .target = {.texture = target.Get()},
+            .format = rgba8,
+            .size = {Target, Target},
+            .jitter = {0.0f, 0.0f},
+            .motion_scale = {1.0f, 1.0f},
+            .use_history = true,
+        });
+        const uint64_t passes = present.TakePasses();
+        scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Target, Target, 1},
+                                      readback_buffer.Get(), 0, Target * 4, 0);
+        scheduler.Finish();
+        bool colours = true;
+        std::string seen;
+        for (size_t quadrant = 0; quadrant < 4; ++quadrant) {
+            const uint32_t x = (quadrant & 1) != 0 ? Target * 3 / 4 : Target / 4;
+            const uint32_t y = (quadrant & 2) != 0 ? Target * 3 / 4 : Target / 4;
+            Texel texel;
+            std::memcpy(&texel, readback + (y * Target + x) * 4, 4);
+            const auto& want = Quadrants[quadrant];
+            colours = colours && within(texel.r, want[0]) && within(texel.g, want[1]) &&
+                      within(texel.b, want[2]);
+            seen += (quadrant != 0 ? " " : "") + std::to_string(texel.r) + "," +
+                    std::to_string(texel.g) + "," + std::to_string(texel.b);
+        }
+        const uint64_t expected_passes = sharpen ? 2 : 1;
+        const bool frame_passed = drawn && colours && passes == expected_passes;
+        passed = passed && frame_passed;
+        std::printf("metal-smoke: temporal stand-in frame %u (%s): %llu passes (expected %llu), "
+                    "quadrant centres %s: %s\n",
+                    frame + 1, frame == 0 ? "history started" : "blended into the history",
+                    static_cast<unsigned long long>(passes),
+                    static_cast<unsigned long long>(expected_passes), seen.c_str(),
+                    frame_passed ? "PASS" : "FAIL");
+    }
+    return passed ? 0 : 1;
+}
+
 /// Ocarina's temporal inputs Vulkan adds over the camera motion, without MetalFX:
 /// - Link's skinned motion (EDEN_NX2_METAL_OOT_ACTOR, ocarina_actor_motion.vert/.frag through
 ///   the translator): a triangle over a 16x16 scene at depth 0.5 whose previous pose was half
@@ -3306,6 +3624,12 @@ int main(int argc, char** argv) {
             if (std::strcmp(argv[2], "actor-effects") == 0) {
                 return RunOcarinaActorEffects();
             }
+            if (std::strcmp(argv[2], "force-lod0") == 0) {
+                return RunForceLod0();
+            }
+            if (std::strcmp(argv[2], "pass-times") == 0) {
+                return RunPassTimes();
+            }
             return 4;
         }
         const int draw = Run();
@@ -3320,7 +3644,8 @@ int main(int argc, char** argv) {
                                  RunPipelineCheck, RunDeviceMsl, RunBlockCopy, RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
                                  RunStagingBound, RunPipelineFiles, RunOcarinaTemporal,
-                                 RunOcarinaActorEffects, RunVulkanSwitches, RunPresentFilters,
+                                 RunOcarinaActorEffects, RunOcarinaDepthJitter, RunTemporalStandIn, RunForceLod0,
+                                 RunVulkanSwitches, RunPresentFilters,
                                  SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;

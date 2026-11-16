@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #ifdef __APPLE__
@@ -15,6 +16,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/fsr.h"
+#include "video_core/host_shaders/full_screen_triangle_vert_spv.h"
 #include "video_core/host_shaders/fxaa_frag_spv.h"
 #include "video_core/host_shaders/fxaa_vert_spv.h"
 #include "video_core/host_shaders/present_area_frag_spv.h"
@@ -35,6 +37,8 @@
 #include "video_core/host_shaders/smaa_edge_detection_vert_spv.h"
 #include "video_core/host_shaders/smaa_neighborhood_blending_frag_spv.h"
 #include "video_core/host_shaders/smaa_neighborhood_blending_vert_spv.h"
+#include "video_core/host_shaders/temporal_sharpen_frag_spv.h"
+#include "video_core/host_shaders/temporal_upscale_frag_spv.h"
 #include "video_core/host_shaders/vulkan_fidelityfx_fsr_easu_fp16_frag_spv.h"
 #include "video_core/host_shaders/vulkan_fidelityfx_fsr_rcas_fp16_frag_spv.h"
 #include "video_core/host_shaders/vulkan_fidelityfx_fsr_vert_spv.h"
@@ -44,6 +48,7 @@
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_present.h"
 #include "video_core/renderer_metal/metal_resources.h"
+#include "video_core/renderer_metal/metal_switches.h"
 #include "video_core/smaa_area_tex.h"
 #include "video_core/smaa_search_tex.h"
 #include "video_core/textures/texture.h"
@@ -114,6 +119,12 @@ std::span<const u32> Code(Shader shader) {
         return SMAA_NEIGHBORHOOD_BLENDING_VERT_SPV;
     case Shader::SmaaBlend:
         return SMAA_NEIGHBORHOOD_BLENDING_FRAG_SPV;
+    case Shader::FullScreenVertex:
+        return FULL_SCREEN_TRIANGLE_VERT_SPV;
+    case Shader::TemporalUpscale:
+        return TEMPORAL_UPSCALE_FRAG_SPV;
+    case Shader::TemporalSharpen:
+        return TEMPORAL_SHARPEN_FRAG_SPV;
     case Shader::Count:
         break;
     }
@@ -129,6 +140,7 @@ bool IsVertex(Shader shader) {
     case Shader::SmaaEdgeVertex:
     case Shader::SmaaWeightVertex:
     case Shader::SmaaBlendVertex:
+    case Shader::FullScreenVertex:
         return true;
     default:
         return false;
@@ -596,6 +608,118 @@ bool PresentPasses::DrawWindow(const Source& source, Settings::ScalingFilter fil
                  .push_constants = Bytes(constants),
                  .vertices = 4,
                  .strip = true});
+}
+
+bool PresentPasses::TemporalFilter(const TemporalInputs& inputs) {
+    if (inputs.color == nullptr || inputs.target.texture == nullptr || inputs.size[0] == 0 ||
+        inputs.size[1] == 0 || (inputs.use_history && inputs.motion == nullptr)) {
+        return false;
+    }
+    // At half-float precision, as on Vulkan: in the output's format a frame's small share of the
+    // blend rounded away.
+    bool reset = false;
+    if (!history[0] || !history[1] || history_size != inputs.size) {
+        for (Object& image : history) {
+            image = CreateTexture(device, {.kind = TextureKind::e2D,
+                                           .format = Fmt::RGBA16Float,
+                                           .width = inputs.size[0],
+                                           .height = inputs.size[1],
+                                           .shader_write = true});
+        }
+        if (!history[0] || !history[1]) {
+            history = {};
+            return false;
+        }
+        history_size = inputs.size;
+        history_current = 0;
+        reset = true;
+        LOG_INFO(Render_Metal, "Metal: temporal stand-in into {}x{}", inputs.size[0],
+                 inputs.size[1]);
+    }
+    // Vulkan's weights (EDEN_NX2_TEMPORAL_WEIGHT, _KERNEL, _CLIP, _CLIP_MOTION, _KERNEL_MOTION).
+    const auto tuned = [](const char* name, f32 fallback) {
+        const char* const value = VulkanSwitch(name);
+        return value != nullptr ? static_cast<f32>(std::strtod(value, nullptr)) : fallback;
+    };
+    static const f32 current_weight = tuned("EDEN_NX2_TEMPORAL_WEIGHT", 0.1f);
+    static const f32 kernel_scale = tuned("EDEN_NX2_TEMPORAL_KERNEL", 3.0f);
+    static const f32 clip_width = tuned("EDEN_NX2_TEMPORAL_CLIP", 1.5f);
+    static const f32 clip_motion = tuned("EDEN_NX2_TEMPORAL_CLIP_MOTION", 1.0f);
+    static const f32 kernel_motion = tuned("EDEN_NX2_TEMPORAL_KERNEL_MOTION", 1.0f);
+    // full_screen_triangle.vert's scale and offset, then temporal_upscale.frag's constants.
+    struct UpscaleConstants {
+        std::array<f32, 2> tex_scale;
+        std::array<f32, 2> tex_offset;
+        std::array<f32, 2> jitter;
+        std::array<f32, 2> motion_scale;
+        f32 current_weight;
+        f32 kernel_scale;
+        f32 clip_width;
+        f32 clip_motion;
+        f32 kernel_motion;
+        f32 padding;
+    };
+    static_assert(sizeof(UpscaleConstants) == 56);
+    const UpscaleConstants upscale{
+        .tex_scale = {1.0f, 1.0f},
+        .tex_offset = {0.0f, 0.0f},
+        .jitter = inputs.jitter,
+        .motion_scale = inputs.motion_scale,
+        .current_weight = !inputs.use_history ? -1.0f : reset ? 1.0f : current_weight,
+        .kernel_scale = kernel_scale,
+        .clip_width = clip_width,
+        .clip_motion = clip_motion,
+        .kernel_motion = kernel_motion,
+        .padding = 0.0f,
+    };
+    const size_t read = history_current;
+    const size_t write = read ^ 1;
+    // A motion texture is bound without history too; the shader does not read it then.
+    const std::array<TextureHandle, 4> upscale_inputs{
+        inputs.color, inputs.motion != nullptr ? inputs.motion : inputs.color, history[read].Get(),
+        history[write].Get()};
+    if (!Draw({.vertex = Shader::FullScreenVertex,
+               .fragment = Shader::TemporalUpscale,
+               .inputs = upscale_inputs,
+               .target = inputs.target,
+               .format = inputs.format,
+               .size = inputs.size,
+               .keep_target = true,
+               .push_constants = Bytes(upscale)})) {
+        return false;
+    }
+    history_current = write;
+    // RCAS set by the FSR sharpness slider (0 % = stored 200 is off), as Vulkan's;
+    // EDEN_NX2_TEMPORAL_SHARPEN=<stops>|off overrides it. It reads the unsharpened history.
+    static const char* const sharpen_override = VulkanSwitch("EDEN_NX2_TEMPORAL_SHARPEN");
+    const int slider = Settings::values.fsr_sharpening_slider.GetValue();
+    bool sharpen = slider < 200;
+    f32 sharpness = static_cast<f32>(slider) / 100.0f;
+    if (sharpen_override != nullptr) {
+        sharpen = std::string_view{sharpen_override} != "off";
+        sharpness = static_cast<f32>(std::strtod(sharpen_override, nullptr));
+    }
+    if (!sharpen) {
+        return true;
+    }
+    struct SharpenConstants {
+        std::array<f32, 2> tex_scale;
+        std::array<f32, 2> tex_offset;
+        std::array<u32, 4> rcas;
+    };
+    SharpenConstants constants{.tex_scale = {1.0f, 1.0f}, .tex_offset = {0.0f, 0.0f}, .rcas = {}};
+    FSR::FsrRcasCon(constants.rcas.data(), sharpness);
+    const std::array<TextureHandle, 1> sharpen_inputs{history[write].Get()};
+    Draw({.vertex = Shader::FullScreenVertex,
+          .fragment = Shader::TemporalSharpen,
+          .inputs = sharpen_inputs,
+          .nearest = true,
+          .target = inputs.target,
+          .format = inputs.format,
+          .size = inputs.size,
+          .keep_target = true,
+          .push_constants = Bytes(constants)});
+    return true;
 }
 
 u64 PresentPasses::TakePasses() noexcept {

@@ -6,6 +6,7 @@
 #include <array>
 #include <memory>
 #include <optional>
+#include <string>
 
 #include "common/common_types.h"
 #include "video_core/renderer_metal/metal_object.h"
@@ -355,7 +356,18 @@ public:
     /// of each, and the heartbeat that runs until the first guest frame).
     void NotePresent(bool guest_picture);
 
+    /// Vulkan's EDEN_NX2_PASS_TIMES=<s> (read under EDEN_NX2_METAL_VULKAN_SWITCHES): one frame
+    /// in that many seconds has each render pass timed at its stage boundaries (Metal's counter
+    /// sample buffers), resolved once the GPU is done with it ("Perf Metal passes:" line).
+    /// Called at each guest frame's present.
+    void PassTimesFrameEnd();
+
+    /// The last "Perf Metal passes:" text, empty when there was none since the last call.
+    [[nodiscard]] std::string TakePassTimesLine();
+
 private:
+    void ResolvePassTimes();
+
     struct Impl;
     std::unique_ptr<Impl> impl;
 };

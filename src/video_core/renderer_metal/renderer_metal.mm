@@ -630,6 +630,11 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                      Settings::CanonicalizeEnum(Settings::values.scaling_filter.GetValue()),
                      Settings::CanonicalizeEnum(Settings::values.anti_aliasing.GetValue()));
         }
+        if (const u64 draw_flushes = impl->rasterizer.TakeDrawFlushes(); draw_flushes != 0) {
+            LOG_INFO(Render_Metal, "Metal: {} command buffers committed every so many draws "
+                                   "(EDEN_NX2_FLUSH_DRAWS)",
+                     draw_flushes);
+        }
         if (const auto [deferred, idle_commits] = impl->scheduler.TakeDeferredFences();
             deferred != 0) {
             LOG_INFO(Render_Metal,

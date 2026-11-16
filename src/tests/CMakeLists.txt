@@ -6,6 +6,7 @@
 
 add_executable(tests
     video_core/metal_index_convert.cpp
+    video_core/metal_work_policy.cpp
     video_core/vulkan_overlay_filter.cpp
     common/addon_config.cpp
     common/settings_migration.cpp

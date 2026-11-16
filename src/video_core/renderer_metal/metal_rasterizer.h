@@ -27,6 +27,7 @@
 #include "video_core/renderer_metal/metal_pipeline_cache.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
 #include "video_core/renderer_metal/metal_texture_cache.h"
+#include "video_core/renderer_metal/metal_work_policy.h"
 
 namespace Tegra {
 class GPU;
@@ -166,6 +167,11 @@ public:
         u64 staging_bytes;       ///< Held by the staging pool now
     };
 
+    /// Command buffers committed for EDEN_NX2_FLUSH_DRAWS since the last call.
+    [[nodiscard]] u64 TakeDrawFlushes() noexcept {
+        return std::exchange(draw_flushes, 0);
+    }
+
     /// Work taken since the last call (the renderer's 10 s report).
     [[nodiscard]] WorkCounts TakeWorkCounts() noexcept {
         return {std::exchange(draws, 0), std::exchange(draws_with_pipeline, 0),
@@ -212,6 +218,8 @@ private:
     /// staging buffers it took pass the pool's mark, and waits for it when the pool is over its
     /// cap (EDEN_NX2_METAL_STAGING_BOUND).
     void FlushWork();
+    /// Whether mesh draws are skipped for comparisons (EDEN_NX2_NO_MESH and its file).
+    [[nodiscard]] bool SkipMeshDraws();
 
     /// Binds everything the draw needs and opens its render pass; false to skip it
     /// (prepare_refusal says why, empty for a draw of nothing).
@@ -236,6 +244,9 @@ private:
 
     /// Vulkan's TrackOcarinaCamera: the camera matrices of a draw into the scene's targets.
     void TrackOcarinaCamera();
+    /// Vulkan's UpdateOcarinaJitter: a Halton offset for the scene's depth-tested draws while
+    /// MetalFX replaces the upscale and EDEN_NX2_DLSS_JITTER is set.
+    void UpdateOcarinaJitter();
 
     /// Vulkan's TryOcarinaUpscale without `replace`: the scene depth its reader pass names.
     void TrackOcarinaDepth();
@@ -443,6 +454,11 @@ private:
     u64 pass_stores{};
     u64 barrier_pass_ends{};
     u64 staging_flushes{};
+    /// EDEN_NX2_FLUSH_DRAWS: draws since the last such commit, and the commits.
+    WorkPolicy::DrawFlushCounter draw_flush;
+    u64 draw_flushes{};
+    /// EDEN_NX2_NO_MESH and its file.
+    std::optional<WorkPolicy::MeshSkip> mesh_skip;
     u64 staging_waits{};
     VideoCommon::OotNetwork::BypassState oot_network_bypass;
 
@@ -467,6 +483,13 @@ private:
                    (height == extent[1] || height == image_extent[1]);
         }
     } oot_motion;
+    /// EDEN_NX2_DLSS_JITTER as on Vulkan: the frame MetalFX last replaced the upscale in, the
+    /// phase count for its scale, the offset of this frame's scene draws and the one applied.
+    std::optional<u64> oot_temporal_frame;
+    u32 oot_jitter_phases{8};
+    u64 oot_jitter_frame{};
+    std::array<f32, 2> oot_jitter_offset{};
+    std::array<f32, 2> oot_jitter_applied{};
     const char* oot_decline{};
     u64 oot_decline_repeats{};
     u64 oot_replaced{};
