@@ -51,7 +51,14 @@ static_assert(sizeof(ActorTransforms) == 176);
 
 /// Bits of float depth Link's replayed pixels may differ from the scene's by (Vulkan's
 /// ActorOverlay: matches in the captured replay leveled off there).
-constexpr u32 ActorDepthTolerance = 16;
+/// EDEN_NX2_METAL_OOT_ACTOR_TOLERANCE overrides it (4294967295: no comparison).
+u32 ActorDepthTolerance() {
+    static const u32 tolerance = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_OOT_ACTOR_TOLERANCE");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : u32{16};
+    }();
+    return tolerance;
+}
 // The passes Vulkan's TryOcarinaBilinear takes: 2560x1440 (menus, gameplay), the gameplay one
 // when the scene is under half the target (above 0.4 of it, and 0.4 and below: oot_resolution
 // 40 % and 33 %) and the 0xe40f5efb5480e692 one.
@@ -515,8 +522,9 @@ bool OcarinaTemporal::DrawActor(TextureHandle depth, std::array<u32, 2> extent,
         switch (resource.kind) {
         case ShaderTranslate::ResourceKind::Buffer:
             if (resource.set == ShaderTranslate::PushConstantSet) {
-                scheduler.BindBytes(ShaderStage::Fragment, resource.index, &ActorDepthTolerance,
-                                    static_cast<u32>(sizeof(ActorDepthTolerance)));
+                const u32 tolerance = ActorDepthTolerance();
+                scheduler.BindBytes(ShaderStage::Fragment, resource.index, &tolerance,
+                                    static_cast<u32>(sizeof(tolerance)));
             } else if (resource.binding == 2) {
                 scheduler.BindBytes(ShaderStage::Fragment, resource.index, &transforms,
                                     static_cast<u32>(sizeof(transforms)));

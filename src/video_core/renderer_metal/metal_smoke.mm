@@ -3129,6 +3129,12 @@ int RunOcarinaActorEffects() {
                 static_cast<unsigned long long>(actor_frames), actor_error.c_str(), left[0],
                 left[1], actor_wrong, Side * Side / 2, right[0], right[1], camera_wrong,
                 biased ? "made" : "NOT made", bias_wrong, Side * Side, passed ? "PASS" : "FAIL");
+    if (actor_wrong != 0 && std::getenv("EDEN_NX2_METAL_OOT_ACTOR_TOLERANCE") == nullptr) {
+        // The same without the depth comparison: whether that is what discards his pixels.
+        std::printf("metal-smoke: Ocarina actor/effects again with no depth comparison:\n");
+        std::fflush(stdout);
+        (void)RunChildWith("actor-effects", {"EDEN_NX2_METAL_OOT_ACTOR_TOLERANCE=4294967295"});
+    }
     if (actor_wrong != 0) {
         // What the translator made of the actor programs: inputs, bindings, the depth read.
         const auto programs = Metal::OcarinaTemporal::ActorMsl(Metal::DeviceAppleFamily(device));
@@ -3294,6 +3300,9 @@ int main(int argc, char** argv) {
             }
             if (std::strcmp(argv[2], "fence-batch") == 0) {
                 return RunFenceBatch();
+            }
+            if (std::strcmp(argv[2], "actor-effects") == 0) {
+                return RunOcarinaActorEffects();
             }
             return 4;
         }
