@@ -81,7 +81,7 @@ struct RenderPipelineDesc {
     u32 samples;
     u32 topology_class; ///< 0 points, 1 lines, 2 triangles
     u32 rasterize;
-    u32 alpha_to_coverage;
+    u32 alpha_to_coverage; ///< Bit 0 alpha to coverage, bit 1 alpha to one
     std::array<BlendTargetState, Maxwell::NumRenderTargets> blend;
     std::array<VertexAttributeState, Maxwell::NumVertexAttributes> attributes;
     std::array<VertexStreamState, Maxwell::NumVertexArrays> streams;

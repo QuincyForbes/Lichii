@@ -334,7 +334,9 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
     const FormatClass first_class = ClassOf(desc.color_formats[0]);
     const bool integer_alpha = desc.color_formats[0] != 0 && PipelineCheckEnabled() &&
                                (first_class == FormatClass::Uint || first_class == FormatClass::Sint);
-    descriptor.alphaToCoverageEnabled = desc.alpha_to_coverage != 0 && !integer_alpha ? YES : NO;
+    descriptor.alphaToCoverageEnabled =
+        (desc.alpha_to_coverage & 1U) != 0 && !integer_alpha ? YES : NO;
+    descriptor.alphaToOneEnabled = (desc.alpha_to_coverage & 2U) != 0 && !integer_alpha ? YES : NO;
     if (desc.tessellation != 0) {
         // The control kernel writes half-precision factors, one set per patch.
         descriptor.tessellationPartitionMode =

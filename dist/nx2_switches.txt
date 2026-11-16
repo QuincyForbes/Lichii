@@ -374,6 +374,10 @@ EDEN_NX2_FENCE_BATCH=1
 # it is added to their indices.
 #EDEN_NX2_METAL_TESS_BASE_VERTEX=0
 
+# Metal renderer: 0 leaves alpha to one off, as before. By default pipelines take it from the
+# game's state (Metal's alphaToOneEnabled; not on integer targets).
+#EDEN_NX2_METAL_ALPHA_TO_ONE=0
+
 # Either renderer: 0 makes the GPU thread's front wait for the GPU and read a compute dispatch's
 # size the GPU wrote (Ocarina of Time's light tiles, once a frame). By default it passes
 # placeholders on; the dispatch takes its size from the GPU's buffer, and the copy of the size

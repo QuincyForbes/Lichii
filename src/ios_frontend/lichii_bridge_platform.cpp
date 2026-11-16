@@ -481,6 +481,10 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_METAL_TESS_BASE_VERTEX", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment metal_tess_base_off on");
     }
+    if (lichii_platform_experiment("metal_alpha_to_one_off")) {
+        setenv("EDEN_NX2_METAL_ALPHA_TO_ONE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_alpha_to_one_off on");
+    }
     if (lichii_platform_experiment("pipeline_holds_old")) {
         setenv("EDEN_NX2_PIPELINE_HOLD_BOOST", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment pipeline_holds_old on");
