@@ -41,7 +41,7 @@ file reference.
 | A08 | `DrawIndirect` with 8-bit indices | vk_rasterizer.cpp:1635 | native (the indices are rewritten to 32 bits by a kernel sized from each draw's arguments on the GPU, `indirect_rewrite_setup` + an indirect dispatch, `EDEN_NX2_METAL_GPU_INDIRECT`) | metal_rasterizer.cpp:898, metal_indirect.h:129 | RunIndirectArguments, RunIndexRewrite | no |
 | A09 | `DrawIndirect` of quads, fans, loops and other rewritten topologies | vk_rasterizer.cpp:1635 | emulated (Metal draws no quads, fans or loops: their indices are rewritten into lists or strips per draw on the GPU, sized from the arguments, as A08) | metal_rasterizer.cpp:898, metal_indirect.h:129 | RunIndirectArguments, RunIndexRewrite | no |
 | A10 | `DrawMeshTasksFromGpu`: mesh draws whose task count the GPU wrote, drawn without reading it back | vk_rasterizer.cpp:1593 | missing (interface default `false`: the count is read on the CPU and the draw comes through `Draw`) | - | untested | ? |
-| A11 | `DrawTexture` | vk_rasterizer.cpp:1914 | native (a scaled blit of the texture's rectangle into colour target 0, filtered by its sampler's magnification filter, as Vulkan's BlitColor; `EDEN_NX2_METAL_DRAW_TEXTURE`) | metal_rasterizer.cpp:2089 | untested | ? |
+| A11 | `DrawTexture` | vk_rasterizer.cpp:1914 | native (a scaled blit of the texture's rectangle into colour target 0, filtered by its sampler's magnification filter, as Vulkan's BlitColor; `EDEN_NX2_METAL_DRAW_TEXTURE`) | metal_rasterizer.cpp:2089 | untested | no |
 | A12 | `Clear`: whole colour, depth and stencil attachments | vk_rasterizer.cpp:1967 | native (the load action of the next render pass when that pass is on the same attachments, under `EDEN_NX2_METAL_CLEAR_FOLD`; else a pass of its own) | metal_rasterizer.cpp:2048, metal_scheduler.mm:1206, metal_scheduler.mm:1427 | RunClearFold, replay | yes |
 | A13 | `Clear` inside a scissor rectangle | vk_rasterizer.cpp:1967 | emulated (a triangle over the rectangle, Metal has no clear of part of an attachment; under `EDEN_NX2_METAL_CLEAR_DRAWS`; without, the whole target is cleared and counted as refused) | metal_rasterizer.cpp:2048, metal_scheduler.mm:1253 | RunClearRect, replay | ? |
 | A14 | `Clear` of some colour channels | vk_rasterizer.cpp:1967 | emulated (a triangle with the channels as its write mask; under `EDEN_NX2_METAL_CLEAR_DRAWS`; without, the clear is skipped and counted as refused) | metal_rasterizer.cpp:2048, metal_scheduler.mm:1253 | RunClearRect | no |
@@ -113,10 +113,10 @@ file reference.
 | B09 | Blend constants | vk_rasterizer.cpp:5543 | native | metal_rasterizer.cpp:1465 | untested | ? |
 | B10 | Logic operations | vk_rasterizer.cpp:5881, vk_rasterizer.cpp:6006 | missing (Metal has no logic operation; the draw blends as if it were off) | - | untested | no |
 | B11 | Alpha test | fixed_pipeline_state.h | native (in the fragment program, as on Vulkan) | metal_pipeline_translate.cpp:188 | untested | no |
-| B12 | Alpha to coverage | vk_rasterizer.cpp:5910 | native | metal_rasterizer.cpp:1173 | probe:alpha-to-coverage-on-rgba8uint | ? |
-| B13 | Alpha to one | vk_rasterizer.cpp:5929 | native (`alphaToOneEnabled`, not on integer targets; `EDEN_NX2_METAL_ALPHA_TO_ONE`) | metal_draw_desc.cpp:59, metal_graphics.mm:339 | probe:alpha-to-one, probe:alpha-to-one-on-rgba8uint | ? |
+| B12 | Alpha to coverage | vk_rasterizer.cpp:5910 | native | metal_rasterizer.cpp:1173 | probe:alpha-to-coverage-on-rgba8uint | no |
+| B13 | Alpha to one | vk_rasterizer.cpp:5929 | native (`alphaToOneEnabled`, not on integer targets; `EDEN_NX2_METAL_ALPHA_TO_ONE`) | metal_draw_desc.cpp:59, metal_graphics.mm:339 | probe:alpha-to-one, probe:alpha-to-one-on-rgba8uint | no |
 | B14 | Depth test, depth write, depth compare function | vk_rasterizer.cpp:5719, vk_rasterizer.cpp:5949 | native | metal_rasterizer.cpp:1248, metal_graphics.mm:469 | RunRendererDraw, replay | yes |
-| B15 | Depth bounds test | vk_rasterizer.cpp:5553, vk_rasterizer.cpp:5701 | missing (Metal has no depth bounds test; not applied) | - | untested | ? |
+| B15 | Depth bounds test | vk_rasterizer.cpp:5553, vk_rasterizer.cpp:5701 | missing (Metal has no depth bounds test; not applied) | - | untested | no |
 | B16 | Depth bias (constant, slope, clamp) | vk_rasterizer.cpp:5498, vk_rasterizer.cpp:5847 | native | metal_rasterizer.cpp:1564 | untested | yes |
 | B17 | Depth clamp (clip off) | vk_rasterizer.cpp:5893 | native (`setDepthClipMode`) | metal_rasterizer.cpp:1558 | untested | ? |
 | B18 | Depth range -1..1 (`ndc_minus_one_to_one`) | fixed_pipeline_state.h | native (converted by the vertex program, as on Vulkan without the extension) | metal_pipeline_translate.cpp:179 | replay | yes |
@@ -128,10 +128,10 @@ file reference.
 | B24 | Polygon mode point | maxwell_to_vk.cpp | missing (drawn filled: Metal has no point fill mode; emulating it needs the triangles' vertices drawn as points by a rewrite, not done) | - | untested | no |
 | B25 | Rasterizer discard | vk_rasterizer.cpp:5767 | native | metal_rasterizer.cpp:1173 | probe:no-attachments-no-rasterization | ? |
 | B26 | Viewport 0: rectangle, depth range, y flip by window origin | vk_rasterizer.cpp:5339 | native | metal_rasterizer.cpp:1483 | probe:viewport-negative-height | yes |
-| B27 | Viewports 1-15 | vk_rasterizer.cpp:5339 | native (`setViewports:count:16` when the vertex program writes the viewport index; `EDEN_NX2_METAL_VIEWPORTS`) | metal_rasterizer.cpp:1810, metal_scheduler.mm:1581 | untested | ? |
+| B27 | Viewports 1-15 | vk_rasterizer.cpp:5339 | native (`setViewports:count:16` when the vertex program writes the viewport index; `EDEN_NX2_METAL_VIEWPORTS`) | metal_rasterizer.cpp:1810, metal_scheduler.mm:1581 | untested | no |
 | B28 | Viewport swizzles other than a negated y | maxwell_to_vk.cpp | missing (ignored) | metal_rasterizer.cpp:1483 | untested | ? |
 | B29 | Scissor 0 | vk_rasterizer.cpp:5423 | native | metal_rasterizer.cpp:1516 | probe:scissor-past-the-target, probe:scissor-empty | yes |
-| B30 | Scissors 1-15 | vk_rasterizer.cpp:5423 | native (`setScissorRects:count:16` with B27) | metal_rasterizer.cpp:1810, metal_scheduler.mm:1581 | untested | ? |
+| B30 | Scissors 1-15 | vk_rasterizer.cpp:5423 | native (`setScissorRects:count:16` with B27) | metal_rasterizer.cpp:1810, metal_scheduler.mm:1581 | untested | no |
 | B31 | Line width | vk_rasterizer.cpp:5674 | missing (Metal draws lines 1 pixel wide) | - | untested | no |
 | B32 | Line stipple, smooth lines, line rasterization mode | vk_rasterizer.cpp:5796, vk_rasterizer.cpp:5810 | missing (Metal has neither; plain lines) | - | untested | no |
 | B33 | Provoking vertex last | fixed_pipeline_state.h | emulated (Metal has no provoking vertex setting: flat inputs take the first vertex. On by default (`EDEN_NX2_METAL_PROVOKING_LAST=0` undoes it): draws of pipelines whose pixel program reads a flat input get indices rotated to Vulkan's last vertex convention, keeping the winding, for every line and triangle topology, by a kernel or on the CPU; strips with restarts by `rewrite_restart_strip`, degenerate across a restart. Matches what Vulkan draws with VK_EXT_provoking_vertex on a desktop GPU; differs from MoltenVK. 214 of the 847 pixel programs of the census walk read a flat input) | metal_rasterizer.cpp:2413, metal_index_convert.cpp:385 | RunIndexRewrite, RunProvokingVertex | yes |
@@ -299,7 +299,7 @@ file reference.
 | ID | Capability | Vulkan | Status | Metal | Tested | OoT |
 |---|---|---|---|---|---|---|
 | K01 | Geometry programs | vk_graphics_pipeline.cpp | missing (pipeline refused: "geometry stage"; Metal has no geometry stage) | metal_pipeline_translate.cpp:339 | untested | no |
-| K02 | Layer or viewport index written by the vertex program | vk_pipeline_cache.cpp | native | metal_pipeline_cache.cpp:232 | untested | ? |
+| K02 | Layer or viewport index written by the vertex program | vk_pipeline_cache.cpp | native | metal_pipeline_cache.cpp:232 | untested | no |
 | K03 | Geometry program passthrough | vk_pipeline_cache.cpp | missing (profile bit off: it stays a geometry program and is refused) | metal_pipeline_cache.cpp:232 | untested | no |
 | K04 | Transform feedback capture | vk_rasterizer.cpp:5310, vk_buffer_cache.cpp | missing (Metal has no transform feedback; the buffers are recorded and nothing is captured) | metal_buffer_cache.cpp:155 | untested | no |
 | K05 | Draw of captured vertices (byte count draw) | vk_rasterizer.cpp:1635 | missing (see A05) | metal_rasterizer.cpp:1641 | untested | no |
@@ -312,7 +312,7 @@ file reference.
 | L02 | Uniform buffers, storage buffers, textures, samplers, storage images numbered into Metal's slots | vk_pipeline_cache.cpp | native | metal_shader_translate.cpp:110 | RunTranslate, replay | yes |
 | L03 | Vertex programs with more buffers than the slots left next to the vertex streams | - | missing (program refused: "too many buffers for the vertex buffer slots") | metal_shader_translate.cpp:295 | replay | no |
 | L04 | Rescaling words, render area and other push constants | vk_graphics_pipeline.cpp:66 | native (one buffer of bytes after the program's own) | metal_rasterizer.cpp:841 | RunRendererDraw | yes |
-| L05 | Clip distances (up to 8) | vk_pipeline_cache.cpp | native | metal_pipeline_cache.cpp:232 | untested | ? |
+| L05 | Clip distances (up to 8) | vk_pipeline_cache.cpp | native | metal_pipeline_cache.cpp:232 | untested | no |
 | L06 | Cull distances | vk_pipeline_cache.cpp | missing (Metal has no cull distances; what SPIRV-Cross makes of a program writing them is not verified) | - | untested | ? |
 | L07 | Sample mask output, sample shading, sample id | vk_pipeline_cache.cpp | native (not verified beyond the translation) | metal_shader_translate.cpp:110 | untested | ? |
 | L08 | Fragment depth output, early depth tests, discard | vk_pipeline_cache.cpp | native | metal_shader_translate.cpp:110 | replay | yes |
