@@ -1,161 +1,38 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Guest programs -> shader recompiler IR -> SPIR-V -> MSL (metal_shader_translate), cached per
-// pipeline key. Plain C++; Metal objects are made by metal_resources.h.
+// Guest programs translated to MSL (metal_pipeline_translate) and their Metal pipeline states,
+// cached per pipeline key. Plain C++; Metal objects are made by metal_resources.h.
 
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
 #include "common/container/unordered_map.h"
-#include "shader_recompiler/frontend/ir/basic_block.h"
-#include "shader_recompiler/frontend/ir/program.h"
-#include "shader_recompiler/frontend/maxwell/control_flow.h"
-#include "shader_recompiler/backend/bindings.h"
-#include "shader_recompiler/host_translate_info.h"
-#include "shader_recompiler/runtime_info.h"
-#include "shader_recompiler/object_pool.h"
-#include "shader_recompiler/profile.h"
-#include "shader_recompiler/shader_info.h"
+#include "common/polyfill_thread.h"
+#include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_metal/metal_archive.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_object.h"
-#include "video_core/renderer_metal/metal_shader_translate.h"
+#include "video_core/renderer_metal/metal_pipeline_files.h"
+#include "video_core/renderer_metal/metal_pipeline_translate.h"
 #include "video_core/shader_cache.h"
 
 namespace Metal {
 
 class Device;
-
-struct ShaderPools {
-    void ReleaseContents() {
-        flow_block.ReleaseContents();
-        block.ReleaseContents();
-        inst.ReleaseContents();
-    }
-
-    Shader::ObjectPool<Shader::IR::Inst> inst{8192};
-    Shader::ObjectPool<Shader::IR::Block> block{32};
-    Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_block{32};
-};
-
-struct GraphicsPipelineKey {
-    std::array<u64, 6> unique_hashes{};
-    /// Two bits per generic attribute (FixedPipelineState::DynamicAttributeTypes).
-    u64 attribute_types{};
-    u32 topology{}; ///< Maxwell PrimitiveTopology of the draw
-    u32 early_z{};
-    /// Tessellation pipelines: domain | spacing << 2 | output primitives << 4 (Maxwell's).
-    u32 tessellation{};
-
-    bool operator==(const GraphicsPipelineKey&) const noexcept = default;
-
-    [[nodiscard]] size_t Hash() const noexcept;
-};
-
-struct ComputePipelineKey {
-    u64 unique_hash{};
-    u32 shared_memory_size{};
-    std::array<u32, 3> workgroup_size{};
-
-    bool operator==(const ComputePipelineKey&) const noexcept = default;
-
-    [[nodiscard]] size_t Hash() const noexcept;
-};
-
-} // namespace Metal
-
-template <>
-struct std::hash<Metal::GraphicsPipelineKey> {
-    size_t operator()(const Metal::GraphicsPipelineKey& key) const noexcept {
-        return key.Hash();
-    }
-};
-
-template <>
-struct std::hash<Metal::ComputePipelineKey> {
-    size_t operator()(const Metal::ComputePipelineKey& key) const noexcept {
-        return key.Hash();
-    }
-};
-
-namespace Metal {
-
-/// One translated stage: its MSL, the function, the slots its resources got, and what it uses.
-struct StageProgram {
-    ShaderTranslate::Stage stage{};
-    std::string msl;
-    std::string entry_point;
-    std::vector<ShaderTranslate::ResourceSlot> slots;
-    Shader::Info info;
-    /// Tessellation stages: what the stage writes for the next one, and its own buffer slots.
-    std::vector<ShaderTranslate::InterfaceVariable> outputs;
-    ShaderTranslate::TessellationSlots tessellation_slots{};
-    /// The MTLLibrary and MTLFunction, made on first use (BuildFunctions).
-    Object library;
-    Object function;
-    bool build_failed{};
-};
-
-/// A compute kernel of the mesh emulation.
-struct MeshKernel {
-    StageProgram program;
-    Object state;
-    bool failed{};
-    std::array<u32, 3> workgroup_size{};
-};
-
-/// A task/mesh pipeline drawn through Vulkan's mesh emulation: the mesh program runs as a compute
-/// kernel (RuntimeInfo::mesh_as_compute) writing block_words words per workgroup to an output
-/// buffer, which the pipeline's vertex shader (EmitMeshEmulationVertex) draws as a list. With a
-/// task program, its kernel runs first, the distribution pass places the mesh workgroups the
-/// tasks asked for in the command buffer's output arena, and both the mesh dispatch and the draw
-/// are indirect.
-struct MeshEmulation {
-    /// The task program's kernel with a task program, else the mesh program's; its resources
-    /// are the buffer cache's stage 0.
-    MeshKernel first;
-    /// With a task program: the mesh program's kernel (buffer cache stage mesh_stage) and the
-    /// distribution pass (Shader::Backend::SPIRV::EmitMeshEmulationDistribution).
-    MeshKernel mesh;
-    MeshKernel distribution;
-    bool has_task{};
-    u32 mesh_stage{};
-    u32 payload_stride{}; ///< payload words per task workgroup
-    /// The output buffer's binding; with a task program the payload, offsets and arguments
-    /// buffers follow it.
-    u32 output_binding{};
-    u32 block_words{};
-    u32 vertices_per_group{};
-    /// Maxwell PrimitiveTopology of the list: Points, Lines or Triangles.
-    u32 topology{};
-};
-
-/// A tessellation pipeline as MoltenVK runs one: the vertex program as a compute kernel writing
-/// its outputs to a buffer, the control program as a kernel writing control points, patch
-/// constants and tessellation factors, and the evaluation program as the post-tessellation
-/// vertex function (the pipeline's Vertex()) drawing the patches from those buffers.
-struct Tessellation {
-    /// Index sizes of the vertex kernel variants (VertexIndex reads the draw's indices).
-    static constexpr std::array<u32, 3> IndexSizes{0, 2, 4};
-
-    /// The vertex kernel by IndexSizes variant; its resources are the buffer cache's stage 0.
-    std::array<StageProgram, 3> vertex;
-    /// The control program's kernel; its resources are the buffer cache's stage 1.
-    MeshKernel control;
-    ShaderTranslate::TessellationModes modes{};
-    /// Upper bounds of the bytes per element of the buffers between the stages.
-    u32 vertex_stride{};
-    u32 control_point_stride{};
-    u32 patch_stride{};
-};
 
 class GraphicsPipeline {
 public:
@@ -194,12 +71,27 @@ public:
         return fragment;
     }
 
+    /// Whether the pixel program reads an input without interpolation (the provoking vertex's).
+    [[nodiscard]] bool HasFlatInputs() const noexcept {
+        return flat_inputs;
+    }
+
     /// Builds the stages' functions; false (logged once) when Metal rejects one.
     bool BuildFunctions(const Device& device);
 
     /// The archive pipeline states are looked up in and added to (PipelineCache's).
     void SetArchive(PipelineArchive* archive_) noexcept {
         archive = archive_;
+    }
+
+    /// Where the render states Metal makes are written for the next boot, or null.
+    void SetRecorder(PipelineFiles* recorder_) noexcept {
+        recorder = recorder_;
+    }
+
+    /// Marks the pipeline as used by this run; whether it was already.
+    bool MarkUsed() noexcept {
+        return std::exchange(used, true);
     }
 
     /// The MTLRenderPipelineState for these targets, blending and vertex layout (desc's function
@@ -213,6 +105,9 @@ private:
     std::optional<MeshEmulation> mesh;
     std::optional<Tessellation> tessellation;
     PipelineArchive* archive{};
+    PipelineFiles* recorder{};
+    bool used{};
+    bool flat_inputs{};
     ::Common::unordered_map<u64, Object> render_states;
     /// Vertex kernel states by variant and vertex layout.
     ::Common::unordered_map<u64, Object> vertex_kernel_states;
@@ -234,6 +129,10 @@ public:
         archive = archive_;
     }
 
+    bool MarkUsed() noexcept {
+        return std::exchange(used, true);
+    }
+
     /// The MTLComputePipelineState, made on first use; null (logged once) when it fails.
     [[nodiscard]] void* State(const Device& device);
 
@@ -243,6 +142,7 @@ private:
     Object state;
     PipelineArchive* archive{};
     bool failed{};
+    bool used{};
 };
 
 class PipelineCache : public VideoCommon::ShaderCache {
@@ -256,8 +156,23 @@ public:
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
 
+    /// The programs of the last graphics lookup (the feature census).
+    [[nodiscard]] const std::array<u64, 6>& LookupHashes() const noexcept {
+        return graphics_key.unique_hashes;
+    }
+
     /// Opens the game's pipeline archive (EDEN_NX2_METAL_ARCHIVE=0: none).
     void OpenArchive(u64 title_id);
+
+    /// Opens the archive and builds the pipelines earlier runs recorded, with the render states
+    /// they were drawn with, on worker threads (EDEN_NX2_METAL_PIPELINE_FILE=0: archive only).
+    void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+                           const VideoCore::DiskResourceLoadCallback& callback);
+
+    /// Once a frame: the used pipelines list is written within EDEN_NX2_USED_PIPELINES_SAVE_S
+    /// (default 10) of a pipeline's first use and when the app leaves the foreground, the archive
+    /// once a minute and then.
+    void TickFrame();
 
     [[nodiscard]] PipelineArchive& Archive() noexcept {
         return archive;
@@ -266,40 +181,42 @@ public:
     /// Pipelines made and refused since the last call (the renderer's 10 s report).
     [[nodiscard]] std::array<u64, 3> TakeCounts() noexcept;
 
+    /// Why the last CurrentGraphicsPipeline or CurrentComputePipeline call gave no pipeline.
+    [[nodiscard]] std::string_view Refusal() const noexcept {
+        return refusal;
+    }
+
 private:
+    /// Keeps the cause of the pipeline just refused for its key, and returns the key's cause.
+    [[nodiscard]] std::string_view NoteRefusal(u64 key_hash);
+
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
-
-    /// A pipeline whose program 1 is a mesh program, or a task program with the mesh program at
-    /// `mesh_index`, through the emulation.
-    std::unique_ptr<GraphicsPipeline> CreateMeshPipeline(std::span<Shader::IR::Program> programs,
-                                                         size_t mesh_index);
-
-    /// A pipeline with tessellation control (2) and evaluation (3) programs.
-    std::unique_ptr<GraphicsPipeline> CreateTessellationPipeline(
-        std::span<Shader::IR::Program> programs);
 
     std::unique_ptr<ComputePipeline> CreateComputePipeline(const ComputePipelineKey& key,
                                                            const VideoCommon::ShaderInfo* shader);
 
-    [[nodiscard]] std::optional<StageProgram> Translate(Shader::IR::Program& program,
-                                                        ShaderTranslate::Stage stage,
-                                                        Shader::Backend::Bindings& bindings,
-                                                        const Shader::RuntimeInfo& runtime_info,
-                                                        const ShaderTranslate::Options* options = nullptr);
-
     const Device& device;
 
-    Shader::Profile profile;
-    Shader::HostTranslateInfo host_info;
-    ShaderTranslate::Options translate_options;
-
-    ShaderPools pools;
+    PipelineTranslator translator;
     GraphicsPipelineKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
     ::Common::unordered_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
     ::Common::unordered_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_cache;
 
     PipelineArchive archive;
+    PipelineFiles files;
+    std::chrono::steady_clock::time_point archive_saved{std::chrono::steady_clock::now()};
+    std::chrono::steady_clock::time_point used_saved{std::chrono::steady_clock::now()};
+    std::size_t background_listener{};
+    /// The app is leaving the foreground: TickFrame writes the used list at once.
+    std::atomic_bool save_requested{};
+    /// The pipelines the records file holds.
+    std::unordered_set<GraphicsPipelineKey> disk_graphics;
+    std::unordered_set<ComputePipelineKey> disk_compute;
+
+    /// By key hash; the texts stay where they are (refusal points into them).
+    std::map<u64, std::string> refusal_causes;
+    std::string_view refusal;
 
     u64 graphics_made{};
     u64 compute_made{};

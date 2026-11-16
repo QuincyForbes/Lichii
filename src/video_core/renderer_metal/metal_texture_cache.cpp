@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "common/logging.h"
@@ -42,6 +44,20 @@ namespace {
 [[nodiscard]] bool IsColor(FormatClass format_class) {
     return format_class == FormatClass::Float || format_class == FormatClass::Uint ||
            format_class == FormatClass::Sint;
+}
+
+[[nodiscard]] bool IsDepth(FormatClass format_class) {
+    return format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil;
+}
+
+// EDEN_NX2_METAL_COPIES=0: blits between depth images and copies between block-compressed
+// and plain formats are skipped, as this backend started.
+[[nodiscard]] bool CopiesEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_COPIES");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
 }
 
 [[nodiscard]] TextureKind KindOf(const ImageInfo& info) {
@@ -178,26 +194,58 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
     const PixelFormat dst_format = dst.info.format;
     const bool converted = True(src.flags & ImageFlagBits::Converted) ||
                            True(dst.flags & ImageFlagBits::Converted);
+    const u32 src_block_width = VideoCore::Surface::DefaultBlockWidth(src_format);
+    const u32 src_block_height = VideoCore::Surface::DefaultBlockHeight(src_format);
+    const u32 dst_block_width = VideoCore::Surface::DefaultBlockWidth(dst_format);
+    const u32 dst_block_height = VideoCore::Surface::DefaultBlockHeight(dst_format);
+    const bool src_texels = src_block_width == 1 && src_block_height == 1;
+    const bool dst_texels = dst_block_width == 1 && dst_block_height == 1;
+    // Blocks keep their bytes as texels do: a texel of the one image is a block of the other.
+    const bool blocks_fit =
+        (src_texels && dst_texels) ||
+        (CopiesEnabled() && (src_texels || dst_texels ||
+                             (src_block_width == dst_block_width &&
+                              src_block_height == dst_block_height)));
     if (dst.Handle() == nullptr || src.Handle() == nullptr || converted ||
         src.info.num_samples != 1 || dst.info.num_samples != 1 ||
         !IsColor(src.HostFormat().format_class) || !IsColor(dst.HostFormat().format_class) ||
-        VideoCore::Surface::DefaultBlockWidth(src_format) != 1 ||
-        VideoCore::Surface::DefaultBlockWidth(dst_format) != 1 ||
+        !blocks_fit ||
         VideoCore::Surface::BytesPerBlock(src_format) !=
             VideoCore::Surface::BytesPerBlock(dst_format)) {
         LOG_ONCE(warned, "Metal: reinterpreting {} as {} is not done yet", src_format,
                  dst_format);
         return;
     }
-    const u32 bytes_per_texel = VideoCore::Surface::BytesPerBlock(src_format);
+    const u32 bytes_per_block = VideoCore::Surface::BytesPerBlock(src_format);
     for (const VideoCommon::ImageCopy& copy : copies) {
-        const Extent3D extent = ClipExtent(src.info, 0, 0, copy.src_subresource.base_level,
-                                           copy.src_offset, copy.extent);
+        // Whole blocks, or up to the edge of the level: Metal aborts on anything else.
+        if (copy.src_offset.x % static_cast<s32>(src_block_width) != 0 ||
+            copy.src_offset.y % static_cast<s32>(src_block_height) != 0 ||
+            copy.dst_offset.x % static_cast<s32>(dst_block_width) != 0 ||
+            copy.dst_offset.y % static_cast<s32>(dst_block_height) != 0) {
+            LOG_ONCE(warned_offset, "Metal: a copy of {} as {} starts inside a block, skipped",
+                     src_format, dst_format);
+            continue;
+        }
+        const Extent3D extent = ClipExtent(
+            src.info, 0, 0, copy.src_subresource.base_level, copy.src_offset,
+            VideoCommon::Extent3D{Common::AlignUp(copy.extent.width, src_block_width),
+                                  Common::AlignUp(copy.extent.height, src_block_height),
+                                  copy.extent.depth});
         if (extent.width == 0 || extent.height == 0 || extent.depth == 0) {
             continue;
         }
-        const u32 bytes_per_row = extent.width * bytes_per_texel;
-        const u32 bytes_per_image = bytes_per_row * extent.height;
+        const u32 blocks_x = Common::DivCeil(extent.width, src_block_width);
+        const u32 blocks_y = Common::DivCeil(extent.height, src_block_height);
+        const Extent3D dst_extent = ClipExtent(
+            dst.info, 0, 0, copy.dst_subresource.base_level, copy.dst_offset,
+            VideoCommon::Extent3D{blocks_x * dst_block_width, blocks_y * dst_block_height,
+                                  extent.depth});
+        if (dst_extent.width == 0 || dst_extent.height == 0 || dst_extent.depth == 0) {
+            continue;
+        }
+        const u32 bytes_per_row = blocks_x * bytes_per_block;
+        const u32 bytes_per_image = bytes_per_row * blocks_y;
         const u64 size = u64{bytes_per_image} * extent.depth;
         if (size > reinterpret_buffer_size) {
             reinterpret_buffer_size = std::bit_ceil(size);
@@ -217,7 +265,7 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
                 reinterpret_buffer.Get(), 0, bytes_per_row, dst_3d ? bytes_per_image : 0U,
                 dst.Handle(), static_cast<u32>(copy.dst_subresource.base_level),
                 dst_3d ? 0U : static_cast<u32>(copy.dst_subresource.base_layer + layer),
-                ToOffset(copy.dst_offset), extent);
+                ToOffset(copy.dst_offset), dst_extent);
             scheduler.BreakBlits();
         }
     }
@@ -237,8 +285,17 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                                     const Region2D& dst_region, const Region2D& src_region,
                                     Tegra::Engines::Fermi2D::Filter filter,
                                     Tegra::Engines::Fermi2D::Operation operation) {
-    if (!IsColor(dst.HostClass()) || !IsColor(src.HostClass())) {
-        LOG_ONCE(warned_depth, "Metal: depth and stencil blits are not done yet");
+    const FormatClass dst_class = dst.HostClass();
+    const FormatClass src_class = src.HostClass();
+    // Depth to depth: the fragment writes the depth it reads, and the stencil between images
+    // of one format (Scheduler::Blit). Filtered blits of depth are nearest, as Vulkan's.
+    const bool depth = CopiesEnabled() && IsDepth(src_class) && src.Samples() == 1 &&
+                       (dst_class == FormatClass::Depth ||
+                        (dst_class == FormatClass::DepthStencil &&
+                         dst.HostFormat() == src.HostFormat()));
+    if (!depth && (!IsColor(dst_class) || !IsColor(src_class))) {
+        LOG_ONCE(warned_depth, "Metal: a blit of format {} into {} is not done yet", src.format,
+                 dst.format);
         return;
     }
     const TextureHandle source = src.Handle(Shader::TextureType::Color2D);
@@ -250,7 +307,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
         .dst_rect = {dst_region.start.x, dst_region.start.y, dst_region.end.x, dst_region.end.y},
         .dst_width = dst_framebuffer != nullptr ? dst_framebuffer->Width() : dst.size.width,
         .dst_height = dst_framebuffer != nullptr ? dst_framebuffer->Height() : dst.size.height,
-        .linear = filter == Tegra::Engines::Fermi2D::Filter::Bilinear,
+        .linear = !depth && filter == Tegra::Engines::Fermi2D::Filter::Bilinear,
         .keep_dst = true,
     };
     if (!scheduler.Blit(pass)) {
@@ -317,6 +374,8 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
             .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
             .reset = reset,
+            .depth_reversed = true,
+            .auto_exposure = true,
         });
     if (output == nullptr) {
         temporal_unsupported = true;

@@ -11,12 +11,12 @@
 namespace Metal {
 
 Buffer::Buffer(BufferCacheRuntime&, VideoCommon::NullBufferParams null_params)
-    : VideoCommon::BufferBase(null_params) {}
+    : VideoCommon::BufferBase(null_params), tracker{0} {}
 
 Buffer::Buffer(BufferCacheRuntime& runtime_, VAddr cpu_addr_, u64 size_bytes_, bool)
     : VideoCommon::BufferBase(cpu_addr_, size_bytes_), runtime{&runtime_},
       buffer{CreateBuffer(runtime_.device, Common::AlignUp(size_bytes_, 16), false, nullptr)},
-      bytes{Common::AlignUp(size_bytes_, 16)} {
+      bytes{Common::AlignUp(size_bytes_, 16)}, tracker{size_bytes_} {
     runtime->allocated_bytes += bytes;
 }
 
@@ -24,6 +24,22 @@ Buffer::~Buffer() {
     if (buffer && runtime != nullptr) {
         runtime->allocated_bytes -= bytes;
     }
+}
+
+void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
+    if (runtime == nullptr) {
+        return;
+    }
+    if (const u64 serial = runtime->scheduler.SegmentSerial(); serial != usage_serial) {
+        usage_serial = serial;
+        tracker.Reset();
+    }
+    tracker.Track(offset, size);
+}
+
+bool Buffer::IsRegionUsed(u64 offset, u64 size) const noexcept {
+    return runtime != nullptr && usage_serial == runtime->scheduler.SegmentSerial() &&
+           tracker.IsUsed(offset, size);
 }
 
 BufferCacheRuntime::BufferCacheRuntime(const Device& device_, Scheduler& scheduler_,
@@ -48,11 +64,22 @@ void BufferCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
     staging_pool.FreeDeferred(ref);
 }
 
+bool BufferCacheRuntime::CanReorderUpload(
+    const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies) const noexcept {
+    return scheduler.CanUploadAhead() && !scheduler.UsedInOrder(buffer.Handle()) &&
+           std::ranges::none_of(copies, [&](const VideoCommon::BufferCopy& copy) {
+               return buffer.IsRegionUsed(copy.dst_offset, copy.size);
+           });
+}
+
 void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, BufferHandle src_buffer,
-                                    std::span<const VideoCommon::BufferCopy> copies, bool, bool) {
+                                    std::span<const VideoCommon::BufferCopy> copies, bool,
+                                    bool can_reorder_upload) {
     // A blit encoder runs its copies in order; Metal orders encoders on tracked resources.
+    // The scheduler notes the buffers of the copies it records in order.
     for (const VideoCommon::BufferCopy& copy : copies) {
-        scheduler.CopyBuffer(src_buffer, copy.src_offset, dst_buffer, copy.dst_offset, copy.size);
+        scheduler.CopyBuffer(src_buffer, copy.src_offset, dst_buffer, copy.dst_offset, copy.size,
+                             can_reorder_upload);
     }
 }
 

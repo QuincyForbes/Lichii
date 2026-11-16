@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 
 #include "common/common_types.h"
 
@@ -46,6 +47,12 @@ public:
     /// The MTLBinaryArchive (id<MTLBinaryArchive>), or null when closed.
     [[nodiscard]] void* Handle() const noexcept;
 
+    /// Held shared while a pipeline is built with the archive attached, and alone while one is
+    /// added to it or the file is written (boot builds on several threads).
+    [[nodiscard]] std::shared_mutex& BuildMutex() noexcept {
+        return build_mutex;
+    }
+
     /// A pipeline built with the archive attached: found in it or not, and how long it took.
     void NoteBuild(bool hit, u64 nanoseconds) noexcept;
     void NoteAdded(bool added) noexcept;
@@ -60,6 +67,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl;
     mutable std::mutex mutex;
+    std::shared_mutex build_mutex;
     Counts recent{};
     Counts total{};
     bool dirty{};

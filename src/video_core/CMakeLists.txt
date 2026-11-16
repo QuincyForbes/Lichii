@@ -105,6 +105,8 @@ add_library(video_core STATIC
     macro_hle_oot.h
     macro_memo.h
     macro_turing.h
+    feature_census.cpp
+    feature_census.h
     fence_manager.h
     gpu.cpp
     gpu.h
@@ -640,11 +642,16 @@ option(LICHII_METAL_COMPILE_CHECK "Compile the Metal renderer's C++ part without
 set(METAL_RENDERER_CXX_SOURCES
     renderer_metal/metal_buffer_cache.cpp
     renderer_metal/metal_buffer_cache_base.cpp
+    renderer_metal/metal_coverage.cpp
+    renderer_metal/metal_draw_desc.cpp
     renderer_metal/metal_fence_manager.cpp
+    renderer_metal/metal_formats.cpp
     renderer_metal/metal_index_convert.cpp
     renderer_metal/metal_ocarina.cpp
     renderer_metal/metal_pipeline_cache.cpp
     renderer_metal/metal_pipeline_check.cpp
+    renderer_metal/metal_pipeline_files.cpp
+    renderer_metal/metal_pipeline_translate.cpp
     renderer_metal/metal_rasterizer.cpp
     renderer_metal/metal_shader_translate.cpp
     renderer_metal/metal_staging_buffer_pool.cpp
@@ -654,6 +661,14 @@ set(METAL_RENDERER_CXX_SOURCES
 if (ENABLE_METAL OR LICHII_METAL_COMPILE_CHECK)
     # SPIR-V -> MSL (metal_shader_translate.cpp).
     AddJsonPackage(spirv-cross)
+    if (MSVC)
+        # Added below src/, so it inherits this tree's warnings-as-errors.
+        foreach (SPIRV_CROSS_TARGET spirv-cross-core spirv-cross-glsl spirv-cross-msl)
+            if (TARGET ${SPIRV_CROSS_TARGET})
+                target_compile_options(${SPIRV_CROSS_TARGET} PRIVATE /wd4245 /wd4388 /wd4389)
+            endif()
+        endforeach()
+    endif()
 endif()
 if (ENABLE_METAL)
     set(METAL_RENDERER_SOURCES
@@ -673,13 +688,18 @@ if (ENABLE_METAL)
         renderer_metal/metal_archive.h
         renderer_metal/metal_bridge.h
         renderer_metal/metal_buffer_cache.h
+        renderer_metal/metal_coverage.h
         renderer_metal/metal_device.h
+        renderer_metal/metal_draw_desc.h
         renderer_metal/metal_fence_manager.h
+        renderer_metal/metal_formats.h
         renderer_metal/metal_graphics.h
         renderer_metal/metal_index_convert.h
         renderer_metal/metal_object.h
         renderer_metal/metal_ocarina.h
         renderer_metal/metal_pipeline_cache.h
+        renderer_metal/metal_pipeline_files.h
+        renderer_metal/metal_pipeline_translate.h
         renderer_metal/metal_rasterizer.h
         renderer_metal/metal_resources.h
         renderer_metal/metal_scheduler.h
@@ -706,7 +726,8 @@ if (ENABLE_METAL)
         set(METAL_SMOKE_DIR ${CMAKE_CURRENT_BINARY_DIR}/metal_smoke)
         set(METAL_SMOKE_HEADERS)
         foreach (SMOKE_FILE translate_smoke.comp texel_buffer_smoke.comp texture_1d_smoke.comp
-                            tess_smoke.vert tess_smoke.tesc tess_smoke.tese)
+                            tess_smoke.vert tess_smoke.tesc tess_smoke.tese
+                            device_msl_smoke.vert device_msl_smoke.frag)
             string(REPLACE "." "_" SMOKE_SHADER "${SMOKE_FILE}")
             string(TOUPPER "${SMOKE_SHADER}_SPV" SMOKE_VARIABLE)
             set(SMOKE_HEADER ${METAL_SMOKE_DIR}/${SMOKE_SHADER}_spv.h)
@@ -733,10 +754,31 @@ if (ENABLE_METAL)
 elseif (LICHII_METAL_COMPILE_CHECK)
     # Off by default: compiles (does not link) the plain C++ part on machines without Metal, to
     # catch template errors before an Apple CI run.
-    add_library(video_core_metal_check OBJECT ${METAL_RENDERER_CXX_SOURCES})
+    add_library(video_core_metal_check OBJECT ${METAL_RENDERER_CXX_SOURCES}
+                renderer_metal/metal_replay.cpp)
     target_link_libraries(video_core_metal_check PRIVATE video_core spirv-cross-msl)
     add_dependencies(video_core_metal_check host_shaders)
     target_include_directories(video_core_metal_check PRIVATE ${HOST_SHADERS_INCLUDE})
+
+    # A game's stored pipelines and census draws through the renderer's translation and
+    # descriptor checks, on a machine without Metal (tools/nx2/metal-replay.md).
+    add_executable(lichii-metal-replay
+        renderer_metal/metal_replay.cpp
+        renderer_metal/metal_replay_stubs.cpp
+        renderer_metal/metal_draw_desc.cpp
+        renderer_metal/metal_formats.cpp
+        renderer_metal/metal_index_convert.cpp
+        renderer_metal/metal_pipeline_check.cpp
+        renderer_metal/metal_pipeline_translate.cpp
+        renderer_metal/metal_shader_translate.cpp)
+    target_link_libraries(lichii-metal-replay PRIVATE common core video_core spirv-cross-msl
+                          ${PLATFORM_LIBRARIES})
+    add_dependencies(lichii-metal-replay host_shaders)
+    target_include_directories(lichii-metal-replay PRIVATE ${HOST_SHADERS_INCLUDE})
+    if (NOT MSVC)
+        set_source_files_properties(renderer_metal/metal_replay_stubs.cpp PROPERTIES
+            COMPILE_OPTIONS "-Wno-conversion;-Wno-unused-variable;-Wno-unused-parameter;-Wno-missing-field-initializers")
+    endif()
 endif()
 
 # Ocarina of Time's upscaler replaced live by NVIDIA DLSS or Apple MetalFX temporal upscaling

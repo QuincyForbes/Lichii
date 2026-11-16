@@ -20,7 +20,14 @@ bool NeedsConversion(Topology topology) noexcept {
     }
 }
 
-Topology ConvertedTopology(Topology topology) noexcept {
+bool RotatesForProvokingVertex(Topology topology) noexcept {
+    return topology == Topology::Triangles || topology == Topology::TriangleStrip;
+}
+
+Topology ConvertedTopology(Topology topology, bool provoking_last) noexcept {
+    if (provoking_last && RotatesForProvokingVertex(topology)) {
+        return Topology::Triangles;
+    }
     switch (topology) {
     case Topology::Quads:
     case Topology::QuadStrip:
@@ -34,7 +41,13 @@ Topology ConvertedTopology(Topology topology) noexcept {
     }
 }
 
-u32 ConvertedCount(Topology topology, u32 count) noexcept {
+u32 ConvertedCount(Topology topology, u32 count, bool provoking_last) noexcept {
+    if (provoking_last && topology == Topology::Triangles) {
+        return count / 3 * 3;
+    }
+    if (provoking_last && topology == Topology::TriangleStrip) {
+        return count >= 3 ? (count - 2) * 3 : 0;
+    }
     switch (topology) {
     case Topology::Quads:
         return count / 4 * 6;
@@ -51,7 +64,7 @@ u32 ConvertedCount(Topology topology, u32 count) noexcept {
 }
 
 u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 first, u32 count,
-            bool restart, std::span<u32> out) noexcept {
+            bool restart, std::span<u32> out, bool provoking_last) noexcept {
     const auto index = [&](u32 vertex) -> u32 {
         if (source.empty()) {
             return first + vertex;
@@ -77,12 +90,45 @@ u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 f
         }
         }
     };
-    const u32 total = ConvertedCount(topology, count);
+    const u32 total = ConvertedCount(topology, count, provoking_last);
     if (out.size() < total) {
         return 0;
     }
     u32 written = 0;
     const auto emit = [&](u32 vertex) { out[written++] = index(vertex); };
+    if (provoking_last && topology == Topology::Triangles) {
+        // The last vertex first; a rotation keeps the winding.
+        for (u32 vertex = 0; vertex + 3 <= count; vertex += 3) {
+            emit(vertex + 2);
+            emit(vertex);
+            emit(vertex + 1);
+        }
+        return written;
+    }
+    if (provoking_last && topology == Topology::TriangleStrip) {
+        // Triangle i of a strip is i, i+1, i+2 (even) or i, i+2, i+1 (odd), its last vertex
+        // i+2; each is written from that one on. A restart index begins a new strip.
+        u32 start = 0;
+        for (u32 vertex = 0; vertex < count; ++vertex) {
+            if (restart && index(vertex) == 0xFFFFFFFFU) {
+                start = vertex + 1;
+                continue;
+            }
+            if (vertex < start + 2) {
+                continue;
+            }
+            const u32 triangle = vertex - 2;
+            emit(vertex);
+            if ((triangle - start) % 2 == 0) {
+                emit(triangle);
+                emit(triangle + 1);
+            } else {
+                emit(triangle + 1);
+                emit(triangle);
+            }
+        }
+        return written;
+    }
     switch (topology) {
     case Topology::Quads:
         for (u32 quad = 0; quad + 4 <= count; quad += 4) {
@@ -131,7 +177,13 @@ u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 f
     return written;
 }
 
-u32 RewriteMode(Topology topology) noexcept {
+u32 RewriteMode(Topology topology, bool provoking_last) noexcept {
+    if (provoking_last && topology == Topology::Triangles) {
+        return 5;
+    }
+    if (provoking_last && topology == Topology::TriangleStrip) {
+        return 6;
+    }
     switch (topology) {
     case Topology::Quads:
         return 1;
@@ -186,6 +238,17 @@ kernel void rewrite_indices(device const uchar* source [[buffer(0)]],
     case 4:
         element = index < params.count ? index : 0;
         break;
+    case 5:
+        element = index / 3 * 3 + (index % 3 == 0 ? 2 : index % 3 - 1);
+        break;
+    case 6: {
+        const uint triangle = index / 3;
+        const uint corner = index % 3;
+        element = corner == 0 ? triangle + 2
+                  : (triangle % 2 == 0) == (corner == 1) ? triangle
+                                                         : triangle + 1;
+        break;
+    }
     default:
         element = index;
         break;

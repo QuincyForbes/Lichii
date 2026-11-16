@@ -3,10 +3,12 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <limits>
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "video_core/host_budget.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
@@ -16,50 +18,114 @@ namespace Metal {
 namespace {
 /// Frames a free buffer is kept for the next request of its size.
 constexpr u64 KeepFrames = 300;
+/// The same while the pool holds more than a command buffer may take.
+constexpr u64 PressureKeepFrames = 8;
+
+u64 BoundBytes(const char* name, u64 default_mib) {
+    if (const char* const env = std::getenv(name)) {
+        const long mib = std::strtol(env, nullptr, 10);
+        if (mib >= 0) {
+            return static_cast<u64>(mib) << 20;
+        }
+    }
+    return default_mib << 20;
+}
 } // Anonymous namespace
 
 StagingBufferPool::StagingBufferPool(const Device& device_, Scheduler& scheduler_)
-    : device{device_}, scheduler{scheduler_} {}
+    : device{device_}, scheduler{scheduler_} {
+    // EDEN_NX2_METAL_STAGING_BOUND=0: no bounds, and free buffers go only from the list's end.
+    const char* const bound = std::getenv("EDEN_NX2_METAL_STAGING_BOUND");
+    if (bound == nullptr || bound[0] != '0') {
+        const bool phone = VideoCommon::HostBudget::Active();
+        submit_bytes = BoundBytes("EDEN_NX2_STAGING_SUBMIT_MIB", phone ? 24 : 256);
+        cap_bytes = (std::max)(BoundBytes("EDEN_NX2_STAGING_CAP_MIB", phone ? 96 : 1024),
+                               submit_bytes * 2);
+    }
+}
 
 StagingBufferPool::~StagingBufferPool() = default;
 
+StagingBufferRef StagingBufferPool::Take(size_t index, size_t size, bool deferred) {
+    Entry& entry = entries[index];
+    const u64 tick = scheduler.CurrentTick();
+    entry.tick = tick;
+    entry.last_frame = frame;
+    entry.deferred = deferred;
+    // A deferred buffer comes back with FreeDeferred, not with a commit.
+    if (!deferred) {
+        if (taken_tick != tick) {
+            taken_tick = tick;
+            taken_bytes = 0;
+        }
+        taken_bytes += entry.size;
+    }
+    return StagingBufferRef{
+        .buffer = entry.buffer.Get(),
+        .offset = 0,
+        .mapped_span = std::span<u8>(entry.contents, size),
+        .index = index,
+    };
+}
+
 StagingBufferRef StagingBufferPool::Request(size_t size, bool deferred) {
     const u64 rounded = std::bit_ceil((std::max)(size, size_t{4096}));
-    const u64 tick = scheduler.CurrentTick();
+    size_t empty = entries.size();
     for (size_t index = 0; index < entries.size(); ++index) {
-        Entry& entry = entries[index];
+        const Entry& entry = entries[index];
+        if (entry.size == 0) {
+            empty = (std::min)(empty, index);
+            continue;
+        }
         if (entry.size != rounded || entry.deferred || !scheduler.IsFree(entry.tick)) {
             continue;
         }
-        entry.tick = tick;
-        entry.last_frame = frame;
-        entry.deferred = deferred;
-        return StagingBufferRef{
-            .buffer = entry.buffer.Get(),
-            .offset = 0,
-            .mapped_span = std::span<u8>(entry.contents, size),
-            .index = index,
-        };
+        return Take(index, size, deferred);
     }
     u8* contents = nullptr;
     Object buffer = CreateBuffer(device, rounded, true, &contents);
     ASSERT_MSG(buffer && contents != nullptr, "Metal staging buffer of {} bytes failed", rounded);
     held_bytes += rounded;
-    entries.push_back(Entry{
+    if (empty == entries.size()) {
+        entries.emplace_back();
+    }
+    entries[empty] = Entry{
         .buffer = std::move(buffer),
         .contents = contents,
         .size = rounded,
-        .tick = tick,
+        .tick = 0,
         .last_frame = frame,
-        .deferred = deferred,
-    });
-    const Entry& entry = entries.back();
-    return StagingBufferRef{
-        .buffer = entry.buffer.Get(),
-        .offset = 0,
-        .mapped_span = std::span<u8>(entry.contents, size),
-        .index = entries.size() - 1,
+        .deferred = false,
     };
+    return Take(empty, size, deferred);
+}
+
+bool StagingBufferPool::WantsFlush() const noexcept {
+    return submit_bytes != 0 && taken_tick == scheduler.CurrentTick() &&
+           taken_bytes >= submit_bytes;
+}
+
+void StagingBufferPool::Free(Entry& entry) {
+    held_bytes -= entry.size;
+    entry = Entry{};
+    ++freed;
+}
+
+void StagingBufferPool::Trim() {
+    if (submit_bytes == 0) {
+        return;
+    }
+    for (Entry& entry : entries) {
+        if (held_bytes <= cap_bytes / 2) {
+            break;
+        }
+        if (entry.size != 0 && !entry.deferred && scheduler.IsFree(entry.tick)) {
+            Free(entry);
+        }
+    }
+    while (!entries.empty() && entries.back().size == 0) {
+        entries.pop_back();
+    }
 }
 
 void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
@@ -102,6 +168,20 @@ StagingBufferRef StagingBufferPool::Stream(size_t size, size_t alignment) {
 
 void StagingBufferPool::TickFrame() {
     ++frame;
+    if (submit_bytes != 0) {
+        // A slot whose buffer went stays, so the indices handed out stay valid.
+        const u64 keep = held_bytes > submit_bytes ? PressureKeepFrames : KeepFrames;
+        for (Entry& entry : entries) {
+            if (entry.size != 0 && !entry.deferred && frame - entry.last_frame >= keep &&
+                scheduler.IsFree(entry.tick)) {
+                Free(entry);
+            }
+        }
+        while (!entries.empty() && entries.back().size == 0) {
+            entries.pop_back();
+        }
+        return;
+    }
     // Only from the back, so the indices handed out stay valid.
     while (!entries.empty()) {
         const Entry& entry = entries.back();

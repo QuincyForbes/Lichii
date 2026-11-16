@@ -218,7 +218,34 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// (EDEN_NX2_METAL_ABORT_TRACE=0, EDEN_NX2_METAL_ENCODER_STATUS=0). "metal_check_off": the Metal
 /// renderer hands Metal the guest's vertex layout, pipeline, texture and texture view
 /// descriptions unchecked and keeps 1D images as 1D textures, as before
-/// (EDEN_NX2_METAL_PIPELINE_CHECK=0).
+/// (EDEN_NX2_METAL_PIPELINE_CHECK=0). "metal_fixed_state_off": the Metal renderer translates
+/// programs without the draw's fixed state (depth conversion, point size, alpha test, dual source
+/// blending, integer outputs), as before (EDEN_NX2_METAL_FIXED_STATE=0). "metal_cache_plain": the
+/// Metal renderer answers guest reads, guest writes and inline writes on its plain paths (both
+/// caches' locks every time, no hand-off, reads landed by the GPU thread, every fence release
+/// drained), as before (EDEN_NX2_METAL_CACHE_PATHS=0). "metal_msl_plain": the Metal renderer
+/// translates programs without what the GPU has (no base instance, so a program that reads the
+/// instance index is refused; quad groups for subgroups), as before (EDEN_NX2_METAL_MSL_DEVICE=0).
+/// "metal_copies_plain": the Metal renderer skips blits between depth images and copies between
+/// block-compressed and plain formats, as before (EDEN_NX2_METAL_COPIES=0).
+/// "metal_clears_plain": the Metal renderer clears the whole target, every channel and every
+/// stencil bit where the game clears a part, and gives every clear a render pass of its own, as
+/// before (EDEN_NX2_METAL_CLEAR_DRAWS=0, EDEN_NX2_METAL_CLEAR_FOLD=0).
+/// "metal_barrier_off": the Metal renderer ignores the game's fragment barrier, as before
+/// (EDEN_NX2_METAL_FRAGMENT_BARRIER=0). "metal_state_plain": the Metal renderer sets all state
+/// and bindings for every draw and dispatch, as before (EDEN_NX2_METAL_STATE_CACHE=0).
+/// "metal_ahead_off": the Metal renderer records uploads and a draw's kernels where they come,
+/// ending the open render pass, and commits nothing early, as before (EDEN_NX2_METAL_AHEAD=0,
+/// EDEN_NX2_METAL_AHEAD_SPLIT=0). "metal_fences_plain": the Metal renderer commits a command
+/// buffer for every guest fence, also with nothing recorded, as before
+/// (EDEN_NX2_METAL_FENCE_IDLE=0). "metal_staging_plain": the Metal renderer's staging buffers
+/// have no bounds, as before (EDEN_NX2_METAL_STAGING_BOUND=0). "metal_network_runs": on the Metal
+/// renderer Ocarina of Time's anti-aliasing network runs also with anti-aliasing at No
+/// sharpening, as before (EDEN_NX2_METAL_NETWORK_BYPASS=0). "metal_prebuild_off": the Metal
+/// renderer records no pipelines and builds none before play, as before
+/// (EDEN_NX2_METAL_PIPELINE_FILE=0). "metal_temporal_off": on the Metal renderer Ocarina of
+/// Time's upscale pass is not replaced by MetalFX Temporal, as before
+/// (EDEN_NX2_METAL_OOT_TEMPORAL=0).
 /// "pipeline_holds_old": the pipeline build a draw waits for stays queued on the builder pool, as
 /// before (EDEN_NX2_PIPELINE_HOLD_BOOST=0). "pipeline_list_old": the used pipelines list is
 /// written only on a first use 15 s after the last save and at shutdown, as before

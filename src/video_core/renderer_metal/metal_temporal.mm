@@ -26,6 +26,7 @@ struct ScalerKey {
     NSUInteger input_height{};
     std::array<u32, 2> render{};
     std::array<u32, 2> output{};
+    bool auto_exposure{};
 
     bool operator==(const ScalerKey&) const noexcept = default;
 };
@@ -87,6 +88,7 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
             .input_height = color.height,
             .render = inputs.render_size,
             .output = inputs.output_size,
+            .auto_exposure = inputs.auto_exposure,
         };
         if (state.scaler == nil || !(state.key == key)) {
             if (![MTLFXTemporalScalerDescriptor supportsDevice:device.GetDevice()]) {
@@ -102,8 +104,7 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
             descriptor.inputHeight = key.input_height;
             descriptor.outputWidth = key.output[0];
             descriptor.outputHeight = key.output[1];
-            // Linear HDR colour, as the games hand DLSS.
-            descriptor.autoExposureEnabled = YES;
+            descriptor.autoExposureEnabled = key.auto_exposure ? YES : NO;
             // The game renders into part of larger textures: MetalFX reads the render size.
             if (key.render[0] != key.input_width || key.render[1] != key.input_height) {
                 const f32 scale_x = static_cast<f32>(key.output[0]) / key.render[0];
@@ -165,7 +166,7 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
         scaler.jitterOffsetY = inputs.jitter[1];
         scaler.motionVectorScaleX = inputs.motion_vector_scale[0];
         scaler.motionVectorScaleY = inputs.motion_vector_scale[1];
-        scaler.depthReversed = YES;
+        scaler.depthReversed = inputs.depth_reversed ? YES : NO;
         scaler.preExposure = 1.0f;
         scaler.reset = inputs.reset || state.first_evaluation;
         state.first_evaluation = false;

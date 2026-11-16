@@ -99,6 +99,7 @@ void PipelineArchive::Save() {
         std::error_code ec;
         std::filesystem::create_directories(std::filesystem::path{impl->path}.parent_path(), ec);
         NSError* error = nil;
+        std::unique_lock build_lock{build_mutex};
         if (![impl->archive serializeToURL:impl->url error:&error]) {
             LOG_WARNING(Render_Metal, "Metal: pipeline archive {} not written: {}", impl->path,
                         error != nil ? error.localizedDescription.UTF8String : "no reason");

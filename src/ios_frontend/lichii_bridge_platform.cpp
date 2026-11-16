@@ -383,6 +383,60 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_METAL_PIPELINE_CHECK", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment metal_check_off on");
     }
+    if (lichii_platform_experiment("metal_fixed_state_off")) {
+        setenv("EDEN_NX2_METAL_FIXED_STATE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_fixed_state_off on");
+    }
+    if (lichii_platform_experiment("metal_cache_plain")) {
+        setenv("EDEN_NX2_METAL_CACHE_PATHS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_cache_plain on");
+    }
+    if (lichii_platform_experiment("metal_msl_plain")) {
+        setenv("EDEN_NX2_METAL_MSL_DEVICE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_msl_plain on");
+    }
+    if (lichii_platform_experiment("metal_copies_plain")) {
+        setenv("EDEN_NX2_METAL_COPIES", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_copies_plain on");
+    }
+    if (lichii_platform_experiment("metal_clears_plain")) {
+        setenv("EDEN_NX2_METAL_CLEAR_DRAWS", "0", 1);
+        setenv("EDEN_NX2_METAL_CLEAR_FOLD", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_clears_plain on");
+    }
+    if (lichii_platform_experiment("metal_barrier_off")) {
+        setenv("EDEN_NX2_METAL_FRAGMENT_BARRIER", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_barrier_off on");
+    }
+    if (lichii_platform_experiment("metal_state_plain")) {
+        setenv("EDEN_NX2_METAL_STATE_CACHE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_state_plain on");
+    }
+    if (lichii_platform_experiment("metal_ahead_off")) {
+        setenv("EDEN_NX2_METAL_AHEAD", "0", 1);
+        setenv("EDEN_NX2_METAL_AHEAD_SPLIT", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_ahead_off on");
+    }
+    if (lichii_platform_experiment("metal_fences_plain")) {
+        setenv("EDEN_NX2_METAL_FENCE_IDLE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_fences_plain on");
+    }
+    if (lichii_platform_experiment("metal_staging_plain")) {
+        setenv("EDEN_NX2_METAL_STAGING_BOUND", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_staging_plain on");
+    }
+    if (lichii_platform_experiment("metal_network_runs")) {
+        setenv("EDEN_NX2_METAL_NETWORK_BYPASS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_network_runs on");
+    }
+    if (lichii_platform_experiment("metal_prebuild_off")) {
+        setenv("EDEN_NX2_METAL_PIPELINE_FILE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_prebuild_off on");
+    }
+    if (lichii_platform_experiment("metal_temporal_off")) {
+        setenv("EDEN_NX2_METAL_OOT_TEMPORAL", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_temporal_off on");
+    }
     if (lichii_platform_experiment("pipeline_holds_old")) {
         setenv("EDEN_NX2_PIPELINE_HOLD_BOOST", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment pipeline_holds_old on");

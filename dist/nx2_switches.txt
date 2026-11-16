@@ -136,6 +136,18 @@ EDEN_NX2_FENCE_BATCH=1
 # error without the encoders that did not complete.
 #EDEN_NX2_METAL_ENCODER_STATUS=0
 
+# Metal renderer: programs are translated with the draw's fixed state as on Vulkan: depth -1..1
+# converted in the vertex program, point size written for point lists, the alpha test in the pixel
+# program, dual source blending outputs, pixel outputs typed after integer targets, lower left
+# window origin. 0 translates them without, as before.
+#EDEN_NX2_METAL_FIXED_STATE=0
+
+# Either renderer: counts what the game asks of the graphics backend (draw state by pipeline,
+# clears, dispatches, queries, translated programs, images, views, samplers, copies) and writes
+# it every 10 s to nx2_feature_census.json in the log folder. tools/nx2/feature_census.py prints
+# it; tools/nx2/metal_replay reads it. Draws nothing differently.
+#EDEN_NX2_FEATURE_CENSUS=1
+
 # Metal renderer: 0 hands Metal the guest's vertex layout, pipeline and texture descriptions as
 # they are, as before. Metal aborts the process on some (a 32nd vertex stream or attribute, an
 # attribute of a stream without a buffer, a sample count a texture can't have, a texture past its
@@ -150,6 +162,150 @@ EDEN_NX2_FENCE_BATCH=1
 # stencil format.
 #EDEN_NX2_METAL_PIPELINE_CHECK=0
 
+# Metal renderer: guest reads, guest writes and the GPU's inline writes take the paths the
+# Vulkan renderer takes: a cache that can hold nothing of a range is not asked (no wait for its
+# lock: EDEN_NX2_READ_FASTPATH, EDEN_NX2_TEXTURE_READ_FILTER, EDEN_NX2_WRITE_FASTPATH), a guest
+# write that finds the buffer cache's lock held is handed to the lock's owner
+# (EDEN_NX2_WRITE_HANDOFF), collected guest writes are applied in one batch and pages they
+# replace stop being held GPU-modified (EDEN_NX2_CPU_WRITE_RECLAIM), a guest read of GPU data
+# still on its way waits for the copy under way on its own core (EDEN_NX2_GPU_READ_LAND), a
+# fence release with nothing to release does not drain the GPU thread (EDEN_NX2_EXP3), and
+# inline writes go straight to guest memory with one invalidation before the next draw
+# (EDEN_NX2_INLINE_FAST, EDEN_NX2_INLINE_DEFER, EDEN_NX2_I2M_COALESCE, EDEN_NX2_I2M_LIST_PAGE);
+# each of those switches works as on Vulkan. 0 takes the plain paths this renderer had before:
+# every question under both caches' locks, writes applied one at a time, reads landed by the GPU
+# thread, every fence release drained, every inline write invalidating every cache at once.
+# Under it, as on Vulkan: every draw serves the guest threads' waiting sync requests, a draw
+# whose native program failed marks the frame as such, and Donkey Kong Bananza's reset program
+# has its indirect records written on the host (EDEN_NX2_RESETFIX). A draw count the GPU wrote
+# (EDEN_NX2_INDIRECT_DRAWS=1) is read back before the draw, which waits for the GPU; a draw of
+# more than 16 million vertices is skipped with a log line under EDEN_NX2_METAL_PIPELINE_CHECK.
+#EDEN_NX2_METAL_CACHE_PATHS=0
+
+# Metal renderer: 0 translates programs with SPIRV-Cross's settings for any iOS device, as
+# before: a program that reads the base instance or base vertex (every vertex program that reads
+# the instance index) is refused and its draws skipped, and subgroup operations work on groups
+# of four pixels. By default the translation is told what the GPU has, as MoltenVK tells it:
+# base vertex and instance (Apple3 and later), SIMD groups for subgroup operations (Apple6 and
+# later), the cube map gradient fix, no stores from discarded fragments, and an input structure
+# that contains itself declared as a pointer (Metal 3.1's compiler does not return from it).
+#EDEN_NX2_METAL_MSL_DEVICE=0
+
+# Metal renderer: 0 skips two kinds of image copy, as before. By default a blit from a depth
+# image into a depth image is drawn (nearest; the stencil comes along between images of one
+# format), and a copy between a block-compressed image and a plain one whose texels are the
+# size of a block goes through a buffer, block for texel, as Vulkan copies them (Ocarina of
+# Time copies R16G16B16A16_UINT into BC4). A copy that starts inside a block is skipped with a
+# log line either way; images decoded on the CPU are not copied this way.
+#EDEN_NX2_METAL_COPIES=0
+
+# Metal renderer: 0 clears as before: a clear of part of a target (the scissor), of some colour
+# channels or of some stencil bits clears the whole target, every channel and every bit, and a
+# whole-number colour target takes the clear colour's floats. By default such a clear is drawn
+# as a triangle over the rectangle with the channels' and bits' write masks (a clear of the
+# whole target stays the render pass's load action), and whole-number targets get the values
+# Vulkan gives them. Ocarina of Time clears with the scissor test on about 1,600 times a second
+# on a computer (how many of them cover less than the target was not measured).
+#EDEN_NX2_METAL_CLEAR_DRAWS=0
+
+# Metal renderer: 0 gives every clear of a whole target a render pass of its own, as before
+# (the pass stores the cleared image and the pass with the draws loads it again). By default
+# the clear waits and becomes the load action of the next render pass when that pass draws
+# into the same images, as Vulkan's renderer defers its clears; a pass on other images, a
+# dispatch, a blit, a copy that touches one of the images, a present or a flush records the
+# clear first. The 10 s "Metal:" line counts the passes "starting with a clear".
+#EDEN_NX2_METAL_CLEAR_FOLD=0
+
+# Metal renderer: 0 ignores the game's fragment barrier, as before: a draw that samples the
+# image its own render pass draws into reads what the pass before it stored. By default the
+# next draw after a barrier that samples one of its targets (or follows a draw that writes
+# storage) ends the render pass first, so the image holds the earlier draws, and opens it
+# again; other draws stay in the open pass, as on Vulkan (EDEN_NX2_WFI_DEFER). The 10 s
+# "Metal:" line counts the passes ended this way.
+#EDEN_NX2_METAL_FRAGMENT_BARRIER=0
+
+# Metal renderer: 0 sets every piece of state (pipeline, depth-stencil state, viewport,
+# scissor, culling, depth bias, stencil references, blend colour) and every buffer, texture and
+# sampler again for each draw and dispatch, as before. By default what the open encoder already
+# has stays as it is, and a buffer bound again at another offset only gets the offset. The
+# 10 s "Metal:" line counts state and bindings set and left as they were.
+#EDEN_NX2_METAL_STATE_CACHE=0
+
+# Metal renderer: 0 records the buffer cache's uploads and the kernels of a draw (index
+# rewrite, mesh and tessellation emulation) where they come, as before: each ends the open
+# render pass, and the draw opens it again (the pass stores its images and loads them). By
+# default they go into two command buffers of their own, committed before the one with the
+# passes, as Vulkan's renderer records its uploads and its mesh compute before the pass: an
+# upload when nothing recorded since the last commit uses the bytes, a kernel when the pass it
+# belongs to is the first thing recorded since then and has not written storage (a mesh or
+# tessellation kernel also not when the draw writes storage or samples its own targets). The
+# 10 s "Metal:" line counts the copies and kernels "ahead of their segment".
+#EDEN_NX2_METAL_AHEAD=0
+
+# Metal renderer: 0 commits nothing early for the sake of the above. By default a render pass
+# whose kernels had to end it (because other work came before the pass since the last commit)
+# has that earlier work committed just before it begins the next time, at most 8 times between
+# two flushes, so its kernels can go ahead of it. The 10 s "Metal:" line counts the
+# "segments split off".
+#EDEN_NX2_METAL_AHEAD_SPLIT=0
+
+# Metal renderer: 0 commits a command buffer for every guest fence (syncpoint increments, query
+# and download fences), also when nothing was recorded since the last commit, as before. By
+# default such a fence waits for the last command buffer committed and makes none, as Vulkan's
+# renderer does. The 10 s "Metal:" line counts the "fences without a command buffer".
+#EDEN_NX2_METAL_FENCE_IDLE=0
+
+# Metal renderer: 0 leaves its pool of staging buffers (texture and buffer uploads, downloads)
+# without bounds, as before: every upload past the stream ring takes a buffer of its own until
+# the command buffer is committed, and a free buffer is given back only after 300 frames and
+# only from the end of the list. By default the pool has the Vulkan renderer's two marks
+# (EDEN_NX2_STAGING_SUBMIT_MIB, EDEN_NX2_STAGING_CAP_MIB: 24 and 96 MiB on phones, 256 and 1024
+# elsewhere): before a draw, clear or dispatch the command buffer being recorded is committed
+# once the buffers it took pass the first; with more than the second held the GPU thread waits
+# for it and frees buffers down to half the cap; and while more than the first mark is held a
+# free buffer goes after 8 frames. The 10 s "Metal:" line reports the pool ("staging").
+#EDEN_NX2_METAL_STAGING_BOUND=0
+
+# Metal renderer: 0 lets Ocarina of Time's anti-aliasing network run whatever the "Ocarina of
+# Time anti-aliasing" setting says, as before. By default, with that setting at No sharpening,
+# the network's passes are skipped and its output pass is replaced by a copy of the tonemapped
+# image, as on Vulkan (docs/nx2/oot-network-bypass.md).
+#EDEN_NX2_METAL_NETWORK_BYPASS=0
+
+# Metal renderer: 0 writes no pipeline files and builds nothing before play, as before: every
+# program is translated and compiled on the draw's thread at its first use in each run, and its
+# MSL text is kept for the session. By default each pipeline a run makes is recorded in the
+# game's shader directory (metal.fork-v1.bin: its programs, as Vulkan's cache; metal_states.bin:
+# the render states Metal made from it; metal_used.bin: which pipelines the last runs used), and
+# the next boot translates and builds them on worker threads (the pipeline archive then gives
+# the GPU code), the pipelines used in the last 8 runs only once a used list exists. The MSL
+# text is freed once its function is built. 2 builds every recorded pipeline at boot. A boot
+# build that did not finish (the process died in it) is skipped by the next run.
+#EDEN_NX2_METAL_PIPELINE_FILE=0
+
+# Metal renderer: 0 leaves Ocarina of Time's upscale pass to the bilinear pass or the game, as
+# before, also with the upscaler set to MetalFX Temporal. By default, with that setting (or
+# EDEN_NX2_DLSS_REPLACEMENT=dlss), the pass is replaced as on Vulkan: the camera is read from the
+# scene draws, motion is made from the scene depth, MetalFX upscales and the game's target is
+# written from its output; EDEN_NX2_OOT_TEMPORAL_HANDHELD applies as on Vulkan. Link's skinned
+# motion and the effects mask Vulkan adds are not made on Metal.
+#EDEN_NX2_METAL_OOT_TEMPORAL=0
+
+# Metal renderer: 1 rewrites the indices of triangle lists and strips drawn with a pixel program
+# that reads flat inputs while the game asks for the last vertex's values (the provoking vertex),
+# so that they take the last vertex as on a Vulkan driver with VK_EXT_provoking_vertex; Metal
+# takes the first. Off by default, as MoltenVK, which has no such extension: every such draw
+# would be rewritten on the CPU or by a kernel. Strips with restart indices the GPU wrote stay as
+# they are.
+#EDEN_NX2_METAL_PROVOKING_LAST=1
+
+# Either renderer: 0 makes the GPU thread's front wait for the GPU and read a compute dispatch's
+# size the GPU wrote (Ocarina of Time's light tiles, once a frame). By default it passes
+# placeholders on; the dispatch takes its size from the GPU's buffer, and the copy of the size
+# the game's macro writes into a constant buffer is made on the GPU (the Metal renderer made no
+# such copy before: the constant buffer kept the placeholders).
+#EDEN_NX2_INDIRECT_GRID=0
+
 # Threads of a pool of their own ("VkPipelineHeld") for the graphics pipeline builds a draw waits
 # for: such a build starts there at once, at the waiting thread's priority (on Apple its QoS
 # class), instead of queueing behind the other builds on the low-priority builder pool; a build
@@ -160,7 +316,9 @@ EDEN_NX2_FENCE_BATCH=1
 # The list of pipelines a game really drew (what the loading screen builds) is written at most
 # this many seconds after a pipeline's first use and when the app leaves the foreground, off the
 # GPU thread and through a temporary file. 10 by default on MoltenVK; 0 elsewhere: as before, on a
-# first use 15 s after the last save and at shutdown.
+# first use 15 s after the last save and at shutdown. The Metal renderer reads it for its own
+# used list (metal_used.bin, EDEN_NX2_METAL_PIPELINE_FILE): 10 by default, 0 once a minute; it
+# also writes its pipeline archive when the app leaves the foreground.
 #EDEN_NX2_USED_PIPELINES_SAVE_S=10
 
 # Test: every graphics pipeline built at run time (not at boot or by the prebuild) takes this many

@@ -31,6 +31,10 @@ public:
         /// Turns a motion vector into render pixels.
         std::array<f32, 2> motion_vector_scale;
         bool reset;
+        /// Depth 1 at the camera (the games' DLSS inputs); Ocarina's own scene has it at 0.
+        bool depth_reversed{true};
+        /// Linear HDR colour (the games' DLSS inputs); Ocarina's scene is tonemapped already.
+        bool auto_exposure{true};
     };
 
     TemporalUpscaler();

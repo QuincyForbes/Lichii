@@ -56,6 +56,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/feature_census.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
@@ -802,6 +803,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         Profile::Scope scope{Profile::Zone::PipelineLookup};
         return pipeline_cache.CurrentGraphicsPipeline();
     }()};
+    if (VideoCommon::FeatureCensus::Enabled()) {
+        VideoCommon::FeatureCensus::NoteDraw(
+            *maxwell3d, pipeline ? pipeline->ShaderHashes() : pipeline_cache.LookupHashes());
+    }
     if (!pipeline) {
         Common::PerfReport::Add(Common::PerfReport::DrawsSkipped);
         // A pipeline still being built is skipped only into targets cleared every frame (the
@@ -2276,6 +2281,10 @@ void RasterizerVulkan::DispatchCompute() {
             throw Shader::RuntimeError("Native compute pipeline unavailable");
         }
         return;
+    }
+    if (VideoCommon::FeatureCensus::Enabled()) {
+        VideoCommon::FeatureCensus::NoteDispatch(
+            pipeline->ShaderHash(), kepler_compute->GetIndirectComputeAddress().has_value());
     }
     std::scoped_lock buffer_lock{buffer_cache.mutex};
     std::scoped_lock texture_lock{texture_cache.mutex};
@@ -3859,6 +3868,7 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::TickFrame() {
+    VideoCommon::FeatureCensus::Tick();
     NoteDrawReuseProbeFrame();
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {

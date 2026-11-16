@@ -8,13 +8,17 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 #include <utility>
 
 #include "common/common_types.h"
+#include "video_core/buffer_cache/nx2_write_handoff.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/oot_network.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_metal/metal_buffer_cache.h"
 #include "video_core/renderer_metal/metal_fence_manager.h"
@@ -93,6 +97,13 @@ public:
     void OnCacheInvalidation(DAddr addr, u64 size) override;
     bool OnCPUWrite(DAddr addr, u64 size) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+    bool LandDownloadForCpuRead(DAddr addr, u64 size, u64 tick) override;
+    void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
+    void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
+    void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
+    bool TryCacheInvalidation(DAddr addr, u64 size) override;
+    bool FencesQuiet(bool strict, u64& epoch) override;
+    u64 FenceWorkEpoch() const override;
     void InvalidateGPUCache() override;
     void UnmapMemory(DAddr addr, u64 size) override;
     void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) override;
@@ -106,6 +117,7 @@ public:
     void WaitForIdle() override;
     void FragmentBarrier() override;
     void TiledCacheBarrier() override;
+    bool AccelerateConditionalRendering() override;
     void FlushCommands() override;
     void TickFrame() override;
     bool AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
@@ -117,6 +129,7 @@ public:
                                    const Tegra::Texture::TICEntry* depth,
                                    std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
                                    bool use_history) override;
+    VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
@@ -146,6 +159,11 @@ public:
         u64 dispatches;
         u64 dispatches_with_pipeline;
         u64 clears;
+        u64 barrier_pass_ends;   ///< Render passes ended by a fragment barrier
+        u64 staging_flushes;     ///< Command buffers committed for the staging buffers they took
+        u64 staging_waits;       ///< Of them, waited for (the pool was over its cap)
+        u64 staging_freed;       ///< Staging buffers freed
+        u64 staging_bytes;       ///< Held by the staging pool now
     };
 
     /// Work taken since the last call (the renderer's 10 s report).
@@ -157,7 +175,9 @@ public:
                 std::exchange(mesh_groups, 0), ocarina.TakePasses(),
                 std::exchange(tessellated_draws, 0), std::exchange(tessellated_patches, 0),
                 std::exchange(dispatches, 0), std::exchange(dispatches_with_pipeline, 0),
-                std::exchange(clears, 0)};
+                std::exchange(clears, 0), std::exchange(barrier_pass_ends, 0),
+                std::exchange(staging_flushes, 0), std::exchange(staging_waits, 0),
+                staging_pool.TakeFreed(), staging_pool.HeldBytes()};
     }
 
     [[nodiscard]] PipelineCache& Pipelines() noexcept {
@@ -188,9 +208,62 @@ private:
         u64 index_offset;
     };
 
-    /// Binds everything the draw needs and opens its render pass; false to skip it.
+    /// Before a draw, clear or dispatch: commits the command buffer being recorded once the
+    /// staging buffers it took pass the pool's mark, and waits for it when the pool is over its
+    /// cap (EDEN_NX2_METAL_STAGING_BOUND).
+    void FlushWork();
+
+    /// Binds everything the draw needs and opens its render pass; false to skip it
+    /// (prepare_refusal says why, empty for a draw of nothing).
     bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups = 0,
                      TessellationDraw* tess_draw = nullptr);
+
+    /// Draw's work ahead of the pipeline: a vertex count the GPU wrote is read into the draw
+    /// state, a draw past 16M vertices is refused, Bananza's reset draw is done as writes. False
+    /// when the draw is over.
+    bool BeginDraw(bool is_indexed, u32 instance_count);
+
+    /// Vulkan's TryNx2IndirectReset; true when the draw was done as writes to guest memory.
+    bool TryIndirectReset(bool is_indexed, u32 instance_count);
+
+    /// Vulkan's TrackOotTonemappedImage: render target 0 of a tonemap draw is what replaces the
+    /// anti-aliasing network's output (oot_network.h).
+    void TrackOotTonemappedImage();
+
+    /// Whether Ocarina's upscale pass goes to MetalFX temporal upscaling: the game, the
+    /// upscaler setting (MetalFX Temporal) or EDEN_NX2_DLSS_REPLACEMENT, and the GPU.
+    [[nodiscard]] bool OcarinaTemporalEnabled();
+
+    /// Vulkan's TrackOcarinaCamera: the camera matrices of a draw into the scene's targets.
+    void TrackOcarinaCamera();
+
+    /// Vulkan's TryOcarinaUpscale without `replace`: the scene depth its reader pass names.
+    void TrackOcarinaDepth();
+
+    /// A texture descriptor of the compute engine's table, if mapped and within its limit.
+    [[nodiscard]] std::optional<Tegra::Texture::TICEntry> ReadComputeTic(u32 index);
+
+    /// Vulkan's TryOcarinaUpscale: the upscale pass (views: the scene, then the target) replaced
+    /// by OcarinaTemporal; false when the game's pass (or the bilinear one) must run.
+    bool TryOcarinaTemporal(u64 shader_hash, std::span<const VideoCommon::ImageViewInOut> views);
+
+    /// Counts a replaced or declined upscale pass and logs the summary every 600 (Vulkan's
+    /// CountOcarinaUpscale).
+    void CountOcarinaTemporal(bool replaced, const char* reason = nullptr);
+
+    /// Counts the draw PrepareDraw skipped.
+    void NoteUnprepared();
+
+    /// Whether the draw's indices are rewritten so flat inputs take the last vertex, as the
+    /// game asks (EDEN_NX2_METAL_PROVOKING_LAST=1, pipelines with flat inputs).
+    [[nodiscard]] bool ProvokingLastWanted(const GraphicsPipeline& pipeline, bool is_indexed,
+                                           u32 count, u32 index_size, bool restart);
+
+    /// Counts a draw not done, and logs the cause with the draw's state the first time.
+    void RefuseDraw(std::string_view cause);
+
+    /// The programs, topology and targets of the draw at hand, for the log.
+    [[nodiscard]] std::string DescribeDraw() const;
 
     /// Sets the rescaling_words bits of a stage's texture and image descriptors (views from the
     /// stage's first), counting on from texture_bit and image_bit.
@@ -202,7 +275,8 @@ private:
     void FinishTexelWritebacks();
 
     /// Encodes the GPU rewrite of index_rewrite (fills its output; left empty when it can't).
-    void RewriteIndices();
+    /// ahead: before the segment, leaving the open render pass as it is.
+    void RewriteIndices(bool ahead);
 
     /// Binds mesh_buffers to the program's slots of the emulation's bindings.
     void BindMeshBuffers(const StageProgram& program, ShaderStage metal_stage,
@@ -248,6 +322,10 @@ private:
     void WriteQueryResult(DAddr address, bool wide, u64 value);
     void NoteUnmappedReport(GPUVAddr gpu_addr, VideoCommon::QueryType type);
 
+    /// The inline write itself: guest memory, then the caches (AccelerateInlineToMemory adds
+    /// the GPU-sized dispatches' copies).
+    void InlineToMemory(GPUVAddr address, size_t copy_size, std::span<const u8> memory);
+
     Tegra::GPU& gpu;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     const Device& device;
@@ -260,9 +338,12 @@ private:
     BufferCache buffer_cache;
     PipelineCache pipeline_cache;
     OcarinaUpscale ocarina;
+    OcarinaTemporal ocarina_temporal;
     QueryCache query_cache;
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
+    /// Guest writes that found the buffer cache's lock held (EDEN_NX2_WRITE_HANDOFF).
+    VideoCommon::Nx2WriteHandoff write_handoff;
 
     struct TexelViewKey {
         BufferHandle buffer;
@@ -312,7 +393,8 @@ private:
     u64 draws_converted{};
     u64 mesh_draws{};
     u64 mesh_groups{};
-    std::chrono::steady_clock::time_point archive_saved{};
+    /// Why PrepareDraw skipped the draw; empty for a draw of nothing.
+    std::string_view prepare_refusal;
     /// Shader::Backend::SPIRV::RescalingLayout of the draw or dispatch being bound.
     std::array<u32, 8> rescaling_words{};
 
@@ -355,6 +437,41 @@ private:
     u64 dispatches{};
     u64 dispatches_with_pipeline{};
     u64 clears{};
+    /// The render pass (Scheduler::RenderPassSerial) a fragment barrier waits in; 0: none.
+    u64 fragment_barrier_pass{};
+    /// The last render pass with a draw that writes storage.
+    u64 pass_stores{};
+    u64 barrier_pass_ends{};
+    u64 staging_flushes{};
+    u64 staging_waits{};
+    VideoCommon::OotNetwork::BypassState oot_network_bypass;
+
+    /// Frames ended (TickFrame), Vulkan's render_trace_frame for the Ocarina paths.
+    u64 oot_frame{1};
+    /// Vulkan's oot_motion: this frame's camera and scene depth.
+    struct OcarinaMotion {
+        const Tegra::MemoryManager* camera_channel{};
+        const Tegra::MemoryManager* depth_channel{};
+        u64 camera_frame{};
+        u64 depth_frame{};
+        GPUVAddr depth_address{};
+        u32 depth_tic{};
+        std::array<u32, 2> extent{};
+        /// The scene targets' size: wider than the extent at a render scale the game pads.
+        std::array<u32, 2> image_extent{};
+        VideoCommon::OcarinaMatrix current{};
+        VideoCommon::OcarinaMatrix previous{};
+
+        [[nodiscard]] bool SceneSized(u32 width, u32 height) const noexcept {
+            return (width == extent[0] || width == image_extent[0]) &&
+                   (height == extent[1] || height == image_extent[1]);
+        }
+    } oot_motion;
+    const char* oot_decline{};
+    u64 oot_decline_repeats{};
+    u64 oot_replaced{};
+    u64 oot_declined{};
+    std::array<std::pair<const char*, u64>, 8> oot_decline_reasons{};
 };
 
 } // namespace Metal

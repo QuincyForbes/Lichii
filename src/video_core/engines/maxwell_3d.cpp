@@ -22,6 +22,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/feature_census.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/macro_hle_oot.h"
@@ -518,11 +519,18 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
         upload_state.ProcessData(argument, is_last_call);
         return;
     case MAXWELL3D_REG_INDEX(fragment_barrier):
+        if (VideoCommon::FeatureCensus::Enabled()) {
+            VideoCommon::FeatureCensus::NoteMisc(VideoCommon::FeatureCensus::Misc::FragmentBarrier);
+        }
         return rasterizer->FragmentBarrier();
     case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
         rasterizer->InvalidateGPUCache();
         return rasterizer->WaitForIdle();
     case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
+        if (VideoCommon::FeatureCensus::Enabled()) {
+            VideoCommon::FeatureCensus::NoteMisc(
+                VideoCommon::FeatureCensus::Misc::TiledCacheBarrier);
+        }
         return rasterizer->TiledCacheBarrier();
     default:
         draw_manager.ProcessMethodCall(*this, method, argument);
@@ -920,6 +928,11 @@ void Maxwell3D::ProcessQueryGet() {
         static_cast<VideoCommon::QueryType>(regs.report_semaphore.query.report.Value());
     const u32 payload = regs.report_semaphore.payload;
     const u32 subreport = regs.report_semaphore.query.sub_report;
+    if (VideoCommon::FeatureCensus::Enabled()) {
+        VideoCommon::FeatureCensus::NoteQuery(static_cast<u32>(query_type),
+                                              regs.report_semaphore.query.raw,
+                                              sequence_address != 0);
+    }
     switch (regs.report_semaphore.query.operation) {
     case Regs::ReportSemaphore::Operation::Release:
         if (regs.report_semaphore.query.short_query != 0) {
@@ -945,6 +958,12 @@ void Maxwell3D::ProcessQueryGet() {
 }
 
 void Maxwell3D::ProcessQueryCondition() {
+    if (VideoCommon::FeatureCensus::Enabled()) {
+        VideoCommon::FeatureCensus::NoteMisc(
+            VideoCommon::FeatureCensus::Misc::ConditionalRendering,
+            static_cast<u32>(regs.render_enable.mode) |
+                static_cast<u32>(regs.render_enable_override) << 8);
+    }
     if (rasterizer->AccelerateConditionalRendering()) {
         execute_on = true;
         return;
@@ -1026,6 +1045,10 @@ void Maxwell3D::ProcessCounterReset() {
             return VideoCommon::QueryType::Payload;
         }
     }();
+    if (VideoCommon::FeatureCensus::Enabled()) {
+        VideoCommon::FeatureCensus::NoteMisc(VideoCommon::FeatureCensus::Misc::CounterReset,
+                                             static_cast<u32>(regs.clear_report_value));
+    }
     rasterizer->ResetCounter(query_type);
 }
 

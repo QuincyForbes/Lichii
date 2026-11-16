@@ -30,6 +30,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/feature_census.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host_budget.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -2879,6 +2880,14 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
         // Provide a framebuffer in case it's necessary
         ImageView& dst_view = slot_image_views[dst_view_id];
         ImageView& src_view = slot_image_views[src_view_id];
+        if (FeatureCensus::Enabled()) {
+            FeatureCensus::NoteCopy(FeatureCensus::Copy::Blit, static_cast<u32>(src_view.format),
+                                    static_cast<u32>(dst_view.format),
+                                    slot_images[src_view.image_id].info.num_samples,
+                                    slot_images[dst_view.image_id].info.num_samples,
+                                    static_cast<u32>(copy.filter) |
+                                        static_cast<u32>(copy.operation) << 8);
+        }
         runtime.BlitImage(dst_framebuffer, dst_view, src_view, dst_region, src_region, copy.filter,
                           copy.operation);
     }
@@ -3893,6 +3902,16 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     if (info.type == ImageType::Buffer) {
         const ImageViewInfo view_info(config, 0);
         Churn::Add(Churn::ImageViewsCreated);
+        if (FeatureCensus::Enabled()) {
+            FeatureCensus::NoteImageView(static_cast<u32>(view_info.type),
+                                         static_cast<u32>(view_info.format),
+                                         static_cast<u32>(info.format),
+                                         static_cast<u32>(info.type),
+                                         FeatureCensus::PackSwizzle(
+                                             view_info.x_source, view_info.y_source,
+                                             view_info.z_source, view_info.w_source),
+                                         1, 1);
+        }
         return slot_image_views.insert(runtime, info, view_info, config.Address());
     }
     const u32 layer_offset = config.BaseLayer() * info.layer_stride;
@@ -4670,6 +4689,13 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
+    if (FeatureCensus::Enabled()) {
+        FeatureCensus::NoteImage(static_cast<u32>(new_info.format),
+                                 static_cast<u32>(new_info.type), new_info.num_samples,
+                                 static_cast<u32>(new_info.resources.levels),
+                                 static_cast<u32>(new_info.resources.layers),
+                                 (new_info.is_sparse ? 1U : 0U) | (new_info.forced_flushed ? 2U : 0U));
+    }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     if constexpr (requires(const Image& image) { image.FromPool(); }) {
         Churn::Add(Churn::ImagesPooled, slot_images[new_image_id].FromPool() ? 1 : 0);
@@ -4927,6 +4953,14 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             const u32 up_scale = can_rescale ? resolution.up_scale : 1;
             const u32 down_shift = can_rescale ? resolution.down_shift : 0;
             auto copies = MakeShrinkImageCopies(new_info, overlap.info, base, up_scale, down_shift);
+            if (FeatureCensus::Enabled()) {
+                FeatureCensus::NoteCopy(overlap.info.num_samples != new_image.info.num_samples
+                                            ? FeatureCensus::Copy::OverlapCopyMsaa
+                                            : FeatureCensus::Copy::OverlapCopy,
+                                        static_cast<u32>(overlap.info.format),
+                                        static_cast<u32>(new_image.info.format),
+                                        overlap.info.num_samples, new_image.info.num_samples);
+            }
             if (overlap.info.num_samples != new_image.info.num_samples) {
                 runtime.CopyImageMSAA(new_image, overlap, copies);
             } else {
@@ -5105,6 +5139,9 @@ SamplerId TextureCache<P>::FindSampler(const TSCEntry& config, bool compute) {
     }
     const auto [pair, is_new] = channel_state->samplers.try_emplace(config);
     if (is_new) {
+        if (FeatureCensus::Enabled()) {
+            FeatureCensus::NoteSampler(config.raw);
+        }
         pair->second = slot_samplers.insert(runtime, config);
     }
     return pair->second;
@@ -5447,6 +5484,15 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
                  image.gpu_addr, static_cast<u32>(info.type), static_cast<u32>(info.format),
                  info.range.base.level, info.range.extent.levels, info.range.base.layer,
                  info.range.extent.layers);
+    }
+    if (FeatureCensus::Enabled()) {
+        FeatureCensus::NoteImageView(static_cast<u32>(info.type), static_cast<u32>(info.format),
+                                     static_cast<u32>(image.info.format),
+                                     static_cast<u32>(image.info.type),
+                                     FeatureCensus::PackSwizzle(info.x_source, info.y_source,
+                                                                info.z_source, info.w_source),
+                                     static_cast<u32>(info.range.extent.levels),
+                                     static_cast<u32>(info.range.extent.layers));
     }
     const ImageViewId image_view_id = slot_image_views.insert(runtime, info, image_id, image, slot_images);
     Churn::Add(Churn::ImageViewsCreated);
@@ -6381,19 +6427,30 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
     }
     const auto dst_format_type = GetFormatType(dst.info.format);
     const auto src_format_type = GetFormatType(src.info.format);
+    const auto note_copy = [&dst, &src](FeatureCensus::Copy kind) {
+        if (FeatureCensus::Enabled()) {
+            FeatureCensus::NoteCopy(kind, static_cast<u32>(src.info.format),
+                                    static_cast<u32>(dst.info.format), src.info.num_samples,
+                                    dst.info.num_samples);
+        }
+    };
     if (src_format_type == dst_format_type) {
         if constexpr (HAS_EMULATED_COPIES) {
             if (!runtime.CanImageBeCopied(dst, src)) {
+                note_copy(FeatureCensus::Copy::EmulatedCopy);
                 return runtime.EmulateCopyImage(dst, src, copies);
             }
         }
+        note_copy(FeatureCensus::Copy::CopyImage);
         return runtime.CopyImage(dst, src, copies);
     }
     UNIMPLEMENTED_IF(dst.info.type != ImageType::e2D);
     UNIMPLEMENTED_IF(src.info.type != ImageType::e2D);
     if (runtime.ShouldReinterpret(dst, src)) {
+        note_copy(FeatureCensus::Copy::Reinterpret);
         return runtime.ReinterpretImage(dst, src, copies);
     }
+    note_copy(FeatureCensus::Copy::Convert);
     for (const ImageCopy& copy : MakeImageCopyLayers(copies)) {
         UNIMPLEMENTED_IF(copy.dst_subresource.num_layers != 1);
         UNIMPLEMENTED_IF(copy.src_subresource.num_layers != 1);

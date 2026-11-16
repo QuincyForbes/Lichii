@@ -113,6 +113,7 @@ jobs:
           set -uo pipefail
           # The step's shell has -e: a failing run must still print its output.
           rc=0
+          export LICHII_SMOKE_IOS_MSL="$PWD/smoke-ios-msl"
           out=$(build/release/bin/lichii-metal-smoke 2>&1) || rc=$?
           echo "$out"
           printf '::notice title=Metal smoke test (exit %s)::%s\n' "$rc" "$(printf '%s' "$out" | awk 'BEGIN{ORS="%0A"}{print}')"
@@ -120,6 +121,32 @@ jobs:
             echo "::warning title=Metal smoke test::no Metal device on this runner"
             exit 0
           fi
+          exit "$rc"
+
+      # The smoke test's iOS translations (base instance, SIMD groups) through the iOS Metal
+      # compiler, as the renderer builds them on a phone: MSL 3.0, fast math.
+      - name: Compile the iOS translations
+        run: |
+          set -uo pipefail
+          if ! ls smoke-ios-msl/*.metal > /dev/null 2>&1; then
+            echo "::warning title=iOS MSL::the smoke test wrote no iOS translations"
+            exit 0
+          fi
+          if ! xcrun -sdk iphoneos -find metal > /dev/null 2>&1; then
+            echo "::warning title=iOS MSL::this runner has no iOS Metal compiler"
+            exit 0
+          fi
+          rc=0
+          for source in smoke-ios-msl/*.metal; do
+            if out=$(xcrun -sdk iphoneos metal -std=metal3.0 -ffast-math -c "$source" -o "$source.air" 2>&1); then
+              echo "$source: built"
+            else
+              rc=1
+              echo "$out"
+              printf '::error title=iOS MSL %s::%s\n' "$source" "$(printf '%s' "$out" | head -c 3000 | awk 'BEGIN{ORS="%0A"}{print}')"
+            fi
+          done
+          printf '::notice title=iOS MSL::%s translations compiled with the iOS Metal compiler (exit %s)\n' "$(ls smoke-ios-msl/*.metal | wc -l | tr -d ' ')" "$rc"
           exit "$rc"
 
       - name: Check the renderer is linked
