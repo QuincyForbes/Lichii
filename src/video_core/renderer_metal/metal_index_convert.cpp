@@ -323,10 +323,12 @@ static uint read_index(device const uchar* source, constant RewriteParams& param
 kernel void rewrite_indices(device const uchar* source [[buffer(0)]],
                             device uint* indices [[buffer(1)]],
                             constant RewriteParams& params [[buffer(2)]],
-                            uint index [[thread_position_in_grid]]) {
-    if (index >= params.converted) {
+                            uint slot [[thread_position_in_grid]]) {
+    if (slot >= params.converted) {
         return;
     }
+    // Which index of the list is read; the slot written stays where it is.
+    uint index = slot;
     uint mode = params.mode;
     // 11-13: quads, quad strips and fans with the last vertex convention. The list's triangle
     // (a, b, c) becomes (c, a, b) (fans: their own order).
@@ -374,7 +376,7 @@ kernel void rewrite_indices(device const uchar* source [[buffer(0)]],
         element = index;
         break;
     }
-    indices[index] = read_index(source, params, element);
+    indices[slot] = read_index(source, params, element);
 }
 
 // A triangle strip with restarts for the last vertex convention (mode 7), in one threadgroup:

@@ -2377,10 +2377,11 @@ int RunStateCache() {
                           Near(scene.At(1, 4, upper), {0, 0, 255, 255}) &&
                           Near(scene.At(1, Size - 4, upper), {0, 255, 0, 255}) &&
                           Near(scene.At(1, Size - 4, lower), {0, 0, 255, 255});
-    // A draw is ten pieces of state and one buffer. The first of a pass sets them all (11); the
-    // second sets the scissor and the offset (2 set, 9 left); the third nothing (11 left).
+    // A draw is eleven pieces of state (the fill mode the last) and one buffer. The first of a
+    // pass sets them all (12); the second sets the scissor and the offset (2 set, 10 left); the
+    // third nothing (12 left).
     const bool caching = SwitchOn("EDEN_NX2_METAL_STATE_CACHE");
-    const bool counted = caching ? sets == 24 && skips == 20 : sets == 44 && skips == 0;
+    const bool counted = caching ? sets == 26 && skips == 22 : sets == 48 && skips == 0;
     std::printf("metal-smoke: state cache (%s): pictures %s; %llu set, %llu left as they were: "
                 "%s\n",
                 caching ? "on" : "off", pictures ? "PASS" : "FAIL",
