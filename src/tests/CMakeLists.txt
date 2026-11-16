@@ -211,7 +211,8 @@ target_link_libraries(tests PRIVATE common core audio_core input_common video_co
 if (NOT ENABLE_METAL)
     target_sources(tests PRIVATE ../video_core/renderer_metal/metal_index_convert.cpp
                                  ../video_core/renderer_metal/metal_coverage.cpp
-                                 ../video_core/renderer_metal/metal_formats.cpp)
+                                 ../video_core/renderer_metal/metal_formats.cpp
+                                 ../video_core/renderer_metal/metal_pipeline_check.cpp)
 endif()
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 

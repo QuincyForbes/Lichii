@@ -448,10 +448,14 @@ Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc,
         if (!plain) {
             descriptor.lodBias =
                 std::clamp(tsc.LodBias() + options.added_lod_bias, -15.0f, 15.0f);
-            // Tegra's SamplerReduction has MTLSamplerReductionMode's values.
-            if (tsc.reduction_filter.Value() != SamplerReduction::WeightedAverage) {
-                descriptor.reductionMode =
-                    static_cast<MTLSamplerReductionMode>(tsc.reduction_filter.Value());
+            switch (tsc.reduction_filter.Value()) {
+            case SamplerReduction::Min:
+                descriptor.reductionMode = MTLSamplerReductionModeMinimum;
+                break;
+            case SamplerReduction::Max:
+                descriptor.reductionMode = MTLSamplerReductionModeMaximum;
+                break;
+            default: break;
             }
         }
     }

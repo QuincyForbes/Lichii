@@ -2,14 +2,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_formats.h"
+#include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_metal/metal_graphics.h"
+#include "video_core/renderer_metal/metal_resources.h"
+#include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/texture_cache/decode_bc.h"
 
 namespace {
@@ -79,4 +84,64 @@ TEST_CASE("MetalTextures[GuardLine]", "[video_core]") {
     const std::string line = Metal::Coverage::TakeLine();
     REQUIRE(line.find("guards: test guard 2") != std::string::npos);
     REQUIRE(Metal::Coverage::TakeLine().empty());
+}
+
+namespace {
+
+Metal::TextureFacts FakeFacts(Metal::TextureHandle texture) {
+    switch (reinterpret_cast<uintptr_t>(texture)) {
+    case 1: // Colour, sRGB of the pipeline's RGBA8 format, one level and slice
+        return {.format = Metal::Fmt::RGBA8Unorm_sRGB};
+    case 2: // Colour with 4 samples
+        return {.format = Metal::Fmt::RGBA8Unorm, .samples = 4};
+    case 3: // Depth-stencil
+        return {.format = Metal::Fmt::Depth32Float_Stencil8};
+    default:
+        return {.format = 0};
+    }
+}
+
+} // Anonymous namespace
+
+TEST_CASE("MetalTextures[FitAttachments]", "[video_core]") {
+    (void)Metal::Coverage::TakeLine();
+    Metal::RenderPipelineDesc desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.samples = 1;
+    desc.color_formats[0] = Metal::Fmt::RGBA8Unorm;
+    desc.color_formats[1] = Metal::Fmt::RGBA8Unorm;
+    desc.depth_format = Metal::Fmt::Depth32Float;
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = reinterpret_cast<Metal::TextureHandle>(1), .level = 3,
+                        .slice = 2};
+    targets.color[1] = {.texture = reinterpret_cast<Metal::TextureHandle>(2)};
+    targets.depth = {.texture = reinterpret_cast<Metal::TextureHandle>(3)};
+    targets.has_depth = true;
+    Metal::FitAttachments(desc, targets, FakeFacts);
+    // The level and slice fit the texture, the pipeline takes its format of the same kind.
+    REQUIRE(targets.color[0].level == 0U);
+    REQUIRE(targets.color[0].slice == 0U);
+    REQUIRE(desc.color_formats[0] == Metal::Fmt::RGBA8Unorm_sRGB);
+    // Another sample count, another depth format: left out of the pass and the pipeline.
+    REQUIRE(targets.color[1].texture == nullptr);
+    REQUIRE(desc.color_formats[1] == 0U);
+    REQUIRE(!targets.has_depth);
+    REQUIRE(desc.depth_format == 0U);
+    const std::string line = Metal::Coverage::TakeLine();
+    REQUIRE(line.find("attachment level past the texture 1") != std::string::npos);
+    REQUIRE(line.find("attachment slice past the texture 1") != std::string::npos);
+    REQUIRE(line.find("pipeline and pass formats differ 3") != std::string::npos);
+}
+
+TEST_CASE("MetalTextures[Placeholders]", "[video_core]") {
+    const Metal::PipelineLimits limits{};
+    for (u32 type = 0; type < Shader::NUM_TEXTURE_TYPES; ++type) {
+        if (type == static_cast<u32>(Shader::TextureType::Buffer)) {
+            continue;
+        }
+        const Metal::TextureDesc desc = Metal::PlaceholderTexture(type);
+        INFO("texture type " << type);
+        REQUIRE(Metal::CheckTexture(desc, limits).empty());
+        REQUIRE(desc.kind != Metal::TextureKind::e1D);
+        REQUIRE(desc.kind != Metal::TextureKind::e1DArray);
+    }
 }

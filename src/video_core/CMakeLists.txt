@@ -744,9 +744,11 @@ if (ENABLE_METAL)
         endforeach()
         add_executable(lichii-metal-smoke renderer_metal/metal_smoke.mm
                        renderer_metal/metal_smoke_probe.h renderer_metal/metal_smoke_probe.mm
+                       renderer_metal/metal_smoke_textures.h renderer_metal/metal_smoke_textures.mm
                        ${METAL_SMOKE_HEADERS})
         set_source_files_properties(renderer_metal/metal_smoke.mm
-                                    renderer_metal/metal_smoke_probe.mm PROPERTIES
+                                    renderer_metal/metal_smoke_probe.mm
+                                    renderer_metal/metal_smoke_textures.mm PROPERTIES
             LANGUAGE CXX
             COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
         target_include_directories(lichii-metal-smoke PRIVATE ${METAL_SMOKE_DIR})
@@ -767,6 +769,7 @@ elseif (LICHII_METAL_COMPILE_CHECK)
     add_executable(lichii-metal-replay
         renderer_metal/metal_replay.cpp
         renderer_metal/metal_replay_stubs.cpp
+        renderer_metal/metal_coverage.cpp
         renderer_metal/metal_draw_desc.cpp
         renderer_metal/metal_formats.cpp
         renderer_metal/metal_index_convert.cpp

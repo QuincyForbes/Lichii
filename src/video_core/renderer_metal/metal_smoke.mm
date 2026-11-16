@@ -48,6 +48,7 @@
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
 #include "video_core/renderer_metal/metal_smoke_probe.h"
+#include "video_core/renderer_metal/metal_smoke_textures.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
 
 namespace {
@@ -2819,8 +2820,11 @@ int RunPipelineFiles() {
     const Metal::PipelineArchive::Counts second = reopened.Totals();
     const bool passed = boot_marked && rebooted && states_read == Variants && functions_cleared &&
                         listed && unlisted && first_built && second_built &&
-                        first.misses == Variants && first.added == Variants &&
-                        second.hits == Variants && second.misses == 0;
+                        // Built at once, a thread may find what another one just added: every
+                        // miss is added, and nothing is found that was not.
+                        first.misses + first.hits == Variants && first.misses != 0 &&
+                        first.added == first.misses && second.hits == Variants &&
+                        second.misses == 0;
     std::printf("metal-smoke: pipeline files: %zu of %zu render states read back (written twice "
                 "each), functions cleared %s; used list %s/%s; unfinished boot seen %s; %zu "
                 "pipelines on %zu threads: first %llu misses, %llu added, second %llu hits, %llu "
@@ -2854,7 +2858,7 @@ int main(int argc, char** argv) {
                                  RunPipelineCheck, RunDeviceMsl, RunBlockCopy, RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
                                  RunStagingBound, RunPipelineFiles, RunOcarinaTemporal,
-                                 SmokeProbe::RunAll}) {
+                                 SmokeTextures::RunAll, SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }

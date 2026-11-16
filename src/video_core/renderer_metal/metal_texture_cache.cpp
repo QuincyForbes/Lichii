@@ -651,9 +651,10 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     if (PipelineCheckEnabled()) {
         samples = SupportedSamples(samples, runtime->sample_limits);
         if (samples != info.num_samples) {
-            Coverage::NoteGuard("fewer samples per pixel",
-                                fmt::format("{} samples drawn at {}, the GPU's most",
-                                            info.num_samples, samples));
+            Coverage::NoteGuardWith("fewer samples per pixel", [&] {
+                return fmt::format("{} samples drawn at {}, the GPU's most", info.num_samples,
+                                   samples);
+            });
         }
     }
     if (samples == 1 && kind == TextureKind::e2DMultisampleArray) {

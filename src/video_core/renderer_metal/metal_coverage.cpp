@@ -77,20 +77,28 @@ void LogRefused(Work work, std::string_view cause, std::string_view state) {
     }
 }
 
-void NoteGuard(std::string_view name, std::string_view detail) {
+bool CountGuard(std::string_view name) {
     State& state = Get();
-    {
-        std::scoped_lock lock{state.mutex};
-        if (const auto it = state.guards.find(name); it != state.guards.end()) {
-            ++it->second;
-            return;
-        }
-        if (state.guards.size() >= MaxCauses) {
-            ++state.guards["other"];
-            return;
-        }
-        state.guards.emplace(std::string{name}, 1);
+    std::scoped_lock lock{state.mutex};
+    if (const auto it = state.guards.find(name); it != state.guards.end()) {
+        ++it->second;
+        return false;
     }
+    if (state.guards.size() >= MaxCauses) {
+        ++state.guards["other"];
+        return false;
+    }
+    state.guards.emplace(std::string{name}, 1);
+    return true;
+}
+
+void NoteGuard(std::string_view name, std::string_view detail) {
+    if (CountGuard(name)) {
+        LogGuard(name, detail);
+    }
+}
+
+void LogGuard(std::string_view name, std::string_view detail) {
     if (detail.empty()) {
         LOG_WARNING(Render_Metal, "Metal: guard: {}", name);
     } else {

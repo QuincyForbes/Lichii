@@ -753,9 +753,10 @@ struct Scheduler::Impl {
         // Metal checks an offset past the buffer's end only in its validation layer; without it
         // the GPU reads past the allocation. Zeros instead.
         if (buffer != nullptr && PipelineCheckEnabled() && offset >= AsBuffer(buffer).length) {
-            Coverage::NoteGuard("buffer offset past its end",
-                                fmt::format("offset {} of a {}-byte buffer", offset,
-                                            static_cast<u64>(AsBuffer(buffer).length)));
+            Coverage::NoteGuardWith("buffer offset past its end", [&] {
+                return fmt::format("offset {} of a {}-byte buffer", offset,
+                                   static_cast<u64>(AsBuffer(buffer).length));
+            });
             buffer = (__bridge BufferHandle)ZeroBuffer();
             offset = 0;
         }
