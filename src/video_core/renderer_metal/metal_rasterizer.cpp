@@ -614,7 +614,12 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
             Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
             return;
         }
-        if (is_indexed && draw_state.base_index != 0) {
+        // The base vertex is added to the indices (EDEN_NX2_METAL_TESS_BASE_VERTEX=0: ignored,
+        // as before).
+        static const bool tess_base = EnvironmentOn("EDEN_NX2_METAL_TESS_BASE_VERTEX");
+        if (is_indexed && tess_base) {
+            tess_draw.base_vertex = static_cast<s32>(draw_state.base_index);
+        } else if (is_indexed && draw_state.base_index != 0) {
             LOG_ONCE(warned_tess_base, "Metal: tessellated draws ignore a base vertex");
         }
         gpu_memory->FlushCaching();
@@ -1628,18 +1633,27 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             return staging_pool.Stream((std::max)(size, u64{16}), 16);
         };
         if (tess_draw->index_size != 0) {
-            if (tess_draw->widen_indices) {
-                // 8-bit indices (Metal reads 16- and 32-bit ones), widened from guest memory.
+            if (tess_draw->widen_indices || tess_draw->base_vertex != 0) {
+                // 8-bit indices (Metal reads 16- and 32-bit ones) widened from guest memory, and
+                // the base vertex added: the stage-in fetch and VertexIndex both read the index.
                 const auto& draw_state = maxwell3d->draw_manager.draw_state;
-                converted_source.resize(tess_draw->count);
+                const u32 source_size =
+                    static_cast<u32>(draw_state.index_buffer.FormatSizeInBytes());
+                converted_source.resize(size_t{tess_draw->count} * source_size);
                 gpu_memory->ReadBlockUnsafe(draw_state.index_buffer.StartAddress() +
-                                                tess_draw->first_index,
+                                                u64{tess_draw->first_index} * source_size,
                                             converted_source.data(), converted_source.size());
                 const StagingBufferRef widened = stream(u64{tess_draw->count} * sizeof(u32));
-                IndexConvert::Convert(Maxwell::PrimitiveTopology::Patches, converted_source, 1, 0,
-                                      tess_draw->count, regs.primitive_restart.enabled != 0,
-                                      std::span(reinterpret_cast<u32*>(widened.mapped_span.data()),
-                                                tess_draw->count));
+                const std::span<u32> out(reinterpret_cast<u32*>(widened.mapped_span.data()),
+                                         tess_draw->count);
+                const bool restart = regs.primitive_restart.enabled != 0;
+                IndexConvert::Convert(Maxwell::PrimitiveTopology::Patches, converted_source,
+                                      source_size, 0, tess_draw->count, restart, out);
+                for (u32& index : out) {
+                    if (!restart || index != 0xFFFFFFFFU) {
+                        index = static_cast<u32>(static_cast<s32>(index) + tess_draw->base_vertex);
+                    }
+                }
                 tess_draw->index_buffer = widened.buffer;
                 tess_draw->index_offset = widened.offset;
             } else {
@@ -1724,46 +1738,54 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     DrawState draw{};
     draw.pipeline = state;
     draw.depth_stencil = depth_stencil_state.Get();
-    // Viewport 0, as Vulkan's GetViewportState makes it (the shader flips y for Metal).
-    const auto& transform = regs.viewport_transform[0];
-    if (regs.viewport_scale_offset_enabled) {
-        draw.viewport.x = transform.translate_x - transform.scale_x;
-        draw.viewport.width = transform.scale_x * 2.0f;
-        draw.viewport.y = transform.translate_y - transform.scale_y;
-        draw.viewport.height = transform.scale_y * 2.0f;
-        if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
-            draw.viewport.y += static_cast<f32>(regs.surface_clip.height);
-            draw.viewport.height = -draw.viewport.height;
+    // Viewport i, as Vulkan's GetViewportState makes it (the shader flips y for Metal).
+    const auto make_viewport = [&](size_t index) {
+        Viewport viewport{};
+        const auto& transform = regs.viewport_transform[index];
+        if (regs.viewport_scale_offset_enabled) {
+            viewport.x = transform.translate_x - transform.scale_x;
+            viewport.width = transform.scale_x * 2.0f;
+            viewport.y = transform.translate_y - transform.scale_y;
+            viewport.height = transform.scale_y * 2.0f;
+            if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
+                viewport.y += static_cast<f32>(regs.surface_clip.height);
+                viewport.height = -viewport.height;
+            }
+            if (transform.swizzle.y == Maxwell::ViewportSwizzle::NegativeY) {
+                viewport.y += viewport.height;
+                viewport.height = -viewport.height;
+            }
+            const f32 reduce_z =
+                regs.depth_mode == Maxwell::DepthMode::MinusOneToOne ? 1.0f : 0.0f;
+            viewport.znear = transform.translate_z - transform.scale_z * reduce_z;
+            viewport.zfar = transform.translate_z + transform.scale_z;
+        } else {
+            viewport.x = static_cast<f32>(regs.surface_clip.x);
+            viewport.y = static_cast<f32>(regs.surface_clip.y);
+            viewport.width = static_cast<f32>(regs.surface_clip.width);
+            viewport.height = static_cast<f32>(regs.surface_clip.height);
         }
-        if (transform.swizzle.y == Maxwell::ViewportSwizzle::NegativeY) {
-            draw.viewport.y += draw.viewport.height;
-            draw.viewport.height = -draw.viewport.height;
+        if (is_rescaling) {
+            // As Vulkan's GetViewportState: the guest's viewport in scaled pixels.
+            const f32 scale = resolution.up_factor;
+            viewport.x *= scale;
+            viewport.y *= scale;
+            viewport.width *= scale;
+            viewport.height *= scale;
         }
-        const f32 reduce_z = regs.depth_mode == Maxwell::DepthMode::MinusOneToOne ? 1.0f : 0.0f;
-        draw.viewport.znear = transform.translate_z - transform.scale_z * reduce_z;
-        draw.viewport.zfar = transform.translate_z + transform.scale_z;
-    } else {
-        draw.viewport.x = static_cast<f32>(regs.surface_clip.x);
-        draw.viewport.y = static_cast<f32>(regs.surface_clip.y);
-        draw.viewport.width = static_cast<f32>(regs.surface_clip.width);
-        draw.viewport.height = static_cast<f32>(regs.surface_clip.height);
-    }
-    if (is_rescaling) {
-        // As Vulkan's GetViewportState: the guest's viewport in scaled pixels.
-        const f32 scale = resolution.up_factor;
-        draw.viewport.x *= scale;
-        draw.viewport.y *= scale;
-        draw.viewport.width *= scale;
-        draw.viewport.height *= scale;
-    }
-    if (draw.viewport.width == 0.0f) {
-        draw.viewport.width = 1.0f;
-    }
-    if (draw.viewport.height == 0.0f) {
-        draw.viewport.height = 1.0f;
-    }
-    const auto& scissor = regs.scissor_test[0];
-    if (scissor.enable) {
+        if (viewport.width == 0.0f) {
+            viewport.width = 1.0f;
+        }
+        if (viewport.height == 0.0f) {
+            viewport.height = 1.0f;
+        }
+        return viewport;
+    };
+    const auto make_scissor = [&](size_t index) -> Scissor {
+        const auto& scissor = regs.scissor_test[index];
+        if (!scissor.enable) {
+            return {0, 0, targets.width, targets.height};
+        }
         const bool lower_left = regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft;
         const s32 clip_height = static_cast<s32>(regs.surface_clip.height);
         const s32 min_y = (std::max)(lower_left ? clip_height - static_cast<s32>(scissor.max_y)
@@ -1779,11 +1801,32 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         const u32 max_x = scale(static_cast<u32>(scissor.max_x.Value()));
         const u32 scaled_min_y = scale(static_cast<u32>(min_y));
         const u32 scaled_max_y = scale(static_cast<u32>((std::max)(max_y, min_y)));
-        draw.scissor = {min_x, scaled_min_y, max_x > min_x ? max_x - min_x : 0U,
-                        scaled_max_y - scaled_min_y};
-    } else {
-        draw.scissor = {0, 0, targets.width, targets.height};
+        return {min_x, scaled_min_y, max_x > min_x ? max_x - min_x : 0U,
+                scaled_max_y - scaled_min_y};
+    };
+    draw.viewport = make_viewport(0);
+    draw.scissor = make_scissor(0);
+    // A program that picks the viewport gets all 16 with their scissors, as Vulkan sets them
+    // (EDEN_NX2_METAL_VIEWPORTS=0: viewport 0 only, as before).
+    static const bool all_viewports = EnvironmentOn("EDEN_NX2_METAL_VIEWPORTS");
+    if (all_viewports && pipeline.Vertex().info.stores[Shader::IR::Attribute::ViewportIndex]) {
+        draw.viewport_count = static_cast<u8>(Maxwell::NumViewports);
+        for (size_t index = 1; index < Maxwell::NumViewports; ++index) {
+            draw.more_viewports[index - 1] = make_viewport(index);
+            draw.more_scissors[index - 1] = make_scissor(index);
+        }
     }
+    // Triangles drawn as lines when the faces the draw keeps are (Metal has one fill mode for
+    // both; a point fill mode it has not).
+    const bool front_lines = regs.polygon_mode_front == Maxwell::PolygonMode::Line;
+    const bool back_lines = regs.polygon_mode_back == Maxwell::PolygonMode::Line;
+    const bool culls = regs.gl_cull_test_enabled != 0;
+    static const bool fill_lines = EnvironmentOn("EDEN_NX2_METAL_FILL_LINES");
+    draw.fill_lines =
+        fill_lines &&
+        ((front_lines && back_lines) ||
+         (culls && regs.gl_cull_face == Maxwell::CullFace::Back && front_lines) ||
+         (culls && regs.gl_cull_face == Maxwell::CullFace::Front && back_lines));
     if (regs.gl_cull_test_enabled != 0) {
         switch (regs.gl_cull_face) {
         case Maxwell::CullFace::Front:

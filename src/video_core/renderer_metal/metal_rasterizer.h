@@ -215,6 +215,8 @@ private:
         u32 first_index;
         BufferHandle index_buffer;
         u64 index_offset;
+        /// Added to every index (the indices are then read from guest memory and widened).
+        s32 base_vertex;
     };
 
     /// Before a draw, clear or dispatch: commits the command buffer being recorded once the
