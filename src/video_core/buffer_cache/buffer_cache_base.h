@@ -40,6 +40,7 @@
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/cpu_read_stats.h"
 #include "video_core/buffer_cache/cpu_write_stats.h"
+#include "video_core/buffer_cache/hot_pages.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
@@ -821,6 +822,43 @@ private:
     }
 
     void NoteCpuDirty(DAddr device_addr, u64 size);
+
+    /// EDEN_NX2_HOT_PAGES (hot_pages.h): ends an epoch. The hot pages uploaded in it read as
+    /// CPU-modified again, and everything that remembers them by the writes it was told of
+    /// hears of one write to each (NoteHotPagesWritten).
+    void AdvanceHotPages(bool new_frame);
+
+    /// A write to hot pages nobody was told of: at the end of an epoch, or a hot page the GPU
+    /// writes (it turns CPU-modified again, whatever the guest wrote since its upload).
+    void NoteHotPagesWritten(DAddr device_addr, u64 size) {
+        NoteUniformWrite(device_addr, size);
+        NoteCpuDirty(device_addr, size);
+        MarkVertexBuffersStale(device_addr, size);
+    }
+
+    /// Mode 2: ends the epoch when a guest command list ended since it began.
+    void AdvanceHotPagesByList() {
+        if (HotPages::g_mode > 1 &&
+            hot_pages_lists != HotPages::g_command_lists.load(std::memory_order_relaxed))
+            [[unlikely]] {
+            AdvanceHotPages(false);
+        }
+    }
+
+    /// A range the tracker hands to an upload: a hot page's upload is the first the cache hears
+    /// of its writes, so what NoteHotPagesWritten cannot reach at the end of an epoch (a page
+    /// nothing used in it) is told here.
+    void NoteHotPagesUploaded(DAddr device_addr, u64 size);
+
+    /// EDEN_NX2_HOT_PAGES_VERIFY: counts the binds whose bytes on a hot page changed since the
+    /// page's upload in this epoch (data a tracked page would have uploaded again).
+    void VerifyHotPages(DAddr device_addr, u32 size);
+
+    /// The guest command lists ended (HotPages::g_command_lists) when the epoch began.
+    u32 hot_pages_lists = 0;
+    /// EDEN_NX2_HOT_PAGES_VERIFY: the bytes each hot page was uploaded with.
+    std::unordered_map<DAddr, std::unique_ptr<std::array<u8, Core::DEVICE_PAGESIZE>>>
+        hot_page_shadows;
 
     struct UboPageWrite {
         u32 gen{};

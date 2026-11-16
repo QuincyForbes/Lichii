@@ -213,7 +213,9 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// "cpu_writes_old": guest writes of pages holding GPU-written bytes stay trapped until the next
 /// fence, as before (EDEN_NX2_CPU_WRITE_RECLAIM=0). "gpu_reads_old": a guest read of GPU-written
 /// bytes still on their way makes the GPU thread copy the page again and wait for the GPU to go
-/// idle, as before (EDEN_NX2_GPU_READ_LAND=0). "metal_trace_off": the Metal renderer leaves
+/// idle, as before (EDEN_NX2_GPU_READ_LAND=0). "hot_pages_off": every page the guest rewrites
+/// is write-protected again at each upload, as before (EDEN_NX2_HOT_PAGES=0).
+/// "metal_trace_off": the Metal renderer leaves
 /// SIGABRT and uncaught exceptions unlogged and asks for no per-encoder command buffer status
 /// (EDEN_NX2_METAL_ABORT_TRACE=0, EDEN_NX2_METAL_ENCODER_STATUS=0). "metal_check_off": the Metal
 /// renderer hands Metal the guest's vertex layout, pipeline, texture and texture view

@@ -305,6 +305,61 @@ void BufferCache<P>::TickFrame() {
         runtime.FreeDeferredStagingBuffer(buffer);
     }
     async_buffers_death_ring.clear();
+    if (HotPages::g_mode != 0) {
+        AdvanceHotPages(true);
+    }
+}
+
+template <class P>
+void BufferCache<P>::AdvanceHotPages(bool new_frame) {
+    hot_pages_lists = HotPages::g_command_lists.load(std::memory_order_relaxed);
+    memory_tracker.AdvanceHotPages(
+        new_frame, [this](DAddr device_addr, u64 size) { NoteHotPagesWritten(device_addr, size); });
+}
+
+template <class P>
+void BufferCache<P>::NoteHotPagesUploaded(DAddr device_addr, u64 size) {
+    if (!memory_tracker.IsRegionHot(device_addr, size)) {
+        return;
+    }
+    MarkVertexBuffersStale(device_addr, size);
+    if (!HotPages::g_verify) [[likely]] {
+        return;
+    }
+    const DAddr end = device_addr + size;
+    for (DAddr page = device_addr; page < end; page += Core::DEVICE_PAGESIZE) {
+        const u8* const guest = device_memory.template GetPointer<u8>(page);
+        if (guest == nullptr || !memory_tracker.IsRegionHot(page, Core::DEVICE_PAGESIZE)) {
+            continue;
+        }
+        auto& shadow = hot_page_shadows[page];
+        if (!shadow) {
+            shadow = std::make_unique<std::array<u8, Core::DEVICE_PAGESIZE>>();
+        } else if (std::memcmp(shadow->data(), guest, Core::DEVICE_PAGESIZE) == 0) {
+            // The bytes of its previous upload: a tracked page would not have been sent again.
+            HotPages::Add(HotPages::g_counters.verify_same, 1);
+        }
+        std::memcpy(shadow->data(), guest, Core::DEVICE_PAGESIZE);
+        HotPages::Add(HotPages::g_counters.verify_uploads, 1);
+    }
+}
+
+template <class P>
+void BufferCache<P>::VerifyHotPages(DAddr device_addr, u32 size) {
+    const DAddr end = device_addr + size;
+    memory_tracker.ForEachHotCleanPage(device_addr, size, [&](DAddr page) {
+        const auto it = hot_page_shadows.find(page);
+        const u8* const guest = device_memory.template GetPointer<u8>(page);
+        if (it == hot_page_shadows.end() || guest == nullptr) {
+            return;
+        }
+        const u64 begin = (std::max)(page, device_addr) - page;
+        const u64 stop = (std::min<DAddr>)(page + Core::DEVICE_PAGESIZE, end) - page;
+        HotPages::Add(HotPages::g_counters.verify_uses, 1);
+        if (std::memcmp(it->second->data() + begin, guest + begin, stop - begin) != 0) {
+            HotPages::Add(HotPages::g_counters.verify_stale, 1);
+        }
+    });
 }
 
 template <class P>
@@ -975,7 +1030,9 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     dest_buffer.MarkUsage(copy.dst_offset, copy.size);
     runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
     if (has_new_downloads && !inline_grid_copy) {
-        memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount);
+        if (memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount)) {
+            NoteHotPagesWritten(*cpu_dest_address, amount);
+        }
         NoteGpuMark(*cpu_dest_address, amount, 1);
         const bool should_sync = Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         if (should_sync) {
@@ -1139,6 +1196,7 @@ void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
 
 template <class P>
 void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
+    AdvanceHotPagesByList();
     ++native_bank_draw;
     do {
         channel_state->has_deleted_buffers = false;
@@ -1148,6 +1206,7 @@ void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
 
 template <class P>
 void BufferCache<P>::UpdateComputeBuffers() {
+    AdvanceHotPagesByList();
     do {
         channel_state->has_deleted_buffers = false;
         DoUpdateComputeBuffers();
@@ -1858,6 +1917,19 @@ void BufferCache<P>::RefreshRepackedVertexBuffers() {
 template <class P>
 void BufferCache<P>::BindHostVertexBuffers() {
     RefreshRepackedVertexBuffers();
+    // A hot page is uploaded by SynchronizeBuffer below with no write trap before the draw to mark
+    // its stream stale: rebuild the repacked copy within this draw.
+    const auto refresh_hot_repack = [this](u32 index) {
+        if (HotPages::g_mode == 0 || ((stale_vertex_buffers_mask >> index) & 1) == 0) {
+            return;
+        }
+        if constexpr (requires { runtime.IsVertexRepacked(u32{}); }) {
+            stale_vertex_buffers_mask &= ~(1U << index);
+            if (runtime.IsVertexRepacked(index)) {
+                maxwell3d->dirty.flags[Dirty::VertexBuffer0 + index] = true;
+            }
+        }
+    };
 
 #ifdef __ANDROID__
     const bool use_optimized_vertex_buffers = Settings::values.use_optimized_vertex_buffers.GetValue();
@@ -1886,6 +1958,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
             Buffer& buffer = slot_buffers[binding.buffer_id];
             TouchBuffer(buffer, binding.buffer_id);
             SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+            refresh_hot_repack(index);
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 flush_bindings();
                 continue;
@@ -1916,6 +1989,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
             Buffer& buffer = slot_buffers[binding.buffer_id];
             TouchBuffer(buffer, binding.buffer_id);
             SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+            refresh_hot_repack(index);
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 continue;
             }
@@ -2063,7 +2137,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             if (VideoCommon::UniformStreamReuseEnabled()) {
                 streamed = VideoCommon::BindSmallUniformReusing(
                     runtime, device_memory, stage, index, binding_index, device_addr, size,
-                    VideoCore::Nx2Debug::Experiment(17) != 0, cb_write_serial,
+                    VideoCore::Nx2Debug::Experiment(17) != 0,
+                    // No write to a hot page is seen: serial 0 makes every bind compare its bytes.
+                    memory_tracker.IsRegionHot(device_addr, size) ? 0 : cb_write_serial,
                     UboPageGen(device_addr, size), [this, device_addr, size](u64& gen) {
                         return UboRangeClean(device_addr, size, gen);
                     });
@@ -2146,7 +2222,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 continue;
             }
             std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
-            memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
+            memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE, false);
             NoteCpuDirty(page, Core::DEVICE_PAGESIZE);
             if (once_per_draw) {
                 snapshot.checked_draw = native_bank_draw;
@@ -2365,7 +2441,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             snapshot.checked_write_serial = cb_write_serial;
             snapshot.recheck = collected || written;
             needs_per_bind |= snapshot.recheck;
-            memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
+            memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE, false);
             NoteCpuDirty(page, Core::DEVICE_PAGESIZE);
             continue;
         }
@@ -2439,7 +2515,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             has_hot = true;
         }
         std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
-        memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
+        memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE, false);
         NoteCpuDirty(page, Core::DEVICE_PAGESIZE);
     }
     memo.device_addr = device_addr;
@@ -2615,7 +2691,9 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
                     if (compute_bindcache && VideoCommon::UniformStreamReuseEnabled() &&
                         VideoCommon::BindSmallUniformReusing(
                             runtime, device_memory, 5, index, binding_index, binding.device_addr,
-                            size, VideoCore::Nx2Debug::Experiment(17) != 0, cb_write_serial,
+                            size, VideoCore::Nx2Debug::Experiment(17) != 0,
+                            memory_tracker.IsRegionHot(binding.device_addr, size) ? 0
+                                                                                  : cb_write_serial,
                             UboPageGen(binding.device_addr, size),
                             [this, addr = binding.device_addr, size](u64& gen) {
                                 return UboRangeClean(addr, size, gen);
@@ -3234,7 +3312,9 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     for (auto& ranges : pending_download_ranges) {
         ranges.Subtract(device_addr, size);
     }
-    memory_tracker.MarkRegionAsGpuModified(device_addr, size);
+    if (memory_tracker.MarkRegionAsGpuModified(device_addr, size)) {
+        NoteHotPagesWritten(device_addr, size);
+    }
     NoteGpuMark(device_addr, size, 0);
     MarkVertexBuffersStale(device_addr, size);
     static const bool mark_guards = [] {
@@ -3886,6 +3966,10 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
 
 template <class P>
 bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
+    AdvanceHotPagesByList();
+    if (HotPages::g_verify) [[unlikely]] {
+        VerifyHotPages(device_addr, size);
+    }
     // An upload over a clean word of the tracker (word_manager.h) finds and changes nothing:
     // walk only the dirty ones. Verify walks every word and checks the clean words.
     const bool skip_clean = Nx2Perf::On(Nx2Perf::Opt::CleanWords) && !Nx2Perf::Verify();
@@ -3971,6 +4055,9 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
             largest_copy = (std::max)(largest_copy, range_size);
         };
         for_each_upload_range([&](u64 device_addr_out, u64 range_size) {
+            if (HotPages::g_mode != 0) {
+                NoteHotPagesUploaded(device_addr_out, range_size);
+            }
             DAddr upload_start = device_addr_out;
             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, [&](DAddr gpu_start, DAddr gpu_end) {
                 add_upload(upload_start, gpu_start);
@@ -3998,6 +4085,9 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
         u64 largest_copy = 0;
         DAddr buffer_start = buffer.CpuAddr();
         for_each_upload_range([&](u64 device_addr_out, u64 range_size) {
+            if (HotPages::g_mode != 0) {
+                NoteHotPagesUploaded(device_addr_out, range_size);
+            }
             copies.push_back(BufferCopy{
                 .src_offset = total_size_bytes,
                 .dst_offset = device_addr_out - buffer_start,
@@ -4426,7 +4516,7 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     // Mark the whole buffer as CPU written to stop tracking CPU writes
     if (!do_not_mark) {
         Buffer& buffer = slot_buffers[buffer_id];
-        memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddr(), buffer.SizeBytes());
+        memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddr(), buffer.SizeBytes(), false);
         ++cpu_dirty_epoch;
     }
 
