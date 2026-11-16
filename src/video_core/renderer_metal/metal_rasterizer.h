@@ -254,6 +254,11 @@ private:
     /// Counts the draw PrepareDraw skipped.
     void NoteUnprepared();
 
+    /// Whether the draw's indices are rewritten so flat inputs take the last vertex, as the
+    /// game asks (EDEN_NX2_METAL_PROVOKING_LAST=1, pipelines with flat inputs).
+    [[nodiscard]] bool ProvokingLastWanted(const GraphicsPipeline& pipeline, bool is_indexed,
+                                           u32 count, u32 index_size, bool restart);
+
     /// Counts a draw not done, and logs the cause with the draw's state the first time.
     void RefuseDraw(std::string_view cause);
 

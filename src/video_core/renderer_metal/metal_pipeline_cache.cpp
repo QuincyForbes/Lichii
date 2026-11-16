@@ -65,7 +65,15 @@ GraphicsPipeline::GraphicsPipeline(const GraphicsPipelineKey& key_, StageProgram
                                    StageProgram fragment_, std::optional<MeshEmulation> mesh_,
                                    std::optional<Tessellation> tessellation_)
     : key{key_}, vertex{std::move(vertex_)}, fragment{std::move(fragment_)},
-      mesh{std::move(mesh_)}, tessellation{std::move(tessellation_)} {}
+      mesh{std::move(mesh_)}, tessellation{std::move(tessellation_)} {
+    if (!fragment.entry_point.empty()) {
+        for (size_t index = 0; index < fragment.info.interpolation.size(); ++index) {
+            flat_inputs = flat_inputs ||
+                          (fragment.info.loads.Generic(index) &&
+                           fragment.info.interpolation[index] == Shader::Interpolation::Flat);
+        }
+    }
+}
 
 void* GraphicsPipeline::VertexKernelState(const Device& device, size_t variant,
                                           const RenderPipelineDesc& layout) {

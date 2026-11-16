@@ -71,6 +71,11 @@ public:
         return fragment;
     }
 
+    /// Whether the pixel program reads an input without interpolation (the provoking vertex's).
+    [[nodiscard]] bool HasFlatInputs() const noexcept {
+        return flat_inputs;
+    }
+
     /// Builds the stages' functions; false (logged once) when Metal rejects one.
     bool BuildFunctions(const Device& device);
 
@@ -102,6 +107,7 @@ private:
     PipelineArchive* archive{};
     PipelineFiles* recorder{};
     bool used{};
+    bool flat_inputs{};
     ::Common::unordered_map<u64, Object> render_states;
     /// Vertex kernel states by variant and vertex layout.
     ::Common::unordered_map<u64, Object> vertex_kernel_states;

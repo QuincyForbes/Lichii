@@ -885,6 +885,7 @@ int RunIndexRewrite() {
         Topology topology;
         uint32_t index_size;
         bool restart;
+        bool provoking_last{};
         Metal::Object output;
         uint8_t* contents{};
         uint32_t converted{};
@@ -896,6 +897,12 @@ int RunIndexRewrite() {
             cases.push_back({topology, index_size, topology == Topology::TriangleStrip});
         }
     }
+    // Rewritten for the provoking vertex (EDEN_NX2_METAL_PROVOKING_LAST): strips without restarts.
+    for (const Topology topology : {Topology::Triangles, Topology::TriangleStrip}) {
+        for (const uint32_t index_size : {1U, 2U, 4U}) {
+            cases.push_back({topology, index_size, false, true});
+        }
+    }
     // One source for all: bytes that make different values at each size, with restart values.
     for (uint32_t byte = 0; byte < Count * 4; ++byte) {
         source[SourceOffset + byte] = static_cast<uint8_t>(byte * 37 + 5);
@@ -903,10 +910,10 @@ int RunIndexRewrite() {
     std::memset(source + SourceOffset + 4 * 2, 0xFF, 4);
     scheduler.BeginCompute(state.Get());
     for (Case& test : cases) {
-        test.converted = IndexConvert::ConvertedCount(test.topology, Count);
+        test.converted = IndexConvert::ConvertedCount(test.topology, Count, test.provoking_last);
         test.output = Metal::CreateBuffer(device, test.converted * 4, true, &test.contents);
         const IndexConvert::RewriteParams params{
-            .mode = IndexConvert::RewriteMode(test.topology),
+            .mode = IndexConvert::RewriteMode(test.topology, test.provoking_last),
             .index_size = test.index_size,
             .count = Count,
             .restart = test.restart ? 1U : 0U,
@@ -925,7 +932,8 @@ int RunIndexRewrite() {
         std::vector<uint32_t> expected(test.converted);
         IndexConvert::Convert(test.topology,
                               std::span<const uint8_t>(source + SourceOffset, Count * 4),
-                              test.index_size, 0, Count, test.restart, expected);
+                              test.index_size, 0, Count, test.restart, expected,
+                              test.provoking_last);
         for (uint32_t index = 0; index < test.converted; ++index) {
             uint32_t value;
             std::memcpy(&value, test.contents + index * 4, 4);
@@ -933,9 +941,24 @@ int RunIndexRewrite() {
         }
         total += test.converted;
     }
-    std::printf("metal-smoke: index rewrite kernel vs CPU (%zu cases, %u indices): %u wrong: %s\n",
-                cases.size(), total, wrong, wrong == 0 ? "PASS" : "FAIL");
-    return wrong == 0 ? 0 : 1;
+    // A strip with a restart, rewritten for the provoking vertex on the CPU: each part on its own,
+    // every triangle starting with its last vertex and keeping its winding.
+    const std::array<uint16_t, 9> strip{0, 1, 2, 3, 0xFFFF, 4, 5, 6, 7};
+    const std::array<uint32_t, 12> strip_expected{2, 0, 1, 3, 2, 1, 6, 4, 5, 7, 6, 5};
+    std::array<uint32_t, 21> strip_out{};
+    const uint32_t strip_written = IndexConvert::Convert(
+        Topology::TriangleStrip,
+        std::span(reinterpret_cast<const uint8_t*>(strip.data()), sizeof(strip)), 2, 0,
+        static_cast<uint32_t>(strip.size()), true, strip_out, true);
+    const bool strip_passed =
+        strip_written == strip_expected.size() &&
+        std::equal(strip_expected.begin(), strip_expected.end(), strip_out.begin());
+    const bool passed = wrong == 0 && strip_passed;
+    std::printf("metal-smoke: index rewrite kernel vs CPU (%zu cases, %u indices): %u wrong; "
+                "provoking vertex strip with a restart %u indices: %s: %s\n",
+                cases.size(), total, wrong, strip_written, strip_passed ? "as expected" : "WRONG",
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
 }
 
 /// A packed RG11B10 float channel (`mantissa_bits` 6 or 5, 5-bit exponent, no sign).

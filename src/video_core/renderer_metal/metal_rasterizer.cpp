@@ -543,18 +543,22 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     }
     const bool u8_indices =
         is_indexed && draw_state.index_buffer.format == Maxwell::IndexFormat::UnsignedByte;
-    const bool convert = IndexConvert::NeedsConversion(draw_state.topology) || u8_indices;
+    const u32 count = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+    const u32 index_size =
+        is_indexed ? static_cast<u32>(draw_state.index_buffer.FormatSizeInBytes()) : 0U;
+    const bool restart = maxwell3d->regs.primitive_restart.enabled != 0;
+    const bool provoking_last = ProvokingLastWanted(*pipeline, is_indexed, count, index_size,
+                                                    restart);
+    const bool convert =
+        IndexConvert::NeedsConversion(draw_state.topology) || u8_indices || provoking_last;
     const std::optional<u32> primitive =
-        PrimitiveType(IndexConvert::ConvertedTopology(draw_state.topology));
+        PrimitiveType(IndexConvert::ConvertedTopology(draw_state.topology, provoking_last));
     if (!primitive) {
         RefuseDraw("topology Metal can't draw");
         return;
     }
-    const u32 count = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
-    const u32 index_size =
-        is_indexed ? static_cast<u32>(draw_state.index_buffer.FormatSizeInBytes()) : 0U;
-    const u32 converted = convert ? IndexConvert::ConvertedCount(draw_state.topology, count) : 0U;
-    const bool restart = maxwell3d->regs.primitive_restart.enabled != 0;
+    u32 converted =
+        convert ? IndexConvert::ConvertedCount(draw_state.topology, count, provoking_last) : 0U;
     if (convert && converted == 0) {
         Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
         return;
@@ -577,12 +581,17 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         const GPUVAddr start = draw_state.index_buffer.StartAddress() +
                                GPUVAddr{draw_state.index_buffer.first} * index_size;
         const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(start);
+        // A strip rewritten for the provoking vertex with restarts is rewritten on the CPU (its
+        // indices are not GPU-written, or ProvokingLastWanted left it as it is).
+        const bool cpu_only = provoking_last && restart &&
+                              draw_state.topology == Maxwell::PrimitiveTopology::TriangleStrip;
         index_rewrite.wanted =
-            gpu_indices == '1' ||
-            (device_addr && buffer_cache.IsRegionGpuModified(*device_addr,
-                                                             size_t{count} * index_size));
+            !cpu_only &&
+            (gpu_indices == '1' ||
+             (device_addr && buffer_cache.IsRegionGpuModified(*device_addr,
+                                                              size_t{count} * index_size)));
         index_rewrite.params = {
-            .mode = IndexConvert::RewriteMode(draw_state.topology),
+            .mode = IndexConvert::RewriteMode(draw_state.topology, provoking_last),
             .index_size = index_size,
             .count = count,
             .restart = restart ? 1U : 0U,
@@ -597,6 +606,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     CountOcclusion();
     Coverage::Note(Coverage::Work::Draw, convert ? Coverage::Path::RewrittenIndices
                                                  : Coverage::Path::Native);
+
     if (convert) {
         // 32-bit indices in the stream ring: from the GPU rewrite, or rewritten on the CPU from
         // the guest's indices (or the vertex range).
@@ -620,14 +630,16 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
             indices = staging_pool.Stream(size_t{converted} * sizeof(u32), 4);
             const std::span<u32> out(reinterpret_cast<u32*>(indices.mapped_span.data()),
                                      converted);
-            IndexConvert::Convert(draw_state.topology, source, index_size,
-                                  is_indexed ? 0U : draw_state.vertex_buffer.first, count, restart,
-                                  out);
+            converted = IndexConvert::Convert(draw_state.topology, source, index_size,
+                                              is_indexed ? 0U : draw_state.vertex_buffer.first,
+                                              count, restart, out, provoking_last);
         }
-        scheduler.DrawIndexed(*primitive, converted, 4, indices.buffer, indices.offset,
-                              instance_count,
-                              is_indexed ? static_cast<s32>(draw_state.base_index) : 0,
-                              draw_state.base_instance);
+        if (converted != 0) {
+            scheduler.DrawIndexed(*primitive, converted, 4, indices.buffer, indices.offset,
+                                  instance_count,
+                                  is_indexed ? static_cast<s32>(draw_state.base_index) : 0,
+                                  draw_state.base_instance);
+        }
         ++draws_converted;
     } else if (is_indexed) {
         const BufferCacheRuntime::IndexState& index = buffer_cache_runtime.Index();
@@ -1967,6 +1979,36 @@ void RasterizerMetal::CountOcarinaTemporal(bool replaced, const char* reason) {
              oot_motion.extent[1], reasons);
     oot_replaced = oot_declined = 0;
     oot_decline_reasons = {};
+}
+
+bool RasterizerMetal::ProvokingLastWanted(const GraphicsPipeline& pipeline, bool is_indexed,
+                                          u32 count, u32 index_size, bool restart) {
+    // EDEN_NX2_METAL_PROVOKING_LAST=1: flat inputs take the last vertex when the game asks for it.
+    // Off by default, as MoltenVK (no VK_EXT_provoking_vertex): every such draw is rewritten.
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_PROVOKING_LAST");
+        return value != nullptr && value[0] == '1';
+    }();
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (!enabled || maxwell3d->regs.provoking_vertex != Maxwell::ProvokingVertex::Last ||
+        !IndexConvert::RotatesForProvokingVertex(draw_state.topology) ||
+        !pipeline.HasFlatInputs()) {
+        return false;
+    }
+    if (is_indexed && restart && draw_state.topology == Maxwell::PrimitiveTopology::TriangleStrip &&
+        draw_state.inline_index_draw_indexes.empty()) {
+        // Where such a strip starts again is only found on the CPU, from guest memory: indices
+        // the GPU wrote are not there yet.
+        const GPUVAddr start = draw_state.index_buffer.StartAddress() +
+                               GPUVAddr{draw_state.index_buffer.first} * index_size;
+        const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(start);
+        std::scoped_lock lock{buffer_cache.mutex};
+        if (!device_addr ||
+            buffer_cache.IsRegionGpuModified(*device_addr, size_t{count} * index_size)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void RasterizerMetal::NoteUnprepared() {

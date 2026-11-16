@@ -291,6 +291,14 @@ EDEN_NX2_FENCE_BATCH=1
 # motion and the effects mask Vulkan adds are not made on Metal.
 #EDEN_NX2_METAL_OOT_TEMPORAL=0
 
+# Metal renderer: 1 rewrites the indices of triangle lists and strips drawn with a pixel program
+# that reads flat inputs while the game asks for the last vertex's values (the provoking vertex),
+# so that they take the last vertex as on a Vulkan driver with VK_EXT_provoking_vertex; Metal
+# takes the first. Off by default, as MoltenVK, which has no such extension: every such draw
+# would be rewritten on the CPU or by a kernel. Strips with restart indices the GPU wrote stay as
+# they are.
+#EDEN_NX2_METAL_PROVOKING_LAST=1
+
 # Either renderer: 0 makes the GPU thread's front wait for the GPU and read a compute dispatch's
 # size the GPU wrote (Ocarina of Time's light tiles, once a frame). By default it passes
 # placeholders on; the dispatch takes its size from the GPU's buffer, and the copy of the size
