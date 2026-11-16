@@ -1924,7 +1924,7 @@ int RunClearRect() {
     desc.topology_class = 2;
     desc.rasterize = 1;
     desc.attributes[0] = {1, 0, 0, Maxwell::VertexAttribute::Type::Float,
-                          Maxwell::VertexAttribute::Side::Size_R32_G32};
+                          Maxwell::VertexAttribute::Size::Size_R32_G32};
     desc.streams[0] = {1, 8, 0};
     const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
     const Metal::Object equal_state = [&] {
