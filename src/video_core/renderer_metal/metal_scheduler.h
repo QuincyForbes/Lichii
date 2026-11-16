@@ -106,6 +106,20 @@ struct SampleCopy {
     std::array<u32, 2> shift{}; ///< log2 of the guest's samples across and down
 };
 
+/// A nearest scaling of a whole layer that Blit can't draw: a multisampled source into a
+/// texture of its sample count (sample for sample), or a stencil-only one (the fragment exports
+/// the stencil). Resolution scaling of such images (Image::CopyScaled).
+struct ScalePass {
+    TextureHandle src{};  ///< A 2D multisample array, or a Stencil8 2D array view of one level
+    u32 src_layer{};
+    u32 src_width{};
+    u32 src_height{};
+    Attachment dst{};
+    u32 dst_format{};
+    u32 dst_width{};
+    u32 dst_height{};
+};
+
 /// A conversion between a depth and a colour image (Vulkan's BlitImageHelper::Convert*).
 enum class ConvertKind : u8 {
     DepthToColor, ///< D32F / D16 / X8D24 -> R32F, R16, ABGR8 (depth in every channel, alpha 1)
@@ -296,6 +310,9 @@ public:
 
     /// False when no pipeline draws the conversion into dst's format (nothing is drawn).
     bool Convert(const ConvertPass& pass);
+
+    /// False when no pipeline scales into dst's format (a depth-stencil multisampled one).
+    bool ScaleNearest(const ScalePass& pass);
 
     /// Guest depth (and stencil) bytes from `src` into a region of a depth or depth-stencil
     /// texture: drawn, the fragment writing depth and stencil (Metal's blit copies take depth and

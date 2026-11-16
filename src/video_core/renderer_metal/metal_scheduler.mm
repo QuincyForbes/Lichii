@@ -276,6 +276,55 @@ fragment DepthStencilOut convert_abgr8_to_d24s8(ClearOut in [[stage_in]],
     return out;
 }
 
+// Nearest scaling of what Blit can't draw (ScalePass): sample for sample, or the stencil.
+struct ScaleParams {
+    uint2 src_size;
+    uint2 dst_size;
+    uint layer;
+};
+
+uint2 ScaledTexel(float2 position, constant ScaleParams& p) {
+    return min(uint2(position) * p.src_size / p.dst_size, p.src_size - 1);
+}
+
+fragment float4 scale_samples_float(ClearOut in [[stage_in]], uint sample_index [[sample_id]],
+                                    texture2d_ms_array<float> src [[texture(0)]],
+                                    constant ScaleParams& p [[buffer(0)]]) {
+    return src.read(ScaledTexel(in.position.xy, p), p.layer, sample_index);
+}
+
+fragment uint4 scale_samples_uint(ClearOut in [[stage_in]], uint sample_index [[sample_id]],
+                                  texture2d_ms_array<uint> src [[texture(0)]],
+                                  constant ScaleParams& p [[buffer(0)]]) {
+    return src.read(ScaledTexel(in.position.xy, p), p.layer, sample_index);
+}
+
+fragment int4 scale_samples_sint(ClearOut in [[stage_in]], uint sample_index [[sample_id]],
+                                 texture2d_ms_array<int> src [[texture(0)]],
+                                 constant ScaleParams& p [[buffer(0)]]) {
+    return src.read(ScaledTexel(in.position.xy, p), p.layer, sample_index);
+}
+
+fragment DepthOut scale_samples_depth(ClearOut in [[stage_in]], uint sample_index [[sample_id]],
+                                      depth2d_ms_array<float> src [[texture(0)]],
+                                      constant ScaleParams& p [[buffer(0)]]) {
+    DepthOut out;
+    out.depth = src.read(ScaledTexel(in.position.xy, p), p.layer, sample_index);
+    return out;
+}
+
+struct StencilOut {
+    uint stencil [[stencil]];
+};
+
+fragment StencilOut scale_stencil(ClearOut in [[stage_in]],
+                                  texture2d_array<uint> src [[texture(0)]],
+                                  constant ScaleParams& p [[buffer(0)]]) {
+    StencilOut out;
+    out.stencil = src.read(ScaledTexel(in.position.xy, p), p.layer).r;
+    return out;
+}
+
 // Guest depth and stencil bytes (DepthLayout) to and from depth textures.
 struct DepthCopyParams {
     int2 origin;
@@ -1134,6 +1183,47 @@ struct Scheduler::Impl {
         return pipeline;
     }
 
+    /// The pipeline of a nearest scaling into `format` with `samples` per pixel (ScaleNearest).
+    id<MTLRenderPipelineState> ScalePipeline(MTLPixelFormat format, NSUInteger samples) {
+        const u64 key = (static_cast<u64>(format) << 8) | static_cast<u64>(samples);
+        if (const auto it = scale_pipelines.find(key); it != scale_pipelines.end()) {
+            return it->second;
+        }
+        NSString* fragment = nil;
+        const FormatClass format_class = ClassOf(static_cast<u32>(format));
+        switch (format_class) {
+        case FormatClass::Float: fragment = @"scale_samples_float"; break;
+        case FormatClass::Uint: fragment = @"scale_samples_uint"; break;
+        case FormatClass::Sint: fragment = @"scale_samples_sint"; break;
+        case FormatClass::Depth: fragment = @"scale_samples_depth"; break;
+        case FormatClass::Stencil: fragment = samples == 1 ? @"scale_stencil" : nil; break;
+        default: break;
+        }
+        id<MTLRenderPipelineState> pipeline = nil;
+        if (library != nil && fragment != nil) {
+            MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+            desc.label = @"Scale";
+            desc.vertexFunction = [library newFunctionWithName:@"clear_vertex"];
+            desc.fragmentFunction = [library newFunctionWithName:fragment];
+            desc.rasterSampleCount = samples;
+            if (format_class == FormatClass::Depth) {
+                desc.depthAttachmentPixelFormat = format;
+            } else if (format_class == FormatClass::Stencil) {
+                desc.stencilAttachmentPixelFormat = format;
+            } else {
+                desc.colorAttachments[0].pixelFormat = format;
+            }
+            NSError* error = nil;
+            pipeline = [device.GetDevice() newRenderPipelineStateWithDescriptor:desc error:&error];
+            if (pipeline == nil) {
+                LOG_ERROR(Render_Metal, "Metal: scaling pipeline for format {} failed: {}",
+                          static_cast<u32>(format), error.localizedDescription.UTF8String);
+            }
+        }
+        scale_pipelines.emplace(key, pipeline);
+        return pipeline;
+    }
+
     /// The pipeline of a format conversion into `format` (Convert).
     id<MTLRenderPipelineState> ConvertPipeline(ConvertKind kind, MTLPixelFormat format) {
         const u64 key = (static_cast<u64>(format) << 8) | static_cast<u64>(kind);
@@ -1218,6 +1308,7 @@ struct Scheduler::Impl {
     std::unordered_map<u32, id<MTLDepthStencilState>> clear_depth_states;
     std::unordered_map<u64, id<MTLRenderPipelineState>> sample_pipelines;
     std::unordered_map<u64, id<MTLRenderPipelineState>> convert_pipelines;
+    std::unordered_map<u64, id<MTLRenderPipelineState>> scale_pipelines;
     std::unordered_map<u64, id<MTLRenderPipelineState>> depth_upload_pipelines;
     id<MTLComputePipelineState> depth_download = nil;
     id<MTLBuffer> zero_buffer = nil;
@@ -2053,6 +2144,58 @@ bool Scheduler::DepthToBuffer(TextureHandle src_handle, u32 level, u32 slice, Of
     [encoder setBytes:params.data() length:sizeof(params) atIndex:1];
     [encoder dispatchThreadgroups:MTLSizeMake((extent.width + 7) / 8, (extent.height + 7) / 8, 1)
             threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [encoder endEncoding];
+    return true;
+}
+
+bool Scheduler::ScaleNearest(const ScalePass& scale) {
+    impl->FlushClear();
+    const id<MTLTexture> src = AsTexture(scale.src);
+    const id<MTLTexture> dst = AsTexture(scale.dst.texture);
+    if (src == nil || dst == nil || scale.src_width == 0 || scale.src_height == 0) {
+        return false;
+    }
+    const MTLPixelFormat format = static_cast<MTLPixelFormat>(scale.dst_format);
+    const id<MTLRenderPipelineState> pipeline = impl->ScalePipeline(format, dst.sampleCount);
+    if (pipeline == nil) {
+        return false;
+    }
+    const u32 width = std::clamp(scale.dst_width, 1U, MaxRenderTargetSize);
+    const u32 height = std::clamp(scale.dst_height, 1U, MaxRenderTargetSize);
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    const FormatClass format_class = ClassOf(scale.dst_format);
+    MTLRenderPassAttachmentDescriptor* attachment = nil;
+    if (format_class == FormatClass::Depth) {
+        attachment = pass.depthAttachment;
+    } else if (format_class == FormatClass::Stencil) {
+        attachment = pass.stencilAttachment;
+    } else {
+        attachment = pass.colorAttachments[0];
+    }
+    ApplyAttachment(attachment, scale.dst);
+    attachment.loadAction = MTLLoadActionDontCare;
+    attachment.storeAction = MTLStoreActionStore;
+    pass.renderTargetWidth = width;
+    pass.renderTargetHeight = height;
+    const id<MTLRenderCommandEncoder> encoder = impl->RenderEncoder(pass);
+    if (encoder == nil) {
+        return false;
+    }
+    [encoder setRenderPipelineState:pipeline];
+    if (format_class == FormatClass::Depth) {
+        [encoder setDepthStencilState:impl->ClearDepthState(true, false, 0)];
+    } else if (format_class == FormatClass::Stencil) {
+        [encoder setDepthStencilState:impl->DepthWriteAlways()];
+    }
+    [encoder setViewport:MTLViewport{0.0, 0.0, static_cast<f64>(width), static_cast<f64>(height),
+                                     0.0, 1.0}];
+    const f32 depth_value = 0.0f;
+    [encoder setVertexBytes:&depth_value length:sizeof(depth_value) atIndex:0];
+    const std::array<u32, 8> params{scale.src_width, scale.src_height, width, height,
+                                    scale.src_layer, 0, 0, 0};
+    [encoder setFragmentBytes:params.data() length:sizeof(params) atIndex:0];
+    [encoder setFragmentTexture:src atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];
     return true;
 }

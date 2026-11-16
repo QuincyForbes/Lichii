@@ -156,6 +156,137 @@ int RunSampleCopies() {
     return passed ? 0 : 1;
 }
 
+/// G16: resolution scaling of what Blit can't draw (Scheduler::ScaleNearest): a 4-sample 4x4
+/// image to 8x8 sample for sample, and a stencil-only 4x4 one to 8x8.
+int RunScaleNearest() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr uint32_t Small = 4;
+    constexpr uint32_t Large = 8;
+    const auto multisampled = [&](uint32_t side) {
+        return Metal::CreateTexture(device, {.kind = TextureKind::e2DMultisampleArray,
+                                             .format = Rgba8,
+                                             .width = side,
+                                             .height = side,
+                                             .samples = 4,
+                                             .render_target = true});
+    };
+    const auto grid = [&](uint32_t side) {
+        return Metal::CreateTexture(device, {.kind = TextureKind::e2DArray,
+                                             .format = Rgba8,
+                                             .width = side * 2,
+                                             .height = side * 2,
+                                             .render_target = true});
+    };
+    const Object small = multisampled(Small);
+    const Object large = multisampled(Large);
+    const Object small_grid = grid(Small);
+    const Object large_grid = grid(Large);
+    const uint32_t stencil8 = static_cast<uint32_t>(MTLPixelFormatStencil8);
+    const auto stencil_texture = [&](uint32_t side) {
+        return Metal::CreateTexture(device, {.kind = TextureKind::e2DArray,
+                                             .format = stencil8,
+                                             .width = side,
+                                             .height = side,
+                                             .render_target = true});
+    };
+    const Object stencil_small = stencil_texture(Small);
+    const Object stencil_large = stencil_texture(Large);
+    auto [upload, upload_bytes] = SharedBuffer(device, Small * 2 * Small * 2 * 4);
+    auto [back, back_bytes] = SharedBuffer(device, Large * 2 * Large * 2 * 4);
+    auto [stencil_up, stencil_up_bytes] = SharedBuffer(device, Small * Small);
+    auto [stencil_back, stencil_back_bytes] = SharedBuffer(device, Large * Large);
+    if (!small || !large || !small_grid || !large_grid || !stencil_small || !stencil_large ||
+        upload_bytes == nullptr || back_bytes == nullptr || stencil_up_bytes == nullptr ||
+        stencil_back_bytes == nullptr) {
+        std::printf("metal-smoke: FAIL scale nearest: textures\n");
+        return 1;
+    }
+    constexpr uint32_t SmallGrid = Small * 2;
+    constexpr uint32_t LargeGrid = Large * 2;
+    for (uint32_t index = 0; index < SmallGrid * SmallGrid; ++index) {
+        upload_bytes[index * 4] = static_cast<uint8_t>(index * 3);
+        upload_bytes[index * 4 + 1] = static_cast<uint8_t>(255 - index);
+        upload_bytes[index * 4 + 2] = 0;
+        upload_bytes[index * 4 + 3] = 255;
+    }
+    for (uint32_t index = 0; index < Small * Small; ++index) {
+        stencil_up_bytes[index] = static_cast<uint8_t>(index * 11 + 1);
+    }
+    scheduler.CopyBufferToTexture(upload.Get(), 0, SmallGrid * 4, 0, small_grid.Get(), 0, 0, {},
+                                  {SmallGrid, SmallGrid, 1});
+    scheduler.CopyBufferToTexture(stencil_up.Get(), 0, Small, 0, stencil_small.Get(), 0, 0, {},
+                                  {Small, Small, 1});
+    scheduler.BreakBlits();
+    const Object small_view = Metal::CreateTextureView(small_grid.Get(), Rgba8, TextureKind::e2D,
+                                                       0, 1, 0, 1, Metal::IdentitySwizzle);
+    const bool compressed = scheduler.CopySamples(Metal::SampleCopy{.src = small_view.Get(),
+                                                                    .dst = {.texture = small.Get()},
+                                                                    .dst_format = Rgba8,
+                                                                    .dst_width = Small,
+                                                                    .dst_height = Small,
+                                                                    .samples = 4,
+                                                                    .shift = {1, 1}},
+                                                  false);
+    const bool scaled = scheduler.ScaleNearest(Metal::ScalePass{.src = small.Get(),
+                                                                .src_width = Small,
+                                                                .src_height = Small,
+                                                                .dst = {.texture = large.Get()},
+                                                                .dst_format = Rgba8,
+                                                                .dst_width = Large,
+                                                                .dst_height = Large});
+    const bool stencil_scaled =
+        scheduler.ScaleNearest(Metal::ScalePass{.src = stencil_small.Get(),
+                                                .src_width = Small,
+                                                .src_height = Small,
+                                                .dst = {.texture = stencil_large.Get()},
+                                                .dst_format = stencil8,
+                                                .dst_width = Large,
+                                                .dst_height = Large});
+    const bool expanded = scheduler.CopySamples(Metal::SampleCopy{.src = large.Get(),
+                                                                  .dst = {.texture = large_grid.Get()},
+                                                                  .dst_format = Rgba8,
+                                                                  .dst_width = LargeGrid,
+                                                                  .dst_height = LargeGrid,
+                                                                  .samples = 4,
+                                                                  .shift = {1, 1}},
+                                                true);
+    scheduler.CopyTextureToBuffer(large_grid.Get(), 0, 0, {}, {LargeGrid, LargeGrid, 1},
+                                  back.Get(), 0, LargeGrid * 4, 0);
+    scheduler.CopyTextureToBuffer(stencil_large.Get(), 0, 0, {}, {Large, Large, 1},
+                                  stencil_back.Get(), 0, Large, 0);
+    scheduler.Finish();
+    // Pixel p of the large image holds pixel p / 2 of the small one, every sample its own.
+    uint32_t wrong = 0;
+    for (uint32_t y = 0; y < LargeGrid; ++y) {
+        for (uint32_t x = 0; x < LargeGrid; ++x) {
+            const uint32_t pixel_x = x >> 1;
+            const uint32_t pixel_y = y >> 1;
+            const uint32_t sx = ((pixel_x / 2) << 1) | (x & 1);
+            const uint32_t sy = ((pixel_y / 2) << 1) | (y & 1);
+            const uint8_t* const got = back_bytes + (y * LargeGrid + x) * 4;
+            const uint8_t* const want = upload_bytes + (sy * SmallGrid + sx) * 4;
+            wrong += std::memcmp(got, want, 4) == 0 ? 0 : 1;
+        }
+    }
+    uint32_t stencil_wrong = 0;
+    for (uint32_t y = 0; y < Large; ++y) {
+        for (uint32_t x = 0; x < Large; ++x) {
+            stencil_wrong +=
+                stencil_back_bytes[y * Large + x] == stencil_up_bytes[(y / 2) * Small + x / 2] ? 0
+                                                                                              : 1;
+        }
+    }
+    const bool passed = compressed && scaled && stencil_scaled && expanded && wrong == 0 &&
+                        stencil_wrong == 0;
+    std::printf("metal-smoke: scale nearest 4x4 -> 8x8: 4 samples %s, %u of %u samples wrong; "
+                "stencil %s, %u of %u wrong: %s\n",
+                scaled ? "scaled" : "REFUSED", wrong, LargeGrid * LargeGrid,
+                stencil_scaled ? "scaled" : "REFUSED", stencil_wrong, Large * Large,
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 /// The guest's bytes of 24-bit depth with stencil (and of 32-bit float depth with stencil, in a
 /// region) into Depth32Float_Stencil8 and back (Scheduler::DepthFromBuffer / DepthToBuffer).
 int RunDepthBytes() {
@@ -898,7 +1029,7 @@ int RunSamplers() {
 
 int RunAll() {
     int result = 0;
-    for (const auto test : {RunSampleCopies, RunDepthBytes, RunConversions, RunGuards,
+    for (const auto test : {RunSampleCopies, RunScaleNearest, RunDepthBytes, RunConversions, RunGuards,
                             RunSamplesAndPlaceholders, RunExpandedFormats, RunSrgbStorage,
                             RunLayeredTarget, RunMultiRange, RunCrossThreadWait,
                             RunSamplers}) {

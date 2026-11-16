@@ -720,9 +720,17 @@ bool TextureCacheRuntime::CanRescaleImage(const ImageInfo& info) const {
     constexpr u32 MaxTextureSize = 16384;
     const auto& resolution = Settings::values.resolution_info;
     const FormatInfo host = SurfaceFormat(device, info.format, IsConverted(device, info.format));
-    return info.type == ImageType::e2D && info.num_samples == 1 && host.format != 0 &&
-           host.attachable && host.format_class != FormatClass::Stencil &&
-           resolution.ScaleUp(info.size.width) <= MaxTextureSize &&
+    // Multisampled colour and depth images are scaled sample for sample (EDEN_NX2_METAL_MSAA),
+    // stencil-only ones with the stencil exported (EDEN_NX2_METAL_COPIES); a multisampled
+    // depth-stencil one is not (Metal writes no stencil per sample from a fragment).
+    const bool samples_fit =
+        info.num_samples == 1 ||
+        (MsaaEnabled() && host.format_class != FormatClass::Stencil &&
+         host.format_class != FormatClass::DepthStencil);
+    const bool stencil_fits =
+        host.format_class != FormatClass::Stencil || (CopiesEnabled() && info.num_samples == 1);
+    return info.type == ImageType::e2D && samples_fit && stencil_fits && host.format != 0 &&
+           host.attachable && resolution.ScaleUp(info.size.width) <= MaxTextureSize &&
            resolution.ScaleUp(info.size.height) <= MaxTextureSize;
 }
 
@@ -773,17 +781,47 @@ bool Image::ScaleDown(bool ignore) {
 bool Image::CopyScaled(bool scale_up) {
     const TextureHandle src = scale_up ? texture.Get() : scaled_texture.Get();
     const TextureHandle dst = scale_up ? scaled_texture.Get() : texture.Get();
-    if (src == nullptr || dst == nullptr || info.num_samples != 1 ||
-        kind == TextureKind::e3D || !host_format.attachable) {
-        return false;
-    }
-    // Depth-stencil images carry both (the blit writes the stencil from the shader); stencil-only
-    // ones are not rescaled (CanRescaleImage).
-    if (host_format.format_class == FormatClass::Stencil) {
+    if (src == nullptr || dst == nullptr || kind == TextureKind::e3D || !host_format.attachable) {
         return false;
     }
     const auto& resolution = Settings::values.resolution_info;
     const bool is_2d = info.type == ImageType::e2D;
+    // Multisampled and stencil-only images: what Blit can't draw, sample for sample or the
+    // stencil exported, nearest (CanRescaleImage lets them through).
+    const bool multisampled = desc.samples > 1;
+    if (multisampled || host_format.format_class == FormatClass::Stencil) {
+        for (u32 level = 0; level < desc.levels; ++level) {
+            const u32 width = (std::max)(desc.width >> level, 1U);
+            const u32 height = (std::max)(desc.height >> level, 1U);
+            const u32 scaled_width = (std::max)(resolution.ScaleUp(desc.width) >> level, 1U);
+            const u32 scaled_height = (std::max)(resolution.ScaleUp(desc.height) >> level, 1U);
+            // The shader reads the level as level 0 of a view (stencil images have levels).
+            Object view;
+            TextureHandle source = src;
+            if (!multisampled) {
+                view = CreateTextureView(src, host_format.format, TextureKind::e2DArray, level, 1,
+                                         0, desc.layers, IdentitySwizzle);
+                source = view.Get();
+            }
+            for (u32 layer = 0; layer < desc.layers; ++layer) {
+                if (!runtime->scheduler.ScaleNearest(ScalePass{
+                        .src = source,
+                        .src_layer = layer,
+                        .src_width = scale_up ? width : scaled_width,
+                        .src_height = scale_up ? height : scaled_height,
+                        .dst = {.texture = dst, .level = level, .slice = layer},
+                        .dst_format = host_format.format,
+                        .dst_width = scale_up ? scaled_width : width,
+                        .dst_height = scale_up ? scaled_height : height,
+                    })) {
+                    LOG_ONCE(warned_scale, "Metal: rescaling a {} x{} image failed", info.format,
+                             desc.samples);
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
     const bool depth = host_format.format_class == FormatClass::Depth ||
                        host_format.format_class == FormatClass::DepthStencil;
     const bool integer = host_format.format_class == FormatClass::Uint ||
@@ -865,6 +903,10 @@ TextureHandle Image::SampleGrid() {
 bool Image::CopySampleGrid(bool expand) {
     const TextureHandle grid = SampleGrid();
     if (grid == nullptr || desc.samples < 2) {
+        return false;
+    }
+    // The grid is the native size: a rescaled image's drawing comes down to the native texture.
+    if (expand && rescaled && !CopyScaled(false)) {
         return false;
     }
     const auto [shift_x, shift_y] = VideoCommon::SamplesLog2(info.num_samples);

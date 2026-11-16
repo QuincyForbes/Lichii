@@ -236,8 +236,8 @@ EDEN_NX2_FENCE_BATCH=1
 # downloaded in the guest's bytes (a draw writes depth and stencil from the buffer, a kernel
 # reads them back: Metal has no 24-bit depth and no blit copy of packed depth-stencil), Vulkan's
 # depth <-> colour conversions (ABGR8 <-> D24S8 / S8D24 / X8D24 / D32F, D32F -> R32F, D16 <->
-# R16) are drawn, and depth images are reinterpreted through a buffer. With 0 all of them are
-# skipped, as before.
+# R16) are drawn, depth images are reinterpreted through a buffer, and resolution scaling scales
+# stencil-only images with a draw exporting the stencil. With 0 all of them are skipped, as before.
 #EDEN_NX2_METAL_COPIES=0
 
 # Metal renderer: 0 makes one sampler state per guest sampler, as before: no LOD bias and no
@@ -257,8 +257,10 @@ EDEN_NX2_FENCE_BATCH=1
 # texture holding its samples as texels, as the guest lays them out, filled and drained by a draw
 # per layer: uploads and downloads go through it, CopyImageMSAA draws between the two, a program
 # that reads the image as a plain texture reads it, and blits resolve (Metal's resolve store
-# action for a whole image, the samples scaled into the rectangle otherwise). Multisampled stencil
-# is not copied (Metal writes no stencil per sample from a fragment).
+# action for a whole image, the samples scaled into the rectangle otherwise), and resolution
+# scaling scales colour and depth ones sample for sample with a draw (Metal blits no multisampled
+# texture). Multisampled stencil is not copied or scaled (Metal writes no stencil per sample from a
+# fragment).
 #EDEN_NX2_METAL_MSAA=0
 
 # Metal renderer: 0 makes no texture for R32G32B32_FLOAT (Metal has no 96-bit format) and reads
