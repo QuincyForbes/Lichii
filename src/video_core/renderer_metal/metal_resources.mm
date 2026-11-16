@@ -551,10 +551,6 @@ u64 DeviceAllocatedSize(const Device& device) {
     return device.AllocatedSize();
 }
 
-u64 DeviceMemoryBudget(const Device& device) {
-    return device.MemoryBudget();
-}
-
 TextureFacts DescribeTexture(TextureHandle texture) {
     const id<MTLTexture> object = AsTexture(texture);
     if (object == nil) {

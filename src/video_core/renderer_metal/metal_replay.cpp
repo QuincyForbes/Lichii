@@ -562,14 +562,17 @@ enum ProgramFeature : u32 {
     StoresLayer = 1U << 4,
     StoresViewportIndex = 1U << 5,
     ReadsDepthTexture = 1U << 6,
-    ProgramFeatureCount = 7,
+    ReadsTexelBuffer = 1U << 7,
+    UsesImageBuffer = 1U << 8,
+    ProgramFeatureCount = 9,
 };
 
 constexpr std::array<std::string_view, ProgramFeatureCount> ProgramFeatureNames{
     "writes a storage image",       "writes a storage image without a format",
     "byte-addressed storage image", "reads a multisampled texture",
     "stores the layer",             "stores the viewport index",
-    "reads a depth texture",
+    "reads a depth texture",       "reads a texel buffer",
+    "uses an image buffer",
 };
 
 u32 ProgramFeatures(const Shader::Info& info) {
@@ -592,6 +595,12 @@ u32 ProgramFeatures(const Shader::Info& info) {
         if (desc.is_depth) {
             features |= ReadsDepthTexture;
         }
+    }
+    if (!info.texture_buffer_descriptors.empty()) {
+        features |= ReadsTexelBuffer;
+    }
+    if (!info.image_buffer_descriptors.empty()) {
+        features |= UsesImageBuffer;
     }
     if (info.stores[Shader::IR::Attribute::Layer]) {
         features |= StoresLayer;

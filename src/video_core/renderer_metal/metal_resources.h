@@ -158,10 +158,8 @@ struct TextureFacts {
 
 [[nodiscard]] TextureFacts DescribeTexture(TextureHandle texture);
 
-/// Bytes the device has allocated for this process, and the budget it gives (Device::
-/// AllocatedSize, Device::MemoryBudget), for plain C++.
+/// Bytes the device has allocated for this process (Device::AllocatedSize), for plain C++.
 [[nodiscard]] u64 DeviceAllocatedSize(const Device& device);
-[[nodiscard]] u64 DeviceMemoryBudget(const Device& device);
 
 /// Bytes the resource (texture or buffer) holds on the GPU.
 [[nodiscard]] u64 AllocatedSize(const void* resource);

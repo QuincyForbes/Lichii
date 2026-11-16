@@ -7,6 +7,7 @@
 
 #include "common/alignment.h"
 #include "video_core/renderer_metal/metal_buffer_cache.h"
+#include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_resources.h"
 
 namespace Metal {
@@ -94,6 +95,7 @@ bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
     }
     bindings.push_back({Binding::Kind::Buffer, entry.buffer.Get(), 0,
                         static_cast<u32>(multi_range_total), {}});
+    Coverage::NoteGuard("storage buffer gathered from several mappings");
     return true;
 }
 

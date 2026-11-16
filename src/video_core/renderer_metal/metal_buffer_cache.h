@@ -96,9 +96,16 @@ public:
         scheduler.Wait(tick);
     }
 
-    /// Metal records on the GPU thread only, so this waits as Wait does.
+    /// Callers outside the GPU thread (the list reads of BufferCache's Nx2 paths, with the GPU
+    /// split in two threads) wait for a committed tick through the scheduler's completion
+    /// signal: Scheduler::Wait commits and walks the command buffers in flight, which only the
+    /// recording thread may. A tick not committed yet can only be the recording thread's own.
     void WaitSubmittedTick(u64 tick, u64 writer = 0) {
-        scheduler.Wait(tick);
+        if (scheduler.IsSubmitted(tick)) {
+            scheduler.WaitSubmitted(tick);
+        } else {
+            scheduler.Wait(tick);
+        }
     }
 
     void Finish() {

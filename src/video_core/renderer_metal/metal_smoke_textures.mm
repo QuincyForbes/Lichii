@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "shader_recompiler/shader_info.h"
@@ -679,6 +680,38 @@ int RunMultiRange() {
     return passed ? 0 : 1;
 }
 
+/// M05: a thread that is not the recording one (the GPU's front thread reading command lists,
+/// a guest core landing a download) waits for a committed tick without touching the command
+/// buffers in flight (BufferCacheRuntime::WaitSubmittedTick).
+int RunCrossThreadWait() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Metal::StagingBufferPool pool(device, scheduler);
+    Metal::BufferCacheRuntime runtime(device, scheduler, pool);
+    auto [target, target_bytes] = SharedBuffer(device, 4096);
+    if (target_bytes == nullptr) {
+        std::printf("metal-smoke: FAIL cross-thread wait: buffer\n");
+        return 1;
+    }
+    scheduler.FillBuffer(target.Get(), 0, 4096, 0x5A);
+    const uint64_t tick = scheduler.CurrentTick();
+    scheduler.Flush();
+    const bool submitted = scheduler.IsSubmitted(tick);
+    bool free_after = false;
+    std::thread waiter([&] {
+        runtime.WaitSubmittedTick(tick);
+        free_after = scheduler.IsFree(tick);
+    });
+    waiter.join();
+    const bool filled = target_bytes[0] == 0x5A && target_bytes[4095] == 0x5A;
+    const bool passed = submitted && free_after && filled;
+    std::printf("metal-smoke: wait for a committed tick from another thread: submitted %s, done "
+                "%s, contents %s: %s\n",
+                submitted ? "yes" : "NO", free_after ? "yes" : "NO", filled ? "written" : "NOT",
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 constexpr const char* SamplerSource = R"(
 #include <metal_stdlib>
 using namespace metal;
@@ -867,7 +900,8 @@ int RunAll() {
     int result = 0;
     for (const auto test : {RunSampleCopies, RunDepthBytes, RunConversions, RunGuards,
                             RunSamplesAndPlaceholders, RunExpandedFormats, RunSrgbStorage,
-                            RunLayeredTarget, RunMultiRange, RunSamplers}) {
+                            RunLayeredTarget, RunMultiRange, RunCrossThreadWait,
+                            RunSamplers}) {
         const int outcome = test();
         result = result != 0 ? result : outcome;
     }
