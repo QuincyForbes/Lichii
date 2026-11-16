@@ -2,16 +2,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #import <Metal/Metal.h>
 #include <TargetConditionals.h>
@@ -110,6 +114,30 @@ fragment DepthStencilOut blit_depth_stencil(BlitOut in [[stage_in]],
     out.stencil = src_stencil.read(texel).x;
     return out;
 }
+
+struct ClearOut {
+    float4 position [[position]];
+};
+
+// One triangle over the viewport at the depth a clear writes.
+vertex ClearOut clear_vertex(uint id [[vertex_id]], constant float& depth [[buffer(0)]]) {
+    const float2 corner = float2(float((id << 1) & 2), float(id & 2));
+    ClearOut out;
+    out.position = float4(corner.x * 2.0 - 1.0, 1.0 - corner.y * 2.0, depth, 1.0);
+    return out;
+}
+
+fragment float4 clear_float(constant float4& color [[buffer(0)]]) {
+    return color;
+}
+
+fragment uint4 clear_uint(constant uint4& color [[buffer(0)]]) {
+    return color;
+}
+
+fragment int4 clear_sint(constant int4& color [[buffer(0)]]) {
+    return color;
+}
 )";
 
 /// The stencil-only view format of a depth-stencil format (invalid when it has none).
@@ -131,6 +159,86 @@ void ApplyAttachment(MTLRenderPassAttachmentDescriptor* descriptor, const Attach
     descriptor.level = attachment.level;
     descriptor.slice = attachment.slice;
     descriptor.depthPlane = attachment.depth_plane;
+}
+
+id<MTLTexture> RootOf(id<MTLTexture> texture) {
+    while (texture.parentTexture != nil) {
+        texture = texture.parentTexture;
+    }
+    return texture;
+}
+
+// EDEN_NX2_METAL_CLEAR_FOLD=0: every clear is a render pass of its own, as this backend started.
+bool ClearFoldEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_CLEAR_FOLD");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// Adds `clear` to the waiting `pending` when one render pass can do both.
+bool MergeClear(ClearPass& pending, const ClearPass& clear) {
+    if (pending.width != clear.width || pending.height != clear.height) {
+        return false;
+    }
+    for (size_t index = 0; index < clear.color.size(); ++index) {
+        if (clear.clear_color[index] && pending.clear_color[index] &&
+            pending.color[index] != clear.color[index]) {
+            return false;
+        }
+    }
+    // One depth-stencil texture a pass.
+    const Attachment* texture = nullptr;
+    const std::array<const Attachment*, 4> depth_stencil{
+        pending.clear_depth ? &pending.depth : nullptr,
+        pending.clear_stencil ? &pending.stencil : nullptr,
+        clear.clear_depth ? &clear.depth : nullptr,
+        clear.clear_stencil ? &clear.stencil : nullptr,
+    };
+    for (const Attachment* const attachment : depth_stencil) {
+        if (attachment == nullptr) {
+            continue;
+        }
+        if (texture != nullptr && *texture != *attachment) {
+            return false;
+        }
+        texture = attachment;
+    }
+    for (size_t index = 0; index < clear.color.size(); ++index) {
+        if (clear.clear_color[index]) {
+            pending.color[index] = clear.color[index];
+            pending.clear_color[index] = true;
+            pending.color_value[index] = clear.color_value[index];
+        }
+    }
+    if (clear.clear_depth) {
+        pending.depth = clear.depth;
+        pending.clear_depth = true;
+        pending.depth_value = clear.depth_value;
+    }
+    if (clear.clear_stencil) {
+        pending.stencil = clear.stencil;
+        pending.clear_stencil = true;
+        pending.stencil_value = clear.stencil_value;
+    }
+    return true;
+}
+
+/// Whether a render pass on `targets` can clear what `clear` does as its load actions.
+bool ClearFitsTargets(const ClearPass& clear, const RenderTargetSet& targets) {
+    if (clear.width != targets.width || clear.height != targets.height) {
+        return false;
+    }
+    for (size_t index = 0; index < clear.color.size(); ++index) {
+        if (clear.clear_color[index] && clear.color[index] != targets.color[index]) {
+            return false;
+        }
+    }
+    if (clear.clear_depth && (!targets.has_depth || clear.depth != targets.depth)) {
+        return false;
+    }
+    return !clear.clear_stencil || (targets.has_stencil && clear.stencil == targets.depth);
 }
 
 } // Anonymous namespace
@@ -240,6 +348,85 @@ struct Scheduler::Impl {
         return encoder;
     }
 
+    /// A render pass that only clears.
+    void RecordClear(const ClearPass& clear) {
+        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        bool any = false;
+        for (size_t index = 0; index < clear.color.size(); ++index) {
+            if (clear.color[index].texture == nullptr || !clear.clear_color[index]) {
+                continue;
+            }
+            MTLRenderPassColorAttachmentDescriptor* color = pass.colorAttachments[index];
+            ApplyAttachment(color, clear.color[index]);
+            const auto& value = clear.color_value[index];
+            color.loadAction = MTLLoadActionClear;
+            color.storeAction = MTLStoreActionStore;
+            color.clearColor = MTLClearColorMake(value[0], value[1], value[2], value[3]);
+            any = true;
+        }
+        if (clear.depth.texture != nullptr && clear.clear_depth) {
+            ApplyAttachment(pass.depthAttachment, clear.depth);
+            pass.depthAttachment.loadAction = MTLLoadActionClear;
+            pass.depthAttachment.storeAction = MTLStoreActionStore;
+            pass.depthAttachment.clearDepth = clear.depth_value;
+            any = true;
+        }
+        if (clear.stencil.texture != nullptr && clear.clear_stencil) {
+            ApplyAttachment(pass.stencilAttachment, clear.stencil);
+            pass.stencilAttachment.loadAction = MTLLoadActionClear;
+            pass.stencilAttachment.storeAction = MTLStoreActionStore;
+            pass.stencilAttachment.clearStencil = clear.stencil_value;
+            any = true;
+        }
+        if (!any) {
+            return;
+        }
+        pass.renderTargetWidth = std::clamp(clear.width, 1U, MaxRenderTargetSize);
+        pass.renderTargetHeight = std::clamp(clear.height, 1U, MaxRenderTargetSize);
+        [RenderEncoder(pass) endEncoding];
+    }
+
+    /// The clear that waits for a render pass gets one of its own: work that may read or write
+    /// its attachments comes next.
+    void FlushClear() {
+        if (pending_clear) {
+            const ClearPass clear = *pending_clear;
+            pending_clear.reset();
+            RecordClear(clear);
+            pending_clear_textures.clear();
+        }
+    }
+
+    void HoldClear(const ClearPass& clear) {
+        pending_clear_textures.clear();
+        for (const Attachment& attachment : clear.color) {
+            if (attachment.texture != nullptr) {
+                pending_clear_textures.push_back(AsTexture(attachment.texture));
+            }
+        }
+        for (const Attachment* const attachment : {&clear.depth, &clear.stencil}) {
+            if (attachment->texture != nullptr) {
+                pending_clear_textures.push_back(AsTexture(attachment->texture));
+            }
+        }
+    }
+
+    /// A copy reads or writes `texture`: the waiting clear of it (or of what it is a view of)
+    /// goes first.
+    void Touch(TextureHandle texture) {
+        if (!pending_clear) {
+            return;
+        }
+        const id<MTLTexture> root = RootOf(AsTexture(texture));
+        const auto same = [&](const Attachment& attachment) {
+            return attachment.texture != nullptr && RootOf(AsTexture(attachment.texture)) == root;
+        };
+        if (std::ranges::any_of(pending_clear->color, same) || same(pending_clear->depth) ||
+            same(pending_clear->stencil)) {
+            FlushClear();
+        }
+    }
+
     id<MTLRenderPipelineState> BlitPipeline(MTLPixelFormat format, BlitBlend blend) {
         const u64 key = (static_cast<u64>(format) << 8) | static_cast<u64>(blend);
         if (const auto it = blit_pipelines.find(key); it != blit_pipelines.end()) {
@@ -311,14 +498,101 @@ struct Scheduler::Impl {
         return depth_write_always;
     }
 
+    /// The pipeline of a drawn clear: colour 0 with a write mask, or depth and stencil alone.
+    id<MTLRenderPipelineState> ClearPipeline(MTLPixelFormat color, u8 mask, MTLPixelFormat depth,
+                                             bool stencil, NSUInteger samples) {
+        const u64 key = (static_cast<u64>(color) << 32) | (static_cast<u64>(depth) << 12) |
+                        (static_cast<u64>(samples) << 5) | (static_cast<u64>(mask) << 1) |
+                        (stencil ? 1U : 0U);
+        if (const auto it = clear_pipelines.find(key); it != clear_pipelines.end()) {
+            return it->second;
+        }
+        id<MTLRenderPipelineState> pipeline = nil;
+        NSString* fragment = nil;
+        if (color != MTLPixelFormatInvalid) {
+            switch (ClassOf(static_cast<u32>(color))) {
+            case FormatClass::Float: fragment = @"clear_float"; break;
+            case FormatClass::Uint: fragment = @"clear_uint"; break;
+            case FormatClass::Sint: fragment = @"clear_sint"; break;
+            default: break;
+            }
+        }
+        if (library != nil && (fragment != nil || color == MTLPixelFormatInvalid)) {
+            MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+            desc.label = @"Clear";
+            desc.vertexFunction = [library newFunctionWithName:@"clear_vertex"];
+            desc.rasterSampleCount = samples;
+            if (fragment != nil) {
+                desc.fragmentFunction = [library newFunctionWithName:fragment];
+                desc.colorAttachments[0].pixelFormat = color;
+                MTLColorWriteMask write = MTLColorWriteMaskNone;
+                write |= (mask & 1) != 0 ? MTLColorWriteMaskRed : MTLColorWriteMaskNone;
+                write |= (mask & 2) != 0 ? MTLColorWriteMaskGreen : MTLColorWriteMaskNone;
+                write |= (mask & 4) != 0 ? MTLColorWriteMaskBlue : MTLColorWriteMaskNone;
+                write |= (mask & 8) != 0 ? MTLColorWriteMaskAlpha : MTLColorWriteMaskNone;
+                desc.colorAttachments[0].writeMask = write;
+            }
+            if (depth != MTLPixelFormatInvalid && !stencil) {
+                desc.depthAttachmentPixelFormat = depth;
+            } else if (depth != MTLPixelFormatInvalid) {
+                // A stencil-only format has no depth to attach.
+                if (depth != MTLPixelFormatStencil8) {
+                    desc.depthAttachmentPixelFormat = depth;
+                }
+                desc.stencilAttachmentPixelFormat = depth;
+            }
+            NSError* error = nil;
+            pipeline = [device.GetDevice() newRenderPipelineStateWithDescriptor:desc error:&error];
+            if (pipeline == nil) {
+                LOG_ERROR(Render_Metal, "Metal: clear pipeline for formats {} and {} failed: {}",
+                          static_cast<u32>(color), static_cast<u32>(depth),
+                          error.localizedDescription.UTF8String);
+            }
+        }
+        clear_pipelines.emplace(key, pipeline);
+        return pipeline;
+    }
+
+    /// The state of a drawn clear: depth written or kept, the stencil bits of `mask` replaced.
+    id<MTLDepthStencilState> ClearDepthState(bool depth, bool stencil, u32 mask) {
+        const u32 key = (depth ? 0x200U : 0U) | (stencil ? 0x100U | (mask & 0xFFU) : 0U);
+        if (const auto it = clear_depth_states.find(key); it != clear_depth_states.end()) {
+            return it->second;
+        }
+        MTLDepthStencilDescriptor* desc = [MTLDepthStencilDescriptor new];
+        desc.depthCompareFunction = MTLCompareFunctionAlways;
+        desc.depthWriteEnabled = depth ? YES : NO;
+        if (stencil) {
+            MTLStencilDescriptor* face = [MTLStencilDescriptor new];
+            face.stencilCompareFunction = MTLCompareFunctionAlways;
+            face.depthStencilPassOperation = MTLStencilOperationReplace;
+            face.readMask = 0xFF;
+            face.writeMask = mask & 0xFFU;
+            desc.frontFaceStencil = face;
+            desc.backFaceStencil = face;
+        }
+        const id<MTLDepthStencilState> state =
+            [device.GetDevice() newDepthStencilStateWithDescriptor:desc];
+        clear_depth_states.emplace(key, state);
+        return state;
+    }
+
     const Device& device;
     id<MTLCommandQueue> queue;
     id<MTLDepthStencilState> depth_write_always = nil;
+    /// By ClearPipeline's formats, mask and sample count.
+    std::unordered_map<u64, id<MTLRenderPipelineState>> clear_pipelines;
+    std::unordered_map<u32, id<MTLDepthStencilState>> clear_depth_states;
     id<MTLCommandBuffer> command_buffer = nil;
     id<MTLBlitCommandEncoder> blit = nil;
     /// The render encoder draws go to, open until other work needs the command buffer.
     id<MTLRenderCommandEncoder> render = nil;
     RenderTargetSet render_targets{};
+    /// A clear not recorded yet: the load actions of the next render pass on its attachments
+    /// (EDEN_NX2_METAL_CLEAR_FOLD), with its textures held until then.
+    std::optional<ClearPass> pending_clear;
+    std::vector<id<MTLTexture>> pending_clear_textures;
+    u64 clears_folded{};
     id<MTLComputeCommandEncoder> compute = nil;
     id<MTLBuffer> visibility = nil;
     u64 render_pass_serial{};
@@ -394,10 +668,11 @@ void Scheduler::WaitSubmitted(u64 tick) {
 }
 
 bool Scheduler::HasPendingWork() const noexcept {
-    return impl->command_buffer != nil;
+    return impl->command_buffer != nil || impl->pending_clear.has_value();
 }
 
 u64 Scheduler::Flush() {
+    impl->FlushClear();
     impl->EndEncoder();
     const id<MTLCommandBuffer> command_buffer = impl->Commands();
     const u64 tick = impl->current_tick++;
@@ -503,6 +778,7 @@ void Scheduler::CopyBufferToTexture(BufferHandle src, u64 offset, u32 bytes_per_
     if (src == nullptr || dst == nullptr) {
         return;
     }
+    impl->Touch(dst);
     [impl->BlitEncoder() copyFromBuffer:AsBuffer(src)
                            sourceOffset:offset
                       sourceBytesPerRow:bytes_per_row
@@ -520,6 +796,7 @@ void Scheduler::CopyTextureToBuffer(TextureHandle src, u32 level, u32 slice, Off
     if (src == nullptr || dst == nullptr) {
         return;
     }
+    impl->Touch(src);
     [impl->BlitEncoder() copyFromTexture:AsTexture(src)
                              sourceSlice:slice
                              sourceLevel:level
@@ -537,6 +814,8 @@ void Scheduler::CopyTexture(TextureHandle src, u32 src_level, u32 src_slice, Off
     if (src == nullptr || dst == nullptr) {
         return;
     }
+    impl->Touch(src);
+    impl->Touch(dst);
     [impl->BlitEncoder() copyFromTexture:AsTexture(src)
                              sourceSlice:src_slice
                              sourceLevel:src_level
@@ -553,43 +832,137 @@ void Scheduler::BreakBlits() {
 }
 
 void Scheduler::Clear(const ClearPass& clear) {
-    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (!ClearFoldEnabled()) {
+        impl->RecordClear(clear);
+        return;
+    }
+    // The clear waits for the next render pass: its load actions when the pass is on the same
+    // attachments, saving the clear a pass of its own that stores what the next one loads.
+    ClearPass wanted = clear;
     bool any = false;
-    for (size_t index = 0; index < clear.color.size(); ++index) {
-        if (clear.color[index].texture == nullptr || !clear.clear_color[index]) {
-            continue;
+    for (size_t index = 0; index < wanted.color.size(); ++index) {
+        if (wanted.color[index].texture == nullptr || !wanted.clear_color[index]) {
+            wanted.color[index] = {};
+            wanted.clear_color[index] = false;
+        } else {
+            any = true;
         }
-        MTLRenderPassColorAttachmentDescriptor* color = pass.colorAttachments[index];
-        ApplyAttachment(color, clear.color[index]);
-        const auto& value = clear.color_value[index];
-        color.loadAction = MTLLoadActionClear;
-        color.storeAction = MTLStoreActionStore;
-        color.clearColor = MTLClearColorMake(value[0], value[1], value[2], value[3]);
+    }
+    if (wanted.depth.texture == nullptr || !wanted.clear_depth) {
+        wanted.depth = {};
+        wanted.clear_depth = false;
+    } else {
         any = true;
     }
-    if (clear.depth.texture != nullptr && clear.clear_depth) {
-        ApplyAttachment(pass.depthAttachment, clear.depth);
-        pass.depthAttachment.loadAction = MTLLoadActionClear;
-        pass.depthAttachment.storeAction = MTLStoreActionStore;
-        pass.depthAttachment.clearDepth = clear.depth_value;
-        any = true;
-    }
-    if (clear.stencil.texture != nullptr && clear.clear_stencil) {
-        ApplyAttachment(pass.stencilAttachment, clear.stencil);
-        pass.stencilAttachment.loadAction = MTLLoadActionClear;
-        pass.stencilAttachment.storeAction = MTLStoreActionStore;
-        pass.stencilAttachment.clearStencil = clear.stencil_value;
+    if (wanted.stencil.texture == nullptr || !wanted.clear_stencil) {
+        wanted.stencil = {};
+        wanted.clear_stencil = false;
+    } else {
         any = true;
     }
     if (!any) {
         return;
     }
-    pass.renderTargetWidth = std::clamp(clear.width, 1U, MaxRenderTargetSize);
-    pass.renderTargetHeight = std::clamp(clear.height, 1U, MaxRenderTargetSize);
-    [impl->RenderEncoder(pass) endEncoding];
+    // The draws and dispatches recorded so far come before it.
+    if (impl->render != nil || impl->compute != nil) {
+        impl->EndEncoder();
+    }
+    if (impl->pending_clear) {
+        if (MergeClear(*impl->pending_clear, wanted)) {
+            impl->HoldClear(*impl->pending_clear);
+            return;
+        }
+        impl->FlushClear();
+    }
+    impl->pending_clear = wanted;
+    impl->HoldClear(wanted);
+}
+
+bool Scheduler::ClearRectangle(const ClearRect& clear) {
+    impl->FlushClear();
+    const id<MTLTexture> color = clear.color_mask != 0 ? AsTexture(clear.color.texture) : nil;
+    const id<MTLTexture> depth =
+        clear.clear_depth || clear.clear_stencil ? AsTexture(clear.depth.texture) : nil;
+    if (color == nil && depth == nil) {
+        return false;
+    }
+    const MTLPixelFormat color_format = color != nil ? color.pixelFormat : MTLPixelFormatInvalid;
+    const MTLPixelFormat depth_format = depth != nil ? depth.pixelFormat : MTLPixelFormatInvalid;
+    const bool stencil = depth != nil && (depth_format == MTLPixelFormatStencil8 ||
+                                          StencilViewFormat(depth_format) != MTLPixelFormatInvalid);
+    const NSUInteger samples = color != nil ? color.sampleCount : depth.sampleCount;
+    const id<MTLRenderPipelineState> pipeline =
+        impl->ClearPipeline(color_format, clear.color_mask, depth_format, stencil, samples);
+    if (pipeline == nil) {
+        return false;
+    }
+    const u32 limit_w = std::clamp(clear.width, 1U, MaxRenderTargetSize);
+    const u32 limit_h = std::clamp(clear.height, 1U, MaxRenderTargetSize);
+    const u32 x = (std::min)(clear.rect[0], limit_w);
+    const u32 y = (std::min)(clear.rect[1], limit_h);
+    const u32 w = (std::min)(clear.rect[2], limit_w - x);
+    const u32 h = (std::min)(clear.rect[3], limit_h - y);
+    if (w == 0 || h == 0) {
+        return true;
+    }
+
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (color != nil) {
+        ApplyAttachment(pass.colorAttachments[0], clear.color);
+        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+    if (depth != nil && depth_format != MTLPixelFormatStencil8) {
+        ApplyAttachment(pass.depthAttachment, clear.depth);
+        pass.depthAttachment.loadAction = MTLLoadActionLoad;
+        pass.depthAttachment.storeAction = MTLStoreActionStore;
+    }
+    if (stencil) {
+        ApplyAttachment(pass.stencilAttachment, clear.depth);
+        pass.stencilAttachment.loadAction = MTLLoadActionLoad;
+        pass.stencilAttachment.storeAction = MTLStoreActionStore;
+    }
+    pass.renderTargetWidth = limit_w;
+    pass.renderTargetHeight = limit_h;
+    const id<MTLRenderCommandEncoder> encoder = impl->RenderEncoder(pass);
+    if (encoder == nil) {
+        return false;
+    }
+    [encoder setRenderPipelineState:pipeline];
+    if (depth != nil) {
+        [encoder setDepthStencilState:impl->ClearDepthState(clear.clear_depth,
+                                                            stencil && clear.clear_stencil,
+                                                            clear.stencil_mask)];
+        [encoder setStencilReferenceValue:clear.stencil_value];
+    }
+    [encoder setViewport:MTLViewport{static_cast<f64>(x), static_cast<f64>(y), static_cast<f64>(w),
+                                     static_cast<f64>(h), 0.0, 1.0}];
+    [encoder setScissorRect:MTLScissorRect{x, y, w, h}];
+    const f32 depth_value = std::clamp(clear.depth_value, 0.0f, 1.0f);
+    [encoder setVertexBytes:&depth_value length:sizeof(depth_value) atIndex:0];
+    if (color != nil) {
+        // 16 bytes read as float4, uint4 or int4 by the format's class.
+        std::array<u32, 4> bits{};
+        const FormatClass format_class = ClassOf(static_cast<u32>(color_format));
+        for (size_t component = 0; component < bits.size(); ++component) {
+            const f64 value = clear.color_value[component];
+            if (format_class == FormatClass::Uint) {
+                bits[component] = static_cast<u32>(value);
+            } else if (format_class == FormatClass::Sint) {
+                bits[component] = static_cast<u32>(static_cast<s32>(value));
+            } else {
+                bits[component] = std::bit_cast<u32>(static_cast<f32>(value));
+            }
+        }
+        [encoder setFragmentBytes:bits.data() length:sizeof(bits) atIndex:0];
+    }
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [encoder endEncoding];
+    return true;
 }
 
 bool Scheduler::Blit(const BlitPass& blit) {
+    impl->FlushClear();
     const id<MTLTexture> src = AsTexture(blit.src);
     if (src == nil || blit.dst.texture == nullptr) {
         return false;
@@ -683,24 +1056,49 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
     if (impl->render != nil && impl->render_targets == targets) {
         return;
     }
+    // The waiting clear: this pass's load actions, or a pass of its own first.
+    std::optional<ClearPass> clear;
+    if (impl->pending_clear) {
+        if (ClearFitsTargets(*impl->pending_clear, targets)) {
+            clear = std::exchange(impl->pending_clear, std::nullopt);
+            impl->pending_clear_textures.clear();
+            ++impl->clears_folded;
+        } else {
+            impl->FlushClear();
+        }
+    }
     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
     for (size_t index = 0; index < targets.color.size(); ++index) {
         if (targets.color[index].texture == nullptr) {
             continue;
         }
-        ApplyAttachment(pass.colorAttachments[index], targets.color[index]);
-        pass.colorAttachments[index].loadAction = MTLLoadActionLoad;
-        pass.colorAttachments[index].storeAction = MTLStoreActionStore;
+        MTLRenderPassColorAttachmentDescriptor* const color = pass.colorAttachments[index];
+        ApplyAttachment(color, targets.color[index]);
+        color.loadAction = MTLLoadActionLoad;
+        color.storeAction = MTLStoreActionStore;
+        if (clear && clear->clear_color[index]) {
+            const auto& value = clear->color_value[index];
+            color.loadAction = MTLLoadActionClear;
+            color.clearColor = MTLClearColorMake(value[0], value[1], value[2], value[3]);
+        }
     }
     if (targets.has_depth) {
         ApplyAttachment(pass.depthAttachment, targets.depth);
         pass.depthAttachment.loadAction = MTLLoadActionLoad;
         pass.depthAttachment.storeAction = MTLStoreActionStore;
+        if (clear && clear->clear_depth) {
+            pass.depthAttachment.loadAction = MTLLoadActionClear;
+            pass.depthAttachment.clearDepth = clear->depth_value;
+        }
     }
     if (targets.has_stencil) {
         ApplyAttachment(pass.stencilAttachment, targets.depth);
         pass.stencilAttachment.loadAction = MTLLoadActionLoad;
         pass.stencilAttachment.storeAction = MTLStoreActionStore;
+        if (clear && clear->clear_stencil) {
+            pass.stencilAttachment.loadAction = MTLLoadActionClear;
+            pass.stencilAttachment.clearStencil = clear->stencil_value;
+        }
     }
     // Draws without attachments (occlusion queries) still need a size, within Metal's limit.
     pass.renderTargetWidth = std::clamp(targets.width, 1U, MaxRenderTargetSize);
@@ -719,6 +1117,16 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
     impl->render_targets = targets;
     impl->visibility_slot = -1;
     ++impl->render_pass_serial;
+}
+
+bool Scheduler::IsRendering() const noexcept {
+    return impl->render != nil;
+}
+
+void Scheduler::EndRendering() {
+    if (impl->render != nil) {
+        impl->EndEncoder();
+    }
 }
 
 void Scheduler::SetVisibility(std::optional<u32> slot) {
@@ -875,6 +1283,7 @@ void Scheduler::DrawIndexedIndirect(u32 primitive, u32 index_size, BufferHandle 
 }
 
 void Scheduler::BeginCompute(void* pipeline) {
+    impl->FlushClear();
     if (impl->compute == nil) {
         impl->EndEncoder();
         impl->compute = [impl->Commands() computeCommandEncoder];
@@ -966,6 +1375,7 @@ void Scheduler::DrawIndexed(u32 primitive, u32 index_count, u32 index_size,
 }
 
 void* Scheduler::CommandBuffer() {
+    impl->FlushClear();
     impl->EndEncoder();
     return (__bridge void*)impl->Commands();
 }
@@ -988,9 +1398,10 @@ void Scheduler::NotePresent(bool guest_picture) {
     }
 }
 
-std::array<u64, 4> Scheduler::TakeCounts() noexcept {
+std::array<u64, 5> Scheduler::TakeCounts() noexcept {
     return {std::exchange(impl->encoders, 0), std::exchange(impl->command_buffers, 0),
-            std::exchange(impl->blit_commands, 0), std::exchange(impl->render_passes, 0)};
+            std::exchange(impl->blit_commands, 0), std::exchange(impl->render_passes, 0),
+            std::exchange(impl->clears_folded, 0)};
 }
 
 } // namespace Metal

@@ -116,6 +116,7 @@ public:
     void WaitForIdle() override;
     void FragmentBarrier() override;
     void TiledCacheBarrier() override;
+    bool AccelerateConditionalRendering() override;
     void FlushCommands() override;
     void TickFrame() override;
     bool AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
@@ -156,6 +157,7 @@ public:
         u64 dispatches;
         u64 dispatches_with_pipeline;
         u64 clears;
+        u64 barrier_pass_ends;   ///< Render passes ended by a fragment barrier
     };
 
     /// Work taken since the last call (the renderer's 10 s report).
@@ -167,7 +169,7 @@ public:
                 std::exchange(mesh_groups, 0), ocarina.TakePasses(),
                 std::exchange(tessellated_draws, 0), std::exchange(tessellated_patches, 0),
                 std::exchange(dispatches, 0), std::exchange(dispatches_with_pipeline, 0),
-                std::exchange(clears, 0)};
+                std::exchange(clears, 0), std::exchange(barrier_pass_ends, 0)};
     }
 
     [[nodiscard]] PipelineCache& Pipelines() noexcept {
@@ -391,6 +393,11 @@ private:
     u64 dispatches{};
     u64 dispatches_with_pipeline{};
     u64 clears{};
+    /// The render pass (Scheduler::RenderPassSerial) a fragment barrier waits in; 0: none.
+    u64 fragment_barrier_pass{};
+    /// The last render pass with a draw that writes storage.
+    u64 pass_stores{};
+    u64 barrier_pass_ends{};
 };
 
 } // namespace Metal

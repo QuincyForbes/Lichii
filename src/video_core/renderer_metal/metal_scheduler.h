@@ -36,8 +36,8 @@ struct Attachment {
     bool operator==(const Attachment&) const noexcept = default;
 };
 
-/// A pass whose only work is clearing attachments (Maxwell clears; M3 folds them into the next
-/// draw's pass as load actions).
+/// A clear of whole attachments (Maxwell clears): the load actions of the next render pass on
+/// them, or a pass of its own when other work comes first (EDEN_NX2_METAL_CLEAR_FOLD).
 struct ClearPass {
     std::array<Attachment, 8> color{};
     std::array<bool, 8> clear_color{};
@@ -48,6 +48,23 @@ struct ClearPass {
     bool clear_stencil{};
     f64 depth_value{};
     u32 stencil_value{};
+    u32 width{};
+    u32 height{};
+};
+
+/// A clear drawn as a triangle: what a load action can't do (a rectangle of the target, some
+/// colour channels, some stencil bits).
+struct ClearRect {
+    Attachment color{};
+    u8 color_mask{};                 ///< R 1, G 2, B 4, A 8; 0: colour stays
+    std::array<f64, 4> color_value{}; ///< Integers for integer formats
+    Attachment depth{};              ///< The depth (and stencil) texture, if either is cleared
+    bool clear_depth{};
+    bool clear_stencil{};
+    f32 depth_value{};
+    u32 stencil_value{};
+    u32 stencil_mask{0xFF};
+    std::array<u32, 4> rect{}; ///< x, y, width, height
     u32 width{};
     u32 height{};
 };
@@ -183,12 +200,21 @@ public:
 
     void Clear(const ClearPass& pass);
 
+    /// False when no pipeline can draw the clear (nothing is cleared).
+    bool ClearRectangle(const ClearRect& clear);
+
     /// False when no pipeline can draw into dst's format (the blit is dropped).
     bool Blit(const BlitPass& pass);
 
     /// Opens a render encoder on the targets (loading their contents), or keeps the open one
     /// when they are the same.
     void BeginRendering(const RenderTargetSet& targets);
+
+    /// Whether a render encoder for draws is open.
+    [[nodiscard]] bool IsRendering() const noexcept;
+
+    /// Ends the open render encoder: the next BeginRendering loads what it stored.
+    void EndRendering();
 
     /// Slots of the visibility result buffer every draw render pass carries (occlusion queries).
     static constexpr u32 VisibilitySlots = 16384;
@@ -257,8 +283,9 @@ public:
     /// since the last call.
     [[nodiscard]] u64 TakeGpuNanoseconds() noexcept;
 
-    /// Encoders and command buffers since the last call (the renderer's 10 s report).
-    [[nodiscard]] std::array<u64, 4> TakeCounts() noexcept;
+    /// Encoders, command buffers, blit commands, render passes and clears made the load actions
+    /// of a pass since the last call (the renderer's 10 s report).
+    [[nodiscard]] std::array<u64, 5> TakeCounts() noexcept;
 
     /// A drawable was presented, with a guest layer on it or not (the progress trace: the first
     /// of each, and the heartbeat that runs until the first guest frame).

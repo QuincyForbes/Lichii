@@ -23,6 +23,7 @@
 #include <fmt/format.h>
 
 #include "common/console_capture.h"
+#include "common/frame_deadline.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/scope_exit.h"
@@ -519,7 +520,8 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
     const auto now = std::chrono::steady_clock::now();
     if (now - impl->report_start >= std::chrono::seconds{10}) {
         const auto work = impl->rasterizer.TakeWorkCounts();
-        const auto [encoders, command_buffers, blits, passes] = impl->scheduler.TakeCounts();
+        const auto [encoders, command_buffers, blits, passes, clears_folded] =
+            impl->scheduler.TakeCounts();
         const auto [graphics_made, compute_made, refused] =
             impl->rasterizer.Pipelines().TakeCounts();
         LOG_INFO(Render_Metal,
@@ -529,18 +531,23 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                  "pipeline); {} clears, {} texel buffer copies, {} occlusion queries, {} emulated "
                  "mesh draws ({} workgroups), {} tessellated draws ({} patches), {} Ocarina "
                  "upscales bilinear; pipelines made {} graphics, {} compute, {} refused; {} command "
-                 "buffers, {} encoders ({} render passes), {} blit commands; textures {} MiB, "
-                 "buffers {} MiB",
+                 "buffers, {} encoders ({} render passes, {} ended by a fragment barrier, {} "
+                 "starting with a clear), {} blit commands; textures {} MiB, buffers {} MiB",
                  impl->presented, impl->from_cache, impl->from_memory, impl->skipped, work.draws,
                  work.draws_with_pipeline, work.draws_encoded, work.draws_converted,
                  work.indices_rewritten_on_gpu, work.dispatches, work.dispatches_with_pipeline,
                  work.clears, work.texel_copies, work.occlusion_queries, work.mesh_draws,
                  work.mesh_groups, work.tessellated_draws, work.tessellated_patches,
-                 work.ocarina_bilinear, graphics_made, compute_made, refused, command_buffers, encoders, passes, blits,
+                 work.ocarina_bilinear, graphics_made, compute_made, refused, command_buffers,
+                 encoders, passes, work.barrier_pass_ends, clears_folded, blits,
                  impl->rasterizer.TextureRuntime().allocated_bytes >> 20,
                  impl->rasterizer.BufferRuntime().GetDeviceMemoryUsage() >> 20);
         if (const std::string coverage = Coverage::TakeLine(); !coverage.empty()) {
             LOG_INFO(Render_Metal, "Perf Metal coverage: {}", coverage);
+        }
+        if (const std::string deadlines = Common::FrameDeadline::TakeStatusText();
+            !deadlines.empty()) {
+            LOG_INFO(Render_Metal, "Perf Metal threads{}", deadlines);
         }
         // The pipeline archive: builds it served, and the build time that saved so far (each hit
         // at the average miss's cost, less what the hit took).

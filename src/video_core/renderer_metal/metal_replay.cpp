@@ -1260,6 +1260,9 @@ void ReplayClears(std::string& out, const CensusCategory& clears) {
     const size_t control = clears.Column("clear_control");
     const size_t scissor = clears.Column("scissor_test.enable");
     const size_t stencil_mask = clears.Column("stencil_front_mask");
+    // As the rasterizer's EDEN_NX2_METAL_CLEAR_DRAWS.
+    const char* const value = std::getenv("EDEN_NX2_METAL_CLEAR_DRAWS");
+    const bool draws = value == nullptr || value[0] != '0';
     Tallies tallies;
     for (const CensusRow& row : clears.rows) {
         const u32 raw = row.words[surface];
@@ -1269,13 +1272,21 @@ void ReplayClears(std::string& out, const CensusCategory& clears) {
         if (channels == 0 && (raw & 3) == 0) {
             Count(tallies, "nothing to clear", row.count);
         } else if (channels != 0 && channels != 0xF) {
-            Count(tallies, "refused: clear of some colour channels", row.count);
+            Count(tallies,
+                  draws ? "drawn as a triangle: clear of some colour channels"
+                        : "refused: clear of some colour channels",
+                  row.count);
         } else if (stencil && mask != 0xFF && mask != 0) {
-            Count(tallies, "refused: clear of some stencil bits", row.count);
+            Count(tallies,
+                  draws ? "drawn as a triangle: clear of some stencil bits"
+                        : "refused: clear of some stencil bits",
+                  row.count);
         } else if ((row.words[control] >> 8 & 1) != 0 && row.words[scissor] != 0) {
             Count(tallies,
-                  "native when the scissor covers the target, else refused: clear of part of the "
-                  "target (the rectangle is not in the census)",
+                  draws ? "native when the scissor covers the target, else drawn as a triangle "
+                          "(the rectangle is not in the census)"
+                        : "native when the scissor covers the target, else refused: clear of "
+                          "part of the target (the rectangle is not in the census)",
                   row.count);
         } else {
             Count(tallies, "native", row.count);

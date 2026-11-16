@@ -199,6 +199,31 @@ EDEN_NX2_FENCE_BATCH=1
 # log line either way; images decoded on the CPU are not copied this way.
 #EDEN_NX2_METAL_COPIES=0
 
+# Metal renderer: 0 clears as before: a clear of part of a target (the scissor), of some colour
+# channels or of some stencil bits clears the whole target, every channel and every bit, and a
+# whole-number colour target takes the clear colour's floats. By default such a clear is drawn
+# as a triangle over the rectangle with the channels' and bits' write masks (a clear of the
+# whole target stays the render pass's load action), and whole-number targets get the values
+# Vulkan gives them. Ocarina of Time clears with the scissor test on about 1,600 times a second
+# on a computer (how many of them cover less than the target was not measured).
+#EDEN_NX2_METAL_CLEAR_DRAWS=0
+
+# Metal renderer: 0 gives every clear of a whole target a render pass of its own, as before
+# (the pass stores the cleared image and the pass with the draws loads it again). By default
+# the clear waits and becomes the load action of the next render pass when that pass draws
+# into the same images, as Vulkan's renderer defers its clears; a pass on other images, a
+# dispatch, a blit, a copy that touches one of the images, a present or a flush records the
+# clear first. The 10 s "Metal:" line counts the passes "starting with a clear".
+#EDEN_NX2_METAL_CLEAR_FOLD=0
+
+# Metal renderer: 0 ignores the game's fragment barrier, as before: a draw that samples the
+# image its own render pass draws into reads what the pass before it stored. By default the
+# next draw after a barrier that samples one of its targets (or follows a draw that writes
+# storage) ends the render pass first, so the image holds the earlier draws, and opens it
+# again; other draws stay in the open pass, as on Vulkan (EDEN_NX2_WFI_DEFER). The 10 s
+# "Metal:" line counts the passes ended this way.
+#EDEN_NX2_METAL_FRAGMENT_BARRIER=0
+
 # Either renderer: 0 makes the GPU thread's front wait for the GPU and read a compute dispatch's
 # size the GPU wrote (Ocarina of Time's light tiles, once a frame). By default it passes
 # placeholders on; the dispatch takes its size from the GPU's buffer, and the copy of the size

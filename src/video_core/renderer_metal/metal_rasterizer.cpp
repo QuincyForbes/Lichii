@@ -17,6 +17,7 @@
 
 #include "common/alignment.h"
 #include "common/cityhash.h"
+#include "common/frame_deadline.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -37,6 +38,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_indirect_grid.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/oot_network.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_draw_desc.h"
@@ -110,6 +112,49 @@ bool EnvironmentOn(const char* name) {
 // write invalidating every cache at once). On, they are the Vulkan rasterizer's.
 bool CachePathsEnabled() {
     static const bool enabled = EnvironmentOn("EDEN_NX2_METAL_CACHE_PATHS");
+    return enabled;
+}
+
+// EDEN_NX2_METAL_CLEAR_DRAWS=0: a clear of part of a target, of some colour channels or of some
+// stencil bits clears what a load action can instead, and integer targets take the register's
+// floats, as this backend started.
+bool ClearDrawsEnabled() {
+    static const bool enabled = EnvironmentOn("EDEN_NX2_METAL_CLEAR_DRAWS");
+    return enabled;
+}
+
+/// The rectangle (x, y, width, height) a clear covers of a target of the given size: scissor 0
+/// when the clear uses it, as Vulkan's Clear.
+std::array<u32, 4> ClearArea(const Maxwell& regs, bool is_rescaling, u32 width, u32 height) {
+    const auto& scissor = regs.scissor_test[0];
+    if (regs.clear_control.use_scissor == 0 || scissor.enable == 0) {
+        return {0, 0, width, height};
+    }
+    const auto& resolution = Settings::values.resolution_info;
+    const auto scale = [&](s32 value) {
+        const u32 positive = static_cast<u32>((std::max)(value, 0));
+        return static_cast<s32>(is_rescaling ? resolution.ScaleUp(positive) : positive);
+    };
+    const bool lower_left = regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft;
+    const s32 clip_height = static_cast<s32>(regs.surface_clip.height);
+    const s32 min_y = lower_left ? clip_height - static_cast<s32>(scissor.max_y)
+                                 : static_cast<s32>(scissor.min_y.Value());
+    const s32 max_y = lower_left ? clip_height - static_cast<s32>(scissor.min_y)
+                                 : static_cast<s32>(scissor.max_y.Value());
+    const s32 limit_x = static_cast<s32>(width);
+    const s32 limit_y = static_cast<s32>(height);
+    const s32 x0 = std::clamp(scale(static_cast<s32>(scissor.min_x.Value())), 0, limit_x);
+    const s32 y0 = std::clamp(scale(min_y), 0, limit_y);
+    const s32 x1 = std::clamp(scale(static_cast<s32>(scissor.max_x.Value())), x0, limit_x);
+    const s32 y1 = std::clamp(scale(max_y), y0, limit_y);
+    return {static_cast<u32>(x0), static_cast<u32>(y0), static_cast<u32>(x1 - x0),
+            static_cast<u32>(y1 - y0)};
+}
+
+// EDEN_NX2_METAL_FRAGMENT_BARRIER=0: the guest's fragment barrier does nothing, as this backend
+// started (a draw sampling the target of its own pass reads what the pass before it stored).
+bool FragmentBarrierEnabled() {
+    static const bool enabled = EnvironmentOn("EDEN_NX2_METAL_FRAGMENT_BARRIER");
     return enabled;
 }
 
@@ -985,6 +1030,37 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         texture_cache.BoundTargetlessFramebuffer(
             TargetlessReach(regs, texture_cache.IsRescaling()));
     }
+    const bool writes_storage = [&] {
+        const auto any_written = [](const auto& descriptors) {
+            return std::ranges::any_of(descriptors,
+                                       [](const auto& desc) { return desc.is_written; });
+        };
+        for (size_t index = 0; index < stages.size(); ++index) {
+            if (absent(index)) {
+                continue;
+            }
+            const Shader::Info& info = programs[index]->info;
+            if (info.stores_global_memory || any_written(info.storage_buffers_descriptors) ||
+                any_written(info.image_descriptors) ||
+                any_written(info.image_buffer_descriptors)) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    if (fragment_barrier_pass != 0) {
+        // A pending barrier: the encoder ends (storing its targets) when this draw samples one
+        // of them or the pass wrote storage, and the draw's pass loads them again.
+        const u64 serial = scheduler.RenderPassSerial();
+        if (scheduler.IsRendering() && fragment_barrier_pass == serial &&
+            (pass_stores == serial || texture_cache.SamplesRenderTarget(views))) {
+            scheduler.EndRendering();
+            ++barrier_pass_ends;
+        }
+        if (!scheduler.IsRendering() || fragment_barrier_pass != serial) {
+            fragment_barrier_pass = 0;
+        }
+    }
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     if (framebuffer == nullptr) {
         prepare_refusal = "no framebuffer";
@@ -1333,6 +1409,9 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     }
 
     scheduler.BeginRendering(targets);
+    if (writes_storage) {
+        pass_stores = scheduler.RenderPassSerial();
+    }
     DrawState draw{};
     draw.pipeline = state;
     draw.depth_stencil = depth_stencil_state.Get();
@@ -1625,15 +1704,8 @@ void RasterizerMetal::Clear(u32 layer_count) {
                            layer_count, static_cast<u32>(regs.clear_surface.layer),
                            regs.stencil_front_mask);
     };
-    // What a load action can't do is a draw on Metal; until it is one, the parts that fit a load
-    // action are done and the rest is counted.
-    const char* partial = nullptr;
-    if (any_color && !all_color) {
-        partial = "clear of some colour channels";
-    } else if (regs.clear_surface.S && regs.stencil_front_mask != 0xFF &&
-               regs.stencil_front_mask != 0) {
-        partial = "clear of some stencil bits";
-    }
+    const bool stencil_partial = regs.clear_surface.S && regs.stencil_front_mask != 0xFF &&
+                                 regs.stencil_front_mask != 0;
     std::scoped_lock lock{texture_cache.mutex};
     texture_cache.UpdateRenderTargets(true);
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
@@ -1641,44 +1713,107 @@ void RasterizerMetal::Clear(u32 layer_count) {
         Coverage::Refuse(Coverage::Work::Clear, "no framebuffer", describe);
         return;
     }
-    if (const auto& scissor = regs.scissor_test[0];
-        partial == nullptr && regs.clear_control.use_scissor != 0 && scissor.enable != 0) {
-        const auto& resolution = Settings::values.resolution_info;
-        const bool scaled = texture_cache.IsRescaling();
-        const u32 max_x = scaled ? resolution.ScaleUp(scissor.max_x.Value()) : scissor.max_x.Value();
-        const u32 max_y = scaled ? resolution.ScaleUp(scissor.max_y.Value()) : scissor.max_y.Value();
-        if (scissor.min_x != 0 || scissor.min_y != 0 || max_x < framebuffer->Width() ||
-            max_y < framebuffer->Height()) {
-            partial = "clear of part of the target (scissor), whole target cleared";
+    const u32 rt = regs.clear_surface.RT;
+    const bool use_color =
+        any_color && rt < NUM_RT && framebuffer->Colors()[rt].texture != nullptr;
+    const bool use_depth = regs.clear_surface.Z && framebuffer->HasDepth();
+    const bool use_stencil = regs.clear_surface.S && framebuffer->HasStencil();
+    if (!use_color && !use_depth && !use_stencil) {
+        return;
+    }
+    const std::array<u32, 4> rect = ClearArea(regs, texture_cache.IsRescaling(),
+                                              framebuffer->Width(), framebuffer->Height());
+    if (rect[2] == 0 || rect[3] == 0) {
+        return;
+    }
+    const bool covers = rect[0] == 0 && rect[1] == 0 && rect[2] >= framebuffer->Width() &&
+                        rect[3] >= framebuffer->Height();
+    const bool draws = ClearDrawsEnabled();
+    // What a load action can't do (a rectangle, some colour channels, some stencil bits) is a
+    // draw; EDEN_NX2_METAL_CLEAR_DRAWS=0 clears the whole of it instead and counts that.
+    const bool draw_color = use_color && (!covers || !all_color);
+    const bool draw_depth = use_depth && !covers;
+    const bool draw_stencil = use_stencil && (!covers || stencil_partial);
+    const bool needs_draw = draw_color || draw_depth || draw_stencil;
+    std::array<f64, 4> color_value{};
+    if (use_color) {
+        const auto format =
+            VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[rt].format);
+        const bool is_integer = draws && VideoCore::Surface::IsPixelFormatInteger(format);
+        const f32 bits =
+            static_cast<f32>(VideoCore::Surface::PixelComponentSizeBitsInteger(format));
+        for (size_t component = 0; component < 4; ++component) {
+            const f32 value = regs.clear_color[component];
+            // Integer targets: the values Vulkan's Clear writes.
+            if (!is_integer) {
+                color_value[component] = value;
+            } else if (!VideoCore::Surface::IsPixelFormatSignedInteger(format)) {
+                color_value[component] = static_cast<u32>(bits * 2.0f * value);
+            } else {
+                color_value[component] = static_cast<s32>((bits - 1.0f) * 2.0f * (value - 0.5f));
+            }
         }
     }
-    if (partial != nullptr) {
-        Coverage::Refuse(Coverage::Work::Clear, partial, describe);
-    } else {
-        Coverage::Note(Coverage::Work::Clear, Coverage::Path::Native);
+    if (!draws && needs_draw) {
+        Coverage::Refuse(Coverage::Work::Clear,
+                         !covers ? "clear of part of the target (scissor), whole target cleared"
+                                 : draw_color ? "clear of some colour channels"
+                                              : "clear of some stencil bits",
+                         describe);
     }
     ClearPass pass{};
     pass.width = framebuffer->Width();
     pass.height = framebuffer->Height();
-    const u32 rt = regs.clear_surface.RT;
-    if (all_color && rt < NUM_RT && framebuffer->Colors()[rt].texture != nullptr) {
+    bool whole = false;
+    if (use_color && all_color && (!draw_color || !draws)) {
         pass.color[rt] = framebuffer->Colors()[rt];
         pass.clear_color[rt] = true;
-        for (size_t component = 0; component < 4; ++component) {
-            pass.color_value[rt][component] = regs.clear_color[component];
-        }
+        pass.color_value[rt] = color_value;
+        whole = true;
     }
-    if (regs.clear_surface.Z && framebuffer->HasDepth()) {
+    if (use_depth && (!draw_depth || !draws)) {
         pass.depth = framebuffer->Depth();
         pass.clear_depth = true;
         pass.depth_value = regs.clear_depth;
+        whole = true;
     }
-    if (regs.clear_surface.S && framebuffer->HasStencil()) {
+    if (use_stencil && (!draw_stencil || !draws)) {
         pass.stencil = framebuffer->Depth();
         pass.clear_stencil = true;
         pass.stencil_value = static_cast<u32>(regs.clear_stencil);
+        whole = true;
     }
-    scheduler.Clear(pass);
+    if (whole) {
+        scheduler.Clear(pass);
+    }
+    if (draws && needs_draw) {
+        ClearRect draw{};
+        if (draw_color) {
+            draw.color = framebuffer->Colors()[rt];
+            draw.color_mask = static_cast<u8>(regs.clear_surface.R | regs.clear_surface.G << 1 |
+                                              regs.clear_surface.B << 2 |
+                                              regs.clear_surface.A << 3);
+            draw.color_value = color_value;
+        }
+        if (draw_depth || draw_stencil) {
+            draw.depth = framebuffer->Depth();
+            draw.clear_depth = draw_depth;
+            draw.clear_stencil = draw_stencil;
+            draw.depth_value = regs.clear_depth;
+            draw.stencil_value = static_cast<u32>(regs.clear_stencil);
+            draw.stencil_mask = stencil_partial ? regs.stencil_front_mask : 0xFFU;
+        }
+        draw.rect = rect;
+        draw.width = framebuffer->Width();
+        draw.height = framebuffer->Height();
+        if (scheduler.ClearRectangle(draw)) {
+            Coverage::Note(Coverage::Work::Clear, Coverage::Path::ClearDraw);
+        } else {
+            Coverage::Refuse(Coverage::Work::Clear, "no pipeline draws this clear", describe);
+        }
+    } else if (!needs_draw) {
+        Coverage::Note(Coverage::Work::Clear, Coverage::Path::Native);
+    }
     ++clears;
 }
 
@@ -2355,9 +2490,28 @@ void RasterizerMetal::WaitForIdle() {
     SignalReference();
 }
 
-void RasterizerMetal::FragmentBarrier() {}
+void RasterizerMetal::FragmentBarrier() {
+    // The next draw ends the render encoder only if it reads what the pass wrote, as Vulkan's.
+    fragment_barrier_pass = FragmentBarrierEnabled() && scheduler.IsRendering()
+                                ? scheduler.RenderPassSerial()
+                                : 0;
+}
 
 void RasterizerMetal::TiledCacheBarrier() {}
+
+bool RasterizerMetal::AccelerateConditionalRendering() {
+    // Metal has no predicate rendering: the caller compares the report values on the CPU, as it
+    // does for Vulkan without VK_EXT_conditional_rendering (MoltenVK), after the same flush.
+    const auto& regs = maxwell3d->regs;
+    const bool reads_memory =
+        regs.render_enable_override == Maxwell::RenderEnable::Override::UseRenderEnable &&
+        regs.render_enable.mode != Maxwell::RenderEnable::Mode::False &&
+        regs.render_enable.mode != Maxwell::RenderEnable::Mode::True;
+    if (reads_memory && CachePathsEnabled()) {
+        gpu_memory->FlushCaching();
+    }
+    return false;
+}
 
 void RasterizerMetal::FlushCommands() {
     if (scheduler.HasPendingWork()) {
@@ -2384,6 +2538,10 @@ void RasterizerMetal::TickFrame() {
         archive_saved = now;
         pipeline_cache.Archive().Save();
     }
+    // The frame threads' deadlines follow the frames presented (EDEN_NX2_APPLE_FRAME_DEADLINE).
+    Common::FrameDeadline::SetPeriodNs(static_cast<u64>((std::max)(
+        VideoCommon::Nx2Perf::g_guest_frame_interval_ns.load(std::memory_order_relaxed), 0LL)));
+    Common::FrameDeadline::NoteFrame();
 }
 
 bool RasterizerMetal::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,

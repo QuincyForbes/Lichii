@@ -1876,6 +1876,314 @@ int RunBlockCopy() {
     return passed ? 0 : 1;
 }
 
+/// Clears a load action can't do, drawn (Scheduler::ClearRectangle): the middle 8x8 of 16x16
+/// targets cleared in green only, in depth, in the stencil bits of mask 0x3C, and in integers.
+int RunClearRect() {
+    using Maxwell = Metal::Maxwell;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr uint32_t Side = 16;
+    constexpr std::array<uint32_t, 4> Middle{4, 4, 8, 8};
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    const uint32_t packed = static_cast<uint32_t>(MTLPixelFormatDepth32Float_Stencil8);
+    const auto make = [&](uint32_t format) {
+        return Metal::CreateTexture(device, {.kind = Metal::TextureKind::e2D,
+                                             .format = format,
+                                             .width = Side,
+                                             .height = Side,
+                                             .render_target = true});
+    };
+    const Metal::Object color = make(rgba8);
+    const Metal::Object integers = make(static_cast<uint32_t>(MTLPixelFormatRGBA8Uint));
+    const Metal::Object depth = make(static_cast<uint32_t>(MTLPixelFormatDepth32Float));
+    const Metal::Object depth_stencil = make(packed);
+    const Metal::Object counted = make(rgba8);
+    const auto readback = [&](uint8_t** data) {
+        return Metal::CreateBuffer(device, Side * Side * 4, true, data);
+    };
+    uint8_t* color_data = nullptr;
+    uint8_t* integer_data = nullptr;
+    uint8_t* depth_data = nullptr;
+    const Metal::Object color_buffer = readback(&color_data);
+    const Metal::Object integer_buffer = readback(&integer_data);
+    const Metal::Object depth_buffer = readback(&depth_data);
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, QuadSource, error);
+    const Metal::Object vertex =
+        library ? Metal::CreateFunction(library.Get(), "quad_vertex") : Metal::Object{};
+    const Metal::Object fragment =
+        library ? Metal::CreateFunction(library.Get(), "quad_fragment") : Metal::Object{};
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = vertex.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = rgba8;
+    desc.blend[0].write_mask = 0xF;
+    desc.depth_format = packed;
+    desc.stencil_format = packed;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    desc.attributes[0] = {1, 0, 0, Maxwell::VertexAttribute::Type::Float,
+                          Maxwell::VertexAttribute::Side::Size_R32_G32};
+    desc.streams[0] = {1, 8, 0};
+    const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
+    const Metal::Object equal_state = [&] {
+        auto state = Metal::Zeroed<Metal::DepthStencilDesc>();
+        state.stencil_test = 1;
+        state.front = {Maxwell::StencilOp::Op::Keep_D3D, Maxwell::StencilOp::Op::Keep_D3D,
+                       Maxwell::StencilOp::Op::Keep_D3D, Maxwell::ComparisonOp::Equal_D3D, 0xFF,
+                       0};
+        state.back = state.front;
+        return Metal::CreateDepthStencilState(device, state);
+    }();
+    uint8_t* vertices = nullptr;
+    const Metal::Object vertex_buffer = Metal::CreateBuffer(device, 48, true, &vertices);
+    if (!color || !integers || !depth || !depth_stencil || !counted || !pipeline ||
+        !equal_state || color_data == nullptr || integer_data == nullptr ||
+        depth_data == nullptr || vertices == nullptr) {
+        std::printf("metal-smoke: FAIL clear rectangle setup: %s\n", error.c_str());
+        return 1;
+    }
+    const float positions[12]{-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1};
+    std::memcpy(vertices, positions, sizeof(positions));
+
+    Metal::ClearPass whole{};
+    whole.color[0] = {.texture = color.Get()};
+    whole.clear_color[0] = true;
+    whole.color_value[0] = {0.2, 0.4, 0.6, 1.0};
+    whole.depth = {.texture = depth.Get()};
+    whole.clear_depth = true;
+    whole.depth_value = 1.0;
+    whole.width = Side;
+    whole.height = Side;
+    scheduler.Clear(whole);
+    Metal::ClearPass whole_stencil{};
+    whole_stencil.depth = {.texture = depth_stencil.Get()};
+    whole_stencil.stencil = {.texture = depth_stencil.Get()};
+    whole_stencil.clear_depth = true;
+    whole_stencil.clear_stencil = true;
+    whole_stencil.depth_value = 1.0;
+    whole_stencil.stencil_value = 0x0F;
+    whole_stencil.width = Side;
+    whole_stencil.height = Side;
+    scheduler.Clear(whole_stencil);
+
+    bool drawn = scheduler.ClearRectangle(Metal::ClearRect{
+        .color = {.texture = color.Get()},
+        .color_mask = 2,
+        .color_value = {1.0, 1.0, 1.0, 0.0},
+        .depth = {.texture = depth.Get()},
+        .clear_depth = true,
+        .depth_value = 0.5f,
+        .rect = Middle,
+        .width = Side,
+        .height = Side,
+    });
+    // Stencil bits 0x3C of 0x0F become those of 0xF0: 0x33. The depth beside them stays.
+    drawn = scheduler.ClearRectangle(Metal::ClearRect{
+        .depth = {.texture = depth_stencil.Get()},
+        .clear_stencil = true,
+        .stencil_value = 0xF0,
+        .stencil_mask = 0x3C,
+        .rect = Middle,
+        .width = Side,
+        .height = Side,
+    }) && drawn;
+    drawn = scheduler.ClearRectangle(Metal::ClearRect{
+        .color = {.texture = integers.Get()},
+        .color_mask = 0xF,
+        .color_value = {7.0, 8.0, 9.0, 10.0},
+        .rect = {0, 0, Side, Side},
+        .width = Side,
+        .height = Side,
+    }) && drawn;
+    scheduler.CopyTextureToBuffer(color.Get(), 0, 0, {}, {Side, Side, 1}, color_buffer.Get(), 0,
+                                  Side * 4, 0);
+    scheduler.CopyTextureToBuffer(integers.Get(), 0, 0, {}, {Side, Side, 1},
+                                  integer_buffer.Get(), 0, Side * 4, 0);
+    scheduler.CopyTextureToBuffer(depth.Get(), 0, 0, {}, {Side, Side, 1}, depth_buffer.Get(), 0,
+                                  Side * 4, 0);
+    // The stencil is counted: a quad over the target at reference 0x33, then at 0x0F.
+    for (uint32_t pass = 0; pass < 2; ++pass) {
+        Metal::RenderTargetSet targets{};
+        targets.color[0] = {.texture = counted.Get()};
+        targets.depth = {.texture = depth_stencil.Get()};
+        targets.has_depth = true;
+        targets.has_stencil = true;
+        targets.width = Side;
+        targets.height = Side;
+        scheduler.BeginRendering(targets);
+        Metal::DrawState state{};
+        state.pipeline = pipeline.Get();
+        state.depth_stencil = equal_state.Get();
+        state.viewport = {0.0f, 0.0f, float(Side), float(Side), 0.0f, 1.0f};
+        state.scissor = {0, 0, Side, Side};
+        state.stencil_front_ref = pass == 0 ? 0x33 : 0x0F;
+        state.stencil_back_ref = state.stencil_front_ref;
+        scheduler.SetDrawState(state);
+        scheduler.BindVertexBuffer(Metal::VertexBufferSlot(0), vertex_buffer.Get(), 0);
+        scheduler.VisibilityResults()[5 + pass] = 0;
+        scheduler.SetVisibility(5 + pass);
+        scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 6, 1, 0);
+    }
+    scheduler.Finish();
+    const uint64_t inside = scheduler.VisibilityResults()[5];
+    const uint64_t outside = scheduler.VisibilityResults()[6];
+    const auto* texels = reinterpret_cast<const Texel*>(color_data);
+    uint32_t wrong_color = 0;
+    uint32_t wrong_integer = 0;
+    uint32_t wrong_depth = 0;
+    for (uint32_t y = 0; y < Side; ++y) {
+        for (uint32_t x = 0; x < Side; ++x) {
+            const bool middle = x >= Middle[0] && x < Middle[0] + Middle[2] && y >= Middle[1] &&
+                                y < Middle[1] + Middle[3];
+            const std::array<uint8_t, 4> expected{51, static_cast<uint8_t>(middle ? 255 : 102),
+                                                  153, 255};
+            wrong_color += Near(texels[y * Side + x], expected) ? 0 : 1;
+            const uint8_t* const integer = integer_data + (y * Side + x) * 4;
+            wrong_integer +=
+                integer[0] == 7 && integer[1] == 8 && integer[2] == 9 && integer[3] == 10 ? 0 : 1;
+            float value;
+            std::memcpy(&value, depth_data + (y * Side + x) * 4, 4);
+            wrong_depth += value == (middle ? 0.5f : 1.0f) ? 0 : 1;
+        }
+    }
+    const uint64_t middle_samples = Middle[2] * Middle[3];
+    const bool passed = drawn && wrong_color == 0 && wrong_integer == 0 && wrong_depth == 0 &&
+                        inside == middle_samples && outside == Side * Side - middle_samples;
+    std::printf("metal-smoke: clear rectangle 8x8 of 16x16 (%s): %u colour, %u integer, %u depth "
+                "texels wrong, stencil 0x33 on %llu samples (of %llu), 0x0F on %llu: %s\n",
+                drawn ? "drawn" : "refused", wrong_color, wrong_integer, wrong_depth,
+                static_cast<unsigned long long>(inside),
+                static_cast<unsigned long long>(middle_samples),
+                static_cast<unsigned long long>(outside), passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// A clear waiting for its render pass (EDEN_NX2_METAL_CLEAR_FOLD): the load action of a pass on
+/// its target, recorded first when a copy reads the target or a pass on another target comes.
+int RunClearFold() {
+    using Maxwell = Metal::Maxwell;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    const auto make = [&] {
+        return Metal::CreateTexture(device, {.kind = Metal::TextureKind::e2D,
+                                             .format = rgba8,
+                                             .width = Size,
+                                             .height = Size,
+                                             .render_target = true});
+    };
+    const Metal::Object first = make();
+    const Metal::Object second = make();
+    uint8_t* first_data = nullptr;
+    uint8_t* second_data = nullptr;
+    uint8_t* late_data = nullptr;
+    const auto readback = [&](uint8_t** data) {
+        return Metal::CreateBuffer(device, Size * Size * 4, true, data);
+    };
+    const Metal::Object first_buffer = readback(&first_data);
+    const Metal::Object second_buffer = readback(&second_data);
+    const Metal::Object late_buffer = readback(&late_data);
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, QuadSource, error);
+    const Metal::Object vertex =
+        library ? Metal::CreateFunction(library.Get(), "quad_vertex") : Metal::Object{};
+    const Metal::Object fragment =
+        library ? Metal::CreateFunction(library.Get(), "quad_fragment") : Metal::Object{};
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = vertex.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = rgba8;
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    desc.attributes[0] = {1, 0, 0, Maxwell::VertexAttribute::Type::Float,
+                          Maxwell::VertexAttribute::Size::Size_R32_G32};
+    desc.streams[0] = {1, 8, 0};
+    const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
+    const Metal::Object depth_stencil =
+        Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+    uint8_t* vertices = nullptr;
+    const Metal::Object vertex_buffer = Metal::CreateBuffer(device, 48, true, &vertices);
+    if (!first || !second || !pipeline || !depth_stencil || first_data == nullptr ||
+        second_data == nullptr || late_data == nullptr || vertices == nullptr) {
+        std::printf("metal-smoke: FAIL clear fold setup: %s\n", error.c_str());
+        return 1;
+    }
+    // The left half of the target.
+    const float positions[12]{-1, -1, 0, -1, 0, 1, -1, -1, 0, 1, -1, 1};
+    std::memcpy(vertices, positions, sizeof(positions));
+
+    const auto clear = [&](const Metal::Object& texture, std::array<double, 4> value) {
+        Metal::ClearPass pass{};
+        pass.color[0] = {.texture = texture.Get()};
+        pass.clear_color[0] = true;
+        pass.color_value[0] = value;
+        pass.width = Size;
+        pass.height = Size;
+        scheduler.Clear(pass);
+    };
+    const auto draw_left = [&](const Metal::Object& texture) {
+        Metal::RenderTargetSet targets{};
+        targets.color[0] = {.texture = texture.Get()};
+        targets.width = Size;
+        targets.height = Size;
+        scheduler.BeginRendering(targets);
+        Metal::DrawState state{};
+        state.pipeline = pipeline.Get();
+        state.depth_stencil = depth_stencil.Get();
+        state.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+        state.scissor = {0, 0, Size, Size};
+        scheduler.SetDrawState(state);
+        scheduler.BindVertexBuffer(Metal::VertexBufferSlot(0), vertex_buffer.Get(), 0);
+        scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 6, 1, 0);
+    };
+    const auto read = [&](const Metal::Object& texture, const Metal::Object& buffer) {
+        scheduler.CopyTextureToBuffer(texture.Get(), 0, 0, {}, {Size, Size, 1}, buffer.Get(), 0,
+                                      Size * 4, 0);
+    };
+    (void)scheduler.TakeCounts();
+    // Red as the load action of the pass that draws the left half green.
+    clear(first, {1.0, 0.0, 0.0, 1.0});
+    draw_left(first);
+    // Blue read by a copy before any pass on the target.
+    clear(second, {0.0, 0.0, 1.0, 1.0});
+    read(second, second_buffer);
+    read(first, first_buffer);
+    // Two clears of one target are one, the later value; a pass on another target comes after it.
+    clear(first, {1.0, 0.0, 0.0, 1.0});
+    clear(first, {1.0, 1.0, 0.0, 1.0});
+    draw_left(second);
+    read(first, late_buffer);
+    scheduler.Finish();
+    const auto counts = scheduler.TakeCounts();
+    const uint64_t passes = counts[3];
+    const uint64_t folded = counts[4];
+
+    const auto texel = [](const uint8_t* data, uint32_t x) {
+        return reinterpret_cast<const Texel*>(data)[(Size / 2) * Size + x];
+    };
+    const bool pictures = Near(texel(first_data, 4), {0, 255, 0, 255}) &&
+                          Near(texel(first_data, Size - 4), {255, 0, 0, 255}) &&
+                          Near(texel(second_data, 4), {0, 0, 255, 255}) &&
+                          Near(texel(second_data, Size - 4), {0, 0, 255, 255}) &&
+                          Near(texel(late_data, 4), {255, 255, 0, 255}) &&
+                          Near(texel(late_data, Size - 4), {255, 255, 0, 255});
+    // Folding: the first clear rides its pass, the other two get one pass each (4 with the two
+    // draws' passes); without it each of the four clears has a pass (6).
+    const char* const value = std::getenv("EDEN_NX2_METAL_CLEAR_FOLD");
+    const bool folding = value == nullptr || value[0] != '0';
+    const bool counted = folding ? folded == 1 && passes == 4 : folded == 0 && passes == 6;
+    std::printf("metal-smoke: clear fold (%s): pictures %s; %llu render passes, %llu starting "
+                "with a clear: %s\n",
+                folding ? "on" : "off", pictures ? "PASS" : "FAIL",
+                static_cast<unsigned long long>(passes), static_cast<unsigned long long>(folded),
+                counted ? "PASS" : "FAIL");
+    return pictures && counted ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main(int argc, char** argv) {
@@ -1892,8 +2200,8 @@ int main(int argc, char** argv) {
                                  RunMeshEmulation, RunMeshDistribution, RunIndexRewrite,
                                  RunOcarinaBilinear, RunPipelineArchive,
                                  RunDepthBlit, RunTessellation, RunDepthStencilBlit,
-                                 RunPipelineCheck, RunDeviceMsl, RunBlockCopy,
-                                 SmokeProbe::RunAll}) {
+                                 RunPipelineCheck, RunDeviceMsl, RunBlockCopy, RunClearRect,
+                                 RunClearFold, SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }

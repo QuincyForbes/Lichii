@@ -228,6 +228,11 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// instance index is refused; quad groups for subgroups), as before (EDEN_NX2_METAL_MSL_DEVICE=0).
 /// "metal_copies_plain": the Metal renderer skips blits between depth images and copies between
 /// block-compressed and plain formats, as before (EDEN_NX2_METAL_COPIES=0).
+/// "metal_clears_plain": the Metal renderer clears the whole target, every channel and every
+/// stencil bit where the game clears a part, and gives every clear a render pass of its own, as
+/// before (EDEN_NX2_METAL_CLEAR_DRAWS=0, EDEN_NX2_METAL_CLEAR_FOLD=0).
+/// "metal_barrier_off": the Metal renderer ignores the game's fragment barrier, as before
+/// (EDEN_NX2_METAL_FRAGMENT_BARRIER=0).
 /// "pipeline_holds_old": the pipeline build a draw waits for stays queued on the builder pool, as
 /// before (EDEN_NX2_PIPELINE_HOLD_BOOST=0). "pipeline_list_old": the used pipelines list is
 /// written only on a first use 15 s after the last save and at shutdown, as before
