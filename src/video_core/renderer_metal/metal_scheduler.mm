@@ -1572,7 +1572,7 @@ void Scheduler::SetDrawState(const DrawState& state) {
                             alpha:state.blend_color[3]];
     }
     // A draw without a depth-stencil state leaves the encoder's.
-    const void* const depth_stencil =
+    void* const depth_stencil =
         state.depth_stencil != nullptr ? state.depth_stencil : last.depth_stencil;
     impl->render_state = state;
     impl->render_state.depth_stencil = depth_stencil;
