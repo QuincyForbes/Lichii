@@ -10,6 +10,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "common/common_types.h"
@@ -175,6 +176,11 @@ public:
     /// Since the last call: frames with Link's motion drawn, frames with a reactive mask.
     [[nodiscard]] std::array<u64, 2> TakeExtras() noexcept;
 
+    /// Why Link's motion was last not drawn (empty when it was), for the smoke test.
+    [[nodiscard]] const std::string& ActorError() const noexcept {
+        return actor_error;
+    }
+
 private:
     struct Pass {
         Object library;
@@ -252,6 +258,7 @@ private:
     std::array<ActorSlot, 4> actor_slots;
     bool actor_prepared{};
     bool actor_failed{};
+    std::string actor_error;
     u64 actor_frames{};
 
     Effects effects;

@@ -308,6 +308,7 @@ bool OcarinaTemporal::PrepareActor() {
         sampler = CreateLinearClampSampler(device);
     }
     if (!actor_state || !sampler) {
+        actor_error = error.empty() ? "no sampler" : error;
         LOG_WARNING(Render_Metal, "Metal: Ocarina actor motion unavailable: {}", error);
         return false;
     }
@@ -439,14 +440,19 @@ bool OcarinaTemporal::DrawActor(TextureHandle depth, std::array<u32, 2> extent,
     const OcarinaActorMesh& mesh = actor.mesh;
     const size_t bone_floats = size_t{OcarinaActorMesh::Bones} * 12;
     if (mesh.indices.empty() || mesh.vertices.size() < OcarinaActorMesh::Stride ||
-        mesh.current_bones.size() < bone_floats || mesh.previous_bones.size() < bone_floats ||
-        !PrepareActor()) {
+        mesh.current_bones.size() < bone_floats || mesh.previous_bones.size() < bone_floats) {
+        actor_error = "mesh or poses incomplete";
+        return false;
+    }
+    if (!PrepareActor()) {
         return false;
     }
     ActorSlot* const slot = AcquireActorSlot(mesh);
     if (slot == nullptr) {
+        actor_error = "no free actor slot";
         return false;
     }
+    actor_error.clear();
     const ActorTransforms transforms{
         .current = actor.current,
         .previous = actor.previous,

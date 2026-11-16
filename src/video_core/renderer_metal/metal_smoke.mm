@@ -3117,11 +3117,16 @@ int RunOcarinaActorEffects() {
     }
     const bool passed =
         encoded && biased && actor_wrong == 0 && camera_wrong == 0 && bias_wrong == 0;
-    std::printf("metal-smoke: Ocarina actor/effects: %s; Link's pixels %.3f,%.3f (expected 4,0) "
-                "%u of %u wrong, hidden pixels %.3f,%.3f (expected 0,0) %u wrong; effects mask "
-                "%s, %u of %u wrong: %s\n",
-                encoded ? "motion encoded" : "motion NOT encoded", left[0], left[1], actor_wrong,
-                Side * Side / 2, right[0], right[1], camera_wrong,
+    // Whether Link's draw ran at all (and why not), apart from what it wrote.
+    const uint64_t actor_frames = temporal.TakeExtras()[0];
+    const std::string actor_error =
+        temporal.ActorError().empty() ? std::string{"none"} : temporal.ActorError();
+    std::printf("metal-smoke: Ocarina actor/effects: %s, %llu actor draws (last failure: %s); "
+                "Link's pixels %.3f,%.3f (expected 4,0) %u of %u wrong, hidden pixels %.3f,%.3f "
+                "(expected 0,0) %u wrong; effects mask %s, %u of %u wrong: %s\n",
+                encoded ? "motion encoded" : "motion NOT encoded",
+                static_cast<unsigned long long>(actor_frames), actor_error.c_str(), left[0],
+                left[1], actor_wrong, Side * Side / 2, right[0], right[1], camera_wrong,
                 biased ? "made" : "NOT made", bias_wrong, Side * Side, passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
