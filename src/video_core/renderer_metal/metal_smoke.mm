@@ -2752,13 +2752,19 @@ int RunPipelineFiles() {
     std::error_code ec;
     std::filesystem::remove_all(directory, ec);
     constexpr size_t Variants = 8;
+    // Variants of other GPU code: the archive keys on it, so variants differing only in state it
+    // does not compile in (the write mask) hit each other's entries once one of them was added.
+    constexpr std::array<MTLPixelFormat, Variants> formats{
+        MTLPixelFormatR8Unorm,    MTLPixelFormatRG8Unorm,  MTLPixelFormatRGBA8Unorm,
+        MTLPixelFormatR16Float,   MTLPixelFormatRG16Float, MTLPixelFormatRGBA16Float,
+        MTLPixelFormatR32Float,   MTLPixelFormatRG32Float};
     std::vector<Metal::RenderPipelineDesc> descs;
     for (size_t index = 0; index < Variants; ++index) {
         auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
         desc.vertex_function = vertex.Get();
         desc.fragment_function = fragment.Get();
-        desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
-        desc.blend[0].write_mask = static_cast<uint32_t>(index + 1);
+        desc.color_formats[0] = static_cast<uint32_t>(formats[index]);
+        desc.blend[0].write_mask = 0xF;
         desc.samples = 1;
         desc.topology_class = 2;
         desc.rasterize = 1;
@@ -2841,8 +2847,9 @@ int RunPipelineFiles() {
     Metal::PipelineArchive reopened;
     const bool second_built = reopened.Open(device, archive_path) && build_all(reopened);
     const Metal::PipelineArchive::Counts second = reopened.Totals();
-    // A build can hit in the first run when another thread just added the same GPU code (which
-    // depends on timing): every build is a hit or a miss, and every miss is added.
+    // Checked without timing: every build is a hit or a miss (counted under the archive's lock),
+    // every miss is added, the reopened archive serves all. Should Metal still find two variants
+    // equal, a thread may hit the other's entry in the first run; that is a real hit, not a race.
     const bool passed = boot_marked && rebooted && states_read == Variants && functions_cleared &&
                         listed && unlisted && first_built && second_built && first.misses != 0 &&
                         first.misses + first.hits == Variants && first.added == first.misses &&

@@ -23,6 +23,7 @@
 #include "common/logging.h"
 #include "common/platform_events.h"
 #include "common/thread_worker.h"
+#include "video_core/async_translate.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
@@ -61,8 +62,16 @@ u64 NanosecondsSince(std::chrono::steady_clock::time_point start) {
 
 u32 AsyncPipelineThreads() {
     static const u32 threads = [] {
+        // Vulkan's switches apply too: EDEN_NX2_ASYNC_TRANSLATE other than 1 translates on the
+        // draw's thread; EDEN_NX2_ASYNC_TRANSLATE_THREADS sets the count unless the Metal one does.
+        if (VideoCommon::AsyncTranslateMode() != 1) {
+            return 0U;
+        }
         const u32 automatic = (std::max)(std::thread::hardware_concurrency(), 2U) - 1;
-        const char* const value = std::getenv("EDEN_NX2_METAL_ASYNC_PIPELINES");
+        const char* value = std::getenv("EDEN_NX2_METAL_ASYNC_PIPELINES");
+        if (value == nullptr || value[0] == '\0') {
+            value = std::getenv("EDEN_NX2_ASYNC_TRANSLATE_THREADS");
+        }
         if (value == nullptr || value[0] == '\0') {
             return automatic;
         }

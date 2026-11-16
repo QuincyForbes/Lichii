@@ -331,7 +331,9 @@ EDEN_NX2_FENCE_BATCH=1
 # thread, which waits, as before. By default it is built on builder threads (this many; default
 # logical CPUs - 1): a draw that may be skipped (EDEN_NX2_ASYNC_DISCARD, as Vulkan's
 # DrawMayBeSkipped) is skipped meanwhile, one that may not runs an unstarted build itself or
-# lends a running one its QoS class, as EDEN_NX2_PIPELINE_HOLD_BOOST on Vulkan.
+# lends a running one its QoS class, as EDEN_NX2_PIPELINE_HOLD_BOOST on Vulkan. Vulkan's
+# EDEN_NX2_ASYNC_TRANSLATE other than 1 turns it off too, and EDEN_NX2_ASYNC_TRANSLATE_THREADS
+# sets the thread count when this one is not set.
 #EDEN_NX2_METAL_ASYNC_PIPELINES=0
 
 # Metal renderer: 0 decides conditional rendering on the CPU from guest memory only (a pending
