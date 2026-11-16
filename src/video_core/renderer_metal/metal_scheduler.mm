@@ -537,6 +537,36 @@ struct Scheduler::Impl {
                 break;
             }
             break;
+        case ShaderStage::Object:
+            if (render == nil) {
+                return;
+            }
+            switch (NoteBuffer(object_bound, slot, buffer, offset)) {
+            case Bound::Same:
+                break;
+            case Bound::Offset:
+                [render setObjectBufferOffset:offset atIndex:slot];
+                break;
+            case Bound::Other:
+                [render setObjectBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
+                break;
+            }
+            break;
+        case ShaderStage::Mesh:
+            if (render == nil) {
+                return;
+            }
+            switch (NoteBuffer(mesh_bound, slot, buffer, offset)) {
+            case Bound::Same:
+                break;
+            case Bound::Offset:
+                [render setMeshBufferOffset:offset atIndex:slot];
+                break;
+            case Bound::Other:
+                [render setMeshBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
+                break;
+            }
+            break;
         case ShaderStage::Compute:
             if (active_compute == nil) {
                 return;
@@ -877,6 +907,8 @@ struct Scheduler::Impl {
     /// only what differs from the one before it.
     StageBindings vertex_bound;
     StageBindings fragment_bound;
+    StageBindings object_bound;
+    StageBindings mesh_bound;
     DrawState render_state{};
     bool render_state_valid{};
     StageBindings compute_bound;
@@ -1490,6 +1522,8 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
     impl->visibility_slot = -1;
     impl->vertex_bound = {};
     impl->fragment_bound = {};
+    impl->object_bound = {};
+    impl->mesh_bound = {};
     impl->render_state = {};
     impl->render_state_valid = false;
     ++impl->render_pass_serial;
@@ -1629,6 +1663,18 @@ void Scheduler::BindBytes(ShaderStage stage, u32 slot, const void* data, u32 siz
         }
         [impl->render setFragmentBytes:data length:size atIndex:slot];
         break;
+    case ShaderStage::Object:
+        if (slot < BufferSlots) {
+            impl->object_bound.buffers[slot] = &InlineBytes;
+        }
+        [impl->render setObjectBytes:data length:size atIndex:slot];
+        break;
+    case ShaderStage::Mesh:
+        if (slot < BufferSlots) {
+            impl->mesh_bound.buffers[slot] = &InlineBytes;
+        }
+        [impl->render setMeshBytes:data length:size atIndex:slot];
+        break;
     case ShaderStage::Compute:
         if (impl->active_compute == nil) {
             return;
@@ -1657,6 +1703,16 @@ void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture) 
             [impl->render setFragmentTexture:AsTexture(texture) atIndex:slot];
         }
         break;
+    case ShaderStage::Object:
+        if (impl->render != nil && impl->NoteObject(impl->object_bound.textures, slot, texture)) {
+            [impl->render setObjectTexture:AsTexture(texture) atIndex:slot];
+        }
+        break;
+    case ShaderStage::Mesh:
+        if (impl->render != nil && impl->NoteObject(impl->mesh_bound.textures, slot, texture)) {
+            [impl->render setMeshTexture:AsTexture(texture) atIndex:slot];
+        }
+        break;
     case ShaderStage::Compute:
         if (impl->active_compute != nil &&
             impl->NoteObject(impl->active_bound->textures, slot, texture)) {
@@ -1680,6 +1736,16 @@ void Scheduler::BindSampler(ShaderStage stage, u32 slot, void* sampler) {
         if (impl->render != nil &&
             impl->NoteObject(impl->fragment_bound.samplers, slot, sampler)) {
             [impl->render setFragmentSamplerState:AsSampler(sampler) atIndex:slot];
+        }
+        break;
+    case ShaderStage::Object:
+        if (impl->render != nil && impl->NoteObject(impl->object_bound.samplers, slot, sampler)) {
+            [impl->render setObjectSamplerState:AsSampler(sampler) atIndex:slot];
+        }
+        break;
+    case ShaderStage::Mesh:
+        if (impl->render != nil && impl->NoteObject(impl->mesh_bound.samplers, slot, sampler)) {
+            [impl->render setMeshSamplerState:AsSampler(sampler) atIndex:slot];
         }
         break;
     case ShaderStage::Compute:
@@ -1809,6 +1875,30 @@ void Scheduler::Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 inst
                      vertexCount:vertex_count
                    instanceCount:instance_count
                     baseInstance:base_instance];
+    impl->CountDraw();
+}
+
+void Scheduler::DrawMeshThreadgroups(u32 groups, u32 object_threads, u32 mesh_threads) {
+    if (impl->render == nil || groups == 0) {
+        return;
+    }
+    [impl->render drawMeshThreadgroups:MTLSizeMake(groups, 1, 1)
+           threadsPerObjectThreadgroup:MTLSizeMake((std::max)(object_threads, 1U), 1, 1)
+             threadsPerMeshThreadgroup:MTLSizeMake((std::max)(mesh_threads, 1U), 1, 1)];
+    impl->CountDraw();
+}
+
+void Scheduler::DrawMeshThreadgroupsIndirect(BufferHandle buffer, u64 offset, u32 object_threads,
+                                             u32 mesh_threads) {
+    if (impl->render == nil || buffer == nullptr) {
+        return;
+    }
+    [impl->render drawMeshThreadgroupsWithIndirectBuffer:AsBuffer(buffer)
+                                    indirectBufferOffset:offset
+                             threadsPerObjectThreadgroup:MTLSizeMake((std::max)(object_threads, 1U),
+                                                                     1, 1)
+                               threadsPerMeshThreadgroup:MTLSizeMake((std::max)(mesh_threads, 1U),
+                                                                     1, 1)];
     impl->CountDraw();
 }
 

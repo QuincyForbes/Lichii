@@ -36,6 +36,7 @@
 
 #include "common/cityhash.h"
 #include "common/common_types.h"
+#include "common/scope_exit.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/stage.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -481,6 +482,14 @@ struct Outcome {
     bool mesh{};
     bool has_task{};
     u32 mesh_topology{};
+    /// Drawn with Metal mesh functions (NativeMesh); else why not.
+    bool native_mesh{};
+    std::string native_cause;
+    /// The mesh pipeline's emulation, if it has one (its fallback when native).
+    bool mesh_emulated{};
+    u64 mesh_hash{};
+    u64 task_hash{};
+    NativeMesh native_shape{};
     bool tessellated{};
     ShaderTranslate::TessellationModes modes{};
     /// By Tessellation::IndexSizes variant for a tessellation pipeline, else [0].
@@ -554,9 +563,24 @@ void Summarise(const TranslatedPipeline& pipeline, Outcome& outcome, MslSink& si
     outcome.ok = true;
     outcome.cause.clear();
     outcome.detail.clear();
+    if (pipeline.native_mesh) {
+        const NativeMesh& native = *pipeline.native_mesh;
+        outcome.mesh = true;
+        outcome.native_mesh = true;
+        outcome.has_task = !native.object.entry_point.empty();
+        outcome.mesh_topology = native.topology;
+        outcome.native_shape.payload_bytes = native.payload_bytes;
+        outcome.native_shape.object_threads = native.object_threads;
+        outcome.native_shape.mesh_threads = native.mesh_threads;
+        outcome.native_shape.threadgroup_bytes = native.threadgroup_bytes;
+        sink.Add("object", native.object);
+        sink.Add("mesh", native.mesh);
+        sink.Add("mesh_fragment", native.fragment);
+    }
     if (pipeline.mesh) {
         const MeshEmulation& mesh = *pipeline.mesh;
         outcome.mesh = true;
+        outcome.mesh_emulated = true;
         outcome.has_task = mesh.has_task;
         outcome.mesh_topology = mesh.topology;
         sink.Add(mesh.has_task ? "task_kernel" : "mesh_kernel", mesh.first.program);
@@ -565,6 +589,8 @@ void Summarise(const TranslatedPipeline& pipeline, Outcome& outcome, MslSink& si
             sink.Add("mesh_distribution", mesh.distribution.program);
         }
         sink.Add("mesh_vertex", pipeline.vertex);
+    } else if (pipeline.native_mesh) {
+        return;
     } else if (pipeline.tessellation) {
         const Tessellation& tessellation = *pipeline.tessellation;
         outcome.tessellated = true;
@@ -616,6 +642,7 @@ std::optional<TranslatedPipeline> TryGraphics(PipelineTranslator& translator,
     std::optional<TranslatedPipeline> pipeline;
     try {
         pipeline = translator.Graphics(key, envs);
+        outcome.native_cause = translator.NativeMeshCause();
         if (!pipeline) {
             outcome.cause = translator.Cause();
             outcome.detail = translator.Detail();
@@ -632,6 +659,24 @@ std::optional<TranslatedPipeline> TryGraphics(PipelineTranslator& translator,
 
 void RunGraphics(GraphicsJob& job, PipelineTranslator& translator, MslSink& sink) {
     Outcome& outcome = job.outcome;
+    SCOPE_EXIT {
+        if (!outcome.mesh) {
+            return;
+        }
+        // The mesh program follows the task program (slot 1) or is in slot 1 itself.
+        const auto& hashes = job.key.unique_hashes;
+        if (outcome.has_task) {
+            outcome.task_hash = hashes[1];
+            for (size_t index = 2; index < 5; ++index) {
+                if (hashes[index] != 0) {
+                    outcome.mesh_hash = hashes[index];
+                    break;
+                }
+            }
+        } else {
+            outcome.mesh_hash = hashes[1];
+        }
+    };
     if (job.candidates.empty()) {
         outcome.missing_env = true;
         outcome.cause = "no environment in the caches";
@@ -702,11 +747,12 @@ void RunCompute(ComputeJob& job, PipelineTranslator& translator, MslSink& sink) 
     }
 }
 
-void RunJobs(Jobs& jobs, bool ios, u32 apple_family, u32 threads, MslSink& sink) {
+void RunJobs(Jobs& jobs, bool ios, u32 apple_family, bool native_mesh, u32 threads,
+             MslSink& sink) {
     const size_t total = jobs.graphics.size() + jobs.compute.size();
     std::atomic<size_t> next{0};
     const auto work = [&] {
-        PipelineTranslator translator{ios, apple_family};
+        PipelineTranslator translator{ios, apple_family, native_mesh};
         for (;;) {
             const size_t index = next.fetch_add(1);
             if (index >= total) {
@@ -1080,11 +1126,15 @@ void ReplayDraw(DrawResults& results, const Maxwell& regs, const DrawRow& row,
         refuse("transform feedback draw");
         return;
     }
-    if ((row.flags & Census::DrawIndirect) != 0) {
-        if (outcome.mesh) {
-            refuse("indirect draw of an emulated mesh pipeline");
-            return;
-        }
+    if (outcome.mesh && (row.flags & Census::DrawIndirect) != 0) {
+        path = outcome.native_mesh
+                   ? "native: indirect mesh draw (records rewritten into Metal's by a kernel)"
+                   : "emulated: indirect mesh draw (records read on the CPU), kernels (compute)";
+    } else if (outcome.mesh && (row.flags & Census::DrawFromGpuArguments) != 0) {
+        path = outcome.native_mesh
+                   ? "native: mesh functions, task count the GPU wrote (indirect)"
+                   : "emulated: task count read on the CPU, kernels (compute)";
+    } else if ((row.flags & Census::DrawIndirect) != 0) {
         if (outcome.tessellated) {
             refuse("indirect tessellated draw");
             return;
@@ -1101,8 +1151,10 @@ void ReplayDraw(DrawResults& results, const Maxwell& regs, const DrawRow& row,
                    ? "emulated: indirect loop (draw count from a buffer)"
                    : "native: indirect (a loop when the draw count is above one)";
     } else if (outcome.mesh) {
-        path = outcome.has_task ? "emulated: task and mesh kernels (compute)"
-                                : "emulated: mesh kernel (compute)";
+        path = outcome.native_mesh ? outcome.has_task ? "native: object and mesh functions"
+                                                      : "native: mesh function"
+               : outcome.has_task  ? "emulated: task and mesh kernels (compute)"
+                                   : "emulated: mesh kernel (compute)";
     } else if (outcome.tessellated) {
         path = "emulated: vertex and control kernels (compute), Metal tessellation";
     } else {
@@ -1218,8 +1270,11 @@ void CheckRecord(Tallies& findings, Tallies& paths, const Record& record,
     }
     const Topology topology = state.topology.Value();
     if (outcome.mesh) {
-        Count(paths, outcome.has_task ? "emulated: task and mesh kernels (compute)"
-                                      : "emulated: mesh kernel (compute)",
+        Count(paths,
+              outcome.native_mesh ? outcome.has_task ? "native: object and mesh functions"
+                                                     : "native: mesh function"
+              : outcome.has_task  ? "emulated: task and mesh kernels (compute)"
+                                  : "emulated: mesh kernel (compute)",
               1);
     } else if (outcome.tessellated) {
         Count(paths, "emulated: vertex and control kernels (compute), Metal tessellation", 1);
@@ -1250,9 +1305,81 @@ void TallyOutcome(Tallies& results, Tallies& details, const Outcome& outcome, u6
 }
 
 std::string_view KindOf(const Outcome& outcome) {
-    return outcome.mesh          ? outcome.has_task ? "task and mesh" : "mesh"
-           : outcome.tessellated ? "tessellation"
-                                 : "vertex and fragment";
+    if (outcome.mesh) {
+        if (outcome.native_mesh) {
+            if (!outcome.mesh_emulated) {
+                return outcome.has_task ? "task and mesh, Metal mesh functions only (no emulation)"
+                                        : "mesh, Metal mesh function only (no emulation)";
+            }
+            return outcome.has_task ? "task and mesh, Metal mesh functions (emulation as fallback)"
+                                    : "mesh, Metal mesh function (emulation as fallback)";
+        }
+        return outcome.has_task ? "task and mesh, emulated" : "mesh, emulated";
+    }
+    return outcome.tessellated ? "tessellation" : "vertex and fragment";
+}
+
+/// The task and mesh programs of the translated keys: which are drawn with Metal mesh functions
+/// in every pipeline they are in, and why the others are not; the native ones' shapes.
+void ReportMeshPrograms(std::string& out, const Jobs& jobs) {
+    struct Program {
+        bool task{};
+        u64 native{};
+        u64 emulated{};
+        std::string cause;
+    };
+    std::map<u64, Program> programs;
+    NativeMesh largest{};
+    Tallies causes;
+    for (const GraphicsJob& job : jobs.graphics) {
+        const Outcome& outcome = job.outcome;
+        if (!outcome.ok || !outcome.mesh) {
+            continue;
+        }
+        for (const u64 hash : {outcome.mesh_hash, outcome.task_hash}) {
+            if (hash == 0) {
+                continue;
+            }
+            Program& program = programs[hash];
+            program.task = hash == outcome.task_hash;
+            (outcome.native_mesh ? program.native : program.emulated) += 1;
+            if (!outcome.native_mesh && program.cause.empty()) {
+                program.cause = outcome.native_cause;
+            }
+        }
+        if (outcome.native_mesh) {
+            const NativeMesh& shape = outcome.native_shape;
+            largest.payload_bytes = (std::max)(largest.payload_bytes, shape.payload_bytes);
+            largest.object_threads = (std::max)(largest.object_threads, shape.object_threads);
+            largest.mesh_threads = (std::max)(largest.mesh_threads, shape.mesh_threads);
+            largest.threadgroup_bytes =
+                (std::max)(largest.threadgroup_bytes, shape.threadgroup_bytes);
+        } else {
+            Count(causes, outcome.native_cause.empty() ? "(no cause)" : outcome.native_cause, 1,
+                  HashText(job.key.unique_hashes));
+        }
+    }
+    std::array<std::array<u64, 3>, 2> counts{};
+    for (const auto& [hash, program] : programs) {
+        const size_t column = program.emulated == 0 ? 0 : program.native == 0 ? 2 : 1;
+        ++counts[program.task ? 1 : 0][column];
+    }
+    Line(out, "");
+    Line(out, "Task and mesh programs as Metal object and mesh functions (Metal: {} vertices, {} "
+              "primitives, {} B payload, {} threads, {} B threadgroup memory)",
+         NativeMeshLimits::MaxVertices, NativeMeshLimits::MaxPrimitives,
+         NativeMeshLimits::MaxPayloadBytes, NativeMeshLimits::MaxThreads,
+         NativeMeshLimits::MaxThreadgroupBytes);
+    for (const bool task : {false, true}) {
+        const auto& row = counts[task ? 1 : 0];
+        Line(out, "  {} programs: {} native in every pipeline, {} in some, {} in none",
+             task ? "task" : "mesh", row[0], row[1], row[2]);
+    }
+    Line(out, "  largest native: payload {} B, object {} threads, mesh {} threads, ~{} B mesh "
+              "threadgroup memory",
+         largest.payload_bytes, largest.object_threads, largest.mesh_threads,
+         largest.threadgroup_bytes);
+    Print(out, "Mesh pipelines not native, by cause", causes, "keys");
 }
 
 void ReplayClears(std::string& out, const CensusCategory& clears) {
@@ -1322,6 +1449,8 @@ struct Arguments {
     std::filesystem::path msl_out;
     std::filesystem::path report;
     bool ios{true};
+    /// Task/mesh pipelines as Metal mesh functions, as on a GPU with Metal 3 mesh pipelines.
+    bool native_mesh{true};
     u32 apple_family{10};
     u32 jobs{(std::max)(std::thread::hardware_concurrency() / 2, 1U)};
 };
@@ -1332,6 +1461,10 @@ std::optional<Arguments> ParseArguments(int argc, char** argv) {
         const std::string_view name = argv[index];
         if (name == "--macos") {
             arguments.ios = false;
+            continue;
+        }
+        if (name == "--no-native-mesh") {
+            arguments.native_mesh = false;
             continue;
         }
         if (index + 1 >= argc) {
@@ -1368,10 +1501,12 @@ int TranslateFiles(const Arguments& arguments) {
     int result = 0;
     for (const std::filesystem::path& path : arguments.spirv) {
         const std::string stage_name = path.stem().extension().string();
-        const ShaderTranslate::Stage stage = stage_name == ".vert" ? ShaderTranslate::Stage::Vertex
-                                             : stage_name == ".frag"
-                                                 ? ShaderTranslate::Stage::Fragment
-                                                 : ShaderTranslate::Stage::Compute;
+        const ShaderTranslate::Stage stage =
+            stage_name == ".vert"   ? ShaderTranslate::Stage::Vertex
+            : stage_name == ".frag" ? ShaderTranslate::Stage::Fragment
+            : stage_name == ".task" ? ShaderTranslate::Stage::Object
+            : stage_name == ".mesh" ? ShaderTranslate::Stage::Mesh
+                                    : ShaderTranslate::Stage::Compute;
         std::ifstream file{path, std::ios::binary};
         const std::string bytes{std::istreambuf_iterator<char>{file},
                                 std::istreambuf_iterator<char>{}};
@@ -1471,7 +1606,8 @@ int Run(const Arguments& arguments) {
     fmt::print(stderr, "{} graphics keys, {} compute programs, {} threads\n", jobs.graphics.size(),
                jobs.compute.size(), arguments.jobs);
     MslSink sink{arguments.msl_out};
-    RunJobs(jobs, arguments.ios, arguments.apple_family, arguments.jobs, sink);
+    RunJobs(jobs, arguments.ios, arguments.apple_family, arguments.native_mesh, arguments.jobs,
+            sink);
 
     // The stored pipelines.
     {
@@ -1511,6 +1647,7 @@ int Run(const Arguments& arguments) {
               "records");
         Print(out, "What the failing step said", compute_details, "programs", "records");
     }
+    ReportMeshPrograms(out, jobs);
 
     if (census) {
         Line(out, "");
@@ -1632,9 +1769,10 @@ int main(int argc, char** argv) {
     if (!arguments) {
         std::fputs("usage: lichii-metal-replay --cache <pipeline cache file> [--cache <newer "
                    "file> ...] [--census <nx2_feature_census.json>] [--msl-out <directory>] "
-                   "[--report <file>] [--macos] [--apple-family <n>] [--jobs <n>]\n"
-                   "       lichii-metal-replay --spirv <file.vert.spv, .frag.spv or .comp.spv> "
-                   "[--spirv ...] [--macos] [--apple-family <n>]\n",
+                   "[--report <file>] [--macos] [--no-native-mesh] [--apple-family <n>] "
+                   "[--jobs <n>]\n"
+                   "       lichii-metal-replay --spirv <file.vert.spv, .frag.spv, .comp.spv, "
+                   ".task.spv or .mesh.spv> [--spirv ...] [--macos] [--apple-family <n>]\n",
                    stderr);
         return 2;
     }

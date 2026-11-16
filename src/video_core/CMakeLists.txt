@@ -697,6 +697,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_formats.h
         renderer_metal/metal_graphics.h
         renderer_metal/metal_index_convert.h
+        renderer_metal/metal_mesh_indirect.h
         renderer_metal/metal_object.h
         renderer_metal/metal_ocarina.h
         renderer_metal/metal_pipeline_cache.h
@@ -729,15 +730,21 @@ if (ENABLE_METAL)
         set(METAL_SMOKE_HEADERS)
         foreach (SMOKE_FILE translate_smoke.comp texel_buffer_smoke.comp texture_1d_smoke.comp
                             tess_smoke.vert tess_smoke.tesc tess_smoke.tese
-                            device_msl_smoke.vert device_msl_smoke.frag)
+                            device_msl_smoke.vert device_msl_smoke.frag
+                            native_mesh_smoke.task native_mesh_smoke.mesh native_mesh_smoke.frag)
             string(REPLACE "." "_" SMOKE_SHADER "${SMOKE_FILE}")
             string(TOUPPER "${SMOKE_SHADER}_SPV" SMOKE_VARIABLE)
             set(SMOKE_HEADER ${METAL_SMOKE_DIR}/${SMOKE_SHADER}_spv.h)
             set(SMOKE_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/renderer_metal/smoke/${SMOKE_FILE})
+            # SPV_EXT_mesh_shader needs SPIR-V 1.4.
+            set(SMOKE_TARGET_ENV spirv1.3)
+            if (SMOKE_FILE MATCHES "^native_mesh_smoke")
+                set(SMOKE_TARGET_ENV spirv1.4)
+            endif()
             add_custom_command(
                 OUTPUT ${SMOKE_HEADER}
                 COMMAND ${CMAKE_COMMAND} -E make_directory ${METAL_SMOKE_DIR}
-                COMMAND ${GLSLANGVALIDATOR} -V --target-env spirv1.3
+                COMMAND ${GLSLANGVALIDATOR} -V --target-env ${SMOKE_TARGET_ENV}
                         --variable-name ${SMOKE_VARIABLE} -o ${SMOKE_HEADER} ${SMOKE_SOURCE}
                 MAIN_DEPENDENCY ${SMOKE_SOURCE})
             list(APPEND METAL_SMOKE_HEADERS ${SMOKE_HEADER})

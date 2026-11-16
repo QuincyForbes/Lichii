@@ -441,6 +441,17 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_METAL_OOT_TEMPORAL", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment metal_temporal_off on");
     }
+    if (lichii_platform_experiment("metal_mesh_emulated")) {
+        setenv("EDEN_NX2_METAL_MESH_NATIVE", "0", 1);
+        setenv("EDEN_NX2_METAL_MESH_FROM_GPU", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_mesh_emulated on");
+    }
+    if (lichii_platform_experiment("metal_vertex_plain")) {
+        setenv("EDEN_NX2_METAL_ADJACENCY", "0", 1);
+        setenv("EDEN_NX2_METAL_VERTEX_UNPACK", "0", 1);
+        setenv("EDEN_NX2_METAL_VERTEX_GATHER", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_vertex_plain on");
+    }
     if (lichii_platform_experiment("pipeline_holds_old")) {
         setenv("EDEN_NX2_PIPELINE_HOLD_BOOST", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment pipeline_holds_old on");

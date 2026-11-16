@@ -326,6 +326,45 @@ EDEN_NX2_FENCE_BATCH=1
 # they are.
 #EDEN_NX2_METAL_PROVOKING_LAST=1
 
+# Metal renderer: 0 draws every task/mesh pipeline through the compute emulation, as before. By
+# default, on a GPU with Metal 3 mesh pipelines (Apple7 and later, Mac2 with Metal 3), the task
+# program becomes an object function and the mesh program a mesh function
+# (MTLMeshRenderPipelineDescriptor, drawMeshThreadgroups); indirect mesh draws have their guest
+# records rewritten into Metal's threadgroup counts by a kernel. A pipeline past Metal's mesh
+# limits (256 vertices, 512 primitives, 16 KiB payload, 1024 threads, 32 KiB threadgroup memory),
+# one whose functions or render state Metal refuses (logged once as "not drawn natively"), and
+# every pipeline on a GPU without mesh pipelines take the emulation as before.
+#EDEN_NX2_METAL_MESH_NATIVE=0
+
+# Metal renderer: 1 builds natively also mesh programs that write per-primitive attributes. Off by
+# default: they take the emulation, as Vulkan does on MoltenVK, where the iPhone's compiler
+# refused such a mesh function (Ocarina of Time's pipeline bbfd9d39350cdaaa).
+#EDEN_NX2_METAL_MESH_PER_PRIMITIVE=1
+
+# Metal renderer: 0 reads a task count the GPU wrote on the CPU before the draw (which waits for
+# the GPU), as before. By default a natively drawn mesh pipeline takes the count from the GPU's
+# copy of it (drawMeshThreadgroupsWithIndirectBuffer); emulated pipelines still read it.
+#EDEN_NX2_METAL_MESH_FROM_GPU=0
+
+# Metal renderer: 0 refuses draws of lines, line strips, triangles and triangle strips with
+# adjacency, as before ("topology Metal can't draw"). By default their indices are rewritten as
+# Vulkan draws them without a geometry program: the adjacent vertices left out (Metal has no
+# adjacency topologies).
+#EDEN_NX2_METAL_ADJACENCY=0
+
+# Metal renderer: 0 reads integer and scaled 10:10:10:2 attributes through Metal's normalized
+# 10:10:10:2 formats, as before (wrong values). By default a kernel widens such an attribute into
+# a buffer of its own as four 16-bit integers, which the vertex program reads as the guest's
+# integers (Metal has 10:10:10:2 vertex formats only normalized).
+#EDEN_NX2_METAL_VERTEX_UNPACK=0
+
+# Metal renderer: 0 refuses a draw that reads more vertex streams than Metal has buffer slots
+# next to the vertex program's own buffers, as before. By default the last free slot holds a
+# buffer the attributes of the remaining per-vertex streams are copied into by a kernel before
+# the draw (Metal has 31 buffer slots per stage); instanced and constant streams past the slots
+# are still refused.
+#EDEN_NX2_METAL_VERTEX_GATHER=0
+
 # Either renderer: 0 makes the GPU thread's front wait for the GPU and read a compute dispatch's
 # size the GPU wrote (Ocarina of Time's light tiles, once a frame). By default it passes
 # placeholders on; the dispatch takes its size from the GPU's buffer, and the copy of the size

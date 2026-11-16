@@ -105,6 +105,81 @@ bool PipelineCheckEnabled() {
     return enabled;
 }
 
+bool VertexUnpackEnabled() {
+    static const bool enabled = EnvironmentSwitch("EDEN_NX2_METAL_VERTEX_UNPACK");
+    return enabled;
+}
+
+const char* VertexUnpackKernelSource() noexcept {
+    // Maxwell's A2B10G10R10: red in the low ten bits, alpha in the top two.
+    return R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct VertexUnpackParams {
+    uint count;
+    uint stride;
+    uint is_signed;
+    uint offset;
+};
+
+kernel void unpack_1010102(device const uchar* source [[buffer(0)]],
+                           device ushort4* elements [[buffer(1)]],
+                           constant VertexUnpackParams& params [[buffer(2)]],
+                           uint element [[thread_position_in_grid]]) {
+    if (element >= params.count) {
+        return;
+    }
+    const uint at = params.offset + element * params.stride;
+    const uint value = uint(source[at]) | (uint(source[at + 1]) << 8) |
+                       (uint(source[at + 2]) << 16) | (uint(source[at + 3]) << 24);
+    const uint4 fields = uint4(value & 0x3FFu, (value >> 10) & 0x3FFu, (value >> 20) & 0x3FFu,
+                               value >> 30);
+    if (params.is_signed != 0) {
+        const uint4 widths = uint4(22u, 22u, 22u, 30u);
+        elements[element] = ushort4(short4(int4(fields << widths) >> int4(widths)));
+    } else {
+        elements[element] = ushort4(fields);
+    }
+}
+)";
+}
+
+bool VertexGatherEnabled() {
+    static const bool enabled = EnvironmentSwitch("EDEN_NX2_METAL_VERTEX_GATHER");
+    return enabled;
+}
+
+const char* VertexGatherKernelSource() noexcept {
+    return R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct VertexGatherParams {
+    uint count;
+    uint stride;
+    uint offset;
+    uint bytes;
+    uint gathered_stride;
+    uint gathered_offset;
+};
+
+kernel void gather_vertices(device const uchar* source [[buffer(0)]],
+                            device uchar* gathered [[buffer(1)]],
+                            constant VertexGatherParams& params [[buffer(2)]],
+                            uint element [[thread_position_in_grid]]) {
+    if (element >= params.count) {
+        return;
+    }
+    const uint from = params.offset + element * params.stride;
+    const uint to = params.gathered_offset + element * params.gathered_stride;
+    for (uint byte = 0; byte < params.bytes; ++byte) {
+        gathered[to + byte] = source[from + byte];
+    }
+}
+)";
+}
+
 bool BootTraceEnabled() {
     static const bool enabled = EnvironmentSwitch("EDEN_NX2_METAL_ABORT_TRACE");
     return enabled;
@@ -186,9 +261,24 @@ bool SanitizeVertexLayout(RenderPipelineDesc& desc, u32 loaded, u32 resource_slo
         VertexSource source{};
         VertexStreamState layout{.enabled = 1, .stride = 16, .divisor = ConstantStep};
         u32 offset = 0;
+        Size size = input.size;
         const bool bound =
             input.stream < desc.streams.size() && desc.streams[input.stream].enabled != 0;
-        if (bound) {
+        const bool packed_integer =
+            VertexUnpackEnabled() && input.size == Size::Size_A2_B10_G10_R10 &&
+            input.type != Type::UNorm && input.type != Type::SNorm && input.type != Type::Float;
+        if (bound && packed_integer) {
+            // Metal has 10:10:10:2 only normalized: a kernel widens the attribute into a buffer
+            // of its own, which the program reads as the same integers (VertexSource::unpack).
+            const VertexStreamState& stream = desc.streams[input.stream];
+            const bool constant = stream.stride == 0 || stream.divisor == ConstantStep;
+            source.stream = input.stream;
+            source.shift = input.offset;
+            source.unpack = input.type == Type::SInt || input.type == Type::SScaled ? 2U : 1U;
+            layout.stride = 8;
+            layout.divisor = constant ? ConstantStep : stream.divisor;
+            size = Size::Size_R16_G16_B16_A16;
+        } else if (bound) {
             const VertexStreamState& stream = desc.streams[input.stream];
             source.stream = input.stream;
             if (stream.stride == 0 || stream.divisor == ConstantStep) {
@@ -217,6 +307,28 @@ bool SanitizeVertexLayout(RenderPipelineDesc& desc, u32 loaded, u32 resource_slo
         while (slot < found.count && found.streams[slot] != source) {
             ++slot;
         }
+        // The last free slot goes to the gathered buffer when more streams follow; an attribute
+        // of a per-vertex stream past it is copied there.
+        const bool gatherable = VertexGatherEnabled() && bound && source.unpack == 0 &&
+                                layout.divisor == 0 && layout.stride != 0;
+        if (slot == found.count && gatherable &&
+            (found.gather_slot != ~0U || found.count + resource_slots + 1 == MaxVertexSlots)) {
+            if (found.gather_slot == ~0U) {
+                found.gather_slot = found.count++;
+                found.streams[found.gather_slot] = {.stream = VertexSource::Gathered};
+            }
+            const u32 gathered_offset = found.gather_stride;
+            found.gathered[found.gathered_count++] = {
+                .stream = input.stream,
+                .offset = input.offset,
+                .bytes = bytes,
+                .gathered_offset = gathered_offset,
+            };
+            found.gather_stride += (bytes + 3) & ~3U;
+            streams[found.gather_slot] = {.enabled = 1, .stride = found.gather_stride, .divisor = 0};
+            attributes[index] = {1, found.gather_slot, gathered_offset, input.type, size};
+            continue;
+        }
         if (slot == found.count) {
             // Stream n sits at buffer slot 30 - n, the function's own buffers at 0 up.
             if (found.count + resource_slots >= MaxVertexSlots) {
@@ -229,7 +341,7 @@ bool SanitizeVertexLayout(RenderPipelineDesc& desc, u32 loaded, u32 resource_slo
             streams[slot] = layout;
             ++found.count;
         }
-        attributes[index] = {1, slot, offset, input.type, input.size};
+        attributes[index] = {1, slot, offset, input.type, size};
     }
     desc.attributes = attributes;
     desc.streams = streams;

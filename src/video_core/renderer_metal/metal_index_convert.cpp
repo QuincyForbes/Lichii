@@ -1,19 +1,45 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <cstdlib>
 #include <cstring>
 
 #include "video_core/renderer_metal/metal_index_convert.h"
 
 namespace Metal::IndexConvert {
 
+bool AdjacencyEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_ADJACENCY");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+namespace {
+
+[[nodiscard]] bool IsAdjacency(Topology topology) noexcept {
+    return topology == Topology::LinesAdjacency || topology == Topology::LineStripAdjacency ||
+           topology == Topology::TrianglesAdjacency ||
+           topology == Topology::TriangleStripAdjacency;
+}
+
+} // Anonymous namespace
+
 bool NeedsConversion(Topology topology) noexcept {
+    if (IsAdjacency(topology) && !AdjacencyEnabled()) {
+        return false;
+    }
     switch (topology) {
     case Topology::Quads:
     case Topology::QuadStrip:
     case Topology::TriangleFan:
     case Topology::Polygon:
     case Topology::LineLoop:
+    case Topology::LinesAdjacency:
+    case Topology::LineStripAdjacency:
+    case Topology::TrianglesAdjacency:
+    case Topology::TriangleStripAdjacency:
         return true;
     default:
         return false;
@@ -28,14 +54,22 @@ Topology ConvertedTopology(Topology topology, bool provoking_last) noexcept {
     if (provoking_last && RotatesForProvokingVertex(topology)) {
         return Topology::Triangles;
     }
+    if (IsAdjacency(topology) && !AdjacencyEnabled()) {
+        return topology;
+    }
     switch (topology) {
     case Topology::Quads:
     case Topology::QuadStrip:
     case Topology::TriangleFan:
     case Topology::Polygon:
+    case Topology::TrianglesAdjacency:
+    case Topology::TriangleStripAdjacency:
         return Topology::Triangles;
     case Topology::LineLoop:
+    case Topology::LineStripAdjacency:
         return Topology::LineStrip;
+    case Topology::LinesAdjacency:
+        return Topology::Lines;
     default:
         return topology;
     }
@@ -58,6 +92,14 @@ u32 ConvertedCount(Topology topology, u32 count, bool provoking_last) noexcept {
         return count >= 3 ? (count - 2) * 3 : 0;
     case Topology::LineLoop:
         return count >= 2 ? count + 1 : count;
+    case Topology::LinesAdjacency:
+        return count / 4 * 2;
+    case Topology::LineStripAdjacency:
+        return count >= 4 ? count - 2 : 0;
+    case Topology::TrianglesAdjacency:
+        return count / 6 * 3;
+    case Topology::TriangleStripAdjacency:
+        return count >= 6 ? (count - 4) / 2 * 3 : 0;
     default:
         return count;
     }
@@ -168,6 +210,36 @@ u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 f
             emit(0);
         }
         break;
+    // Without a geometry program Vulkan draws adjacency primitives without their adjacent
+    // vertices: the line of 1 and 2 of each four, the strip of all but the first and last
+    // vertex, the triangle of 0, 2 and 4 of each six, and strip triangle i of 2i, 2i + 2 and
+    // 2i + 4 (2i + 2 first when i is odd, keeping the winding).
+    case Topology::LinesAdjacency:
+        for (u32 line = 0; line + 4 <= count; line += 4) {
+            emit(line + 1);
+            emit(line + 2);
+        }
+        break;
+    case Topology::LineStripAdjacency:
+        for (u32 vertex = 1; count >= 4 && vertex + 1 < count; ++vertex) {
+            emit(vertex);
+        }
+        break;
+    case Topology::TrianglesAdjacency:
+        for (u32 triangle = 0; triangle + 6 <= count; triangle += 6) {
+            emit(triangle);
+            emit(triangle + 2);
+            emit(triangle + 4);
+        }
+        break;
+    case Topology::TriangleStripAdjacency:
+        for (u32 triangle = 0; count >= 6 && triangle < (count - 4) / 2; ++triangle) {
+            const bool odd = triangle % 2 != 0;
+            emit(odd ? 2 * triangle + 2 : 2 * triangle);
+            emit(odd ? 2 * triangle : 2 * triangle + 2);
+            emit(2 * triangle + 4);
+        }
+        break;
     default:
         for (u32 vertex = 0; vertex < count; ++vertex) {
             emit(vertex);
@@ -194,6 +266,14 @@ u32 RewriteMode(Topology topology, bool provoking_last) noexcept {
         return 3;
     case Topology::LineLoop:
         return 4;
+    case Topology::LinesAdjacency:
+        return 7;
+    case Topology::LineStripAdjacency:
+        return 8;
+    case Topology::TrianglesAdjacency:
+        return 9;
+    case Topology::TriangleStripAdjacency:
+        return 10;
     default:
         return 0;
     }
@@ -247,6 +327,23 @@ kernel void rewrite_indices(device const uchar* source [[buffer(0)]],
         element = corner == 0 ? triangle + 2
                   : (triangle % 2 == 0) == (corner == 1) ? triangle
                                                          : triangle + 1;
+        break;
+    }
+    case 7:
+        element = index / 2 * 4 + 1 + index % 2;
+        break;
+    case 8:
+        element = index + 1;
+        break;
+    case 9:
+        element = index / 3 * 6 + index % 3 * 2;
+        break;
+    case 10: {
+        const uint triangle = index / 3;
+        const uint corner = index % 3;
+        element = corner == 2               ? 2 * triangle + 4
+                  : (triangle % 2 == 0) == (corner == 0) ? 2 * triangle
+                                                         : 2 * triangle + 2;
         break;
     }
     default:

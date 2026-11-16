@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Index lists Metal can draw: quads, quad strips, fans, polygons and line loops rewritten, and
-// 8-bit indices widened (Metal draws 16- and 32-bit indices only). With `provoking_last`,
+// Index lists Metal can draw: quads, quad strips, fans, polygons, line loops and adjacency
+// topologies rewritten (Metal has none of them), and 8-bit indices widened (Metal draws 16- and
+// 32-bit indices only). With `provoking_last`,
 // triangle lists and strips become lists whose triangles start with the vertex Vulkan's last
 // vertex convention takes flat inputs from (Metal takes them from the first). Plain C++, no Metal.
 
@@ -17,14 +18,19 @@ namespace Metal::IndexConvert {
 
 using Topology = Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology;
 
+/// EDEN_NX2_METAL_ADJACENCY (default on; 0: adjacency topologies are not rewritten, their draws
+/// refused as before).
+[[nodiscard]] bool AdjacencyEnabled() noexcept;
+
 /// Whether Metal can't draw the topology from the guest's own vertices or indices.
 [[nodiscard]] bool NeedsConversion(Topology topology) noexcept;
 
 /// Whether the provoking vertex rewrite takes the topology (triangle lists and strips).
 [[nodiscard]] bool RotatesForProvokingVertex(Topology topology) noexcept;
 
-/// What the rewritten list is drawn as: Triangles for quads, quad strips, fans and polygons
-/// (and strips with `provoking_last`), LineStrip for line loops, the topology itself otherwise.
+/// What the rewritten list is drawn as: Triangles for quads, quad strips, fans, polygons and
+/// triangle adjacency (and strips with `provoking_last`), LineStrip for line loops and line
+/// strips with adjacency, Lines for lines with adjacency, the topology itself otherwise.
 [[nodiscard]] Topology ConvertedTopology(Topology topology, bool provoking_last = false) noexcept;
 
 /// Indices the rewritten list of `count` guest vertices holds at most.
@@ -53,7 +59,8 @@ struct RewriteParams {
 
 /// RewriteParams::mode of a topology: 0 as it is, 1 quads, 2 quad strip, 3 fan or polygon,
 /// 4 line loop; with `provoking_last` 5 triangles, 6 triangle strip (without restarts: the GPU
-/// rewrite does not find where a strip starts again).
+/// rewrite does not find where a strip starts again); 7 lines, 8 line strip, 9 triangles and
+/// 10 triangle strip with adjacency.
 [[nodiscard]] u32 RewriteMode(Topology topology, bool provoking_last = false) noexcept;
 
 /// MSL of the kernel `rewrite_indices`: source bytes at buffer 0, the u32 indices at buffer 1,

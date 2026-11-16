@@ -25,6 +25,10 @@ enum class Stage : u8 {
     VertexForTessellation,
     TessellationControl,
     TessellationEvaluation,
+    /// Metal 3 mesh pipelines: a task program as an object function, a mesh program as a mesh
+    /// function (SPV_EXT_mesh_shader through SPIRV-Cross).
+    Object,
+    Mesh,
 };
 
 enum class ResourceKind : u8 {

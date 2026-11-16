@@ -230,6 +230,49 @@ MTLVertexFormat VertexFormat(Type type, Size size) {
     }
 }
 
+/// Targets, blending, samples and rasterization: what render and mesh pipeline descriptors share.
+template <typename Descriptor>
+void SetTargets(Descriptor* descriptor, const RenderPipelineDesc& desc) {
+    descriptor.rasterizationEnabled = desc.rasterize != 0 ? YES : NO;
+    descriptor.rasterSampleCount = (std::max)(desc.samples, 1U);
+    // Coverage comes from the alpha of target 0: Metal's descriptor check aborts the process when
+    // that target holds integers, where Vulkan leaves the coverage alone.
+    const FormatClass first_class = ClassOf(desc.color_formats[0]);
+    const bool integer_alpha = desc.color_formats[0] != 0 && PipelineCheckEnabled() &&
+                               (first_class == FormatClass::Uint || first_class == FormatClass::Sint);
+    descriptor.alphaToCoverageEnabled = desc.alpha_to_coverage != 0 && !integer_alpha ? YES : NO;
+    for (size_t index = 0; index < desc.color_formats.size(); ++index) {
+        MTLRenderPipelineColorAttachmentDescriptor* color = descriptor.colorAttachments[index];
+        color.pixelFormat = static_cast<MTLPixelFormat>(desc.color_formats[index]);
+        if (desc.color_formats[index] == 0) {
+            continue;
+        }
+        const BlendTargetState& blend = desc.blend[index];
+        MTLColorWriteMask mask = MTLColorWriteMaskNone;
+        mask |= (blend.write_mask & 1) != 0 ? MTLColorWriteMaskRed : MTLColorWriteMaskNone;
+        mask |= (blend.write_mask & 2) != 0 ? MTLColorWriteMaskGreen : MTLColorWriteMaskNone;
+        mask |= (blend.write_mask & 4) != 0 ? MTLColorWriteMaskBlue : MTLColorWriteMaskNone;
+        mask |= (blend.write_mask & 8) != 0 ? MTLColorWriteMaskAlpha : MTLColorWriteMaskNone;
+        color.writeMask = mask;
+        // Metal's descriptor check aborts the process for blending on an integer target; the
+        // hardware ignores it there.
+        const FormatClass format_class = ClassOf(desc.color_formats[index]);
+        const bool blending = blend.enable != 0 && format_class != FormatClass::Uint &&
+                              format_class != FormatClass::Sint;
+        color.blendingEnabled = blending ? YES : NO;
+        if (blending) {
+            color.rgbBlendOperation = BlendOperation(blend.color_op);
+            color.alphaBlendOperation = BlendOperation(blend.alpha_op);
+            color.sourceRGBBlendFactor = BlendFactor(blend.color_source);
+            color.destinationRGBBlendFactor = BlendFactor(blend.color_dest);
+            color.sourceAlphaBlendFactor = BlendFactor(blend.alpha_source);
+            color.destinationAlphaBlendFactor = BlendFactor(blend.alpha_dest);
+        }
+    }
+    descriptor.depthAttachmentPixelFormat = static_cast<MTLPixelFormat>(desc.depth_format);
+    descriptor.stencilAttachmentPixelFormat = static_cast<MTLPixelFormat>(desc.stencil_format);
+}
+
 } // Anonymous namespace
 
 std::optional<u32> PrimitiveType(Maxwell::PrimitiveTopology topology) {
@@ -327,14 +370,7 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
     MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
     descriptor.vertexFunction = (__bridge id<MTLFunction>)desc.vertex_function;
     descriptor.fragmentFunction = (__bridge id<MTLFunction>)desc.fragment_function;
-    descriptor.rasterizationEnabled = desc.rasterize != 0 ? YES : NO;
-    descriptor.rasterSampleCount = (std::max)(desc.samples, 1U);
-    // Coverage comes from the alpha of target 0: Metal's descriptor check aborts the process when
-    // that target holds integers, where Vulkan leaves the coverage alone.
-    const FormatClass first_class = ClassOf(desc.color_formats[0]);
-    const bool integer_alpha = desc.color_formats[0] != 0 && PipelineCheckEnabled() &&
-                               (first_class == FormatClass::Uint || first_class == FormatClass::Sint);
-    descriptor.alphaToCoverageEnabled = desc.alpha_to_coverage != 0 && !integer_alpha ? YES : NO;
+    SetTargets(descriptor, desc);
     if (desc.tessellation != 0) {
         // The control kernel writes half-precision factors, one set per patch.
         descriptor.tessellationPartitionMode =
@@ -356,36 +392,6 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
                                                 ? MTLPrimitiveTopologyClassLine
                                                 : MTLPrimitiveTopologyClassTriangle;
     }
-    for (size_t index = 0; index < desc.color_formats.size(); ++index) {
-        MTLRenderPipelineColorAttachmentDescriptor* color = descriptor.colorAttachments[index];
-        color.pixelFormat = static_cast<MTLPixelFormat>(desc.color_formats[index]);
-        if (desc.color_formats[index] == 0) {
-            continue;
-        }
-        const BlendTargetState& blend = desc.blend[index];
-        MTLColorWriteMask mask = MTLColorWriteMaskNone;
-        mask |= (blend.write_mask & 1) != 0 ? MTLColorWriteMaskRed : MTLColorWriteMaskNone;
-        mask |= (blend.write_mask & 2) != 0 ? MTLColorWriteMaskGreen : MTLColorWriteMaskNone;
-        mask |= (blend.write_mask & 4) != 0 ? MTLColorWriteMaskBlue : MTLColorWriteMaskNone;
-        mask |= (blend.write_mask & 8) != 0 ? MTLColorWriteMaskAlpha : MTLColorWriteMaskNone;
-        color.writeMask = mask;
-        // Metal's descriptor check aborts the process for blending on an integer target; the
-        // hardware ignores it there.
-        const FormatClass format_class = ClassOf(desc.color_formats[index]);
-        const bool blending = blend.enable != 0 && format_class != FormatClass::Uint &&
-                              format_class != FormatClass::Sint;
-        color.blendingEnabled = blending ? YES : NO;
-        if (blending) {
-            color.rgbBlendOperation = BlendOperation(blend.color_op);
-            color.alphaBlendOperation = BlendOperation(blend.alpha_op);
-            color.sourceRGBBlendFactor = BlendFactor(blend.color_source);
-            color.destinationRGBBlendFactor = BlendFactor(blend.color_dest);
-            color.sourceAlphaBlendFactor = BlendFactor(blend.alpha_source);
-            color.destinationAlphaBlendFactor = BlendFactor(blend.alpha_dest);
-        }
-    }
-    descriptor.depthAttachmentPixelFormat = static_cast<MTLPixelFormat>(desc.depth_format);
-    descriptor.stencilAttachmentPixelFormat = static_cast<MTLPixelFormat>(desc.stencil_format);
 
     MTLVertexDescriptor* vertex = [MTLVertexDescriptor vertexDescriptor];
     for (size_t index = 0; index < desc.attributes.size(); ++index) {
@@ -461,6 +467,84 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
                 added = [binary addRenderPipelineFunctionsWithDescriptor:descriptor error:nil];
             }
             archive->NoteAdded(added);
+        }
+    }
+    return Retain(state);
+}
+
+Object CreateMeshRenderPipelineState(const Device& device, const RenderPipelineDesc& desc,
+                                     const MeshFunctions& functions, std::string& error,
+                                     PipelineArchive* archive) {
+    if (PipelineCheckEnabled()) {
+        error = CheckPipeline(desc, DevicePipelineLimits(device));
+        if (!error.empty()) {
+            return {};
+        }
+    }
+    if (!device.SupportsMeshShaders()) {
+        error = "the device has no mesh pipelines";
+        return {};
+    }
+    MTLMeshRenderPipelineDescriptor* descriptor = [MTLMeshRenderPipelineDescriptor new];
+    descriptor.objectFunction = (__bridge id<MTLFunction>)functions.object_function;
+    descriptor.meshFunction = (__bridge id<MTLFunction>)functions.mesh_function;
+    descriptor.fragmentFunction = (__bridge id<MTLFunction>)functions.fragment_function;
+    if (functions.object_function != nullptr) {
+        // Metal wants the payload in 16-byte steps.
+        descriptor.payloadMemoryLength = (functions.payload_bytes + 15) & ~15U;
+        descriptor.maxTotalThreadsPerObjectThreadgroup = functions.object_threads;
+    }
+    descriptor.maxTotalThreadsPerMeshThreadgroup = functions.mesh_threads;
+    SetTargets(descriptor, desc);
+
+    const id<MTLBinaryArchive> binary =
+        archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
+    bool archived = false;
+    if (@available(iOS 18.0, macOS 15.0, *)) {
+        archived = binary != nil;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    id<MTLRenderPipelineState> state = nil;
+    std::shared_lock<std::shared_mutex> building;
+    if (archived) {
+        if (@available(iOS 18.0, macOS 15.0, *)) {
+            building = std::shared_lock{archive->BuildMutex()};
+            descriptor.binaryArchives = @[ binary ];
+            state = [device.GetDevice()
+                newRenderPipelineStateWithMeshDescriptor:descriptor
+                                                 options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                              reflection:nil
+                                                   error:nil];
+        }
+    }
+    const bool hit = state != nil;
+    NSError* ns_error = nil;
+    if (!hit) {
+        state = [device.GetDevice() newRenderPipelineStateWithMeshDescriptor:descriptor
+                                                                     options:MTLPipelineOptionNone
+                                                                  reflection:nil
+                                                                       error:&ns_error];
+    }
+    if (building.owns_lock()) {
+        building.unlock();
+    }
+    if (state == nil) {
+        error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
+    }
+    if (archived && state != nil) {
+        archive->NoteBuild(hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     std::chrono::steady_clock::now() - start)
+                                                     .count()));
+        if (!hit) {
+            if (@available(iOS 18.0, macOS 15.0, *)) {
+                BOOL added = NO;
+                {
+                    std::unique_lock adding{archive->BuildMutex()};
+                    added = [binary addMeshRenderPipelineFunctionsWithDescriptor:descriptor
+                                                                           error:nil];
+                }
+                archive->NoteAdded(added);
+            }
         }
     }
     return Retain(state);

@@ -45,6 +45,7 @@
 #include "video_core/renderer_metal/metal_draw_desc.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
+#include "video_core/renderer_metal/metal_mesh_indirect.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_rasterizer.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
@@ -465,7 +466,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     }
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     index_rewrite = {};
-    if (const MeshEmulation* const mesh = pipeline->Mesh()) {
+    if (pipeline->IsMeshPipeline()) {
         // The draw's count is its mesh workgroups (the index count for indexed draws).
         const u32 groups = is_indexed ? draw_state.index_buffer.count
                                       : draw_state.vertex_buffer.count;
@@ -473,30 +474,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
             Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
             return;
         }
-        gpu_memory->FlushCaching();
-        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
-        // Written texel buffers read through aligned copies go back once the work is encoded.
-        SCOPE_EXIT {
-            FinishTexelWritebacks();
-        };
-        if (!PrepareDraw(*pipeline, is_indexed, groups)) {
-            NoteUnprepared();
-            return;
-        }
-        CountOcclusion();
-        const auto topology = static_cast<Maxwell::PrimitiveTopology>(mesh->topology);
-        if (mesh->has_task) {
-            // The distribution pass wrote the vertex count.
-            scheduler.DrawIndirect(*PrimitiveType(topology), mesh_buffers.args.buffer,
-                                   mesh_buffers.args.offset +
-                                       Shader::Backend::SPIRV::MESH_EMULATION_DRAW_ARGS_OFFSET);
-        } else {
-            scheduler.Draw(*PrimitiveType(topology), 0, groups * mesh->vertices_per_group, 1, 0);
-        }
-        ++draws_encoded;
-        ++mesh_draws;
-        mesh_groups += groups;
-        Coverage::Note(Coverage::Work::Draw, Coverage::Path::MeshCompute);
+        DrawMesh(*pipeline, is_indexed, MeshGroups{.count = groups});
         return;
     }
     if (pipeline->Tess() != nullptr) {
@@ -735,6 +713,327 @@ void RasterizerMetal::RewriteIndices(bool ahead) {
     scheduler.Dispatch({(params.converted + GroupSize - 1) / GroupSize, 1, 1}, {GroupSize, 1, 1});
 }
 
+namespace {
+
+/// EDEN_NX2_METAL_MESH_FROM_GPU=0: mesh draws whose task count the GPU wrote are read back on
+/// the CPU even when drawn natively (DrawMeshTasksFromGpu says no).
+bool MeshFromGpuEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_MESH_FROM_GPU");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+} // Anonymous namespace
+
+bool RasterizerMetal::DrawMesh(GraphicsPipeline& pipeline, bool is_indexed,
+                               const MeshGroups& groups) {
+    const bool from_buffer = groups.buffer != nullptr || mesh_indirect.wanted;
+    gpu_memory->FlushCaching();
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // Written texel buffers read through aligned copies go back once the work is encoded.
+    SCOPE_EXIT {
+        FinishTexelWritebacks();
+        mesh_indirect = {};
+    };
+    for (;;) {
+        NativeMesh* const native = pipeline.Native();
+        if (native == nullptr && (from_buffer || pipeline.Mesh() == nullptr)) {
+            if (!from_buffer) {
+                RefuseDraw("mesh pipeline Metal refused, which the emulation can't take");
+            }
+            return false;
+        }
+        if (PrepareDraw(pipeline, is_indexed, from_buffer ? 0U : groups.count)) {
+            break;
+        }
+        if (native != nullptr && pipeline.Native() == nullptr && pipeline.BuildFunctions(device)) {
+            // Metal refused the mesh pipeline state just now: the emulation draws it.
+            continue;
+        }
+        NoteUnprepared();
+        return true;
+    }
+    CountOcclusion();
+    if (const NativeMesh* const native = pipeline.Native()) {
+        if (!from_buffer) {
+            scheduler.DrawMeshThreadgroups(groups.count, native->object_threads,
+                                           native->mesh_threads);
+        } else {
+            const BufferHandle buffer =
+                mesh_indirect.wanted ? mesh_indirect.output.buffer : groups.buffer;
+            const u64 offset = mesh_indirect.wanted ? mesh_indirect.output.offset : groups.offset;
+            if (buffer == nullptr) {
+                RefuseDraw("indirect mesh draw without its rewritten arguments");
+                return true;
+            }
+            for (u32 draw = 0; draw < groups.draws; ++draw) {
+                scheduler.DrawMeshThreadgroupsIndirect(buffer, offset + u64{draw} * groups.stride,
+                                                       native->object_threads,
+                                                       native->mesh_threads);
+            }
+        }
+        ++draws_encoded;
+        ++native_mesh_draws;
+        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Native);
+        return true;
+    }
+    const MeshEmulation* const mesh = pipeline.Mesh();
+    const auto topology = static_cast<Maxwell::PrimitiveTopology>(mesh->topology);
+    if (mesh->has_task) {
+        // The distribution pass wrote the vertex count.
+        scheduler.DrawIndirect(*PrimitiveType(topology), mesh_buffers.args.buffer,
+                               mesh_buffers.args.offset +
+                                   Shader::Backend::SPIRV::MESH_EMULATION_DRAW_ARGS_OFFSET);
+    } else {
+        scheduler.Draw(*PrimitiveType(topology), 0, groups.count * mesh->vertices_per_group, 1, 0);
+    }
+    ++draws_encoded;
+    ++mesh_draws;
+    ++emulated_mesh_draws;
+    mesh_groups += groups.count;
+    Coverage::Note(Coverage::Work::Draw, Coverage::Path::MeshCompute);
+    return true;
+}
+
+void RasterizerMetal::DrawMeshIndirect(GraphicsPipeline& pipeline) {
+    const auto& params = maxwell3d->draw_manager.indirect_state;
+    if (params.is_byte_count) {
+        RefuseDraw("transform feedback draw of a mesh pipeline");
+        return;
+    }
+    const size_t stride = params.stride != 0 ? params.stride
+                                             : (params.is_indexed ? 5 : 4) * sizeof(u32);
+    if (pipeline.Native() != nullptr && stride % sizeof(u32) == 0 && params.max_draw_counts != 0) {
+        // PrepareDraw finds the records (and the count) in the buffer cache and rewrites them.
+        mesh_indirect = {
+            .wanted = true,
+            .has_count = params.include_count,
+            .draws = static_cast<u32>(params.max_draw_counts),
+            .stride_words = static_cast<u32>(stride / sizeof(u32)),
+        };
+        buffer_cache.SetDrawIndirect(&params);
+        const bool drawn =
+            DrawMesh(pipeline, params.is_indexed, MeshGroups{.draws = mesh_indirect.draws});
+        buffer_cache.SetDrawIndirect(nullptr);
+        if (drawn) {
+            ++native_mesh_indirect;
+            return;
+        }
+    }
+    mesh_indirect = {};
+    // The emulation needs the threadgroup counts on the CPU: the records (and their count) as
+    // guest memory has them once the caches wrote back what the GPU wrote there.
+    const auto read_word = [this](GPUVAddr address) {
+        if (const std::optional<DAddr> device_address = gpu_memory->GpuToCpuAddress(address)) {
+            FlushRegion(*device_address, sizeof(u32), VideoCommon::CacheType::BufferCache);
+        }
+        return gpu_memory->Read<u32>(address);
+    };
+    size_t count = params.max_draw_counts;
+    if (params.include_count) {
+        count = (std::min)(count, size_t{read_word(params.count_start_address)});
+    }
+    for (size_t draw = 0; draw < count; ++draw) {
+        const u32 groups = read_word(params.indirect_start_address + draw * stride);
+        if (groups == 0) {
+            Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+            continue;
+        }
+        DrawMesh(pipeline, params.is_indexed, MeshGroups{.count = groups});
+    }
+}
+
+void RasterizerMetal::UnpackVertices(u32 slot, const VertexSource& source, bool ahead) {
+    if (!vertex_unpack_kernel && !vertex_unpack_failed) {
+        std::string error;
+        vertex_unpack_library = CreateLibrary(device, VertexUnpackKernelSource(), error);
+        const Object function = vertex_unpack_library
+                                    ? CreateFunction(vertex_unpack_library.Get(), "unpack_1010102")
+                                    : Object{};
+        vertex_unpack_kernel =
+            function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
+        if (!vertex_unpack_kernel) {
+            vertex_unpack_failed = true;
+            LOG_ERROR(Render_Metal, "Metal: 10:10:10:2 vertex unpack kernel failed to build: {}",
+                      error);
+        }
+    }
+    const auto& vertex_states = buffer_cache_runtime.Vertices();
+    if (!vertex_unpack_kernel || source.stream >= vertex_states.size()) {
+        return;
+    }
+    const auto& stream = vertex_states[source.stream];
+    if (stream.buffer == nullptr || u64{stream.size} < u64{source.shift} + 4) {
+        return;
+    }
+    // Every element the bound range holds: an indexed draw may read any of them.
+    const u32 count = stream.stride == 0 ? 1U : (stream.size - source.shift - 4) / stream.stride + 1;
+    // The source is bound 4-byte aligned; the rest of its offset goes in the parameters.
+    const VertexUnpackParams params{
+        .count = count,
+        .stride = stream.stride,
+        .is_signed = source.unpack == 2 ? 1U : 0U,
+        .offset = (stream.offset & 3U) + source.shift,
+    };
+    unpacked_vertices[slot] = staging_pool.Stream(size_t{count} * 8, 16);
+    scheduler.BeginCompute(vertex_unpack_kernel.Get(), ahead);
+    scheduler.BindBuffer(ShaderStage::Compute, 0, stream.buffer, stream.offset & ~3U);
+    scheduler.BindBuffer(ShaderStage::Compute, 1, unpacked_vertices[slot].buffer,
+                         static_cast<u32>(unpacked_vertices[slot].offset));
+    scheduler.BindBytes(ShaderStage::Compute, 2, &params, static_cast<u32>(sizeof(params)));
+    constexpr u32 GroupSize = 64;
+    scheduler.Dispatch({(count + GroupSize - 1) / GroupSize, 1, 1}, {GroupSize, 1, 1});
+}
+
+void RasterizerMetal::GatherVertices(const VertexSources& sources, bool ahead) {
+    if (!vertex_gather_kernel && !vertex_gather_failed) {
+        std::string error;
+        vertex_gather_library = CreateLibrary(device, VertexGatherKernelSource(), error);
+        const Object function = vertex_gather_library
+                                    ? CreateFunction(vertex_gather_library.Get(), "gather_vertices")
+                                    : Object{};
+        vertex_gather_kernel =
+            function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
+        if (!vertex_gather_kernel) {
+            vertex_gather_failed = true;
+            LOG_ERROR(Render_Metal, "Metal: vertex gather kernel failed to build: {}", error);
+        }
+    }
+    if (!vertex_gather_kernel) {
+        return;
+    }
+    const auto& vertex_states = buffer_cache_runtime.Vertices();
+    const auto elements = [&](const GatheredAttribute& attribute) -> u32 {
+        const auto& stream = vertex_states[attribute.stream];
+        if (stream.buffer == nullptr || stream.stride == 0 ||
+            u64{stream.size} < u64{attribute.offset} + attribute.bytes) {
+            return 0;
+        }
+        return (stream.size - attribute.offset - attribute.bytes) / stream.stride + 1;
+    };
+    // As many vertices as the longest stream has: an indexed draw may read any of them.
+    u32 count = 0;
+    for (u32 index = 0; index < sources.gathered_count; ++index) {
+        count = (std::max)(count, elements(sources.gathered[index]));
+    }
+    if (count == 0) {
+        return;
+    }
+    gathered_vertices = staging_pool.Stream(size_t{count} * sources.gather_stride, 16);
+    scheduler.BeginCompute(vertex_gather_kernel.Get(), ahead);
+    for (u32 index = 0; index < sources.gathered_count; ++index) {
+        const GatheredAttribute& attribute = sources.gathered[index];
+        const auto& stream = vertex_states[attribute.stream];
+        const u32 stream_elements = elements(attribute);
+        if (stream_elements == 0) {
+            continue;
+        }
+        const VertexGatherParams params{
+            .count = stream_elements,
+            .stride = stream.stride,
+            .offset = (stream.offset & 3U) + attribute.offset,
+            .bytes = attribute.bytes,
+            .gathered_stride = sources.gather_stride,
+            .gathered_offset = attribute.gathered_offset,
+        };
+        scheduler.BindBuffer(ShaderStage::Compute, 0, stream.buffer, stream.offset & ~3U);
+        scheduler.BindBuffer(ShaderStage::Compute, 1, gathered_vertices.buffer,
+                             static_cast<u32>(gathered_vertices.offset));
+        scheduler.BindBytes(ShaderStage::Compute, 2, &params, static_cast<u32>(sizeof(params)));
+        constexpr u32 GroupSize = 64;
+        scheduler.Dispatch({(stream_elements + GroupSize - 1) / GroupSize, 1, 1},
+                           {GroupSize, 1, 1});
+    }
+}
+
+void RasterizerMetal::ConvertMeshIndirect(bool ahead) {
+    if (!mesh_indirect_kernel && !mesh_indirect_failed) {
+        std::string error;
+        mesh_indirect_library = CreateLibrary(device, MeshIndirectKernelSource, error);
+        const Object function =
+            mesh_indirect_library
+                ? CreateFunction(mesh_indirect_library.Get(), MeshIndirectKernelName)
+                : Object{};
+        mesh_indirect_kernel =
+            function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
+        if (!mesh_indirect_kernel) {
+            mesh_indirect_failed = true;
+            LOG_ERROR(Render_Metal, "Metal: indirect mesh argument kernel failed to build: {}",
+                      error);
+        }
+    }
+    if (!mesh_indirect_kernel || mesh_indirect.draws == 0) {
+        return;
+    }
+    const MeshIndirectParams params{
+        .draws = mesh_indirect.draws,
+        .stride_words = mesh_indirect.stride_words,
+        .has_count = mesh_indirect.has_count ? 1U : 0U,
+    };
+    if (mesh_indirect.records == nullptr ||
+        (mesh_indirect.has_count && mesh_indirect.count == nullptr)) {
+        return;
+    }
+    mesh_indirect.output = staging_pool.Stream(size_t{mesh_indirect.draws} * 3 * sizeof(u32), 16);
+    scheduler.BeginCompute(mesh_indirect_kernel.Get(), ahead);
+    scheduler.BindBuffer(ShaderStage::Compute, 0, mesh_indirect.records,
+                         static_cast<u32>(mesh_indirect.records_offset));
+    scheduler.BindBuffer(ShaderStage::Compute, 1,
+                         mesh_indirect.has_count ? mesh_indirect.count : mesh_indirect.records,
+                         static_cast<u32>(mesh_indirect.has_count ? mesh_indirect.count_offset
+                                                                  : mesh_indirect.records_offset));
+    scheduler.BindBuffer(ShaderStage::Compute, 2, mesh_indirect.output.buffer,
+                         static_cast<u32>(mesh_indirect.output.offset));
+    scheduler.BindBytes(ShaderStage::Compute, 3, &params, static_cast<u32>(sizeof(params)));
+    scheduler.Dispatch({(params.draws + MeshIndirectGroupSize - 1) / MeshIndirectGroupSize, 1, 1},
+                       {MeshIndirectGroupSize, 1, 1});
+}
+
+bool RasterizerMetal::DrawMeshTasksFromGpu(DAddr count_addr) {
+    if (!MeshFromGpuEnabled() || !maxwell3d->regs.IsMeshEnabled()) {
+        return false;
+    }
+    gpu_memory->FlushCaching();
+    FlushWork();
+    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
+    // Only Metal's mesh functions take the count as it is; the emulation needs it on the CPU
+    // (the caller reads it and draws again).
+    if (pipeline == nullptr || pipeline->Native() == nullptr || !pipeline->BuildFunctions(device) ||
+        pipeline->Native() == nullptr) {
+        return false;
+    }
+    std::optional<u32> slot;
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        slot = buffer_cache.Nx2MeshCountSlot(count_addr);
+    }
+    if (!slot) {
+        return false;
+    }
+    SCOPE_EXIT {
+        if (CachePathsEnabled()) {
+            gpu.TickWork();
+        }
+    };
+    TrackOotTonemappedImage();
+    const MeshGroups groups{
+        .buffer = buffer_cache_runtime.Nx2MeshMirror(),
+        .offset = u64{*slot} * BufferCacheRuntime::Nx2MeshMirrorSlotSize,
+    };
+    if (!DrawMesh(*pipeline, false, groups)) {
+        return false;
+    }
+    ++draws;
+    ++draws_with_pipeline;
+    ++native_mesh_from_gpu;
+    if (VideoCommon::FeatureCensus::Enabled()) {
+        VideoCommon::FeatureCensus::NoteDraw(*maxwell3d, pipeline_cache.LookupHashes());
+    }
+    return true;
+}
+
 void RasterizerMetal::BindMeshBuffers(const StageProgram& program, ShaderStage metal_stage,
                                       const MeshEmulation& mesh) {
     // The output buffer's binding, then (with a task program) payload, offsets and arguments.
@@ -937,23 +1236,32 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     // pipeline's task or mesh kernel, or a tessellation pipeline's vertex kernel), a second kernel
     // (the mesh program after a task program, the tessellation control program), the render
     // vertex function where it is not the first (tessellation evaluation), and the pixel program.
-    // Kernels are dispatched before the render pass.
-    MeshEmulation* const mesh = pipeline.Mesh();
+    // Kernels are dispatched before the render pass. A natively drawn task/mesh pipeline has its
+    // object (or mesh) function first, the mesh function second, on the render encoder.
+    NativeMesh* const native = pipeline.Native();
+    MeshEmulation* const mesh = native != nullptr ? nullptr : pipeline.Mesh();
     Tessellation* const tess = pipeline.Tess();
-    const bool has_task = mesh != nullptr && mesh->has_task;
+    const bool native_task = native != nullptr && !native->object.entry_point.empty();
+    const bool has_task = (mesh != nullptr && mesh->has_task) || native_task;
+    const u32 mesh_stage = native != nullptr ? native->mesh_stage
+                           : mesh != nullptr ? mesh->mesh_stage
+                                             : 0U;
     const size_t vertex_variant =
         tess_draw == nullptr || tess_draw->index_size == 0 ? 0 : tess_draw->index_size == 2 ? 1 : 2;
     const std::array<size_t, 4> stages{
-        0, has_task ? size_t{mesh->mesh_stage} : tess != nullptr ? size_t{1} : 0,
+        0, has_task ? size_t{mesh_stage} : tess != nullptr ? size_t{1} : 0,
         tess != nullptr ? size_t{2} : 0, 4};
     const std::array<StageProgram*, 4> programs{
-        mesh != nullptr   ? &mesh->first.program
+        native != nullptr ? (native_task ? &native->object : &native->mesh)
+        : mesh != nullptr ? &mesh->first.program
         : tess != nullptr ? &tess->vertex[vertex_variant]
                           : &pipeline.Vertex(),
-        has_task          ? &mesh->mesh.program
+        native_task       ? &native->mesh
+        : has_task        ? &mesh->mesh.program
         : tess != nullptr ? &tess->control.program
                           : nullptr,
-        tess != nullptr ? &pipeline.Vertex() : nullptr, &pipeline.Fragment()};
+        tess != nullptr ? &pipeline.Vertex() : nullptr,
+        native != nullptr ? &native->fragment : &pipeline.Fragment()};
     prepare_refusal = {};
     if (tess != nullptr && tess_draw == nullptr) {
         prepare_refusal = "tessellated draw without its vertex count";
@@ -964,8 +1272,10 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     };
     const auto& regs = maxwell3d->regs;
     const Maxwell::PrimitiveTopology topology =
-        mesh != nullptr ? static_cast<Maxwell::PrimitiveTopology>(mesh->topology)
-                        : maxwell3d->draw_manager.draw_state.topology;
+        native != nullptr ? static_cast<Maxwell::PrimitiveTopology>(native->topology)
+        : mesh != nullptr ? static_cast<Maxwell::PrimitiveTopology>(mesh->topology)
+                          : maxwell3d->draw_manager.draw_state.topology;
+    const bool mesh_pipeline = native != nullptr || mesh != nullptr;
 
     std::array<u32, VideoCommon::NUM_STAGES> uniform_masks{};
     for (size_t index = 0; index < stages.size(); ++index) {
@@ -1155,6 +1465,16 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     }
     buffer_cache.UpdateGraphicsBuffers(is_indexed);
     buffer_cache.BindHostGeometryBuffers(is_indexed);
+    if (mesh_indirect.wanted) {
+        const auto [records, records_offset] = buffer_cache.GetDrawIndirectBuffer();
+        mesh_indirect.records = records->Handle();
+        mesh_indirect.records_offset = records_offset;
+        if (mesh_indirect.has_count) {
+            const auto [count, count_offset] = buffer_cache.GetDrawIndirectCount();
+            mesh_indirect.count = count->Handle();
+            mesh_indirect.count_offset = count_offset;
+        }
+    }
 
     // Each stage's buffer bindings, and texel buffer views (copies of misaligned ranges go
     // before the render pass).
@@ -1182,11 +1502,11 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     state_desc.depth_format = targets.has_depth ? framebuffer->DepthFormat() : 0U;
     state_desc.stencil_format = targets.has_stencil ? framebuffer->DepthFormat() : 0U;
     state_desc.samples = framebuffer->Samples();
-    FillRegisterState(state_desc, regs, topology, mesh != nullptr);
+    FillRegisterState(state_desc, regs, topology, mesh_pipeline);
     const auto& vertex_states = buffer_cache_runtime.Vertices();
     for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
         FillStream(state_desc, regs, index,
-                   vertex_states[index].buffer != nullptr && mesh == nullptr,
+                   vertex_states[index].buffer != nullptr && !mesh_pipeline,
                    vertex_states[index].stride);
     }
     // The guest's layout as Metal takes it: Metal's vertex descriptor has 31 attributes and 31
@@ -1196,7 +1516,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     VertexSources vertex_sources{};
     if (checked) {
         const VertexProgramUse use =
-            mesh == nullptr && !absent(0) ? VertexUse(*programs[0]) : VertexProgramUse{};
+            !mesh_pipeline && !absent(0) ? VertexUse(*programs[0]) : VertexProgramUse{};
         std::string reason;
         if (!SanitizeVertexLayout(state_desc, use.loaded, use.resource_slots, vertex_sources,
                                   reason)) {
@@ -1229,6 +1549,18 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                     zero_vertices = CreateBuffer(device, 64, false, nullptr);
                 }
                 bind(VertexBufferSlot(slot), zero_vertices.Get(), 0U);
+            } else if (source.unpack != 0 || source.stream == VertexSource::Gathered) {
+                const StagingBufferRef& unpacked = source.unpack != 0 ? unpacked_vertices[slot]
+                                                                      : gathered_vertices;
+                if (unpacked.buffer != nullptr) {
+                    bind(VertexBufferSlot(slot), unpacked.buffer,
+                         static_cast<u32>(unpacked.offset));
+                } else {
+                    if (!zero_vertices) {
+                        zero_vertices = CreateBuffer(device, 64, false, nullptr);
+                    }
+                    bind(VertexBufferSlot(slot), zero_vertices.Get(), 0U);
+                }
             } else {
                 bind(VertexBufferSlot(slot), vertex_states[source.stream].buffer,
                      vertex_states[source.stream].offset + source.shift);
@@ -1243,6 +1575,9 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     }
     void* const state = pipeline.RenderState(device, state_desc);
     if (state == nullptr) {
+        if (native != nullptr && pipeline.Native() == nullptr) {
+            prepare_refusal = "mesh render pipeline state refused by Metal";
+        }
         return false;
     }
     prepare_refusal = {};
@@ -1277,6 +1612,19 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     };
     if (index_rewrite.wanted) {
         RewriteIndices(record_ahead(false));
+    }
+    if (mesh_indirect.wanted && native != nullptr) {
+        ConvertMeshIndirect(record_ahead(false));
+    }
+    unpacked_vertices = {};
+    for (u32 slot = 0; slot < vertex_sources.count; ++slot) {
+        if (vertex_sources.streams[slot].unpack != 0) {
+            UnpackVertices(slot, vertex_sources.streams[slot], record_ahead(false));
+        }
+    }
+    gathered_vertices = {};
+    if (vertex_sources.gathered_count != 0) {
+        GatherVertices(vertex_sources, record_ahead(false));
     }
     if (mesh != nullptr) {
         void* const first = pipeline.KernelState(device, mesh->first);
@@ -1577,7 +1925,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                         regs.blend_color.a};
     scheduler.SetDrawState(draw);
 
-    if (mesh == nullptr && tess == nullptr) {
+    if (!mesh_pipeline && tess == nullptr) {
         bind_vertex_streams([&](u32 slot, BufferHandle buffer, u32 offset) {
             scheduler.BindVertexBuffer(slot, buffer, offset);
         });
@@ -1587,10 +1935,13 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     // and images, into the slots the translator gave them.
     for (size_t index = 0; index < stages.size(); ++index) {
         // Kernels were bound when they were dispatched.
-        if (absent(index) || index == 1 || (index == 0 && tess != nullptr)) {
+        if (absent(index) || (index == 1 && native == nullptr) || (index == 0 && tess != nullptr)) {
             continue;
         }
-        const ShaderStage metal_stage = index == 3 ? ShaderStage::Fragment : ShaderStage::Vertex;
+        ShaderStage metal_stage = index == 3 ? ShaderStage::Fragment : ShaderStage::Vertex;
+        if (native != nullptr && index < 2) {
+            metal_stage = index == 0 && native_task ? ShaderStage::Object : ShaderStage::Mesh;
+        }
         if (index == 0 && mesh != nullptr) {
             BindMeshBuffers(pipeline.Vertex(), metal_stage, *mesh);
             continue;
@@ -1644,10 +1995,8 @@ void RasterizerMetal::DrawIndirect() {
         RefuseDraw("transform feedback draw");
         return;
     }
-    if (pipeline->Mesh() != nullptr) {
-        // As on Vulkan: the emulation needs the workgroup count on the CPU (mesh draws whose
-        // count the GPU wrote come through Draw, DrawMeshTasksFromGpu being false).
-        RefuseDraw("indirect draw of an emulated mesh pipeline");
+    if (pipeline->IsMeshPipeline()) {
+        DrawMeshIndirect(*pipeline);
         return;
     }
     if (pipeline->Tess() != nullptr) {

@@ -145,6 +145,49 @@ struct MeshEmulation {
     u32 topology{};
 };
 
+/// A task/mesh pipeline as a Metal 3 mesh pipeline (EDEN_NX2_METAL_MESH_NATIVE): the task program
+/// as an object function, the mesh program as a mesh function, drawn with drawMeshThreadgroups.
+/// The pipeline keeps its emulation (MeshEmulation) for when Metal refuses this one.
+struct NativeMesh {
+    StageProgram object; ///< Empty without a task program
+    StageProgram mesh;
+    /// The pixel program as it reads the mesh function's outputs (per-primitive inputs).
+    StageProgram fragment;
+    /// The mesh program's buffer cache stage (the task program's is 0).
+    u32 mesh_stage{};
+    u32 payload_bytes{};  ///< MTLMeshRenderPipelineDescriptor.payloadMemoryLength
+    u32 object_threads{1};
+    u32 mesh_threads{1};
+    /// Maxwell PrimitiveTopology of the mesh function's primitives: Points, Lines or Triangles.
+    u32 topology{};
+    /// Threadgroup memory the mesh function needs, as Vulkan estimates it for MoltenVK.
+    u32 threadgroup_bytes{};
+    /// Metal refused the functions or the pipeline: draws go through the emulation.
+    bool failed{};
+};
+
+/// EDEN_NX2_METAL_MESH_NATIVE (default on; 0: every task/mesh pipeline takes the emulation).
+[[nodiscard]] bool NativeMeshEnabled();
+
+/// EDEN_NX2_METAL_MESH_PER_PRIMITIVE=1: a mesh program that writes per-primitive generics is built
+/// natively too (default: emulated, as Vulkan on MoltenVK does since IPA 150).
+[[nodiscard]] bool NativeMeshPerPrimitive();
+
+/// Metal's limits for mesh pipelines on Apple GPUs, as the native path checks them.
+struct NativeMeshLimits {
+    static constexpr u32 MaxVertices = 256;
+    static constexpr u32 MaxPrimitives = 512;
+    static constexpr u32 MaxPayloadBytes = 16384;
+    static constexpr u32 MaxThreads = 1024;
+    static constexpr u32 MaxThreadgroupBytes = 32768;
+    /// Scalar outputs per vertex a fragment function can take.
+    static constexpr u32 MaxVertexComponents = 124;
+};
+
+/// Why a mesh program (after the task program, if any) can't be a Metal mesh function, or nothing.
+[[nodiscard]] std::optional<std::string> NativeMeshLimit(const Shader::IR::Program* task,
+                                                         const Shader::IR::Program& mesh);
+
 /// A tessellation pipeline as MoltenVK runs one: the vertex program as a compute kernel writing
 /// its outputs to a buffer, the control program as a kernel writing control points, patch
 /// constants and tessellation factors, and the evaluation program as the post-tessellation
@@ -170,13 +213,17 @@ struct TranslatedPipeline {
     StageProgram fragment;
     std::optional<MeshEmulation> mesh;
     std::optional<Tessellation> tessellation;
+    /// A task/mesh pipeline Metal draws with mesh functions; `mesh` is its fallback, when the
+    /// emulation can take it.
+    std::optional<NativeMesh> native_mesh;
 };
 
 class PipelineTranslator {
 public:
     /// `ios`: MSL for iOS (ShaderTranslate::Options::ios). `apple_family`: the GPU's
-    /// MTLGPUFamilyApple number, 0 when it has none (Options::apple_family).
-    explicit PipelineTranslator(bool ios, u32 apple_family);
+    /// MTLGPUFamilyApple number, 0 when it has none (Options::apple_family). `native_mesh`: the
+    /// device has Metal 3 mesh pipelines (and NativeMeshEnabled()).
+    explicit PipelineTranslator(bool ios, u32 apple_family, bool native_mesh = false);
 
     /// Fills everything of the key but its programs from the registers and the draw's topology.
     static void RefreshKey(GraphicsPipelineKey& key, const Tegra::Engines::Maxwell3D::Regs& regs,
@@ -198,7 +245,25 @@ public:
         return detail;
     }
 
+    /// Why the last Graphics call's task/mesh pipeline has no NativeMesh (empty when it has one,
+    /// or when it is no mesh pipeline).
+    [[nodiscard]] std::string_view NativeMeshCause() const noexcept {
+        return native_cause;
+    }
+
 private:
+    /// The key's programs from their environments; false (Cause() set) when they can't be.
+    bool TranslatePrograms(const GraphicsPipelineKey& key,
+                           std::span<Shader::Environment* const> envs,
+                           std::span<Shader::IR::Program> programs, size_t& mesh_index);
+
+    /// The task and mesh programs (mesh at `mesh_index`) as Metal object and mesh functions, and
+    /// the pixel program reading them; nothing (NativeMeshCause() set) when Metal's mesh stage
+    /// can't take them.
+    std::optional<NativeMesh> NativeMeshPipeline(const GraphicsPipelineKey& key,
+                                                 std::span<Shader::IR::Program> programs,
+                                                 size_t mesh_index);
+
     /// Notes why the pipeline being made is not, and logs one of the first 16 of `count`.
     void Refuse(std::atomic<u32>& count, u64 hash, std::string_view cause_,
                 std::string_view detail_ = {});
@@ -224,6 +289,8 @@ private:
     ShaderPools pools;
     std::string cause;
     std::string detail;
+    std::string native_cause;
+    bool native_mesh{};
 };
 
 } // namespace Metal

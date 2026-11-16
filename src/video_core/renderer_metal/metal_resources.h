@@ -73,6 +73,9 @@ struct FormatInfo {
 /// Device::AppleFamily for plain C++.
 [[nodiscard]] u32 DeviceAppleFamily(const Device& device);
 
+/// Device::SupportsMeshShaders for plain C++.
+[[nodiscard]] bool DeviceSupportsMeshShaders(const Device& device);
+
 /// Runs work inside an autorelease pool: threads of plain C++ that make Metal objects have none.
 void InAutoreleasePool(const std::function<void()>& work);
 

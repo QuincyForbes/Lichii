@@ -95,16 +95,38 @@ struct RenderPipelineDesc {
 /// Where the buffer of a sanitised vertex layout's stream comes from (SanitizeVertexLayout).
 struct VertexSource {
     static constexpr u32 Zeros = ~0U;
+    static constexpr u32 Gathered = ~1U;
 
-    u32 stream{Zeros}; ///< The guest's vertex stream, or Zeros: a buffer of zeros
+    /// The guest's vertex stream, Zeros: a buffer of zeros, or Gathered: VertexSources' gathered
+    /// buffer.
+    u32 stream{Zeros};
     u32 shift{};       ///< Added to the offset the stream's buffer is bound at
+    /// Integer or scaled 10:10:10:2, which Metal has no vertex format for: the attribute at
+    /// `shift` of each element of the stream, widened by a kernel to four 16-bit integers (8
+    /// bytes each, the layout's stride); 1 unsigned, 2 signed (VertexUnpackKernelSource).
+    u32 unpack{};
 
     bool operator==(const VertexSource&) const noexcept = default;
+};
+
+/// An attribute of a per-vertex stream copied into the gathered buffer (VertexSources::gather).
+struct GatheredAttribute {
+    u32 stream;
+    u32 offset; ///< In the stream's element
+    u32 bytes;
+    u32 gathered_offset; ///< In the gathered buffer's element
 };
 
 struct VertexSources {
     std::array<VertexSource, Maxwell::NumVertexArrays> streams{};
     u32 count{};
+    /// With more streams than buffer slots, the last slot (gather_slot) holds a buffer the
+    /// attributes of the remaining per-vertex streams are copied into, gather_stride bytes a
+    /// vertex (VertexGatherKernelSource).
+    std::array<GatheredAttribute, Maxwell::NumVertexAttributes> gathered{};
+    u32 gathered_count{};
+    u32 gather_slot{~0U};
+    u32 gather_stride{};
 };
 
 /// What the device takes in a render pipeline descriptor.
@@ -115,6 +137,38 @@ struct PipelineLimits {
 /// EDEN_NX2_METAL_PIPELINE_CHECK (on by default; 0: descriptors go to Metal as the guest's state
 /// gives them, and one Metal rejects by assertion aborts the process).
 [[nodiscard]] bool PipelineCheckEnabled();
+
+/// EDEN_NX2_METAL_VERTEX_UNPACK (on by default; 0: integer and scaled 10:10:10:2 attributes are
+/// read through Metal's normalized 10:10:10:2 formats, as before).
+[[nodiscard]] bool VertexUnpackEnabled();
+
+/// MSL of the kernel `unpack_1010102`: the stream's bytes at buffer 0, four 16-bit integers per
+/// element at buffer 1, VertexUnpackParams at buffer 2.
+[[nodiscard]] const char* VertexUnpackKernelSource() noexcept;
+
+/// EDEN_NX2_METAL_VERTEX_GATHER (on by default; 0: a draw with more streams than buffer slots is
+/// refused, as before).
+[[nodiscard]] bool VertexGatherEnabled();
+
+/// MSL of the kernel `gather_vertices`: one attribute's bytes of each element copied from the
+/// stream (buffer 0) into the gathered buffer (buffer 1), VertexGatherParams at buffer 2.
+[[nodiscard]] const char* VertexGatherKernelSource() noexcept;
+
+struct VertexGatherParams {
+    u32 count;  ///< Elements
+    u32 stride; ///< Of the stream
+    u32 offset; ///< Of the attribute in the first element, from the bound offset
+    u32 bytes;
+    u32 gathered_stride;
+    u32 gathered_offset;
+};
+
+struct VertexUnpackParams {
+    u32 count;     ///< Elements
+    u32 stride;    ///< Of the stream, 0 for one element
+    u32 is_signed;
+    u32 offset;    ///< Bytes before the first element's attribute, from the bound offset
+};
 
 /// EDEN_NX2_METAL_ABORT_TRACE (on by default): the renderer's boot trace.
 [[nodiscard]] bool BootTraceEnabled();
@@ -182,6 +236,27 @@ struct DepthStencilDesc {
 [[nodiscard]] Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc& desc,
                                                std::string& error,
                                                PipelineArchive* archive = nullptr);
+
+/// The functions of a Metal 3 mesh pipeline (NativeMesh) and what else its descriptor takes
+/// besides desc's targets and blending.
+struct MeshFunctions {
+    const void* object_function; ///< Null without a task program
+    const void* mesh_function;
+    const void* fragment_function;
+    u32 payload_bytes;
+    u32 object_threads;
+    u32 mesh_threads;
+};
+
+/// An MTLRenderPipelineState from an MTLMeshRenderPipelineDescriptor: desc's targets, blending,
+/// samples and rasterization, `functions` for the stages (desc's functions and vertex layout are
+/// not read). With `archive` as CreateRenderPipelineState, where the OS has binary archives of
+/// mesh pipelines (iOS 18, macOS 15).
+[[nodiscard]] Object CreateMeshRenderPipelineState(const Device& device,
+                                                   const RenderPipelineDesc& desc,
+                                                   const MeshFunctions& functions,
+                                                   std::string& error,
+                                                   PipelineArchive* archive = nullptr);
 
 [[nodiscard]] Object CreateDepthStencilState(const Device& device, const DepthStencilDesc& desc);
 

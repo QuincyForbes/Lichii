@@ -63,9 +63,11 @@ std::string_view PipelineCache::NoteRefusal(u64 key_hash) {
 
 GraphicsPipeline::GraphicsPipeline(const GraphicsPipelineKey& key_, StageProgram vertex_,
                                    StageProgram fragment_, std::optional<MeshEmulation> mesh_,
-                                   std::optional<Tessellation> tessellation_)
+                                   std::optional<Tessellation> tessellation_,
+                                   std::optional<NativeMesh> native_mesh_)
     : key{key_}, vertex{std::move(vertex_)}, fragment{std::move(fragment_)},
-      mesh{std::move(mesh_)}, tessellation{std::move(tessellation_)} {
+      mesh{std::move(mesh_)}, tessellation{std::move(tessellation_)},
+      native_mesh{std::move(native_mesh_)} {
     if (!fragment.entry_point.empty()) {
         for (size_t index = 0; index < fragment.info.interpolation.size(); ++index) {
             flat_inputs = flat_inputs ||
@@ -146,7 +148,51 @@ void* GraphicsPipeline::KernelState(const Device& device, MeshKernel& kernel) {
     return kernel.state.Get();
 }
 
+void GraphicsPipeline::FailNative(std::string_view reason) {
+    if (!native_mesh || native_mesh->failed) {
+        return;
+    }
+    native_mesh->failed = true;
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        // Warning: the iOS log shows Render.Metal from there.
+        LOG_WARNING(Render_Metal, "Metal: mesh pipeline {:016x} not drawn natively: {}; {}",
+                    key.Hash(), reason,
+                    mesh ? "drawn through the emulation" : "the emulation can't take it either");
+    }
+}
+
+bool GraphicsPipeline::BuildNativeFunctions(const Device& device) {
+    for (StageProgram* const stage :
+         {&native_mesh->object, &native_mesh->mesh, &native_mesh->fragment}) {
+        if (stage->function || stage->entry_point.empty()) {
+            continue;
+        }
+        std::string error;
+        stage->library = CreateLibrary(device, stage->msl, error);
+        stage->function = stage->library ? CreateFunction(stage->library.Get(), stage->entry_point)
+                                         : Object{};
+        if (!stage->function) {
+            FailNative(fmt::format("{} function not built: {}",
+                                   stage == &native_mesh->object ? "object"
+                                   : stage == &native_mesh->mesh ? "mesh"
+                                                                 : "fragment",
+                                   error));
+            return false;
+        }
+        ReleaseSource(*stage);
+    }
+    return true;
+}
+
 bool GraphicsPipeline::BuildFunctions(const Device& device) {
+    if (Native() != nullptr && BuildNativeFunctions(device)) {
+        return true;
+    }
+    if (native_mesh && !mesh) {
+        // Refused natively and not emulated.
+        return false;
+    }
     for (StageProgram* const stage : {&vertex, &fragment}) {
         if (stage->function || stage->entry_point.empty()) {
             continue;
@@ -173,11 +219,38 @@ bool GraphicsPipeline::BuildFunctions(const Device& device) {
 }
 
 void* GraphicsPipeline::RenderState(const Device& device, RenderPipelineDesc& desc) {
-    desc.vertex_function = vertex.function.Get();
-    desc.fragment_function = fragment.function.Get();
+    NativeMesh* const native = Native();
+    if (native != nullptr) {
+        desc.vertex_function = native->mesh.function.Get();
+        desc.fragment_function = native->fragment.function.Get();
+    } else {
+        desc.vertex_function = vertex.function.Get();
+        desc.fragment_function = fragment.function.Get();
+    }
     const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(&desc), sizeof(desc));
     const auto [it, is_new] = render_states.try_emplace(hash);
-    if (is_new) {
+    if (is_new && native != nullptr) {
+        std::string error;
+        it->second = CreateMeshRenderPipelineState(
+            device, desc,
+            MeshFunctions{
+                .object_function = native->object.function.Get(),
+                .mesh_function = native->mesh.function.Get(),
+                .fragment_function = native->fragment.function.Get(),
+                .payload_bytes = native->payload_bytes,
+                .object_threads = native->object_threads,
+                .mesh_threads = native->mesh_threads,
+            },
+            error, archive);
+        if (!it->second) {
+            render_states.erase(it);
+            FailNative(fmt::format("mesh render pipeline refused: {}; {}", error, Describe(desc)));
+            return nullptr;
+        }
+        if (recorder != nullptr) {
+            recorder->RecordState(key, desc);
+        }
+    } else if (is_new) {
         // The boot trace: what the first pipelines ask of Metal, written before Metal sees it.
         static std::atomic<u32> traced{};
         if (BootTraceEnabled() && traced.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -230,7 +303,7 @@ void* ComputePipeline::State(const Device& device) {
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory,
                              const Device& device_)
     : VideoCommon::ShaderCache{device_memory}, device{device_},
-      translator{TranslateForIos, DeviceAppleFamily(device_)} {
+      translator{TranslateForIos, DeviceAppleFamily(device_), DeviceSupportsMeshShaders(device_)} {
     // A suspended app may be killed without notice (iOS): the archive is written when it leaves
     // the foreground, and the used list at the GPU thread's next frame.
     background_listener = Common::PlatformEvents::AddBackgroundListener([this] {
@@ -313,11 +386,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     size_t unlisted = 0;
     const size_t num_workers = (std::max)(std::thread::hardware_concurrency(), 2U) - 1;
     const u32 apple_family = DeviceAppleFamily(device);
+    const bool mesh_shaders = DeviceSupportsMeshShaders(device);
     const auto start = std::chrono::steady_clock::now();
     {
         Common::StatefulThreadWorker<PipelineTranslator> workers{
-            build ? num_workers : 0, "MetalPipelines",
-            [apple_family] { return PipelineTranslator{TranslateForIos, apple_family}; }};
+            build ? num_workers : 0, "MetalPipelines", [apple_family, mesh_shaders] {
+                return PipelineTranslator{TranslateForIos, apple_family, mesh_shaders};
+            }};
         const auto finish = [&state, &callback] {
             ++state.built;
             if (state.has_loaded && callback) {
@@ -396,12 +471,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                     }
                     pipeline = std::make_unique<GraphicsPipeline>(
                         key, std::move(translated->vertex), std::move(translated->fragment),
-                        std::move(translated->mesh), std::move(translated->tessellation));
+                        std::move(translated->mesh), std::move(translated->tessellation),
+                        std::move(translated->native_mesh));
                     pipeline->SetArchive(&archive);
                     if (!pipeline->BuildFunctions(device)) {
                         return;
                     }
-                    if (MeshEmulation* const mesh = pipeline->Mesh()) {
+                    MeshEmulation* const mesh = pipeline->Mesh();
+                    if (mesh != nullptr && pipeline->Native() == nullptr) {
                         static_cast<void>(pipeline->KernelState(device, mesh->first));
                         if (mesh->has_task) {
                             static_cast<void>(pipeline->KernelState(device, mesh->mesh));
@@ -542,7 +619,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     }
     return std::make_unique<GraphicsPipeline>(
         graphics_key, std::move(translated->vertex), std::move(translated->fragment),
-        std::move(translated->mesh), std::move(translated->tessellation));
+        std::move(translated->mesh), std::move(translated->tessellation),
+        std::move(translated->native_mesh));
 }
 
 std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(

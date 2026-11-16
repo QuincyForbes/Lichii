@@ -40,7 +40,7 @@ public:
         return apple_family;
     }
 
-    /// Metal mesh pipelines (MTLMeshRenderPipelineDescriptor): Apple7+ and Mac2 GPUs.
+    /// Metal mesh pipelines (MTLMeshRenderPipelineDescriptor): Metal 3 Apple7+ and Mac2 GPUs.
     [[nodiscard]] bool SupportsMeshShaders() const noexcept {
         return mesh_shaders;
     }
