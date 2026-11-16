@@ -8,7 +8,12 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include <chrono>
+#include <optional>
+#include <string>
+
 #include "common/common_types.h"
+#include "video_core/renderer_metal/metal_work_policy.h"
 
 namespace Metal {
 
@@ -32,6 +37,16 @@ public:
         return MTLPixelFormatBGRA8Unorm;
     }
 
+    /// Presents `drawable` with `command_buffer`. A guest frame is paced as Vulkan's host pacer
+    /// does (EDEN_NX2_HOST_PACE, EDEN_NX2_METAL_HOST_PACE): no earlier than the game's frame
+    /// period in whole refreshes after the one before.
+    void Present(id<MTLCommandBuffer> command_buffer, id<CAMetalDrawable> drawable,
+                 bool guest_frame);
+
+    /// Since the last call: guest frames presented, those held for pacing, and the refreshes
+    /// each was held for ("Metal pacing:" line); empty without pacing.
+    [[nodiscard]] std::string TakePacingLine();
+
 private:
     void ApplyVsync();
 
@@ -39,6 +54,11 @@ private:
     u32 drawable_width{};
     u32 drawable_height{};
     bool vsync{};
+    WorkPolicy::PresentPacer pacer;
+    std::optional<std::chrono::steady_clock::time_point> last_guest_frame;
+    u64 paced_frames{};
+    u64 held_frames{};
+    f64 held_refreshes{};
 };
 
 } // namespace Metal

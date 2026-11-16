@@ -100,12 +100,17 @@ def check_tests(rows):
     """Every smoke case and probe a row names exists in the smoke test's sources."""
     smoke = (METAL / "metal_smoke.mm").read_text(encoding="utf-8", errors="replace")
     probes = (METAL / "metal_smoke_probe.mm").read_text(encoding="utf-8", errors="replace")
+    units = "".join(path.read_text(encoding="utf-8", errors="replace")
+                    for path in (ROOT / "src" / "tests").rglob("*.cpp"))
     problems = []
     for row in rows:
         for item in (part.strip() for part in row["tested"].split(",")):
             if item in ("untested", "-", "replay"):
                 continue
-            if item.startswith("probe:"):
+            if item.startswith("unit:"):
+                if f'TEST_CASE("{item[5:]}"' not in units:
+                    problems.append(f"{row['id']}: no unit test '{item[5:]}'")
+            elif item.startswith("probe:"):
                 if f'{{"{item[6:]}"' not in probes:
                     problems.append(f"{row['id']}: no probe '{item[6:]}'")
             elif not re.search(rf"\b{re.escape(item)}\(", smoke):

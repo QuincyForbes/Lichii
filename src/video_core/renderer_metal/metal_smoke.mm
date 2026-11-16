@@ -24,6 +24,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <optional>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -58,6 +59,7 @@
 #include "video_core/renderer_metal/metal_shader_translate.h"
 #include "video_core/renderer_metal/metal_smoke_probe.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
+#include "video_core/renderer_metal/metal_swapchain.h"
 #include "video_core/textures/texture.h"
 
 extern char** environ;
@@ -2598,6 +2600,58 @@ int RunPassTimes() {
     return passed ? 0 : 1;
 }
 
+/// The swapchain on a CAMetalLayer of its own (no window): tagged sRGB as Vulkan's swapchain is
+/// (EDEN_NX2_METAL_COLORSPACE), and twelve guest frames presented through Swapchain::Present
+/// (the host pacer: held only once the screen's refresh is known, which a CI Mac may not say).
+int RunSwapchain() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    CAMetalLayer* const layer = [CAMetalLayer layer];
+    std::optional<Metal::Swapchain> swapchain;
+    try {
+        swapchain.emplace(device, (__bridge void*)layer);
+    } catch (const std::exception& error) {
+        std::printf("metal-smoke: FAIL swapchain: %s\n", error.what());
+        return 1;
+    }
+    bool srgb = true;
+    if (SwitchOn("EDEN_NX2_METAL_COLORSPACE")) {
+        const CGColorSpaceRef space = layer.colorspace;
+        const CFStringRef name = space != nullptr ? CGColorSpaceCopyName(space) : nullptr;
+        srgb = name != nullptr && CFStringCompare(name, kCGColorSpaceSRGB, 0) == kCFCompareEqualTo;
+        if (name != nullptr) {
+            CFRelease(name);
+        }
+    }
+    u32 presented = 0;
+    for (u32 frame = 0; frame < 12; ++frame) {
+        const id<CAMetalDrawable> drawable = swapchain->NextDrawable(64, 64);
+        if (drawable == nil) {
+            break;
+        }
+        Metal::ClearPass clear{};
+        clear.color[0] = {.texture = (__bridge void*)drawable.texture};
+        clear.clear_color[0] = true;
+        clear.color_value[0] = {0.0, 0.5, 0.0, 1.0};
+        clear.width = 64;
+        clear.height = 64;
+        scheduler.Clear(clear);
+        const id<MTLCommandBuffer> command_buffer =
+            (__bridge id<MTLCommandBuffer>)scheduler.CommandBuffer();
+        swapchain->Present(command_buffer, drawable, true);
+        scheduler.Flush();
+        ++presented;
+        std::this_thread::sleep_for(std::chrono::milliseconds{33});
+    }
+    scheduler.Finish();
+    const std::string pacing = swapchain->TakePacingLine();
+    const bool passed = srgb && presented == 12;
+    std::printf("metal-smoke: swapchain: layer %s, %u of 12 frames presented, pacing \"%s\": %s\n",
+                srgb ? "tagged sRGB" : "NOT tagged sRGB", presented, pacing.c_str(),
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 /// A guest sampler with mipmaps (Metal::CreateSampler) read at level 1 of a texture whose level 0
 /// is red and level 1 green: green, and red with Vulkan's EDEN_NX2_FORCE_LOD0 (the top level
 /// only; run in a child by RunVulkanSwitches).
@@ -3645,6 +3699,7 @@ int main(int argc, char** argv) {
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
                                  RunStagingBound, RunPipelineFiles, RunOcarinaTemporal,
                                  RunOcarinaActorEffects, RunOcarinaDepthJitter, RunTemporalStandIn, RunForceLod0,
+                                 RunSwapchain,
                                  RunVulkanSwitches, RunPresentFilters,
                                  SmokeProbe::RunAll}) {
             const int outcome = test();

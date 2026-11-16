@@ -27,6 +27,8 @@
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_metal/metal_pipeline_cache.h"
 #include "video_core/renderer_metal/metal_resources.h"
+#include "video_core/renderer_metal/metal_switches.h"
+#include "video_core/renderer_metal/metal_work_policy.h"
 #include "video_core/shader_environment.h"
 
 namespace Metal {
@@ -274,6 +276,74 @@ void PipelineCache::TickFrame() {
         archive_saved = now;
         archive.Save();
     }
+    ++frame_count;
+    EvictUnusedPipelines();
+}
+
+void PipelineCache::EvictUnusedPipelines() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_PIPELINE_EVICT");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled) {
+        return;
+    }
+    // As Vulkan on Apple: building a pipeline again is a Metal compile mid-game, so none go
+    // unless the OS reports memory pressure, ahead of a jetsam kill.
+    const u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
+    if (pressure == evict_pressure_generation) {
+        return;
+    }
+    evict_pressure_generation = pressure;
+    // Vulkan's EDEN_NX2_PIPELINE_EVICT_LEFT_MIB (the iOS device profile sets it) and _MAX, read
+    // under EDEN_NX2_METAL_VULKAN_SWITCHES: only near the limit, fewer, older ones.
+    static const u64 left_limit = [] {
+        const char* const value = VulkanSwitch("EDEN_NX2_PIPELINE_EVICT_LEFT_MIB");
+        return value != nullptr ? u64{std::strtoull(value, nullptr, 10)} << 20 : u64{0};
+    }();
+    static const size_t evict_max = [] {
+        const char* const value = VulkanSwitch("EDEN_NX2_PIPELINE_EVICT_MAX");
+        return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
+                                : size_t{256};
+    }();
+    bool critical = false;
+    if (left_limit != 0) {
+        const u64 left = Common::PlatformEvents::AvailableProcessMemory();
+        if (left != 0 && left >= left_limit) {
+            ++pressure_evictions_skipped;
+            return;
+        }
+        critical = true;
+    }
+    std::vector<WorkPolicy::PipelineUse> uses;
+    std::vector<GraphicsPipelineKey> keys;
+    uses.reserve(graphics_cache.size());
+    keys.reserve(graphics_cache.size());
+    for (const auto& [key, pipeline] : graphics_cache) {
+        if (pipeline == nullptr) {
+            continue;
+        }
+        uses.push_back({.last_use = pipeline->LastUse(),
+                        .used = pipeline->WasUsed(),
+                        .current = pipeline.get() == current_pipeline});
+        keys.push_back(key);
+    }
+    const std::vector<size_t> evicted =
+        WorkPolicy::PressureEvictions(uses, frame_count, critical, evict_max);
+    if (evicted.empty()) {
+        return;
+    }
+    for (const size_t index : evicted) {
+        graphics_cache.erase(keys[index]);
+    }
+    LOG_INFO(Render_Metal,
+             "Metal: evicted {} graphics pipelines on memory pressure, {} left{}", evicted.size(),
+             graphics_cache.size(),
+             critical ? fmt::format(" ({} MiB left to the process; {} pressure signals before "
+                                    "passed with more than {} MiB left)",
+                                    Common::PlatformEvents::AvailableProcessMemory() >> 20,
+                                    pressure_evictions_skipped, left_limit >> 20)
+                      : std::string{});
 }
 
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
@@ -471,6 +541,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     PipelineTranslator::RefreshKey(graphics_key, maxwell3d->regs,
                                    maxwell3d->draw_manager.draw_state.topology);
     if (current_pipeline != nullptr && current_pipeline->Key() == graphics_key) {
+        current_pipeline->SetLastUse(frame_count);
         return current_pipeline;
     }
     const auto [it, is_new] = graphics_cache.try_emplace(graphics_key);
@@ -485,8 +556,11 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     current_pipeline = it->second.get();
     if (current_pipeline == nullptr) {
         refusal = NoteRefusal(graphics_key.Hash());
-    } else if (!current_pipeline->MarkUsed()) {
-        files.NoteUsed(graphics_key.Hash());
+    } else {
+        current_pipeline->SetLastUse(frame_count);
+        if (!current_pipeline->MarkUsed()) {
+            files.NoteUsed(graphics_key.Hash());
+        }
     }
     return current_pipeline;
 }

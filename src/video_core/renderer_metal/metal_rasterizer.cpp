@@ -47,6 +47,7 @@
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
+#include "video_core/renderer_metal/metal_bind_memo.h"
 #include "video_core/renderer_metal/metal_rasterizer.h"
 #include "video_core/renderer_metal/metal_switches.h"
 #include "video_core/renderer_metal/metal_work_policy.h"
@@ -1036,6 +1037,11 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     std::vector<VideoCommon::SamplerId> samplers;
     std::array<size_t, 4> first_view{};
     std::array<size_t, 4> first_sampler{};
+    // EDEN_NX2_BINDMEMO: the sampler handles and binding kinds, to look the bindings up in the
+    // texture cache's memo.
+    const bool use_bind_memo = BindMemo::Enabled();
+    std::vector<u32> sampler_handles;
+    std::vector<u32> binding_kinds;
     const bool via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
     for (size_t index = 0; index < stages.size(); ++index) {
         first_view[index] = views.size();
@@ -1092,7 +1098,12 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             for (u32 element = 0; element < desc.count; ++element) {
                 const auto handle = read_handle(desc, element);
                 views.push_back({.index = handle.first});
-                samplers.push_back(texture_cache.GetSamplerId(handle.second, false));
+                if (use_bind_memo) {
+                    sampler_handles.push_back(handle.second);
+                    samplers.emplace_back();
+                } else {
+                    samplers.push_back(texture_cache.GetSamplerId(handle.second, false));
+                }
             }
         }
         for (const auto& desc : info.image_descriptors) {
@@ -1101,8 +1112,21 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                     {.index = read_handle(desc, element).first, .blacklist = desc.is_written});
             }
         }
+        if (use_bind_memo) {
+            BindMemo::AppendKinds(info, 0, binding_kinds);
+        }
     }
-    texture_cache.FillImageViews(views, false, true);
+    if (use_bind_memo && binding_kinds.size() == views.size()) {
+        BindMemo::Resolve(texture_cache, false, true, binding_kinds, views, sampler_handles,
+                          samplers, bind_memo_counts);
+    } else if (use_bind_memo) {
+        for (size_t index = 0; index < sampler_handles.size(); ++index) {
+            samplers[index] = texture_cache.GetSamplerId(sampler_handles[index], false);
+        }
+        texture_cache.FillImageViews(views, false, true);
+    } else {
+        texture_cache.FillImageViews(views, false, true);
+    }
     texture_cache.UpdateRenderTargets(false);
     TrackOcarinaCamera();
     UpdateOcarinaJitter();
@@ -2531,6 +2555,8 @@ void RasterizerMetal::DispatchCompute() {
     };
     std::vector<VideoCommon::ImageViewInOut> views;
     std::vector<VideoCommon::SamplerId> samplers;
+    const bool use_bind_memo = BindMemo::Enabled();
+    std::vector<u32> sampler_handles;
     for (const auto& desc : info.texture_buffer_descriptors) {
         for (u32 element = 0; element < desc.count; ++element) {
             views.push_back({.index = read_handle(desc, element).first});
@@ -2545,7 +2571,12 @@ void RasterizerMetal::DispatchCompute() {
         for (u32 element = 0; element < desc.count; ++element) {
             const auto handle = read_handle(desc, element);
             views.push_back({.index = handle.first});
-            samplers.push_back(texture_cache.GetSamplerId(handle.second, true));
+            if (use_bind_memo) {
+                sampler_handles.push_back(handle.second);
+                samplers.emplace_back();
+            } else {
+                samplers.push_back(texture_cache.GetSamplerId(handle.second, true));
+            }
         }
     }
     for (const auto& desc : info.image_descriptors) {
@@ -2554,7 +2585,21 @@ void RasterizerMetal::DispatchCompute() {
                 {.index = read_handle(desc, element).first, .blacklist = desc.is_written});
         }
     }
-    texture_cache.FillImageViews(views, true);
+    if (use_bind_memo) {
+        std::vector<u32> binding_kinds;
+        BindMemo::AppendKinds(info, TextureCache::BINDING_KIND_COMPUTE, binding_kinds);
+        if (binding_kinds.size() == views.size()) {
+            BindMemo::Resolve(texture_cache, true, true, binding_kinds, views, sampler_handles,
+                              samplers, bind_memo_counts);
+        } else {
+            for (size_t index = 0; index < sampler_handles.size(); ++index) {
+                samplers[index] = texture_cache.GetSamplerId(sampler_handles[index], true);
+            }
+            texture_cache.FillImageViews(views, true);
+        }
+    } else {
+        texture_cache.FillImageViews(views, true);
+    }
     if (pipeline->Key().unique_hash == OcarinaTemporal::DepthReader) {
         TrackOcarinaDepth();
     }

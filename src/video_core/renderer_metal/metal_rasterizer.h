@@ -20,6 +20,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/oot_network.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/renderer_metal/metal_bind_memo.h"
 #include "video_core/renderer_metal/metal_buffer_cache.h"
 #include "video_core/renderer_metal/metal_fence_manager.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
@@ -166,6 +167,11 @@ public:
         u64 staging_freed;       ///< Staging buffers freed
         u64 staging_bytes;       ///< Held by the staging pool now
     };
+
+    /// The binding memo's hits and misses since the last call (EDEN_NX2_BINDMEMO).
+    [[nodiscard]] BindMemo::Counts TakeBindMemoCounts() noexcept {
+        return std::exchange(bind_memo_counts, BindMemo::Counts{});
+    }
 
     /// Command buffers committed for EDEN_NX2_FLUSH_DRAWS since the last call.
     [[nodiscard]] u64 TakeDrawFlushes() noexcept {
@@ -456,6 +462,7 @@ private:
     u64 staging_flushes{};
     /// EDEN_NX2_FLUSH_DRAWS: draws since the last such commit, and the commits.
     WorkPolicy::DrawFlushCounter draw_flush;
+    BindMemo::Counts bind_memo_counts;
     u64 draw_flushes{};
     /// EDEN_NX2_NO_MESH and its file.
     std::optional<WorkPolicy::MeshSkip> mesh_skip;

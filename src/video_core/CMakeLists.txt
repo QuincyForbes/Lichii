@@ -723,7 +723,7 @@ if (ENABLE_METAL)
         SKIP_PRECOMPILE_HEADERS ON
         SKIP_UNITY_BUILD_INCLUSION ON)
     target_link_libraries(video_core PRIVATE spirv-cross-msl "-framework Metal"
-                                             "-framework QuartzCore" "-framework Foundation")
+                                             "-framework QuartzCore" "-framework CoreGraphics" "-framework Foundation")
     target_compile_definitions(video_core PUBLIC LICHII_METAL_RENDERER)
 
     # Offscreen check for machines without a window (the macOS CI runner): raw Metal, then the
