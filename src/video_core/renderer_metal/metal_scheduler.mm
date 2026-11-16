@@ -206,6 +206,16 @@ bool AheadSplitEnabled() {
     return enabled;
 }
 
+// EDEN_NX2_METAL_FENCE_IDLE=0: a guest fence commits a command buffer even when nothing was
+// recorded since the last one.
+bool FenceIdleEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_FENCE_IDLE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 /// What one stage of an encoder has bound; a new encoder has nothing bound, as this starts.
 struct StageBindings {
     std::array<const void*, BufferSlots> buffers{};
@@ -899,6 +909,7 @@ struct Scheduler::Impl {
     u64 splits{};
     u64 ahead_copies{};
     u64 ahead_kernels{};
+    u64 idle_fences{};
     id<MTLBuffer> visibility = nil;
     u64 render_pass_serial{};
     /// The open render encoder's counting slot (-1: not counting).
@@ -1039,6 +1050,15 @@ u64 Scheduler::Flush() {
 
 void Scheduler::Finish() {
     Wait(Flush());
+}
+
+u64 Scheduler::FenceTick() {
+    if (FenceIdleEnabled() && !HasPendingWork()) {
+        // Everything before the fence is in the ticks committed so far (tick 0 is always free).
+        ++impl->idle_fences;
+        return impl->current_tick - 1;
+    }
+    return Flush();
 }
 
 void Scheduler::CopyBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u64 dst_offset,
@@ -1835,12 +1855,13 @@ void Scheduler::NotePresent(bool guest_picture) {
     }
 }
 
-std::array<u64, 10> Scheduler::TakeCounts() noexcept {
+std::array<u64, 11> Scheduler::TakeCounts() noexcept {
     return {std::exchange(impl->encoders, 0),      std::exchange(impl->command_buffers, 0),
             std::exchange(impl->blit_commands, 0), std::exchange(impl->render_passes, 0),
             std::exchange(impl->clears_folded, 0), std::exchange(impl->state_sets, 0),
             std::exchange(impl->state_skips, 0),   std::exchange(impl->splits, 0),
-            std::exchange(impl->ahead_copies, 0),  std::exchange(impl->ahead_kernels, 0)};
+            std::exchange(impl->ahead_copies, 0),  std::exchange(impl->ahead_kernels, 0),
+            std::exchange(impl->idle_fences, 0)};
 }
 
 } // namespace Metal

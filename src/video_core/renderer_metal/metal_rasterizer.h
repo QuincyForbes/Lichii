@@ -18,6 +18,7 @@
 #include "video_core/buffer_cache/nx2_write_handoff.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/oot_network.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_metal/metal_buffer_cache.h"
 #include "video_core/renderer_metal/metal_fence_manager.h"
@@ -128,6 +129,7 @@ public:
                                    const Tegra::Texture::TICEntry* depth,
                                    std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
                                    bool use_history) override;
+    VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
@@ -158,6 +160,10 @@ public:
         u64 dispatches_with_pipeline;
         u64 clears;
         u64 barrier_pass_ends;   ///< Render passes ended by a fragment barrier
+        u64 staging_flushes;     ///< Command buffers committed for the staging buffers they took
+        u64 staging_waits;       ///< Of them, waited for (the pool was over its cap)
+        u64 staging_freed;       ///< Staging buffers freed
+        u64 staging_bytes;       ///< Held by the staging pool now
     };
 
     /// Work taken since the last call (the renderer's 10 s report).
@@ -169,7 +175,9 @@ public:
                 std::exchange(mesh_groups, 0), ocarina.TakePasses(),
                 std::exchange(tessellated_draws, 0), std::exchange(tessellated_patches, 0),
                 std::exchange(dispatches, 0), std::exchange(dispatches_with_pipeline, 0),
-                std::exchange(clears, 0), std::exchange(barrier_pass_ends, 0)};
+                std::exchange(clears, 0), std::exchange(barrier_pass_ends, 0),
+                std::exchange(staging_flushes, 0), std::exchange(staging_waits, 0),
+                staging_pool.TakeFreed(), staging_pool.HeldBytes()};
     }
 
     [[nodiscard]] PipelineCache& Pipelines() noexcept {
@@ -200,6 +208,11 @@ private:
         u64 index_offset;
     };
 
+    /// Before a draw, clear or dispatch: commits the command buffer being recorded once the
+    /// staging buffers it took pass the pool's mark, and waits for it when the pool is over its
+    /// cap (EDEN_NX2_METAL_STAGING_BOUND).
+    void FlushWork();
+
     /// Binds everything the draw needs and opens its render pass; false to skip it
     /// (prepare_refusal says why, empty for a draw of nothing).
     bool PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups = 0,
@@ -212,6 +225,10 @@ private:
 
     /// Vulkan's TryNx2IndirectReset; true when the draw was done as writes to guest memory.
     bool TryIndirectReset(bool is_indexed, u32 instance_count);
+
+    /// Vulkan's TrackOotTonemappedImage: render target 0 of a tonemap draw is what replaces the
+    /// anti-aliasing network's output (oot_network.h).
+    void TrackOotTonemappedImage();
 
     /// Counts the draw PrepareDraw skipped.
     void NoteUnprepared();
@@ -399,6 +416,9 @@ private:
     /// The last render pass with a draw that writes storage.
     u64 pass_stores{};
     u64 barrier_pass_ends{};
+    u64 staging_flushes{};
+    u64 staging_waits{};
+    VideoCommon::OotNetwork::BypassState oot_network_bypass;
 };
 
 } // namespace Metal

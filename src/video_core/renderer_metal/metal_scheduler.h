@@ -183,6 +183,10 @@ public:
     /// Flush, then wait for the GPU to finish everything.
     void Finish();
 
+    /// The tick a guest fence queued now waits for. Pending work is committed for it; with none
+    /// it is the last tick committed, and no command buffer is made (EDEN_NX2_METAL_FENCE_IDLE).
+    u64 FenceTick();
+
     /// ahead: recorded before everything else of the segment (see CanUploadAhead), leaving the
     /// open encoder as it is.
     void CopyBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u64 dst_offset, u64 size,
@@ -324,8 +328,9 @@ public:
     /// Since the last call (the renderer's 10 s report): encoders, command buffers, blit
     /// commands, render passes, clears made the load actions of a pass, state and bindings set,
     /// those left as they were (EDEN_NX2_METAL_STATE_CACHE), segments split off, copies and
-    /// kernels recorded ahead (EDEN_NX2_METAL_AHEAD).
-    [[nodiscard]] std::array<u64, 10> TakeCounts() noexcept;
+    /// kernels recorded ahead (EDEN_NX2_METAL_AHEAD), fences that took no command buffer
+    /// (EDEN_NX2_METAL_FENCE_IDLE).
+    [[nodiscard]] std::array<u64, 11> TakeCounts() noexcept;
 
     /// A drawable was presented, with a guest layer on it or not (the progress trace: the first
     /// of each, and the heartbeat that runs until the first guest frame).

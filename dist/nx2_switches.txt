@@ -249,6 +249,29 @@ EDEN_NX2_FENCE_BATCH=1
 # "segments split off".
 #EDEN_NX2_METAL_AHEAD_SPLIT=0
 
+# Metal renderer: 0 commits a command buffer for every guest fence (syncpoint increments, query
+# and download fences), also when nothing was recorded since the last commit, as before. By
+# default such a fence waits for the last command buffer committed and makes none, as Vulkan's
+# renderer does. The 10 s "Metal:" line counts the "fences without a command buffer".
+#EDEN_NX2_METAL_FENCE_IDLE=0
+
+# Metal renderer: 0 leaves its pool of staging buffers (texture and buffer uploads, downloads)
+# without bounds, as before: every upload past the stream ring takes a buffer of its own until
+# the command buffer is committed, and a free buffer is given back only after 300 frames and
+# only from the end of the list. By default the pool has the Vulkan renderer's two marks
+# (EDEN_NX2_STAGING_SUBMIT_MIB, EDEN_NX2_STAGING_CAP_MIB: 24 and 96 MiB on phones, 256 and 1024
+# elsewhere): before a draw, clear or dispatch the command buffer being recorded is committed
+# once the buffers it took pass the first; with more than the second held the GPU thread waits
+# for it and frees buffers down to half the cap; and while more than the first mark is held a
+# free buffer goes after 8 frames. The 10 s "Metal:" line reports the pool ("staging").
+#EDEN_NX2_METAL_STAGING_BOUND=0
+
+# Metal renderer: 0 lets Ocarina of Time's anti-aliasing network run whatever the "Ocarina of
+# Time anti-aliasing" setting says, as before. By default, with that setting at No sharpening,
+# the network's passes are skipped and its output pass is replaced by a copy of the tonemapped
+# image, as on Vulkan (docs/nx2/oot-network-bypass.md).
+#EDEN_NX2_METAL_NETWORK_BYPASS=0
+
 # Either renderer: 0 makes the GPU thread's front wait for the GPU and read a compute dispatch's
 # size the GPU wrote (Ocarina of Time's light tiles, once a frame). By default it passes
 # placeholders on; the dispatch takes its size from the GPU's buffer, and the copy of the size

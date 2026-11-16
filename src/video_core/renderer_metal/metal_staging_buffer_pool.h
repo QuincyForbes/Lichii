@@ -5,6 +5,7 @@
 
 #include <array>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
@@ -24,6 +25,9 @@ struct StagingBufferRef {
 
 /// Shared-storage buffers for uploads and downloads, reused once the GPU is past the command
 /// buffer that last used them. Sizes are rounded to powers of two.
+/// EDEN_NX2_METAL_STAGING_BOUND: the buffers one command buffer takes are bounded by committing
+/// it early (WantsFlush), all of them by waiting for the GPU (OverCap), with Vulkan's marks
+/// (EDEN_NX2_STAGING_SUBMIT_MIB, EDEN_NX2_STAGING_CAP_MIB).
 class StagingBufferPool {
 public:
     explicit StagingBufferPool(const Device& device, Scheduler& scheduler);
@@ -48,6 +52,23 @@ public:
         return held_bytes;
     }
 
+    /// Whether the command buffer being recorded took enough buffers to be committed now, so the
+    /// GPU can give them back.
+    [[nodiscard]] bool WantsFlush() const noexcept;
+
+    /// Whether the pool holds more than its cap: the caller waits for the GPU, then Trim.
+    [[nodiscard]] bool OverCap() const noexcept {
+        return submit_bytes != 0 && held_bytes > cap_bytes;
+    }
+
+    /// Frees buffers the GPU is done with until half the cap is held.
+    void Trim();
+
+    /// Buffers freed since the last call.
+    [[nodiscard]] u64 TakeFreed() noexcept {
+        return std::exchange(freed, 0);
+    }
+
 private:
     struct Entry {
         Object buffer;
@@ -62,6 +83,11 @@ private:
     static constexpr u64 StreamRegions = 16;
     static constexpr u64 StreamRegionSize = StreamSize / StreamRegions;
 
+    /// Takes entries[index] for the command buffer being recorded.
+    StagingBufferRef Take(size_t index, size_t size, bool deferred);
+
+    void Free(Entry& entry);
+
     const Device& device;
     Scheduler& scheduler;
     std::vector<Entry> entries;
@@ -72,6 +98,13 @@ private:
     std::array<u64, StreamRegions> stream_ticks{};
     u64 frame{};
     u64 held_bytes{};
+    /// 0: not bounded.
+    u64 submit_bytes{};
+    u64 cap_bytes{};
+    /// Bytes of the buffers taken in taken_tick.
+    u64 taken_tick{};
+    u64 taken_bytes{};
+    u64 freed{};
 };
 
 } // namespace Metal

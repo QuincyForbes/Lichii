@@ -411,6 +411,19 @@ bool RasterizerMetal::TryIndirectReset(bool is_indexed, u32 instance_count) {
     return true;
 }
 
+void RasterizerMetal::FlushWork() {
+    if (!staging_pool.WantsFlush()) {
+        return;
+    }
+    ++staging_flushes;
+    const u64 tick = scheduler.Flush();
+    if (staging_pool.OverCap()) {
+        ++staging_waits;
+        scheduler.Wait(tick);
+        staging_pool.Trim();
+    }
+}
+
 void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     ++draws;
     // Cores waiting for a flush are served after each draw, as on Vulkan, not only when the
@@ -422,6 +435,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     };
     // Deferred inline writes reach the caches before anything of theirs is used.
     gpu_memory->FlushCaching();
+    FlushWork();
     if (!BeginDraw(is_indexed, instance_count)) {
         return;
     }
@@ -438,6 +452,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         return;
     }
     ++draws_with_pipeline;
+    TrackOotTonemappedImage();
     // EDEN_NX2_METAL_DRAW=0: build pipelines but encode no draw (milestone 2 behaviour).
     static const bool encode = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_DRAW");
@@ -1594,6 +1609,7 @@ void RasterizerMetal::DrawIndirect() {
         }
     };
     gpu_memory->FlushCaching();
+    FlushWork();
     GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
     if (VideoCommon::FeatureCensus::Enabled()) {
         VideoCommon::FeatureCensus::NoteDraw(*maxwell3d, pipeline_cache.LookupHashes());
@@ -1607,6 +1623,7 @@ void RasterizerMetal::DrawIndirect() {
         return;
     }
     ++draws_with_pipeline;
+    TrackOotTonemappedImage();
     const auto& params = maxwell3d->draw_manager.indirect_state;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     if (params.is_byte_count) {
@@ -1682,6 +1699,45 @@ void RasterizerMetal::DrawTexture() {
     RefuseDraw("DrawTexture");
 }
 
+namespace {
+
+/// EDEN_NX2_METAL_NETWORK_BYPASS=0: Ocarina of Time's anti-aliasing network runs whatever the
+/// anti-aliasing setting says, as before the bypass reached this renderer.
+bool NetworkBypassEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_NETWORK_BYPASS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+} // Anonymous namespace
+
+VideoCommon::OotNetwork::BypassState* RasterizerMetal::OotNetworkBypass() {
+    return NetworkBypassEnabled() ? &oot_network_bypass : nullptr;
+}
+
+void RasterizerMetal::TrackOotTonemappedImage() {
+    if (!NetworkBypassEnabled() ||
+        !VideoCommon::OotNetwork::BypassEnabled(Settings::GetCurrentProgramID())) {
+        return;
+    }
+    const auto& hashes = pipeline_cache.LookupHashes();
+    if (std::none_of(hashes.begin(), hashes.end(), VideoCommon::OotNetwork::IsTonemapShader)) {
+        return;
+    }
+    const auto& target = maxwell3d->regs.rt[0];
+    if (target.Address() == 0) {
+        return;
+    }
+    std::scoped_lock lock{oot_network_bypass.mutex};
+    if (oot_network_bypass.tonemapped.Address() != target.Address()) {
+        LOG_INFO(Render_Metal, "Ocarina of Time: tonemapped image at {:#x} {}x{}", target.Address(),
+                 target.width, target.height);
+    }
+    oot_network_bypass.tonemapped = target;
+}
+
 void RasterizerMetal::NoteUnprepared() {
     if (prepare_refusal.empty()) {
         Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
@@ -1721,6 +1777,7 @@ void RasterizerMetal::Clear(u32 layer_count) {
         return;
     }
     gpu_memory->FlushCaching();
+    FlushWork();
     const auto& regs = maxwell3d->regs;
     const bool any_color = regs.clear_surface.R || regs.clear_surface.G ||
                            regs.clear_surface.B || regs.clear_surface.A;
@@ -1851,6 +1908,7 @@ void RasterizerMetal::Clear(u32 layer_count) {
 void RasterizerMetal::DispatchCompute() {
     ++dispatches;
     gpu_memory->FlushCaching();
+    FlushWork();
     ComputePipeline* const pipeline = pipeline_cache.CurrentComputePipeline();
     if (pipeline != nullptr && VideoCommon::FeatureCensus::Enabled()) {
         VideoCommon::FeatureCensus::NoteDispatch(

@@ -46,6 +46,7 @@
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
 #include "video_core/renderer_metal/metal_smoke_probe.h"
+#include "video_core/renderer_metal/metal_staging_buffer_pool.h"
 
 namespace {
 
@@ -2448,6 +2449,118 @@ int RunAhead() {
     return results && counted ? 0 : 1;
 }
 
+/// A guest fence with nothing recorded since the last commit takes no command buffer and is
+/// free once that commit is done (EDEN_NX2_METAL_FENCE_IDLE).
+int RunFenceIdle() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const QuadScene scene(device);
+    if (!scene.valid) {
+        std::printf("metal-smoke: FAIL fence setup: %s\n", scene.error.c_str());
+        return 1;
+    }
+    (void)scheduler.TakeCounts();
+    const uint64_t start = scheduler.CurrentTick();
+    // Before anything was recorded, after a draw, and twice with nothing new.
+    const uint64_t first = scheduler.FenceTick();
+    scene.Draw(scheduler, 0, 0, Size);
+    const uint64_t working = scheduler.FenceTick();
+    const bool committed = !scheduler.HasPendingWork() && scheduler.IsSubmitted(working);
+    const uint64_t idle = scheduler.FenceTick();
+    const uint64_t again = scheduler.FenceTick();
+    scheduler.Wait(again);
+    scheduler.WaitSubmitted(again);
+    const bool all_free = scheduler.IsFree(first) && scheduler.IsFree(working) &&
+                      scheduler.IsFree(idle) && scheduler.IsFree(again);
+    const auto counts = scheduler.TakeCounts();
+    const uint64_t command_buffers = counts[1];
+    const uint64_t idle_fences = counts[10];
+    scene.Read(scheduler, 0);
+    scheduler.Finish();
+    const bool results = committed && all_free &&
+                         Near(scene.At(0, 4, Size / 2), {0, 255, 0, 255});
+    const bool skipping = SwitchOn("EDEN_NX2_METAL_FENCE_IDLE");
+    const bool counted =
+        skipping ? first == start - 1 && working == start && idle == working && again == working &&
+                       command_buffers == 1 && idle_fences == 3
+                 : first == start && working == start + 1 && idle == start + 2 &&
+                       again == start + 3 && command_buffers == 4 && idle_fences == 0;
+    std::printf("metal-smoke: fences with nothing pending (%s): results %s; %llu command "
+                "buffers for 4 fences, %llu without one: %s\n",
+                skipping ? "on" : "off", results ? "PASS" : "FAIL",
+                static_cast<unsigned long long>(command_buffers),
+                static_cast<unsigned long long>(idle_fences), counted ? "PASS" : "FAIL");
+    return results && counted ? 0 : 1;
+}
+
+/// Staging buffers bounded (EDEN_NX2_METAL_STAGING_BOUND): a command buffer that took its mark's
+/// worth asks to be committed, over the cap the buffers the GPU is done with go, a slot freed is
+/// used again, and a deferred buffer stays through all of it.
+int RunStagingBound() {
+    const bool bounded = SwitchOn("EDEN_NX2_METAL_STAGING_BOUND");
+    constexpr uint64_t MiB = 1 << 20;
+    constexpr size_t Chunk = 512 << 10;
+    // Marks of 1 and 2 MiB for this pool.
+    setenv("EDEN_NX2_STAGING_SUBMIT_MIB", "1", 1);
+    setenv("EDEN_NX2_STAGING_CAP_MIB", "2", 1);
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Metal::StagingBufferPool pool(device, scheduler);
+    unsetenv("EDEN_NX2_STAGING_SUBMIT_MIB");
+    unsetenv("EDEN_NX2_STAGING_CAP_MIB");
+    const auto finish = [&scheduler] {
+        const uint64_t tick = scheduler.Flush();
+        scheduler.Wait(tick);
+        scheduler.WaitSubmitted(tick);
+    };
+
+    bool asked_early = false;
+    for (uint32_t index = 0; index < 6; ++index) {
+        const Metal::StagingBufferRef ref = pool.Request(Chunk);
+        std::memset(ref.mapped_span.data(), static_cast<int>(index), 16);
+        asked_early |= index == 0 && pool.WantsFlush();
+    }
+    const bool asked = pool.WantsFlush();
+    const bool over = pool.OverCap();
+    const uint64_t held_taken = pool.HeldBytes();
+    finish();
+    const bool asked_after = pool.WantsFlush();
+    pool.Trim();
+    const uint64_t held_trimmed = pool.HeldBytes();
+    const uint64_t freed_trimmed = pool.TakeFreed();
+    (void)pool.Request(Chunk);
+    const uint64_t held_again = pool.HeldBytes();
+    Metal::StagingBufferRef kept = pool.Request(4 * Chunk, true);
+    finish();
+    for (uint32_t tick = 0; tick < 10; ++tick) {
+        pool.TickFrame();
+    }
+    const uint64_t held_ticked = pool.HeldBytes();
+    const uint64_t freed_ticked = pool.TakeFreed();
+    std::memset(kept.mapped_span.data(), 0x5A, kept.mapped_span.size());
+    pool.FreeDeferred(kept);
+
+    const bool passed =
+        bounded ? !asked_early && asked && over && held_taken == 3 * MiB && !asked_after &&
+                      held_trimmed == MiB && freed_trimmed == 4 && held_again == MiB &&
+                      held_ticked == 2 * MiB && freed_ticked == 2
+                : !asked_early && !asked && !over && held_taken == 3 * MiB && !asked_after &&
+                      held_trimmed == 3 * MiB && freed_trimmed == 0 && held_again == 3 * MiB &&
+                      held_ticked == 5 * MiB && freed_ticked == 0;
+    std::printf("metal-smoke: staging bound (%s): 6 buffers of 512 KiB in one command buffer "
+                "ask for a commit %d, over the cap %d; held %llu KiB, %llu after the trim (%llu "
+                "freed), %llu with one more, %llu after 10 frames with 2 MiB deferred (%llu "
+                "freed): %s\n",
+                bounded ? "on" : "off", asked ? 1 : 0, over ? 1 : 0,
+                static_cast<unsigned long long>(held_taken >> 10),
+                static_cast<unsigned long long>(held_trimmed >> 10),
+                static_cast<unsigned long long>(freed_trimmed),
+                static_cast<unsigned long long>(held_again >> 10),
+                static_cast<unsigned long long>(held_ticked >> 10),
+                static_cast<unsigned long long>(freed_ticked), passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main(int argc, char** argv) {
@@ -2465,7 +2578,8 @@ int main(int argc, char** argv) {
                                  RunOcarinaBilinear, RunPipelineArchive,
                                  RunDepthBlit, RunTessellation, RunDepthStencilBlit,
                                  RunPipelineCheck, RunDeviceMsl, RunBlockCopy, RunClearRect,
-                                 RunClearFold, RunStateCache, RunAhead, SmokeProbe::RunAll}) {
+                                 RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
+                                 RunStagingBound, SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }

@@ -11,7 +11,7 @@ InnerFence::InnerFence(Scheduler& scheduler_, bool is_stubbed_)
 
 void InnerFence::Queue() {
     if (!is_stubbed) {
-        tick = scheduler.Flush();
+        tick = scheduler.FenceTick();
     }
 }
 

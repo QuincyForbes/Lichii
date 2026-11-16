@@ -521,7 +521,7 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
     if (now - impl->report_start >= std::chrono::seconds{10}) {
         const auto work = impl->rasterizer.TakeWorkCounts();
         const auto [encoders, command_buffers, blits, passes, clears_folded, state_sets,
-                    state_skips, splits, ahead_copies, ahead_kernels] =
+                    state_skips, splits, ahead_copies, ahead_kernels, idle_fences] =
             impl->scheduler.TakeCounts();
         const auto [graphics_made, compute_made, refused] =
             impl->rasterizer.Pipelines().TakeCounts();
@@ -535,7 +535,8 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                  "buffers, {} encoders ({} render passes, {} ended by a fragment barrier, {} "
                  "starting with a clear), {} blit commands; state and bindings {} set, {} left as "
                  "they were; {} copies and {} kernels ahead of their segment, {} segments split "
-                 "off; textures {} MiB, buffers {} MiB",
+                 "off; {} fences without a command buffer; staging {} MiB ({} early commits, {} "
+                 "waited for, {} buffers freed); textures {} MiB, buffers {} MiB",
                  impl->presented, impl->from_cache, impl->from_memory, impl->skipped, work.draws,
                  work.draws_with_pipeline, work.draws_encoded, work.draws_converted,
                  work.indices_rewritten_on_gpu, work.dispatches, work.dispatches_with_pipeline,
@@ -543,7 +544,9 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                  work.mesh_groups, work.tessellated_draws, work.tessellated_patches,
                  work.ocarina_bilinear, graphics_made, compute_made, refused, command_buffers,
                  encoders, passes, work.barrier_pass_ends, clears_folded, blits, state_sets,
-                 state_skips, ahead_copies, ahead_kernels, splits,
+                 state_skips, ahead_copies, ahead_kernels, splits, idle_fences,
+                 work.staging_bytes >> 20, work.staging_flushes, work.staging_waits,
+                 work.staging_freed,
                  impl->rasterizer.TextureRuntime().allocated_bytes >> 20,
                  impl->rasterizer.BufferRuntime().GetDeviceMemoryUsage() >> 20);
         if (const std::string coverage = Coverage::TakeLine(); !coverage.empty()) {
