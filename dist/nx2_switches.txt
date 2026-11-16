@@ -308,7 +308,9 @@ EDEN_NX2_FENCE_BATCH=1
 # The list of pipelines a game really drew (what the loading screen builds) is written at most
 # this many seconds after a pipeline's first use and when the app leaves the foreground, off the
 # GPU thread and through a temporary file. 10 by default on MoltenVK; 0 elsewhere: as before, on a
-# first use 15 s after the last save and at shutdown.
+# first use 15 s after the last save and at shutdown. The Metal renderer reads it for its own
+# used list (metal_used.bin, EDEN_NX2_METAL_PIPELINE_FILE): 10 by default, 0 once a minute; it
+# also writes its pipeline archive when the app leaves the foreground.
 #EDEN_NX2_USED_PIPELINES_SAVE_S=10
 
 # Test: every graphics pipeline built at run time (not at boot or by the prebuild) takes this many

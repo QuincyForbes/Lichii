@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <mutex>
 #include <thread>
@@ -19,6 +20,7 @@
 #include "common/cityhash.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/platform_events.h"
 #include "common/thread_worker.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -220,9 +222,21 @@ void* ComputePipeline::State(const Device& device) {
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory,
                              const Device& device_)
     : VideoCommon::ShaderCache{device_memory}, device{device_},
-      translator{TranslateForIos, DeviceAppleFamily(device_)} {}
+      translator{TranslateForIos, DeviceAppleFamily(device_)} {
+    // A suspended app may be killed without notice (iOS): the archive is written when it leaves
+    // the foreground, and the used list at the GPU thread's next frame.
+    background_listener = Common::PlatformEvents::AddBackgroundListener([this] {
+        save_requested.store(true, std::memory_order_relaxed);
+        for (int wait = 0; wait < 25 && save_requested.load(std::memory_order_relaxed); ++wait) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        files.Wait();
+        archive.Save();
+    });
+}
 
 PipelineCache::~PipelineCache() {
+    Common::PlatformEvents::RemoveBackgroundListener(background_listener);
     files.SaveUsed();
 }
 
@@ -234,9 +248,24 @@ void PipelineCache::OpenArchive(u64 title_id) {
     archive.Open(device, shader_dir / fmt::format("{:016x}", title_id) / "metal_pipelines.bin");
 }
 
-void PipelineCache::SaveFiles() {
-    archive.Save();
-    files.SaveUsed();
+void PipelineCache::TickFrame() {
+    // 0: with the archive, once a minute.
+    static const std::chrono::seconds interval = [] {
+        const char* const value = std::getenv("EDEN_NX2_USED_PIPELINES_SAVE_S");
+        const long long seconds = value != nullptr ? (std::max)(0LL, std::atoll(value)) : 10LL;
+        return std::chrono::seconds{seconds != 0 ? seconds : 60LL};
+    }();
+    const auto now = std::chrono::steady_clock::now();
+    const bool requested = save_requested.load(std::memory_order_relaxed);
+    if (requested || (files.Dirty() && now - used_saved >= interval)) {
+        files.SaveUsed();
+        used_saved = now;
+        save_requested.store(false, std::memory_order_relaxed);
+    }
+    if (now - archive_saved > std::chrono::minutes{1}) {
+        archive_saved = now;
+        archive.Save();
+    }
 }
 
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,

@@ -2880,13 +2880,7 @@ void RasterizerMetal::TickFrame() {
         buffer_cache.TickFrame();
     }
     staging_pool.TickFrame();
-    // New pipelines reach the archive file and the used list once a minute (and when the game
-    // stops).
-    const auto now = std::chrono::steady_clock::now();
-    if (now - archive_saved > std::chrono::minutes{1}) {
-        archive_saved = now;
-        pipeline_cache.SaveFiles();
-    }
+    pipeline_cache.TickFrame();
     // The frame threads' deadlines follow the frames presented (EDEN_NX2_APPLE_FRAME_DEADLINE).
     Common::FrameDeadline::SetPeriodNs(static_cast<u64>((std::max)(
         VideoCommon::Nx2Perf::g_guest_frame_interval_ns.load(std::memory_order_relaxed), 0LL)));
@@ -3086,7 +3080,6 @@ void RasterizerMetal::InlineToMemory(GPUVAddr address, size_t copy_size,
 void RasterizerMetal::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                         const VideoCore::DiskResourceLoadCallback& callback) {
     pipeline_cache.LoadDiskResources(title_id, stop_loading, callback);
-    archive_saved = std::chrono::steady_clock::now();
 }
 
 void RasterizerMetal::InitializeChannel(Tegra::Control::ChannelState& channel) {

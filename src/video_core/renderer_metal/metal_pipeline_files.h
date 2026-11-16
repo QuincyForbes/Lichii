@@ -83,6 +83,11 @@ public:
 
     void NoteUsed(u64 key_hash);
 
+    /// Pipelines were first used since the used list was last written.
+    [[nodiscard]] bool Dirty() const noexcept {
+        return used_changed;
+    }
+
     /// Writes the used list when pipelines were used since the last call.
     void SaveUsed();
 

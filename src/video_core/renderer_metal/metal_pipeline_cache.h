@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <optional>
@@ -162,8 +163,10 @@ public:
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
-    /// Writes the archive and the used pipelines list when they changed.
-    void SaveFiles();
+    /// Once a frame: the used pipelines list is written within EDEN_NX2_USED_PIPELINES_SAVE_S
+    /// (default 10) of a pipeline's first use and when the app leaves the foreground, the archive
+    /// once a minute and then.
+    void TickFrame();
 
     [[nodiscard]] PipelineArchive& Archive() noexcept {
         return archive;
@@ -196,6 +199,11 @@ private:
 
     PipelineArchive archive;
     PipelineFiles files;
+    std::chrono::steady_clock::time_point archive_saved{std::chrono::steady_clock::now()};
+    std::chrono::steady_clock::time_point used_saved{std::chrono::steady_clock::now()};
+    std::size_t background_listener{};
+    /// The app is leaving the foreground: TickFrame writes the used list at once.
+    std::atomic_bool save_requested{};
     /// The pipelines the records file holds.
     std::unordered_set<GraphicsPipelineKey> disk_graphics;
     std::unordered_set<ComputePipelineKey> disk_compute;

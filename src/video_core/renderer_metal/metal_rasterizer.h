@@ -390,7 +390,6 @@ private:
     u64 mesh_groups{};
     /// Why PrepareDraw skipped the draw; empty for a draw of nothing.
     std::string_view prepare_refusal;
-    std::chrono::steady_clock::time_point archive_saved{};
     /// Shader::Backend::SPIRV::RescalingLayout of the draw or dispatch being bound.
     std::array<u32, 8> rescaling_words{};
 
