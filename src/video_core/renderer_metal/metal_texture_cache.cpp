@@ -5,6 +5,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdlib>
+#include <optional>
 
 #include <fmt/format.h>
 
@@ -16,6 +17,7 @@
 #include "video_core/dlss_contract.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/renderer_metal/metal_coverage.h"
+#include "video_core/renderer_metal/metal_formats.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_texture_cache.h"
@@ -158,6 +160,16 @@ namespace {
     return std::nullopt;
 }
 
+// EDEN_NX2_METAL_LAYERS=0: a render pass has the bound slice of each attachment only, as this
+// backend started (a program's layer output is not honoured).
+[[nodiscard]] bool LayersEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_LAYERS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 [[nodiscard]] TextureKind KindOf(const ImageInfo& info) {
     switch (info.type) {
     case ImageType::e1D:
@@ -277,6 +289,17 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                 dst_3d ? 0U : static_cast<u32>(copy.dst_subresource.base_layer + layer),
                 ToOffset(copy.dst_offset));
         }
+    }
+}
+
+void TextureCacheRuntime::BarrierFeedbackLoop() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_FRAGMENT_BARRIER");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (enabled && scheduler.IsRendering()) {
+        scheduler.EndRendering();
+        Coverage::NoteGuard("depth feedback loop pass ends");
     }
 }
 
@@ -670,7 +693,10 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         .layers = info.type == ImageType::e3D ? 1U : static_cast<u32>(info.resources.layers),
         .samples = samples,
         .render_target = host_format.attachable,
-        .shader_write = host_format.storage && samples == 1,
+        // sRGB images take writes through a linear view (Vulkan's mutable format).
+        .shader_write = (host_format.storage ||
+                         (FormatsExpanded() && LinearTwin(host_format.format) != 0)) &&
+                        samples == 1,
     };
     texture = CreateTexture(runtime->device, desc);
     if (!texture) {
@@ -1222,10 +1248,10 @@ Sampler::Sampler(TextureCacheRuntime& runtime_, const Tegra::Texture::TSCEntry& 
     has_srgb_border = tsc.srgb_conversion != 0 && tsc.SrgbBorderColor() != tsc.BorderColor();
     sampler = CreateSampler(*device, tsc, SamplerOptions{.added_lod_bias = added_lod_bias});
     with_variants = true;
-    if (!SamplerBiasSupported() &&
+    if (!SamplerBiasSupported(*device) &&
         (tsc.LodBias() != 0.0f || added_lod_bias != 0.0f ||
          tsc.reduction_filter.Value() != SamplerReduction::WeightedAverage)) {
-        LOG_ONCE(warned_bias, "Metal: sampler LOD bias {} and reduction {} need macOS / iOS 26; "
+        LOG_ONCE(warned_bias, "Metal: sampler LOD bias {} and reduction {} need macOS / iOS 26 on an Apple7 GPU; "
                  "sampled without them", tsc.LodBias() + added_lod_bias,
                  static_cast<u32>(tsc.reduction_filter.Value()));
     }
@@ -1280,6 +1306,25 @@ void* Sampler::HandleFor(const ImageView& view, bool is_depth) {
 Framebuffer::Framebuffer(TextureCacheRuntime&, std::span<ImageView*, NUM_RT> color_buffers,
                          ImageView* depth_buffer, const VideoCommon::RenderTargets& key)
     : width{key.size.width}, height{key.size.height} {
+    // The fewest layers among the attachments' views; a 3D slice takes none beyond its own.
+    std::optional<u32> view_layers;
+    const auto note_layers = [&view_layers](const ImageView& view) {
+        const u32 count = True(view.flags & ImageViewFlagBits::Slice)
+                              ? 1U
+                              : static_cast<u32>((std::max)(view.range.extent.layers, 1));
+        view_layers = (std::min)(view_layers.value_or(count), count);
+    };
+    for (size_t index = 0; index < NUM_RT; ++index) {
+        if (color_buffers[index] != nullptr) {
+            note_layers(*color_buffers[index]);
+        }
+    }
+    if (depth_buffer != nullptr) {
+        note_layers(*depth_buffer);
+    }
+    if (LayersEnabled()) {
+        layers = view_layers.value_or(1);
+    }
     for (size_t index = 0; index < NUM_RT; ++index) {
         if (color_buffers[index] == nullptr) {
             continue;

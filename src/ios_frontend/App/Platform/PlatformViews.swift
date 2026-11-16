@@ -461,6 +461,11 @@ struct ExperimentsView: View {
     @State private var metalCachePlain = lichii_platform_experiment("metal_cache_plain") != 0
     @State private var metalMslPlain = lichii_platform_experiment("metal_msl_plain") != 0
     @State private var metalCopiesPlain = lichii_platform_experiment("metal_copies_plain") != 0
+    @State private var metalSamplersPlain = lichii_platform_experiment("metal_samplers_plain") != 0
+    @State private var metalMsaaOff = lichii_platform_experiment("metal_msaa_off") != 0
+    @State private var metalFormatsPlain = lichii_platform_experiment("metal_formats_plain") != 0
+    @State private var metalLayersOff = lichii_platform_experiment("metal_layers_off") != 0
+    @State private var metalMultiRangeOff = lichii_platform_experiment("metal_multirange_off") != 0
     @State private var metalClearsPlain = lichii_platform_experiment("metal_clears_plain") != 0
     @State private var metalBarrierOff = lichii_platform_experiment("metal_barrier_off") != 0
     @State private var metalStatePlain = lichii_platform_experiment("metal_state_plain") != 0
@@ -711,6 +716,26 @@ struct ExperimentsView: View {
                 Toggle("Image Copies as Before", isOn: $metalCopiesPlain)
                     .onChange(of: metalCopiesPlain) { value in
                         lichii_platform_set_experiment("metal_copies_plain", value ? 1 : 0)
+                    }
+                Toggle("Samplers as Before", isOn: $metalSamplersPlain)
+                    .onChange(of: metalSamplersPlain) { value in
+                        lichii_platform_set_experiment("metal_samplers_plain", value ? 1 : 0)
+                    }
+                Toggle("No Multisampled Image Copies", isOn: $metalMsaaOff)
+                    .onChange(of: metalMsaaOff) { value in
+                        lichii_platform_set_experiment("metal_msaa_off", value ? 1 : 0)
+                    }
+                Toggle("Formats Metal Lacks as Before", isOn: $metalFormatsPlain)
+                    .onChange(of: metalFormatsPlain) { value in
+                        lichii_platform_set_experiment("metal_formats_plain", value ? 1 : 0)
+                    }
+                Toggle("One Layer per Render Pass", isOn: $metalLayersOff)
+                    .onChange(of: metalLayersOff) { value in
+                        lichii_platform_set_experiment("metal_layers_off", value ? 1 : 0)
+                    }
+                Toggle("Split Storage Buffers as Before", isOn: $metalMultiRangeOff)
+                    .onChange(of: metalMultiRangeOff) { value in
+                        lichii_platform_set_experiment("metal_multirange_off", value ? 1 : 0)
                     }
                 Toggle("Clears as Before", isOn: $metalClearsPlain)
                     .onChange(of: metalClearsPlain) { value in

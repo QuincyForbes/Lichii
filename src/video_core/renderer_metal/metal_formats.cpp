@@ -158,6 +158,14 @@ Entry Lookup(PixelFormat format) {
 
 } // Anonymous namespace
 
+u32 LinearTwin(u32 mtl_format) {
+    switch (mtl_format) {
+    case Fmt::RGBA8Unorm_sRGB: return Fmt::RGBA8Unorm;
+    case Fmt::BGRA8Unorm_sRGB: return Fmt::BGRA8Unorm;
+    default: return 0;
+    }
+}
+
 bool FormatsExpanded() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_FORMATS");

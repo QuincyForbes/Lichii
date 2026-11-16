@@ -363,10 +363,11 @@ Object CreateLinearClampSampler(const Device& device) {
     return Retain([device.GetDevice() newSamplerStateWithDescriptor:descriptor]);
 }
 
-bool SamplerBiasSupported() {
+bool SamplerBiasSupported(const Device& device) {
 #if LICHII_METAL_SAMPLER_BIAS
     if (@available(iOS 26.0, macOS 26.0, *)) {
-        return true;
+        // Older GPUs take the properties and sample without them (CI's paravirtual Apple5).
+        return [device.GetDevice() supportsFamily:MTLGPUFamilyApple7];
     }
 #endif
     return false;
@@ -445,7 +446,7 @@ Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc,
     descriptor.maxAnisotropy = static_cast<NSUInteger>(anisotropy);
 #if LICHII_METAL_SAMPLER_BIAS
     if (@available(iOS 26.0, macOS 26.0, *)) {
-        if (!plain) {
+        if (!plain && SamplerBiasSupported(device)) {
             descriptor.lodBias =
                 std::clamp(tsc.LodBias() + options.added_lod_bias, -15.0f, 15.0f);
             switch (tsc.reduction_filter.Value()) {
@@ -544,6 +545,14 @@ Object CreateComputePipelineState(const Device& device, const void* function, st
     MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
     descriptor.computeFunction = (__bridge id<MTLFunction>)function;
     return CreateComputeState(device, descriptor, error, archive);
+}
+
+u64 DeviceAllocatedSize(const Device& device) {
+    return device.AllocatedSize();
+}
+
+u64 DeviceMemoryBudget(const Device& device) {
+    return device.MemoryBudget();
 }
 
 TextureFacts DescribeTexture(TextureHandle texture) {

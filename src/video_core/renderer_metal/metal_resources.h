@@ -124,9 +124,11 @@ struct SamplerOptions {
 [[nodiscard]] Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc,
                                    const SamplerOptions& options = {});
 
-/// Whether sampler states take a LOD bias and a min / max reduction: Metal has both from
-/// macOS / iOS 26 (MTLSamplerDescriptor lodBias, reductionMode), built with that SDK.
-[[nodiscard]] bool SamplerBiasSupported();
+/// Whether sampler states take a LOD bias and a min / max reduction: Metal 4's
+/// MTLSamplerDescriptor lodBias and reductionMode (macOS / iOS 26 SDK and OS) on a Metal 4 GPU
+/// (Apple7 and later: A14, M1). Metal applies the reduction only with linear min, mag and mip
+/// filters.
+[[nodiscard]] bool SamplerBiasSupported(const Device& device);
 
 /// A bilinear sampler clamping to the edge, for the renderer's own passes.
 [[nodiscard]] Object CreateLinearClampSampler(const Device& device);
@@ -155,6 +157,11 @@ struct TextureFacts {
 };
 
 [[nodiscard]] TextureFacts DescribeTexture(TextureHandle texture);
+
+/// Bytes the device has allocated for this process, and the budget it gives (Device::
+/// AllocatedSize, Device::MemoryBudget), for plain C++.
+[[nodiscard]] u64 DeviceAllocatedSize(const Device& device);
+[[nodiscard]] u64 DeviceMemoryBudget(const Device& device);
 
 /// Bytes the resource (texture or buffer) holds on the GPU.
 [[nodiscard]] u64 AllocatedSize(const void* resource);

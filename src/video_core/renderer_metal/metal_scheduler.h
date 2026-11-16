@@ -142,6 +142,8 @@ struct RenderTargetSet {
     bool has_stencil{};
     u32 width{};
     u32 height{};
+    /// Layers a program may choose between (its layer output); 1: the bound slice alone.
+    u32 layers{1};
 
     bool operator==(const RenderTargetSet&) const noexcept = default;
 };

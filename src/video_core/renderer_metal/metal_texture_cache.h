@@ -123,7 +123,10 @@ public:
         return true;
     }
 
-    void BarrierFeedbackLoop() const noexcept {}
+    /// A draw samples the depth image its pass writes (TextureCache::CheckFeedbackLoop): the pass
+    /// ends, storing what was drawn, so the draw's own pass reads it, as Vulkan's barrier orders
+    /// it (EDEN_NX2_METAL_FRAGMENT_BARRIER).
+    void BarrierFeedbackLoop();
 
     /// The LOD bias Ocarina of Time's mipmapped samplers get while a jittered temporal upscaler
     /// runs (VideoCommon::OcarinaFsrLodBias with MetalFX as Vulkan's Dlss backend), else 0.
@@ -414,6 +417,11 @@ public:
         return height;
     }
 
+    /// The layers every attachment's view has (RenderTargetSet::layers).
+    [[nodiscard]] u32 Layers() const noexcept {
+        return layers;
+    }
+
 private:
     std::array<Attachment, NUM_RT> colors{};
     std::array<u32, NUM_RT> color_formats{};
@@ -424,6 +432,7 @@ private:
     bool has_stencil{};
     u32 width{};
     u32 height{};
+    u32 layers{1};
 };
 
 struct TextureCacheParams {

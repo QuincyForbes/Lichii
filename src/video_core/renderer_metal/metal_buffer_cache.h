@@ -9,6 +9,7 @@
 
 #include <array>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
@@ -182,6 +183,35 @@ public:
         bindings.push_back({Binding::Kind::TexelBuffer, buffer.Handle(), offset, size, format});
     }
 
+    /// A storage buffer whose guest range spans several mappings (BufferCache's multi-range
+    /// bindings, EDEN_NX2_METAL_MULTI_RANGE): Metal binds one buffer a slot and has no sparse
+    /// aliasing here, so a read-only binding gets its segments gathered into one buffer, as
+    /// Vulkan's gathered fallback; a written one stays on the plain path, as on Vulkan without
+    /// sparse buffers.
+    [[nodiscard]] bool PrefersSparseSources() const noexcept {
+        return false;
+    }
+
+    void ResetMultiRange() noexcept {
+        multi_range_sources.clear();
+        multi_range_total = 0;
+    }
+
+    void PushMultiRangeSource(const Buffer& buffer, u32 offset, u32 size) {
+        PushMultiRangeSource(buffer.Handle(), offset, size);
+    }
+
+    void PushMultiRangeSource(BufferHandle buffer, u32 offset, u32 size) {
+        multi_range_sources.push_back({buffer, offset, size});
+        multi_range_total += size;
+    }
+
+    /// Gathers the pushed segments into the buffer kept for `key` and binds it next.
+    bool BindMultiRangeStorageBuffer(u64 key, bool is_written);
+
+    /// Gathered buffers are refilled at every bind (BindFreshMultiRangeStorage).
+    void InvalidateMultiRange(u64) noexcept {}
+
     /// The bindings appended since the last call, for the pipeline at the draw.
     [[nodiscard]] std::vector<Binding>& PendingBindings() noexcept {
         return bindings;
@@ -221,6 +251,20 @@ private:
     StagingBufferPool& staging_pool;
 
     std::vector<Binding> bindings;
+    struct MultiRangeSource {
+        BufferHandle buffer{};
+        u32 offset{};
+        u32 size{};
+    };
+    struct MultiRangeBuffer {
+        Object buffer;
+        u64 size{};
+        u64 frame{};
+    };
+    std::vector<MultiRangeSource> multi_range_sources;
+    u64 multi_range_total{};
+    std::unordered_map<u64, MultiRangeBuffer> multi_range_buffers;
+    u64 frame{};
     IndexState index_state{};
     std::array<VertexState, VideoCommon::NUM_VERTEX_BUFFERS> vertex_states{};
     std::array<VertexState, VideoCommon::NUM_TRANSFORM_FEEDBACK_BUFFERS> feedback_states{};

@@ -66,4 +66,8 @@ u64 Device::MemoryBudget() const {
 #endif
 }
 
+u64 Device::AllocatedSize() const {
+    return device.currentAllocatedSize;
+}
+
 } // namespace Metal

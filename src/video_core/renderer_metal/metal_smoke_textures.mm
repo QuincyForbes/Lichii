@@ -20,6 +20,7 @@
 
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_metal/metal_bridge.h"
+#include "video_core/renderer_metal/metal_buffer_cache.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_formats.h"
@@ -27,6 +28,7 @@
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_smoke_textures.h"
+#include "video_core/renderer_metal/metal_staging_buffer_pool.h"
 #include "video_core/texture_cache/decode_bc.h"
 #include "video_core/textures/texture.h"
 
@@ -475,6 +477,208 @@ int RunExpandedFormats() {
     return passed ? 0 : 1;
 }
 
+constexpr const char* StorageSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void write_texels(uint2 id [[thread_position_in_grid]],
+                         texture2d<float, access::write> image [[texture(0)]]) {
+    image.write(float4(0.25, 0.5, 0.75, 1.0), id);
+}
+)";
+
+/// F09: an sRGB image written by a program through a view of its linear format (as the game's
+/// UNORM views of its sRGB images): the texture cache gives such textures shader-write usage.
+int RunSrgbStorage() {
+    using VideoCore::Surface::PixelFormat;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const id<MTLDevice> mtl = device.GetDevice();
+    const Metal::FormatInfo srgb = Metal::SurfaceFormat(device, PixelFormat::A8B8G8R8_SRGB, false);
+    const uint32_t linear = Metal::LinearTwin(srgb.format);
+    const Object texture = Metal::CreateTexture(device, {.kind = TextureKind::e2D,
+                                                         .format = srgb.format,
+                                                         .width = 4,
+                                                         .height = 4,
+                                                         .shader_write = linear != 0});
+    const Object view = texture ? Metal::CreateTextureView(texture.Get(), linear, TextureKind::e2D,
+                                                           0, 1, 0, 1, Metal::IdentitySwizzle)
+                                : Object{};
+    NSError* error = nil;
+    const id<MTLLibrary> library = [mtl newLibraryWithSource:@(StorageSource)
+                                                     options:[MTLCompileOptions new]
+                                                       error:&error];
+    const id<MTLComputePipelineState> kernel =
+        library != nil
+            ? [mtl newComputePipelineStateWithFunction:[library newFunctionWithName:@"write_texels"]
+                                                 error:&error]
+            : nil;
+    auto [back, back_bytes] = SharedBuffer(device, 4 * 4 * 4);
+    if (linear == 0 || !texture || !view || kernel == nil || back_bytes == nullptr) {
+        std::printf("metal-smoke: FAIL sRGB storage: linear twin %u, texture %d, view %d, %s\n",
+                    linear, static_cast<bool>(texture), static_cast<bool>(view),
+                    error != nil ? error.localizedDescription.UTF8String : "kernel built");
+        return 1;
+    }
+    const id<MTLCommandQueue> queue = [mtl newCommandQueue];
+    const id<MTLCommandBuffer> commands = [queue commandBuffer];
+    const id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
+    [encoder setComputePipelineState:kernel];
+    [encoder setTexture:Metal::AsTexture(view.Get()) atIndex:0];
+    [encoder dispatchThreads:MTLSizeMake(4, 4, 1) threadsPerThreadgroup:MTLSizeMake(4, 4, 1)];
+    [encoder endEncoding];
+    [commands commit];
+    [commands waitUntilCompleted];
+    scheduler.CopyTextureToBuffer(texture.Get(), 0, 0, {}, {4, 4, 1}, back.Get(), 0, 16, 0);
+    scheduler.Finish();
+    uint32_t wrong = 0;
+    for (uint32_t texel = 0; texel < 16; ++texel) {
+        const uint8_t* const bytes = back_bytes + texel * 4;
+        // The linear view stores the values as they are (no sRGB encoding).
+        wrong += Close(bytes[0], 64, 1) && Close(bytes[1], 128, 1) && Close(bytes[2], 191, 1) &&
+                         bytes[3] == 255
+                     ? 0
+                     : 1;
+    }
+    const bool passed = wrong == 0;
+    std::printf("metal-smoke: sRGB storage through a linear view: %u of 16 texels wrong: %s\n",
+                wrong, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+constexpr const char* LayerSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct LayerOut {
+    float4 position [[position]];
+    uint layer [[render_target_array_index]];
+};
+
+vertex LayerOut layer_vertex(uint id [[vertex_id]], uint instance [[instance_id]]) {
+    const float2 positions[3] = {float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0)};
+    LayerOut out;
+    out.position = float4(positions[id], 0.0, 1.0);
+    out.layer = instance;
+    return out;
+}
+
+fragment float4 layer_fragment(LayerOut in [[stage_in]]) {
+    return in.layer == 0 ? float4(1.0, 0.0, 0.0, 1.0) : float4(0.0, 0.0, 1.0, 1.0);
+}
+)";
+
+/// F11: a program that picks the layer draws into a 2-layer target through the scheduler's
+/// render pass (RenderTargetSet::layers -> renderTargetArrayLength).
+int RunLayeredTarget() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const id<MTLDevice> mtl = device.GetDevice();
+    NSError* error = nil;
+    const id<MTLLibrary> library = [mtl newLibraryWithSource:@(LayerSource)
+                                                     options:[MTLCompileOptions new]
+                                                       error:&error];
+    MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+    desc.vertexFunction = [library newFunctionWithName:@"layer_vertex"];
+    desc.fragmentFunction = [library newFunctionWithName:@"layer_fragment"];
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+    const Object pipeline = Metal::Retain(
+        library != nil ? [mtl newRenderPipelineStateWithDescriptor:desc error:&error] : nil);
+    const Object depth_stencil =
+        Metal::Retain([mtl newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]]);
+    constexpr uint32_t Side = 4;
+    const Object target = Metal::CreateTexture(device, {.kind = TextureKind::e2DArray,
+                                                        .format = Rgba8,
+                                                        .width = Side,
+                                                        .height = Side,
+                                                        .layers = 2,
+                                                        .render_target = true});
+    auto [back, back_bytes] = SharedBuffer(device, Side * Side * 4 * 2);
+    if (!pipeline || !depth_stencil || !target || back_bytes == nullptr) {
+        std::printf("metal-smoke: FAIL layered target: %s\n",
+                    error != nil ? error.localizedDescription.UTF8String : "textures");
+        return 1;
+    }
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = Side;
+    targets.height = Side;
+    targets.layers = 2;
+    scheduler.BeginRendering(targets);
+    Metal::DrawState state{};
+    state.pipeline = pipeline.Get();
+    state.depth_stencil = depth_stencil.Get();
+    state.viewport = {0.0f, 0.0f, float(Side), float(Side), 0.0f, 1.0f};
+    state.scissor = {0, 0, Side, Side};
+    scheduler.SetDrawState(state);
+    scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 3, 2, 0);
+    scheduler.EndRendering();
+    for (uint32_t layer = 0; layer < 2; ++layer) {
+        scheduler.CopyTextureToBuffer(target.Get(), 0, layer, {}, {Side, Side, 1}, back.Get(),
+                                      layer * Side * Side * 4, Side * 4, 0);
+    }
+    scheduler.Finish();
+    const auto texel = [&](uint32_t layer) {
+        uint32_t value = 0;
+        std::memcpy(&value, back_bytes + layer * Side * Side * 4 + (Side + 1) * 4, sizeof(value));
+        return value;
+    };
+    const uint32_t first = texel(0);
+    const uint32_t second = texel(1);
+    const bool passed = first == 0xFF0000FFU && second == 0xFFFF0000U;
+    std::printf("metal-smoke: layered target, layer from the program: layer 0 %08x (red), "
+                "layer 1 %08x (blue): %s\n",
+                first, second, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// M07: a read-only storage binding whose guest range spans two mappings gets the two segments
+/// gathered into one buffer (BufferCacheRuntime::BindMultiRangeStorageBuffer); a written one is
+/// left to the plain path.
+int RunMultiRange() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Metal::StagingBufferPool pool(device, scheduler);
+    Metal::BufferCacheRuntime runtime(device, scheduler, pool);
+    auto [first, first_bytes] = SharedBuffer(device, 64);
+    auto [second, second_bytes] = SharedBuffer(device, 64);
+    auto [back, back_bytes] = SharedBuffer(device, 48);
+    if (first_bytes == nullptr || second_bytes == nullptr || back_bytes == nullptr) {
+        std::printf("metal-smoke: FAIL multi-range: buffers\n");
+        return 1;
+    }
+    for (uint32_t index = 0; index < 64; ++index) {
+        first_bytes[index] = static_cast<uint8_t>(index);
+        second_bytes[index] = static_cast<uint8_t>(0x80 + index);
+    }
+    // 16 bytes from offset 48 of the first mapping, then 32 from offset 4 of the second.
+    runtime.ResetMultiRange();
+    runtime.PushMultiRangeSource(first.Get(), 48, 16);
+    runtime.PushMultiRangeSource(second.Get(), 4, 32);
+    const bool written_refused = !runtime.BindMultiRangeStorageBuffer(7, true);
+    const bool bound = runtime.BindMultiRangeStorageBuffer(7, false);
+    const auto& bindings = runtime.PendingBindings();
+    const Metal::Binding gathered = bindings.empty() ? Metal::Binding{} : bindings.back();
+    const std::array copy{VideoCommon::BufferCopy{.src_offset = 0, .dst_offset = 0, .size = 48}};
+    if (gathered.buffer != nullptr) {
+        runtime.CopyBuffer(back.Get(), gathered.buffer, copy, false);
+    }
+    scheduler.Finish();
+    uint32_t wrong = 0;
+    for (uint32_t index = 0; index < 48; ++index) {
+        const uint8_t expected = index < 16 ? static_cast<uint8_t>(48 + index)
+                                            : static_cast<uint8_t>(0x80 + 4 + index - 16);
+        wrong += back_bytes[index] == expected ? 0 : 1;
+    }
+    const bool passed = written_refused && bound && gathered.size == 48 && wrong == 0;
+    std::printf("metal-smoke: multi-range storage binding of 2 segments: %s, %u bytes, %u of 48 "
+                "wrong; written binding %s: %s\n",
+                bound ? "gathered" : "NOT BOUND", gathered.size, wrong,
+                written_refused ? "left to the plain path" : "GATHERED", passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 constexpr const char* SamplerSource = R"(
 #include <metal_stdlib>
 using namespace metal;
@@ -632,7 +836,7 @@ int RunSamplers() {
            draw(red_green, tsc_of(WrapMode::MirrorOnceClampOGL, TextureFilter::Nearest),
                 Mirrored),
            Green);
-    const bool bias = Metal::SamplerBiasSupported();
+    const bool bias = Metal::SamplerBiasSupported(device);
     if (bias) {
         const std::array<float, 4> PerTexel{0.5f, 0.5f, 0.0f, 0.0f};
         TSCEntry mip = tsc_of(WrapMode::ClampToEdge, TextureFilter::Nearest);
@@ -640,8 +844,10 @@ int RunSamplers() {
         expect("lod bias 0", draw(mips, mip, PerTexel), Red);
         mip.mip_lod_bias.Assign(256); // 1.0
         expect("lod bias 1", draw(mips, mip, PerTexel), Green);
+        // Metal reduces only with linear min, mag and mip filters.
         const std::array<float, 4> Middle{0.0f, 0.0f, 0.5f, 0.5f};
         TSCEntry reduce = tsc_of(WrapMode::ClampToEdge, TextureFilter::Linear);
+        reduce.mipmap_filter.Assign(TextureMipmapFilter::Linear);
         expect("average", draw(black_white, reduce, Middle), 0xFF808080, 2);
         reduce.reduction_filter.Assign(SamplerReduction::Min);
         expect("min", draw(black_white, reduce, Middle), 0xFF000000);
@@ -650,7 +856,7 @@ int RunSamplers() {
     }
     const bool passed = wrong == 0;
     std::printf("metal-smoke: samplers: %s%s: %s\n", report.c_str(),
-                bias ? "" : "; LOD bias and reduction SKIP (need the macOS / iOS 26 SDK and OS)",
+                bias ? "" : "; LOD bias and reduction SKIP (need the macOS / iOS 26 SDK and OS on an Apple7 GPU)",
                 passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
@@ -660,7 +866,8 @@ int RunSamplers() {
 int RunAll() {
     int result = 0;
     for (const auto test : {RunSampleCopies, RunDepthBytes, RunConversions, RunGuards,
-                            RunSamplesAndPlaceholders, RunExpandedFormats, RunSamplers}) {
+                            RunSamplesAndPlaceholders, RunExpandedFormats, RunSrgbStorage,
+                            RunLayeredTarget, RunMultiRange, RunSamplers}) {
         const int outcome = test();
         result = result != 0 ? result : outcome;
     }

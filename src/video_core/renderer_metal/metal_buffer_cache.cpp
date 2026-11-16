@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include "common/alignment.h"
@@ -46,7 +47,55 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, Scheduler& schedul
                                        StagingBufferPool& staging_pool_)
     : device{device_}, scheduler{scheduler_}, staging_pool{staging_pool_} {}
 
-void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>&) noexcept {}
+void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>&) noexcept {
+    ++frame;
+    // Gathered buffers of bindings not seen for a while go.
+    std::erase_if(multi_range_buffers, [this](auto& entry) {
+        if (frame - entry.second.frame < 64) {
+            return false;
+        }
+        allocated_bytes -= entry.second.size;
+        return true;
+    });
+}
+
+bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_MULTI_RANGE");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled || is_written || multi_range_sources.empty() || multi_range_total == 0 ||
+        multi_range_total > GetMaxStorageBufferRange()) {
+        return false;
+    }
+    MultiRangeBuffer& entry = multi_range_buffers[key];
+    if (!entry.buffer || entry.size < multi_range_total) {
+        allocated_bytes -= entry.size;
+        entry.size = Common::AlignUp(multi_range_total, u64{256});
+        entry.buffer = CreateBuffer(device, entry.size, false, nullptr);
+        if (!entry.buffer) {
+            entry.size = 0;
+            return false;
+        }
+        allocated_bytes += entry.size;
+    }
+    entry.frame = frame;
+    // In order in the segment: the copies land before this draw reads them and after the draws
+    // before it read the last gather (Metal tracks the buffer's hazards).
+    u64 dst_offset = 0;
+    for (const MultiRangeSource& source : multi_range_sources) {
+        const std::array copy{VideoCommon::BufferCopy{
+            .src_offset = source.offset,
+            .dst_offset = dst_offset,
+            .size = source.size,
+        }};
+        CopyBuffer(entry.buffer.Get(), source.buffer, copy, false);
+        dst_offset += source.size;
+    }
+    bindings.push_back({Binding::Kind::Buffer, entry.buffer.Get(), 0,
+                        static_cast<u32>(multi_range_total), {}});
+    return true;
+}
 
 u64 BufferCacheRuntime::GetDeviceLocalMemory() const {
     return DeviceMemoryBudget(device);

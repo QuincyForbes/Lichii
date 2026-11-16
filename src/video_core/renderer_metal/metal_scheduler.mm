@@ -243,8 +243,10 @@ fragment DepthOut convert_abgr8_to_x8d24(ClearOut in [[stage_in]],
 }
 
 uint4 DepthStencilBytes(float depth, uint stencil, bool stencil_first) {
-    const uint depth_bits = uint(min(depth * 4294967295.0, 4294967040.0));
-    const uint3 bytes = (uint3(depth_bits) >> uint3(24, 16, 8)) & 0xFFu;
+    // The 24-bit value rounded, not Vulkan's float scaling by 2^32 - 1, which loses its low
+    // bits in float and carries into the next byte.
+    const uint depth24 = uint(round(saturate(depth) * 16777215.0));
+    const uint3 bytes = (uint3(depth24) >> uint3(16, 8, 0)) & 0xFFu;
     return stencil_first ? uint4(stencil, bytes) : uint4(bytes, stencil);
 }
 
@@ -2154,6 +2156,43 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
         // Without attachments nothing else tells Metal the pass has one sample per pixel, as
         // the pipelines drawn into it have (MoltenVK sets it for such a pass too).
         pass.defaultRasterSampleCount = 1;
+    }
+    if (targets.layers > 1 && !targetless) {
+        // A program's layer output picks among this many slices from each attachment's own.
+        // Metal requires every attachment to have them (array and cube textures only).
+        NSUInteger layers = targets.layers;
+        const auto fit = [&layers](const Attachment& attachment) {
+            const id<MTLTexture> texture = AsTexture(attachment.texture);
+            if (texture == nil) {
+                return;
+            }
+            const MTLTextureType type = texture.textureType;
+            const bool array = type == MTLTextureType2DArray ||
+                               type == MTLTextureType2DMultisampleArray ||
+                               type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray;
+            const NSUInteger slices =
+                texture.arrayLength * (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray
+                                           ? 6
+                                           : 1);
+            layers = array && attachment.slice < slices
+                         ? (std::min)(layers, slices - attachment.slice)
+                         : 1;
+        };
+        for (const Attachment& color : targets.color) {
+            fit(color);
+        }
+        if (targets.has_depth || targets.has_stencil) {
+            fit(targets.depth);
+        }
+        if (layers > 1) {
+            pass.renderTargetArrayLength = layers;
+        } else {
+            static std::atomic<bool> logged{};
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                LOG_INFO(Render_Metal, "Metal: a pass of {} layers has an attachment of one",
+                         targets.layers);
+            }
+        }
     }
     pass.visibilityResultBuffer = impl->visibility;
     impl->render = impl->RenderEncoder(pass);

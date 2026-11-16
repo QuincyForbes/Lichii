@@ -19,6 +19,7 @@
 #include "common/cityhash.h"
 #include "common/frame_deadline.h"
 #include "common/logging.h"
+#include "common/platform_events.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -251,6 +252,7 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
       ocarina{device_, scheduler_}, ocarina_temporal{device_, scheduler_},
       accelerate_dma{buffer_cache, texture_cache},
       fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_} {
+    Common::PlatformEvents::SetGraphicsMemoryReport([this] { return GraphicsMemoryReport(); });
     if (!CachePathsEnabled()) {
         LOG_WARNING(Render_Metal, "Metal: plain cache paths (EDEN_NX2_METAL_CACHE_PATHS=0)");
         return;
@@ -288,6 +290,7 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
 }
 
 RasterizerMetal::~RasterizerMetal() {
+    Common::PlatformEvents::SetGraphicsMemoryReport({});
     if (CachePathsEnabled()) {
         VideoCommon::GpuSplit::Get().SetFenceQuietCheck(nullptr, nullptr);
     }
@@ -841,6 +844,16 @@ void RasterizerMetal::AddRescalingBits(const Shader::Info& info,
     }
 }
 
+std::string RasterizerMetal::GraphicsMemoryReport() const {
+    constexpr u64 MiB = u64{1} << 20;
+    return fmt::format("textures {} MiB, buffers {} MiB, staging {} MiB; Metal device {} MiB "
+                       "allocated, budget {} MiB",
+                       texture_cache_runtime.allocated_bytes / MiB,
+                       buffer_cache_runtime.GetDeviceMemoryUsage() / MiB,
+                       staging_pool.HeldBytes() / MiB, DeviceAllocatedSize(device) / MiB,
+                       DeviceMemoryBudget(device) / MiB);
+}
+
 TextureHandle RasterizerMetal::OrPlaceholder(const ImageView& view, TextureHandle handle,
                                              Shader::TextureType type) {
     if (handle != nullptr || !PipelineCheckEnabled() || type == Shader::TextureType::Buffer) {
@@ -1133,6 +1146,9 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         texture_cache.BoundTargetlessFramebuffer(
             TargetlessReach(regs, texture_cache.IsRescaling()));
     }
+    // A draw sampling the depth image it writes: the pass before it ends (BarrierFeedbackLoop),
+    // as Vulkan's graphics pipeline asks at this point.
+    texture_cache.CheckFeedbackLoop(views);
     const bool writes_storage = [&] {
         const auto any_written = [](const auto& descriptors) {
             return std::ranges::any_of(descriptors,
@@ -1178,6 +1194,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     targets.has_stencil = framebuffer->HasStencil();
     targets.width = framebuffer->Width();
     targets.height = framebuffer->Height();
+    targets.layers = framebuffer->Layers();
     // Before the buffer cache notes what this draw uses in the segment.
     scheduler.SplitBefore(targets);
     const u64 draw_segment = scheduler.SegmentSerial();
@@ -3003,6 +3020,10 @@ void RasterizerMetal::FlushCommands() {
 void RasterizerMetal::TickFrame() {
     VideoCommon::FeatureCensus::Tick();
     ++oot_frame;
+    if (!graphics_report_logged && oot_frame == 600) {
+        graphics_report_logged = true;
+        LOG_INFO(Common_Memory, "Graphics memory (renderer): {}", GraphicsMemoryReport());
+    }
     texel_view_cache.clear();
     fence_manager.TickFrame();
     {

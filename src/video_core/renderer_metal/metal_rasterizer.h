@@ -307,6 +307,10 @@ private:
     /// The zero textures OrPlaceholder binds, made once outside a render pass.
     void MakePlaceholders();
 
+    /// The "Graphics memory (renderer):" text (Vulkan's GraphicsMemoryReport): what the caches
+    /// hold and what the device has allocated, logged once and on memory warnings.
+    [[nodiscard]] std::string GraphicsMemoryReport() const;
+
     /// Fills the sample grids of the multisampled images a stage reads as plain textures
     /// (ImageView::PrepareSampleGrid). `views` start at the stage's first.
     void PrepareSampleGrids(const Shader::Info& info,
@@ -459,6 +463,7 @@ private:
     std::array<Object, Shader::NUM_TEXTURE_TYPES> placeholders;
     Object placeholder_zeros;
     bool placeholders_made{};
+    bool graphics_report_logged{};
     u64 staging_flushes{};
     u64 staging_waits{};
     VideoCommon::OotNetwork::BypassState oot_network_bypass;

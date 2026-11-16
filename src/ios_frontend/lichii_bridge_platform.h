@@ -230,6 +230,16 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// instance index is refused; quad groups for subgroups), as before (EDEN_NX2_METAL_MSL_DEVICE=0).
 /// "metal_copies_plain": the Metal renderer skips blits between depth images and copies between
 /// block-compressed and plain formats, as before (EDEN_NX2_METAL_COPIES=0).
+/// "metal_samplers_plain": the Metal renderer makes one sampler per guest sampler without LOD
+/// bias, min / max reduction or the per-view variants, as before (EDEN_NX2_METAL_SAMPLERS=0).
+/// "metal_msaa_off": the Metal renderer neither uploads, downloads, copies nor resolves
+/// multisampled images, as before (EDEN_NX2_METAL_MSAA=0). "metal_formats_plain": the Metal
+/// renderer makes no texture for R32G32B32_FLOAT and reads G4R4 as R8, as before
+/// (EDEN_NX2_METAL_FORMATS=0).
+/// "metal_layers_off": the Metal renderer gives a render pass one slice of each attachment, as
+/// before, so a program's layer output draws into the first (EDEN_NX2_METAL_LAYERS=0).
+/// "metal_multirange_off": the Metal renderer binds a storage buffer spanning several mappings
+/// at its first one, as before (EDEN_NX2_METAL_MULTI_RANGE=0).
 /// "metal_clears_plain": the Metal renderer clears the whole target, every channel and every
 /// stencil bit where the game clears a part, and gives every clear a render pass of its own, as
 /// before (EDEN_NX2_METAL_CLEAR_DRAWS=0, EDEN_NX2_METAL_CLEAR_FOLD=0).
