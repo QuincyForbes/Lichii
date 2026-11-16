@@ -9,6 +9,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "video_core/host_budget.h"
+#include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
@@ -84,6 +85,19 @@ StagingBufferRef StagingBufferPool::Request(size_t size, bool deferred) {
     }
     u8* contents = nullptr;
     Object buffer = CreateBuffer(device, rounded, true, &contents);
+    if (!buffer || contents == nullptr) {
+        // Out of memory: the GPU's work finishes and every idle staging buffer goes, then once
+        // more (Vulkan's allocator falls back to host memory; Metal's shared buffers already are).
+        scheduler.Finish();
+        for (Entry& entry : entries) {
+            if (entry.size != 0 && !entry.deferred && scheduler.IsFree(entry.tick)) {
+                held_bytes -= entry.size;
+                entry = {};
+            }
+        }
+        buffer = CreateBuffer(device, rounded, true, &contents);
+        Coverage::NoteGuard("staging buffer made again after freeing idle ones");
+    }
     ASSERT_MSG(buffer && contents != nullptr, "Metal staging buffer of {} bytes failed", rounded);
     held_bytes += rounded;
     if (empty == entries.size()) {

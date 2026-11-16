@@ -11,8 +11,12 @@
 
 #include <fmt/format.h>
 
+#include "shader_recompiler/shader_info.h"
+#include "video_core/renderer_metal/metal_coverage.h"
+#include "video_core/renderer_metal/metal_formats.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_resources.h"
+#include "video_core/renderer_metal/metal_scheduler.h"
 
 namespace Metal {
 
@@ -570,6 +574,96 @@ std::string Describe(const RenderPipelineDesc& desc) {
                             desc.tess_winding);
     }
     return text;
+}
+
+void FitAttachments(RenderPipelineDesc& desc, RenderTargetSet& targets,
+                    TextureFacts (*describe)(TextureHandle)) {
+    const auto fit = [describe](Attachment& attachment) {
+        const TextureFacts facts = describe(attachment.texture);
+        if (facts.format == 0) {
+            return facts;
+        }
+        if (attachment.level >= facts.levels) {
+            Coverage::NoteGuardWith("attachment level past the texture", [&] {
+                return fmt::format("level {} of {}", attachment.level, facts.levels);
+            });
+            attachment.level = facts.levels - 1;
+        }
+        const u32 planes = (std::max)(facts.depth >> attachment.level, 1U);
+        if (facts.depth > 1 && attachment.depth_plane >= planes) {
+            Coverage::NoteGuardWith("attachment slice past the texture", [&] {
+                return fmt::format("plane {} of {}", attachment.depth_plane, planes);
+            });
+            attachment.depth_plane = planes - 1;
+        } else if (facts.depth == 1 && attachment.slice >= facts.slices) {
+            Coverage::NoteGuardWith("attachment slice past the texture", [&] {
+                return fmt::format("slice {} of {}", attachment.slice, facts.slices);
+            });
+            attachment.slice = facts.slices - 1;
+        }
+        return facts;
+    };
+    for (size_t rt = 0; rt < targets.color.size(); ++rt) {
+        if (targets.color[rt].texture == nullptr) {
+            continue;
+        }
+        const TextureFacts facts = fit(targets.color[rt]);
+        if (facts.format == desc.color_formats[rt] && facts.samples == desc.samples) {
+            continue;
+        }
+        Coverage::NoteGuardWith("pipeline and pass formats differ", [&] {
+            return fmt::format("colour {}: format {} x{} drawn as {} x{}", rt, facts.format,
+                               facts.samples, desc.color_formats[rt], desc.samples);
+        });
+        if (facts.format != 0 && facts.samples == desc.samples &&
+            ClassOf(facts.format) == ClassOf(desc.color_formats[rt])) {
+            desc.color_formats[rt] = facts.format;
+        } else {
+            targets.color[rt] = {};
+            desc.color_formats[rt] = 0;
+        }
+    }
+    if (targets.has_depth || targets.has_stencil) {
+        const TextureFacts facts = fit(targets.depth);
+        const u32 wanted = desc.depth_format != 0 ? desc.depth_format : desc.stencil_format;
+        if (facts.format != wanted || facts.samples != desc.samples) {
+            Coverage::NoteGuardWith("pipeline and pass formats differ", [&] {
+                return fmt::format("depth: format {} x{} drawn as {} x{}", facts.format,
+                                   facts.samples, wanted, desc.samples);
+            });
+            targets.has_depth = false;
+            targets.has_stencil = false;
+            targets.depth = {};
+            desc.depth_format = 0;
+            desc.stencil_format = 0;
+        }
+    }
+}
+
+TextureDesc PlaceholderTexture(u32 texture_type) {
+    using Shader::TextureType;
+    TextureDesc desc{.format = Fmt::RGBA8Unorm, .shader_write = true};
+    switch (static_cast<TextureType>(texture_type)) {
+    case TextureType::ColorArray1D:
+    case TextureType::ColorArray2D:
+        desc.kind = TextureKind::e2DArray;
+        break;
+    case TextureType::Color3D:
+        desc.kind = TextureKind::e3D;
+        break;
+    case TextureType::ColorCube:
+        desc.kind = TextureKind::Cube;
+        desc.layers = 6;
+        break;
+    case TextureType::ColorArrayCube:
+        desc.kind = TextureKind::CubeArray;
+        desc.layers = 6;
+        break;
+    default:
+        desc.kind = TextureKind::e2D;
+        break;
+    }
+    return desc;
 }
 
 } // namespace Metal

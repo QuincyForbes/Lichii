@@ -398,6 +398,23 @@ private:
     [[nodiscard]] std::vector<TextureHandle> PrepareTexelBuffers(std::span<const Binding> bindings,
                                                                  const Shader::Info& info);
 
+    /// `handle`, or with the pipeline check a texture of zeros of `type` in its place when the
+    /// view has none (refused by the checks, or a null descriptor); counted as a guard.
+    [[nodiscard]] TextureHandle OrPlaceholder(const ImageView& view, TextureHandle handle,
+                                              Shader::TextureType type);
+
+    /// The zero textures OrPlaceholder binds, made once outside a render pass.
+    void MakePlaceholders();
+
+    /// The "Graphics memory (renderer):" text (Vulkan's GraphicsMemoryReport): what the caches
+    /// hold and what the device has allocated, logged once and on memory warnings.
+    [[nodiscard]] std::string GraphicsMemoryReport() const;
+
+    /// Fills the sample grids of the multisampled images a stage reads as plain textures
+    /// (ImageView::PrepareSampleGrid). `views` start at the stage's first.
+    void PrepareSampleGrids(const Shader::Info& info,
+                            std::span<const VideoCommon::ImageViewInOut> views);
+
     /// Binds a stage's buffers (the buffer cache's pending bindings for it), textures, samplers,
     /// images and push constants into the slots the translator gave them. `views` and
     /// samplers start at the stage's first.
@@ -634,6 +651,11 @@ private:
     /// The last render pass with a draw that writes storage.
     u64 pass_stores{};
     u64 barrier_pass_ends{};
+    /// One 1x1 RGBA8 texture of zeros per shader texture type (OrPlaceholder).
+    std::array<Object, Shader::NUM_TEXTURE_TYPES> placeholders;
+    Object placeholder_zeros;
+    bool placeholders_made{};
+    bool graphics_report_logged{};
     u64 staging_flushes{};
     u64 staging_waits{};
     VideoCommon::OotNetwork::BypassState oot_network_bypass;

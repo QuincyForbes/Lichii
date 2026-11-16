@@ -494,6 +494,8 @@ struct Outcome {
     ShaderTranslate::TessellationModes modes{};
     /// By Tessellation::IndexSizes variant for a tessellation pipeline, else [0].
     std::array<VertexProgramUse, 3> vertex_use{};
+    /// ProgramFeature bits of the programs (texture rows of metal-coverage.md).
+    u32 features{};
 };
 
 struct GraphicsJob {
@@ -559,6 +561,65 @@ private:
     std::unordered_set<u64> seen;
 };
 
+/// What the texture rows of metal-coverage.md ask of a game's programs and the census does not
+/// count (F09, F11, G19, R14).
+enum ProgramFeature : u32 {
+    WritesImage = 1U << 0,
+    WritesTypelessImage = 1U << 1,
+    ByteAddressedImage = 1U << 2,
+    ReadsMultisample = 1U << 3,
+    StoresLayer = 1U << 4,
+    StoresViewportIndex = 1U << 5,
+    ReadsDepthTexture = 1U << 6,
+    ReadsTexelBuffer = 1U << 7,
+    UsesImageBuffer = 1U << 8,
+    ProgramFeatureCount = 9,
+};
+
+constexpr std::array<std::string_view, ProgramFeatureCount> ProgramFeatureNames{
+    "writes a storage image",       "writes a storage image without a format",
+    "byte-addressed storage image", "reads a multisampled texture",
+    "stores the layer",             "stores the viewport index",
+    "reads a depth texture",       "reads a texel buffer",
+    "uses an image buffer",
+};
+
+u32 ProgramFeatures(const Shader::Info& info) {
+    u32 features = 0;
+    for (const auto& desc : info.image_descriptors) {
+        if (desc.is_written) {
+            features |= WritesImage;
+            if (desc.format == Shader::ImageFormat::Typeless) {
+                features |= WritesTypelessImage;
+            }
+        }
+        if (desc.is_byte_addressed) {
+            features |= ByteAddressedImage;
+        }
+    }
+    for (const auto& desc : info.texture_descriptors) {
+        if (desc.is_multisample) {
+            features |= ReadsMultisample;
+        }
+        if (desc.is_depth) {
+            features |= ReadsDepthTexture;
+        }
+    }
+    if (!info.texture_buffer_descriptors.empty()) {
+        features |= ReadsTexelBuffer;
+    }
+    if (!info.image_buffer_descriptors.empty()) {
+        features |= UsesImageBuffer;
+    }
+    if (info.stores[Shader::IR::Attribute::Layer]) {
+        features |= StoresLayer;
+    }
+    if (info.stores[Shader::IR::Attribute::ViewportIndex]) {
+        features |= StoresViewportIndex;
+    }
+    return features;
+}
+
 void Summarise(const TranslatedPipeline& pipeline, Outcome& outcome, MslSink& sink) {
     outcome.ok = true;
     outcome.cause.clear();
@@ -584,6 +645,8 @@ void Summarise(const TranslatedPipeline& pipeline, Outcome& outcome, MslSink& si
         outcome.has_task = mesh.has_task;
         outcome.mesh_topology = mesh.topology;
         sink.Add(mesh.has_task ? "task_kernel" : "mesh_kernel", mesh.first.program);
+        outcome.features |= ProgramFeatures(mesh.first.program.info) |
+                            ProgramFeatures(mesh.mesh.program.info);
         if (mesh.has_task) {
             sink.Add("mesh_kernel", mesh.mesh.program);
             sink.Add("mesh_distribution", mesh.distribution.program);
@@ -600,12 +663,15 @@ void Summarise(const TranslatedPipeline& pipeline, Outcome& outcome, MslSink& si
             sink.Add("tess_vertex_kernel", tessellation.vertex[variant]);
         }
         sink.Add("tess_control_kernel", tessellation.control.program);
+        outcome.features |= ProgramFeatures(tessellation.control.program.info);
         sink.Add("tess_evaluation", pipeline.vertex);
     } else {
         outcome.vertex_use[0] = VertexUse(pipeline.vertex);
         sink.Add("vertex", pipeline.vertex);
     }
     sink.Add("fragment", pipeline.fragment);
+    outcome.features |=
+        ProgramFeatures(pipeline.vertex.info) | ProgramFeatures(pipeline.fragment.info);
 }
 
 /// The environment lacks a value: another record's may have it.
@@ -730,6 +796,7 @@ void RunCompute(ComputeJob& job, PipelineTranslator& translator, MslSink& sink) 
         outcome.cause.clear();
         outcome.detail.clear();
         sink.Add("compute", program);
+        outcome.features |= ProgramFeatures(program.info);
     };
     for (Record* const record : job.candidates) {
         if (const auto program = TryCompute(translator, job.hash, *record, false, outcome)) {
@@ -1646,6 +1713,28 @@ int Run(const Arguments& arguments) {
         Print(out, "Translation of the stored compute programs", compute_results, "programs",
               "records");
         Print(out, "What the failing step said", compute_details, "programs", "records");
+
+        Tallies features;
+        for (size_t index = 0; index < stored_graphics; ++index) {
+            const GraphicsJob& job = jobs.graphics[index];
+            for (u32 bit = 0; bit < ProgramFeatureCount; ++bit) {
+                if ((job.outcome.features >> bit) & 1) {
+                    Count(features, fmt::format("graphics: {}", ProgramFeatureNames[bit]),
+                          job.records, HashText(job.key.unique_hashes));
+                }
+            }
+        }
+        for (size_t index = 0; index < stored_compute; ++index) {
+            const ComputeJob& job = jobs.compute[index];
+            for (u32 bit = 0; bit < ProgramFeatureCount; ++bit) {
+                if ((job.outcome.features >> bit) & 1) {
+                    Count(features, fmt::format("compute: {}", ProgramFeatureNames[bit]),
+                          job.records, fmt::format("compute={:016x}", job.hash));
+                }
+            }
+        }
+        Print(out, "Program features of the translated pipelines (texture rows)", features,
+              "pipelines", "records");
     }
     ReportMeshPrograms(out, jobs);
 

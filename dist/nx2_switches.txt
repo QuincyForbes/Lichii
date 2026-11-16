@@ -186,7 +186,15 @@ EDEN_NX2_FENCE_BATCH=1
 # such, as on MoltenVK (Metal's 1D textures take no mip levels and no 2D views); a texture view
 # of another family of texture types, with a slice count its type can't have or in a format Metal
 # doesn't cast to is refused with a "refused:" log line, as is a 1D or 3D texture in a depth or
-# stencil format.
+# stencil format. The same switch holds the checks Metal makes only in its validation layer,
+# which release builds lack: a buffer bound at an offset past its end is bound as zeros, an
+# attachment's level or slice past its texture becomes the last one, an attachment whose format
+# or sample count the pipeline lacks takes the texture's format of the same kind or is left out;
+# the stencil views the scheduler's blits make are checked as texture views are; a guest target
+# of more samples than the GPU has (8 on Apple GPUs) is drawn at the GPU's most; and a refused
+# render pipeline is drawn again without blending and alpha to coverage, a refused or missing
+# texture reads zeros. Each is counted on the `Perf Metal coverage:` line as `guards: <name>
+# <count>` and logged once as `Metal: guard: ...`.
 #EDEN_NX2_METAL_PIPELINE_CHECK=0
 
 # Metal renderer: guest reads, guest writes and the GPU's inline writes take the paths the
@@ -223,8 +231,57 @@ EDEN_NX2_FENCE_BATCH=1
 # format), and a copy between a block-compressed image and a plain one whose texels are the
 # size of a block goes through a buffer, block for texel, as Vulkan copies them (Ocarina of
 # Time copies R16G16B16A16_UINT into BC4). A copy that starts inside a block is skipped with a
-# log line either way; images decoded on the CPU are not copied this way.
+# log line either way; images decoded on the CPU are not copied this way. The same switch covers
+# depth and stencil data: 24-bit depth, depth with stencil and stencil images are uploaded and
+# downloaded in the guest's bytes (a draw writes depth and stencil from the buffer, a kernel
+# reads them back: Metal has no 24-bit depth and no blit copy of packed depth-stencil), Vulkan's
+# depth <-> colour conversions (ABGR8 <-> D24S8 / S8D24 / X8D24 / D32F, D32F -> R32F, D16 <->
+# R16) are drawn, depth images are reinterpreted through a buffer, and resolution scaling scales
+# stencil-only images with a draw exporting the stencil. With 0 all of them are skipped, as before.
 #EDEN_NX2_METAL_COPIES=0
+
+# Metal renderer: 0 makes one sampler state per guest sampler, as before: no LOD bias and no
+# min / max reduction, the OpenGL clamp clamps to the edge and both mirror-once modes Metal
+# lacks clamp without the mirrored repeat. By default the guest's LOD bias (plus the Ocarina
+# upscaler's, as Vulkan's) and reduction are set where the SDK and OS have them (macOS / iOS 26;
+# older systems log once and sample without), the OpenGL clamp reaches the border when the
+# guest filters, the mirror-once modes mirror once and clamp to the edge, and a view gets a
+# variant of the sampler where Vulkan uses another one: no added anisotropy for views that take
+# none, nearest for integer views, no comparison for plain reads, the sRGB border colour for
+# sRGB views. Metal has three fixed border colours: a guest border colour is the nearest of them.
+#EDEN_NX2_METAL_SAMPLERS=0
+
+# Metal renderer: 0 leaves multisampled images as before: never uploaded, downloaded or copied
+# to or from single-sampled images, blits from them dropped, and a program reading one as a plain
+# texture given the multisampled texture. By default a multisampled image keeps a single-sampled
+# texture holding its samples as texels, as the guest lays them out, filled and drained by a draw
+# per layer: uploads and downloads go through it, CopyImageMSAA draws between the two, a program
+# that reads the image as a plain texture reads it, and blits resolve (Metal's resolve store
+# action for a whole image, the samples scaled into the rectangle otherwise), and resolution
+# scaling scales colour and depth ones sample for sample with a draw (Metal blits no multisampled
+# texture). Multisampled stencil is not copied or scaled (Metal writes no stencil per sample from a
+# fragment).
+#EDEN_NX2_METAL_MSAA=0
+
+# Metal renderer: 0 makes no texture for R32G32B32_FLOAT (Metal has no 96-bit format) and reads
+# G4R4_UNORM as R8 (only the high nibble survives), as before. By default both are expanded on
+# the CPU at upload, into RGBA32Float (alpha 1) and RG8Unorm (red from the high nibble, as
+# Vulkan's R4G4_UNORM_PACK8); texel buffers of them keep the guest's bytes.
+#EDEN_NX2_METAL_FORMATS=0
+
+# Metal renderer: 0 gives a render pass the bound slice of each attachment only, as before: a
+# program that picks the layer (its layer output) draws into the first. By default a pass of a
+# layered framebuffer has renderTargetArrayLength set to the fewest layers among its attachments'
+# views (array and cube textures; a 3D slice or a plain 2D texture keeps one), as Vulkan's
+# framebuffer layers.
+#EDEN_NX2_METAL_LAYERS=0
+
+# Metal renderer: 0 binds a storage buffer whose guest range spans several mappings at its first
+# mapping, as before (what lies past it is read from the wrong place). By default such a binding,
+# when the program only reads it, gets its segments copied into one buffer before the draw or
+# dispatch, as Vulkan's gathered multi-range fallback; written ones stay on the plain path (Metal
+# has no sparse buffer aliasing here, as Vulkan without sparse binding).
+#EDEN_NX2_METAL_MULTI_RANGE=0
 
 # Metal renderer: 0 clears as before: a clear of part of a target (the scissor), of some colour
 # channels or of some stencil bits clears the whole target, every channel and every bit, and a
@@ -248,7 +305,9 @@ EDEN_NX2_FENCE_BATCH=1
 # next draw after a barrier that samples one of its targets (or follows a draw that writes
 # storage) ends the render pass first, so the image holds the earlier draws, and opens it
 # again; other draws stay in the open pass, as on Vulkan (EDEN_NX2_WFI_DEFER). The 10 s
-# "Metal:" line counts the passes ended this way.
+# "Metal:" line counts the passes ended this way. The same holds for a depth feedback loop (a
+# draw sampling the depth image its pass writes, the texture cache's barrier_feedback_loops
+# check): the pass ends before it, counted as "guards: depth feedback loop pass ends".
 #EDEN_NX2_METAL_FRAGMENT_BARRIER=0
 
 # Metal renderer: 0 sets every piece of state (pipeline, depth-stencil state, viewport,

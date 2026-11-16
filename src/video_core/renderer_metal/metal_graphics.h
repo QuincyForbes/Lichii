@@ -196,9 +196,35 @@ struct VertexUnpackParams {
 /// Why Metal would reject the texture by assertion, or nothing.
 [[nodiscard]] std::string CheckTexture(const TextureDesc& desc, const PipelineLimits& limits);
 
+/// The sample count a texture asking for `samples` gets: the largest the device takes up to it
+/// (Apple GPUs take 4 at most, so the guest's 8 draw at 4 instead of being refused).
+[[nodiscard]] inline u32 SupportedSamples(u32 samples, const PipelineLimits& limits) {
+    for (u32 count = samples < 31 ? samples : 31; count > 1; --count) {
+        if (((limits.sample_counts >> count) & 1) != 0) {
+            return count;
+        }
+    }
+    return 1;
+}
+
 /// Why Metal would reject by assertion a view of kind `view` with `layers` slices of a texture
 /// of kind `base`, or nothing.
 [[nodiscard]] std::string CheckTextureView(TextureKind base, TextureKind view, u32 layers);
+
+struct RenderTargetSet;
+struct TextureFacts;
+
+/// The pass's attachments as Metal must get them (its validation layer checks these; release
+/// builds have none): a level or slice past the texture becomes its last one, and an attachment
+/// whose format or sample count the pipeline does not have takes the texture's format when it is
+/// of the same kind and sample count, else is left out of the pass and the pipeline. Counted as
+/// guards (Coverage::NoteGuard). `describe` is DescribeTexture outside tests.
+void FitAttachments(RenderPipelineDesc& desc, RenderTargetSet& targets,
+                    TextureFacts (*describe)(TextureHandle));
+
+/// The 1x1 RGBA8 texture of zeros bound where a program reads a texture of `type` and its view
+/// has none (RasterizerMetal::OrPlaceholder); 1D types as 2D, as the pipeline check makes them.
+[[nodiscard]] TextureDesc PlaceholderTexture(u32 texture_type);
 
 /// The whole description on one line, for the log.
 [[nodiscard]] std::string Describe(const RenderPipelineDesc& desc);

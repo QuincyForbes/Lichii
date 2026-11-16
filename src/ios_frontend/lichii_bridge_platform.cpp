@@ -403,6 +403,26 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_METAL_COPIES", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment metal_copies_plain on");
     }
+    if (lichii_platform_experiment("metal_samplers_plain")) {
+        setenv("EDEN_NX2_METAL_SAMPLERS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_samplers_plain on");
+    }
+    if (lichii_platform_experiment("metal_msaa_off")) {
+        setenv("EDEN_NX2_METAL_MSAA", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_msaa_off on");
+    }
+    if (lichii_platform_experiment("metal_formats_plain")) {
+        setenv("EDEN_NX2_METAL_FORMATS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_formats_plain on");
+    }
+    if (lichii_platform_experiment("metal_layers_off")) {
+        setenv("EDEN_NX2_METAL_LAYERS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_layers_off on");
+    }
+    if (lichii_platform_experiment("metal_multirange_off")) {
+        setenv("EDEN_NX2_METAL_MULTI_RANGE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_multirange_off on");
+    }
     if (lichii_platform_experiment("metal_clears_plain")) {
         setenv("EDEN_NX2_METAL_CLEAR_DRAWS", "0", 1);
         setenv("EDEN_NX2_METAL_CLEAR_FOLD", "0", 1);

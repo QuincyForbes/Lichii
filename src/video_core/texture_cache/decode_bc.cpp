@@ -57,8 +57,51 @@ u32 ConvertedBytesPerBlock(VideoCore::Surface::PixelFormat pixel_format) {
     case PixelFormat::BC6H_SFLOAT:
     case PixelFormat::BC6H_UFLOAT:
         return 8;
+    // Plain formats a backend has no counterpart for (ExpandTexels): RGBA32F and RG8.
+    case PixelFormat::R32G32B32_FLOAT:
+        return 16;
+    case PixelFormat::G4R4_UNORM:
+        return 2;
     default:
         return 4;
+    }
+}
+
+bool IsExpandedFormat(VideoCore::Surface::PixelFormat pixel_format) {
+    return pixel_format == PixelFormat::R32G32B32_FLOAT || pixel_format == PixelFormat::G4R4_UNORM;
+}
+
+void ExpandTexels(std::span<const u8> input, std::span<u8> output, const BufferImageCopy& copy,
+                  VideoCore::Surface::PixelFormat pixel_format) {
+    const bool rgb32 = pixel_format == PixelFormat::R32G32B32_FLOAT;
+    const u32 in_bpp = rgb32 ? 12 : 1;
+    const u32 out_bpp = ConvertedBytesPerBlock(pixel_format);
+    const u32 width = copy.image_extent.width;
+    const u32 height = copy.image_extent.height;
+    const u32 planes = copy.image_subresource.num_layers * copy.image_extent.depth;
+    const u32 row_texels = copy.buffer_row_length != 0 ? copy.buffer_row_length : width;
+    const u32 plane_rows = copy.buffer_image_height != 0 ? copy.buffer_image_height : height;
+    static constexpr std::array<u8, 4> One{0x00, 0x00, 0x80, 0x3f}; // 1.0f
+    size_t out = 0;
+    for (u32 plane = 0; plane < planes; ++plane) {
+        for (u32 y = 0; y < height; ++y) {
+            size_t in = (size_t{plane} * plane_rows + y) * row_texels * in_bpp;
+            for (u32 x = 0; x < width; ++x, in += in_bpp, out += out_bpp) {
+                if (in + in_bpp > input.size() || out + out_bpp > output.size()) {
+                    return;
+                }
+                if (rgb32) {
+                    // RGB, then alpha 1.
+                    std::copy_n(input.begin() + in, 12, output.begin() + out);
+                    std::ranges::copy(One, output.begin() + out + 12);
+                } else {
+                    // Vulkan's R4G4_UNORM_PACK8: red in the high nibble.
+                    const u8 value = input[in];
+                    output[out] = static_cast<u8>((value >> 4) * 17);
+                    output[out + 1] = static_cast<u8>((value & 0xF) * 17);
+                }
+            }
+        }
     }
 }
 

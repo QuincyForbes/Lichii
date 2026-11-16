@@ -19,6 +19,7 @@
 #include "common/cityhash.h"
 #include "common/frame_deadline.h"
 #include "common/logging.h"
+#include "common/platform_events.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -43,6 +44,7 @@
 #include "video_core/oot_network.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_draw_desc.h"
+#include "video_core/renderer_metal/metal_formats.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_mesh_indirect.h"
@@ -283,6 +285,7 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
       accelerate_dma{buffer_cache, texture_cache, scheduler_},
       fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_} {
     pipeline_cache.SetSkipCheck([this] { return DrawMayBeSkipped(); });
+    Common::PlatformEvents::SetGraphicsMemoryReport([this] { return GraphicsMemoryReport(); });
     if (!CachePathsEnabled()) {
         LOG_WARNING(Render_Metal, "Metal: plain cache paths (EDEN_NX2_METAL_CACHE_PATHS=0)");
         return;
@@ -320,6 +323,7 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
 }
 
 RasterizerMetal::~RasterizerMetal() {
+    Common::PlatformEvents::SetGraphicsMemoryReport({});
     if (CachePathsEnabled()) {
         VideoCommon::GpuSplit::Get().SetFenceQuietCheck(nullptr, nullptr);
     }
@@ -1386,6 +1390,79 @@ void RasterizerMetal::AddRescalingBits(const Shader::Info& info,
     }
 }
 
+std::string RasterizerMetal::GraphicsMemoryReport() const {
+    constexpr u64 MiB = u64{1} << 20;
+    return fmt::format("textures {} MiB, buffers {} MiB, staging {} MiB; Metal device {} MiB "
+                       "allocated, budget {} MiB",
+                       texture_cache_runtime.allocated_bytes / MiB,
+                       buffer_cache_runtime.GetDeviceMemoryUsage() / MiB,
+                       staging_pool.HeldBytes() / MiB, DeviceAllocatedSize(device) / MiB,
+                       DeviceMemoryBudget(device) / MiB);
+}
+
+TextureHandle RasterizerMetal::OrPlaceholder(const ImageView& view, TextureHandle handle,
+                                             Shader::TextureType type) {
+    if (handle != nullptr || !PipelineCheckEnabled() || type == Shader::TextureType::Buffer) {
+        return handle;
+    }
+    // A texture or view Metal refused (or a null descriptor) reads zeros, as Vulkan's null
+    // image, instead of a texture Metal leaves undefined.
+    if (view.image_id != VideoCommon::NULL_IMAGE_ID) {
+        Coverage::NoteGuard("refused texture read as zeros");
+    }
+    const size_t index = static_cast<size_t>(type);
+    return index < placeholders.size() ? placeholders[index].Get() : nullptr;
+}
+
+void RasterizerMetal::MakePlaceholders() {
+    if (placeholders_made || !PipelineCheckEnabled()) {
+        return;
+    }
+    // Made before any render pass is open: filling them takes a blit encoder.
+    placeholders_made = true;
+    for (size_t index = 0; index < placeholders.size(); ++index) {
+        const auto type = static_cast<Shader::TextureType>(index);
+        if (type == Shader::TextureType::Buffer) {
+            continue;
+        }
+        Object& placeholder = placeholders[index];
+        const TextureDesc desc = PlaceholderTexture(static_cast<u32>(index));
+        const u32 layers = desc.layers;
+        placeholder = CreateTexture(device, desc);
+        if (!placeholder_zeros) {
+            u8* zeros = nullptr;
+            placeholder_zeros = CreateBuffer(device, 256, true, &zeros);
+            if (zeros != nullptr) {
+                std::memset(zeros, 0, 256);
+            }
+        }
+        for (u32 layer = 0; layer < layers && placeholder; ++layer) {
+            scheduler.CopyBufferToTexture(placeholder_zeros.Get(), 0, 4, 4, placeholder.Get(), 0,
+                                          layer, {}, {});
+        }
+    }
+}
+
+void RasterizerMetal::PrepareSampleGrids(const Shader::Info& info,
+                                         std::span<const VideoCommon::ImageViewInOut> views) {
+    // A multisampled image a program reads as a plain texture reads its samples as texels, as
+    // the guest sees it: the grid is filled before the draw's render pass.
+    size_t view = Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                  Shader::NumDescriptors(info.image_buffer_descriptors);
+    for (const auto& desc : info.texture_descriptors) {
+        for (u32 element = 0; element < desc.count; ++element, ++view) {
+            if (view >= views.size()) {
+                return;
+            }
+            ImageView& image_view = texture_cache.GetImageView(views[view].id);
+            if (image_view.Samples() > 1 && !desc.is_multisample &&
+                image_view.PrepareSampleGrid()) {
+                Coverage::NoteGuard("multisampled image read as its samples");
+            }
+        }
+    }
+}
+
 void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage metal_stage,
                                          std::span<const Binding> pending,
                                          std::span<const TextureHandle> texel_buffer_views,
@@ -1449,15 +1526,18 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
         for (u32 element = 0; element < desc.count; ++element) {
             ImageView& image_view = texture_cache.GetImageView(views[view++].id);
             if (texture_slot < texture_slots.size()) {
-                scheduler.BindTexture(metal_stage, texture_slots[texture_slot],
-                                      image_view.Handle(desc.type));
+                scheduler.BindTexture(
+                    metal_stage, texture_slots[texture_slot],
+                    OrPlaceholder(image_view, image_view.SampledHandle(desc.type,
+                                                                       desc.is_multisample),
+                                  desc.type));
             }
             ++texture_slot;
             if (sampler < sampler_slots.size()) {
                 scheduler.BindSampler(
                     metal_stage, sampler_slots[sampler],
                     texture_cache.GetSampler(samplers[sampler])
-                        .Handle());
+                        .HandleFor(image_view, desc.is_depth));
             }
             ++sampler;
         }
@@ -1469,8 +1549,9 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                 texture_cache.MarkModification(image_view.image_id);
             }
             if (texture_slot < texture_slots.size()) {
-                scheduler.BindTexture(metal_stage, texture_slots[texture_slot],
-                                      image_view.Handle(desc.type));
+                scheduler.BindTexture(
+                    metal_stage, texture_slots[texture_slot],
+                    OrPlaceholder(image_view, image_view.Handle(desc.type), desc.type));
             }
             ++texture_slot;
         }
@@ -1535,6 +1616,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                             uniform_buffer_sizes[stages[index]].size(),
                             uniform_buffer_sizes[stages[index]].begin());
     }
+    MakePlaceholders();
     texture_cache.SynchronizeDescriptors(false);
     buffer_cache.SetUniformBuffersState(uniform_masks, &uniform_buffer_sizes);
 
@@ -1610,12 +1692,20 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         }
     }
     texture_cache.FillImageViews(views, false, true);
+    for (size_t index = 0; index < stages.size(); ++index) {
+        if (!absent(index)) {
+            PrepareSampleGrids(programs[index]->info, std::span(views).subspan(first_view[index]));
+        }
+    }
     texture_cache.UpdateRenderTargets(false);
     TrackOcarinaCamera();
     if (TargetlessReachEnabled() && texture_cache.HasNoRenderTargets()) {
         texture_cache.BoundTargetlessFramebuffer(
             TargetlessReach(regs, texture_cache.IsRescaling()));
     }
+    // A draw sampling the depth image it writes: the pass before it ends (BarrierFeedbackLoop),
+    // as Vulkan's graphics pipeline asks at this point.
+    texture_cache.CheckFeedbackLoop(views);
     const bool writes_storage = [&] {
         const auto any_written = [](const auto& descriptors) {
             return std::ranges::any_of(descriptors,
@@ -1661,6 +1751,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     targets.has_stencil = framebuffer->HasStencil();
     targets.width = framebuffer->Width();
     targets.height = framebuffer->Height();
+    targets.layers = framebuffer->Layers();
     // Before the buffer cache notes what this draw uses in the segment.
     scheduler.SplitBefore(targets);
     const u64 draw_segment = scheduler.SegmentSerial();
@@ -1749,6 +1840,9 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     state_desc.depth_format = targets.has_depth ? framebuffer->DepthFormat() : 0U;
     state_desc.stencil_format = targets.has_stencil ? framebuffer->DepthFormat() : 0U;
     state_desc.samples = framebuffer->Samples();
+    if (PipelineCheckEnabled()) {
+        FitAttachments(state_desc, targets, DescribeTexture);
+    }
     FillRegisterState(state_desc, regs, topology, mesh_pipeline);
     const auto& vertex_states = buffer_cache_runtime.Vertices();
     for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
@@ -1821,7 +1915,20 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         ApplyTessellation(state_desc, *tess);
     }
     bool state_building = false;
-    void* const state = pipeline_cache.RenderState(pipeline, state_desc, state_building);
+    void* state = pipeline_cache.RenderState(pipeline, state_desc, state_building);
+    if (state == nullptr && !state_building && native == nullptr && PipelineCheckEnabled()) {
+        // A state Metal refused is drawn without blending and alpha to coverage, what a target
+        // format most often refuses, rather than leaving a hole.
+        RenderPipelineDesc fallback = state_desc;
+        for (BlendTargetState& blend : fallback.blend) {
+            blend.enable = 0;
+        }
+        fallback.alpha_to_coverage = 0;
+        state = pipeline_cache.RenderState(pipeline, fallback, state_building);
+        if (state != nullptr) {
+            Coverage::NoteGuard("refused pipeline drawn without blending");
+        }
+    }
     if (state == nullptr) {
         if (state_building) {
             prepare_refusal = "render pipeline state still building";
@@ -3151,6 +3258,8 @@ void RasterizerMetal::DispatchCompute() {
         }
     }
     texture_cache.FillImageViews(views, true);
+    MakePlaceholders();
+    PrepareSampleGrids(info, views);
     if (pipeline->Key().unique_hash == OcarinaTemporal::DepthReader) {
         TrackOcarinaDepth();
     }
@@ -4033,6 +4142,10 @@ void RasterizerMetal::FlushCommands() {
 void RasterizerMetal::TickFrame() {
     VideoCommon::FeatureCensus::Tick();
     ++oot_frame;
+    if (!graphics_report_logged && oot_frame == 600) {
+        graphics_report_logged = true;
+        LOG_INFO(Common_Memory, "Graphics memory (renderer): {}", GraphicsMemoryReport());
+    }
     texel_view_cache.clear();
     fence_manager.TickFrame();
     {

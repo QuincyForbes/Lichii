@@ -54,6 +54,9 @@ public:
     /// process may still allocate on iOS (unified memory).
     [[nodiscard]] u64 MemoryBudget() const;
 
+    /// Bytes the device has allocated for this process (currentAllocatedSize).
+    [[nodiscard]] u64 AllocatedSize() const;
+
 private:
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
