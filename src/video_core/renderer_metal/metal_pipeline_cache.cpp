@@ -72,51 +72,6 @@ u32 AsyncPipelineThreads() {
     return threads;
 }
 
-bool PipelineBuildJob::Run(PipelineTranslator& translator) noexcept {
-    if (claimed.exchange(true, std::memory_order_acq_rel)) {
-        return false;
-    }
-    {
-        std::scoped_lock lock{mutex};
-        builder_thread = Common::CurrentThreadHandle();
-    }
-    condition.notify_all();
-    try {
-        task(translator);
-    } catch (const std::exception& exception) {
-        LOG_ERROR(Render_Metal, "Metal: pipeline build failed: {}", exception.what());
-    } catch (...) {
-        LOG_ERROR(Render_Metal, "Metal: pipeline build failed with an unknown exception");
-    }
-    task = {};
-    {
-        std::scoped_lock lock{mutex};
-        builder_thread = nullptr;
-        done.store(true, std::memory_order_release);
-    }
-    condition.notify_all();
-    return true;
-}
-
-bool PipelineBuildJob::Wait(PipelineTranslator& translator, bool& boosted) {
-    boosted = false;
-    if (IsDone()) {
-        return false;
-    }
-    if (Run(translator)) {
-        return true;
-    }
-    std::unique_lock lock{mutex};
-    // The builder notes its thread right after claiming the task.
-    condition.wait(lock, [this] { return builder_thread != nullptr || IsDone(); });
-    if (!IsDone()) {
-        const Common::ThreadQosBoost boost{builder_thread};
-        boosted = boost.Active();
-        condition.wait(lock, [this] { return IsDone(); });
-    }
-    return false;
-}
-
 std::string_view PipelineCache::NoteRefusal(u64 key_hash) {
     const auto [it, is_new] = refusal_causes.try_emplace(key_hash);
     if (is_new) {

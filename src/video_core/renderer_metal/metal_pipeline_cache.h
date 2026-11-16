@@ -28,6 +28,7 @@
 #include "common/thread_worker.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_metal/metal_archive.h"
+#include "video_core/renderer_metal/metal_build_job.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_object.h"
 #include "video_core/renderer_metal/metal_pipeline_files.h"
@@ -43,37 +44,8 @@ class Device;
 /// seen in a run (default logical CPUs - 1); 0 builds them on the draw's thread as before.
 [[nodiscard]] u32 AsyncPipelineThreads();
 
-/// A pipeline build handed to the builder threads. Whoever claims it first runs it: a builder, or
-/// a draw that may not be skipped and found it unstarted, at that thread's own QoS. A build already
-/// running on a builder (background QoS) is lent the waiter's QoS while the waiter waits, as
-/// EDEN_NX2_PIPELINE_HOLD_BOOST does for Vulkan on Apple.
-class PipelineBuildJob {
-public:
-    using Task = std::function<void(PipelineTranslator&)>;
-
-    explicit PipelineBuildJob(Task task_) : task{std::move(task_)} {}
-
-    /// Runs the task here; false when another thread had claimed it.
-    bool Run(PipelineTranslator& translator) noexcept;
-
-    [[nodiscard]] bool IsDone() const noexcept {
-        return done.load(std::memory_order_acquire);
-    }
-
-    /// Until the task is done: runs it with `translator` when nobody has claimed it, else waits,
-    /// lending this thread's QoS to the builder. True when it ran here; `boosted` when a builder
-    /// was lent the QoS.
-    bool Wait(PipelineTranslator& translator, bool& boosted);
-
-private:
-    Task task;
-    std::atomic_bool claimed{};
-    std::atomic_bool done{};
-    std::mutex mutex;
-    std::condition_variable condition;
-    /// Under the mutex: the thread running the task (Apple), null when none or done.
-    void* builder_thread{};
-};
+/// A pipeline build handed to the builder threads (metal_build_job.h).
+using PipelineBuildJob = BuildJob<PipelineTranslator>;
 
 class GraphicsPipeline {
 public:

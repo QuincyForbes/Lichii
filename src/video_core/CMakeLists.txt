@@ -689,6 +689,7 @@ if (ENABLE_METAL)
         ${METAL_RENDERER_CXX_SOURCES}
         renderer_metal/metal_archive.h
         renderer_metal/metal_bridge.h
+        renderer_metal/metal_build_job.h
         renderer_metal/metal_buffer_cache.h
         renderer_metal/metal_condition.h
         renderer_metal/metal_coverage.h

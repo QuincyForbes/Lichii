@@ -47,9 +47,8 @@
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_indirect.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
-#include "video_core/renderer_metal/metal_pipeline_cache.h"
+#include "video_core/renderer_metal/metal_build_job.h"
 #include "video_core/renderer_metal/metal_pipeline_files.h"
-#include "video_core/renderer_metal/metal_pipeline_translate.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
@@ -3230,12 +3229,13 @@ int RunIndirectArguments() {
 /// job nobody claimed runs on the thread that waits for it; one a builder thread runs is waited
 /// for (lent the waiter's QoS) and runs once; a finished one is not waited for.
 int RunPipelineJobs() {
-    Metal::PipelineTranslator translator(false, 0);
+    using Job = Metal::BuildJob<int>;
+    int translator = 0;
     std::atomic<uint32_t> runs{0};
     std::atomic<bool> release{false};
     std::thread::id ran_on{};
     // Unclaimed: the waiter runs it.
-    Metal::PipelineBuildJob unclaimed([&](Metal::PipelineTranslator&) {
+    Job unclaimed([&](int&) {
         ran_on = std::this_thread::get_id();
         ++runs;
     });
@@ -3244,7 +3244,7 @@ int RunPipelineJobs() {
     const bool unclaimed_ok = ran_here && unclaimed.IsDone() && !boosted &&
                               ran_on == std::this_thread::get_id();
     // Claimed by a builder that runs until released: the waiter waits, the task runs once.
-    Metal::PipelineBuildJob claimed([&](Metal::PipelineTranslator&) {
+    Job claimed([&](int&) {
         while (!release.load()) {
             std::this_thread::yield();
         }
@@ -3252,7 +3252,7 @@ int RunPipelineJobs() {
     });
     std::atomic<bool> builder_started{false};
     std::thread builder([&] {
-        Metal::PipelineTranslator builder_translator(false, 0);
+        int builder_translator = 1;
         builder_started = true;
         static_cast<void>(claimed.Run(builder_translator));
     });
