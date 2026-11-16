@@ -3555,6 +3555,22 @@ bool RasterizerMetal::AccelerateConditionalRendering() {
     return true;
 }
 
+std::string RasterizerMetal::TakeGpuDecisionLine() {
+    const u64 on_gpu = std::exchange(conditions_on_gpu, 0);
+    const u64 on_cpu = std::exchange(conditions_on_cpu, 0);
+    const u64 under = std::exchange(draws_under_condition, 0);
+    const u64 indirect = std::exchange(indirect_draws_on_gpu, 0);
+    const u64 counts_read = std::exchange(indirect_counts_read, 0);
+    const u64 grid = std::exchange(grid_draws_on_gpu, 0);
+    if (on_gpu + on_cpu + under + indirect + counts_read + grid == 0) {
+        return {};
+    }
+    return fmt::format("conditions on pending reports {} on the GPU ({} draws under them), {} "
+                       "waited for on the CPU; indirect draws prepared on the GPU {}, counts "
+                       "read on the CPU {}; GPU-counted draws drawn from GPU arguments {}",
+                       on_gpu, under, on_cpu, indirect, counts_read, grid);
+}
+
 bool RasterizerMetal::ConditionHoldsOnCpu() {
     if (!gpu_condition.active) {
         return true;

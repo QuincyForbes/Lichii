@@ -189,6 +189,10 @@ public:
                 staging_pool.TakeFreed(), staging_pool.HeldBytes()};
     }
 
+    /// What was decided on the GPU since the last call (conditions, indirect counts, GPU-counted
+    /// draws), for the renderer's 10 s report; empty when nothing was.
+    [[nodiscard]] std::string TakeGpuDecisionLine();
+
     [[nodiscard]] PipelineCache& Pipelines() noexcept {
         return pipeline_cache;
     }
