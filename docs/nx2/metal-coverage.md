@@ -32,69 +32,69 @@ file reference.
 | ID | Capability | Vulkan | Status | Metal | Tested | OoT |
 |---|---|---|---|---|---|---|
 | A01 | `Draw`: arrays, indexed (16/32-bit), instanced, base vertex, base instance | vk_rasterizer.cpp:1265 | native | metal_rasterizer.cpp:412 | RunRendererDraw, replay | yes |
-| A02 | `DrawIndirect`: one draw, arguments in a buffer | vk_rasterizer.cpp:1635 | native | metal_rasterizer.cpp:1587 | untested | no |
-| A03 | `DrawIndirect`: several draws from one buffer | vk_rasterizer.cpp:1635 | emulated (one Metal indirect draw per guest draw: Metal has no multi-draw) | metal_rasterizer.cpp:1653 | untested | no |
-| A04 | `DrawIndirect`: draw count from a buffer | vk_rasterizer.cpp:1635 | missing (the count is read from guest memory on the CPU: Metal has no count buffer; stale when the GPU wrote it and it was not downloaded) | metal_rasterizer.cpp:1656 | untested | no |
-| A05 | `DrawIndirect`: transform feedback byte count | vk_rasterizer.cpp:1635 | missing (draw refused: "transform feedback draw") | metal_rasterizer.cpp:1610 | untested | no |
-| A06 | `DrawIndirect` of a mesh pipeline | vk_rasterizer.cpp:1635 | missing (draw refused) | metal_rasterizer.cpp:1617 | untested | no |
-| A07 | `DrawIndirect` of a tessellated pipeline | vk_rasterizer.cpp:1635 | missing (draw refused) | metal_rasterizer.cpp:1622 | untested | no |
-| A08 | `DrawIndirect` with 8-bit indices | vk_rasterizer.cpp:1635 | missing (draw refused) | metal_rasterizer.cpp:1630 | untested | no |
-| A09 | `DrawIndirect` of quads, fans, loops and other rewritten topologies | vk_rasterizer.cpp:1635 | missing (draw refused) | metal_rasterizer.cpp:1630 | untested | no |
+| A02 | `DrawIndirect`: one draw, arguments in a buffer | vk_rasterizer.cpp:1635 | native | metal_rasterizer.cpp:1602 | untested | no |
+| A03 | `DrawIndirect`: several draws from one buffer | vk_rasterizer.cpp:1635 | emulated (one Metal indirect draw per guest draw: Metal has no multi-draw) | metal_rasterizer.cpp:1670 | untested | no |
+| A04 | `DrawIndirect`: draw count from a buffer | vk_rasterizer.cpp:1635 | missing (the count is read from guest memory on the CPU: Metal has no count buffer; stale when the GPU wrote it and it was not downloaded) | metal_rasterizer.cpp:1673 | untested | no |
+| A05 | `DrawIndirect`: transform feedback byte count | vk_rasterizer.cpp:1635 | missing (draw refused: "transform feedback draw") | metal_rasterizer.cpp:1627 | untested | no |
+| A06 | `DrawIndirect` of a mesh pipeline | vk_rasterizer.cpp:1635 | missing (draw refused) | metal_rasterizer.cpp:1634 | untested | no |
+| A07 | `DrawIndirect` of a tessellated pipeline | vk_rasterizer.cpp:1635 | missing (draw refused) | metal_rasterizer.cpp:1639 | untested | no |
+| A08 | `DrawIndirect` with 8-bit indices | vk_rasterizer.cpp:1635 | missing (draw refused) | metal_rasterizer.cpp:1647 | untested | no |
+| A09 | `DrawIndirect` of quads, fans, loops and other rewritten topologies | vk_rasterizer.cpp:1635 | missing (draw refused) | metal_rasterizer.cpp:1647 | untested | no |
 | A10 | `DrawMeshTasksFromGpu`: mesh draws whose task count the GPU wrote, drawn without reading it back | vk_rasterizer.cpp:1593 | missing (interface default `false`: the count is read on the CPU and the draw comes through `Draw`) | - | untested | ? |
-| A11 | `DrawTexture` | vk_rasterizer.cpp:1914 | missing (draw refused) | metal_rasterizer.cpp:1680 | untested | ? |
-| A12 | `Clear`: whole colour, depth and stencil attachments | vk_rasterizer.cpp:1967 | native (the load action of the next render pass when that pass is on the same attachments, under `EDEN_NX2_METAL_CLEAR_FOLD`; else a pass of its own) | metal_rasterizer.cpp:1719, metal_scheduler.mm:1186, metal_scheduler.mm:1407 | RunClearFold, replay | yes |
-| A13 | `Clear` inside a scissor rectangle | vk_rasterizer.cpp:1967 | emulated (a triangle over the rectangle, Metal has no clear of part of an attachment; under `EDEN_NX2_METAL_CLEAR_DRAWS`; without, the whole target is cleared and counted as refused) | metal_rasterizer.cpp:1719, metal_scheduler.mm:1233 | RunClearRect, replay | ? |
-| A14 | `Clear` of some colour channels | vk_rasterizer.cpp:1967 | emulated (a triangle with the channels as its write mask; under `EDEN_NX2_METAL_CLEAR_DRAWS`; without, the clear is skipped and counted as refused) | metal_rasterizer.cpp:1719, metal_scheduler.mm:1233 | RunClearRect | no |
-| A15 | `Clear` of some stencil bits (write mask) | vk_rasterizer.cpp:1967 | emulated (a triangle replacing the stencil bits of the mask; under `EDEN_NX2_METAL_CLEAR_DRAWS`; without, all bits are cleared and counted as refused) | metal_rasterizer.cpp:1719, metal_scheduler.mm:1233 | RunClearRect | no |
-| A16 | `Clear` of chosen layers (`layer_count`, `clear_surface.layer`) | vk_rasterizer.cpp:1967 | missing (the attachment's bound layer is cleared) | metal_rasterizer.cpp:1719 | untested | no |
-| A17 | `Clear` values of integer targets (float register bits converted) | vk_rasterizer.cpp:1967 | native (the values Vulkan's clear writes, under `EDEN_NX2_METAL_CLEAR_DRAWS`; tested on the drawn clear only) | metal_rasterizer.cpp:1719 | RunClearRect | ? |
-| A18 | `DispatchCompute` with a grid in the launch description | vk_rasterizer.cpp:2243 | native | metal_rasterizer.cpp:1849, metal_scheduler.mm:1726 | RunTranslate, RunTexelBuffer, replay | yes |
-| A19 | `DispatchCompute` with the grid in a buffer | vk_rasterizer.cpp:2243 | native | metal_rasterizer.cpp:1849, metal_scheduler.mm:1736 | replay | yes |
-| A20 | `BindGraphicsUniformBuffer`, `DisableGraphicsUniformBuffer` | vk_rasterizer.cpp:2550 | native | metal_rasterizer.cpp:2165 | RunRendererDraw | yes |
-| A21 | `FlushAll` | vk_rasterizer.cpp:2559 | n/a (empty on Vulkan too) | metal_rasterizer.cpp:2175 | - | no |
-| A22 | `FlushRegion`: texture and buffer downloads | vk_rasterizer.cpp:2595 | native | metal_rasterizer.cpp:2177 | untested | yes |
-| A23 | `FlushRegion`: collected CPU writes applied before the download (`gpu.InvalidateGPUCache`) | vk_rasterizer.cpp:2595 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2177 | untested | yes |
+| A11 | `DrawTexture` | vk_rasterizer.cpp:1914 | missing (draw refused) | metal_rasterizer.cpp:1697 | untested | ? |
+| A12 | `Clear`: whole colour, depth and stencil attachments | vk_rasterizer.cpp:1967 | native (the load action of the next render pass when that pass is on the same attachments, under `EDEN_NX2_METAL_CLEAR_FOLD`; else a pass of its own) | metal_rasterizer.cpp:1775, metal_scheduler.mm:1206, metal_scheduler.mm:1427 | RunClearFold, replay | yes |
+| A13 | `Clear` inside a scissor rectangle | vk_rasterizer.cpp:1967 | emulated (a triangle over the rectangle, Metal has no clear of part of an attachment; under `EDEN_NX2_METAL_CLEAR_DRAWS`; without, the whole target is cleared and counted as refused) | metal_rasterizer.cpp:1775, metal_scheduler.mm:1253 | RunClearRect, replay | ? |
+| A14 | `Clear` of some colour channels | vk_rasterizer.cpp:1967 | emulated (a triangle with the channels as its write mask; under `EDEN_NX2_METAL_CLEAR_DRAWS`; without, the clear is skipped and counted as refused) | metal_rasterizer.cpp:1775, metal_scheduler.mm:1253 | RunClearRect | no |
+| A15 | `Clear` of some stencil bits (write mask) | vk_rasterizer.cpp:1967 | emulated (a triangle replacing the stencil bits of the mask; under `EDEN_NX2_METAL_CLEAR_DRAWS`; without, all bits are cleared and counted as refused) | metal_rasterizer.cpp:1775, metal_scheduler.mm:1253 | RunClearRect | no |
+| A16 | `Clear` of chosen layers (`layer_count`, `clear_surface.layer`) | vk_rasterizer.cpp:1967 | missing (the attachment's bound layer is cleared) | metal_rasterizer.cpp:1775 | untested | no |
+| A17 | `Clear` values of integer targets (float register bits converted) | vk_rasterizer.cpp:1967 | native (the values Vulkan's clear writes, under `EDEN_NX2_METAL_CLEAR_DRAWS`; tested on the drawn clear only) | metal_rasterizer.cpp:1775 | RunClearRect | ? |
+| A18 | `DispatchCompute` with a grid in the launch description | vk_rasterizer.cpp:2243 | native | metal_rasterizer.cpp:1906, metal_scheduler.mm:1746 | RunTranslate, RunTexelBuffer, replay | yes |
+| A19 | `DispatchCompute` with the grid in a buffer | vk_rasterizer.cpp:2243 | native | metal_rasterizer.cpp:1906, metal_scheduler.mm:1756 | replay | yes |
+| A20 | `BindGraphicsUniformBuffer`, `DisableGraphicsUniformBuffer` | vk_rasterizer.cpp:2550 | native | metal_rasterizer.cpp:2223 | RunRendererDraw | yes |
+| A21 | `FlushAll` | vk_rasterizer.cpp:2559 | n/a (empty on Vulkan too) | metal_rasterizer.cpp:2233 | - | no |
+| A22 | `FlushRegion`: texture and buffer downloads | vk_rasterizer.cpp:2595 | native | metal_rasterizer.cpp:2235 | untested | yes |
+| A23 | `FlushRegion`: collected CPU writes applied before the download (`gpu.InvalidateGPUCache`) | vk_rasterizer.cpp:2595 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2235 | untested | yes |
 | A24 | `FlushRegion` / `InvalidateRegion` of the query cache | vk_rasterizer.cpp:2595 | n/a (Metal's reports are written when their fence signals; no cached reports) | - | - | no |
-| A25 | `MustFlushRegion` | vk_rasterizer.cpp:2631 | native | metal_rasterizer.cpp:2196 | untested | yes |
-| A26 | `MustFlushRegion` / `GetFlushArea` skipping the caches' locks for pages nothing wrote | vk_rasterizer.cpp:2631, vk_rasterizer.cpp:2676 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2196, metal_rasterizer.cpp:2218 | untested | yes |
-| A27 | `GetFlushArea` | vk_rasterizer.cpp:2676 | native | metal_rasterizer.cpp:2218 | untested | yes |
-| A28 | `LandDownloadForCpuRead`: an in-flight download landed on the reading core | vk_rasterizer.cpp:2718 | native (under `EDEN_NX2_METAL_CACHE_PATHS`; `EDEN_NX2_GPU_READ_LAND` as on Vulkan) | metal_rasterizer.cpp:2258, metal_scheduler.mm:965 | untested | yes |
-| A29 | `PrepareRegionWrite` | vk_rasterizer.cpp:2731 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2269 | untested | ? |
-| A30 | `InvalidateRegion` | vk_rasterizer.cpp:2739 | native | metal_rasterizer.cpp:2278 | untested | yes |
-| A31 | `InnerInvalidation` (the GPU's own cached writes, batched, page filter) | vk_rasterizer.cpp:2759 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2295 | untested | ? |
-| A32 | `OnCPUWrite` | vk_rasterizer.cpp:2826 | native | metal_rasterizer.cpp:2331 | untested | yes |
-| A33 | `OnCacheInvalidations` (batch, CPU write reclaim) | vk_rasterizer.cpp:2881 | native (under `EDEN_NX2_METAL_CACHE_PATHS`; `EDEN_NX2_CPU_WRITE_RECLAIM` as on Vulkan) | metal_rasterizer.cpp:2390 | untested | yes |
-| A34 | `OnCacheInvalidation` | vk_rasterizer.cpp:2920 | native | metal_rasterizer.cpp:2463 | untested | yes |
-| A35 | `TryCacheInvalidation` (invalidation on the writing core) | vk_rasterizer.cpp:2936 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2431 | untested | ? |
-| A36 | `InvalidateGPUCache`, `UnmapMemory` | vk_rasterizer.cpp:2952 | native | metal_rasterizer.cpp:2478 | untested | yes |
-| A37 | `ModifyGPUMemory`: texture cache | vk_rasterizer.cpp:2968 | native | metal_rasterizer.cpp:2494 | untested | yes |
-| A38 | `ModifyGPUMemory`: buffer cache (`UnmapGPUMemory`) | vk_rasterizer.cpp:2968 | n/a (the shared buffer cache keeps virtual ranges only for runtimes with `BindMultiRangeStorageBuffer`, which is Vulkan's alone; the call is made and does nothing) | metal_rasterizer.cpp:2494 | - | no |
-| A39 | `SignalFence`, `SyncOperation`, `SignalSyncPoint`, `SignalReference`, `ReleaseFences` | vk_rasterizer.cpp:2976 | native | metal_rasterizer.cpp:2503, metal_fence_manager.cpp:12 | untested | yes |
-| A40 | `FencesQuiet`, `FenceWorkEpoch` (the puller skips fence releases when nothing is pending) | vk_rasterizer.cpp:2996 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2454 | untested | yes |
+| A25 | `MustFlushRegion` | vk_rasterizer.cpp:2631 | native | metal_rasterizer.cpp:2254 | untested | yes |
+| A26 | `MustFlushRegion` / `GetFlushArea` skipping the caches' locks for pages nothing wrote | vk_rasterizer.cpp:2631, vk_rasterizer.cpp:2676 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2254, metal_rasterizer.cpp:2276 | untested | yes |
+| A27 | `GetFlushArea` | vk_rasterizer.cpp:2676 | native | metal_rasterizer.cpp:2276 | untested | yes |
+| A28 | `LandDownloadForCpuRead`: an in-flight download landed on the reading core | vk_rasterizer.cpp:2718 | native (under `EDEN_NX2_METAL_CACHE_PATHS`; `EDEN_NX2_GPU_READ_LAND` as on Vulkan) | metal_rasterizer.cpp:2316, metal_scheduler.mm:976 | untested | yes |
+| A29 | `PrepareRegionWrite` | vk_rasterizer.cpp:2731 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2327 | untested | ? |
+| A30 | `InvalidateRegion` | vk_rasterizer.cpp:2739 | native | metal_rasterizer.cpp:2336 | untested | yes |
+| A31 | `InnerInvalidation` (the GPU's own cached writes, batched, page filter) | vk_rasterizer.cpp:2759 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2353 | untested | ? |
+| A32 | `OnCPUWrite` | vk_rasterizer.cpp:2826 | native | metal_rasterizer.cpp:2389 | untested | yes |
+| A33 | `OnCacheInvalidations` (batch, CPU write reclaim) | vk_rasterizer.cpp:2881 | native (under `EDEN_NX2_METAL_CACHE_PATHS`; `EDEN_NX2_CPU_WRITE_RECLAIM` as on Vulkan) | metal_rasterizer.cpp:2448 | untested | yes |
+| A34 | `OnCacheInvalidation` | vk_rasterizer.cpp:2920 | native | metal_rasterizer.cpp:2521 | untested | yes |
+| A35 | `TryCacheInvalidation` (invalidation on the writing core) | vk_rasterizer.cpp:2936 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2489 | untested | ? |
+| A36 | `InvalidateGPUCache`, `UnmapMemory` | vk_rasterizer.cpp:2952 | native | metal_rasterizer.cpp:2536 | untested | yes |
+| A37 | `ModifyGPUMemory`: texture cache | vk_rasterizer.cpp:2968 | native | metal_rasterizer.cpp:2552 | untested | yes |
+| A38 | `ModifyGPUMemory`: buffer cache (`UnmapGPUMemory`) | vk_rasterizer.cpp:2968 | n/a (the shared buffer cache keeps virtual ranges only for runtimes with `BindMultiRangeStorageBuffer`, which is Vulkan's alone; the call is made and does nothing) | metal_rasterizer.cpp:2552 | - | no |
+| A39 | `SignalFence`, `SyncOperation`, `SignalSyncPoint`, `SignalReference`, `ReleaseFences` | vk_rasterizer.cpp:2976 | native | metal_rasterizer.cpp:2561, metal_fence_manager.cpp:12 | untested | yes |
+| A40 | `FencesQuiet`, `FenceWorkEpoch` (the puller skips fence releases when nothing is pending) | vk_rasterizer.cpp:2996 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2512 | untested | yes |
 | A41 | `FlushQueryResults`, `HasPendingQueries`, `HasCachedReports` | vk_rasterizer.cpp:3004, vk_rasterizer.cpp:2668 | n/a (reports are written when their fence signals; nothing is cached) | - | - | no |
 | A42 | `ReadGpuWrittenCommandList`, `NoteGpuWrittenCommandListSynced`, `FlushGpuWrittenCommandListPages` (command lists the GPU wrote, read from copies) | vk_rasterizer.cpp:2570 | missing (interface defaults: `Unknown`, the list is read after a full sync) | - | untested | ? |
-| A43 | `FlushAndInvalidateRegion` | vk_rasterizer.cpp:3025 | native | metal_rasterizer.cpp:2523 | untested | ? |
-| A44 | `WaitForIdle`: later work sees earlier writes | vk_rasterizer.cpp:3033 | native (Metal orders the encoders of a queue and tracks hazards itself) | metal_rasterizer.cpp:2531 | untested | yes |
-| A45 | `FragmentBarrier`: the next draw may read what this pass wrote | vk_rasterizer.cpp:3086 | native (under `EDEN_NX2_METAL_FRAGMENT_BARRIER`: the next draw of the pass that samples a render target, or that follows a draw writing storage, starts a new render encoder, so it reads what was stored; other draws stay in the pass, as on Vulkan) | metal_rasterizer.cpp:2537, metal_rasterizer.cpp:906 | untested | yes |
-| A46 | `TiledCacheBarrier` | vk_rasterizer.cpp:3092 | n/a (empty on Vulkan too) | metal_rasterizer.cpp:2542 | - | no |
-| A47 | `FlushCommands` | vk_rasterizer.cpp:3096 | native | metal_rasterizer.cpp:2558 | untested | yes |
-| A48 | `TickFrame` | vk_rasterizer.cpp:3870 | native | metal_rasterizer.cpp:2564 | untested | yes |
-| A49 | `AccelerateConditionalRendering` | vk_rasterizer.cpp:4716 | emulated (the report values are compared on the CPU after the caches' waiting writes are flushed: what Vulkan does without VK_EXT_conditional_rendering, which MoltenVK does not have) | metal_rasterizer.cpp:2546 | untested | yes |
+| A43 | `FlushAndInvalidateRegion` | vk_rasterizer.cpp:3025 | native | metal_rasterizer.cpp:2581 | untested | ? |
+| A44 | `WaitForIdle`: later work sees earlier writes | vk_rasterizer.cpp:3033 | native (Metal orders the encoders of a queue and tracks hazards itself) | metal_rasterizer.cpp:2589 | untested | yes |
+| A45 | `FragmentBarrier`: the next draw may read what this pass wrote | vk_rasterizer.cpp:3086 | native (under `EDEN_NX2_METAL_FRAGMENT_BARRIER`: the next draw of the pass that samples a render target, or that follows a draw writing storage, starts a new render encoder, so it reads what was stored; other draws stay in the pass, as on Vulkan) | metal_rasterizer.cpp:2595, metal_rasterizer.cpp:921 | untested | yes |
+| A46 | `TiledCacheBarrier` | vk_rasterizer.cpp:3092 | n/a (empty on Vulkan too) | metal_rasterizer.cpp:2600 | - | no |
+| A47 | `FlushCommands` | vk_rasterizer.cpp:3096 | native | metal_rasterizer.cpp:2616 | untested | yes |
+| A48 | `TickFrame` | vk_rasterizer.cpp:3870 | native | metal_rasterizer.cpp:2622 | untested | yes |
+| A49 | `AccelerateConditionalRendering` | vk_rasterizer.cpp:4716 | emulated (the report values are compared on the CPU after the caches' waiting writes are flushed: what Vulkan does without VK_EXT_conditional_rendering, which MoltenVK does not have) | metal_rasterizer.cpp:2604 | untested | yes |
 | A50 | `HasDrawTransformFeedback` | vk_rasterizer.cpp:4728 | missing (interface default `false`) | - | untested | no |
-| A51 | `AccelerateSurfaceCopy` (Fermi 2D) | vk_rasterizer.cpp:4732 | native | metal_rasterizer.cpp:2585 | untested | ? |
-| A52 | `AccessAccelerateDMA` | vk_rasterizer.cpp:4763 | native | metal_rasterizer.cpp:2601 | untested | ? |
-| A53 | `AccelerateInlineToMemory` | vk_rasterizer.cpp:4767 | native | metal_rasterizer.cpp:2605 | untested | ? |
-| A54 | `AccelerateInlineToMemory` fast paths (one-page writes without locks, deferred and merged invalidations) | vk_rasterizer.cpp:4767 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2657 | untested | ? |
-| A55 | `AccelerateDisplay` | vk_rasterizer.cpp:4949 | native | metal_rasterizer.cpp:2806 | untested | yes |
-| A56 | `LoadDiskResources`: pipelines of earlier runs built before play | vk_rasterizer.cpp:5009 | missing (only the binary archive is opened; programs are translated at first use) | metal_rasterizer.cpp:2775 | RunPipelineArchive | yes |
-| A57 | `InitializeChannel`, `BindChannel`, `ReleaseChannel` | vk_rasterizer.cpp:6273 | native | metal_rasterizer.cpp:2781 | untested | yes |
+| A51 | `AccelerateSurfaceCopy` (Fermi 2D) | vk_rasterizer.cpp:4732 | native | metal_rasterizer.cpp:2643 | untested | ? |
+| A52 | `AccessAccelerateDMA` | vk_rasterizer.cpp:4763 | native | metal_rasterizer.cpp:2659 | untested | ? |
+| A53 | `AccelerateInlineToMemory` | vk_rasterizer.cpp:4767 | native | metal_rasterizer.cpp:2663 | untested | ? |
+| A54 | `AccelerateInlineToMemory` fast paths (one-page writes without locks, deferred and merged invalidations) | vk_rasterizer.cpp:4767 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2715 | untested | ? |
+| A55 | `AccelerateDisplay` | vk_rasterizer.cpp:4949 | native | metal_rasterizer.cpp:2864 | untested | yes |
+| A56 | `LoadDiskResources`: pipelines of earlier runs built before play | vk_rasterizer.cpp:5009 | missing (only the binary archive is opened; programs are translated at first use) | metal_rasterizer.cpp:2833 | RunPipelineArchive | yes |
+| A57 | `InitializeChannel`, `BindChannel`, `ReleaseChannel` | vk_rasterizer.cpp:6273 | native | metal_rasterizer.cpp:2839 | untested | yes |
 | A58 | `SupportsGameDlssNetwork`, `UsesNvidiaDlss`, `CanProbeGameDlssOutput`, `ProbeGameDlssOutput` | vk_rasterizer.cpp:4739 | n/a (NVIDIA DLSS does not exist on Apple devices; the interface defaults say so) | - | - | no |
-| A59 | `OotNetworkBypass` (the game's upscale network replaced, `oot_network_bypass`) | vk_rasterizer.cpp:1733 | missing (interface default: the game's dispatches run as they are, or O01 takes the one upscale dispatch) | - | untested | yes |
-| A60 | GPU-sized dispatches: the size's words copied into the constant buffer on the GPU | vk_rasterizer.cpp:4767 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2605 | untested | yes |
+| A59 | `OotNetworkBypass` (the game's upscale network replaced, `oot_network_bypass`) | vk_rasterizer.cpp:1733 | native (under `EDEN_NX2_METAL_NETWORK_BYPASS`: the tonemap draw's target is tracked and the front replaces the network's output pass by a copy through `AccelerateSurfaceCopy`, as on Vulkan) | metal_rasterizer.cpp:1716, metal_rasterizer.cpp:1720 | untested | yes |
+| A60 | GPU-sized dispatches: the size's words copied into the constant buffer on the GPU | vk_rasterizer.cpp:4767 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2663 | untested | yes |
 | A61 | Draws whose vertex count GPU work wrote (`EDEN_NX2_INDIRECT_DRAWS=1`, off by default) | vk_rasterizer.cpp:1267 | emulated (the count is read back on the CPU, which waits for the GPU; Vulkan draws most of them with the count read on the GPU) | metal_rasterizer.cpp:292 | untested | no |
 | A62 | Draws of more than 16 million vertices skipped | vk_rasterizer.cpp:1347 | native (under `EDEN_NX2_METAL_PIPELINE_CHECK`) | metal_rasterizer.cpp:292 | untested | no |
 | A63 | Waiting sync requests of the guest threads served after every draw | vk_rasterizer.cpp:758 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:412 | untested | yes |
-| A64 | A draw whose native program failed marks the frame (`native_execution_failed`) | vk_rasterizer.cpp:764 | native | metal_rasterizer.cpp:1691 | untested | ? |
+| A64 | A draw whose native program failed marks the frame (`native_execution_failed`) | vk_rasterizer.cpp:764 | native | metal_rasterizer.cpp:1747 | untested | ? |
 | A65 | Donkey Kong Bananza's reset program: its indirect records written on the host (`EDEN_NX2_RESETFIX`) | vk_rasterizer.cpp:682 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:335 | untested | no |
 | A66 | Caches invalidated before a draw or dispatch uses them (`EDEN_NX2_INVALIDATE_BEFORE_DISPATCH`, off by default) | vk_rasterizer.cpp:110 | missing (an experiment of the Vulkan backend; not present) | - | untested | no |
 
@@ -102,46 +102,46 @@ file reference.
 
 | ID | Capability | Vulkan | Status | Metal | Tested | OoT |
 |---|---|---|---|---|---|---|
-| B01 | Colour attachment formats, up to 8 targets | vk_graphics_pipeline.cpp, fixed_pipeline_state.h | native | metal_rasterizer.cpp:1144, metal_graphics.mm:316 | RunRendererDraw, replay | yes |
-| B02 | Depth and stencil attachment formats | vk_graphics_pipeline.cpp, fixed_pipeline_state.h | native | metal_rasterizer.cpp:1144 | RunDepthStencilBlit, replay | yes |
-| B03 | Draws without any attachment (targetless, sized by the scissor) | vk_rasterizer.cpp:750, vk_graphics_pipeline.cpp:77 | native | metal_rasterizer.cpp:72, metal_scheduler.mm:1405 | probe:no-attachments, probe:draw-without-attachments, replay | yes |
-| B04 | Sample count of the pipeline (`msaa_mode`) | fixed_pipeline_state.h, maxwell_to_vk.cpp | native | metal_rasterizer.cpp:1144 | probe:samples-4 | no |
-| B05 | Colour write masks, per target or common | vk_rasterizer.cpp:6111 | native | metal_rasterizer.cpp:1144 | replay | yes |
-| B06 | Blend enable, equations and factors, per target or common | vk_rasterizer.cpp:6016, maxwell_to_vk.cpp | native | metal_rasterizer.cpp:1144, metal_graphics.mm:24 | replay | yes |
+| B01 | Colour attachment formats, up to 8 targets | vk_graphics_pipeline.cpp, fixed_pipeline_state.h | native | metal_rasterizer.cpp:1159, metal_graphics.mm:316 | RunRendererDraw, replay | yes |
+| B02 | Depth and stencil attachment formats | vk_graphics_pipeline.cpp, fixed_pipeline_state.h | native | metal_rasterizer.cpp:1159 | RunDepthStencilBlit, replay | yes |
+| B03 | Draws without any attachment (targetless, sized by the scissor) | vk_rasterizer.cpp:750, vk_graphics_pipeline.cpp:77 | native | metal_rasterizer.cpp:72, metal_scheduler.mm:1425 | probe:no-attachments, probe:draw-without-attachments, replay | yes |
+| B04 | Sample count of the pipeline (`msaa_mode`) | fixed_pipeline_state.h, maxwell_to_vk.cpp | native | metal_rasterizer.cpp:1159 | probe:samples-4 | no |
+| B05 | Colour write masks, per target or common | vk_rasterizer.cpp:6111 | native | metal_rasterizer.cpp:1159 | replay | yes |
+| B06 | Blend enable, equations and factors, per target or common | vk_rasterizer.cpp:6016, maxwell_to_vk.cpp | native | metal_rasterizer.cpp:1159, metal_graphics.mm:24 | replay | yes |
 | B07 | Dual-source blend factors | maxwell_to_vk.cpp | native | metal_graphics.mm:43 | untested | ? |
 | B08 | Blending switched off on integer targets | vk_graphics_pipeline.cpp | native | metal_graphics.mm:316 | probe:blending-on-rgba8uint | ? |
-| B09 | Blend constants | vk_rasterizer.cpp:5543 | native | metal_rasterizer.cpp:1436 | untested | ? |
+| B09 | Blend constants | vk_rasterizer.cpp:5543 | native | metal_rasterizer.cpp:1451 | untested | ? |
 | B10 | Logic operations | vk_rasterizer.cpp:5881, vk_rasterizer.cpp:6006 | missing (Metal has no logic operation; the draw blends as if it were off) | - | untested | no |
 | B11 | Alpha test | fixed_pipeline_state.h | native (in the fragment program, as on Vulkan) | metal_pipeline_translate.cpp:188 | untested | no |
-| B12 | Alpha to coverage | vk_rasterizer.cpp:5910 | native | metal_rasterizer.cpp:1144 | probe:alpha-to-coverage-on-rgba8uint | ? |
+| B12 | Alpha to coverage | vk_rasterizer.cpp:5910 | native | metal_rasterizer.cpp:1159 | probe:alpha-to-coverage-on-rgba8uint | ? |
 | B13 | Alpha to one | vk_rasterizer.cpp:5929 | missing (not set) | - | untested | ? |
-| B14 | Depth test, depth write, depth compare function | vk_rasterizer.cpp:5719, vk_rasterizer.cpp:5949 | native | metal_rasterizer.cpp:1219, metal_graphics.mm:458 | RunRendererDraw, replay | yes |
+| B14 | Depth test, depth write, depth compare function | vk_rasterizer.cpp:5719, vk_rasterizer.cpp:5949 | native | metal_rasterizer.cpp:1234, metal_graphics.mm:458 | RunRendererDraw, replay | yes |
 | B15 | Depth bounds test | vk_rasterizer.cpp:5553, vk_rasterizer.cpp:5701 | missing (Metal has no depth bounds test; not applied) | - | untested | ? |
-| B16 | Depth bias (constant, slope, clamp) | vk_rasterizer.cpp:5498, vk_rasterizer.cpp:5847 | native | metal_rasterizer.cpp:1535 | untested | yes |
-| B17 | Depth clamp (clip off) | vk_rasterizer.cpp:5893 | native (`setDepthClipMode`) | metal_rasterizer.cpp:1529 | untested | ? |
+| B16 | Depth bias (constant, slope, clamp) | vk_rasterizer.cpp:5498, vk_rasterizer.cpp:5847 | native | metal_rasterizer.cpp:1550 | untested | yes |
+| B17 | Depth clamp (clip off) | vk_rasterizer.cpp:5893 | native (`setDepthClipMode`) | metal_rasterizer.cpp:1544 | untested | ? |
 | B18 | Depth range -1..1 (`ndc_minus_one_to_one`) | fixed_pipeline_state.h | native (converted by the vertex program, as on Vulkan without the extension) | metal_pipeline_translate.cpp:179 | replay | yes |
-| B19 | Stencil test: functions, operations, compare and write masks, two-sided | vk_rasterizer.cpp:5561, vk_rasterizer.cpp:5972, vk_rasterizer.cpp:6125 | native | metal_rasterizer.cpp:1219, metal_graphics.mm:458 | untested | no |
-| B20 | Stencil reference values, front and back | vk_rasterizer.cpp:5561 | native | metal_rasterizer.cpp:1436 | untested | no |
-| B21 | Cull mode front or back, front face (with the window origin flip) | vk_rasterizer.cpp:5686, vk_rasterizer.cpp:5958 | native | metal_rasterizer.cpp:1524 | untested | yes |
-| B22 | Cull mode front and back | vk_rasterizer.cpp:5686 | emulated (triangles are not drawn at all; points and lines are) | metal_rasterizer.cpp:1515 | untested | ? |
+| B19 | Stencil test: functions, operations, compare and write masks, two-sided | vk_rasterizer.cpp:5561, vk_rasterizer.cpp:5972, vk_rasterizer.cpp:6125 | native | metal_rasterizer.cpp:1234, metal_graphics.mm:458 | untested | no |
+| B20 | Stencil reference values, front and back | vk_rasterizer.cpp:5561 | native | metal_rasterizer.cpp:1451 | untested | no |
+| B21 | Cull mode front or back, front face (with the window origin flip) | vk_rasterizer.cpp:5686, vk_rasterizer.cpp:5958 | native | metal_rasterizer.cpp:1539 | untested | yes |
+| B22 | Cull mode front and back | vk_rasterizer.cpp:5686 | emulated (triangles are not drawn at all; points and lines are) | metal_rasterizer.cpp:1530 | untested | ? |
 | B23 | Polygon mode line | maxwell_to_vk.cpp | missing (drawn filled) | - | untested | no |
 | B24 | Polygon mode point | maxwell_to_vk.cpp | missing (drawn filled; Metal has no point fill mode) | - | untested | no |
-| B25 | Rasterizer discard | vk_rasterizer.cpp:5767 | native | metal_rasterizer.cpp:1144 | probe:no-attachments-no-rasterization | ? |
-| B26 | Viewport 0: rectangle, depth range, y flip by window origin | vk_rasterizer.cpp:5339 | native | metal_rasterizer.cpp:1454 | probe:viewport-negative-height | yes |
-| B27 | Viewports 1-15 | vk_rasterizer.cpp:5339 | missing (viewport 0 only; a program that writes the viewport index draws into viewport 0) | metal_rasterizer.cpp:1454 | untested | ? |
-| B28 | Viewport swizzles other than a negated y | maxwell_to_vk.cpp | missing (ignored) | metal_rasterizer.cpp:1454 | untested | ? |
-| B29 | Scissor 0 | vk_rasterizer.cpp:5423 | native | metal_rasterizer.cpp:1487 | probe:scissor-past-the-target, probe:scissor-empty | yes |
-| B30 | Scissors 1-15 | vk_rasterizer.cpp:5423 | missing (scissor 0 only) | metal_rasterizer.cpp:1487 | untested | ? |
+| B25 | Rasterizer discard | vk_rasterizer.cpp:5767 | native | metal_rasterizer.cpp:1159 | probe:no-attachments-no-rasterization | ? |
+| B26 | Viewport 0: rectangle, depth range, y flip by window origin | vk_rasterizer.cpp:5339 | native | metal_rasterizer.cpp:1469 | probe:viewport-negative-height | yes |
+| B27 | Viewports 1-15 | vk_rasterizer.cpp:5339 | missing (viewport 0 only; a program that writes the viewport index draws into viewport 0) | metal_rasterizer.cpp:1469 | untested | ? |
+| B28 | Viewport swizzles other than a negated y | maxwell_to_vk.cpp | missing (ignored) | metal_rasterizer.cpp:1469 | untested | ? |
+| B29 | Scissor 0 | vk_rasterizer.cpp:5423 | native | metal_rasterizer.cpp:1502 | probe:scissor-past-the-target, probe:scissor-empty | yes |
+| B30 | Scissors 1-15 | vk_rasterizer.cpp:5423 | missing (scissor 0 only) | metal_rasterizer.cpp:1502 | untested | ? |
 | B31 | Line width | vk_rasterizer.cpp:5674 | missing (Metal draws lines 1 pixel wide) | - | untested | no |
 | B32 | Line stipple, smooth lines, line rasterization mode | vk_rasterizer.cpp:5796, vk_rasterizer.cpp:5810 | missing (Metal has neither; plain lines) | - | untested | no |
 | B33 | Provoking vertex last | fixed_pipeline_state.h | missing (Metal's is always the first vertex; flat inputs take the wrong vertex. The game sets last on every draw; MoltenVK has no VK_EXT_provoking_vertex either, so the phone's Vulkan picture is the same. Candidate: rotated indices for programs with flat inputs) | - | untested | yes |
 | B34 | Conservative rasterization | vk_rasterizer.cpp:5780 | missing (Metal has none; rasterized normally) | - | untested | no |
-| B35 | Primitive restart enabled | vk_rasterizer.cpp:5745 | native (Metal always restarts strips at the all-ones index) | metal_scheduler.mm:1793 | RunIndexRewrite | yes |
+| B35 | Primitive restart enabled | vk_rasterizer.cpp:5745 | native (Metal always restarts strips at the all-ones index) | metal_scheduler.mm:1813 | RunIndexRewrite | yes |
 | B36 | Primitive restart disabled while the all-ones index is drawn | vk_rasterizer.cpp:5745 | missing (Metal restarts all the same) | - | untested | ? |
 | B37 | Point size from the register, point size written by the program | fixed_pipeline_state.h | native (fixed state of the translated program) | metal_pipeline_translate.cpp:122 | replay | yes |
 | B38 | y negate (`y_negate`), early depth test (`early_z`) | fixed_pipeline_state.h | native | metal_pipeline_translate.cpp:179, metal_pipeline_translate.cpp:188 | replay | yes |
 | B39 | Transform feedback state (`xfb_state`) | vk_rasterizer.cpp:5310 | missing (see section K) | - | untested | no |
-| B40 | Dynamic state (extended dynamic state 1-3) | vk_rasterizer.cpp:5201 | n/a (all of it is encoder state on Metal; that every draw sets it again is P11) | metal_scheduler.mm:1508 | - | no |
+| B40 | Dynamic state (extended dynamic state 1-3) | vk_rasterizer.cpp:5201 | n/a (all of it is encoder state on Metal; that every draw sets it again is P11) | metal_scheduler.mm:1528 | - | no |
 | B41 | Pipelines built off the draw's thread (worker threads, pipeline libraries, translation threads) | vk_pipeline_cache.cpp:1164, vk_pipeline_translate_queue.cpp, vk_pipeline_library.cpp | missing (programs are translated and render states built on the draw's thread; the draw waits) | metal_pipeline_cache.cpp:214 | untested | yes |
 | B42 | Pipeline binaries kept between runs | vk_pipeline_cache.cpp | native (`MTLBinaryArchive`) | metal_archive.mm:30 | RunPipelineArchive | yes |
 
@@ -149,11 +149,11 @@ file reference.
 
 | ID | Capability | Vulkan | Status | Metal | Tested | OoT |
 |---|---|---|---|---|---|---|
-| C01 | Attributes, streams, strides, offsets, per-instance streams with divisors | vk_rasterizer.cpp:6166 | native | metal_rasterizer.cpp:1144, metal_graphics.mm:316 | RunRendererDraw, probe:constant-step-with-rate-1, replay | yes |
+| C01 | Attributes, streams, strides, offsets, per-instance streams with divisors | vk_rasterizer.cpp:6166 | native | metal_rasterizer.cpp:1159, metal_graphics.mm:316 | RunRendererDraw, probe:constant-step-with-rate-1, replay | yes |
 | C02 | More than 31 attributes or streams in the guest's layout (Metal has 31) | vk_rasterizer.cpp:6166 | emulated (only what the vertex program reads is declared, renumbered from 0) | metal_pipeline_check.cpp:166 | RunPipelineCheck, probe:layout-index-31, replay | yes |
 | C03 | More read streams than Metal has free buffer slots next to the program's buffers | vk_rasterizer.cpp:6166 | missing (draw refused) | metal_pipeline_check.cpp:166, metal_shader_translate.cpp:295 | RunPipelineCheck, replay | no |
 | C04 | Attribute past its stream's stride | vk_rasterizer.cpp:6166 | emulated (the attribute moves into the stride and reads a copy of the stream bound that many bytes further on) | metal_pipeline_check.cpp:166 | RunPipelineCheck, probe:offset-past-stride | ? |
-| C05 | Attribute of a stream without a buffer, constant attributes | vk_buffer_cache.cpp | emulated (a zeroed buffer read at a constant step) | metal_rasterizer.cpp:1144 | probe:attribute-without-layout | yes |
+| C05 | Attribute of a stream without a buffer, constant attributes | vk_buffer_cache.cpp | emulated (a zeroed buffer read at a constant step) | metal_rasterizer.cpp:1159 | probe:attribute-without-layout | yes |
 | C06 | Zero stride streams | vk_buffer_cache.cpp | emulated (constant step) | metal_pipeline_check.cpp:166 | probe:constant-step-with-rate-0 | yes |
 | C07 | Float 16/32-bit 1-4 components, 11:11:10 float | maxwell_to_vk.cpp | native | metal_graphics.mm:169 | RunRendererDraw, replay | yes |
 | C08 | UNORM / SNORM 8 and 16-bit 1-4 components | maxwell_to_vk.cpp | native | metal_graphics.mm:169 | replay | yes |
@@ -170,12 +170,12 @@ file reference.
 |---|---|---|---|---|---|---|
 | D01 | Points, lines, line strips, triangles, triangle strips | maxwell_to_vk.cpp | native | metal_graphics.mm:233 | RunRendererDraw | yes |
 | D02 | Triangle fans, line loops, polygons | maxwell_to_vk.cpp | emulated (indices rewritten to lists: Metal has no fans or loops) | metal_index_convert.cpp:53 | RunIndexRewrite | no |
-| D03 | Quads, quad strips | vk_buffer_cache.cpp, vk_compute_pass.cpp | emulated (indices rewritten to triangles, on the CPU or by a kernel for GPU-written indices) | metal_index_convert.cpp:53, metal_rasterizer.cpp:676 | RunIndexRewrite | no |
-| D04 | Lines and triangles with adjacency | maxwell_to_vk.cpp | missing (draw refused: "topology Metal can't draw"; only geometry programs read adjacency) | metal_rasterizer.cpp:532 | untested | no |
-| D05 | Patches | maxwell_to_vk.cpp | native (see section J) | metal_scheduler.mm:1766 | RunTessellation | yes |
-| D06 | 16 and 32-bit indices | maxwell_to_vk.cpp | native | metal_rasterizer.cpp:580, metal_scheduler.mm:1793 | RunRendererDraw | yes |
-| D07 | 8-bit indices | vk_buffer_cache.cpp:898, vk_compute_pass.cpp | emulated (widened, on the CPU or by a kernel) | metal_index_convert.cpp:10, metal_rasterizer.cpp:676 | RunIndexRewrite, replay | yes |
-| D08 | Inline index data | vk_rasterizer.cpp:1265 | native (copied into the stream ring) | metal_rasterizer.cpp:580 | untested | ? |
+| D03 | Quads, quad strips | vk_buffer_cache.cpp, vk_compute_pass.cpp | emulated (indices rewritten to triangles, on the CPU or by a kernel for GPU-written indices) | metal_index_convert.cpp:53, metal_rasterizer.cpp:691 | RunIndexRewrite | no |
+| D04 | Lines and triangles with adjacency | maxwell_to_vk.cpp | missing (draw refused: "topology Metal can't draw"; only geometry programs read adjacency) | metal_rasterizer.cpp:547 | untested | no |
+| D05 | Patches | maxwell_to_vk.cpp | native (see section J) | metal_scheduler.mm:1786 | RunTessellation | yes |
+| D06 | 16 and 32-bit indices | maxwell_to_vk.cpp | native | metal_rasterizer.cpp:595, metal_scheduler.mm:1813 | RunRendererDraw | yes |
+| D07 | 8-bit indices | vk_buffer_cache.cpp:898, vk_compute_pass.cpp | emulated (widened, on the CPU or by a kernel) | metal_index_convert.cpp:10, metal_rasterizer.cpp:691 | RunIndexRewrite, replay | yes |
+| D08 | Inline index data | vk_rasterizer.cpp:1265 | native (copied into the stream ring) | metal_rasterizer.cpp:595 | untested | ? |
 
 ## E. Texture formats
 
@@ -218,8 +218,8 @@ file reference.
 | F08 | Storage image views, written images | vk_texture_cache.cpp | native | metal_texture_cache.cpp:673 | untested | yes |
 | F09 | Storage use of sRGB, packed or multisampled images | vk_texture_cache.cpp | missing (such textures are made without shader-write usage; a program writing one is not handled) | metal_texture_cache.cpp:386, metal_resources.mm:199 | untested | ? |
 | F10 | Slices of 3D images as render targets | vk_texture_cache.cpp | native (depth plane) | metal_texture_cache.cpp:735, metal_scheduler.mm:157 | untested | ? |
-| F11 | Layered render targets (layer chosen by the program) | vk_texture_cache.cpp | missing (one layer is bound; `renderTargetArrayLength` is not set) | metal_scheduler.mm:1405 | untested | ? |
-| F12 | Texel buffer views | vk_buffer_cache.cpp | native (a texture over the buffer; misaligned ranges through a copy) | metal_rasterizer.cpp:627, metal_resources.mm:301 | RunTexelBuffer | ? |
+| F11 | Layered render targets (layer chosen by the program) | vk_texture_cache.cpp | missing (one layer is bound; `renderTargetArrayLength` is not set) | metal_scheduler.mm:1425 | untested | ? |
+| F12 | Texel buffer views | vk_buffer_cache.cpp | native (a texture over the buffer; misaligned ranges through a copy) | metal_rasterizer.cpp:642, metal_resources.mm:301 | RunTexelBuffer | ? |
 | F13 | Sampler filters, mip filter, address modes, compare function, LOD clamp, anisotropy | vk_texture_cache.cpp, maxwell_to_vk.cpp | native | metal_resources.mm:342 | probe:sampler-anisotropy-17 | yes |
 | F14 | Sampler LOD bias | vk_texture_cache.cpp | missing (no bias is set; `MTLSamplerDescriptor.lodBias` is the candidate where the SDK has it) | metal_resources.mm:342 | untested | ? |
 | F15 | Sampler border colours | vk_texture_cache.cpp | missing (approximated: the nearest of Metal's three border colours) | metal_resources.mm:342 | untested | ? |
@@ -243,8 +243,8 @@ file reference.
 | G08 | `ReinterpretImage`: depth <-> colour, compressed, multisampled | vk_texture_cache.cpp | missing (skipped, logged once) | metal_texture_cache.cpp:174 | untested | ? |
 | G09 | `ConvertImage`: D32F <-> R32F, D16 <-> R16 | blit_image.h | missing (goes to the blit, which draws depth into depth only, logged once) | metal_texture_cache.cpp:274 | untested | ? |
 | G10 | `ConvertImage`: ABGR8 <-> D24S8 / S8D24 / X8D24 / D32F | blit_image.h | missing (goes to the blit, which draws depth into depth only, logged once) | metal_texture_cache.cpp:274 | untested | ? |
-| G11 | `BlitImage`: colour, scaled, linear or nearest | vk_texture_cache.cpp, blit_image.h | native (a full-screen triangle) | metal_texture_cache.cpp:236, metal_scheduler.mm:1314 | RunOcarinaBilinear | yes |
-| G12 | `BlitImage`: depth and stencil | blit_image.h | native (depth into depth under `EDEN_NX2_METAL_COPIES`: nearest, the stencil comes along between images of one format; a stencil-only blit and one into a depth-stencil image of another format are skipped, logged once) | metal_texture_cache.cpp:284, metal_scheduler.mm:1314 | RunDepthBlit, RunDepthStencilBlit | yes |
+| G11 | `BlitImage`: colour, scaled, linear or nearest | vk_texture_cache.cpp, blit_image.h | native (a full-screen triangle) | metal_texture_cache.cpp:236, metal_scheduler.mm:1334 | RunOcarinaBilinear | yes |
+| G12 | `BlitImage`: depth and stencil | blit_image.h | native (depth into depth under `EDEN_NX2_METAL_COPIES`: nearest, the stencil comes along between images of one format; a stencil-only blit and one into a depth-stencil image of another format are skipped, logged once) | metal_texture_cache.cpp:284, metal_scheduler.mm:1334 | RunDepthBlit, RunDepthStencilBlit | yes |
 | G13 | `BlitImage`: Fermi 2D operations other than source copy | vk_texture_cache.cpp | missing (copied) | metal_texture_cache.cpp:236 | untested | ? |
 | G14 | Multisample resolves (colour and depth-stencil) | blit_image.h, vk_texture_cache.cpp | missing (no resolve attachment or resolve pass) | - | untested | no |
 | G15 | Rescaling: scale up, scale down, scaled copies of 2D colour and depth images | vk_texture_cache.cpp | native | metal_texture_cache.cpp:416, metal_texture_cache.cpp:460 | RunDepthBlit, RunDepthStencilBlit | ? |
@@ -252,7 +252,7 @@ file reference.
 | G17 | `AccelerateImageUpload` (GPU ASTC decode, BC transcode, 3D unswizzle on the GPU) | vk_texture_cache.cpp, vk_compute_pass.cpp | n/a (never asked: the runtime reports no accelerated uploads; ASTC and BC are read natively, unswizzle is on the CPU) | metal_texture_cache.cpp:350 | - | no |
 | G18 | Sparse images | vk_texture_cache.cpp:278 | missing (images are made whole) | - | untested | ? |
 | G19 | Byte-addressed shadows of images bound as buffers | vk_texture_cache.cpp | missing (the runtime has no such shadow; what a program reading one gets is not verified) | - | untested | ? |
-| G20 | Deferred clears kept across passes | vk_scheduler.cpp:153 | native (the waiting clear is kept until a pass on its attachments or other work that touches them, `EDEN_NX2_METAL_CLEAR_FOLD`) | metal_scheduler.mm:1186 | RunClearFold | yes |
+| G20 | Deferred clears kept across passes | vk_scheduler.cpp:153 | native (the waiting clear is kept until a pass on its attachments or other work that touches them, `EDEN_NX2_METAL_CLEAR_FOLD`) | metal_scheduler.mm:1206 | RunClearFold | yes |
 | G21 | Feedback loops (an image sampled while it is a target) | vk_texture_cache.cpp | missing (see A45) | - | untested | ? |
 | G22 | Copies between an uncompressed image and a block-compressed one of the same block size (R16G16B16A16_UINT -> BC4_UNORM, 64 times in the walk) | vk_texture_cache.cpp:1382 | emulated (through a buffer, block for texel, under `EDEN_NX2_METAL_COPIES`: Metal copies texture to texture only within one format; a copy that starts inside a block is skipped, logged once) | metal_texture_cache.cpp:190 | RunBlockCopy | yes |
 
@@ -260,38 +260,38 @@ file reference.
 
 | ID | Capability | Vulkan | Status | Metal | Tested | OoT |
 |---|---|---|---|---|---|---|
-| H01 | Occlusion counter (samples passed), reported at a fence | vk_query_cache.cpp | native (visibility result buffer, 16384 slots) | metal_rasterizer.cpp:2069, metal_scheduler.mm:1486 | untested | yes |
-| H02 | Occlusion reports to unmapped addresses dropped, waiting channels woken | vk_query_cache.cpp | native | metal_rasterizer.cpp:2113 | untested | yes |
-| H03 | Payload reports (semaphores, timestamps) | vk_query_cache.cpp | native | metal_rasterizer.cpp:2082 | untested | yes |
-| H04 | Primitives generated, transform feedback bytes and primitives counters | vk_query_cache.cpp | missing (read as 1) | metal_rasterizer.cpp:2139 | untested | no |
-| H05 | Other counters (vertices, invocations, clipping) | vk_query_cache.cpp | missing (read as 1) | metal_rasterizer.cpp:2139 | untested | ? |
-| H06 | Counter resets | vk_rasterizer.cpp:2531 | native (occlusion) | metal_rasterizer.cpp:2049 | untested | yes |
-| H07 | Conditional rendering on a host query | vk_query_cache.cpp, vk_compute_pass.cpp | emulated (A49: compared on the CPU, as Vulkan on MoltenVK; Metal has no predicate for draws) | metal_rasterizer.cpp:2546 | untested | yes |
-| H08 | Query prefix sums on the GPU | vk_compute_pass.cpp | n/a (sums are made on the CPU when the fence signals) | metal_rasterizer.cpp:2082 | - | no |
+| H01 | Occlusion counter (samples passed), reported at a fence | vk_query_cache.cpp | native (visibility result buffer, 16384 slots) | metal_rasterizer.cpp:2127, metal_scheduler.mm:1506 | untested | yes |
+| H02 | Occlusion reports to unmapped addresses dropped, waiting channels woken | vk_query_cache.cpp | native | metal_rasterizer.cpp:2171 | untested | yes |
+| H03 | Payload reports (semaphores, timestamps) | vk_query_cache.cpp | native | metal_rasterizer.cpp:2140 | untested | yes |
+| H04 | Primitives generated, transform feedback bytes and primitives counters | vk_query_cache.cpp | missing (read as 1) | metal_rasterizer.cpp:2197 | untested | no |
+| H05 | Other counters (vertices, invocations, clipping) | vk_query_cache.cpp | missing (read as 1) | metal_rasterizer.cpp:2197 | untested | ? |
+| H06 | Counter resets | vk_rasterizer.cpp:2531 | native (occlusion) | metal_rasterizer.cpp:2107 | untested | yes |
+| H07 | Conditional rendering on a host query | vk_query_cache.cpp, vk_compute_pass.cpp | emulated (A49: compared on the CPU, as Vulkan on MoltenVK; Metal has no predicate for draws) | metal_rasterizer.cpp:2604 | untested | yes |
+| H08 | Query prefix sums on the GPU | vk_compute_pass.cpp | n/a (sums are made on the CPU when the fence signals) | metal_rasterizer.cpp:2140 | - | no |
 
 ## I. Compute, mesh and task programs
 
 | ID | Capability | Vulkan | Status | Metal | Tested | OoT |
 |---|---|---|---|---|---|---|
-| I01 | Compute programs: uniform and storage buffers, textures, storage images, texel buffers | vk_compute_pipeline.cpp | native | metal_rasterizer.cpp:813, metal_pipeline_cache.cpp:240 | RunTranslate, RunTexelBuffer | yes |
-| I02 | Mesh programs without a task program | vk_rasterizer.cpp:1265, vk_graphics_pipeline.cpp | emulated (a compute kernel writes the vertices, a vertex function reads them: Metal mesh functions are not used yet) | metal_rasterizer.cpp:904, metal_pipeline_translate.cpp:449 | RunMeshEmulation, replay | yes |
-| I03 | Task + mesh programs | vk_rasterizer.cpp:1265, vk_graphics_pipeline.cpp | emulated (task kernel, distribution kernel, mesh kernel, indirect draw) | metal_rasterizer.cpp:904, metal_pipeline_translate.cpp:449 | RunMeshDistribution, replay | yes |
+| I01 | Compute programs: uniform and storage buffers, textures, storage images, texel buffers | vk_compute_pipeline.cpp | native | metal_rasterizer.cpp:828, metal_pipeline_cache.cpp:240 | RunTranslate, RunTexelBuffer | yes |
+| I02 | Mesh programs without a task program | vk_rasterizer.cpp:1265, vk_graphics_pipeline.cpp | emulated (a compute kernel writes the vertices, a vertex function reads them: Metal mesh functions are not used yet) | metal_rasterizer.cpp:919, metal_pipeline_translate.cpp:449 | RunMeshEmulation, replay | yes |
+| I03 | Task + mesh programs | vk_rasterizer.cpp:1265, vk_graphics_pipeline.cpp | emulated (task kernel, distribution kernel, mesh kernel, indirect draw) | metal_rasterizer.cpp:919, metal_pipeline_translate.cpp:449 | RunMeshDistribution, replay | yes |
 | I04 | Mesh programs the emulation can't take | vk_pipeline_cache.cpp:4112 | missing (pipeline refused: "mesh program the emulation can't take"; none of the game's 241 stored mesh and task+mesh keys is one) | metal_pipeline_translate.cpp:449 | replay | no |
-| I05 | Mesh kernels run ahead of the open render pass | vk_graphics_pipeline.cpp:94 | native (under `EDEN_NX2_METAL_AHEAD`, P02: when the draw's pass is the first thing of the segment and has not written storage, and the draw neither writes storage nor samples its targets; else the kernels end the pass as before) | metal_rasterizer.cpp:1234, metal_scheduler.mm:1698 | RunAhead | yes |
-| I06 | Consecutive dispatches share one compute encoder | vk_rasterizer.cpp:317 | native | metal_scheduler.mm:1696 | untested | yes |
+| I05 | Mesh kernels run ahead of the open render pass | vk_graphics_pipeline.cpp:94 | native (under `EDEN_NX2_METAL_AHEAD`, P02: when the draw's pass is the first thing of the segment and has not written storage, and the draw neither writes storage nor samples its targets; else the kernels end the pass as before) | metal_rasterizer.cpp:1249, metal_scheduler.mm:1718 | RunAhead | yes |
+| I06 | Consecutive dispatches share one compute encoder | vk_rasterizer.cpp:317 | native | metal_scheduler.mm:1716 | untested | yes |
 
 ## J. Tessellation
 
 | ID | Capability | Vulkan | Status | Metal | Tested | OoT |
 |---|---|---|---|---|---|---|
-| J01 | Control + evaluation programs: triangles and quads, integer and fractional spacing, winding | vk_graphics_pipeline.cpp | native (Metal's tessellator; the vertex and control programs run as compute kernels, as MoltenVK does) | metal_rasterizer.cpp:904, metal_pipeline_translate.cpp:605, metal_scheduler.mm:1766 | RunTessellation | yes |
+| J01 | Control + evaluation programs: triangles and quads, integer and fractional spacing, winding | vk_graphics_pipeline.cpp | native (Metal's tessellator; the vertex and control programs run as compute kernels, as MoltenVK does) | metal_rasterizer.cpp:919, metal_pipeline_translate.cpp:605, metal_scheduler.mm:1786 | RunTessellation | yes |
 | J02 | Isolines | vk_graphics_pipeline.cpp | missing (translated with the isoline mode, but Metal's tessellator has triangle and quad patches only; what is drawn is not verified) | metal_pipeline_translate.cpp:605 | untested | ? |
 | J03 | Point mode | vk_graphics_pipeline.cpp | missing (the mode reaches the translation, but Metal's tessellator has no point mode; what is drawn is not verified) | metal_pipeline_translate.cpp:605 | untested | ? |
-| J04 | Indexed tessellated draws, 16 and 32-bit, 8-bit widened | vk_rasterizer.cpp:1265 | native | metal_rasterizer.cpp:1330 | RunTessellation | ? |
-| J05 | Tessellated draws with a base vertex | vk_rasterizer.cpp:1265 | missing (the base vertex is ignored, logged once) | metal_rasterizer.cpp:505 | untested | ? |
+| J04 | Indexed tessellated draws, 16 and 32-bit, 8-bit widened | vk_rasterizer.cpp:1265 | native | metal_rasterizer.cpp:1345 | RunTessellation | ? |
+| J05 | Tessellated draws with a base vertex | vk_rasterizer.cpp:1265 | missing (the base vertex is ignored, logged once) | metal_rasterizer.cpp:520 | untested | ? |
 | J06 | Evaluation program without a control program (factors from registers) | vk_graphics_pipeline.cpp | missing (pipeline refused: "only one of the tessellation programs") | metal_pipeline_translate.cpp:605 | untested | ? |
-| J07 | Patches of 1-32 control points | fixed_pipeline_state.h | native | metal_rasterizer.cpp:1330 | RunTessellation | yes |
-| J08 | Tessellation kernels run ahead of the open render pass | vk_graphics_pipeline.cpp | native (as I05) | metal_rasterizer.cpp:1400, metal_scheduler.mm:1698 | RunAhead | yes |
+| J07 | Patches of 1-32 control points | fixed_pipeline_state.h | native | metal_rasterizer.cpp:1345 | RunTessellation | yes |
+| J08 | Tessellation kernels run ahead of the open render pass | vk_graphics_pipeline.cpp | native (as I05) | metal_rasterizer.cpp:1415, metal_scheduler.mm:1718 | RunAhead | yes |
 
 ## K. Geometry programs and transform feedback
 
@@ -301,7 +301,7 @@ file reference.
 | K02 | Layer or viewport index written by the vertex program | vk_pipeline_cache.cpp | native | metal_pipeline_cache.cpp:197 | untested | ? |
 | K03 | Geometry program passthrough | vk_pipeline_cache.cpp | missing (profile bit off: it stays a geometry program and is refused) | metal_pipeline_cache.cpp:197 | untested | no |
 | K04 | Transform feedback capture | vk_rasterizer.cpp:5310, vk_buffer_cache.cpp | missing (Metal has no transform feedback; the buffers are recorded and nothing is captured) | metal_buffer_cache.cpp:155 | untested | no |
-| K05 | Draw of captured vertices (byte count draw) | vk_rasterizer.cpp:1635 | missing (see A05) | metal_rasterizer.cpp:1610 | untested | no |
+| K05 | Draw of captured vertices (byte count draw) | vk_rasterizer.cpp:1635 | missing (see A05) | metal_rasterizer.cpp:1627 | untested | no |
 
 ## L. Shader translation
 
@@ -310,14 +310,14 @@ file reference.
 | L01 | Vertex, fragment and compute programs: guest code -> IR -> SPIR-V -> MSL (SPIRV-Cross) | vk_pipeline_cache.cpp | native | metal_shader_translate.cpp:110, metal_pipeline_translate.cpp:339 | RunTranslate, replay | yes |
 | L02 | Uniform buffers, storage buffers, textures, samplers, storage images numbered into Metal's slots | vk_pipeline_cache.cpp | native | metal_shader_translate.cpp:110 | RunTranslate, replay | yes |
 | L03 | Vertex programs with more buffers than the slots left next to the vertex streams | - | missing (program refused: "too many buffers for the vertex buffer slots") | metal_shader_translate.cpp:295 | replay | no |
-| L04 | Rescaling words, render area and other push constants | vk_graphics_pipeline.cpp:66 | native (one buffer of bytes after the program's own) | metal_rasterizer.cpp:813 | RunRendererDraw | yes |
+| L04 | Rescaling words, render area and other push constants | vk_graphics_pipeline.cpp:66 | native (one buffer of bytes after the program's own) | metal_rasterizer.cpp:828 | RunRendererDraw | yes |
 | L05 | Clip distances (up to 8) | vk_pipeline_cache.cpp | native | metal_pipeline_cache.cpp:197 | untested | ? |
 | L06 | Cull distances | vk_pipeline_cache.cpp | missing (Metal has no cull distances; what SPIRV-Cross makes of a program writing them is not verified) | - | untested | ? |
 | L07 | Sample mask output, sample shading, sample id | vk_pipeline_cache.cpp | native (not verified beyond the translation) | metal_shader_translate.cpp:110 | untested | ? |
 | L08 | Fragment depth output, early depth tests, discard | vk_pipeline_cache.cpp | native | metal_shader_translate.cpp:110 | replay | yes |
 | L09 | 64-bit floats | vk_pipeline_cache.cpp | n/a (lowered to 32-bit by the IR, as on Vulkan devices without them) | metal_pipeline_cache.cpp:197 | - | ? |
 | L10 | 64-bit integer atomics, typeless image loads, viewport masks | vk_pipeline_cache.cpp | n/a (profile bits off: the IR takes the path Vulkan takes on devices without them) | metal_pipeline_cache.cpp:197 | - | ? |
-| L11 | Texture handles computed by the program (bindless) | vk_compute_pipeline.cpp:445 | native | metal_rasterizer.cpp:968 | replay | yes |
+| L11 | Texture handles computed by the program (bindless) | vk_compute_pipeline.cpp:445 | native | metal_rasterizer.cpp:983 | replay | yes |
 | L12 | Programs translated with the draw's fixed state | vk_pipeline_cache.cpp | native | metal_pipeline_translate.cpp:122 | replay | yes |
 | L13 | Compiled programs kept between runs | vk_pipeline_cache.cpp | native (binary archive; the SPIR-V -> MSL step is redone each run) | metal_archive.mm:30 | RunPipelineArchive | yes |
 | L14 | Instance index, base instance and base vertex read by a vertex program on iOS (every program reading the instance index: 22 % of the game's stored pipelines) | - | native (under `EDEN_NX2_METAL_MSL_DEVICE`: SPIRV-Cross is told the GPU family, as MoltenVK tells it; without, the program is refused) | metal_shader_translate.cpp:110 | RunDeviceMsl, replay | yes |
@@ -329,15 +329,15 @@ file reference.
 
 | ID | Capability | Vulkan | Status | Metal | Tested | OoT |
 |---|---|---|---|---|---|---|
-| M01 | Uniform buffers | vk_buffer_cache.cpp | native (the stream ring) | metal_buffer_cache.cpp:173, metal_staging_buffer_pool.cpp:73 | RunRendererDraw | yes |
-| M02 | Storage buffers, written storage buffers tracked as GPU-modified | vk_buffer_cache.cpp | native | metal_rasterizer.cpp:813, metal_rasterizer.cpp:968 | RunTranslate | yes |
+| M01 | Uniform buffers | vk_buffer_cache.cpp | native (the stream ring) | metal_buffer_cache.cpp:173, metal_staging_buffer_pool.cpp:139 | RunRendererDraw | yes |
+| M02 | Storage buffers, written storage buffers tracked as GPU-modified | vk_buffer_cache.cpp | native | metal_rasterizer.cpp:828, metal_rasterizer.cpp:983 | RunTranslate | yes |
 | M03 | Vertex, index and indirect buffers | vk_buffer_cache.cpp | native | metal_buffer_cache.cpp:109, metal_buffer_cache.cpp:132 | RunRendererDraw | yes |
 | M04 | `CopyBuffer`, `ClearBuffer` | vk_buffer_cache.cpp | native | metal_buffer_cache.cpp:75, metal_buffer_cache.cpp:86 | untested | ? |
-| M05 | Buffer downloads at fences, CPU reads of GPU-written pages | vk_buffer_cache.cpp | native (the shared buffer cache) | metal_rasterizer.cpp:2177 | untested | yes |
+| M05 | Buffer downloads at fences, CPU reads of GPU-written pages | vk_buffer_cache.cpp | native (the shared buffer cache) | metal_rasterizer.cpp:2235 | untested | yes |
 | M06 | Mesh output mirror (`Nx2MeshMirror`) | vk_buffer_cache.cpp | native | metal_buffer_cache.cpp:101 | RunMeshEmulation | ? |
 | M07 | Storage buffers spanning several mappings | vk_buffer_cache.cpp, vk_multi_range_buffer.cpp | missing (the runtime has no such entry; what the shared cache does instead is not verified) | - | untested | ? |
-| M08 | Staging and stream buffers bounded under memory pressure | vk_staging_buffer_pool.cpp:95, vk_staging_buffer_pool.cpp:157 | missing (a fixed stream ring; power-of-two staging buffers kept 300 frames; no cap) | metal_staging_buffer_pool.cpp:26, metal_staging_buffer_pool.cpp:103 | untested | yes |
-| M09 | Out-of-memory and device-loss handling | vk_scheduler.cpp, vk_swapchain.cpp | missing (no recovery: command buffer errors are logged with the failing encoders, a refused render pass drops its draws, a staging buffer that can't be made asserts) | metal_scheduler.mm:978, metal_staging_buffer_pool.cpp:26 | untested | ? |
+| M08 | Staging and stream buffers bounded under memory pressure | vk_staging_buffer_pool.cpp:95, vk_staging_buffer_pool.cpp:157 | native (under `EDEN_NX2_METAL_STAGING_BOUND`, with Vulkan's marks: the command buffer is committed once it took the submit mark's worth of staging buffers, waited for over the cap, free buffers go then and after 8 idle frames while more than the mark is held. The stream ring is 32 MiB as Vulkan's on iOS) | metal_staging_buffer_pool.cpp:103, metal_staging_buffer_pool.cpp:114, metal_rasterizer.cpp:414 | RunStagingBound | yes |
+| M09 | Out-of-memory and device-loss handling | vk_scheduler.cpp, vk_swapchain.cpp | missing (no recovery: command buffer errors are logged with the failing encoders, a refused render pass drops its draws, a staging buffer that can't be made asserts) | metal_scheduler.mm:989, metal_staging_buffer_pool.cpp:71 | untested | ? |
 | M10 | Memory report lines ("Graphics memory") | vk_rasterizer.cpp:4591 | missing (allocated bytes are part of the 10 s `Metal:` line only) | renderer_metal.mm:520 | untested | no |
 
 ## N. Presentation, scalers, frame generation
@@ -358,7 +358,7 @@ file reference.
 | N12 | Vsync modes | vk_swapchain.cpp | native (macOS: `displaySyncEnabled`; iOS presents on the display's refresh only, as it does under Vulkan) | metal_swapchain.mm:33 | untested | yes |
 | N13 | Frame pacing (host pacer, present thread, turbo mode) | vk_present_manager.cpp, vk_host_pacer.cpp | missing (frames are presented when they are ready) | metal_swapchain.mm:43 | untested | ? |
 | N14 | Screenshots | renderer_vulkan.cpp | missing (the request is answered with failure) | renderer_metal.mm:411 | untested | no |
-| N15 | Applet capture buffer | renderer_vulkan.cpp | missing (an empty buffer) | renderer_metal.mm:588 | untested | ? |
+| N15 | Applet capture buffer | renderer_vulkan.cpp | missing (an empty buffer) | renderer_metal.mm:591 | untested | ? |
 | N16 | Performance report lines every 10 s | vk_rasterizer.cpp:4204 | native (own lines: `Metal: N frames presented ...`, `Perf Metal coverage:`) | renderer_metal.mm:520 | untested | yes |
 | N17 | Frame dump, texture dump, flash watch | vk_frame_dump.cpp, vk_flash_watch.cpp | missing (debugging tools of the Vulkan backend) | - | untested | no |
 | N18 | Debug server hooks (render target list, pass list, GPU profile) | vk_rasterizer.cpp:3816 | missing (the debug server's graphics commands answer nothing under Metal) | - | untested | no |
@@ -367,7 +367,7 @@ file reference.
 
 | ID | Capability | Vulkan | Status | Metal | Tested | OoT |
 |---|---|---|---|---|---|---|
-| O01 | Upscale dispatch replaced by one bilinear pass (phones) | vk_rasterizer.cpp:3726, vk_ocarina_camera_motion.cpp:1116 | native | metal_ocarina.cpp:79, metal_rasterizer.cpp:1849 | RunOcarinaBilinear | yes |
+| O01 | Upscale dispatch replaced by one bilinear pass (phones) | vk_rasterizer.cpp:3726, vk_ocarina_camera_motion.cpp:1116 | native | metal_ocarina.cpp:79, metal_rasterizer.cpp:1906 | RunOcarinaBilinear | yes |
 | O02 | Upscale dispatch replaced by a temporal upscaler (`TryOcarinaUpscale`: camera tracking, jitter, motion, MetalFX Temporal / FSR 3 / DLSS) | vk_rasterizer.cpp:3496, vk_ocarina_camera_motion.cpp | missing (the camera tracking lives in the Vulkan backend) | - | untested | yes |
 | O03 | `AccelerateTemporalUpscale` through MetalFX Temporal (the game's own network inputs) | vk_rasterizer.cpp:4754, present/metalfx_temporal.mm | native | metal_texture_cache.cpp:265, metal_temporal.mm:58 | untested | ? |
 | O04 | Temporal upscale through FSR 3 or the built-in temporal filter | vk_texture_cache.cpp:1936, blit_image.h | missing (declined: the game's dispatch runs) | metal_texture_cache.cpp:265 | untested | ? |
@@ -380,20 +380,20 @@ file reference.
 
 | ID | Capability | Vulkan | Status | Metal | Tested | OoT |
 |---|---|---|---|---|---|---|
-| P01 | Render pass kept open across draws to the same targets | vk_scheduler.cpp | native | metal_scheduler.mm:1405 | untested | yes |
-| P02 | Uploads, copies and dispatches recorded ahead of the open pass (upload command buffer, before-pass command buffer) | vk_scheduler.cpp:144 | native (under `EDEN_NX2_METAL_AHEAD`: buffer uploads nothing in the segment uses and a draw's kernels go into two command buffers committed before the one with the passes; a pass whose kernels had to end it gets a segment of its own the next time, `EDEN_NX2_METAL_AHEAD_SPLIT`. As on Vulkan, texture uploads and the game's own dispatches stay in order) | metal_scheduler.mm:364, metal_scheduler.mm:1076, metal_buffer_cache.cpp:67 | RunAhead | yes |
-| P03 | Fences without a submission of their own (no flush when nothing is pending, deferred and batched flushes) | vk_fence_manager.cpp:48, vk_scheduler.cpp:471 | missing (a command buffer is committed for every fence that is not stubbed) | metal_fence_manager.cpp:12 | untested | yes |
-| P04 | CPU write reclaim | vk_rasterizer.cpp:2881 | native (A33, under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2390 | untested | yes |
-| P05 | GPU read landing | vk_rasterizer.cpp:2718 | native (A28, under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2258 | untested | yes |
-| P06 | Guest writes collected without the caches' locks | vk_rasterizer.cpp:2826 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2331 | untested | yes |
-| P07 | Pass contents discarded on tile GPUs where nothing reads them (store and load actions) | vk_texture_cache.cpp:85 | missing (every attachment is loaded and stored) | metal_scheduler.mm:1405 | untested | ? |
-| P08 | GPU time of the frame | metal_gpu_time.mm:117 | native (GPU time of every command buffer) | metal_scheduler.mm:1818, renderer_metal.mm:520 | untested | yes |
+| P01 | Render pass kept open across draws to the same targets | vk_scheduler.cpp | native | metal_scheduler.mm:1425 | untested | yes |
+| P02 | Uploads, copies and dispatches recorded ahead of the open pass (upload command buffer, before-pass command buffer) | vk_scheduler.cpp:144 | native (under `EDEN_NX2_METAL_AHEAD`: buffer uploads nothing in the segment uses and a draw's kernels go into two command buffers committed before the one with the passes; a pass whose kernels had to end it gets a segment of its own the next time, `EDEN_NX2_METAL_AHEAD_SPLIT`. As on Vulkan, texture uploads and the game's own dispatches stay in order) | metal_scheduler.mm:374, metal_scheduler.mm:1096, metal_buffer_cache.cpp:67 | RunAhead | yes |
+| P03 | Fences without a submission of their own (no flush when nothing is pending, deferred and batched flushes) | vk_fence_manager.cpp:48, vk_scheduler.cpp:471 | native (under `EDEN_NX2_METAL_FENCE_IDLE`: a fence with nothing recorded since the last commit waits for that commit. No deferred or batched flush: Vulkan's is off by default too) | metal_scheduler.mm:1055, metal_fence_manager.cpp:14 | RunFenceIdle | yes |
+| P04 | CPU write reclaim | vk_rasterizer.cpp:2881 | native (A33, under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2448 | untested | yes |
+| P05 | GPU read landing | vk_rasterizer.cpp:2718 | native (A28, under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2316 | untested | yes |
+| P06 | Guest writes collected without the caches' locks | vk_rasterizer.cpp:2826 | native (under `EDEN_NX2_METAL_CACHE_PATHS`) | metal_rasterizer.cpp:2389 | untested | yes |
+| P07 | Pass contents discarded on tile GPUs where nothing reads them (store and load actions) | vk_texture_cache.cpp:85 | missing (every attachment is loaded and stored) | metal_scheduler.mm:1425 | untested | ? |
+| P08 | GPU time of the frame | metal_gpu_time.mm:117 | native (GPU time of every command buffer) | metal_scheduler.mm:1838, renderer_metal.mm:520 | untested | yes |
 | P09 | GPU time per pass | vk_scheduler.cpp:295 | missing (only the total; no `Perf passes` lines) | - | untested | no |
 | P10 | Pipeline eviction under memory pressure | vk_pipeline_cache.cpp:1181 | missing (no pipeline is ever released) | - | untested | ? |
-| P11 | Unchanged draw state and bindings not set again | vk_rasterizer.cpp:343, pipeline_helper.h:467 | native (under `EDEN_NX2_METAL_STATE_CACHE`: what the open encoder has stays; a buffer at another offset gets the offset only) | metal_scheduler.mm:1510, metal_scheduler.mm:466 | RunStateCache | yes |
+| P11 | Unchanged draw state and bindings not set again | vk_rasterizer.cpp:343, pipeline_helper.h:467 | native (under `EDEN_NX2_METAL_STATE_CACHE`: what the open encoder has stays; a buffer at another offset gets the offset only) | metal_scheduler.mm:1530, metal_scheduler.mm:476 | RunStateCache | yes |
 | P12 | Texture cache budget from the memory left | vk_texture_cache.cpp | native (`DeviceMemoryBudget`) | metal_resources.mm:183 | untested | yes |
 | P13 | Uniform padding, push-constant reuse | vk_buffer_cache.cpp:442, vk_graphics_pipeline.cpp:66 | n/a (costs of MoltenVK's translation that Metal used directly does not have) | - | - | no |
-| P14 | Frame threads tell the kernel their frame deadline (`EDEN_NX2_APPLE_FRAME_DEADLINE`: guest command thread, GPU thread, guest cores) | vk_rasterizer.cpp:3978 | native (the same shared code, fed from `TickFrame`; before, the threads joined and never got a period on Metal. Vulkan's submit worker has no Metal counterpart) | metal_rasterizer.cpp:2566 | untested | yes |
+| P14 | Frame threads tell the kernel their frame deadline (`EDEN_NX2_APPLE_FRAME_DEADLINE`: guest command thread, GPU thread, guest cores) | vk_rasterizer.cpp:3978 | native (the same shared code, fed from `TickFrame`; before, the threads joined and never got a period on Metal. Vulkan's submit worker has no Metal counterpart) | metal_rasterizer.cpp:2624 | untested | yes |
 
 ## Q. Switches that change what Vulkan renders
 
@@ -404,14 +404,14 @@ are the rows whose Vulkan cell starts with `../`.
 
 | ID | Capability | Vulkan | Status | Metal | Tested | OoT |
 |---|---|---|---|---|---|---|
-| Q01 | `EDEN_NX2_A2C_REFRESH`: alpha to coverage recorded on every draw | vk_rasterizer.cpp:5913 | n/a (B12: part of the render state built for each draw) | metal_rasterizer.cpp:1144 | - | no |
+| Q01 | `EDEN_NX2_A2C_REFRESH`: alpha to coverage recorded on every draw | vk_rasterizer.cpp:5913 | n/a (B12: part of the render state built for each draw) | metal_rasterizer.cpp:1159 | - | no |
 | Q02 | `EDEN_NX2_ASTC_BC1`, `EDEN_NX2_KEEP_ASTC` | vk_texture_cache.cpp:2977, vk_texture_cache.cpp:1293 | n/a (E22) | - | - | no |
 | Q03 | `EDEN_NX2_ASYNC_DISCARD`: draws skipped or held while their pipeline builds | vk_pipeline_cache.cpp:3654 | missing (B41: every draw waits for its pipeline) | - | untested | yes |
 | Q04 | `EDEN_NX2_ASYNC_TRANSLATE`, `EDEN_NX2_ASYNC_TRANSLATE_THREADS` | ../async_translate.h:20, vk_pipeline_cache.cpp:402 | missing (B41) | - | untested | yes |
 | Q05 | `EDEN_NX2_BACKGROUND_PIPELINES`, `_THREADS`, `_LIMIT`, `EDEN_NX2_PRELOAD_ALL_PIPELINES`, `EDEN_NX2_BUILD_SHADERS_LIMIT`, `EDEN_NX2_REKEY_FOREIGN_PIPELINES` | vk_pipeline_cache.cpp:1164, vk_pipeline_cache.cpp:1320 | missing (A56) | - | untested | yes |
 | Q06 | `EDEN_NX2_BEFORE_PASS` | vk_scheduler.cpp:144 | missing (P02) | - | untested | yes |
 | Q07 | `EDEN_NX2_BINDMEMO`, `_BATCH`, `_PARTIAL` | pipeline_helper.h:467 | missing (P11) | - | untested | yes |
-| Q08 | `EDEN_NX2_DISPATCH_CHAIN` | vk_rasterizer.cpp:317 | native (I06) | metal_scheduler.mm:1696 | untested | yes |
+| Q08 | `EDEN_NX2_DISPATCH_CHAIN` | vk_rasterizer.cpp:317 | native (I06) | metal_scheduler.mm:1716 | untested | yes |
 | Q09 | `EDEN_NX2_DYNSTATE_CACHE`, `EDEN_NX2_VERTEX_INPUT_CACHE` | vk_rasterizer.cpp:343, vk_rasterizer.cpp:351 | missing (P11) | - | untested | yes |
 | Q10 | `EDEN_NX2_FAIL_NATIVE_MESH`, `EDEN_NX2_MESH_EMULATE`, `EDEN_NX2_NATIVE_PER_PRIMITIVE`, `EDEN_NX2_FLAT_PER_PRIMITIVE`, `EDEN_NX2_MESH_DIRECT_OUTPUTS`: native mesh pipelines and the choice between them and the emulation | vk_graphics_pipeline.cpp:686, vk_pipeline_cache.cpp:1374, vk_pipeline_cache.cpp:1361, vk_pipeline_cache.cpp:1347, vk_pipeline_cache.cpp:1331 | missing (I02: Metal has the emulation only) | - | untested | yes |
 | Q11 | `EDEN_NX2_NO_MESH`, `EDEN_NX2_NO_MESH_FILE`, `EDEN_NX2_NO_MESH_EMULATION`: mesh draws skipped for comparisons | vk_rasterizer.cpp:847, vk_pipeline_cache.cpp:4112 | missing (`EDEN_NX2_METAL_DRAW=0` skips every draw, not mesh draws alone) | metal_rasterizer.cpp:412 | untested | no |
@@ -419,12 +419,12 @@ are the rows whose Vulkan cell starts with `../`.
 | Q13 | `EDEN_NX2_FENCE_FLUSH_US`, `EDEN_NX2_FENCE_PATIENCE_US`, `EDEN_NX2_LAZY_WAKE` | vk_scheduler.cpp:471, vk_fence_manager.cpp:48, vk_scheduler.cpp:1113 | missing (P03) | - | untested | yes |
 | Q14 | `EDEN_NX2_FENCE_BATCH`, `EDEN_NX2_FENCE_FOLD` | ../fence_manager.h:356, ../fence_manager.h:449 | native (shared fence manager) | metal_fence_manager.cpp:12 | untested | yes |
 | Q15 | `EDEN_NX2_RELEASE_SUBMIT` | ../fence_manager.h:260 | n/a (Metal defers no submission; with P03 closed it applies) | - | - | no |
-| Q16 | `EDEN_NX2_FLUSH_DRAWS`: a submission every so many draws | vk_rasterizer.cpp:5025 | missing (command buffers are committed at fences, waits and frame ends only) | metal_rasterizer.cpp:2558 | untested | ? |
+| Q16 | `EDEN_NX2_FLUSH_DRAWS`: a submission every so many draws | vk_rasterizer.cpp:5025 | missing (command buffers are committed at fences, waits and frame ends only) | metal_rasterizer.cpp:2616 | untested | ? |
 | Q17 | `EDEN_NX2_FORCE_LOD0` | vk_texture_cache.cpp:4950 | missing (debug aid) | - | untested | no |
 | Q18 | `EDEN_NX2_GPL`, `EDEN_NX2_GPL_OPTIMIZE`, `EDEN_NX2_MVK_PIPELINE_CACHE` | vk_pipeline_library.cpp:35, vk_pipeline_cache.cpp:565 | n/a (Vulkan pipeline library and cache objects; Metal's counterpart is B42) | - | - | no |
-| Q19 | `EDEN_NX2_HANDLE_ALIGN` | vk_compute_pipeline.cpp:445 | native (L11: the shared `EvaluateTextureHandle`; aligned read not verified) | metal_rasterizer.cpp:968 | untested | yes |
+| Q19 | `EDEN_NX2_HANDLE_ALIGN` | vk_compute_pipeline.cpp:445 | native (L11: the shared `EvaluateTextureHandle`; aligned read not verified) | metal_rasterizer.cpp:983 | untested | yes |
 | Q20 | `EDEN_NX2_HOST_PACE` | vk_host_pacer.cpp | missing (N13) | - | untested | ? |
-| Q21 | `EDEN_NX2_INLINE_FAST`, `EDEN_NX2_INLINE_DEFER`, `EDEN_NX2_I2M_COALESCE`, `EDEN_NX2_I2M_LIST_PAGE` | vk_rasterizer.cpp:4839, vk_rasterizer.cpp:4880 | native (A54) | metal_rasterizer.cpp:2657 | untested | ? |
+| Q21 | `EDEN_NX2_INLINE_FAST`, `EDEN_NX2_INLINE_DEFER`, `EDEN_NX2_I2M_COALESCE`, `EDEN_NX2_I2M_LIST_PAGE` | vk_rasterizer.cpp:4839, vk_rasterizer.cpp:4880 | native (A54) | metal_rasterizer.cpp:2715 | untested | ? |
 | Q22 | `EDEN_NX2_INDIRECT_GRID`, `EDEN_NX2_INDIRECT_DRAWS`, `EDEN_NX2_GPU_ARG_DRAW`: draws and dispatches whose arguments the GPU wrote, issued without reading them back | ../nx2_indirect_grid.h:56, vk_rasterizer.cpp:1328 | missing (dispatch grids are native, A19 and A60; draw counts are read back, A61; mesh task counts are A10) | - | untested | ? |
 | Q23 | `EDEN_NX2_INVALIDATE_BEFORE_DISPATCH` | vk_rasterizer.cpp:112 | missing (A66: experiment, off by default) | - | untested | no |
 | Q24 | `EDEN_NX2_KEEP_DEFERRED_CLEAR` | vk_scheduler.cpp:153 | native (G20; Metal's own switch is `EDEN_NX2_METAL_CLEAR_FOLD`) | metal_scheduler.mm:172 | RunClearFold | yes |
@@ -437,22 +437,22 @@ are the rows whose Vulkan cell starts with `../`.
 | Q31 | `EDEN_NX2_PIPELINE_EVICT_ABOVE`, `_LEFT_MIB`, `_MAX` | vk_pipeline_cache.cpp:1181 | missing (P10) | - | untested | ? |
 | Q32 | `EDEN_NX2_PUSH_CONSTANT_REUSE`, `EDEN_NX2_UBO_PAD` | vk_graphics_pipeline.cpp:66, vk_buffer_cache.cpp:442 | n/a (P13) | - | - | no |
 | Q33 | `EDEN_NX2_QUERY_LAZY_SYNC` | vk_query_cache.h:45 | n/a (A41: no query cache) | - | - | no |
-| Q34 | `EDEN_NX2_READ_FASTPATH`, `EDEN_NX2_TEXTURE_READ_FILTER` | vk_rasterizer.cpp:2678, vk_rasterizer.cpp:2624 | native (A26) | metal_rasterizer.cpp:2196 | untested | yes |
-| Q35 | `EDEN_NX2_WRITE_FASTPATH` | vk_rasterizer.cpp:2846 | native (P06) | metal_rasterizer.cpp:2331 | untested | yes |
-| Q36 | `EDEN_NX2_CPU_WRITE_RECLAIM` | ../buffer_cache/cpu_write_stats.h:40 | native (A33) | metal_rasterizer.cpp:2390 | untested | yes |
-| Q37 | `EDEN_NX2_GPU_READ_LAND` | ../buffer_cache/cpu_read_stats.h:48 | native (A28) | metal_rasterizer.cpp:2258 | untested | yes |
+| Q34 | `EDEN_NX2_READ_FASTPATH`, `EDEN_NX2_TEXTURE_READ_FILTER` | vk_rasterizer.cpp:2678, vk_rasterizer.cpp:2624 | native (A26) | metal_rasterizer.cpp:2254 | untested | yes |
+| Q35 | `EDEN_NX2_WRITE_FASTPATH` | vk_rasterizer.cpp:2846 | native (P06) | metal_rasterizer.cpp:2389 | untested | yes |
+| Q36 | `EDEN_NX2_CPU_WRITE_RECLAIM` | ../buffer_cache/cpu_write_stats.h:40 | native (A33) | metal_rasterizer.cpp:2448 | untested | yes |
+| Q37 | `EDEN_NX2_GPU_READ_LAND` | ../buffer_cache/cpu_read_stats.h:48 | native (A28) | metal_rasterizer.cpp:2316 | untested | yes |
 | Q38 | `EDEN_NX2_REBAR_UPLOAD`, `EDEN_NX2_STREAM_BUFFER_MIB`, `EDEN_NX2_STAGING_CAP_MIB`, `EDEN_NX2_STAGING_SUBMIT_MIB` | vk_staging_buffer_pool.cpp:86, vk_staging_buffer_pool.cpp:95, vk_staging_buffer_pool.cpp:157 | missing (M08; resizable BAR is n/a on shared memory) | - | untested | yes |
 | Q39 | `EDEN_NX2_RESETFIX` (Donkey Kong Bananza: the reset program's indirect records written on the host) | vk_rasterizer.cpp:662 | native (A65) | metal_rasterizer.cpp:335 | untested | no |
 | Q40 | `EDEN_NX2_SPARSE_ALIASED` | vk_texture_cache.cpp:278 | missing (G18) | - | untested | ? |
 | Q41 | `EDEN_NX2_TARGETLESS_REACH` | vk_graphics_pipeline.cpp:77 | native (B03; the same switch) | metal_rasterizer.cpp:72 | probe:no-attachments | yes |
 | Q42 | `EDEN_NX2_UINT8_INDICES`, `EDEN_NX2_UINT8_REUSE` | vk_buffer_cache.h:206, vk_buffer_cache.cpp:898 | emulated (D07: widened for each draw; the widened copy is not kept) | metal_index_convert.cpp:10 | RunIndexRewrite | ? |
 | Q43 | `EDEN_NX2_WFI_DEFER` | vk_rasterizer.cpp:3061 | n/a (Metal's `WaitForIdle` records no barrier to defer; the deferred barrier itself is A45) | - | - | no |
-| Q44 | `EDEN_NX2_SPLIT`, `EDEN_NX2_METAL_SPLIT`: guest commands and backend work on two threads | ../gpu_split.cpp:115, ../gpu_split.cpp:130 | native (shared; on for Metal unless `EDEN_NX2_METAL_SPLIT=0`) | metal_scheduler.mm:334 | untested | ? |
+| Q44 | `EDEN_NX2_SPLIT`, `EDEN_NX2_METAL_SPLIT`: guest commands and backend work on two threads | ../gpu_split.cpp:115, ../gpu_split.cpp:130 | native (shared; on for Metal unless `EDEN_NX2_METAL_SPLIT=0`) | metal_scheduler.mm:344 | untested | ? |
 | Q45 | `EDEN_NX2_OOT_MACROS`, `EDEN_NX2_OOT_MOVIE_NETWORK`, `EDEN_NX2_EXPERIMENTAL_GEOMETRY` and the buffer and texture cache tuning switches (`EDEN_NX2_BC_*`, `EDEN_NX2_BUFCACHE_*`, `EDEN_NX2_TC_*`, `EDEN_NX2_SSBO_MEMO`, `EDEN_NX2_COMPUTE_BINDCACHE`, `EDEN_NX2_RT_FAST`, `EDEN_NX2_RT_LOOKUP_MEMO`, `EDEN_NX2_CACHE_BUDGET`) | ../engines/maxwell_3d.cpp:1377, ../engines/kepler_compute.cpp:56, ../shader_environment.cpp:894 | native (read in shared code both backends run; not verified one by one on Metal) | - | untested | ? |
 | Q46 | `EDEN_NX2_PIPELINE_HOLD_BOOST`: pipelines a draw waits for built on threads of the waiter's priority | vk_pipeline_cache.cpp:579 | n/a (B41: the draw's own thread builds its pipeline, so no builder of lower priority is waited for) | - | - | no |
-| Q47 | `EDEN_NX2_USED_PIPELINES_SAVE_S`: the list of used pipelines saved within seconds | vk_pipeline_cache.cpp:599 | missing (A56: no list of used pipelines; the binary archive is saved once a minute and at stop, so a kill loses up to a minute of builds) | metal_rasterizer.cpp:2566 | untested | yes |
+| Q47 | `EDEN_NX2_USED_PIPELINES_SAVE_S`: the list of used pipelines saved within seconds | vk_pipeline_cache.cpp:599 | missing (A56: no list of used pipelines; the binary archive is saved once a minute and at stop, so a kill loses up to a minute of builds) | metal_rasterizer.cpp:2624 | untested | yes |
 | Q48 | `EDEN_NX2_MVK_STATS`: MoltenVK's pipeline stage times | ../vulkan_common/vulkan_library.cpp:155 | n/a (MoltenVK's own counters; Metal's builds are not timed by stage) | - | - | no |
-| Q49 | `EDEN_NX2_APPLE_FRAME_DEADLINE` | ../../common/frame_deadline.cpp:205 | native (P14) | metal_rasterizer.cpp:2566 | untested | yes |
+| Q49 | `EDEN_NX2_APPLE_FRAME_DEADLINE` | ../../common/frame_deadline.cpp:205 | native (P14) | metal_rasterizer.cpp:2624 | untested | yes |
 | Q50 | `EDEN_NX2_SPLIT_ADDRESS_WAIT`, `EDEN_NX2_IDLE_HOLD_US` | ../gpu_split.cpp:1191, ../gpu_split.cpp:1175 | native (shared code of the two GPU threads, Q44; not verified on Metal) | - | untested | yes |
 | Q51 | `EDEN_NX2_POLL_YIELD` | ../../common/nx2_poll.h:15 | native (shared; not verified on Metal) | - | untested | yes |
 
@@ -475,13 +475,13 @@ What Metal needs and Vulkan does not; not part of the parity count.
 |---|---|---|---|---|---|---|
 | R01 | Descriptors Metal's validation aborts on are refused and logged (`EDEN_NX2_METAL_PIPELINE_CHECK`) | - | native | metal_pipeline_check.cpp:270, metal_graphics.mm:316 | RunPipelineCheck, probe:control | yes |
 | R02 | Texture descriptors Metal aborts on are refused | - | native | metal_pipeline_check.cpp:301, metal_resources.mm:206 | RunPipelineCheck, probe:texture-4-samples | yes |
-| R03 | Refused draws, dispatches and clears counted by cause, logged once per cause; `Perf Metal coverage:` every 10 s | - | native | metal_coverage.cpp, renderer_metal.mm:549 | untested | yes |
+| R03 | Refused draws, dispatches and clears counted by cause, logged once per cause; `Perf Metal coverage:` every 10 s | - | native | metal_coverage.cpp, renderer_metal.mm:552 | untested | yes |
 | R04 | Abort trace: the last render state and the abort's stack in the log (`EDEN_NX2_METAL_ABORT_TRACE`) | - | native | renderer_metal.mm:270 | untested | yes |
-| R05 | Command buffer errors logged with the failing encoders (`EDEN_NX2_METAL_ENCODER_STATUS`) | - | native | metal_scheduler.mm:978 | untested | yes |
-| R06 | Draws, dispatches and GPU index rewriting switched off for comparisons (`EDEN_NX2_METAL_DRAW`, `EDEN_NX2_METAL_DISPATCH`, `EDEN_NX2_METAL_GPU_INDICES`) | - | native | metal_rasterizer.cpp:412, metal_rasterizer.cpp:1849 | untested | no |
+| R05 | Command buffer errors logged with the failing encoders (`EDEN_NX2_METAL_ENCODER_STATUS`) | - | native | metal_scheduler.mm:989 | untested | yes |
+| R06 | Draws, dispatches and GPU index rewriting switched off for comparisons (`EDEN_NX2_METAL_DRAW`, `EDEN_NX2_METAL_DISPATCH`, `EDEN_NX2_METAL_GPU_INDICES`) | - | native | metal_rasterizer.cpp:412, metal_rasterizer.cpp:1906 | untested | no |
 | R07 | Programs translated with fixed state on or off (`EDEN_NX2_METAL_FIXED_STATE`) | - | native | metal_pipeline_translate.cpp:56 | untested | yes |
 | R08 | Pipeline archive on or off (`EDEN_NX2_METAL_ARCHIVE`) | - | native | metal_archive.mm:30 | RunPipelineArchive | yes |
-| R09 | Guest reads, guest writes, inline writes and fences on the Vulkan rasterizer's paths or the plain ones (`EDEN_NX2_METAL_CACHE_PATHS`) | - | native | metal_rasterizer.cpp:2331 | untested | yes |
+| R09 | Guest reads, guest writes, inline writes and fences on the Vulkan rasterizer's paths or the plain ones (`EDEN_NX2_METAL_CACHE_PATHS`) | - | native | metal_rasterizer.cpp:2389 | untested | yes |
 | R10 | MSL for the device's GPU family or plain (`EDEN_NX2_METAL_MSL_DEVICE`) | - | native | metal_shader_translate.cpp:102 | RunDeviceMsl, replay | yes |
 | R11 | Vertex buffer offset past the buffer's end, attachment level or slice past the texture, pipeline and pass disagreeing on attachment formats | - | missing (not checked: Metal aborts on them only with its validation layer on, which release builds do not have; what is drawn then is undefined) | - | untested | ? |
 | R12 | Guest targets of 8 samples | - | missing (texture refused: Apple GPUs have 4 at most; not drawn at 4 instead) | metal_pipeline_check.cpp:301 | probe:texture-4-samples | no |
@@ -495,3 +495,6 @@ What Metal needs and Vulkan does not; not part of the parity count.
 | R20 | State and bindings kept or set for every draw (`EDEN_NX2_METAL_STATE_CACHE`) | - | native | metal_scheduler.mm:181 | RunStateCache | yes |
 | R21 | Uploads and kernels ahead of the segment or in their place (`EDEN_NX2_METAL_AHEAD`) | - | native | metal_scheduler.mm:191 | RunAhead | yes |
 | R22 | Early commits so a pass begins a segment (`EDEN_NX2_METAL_AHEAD_SPLIT`) | - | native | metal_scheduler.mm:201 | RunAhead | yes |
+| R23 | Fences with nothing pending take no command buffer (`EDEN_NX2_METAL_FENCE_IDLE`) | - | native | metal_scheduler.mm:211 | RunFenceIdle | yes |
+| R24 | Staging buffers bounded or not (`EDEN_NX2_METAL_STAGING_BOUND`) | - | native | metal_staging_buffer_pool.cpp:37 | RunStagingBound | yes |
+| R25 | Anti-aliasing network bypass on or off (`EDEN_NX2_METAL_NETWORK_BYPASS`) | - | native | metal_rasterizer.cpp:1706 | untested | yes |
