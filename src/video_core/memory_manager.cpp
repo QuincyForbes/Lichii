@@ -16,6 +16,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_poll.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
@@ -286,7 +287,7 @@ bool MemoryManager::TryLockPageTableShared() const {
     }
     const auto give_up = std::chrono::steady_clock::now() + std::chrono::milliseconds{2};
     do {
-        std::this_thread::yield();
+        Common::PollWait();
         if (page_table_lock.try_lock_shared()) {
             return true;
         }

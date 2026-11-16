@@ -9,6 +9,7 @@
 
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
+#include "common/nx2_poll.h"
 #include "common/nx2_timeline.h"
 #include "common/platform_events.h"
 #include "common/settings.h"
@@ -561,7 +562,7 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
             if (left > std::chrono::microseconds{1500}) {
                 std::this_thread::sleep_for(left - std::chrono::microseconds{1000});
             } else {
-                std::this_thread::yield();
+                Common::PollWait();
             }
         }
         pacer.NoteHold(Clock::now() - start);
@@ -578,7 +579,7 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
         if (left > std::chrono::microseconds{1500}) {
             std::this_thread::sleep_for(left - std::chrono::microseconds{1000});
         } else {
-            std::this_thread::yield();
+            Common::PollWait();
         }
     }
     pacer.NoteHold(Clock::now() - start);

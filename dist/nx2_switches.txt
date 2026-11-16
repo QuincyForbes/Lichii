@@ -96,7 +96,34 @@ EDEN_NX2_FENCE_BATCH=1
 # sleep 50 us between polls instead of yielding. Phones get 0 from their device profile: Apple's
 # sched_yield (swtch_pri) runs the caller at priority 0 for up to 10 ms when anything else is
 # runnable, and spins on its core when nothing is. (On Windows a 50 us sleep lasts a timer tick.)
+# Also the other short polls: the frame limiter's and present hold's last millisecond, a guest
+# write waiting for a GPU download to land, the 200 us wait for a background pipeline, the GPU
+# memory page table's 2 ms try-lock, a full split ring, a busy fiber, the IPC reply hold, a new
+# guest thread's start, and a GPU unmap waiting for deferred page protection changes.
 #EDEN_NX2_POLL_YIELD=1
+
+# Graphics thread cuts from zortos293/Lichii (each on by default; 0 turns one back):
+# QUERY_CUTS (#1515): report ids taken from the free list a batch at a time, finished reports
+# freed a streamer at a time outside the cache lock, small report lookups probe the offsets a
+# report can start at, and pages no report was ever on are skipped without the lock.
+# FENCE_CUTS (#1516): a new fence wakes the fencing thread only when it waits for fences, and
+# occlusion report lists are kept for reuse.
+# PROTECT_UNLOCKED (#1518): page untracking caused by a guest CPU write (a protection system call
+# per run) runs after the buffer cache's lock is dropped; GPU unmaps wait for it.
+# WORDS_POOL (#1520): the submit-time copies of command lists come from a pool of kept blocks
+# (at most 4 MiB a size class) instead of the heap.
+# RESUME_PUBLISH (#1520): at a resumed semaphore acquire, what the front decoded goes to the back
+# before the waiting lists are copied again.
+# COLLECT_SPLIT (#1586): a guest write crossing a 2 KiB page is collected a page at a time (one
+# transform could not hold it and lost part of it).
+# USAGE_RESET_BOUNDED (#1586): a buffer's per-frame usage words are cleared only where set.
+#EDEN_NX2_QUERY_CUTS=1
+#EDEN_NX2_FENCE_CUTS=1
+#EDEN_NX2_PROTECT_UNLOCKED=1
+#EDEN_NX2_WORDS_POOL=1
+#EDEN_NX2_RESUME_PUBLISH=1
+#EDEN_NX2_COLLECT_SPLIT=1
+#EDEN_NX2_USAGE_RESET_BOUNDED=1
 
 # Apple: frame threads tell the kernel how much CPU time they need each frame
 # (THREAD_TIME_CONSTRAINT_POLICY, measured over 120 frames; port of nxnative PR #2569 / #2137).

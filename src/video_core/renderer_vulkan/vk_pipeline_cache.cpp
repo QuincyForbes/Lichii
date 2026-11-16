@@ -30,6 +30,7 @@
 #include <immintrin.h>
 #endif
 #include "common/cityhash.h"
+#include "common/nx2_poll.h"
 #include "common/platform_events.h"
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
@@ -3526,7 +3527,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::TakeBackgroundPipeline(
             if (std::chrono::steady_clock::now() > give_up) {
                 return nullptr;
             }
-            std::this_thread::yield();
+            // An Apple yield can hold this thread off its core far past the 200 us.
+            Common::PollWait();
         }
     }
     if (const auto it = background_ready.find(key); it != background_ready.end()) {

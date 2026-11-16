@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdlib>
+#include <thread>
 
 namespace Common {
 
@@ -16,6 +18,15 @@ namespace Common {
         return value == nullptr || value[0] != '0';
     }();
     return yield;
+}
+
+/// One wait of a polling loop: a yield, or with EDEN_NX2_POLL_YIELD=0 a 50 us sleep.
+inline void PollWait() {
+    if (PollYield()) {
+        std::this_thread::yield();
+    } else {
+        std::this_thread::sleep_for(std::chrono::microseconds{50});
+    }
 }
 
 } // namespace Common

@@ -14,6 +14,7 @@
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/nx2_poll.h"
 #include "common/scope_exit.h"
 #include "common/scratch_buffer.h"
 #include "core/core.h"
@@ -1265,7 +1266,7 @@ void HoldHleReply(KernelCore& kernel, KThread* client_thread) {
         if (running == client_thread || running == scheduler.GetIdleThread()) {
             return;
         }
-        std::this_thread::yield();
+        Common::PollWait();
     }
 }
 } // namespace

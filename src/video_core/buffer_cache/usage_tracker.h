@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
+#include <cstdlib>
 #include <span>
 #include <utility>
 #include <vector>
@@ -36,7 +38,22 @@ public:
             return;
         }
         tracked = false;
-        std::ranges::fill(pages, 0ULL);
+        if (BoundedReset()) {
+            // Only Track sets words, and only in [set_begin, set_end): a buffer of hundreds of
+            // MiB bound in part cleared all its words (8 bytes a 4 KiB page) every frame
+            // (zortos293/Lichii#1586).
+            std::fill(pages.begin() + static_cast<std::ptrdiff_t>(set_begin),
+                      pages.begin() + static_cast<std::ptrdiff_t>(set_end), 0ULL);
+            if (Nx2Perf::Verify() && std::ranges::any_of(pages, [](u64 word) { return word != 0; })) {
+                LOG_ERROR(HW_GPU, "Usage tracker word set outside the tracked extent {}..{}",
+                          set_begin, set_end);
+                std::ranges::fill(pages, 0ULL);
+            }
+        } else {
+            std::ranges::fill(pages, 0ULL);
+        }
+        set_begin = 0;
+        set_end = 0;
         recent.fill({~u64{0}, 0});
         full_begin = 0;
         full_end = 0;
@@ -58,6 +75,9 @@ public:
         if (page_end < page || page_end >= pages.size()) {
             return;
         }
+        // TrackPage and FillPages below set words only in [page, page_end].
+        set_begin = set_end == 0 ? page : (std::min)(set_begin, page);
+        set_end = (std::max)(set_end, page_end + 1);
         TrackPage(page, offset, size);
         if (page == page_end) {
             return;
@@ -165,6 +185,18 @@ private:
     /// Pages known to be all ones (FillPages).
     size_t full_begin{};
     size_t full_end{};
+    /// The words set since the last reset lie in [set_begin, set_end) (none when set_end is 0).
+    size_t set_begin{};
+    size_t set_end{};
+
+    /// EDEN_NX2_USAGE_RESET_BOUNDED=0: Reset clears every word, as before.
+    [[nodiscard]] static bool BoundedReset() noexcept {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_USAGE_RESET_BOUNDED");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
 };
 
 } // namespace VideoCommon

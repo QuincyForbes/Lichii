@@ -6,9 +6,13 @@
 
 #include <chrono>
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstring>
+#include <mutex>
+#include <new>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -48,6 +52,106 @@ namespace Tegra {
 
 constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
+
+namespace CommandWordsPool {
+namespace {
+
+constexpr std::size_t SmallestBlock = std::size_t{4} << 10;
+constexpr std::size_t ClassCount = 11; ///< Blocks of 4 KiB to 4 MiB, each twice the one before
+constexpr std::size_t MaxBlocksPerClass = 32;
+/// Half of zortos293/Lichii#1520's 8 MiB: at most ~28 MiB kept over all classes on a phone.
+constexpr std::size_t MaxBytesPerClass = std::size_t{4} << 20;
+
+struct Pool {
+    Pool() {
+        for (auto& blocks : free) {
+            blocks.reserve(MaxBlocksPerClass);
+        }
+    }
+    std::mutex mutex;
+    std::array<std::vector<void*>, ClassCount> free;
+};
+
+Pool& GetPool() {
+    static Pool pool;
+    return pool;
+}
+
+bool Enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_WORDS_POOL");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// The class of a block of `bytes`, ClassCount and over for blocks the pool does not keep.
+std::size_t ClassOf(std::size_t bytes) {
+    const std::size_t blocks =
+        ((std::max<std::size_t>)(bytes, 1) + SmallestBlock - 1) / SmallestBlock;
+    return static_cast<std::size_t>(std::bit_width(blocks - 1));
+}
+
+std::size_t MaxBlocks(std::size_t index) {
+    return (std::min<std::size_t>)(MaxBlocksPerClass,
+                                   (std::max<std::size_t>)(1, MaxBytesPerClass / SmallestBlock >>
+                                                                  index));
+}
+
+} // Anonymous namespace
+
+void* Allocate(std::size_t bytes) {
+    const std::size_t index = ClassOf(bytes);
+    if (!Enabled() || index >= ClassCount) {
+        return ::operator new(bytes);
+    }
+    Pool& pool = GetPool();
+    {
+        std::scoped_lock lock{pool.mutex};
+        if (auto& blocks = pool.free[index]; !blocks.empty()) {
+            void* const block = blocks.back();
+            blocks.pop_back();
+            return block;
+        }
+    }
+    return ::operator new(SmallestBlock << index);
+}
+
+void Deallocate(void* pointer, std::size_t bytes) noexcept {
+    const std::size_t index = ClassOf(bytes);
+    if (Enabled() && index < ClassCount) {
+        Pool& pool = GetPool();
+        std::scoped_lock lock{pool.mutex};
+        if (auto& blocks = pool.free[index]; blocks.size() < MaxBlocks(index)) {
+            blocks.push_back(pointer);
+            return;
+        }
+    }
+    ::operator delete(pointer);
+}
+
+void Trim() noexcept {
+    Pool& pool = GetPool();
+    std::scoped_lock lock{pool.mutex};
+    for (auto& blocks : pool.free) {
+        for (void* const block : blocks) {
+            ::operator delete(block);
+        }
+        blocks.clear();
+    }
+}
+
+std::size_t PooledBytes() noexcept {
+    Pool& pool = GetPool();
+    std::scoped_lock lock{pool.mutex};
+    std::size_t bytes = 0;
+    for (std::size_t index = 0; index < ClassCount; ++index) {
+        bytes += pool.free[index].size() * (SmallestBlock << index);
+    }
+    return bytes;
+}
+
+} // namespace CommandWordsPool
 
 namespace {
 // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads. The
@@ -158,7 +262,10 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
     , synced{false}
 {}
 
-DmaPusher::~DmaPusher() = default;
+DmaPusher::~DmaPusher() {
+    dma_pushbuffer.clear();
+    CommandWordsPool::Trim();
+}
 
 void DmaPusher::DispatchCalls() {
     // EXPERIMENT EDEN_NX2_INVALIDATE_BEFORE_DISPATCH=list: apply the guest's collected CPU writes
@@ -216,6 +323,15 @@ bool DmaPusher::Step() {
     // (CanUseSubmittedCommands): neither is copied (zortos293/Lichii#805).
     if (ResnapshotEnabled() && suspensions.load(std::memory_order_relaxed) != suspensions_before) {
         const u64 now = suspensions.load(std::memory_order_acquire);
+        // The copy takes the front a while: what it sent before goes to the back first
+        // (zortos293/Lichii#1520; EDEN_NX2_RESUME_PUBLISH=0: after the copy, as before).
+        static const bool publish_first = [] {
+            const char* value = std::getenv("EDEN_NX2_RESUME_PUBLISH");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (auto& split = VideoCommon::GpuSplit::Get(); publish_first && split.Active()) {
+            split.Publish();
+        }
         size_t first_entry = dma_pushbuffer_subindex + (command_resume_offset != 0 ? 1 : 0);
         for (CommandList& list : dma_pushbuffer) {
             if (!list.submitted_offsets.empty()) {

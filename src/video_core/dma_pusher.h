@@ -110,6 +110,39 @@ inline CommandHeader BuildCommandHeader(BufferMethods method, u32 arg_count, Sub
     return result;
 }
 
+/// Keeps the blocks of the command lists' submit-time copies for reuse (zortos293/Lichii#1520).
+/// The guest's submit thread allocated ~1000 a second, of up to hundreds of KiB, and the GPU
+/// thread freed them: in Ocarina of Time each free took the heap ~30 us of the GPU thread, and
+/// each allocation the submit thread almost as long. EDEN_NX2_WORDS_POOL=0: plain new and delete.
+namespace CommandWordsPool {
+[[nodiscard]] void* Allocate(std::size_t bytes);
+void Deallocate(void* pointer, std::size_t bytes) noexcept;
+/// Frees the blocks kept for reuse (when a channel goes away).
+void Trim() noexcept;
+/// Bytes kept for reuse.
+[[nodiscard]] std::size_t PooledBytes() noexcept;
+} // namespace CommandWordsPool
+
+template <typename T>
+struct CommandWordsAllocator {
+    using value_type = T;
+
+    CommandWordsAllocator() noexcept = default;
+    template <typename U>
+    CommandWordsAllocator(const CommandWordsAllocator<U>&) noexcept {}
+
+    [[nodiscard]] T* allocate(std::size_t count) {
+        return static_cast<T*>(CommandWordsPool::Allocate(count * sizeof(T)));
+    }
+    void deallocate(T* pointer, std::size_t count) noexcept {
+        CommandWordsPool::Deallocate(pointer, count * sizeof(T));
+    }
+    template <typename U>
+    bool operator==(const CommandWordsAllocator<U>&) const noexcept {
+        return true;
+    }
+};
+
 struct CommandList final {
     CommandList() = default;
     explicit CommandList(std::size_t size) : command_lists(size) {}
@@ -122,7 +155,7 @@ struct CommandList final {
     std::vector<u64> submit_hashes;
     /// The entries' words when they were submitted (NX2), each entry's at submitted_offsets[i]:
     /// executed instead of the memory, which the game may already be refilling for a later frame.
-    std::vector<CommandHeader> submitted_words;
+    std::vector<CommandHeader, CommandWordsAllocator<CommandHeader>> submitted_words;
     std::vector<u32> submitted_offsets;
     /// Entries (ascending) not copied when submitted, because a GPU map still queued covers them:
     /// DmaPusher::Push copies them after the map, and until then they read memory.

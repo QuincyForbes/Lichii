@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <atomic>
+#include <chrono>
 #include <exception>
 #include <limits>
 #include <random>
+#include <thread>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
@@ -191,4 +194,24 @@ TEST_CASE("MaxContinuousRange from the mapping runs matches the page walk", "[me
         check(address_space_end - back, back);
         check(address_space_end - back, back + 1);
     }
+}
+
+TEST_CASE("Device unmaps wait for deferred page count changes", "[memory_manager]") {
+    // Ported from zortos293/Lichii#1518.
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    NullRasterizer rasterizer;
+    device_memory.BindInterface(&rasterizer);
+
+    device_memory.BeginDeferredCachedUpdates();
+    std::atomic<bool> unmapped{};
+    std::thread unmapper{[&] {
+        device_memory.Unmap(0x10000, 0x1000);
+        unmapped = true;
+    }};
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK_FALSE(unmapped);
+    device_memory.EndDeferredCachedUpdates();
+    unmapper.join();
+    REQUIRE(unmapped);
 }

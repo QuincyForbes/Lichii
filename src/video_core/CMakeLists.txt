@@ -21,6 +21,7 @@ add_library(video_core STATIC
     buffer_cache/buffer_cache.h
     buffer_cache/cpu_read_stats.h
     buffer_cache/cpu_write_stats.h
+    buffer_cache/deferred_page_caching.h
     buffer_cache/hot_pages.h
     buffer_cache/memory_tracker_base.h
     buffer_cache/usage_tracker.h

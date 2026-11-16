@@ -453,6 +453,34 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_MVK_STATS", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment mvk_stats_off on");
     }
+    if (lichii_platform_experiment("query_cuts_off")) {
+        setenv("EDEN_NX2_QUERY_CUTS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment query_cuts_off on");
+    }
+    if (lichii_platform_experiment("fence_cuts_off")) {
+        setenv("EDEN_NX2_FENCE_CUTS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment fence_cuts_off on");
+    }
+    if (lichii_platform_experiment("protect_locked")) {
+        setenv("EDEN_NX2_PROTECT_UNLOCKED", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment protect_locked on");
+    }
+    if (lichii_platform_experiment("words_pool_off")) {
+        setenv("EDEN_NX2_WORDS_POOL", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment words_pool_off on");
+    }
+    if (lichii_platform_experiment("resume_publish_off")) {
+        setenv("EDEN_NX2_RESUME_PUBLISH", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment resume_publish_off on");
+    }
+    if (lichii_platform_experiment("collect_split_off")) {
+        setenv("EDEN_NX2_COLLECT_SPLIT", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment collect_split_off on");
+    }
+    if (lichii_platform_experiment("usage_reset_full")) {
+        setenv("EDEN_NX2_USAGE_RESET_BOUNDED", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment usage_reset_full on");
+    }
     ApplyCpuExperiments();
 }
 

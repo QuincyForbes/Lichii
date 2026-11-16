@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "common/common_types.h"
+#include "common/nx2_poll.h"
 
 namespace VideoCore {
 
@@ -87,7 +88,7 @@ private:
         }
         state.waits.fetch_add(1, std::memory_order_relaxed);
         while (state.sequence.load(std::memory_order_acquire) == sequence) {
-            std::this_thread::yield();
+            Common::PollWait();
         }
     }
 
