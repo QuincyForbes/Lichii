@@ -321,15 +321,15 @@ void ConfigurePerGameAddons::showContextMenu(const QPoint& pos) {
 
     QMenu menu(this);
 
-    const bool all_builtin = std::ranges::all_of(selected, [](const QModelIndex& index) {
-        return index.data(BUILTIN_CHOICE).isValid();
+    const bool all_builtin = std::ranges::all_of(selected, [](const QModelIndex& row) {
+        return row.data(BUILTIN_CHOICE).isValid();
     });
     if (all_builtin) {
         QAction* follow = menu.addAction(tr("&Follow the global setting"));
         connect(follow, &QAction::triggered, this, [this, selected]() {
             const QSignalBlocker blocker{item_model};
-            for (const QModelIndex& index : selected) {
-                auto* item = item_model->itemFromIndex(index.sibling(index.row(), 0));
+            for (const QModelIndex& row : selected) {
+                auto* item = item_model->itemFromIndex(row.sibling(row.row(), 0));
                 const bool on = item->data(BUILTIN_FOLLOW_STATE).toBool();
                 item->setCheckState(on ? Qt::Checked : Qt::Unchecked);
                 item->setData(static_cast<int>(item->checkState()), BUILTIN_CHECK);
