@@ -459,6 +459,13 @@ struct ExperimentsView: View {
     @State private var pipelineHoldsOld = lichii_platform_experiment("pipeline_holds_old") != 0
     @State private var pipelineListOld = lichii_platform_experiment("pipeline_list_old") != 0
     @State private var mvkStatsOff = lichii_platform_experiment("mvk_stats_off") != 0
+    @State private var queryCutsOff = lichii_platform_experiment("query_cuts_off") != 0
+    @State private var fenceCutsOff = lichii_platform_experiment("fence_cuts_off") != 0
+    @State private var protectLocked = lichii_platform_experiment("protect_locked") != 0
+    @State private var wordsPoolOff = lichii_platform_experiment("words_pool_off") != 0
+    @State private var resumePublishOff = lichii_platform_experiment("resume_publish_off") != 0
+    @State private var collectSplitOff = lichii_platform_experiment("collect_split_off") != 0
+    @State private var usageResetFull = lichii_platform_experiment("usage_reset_full") != 0
 
     var body: some View {
         List {
@@ -644,7 +651,7 @@ struct ExperimentsView: View {
             } header: {
                 Text("CPU Scheduling")
             } footer: {
-                Text("For finding out why the game's CPU threads run on the efficiency cores. Two Guest Cores First leaves the top priority to two of the six emulated CPU cores and the graphics threads, and runs the other four one step lower, so iOS has fewer threads asking for its two performance cores (on a computer limited to four CPUs this gave Ocarina of Time 25 % more frames). Game's Own Thread Cores lets Ocarina of Time's main threads run only on the cores the game asks for, instead of on any core. One Core per Game Thread keeps each such thread on one core, so one host thread does its work; wins over Game's Own Thread Cores. Idle Guest Cores Wait Briefly keeps an emulated core that runs out of work polling for 20 µs before it sleeps, as on a computer, which saves a wake-up per hand-off but keeps a CPU busy. No CPU Scheduling Log Lines stops the \"Perf threads:\" and \"Perf sched:\" log lines and the counting behind them (thread listing every 10 s, a 20 Hz thread sampler, timestamps at each guest thread switch). Graphics Threads Declare No Frame Time stops Lichii's three graphics threads from telling iOS how much CPU time they need each frame, as before; with it iOS schedules them like audio threads, which on another emulator kept the performance cores faster and busier (\"frame deadlines:\" in the log's Perf line shows what each declared). Turn it on if the game stutters or runs slower than before. Guest Cores Declare Frame Time Too does the same for the emulated CPU cores; untested, and iOS may take it back from a core that never rests. Graphics Threads Poll Before Sleeping lets the two graphics threads poll for up to 64 µs before they sleep waiting on each other, as before. Polling Threads Yield lets the graphics thread that waits for the game to release a GPU value, and threads waiting for the graphics thread to send its work, give up the CPU between checks instead of sleeping 50 µs, as before; when other threads are waiting for a CPU, iOS then runs the yielding thread last for up to 10 ms.\n\nAll nine apply the next time Lichii starts.")
+                Text("For finding out why the game's CPU threads run on the efficiency cores. Two Guest Cores First leaves the top priority to two of the six emulated CPU cores and the graphics threads, and runs the other four one step lower, so iOS has fewer threads asking for its two performance cores (on a computer limited to four CPUs this gave Ocarina of Time 25 % more frames). Game's Own Thread Cores lets Ocarina of Time's main threads run only on the cores the game asks for, instead of on any core. One Core per Game Thread keeps each such thread on one core, so one host thread does its work; wins over Game's Own Thread Cores. Idle Guest Cores Wait Briefly keeps an emulated core that runs out of work polling for 20 µs before it sleeps, as on a computer, which saves a wake-up per hand-off but keeps a CPU busy. No CPU Scheduling Log Lines stops the \"Perf threads:\" and \"Perf sched:\" log lines and the counting behind them (thread listing every 10 s, a 20 Hz thread sampler, timestamps at each guest thread switch). Graphics Threads Declare No Frame Time stops Lichii's three graphics threads from telling iOS how much CPU time they need each frame, as before; with it iOS schedules them like audio threads, which on another emulator kept the performance cores faster and busier (\"frame deadlines:\" in the log's Perf line shows what each declared). Turn it on if the game stutters or runs slower than before. Guest Cores Declare Frame Time Too does the same for the emulated CPU cores; untested, and iOS may take it back from a core that never rests. Graphics Threads Poll Before Sleeping lets the two graphics threads poll for up to 64 µs before they sleep waiting on each other, as before. Polling Threads Yield lets the graphics thread that waits for the game to release a GPU value, and threads waiting for the graphics thread to send its work, give up the CPU between checks instead of sleeping 50 µs, as before; when other threads are waiting for a CPU, iOS then runs the yielding thread last for up to 10 ms. It covers the other short waits too (frame pacing, the present hold, a guest write waiting for GPU data to land, shader handover, ring space, kernel thread starts).\n\nAll nine apply the next time Lichii starts.")
             }
 
             Section {
@@ -687,6 +694,41 @@ struct ExperimentsView: View {
                 Text("Shader Builds")
             } footer: {
                 Text("A draw whose shaders are not built yet either is left out for a frame or waits. Normally the build a draw waits for runs at once on two threads of its own at the waiting thread's priority, and the background builds pause meanwhile. Held Draws Wait in the Queue leaves it in line behind the other builds on the low-priority build threads, as before (waits of 0.1-2.2 s each in Kokiri Forest on an iPhone); turn it on if the game stutters more than before.\n\nLichii keeps a list of the shaders a game really drew and builds those on the loading screen. Normally the list is saved within 10 s of a new shader's first use and when Lichii leaves the foreground. Used Shader List Saved as Before saves it only when a new shader is first drawn 15 s or more after the last save or the game is stopped from the menu, so the shaders first drawn since the last save are missing from it when Lichii is closed from the app switcher.\n\nNo MoltenVK Compile Times stops MoltenVK timing its work (a few timestamps per command buffer), which the \"Perf pipelines:\" log line reports per stage.\n\nAll three apply the next time Lichii starts.")
+            }
+
+            Section {
+                Toggle("GPU Reports Kept as Before", isOn: $queryCutsOff)
+                    .onChange(of: queryCutsOff) { value in
+                        lichii_platform_set_experiment("query_cuts_off", value ? 1 : 0)
+                    }
+                Toggle("Every Fence Wakes the Fence Thread", isOn: $fenceCutsOff)
+                    .onChange(of: fenceCutsOff) { value in
+                        lichii_platform_set_experiment("fence_cuts_off", value ? 1 : 0)
+                    }
+                Toggle("Page Protection Inside the Lock", isOn: $protectLocked)
+                    .onChange(of: protectLocked) { value in
+                        lichii_platform_set_experiment("protect_locked", value ? 1 : 0)
+                    }
+                Toggle("Command Copies Freed at Once", isOn: $wordsPoolOff)
+                    .onChange(of: wordsPoolOff) { value in
+                        lichii_platform_set_experiment("words_pool_off", value ? 1 : 0)
+                    }
+                Toggle("Resumed Lists Sent After Their Copy", isOn: $resumePublishOff)
+                    .onChange(of: resumePublishOff) { value in
+                        lichii_platform_set_experiment("resume_publish_off", value ? 1 : 0)
+                    }
+                Toggle("Page-Crossing Writes as One", isOn: $collectSplitOff)
+                    .onChange(of: collectSplitOff) { value in
+                        lichii_platform_set_experiment("collect_split_off", value ? 1 : 0)
+                    }
+                Toggle("Buffer Use Cleared in Full", isOn: $usageResetFull)
+                    .onChange(of: usageResetFull) { value in
+                        lichii_platform_set_experiment("usage_reset_full", value ? 1 : 0)
+                    }
+            } header: {
+                Text("Graphics Thread Cuts")
+            } footer: {
+                Text("Small savings on the graphics threads, ported from another Lichii fork; none was tried on an iPhone yet. Each switch turns one back to how it was.\n\nGPU Reports Kept as Before: occlusion and counter reports are again looked up, freed and numbered one at a time under a lock. Every Fence Wakes the Fence Thread: each new fence wakes the thread that waits for fences even when it is busy anyway. Page Protection Inside the Lock: when the game writes memory the GPU caches use, the page protection system call runs while the buffer cache stays locked for everyone else. Command Copies Freed at Once: the copies of the game's command lists go back to the system heap instead of being kept for reuse. Resumed Lists Sent After Their Copy: after the game releases a GPU wait, the graphics thread copies the waiting lists before it hands over what it already decoded. Page-Crossing Writes as One: a game write crossing a 2 KB boundary is noted as one piece, as before, which can lose part of it (turn it on only to compare). Buffer Use Cleared in Full: the per-frame record of which parts of a buffer were used is cleared whole instead of only where it was set.\n\nTurn one on if the picture shows stale data, objects flicker or the game stops; all apply the next time Lichii starts.")
             }
 
             Section {

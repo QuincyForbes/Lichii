@@ -87,6 +87,7 @@ add_executable(tests
     video_core/command_fetch_order.cpp
     video_core/command_snapshot_suspensions.cpp
     video_core/pending_maps.cpp
+    video_core/query_stream.cpp
     video_core/maxwell_fast_method.cpp
     video_core/split_write_tracker.cpp
     hid_core/sensor_info.cpp

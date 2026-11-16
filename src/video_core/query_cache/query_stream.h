@@ -6,8 +6,11 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <deque>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include "common/assert.h"
@@ -16,6 +19,17 @@
 #include "video_core/query_cache/query_base.h"
 
 namespace VideoCommon {
+
+/// EDEN_NX2_QUERY_CUTS=0 turns off the cheaper report bookkeeping (zortos293/Lichii#1515): free
+/// ids taken by the batch, queries freed a streamer at a time, and small report lookups that probe
+/// the offsets a query can start at (or skip pages no report was ever on).
+[[nodiscard]] inline bool QueryCutsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_QUERY_CUTS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
 
 class StreamerInterface {
 public:
@@ -85,6 +99,13 @@ public:
 
     virtual void Free(size_t query_id) = 0;
 
+    /// Free for each id, as one batch.
+    virtual void FreeMany(std::span<const size_t> query_ids) {
+        for (const size_t query_id : query_ids) {
+            Free(query_id);
+        }
+    }
+
     size_t GetId() const {
         return id;
     }
@@ -137,8 +158,42 @@ protected:
         ReleaseQuery(query_id);
     }
 
+    virtual void FreeMany(std::span<const size_t> query_ids) override {
+        std::scoped_lock lk(guard);
+        for (const size_t query_id : query_ids) {
+            ReleaseQuery(query_id);
+        }
+    }
+
     template <typename... Args, typename = decltype(QueryType(std::declval<Args>()...))>
     size_t BuildQuery(Args&&... args) {
+        if (QueryCutsEnabled()) {
+            // Called by the one thread that records reports (the GPU thread, or the split's back
+            // while it runs). Free ids come from `reusable`, which only this thread touches,
+            // moved there from old_queries a batch at a time: one lock per batch instead of one
+            // per query (a report per draw builds two).
+            if (reusable_head == reusable.size()) {
+                reusable.clear();
+                reusable_head = 0;
+                std::scoped_lock lk(guard);
+                if (old_queries_head == old_queries.size()) {
+                    const size_t new_id = slot_queries.size();
+                    slot_queries.emplace_back(std::forward<Args>(args)...);
+                    return new_id;
+                }
+                // Oldest first, as they were freed.
+                if (old_queries_head != 0) {
+                    old_queries.erase(old_queries.begin(),
+                                      old_queries.begin() +
+                                          static_cast<std::ptrdiff_t>(old_queries_head));
+                    old_queries_head = 0;
+                }
+                reusable.swap(old_queries);
+            }
+            const size_t new_id = reusable[reusable_head++];
+            new (&slot_queries[new_id]) QueryType(std::forward<Args>(args)...);
+            return new_id;
+        }
         std::scoped_lock lk(guard);
         if (old_queries_head != old_queries.size()) {
             size_t new_id = old_queries[old_queries_head++];
@@ -172,6 +227,10 @@ protected:
     std::deque<QueryType> slot_queries;
     std::vector<size_t> old_queries;
     size_t old_queries_head{};
+    /// EDEN_NX2_QUERY_CUTS: free ids BuildQuery took from old_queries, used from reusable_head
+    /// (its thread only).
+    std::vector<size_t> reusable;
+    size_t reusable_head{};
 };
 
 } // namespace VideoCommon

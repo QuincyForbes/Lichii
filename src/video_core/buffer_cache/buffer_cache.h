@@ -426,7 +426,9 @@ bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
     Stats::Note(memory_tracker.IsRegionCpuModified(device_addr, size) ? Stats::Outcome::AlreadyCpu
                                                                      : Stats::Outcome::Marked);
     WriteMemory(device_addr, size);
-    if (Stats::Detailed() && device_memory.PageCachedCount(device_addr) != 0) [[unlikely]] {
+    // Untracking kept for later (EDEN_NX2_PROTECT_UNLOCKED) still shows the page protected.
+    if (Stats::Detailed() && t_deferred_page_caching == nullptr &&
+        device_memory.PageCachedCount(device_addr) != 0) [[unlikely]] {
         Stats::Note(Stats::Outcome::StillProtected);
     }
     return false;

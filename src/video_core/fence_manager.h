@@ -149,8 +149,13 @@ public:
             rasterizer.FlushCommands();
         }
         if constexpr (can_async_check) {
+            // The fencing thread waits for the host GPU while it has fences: it needs waking (a
+            // system call) only when it waits for fences to be made (zortos293/Lichii#1516).
+            const bool wake = !WakeOnlyWaiting() || fence_thread_waiting;
             guard.unlock();
-            cv.notify_all();
+            if (wake) {
+                cv.notify_all();
+            }
         }
         if (delay_fence) {
             // Its callback runs on the fencing thread once the fence's work is done, and the
@@ -376,8 +381,11 @@ private:
             {
                 std::unique_lock lock(guard);
                 cv.wait(lock, [&] {
-                    return stop_token.stop_requested() || (!fences.empty() && !inline_running);
+                    fence_thread_waiting =
+                        !stop_token.stop_requested() && (fences.empty() || inline_running);
+                    return !fence_thread_waiting;
                 });
+                fence_thread_waiting = false;
                 if (stop_token.stop_requested()) [[unlikely]] {
                     return;
                 }
@@ -516,8 +524,20 @@ private:
         fences.push(std::move(new_fence));
         fences_in_flight.fetch_add(1, std::memory_order_relaxed);
         work_epoch.fetch_add(1, std::memory_order_release);
+        const bool wake = !WakeOnlyWaiting() || fence_thread_waiting;
         lock.unlock();
-        cv.notify_all();
+        if (wake) {
+            cv.notify_all();
+        }
+    }
+
+    /// EDEN_NX2_FENCE_CUTS=0: every new fence wakes the fencing thread, waiting or not.
+    static bool WakeOnlyWaiting() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_FENCE_CUTS");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
     }
 
     static constexpr size_t MaxSpareOperationLists = 32;
@@ -676,6 +696,7 @@ private:
     std::atomic<u64> work_epoch{};       ///< Bumped by every fence and fence operation added
     bool fence_thread_busy{};
     bool inline_running{};
+    bool fence_thread_waiting{}; ///< The fencing thread waits on cv for fences (guarded by guard)
 
     std::mutex guard;
     std::mutex ring_guard;

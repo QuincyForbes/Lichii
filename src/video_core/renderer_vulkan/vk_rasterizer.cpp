@@ -2853,11 +2853,33 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     } else if (!handoff) {
         buffer_cache.mutex.lock();
     }
+    // EDEN_NX2_PROTECT_UNLOCKED (zortos293/Lichii#1518): the pages the write untracks get their
+    // protection changed (a system call each run) after the lock is dropped, not while every
+    // other drawing or reading thread waits for it.
+    static thread_local VideoCommon::DeferredPageCaching deferred;
+    const bool defer = VideoCommon::ProtectUnlockedEnabled() &&
+                       VideoCommon::t_deferred_page_caching == nullptr &&
+                       !VideoCommon::GpuSplit::OwnsScheduler();
+    bool gpu_modified;
     {
         std::unique_lock lock{buffer_cache.mutex, std::adopt_lock};
-        if (buffer_cache.OnCPUWrite(addr, size)) {
-            return true;
+        if (defer) {
+            VideoCommon::t_deferred_page_caching = &deferred;
         }
+        gpu_modified = buffer_cache.OnCPUWrite(addr, size);
+        if (defer) {
+            VideoCommon::t_deferred_page_caching = nullptr;
+            if (!deferred.Empty()) {
+                device_memory.BeginDeferredCachedUpdates();
+            }
+        }
+    }
+    if (defer && !deferred.Empty()) {
+        deferred.ApplyAll();
+        device_memory.EndDeferredCachedUpdates();
+    }
+    if (gpu_modified) {
+        return true;
     }
     if (!fast_path || texture_cache.page_filter.Any(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};

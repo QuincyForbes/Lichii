@@ -21,6 +21,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/fiber.h"
+#include "common/nx2_poll.h"
 
 #include <boost/context/detail/fcontext.hpp>
 
@@ -71,7 +72,7 @@ void AcquireFiber(std::atomic<bool>& in_use) noexcept {
             if (++spins < 256) {
                 PauseHint();
             } else {
-                std::this_thread::yield();
+                Common::PollWait();
             }
         }
         if (!in_use.exchange(true, std::memory_order_acquire)) {

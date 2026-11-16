@@ -24,6 +24,7 @@
 #include "common/common_types.h"
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
+#include "common/nx2_poll.h"
 #include "common/polyfill_thread.h"
 #include "common/nx2_timeline.h"
 #include "common/perf_report.h"
@@ -448,7 +449,7 @@ public:
                     }
                 }
                 while (std::chrono::steady_clock::now() < target_time) {
-                    std::this_thread::yield();
+                    Common::PollWait();
                 }
             } else if (frame_counter > max_frame_count) {
                 frame_counter = 0;

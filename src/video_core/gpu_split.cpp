@@ -20,6 +20,7 @@
 #include "common/dkb_cpu_trace.h"
 #include "common/frame_deadline.h"
 #include "common/logging.h"
+#include "common/nx2_poll.h"
 #include "common/perf_report.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -257,7 +258,7 @@ void GpuSplit::WaitForSpace(size_t words) {
         if (spins < 4096) {
             Pause();
         } else {
-            std::this_thread::yield();
+            Common::PollWait();
         }
     }
 }
@@ -723,7 +724,7 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
         return;
     }
     if (!Nx2Perf::On(Nx2Perf::Opt::FrontSleep) || !back_running.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
+        Common::PollWait();
         return;
     }
     // A long wait sleeps until the back stores a new position (port of #161's front_wake): the

@@ -224,6 +224,12 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// written only on a first use 15 s after the last save and at shutdown, as before
 /// (EDEN_NX2_USED_PIPELINES_SAVE_S=0). "mvk_stats_off": MoltenVK does not time its compilation
 /// stages (EDEN_NX2_MVK_STATS=0).
+/// Graphics thread cuts (zortos293/Lichii#1515-#1586), each back to before: "query_cuts_off"
+/// (EDEN_NX2_QUERY_CUTS=0), "fence_cuts_off" (EDEN_NX2_FENCE_CUTS=0), "protect_locked" (page
+/// protection changes under the buffer cache's lock, EDEN_NX2_PROTECT_UNLOCKED=0),
+/// "words_pool_off" (EDEN_NX2_WORDS_POOL=0), "resume_publish_off" (EDEN_NX2_RESUME_PUBLISH=0),
+/// "collect_split_off" (EDEN_NX2_COLLECT_SPLIT=0), "usage_reset_full"
+/// (EDEN_NX2_USAGE_RESET_BOUNDED=0).
 /// "frame_time_off": the graphics threads
 /// declare no frame time to the kernel, as before (EDEN_NX2_APPLE_FRAME_DEADLINE=0);
 /// "frame_time_guest": the guest cores declare theirs too (=15), off wins. "split_std_waits": the

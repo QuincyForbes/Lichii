@@ -21,6 +21,7 @@
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "common/logging.h"
+#include "video_core/buffer_cache/deferred_page_caching.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2_perf.h"
 
@@ -320,8 +321,8 @@ struct WordManager {
         std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
         if (Nx2Perf::On(Nx2Perf::Opt::SortedPageBatches) && !Nx2Perf::Verify()) {
             CoalesceInPlace(ranges);
-            tracker->UpdatePagesCachedBatch(
-                std::span<const std::pair<VAddr, size_t>>(ranges.data(), ranges.size()), delta);
+            UpdateRuns(std::span<const std::pair<VAddr, size_t>>(ranges.data(), ranges.size()),
+                       delta);
             ranges.clear();
             return;
         }
@@ -350,9 +351,29 @@ struct WordManager {
             }
         }
         // Use batch API to reduce lock acquisitions and contention.
-        tracker->UpdatePagesCachedBatch(
-            std::span<const std::pair<VAddr, size_t>>(coalesced.data(), coalesced.size()), delta);
+        UpdateRuns(std::span<const std::pair<VAddr, size_t>>(coalesced.data(), coalesced.size()),
+                   delta);
         ranges.clear();
+    }
+
+    /// UpdatePagesCachedBatch, or with t_deferred_page_caching set, untracking kept for the
+    /// caller to apply after it drops the buffer cache's lock. Tracking applies at once: counts
+    /// add up in any order, and with only untracking late a page's count never drops below what
+    /// it is due (it stays protected a little longer).
+    void UpdateRuns(std::span<const std::pair<VAddr, size_t>> runs, int delta) const {
+        if (DeferredPageCaching* const deferred = t_deferred_page_caching;
+            deferred != nullptr && delta < 0) [[unlikely]] {
+            deferred->Add(
+                tracker,
+                [](void* deferred_tracker, std::span<const DeferredPageCaching::Run> runs_,
+                   s32 run_delta) {
+                    static_cast<DeviceTracker*>(deferred_tracker)
+                        ->UpdatePagesCachedBatch(runs_, run_delta);
+                },
+                runs, static_cast<s32>(delta));
+            return;
+        }
+        tracker->UpdatePagesCachedBatch(runs, delta);
     }
 
     /// Merges the contiguous neighbours of sorted, disjoint runs where they lie (no copy).

@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <mutex>
 #include <utility>
@@ -26,6 +27,33 @@ public:
     ~GPUDirtyMemoryManager() = default;
 
     void Collect(PAddr address, size_t size) {
+        // A transform covers one 2 KiB page: a write past its page goes in a page at a time. Its
+        // mask was otherwise built with shifts of 32 or more, which could leave it wrong or empty
+        // and lose the write (zortos293/Lichii#1586, #1591).
+        if ((address & page_mask) + size <= page_size || !SplitAcrossPages()) [[likely]] {
+            CollectInPage(address, size);
+            return;
+        }
+        while (size != 0) {
+            const size_t in_page = (std::min<size_t>)(size, page_size - (address & page_mask));
+            CollectInPage(address, in_page);
+            address += in_page;
+            size -= in_page;
+        }
+    }
+
+    /// EDEN_NX2_COLLECT_SPLIT=0: a write crossing a 2 KiB page is collected as one transform, as
+    /// before.
+    [[nodiscard]] static bool SplitAcrossPages() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_COLLECT_SPLIT");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+
+private:
+    void CollectInPage(PAddr address, size_t size) {
         TransformAddress t = BuildTransform(address, size);
         TransformAddress tmp, original;
         do {
@@ -54,6 +82,7 @@ public:
         }
     }
 
+public:
     [[nodiscard]] static bool AnyWrites() {
         return any_writes.load(std::memory_order_seq_cst) ||
                any_gatherers.load(std::memory_order_seq_cst) != 0;

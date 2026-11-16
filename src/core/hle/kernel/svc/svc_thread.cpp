@@ -13,6 +13,7 @@
 #include <optional>
 #include <thread>
 
+#include "common/nx2_poll.h"
 #include "common/perf_report.h"
 #include "common/perf_sched.h"
 #include "common/scope_exit.h"
@@ -294,7 +295,7 @@ Result StartThread(Core::System& system, Handle thread_handle) {
                 std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
             while (!thread->HasEnteredKernel() && !thread->IsTerminationRequested() &&
                    std::chrono::steady_clock::now() < deadline) {
-                std::this_thread::yield();
+                Common::PollWait();
             }
         }
     }
