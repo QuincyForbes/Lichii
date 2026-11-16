@@ -37,7 +37,10 @@ Device::Device() {
             break;
         }
     }
-    mesh_shaders = apple_family >= 7 || [device supportsFamily:MTLGPUFamilyMac2];
+    // Mesh pipelines are a Metal 3 feature: a Mac2 GPU without Metal 3 (the paravirtual GPU of a
+    // macOS VM) has none.
+    mesh_shaders = [device supportsFamily:MTLGPUFamilyMetal3] &&
+                   (apple_family >= 7 || [device supportsFamily:MTLGPUFamilyMac2]);
 #if TARGET_OS_IPHONE
     bc_textures = false;
     if (@available(iOS 16.4, *)) {
@@ -64,6 +67,10 @@ u64 Device::MemoryBudget() const {
 #else
     return device.recommendedMaxWorkingSetSize;
 #endif
+}
+
+u64 Device::AllocatedSize() const {
+    return device.currentAllocatedSize;
 }
 
 } // namespace Metal

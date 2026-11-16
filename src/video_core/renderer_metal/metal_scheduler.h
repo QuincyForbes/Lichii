@@ -6,6 +6,7 @@
 #include <array>
 #include <memory>
 #include <optional>
+#include <string>
 
 #include "common/common_types.h"
 #include "video_core/renderer_metal/metal_object.h"
@@ -92,6 +93,62 @@ struct BlitPass {
     BlitBlend blend{BlitBlend::None};
 };
 
+/// A copy between a multisampled texture and a single-sampled one that holds each sample as a
+/// texel, as the guest sees a multisampled image (sample s of pixel p at texel
+/// (p << shift) | (s & (2^shift.x - 1), s >> shift.x)). Colour and depth formats.
+struct SampleCopy {
+    TextureHandle src{};    ///< The multisampled texture (2D multisample array), or the 2D one
+    u32 src_layer{};        ///< Layer of a multisampled source
+    Attachment dst{};       ///< The single-sampled texel grid, or the multisampled texture
+    u32 dst_format{};       ///< MTLPixelFormat of dst
+    u32 dst_width{};        ///< dst's size at its level
+    u32 dst_height{};
+    u32 samples{};          ///< Samples of the multisampled side
+    std::array<u32, 2> shift{}; ///< log2 of the guest's samples across and down
+};
+
+/// A nearest scaling of a whole layer that Blit can't draw: a multisampled source into a
+/// texture of its sample count (sample for sample), or a stencil-only one (the fragment exports
+/// the stencil). Resolution scaling of such images (Image::CopyScaled).
+struct ScalePass {
+    TextureHandle src{};  ///< A 2D multisample array, or a Stencil8 2D array view of one level
+    u32 src_layer{};
+    u32 src_width{};
+    u32 src_height{};
+    Attachment dst{};
+    u32 dst_format{};
+    u32 dst_width{};
+    u32 dst_height{};
+};
+
+/// A conversion between a depth and a colour image (Vulkan's BlitImageHelper::Convert*).
+enum class ConvertKind : u8 {
+    DepthToColor, ///< D32F / D16 / X8D24 -> R32F, R16, ABGR8 (depth in every channel, alpha 1)
+    ColorToDepth, ///< R32F / R16 -> D32F / D16 (red as the depth)
+    Abgr8ToD32f,
+    X8d24ToAbgr8,
+    Abgr8ToX8d24,
+    D24s8ToAbgr8, ///< S8_UINT_D24_UNORM's bytes
+    S8d24ToAbgr8, ///< D24_UNORM_S8_UINT's bytes
+    Abgr8ToD24s8, ///< Depth and stencil (stencil exported by the fragment)
+};
+
+struct ConvertPass {
+    TextureHandle src{}; ///< A 2D view
+    Attachment dst{};
+    u32 dst_format{};
+    u32 width{};
+    u32 height{};
+    ConvertKind kind{};
+};
+
+/// How the guest lays out depth and stencil in memory (OpenGL's GL_UNSIGNED_INT_24_8 and
+/// GL_FLOAT_32_UNSIGNED_INT_24_8_REV, which take the guest's bytes as they are).
+enum class DepthLayout : u8 {
+    Packed24_8,   ///< u32: depth in the high 24 bits, stencil in the low 8 (D24S8, S8D24, X8D24)
+    Float32_X24S8, ///< f32 depth, then u32 with the stencil in the low 8 bits
+};
+
 /// The attachments draws render into. Equal sets share one render encoder.
 struct RenderTargetSet {
     std::array<Attachment, 8> color{};
@@ -100,6 +157,8 @@ struct RenderTargetSet {
     bool has_stencil{};
     u32 width{};
     u32 height{};
+    /// Layers a program may choose between (its layer output); 1: the bound slice alone.
+    u32 layers{1};
 
     bool operator==(const RenderTargetSet&) const noexcept = default;
 };
@@ -128,6 +187,9 @@ enum class ShaderStage : u8 {
     Vertex,
     Fragment,
     Compute,
+    /// The object and mesh functions of a mesh pipeline (on the render encoder).
+    Object,
+    Mesh,
 };
 
 /// Encoder state of a draw besides its bindings.
@@ -145,6 +207,12 @@ struct DrawState {
     u32 stencil_front_ref{};
     u32 stencil_back_ref{};
     std::array<f32, 4> blend_color{};
+    /// Viewports and scissors 1-15 follow 0 when a program writes the viewport index: 16, else 1.
+    u8 viewport_count{1};
+    std::array<Viewport, 15> more_viewports{};
+    std::array<Scissor, 15> more_scissors{};
+    /// Triangles drawn as their edges (MTLTriangleFillModeLines).
+    bool fill_lines{};
 };
 
 /// Records Metal work in submission order on one command queue. Copies go to one blit encoder
@@ -185,7 +253,26 @@ public:
 
     /// The tick a guest fence queued now waits for. Pending work is committed for it; with none
     /// it is the last tick committed, and no command buffer is made (EDEN_NX2_METAL_FENCE_IDLE).
+    /// On the split's back within EDEN_NX2_FENCE_FLUSH_US of the last commit the work stays
+    /// pending (EDEN_NX2_METAL_FENCE_BATCH), as Vulkan's DeferFlush: the next commit, a fence
+    /// past the window or the back going idle (FlushDeferredFromIdle) sends it.
     u64 FenceTick();
+
+    /// The back's idle hook: commits work a fence left pending; whether it did.
+    bool FlushDeferredFromIdle(bool requested);
+
+    /// Commits work a fence left pending (FenceManager::SubmitDeferredWork).
+    void FlushDeferred();
+
+    /// The back's idle check: whether pending fence work may wait a little longer for more.
+    [[nodiscard]] bool DeferredFlushMayWait() const;
+
+    /// Whether the GPU has more than one command buffer of earlier work left to run.
+    [[nodiscard]] bool GpuBehind() const noexcept;
+
+    /// Since the last call: fences whose work was left pending, and the commits of such work by
+    /// the idle hook.
+    [[nodiscard]] std::array<u64, 2> TakeDeferredFences() noexcept;
 
     /// ahead: recorded before everything else of the segment (see CanUploadAhead), leaving the
     /// open encoder as it is.
@@ -246,6 +333,32 @@ public:
     /// False when no pipeline can draw into dst's format (the blit is dropped).
     bool Blit(const BlitPass& pass);
 
+    /// Multisampled src into its texel grid in dst (`expand`), or a texel grid into multisampled
+    /// dst. False when no pipeline draws it (stencil, or a format of no colour or depth class).
+    bool CopySamples(const SampleCopy& copy, bool expand);
+
+    /// False when no pipeline draws the conversion into dst's format (nothing is drawn).
+    bool Convert(const ConvertPass& pass);
+
+    /// False when no pipeline scales into dst's format (a depth-stencil multisampled one).
+    bool ScaleNearest(const ScalePass& pass);
+
+    /// Guest depth (and stencil) bytes from `src` into a region of a depth or depth-stencil
+    /// texture: drawn, the fragment writing depth and stencil (Metal's blit copies take depth and
+    /// stencil as separate planes, and there is no 24-bit depth).
+    bool DepthFromBuffer(BufferHandle src, u64 offset, u32 bytes_per_row, TextureHandle dst,
+                         u32 level, u32 slice, Offset3D origin, Extent3D extent,
+                         DepthLayout layout);
+
+    /// The other way: a kernel reads depth (and stencil) and writes the guest's bytes.
+    bool DepthToBuffer(TextureHandle src, u32 level, u32 slice, Offset3D origin, Extent3D extent,
+                       BufferHandle dst, u64 offset, u32 bytes_per_row, DepthLayout layout);
+
+    /// Resolves layer `src_slice` of multisampled `src` into dst with a render pass's resolve
+    /// store action (the average of colour samples; sample 0 of depth, stencil kept). The
+    /// whole texture: Metal resolves the render area.
+    bool Resolve(TextureHandle src, u32 src_slice, const Attachment& dst, u32 width, u32 height);
+
     /// Opens a render encoder on the targets (loading their contents), or keeps the open one
     /// when they are the same.
     void BeginRendering(const RenderTargetSet& targets);
@@ -265,6 +378,9 @@ public:
 
     /// The visibility results (one u64 per slot), readable once the GPU is done with them.
     [[nodiscard]] u64* VisibilityResults() noexcept;
+
+    /// The visibility result buffer itself, for kernels reading the results in GPU order.
+    [[nodiscard]] BufferHandle VisibilityBuffer() const noexcept;
 
     /// Changes whenever BeginRendering opens a new render encoder.
     [[nodiscard]] u64 RenderPassSerial() const noexcept;
@@ -313,6 +429,15 @@ public:
     /// post-tessellation vertex function from its buffers.
     void DrawPatches(u32 control_points, u32 patch_count);
 
+    /// A mesh pipeline's draw: `groups` object threadgroups (mesh threadgroups without an object
+    /// function) along x.
+    void DrawMeshThreadgroups(u32 groups, u32 object_threads, u32 mesh_threads);
+
+    /// The same with the threadgroup counts (MTLDispatchThreadgroupsIndirectArguments: three u32)
+    /// at `offset` of `buffer`.
+    void DrawMeshThreadgroupsIndirect(BufferHandle buffer, u64 offset, u32 object_threads,
+                                      u32 mesh_threads);
+
     /// index_size: 2 or 4 bytes.
     void DrawIndexed(u32 primitive, u32 index_count, u32 index_size, BufferHandle index_buffer,
                      u64 index_offset, u32 instance_count, s32 base_vertex, u32 base_instance);
@@ -336,7 +461,18 @@ public:
     /// of each, and the heartbeat that runs until the first guest frame).
     void NotePresent(bool guest_picture);
 
+    /// Vulkan's EDEN_NX2_PASS_TIMES=<s> (read under EDEN_NX2_METAL_VULKAN_SWITCHES): one frame
+    /// in that many seconds has each render pass timed at its stage boundaries (Metal's counter
+    /// sample buffers), resolved once the GPU is done with it ("Perf Metal passes:" line).
+    /// Called at each guest frame's present.
+    void PassTimesFrameEnd();
+
+    /// The last "Perf Metal passes:" text, empty when there was none since the last call.
+    [[nodiscard]] std::string TakePassTimesLine();
+
 private:
+    void ResolvePassTimes();
+
     struct Impl;
     std::unique_ptr<Impl> impl;
 };

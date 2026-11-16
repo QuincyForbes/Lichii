@@ -654,6 +654,7 @@ set(METAL_RENDERER_CXX_SOURCES
     renderer_metal/metal_pipeline_check.cpp
     renderer_metal/metal_pipeline_files.cpp
     renderer_metal/metal_pipeline_translate.cpp
+    renderer_metal/metal_present.cpp
     renderer_metal/metal_rasterizer.cpp
     renderer_metal/metal_shader_translate.cpp
     renderer_metal/metal_staging_buffer_pool.cpp
@@ -689,7 +690,9 @@ if (ENABLE_METAL)
         ${METAL_RENDERER_CXX_SOURCES}
         renderer_metal/metal_archive.h
         renderer_metal/metal_bridge.h
+        renderer_metal/metal_build_job.h
         renderer_metal/metal_buffer_cache.h
+        renderer_metal/metal_condition.h
         renderer_metal/metal_coverage.h
         renderer_metal/metal_device.h
         renderer_metal/metal_draw_desc.h
@@ -697,9 +700,12 @@ if (ENABLE_METAL)
         renderer_metal/metal_formats.h
         renderer_metal/metal_graphics.h
         renderer_metal/metal_index_convert.h
+        renderer_metal/metal_mesh_indirect.h
+        renderer_metal/metal_indirect.h
         renderer_metal/metal_object.h
         renderer_metal/metal_ocarina.h
         renderer_metal/metal_pipeline_cache.h
+        renderer_metal/metal_present.h
         renderer_metal/metal_pipeline_files.h
         renderer_metal/metal_pipeline_translate.h
         renderer_metal/metal_rasterizer.h
@@ -708,7 +714,9 @@ if (ENABLE_METAL)
         renderer_metal/metal_shader_translate.h
         renderer_metal/metal_staging_buffer_pool.h
         renderer_metal/metal_swapchain.h
+        renderer_metal/metal_switches.h
         renderer_metal/metal_temporal.h
+        renderer_metal/metal_work_policy.h
         renderer_metal/metal_texture_cache.h
         renderer_metal/renderer_metal.h
     )
@@ -719,7 +727,7 @@ if (ENABLE_METAL)
         SKIP_PRECOMPILE_HEADERS ON
         SKIP_UNITY_BUILD_INCLUSION ON)
     target_link_libraries(video_core PRIVATE spirv-cross-msl "-framework Metal"
-                                             "-framework QuartzCore" "-framework Foundation")
+                                             "-framework QuartzCore" "-framework CoreGraphics" "-framework Foundation")
     target_compile_definitions(video_core PUBLIC LICHII_METAL_RENDERER)
 
     # Offscreen check for machines without a window (the macOS CI runner): raw Metal, then the
@@ -729,24 +737,32 @@ if (ENABLE_METAL)
         set(METAL_SMOKE_HEADERS)
         foreach (SMOKE_FILE translate_smoke.comp texel_buffer_smoke.comp texture_1d_smoke.comp
                             tess_smoke.vert tess_smoke.tesc tess_smoke.tese
-                            device_msl_smoke.vert device_msl_smoke.frag)
+                            device_msl_smoke.vert device_msl_smoke.frag
+                            native_mesh_smoke.task native_mesh_smoke.mesh native_mesh_smoke.frag)
             string(REPLACE "." "_" SMOKE_SHADER "${SMOKE_FILE}")
             string(TOUPPER "${SMOKE_SHADER}_SPV" SMOKE_VARIABLE)
             set(SMOKE_HEADER ${METAL_SMOKE_DIR}/${SMOKE_SHADER}_spv.h)
             set(SMOKE_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/renderer_metal/smoke/${SMOKE_FILE})
+            # SPV_EXT_mesh_shader needs SPIR-V 1.4.
+            set(SMOKE_TARGET_ENV spirv1.3)
+            if (SMOKE_FILE MATCHES "^native_mesh_smoke")
+                set(SMOKE_TARGET_ENV spirv1.4)
+            endif()
             add_custom_command(
                 OUTPUT ${SMOKE_HEADER}
                 COMMAND ${CMAKE_COMMAND} -E make_directory ${METAL_SMOKE_DIR}
-                COMMAND ${GLSLANGVALIDATOR} -V --target-env spirv1.3
+                COMMAND ${GLSLANGVALIDATOR} -V --target-env ${SMOKE_TARGET_ENV}
                         --variable-name ${SMOKE_VARIABLE} -o ${SMOKE_HEADER} ${SMOKE_SOURCE}
                 MAIN_DEPENDENCY ${SMOKE_SOURCE})
             list(APPEND METAL_SMOKE_HEADERS ${SMOKE_HEADER})
         endforeach()
         add_executable(lichii-metal-smoke renderer_metal/metal_smoke.mm
                        renderer_metal/metal_smoke_probe.h renderer_metal/metal_smoke_probe.mm
+                       renderer_metal/metal_smoke_textures.h renderer_metal/metal_smoke_textures.mm
                        ${METAL_SMOKE_HEADERS})
         set_source_files_properties(renderer_metal/metal_smoke.mm
-                                    renderer_metal/metal_smoke_probe.mm PROPERTIES
+                                    renderer_metal/metal_smoke_probe.mm
+                                    renderer_metal/metal_smoke_textures.mm PROPERTIES
             LANGUAGE CXX
             COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
         target_include_directories(lichii-metal-smoke PRIVATE ${METAL_SMOKE_DIR})
@@ -767,6 +783,7 @@ elseif (LICHII_METAL_COMPILE_CHECK)
     add_executable(lichii-metal-replay
         renderer_metal/metal_replay.cpp
         renderer_metal/metal_replay_stubs.cpp
+        renderer_metal/metal_coverage.cpp
         renderer_metal/metal_draw_desc.cpp
         renderer_metal/metal_formats.cpp
         renderer_metal/metal_index_convert.cpp

@@ -13,24 +13,38 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <span>
 #include <string>
 #include <system_error>
 #include <thread>
+#include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
+#include <mach-o/dyld.h>
+#include <spawn.h>
+#include <sys/wait.h>
+
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/attribute.h"
+#include "common/settings.h"
+#include "common/settings_enums.h"
 #include "shader_recompiler/shader_info.h"
 #include "device_msl_smoke_frag_spv.h"
 #include "device_msl_smoke_vert_spv.h"
+#include "native_mesh_smoke_frag_spv.h"
+#include "native_mesh_smoke_mesh_spv.h"
+#include "native_mesh_smoke_task_spv.h"
 #include "tess_smoke_tesc_spv.h"
 #include "tess_smoke_tese_spv.h"
 #include "tess_smoke_vert_spv.h"
@@ -39,16 +53,26 @@
 #include "translate_smoke_comp_spv.h"
 #include "video_core/renderer_metal/metal_archive.h"
 #include "video_core/renderer_metal/metal_bridge.h"
+#include "video_core/renderer_metal/metal_condition.h"
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
+#include "video_core/renderer_metal/metal_mesh_indirect.h"
+#include "video_core/renderer_metal/metal_indirect.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
+#include "video_core/renderer_metal/metal_build_job.h"
 #include "video_core/renderer_metal/metal_pipeline_files.h"
+#include "video_core/renderer_metal/metal_present.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
 #include "video_core/renderer_metal/metal_smoke_probe.h"
+#include "video_core/renderer_metal/metal_smoke_textures.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
+#include "video_core/renderer_metal/metal_swapchain.h"
+#include "video_core/textures/texture.h"
+
+extern char** environ;
 
 namespace {
 
@@ -383,6 +407,256 @@ int RunRendererDraw() {
                 static_cast<unsigned long long>(indirect_samples), Size * Size / 2,
                 counted ? "PASS" : "FAIL");
     return drawn && counted ? 0 : 1;
+}
+
+/// A vertex stream whose stride is not a multiple of 4 (10 bytes: two floats and two bytes of
+/// padding, so most positions sit at addresses no float is aligned to), drawn as Metal takes it:
+/// two triangles over the whole target.
+int RunOddStride() {
+    using Maxwell = Metal::Maxwell;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, QuadSource, error);
+    const Metal::Object vertex = library ? Metal::CreateFunction(library.Get(), "quad_vertex")
+                                         : Metal::Object{};
+    const Metal::Object fragment =
+        library ? Metal::CreateFunction(library.Get(), "quad_fragment") : Metal::Object{};
+    if (!vertex || !fragment) {
+        std::printf("metal-smoke: FAIL odd stride shaders: %s\n", error.c_str());
+        return 1;
+    }
+    constexpr uint32_t Stride = 10;
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = vertex.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    desc.attributes[0] = {1, 0, 0, Maxwell::VertexAttribute::Type::Float,
+                          Maxwell::VertexAttribute::Size::Size_R32_G32};
+    desc.streams[0] = {1, Stride, 0};
+    const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
+    const Metal::Object depth_stencil =
+        Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+    if (!pipeline || !depth_stencil) {
+        std::printf("metal-smoke: FAIL odd stride: render pipeline with stride %u: %s\n", Stride,
+                    error.c_str());
+        return 1;
+    }
+    const std::array<std::array<float, 2>, 6> positions{
+        {{-1.0f, -1.0f}, {1.0f, -1.0f}, {1.0f, 1.0f}, {-1.0f, -1.0f}, {1.0f, 1.0f}, {-1.0f, 1.0f}}};
+    uint8_t* vertices = nullptr;
+    const Metal::Object vertex_buffer =
+        Metal::CreateBuffer(device, positions.size() * Stride, true, &vertices);
+    std::memset(vertices, 0x7F, positions.size() * Stride);
+    for (size_t index = 0; index < positions.size(); ++index) {
+        std::memcpy(vertices + index * Stride, positions[index].data(), sizeof(positions[index]));
+    }
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm),
+                 .width = Size,
+                 .height = Size,
+                 .render_target = true});
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Size * Size * 4, true, &readback);
+    Metal::ClearPass clear{};
+    clear.color[0] = {.texture = target.Get()};
+    clear.clear_color[0] = true;
+    clear.color_value[0] = {1.0, 0.0, 0.0, 1.0};
+    clear.width = Size;
+    clear.height = Size;
+    scheduler.Clear(clear);
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = Size;
+    targets.height = Size;
+    scheduler.BeginRendering(targets);
+    Metal::DrawState state{};
+    state.pipeline = pipeline.Get();
+    state.depth_stencil = depth_stencil.Get();
+    state.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+    state.scissor = {0, 0, Size, Size};
+    scheduler.SetDrawState(state);
+    scheduler.SetVisibility(std::nullopt);
+    scheduler.BindVertexBuffer(Metal::VertexBufferSlot(0), vertex_buffer.Get(), 0);
+    scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0,
+                   static_cast<uint32_t>(positions.size()), 1, 0);
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Size, Size, 1}, readback_buffer.Get(),
+                                  0, Size * 4, 0);
+    scheduler.Finish();
+    const auto* texels = reinterpret_cast<const Texel*>(readback);
+    uint32_t wrong = 0;
+    for (uint32_t texel = 0; texel < Size * Size; ++texel) {
+        wrong += Near(texels[texel], {0, 255, 0, 255}) ? 0 : 1;
+    }
+    std::printf("metal-smoke: vertex stride %u (not a multiple of 4), Apple%u: %u of %u texels "
+                "not drawn: %s\n",
+                Stride, device.AppleFamily(), wrong, Size * Size, wrong == 0 ? "PASS" : "FAIL");
+    return wrong == 0 ? 0 : 1;
+}
+
+/// Integer 10:10:10:2 attributes (Metal has the format normalized only): the layout gives the
+/// attribute a source of its own as four 16-bit integers, and the kernel widens unsigned and
+/// signed values, read at an offset no word is aligned to, from a stream with a 6-byte stride.
+int RunVertexUnpack() {
+    using Maxwell = Metal::Maxwell;
+    using Type = Maxwell::VertexAttribute::Type;
+    using Size = Maxwell::VertexAttribute::Size;
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.attributes[0] = {1, 0, 2, Type::SInt, Size::Size_A2_B10_G10_R10};
+    desc.streams[0] = {1, 6, 0};
+    Metal::VertexSources sources;
+    std::string reason;
+    const bool sanitised = Metal::SanitizeVertexLayout(desc, 1, 0, sources, reason);
+    const bool layout = !Metal::VertexUnpackEnabled() ||
+                        (sanitised && sources.count == 1 && sources.streams[0].unpack == 2 &&
+                         sources.streams[0].shift == 2 && desc.streams[0].stride == 8 &&
+                         desc.attributes[0].offset == 0 &&
+                         desc.attributes[0].size == Size::Size_R16_G16_B16_A16);
+
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    std::string error;
+    const Metal::Object library =
+        Metal::CreateLibrary(device, Metal::VertexUnpackKernelSource(), error);
+    const Metal::Object function =
+        library ? Metal::CreateFunction(library.Get(), "unpack_1010102") : Metal::Object{};
+    const Metal::Object kernel =
+        function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                 : Metal::Object{};
+    if (!kernel) {
+        std::printf("metal-smoke: FAIL vertex unpack kernel: %s\n", error.c_str());
+        return 1;
+    }
+    constexpr uint32_t Count = 5;
+    constexpr uint32_t Stride = 6;
+    constexpr uint32_t Offset = 2;
+    uint8_t* source = nullptr;
+    const Metal::Object source_buffer = Metal::CreateBuffer(device, Count * Stride + 8, true, &source);
+    std::array<uint32_t, Count> packed{};
+    for (uint32_t element = 0; element < Count; ++element) {
+        packed[element] = element * 0x2E8BA2E9U + 0x1234567U;
+        std::memcpy(source + Offset + element * Stride, &packed[element], 4);
+    }
+    std::array<Metal::Object, 2> outputs;
+    std::array<uint8_t*, 2> contents{};
+    scheduler.BeginCompute(kernel.Get());
+    for (uint32_t is_signed = 0; is_signed < 2; ++is_signed) {
+        outputs[is_signed] = Metal::CreateBuffer(device, Count * 8, true, &contents[is_signed]);
+        const Metal::VertexUnpackParams params{
+            .count = Count, .stride = Stride, .is_signed = is_signed, .offset = Offset};
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, source_buffer.Get(), 0);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, outputs[is_signed].Get(), 0);
+        scheduler.BindBytes(Metal::ShaderStage::Compute, 2, &params,
+                            static_cast<uint32_t>(sizeof(params)));
+        scheduler.Dispatch({1, 1, 1}, {64, 1, 1});
+    }
+    scheduler.Finish();
+    uint32_t wrong = 0;
+    for (uint32_t is_signed = 0; is_signed < 2; ++is_signed) {
+        for (uint32_t element = 0; element < Count; ++element) {
+            const uint32_t value = packed[element];
+            const std::array<uint32_t, 4> fields{value & 0x3FF, (value >> 10) & 0x3FF,
+                                                 (value >> 20) & 0x3FF, value >> 30};
+            for (uint32_t component = 0; component < 4; ++component) {
+                const uint32_t bits = component == 3 ? 2 : 10;
+                int32_t expected = static_cast<int32_t>(fields[component]);
+                if (is_signed != 0 && (fields[component] >> (bits - 1)) != 0) {
+                    expected -= 1 << bits;
+                }
+                uint16_t got;
+                std::memcpy(&got, contents[is_signed] + element * 8 + component * 2, 2);
+                const int32_t value_got =
+                    is_signed != 0 ? static_cast<int16_t>(got) : static_cast<int32_t>(got);
+                wrong += value_got != expected ? 1 : 0;
+            }
+        }
+    }
+    // More streams than slots: 28 slots of the function's own buffers leave three, so streams 0
+    // and 1 get theirs and streams 2 and 3 (float2 at 4 of a 12-byte stride, float at 0 of 8)
+    // are gathered into the last one.
+    auto many = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    for (uint32_t stream = 0; stream < 4; ++stream) {
+        many.attributes[stream] = {1, stream, stream == 2 ? 4U : 0U, Type::Float,
+                                   stream == 2 ? Size::Size_R32_G32 : Size::Size_R32};
+        many.streams[stream] = {1, stream == 2 ? 12U : 8U, 0};
+    }
+    Metal::VertexSources many_sources;
+    std::string many_reason;
+    const bool many_sanitised =
+        Metal::SanitizeVertexLayout(many, 0xF, 28, many_sources, many_reason);
+    const bool gather_layout =
+        !Metal::VertexGatherEnabled() ||
+        (many_sanitised && many_sources.count == 3 && many_sources.gather_slot == 2 &&
+         many_sources.gathered_count == 2 && many_sources.gather_stride == 12 &&
+         many.attributes[2].stream == 2 && many.attributes[2].offset == 0 &&
+         many.attributes[3].stream == 2 && many.attributes[3].offset == 8 &&
+         many.streams[2].stride == 12);
+    const Metal::Object gather_library =
+        Metal::CreateLibrary(device, Metal::VertexGatherKernelSource(), error);
+    const Metal::Object gather_function =
+        gather_library ? Metal::CreateFunction(gather_library.Get(), "gather_vertices")
+                       : Metal::Object{};
+    const Metal::Object gather =
+        gather_function ? Metal::CreateComputePipelineState(device, gather_function.Get(), error)
+                        : Metal::Object{};
+    if (!gather) {
+        std::printf("metal-smoke: FAIL vertex gather kernel: %s\n", error.c_str());
+        return 1;
+    }
+    constexpr uint32_t Vertices = 4;
+    uint8_t* stream_a = nullptr;
+    uint8_t* stream_b = nullptr;
+    uint8_t* gathered = nullptr;
+    const Metal::Object buffer_a = Metal::CreateBuffer(device, Vertices * 12, true, &stream_a);
+    const Metal::Object buffer_b = Metal::CreateBuffer(device, Vertices * 8, true, &stream_b);
+    const Metal::Object gathered_buffer =
+        Metal::CreateBuffer(device, Vertices * 12, true, &gathered);
+    for (uint32_t byte = 0; byte < Vertices * 12; ++byte) {
+        stream_a[byte] = static_cast<uint8_t>(byte * 7 + 1);
+        gathered[byte] = 0;
+    }
+    for (uint32_t byte = 0; byte < Vertices * 8; ++byte) {
+        stream_b[byte] = static_cast<uint8_t>(byte * 11 + 3);
+    }
+    scheduler.BeginCompute(gather.Get());
+    const std::array<std::pair<const Metal::Object*, Metal::VertexGatherParams>, 2> copies{{
+        {&buffer_a, {.count = Vertices, .stride = 12, .offset = 4, .bytes = 8,
+                     .gathered_stride = 12, .gathered_offset = 0}},
+        {&buffer_b, {.count = Vertices, .stride = 8, .offset = 0, .bytes = 4,
+                     .gathered_stride = 12, .gathered_offset = 8}},
+    }};
+    for (const auto& [buffer, params] : copies) {
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, buffer->Get(), 0);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, gathered_buffer.Get(), 0);
+        scheduler.BindBytes(Metal::ShaderStage::Compute, 2, &params,
+                            static_cast<uint32_t>(sizeof(params)));
+        scheduler.Dispatch({1, 1, 1}, {64, 1, 1});
+    }
+    scheduler.Finish();
+    uint32_t gather_wrong = 0;
+    for (uint32_t vertex = 0; vertex < Vertices; ++vertex) {
+        gather_wrong += std::memcmp(gathered + vertex * 12, stream_a + vertex * 12 + 4, 8) != 0;
+        gather_wrong += std::memcmp(gathered + vertex * 12 + 8, stream_b + vertex * 8, 4) != 0;
+    }
+    const bool passed = layout && wrong == 0 && gather_layout && gather_wrong == 0;
+    std::printf("metal-smoke: 10:10:10:2 integer attribute: layout %s (%s), %u of %u widened "
+                "components wrong; streams past the slots: layout %s (%s), %u of %u gathered "
+                "attributes wrong: %s\n",
+                !Metal::VertexUnpackEnabled() ? "off (EDEN_NX2_METAL_VERTEX_UNPACK=0)"
+                : layout                      ? "own source of 16-bit integers"
+                                              : "WRONG",
+                reason.c_str(), wrong, Count * 8,
+                !Metal::VertexGatherEnabled() ? "off (EDEN_NX2_METAL_VERTEX_GATHER=0)"
+                : gather_layout               ? "two gathered into the last slot"
+                                              : "WRONG",
+                many_reason.c_str(), gather_wrong, Vertices * 2, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
 }
 
 /// A texel buffer read: GLSL samplerBuffer -> SPIR-V -> translator (native texture_buffer), the
@@ -872,7 +1146,12 @@ int RunIndexRewrite() {
     const Metal::Object state =
         function ? Metal::CreateComputePipelineState(device, function.Get(), error)
                  : Metal::Object{};
-    if (!state) {
+    const Metal::Object strip_function =
+        library ? Metal::CreateFunction(library.Get(), "rewrite_restart_strip") : Metal::Object{};
+    const Metal::Object strip_state =
+        strip_function ? Metal::CreateComputePipelineState(device, strip_function.Get(), error)
+                       : Metal::Object{};
+    if (!state || !strip_state) {
         std::printf("metal-smoke: FAIL index rewrite kernel: %s\n", error.c_str());
         return 1;
     }
@@ -891,16 +1170,24 @@ int RunIndexRewrite() {
         uint32_t converted{};
     };
     std::vector<Case> cases;
-    for (const Topology topology : {Topology::Quads, Topology::QuadStrip, Topology::TriangleFan,
-                                    Topology::LineLoop, Topology::TriangleStrip}) {
+    for (const Topology topology :
+         {Topology::Quads, Topology::QuadStrip, Topology::TriangleFan, Topology::LineLoop,
+          Topology::TriangleStrip, Topology::LinesAdjacency, Topology::LineStripAdjacency,
+          Topology::TrianglesAdjacency, Topology::TriangleStripAdjacency}) {
         for (const uint32_t index_size : {1U, 2U, 4U}) {
             cases.push_back({topology, index_size, topology == Topology::TriangleStrip});
         }
     }
-    // Rewritten for the provoking vertex (EDEN_NX2_METAL_PROVOKING_LAST): strips without restarts.
-    for (const Topology topology : {Topology::Triangles, Topology::TriangleStrip}) {
+    // Rewritten for the last vertex convention (EDEN_NX2_METAL_PROVOKING_LAST): every line and
+    // triangle topology, strips also with restarts (kernel rewrite_restart_strip).
+    for (const Topology topology :
+         {Topology::Triangles, Topology::TriangleStrip, Topology::Quads, Topology::QuadStrip,
+          Topology::TriangleFan, Topology::Lines, Topology::LineStrip, Topology::LineLoop}) {
         for (const uint32_t index_size : {1U, 2U, 4U}) {
             cases.push_back({topology, index_size, false, true});
+            if (topology == Topology::TriangleStrip) {
+                cases.push_back({topology, index_size, true, true});
+            }
         }
     }
     // One source for all: bytes that make different values at each size, with restart values.
@@ -908,22 +1195,27 @@ int RunIndexRewrite() {
         source[SourceOffset + byte] = static_cast<uint8_t>(byte * 37 + 5);
     }
     std::memset(source + SourceOffset + 4 * 2, 0xFF, 4);
-    scheduler.BeginCompute(state.Get());
     for (Case& test : cases) {
         test.converted = IndexConvert::ConvertedCount(test.topology, Count, test.provoking_last);
         test.output = Metal::CreateBuffer(device, test.converted * 4, true, &test.contents);
         const IndexConvert::RewriteParams params{
-            .mode = IndexConvert::RewriteMode(test.topology, test.provoking_last),
+            .mode = IndexConvert::RewriteMode(test.topology, test.provoking_last, test.restart),
             .index_size = test.index_size,
             .count = Count,
             .restart = test.restart ? 1U : 0U,
             .converted = test.converted,
             .source_offset = SourceOffset,
         };
+        const bool strip = params.mode == IndexConvert::StripRestartMode;
+        scheduler.BeginCompute(strip ? strip_state.Get() : state.Get());
         scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, source_buffer.Get(), 0);
         scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, test.output.Get(), 0);
         scheduler.BindBytes(Metal::ShaderStage::Compute, 2, &params, sizeof(params));
-        scheduler.Dispatch({(test.converted + 63) / 64, 1, 1}, {64, 1, 1});
+        if (strip) {
+            scheduler.Dispatch({1, 1, 1}, {IndexConvert::StripRestartThreads, 1, 1});
+        } else {
+            scheduler.Dispatch({(test.converted + 63) / 64, 1, 1}, {64, 1, 1});
+        }
     }
     scheduler.Finish();
     uint32_t wrong = 0;
@@ -942,9 +1234,11 @@ int RunIndexRewrite() {
         total += test.converted;
     }
     // A strip with a restart, rewritten for the provoking vertex on the CPU: each part on its own,
-    // every triangle starting with its last vertex and keeping its winding.
+    // every triangle starting with its last vertex and keeping its winding, the triangles across
+    // the restart degenerate.
     const std::array<uint16_t, 9> strip{0, 1, 2, 3, 0xFFFF, 4, 5, 6, 7};
-    const std::array<uint32_t, 12> strip_expected{2, 0, 1, 3, 2, 1, 6, 4, 5, 7, 6, 5};
+    const std::array<uint32_t, 21> strip_expected{2, 0, 1, 3, 2, 1, 0, 0, 0, 0, 0, 0,
+                                                  0, 0, 0, 6, 4, 5, 7, 6, 5};
     std::array<uint32_t, 21> strip_out{};
     const uint32_t strip_written = IndexConvert::Convert(
         Topology::TriangleStrip,
@@ -953,10 +1247,27 @@ int RunIndexRewrite() {
     const bool strip_passed =
         strip_written == strip_expected.size() &&
         std::equal(strip_expected.begin(), strip_expected.end(), strip_out.begin());
-    const bool passed = wrong == 0 && strip_passed;
+    // Adjacency without a geometry program, as Vulkan draws it: the adjacent vertices skipped.
+    const auto adjacency = [](Topology topology, uint32_t count) {
+        std::vector<uint32_t> out(IndexConvert::ConvertedCount(topology, count));
+        out.resize(IndexConvert::Convert(topology, {}, 0, 0, count, false, out));
+        return out;
+    };
+    const bool adjacency_passed =
+        !IndexConvert::AdjacencyEnabled() ||
+        (adjacency(Topology::LinesAdjacency, 8) == std::vector<uint32_t>{1, 2, 5, 6} &&
+         adjacency(Topology::LineStripAdjacency, 5) == std::vector<uint32_t>{1, 2, 3} &&
+         adjacency(Topology::TrianglesAdjacency, 12) ==
+             std::vector<uint32_t>{0, 2, 4, 6, 8, 10} &&
+         adjacency(Topology::TriangleStripAdjacency, 8) ==
+             std::vector<uint32_t>{0, 2, 4, 4, 2, 6});
+    const bool passed = wrong == 0 && strip_passed && adjacency_passed;
     std::printf("metal-smoke: index rewrite kernel vs CPU (%zu cases, %u indices): %u wrong; "
-                "provoking vertex strip with a restart %u indices: %s: %s\n",
+                "provoking vertex strip with a restart %u indices: %s; adjacency lists %s: %s\n",
                 cases.size(), total, wrong, strip_written, strip_passed ? "as expected" : "WRONG",
+                !IndexConvert::AdjacencyEnabled() ? "off (EDEN_NX2_METAL_ADJACENCY=0)"
+                : adjacency_passed                ? "as expected"
+                                                  : "WRONG",
                 passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
@@ -1044,6 +1355,157 @@ int RunOcarinaBilinear() {
                 sample[0], sample[1], sample[2], wrong, (TargetSize - 2) * (TargetSize - 2),
                 wrong == 0 ? "PASS" : "FAIL");
     return wrong == 0 ? 0 : 1;
+}
+
+/// The Vulkan present filters on Metal (EDEN_NX2_METAL_PRESENT_FILTERS): every shader
+/// translated and built, then a 32x32 picture of four coloured quadrants through FXAA, SMAA and
+/// each scaling filter to a 64x64 target. Each quadrant's centre keeps its colour: wrong
+/// bindings, constants or a flipped picture show there.
+int RunPresentFilters() {
+    using Filter = Settings::ScalingFilter;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Metal::PresentPasses present(device, scheduler);
+    uint32_t shaders_failed = 0;
+    for (size_t shader = 0; shader < static_cast<size_t>(Metal::PresentPasses::Shader::Count);
+         ++shader) {
+        if (!present.Prepare(static_cast<Metal::PresentPasses::Shader>(shader))) {
+            std::printf("metal-smoke: present shader %zu not built (see the log)\n", shader);
+            ++shaders_failed;
+        }
+    }
+    constexpr uint32_t Source = 32;
+    constexpr uint32_t Target = 64;
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    const Metal::Object picture = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D, .format = rgba8, .width = Source, .height = Source});
+    const Metal::Object target = Metal::CreateTexture(device, {.kind = Metal::TextureKind::e2D,
+                                                               .format = rgba8,
+                                                               .width = Target,
+                                                               .height = Target,
+                                                               .render_target = true});
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer = Metal::CreateBuffer(device, Source * Source * 4, true, &upload);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Target * Target * 4, true, &readback);
+    if (!picture || !target || upload == nullptr || readback == nullptr) {
+        std::printf("metal-smoke: FAIL present filter textures\n");
+        return 1;
+    }
+    // Top left, top right, bottom left, bottom right.
+    constexpr std::array<std::array<uint8_t, 4>, 4> Quadrants{{
+        {200, 40, 40, 255},
+        {40, 200, 40, 255},
+        {40, 40, 200, 255},
+        {200, 200, 200, 255},
+    }};
+    for (uint32_t y = 0; y < Source; ++y) {
+        for (uint32_t x = 0; x < Source; ++x) {
+            const size_t quadrant = (y >= Source / 2 ? 2 : 0) + (x >= Source / 2 ? 1 : 0);
+            std::memcpy(upload + (y * Source + x) * 4, Quadrants[quadrant].data(), 4);
+        }
+    }
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Source * 4, 0, picture.Get(), 0, 0, {},
+                                  {Source, Source, 1});
+    scheduler.Finish();
+
+    struct Case {
+        const char* name;
+        Settings::AntiAliasing anti_aliasing;
+        Filter filter;
+    };
+    constexpr std::array Cases{
+        Case{"FXAA", Settings::AntiAliasing::Fxaa, Filter::Bilinear},
+        Case{"SMAA", Settings::AntiAliasing::Smaa, Filter::Bilinear},
+        Case{"FSR", Settings::AntiAliasing::None, Filter::Fsr},
+        Case{"SGSR", Settings::AntiAliasing::None, Filter::Sgsr},
+        Case{"SGSR edge", Settings::AntiAliasing::None, Filter::SgsrEdge},
+        Case{"bicubic", Settings::AntiAliasing::None, Filter::Bicubic},
+        Case{"zero tangent", Settings::AntiAliasing::None, Filter::ZeroTangent},
+        Case{"B-spline", Settings::AntiAliasing::None, Filter::BSpline},
+        Case{"Mitchell", Settings::AntiAliasing::None, Filter::Mitchell},
+        Case{"spline", Settings::AntiAliasing::None, Filter::Spline1},
+        Case{"Gaussian", Settings::AntiAliasing::None, Filter::Gaussian},
+        Case{"Lanczos", Settings::AntiAliasing::None, Filter::Lanczos},
+        Case{"ScaleForce", Settings::AntiAliasing::None, Filter::ScaleForce},
+        Case{"area", Settings::AntiAliasing::None, Filter::Area},
+        Case{"MMPX", Settings::AntiAliasing::None, Filter::Mmpx},
+        Case{"SMAA + FSR", Settings::AntiAliasing::Smaa, Filter::Fsr},
+    };
+    const auto within = [](uint8_t a, uint8_t b) { return (a > b ? a - b : b - a) <= 6; };
+    uint32_t failed = 0;
+    for (const Case& test : Cases) {
+        (void)present.TakePasses();
+        Metal::PresentPasses::Source source{.texture = picture.Get(),
+                                            .size = {Source, Source},
+                                            .render = {Source, Source}};
+        source = present.AntiAlias(source, test.anti_aliasing);
+        source = present.Upscale(source, test.filter, {Target, Target});
+        const Metal::Attachment attachment{.texture = target.Get()};
+        bool drawn = false;
+        if (Metal::PresentPasses::HasWindowShader(test.filter)) {
+            drawn = present.DrawWindow(source, test.filter, attachment, rgba8, {Target, Target},
+                                       {0, 0, static_cast<int32_t>(Target),
+                                        static_cast<int32_t>(Target)},
+                                       false, Metal::BlitBlend::None);
+        } else {
+            const float width = static_cast<float>(source.size[0]);
+            const float height = static_cast<float>(source.size[1]);
+            drawn = scheduler.Blit({
+                .src = source.texture,
+                .src_rect = {static_cast<int32_t>(source.crop[0] * width),
+                             static_cast<int32_t>(source.crop[1] * height),
+                             static_cast<int32_t>(source.crop[2] * width),
+                             static_cast<int32_t>(source.crop[3] * height)},
+                .dst = attachment,
+                .dst_format = rgba8,
+                .dst_rect = {0, 0, static_cast<int32_t>(Target), static_cast<int32_t>(Target)},
+                .dst_width = Target,
+                .dst_height = Target,
+                .linear = true,
+                .keep_dst = false,
+            });
+        }
+        const uint64_t passes = present.TakePasses();
+        scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Target, Target, 1},
+                                      readback_buffer.Get(), 0, Target * 4, 0);
+        scheduler.Finish();
+        // The anti-aliasing passes (1 or 3) and the scaler's (FSR 2, SGSR 1, a window filter 1).
+        const uint64_t expected_passes =
+            (test.anti_aliasing == Settings::AntiAliasing::Fxaa   ? 1
+             : test.anti_aliasing == Settings::AntiAliasing::Smaa ? 3
+                                                                  : 0) +
+            (test.filter == Filter::Fsr                                   ? 2
+             : test.filter == Filter::Sgsr || test.filter == Filter::SgsrEdge ? 1
+             : Metal::PresentPasses::HasWindowShader(test.filter)         ? 1
+                                                                          : 0);
+        bool colours = true;
+        std::string seen;
+        for (size_t quadrant = 0; quadrant < 4; ++quadrant) {
+            const uint32_t x = (quadrant & 1) != 0 ? Target * 3 / 4 : Target / 4;
+            const uint32_t y = (quadrant & 2) != 0 ? Target * 3 / 4 : Target / 4;
+            Texel texel;
+            std::memcpy(&texel, readback + (y * Target + x) * 4, 4);
+            const auto& want = Quadrants[quadrant];
+            colours = colours && within(texel.r, want[0]) && within(texel.g, want[1]) &&
+                      within(texel.b, want[2]) && within(texel.a, want[3]);
+            seen += (quadrant != 0 ? " " : "") + std::to_string(texel.r) + "," +
+                    std::to_string(texel.g) + "," + std::to_string(texel.b);
+        }
+        const bool passed = drawn && colours && passes == expected_passes;
+        failed += passed ? 0 : 1;
+        std::printf("metal-smoke: present %s: %llu passes (expected %llu), quadrant centres %s: "
+                    "%s\n",
+                    test.name, static_cast<unsigned long long>(passes),
+                    static_cast<unsigned long long>(expected_passes), seen.c_str(),
+                    passed ? "PASS" : "FAIL");
+    }
+    std::printf("metal-smoke: present filters: %u of %zu shaders not built, %u of %zu cases "
+                "failed: %s\n",
+                shaders_failed, static_cast<size_t>(Metal::PresentPasses::Shader::Count), failed,
+                Cases.size(), shaders_failed == 0 && failed == 0 ? "PASS" : "FAIL");
+    return shaders_failed == 0 && failed == 0 ? 0 : 1;
 }
 
 /// The pipeline archive: a compute and a render pipeline built into a new archive file (misses,
@@ -1808,6 +2270,204 @@ int RunDeviceMsl() {
     return passed ? 0 : 1;
 }
 
+/// Native mesh pipelines: a task and a mesh program (GLSL) through the translator as object and
+/// mesh functions, written out for the iOS compiler. The indirect argument kernel turns two guest
+/// records, one of them past the count, into Metal's arguments. On a GPU with mesh pipelines the
+/// functions are drawn directly (two halves through the payload) and from those arguments.
+int RunNativeMesh() {
+    namespace Translate = Metal::ShaderTranslate;
+    const std::span<const uint32_t> task_spirv{NATIVE_MESH_SMOKE_TASK_SPV};
+    const std::span<const uint32_t> mesh_spirv{NATIVE_MESH_SMOKE_MESH_SPV};
+    const std::span<const uint32_t> fragment_spirv{NATIVE_MESH_SMOKE_FRAG_SPV};
+    Translate::Options phone;
+    phone.ios = true;
+    phone.apple_family = 10;
+    const Translate::Result phone_object =
+        Translate::SpirvToMsl(task_spirv, Translate::Stage::Object, phone);
+    const Translate::Result phone_mesh =
+        Translate::SpirvToMsl(mesh_spirv, Translate::Stage::Mesh, phone);
+    if (phone_object.source.empty() || phone_mesh.source.empty()) {
+        std::printf("metal-smoke: FAIL native mesh: iOS translation: %s%s\n",
+                    phone_object.error.c_str(), phone_mesh.error.c_str());
+        return 1;
+    }
+    if (const char* const directory = std::getenv("LICHII_SMOKE_IOS_MSL")) {
+        const std::filesystem::path root{directory};
+        std::error_code code;
+        std::filesystem::create_directories(root, code);
+        for (const auto& [name, msl] : {std::pair{"native_mesh_object.metal", &phone_object},
+                                        std::pair{"native_mesh_mesh.metal", &phone_mesh}}) {
+            if (std::FILE* const file = std::fopen((root / name).c_str(), "wb")) {
+                std::fwrite(msl->source.data(), 1, msl->source.size(), file);
+                std::fclose(file);
+            }
+        }
+    }
+
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    std::string error;
+
+    // Two records of five words (an indexed draw's stride), the count buffer saying one.
+    const Metal::Object kernel_library =
+        Metal::CreateLibrary(device, Metal::MeshIndirectKernelSource, error);
+    const Metal::Object kernel_function =
+        kernel_library ? Metal::CreateFunction(kernel_library.Get(), Metal::MeshIndirectKernelName)
+                       : Metal::Object{};
+    const Metal::Object kernel =
+        kernel_function ? Metal::CreateComputePipelineState(device, kernel_function.Get(), error)
+                        : Metal::Object{};
+    if (!kernel) {
+        std::printf("metal-smoke: FAIL native mesh: indirect argument kernel: %s\n",
+                    error.c_str());
+        return 1;
+    }
+    uint8_t* records_data = nullptr;
+    const Metal::Object records = Metal::CreateBuffer(device, 64, true, &records_data);
+    const std::array<uint32_t, 10> record_words{1, 9, 9, 9, 9, 7, 9, 9, 9, 9};
+    std::memcpy(records_data, record_words.data(), sizeof(record_words));
+    uint8_t* count_data = nullptr;
+    const Metal::Object count = Metal::CreateBuffer(device, 16, true, &count_data);
+    const uint32_t one = 1;
+    std::memcpy(count_data, &one, sizeof(one));
+    uint8_t* args_data = nullptr;
+    const Metal::Object args = Metal::CreateBuffer(device, 64, true, &args_data);
+    std::memset(args_data, 0xFF, 64);
+    const Metal::MeshIndirectParams params{.draws = 2, .stride_words = 5, .has_count = 1};
+    scheduler.BeginCompute(kernel.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, records.Get(), 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, count.Get(), 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 2, args.Get(), 0);
+    scheduler.BindBytes(Metal::ShaderStage::Compute, 3, &params,
+                        static_cast<uint32_t>(sizeof(params)));
+    scheduler.Dispatch({1, 1, 1}, {Metal::MeshIndirectGroupSize, 1, 1});
+    scheduler.Finish();
+    std::array<uint32_t, 6> arguments{};
+    std::memcpy(arguments.data(), args_data, sizeof(arguments));
+    const bool converted = arguments == std::array<uint32_t, 6>{1, 1, 1, 0, 1, 1};
+    if (!converted) {
+        std::printf("metal-smoke: FAIL native mesh: indirect arguments %u,%u,%u %u,%u,%u (want "
+                    "1,1,1 0,1,1)\n",
+                    arguments[0], arguments[1], arguments[2], arguments[3], arguments[4],
+                    arguments[5]);
+        return 1;
+    }
+    if (!device.SupportsMeshShaders()) {
+        std::printf("metal-smoke: native mesh: iOS translation %zu + %zu bytes, indirect arguments "
+                    "right; SKIP draw: this GPU has no Metal 3 mesh pipelines\n",
+                    phone_object.source.size(), phone_mesh.source.size());
+        return 0;
+    }
+
+    Translate::Options here;
+    here.apple_family = device.AppleFamily();
+    const Translate::Result object_msl =
+        Translate::SpirvToMsl(task_spirv, Translate::Stage::Object, here);
+    const Translate::Result mesh_msl =
+        Translate::SpirvToMsl(mesh_spirv, Translate::Stage::Mesh, here);
+    const Translate::Result fragment_msl =
+        Translate::SpirvToMsl(fragment_spirv, Translate::Stage::Fragment, here);
+    const auto function = [&](const Translate::Result& msl, Metal::Object& library) {
+        error += msl.error;
+        library = Metal::CreateLibrary(device, msl.source, error);
+        return library ? Metal::CreateFunction(library.Get(), msl.entry_point) : Metal::Object{};
+    };
+    Metal::Object object_library;
+    Metal::Object mesh_library;
+    Metal::Object fragment_library;
+    const Metal::Object object = function(object_msl, object_library);
+    const Metal::Object mesh = function(mesh_msl, mesh_library);
+    const Metal::Object fragment = function(fragment_msl, fragment_library);
+    if (!object || !mesh || !fragment) {
+        std::printf("metal-smoke: FAIL native mesh: functions: %s\n", error.c_str());
+        return 1;
+    }
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = mesh.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = rgba8;
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    constexpr uint32_t ObjectThreads = 32;
+    constexpr uint32_t MeshThreads = 4;
+    const Metal::Object pipeline = Metal::CreateMeshRenderPipelineState(
+        device, desc,
+        Metal::MeshFunctions{
+            .object_function = object.Get(),
+            .mesh_function = mesh.Get(),
+            .fragment_function = fragment.Get(),
+            .payload_bytes = 32,
+            .object_threads = ObjectThreads,
+            .mesh_threads = MeshThreads,
+        },
+        error);
+    const Metal::Object depth_stencil =
+        Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+    if (!pipeline || !depth_stencil) {
+        std::printf("metal-smoke: FAIL native mesh: pipeline: %s\n", error.c_str());
+        return 1;
+    }
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = rgba8,
+                 .width = Size,
+                 .height = Size,
+                 .render_target = true});
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Size * Size * 4, true, &readback);
+    // Each draw over red: directly with one object threadgroup, then from the arguments (the
+    // second of which draws nothing).
+    std::array<std::pair<Texel, Texel>, 2> results{};
+    for (size_t pass = 0; pass < results.size(); ++pass) {
+        Metal::ClearPass clear{};
+        clear.color[0] = {.texture = target.Get()};
+        clear.clear_color[0] = true;
+        clear.color_value[0] = {1.0, 0.0, 0.0, 1.0};
+        clear.width = Size;
+        clear.height = Size;
+        scheduler.Clear(clear);
+        Metal::RenderTargetSet targets{};
+        targets.color[0] = {.texture = target.Get()};
+        targets.width = Size;
+        targets.height = Size;
+        scheduler.BeginRendering(targets);
+        Metal::DrawState state{};
+        state.pipeline = pipeline.Get();
+        state.depth_stencil = depth_stencil.Get();
+        state.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+        state.scissor = {0, 0, Size, Size};
+        scheduler.SetDrawState(state);
+        if (pass == 0) {
+            scheduler.DrawMeshThreadgroups(1, ObjectThreads, MeshThreads);
+        } else {
+            for (uint32_t draw = 0; draw < 2; ++draw) {
+                scheduler.DrawMeshThreadgroupsIndirect(args.Get(), draw * 3 * sizeof(uint32_t),
+                                                       ObjectThreads, MeshThreads);
+            }
+        }
+        scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Size, Size, 1},
+                                      readback_buffer.Get(), 0, Size * 4, 0);
+        scheduler.Finish();
+        const auto* texels = reinterpret_cast<const Texel*>(readback);
+        results[pass] = {texels[(Size / 2) * Size + 4], texels[(Size / 2) * Size + Size - 4]};
+    }
+    bool passed = true;
+    for (const auto& [left, right] : results) {
+        passed = passed && Near(left, {0, 255, 0, 255}) && Near(right, {0, 0, 255, 255});
+    }
+    std::printf("metal-smoke: native mesh (object + mesh functions, Apple%u): direct left "
+                "%u,%u,%u right %u,%u,%u; indirect left %u,%u,%u right %u,%u,%u: %s\n",
+                device.AppleFamily(), results[0].first.r, results[0].first.g, results[0].first.b,
+                results[0].second.r, results[0].second.g, results[0].second.b, results[1].first.r,
+                results[1].first.g, results[1].first.b, results[1].second.r, results[1].second.g,
+                results[1].second.b, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 /// A copy between a plain format and a block-compressed one, as the texture cache makes it
 /// (ReinterpretImage): four RGBA16Uint texels through a buffer into an 8x8 BC4 texture as its
 /// four blocks, each of one red value, then the blocks read back and the texture drawn.
@@ -2357,16 +3017,259 @@ int RunStateCache() {
                           Near(scene.At(1, 4, upper), {0, 0, 255, 255}) &&
                           Near(scene.At(1, Size - 4, upper), {0, 255, 0, 255}) &&
                           Near(scene.At(1, Size - 4, lower), {0, 0, 255, 255});
-    // A draw is ten pieces of state and one buffer. The first of a pass sets them all (11); the
-    // second sets the scissor and the offset (2 set, 9 left); the third nothing (11 left).
+    // A draw is eleven pieces of state (the fill mode the last) and one buffer. The first of a
+    // pass sets them all (12); the second sets the scissor and the offset (2 set, 10 left); the
+    // third nothing (12 left). Vulkan's EDEN_NX2_DYNSTATE_CACHE=0 sets the eleven every draw, EDEN_NX2_VERTEX_INPUT_CACHE=0
+    // the buffer (both read under EDEN_NX2_METAL_VULKAN_SWITCHES).
     const bool caching = SwitchOn("EDEN_NX2_METAL_STATE_CACHE");
-    const bool counted = caching ? sets == 24 && skips == 20 : sets == 44 && skips == 0;
-    std::printf("metal-smoke: state cache (%s): pictures %s; %llu set, %llu left as they were: "
-                "%s\n",
-                caching ? "on" : "off", pictures ? "PASS" : "FAIL",
+    const bool vulkan = SwitchOn("EDEN_NX2_METAL_VULKAN_SWITCHES");
+    const bool state_cached = caching && !(vulkan && !SwitchOn("EDEN_NX2_DYNSTATE_CACHE"));
+    const bool buffers_cached = caching && !(vulkan && !SwitchOn("EDEN_NX2_VERTEX_INPUT_CACHE"));
+    const uint64_t state_sets = state_cached ? 11 + 1 + 0 + 11 : 44;
+    const uint64_t buffer_sets = buffers_cached ? 1 + 1 + 0 + 1 : 4;
+    const bool counted = sets == state_sets + buffer_sets && skips == 48 - sets;
+    std::printf("metal-smoke: state cache (%s, draw state %s, vertex buffers %s): pictures %s; "
+                "%llu set, %llu left as they were: %s\n",
+                caching ? "on" : "off", state_cached ? "cached" : "set every draw",
+                buffers_cached ? "cached" : "bound every draw", pictures ? "PASS" : "FAIL",
                 static_cast<unsigned long long>(sets), static_cast<unsigned long long>(skips),
                 counted ? "PASS" : "FAIL");
     return pictures && counted ? 0 : 1;
+}
+
+/// Runs this program again with `--child <name>` and `variables` (NAME=VALUE) added to its
+/// environment; the child's exit code, -1 when it could not run.
+int RunChildWith(const char* name, std::initializer_list<const char*> variables) {
+    char path[4096];
+    uint32_t path_size = sizeof(path);
+    if (_NSGetExecutablePath(path, &path_size) != 0) {
+        return -1;
+    }
+    std::vector<std::string> owned(variables.begin(), variables.end());
+    std::vector<char*> environment;
+    for (char** entry = environ; *entry != nullptr; ++entry) {
+        environment.push_back(*entry);
+    }
+    for (std::string& variable : owned) {
+        environment.push_back(variable.data());
+    }
+    environment.push_back(nullptr);
+    char child_flag[] = "--child";
+    std::string child_name = name;
+    char* const arguments[] = {path, child_flag, child_name.data(), nullptr};
+    pid_t child = 0;
+    if (posix_spawn(&child, path, nullptr, nullptr, arguments, environment.data()) != 0) {
+        return -1;
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/// Vulkan's EDEN_NX2_PASS_TIMES on Metal (run in a child with it set by RunVulkanSwitches): a
+/// frame of two render passes is timed at their stage boundaries and the line names both, once
+/// the GPU is done with the frame. A GPU without timestamps at pass boundaries says so.
+int RunPassTimes() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const QuadScene scene(device);
+    if (!scene.valid) {
+        std::printf("metal-smoke: FAIL pass times setup: %s\n", scene.error.c_str());
+        return 1;
+    }
+    const bool supported =
+        [device.GetDevice() supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary];
+    scheduler.NotePresent(true); // starts the timed frame
+    scene.Clear(scheduler, 0, {1.0, 0.0, 0.0, 1.0});
+    scene.Draw(scheduler, 0, 0, Size);
+    scene.Clear(scheduler, 1, {0.0, 0.0, 1.0, 1.0});
+    scene.Draw(scheduler, 1, 0, Size);
+    scheduler.NotePresent(true); // ends it with the command buffer committed next
+    scheduler.Finish();
+    scheduler.NotePresent(true); // resolves it
+    const std::string line = scheduler.TakePassTimesLine();
+    const bool passed = supported ? line.starts_with("2 render passes (2 timed)") : line.empty();
+    std::printf("metal-smoke: pass times (EDEN_NX2_PASS_TIMES, %s): \"%s\": %s\n",
+                supported ? "timestamps at pass boundaries" : "no timestamps at pass boundaries",
+                line.c_str(), passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// The swapchain on a CAMetalLayer of its own (no window): tagged sRGB as Vulkan's swapchain is
+/// (EDEN_NX2_METAL_COLORSPACE), and twelve guest frames presented through Swapchain::Present
+/// (the host pacer: held only once the screen's refresh is known, which a CI Mac may not say).
+int RunSwapchain() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    CAMetalLayer* const layer = [CAMetalLayer layer];
+    std::optional<Metal::Swapchain> swapchain;
+    try {
+        swapchain.emplace(device, (__bridge void*)layer);
+    } catch (const std::exception& error) {
+        std::printf("metal-smoke: FAIL swapchain: %s\n", error.what());
+        return 1;
+    }
+    bool srgb = true;
+    if (SwitchOn("EDEN_NX2_METAL_COLORSPACE")) {
+        const CGColorSpaceRef space = layer.colorspace;
+        const CFStringRef name = space != nullptr ? CGColorSpaceCopyName(space) : nullptr;
+        srgb = name != nullptr && CFStringCompare(name, kCGColorSpaceSRGB, 0) == kCFCompareEqualTo;
+        if (name != nullptr) {
+            CFRelease(name);
+        }
+    }
+    u32 presented = 0;
+    for (u32 frame = 0; frame < 12; ++frame) {
+        const id<CAMetalDrawable> drawable = swapchain->NextDrawable(64, 64);
+        if (drawable == nil) {
+            break;
+        }
+        Metal::ClearPass clear{};
+        clear.color[0] = {.texture = (__bridge void*)drawable.texture};
+        clear.clear_color[0] = true;
+        clear.color_value[0] = {0.0, 0.5, 0.0, 1.0};
+        clear.width = 64;
+        clear.height = 64;
+        scheduler.Clear(clear);
+        const id<MTLCommandBuffer> command_buffer =
+            (__bridge id<MTLCommandBuffer>)scheduler.CommandBuffer();
+        swapchain->Present(command_buffer, drawable, true);
+        scheduler.Flush();
+        ++presented;
+        std::this_thread::sleep_for(std::chrono::milliseconds{33});
+    }
+    scheduler.Finish();
+    const std::string pacing = swapchain->TakePacingLine();
+    const bool passed = srgb && presented == 12;
+    std::printf("metal-smoke: swapchain: layer %s, %u of 12 frames presented, pacing \"%s\": %s\n",
+                srgb ? "tagged sRGB" : "NOT tagged sRGB", presented, pacing.c_str(),
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// A guest sampler with mipmaps (Metal::CreateSampler) read at level 1 of a texture whose level 0
+/// is red and level 1 green: green, and red with Vulkan's EDEN_NX2_FORCE_LOD0 (the top level
+/// only; run in a child by RunVulkanSwitches).
+int RunForceLod0() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr const char* Source = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct LodOut {
+    float4 position [[position]];
+};
+vertex LodOut lod_vertex(uint id [[vertex_id]]) {
+    const float2 positions[3] = {float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0)};
+    LodOut out;
+    out.position = float4(positions[id], 0.0, 1.0);
+    return out;
+}
+fragment float4 lod_fragment(LodOut in [[stage_in]], texture2d<float> tex [[texture(0)]],
+                             sampler smp [[sampler(0)]]) {
+    return tex.sample(smp, float2(0.5), level(1.0));
+}
+)";
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, Source, error);
+    const Metal::Object vertex =
+        library ? Metal::CreateFunction(library.Get(), "lod_vertex") : Metal::Object{};
+    const Metal::Object fragment =
+        library ? Metal::CreateFunction(library.Get(), "lod_fragment") : Metal::Object{};
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = vertex.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = rgba8;
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    const Metal::Object pipeline =
+        vertex && fragment ? Metal::CreateRenderPipelineState(device, desc, error) : Metal::Object{};
+    constexpr uint32_t Side = 8;
+    const Metal::Object texture = Metal::CreateTexture(device, {.kind = Metal::TextureKind::e2D,
+                                                                .format = rgba8,
+                                                                .width = Side,
+                                                                .height = Side,
+                                                                .levels = 2});
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D, .format = rgba8, .render_target = true});
+    Tegra::Texture::TSCEntry tsc{};
+    tsc.wrap_u.Assign(Tegra::Texture::WrapMode::ClampToEdge);
+    tsc.wrap_v.Assign(Tegra::Texture::WrapMode::ClampToEdge);
+    tsc.wrap_p.Assign(Tegra::Texture::WrapMode::ClampToEdge);
+    tsc.mag_filter.Assign(Tegra::Texture::TextureFilter::Nearest);
+    tsc.min_filter.Assign(Tegra::Texture::TextureFilter::Nearest);
+    tsc.mipmap_filter.Assign(Tegra::Texture::TextureMipmapFilter::Nearest);
+    tsc.max_lod_clamp.Assign(2 << 8);
+    const Metal::Object sampler = Metal::CreateSampler(device, tsc);
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer = Metal::CreateBuffer(device, Side * Side * 4, true, &upload);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer = Metal::CreateBuffer(device, 4, true, &readback);
+    if (!pipeline || !texture || !target || !sampler || upload == nullptr || readback == nullptr) {
+        std::printf("metal-smoke: FAIL force LOD 0 setup: %s\n", error.c_str());
+        return 1;
+    }
+    // Level 0 red, level 1 (4x4) green, uploaded one after the other.
+    for (uint32_t level = 0; level < 2; ++level) {
+        const uint32_t size = Side >> level;
+        const std::array<uint8_t, 4> texel =
+            level == 0 ? std::array<uint8_t, 4>{255, 0, 0, 255} : std::array<uint8_t, 4>{0, 255, 0, 255};
+        for (uint32_t i = 0; i < size * size; ++i) {
+            std::memcpy(upload + i * 4, texel.data(), 4);
+        }
+        scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, size * 4, 0, texture.Get(), level, 0,
+                                      {}, {size, size, 1});
+        scheduler.Finish();
+    }
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = 1;
+    targets.height = 1;
+    scheduler.BeginRendering(targets);
+    scheduler.SetDrawState({.pipeline = pipeline.Get(),
+                            .viewport = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f},
+                            .scissor = {0, 0, 1, 1}});
+    scheduler.BindTexture(Metal::ShaderStage::Fragment, 0, texture.Get());
+    scheduler.BindSampler(Metal::ShaderStage::Fragment, 0, sampler.Get());
+    scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 3, 1, 0);
+    scheduler.EndRendering();
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {1, 1, 1}, readback_buffer.Get(), 0, 4, 0);
+    scheduler.Finish();
+    Texel texel;
+    std::memcpy(&texel, readback, 4);
+    const bool forced = std::getenv("EDEN_NX2_FORCE_LOD0") != nullptr &&
+                        SwitchOn("EDEN_NX2_METAL_VULKAN_SWITCHES");
+    const bool passed = forced ? Near(texel, {255, 0, 0, 255}) : Near(texel, {0, 255, 0, 255});
+    std::printf("metal-smoke: sampler at level 1 (%s): %u,%u,%u (expected %s): %s\n",
+                forced ? "EDEN_NX2_FORCE_LOD0" : "as the guest asks", texel.r, texel.g, texel.b,
+                forced ? "level 0, red" : "level 1, green", passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// Vulkan's switches the Metal renderer reads (EDEN_NX2_METAL_VULKAN_SWITCHES), each read once
+/// per process: the state cache test in children with EDEN_NX2_DYNSTATE_CACHE=0,
+/// EDEN_NX2_VERTEX_INPUT_CACHE=0, and both with the Vulkan switches ignored.
+int RunVulkanSwitches() {
+    const int draw_state = RunChildWith("state-cache", {"EDEN_NX2_DYNSTATE_CACHE=0"});
+    const int vertex_input = RunChildWith("state-cache", {"EDEN_NX2_VERTEX_INPUT_CACHE=0"});
+    const int ignored =
+        RunChildWith("state-cache", {"EDEN_NX2_DYNSTATE_CACHE=0", "EDEN_NX2_VERTEX_INPUT_CACHE=0",
+                                     "EDEN_NX2_METAL_VULKAN_SWITCHES=0"});
+    const int fence_batch = RunChildWith(
+        "fence-batch", {"EDEN_NX2_FENCE_FLUSH_US=10000000", "EDEN_NX2_METAL_FENCE_BATCH=2"});
+    const int force_lod0 = RunChildWith("force-lod0", {"EDEN_NX2_FORCE_LOD0=1"});
+    const int pass_times = RunChildWith("pass-times", {"EDEN_NX2_PASS_TIMES=0.001"});
+    const bool passed = draw_state == 0 && vertex_input == 0 && ignored == 0 &&
+                        fence_batch == 0 && force_lod0 == 0 && pass_times == 0;
+    std::printf("metal-smoke: Vulkan switches in children: EDEN_NX2_DYNSTATE_CACHE=0 %d, "
+                "EDEN_NX2_VERTEX_INPUT_CACHE=0 %d, ignored %d, EDEN_NX2_FENCE_FLUSH_US %d, "
+                "EDEN_NX2_FORCE_LOD0 %d, EDEN_NX2_PASS_TIMES %d (0 each): %s\n",
+                draw_state, vertex_input, ignored, fence_batch, force_lod0, pass_times,
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
 }
 
 /// Uploads and kernels ahead of their segment (EDEN_NX2_METAL_AHEAD): a copy and a compute
@@ -2518,6 +3421,46 @@ int RunFenceIdle() {
     return results && counted ? 0 : 1;
 }
 
+/// Fences batched (EDEN_NX2_METAL_FENCE_BATCH with Vulkan's EDEN_NX2_FENCE_FLUSH_US, run in a
+/// child with a 10 s window and =2 so it applies off the split's back): two fences after draws
+/// within the window share the tick being recorded and commit nothing, the idle hook commits it.
+int RunFenceBatch() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const QuadScene scene(device);
+    if (!scene.valid) {
+        std::printf("metal-smoke: FAIL fence batch setup: %s\n", scene.error.c_str());
+        return 1;
+    }
+    scheduler.Flush();
+    (void)scheduler.TakeCounts();
+    (void)scheduler.TakeDeferredFences();
+    scene.Draw(scheduler, 0, 0, Size);
+    const uint64_t first = scheduler.FenceTick();
+    const bool first_pending = !scheduler.IsSubmitted(first) && scheduler.HasPendingWork();
+    scene.Draw(scheduler, 0, 1, Size / 2);
+    const uint64_t second = scheduler.FenceTick();
+    const bool may_wait = scheduler.DeferredFlushMayWait();
+    const bool idle_committed = scheduler.FlushDeferredFromIdle(false);
+    const bool submitted = scheduler.IsSubmitted(second);
+    const bool nothing_left = !scheduler.FlushDeferredFromIdle(false);
+    scheduler.Wait(second);
+    scheduler.WaitSubmitted(second);
+    const auto counts = scheduler.TakeCounts();
+    const auto [deferred, idle_commits] = scheduler.TakeDeferredFences();
+    const bool passed = first == second && first_pending && may_wait && idle_committed &&
+                        submitted && nothing_left && scheduler.IsFree(second) &&
+                        counts[1] == 1 && deferred == 2 && idle_commits == 1;
+    std::printf("metal-smoke: fence batch: ticks %llu/%llu, pending %d, may wait %d, idle commit "
+                "%d, %llu command buffers, %llu fences left pending, %llu idle commits: %s\n",
+                static_cast<unsigned long long>(first), static_cast<unsigned long long>(second),
+                first_pending ? 1 : 0, may_wait ? 1 : 0, idle_committed ? 1 : 0,
+                static_cast<unsigned long long>(counts[1]),
+                static_cast<unsigned long long>(deferred),
+                static_cast<unsigned long long>(idle_commits), passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 /// Staging buffers bounded (EDEN_NX2_METAL_STAGING_BOUND): a command buffer that took its mark's
 /// worth asks to be committed, over the cap the buffers the GPU is done with go, a slot freed is
 /// used again, and a deferred buffer stays through all of it.
@@ -2565,24 +3508,40 @@ int RunStagingBound() {
     std::memset(kept.mapped_span.data(), 0x5A, kept.mapped_span.size());
     pool.FreeDeferred(kept);
 
-    const bool passed =
+    // EDEN_NX2_STREAM_BUFFER_MIB=8: a ring of 8 MiB, regions of 512 KiB; a larger slice is a
+    // buffer of its own, a smaller one is in the ring.
+    setenv("EDEN_NX2_STREAM_BUFFER_MIB", "8", 1);
+    Metal::StagingBufferPool small_ring(device, scheduler);
+    unsetenv("EDEN_NX2_STREAM_BUFFER_MIB");
+    const Metal::StagingBufferPool default_ring(device, scheduler);
+    const Metal::StagingBufferRef in_ring = small_ring.Stream(Chunk, 16);
+    const Metal::StagingBufferRef own = small_ring.Stream(Chunk + 16, 16);
+    constexpr size_t NotPooled = (std::numeric_limits<size_t>::max)();
+    const bool stream_sized = small_ring.StreamSize() == 8 * MiB &&
+                              default_ring.StreamSize() == 32 * MiB && in_ring.index == NotPooled &&
+                              own.index != NotPooled;
+    finish();
+
+    const bool bound_passed =
         bounded ? !asked_early && asked && over && held_taken == 3 * MiB && !asked_after &&
                       held_trimmed == MiB && freed_trimmed == 4 && held_again == MiB &&
                       held_ticked == 2 * MiB && freed_ticked == 2
                 : !asked_early && !asked && !over && held_taken == 3 * MiB && !asked_after &&
                       held_trimmed == 3 * MiB && freed_trimmed == 0 && held_again == 3 * MiB &&
                       held_ticked == 5 * MiB && freed_ticked == 0;
+    const bool passed = bound_passed && stream_sized;
     std::printf("metal-smoke: staging bound (%s): 6 buffers of 512 KiB in one command buffer "
                 "ask for a commit %d, over the cap %d; held %llu KiB, %llu after the trim (%llu "
                 "freed), %llu with one more, %llu after 10 frames with 2 MiB deferred (%llu "
-                "freed): %s\n",
+                "freed); stream ring %s for EDEN_NX2_STREAM_BUFFER_MIB: %s\n",
                 bounded ? "on" : "off", asked ? 1 : 0, over ? 1 : 0,
                 static_cast<unsigned long long>(held_taken >> 10),
                 static_cast<unsigned long long>(held_trimmed >> 10),
                 static_cast<unsigned long long>(freed_trimmed),
                 static_cast<unsigned long long>(held_again >> 10),
                 static_cast<unsigned long long>(held_ticked >> 10),
-                static_cast<unsigned long long>(freed_ticked), passed ? "PASS" : "FAIL");
+                static_cast<unsigned long long>(freed_ticked), stream_sized ? "sized" : "NOT sized",
+                passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
 
@@ -2708,6 +3667,368 @@ int RunOcarinaTemporal() {
     return passed ? 0 : 1;
 }
 
+/// The camera motion pass reading the scene depth, and the jitter: a 16x16 Depth32Float scene
+/// whose depth grows across it ((x + 0.5) / 16), so a wrong depth read changes the result.
+/// - A camera whose previous x is the current x plus a quarter of the clip depth: the motion is
+///   2 (2 depth - 1) pixels in x, different for every column.
+/// - A camera whose previous x is twice the current x, with the scene drawn 0.5 pixels to the
+///   right (EDEN_NX2_DLSS_JITTER): from the unjittered position, x - 8 pixels in x.
+int RunOcarinaDepthJitter() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr uint32_t Side = 16;
+    const Metal::Object depth = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatDepth32Float),
+                 .width = Side,
+                 .height = Side,
+                 .render_target = true});
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer = Metal::CreateBuffer(device, Side * Side * 4, true, &upload);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Side * Side * 4, true, &readback);
+    if (!depth || upload == nullptr || readback == nullptr) {
+        std::printf("metal-smoke: FAIL Ocarina depth/jitter textures\n");
+        return 1;
+    }
+    for (uint32_t y = 0; y < Side; ++y) {
+        for (uint32_t x = 0; x < Side; ++x) {
+            const float value = (static_cast<float>(x) + 0.5f) / Side;
+            std::memcpy(upload + (y * Side + x) * 4, &value, 4);
+        }
+    }
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Side * 4, 0, depth.Get(), 0, 0, {},
+                                  {Side, Side, 1});
+    scheduler.Finish();
+    const auto half = [](uint16_t bits) {
+        const float magnitude = PackedFloat(bits & 0x7FFFU, 10);
+        return (bits & 0x8000U) != 0 ? -magnitude : magnitude;
+    };
+    Metal::OcarinaTemporal temporal(device, scheduler);
+    // Row-major, as the shader's push constant block reads it.
+    struct Case {
+        const char* name;
+        VideoCommon::OcarinaMatrix matrix;
+        std::array<float, 2> jitter;
+        float (*expected)(uint32_t x);
+    };
+    const std::array<Case, 2> cases{{
+        {"depth", {1, 0, 0.25f, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}, {0.0f, 0.0f},
+         [](uint32_t x) { return 2.0f * (2.0f * (static_cast<float>(x) + 0.5f) / 16.0f - 1.0f); }},
+        {"jitter", {2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}, {0.5f, 0.0f},
+         [](uint32_t x) { return static_cast<float>(x) - 8.0f; }},
+    }};
+    bool passed = true;
+    for (const Case& test : cases) {
+        const bool encoded =
+            temporal.EncodeMotion(depth.Get(), {Side, Side}, test.matrix, nullptr, test.jitter);
+        if (encoded) {
+            scheduler.CopyTextureToBuffer(temporal.Motion(), 0, 0, {}, {Side, Side, 1},
+                                          readback_buffer.Get(), 0, Side * 4, 0);
+        }
+        scheduler.Finish();
+        uint32_t wrong = 0;
+        std::array<float, 2> first{};
+        std::array<float, 2> last{};
+        for (uint32_t texel = 0; encoded && texel < Side * Side; ++texel) {
+            std::array<uint16_t, 2> bits{};
+            std::memcpy(bits.data(), readback + texel * 4, 4);
+            const std::array<float, 2> value{half(bits[0]), half(bits[1])};
+            const float want = test.expected(texel % Side);
+            wrong += std::abs(value[0] - want) < 0.02f && std::abs(value[1]) < 0.02f ? 0 : 1;
+            (texel == 0 ? first : last) = value;
+        }
+        const bool case_passed = encoded && wrong == 0;
+        passed = passed && case_passed;
+        std::printf("metal-smoke: Ocarina camera motion (%s): column 0 %.3f (expected %.3f), "
+                    "column 15 %.3f (expected %.3f), %u of %u wrong: %s\n",
+                    test.name, first[0], test.expected(0), last[0], test.expected(Side - 1), wrong,
+                    Side * Side, case_passed ? "PASS" : "FAIL");
+    }
+    return passed ? 0 : 1;
+}
+
+/// Vulkan's temporal stand-in for the game's DLSS on Metal (EDEN_NX2_METAL_TEMPORAL_STANDIN): a
+/// 32x32 picture of four quadrants, still (no motion), upscaled to 64x64 twice: the first frame
+/// starts the history, the second blends into it. Each quadrant's centre keeps its colour.
+int RunTemporalStandIn() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Metal::PresentPasses present(device, scheduler);
+    constexpr uint32_t Source = 32;
+    constexpr uint32_t Target = 64;
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    const Metal::Object picture = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D, .format = rgba8, .width = Source, .height = Source});
+    const Metal::Object motion = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRG16Float),
+                 .width = Source,
+                 .height = Source});
+    const Metal::Object target = Metal::CreateTexture(device, {.kind = Metal::TextureKind::e2D,
+                                                               .format = rgba8,
+                                                               .width = Target,
+                                                               .height = Target,
+                                                               .render_target = true});
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer =
+        Metal::CreateBuffer(device, Source * Source * 4, true, &upload);
+    uint8_t* zeros = nullptr;
+    const Metal::Object zero_buffer = Metal::CreateBuffer(device, Source * Source * 4, true, &zeros);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Target * Target * 4, true, &readback);
+    if (!picture || !motion || !target || upload == nullptr || zeros == nullptr ||
+        readback == nullptr) {
+        std::printf("metal-smoke: FAIL temporal stand-in textures\n");
+        return 1;
+    }
+    constexpr std::array<std::array<uint8_t, 4>, 4> Quadrants{{
+        {200, 40, 40, 255},
+        {40, 200, 40, 255},
+        {40, 40, 200, 255},
+        {200, 200, 200, 255},
+    }};
+    for (uint32_t y = 0; y < Source; ++y) {
+        for (uint32_t x = 0; x < Source; ++x) {
+            const size_t quadrant = (y >= Source / 2 ? 2 : 0) + (x >= Source / 2 ? 1 : 0);
+            std::memcpy(upload + (y * Source + x) * 4, Quadrants[quadrant].data(), 4);
+        }
+    }
+    std::memset(zeros, 0, Source * Source * 4);
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Source * 4, 0, picture.Get(), 0, 0, {},
+                                  {Source, Source, 1});
+    scheduler.CopyBufferToTexture(zero_buffer.Get(), 0, Source * 4, 0, motion.Get(), 0, 0, {},
+                                  {Source, Source, 1});
+    scheduler.Finish();
+    const bool sharpen = Settings::values.fsr_sharpening_slider.GetValue() < 200 &&
+                         std::getenv("EDEN_NX2_TEMPORAL_SHARPEN") == nullptr;
+    const auto within = [](uint8_t a, uint8_t b) { return (a > b ? a - b : b - a) <= 6; };
+    bool passed = true;
+    for (uint32_t frame = 0; frame < 2; ++frame) {
+        (void)present.TakePasses();
+        const bool drawn = present.TemporalFilter({
+            .color = picture.Get(),
+            .motion = motion.Get(),
+            .target = {.texture = target.Get()},
+            .format = rgba8,
+            .size = {Target, Target},
+            .jitter = {0.0f, 0.0f},
+            .motion_scale = {1.0f, 1.0f},
+            .use_history = true,
+        });
+        const uint64_t passes = present.TakePasses();
+        scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Target, Target, 1},
+                                      readback_buffer.Get(), 0, Target * 4, 0);
+        scheduler.Finish();
+        bool colours = true;
+        std::string seen;
+        for (size_t quadrant = 0; quadrant < 4; ++quadrant) {
+            const uint32_t x = (quadrant & 1) != 0 ? Target * 3 / 4 : Target / 4;
+            const uint32_t y = (quadrant & 2) != 0 ? Target * 3 / 4 : Target / 4;
+            Texel texel;
+            std::memcpy(&texel, readback + (y * Target + x) * 4, 4);
+            const auto& want = Quadrants[quadrant];
+            colours = colours && within(texel.r, want[0]) && within(texel.g, want[1]) &&
+                      within(texel.b, want[2]);
+            seen += (quadrant != 0 ? " " : "") + std::to_string(texel.r) + "," +
+                    std::to_string(texel.g) + "," + std::to_string(texel.b);
+        }
+        const uint64_t expected_passes = sharpen ? 2 : 1;
+        const bool frame_passed = drawn && colours && passes == expected_passes;
+        passed = passed && frame_passed;
+        std::printf("metal-smoke: temporal stand-in frame %u (%s): %llu passes (expected %llu), "
+                    "quadrant centres %s: %s\n",
+                    frame + 1, frame == 0 ? "history started" : "blended into the history",
+                    static_cast<unsigned long long>(passes),
+                    static_cast<unsigned long long>(expected_passes), seen.c_str(),
+                    frame_passed ? "PASS" : "FAIL");
+    }
+    return passed ? 0 : 1;
+}
+
+/// Ocarina's temporal inputs Vulkan adds over the camera motion, without MetalFX:
+/// - Link's skinned motion (EDEN_NX2_METAL_OOT_ACTOR, ocarina_actor_motion.vert/.frag through
+///   the translator): a triangle over a 16x16 scene at depth 0.5 whose previous pose was half
+///   of clip space to the right, over a camera that did not move. Where the scene depth is 0.5
+///   (the left half) his motion is 4 pixels right; where it is 0.25 the replay is hidden and the
+///   camera's motion (none) stays.
+/// - The effects mask (EDEN_NX2_METAL_OOT_EFFECTS): a scene saved at 0.2, then brightened to 1.0
+///   in a 4x4 block; the reactive mask is 1 over the block and one pixel around it, 0 elsewhere.
+int RunOcarinaActorEffects() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr uint32_t Side = 16;
+    const Metal::Object depth = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatDepth32Float),
+                 .width = Side,
+                 .height = Side,
+                 .render_target = true});
+    const Metal::Object scene = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRGBA16Float),
+                 .width = Side,
+                 .height = Side});
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer = Metal::CreateBuffer(device, Side * Side * 8, true, &upload);
+    uint8_t* bright = nullptr;
+    const Metal::Object bright_buffer = Metal::CreateBuffer(device, Side * Side * 8, true, &bright);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Side * Side * 4, true, &readback);
+    uint8_t* bias_readback = nullptr;
+    const Metal::Object bias_buffer = Metal::CreateBuffer(device, Side * Side * 2, true,
+                                                          &bias_readback);
+    if (!depth || !scene || upload == nullptr || bright == nullptr || readback == nullptr ||
+        bias_readback == nullptr) {
+        std::printf("metal-smoke: FAIL Ocarina actor/effects textures\n");
+        return 1;
+    }
+    for (uint32_t y = 0; y < Side; ++y) {
+        for (uint32_t x = 0; x < Side; ++x) {
+            const float value = x < Side / 2 ? 0.5f : 0.25f;
+            std::memcpy(upload + (y * Side + x) * 4, &value, 4);
+        }
+    }
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Side * 4, 0, depth.Get(), 0, 0, {},
+                                  {Side, Side, 1});
+    // The effects' pictures go into the same upload buffer below.
+    scheduler.Finish();
+    // One vertex layout of Link's: position, joints, extra joints, weights, extra weights.
+    std::vector<uint8_t> vertices(3 * Metal::OcarinaActorMesh::Stride);
+    const std::array<std::array<float, 3>, 3> positions{{{-1, -1, 0}, {3, -1, 0}, {-1, 3, 0}}};
+    for (size_t vertex = 0; vertex < 3; ++vertex) {
+        uint8_t* const base = vertices.data() + vertex * Metal::OcarinaActorMesh::Stride;
+        std::memcpy(base, positions[vertex].data(), 12);
+        base[40] = 255; // all of joint 0
+    }
+    const std::array<uint16_t, 3> indices{0, 1, 2};
+    std::vector<float> current_bones(Metal::OcarinaActorMesh::Bones * 12);
+    std::vector<float> previous_bones(current_bones.size());
+    const std::array<float, 12> identity_bone{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    std::copy(identity_bone.begin(), identity_bone.end(), current_bones.begin());
+    std::copy(identity_bone.begin(), identity_bone.end(), previous_bones.begin());
+    previous_bones[3] = 0.5f;
+    const Metal::OcarinaActorMesh mesh{
+        .vertices = vertices,
+        .indices = indices,
+        .mesh_key = 1,
+        .current_origin = {},
+        .previous_origin = {},
+        .current_bones = current_bones,
+        .previous_bones = previous_bones,
+    };
+    const VideoCommon::OcarinaMatrix identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    Metal::OcarinaTemporal temporal(device, scheduler);
+    const Metal::OcarinaTemporal::ActorMotion actor{mesh, identity, identity};
+    const bool encoded = temporal.EncodeMotion(depth.Get(), {Side, Side}, identity, &actor);
+    if (encoded) {
+        scheduler.CopyTextureToBuffer(temporal.Motion(), 0, 0, {}, {Side, Side, 1},
+                                      readback_buffer.Get(), 0, Side * 4, 0);
+    }
+    // The effects: the saved scene at 0.2, a 4x4 block at 1.0 after it.
+    const auto half = [](float value) {
+        // 0.2 and 1.0 only (the test's two values).
+        return static_cast<uint16_t>(value == 1.0f ? 0x3C00 : 0x3266);
+    };
+    for (uint32_t texel = 0; texel < Side * Side; ++texel) {
+        const uint16_t dim = half(0.2f);
+        const std::array<uint16_t, 4> pixel{dim, dim, dim, 0x3C00};
+        std::memcpy(upload + texel * 8, pixel.data(), 8);
+        const uint32_t x = texel % Side;
+        const uint32_t y = texel / Side;
+        const bool lit = x >= 4 && x < 8 && y >= 4 && y < 8;
+        const uint16_t value = lit ? half(1.0f) : dim;
+        const std::array<uint16_t, 4> after{value, value, value, 0x3C00};
+        std::memcpy(bright + texel * 8, after.data(), 8);
+    }
+    constexpr uint64_t Frame = 5;
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Side * 8, 0, scene.Get(), 0, 0, {},
+                                  {Side, Side, 1});
+    temporal.SaveEffectsBase(scene.Get(), {Side, Side}, Frame);
+    scheduler.CopyBufferToTexture(bright_buffer.Get(), 0, Side * 8, 0, scene.Get(), 0, 0, {},
+                                  {Side, Side, 1});
+    temporal.MarkEffects(scene.Get(), Frame);
+    const bool biased = temporal.EncodeEffectsBias(Frame, {Side, Side});
+    if (biased) {
+        scheduler.CopyTextureToBuffer(temporal.EffectsBias(), 0, 0, {}, {Side, Side, 1},
+                                      bias_buffer.Get(), 0, Side * 2, 0);
+    }
+    scheduler.Finish();
+    const auto to_float = [](uint16_t bits) {
+        const float magnitude = PackedFloat(bits & 0x7FFFU, 10);
+        return (bits & 0x8000U) != 0 ? -magnitude : magnitude;
+    };
+    uint32_t actor_wrong = 0;
+    uint32_t camera_wrong = 0;
+    std::array<float, 2> left{};
+    std::array<float, 2> right{};
+    for (uint32_t texel = 0; encoded && texel < Side * Side; ++texel) {
+        std::array<uint16_t, 2> bits{};
+        std::memcpy(bits.data(), readback + texel * 4, 4);
+        const std::array<float, 2> value{to_float(bits[0]), to_float(bits[1])};
+        const bool is_left = texel % Side < Side / 2;
+        const float expected = is_left ? 4.0f : 0.0f;
+        const bool right_value =
+            std::abs(value[0] - expected) < 0.05f && std::abs(value[1]) < 0.05f;
+        (is_left ? actor_wrong : camera_wrong) += right_value ? 0 : 1;
+        (is_left ? left : right) = value;
+    }
+    uint32_t bias_wrong = 0;
+    for (uint32_t texel = 0; biased && texel < Side * Side; ++texel) {
+        uint16_t bits;
+        std::memcpy(&bits, bias_readback + texel * 2, 2);
+        const uint32_t x = texel % Side;
+        const uint32_t y = texel / Side;
+        const bool near = x >= 3 && x < 9 && y >= 3 && y < 9;
+        bias_wrong += std::abs(to_float(bits) - (near ? 1.0f : 0.0f)) < 0.01f ? 0 : 1;
+    }
+    const bool passed =
+        encoded && biased && actor_wrong == 0 && camera_wrong == 0 && bias_wrong == 0;
+    // Whether Link's draw ran at all (and why not), apart from what it wrote.
+    const uint64_t actor_frames = temporal.TakeExtras()[0];
+    const std::string actor_error =
+        temporal.ActorError().empty() ? std::string{"none"} : temporal.ActorError();
+    std::printf("metal-smoke: Ocarina actor/effects: %s, %llu actor draws (last failure: %s); "
+                "Link's pixels %.3f,%.3f (expected 4,0) %u of %u wrong, hidden pixels %.3f,%.3f "
+                "(expected 0,0) %u wrong; effects mask %s, %u of %u wrong: %s\n",
+                encoded ? "motion encoded" : "motion NOT encoded",
+                static_cast<unsigned long long>(actor_frames), actor_error.c_str(), left[0],
+                left[1], actor_wrong, Side * Side / 2, right[0], right[1], camera_wrong,
+                biased ? "made" : "NOT made", bias_wrong, Side * Side, passed ? "PASS" : "FAIL");
+    if (actor_wrong != 0 && std::getenv("EDEN_NX2_METAL_OOT_ACTOR_TOLERANCE") == nullptr) {
+        // The same without the depth comparison: whether that is what discards his pixels.
+        std::printf("metal-smoke: Ocarina actor/effects again with no depth comparison:\n");
+        std::fflush(stdout);
+        (void)RunChildWith("actor-effects", {"EDEN_NX2_METAL_OOT_ACTOR_TOLERANCE=4294967295"});
+    }
+    if (actor_wrong != 0) {
+        // What the translator made of the actor programs: inputs, bindings, the depth read.
+        const auto programs = Metal::OcarinaTemporal::ActorMsl(Metal::DeviceAppleFamily(device));
+        constexpr std::array<const char*, 2> Stages{"vertex", "fragment"};
+        constexpr std::array<std::string_view, 12> Wanted{
+            "attribute(", "[[buffer(", "[[texture(", "[[sampler(", "[[position", "user(locn",
+            ".read(",    "discard",   "bones",       "weights",    "// slot",    "error:"};
+        for (size_t stage = 0; stage < programs.size(); ++stage) {
+            std::string_view text = programs[stage];
+            while (!text.empty()) {
+                const size_t end = text.find('\n');
+                const std::string_view line = text.substr(0, end);
+                if (std::ranges::any_of(Wanted, [line](std::string_view word) {
+                        return line.find(word) != std::string_view::npos;
+                    })) {
+                    std::printf("metal-smoke: actor %s msl: %.*s\n", Stages[stage],
+                                static_cast<int>(line.size()), line.data());
+                }
+                text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
+            }
+        }
+    }
+    return passed ? 0 : 1;
+}
+
 /// The pipeline files (EDEN_NX2_METAL_PIPELINE_FILE): render states and the used list written
 /// and read back, the boot marker of a build that never finished, and render pipelines built on
 /// several threads against one archive (the boot build), then again from the written archive.
@@ -2728,13 +4049,19 @@ int RunPipelineFiles() {
     std::error_code ec;
     std::filesystem::remove_all(directory, ec);
     constexpr size_t Variants = 8;
+    // Variants of other GPU code: the archive keys on it, so variants differing only in state it
+    // does not compile in (the write mask) hit each other's entries once one of them was added.
+    constexpr std::array<MTLPixelFormat, Variants> formats{
+        MTLPixelFormatR8Unorm,    MTLPixelFormatRG8Unorm,  MTLPixelFormatRGBA8Unorm,
+        MTLPixelFormatR16Float,   MTLPixelFormatRG16Float, MTLPixelFormatRGBA16Float,
+        MTLPixelFormatR32Float,   MTLPixelFormatRG32Float};
     std::vector<Metal::RenderPipelineDesc> descs;
     for (size_t index = 0; index < Variants; ++index) {
         auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
         desc.vertex_function = vertex.Get();
         desc.fragment_function = fragment.Get();
-        desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
-        desc.blend[0].write_mask = static_cast<uint32_t>(index + 1);
+        desc.color_formats[0] = static_cast<uint32_t>(formats[index]);
+        desc.blend[0].write_mask = 0xF;
         desc.samples = 1;
         desc.topology_class = 2;
         desc.rasterize = 1;
@@ -2817,21 +4144,444 @@ int RunPipelineFiles() {
     Metal::PipelineArchive reopened;
     const bool second_built = reopened.Open(device, archive_path) && build_all(reopened);
     const Metal::PipelineArchive::Counts second = reopened.Totals();
+    // Checked without timing: every build is a hit or a miss (counted under the archive's lock),
+    // every miss is added, the reopened archive serves all. Should Metal still find two variants
+    // equal, a thread may hit the other's entry in the first run; that is a real hit, not a race.
     const bool passed = boot_marked && rebooted && states_read == Variants && functions_cleared &&
-                        listed && unlisted && first_built && second_built &&
-                        first.misses == Variants && first.added == Variants &&
+                        listed && unlisted && first_built && second_built && first.misses != 0 &&
+                        first.misses + first.hits == Variants && first.added == first.misses &&
                         second.hits == Variants && second.misses == 0;
     std::printf("metal-smoke: pipeline files: %zu of %zu render states read back (written twice "
                 "each), functions cleared %s; used list %s/%s; unfinished boot seen %s; %zu "
-                "pipelines on %zu threads: first %llu misses, %llu added, second %llu hits, %llu "
-                "misses: %s\n",
+                "pipelines on %zu threads: first %llu misses, %llu hits, %llu added, second %llu "
+                "hits, %llu misses: %s\n",
                 states_read, Variants, functions_cleared ? "yes" : "no",
                 listed ? "listed" : "missing", unlisted ? "others not" : "others too",
                 rebooted ? "yes" : "no", Variants, Variants,
                 static_cast<unsigned long long>(first.misses),
+                static_cast<unsigned long long>(first.hits),
                 static_cast<unsigned long long>(first.added),
                 static_cast<unsigned long long>(second.hits),
                 static_cast<unsigned long long>(second.misses), passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+constexpr const char* ProvokingSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct FlatOut {
+    float4 position [[position]];
+    float4 colour [[flat]];
+};
+
+vertex FlatOut flat_vertex(uint id [[vertex_id]], constant float2* positions [[buffer(0)]]) {
+    FlatOut out;
+    out.position = float4(positions[id], 0.0, 1.0);
+    out.colour = float4(float(id + 1) * 0.1, 0.0, 0.0, 1.0);
+    return out;
+}
+
+fragment float4 flat_fragment(FlatOut in [[stage_in]]) {
+    return in.colour;
+}
+)";
+
+/// Flat inputs and the provoking vertex: Metal takes them from a primitive's first vertex (it has
+/// no setting); IndexConvert's rewrite for the last vertex convention makes them the last one's,
+/// as Vulkan draws them with VK_EXT_provoking_vertex. Triangle lists, strips and fans, each drawn
+/// as the guest's indices and rewritten, two triangles sampled per draw.
+int RunProvokingVertex() {
+    using Topology = Metal::IndexConvert::Topology;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    NSError* error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:@(ProvokingSource)
+                                                  options:[MTLCompileOptions new]
+                                                    error:&error];
+    MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+    desc.vertexFunction = [library newFunctionWithName:@"flat_vertex"];
+    desc.fragmentFunction = [library newFunctionWithName:@"flat_fragment"];
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> pipeline =
+        library != nil ? [device newRenderPipelineStateWithDescriptor:desc error:&error] : nil;
+    if (pipeline == nil) {
+        std::printf("metal-smoke: FAIL provoking vertex pipeline: %s\n",
+                    error != nil ? error.localizedDescription.UTF8String : "no library");
+        return 1;
+    }
+    struct Case {
+        const char* name;
+        Topology topology;
+        std::vector<float> positions;
+        /// Pixels (x, y) inside the first and the second triangle, and the vertex each takes
+        /// flat inputs from under the first and the last vertex convention (Vulkan's tables).
+        std::array<std::array<uint32_t, 2>, 2> pixels;
+        std::array<uint32_t, 2> first;
+        std::array<uint32_t, 2> last;
+    };
+    constexpr uint32_t Near = 4;
+    constexpr uint32_t Far = Size - 4;
+    const std::vector<Case> cases{
+        {"triangles",
+         Topology::Triangles,
+         {-1, -1, -1, 1, 0, -1, 0, 1, 1, 1, 1, -1},
+         {{{Near, Size / 2}, {Far, Size / 2}}},
+         {0, 3},
+         {2, 5}},
+        {"triangle strip",
+         Topology::TriangleStrip,
+         {-1, -1, -1, 1, 1, -1, 1, 1},
+         {{{Near, Far}, {Far, Near}}},
+         // Metal's own strip: reported only (which vertex of an odd triangle it takes is its own).
+         {~0U, ~0U},
+         {2, 3}},
+        {"triangle fan",
+         Topology::TriangleFan,
+         {-1, -1, 1, -1, 1, 1, -1, 1},
+         {{{Far, Far}, {Near, Near}}},
+         {1, 2},
+         {2, 3}},
+    };
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    MTLTextureDescriptor* texture_desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                           width:Size
+                                                          height:Size
+                                                       mipmapped:NO];
+    texture_desc.usage = MTLTextureUsageRenderTarget;
+    texture_desc.storageMode = MTLStorageModeShared;
+    uint32_t wrong = 0;
+    std::string report;
+    for (const Case& test : cases) {
+        const uint32_t count = static_cast<uint32_t>(test.positions.size() / 2);
+        id<MTLBuffer> positions =
+            [device newBufferWithBytes:test.positions.data()
+                                length:test.positions.size() * sizeof(float)
+                               options:MTLResourceStorageModeShared];
+        for (const bool provoking_last : {false, true}) {
+            std::vector<uint8_t> guest(count);
+            for (uint32_t vertex = 0; vertex < count; ++vertex) {
+                guest[vertex] = static_cast<uint8_t>(vertex);
+            }
+            const auto topology = Metal::IndexConvert::ConvertedTopology(test.topology, provoking_last);
+            std::vector<uint32_t> indices(
+                Metal::IndexConvert::ConvertedCount(test.topology, count, provoking_last));
+            const uint32_t written = Metal::IndexConvert::Convert(
+                test.topology, guest, 1, 0, count, false, indices, provoking_last);
+            id<MTLBuffer> index_buffer =
+                [device newBufferWithBytes:indices.data()
+                                    length:std::max<size_t>(indices.size(), 1) * sizeof(uint32_t)
+                                   options:MTLResourceStorageModeShared];
+            id<MTLTexture> target = [device newTextureWithDescriptor:texture_desc];
+            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = target;
+            pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+            id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+            id<MTLRenderCommandEncoder> encoder =
+                [command_buffer renderCommandEncoderWithDescriptor:pass];
+            [encoder setRenderPipelineState:pipeline];
+            [encoder setVertexBuffer:positions offset:0 atIndex:0];
+            const bool native = !Metal::IndexConvert::NeedsConversion(test.topology) && !provoking_last;
+            if (native) {
+                [encoder drawPrimitives:static_cast<MTLPrimitiveType>(
+                                            *Metal::PrimitiveType(test.topology))
+                            vertexStart:0
+                            vertexCount:count];
+            } else {
+                [encoder drawIndexedPrimitives:static_cast<MTLPrimitiveType>(
+                                                   *Metal::PrimitiveType(topology))
+                                    indexCount:written
+                                     indexType:MTLIndexTypeUInt32
+                                   indexBuffer:index_buffer
+                             indexBufferOffset:0];
+            }
+            [encoder endEncoding];
+            [command_buffer commit];
+            [command_buffer waitUntilCompleted];
+            std::vector<Texel> texels(Size * Size);
+            [target getBytes:texels.data()
+                 bytesPerRow:Size * 4
+                  fromRegion:MTLRegionMake2D(0, 0, Size, Size)
+                 mipmapLevel:0];
+            const std::array<uint32_t, 2>& expected = provoking_last ? test.last : test.first;
+            for (size_t triangle = 0; triangle < 2; ++triangle) {
+                const auto [x, y] = test.pixels[triangle];
+                const uint8_t red = texels[y * Size + x].r;
+                const uint8_t want =
+                    static_cast<uint8_t>(std::lround(float(expected[triangle] + 1) * 0.1f * 255.0f));
+                const bool ok = expected[triangle] == ~0U ||
+                                (red > want ? red - want : want - red) <= 1;
+                wrong += ok ? 0 : 1;
+                char line[96];
+                std::snprintf(line, sizeof(line), " %s %s #%zu: vertex %ld%s", test.name,
+                              provoking_last ? "last" : "first", triangle,
+                              std::lround(float(red) / 25.5f) - 1, ok ? "" : " WRONG");
+                report += line;
+            }
+        }
+    }
+    std::printf("metal-smoke: provoking vertex (first: as Metal draws, last: rewritten):%s: %s\n",
+                report.c_str(), wrong == 0 ? "PASS" : "FAIL");
+    return wrong == 0 ? 0 : 1;
+}
+
+/// Conditional rendering on the GPU (metal_condition.h): a render pass counts the samples of a
+/// full-target quad into a visibility slot, then the condition kernel, recorded after it in the
+/// same command buffer, reads the slot and zeroes the instance counts of a region's draws when
+/// the condition fails. Equal and not-equal against the expected count, and a 32-bit report.
+int RunCondition() {
+    using Maxwell = Metal::Maxwell;
+    namespace Condition = Metal::Condition;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    std::string error;
+    const Metal::Object quad_library = Metal::CreateLibrary(device, QuadSource, error);
+    const Metal::Object vertex =
+        quad_library ? Metal::CreateFunction(quad_library.Get(), "quad_vertex") : Metal::Object{};
+    const Metal::Object fragment = quad_library
+                                       ? Metal::CreateFunction(quad_library.Get(), "quad_fragment")
+                                       : Metal::Object{};
+    const Metal::Object library = Metal::CreateLibrary(device, Condition::KernelSource(), error);
+    const Metal::Object function =
+        library ? Metal::CreateFunction(library.Get(), "condition_arguments") : Metal::Object{};
+    const Metal::Object kernel =
+        function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                 : Metal::Object{};
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = vertex.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    desc.attributes[0] = {1, 0, 0, Maxwell::VertexAttribute::Type::Float,
+                          Maxwell::VertexAttribute::Size::Size_R32_G32};
+    desc.streams[0] = {1, 8, 0};
+    const Metal::Object pipeline =
+        vertex && fragment ? Metal::CreateRenderPipelineState(device, desc, error)
+                           : Metal::Object{};
+    const Metal::Object depth_stencil =
+        Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+    if (!kernel || !pipeline) {
+        std::printf("metal-smoke: FAIL condition kernel or quad pipeline: %s\n", error.c_str());
+        return 1;
+    }
+    uint8_t* vertices = nullptr;
+    const Metal::Object vertex_buffer = Metal::CreateBuffer(device, 48, true, &vertices);
+    const float positions[12]{-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1};
+    std::memcpy(vertices, positions, sizeof(positions));
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm),
+                 .width = Size,
+                 .height = Size,
+                 .render_target = true});
+    constexpr uint32_t Slot = 7;
+    scheduler.VisibilityResults()[Slot] = 0;
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = Size;
+    targets.height = Size;
+    scheduler.BeginRendering(targets);
+    Metal::DrawState state{};
+    state.pipeline = pipeline.Get();
+    state.depth_stencil = depth_stencil.Get();
+    state.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+    state.scissor = {0, 0, Size, Size};
+    scheduler.SetDrawState(state);
+    scheduler.BindVertexBuffer(Metal::VertexBufferSlot(0), vertex_buffer.Get(), 0);
+    scheduler.SetVisibility(Slot);
+    scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 6, 1, 0);
+
+    struct Case {
+        const char* name;
+        Condition::Params params;
+        bool holds;
+        Metal::Object region;
+        uint32_t* words{};
+    };
+    const uint64_t samples = uint64_t{Size} * Size;
+    const auto make = [&](const char* name, Condition::Mode mode, uint64_t other, bool wide,
+                          bool holds) {
+        Case test{.name = name, .holds = holds};
+        test.params.mode = static_cast<uint32_t>(mode);
+        test.params.slot_count[0] = 1;
+        test.params.slots[0][0] = Slot;
+        // A 32-bit report keeps the high word memory holds.
+        test.params.memory[0] = {0x1234U, 0x5678U};
+        test.params.write_mask[0] = {~0U, wide ? ~0U : 0U};
+        const uint64_t expected_first = wide ? samples : (uint64_t{0x5678U} << 32) | samples;
+        const uint64_t compare = other == 0 ? expected_first : other;
+        test.params.memory[1] = {static_cast<uint32_t>(compare),
+                                 static_cast<uint32_t>(compare >> 32)};
+        return test;
+    };
+    std::vector<Case> cases;
+    cases.push_back(make("equal", Condition::Mode::Equal, 0, true, true));
+    cases.push_back(make("equal, other count", Condition::Mode::Equal, samples + 1, true, false));
+    cases.push_back(make("not equal", Condition::Mode::NotEqual, 0, true, false));
+    cases.push_back(make("equal, 32-bit report", Condition::Mode::Equal, 0, false, true));
+    cases.push_back(make("both words", Condition::Mode::BothWordsNonZero, 0, false, true));
+    constexpr uint32_t Draws = 3;
+    for (Case& test : cases) {
+        uint8_t* contents = nullptr;
+        test.region = Metal::CreateBuffer(
+            device, (Condition::HeaderWords + Condition::RegionDraws * Condition::ArgumentWords) * 4,
+            true, &contents);
+        test.words = reinterpret_cast<uint32_t*>(contents);
+        scheduler.BeginCompute(kernel.Get(), false);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, scheduler.VisibilityBuffer(), 0);
+        scheduler.BindBytes(Metal::ShaderStage::Compute, 1, &test.params, sizeof(test.params));
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, 2, test.region.Get(), 0);
+        scheduler.Dispatch({Condition::RegionDraws / 64, 1, 1}, {64, 1, 1});
+        // Written after the kernel was recorded, before the commit, as the rasterizer does.
+        test.words[0] = Draws;
+        for (uint32_t draw = 0; draw < Draws; ++draw) {
+            uint32_t* const arguments =
+                test.words + Condition::HeaderWords + draw * Condition::ArgumentWords;
+            arguments[0] = 6;
+            arguments[1] = 2 + draw;
+        }
+    }
+    scheduler.Finish();
+    const uint64_t counted = scheduler.VisibilityResults()[Slot];
+    uint32_t wrong = 0;
+    std::string report;
+    for (const Case& test : cases) {
+        bool ok = Condition::Evaluate(test.params, scheduler.VisibilityResults()) == test.holds;
+        for (uint32_t draw = 0; draw < Draws; ++draw) {
+            const uint32_t instances =
+                test.words[Condition::HeaderWords + draw * Condition::ArgumentWords + 1];
+            ok = ok && instances == (test.holds ? 2 + draw : 0U);
+        }
+        wrong += ok ? 0 : 1;
+        report += std::string(" ") + test.name + (ok ? " ok," : " WRONG,");
+    }
+    const bool passed = wrong == 0 && counted == samples;
+    std::printf("metal-smoke: GPU condition (%llu samples counted, %llu expected):%s %s\n",
+                static_cast<unsigned long long>(counted),
+                static_cast<unsigned long long>(samples), report.c_str(),
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// Indirect draws prepared on the GPU (metal_indirect.h): all three kernels build, and
+/// indirect_arguments packs the guest's draws (stride of 8 words) with a draw count of 2 from a
+/// buffer, the third draw left with no instances.
+int RunIndirectArguments() {
+    namespace Indirect = Metal::Indirect;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, Indirect::KernelSource(), error);
+    const auto make = [&](const char* name) {
+        const Metal::Object function =
+            library ? Metal::CreateFunction(library.Get(), name) : Metal::Object{};
+        return function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                        : Metal::Object{};
+    };
+    const Metal::Object arguments = make("indirect_arguments");
+    const Metal::Object setup = make("indirect_rewrite_setup");
+    const Metal::Object grid = make("grid_arguments");
+    if (!arguments || !setup || !grid) {
+        std::printf("metal-smoke: FAIL indirect kernels: %s\n", error.c_str());
+        return 1;
+    }
+    constexpr uint32_t Draws = 3;
+    constexpr uint32_t Stride = 8;
+    uint8_t* source_bytes = nullptr;
+    uint8_t* count_bytes = nullptr;
+    uint8_t* out_bytes = nullptr;
+    const Metal::Object source = Metal::CreateBuffer(device, Draws * Stride * 4, true, &source_bytes);
+    const Metal::Object count = Metal::CreateBuffer(device, 16, true, &count_bytes);
+    const Metal::Object out =
+        Metal::CreateBuffer(device, Draws * Indirect::IndexedWords * 4, true, &out_bytes);
+    auto* const words = reinterpret_cast<uint32_t*>(source_bytes);
+    for (uint32_t draw = 0; draw < Draws; ++draw) {
+        for (uint32_t word = 0; word < Indirect::IndexedWords; ++word) {
+            words[draw * Stride + word] = 100 * (draw + 1) + word;
+        }
+    }
+    reinterpret_cast<uint32_t*>(count_bytes)[0] = 2;
+    const Indirect::CopyParams params{
+        .stride_words = Stride, .max_draws = Draws, .has_count = 1, .words = Indirect::IndexedWords};
+    scheduler.BeginCompute(arguments.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, source.Get(), 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, count.Get(), 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 2, out.Get(), 0);
+    scheduler.BindBytes(Metal::ShaderStage::Compute, 3, &params, sizeof(params));
+    scheduler.Dispatch({1, 1, 1}, {64, 1, 1});
+    scheduler.Finish();
+    const auto* const packed = reinterpret_cast<const uint32_t*>(out_bytes);
+    uint32_t wrong = 0;
+    for (uint32_t draw = 0; draw < Draws; ++draw) {
+        for (uint32_t word = 0; word < Indirect::IndexedWords; ++word) {
+            const uint32_t expected = draw == 2 && word == 1 ? 0U : 100 * (draw + 1) + word;
+            wrong += packed[draw * Indirect::IndexedWords + word] != expected ? 1 : 0;
+        }
+    }
+    std::printf("metal-smoke: indirect arguments (count 2 of 3 draws from a buffer): %u of %u "
+                "words wrong: %s\n",
+                wrong, Draws * Indirect::IndexedWords, wrong == 0 ? "PASS" : "FAIL");
+    return wrong == 0 ? 0 : 1;
+}
+
+/// Pipelines built off the draw's thread (EDEN_NX2_METAL_ASYNC_PIPELINES, PipelineBuildJob): a
+/// job nobody claimed runs on the thread that waits for it; one a builder thread runs is waited
+/// for (lent the waiter's QoS) and runs once; a finished one is not waited for.
+int RunPipelineJobs() {
+    using Job = Metal::BuildJob<int>;
+    int translator = 0;
+    std::atomic<uint32_t> runs{0};
+    std::atomic<bool> release{false};
+    std::thread::id ran_on{};
+    // Unclaimed: the waiter runs it.
+    Job unclaimed([&](int&) {
+        ran_on = std::this_thread::get_id();
+        ++runs;
+    });
+    bool boosted = false;
+    const bool ran_here = unclaimed.Wait(translator, boosted);
+    const bool unclaimed_ok = ran_here && unclaimed.IsDone() && !boosted &&
+                              ran_on == std::this_thread::get_id();
+    // Claimed by a builder that runs until released: the waiter waits, the task runs once.
+    Job claimed([&](int&) {
+        while (!release.load()) {
+            std::this_thread::yield();
+        }
+        ++runs;
+    });
+    std::atomic<bool> builder_started{false};
+    std::thread builder([&] {
+        int builder_translator = 1;
+        builder_started = true;
+        static_cast<void>(claimed.Run(builder_translator));
+    });
+    while (!builder_started.load()) {
+        std::this_thread::yield();
+    }
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        release = true;
+    });
+    // The builder may not have claimed it yet: then this thread runs it (and releaser frees it).
+    bool claimed_boosted = false;
+    const bool claimed_here = claimed.Wait(translator, claimed_boosted);
+    builder.join();
+    releaser.join();
+    const bool claimed_ok = claimed.IsDone() && runs.load() == 2;
+    bool done_boosted = false;
+    const bool done_ok = !claimed.Wait(translator, done_boosted) && !done_boosted &&
+                         runs.load() == 2;
+    const bool passed = unclaimed_ok && claimed_ok && done_ok;
+    std::printf("metal-smoke: pipeline jobs: unclaimed ran on the waiter %s; claimed ran %s "
+                "(QoS lent %s), once %s; done not waited for %s: %s\n",
+                unclaimed_ok ? "yes" : "no", claimed_here ? "on the waiter" : "on the builder",
+                claimed_boosted ? "yes" : "no", claimed_ok ? "yes" : "no",
+                done_ok ? "yes" : "no", passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
 
@@ -2842,19 +4592,44 @@ int main(int argc, char** argv) {
         if (argc == 3 && std::strcmp(argv[1], "--probe") == 0) {
             return SmokeProbe::RunChild(argv[2]);
         }
+        if (argc == 3 && std::strcmp(argv[1], "--child") == 0) {
+            if (std::strcmp(argv[2], "state-cache") == 0) {
+                return RunStateCache();
+            }
+            if (std::strcmp(argv[2], "fence-batch") == 0) {
+                return RunFenceBatch();
+            }
+            if (std::strcmp(argv[2], "actor-effects") == 0) {
+                return RunOcarinaActorEffects();
+            }
+            if (std::strcmp(argv[2], "force-lod0") == 0) {
+                return RunForceLod0();
+            }
+            if (std::strcmp(argv[2], "pass-times") == 0) {
+                return RunPassTimes();
+            }
+            return 4;
+        }
         const int draw = Run();
         if (draw == 2) {
             return 2;
         }
         int result = draw;
-        for (const auto test : {RunTranslate, RunRendererDraw, RunTexelBuffer, RunTexture1D,
+        for (const auto test : {RunTranslate, RunRendererDraw, RunOddStride, RunVertexUnpack,
+                                 RunTexelBuffer,
+                                 RunTexture1D,
                                  RunMeshEmulation, RunMeshDistribution, RunIndexRewrite,
                                  RunOcarinaBilinear, RunPipelineArchive,
                                  RunDepthBlit, RunTessellation, RunDepthStencilBlit,
-                                 RunPipelineCheck, RunDeviceMsl, RunBlockCopy, RunClearRect,
+                                 RunPipelineCheck, RunDeviceMsl, RunNativeMesh, RunBlockCopy,
+                                 RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
                                  RunStagingBound, RunPipelineFiles, RunOcarinaTemporal,
-                                 SmokeProbe::RunAll}) {
+                                 RunProvokingVertex, RunCondition, RunIndirectArguments, RunPipelineJobs,
+                                 RunOcarinaActorEffects, RunOcarinaDepthJitter, RunTemporalStandIn, RunForceLod0,
+                                 RunSwapchain,
+                                 RunVulkanSwitches, RunPresentFilters,
+                                 SmokeTextures::RunAll, SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }

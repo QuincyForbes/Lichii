@@ -6,6 +6,8 @@
 
 add_executable(tests
     video_core/metal_index_convert.cpp
+    video_core/metal_textures.cpp
+    video_core/metal_work_policy.cpp
     video_core/vulkan_overlay_filter.cpp
     common/addon_config.cpp
     common/settings_migration.cpp
@@ -208,7 +210,10 @@ create_target_directory_groups(tests)
 target_link_libraries(tests PRIVATE common core audio_core input_common video_core frontend_common)
 # The Metal renderer's index rewriting is plain C++: tested everywhere (video_core has it on Apple).
 if (NOT ENABLE_METAL)
-    target_sources(tests PRIVATE ../video_core/renderer_metal/metal_index_convert.cpp)
+    target_sources(tests PRIVATE ../video_core/renderer_metal/metal_index_convert.cpp
+                                 ../video_core/renderer_metal/metal_coverage.cpp
+                                 ../video_core/renderer_metal/metal_formats.cpp
+                                 ../video_core/renderer_metal/metal_pipeline_check.cpp)
 endif()
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 

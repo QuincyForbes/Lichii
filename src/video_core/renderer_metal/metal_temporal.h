@@ -35,7 +35,13 @@ public:
         bool depth_reversed{true};
         /// Linear HDR colour (the games' DLSS inputs); Ocarina's scene is tonemapped already.
         bool auto_exposure{true};
+        /// Where this frame's colour counts over the history (0..1, R16F at the render size):
+        /// MetalFX's reactive mask (iOS 18, macOS 15; ignored before). Null: none.
+        TextureHandle reactive{};
     };
+
+    /// Whether MetalFX takes a reactive mask on this OS.
+    [[nodiscard]] static bool ReactiveMaskSupported();
 
     TemporalUpscaler();
     ~TemporalUpscaler();

@@ -461,6 +461,11 @@ struct ExperimentsView: View {
     @State private var metalCachePlain = lichii_platform_experiment("metal_cache_plain") != 0
     @State private var metalMslPlain = lichii_platform_experiment("metal_msl_plain") != 0
     @State private var metalCopiesPlain = lichii_platform_experiment("metal_copies_plain") != 0
+    @State private var metalSamplersPlain = lichii_platform_experiment("metal_samplers_plain") != 0
+    @State private var metalMsaaOff = lichii_platform_experiment("metal_msaa_off") != 0
+    @State private var metalFormatsPlain = lichii_platform_experiment("metal_formats_plain") != 0
+    @State private var metalLayersOff = lichii_platform_experiment("metal_layers_off") != 0
+    @State private var metalMultiRangeOff = lichii_platform_experiment("metal_multirange_off") != 0
     @State private var metalClearsPlain = lichii_platform_experiment("metal_clears_plain") != 0
     @State private var metalBarrierOff = lichii_platform_experiment("metal_barrier_off") != 0
     @State private var metalStatePlain = lichii_platform_experiment("metal_state_plain") != 0
@@ -470,6 +475,29 @@ struct ExperimentsView: View {
     @State private var metalNetworkRuns = lichii_platform_experiment("metal_network_runs") != 0
     @State private var metalPrebuildOff = lichii_platform_experiment("metal_prebuild_off") != 0
     @State private var metalTemporalOff = lichii_platform_experiment("metal_temporal_off") != 0
+    @State private var metalMeshEmulated = lichii_platform_experiment("metal_mesh_emulated") != 0
+    @State private var metalVertexPlain = lichii_platform_experiment("metal_vertex_plain") != 0
+    @State private var metalAsyncOff = lichii_platform_experiment("metal_async_off") != 0
+    @State private var metalProvokingFirst = lichii_platform_experiment("metal_provoking_first") != 0
+    @State private var metalConditionCpu = lichii_platform_experiment("metal_condition_cpu") != 0
+    @State private var metalIndirectCpu = lichii_platform_experiment("metal_indirect_cpu") != 0
+    @State private var metalDrawTextureOff = lichii_platform_experiment("metal_draw_texture_off") != 0
+    @State private var metalClearLayersOff = lichii_platform_experiment("metal_clear_layers_off") != 0
+    @State private var metalListCopiesOff = lichii_platform_experiment("metal_list_copies_off") != 0
+    @State private var metalViewportsOff = lichii_platform_experiment("metal_viewports_off") != 0
+    @State private var metalFillLinesOff = lichii_platform_experiment("metal_fill_lines_off") != 0
+    @State private var metalTessBaseOff = lichii_platform_experiment("metal_tess_base_off") != 0
+    @State private var metalAlphaToOneOff = lichii_platform_experiment("metal_alpha_to_one_off") != 0
+    @State private var metalActorOff = lichii_platform_experiment("metal_actor_off") != 0
+    @State private var metalEffectsOff = lichii_platform_experiment("metal_effects_off") != 0
+    @State private var metalVulkanSwitchesOff = lichii_platform_experiment("metal_vulkan_switches_off") != 0
+    @State private var metalFenceBatchOff = lichii_platform_experiment("metal_fence_batch_off") != 0
+    @State private var metalFiltersOff = lichii_platform_experiment("metal_filters_off") != 0
+    @State private var metalStandinOff = lichii_platform_experiment("metal_standin_off") != 0
+    @State private var metalBindmemoOff = lichii_platform_experiment("metal_bindmemo_off") != 0
+    @State private var metalPacingOff = lichii_platform_experiment("metal_pacing_off") != 0
+    @State private var metalColorspaceOff = lichii_platform_experiment("metal_colorspace_off") != 0
+    @State private var metalEvictOff = lichii_platform_experiment("metal_evict_off") != 0
     @State private var pipelineHoldsOld = lichii_platform_experiment("pipeline_holds_old") != 0
     @State private var pipelineListOld = lichii_platform_experiment("pipeline_list_old") != 0
     @State private var mvkStatsOff = lichii_platform_experiment("mvk_stats_off") != 0
@@ -516,7 +544,7 @@ struct ExperimentsView: View {
             } header: {
                 Text("Memory")
             } footer: {
-                Text("Guest memory normally counts once toward the limit iOS closes Lichii at. Per mapping is the old accounting: pages both the game and the emulator touch count twice, and all-zero pages are trimmed.\n\nCompressed files of a .nup game are normally kept in memory up to 96 MB once read, and files over 48 MB (a movie, a texture archive) are unpacked to temporary files in storage instead. Keep Decompressed Game Files in Memory is the old behaviour: up to 512 MB in memory. Turn it on if a game that used to start no longer does.\n\nCount Memory Blocks in the Log writes what Lichii's own memory holds, by block size, to the log 60 s and 180 s into a game (always once when memory runs low). While it counts, threads that need memory wait.\n\nAll four apply the next time Lichii starts.")
+                Text("Guest memory normally counts once toward the limit iOS closes Lichii at. Per mapping is the old accounting: pages both the game and the emulator touch count twice, and all-zero pages are trimmed.\n\nCompressed files of a .nup game are normally kept in memory up to 96 MB once read, and files over 48 MB (a movie, a texture archive) are unpacked to temporary files in storage instead. Keep Decompressed Game Files in Memory is the old behaviour: up to 512 MB in memory. Turn it on if a game that used to start no longer does.\n\nCount Memory Blocks in the Log writes what Lichii's own memory holds, by block size, to the log 60 s and 180 s into a game (always once when memory runs low). While it counts, threads that need memory wait.\n\nLink Moves With the Camera Only: with MetalFX Temporal in Ocarina of Time, the Metal renderer now tells MetalFX how Link himself moved (his animation from one frame to the next), as the Vulkan renderer does, so he trails less. On, his pixels get the camera's motion only, as before; turn it on if Link smears or flickers with a new build.\n\nNo Effects Mask for MetalFX: with MetalFX Temporal in Ocarina of Time (iOS 18 and later), the Metal renderer now marks where Navi's glow, fireflies and dust were drawn so MetalFX takes those pixels from this frame instead of blending in earlier ones, as the Vulkan renderer does. On, no such mask is made, as before; turn it on if glows flicker or the game got slower with a new build.\n\nAll six apply the next time Lichii starts.")
             }
 
             Section {
@@ -712,6 +740,26 @@ struct ExperimentsView: View {
                     .onChange(of: metalCopiesPlain) { value in
                         lichii_platform_set_experiment("metal_copies_plain", value ? 1 : 0)
                     }
+                Toggle("Samplers as Before", isOn: $metalSamplersPlain)
+                    .onChange(of: metalSamplersPlain) { value in
+                        lichii_platform_set_experiment("metal_samplers_plain", value ? 1 : 0)
+                    }
+                Toggle("No Multisampled Image Copies", isOn: $metalMsaaOff)
+                    .onChange(of: metalMsaaOff) { value in
+                        lichii_platform_set_experiment("metal_msaa_off", value ? 1 : 0)
+                    }
+                Toggle("Formats Metal Lacks as Before", isOn: $metalFormatsPlain)
+                    .onChange(of: metalFormatsPlain) { value in
+                        lichii_platform_set_experiment("metal_formats_plain", value ? 1 : 0)
+                    }
+                Toggle("One Layer per Render Pass", isOn: $metalLayersOff)
+                    .onChange(of: metalLayersOff) { value in
+                        lichii_platform_set_experiment("metal_layers_off", value ? 1 : 0)
+                    }
+                Toggle("Split Storage Buffers as Before", isOn: $metalMultiRangeOff)
+                    .onChange(of: metalMultiRangeOff) { value in
+                        lichii_platform_set_experiment("metal_multirange_off", value ? 1 : 0)
+                    }
                 Toggle("Clears as Before", isOn: $metalClearsPlain)
                     .onChange(of: metalClearsPlain) { value in
                         lichii_platform_set_experiment("metal_clears_plain", value ? 1 : 0)
@@ -748,10 +796,102 @@ struct ExperimentsView: View {
                     .onChange(of: metalTemporalOff) { value in
                         lichii_platform_set_experiment("metal_temporal_off", value ? 1 : 0)
                     }
+                Toggle("Mesh Shaders Through the Emulation", isOn: $metalMeshEmulated)
+                    .onChange(of: metalMeshEmulated) { value in
+                        lichii_platform_set_experiment("metal_mesh_emulated", value ? 1 : 0)
+                    }
+                Toggle("Vertex Input as Before", isOn: $metalVertexPlain)
+                    .onChange(of: metalVertexPlain) { value in
+                        lichii_platform_set_experiment("metal_vertex_plain", value ? 1 : 0)
+                    }
+                Toggle("Build New Shaders on the Draw's Thread", isOn: $metalAsyncOff)
+                    .onChange(of: metalAsyncOff) { value in
+                        lichii_platform_set_experiment("metal_async_off", value ? 1 : 0)
+                    }
+                Toggle("Flat Colours From the First Vertex", isOn: $metalProvokingFirst)
+                    .onChange(of: metalProvokingFirst) { value in
+                        lichii_platform_set_experiment("metal_provoking_first", value ? 1 : 0)
+                    }
+                Toggle("Conditional Draws Decided as Before", isOn: $metalConditionCpu)
+                    .onChange(of: metalConditionCpu) { value in
+                        lichii_platform_set_experiment("metal_condition_cpu", value ? 1 : 0)
+                    }
+                Toggle("Indirect Draws as Before", isOn: $metalIndirectCpu)
+                    .onChange(of: metalIndirectCpu) { value in
+                        lichii_platform_set_experiment("metal_indirect_cpu", value ? 1 : 0)
+                    }
+                Toggle("Skip Texture Draws", isOn: $metalDrawTextureOff)
+                    .onChange(of: metalDrawTextureOff) { value in
+                        lichii_platform_set_experiment("metal_draw_texture_off", value ? 1 : 0)
+                    }
+                Toggle("Clear the Bound Layer Only", isOn: $metalClearLayersOff)
+                    .onChange(of: metalClearLayersOff) { value in
+                        lichii_platform_set_experiment("metal_clear_layers_off", value ? 1 : 0)
+                    }
+                Toggle("GPU-Written Command Lists as Before", isOn: $metalListCopiesOff)
+                    .onChange(of: metalListCopiesOff) { value in
+                        lichii_platform_set_experiment("metal_list_copies_off", value ? 1 : 0)
+                    }
+                Toggle("One Viewport Only", isOn: $metalViewportsOff)
+                    .onChange(of: metalViewportsOff) { value in
+                        lichii_platform_set_experiment("metal_viewports_off", value ? 1 : 0)
+                    }
+                Toggle("Always Fill Triangles", isOn: $metalFillLinesOff)
+                    .onChange(of: metalFillLinesOff) { value in
+                        lichii_platform_set_experiment("metal_fill_lines_off", value ? 1 : 0)
+                    }
+                Toggle("Tessellation Without Base Vertex", isOn: $metalTessBaseOff)
+                    .onChange(of: metalTessBaseOff) { value in
+                        lichii_platform_set_experiment("metal_tess_base_off", value ? 1 : 0)
+                    }
+                Toggle("No Alpha to One", isOn: $metalAlphaToOneOff)
+                    .onChange(of: metalAlphaToOneOff) { value in
+                        lichii_platform_set_experiment("metal_alpha_to_one_off", value ? 1 : 0)
+                    }
+                Toggle("Link Moves With the Camera Only", isOn: $metalActorOff)
+                    .onChange(of: metalActorOff) { value in
+                        lichii_platform_set_experiment("metal_actor_off", value ? 1 : 0)
+                    }
+                Toggle("No Effects Mask for MetalFX", isOn: $metalEffectsOff)
+                    .onChange(of: metalEffectsOff) { value in
+                        lichii_platform_set_experiment("metal_effects_off", value ? 1 : 0)
+                    }
+                Toggle("Ignore Vulkan's Switches", isOn: $metalVulkanSwitchesOff)
+                    .onChange(of: metalVulkanSwitchesOff) { value in
+                        lichii_platform_set_experiment("metal_vulkan_switches_off", value ? 1 : 0)
+                    }
+                Toggle("Commit at Every Fence With Work", isOn: $metalFenceBatchOff)
+                    .onChange(of: metalFenceBatchOff) { value in
+                        lichii_platform_set_experiment("metal_fence_batch_off", value ? 1 : 0)
+                    }
+                Toggle("Plain Window Scaling", isOn: $metalFiltersOff)
+                    .onChange(of: metalFiltersOff) { value in
+                        lichii_platform_set_experiment("metal_filters_off", value ? 1 : 0)
+                    }
+                Toggle("Game's DLSS Without MetalFX", isOn: $metalStandinOff)
+                    .onChange(of: metalStandinOff) { value in
+                        lichii_platform_set_experiment("metal_standin_off", value ? 1 : 0)
+                    }
+                Toggle("Resolve Every Binding Every Draw", isOn: $metalBindmemoOff)
+                    .onChange(of: metalBindmemoOff) { value in
+                        lichii_platform_set_experiment("metal_bindmemo_off", value ? 1 : 0)
+                    }
+                Toggle("No Frame Pacing", isOn: $metalPacingOff)
+                    .onChange(of: metalPacingOff) { value in
+                        lichii_platform_set_experiment("metal_pacing_off", value ? 1 : 0)
+                    }
+                Toggle("Untagged Screen Colours", isOn: $metalColorspaceOff)
+                    .onChange(of: metalColorspaceOff) { value in
+                        lichii_platform_set_experiment("metal_colorspace_off", value ? 1 : 0)
+                    }
+                Toggle("Keep Every Pipeline", isOn: $metalEvictOff)
+                    .onChange(of: metalEvictOff) { value in
+                        lichii_platform_set_experiment("metal_evict_off", value ? 1 : 0)
+                    }
             } header: {
                 Text("Metal Renderer")
             } footer: {
-                Text("Only for the Metal renderer (Graphics API). Shaders Without the Draw's State builds the game's shaders as before, without what the draw sets outside the shader: the depth range the game uses, the size of points, the alpha test, blending with two colours and whole-number colour targets. Turn it on if the picture got worse with a new build.\n\nGame Memory Access as Before: when the game reads or writes memory the graphics side also uses, the Metal renderer now handles it the way the Vulkan renderer does (the game's threads wait less for the graphics thread, and the switches under Guest Memory Access apply to it too). On, it handles every such read and write the slow way it did before; turn it on if objects flicker, show stale data or the game hangs with a new build.\n\nShaders Translated as Before: the game's shaders are now turned into Metal shaders with what this iPhone's GPU can do, as the Vulkan renderer's MoltenVK does it. Before, every shader that reads which copy of a model it is drawing was refused (about a fifth of Ocarina of Time's, their draws skipped), and shaders that share values between neighbouring pixels did it in groups of four. On, they are translated as before; turn it on if shaders fail to build or the picture got worse with a new build.\n\nImage Copies as Before: the Metal renderer now copies one depth image into another when the game asks for it, and copies between a compressed image and a plain one whose pixels hold a compressed block each (Ocarina of Time does both). Before, both kinds of copy were skipped. On, they are skipped again; turn it on if the game stops with a new build.\n\nClears as Before: when the game clears only a rectangle of an image, only some of its colour channels or only some stencil bits, the Metal renderer now does exactly that (Ocarina of Time clears rectangles many times a frame). Before, it cleared the whole image. A clear of a whole image now also waits for the drawing that follows it and is done as that drawing starts, instead of as a step of its own. On, it clears the whole image again, each clear as its own step; turn it on if parts of the picture go missing with a new build.\n\nIgnore the Game's Draw Barriers: when the game draws into an image and then reads that same image in a later draw, it tells the graphics chip so first. The Metal renderer now finishes the drawing done so far at that point, so the later draw reads it. Before, such a draw read the image as it was before any of that drawing. On, the barriers are ignored again; turn it on if the game got slower with a new build.\n\nSet All Draw State Every Draw: the Metal renderer now tells the graphics chip only what changed since the draw before (which shader, which buffers and images, the drawing area and so on). On, it sets everything again for every draw, as before; turn it on if objects are drawn with the wrong image or in the wrong place with a new build.\n\nUploads and Kernels in Their Place: data the game changed, and the small programs that prepare some draws (grass and other models built on the graphics chip, some index lists), used to interrupt the drawing into an image each time; the image was put away and fetched again. Now they are sent ahead of that drawing where nothing in between depends on the order. On, they interrupt the drawing again, as before; turn it on if objects flicker, show stale data or parts of the picture go missing with a new build.\n\nA Command Buffer for Every Fence: the game marks points in its drawing and waits for the graphics chip to reach them. When nothing was drawn since the last such point, the Metal renderer now waits for the work already sent instead of sending an empty batch. On, it sends one every time, as before; turn it on if the game hangs or stutters with a new build.\n\nUpload Buffers Without Bounds: while a place loads, the game sends thousands of images and models at once. The Metal renderer now sends what it has to the graphics chip every 24 MiB so the memory can be used again, waits for it when 96 MiB are held, and gives unused memory back after a few frames. On, there are no such bounds, as before; turn it on if loading got slower or stutters with a new build (Lichii then needs more memory while loading).\n\nAlways Run the Anti-Aliasing Network: with Ocarina of Time's anti-aliasing set to No sharpening, the Metal renderer now skips the game's anti-aliasing network and shows the picture from before it, as the Vulkan renderer does. Before, the setting did nothing on Metal. On, the network runs again whatever the setting says; turn it on if the picture is wrong or stays black with that setting and a new build.\n\nBuild Shaders at First Use Only: the Metal renderer now notes every shader it builds and, when the game starts the next time, builds them all again while the game loads, on several cores, so play does not stop for them. On, nothing is noted or built ahead, as before: each shader is built when it is first drawn, and play waits for it; turn it on if the game stops while loading with a new build.\n\nNo MetalFX Temporal in Ocarina of Time: with the upscaler set to MetalFX Temporal, the Metal renderer now hands Ocarina of Time's picture to MetalFX as the Vulkan renderer does (Link and particles may trail more than on Vulkan). On, the game's own upscaling (or the simple one) runs instead, as before; turn it on if the picture is wrong or stutters with a new build.\n\nAll thirteen apply the next time Lichii starts.")
+                Text("Only for the Metal renderer (Graphics API). Shaders Without the Draw's State builds the game's shaders as before, without what the draw sets outside the shader: the depth range the game uses, the size of points, the alpha test, blending with two colours and whole-number colour targets. Turn it on if the picture got worse with a new build.\n\nGame Memory Access as Before: when the game reads or writes memory the graphics side also uses, the Metal renderer now handles it the way the Vulkan renderer does (the game's threads wait less for the graphics thread, and the switches under Guest Memory Access apply to it too). On, it handles every such read and write the slow way it did before; turn it on if objects flicker, show stale data or the game hangs with a new build.\n\nShaders Translated as Before: the game's shaders are now turned into Metal shaders with what this iPhone's GPU can do, as the Vulkan renderer's MoltenVK does it. Before, every shader that reads which copy of a model it is drawing was refused (about a fifth of Ocarina of Time's, their draws skipped), and shaders that share values between neighbouring pixels did it in groups of four. On, they are translated as before; turn it on if shaders fail to build or the picture got worse with a new build.\n\nImage Copies as Before: the Metal renderer now copies one depth image into another when the game asks for it, and copies between a compressed image and a plain one whose pixels hold a compressed block each (Ocarina of Time does both). Before, both kinds of copy were skipped. On, they are skipped again; turn it on if the game stops with a new build.\n\nSamplers as Before: the Metal renderer now gives each texture read the sampler Vulkan would: the game's level-of-detail bias and minimum or maximum filtering (on iOS 26), border colours and mirror modes as close as Metal has them, and a variant for each kind of image read. On, every guest sampler is one plain sampler, as before; turn it on if textures look blurred, too sharp or wrongly tiled with a new build.\n\nNo Multisampled Image Copies: images with several samples per pixel are now uploaded, read back, copied and resolved as on Vulkan (Ocarina of Time uses none). On, none of that is done, as before.\n\nFormats Metal Lacks as Before: images in two formats Metal has no texture for (three 32-bit floats, and two 4-bit channels) are now converted to the nearest format it has. On, they get no texture or the wrong one, as before.\n\nOne Layer per Render Pass: drawing into images with layers now reaches every layer a shader picks. On, a render pass gets one layer of each image, as before.\n\nSplit Storage Buffers as Before: a buffer the game reads from several places in memory is now gathered into one. On, only its first part is read, as before.\n\nClears as Before: when the game clears only a rectangle of an image, only some of its colour channels or only some stencil bits, the Metal renderer now does exactly that (Ocarina of Time clears rectangles many times a frame). Before, it cleared the whole image. A clear of a whole image now also waits for the drawing that follows it and is done as that drawing starts, instead of as a step of its own. On, it clears the whole image again, each clear as its own step; turn it on if parts of the picture go missing with a new build.\n\nIgnore the Game's Draw Barriers: when the game draws into an image and then reads that same image in a later draw, it tells the graphics chip so first. The Metal renderer now finishes the drawing done so far at that point, so the later draw reads it. Before, such a draw read the image as it was before any of that drawing. On, the barriers are ignored again; turn it on if the game got slower with a new build.\n\nSet All Draw State Every Draw: the Metal renderer now tells the graphics chip only what changed since the draw before (which shader, which buffers and images, the drawing area and so on). On, it sets everything again for every draw, as before; turn it on if objects are drawn with the wrong image or in the wrong place with a new build.\n\nUploads and Kernels in Their Place: data the game changed, and the small programs that prepare some draws (grass and other models built on the graphics chip, some index lists), used to interrupt the drawing into an image each time; the image was put away and fetched again. Now they are sent ahead of that drawing where nothing in between depends on the order. On, they interrupt the drawing again, as before; turn it on if objects flicker, show stale data or parts of the picture go missing with a new build.\n\nA Command Buffer for Every Fence: the game marks points in its drawing and waits for the graphics chip to reach them. When nothing was drawn since the last such point, the Metal renderer now waits for the work already sent instead of sending an empty batch. On, it sends one every time, as before; turn it on if the game hangs or stutters with a new build.\n\nUpload Buffers Without Bounds: while a place loads, the game sends thousands of images and models at once. The Metal renderer now sends what it has to the graphics chip every 24 MiB so the memory can be used again, waits for it when 96 MiB are held, and gives unused memory back after a few frames. On, there are no such bounds, as before; turn it on if loading got slower or stutters with a new build (Lichii then needs more memory while loading).\n\nAlways Run the Anti-Aliasing Network: with Ocarina of Time's anti-aliasing set to No sharpening, the Metal renderer now skips the game's anti-aliasing network and shows the picture from before it, as the Vulkan renderer does. Before, the setting did nothing on Metal. On, the network runs again whatever the setting says; turn it on if the picture is wrong or stays black with that setting and a new build.\n\nBuild Shaders at First Use Only: the Metal renderer now notes every shader it builds and, when the game starts the next time, builds them all again while the game loads, on several cores, so play does not stop for them. On, nothing is noted or built ahead, as before: each shader is built when it is first drawn, and play waits for it; turn it on if the game stops while loading with a new build.\n\nNo MetalFX Temporal in Ocarina of Time: with the upscaler set to MetalFX Temporal, the Metal renderer now hands Ocarina of Time's picture to MetalFX as the Vulkan renderer does. On, the game's own upscaling (or the simple one) runs instead, as before; turn it on if the picture is wrong or stutters with a new build.\n\nMesh Shaders Through the Emulation: Ocarina of Time draws its grass and some other models with mesh shaders. The Metal renderer now hands them to the iPhone's own mesh shader stage. Before, each was run as a compute program whose output a second draw then drew. On, they go through that emulation again; turn it on if grass or other models are missing or wrong with a new build.\n\nVertex Input as Before: the Metal renderer now draws models stored in three forms Metal can't read directly (with neighbouring-vertex data, with 10-bit whole numbers, or spread over more buffers than Metal takes), converting them first. Ocarina of Time uses none of them. On, such draws are skipped or read wrongly again, as before; turn it on if models are wrong with a new build.\n\nBuild New Shaders on the Draw's Thread: a shader the game uses for the first time is now built on other cores; draws that may be left out meanwhile are, the others wait for it at full priority. On, it is built where the draw is and the game waits, as before; turn it on if objects go missing for longer with a new build.\n\nFlat Colours From the First Vertex: values the game does not blend across a triangle are now taken from the corner the game asks for, as on a PC. On, they come from the first corner, as before and as on MoltenVK; turn it on if draws got slower or look wrong with a new build.\n\nConditional Draws Decided as Before: draws the game makes only if an earlier one showed any pixels are now decided by the graphics chip once it has counted them. On, they are decided from what memory holds at the time, as before; turn it on if objects flicker or the game stutters with a new build.\n\nIndirect Draws as Before: draws whose sizes the graphics chip wrote are now prepared on it (their count, their index lists). On, the sizes are read on the CPU, which waits for the chip, and some of those draws are skipped, as before; turn it on if objects go missing or flicker with a new build.\n\nSkip Texture Draws: when the game draws a picture straight onto the screen image, the Metal renderer now does it. On, such draws are skipped, as before.\n\nClear the Bound Layer Only: a clear of an image with layers now clears the layers the game names. On, only the first, as before.\n\nGPU-Written Command Lists as Before: drawing commands the graphics chip writes for itself are now read from copies made right after they are written, as the Vulkan renderer does. On, the CPU waits for all work first, as before; turn it on if the game hangs or draws the wrong things with a new build.\n\nOne Viewport Only: shaders that pick one of several drawing areas now get all sixteen. On, only the first, as before.\n\nAlways Fill Triangles: triangles the game asks to draw as outlines are now drawn so. On, they are filled, as before.\n\nTessellation Without Base Vertex: tessellated models now start at the vertex the game names. On, they start at vertex 0, as before; turn it on if tessellated ground or water looks torn with a new build.\n\nNo Alpha to One: when the game asks for the alpha of drawn pixels to be set to one, the Metal renderer now does it. On, it is left as drawn, as before.\n\nIgnore Vulkan's Switches: the Metal renderer now follows the Vulkan renderer's switches that it has a counterpart for (on this iPhone that changes one thing: fences sent together, below). On, they are ignored, as before.\n\nCommit at Every Fence With Work: the game's fences that come within 2 ms of the last batch sent to the graphics chip now go with the next one, as on the Vulkan renderer, instead of each in a batch of its own. On, each is sent at once, as before; turn it on if the game hangs or flashes with a new build.\n\nPlain Window Scaling: the scaling filter and anti-aliasing settings (FSR, SGSR, FXAA, SMAA, bicubic, Lanczos and the others) now apply under the Metal renderer as under Vulkan. Before, the picture was always scaled to the screen bilinearly. On, it is again; turn it on if the picture is wrong with one of these settings and a new build.\n\nGame's DLSS Without MetalFX: where the upscaler is not MetalFX Temporal, or MetalFX cannot run, the game's own DLSS is now replaced by the Vulkan renderer's temporal upscaler. On, the game's DLSS runs again, as before; turn it on if the picture is wrong or slower with a new build.\n\nResolve Every Binding Every Draw: the Metal renderer now remembers which image and sampler each of the game's texture slots stood for, as the Vulkan renderer does, and looks again only when the game changed them. On, it looks every draw, as before; turn it on if objects show the wrong image with a new build.\n\nNo Frame Pacing: a game running below the screen's rate now shows every frame for the same number of refreshes, as under the Vulkan renderer (30 fps on a 120 Hz screen: four each, not three and five by turns). On, each frame is shown as soon as it is ready, as before; turn it on if the game feels slower to respond with a new build.\n\nUntagged Screen Colours: the picture is now marked as sRGB, as the Vulkan renderer marks it, so the screen shows its colours as meant. On, it is left unmarked, as before.\n\nKeep Every Pipeline: when iOS says memory is low, the Metal renderer now frees the drawing pipelines no draw used for 10 s or more, as the Vulkan renderer does. On, it keeps them all, as before; turn it on if the game stutters after a memory warning with a new build.\n\nAll of them apply the next time Lichii starts.")
             }
 
             Section {

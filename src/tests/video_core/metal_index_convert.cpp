@@ -40,9 +40,36 @@ TEST_CASE("MetalIndexConvert[QuadStrip]", "[video_core]") {
 
 TEST_CASE("MetalIndexConvert[FanAndPolygon]", "[video_core]") {
     const std::array<u8, 5> indices{7, 8, 9, 10, 11};
+    // Vulkan's fan triangle i is (i+1, i+2, 0): Metal's first vertex is then Vulkan's.
     REQUIRE(Convert(Topology::TriangleFan, indices, 1, 0, 5) ==
-            std::vector<u32>{7, 8, 9, 7, 9, 10, 7, 10, 11});
-    REQUIRE(Convert(Topology::Polygon, {}, 0, 3, 4) == std::vector<u32>{3, 4, 5, 3, 5, 6});
+            std::vector<u32>{8, 9, 7, 9, 10, 7, 10, 11, 7});
+    REQUIRE(Convert(Topology::Polygon, {}, 0, 3, 4) == std::vector<u32>{4, 5, 3, 5, 6, 3});
+}
+
+TEST_CASE("MetalIndexConvert[ProvokingLast]", "[video_core]") {
+    using Metal::IndexConvert::ConvertedCount;
+    const auto last = [](Topology topology, u32 count, bool restart = false,
+                         std::span<const u8> source = {}, u32 index_size = 0) {
+        std::vector<u32> out(ConvertedCount(topology, count, true));
+        out.resize(Metal::IndexConvert::Convert(topology, source, index_size, 0, count, restart,
+                                                out, true));
+        return out;
+    };
+    // Each triangle starts with its last vertex and keeps its winding: (a, b, c) -> (c, a, b).
+    REQUIRE(last(Topology::Triangles, 7) == std::vector<u32>{2, 0, 1, 5, 3, 4});
+    REQUIRE(last(Topology::TriangleStrip, 5) == std::vector<u32>{2, 0, 1, 3, 2, 1, 4, 2, 3});
+    REQUIRE(last(Topology::Quads, 4) == std::vector<u32>{2, 0, 1, 3, 0, 2});
+    REQUIRE(last(Topology::QuadStrip, 4) == std::vector<u32>{1, 0, 3, 3, 0, 2});
+    REQUIRE(last(Topology::TriangleFan, 4) == std::vector<u32>{2, 0, 1, 3, 0, 2});
+    REQUIRE(last(Topology::Lines, 5) == std::vector<u32>{1, 0, 3, 2});
+    REQUIRE(last(Topology::LineStrip, 3) == std::vector<u32>{2, 1, 0});
+    REQUIRE(last(Topology::LineLoop, 3) == std::vector<u32>{0, 2, 1, 0});
+    // Strips with a restart: each part on its own, the triangles across it degenerate.
+    const std::array<u8, 6> strip{0, 1, 2, 0xFF, 3, 4};
+    REQUIRE(last(Topology::TriangleStrip, 6, true, strip, 1) ==
+            std::vector<u32>{2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    REQUIRE(Metal::IndexConvert::RewriteMode(Topology::TriangleStrip, true, true) ==
+            Metal::IndexConvert::StripRestartMode);
 }
 
 TEST_CASE("MetalIndexConvert[LineLoop]", "[video_core]") {

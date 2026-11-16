@@ -40,7 +40,7 @@ public:
         return apple_family;
     }
 
-    /// Metal mesh pipelines (MTLMeshRenderPipelineDescriptor): Apple7+ and Mac2 GPUs.
+    /// Metal mesh pipelines (MTLMeshRenderPipelineDescriptor): Metal 3 Apple7+ and Mac2 GPUs.
     [[nodiscard]] bool SupportsMeshShaders() const noexcept {
         return mesh_shaders;
     }
@@ -53,6 +53,9 @@ public:
     /// Bytes the GPU should keep resident: recommendedMaxWorkingSetSize on macOS, the memory the
     /// process may still allocate on iOS (unified memory).
     [[nodiscard]] u64 MemoryBudget() const;
+
+    /// Bytes the device has allocated for this process (currentAllocatedSize).
+    [[nodiscard]] u64 AllocatedSize() const;
 
 private:
     id<MTLDevice> device = nil;

@@ -62,6 +62,25 @@ inline void Refuse(Work work, std::string_view cause) {
     }
 }
 
+/// Counts a guard that changed what Metal was given (an offset past a buffer bound as zeros,
+/// a refused pipeline drawn through its fallback, ...), by a short fixed name; logged the first
+/// time with `detail`. They follow the work on the report line as "guards: <name> <count>".
+void NoteGuard(std::string_view name, std::string_view detail = {});
+
+/// Counts a guard; true the first time `name` is seen.
+[[nodiscard]] bool CountGuard(std::string_view name);
+
+/// Logs a guard's first use.
+void LogGuard(std::string_view name, std::string_view detail);
+
+/// NoteGuard with detail() made only the first time (guards that may fire on every draw).
+template <typename Detail>
+void NoteGuardWith(std::string_view name, Detail&& detail) {
+    if (CountGuard(name)) {
+        LogGuard(name, detail());
+    }
+}
+
 /// The counts since the last call as the report line's text; empty when there was no work.
 [[nodiscard]] std::string TakeLine();
 

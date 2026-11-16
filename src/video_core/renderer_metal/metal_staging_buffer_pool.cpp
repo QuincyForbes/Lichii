@@ -9,9 +9,11 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "video_core/host_budget.h"
+#include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
+#include "video_core/renderer_metal/metal_switches.h"
 
 namespace Metal {
 
@@ -30,10 +32,21 @@ u64 BoundBytes(const char* name, u64 default_mib) {
     }
     return default_mib << 20;
 }
+
+/// EDEN_NX2_STREAM_BUFFER_MIB as Vulkan reads it (4 to 1024 MiB), else 32 MiB.
+u64 StreamBufferBytes() {
+    if (const char* const env = VulkanSwitch("EDEN_NX2_STREAM_BUFFER_MIB")) {
+        if (const long mib = std::strtol(env, nullptr, 10); mib >= 4 && mib <= 1024) {
+            return static_cast<u64>(mib) << 20;
+        }
+    }
+    return u64{32} << 20;
+}
 } // Anonymous namespace
 
 StagingBufferPool::StagingBufferPool(const Device& device_, Scheduler& scheduler_)
-    : device{device_}, scheduler{scheduler_} {
+    : device{device_}, scheduler{scheduler_}, stream_size{StreamBufferBytes()},
+      stream_region_size{stream_size / StreamRegions} {
     // EDEN_NX2_METAL_STAGING_BOUND=0: no bounds, and free buffers go only from the list's end.
     const char* const bound = std::getenv("EDEN_NX2_METAL_STAGING_BOUND");
     if (bound == nullptr || bound[0] != '0') {
@@ -84,6 +97,19 @@ StagingBufferRef StagingBufferPool::Request(size_t size, bool deferred) {
     }
     u8* contents = nullptr;
     Object buffer = CreateBuffer(device, rounded, true, &contents);
+    if (!buffer || contents == nullptr) {
+        // Out of memory: the GPU's work finishes and every idle staging buffer goes, then once
+        // more (Vulkan's allocator falls back to host memory; Metal's shared buffers already are).
+        scheduler.Finish();
+        for (Entry& entry : entries) {
+            if (entry.size != 0 && !entry.deferred && scheduler.IsFree(entry.tick)) {
+                held_bytes -= entry.size;
+                entry = {};
+            }
+        }
+        buffer = CreateBuffer(device, rounded, true, &contents);
+        Coverage::NoteGuard("staging buffer made again after freeing idle ones");
+    }
     ASSERT_MSG(buffer && contents != nullptr, "Metal staging buffer of {} bytes failed", rounded);
     held_bytes += rounded;
     if (empty == entries.size()) {
@@ -137,22 +163,22 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
 }
 
 StagingBufferRef StagingBufferPool::Stream(size_t size, size_t alignment) {
-    if (size > StreamRegionSize) {
+    if (size > stream_region_size) {
         return Request(size);
     }
     if (!stream) {
-        stream = CreateBuffer(device, StreamSize, true, &stream_contents);
+        stream = CreateBuffer(device, stream_size, true, &stream_contents);
         ASSERT_MSG(stream && stream_contents != nullptr, "Metal stream buffer failed");
     }
     u64 offset = Common::AlignUp(stream_offset, (std::max)(alignment, size_t{16}));
-    const u64 region = offset / StreamRegionSize;
+    const u64 region = offset / stream_region_size;
     // A slice never spans two regions, so one tick per region covers it.
-    if (region >= StreamRegions || (offset + size - 1) / StreamRegionSize != region) {
-        offset = region + 1 >= StreamRegions ? 0 : (region + 1) * StreamRegionSize;
+    if (region >= StreamRegions || (offset + size - 1) / stream_region_size != region) {
+        offset = region + 1 >= StreamRegions ? 0 : (region + 1) * stream_region_size;
     }
-    const u64 first = offset / StreamRegionSize;
+    const u64 first = offset / stream_region_size;
     const u64 tick = scheduler.CurrentTick();
-    if (stream_ticks[first] != tick && offset % StreamRegionSize == 0) {
+    if (stream_ticks[first] != tick && offset % stream_region_size == 0) {
         // Entering a region: the GPU must be done with what it held a lap ago.
         scheduler.Wait(stream_ticks[first]);
     }

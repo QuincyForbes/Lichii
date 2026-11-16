@@ -4,23 +4,28 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <bitset>
 #include <cmath>
 #include <cstdlib>
 
 #include "common/cityhash.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/attribute.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
+#include "shader_recompiler/ir_opt/oot_visual_workaround.h"
 #include "shader_recompiler/program_header.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/feature_census.h"
 #include "video_core/renderer_metal/metal_pipeline_translate.h"
+#include "video_core/renderer_metal/metal_switches.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 #include "video_core/surface.h"
 
 namespace Metal {
@@ -65,6 +70,45 @@ constexpr u32 StateColorTypesShift = 8;
         return value == nullptr || value[0] != '0';
     }();
     return enabled;
+}
+
+/// EDEN_NX2_METAL_ATTRIBUTE_TYPES=0: the key takes Vulkan's FixedPipelineState::
+/// DynamicAttributeTypes as it is.
+[[nodiscard]] bool AttributeTypesEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_ATTRIBUTE_TYPES");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// Two bits per generic attribute: 0 disabled (or constant), 1 float, 2 signed, 3 unsigned
+/// integer, by Maxwell's VertexAttribute::Type. Normalized and scaled types read as floats. This
+/// is the table FixedPipelineState::DynamicAttributeTypes had before b8d5405b1a packed it into the
+/// constant 0x55dc, which gives SNORM and SINT attributes the unsigned type and UINT ones float.
+[[nodiscard]] u64 AttributeTypes(const Maxwell& regs) {
+    if (!AttributeTypesEnabled()) {
+        return Vulkan::FixedPipelineState::DynamicAttributeTypes(regs);
+    }
+    static constexpr std::array<u32, 8> Types{
+        0, // Invalid
+        1, // SNorm
+        1, // UNorm
+        2, // SInt
+        3, // UInt
+        1, // UScaled
+        1, // SScaled
+        1, // Float
+    };
+    u64 types = 0;
+    for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+        const auto& attribute = regs.vertex_attrib_format[index];
+        if (attribute.constant != 0) {
+            continue;
+        }
+        types |= u64{Types[static_cast<u32>(attribute.type.Value()) & 7]} << (index * 2);
+    }
+    return types;
 }
 
 /// Zero for a test that passes everything, else Shader::CompareFunction + 1.
@@ -199,7 +243,28 @@ void ApplyFragmentState(Shader::RuntimeInfo& info, const GraphicsPipelineKey& ke
     }
 }
 
+std::atomic<u64> visual_workaround_edits{};
+
+/// Vulkan's EDEN_NX2_OOT_VISUAL_WORKAROUND=1 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): its
+/// opt-in edit of two of Ocarina of Time's programs (the fog dispatch, the exposure pass).
+void ApplyVisualWorkaround(Shader::IR::Program& program, u64 hash) {
+    static const bool enabled = [] {
+        const char* const value = VulkanSwitch("EDEN_NX2_OOT_VISUAL_WORKAROUND");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
+            program, Settings::GetCurrentProgramID(), hash, enabled)) {
+        visual_workaround_edits.fetch_add(1, std::memory_order_relaxed);
+        LOG_WARNING(Render_Metal, "Metal: Ocarina visual workaround edited {} instructions of {:016x}",
+                    *edits, hash);
+    }
+}
+
 } // Anonymous namespace
+
+u64 PipelineTranslator::VisualWorkaroundEdits() noexcept {
+    return visual_workaround_edits.load(std::memory_order_relaxed);
+}
 
 void PipelineTranslator::Refuse(std::atomic<u32>& count, u64 hash, std::string_view cause_,
                                 std::string_view detail_) {
@@ -220,7 +285,7 @@ void PipelineTranslator::RefreshKey(GraphicsPipelineKey& key, const Maxwell& reg
                                     Maxwell::PrimitiveTopology topology) {
     key.topology = static_cast<u32>(topology);
     key.early_z = regs.mandated_early_z != 0 ? 1 : 0;
-    key.attribute_types = Vulkan::FixedPipelineState::DynamicAttributeTypes(regs);
+    key.attribute_types = AttributeTypes(regs);
     const auto& tessellation = regs.tessellation.params;
     key.tessellation = key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0
                            ? static_cast<u32>(tessellation.domain_type.Value()) |
@@ -240,7 +305,8 @@ size_t ComputePipelineKey::Hash() const noexcept {
         Common::CityHash64(reinterpret_cast<const char*>(this), sizeof *this));
 }
 
-PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family) {
+PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_mesh_)
+    : native_mesh{native_mesh_ && NativeMeshEnabled()} {
     // What Apple GPUs run through SPIRV-Cross (MoltenVK's defaults for Apple7+).
     profile = Shader::Profile{
         .supported_spirv = 0x00010300,
@@ -336,26 +402,24 @@ std::optional<StageProgram> PipelineTranslator::Translate(
     };
 }
 
-std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
-    const GraphicsPipelineKey& key, std::span<Shader::Environment* const> envs) try {
-    cause.clear();
-    detail.clear();
+bool PipelineTranslator::TranslatePrograms(const GraphicsPipelineKey& key,
+                                           std::span<Shader::Environment* const> envs,
+                                           std::span<Shader::IR::Program> programs,
+                                           size_t& mesh_index) {
     const u64 hash = key.Hash();
     static std::atomic<u32> unsupported_logged{};
     pools.ReleaseContents();
-
     const bool uses_vertex_a = key.unique_hashes[0] != 0;
-    std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
     size_t env_index = 0;
     bool task = false;
-    size_t mesh_index = 0;
+    mesh_index = 0;
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
         if (key.unique_hashes[index] == 0) {
             continue;
         }
         if (env_index >= envs.size()) {
             Refuse(unsupported_logged, hash, "program without an environment");
-            return std::nullopt;
+            return false;
         }
         Shader::Environment& env = *envs[env_index++];
         const Shader::Stage stage = env.ShaderStage();
@@ -365,15 +429,15 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
             mesh_index = index;
         } else if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
             Refuse(unsupported_logged, hash, "task or mesh program out of place");
-            return std::nullopt;
+            return false;
         } else if (index == 4) {
             // Apple GPUs have no geometry stage (MoltenVK skips these pipelines too).
             Refuse(unsupported_logged, hash, "geometry stage");
-            return std::nullopt;
+            return false;
         } else if ((index == 2 && stage != Shader::Stage::TessellationControl) ||
                    (index == 3 && stage != Shader::Stage::TessellationEval)) {
             Refuse(unsupported_logged, hash, "unexpected stage in a tessellation slot");
-            return std::nullopt;
+            return false;
         }
         const u32 cfg_offset = static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader));
         Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
@@ -383,24 +447,62 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
             auto program_vb = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
             programs[index] = MergeDualVertexPrograms(programs[0], program_vb, env, host_info);
         }
+        ApplyVisualWorkaround(programs[index], key.unique_hashes[index]);
         if (VideoCommon::FeatureCensus::Enabled()) {
             VideoCommon::FeatureCensus::NoteProgram(key.unique_hashes[index], programs[index]);
         }
     }
     if (key.unique_hashes[1] == 0) {
         Refuse(unsupported_logged, hash, "no vertex program");
-        return std::nullopt;
+        return false;
     }
     if (task && mesh_index == 0) {
         Refuse(unsupported_logged, hash, "task program without a mesh program");
+        return false;
+    }
+    return true;
+}
+
+std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
+    const GraphicsPipelineKey& key, std::span<Shader::Environment* const> envs) try {
+    cause.clear();
+    detail.clear();
+    native_cause.clear();
+    std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
+    size_t mesh_index = 0;
+    if (!TranslatePrograms(key, envs, programs, mesh_index)) {
         return std::nullopt;
     }
     if (mesh_index != 0) {
-        return Mesh(key, programs, mesh_index);
+        std::optional<NativeMesh> native;
+        if (native_mesh) {
+            native = NativeMeshPipeline(key, programs, mesh_index);
+            // The emulation (the fallback) from programs of its own: translating one IR program
+            // to SPIR-V twice is not something the recompiler promises.
+            programs = {};
+            if (!TranslatePrograms(key, envs, programs, mesh_index)) {
+                return std::nullopt;
+            }
+        } else {
+            native_cause = "the device has no Metal 3 mesh pipelines (or EDEN_NX2_METAL_MESH_NATIVE=0)";
+        }
+        std::optional<TranslatedPipeline> emulated = Mesh(key, programs, mesh_index);
+        if (!native) {
+            return emulated;
+        }
+        if (!emulated) {
+            // Metal's mesh stage takes what the emulation can't: no fallback.
+            cause.clear();
+            detail.clear();
+            emulated.emplace();
+        }
+        emulated->native_mesh = std::move(native);
+        return emulated;
     }
     if (key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0) {
         if (key.unique_hashes[2] == 0 || key.unique_hashes[3] == 0) {
-            Refuse(unsupported_logged, hash, "only one of the tessellation programs");
+            static std::atomic<u32> unsupported_logged{};
+            Refuse(unsupported_logged, key.Hash(), "only one of the tessellation programs");
             return std::nullopt;
         }
         return Tessellated(key, programs);
@@ -579,6 +681,205 @@ std::optional<TranslatedPipeline> PipelineTranslator::Mesh(
     };
 }
 
+bool NativeMeshEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_MESH_NATIVE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool NativeMeshPerPrimitive() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_MESH_PER_PRIMITIVE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+namespace {
+
+/// Generic vec4 outputs, plus one for the built-ins, of a mesh program's output lines.
+template <typename Lines>
+[[nodiscard]] u32 OutputLocations(const Lines& lines) {
+    std::bitset<Shader::IR::NUM_GENERICS> generics;
+    bool builtins = false;
+    for (const u32 line : lines) {
+        const auto attribute = static_cast<Shader::IR::Attribute>(line);
+        if (Shader::IR::IsGeneric(attribute)) {
+            generics.set(Shader::IR::GenericAttributeIndex(attribute));
+        } else {
+            builtins = true;
+        }
+    }
+    return static_cast<u32>(generics.count()) + (builtins ? 1U : 0U);
+}
+
+[[nodiscard]] u32 MeshThreadgroupBytes(const Shader::IR::Program& mesh) {
+    const Shader::MeshInfo& info = mesh.mesh;
+    return static_cast<u32>((std::min)(
+        Vulkan::MetalMeshThreadgroupBytes({
+            .max_vertices = info.max_vertices,
+            .max_primitives = info.max_primitives,
+            .primitive_vertices = info.PrimitiveVertices(),
+            .vertex_lines = static_cast<u32>(info.vertex_lines.size()),
+            .primitive_lines = static_cast<u32>(info.primitive_lines.size()),
+            .vertex_locations = OutputLocations(info.vertex_lines),
+            .primitive_locations = OutputLocations(info.primitive_lines),
+            .shared_memory_bytes = mesh.shared_memory_size,
+            .direct_outputs = true,
+        }),
+        u64{~0U}));
+}
+
+[[nodiscard]] bool WritesPerPrimitiveGenerics(const Shader::IR::Program& mesh) {
+    return std::ranges::any_of(mesh.mesh.primitive_lines, [](u32 line) {
+        return Shader::IR::IsGeneric(static_cast<Shader::IR::Attribute>(line));
+    });
+}
+
+} // Anonymous namespace
+
+std::optional<std::string> NativeMeshLimit(const Shader::IR::Program* task,
+                                           const Shader::IR::Program& mesh) {
+    using Limits = NativeMeshLimits;
+    const Shader::MeshInfo& info = mesh.mesh;
+    if (info.topology != 0 && info.topology != 1 && info.topology != 4) {
+        return fmt::format("output topology {}", info.topology);
+    }
+    if (info.max_vertices == 0 || info.max_primitives == 0) {
+        return std::string{"no vertices or primitives"};
+    }
+    if (info.max_vertices > Limits::MaxVertices || info.max_primitives > Limits::MaxPrimitives) {
+        return fmt::format("{} vertices / {} primitives, Metal {} / {}", info.max_vertices,
+                           info.max_primitives, Limits::MaxVertices, Limits::MaxPrimitives);
+    }
+    if (mesh.workgroup_size[0] > Limits::MaxThreads ||
+        (task != nullptr && task->workgroup_size[0] > Limits::MaxThreads)) {
+        return std::string{"threads per threadgroup"};
+    }
+    if (task != nullptr && task->mesh.payload_words * 4 > Limits::MaxPayloadBytes) {
+        return fmt::format("payload {} B, Metal {} B", task->mesh.payload_words * 4,
+                           Limits::MaxPayloadBytes);
+    }
+    if (task != nullptr && task->shared_memory_size > Limits::MaxThreadgroupBytes) {
+        return fmt::format("object threadgroup memory {} B, Metal {} B", task->shared_memory_size,
+                           Limits::MaxThreadgroupBytes);
+    }
+    if (OutputLocations(info.vertex_lines) * 4 > Limits::MaxVertexComponents) {
+        return fmt::format("{} output components per vertex, Metal {}",
+                           OutputLocations(info.vertex_lines) * 4, Limits::MaxVertexComponents);
+    }
+    if (const u32 bytes = MeshThreadgroupBytes(mesh); bytes > Limits::MaxThreadgroupBytes) {
+        return fmt::format("mesh threadgroup memory {} B, Metal {} B", bytes,
+                           Limits::MaxThreadgroupBytes);
+    }
+    return std::nullopt;
+}
+
+std::optional<NativeMesh> PipelineTranslator::NativeMeshPipeline(
+    const GraphicsPipelineKey& key, std::span<Shader::IR::Program> programs,
+    size_t mesh_index) try {
+    const bool has_task = mesh_index != 1;
+    Shader::IR::Program& mesh = programs[mesh_index];
+    Shader::IR::Program* const task = has_task ? &programs[1] : nullptr;
+    for (size_t index = 2; index < 5; ++index) {
+        if (key.unique_hashes[index] != 0 && index != mesh_index) {
+            native_cause = "stages besides task, mesh and pixel programs";
+            return std::nullopt;
+        }
+    }
+    if (auto limit = NativeMeshLimit(task, mesh)) {
+        native_cause = std::move(*limit);
+        return std::nullopt;
+    }
+    if (WritesPerPrimitiveGenerics(mesh) && !NativeMeshPerPrimitive()) {
+        native_cause = "writes per-primitive attributes (emulated, as Vulkan on MoltenVK; "
+                       "EDEN_NX2_METAL_MESH_PER_PRIMITIVE=1 builds it natively)";
+        return std::nullopt;
+    }
+    const auto keep_cause = [this, saved_cause = cause, saved_detail = detail] {
+        native_cause = cause.empty() ? "translation failed" : cause;
+        if (!detail.empty()) {
+            native_cause += ": " + detail;
+        }
+        cause = saved_cause;
+        detail = saved_detail;
+    };
+    Shader::Backend::Bindings bindings;
+    NativeMesh native{
+        .mesh_stage = static_cast<u32>(mesh_index - 1),
+        .payload_bytes = has_task ? task->mesh.payload_words * 4 : 0U,
+        .object_threads = has_task ? (std::max)(task->workgroup_size[0], 1U) : 1U,
+        .mesh_threads = (std::max)(mesh.workgroup_size[0], 1U),
+        .topology = mesh.mesh.topology,
+        .threadgroup_bytes = MeshThreadgroupBytes(mesh),
+    };
+    // As Vulkan's MakeRuntimeInfo for native task and mesh programs; the mesh program writes its
+    // outputs directly (RuntimeInfo::mesh_direct_outputs), as on MoltenVK.
+    if (has_task) {
+        Shader::RuntimeInfo task_info;
+        task_info.previous_stage_stores.mask.set();
+        task_info.y_negate = (key.state & StateLowerLeftOrigin) != 0;
+        auto object = Translate(*task, ShaderTranslate::Stage::Object, bindings, task_info);
+        if (!object) {
+            keep_cause();
+            return std::nullopt;
+        }
+        native.object = std::move(*object);
+    }
+    Shader::RuntimeInfo mesh_info;
+    mesh_info.previous_stage_stores.mask.set();
+    mesh_info.y_negate = (key.state & StateLowerLeftOrigin) != 0;
+    mesh_info.convert_depth_mode = (key.state & StateDepthMinusOneToOne) != 0;
+    if (FixedStateEnabled() && mesh.mesh.topology == 0) {
+        mesh_info.fixed_state_point_size = std::bit_cast<float>(key.point_size);
+    }
+    mesh_info.mesh_direct_outputs = true;
+    auto mesh_function = Translate(mesh, ShaderTranslate::Stage::Mesh, bindings, mesh_info);
+    if (!mesh_function) {
+        keep_cause();
+        return std::nullopt;
+    }
+    native.mesh = std::move(*mesh_function);
+    if (key.unique_hashes[5] != 0) {
+        Shader::RuntimeInfo fragment_info;
+        fragment_info.previous_stage_stores = mesh.info.stores;
+        fragment_info.previous_stage_legacy_stores_mapping = mesh.info.legacy_stores_mapping;
+        for (const u32 line : mesh.mesh.primitive_lines) {
+            const auto attribute = static_cast<Shader::IR::Attribute>(line);
+            if (Shader::IR::IsGeneric(attribute)) {
+                fragment_info.per_primitive_generics.set(
+                    Shader::IR::GenericAttributeIndex(attribute));
+            }
+        }
+        // Constant over the primitive and compared bit for bit by some pixel programs (Vulkan's
+        // FlatPerPrimitiveInputs on MoltenVK).
+        fragment_info.flat_per_primitive_inputs = true;
+        ApplyFragmentState(fragment_info, key);
+        auto fragment =
+            Translate(programs[5], ShaderTranslate::Stage::Fragment, bindings, fragment_info);
+        if (!fragment) {
+            keep_cause();
+            return std::nullopt;
+        }
+        native.fragment = std::move(*fragment);
+    }
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+        LOG_INFO(Render_Metal,
+                 "Metal: mesh pipeline {:016x} (mesh {:016x}, task {}) native: {} vertices, {} "
+                 "primitives, {} + {} threads, payload {} B, ~{} B threadgroup memory",
+                 key.Hash(), key.unique_hashes[mesh_index], has_task, mesh.mesh.max_vertices,
+                 mesh.mesh.max_primitives, native.object_threads, native.mesh_threads,
+                 native.payload_bytes, native.threadgroup_bytes);
+    }
+    return native;
+} catch (const Shader::Exception& exception) {
+    native_cause = fmt::format("shader recompiler exception: {}", exception.what());
+    return std::nullopt;
+}
+
 namespace {
 
 /// Bytes per element a buffer between tessellation stages needs at most for these variables
@@ -750,6 +1051,7 @@ std::optional<StageProgram> PipelineTranslator::Compute(u64 unique_hash,
     pools.ReleaseContents();
     Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
     auto program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+    ApplyVisualWorkaround(program, unique_hash);
     if (VideoCommon::FeatureCensus::Enabled()) {
         VideoCommon::FeatureCensus::NoteProgram(unique_hash, program);
     }

@@ -15,6 +15,15 @@
 #include "video_core/renderer_metal/metal_formats.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_resources.h"
+#include "video_core/renderer_metal/metal_switches.h"
+#include "video_core/texture_cache/decode_bc.h"
+
+// MTLSamplerDescriptor's lodBias and reductionMode came with the macOS / iOS 26 SDKs.
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+#define LICHII_METAL_SAMPLER_BIAS 1
+#else
+#define LICHII_METAL_SAMPLER_BIAS 0
+#endif
 
 namespace Metal {
 
@@ -190,6 +199,10 @@ u32 DeviceAppleFamily(const Device& device) {
     return device.AppleFamily();
 }
 
+bool DeviceSupportsMeshShaders(const Device& device) {
+    return device.SupportsMeshShaders();
+}
+
 void InAutoreleasePool(const std::function<void()>& work) {
     @autoreleasepool {
         work();
@@ -203,6 +216,10 @@ bool IsConverted(const Device& device, PixelFormat format) {
     }
     if (VideoCore::Surface::IsPixelFormatBCn(format)) {
         return !device.SupportsBCTextures();
+    }
+    // Metal has no 96-bit and no 8-bit 4:4 format.
+    if (VideoCommon::IsExpandedFormat(format)) {
+        return FormatsExpanded();
     }
     return false;
 }
@@ -351,24 +368,47 @@ Object CreateLinearClampSampler(const Device& device) {
     return Retain([device.GetDevice() newSamplerStateWithDescriptor:descriptor]);
 }
 
-Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc) {
+bool SamplerBiasSupported(const Device& device) {
+#if LICHII_METAL_SAMPLER_BIAS
+    if (@available(iOS 26.0, macOS 26.0, *)) {
+        // Older GPUs take the properties and sample without them (CI's paravirtual Apple5).
+        return [device.GetDevice() supportsFamily:MTLGPUFamilyApple7];
+    }
+#endif
+    return false;
+}
+
+Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc,
+                     const SamplerOptions& options) {
+    using Tegra::Texture::SamplerReduction;
     using Tegra::Texture::TextureFilter;
     using Tegra::Texture::TextureMipmapFilter;
     using Tegra::Texture::WrapMode;
-    const auto filter = [](TextureFilter value) {
-        return value == TextureFilter::Linear ? MTLSamplerMinMagFilterLinear
-                                              : MTLSamplerMinMagFilterNearest;
+    const bool plain = options.plain;
+    const auto filter = [&](TextureFilter value) {
+        return value == TextureFilter::Linear && !options.force_nearest
+                   ? MTLSamplerMinMagFilterLinear
+                   : MTLSamplerMinMagFilterNearest;
     };
-    const auto address = [](WrapMode mode) {
+    // As Vulkan's MaxwellToVK::Sampler::WrapMode: the OpenGL clamp reaches the border when the
+    // guest filters, and both mirror-once modes Metal lacks mirror once and clamp to the edge.
+    const auto address = [&](WrapMode mode) {
         switch (mode) {
         case WrapMode::Wrap: return MTLSamplerAddressModeRepeat;
         case WrapMode::Mirror: return MTLSamplerAddressModeMirrorRepeat;
-        case WrapMode::ClampToEdge:
+        case WrapMode::ClampToEdge: return MTLSamplerAddressModeClampToEdge;
         case WrapMode::Clamp:
-        case WrapMode::MirrorOnceClampOGL: return MTLSamplerAddressModeClampToEdge;
-        case WrapMode::Border:
-        case WrapMode::MirrorOnceBorder: return MTLSamplerAddressModeClampToBorderColor;
+            return !plain && tsc.mag_filter.Value() == TextureFilter::Linear
+                       ? MTLSamplerAddressModeClampToBorderColor
+                       : MTLSamplerAddressModeClampToEdge;
+        case WrapMode::Border: return MTLSamplerAddressModeClampToBorderColor;
         case WrapMode::MirrorOnceClampToEdge: return MTLSamplerAddressModeMirrorClampToEdge;
+        case WrapMode::MirrorOnceBorder:
+            return plain ? MTLSamplerAddressModeClampToBorderColor
+                         : MTLSamplerAddressModeMirrorClampToEdge;
+        case WrapMode::MirrorOnceClampOGL:
+            return plain ? MTLSamplerAddressModeClampToEdge
+                         : MTLSamplerAddressModeMirrorClampToEdge;
         }
         return MTLSamplerAddressModeRepeat;
     };
@@ -377,14 +417,18 @@ Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc) 
     descriptor.magFilter = filter(tsc.mag_filter.Value());
     switch (tsc.mipmap_filter.Value()) {
     case TextureMipmapFilter::Nearest: descriptor.mipFilter = MTLSamplerMipFilterNearest; break;
-    case TextureMipmapFilter::Linear: descriptor.mipFilter = MTLSamplerMipFilterLinear; break;
+    case TextureMipmapFilter::Linear:
+        descriptor.mipFilter =
+            options.force_nearest ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterLinear;
+        break;
     default: descriptor.mipFilter = MTLSamplerMipFilterNotMipmapped; break;
     }
     descriptor.sAddressMode = address(tsc.wrap_u.Value());
     descriptor.tAddressMode = address(tsc.wrap_v.Value());
     descriptor.rAddressMode = address(tsc.wrap_p.Value());
-    // Metal has three border colours: the guest's nearest one.
-    const auto border = tsc.BorderColor();
+    // Metal has three border colours and no custom one: the guest's nearest (exact for
+    // transparent black, opaque black and opaque white).
+    const auto border = options.srgb_border ? tsc.SrgbBorderColor() : tsc.BorderColor();
     if (border[3] < 0.5f) {
         descriptor.borderColor = MTLSamplerBorderColorTransparentBlack;
     } else if (border[0] + border[1] + border[2] > 1.5f) {
@@ -392,14 +436,43 @@ Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc) 
     } else {
         descriptor.borderColor = MTLSamplerBorderColorOpaqueBlack;
     }
-    if (tsc.depth_compare_enabled != 0) {
+    if (tsc.depth_compare_enabled != 0 && !options.drop_compare) {
         // Tegra's DepthCompareFunc has MTLCompareFunction's values.
         descriptor.compareFunction = static_cast<MTLCompareFunction>(tsc.depth_compare_func.Value());
     }
     descriptor.lodMinClamp = tsc.MinLod();
     descriptor.lodMaxClamp = (std::max)(tsc.MaxLod(), tsc.MinLod());
-    descriptor.maxAnisotropy =
-        static_cast<NSUInteger>(std::clamp(tsc.MaxAnisotropy(), 1.0f, 16.0f));
+    // Vulkan's EDEN_NX2_FORCE_LOD0 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): mipmapped
+    // samplers read the top level only (a debug aid for mip layout problems).
+    static const bool force_lod0 = VulkanSwitch("EDEN_NX2_FORCE_LOD0") != nullptr;
+    if (force_lod0 && tsc.mipmap_filter != TextureMipmapFilter::None) {
+        descriptor.lodMinClamp = 0.0f;
+        descriptor.lodMaxClamp = 0.25f;
+    }
+    f32 anisotropy = std::clamp(tsc.MaxAnisotropy(), 1.0f, 16.0f);
+    if (options.force_nearest) {
+        anisotropy = 1.0f;
+    } else if (options.reduce_anisotropy) {
+        anisotropy = static_cast<f32>(1U << tsc.max_anisotropy.Value());
+    }
+    descriptor.maxAnisotropy = static_cast<NSUInteger>(anisotropy);
+#if LICHII_METAL_SAMPLER_BIAS
+    if (@available(iOS 26.0, macOS 26.0, *)) {
+        if (!plain && SamplerBiasSupported(device)) {
+            descriptor.lodBias =
+                std::clamp(tsc.LodBias() + options.added_lod_bias, -15.0f, 15.0f);
+            switch (tsc.reduction_filter.Value()) {
+            case SamplerReduction::Min:
+                descriptor.reductionMode = MTLSamplerReductionModeMinimum;
+                break;
+            case SamplerReduction::Max:
+                descriptor.reductionMode = MTLSamplerReductionModeMaximum;
+                break;
+            default: break;
+            }
+        }
+    }
+#endif
     descriptor.normalizedCoordinates = YES;
     descriptor.supportArgumentBuffers = YES;
     return Retain([device.GetDevice() newSamplerStateWithDescriptor:descriptor]);
@@ -484,6 +557,28 @@ Object CreateComputePipelineState(const Device& device, const void* function, st
     MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
     descriptor.computeFunction = (__bridge id<MTLFunction>)function;
     return CreateComputeState(device, descriptor, error, archive);
+}
+
+u64 DeviceAllocatedSize(const Device& device) {
+    return device.AllocatedSize();
+}
+
+TextureFacts DescribeTexture(TextureHandle texture) {
+    const id<MTLTexture> object = AsTexture(texture);
+    if (object == nil) {
+        return {.format = 0};
+    }
+    const bool cube =
+        object.textureType == MTLTextureTypeCube || object.textureType == MTLTextureTypeCubeArray;
+    return TextureFacts{
+        .format = static_cast<u32>(object.pixelFormat),
+        .samples = static_cast<u32>(object.sampleCount),
+        .levels = static_cast<u32>(object.mipmapLevelCount),
+        .slices = object.textureType == MTLTextureType3D
+                      ? 1U
+                      : static_cast<u32>(object.arrayLength) * (cube ? 6U : 1U),
+        .depth = static_cast<u32>(object.depth),
+    };
 }
 
 u64 AllocatedSize(const void* resource) {

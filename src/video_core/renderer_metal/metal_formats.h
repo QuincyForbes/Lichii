@@ -134,6 +134,16 @@ namespace Swizzle {
 enum : u8 { Zero = 0, One = 1, Red = 2, Green = 3, Blue = 4, Alpha = 5 };
 } // namespace Swizzle
 
+/// EDEN_NX2_METAL_FORMATS (on unless 0): guest formats Metal has no counterpart for are expanded
+/// on the CPU at upload (R32G32B32_FLOAT as RGBA32Float, G4R4_UNORM as RG8Unorm,
+/// VideoCommon::ExpandTexels); 0: the first gets no texture and the second is read as R8.
+[[nodiscard]] bool FormatsExpanded();
+
+/// The linear format of an sRGB one that shaders may write through a view (Metal writes no sRGB
+/// texture from a shader): textures of it get shader-write usage under EDEN_NX2_METAL_FORMATS.
+/// 0 for every other format.
+[[nodiscard]] u32 LinearTwin(u32 mtl_format);
+
 /// The host format of a guest format on any device (SurfaceFormat in metal_resources.h).
 [[nodiscard]] FormatInfo SurfaceFormat(VideoCore::Surface::PixelFormat format, bool converted);
 

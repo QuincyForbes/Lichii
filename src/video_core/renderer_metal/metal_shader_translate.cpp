@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <exception>
+#include <optional>
+#include <unordered_map>
+#include <utility>
 
 #include <spirv_msl.hpp>
 
@@ -28,6 +31,10 @@ namespace {
         return spv::ExecutionModelTessellationControl;
     case Stage::TessellationEvaluation:
         return spv::ExecutionModelTessellationEvaluation;
+    case Stage::Object:
+        return spv::ExecutionModelTaskEXT;
+    case Stage::Mesh:
+        return spv::ExecutionModelMeshEXT;
     }
     return spv::ExecutionModelGLCompute;
 }
@@ -89,6 +96,61 @@ namespace {
     return count;
 }
 
+/// Sets the Depth operand of the image types of the sampled images at `bindings` (set, binding),
+/// through their variable, pointer and sampled image types; arrays of them are left as they are.
+void MarkDepthImages(std::vector<u32>& words, std::span<const std::pair<u32, u32>> bindings) {
+    constexpr size_t HeaderWords = 5;
+    std::unordered_map<u32, u32> sets;
+    std::unordered_map<u32, u32> binding_of;
+    std::unordered_map<u32, u32> variable_type;
+    std::unordered_map<u32, u32> pointee;
+    std::unordered_map<u32, u32> sampled_image;
+    std::unordered_map<u32, size_t> image_at;
+    for (size_t at = HeaderWords; at < words.size();) {
+        const u32 count = words[at] >> 16;
+        const u32 opcode = words[at] & 0xFFFF;
+        if (count == 0 || at + count > words.size()) {
+            return;
+        }
+        if (opcode == spv::OpDecorate && count >= 4) {
+            if (words[at + 2] == spv::DecorationDescriptorSet) {
+                sets[words[at + 1]] = words[at + 3];
+            } else if (words[at + 2] == spv::DecorationBinding) {
+                binding_of[words[at + 1]] = words[at + 3];
+            }
+        } else if (opcode == spv::OpVariable && count >= 4) {
+            variable_type[words[at + 2]] = words[at + 1];
+        } else if (opcode == spv::OpTypePointer && count >= 4) {
+            pointee[words[at + 1]] = words[at + 3];
+        } else if (opcode == spv::OpTypeSampledImage && count >= 3) {
+            sampled_image[words[at + 1]] = words[at + 2];
+        } else if (opcode == spv::OpTypeImage && count >= 9) {
+            image_at[words[at + 1]] = at;
+        }
+        at += count;
+    }
+    const auto find = [](const std::unordered_map<u32, u32>& map, u32 key) -> std::optional<u32> {
+        const auto it = map.find(key);
+        return it != map.end() ? std::optional{it->second} : std::nullopt;
+    };
+    for (const auto& [variable, binding] : binding_of) {
+        const u32 set = find(sets, variable).value_or(0);
+        if (std::ranges::find(bindings, std::pair{set, binding}) == bindings.end()) {
+            continue;
+        }
+        std::optional<u32> type = find(variable_type, variable);
+        type = type ? find(pointee, *type) : std::nullopt;
+        if (type) {
+            // A combined image sampler, or a separate image.
+            type = find(sampled_image, *type).value_or(*type);
+        }
+        if (const auto image = type ? image_at.find(*type) : image_at.end();
+            image != image_at.end()) {
+            words[image->second + 4] = 1;
+        }
+    }
+}
+
 struct Declared {
     u32 set;
     u32 binding;
@@ -110,7 +172,11 @@ bool DeviceMslEnabled() {
 Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& options) {
     Result result;
     try {
-        spirv_cross::CompilerMSL compiler(std::vector<u32>(spirv.begin(), spirv.end()));
+        std::vector<u32> words(spirv.begin(), spirv.end());
+        if (!options.depth_images.empty()) {
+            MarkDepthImages(words, options.depth_images);
+        }
+        spirv_cross::CompilerMSL compiler(std::move(words));
         auto msl = compiler.get_msl_options();
         msl.platform = options.ios ? spirv_cross::CompilerMSL::Options::iOS
                                    : spirv_cross::CompilerMSL::Options::macOS;
@@ -153,7 +219,8 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
         compiler.set_msl_options(msl);
         auto common = compiler.get_common_options();
         common.vertex.flip_vert_y =
-            (stage == Stage::Vertex || tess_evaluation) && options.flip_vertex_y;
+            (stage == Stage::Vertex || stage == Stage::Mesh || tess_evaluation) &&
+            options.flip_vertex_y;
         compiler.set_common_options(common);
         if (tess_control || tess_evaluation) {
             // Each program declares part of these (the domain, spacing and winding are the

@@ -8,6 +8,7 @@
 
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
@@ -25,6 +26,10 @@ enum class Stage : u8 {
     VertexForTessellation,
     TessellationControl,
     TessellationEvaluation,
+    /// Metal 3 mesh pipelines: a task program as an object function, a mesh program as a mesh
+    /// function (SPV_EXT_mesh_shader through SPIRV-Cross).
+    Object,
+    Mesh,
 };
 
 enum class ResourceKind : u8 {
@@ -98,6 +103,10 @@ struct Options {
     TessellationModes tessellation{};
     /// Vertex kernel of an indexed draw: its index size (2 or 4), 0 for non-indexed.
     u32 vertex_index_size{};
+    /// (set, binding) of sampled images that are bound to depth textures: they become
+    /// depth2d<float>, the type Metal declares depth formats with (as the blit shaders do).
+    /// A shared image type changes for all its users.
+    std::vector<std::pair<u32, u32>> depth_images;
 };
 
 struct Result {

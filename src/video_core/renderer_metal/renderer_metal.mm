@@ -35,6 +35,8 @@
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_device.h"
+#include "video_core/renderer_metal/metal_formats.h"
+#include "video_core/renderer_metal/metal_present.h"
 #include "video_core/renderer_metal/metal_rasterizer.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
@@ -300,6 +302,30 @@ struct RendererMetal::Impl {
     std::optional<DisplayTexture> PrepareLayer(const Tegra::FramebufferConfig& framebuffer,
                                                size_t layer);
 
+    /// The layers drawn into `target` (`target_format`, `layout.width` x `layout.height`) at the
+    /// layout's screen; with `apply_filters` the scaling filter and anti-aliasing settings apply.
+    /// Whether a layer was drawn.
+    bool DrawLayers(std::span<const Tegra::FramebufferConfig> framebuffers, Attachment target,
+                    u32 target_format, const Layout::FramebufferLayout& layout,
+                    bool apply_filters);
+
+    /// Vulkan's RenderAppletCaptureLayer: the LastFrame layer stack drawn into the capture texture
+    /// (1280x720 RGBA8) each frame, for GetAppletCaptureBuffer.
+    void RenderAppletCapture(std::span<const Tegra::FramebufferConfig> framebuffers);
+
+    /// A texture `width` x `height` read back into memory of `size` bytes (rows of width * 4).
+    bool ReadTexture(TextureHandle texture, u32 width, u32 height, std::span<u8> out);
+
+    Object applet_capture;
+    std::vector<Tegra::FramebufferConfig> applet_layers;
+    Object screenshot_target;
+    u32 screenshot_width{};
+    u32 screenshot_height{};
+    std::vector<Tegra::FramebufferConfig> screenshot_layers;
+    Object readback;
+    u64 readback_size{};
+    u8* readback_contents{};
+
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     Device device;
     Scheduler scheduler;
@@ -319,6 +345,7 @@ struct RendererMetal::Impl {
     };
     std::vector<MemoryLayer> memory_layers;
     SpatialUpscaler spatial;
+    PresentPasses present{device, scheduler};
     std::vector<u8> unswizzled;
 
     std::chrono::steady_clock::time_point report_start = std::chrono::steady_clock::now();
@@ -409,88 +436,130 @@ RendererMetal::RendererMetal(Core::Frontend::EmuWindow& emu_window,
 
 RendererMetal::~RendererMetal() = default;
 
+bool RendererMetal::Impl::DrawLayers(std::span<const Tegra::FramebufferConfig> framebuffers,
+                                     Attachment target, u32 target_format,
+                                     const Layout::FramebufferLayout& layout, bool apply_filters) {
+    // The guest's layers in order: the first replaces the picture, the others are blended over
+    // it as their own blend mode says.
+    std::vector<std::pair<DisplayTexture, size_t>> sources;
+    for (size_t layer = 0; layer < framebuffers.size(); ++layer) {
+        if (auto texture = PrepareLayer(framebuffers[layer], layer)) {
+            sources.emplace_back(*texture, layer);
+        }
+    }
+    bool drawn = false;
+    for (const auto& [source, layer] : sources) {
+        const Tegra::FramebufferConfig& framebuffer = framebuffers[layer];
+        const auto crop = Tegra::NormalizeCrop(framebuffer, source.width, source.height);
+        const f32 width = static_cast<f32>(source.scaled_width);
+        const f32 height = static_cast<f32>(source.scaled_height);
+        const auto& screen = layout.screen;
+        BlitBlend blend = BlitBlend::None;
+        if (drawn) {
+            switch (framebuffer.blending) {
+            case Tegra::BlendMode::Premultiplied:
+                blend = BlitBlend::Premultiplied;
+                break;
+            case Tegra::BlendMode::Coverage:
+                blend = BlitBlend::Coverage;
+                break;
+            default:
+                break;
+            }
+        }
+        std::array<s32, 4> src_rect{static_cast<s32>(crop.left * width),
+                                    static_cast<s32>(crop.top * height),
+                                    static_cast<s32>(crop.right * width),
+                                    static_cast<s32>(crop.bottom * height)};
+        TextureHandle texture = source.texture;
+        bool linear = true;
+        const Settings::ScalingFilter filter = Settings::values.scaling_filter.GetValue();
+        const s32 screen_width = static_cast<s32>(screen.right - screen.left);
+        const s32 screen_height = static_cast<s32>(screen.bottom - screen.top);
+        if (apply_filters && PresentPasses::Enabled() && screen_width > 0 && screen_height > 0) {
+            // Vulkan's Layer::ConfigureDraw: anti-aliasing over the layer's texture,
+            // then FSR or SGSR to the screen's size, then the window filter.
+            PresentPasses::Source passes_source{
+                .texture = texture,
+                .size = {source.scaled_width, source.scaled_height},
+                .render = {source.scaled_width, source.scaled_height},
+                .crop = {crop.left, crop.top, crop.right, crop.bottom},
+            };
+            passes_source = present.AntiAlias(
+                passes_source, Settings::values.anti_aliasing.GetValue());
+            passes_source = present.Upscale(
+                passes_source, filter,
+                {static_cast<u32>(screen_width), static_cast<u32>(screen_height)});
+            if (PresentPasses::HasWindowShader(filter) &&
+                present.DrawWindow(
+                    passes_source, filter, target, target_format,
+                    {layout.width, layout.height},
+                    {static_cast<s32>(screen.left), static_cast<s32>(screen.top),
+                     static_cast<s32>(screen.right), static_cast<s32>(screen.bottom)},
+                    drawn, blend)) {
+                drawn = true;
+                continue;
+            }
+            texture = passes_source.texture;
+            const f32 pass_width = static_cast<f32>(passes_source.size[0]);
+            const f32 pass_height = static_cast<f32>(passes_source.size[1]);
+            src_rect = {static_cast<s32>(passes_source.crop[0] * pass_width),
+                        static_cast<s32>(passes_source.crop[1] * pass_height),
+                        static_cast<s32>(passes_source.crop[2] * pass_width),
+                        static_cast<s32>(passes_source.crop[3] * pass_height)};
+            linear = filter != Settings::ScalingFilter::NearestNeighbor;
+        }
+        if (!drawn && apply_filters && filter == Settings::ScalingFilter::MetalFxSpatial) {
+            const u32 out_width = screen.right - screen.left;
+            const u32 out_height = screen.bottom - screen.top;
+            if (TextureHandle upscaled = spatial.Upscale(
+                    device, scheduler, texture, src_rect, out_width,
+                    out_height)) {
+                texture = upscaled;
+                src_rect = {0, 0, static_cast<s32>(out_width),
+                            static_cast<s32>(out_height)};
+                linear = false;
+            }
+        }
+        const bool layer_drawn = scheduler.Blit(BlitPass{
+            .src = texture,
+            .src_rect = src_rect,
+            .dst = target,
+            .dst_format = target_format,
+            .dst_rect = {static_cast<s32>(screen.left), static_cast<s32>(screen.top),
+                         static_cast<s32>(screen.right), static_cast<s32>(screen.bottom)},
+            .dst_width = layout.width,
+            .dst_height = layout.height,
+            .linear = linear,
+            .keep_dst = drawn,
+            .blend = blend,
+        });
+        drawn = drawn || layer_drawn;
+    }
+    return drawn;
+}
+
 void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
     SCOPE_EXIT {
         render_window.OnFrameDisplayed();
     };
-    if (renderer_settings.screenshot_requested) {
-        renderer_settings.screenshot_requested = false;
-        if (renderer_settings.screenshot_complete_callback) {
-            renderer_settings.screenshot_complete_callback(false);
-        }
+    @autoreleasepool {
+        // The last frame for the applet capture (LayerStackId::LastFrame), shown or not.
+        impl->RenderAppletCapture(framebuffers);
     }
     if (!render_window.IsShown()) {
         return;
     }
 
     @autoreleasepool {
+        RenderScreenshot(framebuffers);
         const auto& layout = render_window.GetFramebufferLayout();
-        // The guest's layers in order: the first replaces the picture, the others are blended
-        // over it as their own blend mode says.
-        std::vector<std::pair<DisplayTexture, size_t>> sources;
-        for (size_t layer = 0; layer < framebuffers.size(); ++layer) {
-            if (auto texture = impl->PrepareLayer(framebuffers[layer], layer)) {
-                sources.emplace_back(*texture, layer);
-            }
-        }
         const id<CAMetalDrawable> drawable =
             impl->swapchain.NextDrawable(layout.width, layout.height);
         if (drawable != nil) {
             const Attachment target{.texture = (__bridge void*)drawable.texture};
-            bool drawn = false;
-            for (const auto& [source, layer] : sources) {
-                const Tegra::FramebufferConfig& framebuffer = framebuffers[layer];
-                const auto crop = Tegra::NormalizeCrop(framebuffer, source.width, source.height);
-                const f32 width = static_cast<f32>(source.scaled_width);
-                const f32 height = static_cast<f32>(source.scaled_height);
-                const auto& screen = layout.screen;
-                BlitBlend blend = BlitBlend::None;
-                if (drawn) {
-                    switch (framebuffer.blending) {
-                    case Tegra::BlendMode::Premultiplied:
-                        blend = BlitBlend::Premultiplied;
-                        break;
-                    case Tegra::BlendMode::Coverage:
-                        blend = BlitBlend::Coverage;
-                        break;
-                    default:
-                        break;
-                    }
-                }
-                std::array<s32, 4> src_rect{static_cast<s32>(crop.left * width),
-                                            static_cast<s32>(crop.top * height),
-                                            static_cast<s32>(crop.right * width),
-                                            static_cast<s32>(crop.bottom * height)};
-                TextureHandle texture = source.texture;
-                bool linear = true;
-                if (!drawn && Settings::values.scaling_filter.GetValue() ==
-                                  Settings::ScalingFilter::MetalFxSpatial) {
-                    const u32 out_width = screen.right - screen.left;
-                    const u32 out_height = screen.bottom - screen.top;
-                    if (TextureHandle upscaled = impl->spatial.Upscale(
-                            impl->device, impl->scheduler, texture, src_rect, out_width,
-                            out_height)) {
-                        texture = upscaled;
-                        src_rect = {0, 0, static_cast<s32>(out_width),
-                                    static_cast<s32>(out_height)};
-                        linear = false;
-                    }
-                }
-                const bool layer_drawn = impl->scheduler.Blit(BlitPass{
-                    .src = texture,
-                    .src_rect = src_rect,
-                    .dst = target,
-                    .dst_format = DrawableFormat(),
-                    .dst_rect = {static_cast<s32>(screen.left), static_cast<s32>(screen.top),
-                                 static_cast<s32>(screen.right), static_cast<s32>(screen.bottom)},
-                    .dst_width = layout.width,
-                    .dst_height = layout.height,
-                    .linear = linear,
-                    .keep_dst = drawn,
-                    .blend = blend,
-                });
-                drawn = drawn || layer_drawn;
-            }
+            const bool drawn =
+                impl->DrawLayers(framebuffers, target, DrawableFormat(), layout, true);
             if (!drawn) {
                 // Dark blue: the renderer runs, the guest has no framebuffer to show.
                 ClearPass clear{};
@@ -503,7 +572,7 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
             }
             const id<MTLCommandBuffer> command_buffer =
                 (__bridge id<MTLCommandBuffer>)impl->scheduler.CommandBuffer();
-            [command_buffer presentDrawable:drawable];
+            impl->swapchain.Present(command_buffer, drawable, drawn);
             impl->scheduler.NotePresent(drawn);
             impl->scheduler.Flush();
             ++impl->presented;
@@ -512,7 +581,6 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
             impl->scheduler.Flush();
         }
     }
-
     ++m_current_frame;
     gpu.RendererFrameEndNotify();
     impl->rasterizer.TickFrame();
@@ -552,9 +620,24 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
         if (const std::string coverage = Coverage::TakeLine(); !coverage.empty()) {
             LOG_INFO(Render_Metal, "Perf Metal coverage: {}", coverage);
         }
+        if (const auto mesh = impl->rasterizer.TakeMeshCounts();
+            mesh.native_draws + mesh.emulated_draws != 0) {
+            LOG_INFO(Render_Metal,
+                     "Perf Metal mesh: {} draws with mesh functions ({} with a task count the GPU "
+                     "wrote, {} from indirect records), {} through the compute emulation",
+                     mesh.native_draws, mesh.from_gpu, mesh.indirect, mesh.emulated_draws);
+        }
         if (const std::string deadlines = Common::FrameDeadline::TakeStatusText();
             !deadlines.empty()) {
             LOG_INFO(Render_Metal, "Perf Metal threads{}", deadlines);
+        }
+        if (const std::string builds = impl->rasterizer.Pipelines().TakeBuildLine();
+            !builds.empty()) {
+            LOG_INFO(Render_Metal, "Perf Metal pipelines: {}", builds);
+        }
+        if (const std::string decisions = impl->rasterizer.TakeGpuDecisionLine();
+            !decisions.empty()) {
+            LOG_INFO(Render_Metal, "Perf Metal GPU decisions: {}", decisions);
         }
         // The pipeline archive: builds it served, and the build time that saved so far (each hit
         // at the average miss's cost, less what the hit took).
@@ -585,6 +668,35 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                  static_cast<f64>(impl->scheduler.TakeGpuNanoseconds()) / 1e6 / frames,
                  static_cast<f64>(command_buffers) / frames, static_cast<f64>(encoders) / frames,
                  static_cast<f64>(passes) / frames, static_cast<f64>(work.draws_encoded) / frames);
+        if (const u64 present_passes = impl->present.TakePasses(); present_passes != 0) {
+            LOG_INFO(Render_Metal,
+                     "Metal present filters: {:.1f} passes per frame (scaling filter {}, "
+                     "anti-aliasing {})",
+                     static_cast<f64>(present_passes) / frames,
+                     Settings::CanonicalizeEnum(Settings::values.scaling_filter.GetValue()),
+                     Settings::CanonicalizeEnum(Settings::values.anti_aliasing.GetValue()));
+        }
+        if (const std::string pacing = impl->swapchain.TakePacingLine(); !pacing.empty()) {
+            LOG_INFO(Render_Metal, "Metal pacing: {}", pacing);
+        }
+        if (const auto memo = impl->rasterizer.TakeBindMemoCounts(); memo.hits + memo.misses != 0) {
+            LOG_INFO(Render_Metal,
+                     "Metal binding memo: {} bindings from the memo, {} resolved ({} draws or "
+                     "dispatches resolved all again)",
+                     memo.hits, memo.misses, memo.full_resolves);
+        }
+        if (const u64 draw_flushes = impl->rasterizer.TakeDrawFlushes(); draw_flushes != 0) {
+            LOG_INFO(Render_Metal, "Metal: {} command buffers committed every so many draws "
+                                   "(EDEN_NX2_FLUSH_DRAWS)",
+                     draw_flushes);
+        }
+        if (const auto [deferred, idle_commits] = impl->scheduler.TakeDeferredFences();
+            deferred != 0) {
+            LOG_INFO(Render_Metal,
+                     "Metal fences: {} left pending to go with later work "
+                     "(EDEN_NX2_FENCE_FLUSH_US), {} commits of such work by the idle GPU thread",
+                     deferred, idle_commits);
+        }
         impl->report_start = now;
         impl->presented = 0;
         impl->skipped = 0;
@@ -593,8 +705,113 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
     }
 }
 
+bool RendererMetal::Impl::ReadTexture(TextureHandle texture, u32 width, u32 height,
+                                      std::span<u8> out) {
+    const u64 size = u64{width} * height * 4;
+    if (texture == nullptr || out.size() < size) {
+        return false;
+    }
+    if (readback_size < size) {
+        readback = CreateBuffer(device, size, true, &readback_contents);
+        readback_size = readback_contents != nullptr ? size : 0;
+    }
+    if (readback_contents == nullptr) {
+        return false;
+    }
+    scheduler.CopyTextureToBuffer(texture, 0, 0, {}, {width, height, 1}, readback.Get(), 0,
+                                  width * 4, 0);
+    // As Vulkan: the copy is waited for before the capture is handed on.
+    scheduler.Finish();
+    std::memcpy(out.data(), readback_contents, size);
+    return true;
+}
+
+void RendererMetal::Impl::RenderAppletCapture(
+    std::span<const Tegra::FramebufferConfig> framebuffers) {
+    const auto layers = Tegra::FilterLayerStack(
+        framebuffers, Service::Nvnflinger::LayerStackId::LastFrame, applet_layers);
+    if (layers.empty()) {
+        return;
+    }
+    using namespace VideoCore::Capture;
+    if (!applet_capture) {
+        applet_capture = CreateTexture(device, {.kind = TextureKind::e2D,
+                                                .format = Fmt::RGBA8Unorm,
+                                                .width = LinearWidth,
+                                                .height = LinearHeight,
+                                                .render_target = true});
+    }
+    if (!applet_capture) {
+        return;
+    }
+    const Attachment target{.texture = applet_capture.Get()};
+    if (!DrawLayers(layers, target, Fmt::RGBA8Unorm, VideoCore::Capture::Layout, false)) {
+        ClearPass clear{};
+        clear.color[0] = target;
+        clear.clear_color[0] = true;
+        clear.color_value[0] = {0.0, 0.0, 0.0, 1.0};
+        clear.width = LinearWidth;
+        clear.height = LinearHeight;
+        scheduler.Clear(clear);
+    }
+}
+
 std::vector<u8> RendererMetal::GetAppletCaptureBuffer() {
-    return std::vector<u8>(VideoCore::Capture::TiledSize);
+    using namespace VideoCore::Capture;
+    std::vector<u8> out(TiledSize);
+    if (!impl->applet_capture) {
+        return out;
+    }
+    // Vulkan's GetAppletCaptureBuffer: the capture read back and swizzled.
+    std::vector<u8> linear(u64{LinearWidth} * LinearHeight * BytesPerPixel);
+    if (impl->ReadTexture(impl->applet_capture.Get(), LinearWidth, LinearHeight, linear)) {
+        Tegra::Texture::SwizzleTexture(out, linear, BytesPerPixel, LinearWidth, LinearHeight,
+                                       LinearDepth, BlockHeight, BlockDepth);
+    }
+    return out;
+}
+
+void RendererMetal::RenderScreenshot(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    if (!renderer_settings.screenshot_requested) {
+        return;
+    }
+    const auto layers = Tegra::FilterLayerStack(
+        framebuffers, renderer_settings.screenshot_layer_stack, impl->screenshot_layers);
+    const auto& layout = renderer_settings.screenshot_framebuffer_layout;
+    if (layout.width != 0 && layout.height != 0) {
+        if (!impl->screenshot_target || impl->screenshot_width != layout.width ||
+            impl->screenshot_height != layout.height) {
+            impl->screenshot_target = CreateTexture(impl->device, {.kind = TextureKind::e2D,
+                                                                   .format = Fmt::BGRA8Unorm,
+                                                                   .width = layout.width,
+                                                                   .height = layout.height,
+                                                                   .render_target = true});
+            impl->screenshot_width = layout.width;
+            impl->screenshot_height = layout.height;
+        }
+        if (impl->screenshot_target) {
+            const Attachment target{.texture = impl->screenshot_target.Get()};
+            if (!impl->DrawLayers(layers, target, Fmt::BGRA8Unorm, layout, true)) {
+                ClearPass clear{};
+                clear.color[0] = target;
+                clear.clear_color[0] = true;
+                clear.color_value[0] = {0.0, 0.0, 0.0, 1.0};
+                clear.width = layout.width;
+                clear.height = layout.height;
+                impl->scheduler.Clear(clear);
+            }
+            // B8G8R8A8 rows, as Vulkan's screenshot buffer.
+            (void)impl->ReadTexture(
+                impl->screenshot_target.Get(), layout.width, layout.height,
+                std::span(static_cast<u8*>(renderer_settings.screenshot_bits),
+                          u64{layout.width} * layout.height * 4));
+        }
+    }
+    renderer_settings.screenshot_requested = false;
+    if (renderer_settings.screenshot_complete_callback) {
+        // Its argument is whether the picture is upside down (never, as on Vulkan).
+        renderer_settings.screenshot_complete_callback(false);
+    }
 }
 
 VideoCore::RasterizerInterface* RendererMetal::ReadRasterizer() {

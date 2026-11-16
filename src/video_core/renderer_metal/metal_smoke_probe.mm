@@ -531,6 +531,28 @@ const Suspect Suspects[] = {
          descriptor.alphaToCoverageEnabled = YES;
          return Build(context, descriptor);
      }},
+    {"alpha-to-one",
+     [](const Context& context) {
+         MTLRenderPipelineDescriptor* descriptor = Quad(context);
+         descriptor.alphaToOneEnabled = YES;
+         return Build(context, descriptor);
+     }},
+    {"alpha-to-one-on-rgba8uint",
+     [](const Context& context) {
+         MTLRenderPipelineDescriptor* descriptor = Quad(context);
+         descriptor.fragmentFunction = context.fragment_uint;
+         descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Uint;
+         descriptor.alphaToOneEnabled = YES;
+         return Build(context, descriptor);
+     }},
+    {"alpha-to-one-with-rgba8uint-second-target",
+     [](const Context& context) {
+         MTLRenderPipelineDescriptor* descriptor = Quad(context);
+         descriptor.fragmentFunction = context.fragment_two;
+         descriptor.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA8Uint;
+         descriptor.alphaToOneEnabled = YES;
+         return Build(context, descriptor);
+     }},
     // Functions.
     {"no-vertex-function",
      [](const Context& context) {
@@ -557,6 +579,49 @@ const Suspect Suspects[] = {
     {"texture-zero-levels", [](const Context& context) { return Texture(context, 16, 0, 1); }},
     {"texture-3-samples", [](const Context& context) { return Texture(context, 16, 1, 3); }},
     {"texture-4-samples", [](const Context& context) { return Texture(context, 16, 1, 4); }},
+    // The texture cache's shapes (metal-coverage.md sections F and G, rows R12 and R13).
+    {"texture-8-samples", [](const Context& context) { return Texture(context, 16, 1, 8); }},
+    {"texture-multisample-array-4-samples",
+     [](const Context& context) {
+         MTLTextureDescriptor* descriptor = [MTLTextureDescriptor new];
+         descriptor.textureType = MTLTextureType2DMultisampleArray;
+         descriptor.pixelFormat = MTLPixelFormatRGBA8Unorm;
+         descriptor.width = 16;
+         descriptor.height = 16;
+         descriptor.arrayLength = 2;
+         descriptor.sampleCount = 4;
+         descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+                            MTLTextureUsagePixelFormatView;
+         descriptor.storageMode = MTLStorageModePrivate;
+         return std::string([context.device newTextureWithDescriptor:descriptor] != nil
+                                ? "built"
+                                : "error: no texture");
+     }},
+    {"srgb-texture-shader-write-with-linear-view",
+     [](const Context& context) {
+         const id<MTLTexture> base =
+             Shape(context, MTLTextureType2D, MTLPixelFormatRGBA8Unorm_sRGB, 16, 16, 1, 1, 1,
+                   MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+                       MTLTextureUsagePixelFormatView);
+         if (base == nil) {
+             return std::string("error: no texture");
+         }
+         return std::string([base newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm] != nil
+                                ? "built"
+                                : "error: no view");
+     }},
+    {"stencil-view-without-format-views",
+     [](const Context& context) {
+         const id<MTLTexture> base =
+             Shape(context, MTLTextureType2D, MTLPixelFormatDepth32Float_Stencil8, 16, 16, 1, 1,
+                   1, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
+         if (base == nil) {
+             return std::string("error: no texture");
+         }
+         return std::string([base newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8] != nil
+                                ? "built"
+                                : "error: no view");
+     }},
     {"texture-multisample-with-1-sample",
      [](const Context& context) {
          MTLTextureDescriptor* descriptor =

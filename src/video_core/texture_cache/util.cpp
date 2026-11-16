@@ -1378,7 +1378,11 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
                 bpp_div;
             output_offset += static_cast<u32>(copy.buffer_size);
         } else {
-            DecompressBCn(input_offset, output.subspan(output_offset), copy, info.format);
+            if (IsExpandedFormat(info.format)) {
+                ExpandTexels(input_offset, output.subspan(output_offset), copy, info.format);
+            } else {
+                DecompressBCn(input_offset, output.subspan(output_offset), copy, info.format);
+            }
             output_offset += copy.image_extent.width * copy.image_extent.height *
                              copy.image_subresource.num_layers *
                              ConvertedBytesPerBlock(info.format);
