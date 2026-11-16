@@ -20,7 +20,7 @@
    <item>
     <widget class="QGroupBox" name="normal">
      <property name="title">
-      <string>Advanced Graphics Settings</string>
+      <string>Performance</string>
      </property>
      <layout class="QVBoxLayout" name="verticalLayout_3">
       <item>

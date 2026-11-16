@@ -516,7 +516,26 @@ void Widget::SetupComponent(const QString& label, std::function<void()>& load_fu
     created = true;
     const auto type_id = setting.TypeId();
 
-    QHBoxLayout* layout = new QHBoxLayout(this);
+    // The iOS layout: the row, and what the setting does on a line under it.
+    QHBoxLayout* layout = nullptr;
+    if (caption.isEmpty()) {
+        layout = new QHBoxLayout(this);
+    } else {
+        QVBoxLayout* const column = new QVBoxLayout(this);
+        column->setContentsMargins(0, 0, 0, 0);
+        column->setSpacing(1);
+        QWidget* const row = new QWidget(this);
+        layout = new QHBoxLayout(row);
+        column->addWidget(row);
+        QLabel* const caption_label = new QLabel(caption, this);
+        caption_label->setObjectName(QStringLiteral("lichiiCaption"));
+        caption_label->setWordWrap(true);
+        QFont font = caption_label->font();
+        font.setPointSizeF(font.pointSizeF() * 0.9);
+        caption_label->setFont(font);
+        column->addWidget(caption_label);
+    }
+    row_layout = layout;
     layout->setContentsMargins(0, 0, 0, 0);
 
     if (other_setting == nullptr) {
@@ -723,6 +742,18 @@ bool Widget::Valid() const {
     return created;
 }
 
+const QString& Widget::Label() const {
+    return label_text;
+}
+
+const Settings::BasicSetting& Widget::GetSetting() const {
+    return setting;
+}
+
+QBoxLayout* Widget::RowLayout() const {
+    return row_layout;
+}
+
 Widget::~Widget() = default;
 
 Widget::Widget(Settings::BasicSetting* setting_, const TranslationMap& translations_,
@@ -757,7 +788,23 @@ Widget::Widget(Settings::BasicSetting* setting_, const TranslationMap& translati
 
     std::function<void()> load_func = []() {};
 
-    SetupComponent(label, load_func, managed, request, multiplier, other_setting, suffix);
+    // Names read as the iOS app's: no trailing colon.
+    label_text = label;
+    while (label_text.endsWith(QLatin1Char(':'))) {
+        label_text.chop(1);
+    }
+    label_text = label_text.trimmed();
+
+    const bool locked = !(runtime_lock || setting.RuntimeModifiable());
+    if (UISettings::IsLichiiTheme()) {
+        caption = QString(tooltip).replace(QLatin1Char('\n'), QLatin1Char(' ')).simplified();
+        if (locked) {
+            const QString stop = tr("Stop the game to change this.");
+            caption = caption.isEmpty() ? stop : caption + QLatin1Char(' ') + stop;
+        }
+    }
+
+    SetupComponent(label_text, load_func, managed, request, multiplier, other_setting, suffix);
 
     if (!created) {
         LOG_WARNING(Frontend, "No widget was created for \"{}\"", setting.GetLabel());
@@ -778,8 +825,8 @@ Widget::Widget(Settings::BasicSetting* setting_, const TranslationMap& translati
     if (setting.Switchable() && Settings::IsConfiguringGlobal() && !runtime_lock &&
         !setting.UsingGlobal()) {
         enable = false;
-        reason = tr("The running game's Properties override this setting: change it there "
-                    "(right-click the game > Configure Game).");
+        reason = tr("The running game's Game Settings override this setting: change it there "
+                    "(right-click the game > Game Settings).");
     }
 
     this->setEnabled(enable);
@@ -798,36 +845,37 @@ Builder::~Builder() = default;
 
 // Settings that do nothing on this platform or in this build get no widget. Their values still load
 // and save, so a config written on another platform keeps them.
-bool AppliesToThisPlatform(const Settings::BasicSetting& setting) {
+QString PlatformUnavailableReason(const Settings::BasicSetting& setting) {
     const u32 id = setting.Id();
     const auto& values = Settings::values;
-    // Android only.
     if (id == values.emulate_bgr565.Id()) {
-        return false;
+        return QObject::tr("Only for some GPUs on Android.");
     }
 #ifndef EGLANTINE_STREAMLINE
     // NVIDIA DLSS runs through NVIDIA Streamline: Windows x64 builds made with it.
     if (id == values.nvidia_dlss_preset.Id()) {
-        return false;
+        return QObject::tr("NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.");
     }
 #endif
-    // A per-game page lists another game's own settings nowhere, nor what the game's own replace.
-    if (!Settings::AppliesToGame(setting.GetLabel(), Settings::ConfiguringProgramId())) {
-        return false;
-    }
 #ifndef __APPLE__
-    // MoltenVK runs on macOS and iOS only.
     if (id == values.moltenvk_driver.Id() || id == values.mesh_direct_outputs.Id()) {
-        return false;
+        return QObject::tr("MoltenVK runs on macOS and iOS only.");
     }
 #endif
 #ifndef __linux__
-    // Feral GameMode (libgamemode) exists on Linux only.
     if (id == UISettings::values.enable_gamemode.Id()) {
-        return false;
+        return QObject::tr("Feral GameMode exists on Linux only.");
     }
 #endif
-    return true;
+    return {};
+}
+
+bool AppliesToThisPlatform(const Settings::BasicSetting& setting) {
+    if (!PlatformUnavailableReason(setting).isEmpty()) {
+        return false;
+    }
+    // A per-game page lists another game's own settings nowhere, nor what the game's own replace.
+    return Settings::AppliesToGame(setting.GetLabel(), Settings::ConfiguringProgramId());
 }
 
 Widget* Builder::BuildWidget(Settings::BasicSetting* setting,

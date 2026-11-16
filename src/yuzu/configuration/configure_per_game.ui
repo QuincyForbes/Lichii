@@ -31,7 +31,7 @@
         </sizepolicy>
        </property>
        <property name="title">
-        <string>Info</string>
+        <string>Game Info</string>
        </property>
        <layout class="QVBoxLayout" name="verticalLayout">
         <item alignment="Qt::AlignHCenter">

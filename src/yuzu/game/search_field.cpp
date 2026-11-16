@@ -7,6 +7,8 @@
 #include <QKeyEvent>
 #include <QToolButton>
 
+#include "yuzu/util/lichii_style.h"
+
 // TODO: Remove GameList dependence?
 GameListSearchField::KeyReleaseEater::KeyReleaseEater(GameList* gamelist_, QObject* parent)
     : QObject(parent), gamelist{gamelist_} {}
@@ -107,6 +109,17 @@ GameListSearchField::GameListSearchField(GameList* parent) : QWidget{parent} {
     layout_filter->addWidget(label_filter_result);
     layout_filter->addWidget(button_filter_close);
     setLayout(layout_filter);
+    // The iOS library's search field in the library's top bar: a magnifier, the count only while
+    // searching. View > Show Filter Bar still hides it.
+    layout_filter->setContentsMargins(0, 0, 0, 0);
+    label_filter->hide();
+    button_filter_close->hide();
+    label_filter_result->hide();
+    edit_filter->addAction(LichiiStyle::Icon(QStringLiteral("search"),
+                                             LichiiStyle::Current().secondary),
+                           QLineEdit::LeadingPosition);
+    connect(edit_filter, &QLineEdit::textChanged, label_filter_result,
+            [this](const QString& text) { label_filter_result->setVisible(!text.isEmpty()); });
     RetranslateUI();
 }
 
@@ -120,5 +133,5 @@ void GameListSearchField::changeEvent(QEvent* event) {
 
 void GameListSearchField::RetranslateUI() {
     label_filter->setText(tr("Filter:"));
-    edit_filter->setPlaceholderText(tr("Enter pattern to filter"));
+    edit_filter->setPlaceholderText(tr("Search games"));
 }

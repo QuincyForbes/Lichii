@@ -1,0 +1,8 @@
+[Icon Theme]
+Name=lichii
+Comment=Lichii theme: the Colorful icons, Lucide icons drawn in code
+Inherits=colorful
+Directories=48x48
+
+[48x48]
+Size=48

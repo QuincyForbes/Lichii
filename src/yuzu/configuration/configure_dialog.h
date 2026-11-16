@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <QDialog>
 #include "configuration/shared_widget.h"
@@ -36,6 +37,10 @@ class ConfigureNetwork;
 class ConfigureUi;
 class ConfigureWeb;
 
+class QLabel;
+class QLineEdit;
+class QListWidget;
+class QListWidgetItem;
 class QScrollArea;
 class HotkeyRegistry;
 
@@ -80,6 +85,33 @@ private:
     void SetConfiguration();
     void UpdateVisibleTabs();
     void PopulateSelectionList();
+
+    /// One page of the sidebar, as the iOS app's settings root lists them: a title, an icon and
+    /// the tabs it shows one under the other (Controls keeps its tabs).
+    struct Page {
+        QString title;
+        QString icon;
+        /// Sidebar group heading shown before this page, if any ("Games & Data").
+        QString group;
+        QString footer;
+        std::vector<std::pair<QString, QWidget*>> sections;
+        bool controls{false};
+        QScrollArea* area{};
+        QLabel* title_label{};
+        QLabel* footer_label{};
+        std::vector<std::pair<std::size_t, QLabel*>> section_labels;
+    };
+    QScrollArea* PageArea(Page& page);
+    void SelectPage(int index);
+    /// The settings search, as the iOS app's: every page's settings by name, and the settings this
+    /// platform has no use for with the reason.
+    void OnSearchChanged(const QString& text);
+    void OpenSearchResult(QListWidgetItem* item);
+
+    std::vector<Page> pages;
+    int last_page{0};
+    QLineEdit* search_field{};
+    QListWidget* search_results{};
 
     std::unique_ptr<Ui::ConfigureDialog> ui;
     HotkeyRegistry& registry;

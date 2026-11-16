@@ -17,6 +17,7 @@
 #include <QDesktopServices>
 #include <QDir>
 #include <QFileDialog>
+#include <QFrame>
 #include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
@@ -50,6 +51,7 @@
 #include "yuzu/configuration/configure_graphics.h"
 #include "yuzu/configuration/nvidia_dlss_panel.h"
 #include "yuzu/configuration/shared_widget.h"
+#include "yuzu/util/lichii_style.h"
 
 #ifdef HAS_LSFG
 #include "video_core/frame_gen/lossless_dll.h"
@@ -321,8 +323,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         if (s->Switchable() && Settings::IsConfiguringGlobal() && !runtime_lock &&
             !s->UsingGlobal()) {
             enable = false;
-            reason = tr("The running game's Properties override this setting: change it there "
-                        "(right-click the game > Configure Game).");
+            reason = tr("The running game's Game Settings override this setting: change it there "
+                        "(right-click the game > Game Settings).");
         }
         row->setEnabled(enable);
         row->setToolTip(reason.isEmpty() ? tooltip_text
@@ -425,7 +427,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                 // Detach API's restore button and place it where we want
                 // Lets us put it on the side, and it will automatically scale if there's a
                 // second combobox (vulkan_device)
-                widget->layout()->removeWidget(api_restore_global_button);
+                widget->RowLayout()->removeWidget(api_restore_global_button);
                 api_layout->addWidget(api_restore_global_button);
             }
         } else if (setting->Id() == Settings::values.vulkan_device.Id()) {
@@ -444,7 +446,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                     ConfigurationShared::Widget::CreateRestoreGlobalButton(
                         Settings::values.vsync_mode.UsingGlobal(), widget);
                 restore_button->setEnabled(true);
-                widget->layout()->addWidget(restore_button);
+                widget->RowLayout()->addWidget(restore_button);
 
                 restore_button->connect(restore_button, &QAbstractButton::clicked,
                                         [restore_button, this](bool) {
@@ -485,7 +487,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             connect(widget->checkbox, &QCheckBox::toggled, post_shader_button,
                     &QWidget::setVisible);
 
-            QBoxLayout* row = qobject_cast<QBoxLayout*>(widget->layout());
+            QBoxLayout* row = widget->RowLayout();
             row->insertWidget(1, post_shader_button);
 
             hold_graphics.emplace(setting->Id(), widget);
@@ -519,19 +521,19 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     // rest follows in the settings' order.
     {
         const auto& v = Settings::values;
+        // The section names and footers of the iOS app's Graphics page.
         std::vector<std::tuple<QString, QString, std::vector<u32>>> sections{
-            {tr("Resolution and textures"),
+            {tr("Resolution & Textures"),
              Settings::ConfiguringProgramId() == 0
                  ? tr("The size games draw at and their texture detail. Games with their own "
-                      "resolution choice have it under their name below.")
+                      "Resolution have it in their section below.")
                  : QString(),
              {v.resolution_setup.Id(), v.texture_quality.Id(), v.aspect_ratio.Id()}},
             {tr("Upscaling"),
-             tr("The game's picture goes through the upscaler (in place of the game's own), then "
-                "the screen filter to the window."),
+             tr("The game's picture goes through the upscaler, then the screen filter."),
              {v.upscaler.Id(), v.nvidia_dlss_preset.Id(), v.scaling_filter.Id(),
               v.fsr_sharpening_slider.Id(), v.anti_aliasing.Id()}},
-            {tr("Frame rate"),
+            {tr("Frame Rate"),
              tr("The Switch 2 frame rate limit paces every game without its own choice. Frame "
                 "generation adds frames on top of the game's."),
              {v.frame_rate_limit.Id(), v.vsync_mode.Id(), v.frame_gen.Id(), v.frame_gen_type.Id(),
@@ -556,22 +558,18 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                                       : QString(),
                                   std::move(ids));
         }
-        sections.emplace_back(tr("Game patches"),
-                              tr("Built-in changes to a game's code with a trade-off. A game's own "
-                                 "choice in its Properties > Add-Ons overrides these."),
+        sections.emplace_back(tr("Game Enhancements"),
+                              tr("Built-in patches by kind, with a trade-off. A game's own choice "
+                                 "in its Updates, DLC & Mods overrides these. Changes apply the "
+                                 "next time a game starts."),
                               std::vector<u32>{v.patch_performance.Id(), v.patch_image.Id()});
-        sections.emplace_back(tr("Other"), QString(), std::vector<u32>{});
+        sections.emplace_back(tr("Image"), QString(), std::vector<u32>{});
         std::map<u32, QWidget*> rest = hold_graphics;
-        const auto add_heading = [&](const QString& title, const QString& text) {
-            QLabel* heading = new QLabel(QStringLiteral("<b>%1</b>").arg(title), this);
-            heading->setContentsMargins(0, 8, 0, 0);
-            graphics_layout.addWidget(heading);
-            if (!text.isEmpty()) {
-                QLabel* description = new QLabel(text, this);
-                description->setWordWrap(true);
-                graphics_layout.addWidget(description);
-            }
-        };
+        // The group box only holds the sections: each is a header, a rounded group of rows and a
+        // footer, as the iOS app's grouped lists.
+        ui->groupBox->setTitle(QString());
+        ui->groupBox->setProperty("lichiiPlain", true);
+        ui->groupBox->setFlat(true);
         for (const auto& [title, text, ids] : sections) {
             std::vector<QWidget*> widgets;
             for (const u32 id : ids) {
@@ -588,9 +586,15 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             if (widgets.empty()) {
                 continue;
             }
-            add_heading(title, text);
+            graphics_layout.addWidget(LichiiStyle::SectionHeader(title, this));
+            QFrame* const card = LichiiStyle::Card(this);
+            card->setProperty("lichiiSection", title);
             for (QWidget* const widget : widgets) {
-                graphics_layout.addWidget(widget);
+                LichiiStyle::AddRow(card, widget);
+            }
+            graphics_layout.addWidget(card);
+            if (!text.isEmpty()) {
+                graphics_layout.addWidget(LichiiStyle::Footer(text, this));
             }
         }
     }
@@ -659,7 +663,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         QVBoxLayout* group_layout = new QVBoxLayout(group);
         group_layout->setContentsMargins(0, 0, 0, 0);
         group_layout->setSpacing(2);
-        graphics_layout.replaceWidget(type_widget, group);
+        type_widget->parentWidget()->layout()->replaceWidget(type_widget, group);
         group_layout->addWidget(type_widget);
         group_layout->addWidget(row);
         type_widget->setVisible(true);

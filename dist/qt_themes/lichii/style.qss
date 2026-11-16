@@ -1,0 +1,510 @@
+/*
+ * Lichii: the iOS app's look on the desktop (docs/design/lichii-design.md). A template: the app
+ * replaces each @token@ with the light or dark value (src/yuzu/util/lichii_style.cpp) and follows
+ * the system's light or dark mode. Colours come from the palette where Qt draws them itself.
+ */
+
+QWidget {
+    selection-background-color: @accent@;
+    selection-color: #FFFFFF;
+}
+
+QMainWindow, QDialog {
+    background: @window@;
+}
+
+QToolTip {
+    color: @text@;
+    background: @card@;
+    border: 1px solid @separator@;
+    border-radius: 6px;
+    padding: 6px 8px;
+}
+
+/* Grouped inset lists: a settings group is a rounded card on the grouped background. */
+QGroupBox {
+    background: @card@;
+    border: none;
+    border-radius: 10px;
+    margin-top: 26px;
+    padding: 10px 12px 10px 12px;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 14px;
+    top: 4px;
+    padding: 0;
+    color: @secondary@;
+    font-weight: 600;
+}
+
+QGroupBox[lichiiPlain="true"] {
+    background: transparent;
+    padding: 0;
+    margin-top: 0;
+}
+
+QFrame#lichiiCard {
+    background: @card@;
+    border: none;
+    border-radius: 10px;
+}
+
+/* The controller pages are dense grids of small groups: tighter cards there. */
+ConfigureInputPlayer QGroupBox, ConfigureInputAdvanced QGroupBox {
+    padding: 4px 6px 6px 6px;
+    margin-top: 20px;
+}
+
+ConfigureInputPlayer QGroupBox::title, ConfigureInputAdvanced QGroupBox::title {
+    left: 8px;
+}
+
+ConfigureInputPlayer QPushButton, ConfigureInputAdvanced QPushButton {
+    padding: 4px 6px;
+}
+
+QLabel#lichiiSectionHeader {
+    color: @secondary@;
+    font-weight: 600;
+    padding: 14px 14px 4px 14px;
+}
+
+QLabel#lichiiFooter, QLabel#lichiiCaption {
+    color: @secondary@;
+}
+
+QLabel#lichiiFooter {
+    padding: 4px 14px 2px 14px;
+}
+
+QLabel#lichiiPageTitle {
+    font-weight: 700;
+    padding: 2px 4px 6px 4px;
+}
+
+QLabel#lichiiPageSubtitle {
+    color: @secondary@;
+    padding: 0 4px 6px 4px;
+}
+
+QLabel:disabled, QCheckBox:disabled, QRadioButton:disabled {
+    color: @tertiary@;
+}
+
+QWidget[lichiiSearchHit="true"] {
+    background: @accent_soft@;
+    border-radius: 6px;
+}
+
+/* Sidebar: the iOS settings root as a list of pages. */
+QListWidget#selectorList {
+    background: transparent;
+    border: none;
+    outline: none;
+    padding: 2px;
+}
+
+QListWidget#selectorList::item {
+    color: @text@;
+    border-radius: 7px;
+    padding: 6px 8px;
+    margin: 1px 0;
+}
+
+QListWidget#selectorList::item:hover {
+    background: @fill@;
+}
+
+QListWidget#selectorList::item:selected {
+    background: @accent@;
+    color: #FFFFFF;
+}
+
+QListWidget#selectorList::item:disabled {
+    color: @secondary@;
+    background: transparent;
+    padding-top: 12px;
+}
+
+/* Text fields and pickers: filled, rounded, no frame (the iOS search field and menu pickers). */
+QLineEdit, QSpinBox, QDoubleSpinBox, QDateTimeEdit, QPlainTextEdit, QTextEdit {
+    background: @fill@;
+    color: @text@;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    padding: 4px 8px;
+}
+
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QDateTimeEdit:focus,
+QPlainTextEdit:focus, QTextEdit:focus {
+    border: 1px solid @accent@;
+}
+
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {
+    color: @tertiary@;
+}
+
+QSpinBox::up-button, QDoubleSpinBox::up-button, QDateTimeEdit::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button, QDateTimeEdit::down-button {
+    border: none;
+    background: transparent;
+    width: 18px;
+}
+
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow, QDateTimeEdit::up-arrow {
+    image: url(:/lichii/rc/chevron-up-@scheme@.png);
+    width: 12px;
+    height: 12px;
+}
+
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow, QDateTimeEdit::down-arrow {
+    image: url(:/lichii/rc/chevron-down-@scheme@.png);
+    width: 12px;
+    height: 12px;
+}
+
+QComboBox {
+    background: @fill@;
+    color: @text@;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    padding: 4px 26px 4px 10px;
+    min-height: 18px;
+}
+
+QComboBox:hover {
+    background: @fill_hover@;
+}
+
+QComboBox:focus {
+    border: 1px solid @accent@;
+}
+
+QComboBox:disabled {
+    color: @tertiary@;
+}
+
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    border: none;
+    width: 24px;
+}
+
+QComboBox::down-arrow {
+    image: url(:/lichii/rc/chevron-down-@scheme@.png);
+    width: 14px;
+    height: 14px;
+}
+
+QComboBox QAbstractItemView {
+    background: @card@;
+    color: @text@;
+    border: 1px solid @separator@;
+    border-radius: 8px;
+    padding: 4px;
+    outline: none;
+    selection-background-color: @accent@;
+    selection-color: #FFFFFF;
+}
+
+/* Buttons: tinted fill; the default (OK) button and lichiiPrimary are the accent, as iOS's
+   prominent buttons. */
+QPushButton, QToolButton {
+    background: @fill@;
+    color: @text@;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    padding: 5px 14px;
+}
+
+QToolButton {
+    padding: 4px 6px;
+}
+
+QPushButton:hover, QToolButton:hover {
+    background: @fill_hover@;
+}
+
+QPushButton:pressed, QToolButton:pressed, QToolButton:checked {
+    background: @fill_pressed@;
+}
+
+QPushButton:focus, QToolButton:focus {
+    border: 1px solid @accent@;
+}
+
+QPushButton:disabled, QToolButton:disabled {
+    color: @tertiary@;
+}
+
+QPushButton:default, QPushButton#lichiiPrimary {
+    background: @accent@;
+    color: #FFFFFF;
+    font-weight: 600;
+}
+
+QPushButton:default:hover, QPushButton#lichiiPrimary:hover {
+    background: @accent_hover@;
+}
+
+QPushButton:default:pressed, QPushButton#lichiiPrimary:pressed {
+    background: @accent_pressed@;
+}
+
+QPushButton:default:disabled, QPushButton#lichiiPrimary:disabled {
+    background: @fill@;
+    color: @tertiary@;
+}
+
+QPushButton#lichiiDestructive {
+    color: @destructive@;
+}
+
+QToolButton#lichiiToolbarButton {
+    background: transparent;
+    border-radius: 7px;
+    padding: 5px;
+}
+
+QToolButton#lichiiToolbarButton:hover {
+    background: @fill@;
+}
+
+QToolButton#lichiiToolbarButton:checked {
+    background: @accent_soft@;
+}
+
+/* Toggles are iOS switches. Check boxes inside lists (add-ons, cheats) keep their own look. */
+QCheckBox {
+    spacing: 10px;
+}
+
+QCheckBox::indicator {
+    width: 38px;
+    height: 23px;
+}
+
+QCheckBox::indicator:unchecked {
+    image: url(:/lichii/rc/switch-off-@scheme@.png);
+}
+
+QCheckBox::indicator:checked {
+    image: url(:/lichii/rc/switch-on.png);
+}
+
+QCheckBox::indicator:unchecked:disabled {
+    image: url(:/lichii/rc/switch-off-@scheme@-disabled.png);
+}
+
+QCheckBox::indicator:checked:disabled {
+    image: url(:/lichii/rc/switch-on-disabled.png);
+}
+
+QSlider::groove:horizontal {
+    height: 4px;
+    background: @fill_pressed@;
+    border-radius: 2px;
+}
+
+QSlider::sub-page:horizontal {
+    background: @accent@;
+    border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+    background: #FFFFFF;
+    border: 1px solid @separator@;
+    width: 18px;
+    height: 18px;
+    margin: -8px 0;
+    border-radius: 10px;
+}
+
+QSlider::handle:horizontal:disabled {
+    background: @fill@;
+}
+
+/* Tabs read as a segmented control. */
+QTabWidget::pane {
+    border: none;
+    background: transparent;
+    top: -1px;
+}
+
+QTabWidget::tab-bar {
+    alignment: left;
+}
+
+QTabBar::tab {
+    background: transparent;
+    color: @secondary@;
+    border: none;
+    border-radius: 7px;
+    padding: 5px 12px;
+    margin: 2px 2px 6px 0;
+}
+
+QTabBar::tab:hover {
+    background: @fill@;
+    color: @text@;
+}
+
+QTabBar::tab:selected {
+    background: @card@;
+    color: @text@;
+    font-weight: 600;
+}
+
+/* Lists: the library and pickers, plain rows on cards. */
+QTreeView, QListView, QTableView, QTreeWidget, QListWidget, QTableWidget {
+    background: @card@;
+    alternate-background-color: @card@;
+    color: @text@;
+    border: none;
+    border-radius: 10px;
+    outline: none;
+}
+
+QTreeView::item, QListView::item, QTableView::item {
+    padding: 3px 4px;
+}
+
+QTreeView::item:hover, QListView::item:hover {
+    background: @fill@;
+}
+
+QTreeView::item:selected, QListView::item:selected, QTableView::item:selected {
+    background: @accent@;
+    color: #FFFFFF;
+}
+
+QTreeView#GameTree, QListView#GameGrid, QListView#GameCarousel {
+    background: @window@;
+    border-radius: 0;
+}
+
+QHeaderView {
+    background: transparent;
+    border: none;
+}
+
+QHeaderView::section {
+    background: transparent;
+    color: @secondary@;
+    border: none;
+    border-bottom: 1px solid @separator@;
+    padding: 6px 8px;
+    font-weight: 600;
+}
+
+QScrollArea {
+    background: transparent;
+    border: none;
+}
+
+QScrollArea > QWidget > QWidget {
+    background: transparent;
+}
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 2px;
+}
+
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background: @scroll@;
+    border-radius: 3px;
+    min-height: 32px;
+    min-width: 32px;
+}
+
+QScrollBar::handle:hover {
+    background: @secondary@;
+}
+
+QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page {
+    background: transparent;
+    border: none;
+    width: 0;
+    height: 0;
+}
+
+QMenuBar {
+    background: @window@;
+    color: @text@;
+}
+
+QMenuBar::item {
+    background: transparent;
+    padding: 4px 9px;
+    border-radius: 5px;
+}
+
+QMenuBar::item:selected {
+    background: @fill@;
+}
+
+QMenu {
+    background: @card@;
+    color: @text@;
+    border: 1px solid @separator@;
+    border-radius: 8px;
+    padding: 5px;
+}
+
+QMenu::item {
+    padding: 5px 24px 5px 22px;
+    border-radius: 5px;
+}
+
+QMenu::item:selected {
+    background: @accent@;
+    color: #FFFFFF;
+}
+
+QMenu::item:disabled {
+    color: @tertiary@;
+}
+
+QMenu::separator {
+    height: 1px;
+    background: @separator@;
+    margin: 4px 8px;
+}
+
+QStatusBar {
+    background: @window@;
+    color: @secondary@;
+}
+
+QStatusBar::item {
+    border: none;
+}
+
+QProgressBar {
+    background: @fill@;
+    border: none;
+    border-radius: 4px;
+    text-align: center;
+    color: @text@;
+}
+
+QProgressBar::chunk {
+    background: @accent@;
+    border-radius: 4px;
+}
+
+QDialogButtonBox {
+    dialogbuttonbox-buttons-have-icons: 0;
+}

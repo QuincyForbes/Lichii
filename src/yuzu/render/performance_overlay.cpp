@@ -3,11 +3,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <numeric>
+#include <string_view>
 #include <vector>
 
 #include "common/settings.h"
 #include "core/perf_stats.h"
+#include "video_core/render_probe.h"
 #include "performance_overlay.h"
 #include "ui_performance_overlay.h"
 #include "video_core/shader_notify.h"
@@ -18,6 +21,9 @@
 #include "main_window.h"
 
 #include <QChart>
+#include <QFontDatabase>
+#include <QFrame>
+#include <QLabel>
 #include <QChartView>
 #include <QGraphicsLayout>
 #include <QGuiApplication>
@@ -217,6 +223,49 @@ bool QueryProcessVram(double& used_gb, double& free_gb) {
 #endif
 }
 
+// The iOS overlay's colours: real and displayed frame rates, a slow speed, shaders building.
+const QColor RealColor{56, 189, 248};
+const QColor DisplayedColor{74, 222, 128};
+const QColor WarningColor{255, 159, 10};
+const QColor BuildingColor{255, 214, 10};
+
+// What draws the picture, in the iOS overlay's short names.
+QString UpscalerLabel() {
+    if (Settings::values.upscaler.GetValue() == Settings::Upscaler::MetalFx) {
+        return QStringLiteral("MetalFX Temporal");
+    }
+    if (Settings::GameDlssNetworkChosen()) {
+        return QStringLiteral("Game DLSS");
+    }
+    if (Settings::NvidiaDlssChosen()) {
+#ifdef EGLANTINE_STREAMLINE
+        // What NVIDIA DLSS does in this game, not just the setting.
+        const auto dlss = Vulkan::Streamline::GetSessionStatus();
+        return dlss.available && dlss.frames > 0 ? QStringLiteral("DLSS")
+               : dlss.available                  ? PerformanceOverlay::tr("DLSS idle")
+                                                 : PerformanceOverlay::tr("DLSS off");
+#else
+        return QStringLiteral("DLSS");
+#endif
+    }
+    static const std::map<std::string_view, const char*> short_names{
+        {"Fsr", "FSR 1"},
+        {"Fsr3", "FSR3"},
+        {"NearestNeighbor", "Nearest"},
+        {"ZeroTangent", "Zero Tangent"},
+        {"BSpline", "B-Spline"},
+        {"Mmpx", "MMPX"},
+        {"Sgsr", "Snapdragon GSR"},
+        {"SgsrEdge", "Snapdragon GSR Edge"},
+        {"MetalFxSpatial", "MetalFX Spatial"},
+    };
+    const auto name = Settings::CanonicalizeEnum(Settings::values.scaling_filter.GetValue());
+    if (const auto it = short_names.find(name); it != short_names.end()) {
+        return QString::fromUtf8(it->second);
+    }
+    return QString::fromUtf8(name.data(), static_cast<qsizetype>(name.size()));
+}
+
 } // namespace
 
 PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
@@ -226,16 +275,43 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
     setAttribute(Qt::WA_TranslucentBackground);
     setWindowFlags(Qt::FramelessWindowHint | Qt::Tool);
     raise();
+    // The app's style sheet stays out: the cards keep the iOS overlay's look in every theme.
+    setStyleSheet(QStringLiteral("QFrame#overlayCard { background: rgba(0, 0, 0, 140); border: 1px "
+                                 "solid rgba(255, 255, 255, 31); border-radius: 10px; }"
+                                 "QLabel { color: #FFFFFF; background: transparent; }"));
 
-    // Actual Game FPS series (sky blue)
+    QFrame* const frames = addCard();
+    m_real = addLine(frames);
+    m_generated = addLine(frames);
+    m_displayed = addLine(frames);
+    m_frametime = addLine(frames);
+    m_low10 = addLine(frames);
+    QFrame* const info = addCard();
+    m_frameGen = addLine(info);
+    m_scale = addLine(info);
+    m_speed = addLine(info);
+    m_shaders = addLine(info);
+    QFrame* const detail = addCard();
+    m_scene = addLine(detail);
+    m_game = addLine(detail);
+    m_screen = addLine(detail);
+    m_gpuAccuracy = addLine(detail);
+    m_ram = addLine(detail);
+    m_vram = addLine(detail);
+    m_textures = addLine(detail);
+    for (QLabel* const line : {m_generated, m_displayed, m_low10, m_shaders, m_scene, m_game,
+                               m_screen, m_gpuAccuracy, m_ram, m_vram, m_textures}) {
+        line->hide();
+    }
+
+    // Real FPS (sky blue) and displayed FPS (green), the iOS overlay's colours.
     m_fpsSeries = new QLineSeries(this);
-    QPen realPen(QColor(56, 189, 248));
+    QPen realPen(RealColor);
     realPen.setWidth(2);
     m_fpsSeries->setPen(realPen);
 
-    // Total Displayed FPS series (emerald green)
     m_totalFpsSeries = new QLineSeries(this);
-    QPen totalPen(QColor(74, 222, 128));
+    QPen totalPen(DisplayedColor);
     totalPen.setWidth(2);
     m_totalFpsSeries->setPen(totalPen);
 
@@ -243,7 +319,8 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
     m_fpsChart->addSeries(m_totalFpsSeries);
     m_fpsChart->addSeries(m_fpsSeries);
     m_fpsChart->legend()->hide();
-    m_fpsChart->setBackgroundBrush(QColor(9, 14, 26, 230));
+    m_fpsChart->setBackgroundBrush(m_background);
+    m_fpsChart->setBackgroundRoundness(10);
     m_fpsChart->setBackgroundVisible(true);
     m_fpsChart->layout()->setContentsMargins(2, 2, 2, 2);
     m_fpsChart->setMargins(QMargins{4, 4, 4, 4});
@@ -256,7 +333,7 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
     m_fpsY = new QValueAxis(this);
     m_fpsY->setRange(0, 120);
     m_fpsY->setLabelFormat(QStringLiteral("%d"));
-    m_fpsY->setLabelsColor(QColor(203, 213, 225));
+    m_fpsY->setLabelsColor(QColor(255, 255, 255, 170));
 
     QFont axisFont = m_fpsY->labelsFont();
     axisFont.setPixelSize(10);
@@ -264,8 +341,8 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
     m_fpsY->setTickCount(5);
 
     m_fpsY->setLabelsVisible(true);
-    m_fpsY->setGridLineColor(QColor(45, 55, 72));
-    m_fpsY->setLinePenColor(QColor(100, 116, 139));
+    m_fpsY->setGridLineColor(QColor(255, 255, 255, 28));
+    m_fpsY->setLinePenColor(QColor(255, 255, 255, 60));
 
     m_fpsChart->addAxis(m_fpsX, Qt::AlignBottom);
     m_fpsChart->addAxis(m_fpsY, Qt::AlignLeft);
@@ -277,19 +354,11 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
     // chart view
     m_fpsChartView = new QChartView(m_fpsChart, this);
     m_fpsChartView->setRenderHint(QPainter::Antialiasing);
-    m_fpsChartView->setMinimumHeight(105);
+    m_fpsChartView->setMinimumHeight(90);
+    m_fpsChartView->setStyleSheet(QStringLiteral("background: transparent;"));
+    m_fpsChartView->setAttribute(Qt::WA_TranslucentBackground);
 
     ui->verticalLayout->addWidget(m_fpsChartView, 1);
-
-    QFont font = ui->fps->font();
-    font.setWeight(QFont::DemiBold);
-
-    ui->total_fps->setFont(font);
-    ui->fps->setFont(font);
-    ui->fps_gen->setFont(font);
-    ui->frametime->setFont(font);
-    ui->ram_widget->setVisible(false);
-    ui->vram_widget->setVisible(false);
 
     // pos/stats
     resetPosition(m_mainWindow->pos());
@@ -299,6 +368,36 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
 
 PerformanceOverlay::~PerformanceOverlay() {
     delete ui;
+}
+
+QFrame* PerformanceOverlay::addCard() {
+    QFrame* const card = new QFrame(this);
+    card->setObjectName(QStringLiteral("overlayCard"));
+    QVBoxLayout* const layout = new QVBoxLayout(card);
+    layout->setContentsMargins(9, 6, 9, 6);
+    layout->setSpacing(1);
+    ui->verticalLayout->addWidget(card);
+    return card;
+}
+
+QLabel* PerformanceOverlay::addLine(QFrame* card) {
+    QLabel* const line = new QLabel(card);
+    QFont font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+    font.setPixelSize(12);
+    font.setWeight(QFont::DemiBold);
+    line->setFont(font);
+    card->layout()->addWidget(line);
+    return line;
+}
+
+void PerformanceOverlay::setLine(QLabel* line, const QString& text, const QColor& color) {
+    line->setVisible(!text.isEmpty());
+    if (text.isEmpty()) {
+        return;
+    }
+    line->setText(text);
+    line->setStyleSheet(color.isValid() ? QStringLiteral("color: %1;").arg(color.name())
+                                        : QString());
 }
 
 void PerformanceOverlay::resetPosition(const QPoint& _) {
@@ -312,203 +411,158 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
         return;
     }
 
-    const double fps = results.average_game_fps;
+    const double fps = std::isnan(results.average_game_fps) ? 0.0 : results.average_game_fps;
     const double gen_fps = std::isnan(results.generated_fps) ? 0.0 : results.generated_fps;
     const double total_fps =
         !std::isnan(results.total_fps) && results.total_fps > 0.0 ? results.total_fps : fps + gen_fps;
+    const bool generating = gen_fps > 0.5 && fps > 0.5;
 
-    if (!std::isnan(fps)) {
-        static constexpr double FPS_SAMPLE_THRESHOLD = 3.0;
+    // Frames: the same lines as the iOS overlay.
+    setLine(m_real, tr("Real %1 FPS").arg(fps, 0, 'f', 1), RealColor);
+    setLine(m_generated, generating ? tr("Generated +%1").arg(gen_fps, 0, 'f', 1) : QString());
+    setLine(m_displayed, generating ? tr("Displayed %1 FPS").arg(total_fps, 0, 'f', 1) : QString(),
+            DisplayedColor);
 
-        ui->fps->setText(tr("%1 FPS").arg(fps, 0, 'f', 1));
-
-        if (gen_fps > 0.5 && fps > 0.5) {
-            const double mult = total_fps / fps;
-            const QString method = FrameGenMethodLabel();
-            ui->fps_gen->setText(
-                tr("+%1 FPS (%2x %3)").arg(gen_fps, 0, 'f', 1).arg(mult, 0, 'f', 1).arg(method));
-            ui->total_fps->setText(
-                tr("%1 FPS (%2x %3)").arg(total_fps, 0, 'f', 1).arg(mult, 0, 'f', 1).arg(method));
-        } else if (Settings::values.frame_gen.GetValue()) {
-            ui->fps_gen->setText(LosslessMissing()
-                                     ? tr("Unavailable (no Lossless.dll, see Graphics)")
-                                     : tr("+0.0 FPS (%1 Warmup)").arg(FrameGenMethodLabel()));
-            ui->total_fps->setText(tr("%1 FPS").arg(fps, 0, 'f', 1));
-        } else {
-            ui->fps_gen->setText(tr("Off (0 FPS)"));
-            ui->total_fps->setText(tr("%1 FPS (Real only)").arg(fps, 0, 'f', 1));
-        }
-
-        if (fps > FPS_SAMPLE_THRESHOLD) {
-            const qreal x = m_xPos++;
-            m_fpsSamples.push_back(fps);
-            m_totalFpsSamples.push_back(total_fps);
-            m_fpsPoints.push_back(QPointF{x, fps});
-            m_totalFpsPoints.push_back(QPointF{x, total_fps});
-        }
-
-        while (m_fpsSamples.size() > NUM_FPS_SAMPLES) {
-            m_fpsSamples.pop_front();
-            m_fpsPoints.pop_front();
-        }
-        while (m_totalFpsSamples.size() > NUM_FPS_SAMPLES) {
-            m_totalFpsSamples.pop_front();
-            m_totalFpsPoints.pop_front();
-        }
-
-        if (m_fpsSamples.size() >= 2) {
-            const size_t back_search = std::min(size_t(10), m_fpsSamples.size());
-            const double sum =
-                std::accumulate(m_fpsSamples.end() - back_search, m_fpsSamples.end(), 0.0);
-            const double avg = sum / static_cast<double>(back_search);
-            ui->fps_avg->setText(tr("Avg: %1").arg(avg, 0, 'f', 0));
-        }
-
-        if (!m_fpsPoints.empty()) {
-            auto [min_it, max_it] = std::minmax_element(m_fpsSamples.begin(), m_fpsSamples.end());
-            const double min_fps = *min_it;
-            const double max_fps = *max_it;
-
-            // Average of the lowest 10% of the real FPS samples
-            std::vector<double> sorted(m_fpsSamples.begin(), m_fpsSamples.end());
-            std::sort(sorted.begin(), sorted.end());
-            const size_t low_count = std::max<size_t>(1, sorted.size() / 10);
-            const double low10_fps =
-                std::accumulate(sorted.begin(), sorted.begin() + low_count, 0.0) /
-                static_cast<double>(low_count);
-
-            ui->fps_min->setText(tr("Min: %1").arg(min_fps, 0, 'f', 0));
-            ui->fps_low1->setText(tr("10% low: %1").arg(low10_fps, 0, 'f', 0));
-            ui->fps_max->setText(tr("Max: %1").arg(max_fps, 0, 'f', 0));
-
-            double peak_chart_fps = max_fps;
-            if (!m_totalFpsSamples.empty()) {
-                peak_chart_fps = std::max(
-                    peak_chart_fps,
-                    *std::max_element(m_totalFpsSamples.begin(), m_totalFpsSamples.end()));
-            }
-            const double axis_top = std::max(60.0, std::ceil((peak_chart_fps + 5.0) / 30.0) * 30.0);
-
-            m_fpsSeries->replace(QList<QPointF>(m_fpsPoints.begin(), m_fpsPoints.end()));
-            m_totalFpsSeries->replace(
-                QList<QPointF>(m_totalFpsPoints.begin(), m_totalFpsPoints.end()));
-
-            const qreal x_min = std::max(0.0, m_xPos - NUM_FPS_SAMPLES);
-            const qreal x_max = std::max(qreal(10), m_xPos);
-            m_fpsX->setRange(x_min, x_max);
-            m_fpsY->setRange(0.0, axis_top);
-        }
+    static constexpr double FPS_SAMPLE_THRESHOLD = 3.0;
+    if (fps > FPS_SAMPLE_THRESHOLD) {
+        const qreal x = m_xPos++;
+        m_fpsSamples.push_back(fps);
+        m_totalFpsSamples.push_back(total_fps);
+        m_fpsPoints.push_back(QPointF{x, fps});
+        m_totalFpsPoints.push_back(QPointF{x, total_fps});
+    }
+    while (m_fpsSamples.size() > NUM_FPS_SAMPLES) {
+        m_fpsSamples.pop_front();
+        m_fpsPoints.pop_front();
+    }
+    while (m_totalFpsSamples.size() > NUM_FPS_SAMPLES) {
+        m_totalFpsSamples.pop_front();
+        m_totalFpsPoints.pop_front();
     }
 
     const double ft = results.frametime;
     const double real_ft_ms =
         (!std::isnan(ft) && ft > 0.0) ? ft * 1000.0 : (fps > 0.1 ? 1000.0 / fps : 0.0);
-    if (real_ft_ms > 0.0) {
-        static constexpr double FT_SAMPLE_THRESHOLD = 500.0;
+    setLine(m_frametime, generating && total_fps > 0.5
+                             ? tr("Frame %1 ms (%2 out)")
+                                   .arg(real_ft_ms, 0, 'f', 1)
+                                   .arg(1000.0 / total_fps, 0, 'f', 1)
+                             : tr("Frame %1 ms").arg(real_ft_ms, 0, 'f', 1));
 
-        if (gen_fps > 0.5 && total_fps > 0.5) {
-            const double out_ft_ms = 1000.0 / total_fps;
-            ui->frametime->setText(
-                tr("%1 ms (%2 ms out)").arg(real_ft_ms, 0, 'f', 2).arg(out_ft_ms, 0, 'f', 2));
+    if (!m_fpsSamples.empty()) {
+        // Average of the lowest 10% of the real FPS samples
+        std::vector<double> sorted(m_fpsSamples.begin(), m_fpsSamples.end());
+        std::sort(sorted.begin(), sorted.end());
+        const size_t low_count = std::max<size_t>(1, sorted.size() / 10);
+        const double low10_fps = std::accumulate(sorted.begin(), sorted.begin() + low_count, 0.0) /
+                                 static_cast<double>(low_count);
+        setLine(m_low10, tr("10% low %1").arg(low10_fps, 0, 'f', 0));
+
+        double peak_chart_fps = *std::max_element(m_fpsSamples.begin(), m_fpsSamples.end());
+        if (!m_totalFpsSamples.empty()) {
+            peak_chart_fps =
+                std::max(peak_chart_fps,
+                         *std::max_element(m_totalFpsSamples.begin(), m_totalFpsSamples.end()));
+        }
+        const double axis_top = std::max(60.0, std::ceil((peak_chart_fps + 5.0) / 30.0) * 30.0);
+        m_fpsSeries->replace(QList<QPointF>(m_fpsPoints.begin(), m_fpsPoints.end()));
+        m_totalFpsSeries->replace(QList<QPointF>(m_totalFpsPoints.begin(), m_totalFpsPoints.end()));
+        m_fpsX->setRange(std::max(0.0, m_xPos - NUM_FPS_SAMPLES), std::max(qreal(10), m_xPos));
+        m_fpsY->setRange(0.0, axis_top);
+    }
+
+    // What draws the frames.
+    QString frame_gen = tr("Off");
+    if (Settings::values.frame_gen.GetValue()) {
+        if (LosslessMissing()) {
+            frame_gen = tr("LSFG needs Lossless.dll");
+        } else if (generating) {
+            frame_gen =
+                QStringLiteral("%1 %2x").arg(FrameGenMethodLabel()).arg(total_fps / fps, 0, 'f', 1);
         } else {
-            ui->frametime->setText(tr("%1 ms").arg(real_ft_ms, 0, 'f', 2));
-        }
-
-        if (real_ft_ms <= FT_SAMPLE_THRESHOLD) {
-            m_frametimeSamples.push_back(real_ft_ms);
-        }
-
-        if (m_frametimeSamples.size() > NUM_FRAMETIME_SAMPLES) {
-            m_frametimeSamples.pop_front();
-        }
-
-        if (!m_frametimeSamples.empty()) {
-            auto [min_it, max_it] =
-                std::minmax_element(m_frametimeSamples.begin(), m_frametimeSamples.end());
-            ui->ft_min->setText(tr("Min: %1").arg(*min_it, 0, 'f', 1));
-            ui->ft_max->setText(tr("Max: %1").arg(*max_it, 0, 'f', 1));
-        }
-
-        if (m_frametimeSamples.size() >= 2) {
-            const size_t back_search = std::min(size_t(10), m_frametimeSamples.size());
-            const double sum = std::accumulate(m_frametimeSamples.end() - back_search,
-                                               m_frametimeSamples.end(), 0.0);
-            const double avg = sum / static_cast<double>(back_search);
-            ui->ft_avg->setText(tr("Avg: %1").arg(avg, 0, 'f', 1));
+            frame_gen = tr("%1 warming up").arg(FrameGenMethodLabel());
         }
     }
+    setLine(m_frameGen, tr("Frame gen %1").arg(frame_gen));
+
+    const f32 res_scale = Settings::values.resolution_info.up_factor;
+    const QString upscaler = UpscalerLabel();
+    const QString scale = tr("Scale %1x").arg(res_scale, 0, 'g', 2);
+    setLine(m_scale, upscaler.isEmpty() ? scale : scale + QLatin1Char(' ') + upscaler);
+
+    const double speed_pct =
+        std::isnan(results.emulation_speed) ? 100.0 : results.emulation_speed * 100.0;
+    setLine(m_speed, tr("Speed %1%").arg(speed_pct, 0, 'f', 0),
+            speed_pct > 0.0 && speed_pct < 90.0 ? WarningColor : QColor{});
+    const int building = const_cast<VideoCore::ShaderNotify&>(shaders).ShadersBuilding();
+    setLine(m_shaders, building > 0 ? tr("Shaders %1 building").arg(building) : QString(),
+            BuildingColor);
+
+    // The 3D scene, the game's finished picture (HUD and menus) and the screen.
+    const auto size = [](u32 width, u32 height) {
+        return width > 0 && height > 0 ? QStringLiteral("%1×%2").arg(width).arg(height)
+                                       : QString();
+    };
+    const u64 scene = VideoCore::Probe::scene_extents.load(std::memory_order_relaxed);
+    const u64 extents = VideoCore::Probe::frame_extents.load(std::memory_order_relaxed);
+    const auto& scaling = Settings::values.resolution_info;
+    const QString scene_size =
+        size(static_cast<u32>(scene & 0xFFFF), static_cast<u32>((scene >> 16) & 0xFFFF));
+    const QString game_size = size(scaling.ScaleUp(static_cast<u32>(extents & 0xFFFF)),
+                                   scaling.ScaleUp(static_cast<u32>((extents >> 16) & 0xFFFF)));
+    const QString screen_size = size(static_cast<u32>((extents >> 32) & 0xFFFF),
+                                     static_cast<u32>((extents >> 48) & 0xFFFF));
+    setLine(m_scene, scene_size.isEmpty() ? QString() : tr("3D %1").arg(scene_size));
+    setLine(m_game, game_size.isEmpty() ? QString() : tr("Game %1").arg(game_size));
+    setLine(m_screen, game_size.isEmpty() || screen_size.isEmpty()
+                          ? QString()
+                          : tr("Screen %1").arg(screen_size));
+    const auto accuracy = Settings::CanonicalizeEnum(Settings::values.current_gpu_accuracy);
+    setLine(m_gpuAccuracy,
+            tr("GPU accuracy %1")
+                .arg(QString::fromUtf8(accuracy.data(), static_cast<qsizetype>(accuracy.size()))));
 
     double ram_used = -1.0;
     double ram_free = -1.0;
     if (QueryProcessRam(ram_used, ram_free) && ram_used >= 0.0) {
-        ui->ram_widget->setVisible(true);
-        ui->ram_usage->setText(ram_free >= 0.0
-                                   ? tr("%1 GB (%2 GB free)")
-                                         .arg(ram_used, 0, 'f', 1)
-                                         .arg(ram_free, 0, 'f', 1)
-                                   : tr("%1 GB").arg(ram_used, 0, 'f', 1));
-        ui->ram_usage->setStyleSheet(ram_free >= 0.0 && ram_free < 2.0
-                                         ? QStringLiteral("color: #fbbf24;")
-                                         : QStringLiteral("color: #e2e8f0;"));
+        setLine(m_ram,
+                ram_free >= 0.0 ? tr("RAM %1 / %2 GB")
+                                      .arg(ram_used, 0, 'f', 1)
+                                      .arg(ram_used + ram_free, 0, 'f', 1)
+                                : tr("RAM %1 GB").arg(ram_used, 0, 'f', 1),
+                ram_free >= 0.0 && ram_free < 2.0 ? WarningColor : QColor{});
     } else {
-        ui->ram_widget->setVisible(false);
+        setLine(m_ram, QString());
     }
-
     double vram_used = -1.0;
     double vram_free = -1.0;
     if (QueryProcessVram(vram_used, vram_free) && vram_used >= 0.0) {
-        ui->vram_widget->setVisible(true);
-        ui->vram_usage->setText(vram_free >= 0.0
-                                    ? tr("%1 GB (%2 GB free)")
-                                          .arg(vram_used, 0, 'f', 1)
-                                          .arg(vram_free, 0, 'f', 1)
-                                    : tr("%1 GB").arg(vram_used, 0, 'f', 1));
-        ui->vram_usage->setStyleSheet(vram_free >= 0.0 && vram_free < 1.0
-                                          ? QStringLiteral("color: #fbbf24;")
-                                          : QStringLiteral("color: #e2e8f0;"));
+        setLine(m_vram,
+                vram_free >= 0.0 ? tr("VRAM %1 / %2 GB")
+                                       .arg(vram_used, 0, 'f', 1)
+                                       .arg(vram_used + vram_free, 0, 'f', 1)
+                                 : tr("VRAM %1 GB").arg(vram_used, 0, 'f', 1),
+                vram_free >= 0.0 && vram_free < 1.0 ? WarningColor : QColor{});
     } else {
-        ui->vram_widget->setVisible(false);
+        setLine(m_vram, QString());
     }
-
-    const double speed_pct =
-        std::isnan(results.emulation_speed) ? 100.0 : results.emulation_speed * 100.0;
-    const f32 res_scale = Settings::values.resolution_info.up_factor;
-    const int building = const_cast<VideoCore::ShaderNotify&>(shaders).ShadersBuilding();
-    // What NVIDIA DLSS does in this game, not just the setting.
-    QString dlss_tag;
-#ifdef EGLANTINE_STREAMLINE
-    if (Settings::NvidiaDlssChosen()) {
-        const auto dlss = Vulkan::Streamline::GetSessionStatus();
-        dlss_tag = dlss.available && dlss.frames > 0 ? QStringLiteral(" | DLSS")
-                   : dlss.available                  ? tr(" | DLSS idle")
-                                                     : tr(" | DLSS off");
-    }
-#endif
-    if (building > 0) {
-        ui->status_info->setText(tr("Speed: %1% | Scale: %2x%3 | Shaders: %4")
-                                     .arg(speed_pct, 0, 'f', 0)
-                                     .arg(res_scale)
-                                     .arg(dlss_tag)
-                                     .arg(building));
+    const u64 texture_bytes = VideoCore::Probe::texture_cache_bytes.load(std::memory_order_relaxed);
+    const u64 texture_expected =
+        VideoCore::Probe::texture_cache_expected.load(std::memory_order_relaxed);
+    if (texture_bytes == 0) {
+        setLine(m_textures, QString());
+    } else if (texture_expected > 0) {
+        setLine(m_textures,
+                tr("Textures %1 / %2 MB").arg(texture_bytes >> 20).arg(texture_expected >> 20));
     } else {
-        ui->status_info->setText(tr("Speed: %1% | Scale: %2x%3")
-                                     .arg(speed_pct, 0, 'f', 0)
-                                     .arg(res_scale)
-                                     .arg(dlss_tag));
+        setLine(m_textures, tr("Textures %1 MB").arg(texture_bytes >> 20));
     }
+    adjustSize();
 }
 
 void PerformanceOverlay::paintEvent(QPaintEvent* event) {
-    QPainter painter(this);
-
-    painter.setRenderHint(QPainter::Antialiasing);
-
-    painter.setBrush(m_background);
-    QPen borderPen(m_border);
-    borderPen.setWidth(1);
-    painter.setPen(borderPen);
-
-    painter.drawRoundedRect(rect().adjusted(1, 1, -1, -1), 10.0, 10.0);
+    // The cards draw themselves; the window stays clear between them.
+    QWidget::paintEvent(event);
 }
 
 void PerformanceOverlay::mousePressEvent(QMouseEvent* event) {

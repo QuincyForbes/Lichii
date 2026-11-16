@@ -1,0 +1,80 @@
+<!--
+SPDX-FileCopyrightText: 2026 Eden Emulator Project
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+<RCC>
+    <qresource prefix="icons/lichii">
+        <file alias="index.theme">icons/index.theme</file>
+    </qresource>
+
+    <qresource prefix="lichii">
+        <file>style.qss</file>
+        <file>rc/chevron-down-dark.png</file>
+        <file>rc/chevron-down-dark@2x.png</file>
+        <file>rc/chevron-down-light.png</file>
+        <file>rc/chevron-down-light@2x.png</file>
+        <file>rc/chevron-up-dark.png</file>
+        <file>rc/chevron-up-dark@2x.png</file>
+        <file>rc/chevron-up-light.png</file>
+        <file>rc/chevron-up-light@2x.png</file>
+        <file>rc/switch-off-dark.png</file>
+        <file>rc/switch-off-dark@2x.png</file>
+        <file>rc/switch-off-dark-disabled.png</file>
+        <file>rc/switch-off-dark-disabled@2x.png</file>
+        <file>rc/switch-off-light.png</file>
+        <file>rc/switch-off-light@2x.png</file>
+        <file>rc/switch-off-light-disabled.png</file>
+        <file>rc/switch-off-light-disabled@2x.png</file>
+        <file>rc/switch-on.png</file>
+        <file>rc/switch-on@2x.png</file>
+        <file>rc/switch-on-disabled.png</file>
+        <file>rc/switch-on-disabled@2x.png</file>
+        <file>icons/app-window.png</file>
+        <file>icons/bug.png</file>
+        <file>icons/chevron-right.png</file>
+        <file>icons/circle-check.png</file>
+        <file>icons/cloud.png</file>
+        <file>icons/cpu.png</file>
+        <file>icons/download.png</file>
+        <file>icons/file-search.png</file>
+        <file>icons/folder.png</file>
+        <file>icons/folder-open.png</file>
+        <file>icons/folder-plus.png</file>
+        <file>icons/gamepad.png</file>
+        <file>icons/gamepad-2.png</file>
+        <file>icons/gauge.png</file>
+        <file>icons/globe.png</file>
+        <file>icons/hammer.png</file>
+        <file>icons/hard-drive.png</file>
+        <file>icons/info.png</file>
+        <file>icons/keyboard.png</file>
+        <file>icons/key-round.png</file>
+        <file>icons/layers.png</file>
+        <file>icons/layout-grid.png</file>
+        <file>icons/list.png</file>
+        <file>icons/maximize.png</file>
+        <file>icons/memory-stick.png</file>
+        <file>icons/monitor.png</file>
+        <file>icons/pause.png</file>
+        <file>icons/play.png</file>
+        <file>icons/plus.png</file>
+        <file>icons/power.png</file>
+        <file>icons/refresh-cw.png</file>
+        <file>icons/rotate-ccw.png</file>
+        <file>icons/search.png</file>
+        <file>icons/settings.png</file>
+        <file>icons/sliders-horizontal.png</file>
+        <file>icons/square.png</file>
+        <file>icons/trash.png</file>
+        <file>icons/upload.png</file>
+        <file>icons/user.png</file>
+        <file>icons/users.png</file>
+        <file>icons/volume-2.png</file>
+        <file>icons/wand.png</file>
+        <file>icons/wand-sparkles.png</file>
+        <file>icons/wifi.png</file>
+        <file>icons/wrench.png</file>
+        <file>icons/x.png</file>
+        <file>icons/zap.png</file>
+    </qresource>
+</RCC>

@@ -308,7 +308,7 @@
   </action>
   <action name="action_Configure">
    <property name="text">
-    <string>Con&amp;figure...</string>
+    <string>&amp;Settings...</string>
    </property>
    <property name="shortcut">
     <string>Ctrl+,</string>
@@ -466,7 +466,7 @@
     <bool>false</bool>
    </property>
    <property name="text">
-    <string>Configure C&amp;urrent Game...</string>
+    <string>C&amp;urrent Game Settings...</string>
    </property>
    <property name="menuRole">
     <enum>QAction::MenuRole::NoRole</enum>

@@ -92,7 +92,7 @@ void ConfigureAudio::Setup(const ConfigurationShared::Builder& builder) {
             } else {
                 restore_sink_button = ConfigurationShared::Widget::CreateRestoreGlobalButton(
                     Settings::values.sink_id.UsingGlobal(), widget);
-                widget->layout()->addWidget(restore_sink_button);
+                widget->RowLayout()->addWidget(restore_sink_button);
                 connect(restore_sink_button, &QAbstractButton::clicked, [this](bool) {
                     Settings::values.sink_id.SetGlobal(true);
                     const int sink_index = static_cast<int>(Settings::values.sink_id.GetValue());
@@ -131,7 +131,7 @@ void ConfigureAudio::Setup(const ConfigurationShared::Builder& builder) {
                 restore_output_device_button->setEnabled(global_sink_match());
                 restore_output_device_button->setVisible(
                     !Settings::values.audio_output_device_id.UsingGlobal());
-                widget->layout()->addWidget(restore_output_device_button);
+                widget->RowLayout()->addWidget(restore_output_device_button);
 
                 connect(restore_output_device_button, &QAbstractButton::clicked, [this](bool) {
                     Settings::values.audio_output_device_id.SetGlobal(true);
@@ -155,7 +155,7 @@ void ConfigureAudio::Setup(const ConfigurationShared::Builder& builder) {
                 restore_input_device_button =
                     ConfigurationShared::Widget::CreateRestoreGlobalButton(
                         Settings::values.audio_input_device_id.UsingGlobal(), widget);
-                widget->layout()->addWidget(restore_input_device_button);
+                widget->RowLayout()->addWidget(restore_input_device_button);
                 connect(restore_input_device_button, &QAbstractButton::clicked, [this](bool) {
                     Settings::values.audio_input_device_id.SetGlobal(true);
                     SetInputDevicesFromDeviceID();

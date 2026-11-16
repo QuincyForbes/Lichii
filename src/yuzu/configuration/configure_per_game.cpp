@@ -80,6 +80,7 @@
 #include "yuzu/configuration/configure_per_game_addons.h"
 #include "yuzu/configuration/configure_system.h"
 #include "yuzu/configuration/recommended_settings.h"
+#include "yuzu/util/lichii_style.h"
 #include "yuzu/util/util.h"
 
 namespace {
@@ -417,19 +418,33 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
     info_scroll->setWidget(ui->groupBox);
     ui->horizontalLayout->insertWidget(0, info_scroll);
 
-    ui->tabWidget->addTab(make_scroll_page(addons_tab.get()), tr("Add-Ons"));
+    // The iOS app's Game Settings order and names: the settings pages as in Settings, then the
+    // game's content.
+    ui->tabWidget->addTab(make_scroll_page(graphics_tab.get()), tr("Graphics"));
+    ui->tabWidget->addTab(make_scroll_page(graphics_advanced_tab.get()), tr("Advanced Graphics"));
+    ui->tabWidget->addTab(make_scroll_page(audio_tab.get()), tr("Audio"));
     ui->tabWidget->addTab(make_scroll_page(system_tab.get()), tr("System"));
     ui->tabWidget->addTab(make_scroll_page(cpu_tab.get()), tr("CPU"));
-    ui->tabWidget->addTab(make_scroll_page(graphics_tab.get()), tr("Graphics"));
-    ui->tabWidget->addTab(make_scroll_page(graphics_advanced_tab.get()), tr("Adv. Graphics"));
-    ui->tabWidget->addTab(make_scroll_page(graphics_extensions_tab.get()), tr("Ext. Graphics"));
-    ui->tabWidget->addTab(make_scroll_page(audio_tab.get()), tr("Audio"));
-    ui->tabWidget->addTab(make_scroll_page(input_tab.get()), tr("Input Profiles"));
+    ui->tabWidget->addTab(make_scroll_page(input_tab.get()), tr("Controls"));
+    ui->tabWidget->addTab(make_scroll_page(addons_tab.get()), tr("Updates, DLC && Mods"));
     ui->tabWidget->addTab(make_scroll_page(network_tab.get()), tr("Network"));
-    ui->tabWidget->addTab(make_scroll_page(applets_tab.get()), tr("Applets"));
+    ui->tabWidget->addTab(make_scroll_page(applets_tab.get()), tr("System Applets"));
+    ui->tabWidget->addTab(make_scroll_page(graphics_extensions_tab.get()),
+                          tr("Graphics Hacks && Extensions"));
+    ui->tabWidget->setUsesScrollButtons(true);
 
+    // What the iOS app says at the top of a game's settings.
+    QLabel* const overrides_note =
+        LichiiStyle::Footer(tr("Changes here apply to this game only. A changed setting gets a "
+                               "button next to it that sets it back to the global value. Only "
+                               "settings that apply to this game are listed."),
+                            this);
+    ui->verticalLayout_2->addWidget(overrides_note);
+
+    // Only true while a game runs.
+    ui->label_8->setVisible(system.IsPoweredOn());
     setFocusPolicy(Qt::ClickFocus);
-    setWindowTitle(tr("Properties"));
+    setWindowTitle(tr("Game Settings"));
 
     addons_tab->SetTitleId(title_id);
 
@@ -481,8 +496,9 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
 
     // Saves the game's config with the recommended values, then closes so the tabs don't write
     // the old ones back.
-    QPushButton* reset = ui->buttonBox->addButton(tr("Reset to Recommended..."),
+    QPushButton* reset = ui->buttonBox->addButton(tr("Reset This Game to Recommended..."),
                                                   QDialogButtonBox::ResetRole);
+    reset->setObjectName(QStringLiteral("lichiiDestructive"));
     reset->setToolTip(tr("Gives this game the recommended settings for this device and removes "
                          "its other overrides."));
     connect(reset, &QAbstractButton::clicked, this, [this, &vk_device_records] {
@@ -664,7 +680,7 @@ void ConfigurePerGame::LoadConfiguration() {
     ui->display_name->setCursorPosition(0);
     initial_nup_title = ui->display_name->text().trimmed().toStdString();
     if (!initial_nup_title.empty()) {
-        setWindowTitle(tr("Properties - %1").arg(ui->display_name->text().trimmed()));
+        setWindowTitle(tr("Game Settings - %1").arg(ui->display_name->text().trimmed()));
     }
     nup_icon_modified = false;
     pending_nup_icon.clear();

@@ -223,6 +223,8 @@ add_executable(yuzu
     util/util.h
     util/icon_search.cpp
     util/icon_search.h
+    util/lichii_style.cpp
+    util/lichii_style.h
 
     user_data_migration.h user_data_migration.cpp
 

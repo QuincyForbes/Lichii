@@ -194,3 +194,17 @@ License: GPL-3.0-or-later
 Comment: CPM.cmake has had additional modifications from crueter to better work with CPMUtil
          https://git.crueter.xyz/CMake/CPMUtil
          https://git.crueter.xyz/CMake/Modules
+
+Files: dist/qt_themes/lichii/icons/*.png
+       dist/qt_themes/lichii/rc/chevron-*.png
+Copyright: 2026 Lucide Icons and Contributors
+           2013-present Cole Bemis
+License: ISC AND MIT
+Comment: Lucide icons (https://github.com/lucide-icons/lucide, 799c2ca5e1), rendered to 64 px
+         masks; the chevrons are tinted. Licence text in dist/qt_themes/lichii/icons/LICENSE.txt.
+
+Files: dist/qt_themes/lichii/rc/switch-*.png
+       dist/qt_themes/lichii/style.qss
+       dist/qt_themes/lichii/icons/index.theme
+Copyright: 2026 Eden Emulator Project
+License: GPL-3.0-or-later

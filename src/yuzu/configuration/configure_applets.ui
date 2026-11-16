@@ -22,7 +22,7 @@
      <item>
       <widget class="QGroupBox" name="group_library_applet_modes">
        <property name="title">
-        <string>Applet mode preference</string>
+        <string>System Applets</string>
        </property>
        <layout class="QVBoxLayout">
         <item>

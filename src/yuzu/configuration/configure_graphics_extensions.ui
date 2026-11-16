@@ -20,7 +20,7 @@
    <item>
     <widget class="QGroupBox" name="hacks">
      <property name="title">
-      <string>Hacks</string>
+      <string>Graphics Hacks</string>
      </property>
      <layout class="QVBoxLayout" name="verticalLayout_6">
       <item>

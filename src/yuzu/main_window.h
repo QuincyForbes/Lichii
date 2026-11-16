@@ -200,6 +200,9 @@ signals:
     // Signal that tells widgets to update icons to use the current theme
     void UpdateThemedIcons();
 
+    /// The theme, or its light or dark mode, changed (UpdateUITheme).
+    void ThemeChanged();
+
     void UpdateInstallProgress();
 
     void AmiiboSettingsFinished(bool is_success, const std::string& name);

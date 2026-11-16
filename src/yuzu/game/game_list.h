@@ -23,6 +23,7 @@
 #include "qt_common/game_list/model.h"
 #include "qt_common/util/game.h"
 
+class QToolButton;
 class QVariantAnimation;
 
 class GameCard;
@@ -121,6 +122,9 @@ signals:
     void LinkToRyujinxRequested(const u64& program_id);
     void OpenDirectory(const QString& directory);
     void AddDirectory();
+    /// The header's Grid and List buttons and its settings button (the iOS library's toolbar).
+    void ViewModeRequested(Settings::GameListMode mode);
+    void OpenSettingsRequested();
     void ShowList(bool show);
     void PopulatingCompleted();
     void SaveConfig();
@@ -147,12 +151,20 @@ private:
     void AddFavoritesPopup(QMenu& context_menu);
 
     void RetranslateUI();
+    void SetupHeader();
+    void UpdateHeader();
 
     friend class GameListSearchField;
 
     std::shared_ptr<FileSys::VfsFilesystem> vfs;
     FileSys::ManualContentProvider* provider;
     GameListSearchField* search_field = nullptr;
+    QWidget* header = nullptr;
+    QLabel* header_title = nullptr;
+    QToolButton* grid_button = nullptr;
+    QToolButton* list_button = nullptr;
+    QToolButton* add_button = nullptr;
+    QToolButton* settings_button = nullptr;
     MainWindow* main_window = nullptr;
     QVBoxLayout* layout = nullptr;
 
@@ -193,8 +205,11 @@ protected:
 private:
     void changeEvent(QEvent* event) override;
     void RetranslateUI();
+    void UpdateIcon();
 
     QVBoxLayout* layout = nullptr;
     QLabel* image = nullptr;
     QLabel* text = nullptr;
+    QLabel* detail = nullptr;
+    QPushButton* add_button = nullptr;
 };

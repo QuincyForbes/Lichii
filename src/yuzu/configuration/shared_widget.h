@@ -17,6 +17,7 @@
 #include <qobjectdefs.h>
 #include "qt_common/config/shared_translation.h"
 
+class QBoxLayout;
 class QCheckBox;
 class QComboBox;
 class QDateTimeEdit;
@@ -85,6 +86,12 @@ public:
      */
     bool Valid() const;
 
+    /// The name shown for the setting, as the settings search matches it.
+    [[nodiscard]] const QString& Label() const;
+    [[nodiscard]] const Settings::BasicSetting& GetSetting() const;
+    /// The row of label, control and restore button (a caption, where shown, sits under it).
+    [[nodiscard]] QBoxLayout* RowLayout() const;
+
     /**
      * Creates a button to appear when a setting has been modified. This exists for custom
      * configurations and wasn't designed to work for the global configuration. It has public access
@@ -149,6 +156,10 @@ private:
 
     bool created{false};
     bool runtime_lock{false};
+    QString label_text;
+    /// What the setting does, under the row in the Lichii theme (as the iOS app's notes).
+    QString caption;
+    QBoxLayout* row_layout{};
 };
 
 class Builder {
@@ -183,5 +194,9 @@ private:
 /// Whether the setting does anything on this platform and in this build; the Builder makes no
 /// widget for those that don't.
 [[nodiscard]] bool AppliesToThisPlatform(const Settings::BasicSetting& setting);
+
+/// Why a setting does nothing on this platform or in this build, empty when it does something.
+/// The settings search lists these, as the iOS app's "Not Available on iOS".
+[[nodiscard]] QString PlatformUnavailableReason(const Settings::BasicSetting& setting);
 
 } // namespace ConfigurationShared

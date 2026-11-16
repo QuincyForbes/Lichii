@@ -132,7 +132,15 @@ bool GameListModel::IsEmpty() const {
         }
     }
 
-    return !invisibleRootItem()->hasChildren();
+    // The "Add New Game Directory" and Favorites rows alone are an empty library: the empty state
+    // offers the first, and favourites are games listed elsewhere too.
+    for (int i = 0; i < rowCount(); i++) {
+        const auto type = static_cast<GameListItemType>(invisibleRootItem()->child(i)->type());
+        if (type != GameListItemType::AddDir && type != GameListItemType::Favorites) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void GameListModel::ToggleFavorite(u64 program_id) {

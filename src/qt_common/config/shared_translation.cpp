@@ -51,10 +51,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "second to show it."));
 
     // Audio
-    INSERT(Settings, sink_id, tr("Output Engine:"), QString());
+    INSERT(Settings, sink_id, tr("Audio Output Engine"), QString());
     INSERT(Settings, audio_output_device_id, tr("Output Device:"), QString());
     INSERT(Settings, audio_input_device_id, tr("Input Device:"), QString());
-    INSERT(Settings, audio_muted, tr("Mute audio"), QString());
+    INSERT(Settings, audio_muted, tr("Mute Audio"), QString());
     INSERT(Settings, volume, tr("Volume:"), QString());
     INSERT(Settings, dump_audio_commands, QString(), QString());
     INSERT(UISettings, mute_when_in_background, tr("Mute audio when in background"), QString());
@@ -69,7 +69,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "mods to load."));
     INSERT(Settings, use_speed_limit, QString(), QString());
     INSERT(Settings, current_speed_mode, QString(), QString());
-    INSERT(Settings, speed_limit, tr("Limit Speed Percent"),
+    INSERT(Settings, speed_limit, tr("Speed Limit"),
            tr("Controls the game's maximum rendering speed, but it's up to each game if it runs "
               "faster or not.\n200% for a 30 FPS game is 60 FPS, and for a "
               "60 FPS game it will be 120 FPS.\nDisabling it means unlocking the framerate to the "
@@ -88,9 +88,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "Can help reduce stuttering at lower framerates."));
 
     // Cpu
-    INSERT(Settings, cpu_accuracy, tr("Accuracy:"),
+    INSERT(Settings, cpu_accuracy, tr("CPU Accuracy"),
            tr("Change the accuracy of the emulated CPU (for debugging only)."));
-    INSERT(Settings, cpu_backend, tr("Backend:"), QString());
+    INSERT(Settings, cpu_backend, tr("CPU Backend"), QString());
 
     INSERT(Settings, cpu_clock, tr("CPU Clocks"),
            tr("Raises the clock the emulated CPU reports, which removes some FPS limiters.\n"
@@ -100,11 +100,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, cpu_ticks, tr("Custom CPU Ticks"),
            tr("Set a custom value of CPU ticks. Higher values can increase performance, but may "
               "cause deadlocks. A range of 77-21000 is recommended."));
-    INSERT(Settings, cpu_backend, tr("Backend:"), QString());
-    INSERT(Settings, guest_wait_backoff, tr("Sleep in long guest waits"),
+    INSERT(Settings, cpu_backend, tr("CPU Backend"), QString());
+    INSERT(Settings, guest_wait_backoff, tr("Sleep in Long Guest Waits"),
            tr("A game thread that yields to no other thread, or polls the clock, for 2 ms sleeps "
               "briefly instead of keeping a host core busy. Frees CPU cores on phones."));
-    INSERT(Settings, cpuopt_compact_jit_code, tr("Compact JIT code"),
+    INSERT(Settings, cpuopt_compact_jit_code, tr("Compact JIT Code"),
            tr("Where the host grants less address space than the guest uses (phones), memory "
               "accesses outside it take the slow path instead of an inline page table walk at "
               "every load and store: about half the code, so the code cache holds twice as much."));
@@ -143,7 +143,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            "other race conditions."));
 
     // Renderer
-    INSERT(Settings, renderer_backend, tr("API:"),
+    INSERT(Settings, renderer_backend, tr("Graphics API"),
            tr("Changes the output graphics API.\nVulkan is recommended."));
     INSERT(Settings, vulkan_device, tr("Device:"),
            tr("This setting selects the GPU to use (Vulkan only)."));
@@ -152,7 +152,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "Resolution setting (Ocarina of Time, under Game-specific) use that instead.\nHigher "
               "scales need more VRAM and bandwidth; scales below 1x can cause artifacts.\nNVIDIA "
               "DLSS, MetalFX and AMD FSR 3.1 as the upscaler need 1x."));
-    INSERT(Settings, scaling_filter, tr("Screen filter:"),
+    INSERT(Settings, scaling_filter, tr("Screen Filter"),
            tr("The last step: how the finished picture is scaled to the window or screen."));
     INSERT(Settings, upscaler, tr("Upscaler:"),
            tr("What takes the place of a game's own upscaler.\nAutomatic: Ocarina of Time's own "
@@ -162,29 +162,29 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "NVIDIA DLSS (GeForce RTX, NVIDIA's files from the download button) and MetalFX "
               "(Apple) replace both, at 1x; Ocarina of Time's resolution then picks the DLSS mode."
               "\nTakes effect when a game starts."));
-    INSERT(Settings, frame_rate_limit, tr("Frame rate limit (Switch 2):"),
+    INSERT(Settings, frame_rate_limit, tr("Frame Rate Limit (Switch 2)"),
            tr("Rate of the Switch 2 VSync event that games start their frames on (default 60 Hz)."
               "\nAbove 60 Hz most games run too fast. Ocarina of Time follows it only with its "
               "frame rate set to Unlocked, and keeps its speed there.\nTakes effect at once, "
               "also while a game runs."));
-    INSERT(Settings, fsr_sharpening_slider, tr("RCAS Sharpness:"),
+    INSERT(Settings, fsr_sharpening_slider, tr("FSR Sharpness"),
            tr("Strength of RCAS (AMD's contrast-adaptive sharpening) on the upscaler used in place "
               "of a game's DLSS (AMD FSR 3.1); 0% turns it off.\nAlso sets the sharpening "
               "of the AMD FSR 1 and SGSR window adapting filters."));
-    INSERT(Settings, nvidia_dlss_preset, tr("DLSS preset:"),
+    INSERT(Settings, nvidia_dlss_preset, tr("DLSS Preset"),
            tr("The DLSS model. K is the tested default; L and M are NVIDIA's newer models, J the "
               "older one. Default lets NVIDIA choose per quality mode."));
-    INSERT(Settings, moltenvk_driver, tr("Graphics driver:"),
+    INSERT(Settings, moltenvk_driver, tr("Graphics Driver"),
            tr("Which MoltenVK runs Vulkan on Metal. The new one draws mesh shaders (Ocarina of "
               "Time's foliage) with Metal's own mesh shaders; the legacy one emulates them with "
               "compute. Lichii falls back to the legacy one when the new one doesn't load.\n"
               "Takes effect the next time Lichii starts."));
-    INSERT(Settings, mesh_direct_outputs, tr("Mesh shader outputs written directly"),
+    INSERT(Settings, mesh_direct_outputs, tr("Mesh Shader Direct Outputs"),
            tr("New MoltenVK only: mesh shaders write their vertices straight to Metal's outputs, "
               "which keeps Ocarina of Time's foliage within Metal's limits. Off copies them at "
               "the end as before (some foliage is then emulated with compute).\nTakes effect "
               "the next time a game starts."));
-    INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
+    INSERT(Settings, anti_aliasing, tr("Anti-Aliasing"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
     INSERT(Settings, oot_anti_aliasing, tr("Sharpening:"),
@@ -197,7 +197,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "stretch.\nGame's own upscaler: the game's video upscaler, which removes banding and "
               "sharpens. Fast on NVIDIA RTX, slow on GPUs that emulate its math.\nAutomatic: the "
               "game's upscaler where the GPU runs it natively, bilinear elsewhere."));
-    INSERT(Settings, oot_graphics_preset, tr("Graphics preset:"),
+    INSERT(Settings, oot_graphics_preset, tr("Graphics Preset"),
            tr("Shadows, reflections and effects, set in the game's own parameter files.\nPhone "
               "Low: a small reflection probe, no bloom or depth of field, one small sun shadow, "
               "thinner grass (about a third fewer render passes). Phone Medium: a small "
@@ -216,23 +216,23 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "50% Ultra Performance (above 100% counts as 100%).\nWith AMD FSR 3.1, NVIDIA DLSS or "
               "MetalFX as the upscaler, Dynamic draws at 100% docked and 75% handheld: the "
               "upscaler needs a fixed size.\nTakes effect when the game starts."));
-    INSERT(Settings, oot_frame_rate, tr("Frame rate:"),
+    INSERT(Settings, oot_frame_rate, tr("Frame Rate"),
            tr("30 FPS: for lower-end PCs. 60 FPS: the game's normal rate. Unlocked: up to the "
               "Frame rate limit (Switch 2) below.\nThe game keeps its normal speed at each (its "
               "time step follows real time).\nTakes effect at once; the FPS button in the status "
               "bar switches it too."));
-    INSERT(Settings, mkw_frame_rate, tr("Frame rate:"),
+    INSERT(Settings, mkw_frame_rate, tr("Frame Rate"),
            tr("Game's own: no change. 30 FPS: the game's native 30 FPS mode at normal speed. "
               "Dynamic: the game moves between 30 and 60 FPS using whole-frame timing to keep "
               "normal speed (experimental).\nTakes effect when the game starts."));
-    INSERT(Settings, patch_performance, tr("Ocarina of Time: Occlusion Off:"),
+    INSERT(Settings, patch_performance, tr("Occlusion Off"),
            tr("Game patch with a trade-off (currently Ocarina of Time: Occlusion Off).\nAuto and "
               "On: the game stops issuing per-object occlusion queries (fewer query stalls and "
               "pop-in problems; hidden objects are drawn, so more GPU work). Off: the game's own "
               "queries.\nThe game's fixes with no visible effect (native zstd, fast lookup, "
               "resource poll backoff, texture pool x2) are always on.\nA game's Add-Ons choice "
               "overrides this. Takes effect when the game starts."));
-    INSERT(Settings, patch_image, tr("Disable game anti-aliasing:"),
+    INSERT(Settings, patch_image, tr("Disable Game Anti-Aliasing"),
            tr("Game enhancement. Applies to every game that ships a patch removing its own "
               "anti-aliasing (currently Ocarina of Time: No NDSR anti-aliasing).\nAuto: on "
               "Apple devices, which lack the cooperative matrices the network needs, off "
@@ -253,28 +253,28 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Stretches the renderer to fit the specified aspect ratio.\nMost games only support "
               "16:9, so modifications are required to get other ratios.\nAlso controls the "
               "aspect ratio of captured screenshots."));
-    INSERT(Settings, use_disk_shader_cache, tr("Use persistent pipeline cache"),
+    INSERT(Settings, use_disk_shader_cache, tr("Disk Shader Cache"),
            tr("Allows saving shaders to storage for faster loading on following game "
               "boots.\nDisabling it is only intended for debugging."));
     INSERT(
         Settings, use_asynchronous_gpu_emulation, tr("Use asynchronous GPU emulation"),
         tr("Uses an extra CPU thread for rendering.\nThis option should always remain enabled."));
-    INSERT(Settings, nvdec_emulation, tr("NVDEC emulation:"),
+    INSERT(Settings, nvdec_emulation, tr("Video Decoding"),
            tr("Specifies how videos should be decoded.\nIt can either use the CPU or the GPU for "
               "decoding, or perform no decoding at all (black screen on videos).\n"
               "In most cases, GPU decoding provides the best performance."));
-    INSERT(Settings, accelerate_astc, tr("ASTC Decoding Method:"),
+    INSERT(Settings, accelerate_astc, tr("ASTC Decoding"),
            tr("This option controls how ASTC textures should be decoded.\n"
               "CPU: Use the CPU for decoding.\n"
               "GPU: Use the GPU's compute shaders to decode ASTC textures (recommended).\n"
               "CPU Asynchronously: Use the CPU to decode ASTC textures on demand. Eliminates"
               "ASTC decoding\nstuttering but may present artifacts."));
-    INSERT(Settings, astc_recompression, tr("ASTC Recompression Method:"),
+    INSERT(Settings, astc_recompression, tr("ASTC Recompression"),
            tr("Most GPUs lack support for ASTC textures and must decompress to an"
               "intermediate format: RGBA8.\n"
               "BC1/BC3: The intermediate format will be recompressed to BC1 or BC3 format,\n"
               " saving VRAM but degrading image quality."));
-    INSERT(Settings, frame_pacing_mode, tr("Frame Pacing Mode (Vulkan only)"),
+    INSERT(Settings, frame_pacing_mode, tr("Frame Rate Target"),
            tr("Controls how the emulator manages frame pacing to reduce stuttering and make the "
               "frame rate smoother and more consistent."));
     INSERT(Settings, vram_usage_mode, tr("VRAM Usage Mode:"),
@@ -294,7 +294,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, bg_green, QString(), QString());
     INSERT(Settings, bg_blue, QString(), QString());
 
-    INSERT(Settings, frame_gen, tr("Enable Frame Generation"),
+    INSERT(Settings, frame_gen, tr("Frame Generation"),
            tr("Inserts generated frames between the game's real frames, so motion looks smoother "
               "on a high refresh rate display. It does not make the game itself run faster and "
               "adds about one real frame of input latency.\nWorks best when the game already "
@@ -308,7 +308,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, frame_gen_multiplier, tr("Frame Generation Multiplier"),
            tr("How many frames are shown per real frame: 2x adds one generated frame, 3x two, "
               "4x three.\nIgnored while Target Frame Rate is set."));
-    INSERT(Settings, frame_gen_target_rate, tr("Target Frame Rate"),
+    INSERT(Settings, frame_gen_target_rate, tr("Frame Generation Target"),
            tr("Off: use the multiplier.\nAbove 60: generate as many frames (up to three per real "
               "frame) as it takes to reach this rate, in place of the multiplier. Set it to your "
               "display's refresh rate.\nValues from 1 to 60 count as Off."));
@@ -334,13 +334,13 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, async_presentation, tr("Enable asynchronous presentation (Vulkan only)"),
            tr("Slightly improves performance by moving presentation to a separate CPU thread."));
     INSERT(
-        Settings, renderer_force_max_clock, tr("Force maximum clocks (Vulkan only)"),
+        Settings, renderer_force_max_clock, tr("Force Maximum GPU Clocks"),
         tr("Runs work in the background while waiting for graphics commands to keep the GPU from "
            "lowering its clock speed."));
     INSERT(Settings, max_anisotropy, tr("Anisotropic Filtering:"),
            tr("Controls the quality of texture rendering at oblique angles.\nSafe to set at 16x on "
               "most GPUs."));
-    INSERT(Settings, gpu_accuracy, tr("GPU Mode:"),
+    INSERT(Settings, gpu_accuracy, tr("GPU Accuracy"),
            tr("Controls the GPU emulation mode.\nMost games render fine with Fast, but Accurate is still "
               "required for some.\nParticles tend to only render correctly with Accurate mode."));
     INSERT(Settings, dma_accuracy, tr("DMA Accuracy:"),
@@ -354,7 +354,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "8 MiB), the original behaviour: it can delay the game's own writes to nearby memory "
               "(flickering effects) and copy far more data back from the GPU.\n64 KiB cap marks at "
               "most 64 KiB, which can miss data a large dispatch really wrote."));
-    INSERT(Settings, use_asynchronous_shaders, tr("Enable asynchronous shader compilation"),
+    INSERT(Settings, use_asynchronous_shaders, tr("Asynchronous Shader Building"),
            tr("May reduce shader stutter."));
     INSERT(Settings, gpu_clock, tr("GPU Clocks"),
            tr("Makes the game believe GPU work finishes faster than it does, so it stops lowering "
@@ -376,7 +376,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "Increasing this can improve throughput on high-end GPUs but may cause TDR or driver "
               "timeouts on weaker hardware."));
 
-    INSERT(Settings, use_vulkan_driver_pipeline_cache, tr("Use Vulkan pipeline cache"),
+    INSERT(Settings, use_vulkan_driver_pipeline_cache, tr("Driver Pipeline Cache"),
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "
               "files internally."));
@@ -402,7 +402,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     // Internal state, not settings.
     INSERT(Settings, oot_fps_asked, QString(), QString());
     INSERT(Settings, frizti_settings_revision, QString(), QString());
-    INSERT(Settings, texture_quality, tr("Texture quality:"),
+    INSERT(Settings, texture_quality, tr("Texture Quality"),
            tr("Half or Quarter drops the top one or two detail levels of the game's large "
               "textures as they load: softer textures up close, much less memory (about 1.2 GB "
               "less in Ocarina of Time). Your game files are not changed.\nTakes effect at the next "
@@ -435,7 +435,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, rng_seed, tr("RNG Seed"),
            tr("Controls the seed of the random number generator.\nMainly used for speedrunning."));
     INSERT(Settings, rng_seed_enabled, QString(), QString());
-    INSERT(Settings, device_name, tr("Device Name"), tr("The name of the console."));
+    INSERT(Settings, device_name, tr("Console Name"), tr("The name of the console."));
     INSERT(Settings, program_args, tr("Homebrew Args"),
            tr("Command-line arguments passed to homebrew at launch (e.g. -noglsl)."));
     INSERT(Settings, custom_rtc, tr("Custom RTC Date:"),

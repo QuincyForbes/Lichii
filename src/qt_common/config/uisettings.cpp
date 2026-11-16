@@ -4,7 +4,10 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <QGuiApplication>
+#include <QPalette>
 #include <QSettings>
+#include <QStyleHints>
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "qt_common/config/uisettings.h"
@@ -73,10 +76,27 @@ const Themes themes{{
     {"Dark Colorful", "colorful_dark"},
     {"Midnight Blue", "qdarkstyle_midnight_blue"},
     {"Midnight Blue Colorful", "colorful_midnight_blue"},
+    {"Lichii", "lichii"},
 }};
+
+bool IsLichiiTheme() {
+    return UISettings::values.theme == std::string("lichii");
+}
 
 bool IsDarkTheme() {
     const auto& theme = UISettings::values.theme;
+    if (IsLichiiTheme()) {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+        const Qt::ColorScheme scheme = QGuiApplication::styleHints()->colorScheme();
+        if (scheme != Qt::ColorScheme::Unknown) {
+            return scheme == Qt::ColorScheme::Dark;
+        }
+#endif
+        // Before Qt 6.5: the palette's own lightness (the theme keeps the mode it started in).
+        const QPalette palette = QGuiApplication::palette();
+        return palette.color(QPalette::WindowText).lightness() >
+               palette.color(QPalette::Window).lightness();
+    }
     return theme == std::string("qdarkstyle") || theme == std::string("qdarkstyle_midnight_blue") ||
            theme == std::string("colorful_dark") || theme == std::string("colorful_midnight_blue");
 }

@@ -40,6 +40,7 @@
 #include "yuzu/main_window.h"
 #include "yuzu/shader_warm_dialog.h"
 #include "yuzu/util/controller_navigation.h"
+#include "yuzu/util/lichii_style.h"
 
 GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvider* provider_,
                    PlayTime::PlayTimeManager& play_time_manager_, Core::System& system_,
@@ -58,7 +59,7 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
     SetupViews();
 
     search_field = new GameListSearchField(this);
-    layout->addWidget(search_field);
+    SetupHeader();
 
     controller_navigation = new ControllerNavigation(system.HIDCore(), this);
 
@@ -107,6 +108,65 @@ void GameList::SetNupConversionRunning(bool running) {
 
 GameList::~GameList() {
     UnloadController();
+}
+
+// The iOS library's top bar: the title, the search field, Grid and List, Add Games and Settings.
+void GameList::SetupHeader() {
+    header = new QWidget(this);
+    header->setObjectName(QStringLiteral("libraryHeader"));
+    QHBoxLayout* const row = new QHBoxLayout(header);
+    row->setContentsMargins(14, 8, 10, 6);
+    row->setSpacing(4);
+    header_title = LichiiStyle::PageTitle(QString(), header);
+    row->addWidget(header_title);
+    row->addStretch(1);
+    search_field->setMaximumWidth(380);
+    row->addWidget(search_field, 2);
+    row->addSpacing(6);
+
+    const auto make_button = [this, row](bool checkable) {
+        QToolButton* const button = new QToolButton(header);
+        button->setObjectName(QStringLiteral("lichiiToolbarButton"));
+        button->setCheckable(checkable);
+        button->setAutoRaise(true);
+        button->setIconSize(QSize(20, 20));
+        row->addWidget(button);
+        return button;
+    };
+    grid_button = make_button(true);
+    list_button = make_button(true);
+    row->addSpacing(6);
+    add_button = make_button(false);
+    settings_button = make_button(false);
+
+    connect(grid_button, &QToolButton::clicked, this,
+            [this] { emit ViewModeRequested(Settings::GameListMode::GridView); });
+    connect(list_button, &QToolButton::clicked, this,
+            [this] { emit ViewModeRequested(Settings::GameListMode::TreeView); });
+    connect(add_button, &QToolButton::clicked, this, &GameList::AddDirectory);
+    connect(settings_button, &QToolButton::clicked, this, &GameList::OpenSettingsRequested);
+    connect(main_window, &MainWindow::ThemeChanged, this, &GameList::UpdateHeader);
+
+    layout->addWidget(header);
+    UpdateHeader();
+}
+
+void GameList::UpdateHeader() {
+    if (header == nullptr) {
+        return;
+    }
+    header_title->setText(tr("Library"));
+    grid_button->setIcon(LichiiStyle::Icon(QStringLiteral("layout-grid")));
+    grid_button->setToolTip(tr("Show as Grid"));
+    list_button->setIcon(LichiiStyle::Icon(QStringLiteral("list")));
+    list_button->setToolTip(tr("Show as List"));
+    add_button->setIcon(LichiiStyle::Icon(QStringLiteral("folder-plus")));
+    add_button->setToolTip(tr("Add Game Folder..."));
+    settings_button->setIcon(LichiiStyle::Icon(QStringLiteral("settings")));
+    settings_button->setToolTip(tr("Settings"));
+    const auto mode = UISettings::values.game_list_mode.GetValue();
+    grid_button->setChecked(mode == Settings::GameListMode::GridView);
+    list_button->setChecked(mode == Settings::GameListMode::TreeView);
 }
 
 void GameList::SetupViews() {
@@ -227,7 +287,8 @@ void GameList::ResetViewMode() {
     // MainWindow switches the view right after starting the first populate; keep it disabled
     // until that finishes, as OnPopulate does for every other populate.
     m_currentView->setEnabled(!m_populating);
-    layout->insertWidget(0, m_currentView);
+    layout->insertWidget(header != nullptr ? 1 : 0, m_currentView);
+    UpdateHeader();
 
     auto view = m_currentView->viewport();
     view->installEventFilter(this);
@@ -533,7 +594,7 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
         edit_nup = context_menu.addAction(tr("Edit NUP Metadata..."));
         edit_nup->setEnabled(!nup_conversion_running);
     }
-    QAction* properties = context_menu.addAction(tr("Configure Game"));
+    QAction* properties = context_menu.addAction(tr("Game Settings"));
 
     favorite->setVisible(program_id != 0);
     favorite->setCheckable(true);
@@ -816,23 +877,45 @@ bool GameList::eventFilter(QObject* obj, QEvent* event) {
     return QWidget::eventFilter(obj, event);
 }
 
+// The iOS library's empty state: an icon, "No games yet", what to add, and one button.
 GameListPlaceholder::GameListPlaceholder(MainWindow* parent) : QWidget{parent} {
     layout = new QVBoxLayout;
     image = new QLabel;
     text = new QLabel;
+    detail = new QLabel;
+    add_button = new QPushButton;
+    add_button->setObjectName(QStringLiteral("lichiiPrimary"));
+    add_button->setDefault(true);
     layout->setAlignment(Qt::AlignCenter);
-    image->setPixmap(QIcon::fromTheme(QStringLiteral("plus_folder")).pixmap(200));
+    layout->setSpacing(12);
 
     RetranslateUI();
+    UpdateIcon();
     QFont font = text->font();
-    font.setPointSize(20);
+    font.setPointSizeF(font.pointSizeF() * 1.6);
+    font.setBold(true);
     text->setFont(font);
     text->setAlignment(Qt::AlignHCenter);
     image->setAlignment(Qt::AlignHCenter);
+    detail->setAlignment(Qt::AlignHCenter);
+    detail->setWordWrap(true);
+    detail->setMaximumWidth(460);
+    detail->setObjectName(QStringLiteral("lichiiFooter"));
 
     layout->addWidget(image);
     layout->addWidget(text);
+    layout->addWidget(detail, 0, Qt::AlignHCenter);
+    layout->addSpacing(6);
+    layout->addWidget(add_button, 0, Qt::AlignHCenter);
     setLayout(layout);
+
+    connect(add_button, &QPushButton::clicked, this, &GameListPlaceholder::AddDirectory);
+    connect(parent, &MainWindow::ThemeChanged, this, &GameListPlaceholder::UpdateIcon);
+}
+
+void GameListPlaceholder::UpdateIcon() {
+    const QColor color = LichiiStyle::Current().secondary;
+    image->setPixmap(LichiiStyle::Icon(QStringLiteral("gamepad-2"), color).pixmap(64, 64));
 }
 
 GameListPlaceholder::~GameListPlaceholder() = default;
@@ -850,5 +933,8 @@ void GameListPlaceholder::changeEvent(QEvent* event) {
 }
 
 void GameListPlaceholder::RetranslateUI() {
-    text->setText(tr("Double-click to add a new folder to the game list"));
+    text->setText(tr("No games yet"));
+    detail->setText(tr("Add a folder with your .nsp, .xci, .nup, .nca or .nro files: Lichii lists "
+                       "every game in it. Double-clicking here does the same."));
+    add_button->setText(tr("Add Game Folder..."));
 }

@@ -63,6 +63,7 @@
 #include "util/clickable_label.h"
 #include "util/controller_navigation.h"
 #include "util/export_log.h"
+#include "util/lichii_style.h"
 #include "util/overlay_dialog.h"
 
 #include "multiplayer/state.h"
@@ -431,6 +432,14 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     default_theme_paths = QIcon::themeSearchPaths();
     UpdateUITheme();
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+    // The Lichii theme is light or dark as the system is, also when the system switches.
+    connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, [this] {
+        if (UISettings::IsLichiiTheme()) {
+            UpdateUITheme();
+        }
+    });
+#endif
 
     SetDiscordEnabled(UISettings::values.enable_discord_presence.GetValue());
     discord_rpc->Update();
@@ -1678,6 +1687,8 @@ void MainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::CopyTIDRequested, this, &MainWindow::OnGameListCopyTID);
     connect(game_list, &GameList::CreateShortcut, this, &MainWindow::OnGameListCreateShortcut);
     connect(game_list, &GameList::AddDirectory, this, &MainWindow::OnGameListAddDirectory);
+    connect(game_list, &GameList::ViewModeRequested, this, &MainWindow::SetGameListMode);
+    connect(game_list, &GameList::OpenSettingsRequested, this, &MainWindow::OnConfigure);
     connect(game_list_placeholder, &GameListPlaceholder::AddDirectory, this,
             &MainWindow::OnGameListAddDirectory);
     connect(game_list, &GameList::ShowList, this, &MainWindow::OnGameListShowList);
@@ -3180,7 +3191,7 @@ void MainWindow::OnGameListOpenPerGameProperties(const std::string& file) {
         const auto loader = Loader::GetLoader(*QtCommon::system, v_file);
 
         if (loader == nullptr || loader->ReadProgramId(title_id) != Loader::ResultStatus::Success) {
-            QMessageBox::information(this, tr("Properties"),
+            QMessageBox::information(this, tr("Game Settings"),
                                      tr("The game properties could not be loaded."));
             return;
         }
@@ -5877,11 +5888,30 @@ static void AdjustLinkColor() {
 
 void MainWindow::UpdateUITheme() {
     const QString default_theme =
-        QString::fromUtf8(UISettings::themes[size_t(UISettings::default_theme)].second);
+        QString::fromUtf8(UISettings::themes[size_t(UISettings::classic_theme)].second);
     QString current_theme = QString::fromStdString(UISettings::values.theme);
 
-    if (current_theme.isEmpty())
-        current_theme = default_theme;
+    if (current_theme.isEmpty()) {
+        UISettings::values.theme =
+            UISettings::themes[size_t(UISettings::default_theme)].second;
+        current_theme = QString::fromStdString(UISettings::values.theme);
+    }
+
+    if (UISettings::IsLichiiTheme()) {
+        // Colorful's icons where Lichii draws none; the style sheet is a template for light or
+        // dark.
+        QIcon::setThemeName(QStringLiteral("lichii"));
+        QIcon::setThemeSearchPaths(QStringList(QStringLiteral(":/icons")));
+        LichiiStyle::Apply(*qApp, UISettings::IsDarkTheme());
+        setStyleSheet({});
+        emit ThemeChanged();
+#ifdef _WIN32
+        RemoveTitlebarFilter();
+        ApplyGlobalDarkTitlebar(UISettings::IsDarkTheme());
+#endif
+        return;
+    }
+    LichiiStyle::Restore(*qApp);
 
 #ifdef _WIN32
     QIcon::setThemeName(current_theme);
@@ -5923,6 +5953,7 @@ void MainWindow::UpdateUITheme() {
         qApp->setStyleSheet({});
         setStyleSheet({});
     }
+    emit ThemeChanged();
 
 #ifdef _WIN32
     RemoveTitlebarFilter();

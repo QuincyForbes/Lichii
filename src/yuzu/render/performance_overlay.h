@@ -16,6 +16,8 @@ namespace Ui {
 class PerformanceOverlay;
 }
 
+class QFrame;
+class QLabel;
 class QLineSeries;
 class QChart;
 class QChartView;
@@ -39,13 +41,36 @@ protected:
 private:
     void resetPosition(const QPoint& pos);
     void updateStats(const Core::PerfStatsResults& results, const VideoCore::ShaderNotify& shaders);
+    /// A small translucent card of lines, as the iOS overlay's.
+    QFrame* addCard();
+    QLabel* addLine(QFrame* card);
+    static void setLine(QLabel* line, const QString& text, const QColor& color = {});
 
     MainWindow* m_mainWindow = nullptr;
     Ui::PerformanceOverlay* ui;
 
+    // The iOS overlay's Detailed preset, in its order: frames, then what draws them, then sizes and
+    // memory. VRAM and the chart are the desktop's own.
+    QLabel* m_real = nullptr;
+    QLabel* m_generated = nullptr;
+    QLabel* m_displayed = nullptr;
+    QLabel* m_frametime = nullptr;
+    QLabel* m_low10 = nullptr;
+    QLabel* m_frameGen = nullptr;
+    QLabel* m_scale = nullptr;
+    QLabel* m_speed = nullptr;
+    QLabel* m_shaders = nullptr;
+    QLabel* m_scene = nullptr;
+    QLabel* m_game = nullptr;
+    QLabel* m_screen = nullptr;
+    QLabel* m_gpuAccuracy = nullptr;
+    QLabel* m_ram = nullptr;
+    QLabel* m_vram = nullptr;
+    QLabel* m_textures = nullptr;
+
     // colors
-    QColor m_background{15, 23, 42, 225};
-    QColor m_border{56, 189, 248, 100};
+    QColor m_background{0, 0, 0, 140};
+    QColor m_border{255, 255, 255, 31};
 
     QPoint m_offset{25, 75};
 

@@ -61,9 +61,13 @@ enum class Theme {
     DarkColorful,
     MidnightBlue,
     MidnightBlueColorful,
+    Lichii,
 };
 
-static constexpr Theme default_theme{
+static constexpr Theme default_theme{Theme::Lichii};
+
+/// The default before the Lichii theme, listed as "Classic" in the theme list.
+static constexpr Theme classic_theme{
 #ifdef _WIN32
     Theme::DarkColorful
 #else
@@ -71,8 +75,11 @@ static constexpr Theme default_theme{
 #endif
 };
 
-using Themes = std::array<std::pair<const char*, const char*>, 6>;
+using Themes = std::array<std::pair<const char*, const char*>, 7>;
 extern const Themes themes;
+
+/// The Lichii theme (the iOS app's look), light or dark as the system is.
+bool IsLichiiTheme();
 
 struct GameDir {
     std::string path;

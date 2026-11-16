@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <QMessageBox>
+#include <QPushButton>
 #include <QString>
 #include <QStringList>
 
@@ -116,7 +117,7 @@ bool ConfirmAndApply(QWidget* parent, const ConfigurationShared::Builder& builde
         all << QStringLiteral("%1: %2\n    %3")
                    .arg(label, to, QString::fromStdString(value.reason));
         if (setting->ToStringGlobal() != value.value) {
-            changes << QStringLiteral("%1: %2 -> %3")
+            changes << QStringLiteral("%1: %2 \u2192 %3")
                            .arg(label,
                                 ValueText(builder, *setting, setting->ToStringGlobal(),
                                           setting->Canonicalize()),
@@ -126,20 +127,24 @@ bool ConfirmAndApply(QWidget* parent, const ConfigurationShared::Builder& builde
     const QString device = QString::fromStdString(profile.device_name);
     if (changes.isEmpty()) {
         QMessageBox::information(parent, QObject::tr("Recommended Settings"),
-                                 QObject::tr("Every setting already has the recommended value for "
-                                             "%1.")
+                                 QObject::tr("Everything is already set as recommended for %1.")
                                      .arg(device));
         return false;
     }
-    QMessageBox box(QMessageBox::Question, QObject::tr("Use Recommended Settings"),
-                    QObject::tr("Recommended for %1. These settings change:\n\n%2\n\nA game's own "
-                                "overrides stay (reset them in its Properties).")
-                        .arg(device, changes.join(QLatin1Char('\n'))),
-                    QMessageBox::Yes | QMessageBox::Cancel, parent);
+    // The wording of the iOS app's Recommended Settings screen.
+    QMessageBox box(QMessageBox::Question, QObject::tr("Recommended Settings"),
+                    QObject::tr("Change these settings?"), QMessageBox::Cancel, parent);
+    box.setInformativeText(QObject::tr("Recommended for %1:\n\n%2\n\nGames use them from their "
+                                       "next start; a game's own overrides stay until you reset "
+                                       "that game in its settings.")
+                               .arg(device, changes.join(QLatin1Char('\n'))));
+    QPushButton* const use =
+        box.addButton(QObject::tr("Use Recommended Settings"), QMessageBox::AcceptRole);
     box.setDetailedText(QObject::tr("Every recommended value and why:\n\n%1")
                             .arg(all.join(QLatin1Char('\n'))));
-    box.setDefaultButton(QMessageBox::Yes);
-    if (box.exec() != QMessageBox::Yes) {
+    box.setDefaultButton(use);
+    box.exec();
+    if (box.clickedButton() != use) {
         return false;
     }
     const auto applied = Profile::Apply(profile);
@@ -163,22 +168,25 @@ bool ConfirmAndResetGame(QWidget* parent, const ConfigurationShared::Builder& bu
                                      builder, *setting, setting->ToStringGlobal(),
                                      setting->ToStringGlobal()))
                                : QString::fromStdString(change.to);
-        lines << QStringLiteral("%1: %2 -> %3")
+        lines << QStringLiteral("%1: %2 \u2192 %3")
                      .arg(Label(builder, *setting), QString::fromStdString(change.from), to);
     }
     if (lines.isEmpty()) {
-        QMessageBox::information(parent, QObject::tr("Reset to Recommended"),
-                                 QObject::tr("This game already has the recommended settings for "
-                                             "%1.")
-                                     .arg(QString::fromStdString(profile.device_name)));
+        QMessageBox::information(parent, QObject::tr("Reset This Game to Recommended"),
+                                 QObject::tr("This game already has the recommended settings."));
         return false;
     }
-    if (QMessageBox::question(
-            parent, QObject::tr("Reset to Recommended"),
-            QObject::tr("Give this game the recommended settings for %1? Its other overrides "
-                        "are removed.\n\n%2")
-                .arg(QString::fromStdString(profile.device_name),
-                     lines.join(QLatin1Char('\n')))) != QMessageBox::Yes) {
+    QMessageBox box(QMessageBox::Question, QObject::tr("Reset This Game to Recommended"),
+                    QObject::tr("Use the recommended settings for this game?"),
+                    QMessageBox::Cancel, parent);
+    box.setInformativeText(QObject::tr("Recommended for %1. Its other overrides are removed.\n\n%2")
+                               .arg(QString::fromStdString(profile.device_name),
+                                    lines.join(QLatin1Char('\n'))));
+    QPushButton* const reset =
+        box.addButton(QObject::tr("Reset to Recommended"), QMessageBox::DestructiveRole);
+    box.setDefaultButton(QMessageBox::Cancel);
+    box.exec();
+    if (box.clickedButton() != reset) {
         return false;
     }
     const auto changes = Profile::ResetGameToRecommended(profile, program_id);

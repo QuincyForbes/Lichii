@@ -95,8 +95,17 @@ ConfigureUi::ConfigureUi(Core::System& system_, QWidget* parent)
 
     InitializeLanguageComboBox();
 
+    // Lichii first; the theme that was the default before it is "Classic".
+    const auto& lichii = UISettings::themes[size_t(UISettings::Theme::Lichii)];
+    ui->theme_combobox->addItem(tr("Lichii (follows system light or dark)"),
+                                QString::fromUtf8(lichii.second));
     for (const auto& theme : UISettings::themes) {
-        ui->theme_combobox->addItem(QString::fromUtf8(theme.first),
+        if (&theme == &lichii) {
+            continue;
+        }
+        const QString name = QString::fromUtf8(theme.first);
+        const bool classic = &theme == &UISettings::themes[size_t(UISettings::classic_theme)];
+        ui->theme_combobox->addItem(classic ? tr("Classic (%1)").arg(name) : name,
                                     QString::fromUtf8(theme.second));
     }
 

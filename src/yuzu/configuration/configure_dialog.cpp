@@ -7,10 +7,17 @@
 #include <algorithm>
 #include <memory>
 #include <QFrame>
+#include <QGroupBox>
 #include <QGuiApplication>
+#include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
 #include <QScreen>
 #include <QScrollArea>
 #include <QShowEvent>
+#include <QStyle>
+#include <QTimer>
+#include <QVBoxLayout>
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -38,6 +45,7 @@
 #include "yuzu/configuration/configure_web.h"
 #include "yuzu/configuration/recommended_settings.h"
 #include "yuzu/hotkeys.h"
+#include "yuzu/util/lichii_style.h"
 
 Q_DECLARE_METATYPE(QList<QWidget*>);
 
@@ -80,13 +88,57 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
     general_tab->SetResetCallback([&] { this->close(); });
 
     SetConfiguration();
+
+    // The sidebar as the iOS settings root: a search field over the list of pages.
+    {
+        QWidget* const sidebar = new QWidget(this);
+        QVBoxLayout* const sidebar_layout = new QVBoxLayout(sidebar);
+        sidebar_layout->setContentsMargins(0, 0, 0, 0);
+        sidebar_layout->setSpacing(6);
+        search_field = new QLineEdit(sidebar);
+        search_field->setObjectName(QStringLiteral("settingsSearch"));
+        search_field->setPlaceholderText(tr("Search settings"));
+        search_field->setClearButtonEnabled(true);
+        search_field->addAction(LichiiStyle::Icon(QStringLiteral("search"),
+                                                  LichiiStyle::Current().secondary),
+                                QLineEdit::LeadingPosition);
+        ui->horizontalLayout->replaceWidget(ui->selectorList, sidebar);
+        sidebar_layout->addWidget(search_field);
+        sidebar_layout->addWidget(ui->selectorList);
+        ui->selectorList->setMinimumWidth(176);
+        ui->selectorList->setMaximumWidth(176);
+        ui->selectorList->setIconSize(QSize(18, 18));
+        ui->selectorList->setSpacing(0);
+        sidebar->setMaximumWidth(176);
+
+        search_results = new QListWidget(this);
+        search_results->setObjectName(QStringLiteral("searchResults"));
+        search_results->setWordWrap(true);
+        search_results->setIconSize(QSize(18, 18));
+        search_results->hide();
+        connect(search_field, &QLineEdit::textChanged, this, &ConfigureDialog::OnSearchChanged);
+        connect(search_field, &QLineEdit::returnPressed, this, [this] {
+            if (search_results->count() > 0) {
+                search_results->setFocus();
+                search_results->setCurrentRow(0);
+            }
+        });
+        connect(search_results, &QListWidget::itemActivated, this,
+                &ConfigureDialog::OpenSearchResult);
+        connect(search_results, &QListWidget::itemClicked, this,
+                &ConfigureDialog::OpenSearchResult);
+    }
+    ui->tabWidget->setTabBarAutoHide(true);
+    ui->tabWidget->setDocumentMode(true);
+    // Only true while a game runs; the iOS app says it under each setting instead.
+    ui->label->setVisible(system.IsPoweredOn());
+
     PopulateSelectionList();
 
     // Every tab is the dialog's child until its page first shows it; hidden until then, or it
     // draws at the dialog's top left behind the list and the buttons.
-    for (int row = 0; row < ui->selectorList->count(); ++row) {
-        const QVariant tabs = ui->selectorList->item(row)->data(Qt::UserRole);
-        for (QWidget* const tab : qvariant_cast<QList<QWidget*>>(tabs)) {
+    for (const Page& page : pages) {
+        for (const auto& [title, tab] : page.sections) {
             tab->hide();
         }
     }
@@ -191,7 +243,7 @@ void ConfigureDialog::FitToAvailableScreen() {
     const int extra_h = std::max(38, frame.height() - height());
     const int max_client_w = std::max(minimumWidth(), avail.width() - extra_w - 16);
     const int max_client_h = std::max(minimumHeight(), avail.height() - extra_h - 16);
-    const QSize desired = size().expandedTo(QSize(840, 720));
+    const QSize desired = size().expandedTo(QSize(960, 760));
     const int new_w = std::min(desired.width(), max_client_w);
     const int new_h = std::min(desired.height(), max_client_h);
     resize(new_w, new_h);
@@ -249,28 +301,296 @@ void ConfigureDialog::HandleApplyButtonClicked() {
 }
 
 void ConfigureDialog::PopulateSelectionList() {
-    const std::array<std::pair<QString, QList<QWidget*>>, 6> items{
-        {{tr("General"),
-          {general_tab.get(), hotkeys_tab.get(), ui_tab.get(), web_tab.get(), debug_tab_tab.get()}},
-         {tr("System"),
-          {system_tab.get(), profile_tab.get(), network_tab.get(), filesystem_tab.get(),
-           applets_tab.get()}},
-         {tr("CPU"), {cpu_tab.get()}},
-         {tr("Graphics"),
-          {graphics_tab.get(), graphics_advanced_tab.get(), graphics_extensions_tab.get()}},
-         {tr("Audio"), {audio_tab.get()}},
-         {tr("Controls"), {}}},
+    // The iOS app's settings root: Graphics, Controls, Audio, System, then Games & Data, then the
+    // desktop app's own pages, and Advanced last. Each page shows its tabs one under the other.
+    std::vector<Page> fresh{
+        {tr("Graphics"),
+         QStringLiteral("monitor"),
+         {},
+         {},
+         {{tr("Graphics"), graphics_tab.get()},
+          {tr("Advanced Graphics"), graphics_advanced_tab.get()}}},
+        {tr("Controls"), QStringLiteral("gamepad-2"), {}, {}, {{tr("Hotkeys"), hotkeys_tab.get()}},
+         true},
+        {tr("Audio"), QStringLiteral("volume-2"), {}, {}, {{tr("Audio"), audio_tab.get()}}},
+        {tr("System"),
+         QStringLiteral("cpu"),
+         {},
+         {},
+         {{tr("System"), system_tab.get()},
+          {tr("CPU"), cpu_tab.get()},
+          {tr("System Applets"), applets_tab.get()},
+          {tr("Network"), network_tab.get()}}},
+        {tr("Users"), QStringLiteral("users"), tr("Games & Data"), {},
+         {{tr("Users"), profile_tab.get()}}},
+        {tr("Storage"), QStringLiteral("hard-drive"), {}, {},
+         {{tr("Storage"), filesystem_tab.get()}}},
+        {tr("General"),
+         QStringLiteral("settings"),
+         tr("App"),
+         {},
+         {{tr("General"), general_tab.get()},
+          {tr("Interface"), ui_tab.get()},
+          {tr("Web Service"), web_tab.get()}}},
+        {tr("Advanced"),
+         QStringLiteral("wrench"),
+         {},
+         tr("These settings are for testing and troubleshooting. If a game stops starting after a "
+            "change here, set it back."),
+         {{tr("Graphics Hacks & Extensions"), graphics_extensions_tab.get()},
+          {tr("Debug"), debug_tab_tab.get()}}},
     };
+    if (pages.empty()) {
+        pages = std::move(fresh);
+    } else {
+        // Retranslated: the same pages and scroll areas, new names.
+        for (std::size_t i = 0; i < pages.size(); ++i) {
+            Page& page = pages[i];
+            page.title = fresh[i].title;
+            page.group = fresh[i].group;
+            page.footer = fresh[i].footer;
+            for (std::size_t s = 0; s < page.sections.size(); ++s) {
+                page.sections[s].first = fresh[i].sections[s].first;
+            }
+            if (page.title_label != nullptr) {
+                page.title_label->setText(page.title);
+            }
+            if (page.footer_label != nullptr) {
+                page.footer_label->setText(page.footer);
+            }
+            for (const auto& [section, label] : page.section_labels) {
+                label->setText(page.sections[section].first);
+            }
+        }
+    }
 
     [[maybe_unused]] const QSignalBlocker blocker(ui->selectorList);
 
     ui->selectorList->clear();
-    for (const auto& entry : items) {
-        auto* const item = new QListWidgetItem(entry.first);
-        item->setData(Qt::UserRole, QVariant::fromValue(entry.second));
-
+    for (std::size_t i = 0; i < pages.size(); ++i) {
+        const Page& page = pages[i];
+        if (!page.group.isEmpty()) {
+            auto* const heading = new QListWidgetItem(page.group);
+            heading->setFlags(Qt::NoItemFlags);
+            heading->setData(Qt::UserRole, -1);
+            QFont font = heading->font();
+            font.setBold(true);
+            font.setPointSizeF(font.pointSizeF() * 0.85);
+            heading->setFont(font);
+            heading->setSizeHint(QSize(0, 34));
+            ui->selectorList->addItem(heading);
+        }
+        auto* const item = new QListWidgetItem(LichiiStyle::Icon(page.icon), page.title);
+        item->setData(Qt::UserRole, static_cast<int>(i));
+        item->setSizeHint(QSize(0, 32));
         ui->selectorList->addItem(item);
     }
+}
+
+QScrollArea* ConfigureDialog::PageArea(Page& page) {
+    if (page.area != nullptr) {
+        return page.area;
+    }
+    QWidget* const content = new QWidget;
+    QVBoxLayout* const layout = new QVBoxLayout(content);
+    layout->setContentsMargins(10, 4, 14, 14);
+    layout->setSpacing(6);
+    page.title_label = LichiiStyle::PageTitle(page.title, content);
+    layout->addWidget(page.title_label);
+    if (!page.footer.isEmpty()) {
+        page.footer_label = LichiiStyle::Footer(page.footer, content);
+        page.footer_label->setObjectName(QStringLiteral("lichiiPageSubtitle"));
+        layout->addWidget(page.footer_label);
+    }
+    for (std::size_t section = 0; section < page.sections.size(); ++section) {
+        const auto& [title, tab] = page.sections[section];
+        // A heading per tab where a page shows several; none for the first one when it carries
+        // the page's own name.
+        if (page.sections.size() > 1 && !(section == 0 && title == page.title)) {
+            QLabel* const heading = new QLabel(title, content);
+            heading->setObjectName(QStringLiteral("lichiiTabHeading"));
+            QFont font = heading->font();
+            font.setPointSizeF(font.pointSizeF() * 1.2);
+            font.setBold(true);
+            heading->setFont(font);
+            heading->setContentsMargins(4, 14, 0, 0);
+            layout->addWidget(heading);
+            page.section_labels.emplace_back(section, heading);
+        }
+        layout->addWidget(tab);
+        tab->show();
+    }
+    layout->addStretch(1);
+
+    auto* const area = new QScrollArea(this);
+    area->setFrameShape(QFrame::NoFrame);
+    area->setWidgetResizable(true);
+    area->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    area->setAccessibleName(page.title);
+    area->setWidget(content);
+    page.area = area;
+    return area;
+}
+
+void ConfigureDialog::SelectPage(int index) {
+    for (int row = 0; row < ui->selectorList->count(); ++row) {
+        if (ui->selectorList->item(row)->data(Qt::UserRole).toInt() == index) {
+            ui->selectorList->setCurrentRow(row);
+            return;
+        }
+    }
+}
+
+void ConfigureDialog::OnSearchChanged(const QString& text) {
+    const QString query = text.trimmed();
+    if (query.isEmpty()) {
+        search_results->hide();
+        if (ui->selectorList->selectedItems().isEmpty()) {
+            SelectPage(last_page);
+        }
+        return;
+    }
+    const auto matches = [&query](const QString& name) {
+        return name.contains(query, Qt::CaseInsensitive);
+    };
+    const LichiiStyle::Colors colors = LichiiStyle::Current();
+    search_results->clear();
+    for (std::size_t i = 0; i < pages.size(); ++i) {
+        Page& page = pages[i];
+        if (matches(page.title)) {
+            auto* const item = new QListWidgetItem(LichiiStyle::Icon(page.icon), page.title);
+            item->setData(Qt::UserRole, static_cast<int>(i));
+            search_results->addItem(item);
+        }
+        if (page.controls) {
+            for (const auto& [title, tab] : page.sections) {
+                if (matches(title)) {
+                    auto* const item = new QListWidgetItem(LichiiStyle::Icon(page.icon),
+                                                           page.title + QStringLiteral(" \u203A ") +
+                                                               title);
+                    item->setData(Qt::UserRole, static_cast<int>(i));
+                    search_results->addItem(item);
+                }
+            }
+            continue;
+        }
+        QWidget* const content = PageArea(page)->widget();
+        for (const auto& [title, tab] : page.sections) {
+            for (auto* const widget : tab->findChildren<ConfigurationShared::Widget*>()) {
+                if (widget->Label().isEmpty()) {
+                    continue;
+                }
+                const QString key = QString::fromStdString(widget->GetSetting().GetLabel());
+                if (!matches(widget->Label()) && !matches(key)) {
+                    continue;
+                }
+                // Where it is: the page, then the group it sits in (a section or a group box).
+                QString place = page.title;
+                for (QWidget* parent = widget->parentWidget(); parent != nullptr && parent != tab;
+                     parent = parent->parentWidget()) {
+                    QString group = parent->property("lichiiSection").toString();
+                    if (const auto* const box = qobject_cast<QGroupBox*>(parent);
+                        group.isEmpty() && box != nullptr) {
+                        group = box->title();
+                    }
+                    if (!group.isEmpty()) {
+                        place += QStringLiteral(" \u203A ") + group;
+                        break;
+                    }
+                }
+                if (place == page.title && page.sections.size() > 1) {
+                    place += QStringLiteral(" \u203A ") + title;
+                }
+                if (!widget->isVisibleTo(content)) {
+                    place += tr(" (shown when it applies)");
+                }
+                auto* const item = new QListWidgetItem(LichiiStyle::Icon(page.icon),
+                                                       widget->Label() + QLatin1Char('\n') + place);
+                item->setData(Qt::UserRole, static_cast<int>(i));
+                item->setData(Qt::UserRole + 1, QVariant::fromValue(static_cast<QObject*>(widget)));
+                item->setToolTip(widget->toolTip());
+                search_results->addItem(item);
+            }
+        }
+    }
+    // What a search finds that does nothing here, with the reason (iOS: "Not Available on iOS").
+    QStringList unavailable;
+    const auto& translations = builder->Translations();
+    for (const auto& [category, settings] : Settings::values.linkage.by_category) {
+        for (const auto* const setting : settings) {
+            const QString reason = ConfigurationShared::PlatformUnavailableReason(*setting);
+            const auto it = translations.find(setting->Id());
+            if (reason.isEmpty() || it == translations.end() || it->second.first.isEmpty()) {
+                continue;
+            }
+            QString name = it->second.first;
+            while (name.endsWith(QLatin1Char(':'))) {
+                name.chop(1);
+            }
+            if (matches(name) || matches(QString::fromStdString(setting->GetLabel()))) {
+                unavailable << name + QStringLiteral(": ") + reason;
+            }
+        }
+    }
+    if (search_results->count() == 0) {
+        auto* const none = new QListWidgetItem(tr("No Results for \u201C%1\u201D").arg(query));
+        none->setFlags(Qt::NoItemFlags);
+        search_results->addItem(none);
+    }
+    if (!unavailable.isEmpty()) {
+        auto* const heading =
+            new QListWidgetItem(tr("Not Available on %1").arg(LichiiStyle::PlatformName()));
+        heading->setFlags(Qt::NoItemFlags);
+        QFont font = heading->font();
+        font.setBold(true);
+        heading->setFont(font);
+        search_results->addItem(heading);
+        for (const QString& line : unavailable) {
+            auto* const item = new QListWidgetItem(line);
+            item->setFlags(Qt::NoItemFlags);
+            item->setForeground(colors.secondary);
+            search_results->addItem(item);
+        }
+    }
+
+    {
+        [[maybe_unused]] const QSignalBlocker blocker(ui->tabWidget);
+        ui->tabWidget->clear();
+        ui->tabWidget->addTab(search_results, tr("Search"));
+    }
+    search_results->show();
+    ui->selectorList->clearSelection();
+}
+
+void ConfigureDialog::OpenSearchResult(QListWidgetItem* item) {
+    if (item == nullptr || !(item->flags() & Qt::ItemIsEnabled)) {
+        return;
+    }
+    const int index = item->data(Qt::UserRole).toInt();
+    auto* const widget = qobject_cast<QWidget*>(item->data(Qt::UserRole + 1).value<QObject*>());
+    {
+        [[maybe_unused]] const QSignalBlocker blocker(search_field);
+        search_field->clear();
+    }
+    search_results->hide();
+    SelectPage(index);
+    UpdateVisibleTabs();
+    if (widget == nullptr || index < 0 || pages[index].area == nullptr) {
+        return;
+    }
+    QScrollArea* const area = pages[index].area;
+    QTimer::singleShot(0, widget, [area, widget] {
+        area->ensureWidgetVisible(widget, 40, 120);
+        widget->setProperty("lichiiSearchHit", true);
+        widget->style()->unpolish(widget);
+        widget->style()->polish(widget);
+        widget->setFocus(Qt::OtherFocusReason);
+        QTimer::singleShot(1800, widget, [widget] {
+            widget->setProperty("lichiiSearchHit", false);
+            widget->style()->unpolish(widget);
+            widget->style()->polish(widget);
+        });
+    });
 }
 
 void ConfigureDialog::OnLanguageChanged(const QString& locale) {
@@ -288,19 +608,32 @@ void ConfigureDialog::UpdateVisibleTabs() {
     if (items.isEmpty()) {
         return;
     }
+    const int index = items[0]->data(Qt::UserRole).toInt();
+    if (index < 0 || static_cast<std::size_t>(index) >= pages.size()) {
+        return;
+    }
+    if (search_field != nullptr && !search_field->text().isEmpty()) {
+        [[maybe_unused]] const QSignalBlocker search_blocker(search_field);
+        search_field->clear();
+        search_results->hide();
+    }
 
     [[maybe_unused]] const QSignalBlocker blocker(ui->tabWidget);
 
     ui->tabWidget->clear();
 
-    const auto tabs = items[0] == ui->selectorList->item(ui->selectorList->count() - 1)
-                          ? ControlsTabs()
-                          : qvariant_cast<QList<QWidget*>>(items[0]->data(Qt::UserRole));
-
-    for (auto* const tab : tabs) {
-        LOG_DEBUG(Frontend, "{}", tab->accessibleName().toStdString());
-        ui->tabWidget->addTab(WrapTab(tab), tab->accessibleName());
+    last_page = index;
+    Page& page = pages[index];
+    if (page.controls) {
+        for (auto* const tab : ControlsTabs()) {
+            ui->tabWidget->addTab(WrapTab(tab), tab->accessibleName());
+        }
+        for (const auto& [title, tab] : page.sections) {
+            ui->tabWidget->addTab(WrapTab(tab), title);
+        }
+        return;
     }
+    ui->tabWidget->addTab(PageArea(page), page.title);
 }
 
 QList<QWidget*> ConfigureDialog::ControlsTabs() {
