@@ -8,6 +8,7 @@
 
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
@@ -98,6 +99,10 @@ struct Options {
     TessellationModes tessellation{};
     /// Vertex kernel of an indexed draw: its index size (2 or 4), 0 for non-indexed.
     u32 vertex_index_size{};
+    /// (set, binding) of sampled images that are bound to depth textures: they become
+    /// depth2d<float>, as Metal reads depth formats (a texture2d<float> read of one did not
+    /// return the depth in the actor smoke test). A shared image type changes for all its users.
+    std::vector<std::pair<u32, u32>> depth_images;
 };
 
 struct Result {

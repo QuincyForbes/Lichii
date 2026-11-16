@@ -100,9 +100,10 @@ bool EnvironmentOn(const char* name) {
 
 /// One of the host compute shaders through the translator into `pass` (OcarinaTemporal::Pass).
 template <typename PassT>
-bool BuildPass(const Device& device, PassT& pass, std::span<const u32> code, std::string& error) {
+bool BuildPass(const Device& device, PassT& pass, std::span<const u32> code, std::string& error,
+               const ShaderTranslate::Options& options = {}) {
     const ShaderTranslate::Result msl =
-        ShaderTranslate::SpirvToMsl(code, ShaderTranslate::Stage::Compute, {});
+        ShaderTranslate::SpirvToMsl(code, ShaderTranslate::Stage::Compute, options);
     error = msl.error;
     if (msl.source.empty()) {
         return false;
@@ -250,7 +251,10 @@ bool OcarinaTemporal::Prepare() {
     failed = true;
     std::string error;
     sampler = CreateLinearClampSampler(device);
-    if (!BuildPass(device, motion_pass, OCARINA_CAMERA_MOTION_COMP_SPV, error) ||
+    // The scene depth (binding 0) is a depth texture.
+    ShaderTranslate::Options motion_options{};
+    motion_options.depth_images = {{0, 0}};
+    if (!BuildPass(device, motion_pass, OCARINA_CAMERA_MOTION_COMP_SPV, error, motion_options) ||
         !BuildPass(device, color_pass, OCARINA_DLSS_COLOR_COMP_SPV, error) ||
         !BuildPass(device, output_pass, OCARINA_DLSS_OUTPUT_COMP_SPV, error) || !sampler) {
         LOG_WARNING(Render_Metal, "Metal: Ocarina temporal upscale unavailable: {}", error);
@@ -276,6 +280,8 @@ bool OcarinaTemporal::PrepareActor() {
     const ShaderTranslate::Result vertex = ShaderTranslate::SpirvToMsl(
         std::span<const u32>(OCARINA_ACTOR_MOTION_VERT_SPV), ShaderTranslate::Stage::Vertex,
         options);
+    // The scene depth (binding 3) is a depth texture.
+    options.depth_images = {{0, 3}};
     const ShaderTranslate::Result fragment = ShaderTranslate::SpirvToMsl(
         std::span<const u32>(OCARINA_ACTOR_MOTION_FRAG_SPV), ShaderTranslate::Stage::Fragment,
         options);
@@ -342,7 +348,9 @@ std::array<std::string, 2> OcarinaTemporal::ActorMsl(u32 apple_family) {
         }
         return text;
     };
-    return {translate(OCARINA_ACTOR_MOTION_VERT_SPV, ShaderTranslate::Stage::Vertex),
+    std::string vertex = translate(OCARINA_ACTOR_MOTION_VERT_SPV, ShaderTranslate::Stage::Vertex);
+    options.depth_images = {{0, 3}};
+    return {std::move(vertex),
             translate(OCARINA_ACTOR_MOTION_FRAG_SPV, ShaderTranslate::Stage::Fragment)};
 }
 
