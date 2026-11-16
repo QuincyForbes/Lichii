@@ -545,6 +545,14 @@ const Suspect Suspects[] = {
          descriptor.alphaToOneEnabled = YES;
          return Build(context, descriptor);
      }},
+    {"alpha-to-one-with-rgba8uint-second-target",
+     [](const Context& context) {
+         MTLRenderPipelineDescriptor* descriptor = Quad(context);
+         descriptor.fragmentFunction = context.fragment_two;
+         descriptor.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA8Uint;
+         descriptor.alphaToOneEnabled = YES;
+         return Build(context, descriptor);
+     }},
     // Functions.
     {"no-vertex-function",
      [](const Context& context) {

@@ -336,7 +336,14 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
                                (first_class == FormatClass::Uint || first_class == FormatClass::Sint);
     descriptor.alphaToCoverageEnabled =
         (desc.alpha_to_coverage & 1U) != 0 && !integer_alpha ? YES : NO;
-    descriptor.alphaToOneEnabled = (desc.alpha_to_coverage & 2U) != 0 && !integer_alpha ? YES : NO;
+    // Alpha to one aborts the process with any integer target (probe:alpha-to-one-on-rgba8uint),
+    // whatever the pipeline check says.
+    const bool any_integer = std::ranges::any_of(desc.color_formats, [](u32 format) {
+        const FormatClass format_class = ClassOf(format);
+        return format != 0 &&
+               (format_class == FormatClass::Uint || format_class == FormatClass::Sint);
+    });
+    descriptor.alphaToOneEnabled = (desc.alpha_to_coverage & 2U) != 0 && !any_integer ? YES : NO;
     if (desc.tessellation != 0) {
         // The control kernel writes half-precision factors, one set per patch.
         descriptor.tessellationPartitionMode =
