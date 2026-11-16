@@ -123,10 +123,10 @@ file reference.
 | B19 | Stencil test: functions, operations, compare and write masks, two-sided | vk_rasterizer.cpp:5561, vk_rasterizer.cpp:5972, vk_rasterizer.cpp:6125 | native | metal_rasterizer.cpp:1248, metal_graphics.mm:469 | untested | no |
 | B20 | Stencil reference values, front and back | vk_rasterizer.cpp:5561 | native | metal_rasterizer.cpp:1465 | untested | no |
 | B21 | Cull mode front or back, front face (with the window origin flip) | vk_rasterizer.cpp:5686, vk_rasterizer.cpp:5958 | native | metal_rasterizer.cpp:1553 | untested | yes |
-| B22 | Cull mode front and back | vk_rasterizer.cpp:5686 | emulated (triangles are not drawn at all; points and lines are) | metal_rasterizer.cpp:1544 | untested | ? |
+| B22 | Cull mode front and back | vk_rasterizer.cpp:5686 | emulated (triangles are not drawn at all; points and lines are) | metal_rasterizer.cpp:1544 | untested | yes |
 | B23 | Polygon mode line | maxwell_to_vk.cpp | native (`setTriangleFillMode:Lines` when the faces drawn are in line mode; Metal has one fill mode for both faces, so front lines with back fill and no culling stay filled; `EDEN_NX2_METAL_FILL_LINES`) | metal_rasterizer.cpp:1824, metal_scheduler.mm:1601 | untested | no |
 | B24 | Polygon mode point | maxwell_to_vk.cpp | missing (drawn filled: Metal has no point fill mode; emulating it needs the triangles' vertices drawn as points by a rewrite, not done) | - | untested | no |
-| B25 | Rasterizer discard | vk_rasterizer.cpp:5767 | native | metal_rasterizer.cpp:1173 | probe:no-attachments-no-rasterization | ? |
+| B25 | Rasterizer discard | vk_rasterizer.cpp:5767 | native | metal_rasterizer.cpp:1173 | probe:no-attachments-no-rasterization | no |
 | B26 | Viewport 0: rectangle, depth range, y flip by window origin | vk_rasterizer.cpp:5339 | native | metal_rasterizer.cpp:1483 | probe:viewport-negative-height | yes |
 | B27 | Viewports 1-15 | vk_rasterizer.cpp:5339 | native (`setViewports:count:16` when the vertex program writes the viewport index; `EDEN_NX2_METAL_VIEWPORTS`) | metal_rasterizer.cpp:1810, metal_scheduler.mm:1581 | untested | no |
 | B28 | Viewport swizzles other than a negated y | maxwell_to_vk.cpp | missing (ignored) | metal_rasterizer.cpp:1483 | untested | ? |
