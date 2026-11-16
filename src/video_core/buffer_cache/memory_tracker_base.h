@@ -13,6 +13,7 @@
 #include <type_traits>
 #include "common/container/unordered_set.h"
 #include <utility>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/common_types.h"
@@ -134,9 +135,70 @@ public:
     }
 
     /// Mark region as CPU modified, notifying the device_tracker about this change
-    void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
-        IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
-            manager->ChangeRegionState(Type::CPU, true, manager->cpu_addr + offset, size);
+    /// @param written False when no guest write is behind the mark (it never turns a page hot)
+    void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size, bool written = true) {
+        IteratePages<true>(dirty_cpu_addr, query_size,
+                           [this, written](Manager* manager, u64 offset, size_t size) {
+            manager->ChangeRegionState(Type::CPU, true, manager->cpu_addr + offset, size, written);
+            TrackHot(manager);
+        });
+    }
+
+    /// Whether a page of the region is hot (EDEN_NX2_HOT_PAGES): the guest writes it without the
+    /// cache being told, so nothing may remember its contents by the writes it has seen.
+    [[nodiscard]] bool IsRegionHot(VAddr query_cpu_addr, u64 query_size) const noexcept {
+        if (HotPages::g_mode == 0) {
+            return false;
+        }
+        std::size_t page_index{query_cpu_addr >> HIGHER_PAGE_BITS};
+        u64 page_offset{query_cpu_addr & HIGHER_PAGE_MASK};
+        u64 remaining{query_size};
+        while (remaining > 0) {
+            const u64 amount = (std::min<u64>)(HIGHER_PAGE_SIZE - page_offset, remaining);
+            const Manager* const manager = top_tier[page_index];
+            if (manager != nullptr && manager->window_used &&
+                manager->IsRangeHot(page_offset, amount)) {
+                return true;
+            }
+            ++page_index;
+            page_offset = 0;
+            remaining -= amount;
+        }
+        return false;
+    }
+
+    /// Ends an epoch of EDEN_NX2_HOT_PAGES: the hot pages uploaded in it read as CPU-modified
+    /// again, and func(address, size) is called for each run of them. With new_frame the frame
+    /// count of the window advances; at its end every hot page cools down.
+    template <typename Func>
+    void AdvanceHotPages(bool new_frame, Func&& func) {
+        if (!epoch_managers.empty()) {
+            for (Manager* const manager : epoch_managers) {
+                manager->epoch_listed = false;
+                manager->ReleaseHotClean(func);
+            }
+            epoch_managers.clear();
+            HotPages::Add(HotPages::g_counters.epochs, 1);
+        }
+        if (!new_frame || ++window_frames < HotPages::WindowFrames) {
+            return;
+        }
+        window_frames = 0;
+        for (Manager* const manager : window_managers) {
+            manager->window_listed = false;
+            manager->ResetHotWindow();
+        }
+        window_managers.clear();
+    }
+
+    /// Calls func(address) for each hot page of the region uploaded in this epoch.
+    template <typename Func>
+    void ForEachHotCleanPage(VAddr query_cpu_addr, u64 query_size, Func&& func) {
+        IteratePages<false>(query_cpu_addr, query_size,
+                            [&func](Manager* manager, u64 offset, size_t size) {
+            if (manager->hot_clean_set != 0) {
+                manager->ForEachHotCleanPage(offset, size, func);
+            }
         });
     }
 
@@ -148,10 +210,16 @@ public:
     }
 
     /// Mark region as modified from the host GPU
-    void MarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
-        IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
-            manager->ChangeRegionState(Type::GPU, true, manager->cpu_addr + offset, size);
+    /// @return True when a hot page uploaded in this epoch (EDEN_NX2_HOT_PAGES) lost that state:
+    ///         it reads as CPU-modified again although no guest write was reported
+    bool MarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        bool hot_page_dirtied = false;
+        IteratePages<true>(dirty_cpu_addr, query_size,
+                           [&hot_page_dirtied](Manager* manager, u64 offset, size_t size) {
+            hot_page_dirtied |=
+                manager->ChangeRegionState(Type::GPU, true, manager->cpu_addr + offset, size);
         });
+        return hot_page_dirtied;
     }
 
     /// Mark region as modified from the host GPU
@@ -202,8 +270,9 @@ public:
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     template <typename Func>
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
-        IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
+        IteratePages<true>(query_cpu_range, query_size, [this, &func](Manager* manager, u64 offset, size_t size) {
             manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + offset, size, func);
+            TrackHot(manager);
         });
     }
 
@@ -234,7 +303,7 @@ public:
     /// part of the range: they have nothing to find or change. A per-word form of PR #161's skip.
     template <typename Func>
     void ForEachDirtyUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
-        IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
+        IteratePages<true>(query_cpu_range, query_size, [this, &func](Manager* manager, u64 offset, size_t size) {
             const u64 dirty =
                 manager->DirtyWords(offset / BYTES_PER_WORD, (offset + size - 1) / BYTES_PER_WORD);
             if (dirty == 0) {
@@ -245,6 +314,7 @@ public:
                 (std::min<u64>)(offset + size, (64 - std::countl_zero(dirty)) * BYTES_PER_WORD);
             manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + begin,
                                           static_cast<s64>(end - begin), func);
+            TrackHot(manager);
         });
     }
     /// Verify mode: true when the clean words of the managers over a range match a recount.
@@ -334,6 +404,19 @@ private:
         }
     }
 
+    /// Lists a manager for AdvanceHotPages once it has something to release or to reset. Both
+    /// stay false while EDEN_NX2_HOT_PAGES is off.
+    void TrackHot(Manager* manager) {
+        if (manager->hot_clean_set != 0 && !manager->epoch_listed) {
+            manager->epoch_listed = true;
+            epoch_managers.push_back(manager);
+        }
+        if (manager->window_used && !manager->window_listed) {
+            manager->window_listed = true;
+            window_managers.push_back(manager);
+        }
+    }
+
     void CreateRegion(std::size_t page_index) {
         const VAddr base_cpu_addr = page_index << HIGHER_PAGE_BITS;
         top_tier[page_index] = GetNewManager(base_cpu_addr);
@@ -358,6 +441,11 @@ private:
     std::deque<std::array<Manager, MANAGER_POOL_SIZE>> manager_pool;
     std::deque<Manager*> free_managers;
     ::Common::unordered_set<u32> cached_pages;
+    /// EDEN_NX2_HOT_PAGES: managers with a hot page uploaded in this epoch, managers with a page
+    /// counted or hot in this window, and the frames of the window so far.
+    std::vector<Manager*> epoch_managers;
+    std::vector<Manager*> window_managers;
+    u32 window_frames = 0;
     DeviceTracker* device_tracker = nullptr;
 };
 

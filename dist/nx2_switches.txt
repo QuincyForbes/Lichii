@@ -392,3 +392,17 @@ EDEN_NX2_FENCE_BATCH=1
 # of Time in Kokiri: GPU thread held 79 -> 49 -> 5.5 ms/s, GPU-tracked load 13.2 -> 9.7 -> 8.2 us.
 #EDEN_NX2_GPU_READ_LAND=0
 #EDEN_NX2_GPU_READ_LAND_KIB=256
+# Hot pages (Djihads80/Eglantine f27522bfb9): a page the guest writes twice within 128 frames,
+# each time after an upload had write-protected it, is no longer protected. It counts as written
+# at the end of each epoch instead, so its first use in the next epoch uploads it, and the buffer
+# cache's write memos (bind skips, uniform reuse, repacked vertex streams) hear of it then. Pages
+# the GPU ever wrote are never hot; all hot pages cool down every 128 frames. 0: off. 1: an epoch
+# is a frame (as upstream). 2: an epoch also ends with each guest command list. Default 2 on
+# Apple hosts, 0 elsewhere. PC phone sim, Ocarina of Time in Kokiri: GPU-tracked guest stores
+# 909k -> 439k/s, tracker protections 17.1k -> 9.7k/s, buffer uploads 97 -> 137 MiB/s, frame
+# rate unchanged (1: 475k/s, 10.8k/s, 109 MiB/s). Tracker protect and unprotect counts, and the
+# hot page counts, are in the "Perf CPU writes:" line.
+#EDEN_NX2_HOT_PAGES=0
+# Diagnostics: keep the bytes of each hot page upload and compare them at each later use in the
+# epoch ("hot verify: stale" = uses write protection would have uploaded first).
+#EDEN_NX2_HOT_PAGES_VERIFY=1

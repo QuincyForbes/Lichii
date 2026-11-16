@@ -4127,13 +4127,39 @@ void RasterizerVulkan::ReportCpuWrites(double seconds) {
                                   sample.gpu_first, sample.gpu_end);
         }
     }
+    namespace Hot = VideoCommon::HotPages;
+    static std::array<u64, 13> hot_then{};
+    const auto hot_delta = [&](const std::atomic<u64>& counter, size_t index) {
+        const u64 now = counter.load(std::memory_order_relaxed);
+        return static_cast<double>(now - std::exchange(hot_then[index], now)) / seconds;
+    };
+    const auto& hc = Hot::g_counters;
+    // Tracker protection changes are counted with hot pages off too, for the comparison.
+    std::string hot_text = fmt::format(
+        " | tracker protects {:.0f}/s ({:.0f} pages), unprotects {:.0f}/s ({:.0f} pages)",
+        hot_delta(hc.protect_ranges, 0), hot_delta(hc.protect_pages, 1),
+        hot_delta(hc.unprotect_ranges, 2), hot_delta(hc.unprotect_pages, 3));
+    if (Hot::g_mode != 0) {
+        hot_text += fmt::format(
+            " | hot pages (mode {}) {} now: promoted {:.0f}/s, cooled {:.0f}/s, GPU-written "
+            "{:.0f}/s, uploads left unprotected {:.0f}/s, epochs {:.0f}/s",
+            Hot::g_mode, hc.hot.load(std::memory_order_relaxed), hot_delta(hc.promoted, 4),
+            hot_delta(hc.cooled, 5), hot_delta(hc.gpu_written, 6), hot_delta(hc.kept, 7),
+            hot_delta(hc.epochs, 8));
+    }
+    if (Hot::g_verify) {
+        hot_text += fmt::format(" | hot verify: uses {:.0f}/s, stale {:.0f}/s, uploads {:.0f}/s, "
+                                "same bytes as the last upload {:.0f}/s",
+                                hot_delta(hc.verify_uses, 9), hot_delta(hc.verify_stale, 10),
+                                hot_delta(hc.verify_uploads, 11), hot_delta(hc.verify_same, 12));
+    }
     LOG_INFO(Common_Memory,
              "Perf CPU writes: buffer cache asked {:.0f}/s: no buffer {:.0f}, GPU-modified page "
              "{:.0f} (written bytes GPU-written {:.0f}; reclaimed as CPU pages {:.0f}, downloads "
              "queued {:.0f}), page already CPU-modified {:.0f}, marked {:.0f}, still protected "
-             "after {:.0f}{}",
+             "after {:.0f}{}{}",
              unregistered + gpu_page + already + marked - reclaimed, unregistered, gpu_page, gpu_bytes,
-             reclaimed, queued, already, marked, still, detail);
+             reclaimed, queued, already, marked, still, hot_text, detail);
 }
 
 void RasterizerVulkan::ReportCpuReads(double seconds) {

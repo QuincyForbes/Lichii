@@ -26,6 +26,7 @@
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/perf_stats.h"
 #include "video_core/buffer_cache/cpu_read_stats.h"
+#include "video_core/buffer_cache/hot_pages.h"
 #include "video_core/cdma_pusher.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/control/scheduler.h"
@@ -156,6 +157,7 @@ struct GPU::Impl {
 
     /// Signal the ending of command list.
     void OnCommandListEnd() {
+        VideoCommon::HotPages::g_command_lists.fetch_add(1, std::memory_order_relaxed);
         renderer->ReadRasterizer()->ReleaseFences(false);
         Settings::UpdateGPUAccuracy();
     }
