@@ -318,13 +318,61 @@ EDEN_NX2_FENCE_BATCH=1
 # motion and the effects mask Vulkan adds are not made on Metal.
 #EDEN_NX2_METAL_OOT_TEMPORAL=0
 
-# Metal renderer: 1 rewrites the indices of triangle lists and strips drawn with a pixel program
-# that reads flat inputs while the game asks for the last vertex's values (the provoking vertex),
-# so that they take the last vertex as on a Vulkan driver with VK_EXT_provoking_vertex; Metal
-# takes the first. Off by default, as MoltenVK, which has no such extension: every such draw
-# would be rewritten on the CPU or by a kernel. Strips with restart indices the GPU wrote stay as
-# they are.
-#EDEN_NX2_METAL_PROVOKING_LAST=1
+# Metal renderer: 0 draws flat inputs from each primitive's first vertex, as Metal (it has no
+# provoking vertex setting) and MoltenVK draw them. By default a draw whose pixel program reads
+# flat inputs while the game asks for the last vertex's values has its indices rewritten (by a
+# kernel, or on the CPU for indices only in guest memory) so each primitive starts with the
+# vertex Vulkan's last vertex convention takes them from, keeping the winding: lists, strips
+# (with restart indices too, degenerate triangles across a restart), fans, quads, quad strips,
+# lines, line strips and loops.
+#EDEN_NX2_METAL_PROVOKING_LAST=0
+
+# Metal renderer: 0 translates and builds a pipeline first seen during a run on the draw's
+# thread, which waits, as before. By default it is built on builder threads (this many; default
+# logical CPUs - 1): a draw that may be skipped (EDEN_NX2_ASYNC_DISCARD, as Vulkan's
+# DrawMayBeSkipped) is skipped meanwhile, one that may not runs an unstarted build itself or
+# lends a running one its QoS class, as EDEN_NX2_PIPELINE_HOLD_BOOST on Vulkan.
+#EDEN_NX2_METAL_ASYNC_PIPELINES=0
+
+# Metal renderer: 0 decides conditional rendering on the CPU from guest memory only (a pending
+# occlusion report reads as what memory held). By default a condition on a report whose fence
+# has not signalled is decided by a kernel after the counting passes, which zeroes the instance
+# counts of the draws under it (drawn through indirect arguments); clears, indirect, mesh and
+# tessellated draws under it wait for the report on the CPU. Metal has no predicated rendering.
+#EDEN_NX2_METAL_GPU_CONDITION=0
+
+# Metal renderer: 0 reads an indirect draw's count from guest memory on the CPU and refuses
+# indirect draws whose indices must be rewritten (8-bit, quads, fans, loops, the provoking
+# vertex), and reads the vertex count of draws GPU work wrote (EDEN_NX2_INDIRECT_DRAWS) on the
+# CPU, as before. By default kernels pack the arguments (draws past the count draw no instances),
+# rewrite each draw's indices sized from its arguments, and build the plain draws' arguments.
+#EDEN_NX2_METAL_GPU_INDIRECT=0
+
+# Metal renderer: 0 refuses DrawTexture, as before. By default it is a scaled blit of the
+# texture's rectangle into colour target 0, filtered as its sampler's magnification filter.
+#EDEN_NX2_METAL_DRAW_TEXTURE=0
+
+# Metal renderer: 0 clears only the bound layer of layered targets, as before. By default a
+# clear covers the layers it names (its first layer and layer count).
+#EDEN_NX2_METAL_CLEAR_LAYERS=0
+
+# Metal renderer: 0 reads command lists the GPU wrote after a full sync and flush of their page,
+# as before. By default, as on Vulkan, the pages a dispatch or DMA copy wrote are copied after it
+# and the split's front reads the copies.
+#EDEN_NX2_METAL_LIST_COPIES=0
+
+# Metal renderer: 0 sets viewport and scissor 0 only, as before. By default a draw whose vertex
+# program writes the viewport index gets all 16.
+#EDEN_NX2_METAL_VIEWPORTS=0
+
+# Metal renderer: 0 fills every triangle, as before. By default triangles whose drawn faces are
+# in line polygon mode are drawn as their edges (Metal's line fill mode; it has no point mode,
+# and one mode for both faces).
+#EDEN_NX2_METAL_FILL_LINES=0
+
+# Metal renderer: 0 ignores the base vertex of indexed tessellated draws, as before. By default
+# it is added to their indices.
+#EDEN_NX2_METAL_TESS_BASE_VERTEX=0
 
 # Either renderer: 0 makes the GPU thread's front wait for the GPU and read a compute dispatch's
 # size the GPU wrote (Ocarina of Time's light tiles, once a frame). By default it passes
