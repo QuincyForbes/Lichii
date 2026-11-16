@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 
 #include "common/logging.h"
@@ -186,6 +188,12 @@ u64 DeviceMemoryBudget(const Device& device) {
 
 u32 DeviceAppleFamily(const Device& device) {
     return device.AppleFamily();
+}
+
+void InAutoreleasePool(const std::function<void()>& work) {
+    @autoreleasepool {
+        work();
+    }
 }
 
 bool IsConverted(const Device& device, PixelFormat format) {
@@ -430,7 +438,9 @@ Object CreateComputeState(const Device& device, MTLComputePipelineDescriptor* de
         archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
     const auto start = std::chrono::steady_clock::now();
     id<MTLComputePipelineState> state = nil;
+    std::shared_lock<std::shared_mutex> building;
     if (binary != nil) {
+        building = std::shared_lock{archive->BuildMutex()};
         descriptor.binaryArchives = @[ binary ];
         state = [device.GetDevice()
             newComputePipelineStateWithDescriptor:descriptor
@@ -446,6 +456,9 @@ Object CreateComputeState(const Device& device, MTLComputePipelineDescriptor* de
                                                                reflection:nil
                                                                     error:&ns_error];
     }
+    if (building.owns_lock()) {
+        building.unlock();
+    }
     if (state == nil) {
         error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
         return {};
@@ -455,8 +468,12 @@ Object CreateComputeState(const Device& device, MTLComputePipelineDescriptor* de
                                                      std::chrono::steady_clock::now() - start)
                                                      .count()));
         if (!hit) {
-            archive->NoteAdded([binary addComputePipelineFunctionsWithDescriptor:descriptor
-                                                                           error:nil]);
+            BOOL added = NO;
+            {
+                std::unique_lock adding{archive->BuildMutex()};
+                added = [binary addComputePipelineFunctionsWithDescriptor:descriptor error:nil];
+            }
+            archive->NoteAdded(added);
         }
     }
     return Retain(state);

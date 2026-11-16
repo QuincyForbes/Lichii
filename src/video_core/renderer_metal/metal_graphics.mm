@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <mutex>
+#include <shared_mutex>
 
 #import <Metal/Metal.h>
 #include <TargetConditionals.h>
@@ -426,7 +428,9 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
         archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
     const auto start = std::chrono::steady_clock::now();
     id<MTLRenderPipelineState> state = nil;
+    std::shared_lock<std::shared_mutex> building;
     if (binary != nil) {
+        building = std::shared_lock{archive->BuildMutex()};
         descriptor.binaryArchives = @[ binary ];
         state = [device.GetDevice() newRenderPipelineStateWithDescriptor:descriptor
                                                                  options:
@@ -440,6 +444,9 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
         state = [device.GetDevice() newRenderPipelineStateWithDescriptor:descriptor
                                                                     error:&ns_error];
     }
+    if (building.owns_lock()) {
+        building.unlock();
+    }
     if (state == nil) {
         error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
     }
@@ -448,8 +455,12 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
                                                      std::chrono::steady_clock::now() - start)
                                                      .count()));
         if (!hit) {
-            archive->NoteAdded([binary addRenderPipelineFunctionsWithDescriptor:descriptor
-                                                                          error:nil]);
+            BOOL added = NO;
+            {
+                std::unique_lock adding{archive->BuildMutex()};
+                added = [binary addRenderPipelineFunctionsWithDescriptor:descriptor error:nil];
+            }
+            archive->NoteAdded(added);
         }
     }
     return Retain(state);

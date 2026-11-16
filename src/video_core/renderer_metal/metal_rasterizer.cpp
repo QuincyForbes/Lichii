@@ -947,7 +947,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         return false;
     }
     const auto absent = [&](size_t index) {
-        return programs[index] == nullptr || programs[index]->msl.empty();
+        return programs[index] == nullptr || programs[index]->entry_point.empty();
     };
     const auto& regs = maxwell3d->regs;
     const Maxwell::PrimitiveTopology topology =
@@ -2634,11 +2634,12 @@ void RasterizerMetal::TickFrame() {
         buffer_cache.TickFrame();
     }
     staging_pool.TickFrame();
-    // New pipelines reach the archive file once a minute (and when the game stops).
+    // New pipelines reach the archive file and the used list once a minute (and when the game
+    // stops).
     const auto now = std::chrono::steady_clock::now();
     if (now - archive_saved > std::chrono::minutes{1}) {
         archive_saved = now;
-        pipeline_cache.Archive().Save();
+        pipeline_cache.SaveFiles();
     }
     // The frame threads' deadlines follow the frames presented (EDEN_NX2_APPLE_FRAME_DEADLINE).
     Common::FrameDeadline::SetPeriodNs(static_cast<u64>((std::max)(
@@ -2836,9 +2837,9 @@ void RasterizerMetal::InlineToMemory(GPUVAddr address, size_t copy_size,
     pipeline_cache.InvalidateRegion(*cpu_addr, copy_size);
 }
 
-void RasterizerMetal::LoadDiskResources(u64 title_id, std::stop_token,
-                                        const VideoCore::DiskResourceLoadCallback&) {
-    pipeline_cache.OpenArchive(title_id);
+void RasterizerMetal::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+                                        const VideoCore::DiskResourceLoadCallback& callback) {
+    pipeline_cache.LoadDiskResources(title_id, stop_loading, callback);
     archive_saved = std::chrono::steady_clock::now();
 }
 

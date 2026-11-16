@@ -241,7 +241,9 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// (EDEN_NX2_METAL_FENCE_IDLE=0). "metal_staging_plain": the Metal renderer's staging buffers
 /// have no bounds, as before (EDEN_NX2_METAL_STAGING_BOUND=0). "metal_network_runs": on the Metal
 /// renderer Ocarina of Time's anti-aliasing network runs also with anti-aliasing at No
-/// sharpening, as before (EDEN_NX2_METAL_NETWORK_BYPASS=0).
+/// sharpening, as before (EDEN_NX2_METAL_NETWORK_BYPASS=0). "metal_prebuild_off": the Metal
+/// renderer records no pipelines and builds none before play, as before
+/// (EDEN_NX2_METAL_PIPELINE_FILE=0).
 /// "pipeline_holds_old": the pipeline build a draw waits for stays queued on the builder pool, as
 /// before (EDEN_NX2_PIPELINE_HOLD_BOOST=0). "pipeline_list_old": the used pipelines list is
 /// written only on a first use 15 s after the last save and at shutdown, as before

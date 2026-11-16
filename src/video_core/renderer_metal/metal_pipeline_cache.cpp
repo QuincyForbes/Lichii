@@ -1,8 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <fstream>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <utility>
+
+#include <boost/container/static_vector.hpp>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -11,6 +19,7 @@
 #include "common/cityhash.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/thread_worker.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
@@ -29,6 +38,15 @@ constexpr bool TranslateForIos = true;
 #else
 constexpr bool TranslateForIos = false;
 #endif
+
+constexpr size_t MaxPrograms = 6;
+
+/// The MSL of a built function is not read again (EDEN_NX2_METAL_PIPELINE_FILE=0 keeps it).
+void ReleaseSource(StageProgram& program) {
+    if (PipelineFiles::Mode() != 0) {
+        std::string{}.swap(program.msl);
+    }
+}
 
 } // Anonymous namespace
 
@@ -71,6 +89,7 @@ void* GraphicsPipeline::VertexKernelState(const Device& device, size_t variant,
             }
             return nullptr;
         }
+        ReleaseSource(program);
     }
     const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(layout.attributes.data()),
                                         sizeof(layout.attributes)) ^
@@ -104,6 +123,7 @@ void* GraphicsPipeline::KernelState(const Device& device, MeshKernel& kernel) {
         program.library ? CreateFunction(program.library.Get(), program.entry_point) : Object{};
     if (program.function) {
         kernel.state = CreateComputePipelineState(device, program.function.Get(), error, archive);
+        ReleaseSource(program);
     }
     if (!kernel.state) {
         kernel.failed = true;
@@ -118,7 +138,7 @@ void* GraphicsPipeline::KernelState(const Device& device, MeshKernel& kernel) {
 
 bool GraphicsPipeline::BuildFunctions(const Device& device) {
     for (StageProgram* const stage : {&vertex, &fragment}) {
-        if (stage->function || stage->msl.empty()) {
+        if (stage->function || stage->entry_point.empty()) {
             continue;
         }
         if (stage->build_failed) {
@@ -137,6 +157,7 @@ bool GraphicsPipeline::BuildFunctions(const Device& device) {
             }
             return false;
         }
+        ReleaseSource(*stage);
     }
     return true;
 }
@@ -162,6 +183,9 @@ void* GraphicsPipeline::RenderState(const Device& device, RenderPipelineDesc& de
                             "Metal: render pipeline {:016x} refused: {}; fragment {:016x}, {}",
                             key.unique_hashes[1], error, key.unique_hashes[5], Describe(desc));
             }
+        } else if (recorder != nullptr) {
+            // Only states Metal made are kept: boot never asks for one it has not seen made.
+            recorder->RecordState(key, desc);
         }
     }
     return it->second.Get();
@@ -180,6 +204,7 @@ void* ComputePipeline::State(const Device& device) {
         program.library ? CreateFunction(program.library.Get(), program.entry_point) : Object{};
     if (program.function) {
         state = CreateComputePipelineState(device, program.function.Get(), error, archive);
+        ReleaseSource(program);
     }
     if (!state) {
         failed = true;
@@ -197,7 +222,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory,
     : VideoCommon::ShaderCache{device_memory}, device{device_},
       translator{TranslateForIos, DeviceAppleFamily(device_)} {}
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    files.SaveUsed();
+}
 
 void PipelineCache::OpenArchive(u64 title_id) {
     if (title_id == 0) {
@@ -205,6 +232,192 @@ void PipelineCache::OpenArchive(u64 title_id) {
     }
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
     archive.Open(device, shader_dir / fmt::format("{:016x}", title_id) / "metal_pipelines.bin");
+}
+
+void PipelineCache::SaveFiles() {
+    archive.Save();
+    files.SaveUsed();
+}
+
+void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+                                      const VideoCore::DiskResourceLoadCallback& callback) {
+    OpenArchive(title_id);
+    if (title_id == 0 || PipelineFiles::Mode() == 0) {
+        return;
+    }
+    const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
+    files.Open(shader_dir / fmt::format("{:016x}", title_id));
+    if (!files.IsOpen()) {
+        return;
+    }
+    // A boot build that never finished (Metal killed the process in it) is not tried again at
+    // once: this run reads the records only, the next one builds again.
+    const bool build = files.BeginBoot();
+    if (!build) {
+        LOG_WARNING(Render_Metal, "Metal: the last boot build of pipelines did not finish; "
+                                  "nothing is built ahead in this run");
+    }
+    std::unordered_map<GraphicsPipelineKey, std::vector<RenderPipelineDesc>> states;
+    if (build) {
+        for (const PipelineFiles::StateRecord& record : files.LoadStates()) {
+            states[record.key].push_back(record.desc);
+        }
+    }
+    struct {
+        std::mutex mutex;
+        size_t total{};
+        size_t built{};
+        size_t graphics{};
+        size_t compute{};
+        size_t render_states{};
+        size_t refused{};
+        bool has_loaded{};
+    } state;
+    size_t unlisted = 0;
+    const size_t num_workers = (std::max)(std::thread::hardware_concurrency(), 2U) - 1;
+    const u32 apple_family = DeviceAppleFamily(device);
+    const auto start = std::chrono::steady_clock::now();
+    {
+        Common::StatefulThreadWorker<PipelineTranslator> workers{
+            build ? num_workers : 0, "MetalPipelines",
+            [apple_family] { return PipelineTranslator{TranslateForIos, apple_family}; }};
+        const auto finish = [&state, &callback] {
+            ++state.built;
+            if (state.has_loaded && callback) {
+                callback(VideoCore::LoadCallbackStage::Build, state.built, state.total);
+            }
+        };
+        const auto load_compute = [&](std::ifstream& file, VideoCommon::FileEnvironment env) {
+            ComputePipelineKey key;
+            file.read(reinterpret_cast<char*>(&key), sizeof(key));
+            if (!disk_compute.insert(key).second || !build) {
+                return;
+            }
+            {
+                std::scoped_lock lock{state.mutex};
+                ++state.total;
+            }
+            workers.QueueWork([this, key, env_ = std::move(env), &state, &finish,
+                               &stop_loading](PipelineTranslator* worker) mutable {
+                if (stop_loading.stop_requested()) {
+                    return;
+                }
+                std::unique_ptr<ComputePipeline> pipeline;
+                InAutoreleasePool([&] {
+                    std::optional<StageProgram> program = worker->Compute(key.unique_hash, env_);
+                    if (!program) {
+                        return;
+                    }
+                    pipeline = std::make_unique<ComputePipeline>(key, std::move(*program));
+                    pipeline->SetArchive(&archive);
+                    static_cast<void>(pipeline->State(device));
+                });
+                std::scoped_lock lock{state.mutex};
+                if (pipeline) {
+                    compute_cache.insert_or_assign(key, std::move(pipeline));
+                    ++state.compute;
+                } else {
+                    ++state.refused;
+                }
+                finish();
+            });
+        };
+        const auto load_graphics = [&](std::ifstream& file,
+                                       std::vector<VideoCommon::FileEnvironment> envs) {
+            GraphicsPipelineKey key;
+            file.read(reinterpret_cast<char*>(&key), sizeof(key));
+            if (!disk_graphics.insert(key).second || !build || envs.size() > MaxPrograms) {
+                return;
+            }
+            if (!files.BuildAtBoot(key.Hash())) {
+                ++unlisted;
+                return;
+            }
+            const auto found = states.find(key);
+            const std::vector<RenderPipelineDesc>* const descs =
+                found != states.end() ? &found->second : nullptr;
+            {
+                std::scoped_lock lock{state.mutex};
+                ++state.total;
+            }
+            workers.QueueWork([this, key, envs_ = std::move(envs), descs, &state, &finish,
+                               &stop_loading](PipelineTranslator* worker) mutable {
+                if (stop_loading.stop_requested()) {
+                    return;
+                }
+                std::unique_ptr<GraphicsPipeline> pipeline;
+                size_t made = 0;
+                InAutoreleasePool([&] {
+                    boost::container::static_vector<Shader::Environment*, MaxPrograms> env_ptrs;
+                    for (VideoCommon::FileEnvironment& env : envs_) {
+                        env_ptrs.push_back(&env);
+                    }
+                    std::optional<TranslatedPipeline> translated =
+                        worker->Graphics(key, {env_ptrs.data(), env_ptrs.size()});
+                    if (!translated) {
+                        return;
+                    }
+                    pipeline = std::make_unique<GraphicsPipeline>(
+                        key, std::move(translated->vertex), std::move(translated->fragment),
+                        std::move(translated->mesh), std::move(translated->tessellation));
+                    pipeline->SetArchive(&archive);
+                    if (!pipeline->BuildFunctions(device)) {
+                        return;
+                    }
+                    if (MeshEmulation* const mesh = pipeline->Mesh()) {
+                        static_cast<void>(pipeline->KernelState(device, mesh->first));
+                        if (mesh->has_task) {
+                            static_cast<void>(pipeline->KernelState(device, mesh->mesh));
+                            static_cast<void>(pipeline->KernelState(device, mesh->distribution));
+                        }
+                    }
+                    if (Tessellation* const tess = pipeline->Tess()) {
+                        static_cast<void>(pipeline->KernelState(device, tess->control));
+                    }
+                    if (descs == nullptr) {
+                        return;
+                    }
+                    for (RenderPipelineDesc desc : *descs) {
+                        made += pipeline->RenderState(device, desc) != nullptr ? 1 : 0;
+                    }
+                });
+                std::scoped_lock lock{state.mutex};
+                if (pipeline) {
+                    // The states made from here on are new ones: they go to the states file.
+                    pipeline->SetRecorder(&files);
+                    graphics_cache.insert_or_assign(key, std::move(pipeline));
+                    ++state.graphics;
+                    state.render_states += made;
+                } else {
+                    ++state.refused;
+                }
+                finish();
+            });
+        };
+        VideoCommon::LoadPipelines(stop_loading, files.Records(), PipelineFiles::RecordsVersion,
+                                   load_compute, load_graphics);
+        {
+            std::scoped_lock lock{state.mutex};
+            if (callback) {
+                callback(VideoCore::LoadCallbackStage::Build, 0, state.total);
+            }
+            state.has_loaded = true;
+        }
+        workers.WaitForRequests(stop_loading);
+    }
+    if (!build) {
+        return;
+    }
+    files.EndBoot();
+    const PipelineArchive::Counts counts = archive.Totals();
+    LOG_INFO(Render_Metal,
+             "Metal: boot pipelines: {} of {} built ({} graphics with {} render states, {} "
+             "compute, {} not made) in {:.1f} s on {} threads; {} recorded but not on the used "
+             "list; archive {} hits, {} misses",
+             state.graphics + state.compute, state.total, state.graphics, state.render_states,
+             state.compute, state.refused,
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
+             num_workers, unlisted, counts.hits, counts.misses);
 }
 
 std::array<u64, 3> PipelineCache::TakeCounts() noexcept {
@@ -229,11 +442,14 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         it->second ? ++graphics_made : ++refused;
         if (it->second) {
             it->second->SetArchive(&archive);
+            it->second->SetRecorder(&files);
         }
     }
     current_pipeline = it->second.get();
     if (current_pipeline == nullptr) {
         refusal = NoteRefusal(graphics_key.Hash());
+    } else if (!current_pipeline->MarkUsed()) {
+        files.NoteUsed(graphics_key.Hash());
     }
     return current_pipeline;
 }
@@ -260,6 +476,8 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     }
     if (!it->second) {
         refusal = NoteRefusal(key.Hash());
+    } else if (!it->second->MarkUsed()) {
+        files.NoteUsed(key.Hash());
     }
     return it->second.get();
 }
@@ -271,6 +489,19 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
         translator.Graphics(graphics_key, environments.Span());
     if (!translated) {
         return nullptr;
+    }
+    if (files.IsOpen() && disk_graphics.insert(graphics_key).second) {
+        files.Queue([this, key = graphics_key, envs = environments.envs] {
+            boost::container::static_vector<const VideoCommon::GenericEnvironment*, MaxPrograms>
+                env_ptrs;
+            for (size_t index = 0; index < MaxPrograms; ++index) {
+                if (key.unique_hashes[index] != 0) {
+                    env_ptrs.push_back(&envs[index]);
+                }
+            }
+            VideoCommon::SerializePipeline(key, env_ptrs, files.Records(),
+                                           PipelineFiles::RecordsVersion);
+        });
     }
     return std::make_unique<GraphicsPipeline>(
         graphics_key, std::move(translated->vertex), std::move(translated->fragment),
@@ -287,6 +518,13 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     std::optional<StageProgram> program = translator.Compute(key.unique_hash, env);
     if (!program) {
         return nullptr;
+    }
+    if (files.IsOpen() && disk_compute.insert(key).second) {
+        files.Queue([this, key, stored = std::move(env)] {
+            VideoCommon::SerializePipeline(
+                key, std::array<const VideoCommon::GenericEnvironment*, 1>{&stored},
+                files.Records(), PipelineFiles::RecordsVersion);
+        });
     }
     return std::make_unique<ComputePipeline>(key, std::move(*program));
 }

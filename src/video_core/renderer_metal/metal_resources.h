@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -71,6 +72,9 @@ struct FormatInfo {
 
 /// Device::AppleFamily for plain C++.
 [[nodiscard]] u32 DeviceAppleFamily(const Device& device);
+
+/// Runs work inside an autorelease pool: threads of plain C++ that make Metal objects have none.
+void InAutoreleasePool(const std::function<void()>& work);
 
 /// The host format of a guest format. `converted` images hold the CPU-decoded data instead
 /// (RGBA8 / R8 / RG8 / RGBA16F, VideoCommon::ConvertImage).

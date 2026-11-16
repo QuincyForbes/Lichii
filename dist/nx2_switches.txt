@@ -272,6 +272,17 @@ EDEN_NX2_FENCE_BATCH=1
 # image, as on Vulkan (docs/nx2/oot-network-bypass.md).
 #EDEN_NX2_METAL_NETWORK_BYPASS=0
 
+# Metal renderer: 0 writes no pipeline files and builds nothing before play, as before: every
+# program is translated and compiled on the draw's thread at its first use in each run, and its
+# MSL text is kept for the session. By default each pipeline a run makes is recorded in the
+# game's shader directory (metal.fork-v1.bin: its programs, as Vulkan's cache; metal_states.bin:
+# the render states Metal made from it; metal_used.bin: which pipelines the last runs used), and
+# the next boot translates and builds them on worker threads (the pipeline archive then gives
+# the GPU code), the pipelines used in the last 8 runs only once a used list exists. The MSL
+# text is freed once its function is built. 2 builds every recorded pipeline at boot. A boot
+# build that did not finish (the process died in it) is skipped by the next run.
+#EDEN_NX2_METAL_PIPELINE_FILE=0
+
 # Either renderer: 0 makes the GPU thread's front wait for the GPU and read a compute dispatch's
 # size the GPU wrote (Ocarina of Time's light tiles, once a frame). By default it passes
 # placeholders on; the dispatch takes its size from the GPU's buffer, and the copy of the size

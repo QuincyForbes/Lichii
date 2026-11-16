@@ -22,6 +22,7 @@
 #include <span>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -42,6 +43,7 @@
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
+#include "video_core/renderer_metal/metal_pipeline_files.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
@@ -2561,6 +2563,133 @@ int RunStagingBound() {
     return passed ? 0 : 1;
 }
 
+/// The pipeline files (EDEN_NX2_METAL_PIPELINE_FILE): render states and the used list written
+/// and read back, the boot marker of a build that never finished, and render pipelines built on
+/// several threads against one archive (the boot build), then again from the written archive.
+int RunPipelineFiles() {
+    Metal::Device device;
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, QuadSource, error);
+    const Metal::Object vertex =
+        library ? Metal::CreateFunction(library.Get(), "quad_vertex") : Metal::Object{};
+    const Metal::Object fragment =
+        library ? Metal::CreateFunction(library.Get(), "quad_fragment") : Metal::Object{};
+    if (!vertex || !fragment) {
+        std::printf("metal-smoke: FAIL pipeline files shaders: %s\n", error.c_str());
+        return 1;
+    }
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / "lichii-metal-smoke" / "pipeline-files";
+    std::error_code ec;
+    std::filesystem::remove_all(directory, ec);
+    constexpr size_t Variants = 8;
+    std::vector<Metal::RenderPipelineDesc> descs;
+    for (size_t index = 0; index < Variants; ++index) {
+        auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+        desc.vertex_function = vertex.Get();
+        desc.fragment_function = fragment.Get();
+        desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+        desc.blend[0].write_mask = static_cast<uint32_t>(index + 1);
+        desc.samples = 1;
+        desc.topology_class = 2;
+        desc.rasterize = 1;
+        desc.attributes[0] = {1, 0, 0, Metal::Maxwell::VertexAttribute::Type::Float,
+                              Metal::Maxwell::VertexAttribute::Size::Size_R32_G32};
+        desc.streams[0] = {1, 8, 0};
+        descs.push_back(desc);
+    }
+    Metal::GraphicsPipelineKey key{};
+    key.unique_hashes[1] = 0x1111;
+    key.unique_hashes[5] = 0x5555;
+    size_t states_read = 0;
+    bool functions_cleared = true;
+    bool boot_marked = false;
+    bool listed = false;
+    bool unlisted = false;
+    bool rebooted = false;
+    {
+        Metal::PipelineFiles files;
+        files.Open(directory);
+        if (!files.IsOpen()) {
+            std::printf("metal-smoke: FAIL pipeline files: not opened\n");
+            return 1;
+        }
+        boot_marked = files.BeginBoot();
+        for (const Metal::RenderPipelineDesc& desc : descs) {
+            files.RecordState(key, desc);
+            files.RecordState(key, desc);
+        }
+        for (u64 hash = 1; hash <= Metal::PipelineFiles::MinimumUsed; ++hash) {
+            files.NoteUsed(hash);
+        }
+        files.SaveUsed();
+        files.Wait();
+    }
+    {
+        Metal::PipelineFiles files;
+        files.Open(directory);
+        // The first boot was never ended: this one must not build.
+        rebooted = !files.BeginBoot();
+        const auto states = files.LoadStates();
+        states_read = states.size();
+        for (const auto& state : states) {
+            functions_cleared = functions_cleared && state.desc.vertex_function == nullptr &&
+                                state.desc.fragment_function == nullptr && state.key == key;
+        }
+        listed = files.BuildAtBoot(1) && files.BuildAtBoot(Metal::PipelineFiles::MinimumUsed);
+        unlisted = !files.BuildAtBoot(Metal::PipelineFiles::MinimumUsed + 1);
+    }
+    const std::filesystem::path archive_path = directory / "metal_pipelines.bin";
+    const auto build_all = [&](Metal::PipelineArchive& archive) {
+        std::array<bool, Variants> built{};
+        std::vector<std::thread> threads;
+        for (size_t index = 0; index < Variants; ++index) {
+            threads.emplace_back([&, index] {
+                Metal::InAutoreleasePool([&] {
+                    std::string thread_error;
+                    built[index] = static_cast<bool>(Metal::CreateRenderPipelineState(
+                        device, descs[index], thread_error, &archive));
+                });
+            });
+        }
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
+        return std::ranges::all_of(built, [](bool value) { return value; });
+    };
+    Metal::PipelineArchive::Counts first{};
+    bool first_built = false;
+    {
+        Metal::PipelineArchive archive;
+        if (!archive.Open(device, archive_path)) {
+            std::printf("metal-smoke: SKIP pipeline files: no MTLBinaryArchive on this device\n");
+            return 0;
+        }
+        first_built = build_all(archive);
+        first = archive.Totals();
+        archive.Save();
+    }
+    Metal::PipelineArchive reopened;
+    const bool second_built = reopened.Open(device, archive_path) && build_all(reopened);
+    const Metal::PipelineArchive::Counts second = reopened.Totals();
+    const bool passed = boot_marked && rebooted && states_read == Variants && functions_cleared &&
+                        listed && unlisted && first_built && second_built &&
+                        first.misses == Variants && first.added == Variants &&
+                        second.hits == Variants && second.misses == 0;
+    std::printf("metal-smoke: pipeline files: %zu of %zu render states read back (written twice "
+                "each), functions cleared %s; used list %s/%s; unfinished boot seen %s; %zu "
+                "pipelines on %zu threads: first %llu misses, %llu added, second %llu hits, %llu "
+                "misses: %s\n",
+                states_read, Variants, functions_cleared ? "yes" : "no",
+                listed ? "listed" : "missing", unlisted ? "others not" : "others too",
+                rebooted ? "yes" : "no", Variants, Variants,
+                static_cast<unsigned long long>(first.misses),
+                static_cast<unsigned long long>(first.added),
+                static_cast<unsigned long long>(second.hits),
+                static_cast<unsigned long long>(second.misses), passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main(int argc, char** argv) {
@@ -2579,7 +2708,7 @@ int main(int argc, char** argv) {
                                  RunDepthBlit, RunTessellation, RunDepthStencilBlit,
                                  RunPipelineCheck, RunDeviceMsl, RunBlockCopy, RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
-                                 RunStagingBound, SmokeProbe::RunAll}) {
+                                 RunStagingBound, RunPipelineFiles, SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }

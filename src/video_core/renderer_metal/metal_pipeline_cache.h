@@ -14,13 +14,18 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
 #include "common/container/unordered_map.h"
+#include "common/polyfill_thread.h"
+#include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_metal/metal_archive.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_object.h"
+#include "video_core/renderer_metal/metal_pipeline_files.h"
 #include "video_core/renderer_metal/metal_pipeline_translate.h"
 #include "video_core/shader_cache.h"
 
@@ -73,6 +78,16 @@ public:
         archive = archive_;
     }
 
+    /// Where the render states Metal makes are written for the next boot, or null.
+    void SetRecorder(PipelineFiles* recorder_) noexcept {
+        recorder = recorder_;
+    }
+
+    /// Marks the pipeline as used by this run; whether it was already.
+    bool MarkUsed() noexcept {
+        return std::exchange(used, true);
+    }
+
     /// The MTLRenderPipelineState for these targets, blending and vertex layout (desc's function
     /// fields are filled in here), made on first use; null when Metal refuses it.
     [[nodiscard]] void* RenderState(const Device& device, RenderPipelineDesc& desc);
@@ -84,6 +99,8 @@ private:
     std::optional<MeshEmulation> mesh;
     std::optional<Tessellation> tessellation;
     PipelineArchive* archive{};
+    PipelineFiles* recorder{};
+    bool used{};
     ::Common::unordered_map<u64, Object> render_states;
     /// Vertex kernel states by variant and vertex layout.
     ::Common::unordered_map<u64, Object> vertex_kernel_states;
@@ -105,6 +122,10 @@ public:
         archive = archive_;
     }
 
+    bool MarkUsed() noexcept {
+        return std::exchange(used, true);
+    }
+
     /// The MTLComputePipelineState, made on first use; null (logged once) when it fails.
     [[nodiscard]] void* State(const Device& device);
 
@@ -114,6 +135,7 @@ private:
     Object state;
     PipelineArchive* archive{};
     bool failed{};
+    bool used{};
 };
 
 class PipelineCache : public VideoCommon::ShaderCache {
@@ -134,6 +156,14 @@ public:
 
     /// Opens the game's pipeline archive (EDEN_NX2_METAL_ARCHIVE=0: none).
     void OpenArchive(u64 title_id);
+
+    /// Opens the archive and builds the pipelines earlier runs recorded, with the render states
+    /// they were drawn with, on worker threads (EDEN_NX2_METAL_PIPELINE_FILE=0: archive only).
+    void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+                           const VideoCore::DiskResourceLoadCallback& callback);
+
+    /// Writes the archive and the used pipelines list when they changed.
+    void SaveFiles();
 
     [[nodiscard]] PipelineArchive& Archive() noexcept {
         return archive;
@@ -165,6 +195,10 @@ private:
     ::Common::unordered_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_cache;
 
     PipelineArchive archive;
+    PipelineFiles files;
+    /// The pipelines the records file holds.
+    std::unordered_set<GraphicsPipelineKey> disk_graphics;
+    std::unordered_set<ComputePipelineKey> disk_compute;
 
     /// By key hash; the texts stay where they are (refusal points into them).
     std::map<u64, std::string> refusal_causes;
