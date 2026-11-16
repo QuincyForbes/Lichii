@@ -30,7 +30,7 @@
 namespace Common {
 void SetCurrentThreadPriority(ThreadPriority) {}
 void SetCurrentThreadName(const char*) {}
-void SetCurrentThreadToPerformanceCores() {}
+void SetCurrentThreadToPerformanceCores(bool) {}
 void SetCurrentThreadToEfficiencyCores() {}
 void SetCurrentThreadToBackgroundWork() {}
 void SetCurrentThreadToAllCores() {}
