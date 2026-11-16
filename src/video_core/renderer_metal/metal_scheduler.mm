@@ -1553,6 +1553,10 @@ void Scheduler::SetVisibility(std::optional<u32> slot) {
     }
 }
 
+BufferHandle Scheduler::VisibilityBuffer() const noexcept {
+    return (__bridge void*)impl->visibility;
+}
+
 u64* Scheduler::VisibilityResults() noexcept {
     return static_cast<u64*>(impl->visibility.contents);
 }
@@ -1583,21 +1587,53 @@ void Scheduler::SetDrawState(const DrawState& state) {
     if (state.depth_stencil != nullptr && changed(last.depth_stencil != state.depth_stencil)) {
         [encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)state.depth_stencil];
     }
-    if (changed(last.viewport != state.viewport)) {
-        [encoder setViewport:MTLViewport{state.viewport.x, state.viewport.y, state.viewport.width,
-                                         state.viewport.height, state.viewport.znear,
-                                         state.viewport.zfar}];
+    const auto to_viewport = [](const Viewport& viewport) {
+        return MTLViewport{viewport.x,      viewport.y,     viewport.width,
+                           viewport.height, viewport.znear, viewport.zfar};
+    };
+    // Metal rejects scissors past the attachments.
+    const u32 target_width = std::clamp(impl->render_targets.width, 1U, MaxRenderTargetSize);
+    const u32 target_height = std::clamp(impl->render_targets.height, 1U, MaxRenderTargetSize);
+    const auto to_scissor = [&](const Scissor& scissor) {
+        const u32 x = (std::min)(scissor.x, target_width - 1);
+        const u32 y = (std::min)(scissor.y, target_height - 1);
+        const u32 width = (std::min)(scissor.width, target_width - x);
+        const u32 height = (std::min)(scissor.height, target_height - y);
+        return MTLScissorRect{x, y, (std::max)(width, 1U), (std::max)(height, 1U)};
+    };
+    if (state.viewport_count > 1) {
+        // A program writes the viewport index: all of them.
+        const size_t count = (std::min)(size_t{state.viewport_count}, size_t{16});
+        if (changed(last.viewport_count != state.viewport_count ||
+                    last.viewport != state.viewport ||
+                    last.more_viewports != state.more_viewports)) {
+            std::array<MTLViewport, 16> viewports{};
+            viewports[0] = to_viewport(state.viewport);
+            for (size_t index = 1; index < count; ++index) {
+                viewports[index] = to_viewport(state.more_viewports[index - 1]);
+            }
+            [encoder setViewports:viewports.data() count:count];
+        }
+        if (changed(last.viewport_count != state.viewport_count ||
+                    last.scissor != state.scissor || last.more_scissors != state.more_scissors)) {
+            std::array<MTLScissorRect, 16> scissors{};
+            scissors[0] = to_scissor(state.scissor);
+            for (size_t index = 1; index < count; ++index) {
+                scissors[index] = to_scissor(state.more_scissors[index - 1]);
+            }
+            [encoder setScissorRects:scissors.data() count:count];
+        }
+    } else {
+        if (changed(last.viewport_count != 1 || last.viewport != state.viewport)) {
+            [encoder setViewport:to_viewport(state.viewport)];
+        }
+        if (changed(last.viewport_count != 1 || last.scissor != state.scissor)) {
+            [encoder setScissorRect:to_scissor(state.scissor)];
+        }
     }
-    if (changed(last.scissor != state.scissor)) {
-        // Metal rejects scissors past the attachments.
-        const u32 target_width = std::clamp(impl->render_targets.width, 1U, MaxRenderTargetSize);
-        const u32 target_height = std::clamp(impl->render_targets.height, 1U, MaxRenderTargetSize);
-        const u32 x = (std::min)(state.scissor.x, target_width - 1);
-        const u32 y = (std::min)(state.scissor.y, target_height - 1);
-        const u32 width = (std::min)(state.scissor.width, target_width - x);
-        const u32 height = (std::min)(state.scissor.height, target_height - y);
-        [encoder
-            setScissorRect:MTLScissorRect{x, y, (std::max)(width, 1U), (std::max)(height, 1U)}];
+    if (changed(last.fill_lines != state.fill_lines)) {
+        [encoder setTriangleFillMode:state.fill_lines ? MTLTriangleFillModeLines
+                                                      : MTLTriangleFillModeFill];
     }
     if (changed(last.cull_mode != state.cull_mode)) {
         [encoder setCullMode:static_cast<MTLCullMode>(state.cull_mode)];

@@ -3,9 +3,11 @@
 
 // Index lists Metal can draw: quads, quad strips, fans, polygons, line loops and adjacency
 // topologies rewritten (Metal has none of them), and 8-bit indices widened (Metal draws 16- and
-// 32-bit indices only). With `provoking_last`,
-// triangle lists and strips become lists whose triangles start with the vertex Vulkan's last
-// vertex convention takes flat inputs from (Metal takes them from the first). Plain C++, no Metal.
+// 32-bit indices only). With `provoking_last`, every line and triangle topology is written so
+// each primitive starts with the vertex Vulkan's last vertex convention takes flat inputs from
+// (Metal has no provoking vertex setting and takes them from the first): triangles as lists
+// rotated to keep their winding, lines swapped, line strips and loops backwards. Plain C++, no
+// Metal.
 
 #pragma once
 
@@ -40,8 +42,8 @@ using Topology = Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology;
 /// Writes ConvertedCount(topology, count) 32-bit indices to `out`. The guest's indices come
 /// from `source` (`index_size` bytes each), or are first, first + 1, ... when it is empty. With
 /// `restart`, an 8-bit 0xFF becomes 0xFFFFFFFF (Metal's restart value for 32-bit indices); a
-/// strip rewritten for the provoking vertex starts again after it. Returns the indices written,
-/// fewer than ConvertedCount for such a strip with restarts.
+/// strip rewritten for the provoking vertex starts again after it, the triangles across a
+/// restart written as (0, 0, 0). Returns the indices written.
 u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 first, u32 count,
             bool restart, std::span<u32> out, bool provoking_last = false) noexcept;
 
@@ -50,20 +52,27 @@ u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 f
 /// source buffer, one thread per index written.
 struct RewriteParams {
     u32 mode; ///< RewriteMode
-    u32 index_size;
+    u32 index_size; ///< 0: no source, the indices are source_offset, source_offset + 1, ...
     u32 count;
     u32 restart;
     u32 converted; ///< ConvertedCount
     u32 source_offset;
 };
 
-/// RewriteParams::mode of a topology: 0 as it is, 1 quads, 2 quad strip, 3 fan or polygon,
-/// 4 line loop; with `provoking_last` 5 triangles, 6 triangle strip (without restarts: the GPU
-/// rewrite does not find where a strip starts again); 7 lines, 8 line strip, 9 triangles and
-/// 10 triangle strip with adjacency.
-[[nodiscard]] u32 RewriteMode(Topology topology, bool provoking_last = false) noexcept;
+/// The mode of a triangle strip with restarts rewritten for the last vertex convention: kernel
+/// `rewrite_restart_strip`, one threadgroup of StripRestartThreads threads.
+constexpr u32 StripRestartMode = 7;
+constexpr u32 StripRestartThreads = 256;
 
-/// MSL of the kernel `rewrite_indices`: source bytes at buffer 0, the u32 indices at buffer 1,
+/// RewriteParams::mode of a topology: 0 as it is, 1 quads, 2 quad strip, 3 fan or polygon,
+/// 4 line loop; with `provoking_last` 5 triangles, 6 triangle strip, StripRestartMode a strip
+/// with `restart`, 8 lines, 9 line strip, 10 line loop, 11 quads, 12 quad strip, 13 fan; 14 lines,
+/// 15 line strip, 16 triangles and 17 triangle strip with adjacency.
+[[nodiscard]] u32 RewriteMode(Topology topology, bool provoking_last = false,
+                              bool restart = false) noexcept;
+
+/// MSL of the kernels `rewrite_indices` (one thread per index written) and
+/// `rewrite_restart_strip`: source bytes at buffer 0, the u32 indices at buffer 1,
 /// RewriteParams at buffer 2.
 [[nodiscard]] const char* RewriteKernelSource() noexcept;
 

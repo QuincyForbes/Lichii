@@ -338,9 +338,20 @@ public:
         return height;
     }
 
+    /// Layers of each colour target's view, and of the depth target's, from its slice on.
+    [[nodiscard]] const std::array<u32, NUM_RT>& ColorLayers() const noexcept {
+        return color_layers;
+    }
+
+    [[nodiscard]] u32 DepthLayers() const noexcept {
+        return depth_layers;
+    }
+
 private:
     std::array<Attachment, NUM_RT> colors{};
     std::array<u32, NUM_RT> color_formats{};
+    std::array<u32, NUM_RT> color_layers{};
+    u32 depth_layers{};
     Attachment depth{};
     u32 depth_format{};
     u32 samples{1};

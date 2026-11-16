@@ -148,6 +148,12 @@ struct DrawState {
     u32 stencil_front_ref{};
     u32 stencil_back_ref{};
     std::array<f32, 4> blend_color{};
+    /// Viewports and scissors 1-15 follow 0 when a program writes the viewport index: 16, else 1.
+    u8 viewport_count{1};
+    std::array<Viewport, 15> more_viewports{};
+    std::array<Scissor, 15> more_scissors{};
+    /// Triangles drawn as their edges (MTLTriangleFillModeLines).
+    bool fill_lines{};
 };
 
 /// Records Metal work in submission order on one command queue. Copies go to one blit encoder
@@ -268,6 +274,9 @@ public:
 
     /// The visibility results (one u64 per slot), readable once the GPU is done with them.
     [[nodiscard]] u64* VisibilityResults() noexcept;
+
+    /// The visibility result buffer itself, for kernels reading the results in GPU order.
+    [[nodiscard]] BufferHandle VisibilityBuffer() const noexcept;
 
     /// Changes whenever BeginRendering opens a new render encoder.
     [[nodiscard]] u64 RenderPassSerial() const noexcept;

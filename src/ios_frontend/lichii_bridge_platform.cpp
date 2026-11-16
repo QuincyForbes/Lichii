@@ -452,6 +452,50 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_METAL_VERTEX_GATHER", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment metal_vertex_plain on");
     }
+    if (lichii_platform_experiment("metal_async_off")) {
+        setenv("EDEN_NX2_METAL_ASYNC_PIPELINES", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_async_off on");
+    }
+    if (lichii_platform_experiment("metal_provoking_first")) {
+        setenv("EDEN_NX2_METAL_PROVOKING_LAST", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_provoking_first on");
+    }
+    if (lichii_platform_experiment("metal_condition_cpu")) {
+        setenv("EDEN_NX2_METAL_GPU_CONDITION", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_condition_cpu on");
+    }
+    if (lichii_platform_experiment("metal_indirect_cpu")) {
+        setenv("EDEN_NX2_METAL_GPU_INDIRECT", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_indirect_cpu on");
+    }
+    if (lichii_platform_experiment("metal_draw_texture_off")) {
+        setenv("EDEN_NX2_METAL_DRAW_TEXTURE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_draw_texture_off on");
+    }
+    if (lichii_platform_experiment("metal_clear_layers_off")) {
+        setenv("EDEN_NX2_METAL_CLEAR_LAYERS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_clear_layers_off on");
+    }
+    if (lichii_platform_experiment("metal_list_copies_off")) {
+        setenv("EDEN_NX2_METAL_LIST_COPIES", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_list_copies_off on");
+    }
+    if (lichii_platform_experiment("metal_viewports_off")) {
+        setenv("EDEN_NX2_METAL_VIEWPORTS", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_viewports_off on");
+    }
+    if (lichii_platform_experiment("metal_fill_lines_off")) {
+        setenv("EDEN_NX2_METAL_FILL_LINES", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_fill_lines_off on");
+    }
+    if (lichii_platform_experiment("metal_tess_base_off")) {
+        setenv("EDEN_NX2_METAL_TESS_BASE_VERTEX", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_tess_base_off on");
+    }
+    if (lichii_platform_experiment("metal_alpha_to_one_off")) {
+        setenv("EDEN_NX2_METAL_ALPHA_TO_ONE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_alpha_to_one_off on");
+    }
     if (lichii_platform_experiment("pipeline_holds_old")) {
         setenv("EDEN_NX2_PIPELINE_HOLD_BOOST", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment pipeline_holds_old on");

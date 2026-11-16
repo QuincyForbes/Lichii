@@ -9,8 +9,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -22,17 +25,27 @@
 #include "common/common_types.h"
 #include "common/container/unordered_map.h"
 #include "common/polyfill_thread.h"
+#include "common/thread_worker.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_metal/metal_archive.h"
+#include "video_core/renderer_metal/metal_build_job.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_object.h"
 #include "video_core/renderer_metal/metal_pipeline_files.h"
 #include "video_core/renderer_metal/metal_pipeline_translate.h"
 #include "video_core/shader_cache.h"
+#include "video_core/shader_environment.h"
 
 namespace Metal {
 
 class Device;
+
+/// EDEN_NX2_METAL_ASYNC_PIPELINES: the builder threads that translate and build pipelines first
+/// seen in a run (default logical CPUs - 1); 0 builds them on the draw's thread as before.
+[[nodiscard]] u32 AsyncPipelineThreads();
+
+/// A pipeline build handed to the builder threads (metal_build_job.h).
+using PipelineBuildJob = BuildJob<PipelineTranslator>;
 
 class GraphicsPipeline {
 public:
@@ -114,6 +127,20 @@ public:
     /// fields are filled in here), made on first use; null when Metal refuses it. While Native()
     /// is there, its mesh pipeline state; when Metal refuses that, Native() becomes null.
     [[nodiscard]] void* RenderState(const Device& device, RenderPipelineDesc& desc);
+
+    /// Fills desc's function fields; the hash render states are kept by.
+    [[nodiscard]] u64 StateHash(RenderPipelineDesc& desc) const noexcept;
+
+    /// The state made for `hash`, if one was asked for (null when Metal refused it).
+    [[nodiscard]] std::optional<void*> FindState(u64 hash) const;
+
+    /// Keeps a state made elsewhere (a builder thread) for `hash`, logged and recorded as one made
+    /// here; returns it. A refused `mesh_state` is not kept and makes Native() null.
+    void* AdoptState(u64 hash, const RenderPipelineDesc& desc, Object state,
+                     std::string_view error, bool mesh_state);
+
+    /// Native()'s functions for a mesh pipeline state, none without Native().
+    [[nodiscard]] std::optional<MeshFunctions> NativeFunctions() const noexcept;
 
 private:
     bool BuildNativeFunctions(const Device& device);
@@ -206,9 +233,84 @@ public:
         return refusal;
     }
 
+    /// Whether the last CurrentGraphicsPipeline call gave no pipeline because it is still being
+    /// built and the draw was skipped.
+    [[nodiscard]] bool Building() const noexcept {
+        return building;
+    }
+
+    /// Asked once per lookup of a pipeline or render state that is not built yet: whether the draw
+    /// may be skipped instead of waiting (the rasterizer's DrawMayBeSkipped). Unset: never.
+    void SetSkipCheck(std::function<bool()> check) {
+        skip_check = std::move(check);
+    }
+
+    /// The pipeline's render state for `desc`, built on the builder threads when it is new
+    /// (EDEN_NX2_METAL_ASYNC_PIPELINES): null and `building` while a draw that may be skipped
+    /// waits for it, else built or waited for here. Null without `building`: Metal refused it.
+    [[nodiscard]] void* RenderState(GraphicsPipeline& pipeline, RenderPipelineDesc& desc,
+                                    bool& building);
+
+    /// The 10 s "Perf Metal pipelines:" line, empty when nothing was built or waited for.
+    [[nodiscard]] std::string TakeBuildLine();
+
 private:
+    struct GraphicsBuild {
+        GraphicsPipelineKey key;
+        std::array<VideoCommon::GraphicsEnvironment, 6> envs;
+        std::unique_ptr<GraphicsPipeline> pipeline;
+        std::string cause;
+        std::chrono::steady_clock::time_point queued;
+        std::shared_ptr<PipelineBuildJob> job;
+    };
+
+    struct StateBuild {
+        RenderPipelineDesc desc;
+        std::optional<MeshFunctions> native; ///< A mesh pipeline state
+        Object state;
+        std::string error;
+        std::shared_ptr<PipelineBuildJob> job;
+    };
+
+    struct BuildStats {
+        u64 queued{};
+        u64 states_queued{};
+        u64 adopted{};
+        u64 stale{};
+        u64 skipped{};
+        u64 held{};
+        u64 held_here{};
+        u64 boosted{};
+        u64 held_ns{};
+        u64 held_max_ns{};
+        u64 ready_ns{};
+        u64 ready_max_ns{};
+    };
+
     /// Keeps the cause of the pipeline just refused for its key, and returns the key's cause.
     [[nodiscard]] std::string_view NoteRefusal(u64 key_hash);
+
+    /// The skip check's answer for this lookup.
+    [[nodiscard]] bool MayBeSkipped() const {
+        return skip_check && skip_check();
+    }
+
+    /// Waits for a job as a held draw does, counted in the build line.
+    void Hold(PipelineBuildJob& job);
+
+    /// The current key's pipeline through the builder threads (async lookups).
+    [[nodiscard]] std::unique_ptr<GraphicsPipeline> BuildInBackground(bool& pending);
+
+    /// A finished build of the current key as the cache's pipeline; null with `retry` when its
+    /// texture reads no longer match the guest's descriptors.
+    [[nodiscard]] std::unique_ptr<GraphicsPipeline> AdoptBuild(GraphicsBuild& build, bool& retry);
+
+    /// Queues the translation and build of the current key on the builder threads.
+    std::shared_ptr<GraphicsBuild> QueueGraphicsBuild();
+
+    /// The records file entry of a pipeline made from `envs` (once per key).
+    void StoreRecord(const GraphicsPipelineKey& key,
+                     const std::array<VideoCommon::GraphicsEnvironment, 6>& envs);
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 
@@ -241,6 +343,16 @@ private:
     u64 graphics_made{};
     u64 compute_made{};
     u64 refused{};
+
+    std::function<bool()> skip_check;
+    bool building{};
+    BuildStats build_stats;
+    /// Builds on the builder threads by key, until a lookup adopts them (draw's thread only).
+    ::Common::unordered_map<GraphicsPipelineKey, std::shared_ptr<GraphicsBuild>> graphics_builds;
+    /// Render states on the builder threads by pipeline and state hash (draw's thread only).
+    std::map<std::pair<const GraphicsPipeline*, u64>, std::shared_ptr<StateBuild>> state_builds;
+    /// Last: stopped before the pipelines and the archive its tasks use go.
+    std::unique_ptr<::Common::StatefulThreadWorker<PipelineTranslator>> builders;
 };
 
 } // namespace Metal

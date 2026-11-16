@@ -49,6 +49,7 @@
 #include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_rasterizer.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
+#include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/shader_handle_program.h"
 #include "video_core/textures/texture.h"
 
@@ -165,6 +166,25 @@ bool TextureReadFilter() {
     return enabled;
 }
 
+// Vulkan's experiment EDEN_NX2_INVALIDATE_BEFORE_DISPATCH=1: the collected guest CPU writes are
+// applied before every dispatch and draw (=list does it once per command list, in DmaPusher, for
+// both backends).
+bool InvalidateBeforeUse() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_INVALIDATE_BEFORE_DISPATCH");
+        return value != nullptr && value[0] != '0' && std::string_view{value} != "list";
+    }();
+    return enabled;
+}
+
+// EDEN_NX2_METAL_LIST_COPIES=0: command lists the GPU wrote are read after a full sync and flush
+// of their page, as this backend started; on, as Vulkan reads them (from copies made after the
+// dispatch or DMA copy that wrote them).
+bool ListCopiesEnabled() {
+    static const bool enabled = EnvironmentOn("EDEN_NX2_METAL_LIST_COPIES");
+    return enabled;
+}
+
 /// False when no page of the range was ever written by the GPU (no lock needed to know).
 bool MayBeGpuModified(DAddr addr, u64 size) {
     if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
@@ -181,12 +201,23 @@ bool MayBeGpuModified(DAddr addr, u64 size) {
 }
 } // Anonymous namespace
 
-AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_cache_)
-    : buffer_cache{buffer_cache_}, texture_cache{texture_cache_} {}
+AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_cache_,
+                             Scheduler& scheduler_)
+    : buffer_cache{buffer_cache_}, texture_cache{texture_cache_}, scheduler{scheduler_} {}
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
     std::scoped_lock lock{buffer_cache.mutex};
-    return buffer_cache.DMACopy(src_address, dest_address, amount);
+    if (!ListCopiesEnabled()) {
+        return buffer_cache.DMACopy(src_address, dest_address, amount);
+    }
+    // As Vulkan's: command list pages the copy writes are copied for the split's front.
+    buffer_cache.Nx2CollectListCopies(true);
+    const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
+    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
+        scheduler.Flush();
+    }
+    buffer_cache.Nx2CollectListCopies(false);
+    return copied;
 }
 
 bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
@@ -249,8 +280,9 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
       buffer_cache_runtime{device_, scheduler_, staging_pool},
       buffer_cache{device_memory_, buffer_cache_runtime}, pipeline_cache{device_memory_, device_},
       ocarina{device_, scheduler_}, ocarina_temporal{device_, scheduler_},
-      accelerate_dma{buffer_cache, texture_cache},
+      accelerate_dma{buffer_cache, texture_cache, scheduler_},
       fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_} {
+    pipeline_cache.SetSkipCheck([this] { return DrawMayBeSkipped(); });
     if (!CachePathsEnabled()) {
         LOG_WARNING(Render_Metal, "Metal: plain cache paths (EDEN_NX2_METAL_CACHE_PATHS=0)");
         return;
@@ -295,9 +327,10 @@ RasterizerMetal::~RasterizerMetal() {
 
 bool RasterizerMetal::BeginDraw(bool is_indexed, u32 instance_count) {
     auto& draw_state = maxwell3d->draw_manager.draw_state;
-    // A vertex count GPU work wrote (nx2_indirect_grid.h, EDEN_NX2_INDIRECT_DRAWS=1). Vulkan
-    // draws most of them with the count read on the GPU; here the words are always read, which
-    // waits for the GPU on this thread.
+    grid_draw = {};
+    // A vertex count GPU work wrote (nx2_indirect_grid.h, EDEN_NX2_INDIRECT_DRAWS=1). As Vulkan,
+    // a plain draw takes it on the GPU (grid_arguments, EDEN_NX2_METAL_GPU_INDIRECT); a draw
+    // whose vertices must be rewritten reads the words here, which waits for the GPU.
     if (!is_indexed && Tegra::Nx2IndirectGrid::AnyLive() &&
         Tegra::Nx2IndirectGrid::LooksLikeDrawPlaceholder(draw_state.vertex_buffer.count)) {
         const u32 count = draw_state.vertex_buffer.count;
@@ -312,13 +345,13 @@ bool RasterizerMetal::BeginDraw(bool is_indexed, u32 instance_count) {
         const bool first_placeholder =
             draw_state.vertex_buffer.first ==
             Tegra::Nx2IndirectGrid::DrawPlaceholder(count & (Tegra::Nx2IndirectGrid::Slots - 1), 1);
-        std::array<u32, 2> words{};
-        gpu_memory->ReadBlock(*source, words.data(), sizeof(words));
-        draw_state.vertex_buffer.count = words[0];
-        if (first_placeholder) {
-            draw_state.vertex_buffer.first = words[1];
+        grid_draw = GridDraw{.wanted = true, .source = *source, .first_from_gpu = first_placeholder};
+        static const bool on_gpu = EnvironmentOn("EDEN_NX2_METAL_GPU_INDIRECT");
+        if (on_gpu && draw_state.topology != Maxwell::PrimitiveTopology::Points) {
+            // Points are left to the CPU: Bananza's reset draw needs its count there.
+            return true;
         }
-        grid.draws_refused.fetch_add(1, std::memory_order_relaxed);
+        ReadGridWords();
     }
     if (PipelineCheckEnabled()) {
         // As Vulkan's Draw: past 16M vertices a first and count are what a rejected compute
@@ -334,6 +367,49 @@ bool RasterizerMetal::BeginDraw(bool is_indexed, u32 instance_count) {
         }
     }
     return !TryIndirectReset(is_indexed, instance_count);
+}
+
+void RasterizerMetal::ReadGridWords() {
+    if (!grid_draw.wanted) {
+        return;
+    }
+    auto& draw_state = maxwell3d->draw_manager.draw_state;
+    std::array<u32, 2> words{};
+    gpu_memory->ReadBlock(grid_draw.source, words.data(), sizeof(words));
+    draw_state.vertex_buffer.count = words[0];
+    if (grid_draw.first_from_gpu) {
+        draw_state.vertex_buffer.first = words[1];
+    }
+    grid_draw = {};
+    Tegra::Nx2IndirectGrid::Get().draws_refused.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool RasterizerMetal::PrepareGridDraw(bool ahead) {
+    const std::optional<DAddr> address = gpu_memory->GpuToCpuAddress(grid_draw.source);
+    if (!address) {
+        return false;
+    }
+    const auto [buffer, offset] = buffer_cache.ObtainBuffer(
+        grid_draw.source, 8, VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+        VideoCommon::ObtainBufferOperation::DoNothing);
+    if (buffer == nullptr || buffer->Handle() == nullptr) {
+        return false;
+    }
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    grid_draw.arguments = staging_pool.Stream(Indirect::PlainWords * sizeof(u32), 16);
+    const Indirect::GridParams params{
+        .instances = grid_draw.instances,
+        .first = draw_state.vertex_buffer.first,
+        .first_from_gpu = grid_draw.first_from_gpu ? 1U : 0U,
+        .base_instance = draw_state.base_instance,
+    };
+    scheduler.BeginCompute(grid_arguments_kernel.Get(), ahead);
+    scheduler.BindBuffer(ShaderStage::Compute, 0, buffer->Handle(), offset);
+    scheduler.BindBuffer(ShaderStage::Compute, 1, grid_draw.arguments.buffer,
+                         static_cast<u32>(grid_draw.arguments.offset));
+    scheduler.BindBytes(ShaderStage::Compute, 2, &params, static_cast<u32>(sizeof(params)));
+    scheduler.Dispatch({1, 1, 1}, {1, 1, 1});
+    return true;
 }
 
 bool RasterizerMetal::TryIndirectReset(bool is_indexed, u32 instance_count) {
@@ -428,6 +504,7 @@ void RasterizerMetal::FlushWork() {
 
 void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     ++draws;
+    skip_valid = false;
     // Cores waiting for a flush are served after each draw, as on Vulkan, not only when the
     // command list ends.
     SCOPE_EXIT {
@@ -435,6 +512,9 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
             gpu.TickWork();
         }
     };
+    if (InvalidateBeforeUse()) {
+        gpu.InvalidateGPUCache();
+    }
     // Deferred inline writes reach the caches before anything of theirs is used.
     gpu_memory->FlushCaching();
     FlushWork();
@@ -466,6 +546,21 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     }
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     index_rewrite = {};
+    if (grid_draw.wanted) {
+        EnsureIndexKernels();
+        // Only a plain draw takes its count on the GPU.
+        if (pipeline->IsMeshPipeline() || pipeline->Tess() != nullptr || gpu_condition.active ||
+            indirect_kernels_failed || IndexConvert::NeedsConversion(draw_state.topology) ||
+            ProvokingLastWanted(*pipeline)) {
+            ReadGridWords();
+        }
+        grid_draw.instances = instance_count;
+    }
+    if ((pipeline->IsMeshPipeline() || pipeline->Tess() != nullptr) && !ConditionHoldsOnCpu()) {
+        // Their kernels run whatever the condition: it is decided on the CPU.
+        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        return;
+    }
     if (pipeline->IsMeshPipeline()) {
         // The draw's count is its mesh workgroups (the index count for indexed draws).
         const u32 groups = is_indexed ? draw_state.index_buffer.count
@@ -497,7 +592,12 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
             Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
             return;
         }
-        if (is_indexed && draw_state.base_index != 0) {
+        // The base vertex is added to the indices (EDEN_NX2_METAL_TESS_BASE_VERTEX=0: ignored,
+        // as before).
+        static const bool tess_base = EnvironmentOn("EDEN_NX2_METAL_TESS_BASE_VERTEX");
+        if (is_indexed && tess_base) {
+            tess_draw.base_vertex = static_cast<s32>(draw_state.base_index);
+        } else if (is_indexed && draw_state.base_index != 0) {
             LOG_ONCE(warned_tess_base, "Metal: tessellated draws ignore a base vertex");
         }
         gpu_memory->FlushCaching();
@@ -525,8 +625,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     const u32 index_size =
         is_indexed ? static_cast<u32>(draw_state.index_buffer.FormatSizeInBytes()) : 0U;
     const bool restart = maxwell3d->regs.primitive_restart.enabled != 0;
-    const bool provoking_last = ProvokingLastWanted(*pipeline, is_indexed, count, index_size,
-                                                    restart);
+    const bool provoking_last = ProvokingLastWanted(*pipeline);
     const bool convert =
         IndexConvert::NeedsConversion(draw_state.topology) || u8_indices || provoking_last;
     const std::optional<u32> primitive =
@@ -559,23 +658,25 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         const GPUVAddr start = draw_state.index_buffer.StartAddress() +
                                GPUVAddr{draw_state.index_buffer.first} * index_size;
         const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(start);
-        // A strip rewritten for the provoking vertex with restarts is rewritten on the CPU (its
-        // indices are not GPU-written, or ProvokingLastWanted left it as it is).
-        const bool cpu_only = provoking_last && restart &&
-                              draw_state.topology == Maxwell::PrimitiveTopology::TriangleStrip;
         index_rewrite.wanted =
-            !cpu_only &&
-            (gpu_indices == '1' ||
-             (device_addr && buffer_cache.IsRegionGpuModified(*device_addr,
-                                                              size_t{count} * index_size)));
+            gpu_indices == '1' ||
+            (device_addr &&
+             buffer_cache.IsRegionGpuModified(*device_addr, size_t{count} * index_size));
         index_rewrite.params = {
-            .mode = IndexConvert::RewriteMode(draw_state.topology, provoking_last),
+            .mode = IndexConvert::RewriteMode(draw_state.topology, provoking_last, restart),
             .index_size = index_size,
             .count = count,
             .restart = restart ? 1U : 0U,
             .converted = converted,
             .source_offset = draw_state.index_buffer.first * index_size,
         };
+    }
+    // Under a condition decided on the GPU, its kernel goes first and the draw through arguments
+    // it can zero; else the CPU's answer.
+    const bool under_condition = gpu_condition.active && PrepareConditionRegion();
+    if (gpu_condition.active && !under_condition && !ConditionHoldsOnCpu()) {
+        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        return;
     }
     if (!PrepareDraw(*pipeline, is_indexed)) {
         NoteUnprepared();
@@ -584,6 +685,23 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     CountOcclusion();
     Coverage::Note(Coverage::Work::Draw, convert ? Coverage::Path::RewrittenIndices
                                                  : Coverage::Path::Native);
+    // The draw through the condition's arguments; false to draw as usual (the condition holds).
+    const auto conditional = [&](u32 draw_primitive, bool indexed, u32 draw_count,
+                                 u32 draw_index_size, BufferHandle index_buffer, u64 index_offset,
+                                 u32 first) {
+        if (!under_condition) {
+            return false;
+        }
+        if (DrawUnderCondition(draw_primitive, indexed, draw_count, draw_index_size,
+                               index_buffer, index_offset, first, instance_count,
+                               indexed && is_indexed ? static_cast<s32>(draw_state.base_index)
+                                                     : 0,
+                               draw_state.base_instance)) {
+            return true;
+        }
+        // The region's command buffer was committed in between: decided on the CPU.
+        return !ConditionHoldsOnCpu();
+    };
 
     if (convert) {
         // 32-bit indices in the stream ring: from the GPU rewrite, or rewritten on the CPU from
@@ -612,7 +730,8 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
                                               is_indexed ? 0U : draw_state.vertex_buffer.first,
                                               count, restart, out, provoking_last);
         }
-        if (converted != 0) {
+        if (converted != 0 &&
+            !conditional(*primitive, true, converted, 4, indices.buffer, indices.offset, 0)) {
             scheduler.DrawIndexed(*primitive, converted, 4, indices.buffer, indices.offset,
                                   instance_count,
                                   is_indexed ? static_cast<s32>(draw_state.base_index) : 0,
@@ -621,11 +740,19 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         ++draws_converted;
     } else if (is_indexed) {
         const BufferCacheRuntime::IndexState& index = buffer_cache_runtime.Index();
-        scheduler.DrawIndexed(*primitive, draw_state.index_buffer.count, index_size, index.buffer,
-                              u64{index.offset} + u64{draw_state.index_buffer.first} * index_size,
-                              instance_count, static_cast<s32>(draw_state.base_index),
-                              draw_state.base_instance);
-    } else {
+        if (!conditional(*primitive, true, draw_state.index_buffer.count, index_size, index.buffer,
+                         index.offset, draw_state.index_buffer.first)) {
+            scheduler.DrawIndexed(
+                *primitive, draw_state.index_buffer.count, index_size, index.buffer,
+                u64{index.offset} + u64{draw_state.index_buffer.first} * index_size,
+                instance_count, static_cast<s32>(draw_state.base_index), draw_state.base_instance);
+        }
+    } else if (grid_draw.wanted) {
+        scheduler.DrawIndirect(*primitive, grid_draw.arguments.buffer, grid_draw.arguments.offset);
+        grid_draw = {};
+        ++grid_draws_on_gpu;
+    } else if (!conditional(*primitive, false, draw_state.vertex_buffer.count, 0, nullptr, 0,
+                            draw_state.vertex_buffer.first)) {
         scheduler.Draw(*primitive, draw_state.vertex_buffer.first, draw_state.vertex_buffer.count,
                        instance_count, draw_state.base_instance);
     }
@@ -683,20 +810,7 @@ std::vector<TextureHandle> RasterizerMetal::PrepareTexelBuffers(std::span<const 
 
 void RasterizerMetal::RewriteIndices(bool ahead) {
     const BufferCacheRuntime::IndexState& index = buffer_cache_runtime.Index();
-    if (!index_kernel && !index_kernel_failed) {
-        std::string error;
-        index_kernel_library =
-            CreateLibrary(device, IndexConvert::RewriteKernelSource(), error);
-        const Object function = index_kernel_library
-                                    ? CreateFunction(index_kernel_library.Get(), "rewrite_indices")
-                                    : Object{};
-        index_kernel =
-            function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
-        if (!index_kernel) {
-            index_kernel_failed = true;
-            LOG_ERROR(Render_Metal, "Metal: index rewrite kernel failed to build: {}", error);
-        }
-    }
+    EnsureIndexKernels();
     if (!index_kernel || index.buffer == nullptr) {
         // The CPU rewrites them from guest memory instead.
         return;
@@ -704,11 +818,17 @@ void RasterizerMetal::RewriteIndices(bool ahead) {
     IndexConvert::RewriteParams params = index_rewrite.params;
     params.source_offset += index.offset;
     index_rewrite.output = staging_pool.Stream(size_t{params.converted} * sizeof(u32), 4);
-    scheduler.BeginCompute(index_kernel.Get(), ahead);
+    const bool strip = params.mode == IndexConvert::StripRestartMode;
+    scheduler.BeginCompute(strip ? index_strip_kernel.Get() : index_kernel.Get(), ahead);
     scheduler.BindBuffer(ShaderStage::Compute, 0, index.buffer, 0);
     scheduler.BindBuffer(ShaderStage::Compute, 1, index_rewrite.output.buffer,
                          static_cast<u32>(index_rewrite.output.offset));
     scheduler.BindBytes(ShaderStage::Compute, 2, &params, static_cast<u32>(sizeof(params)));
+    if (strip) {
+        // One threadgroup finds where each part of the strip starts.
+        scheduler.Dispatch({1, 1, 1}, {IndexConvert::StripRestartThreads, 1, 1});
+        return;
+    }
     constexpr u32 GroupSize = 64;
     scheduler.Dispatch({(params.converted + GroupSize - 1) / GroupSize, 1, 1}, {GroupSize, 1, 1});
 }
@@ -1004,6 +1124,11 @@ bool RasterizerMetal::DrawMeshTasksFromGpu(DAddr count_addr) {
         pipeline->Native() == nullptr) {
         return false;
     }
+    if (!ConditionHoldsOnCpu()) {
+        // As Draw: a mesh draw's condition is decided on the CPU.
+        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        return true;
+    }
     std::optional<u32> slot;
     {
         std::scoped_lock lock{buffer_cache.mutex};
@@ -1030,6 +1155,128 @@ bool RasterizerMetal::DrawMeshTasksFromGpu(DAddr count_addr) {
     ++native_mesh_from_gpu;
     if (VideoCommon::FeatureCensus::Enabled()) {
         VideoCommon::FeatureCensus::NoteDraw(*maxwell3d, pipeline_cache.LookupHashes());
+    }
+    return true;
+}
+
+void RasterizerMetal::EnsureIndexKernels() {
+    if (!index_kernel && !index_kernel_failed) {
+        std::string error;
+        index_kernel_library =
+            CreateLibrary(device, IndexConvert::RewriteKernelSource(), error);
+        const auto make = [&](const char* name) {
+            const Object function = index_kernel_library
+                                        ? CreateFunction(index_kernel_library.Get(), name)
+                                        : Object{};
+            return function ? CreateComputePipelineState(device, function.Get(), error)
+                            : Object{};
+        };
+        index_kernel = make("rewrite_indices");
+        index_strip_kernel = make("rewrite_restart_strip");
+        if (!index_kernel || !index_strip_kernel) {
+            index_kernel = {};
+            index_kernel_failed = true;
+            LOG_ERROR(Render_Metal, "Metal: index rewrite kernel failed to build: {}", error);
+        }
+    }
+    if (!indirect_kernels_failed && !indirect_arguments_kernel) {
+        std::string error;
+        indirect_library = CreateLibrary(device, Indirect::KernelSource(), error);
+        const auto make = [&](const char* name) {
+            const Object function =
+                indirect_library ? CreateFunction(indirect_library.Get(), name) : Object{};
+            return function ? CreateComputePipelineState(device, function.Get(), error)
+                            : Object{};
+        };
+        indirect_arguments_kernel = make("indirect_arguments");
+        indirect_setup_kernel = make("indirect_rewrite_setup");
+        grid_arguments_kernel = make("grid_arguments");
+        if (!indirect_arguments_kernel || !indirect_setup_kernel || !grid_arguments_kernel) {
+            indirect_arguments_kernel = {};
+            indirect_kernels_failed = true;
+            LOG_ERROR(Render_Metal, "Metal: indirect argument kernels failed to build: {}", error);
+        }
+    }
+}
+
+bool RasterizerMetal::PrepareIndirect(bool ahead) {
+    IndirectPlan& plan = indirect_plan;
+    const auto [indirect, indirect_offset] = buffer_cache.GetDrawIndirectBuffer();
+    if (indirect == nullptr || indirect->Handle() == nullptr) {
+        return false;
+    }
+    BufferHandle count_buffer = indirect->Handle();
+    u32 count_offset = indirect_offset;
+    if (plan.has_count) {
+        const auto [count, offset] = buffer_cache.GetDrawIndirectCount();
+        if (count == nullptr || count->Handle() == nullptr) {
+            return false;
+        }
+        count_buffer = count->Handle();
+        count_offset = offset;
+    }
+    const u32 words = plan.indexed ? Indirect::IndexedWords : Indirect::PlainWords;
+    if (!plan.rewrite) {
+        // Draws past the GPU's count draw no instances.
+        plan.arguments = staging_pool.Stream(size_t{plan.max_draws} * words * sizeof(u32), 16);
+        const Indirect::CopyParams params{
+            .stride_words = plan.stride_words,
+            .max_draws = plan.max_draws,
+            .has_count = plan.has_count ? 1U : 0U,
+            .words = words,
+        };
+        scheduler.BeginCompute(indirect_arguments_kernel.Get(), ahead);
+        scheduler.BindBuffer(ShaderStage::Compute, 0, indirect->Handle(), indirect_offset);
+        scheduler.BindBuffer(ShaderStage::Compute, 1, count_buffer, count_offset);
+        scheduler.BindBuffer(ShaderStage::Compute, 2, plan.arguments.buffer,
+                             static_cast<u32>(plan.arguments.offset));
+        scheduler.BindBytes(ShaderStage::Compute, 3, &params, static_cast<u32>(sizeof(params)));
+        constexpr u32 GroupSize = 64;
+        scheduler.Dispatch({(plan.max_draws + GroupSize - 1) / GroupSize, 1, 1},
+                           {GroupSize, 1, 1});
+        return true;
+    }
+    // Each draw: a kernel reads its arguments and sizes the rewrite, the rewrite runs with the
+    // threadgroups it wrote, and the draw takes the arguments it wrote.
+    const BufferCacheRuntime::IndexState& index = buffer_cache_runtime.Index();
+    if (plan.indexed && index.buffer == nullptr) {
+        return false;
+    }
+    plan.control = staging_pool.Stream(size_t{plan.max_draws} * Indirect::ControlWords * 4, 256);
+    plan.indices = staging_pool.Request(size_t{plan.max_draws} * plan.capacity * sizeof(u32));
+    const bool strip = plan.mode == IndexConvert::StripRestartMode;
+    for (u32 draw = 0; draw < plan.max_draws; ++draw) {
+        const u64 control = plan.control.offset + u64{draw} * Indirect::ControlWords * 4;
+        const Indirect::SetupParams params{
+            .draw = draw,
+            .stride_words = plan.stride_words,
+            .has_count = plan.has_count ? 1U : 0U,
+            .indexed = plan.indexed ? 1U : 0U,
+            .mode = plan.mode,
+            .index_size = plan.indexed ? plan.index_size : 0U,
+            .restart = plan.restart ? 1U : 0U,
+            .capacity = plan.capacity,
+            .source_offset = plan.indexed ? index.offset : 0U,
+            .strip_threads = strip ? IndexConvert::StripRestartThreads : 0U,
+        };
+        scheduler.BeginCompute(indirect_setup_kernel.Get(), ahead);
+        scheduler.BindBuffer(ShaderStage::Compute, 0, indirect->Handle(), indirect_offset);
+        scheduler.BindBuffer(ShaderStage::Compute, 1, count_buffer, count_offset);
+        scheduler.BindBytes(ShaderStage::Compute, 2, &params, static_cast<u32>(sizeof(params)));
+        scheduler.BindBuffer(ShaderStage::Compute, 4, plan.control.buffer,
+                             static_cast<u32>(control));
+        scheduler.Dispatch({1, 1, 1}, {1, 1, 1});
+        scheduler.BeginCompute(strip ? index_strip_kernel.Get() : index_kernel.Get(), ahead);
+        scheduler.BindBuffer(ShaderStage::Compute, 0,
+                             plan.indexed ? index.buffer : plan.control.buffer, 0);
+        scheduler.BindBuffer(ShaderStage::Compute, 1, plan.indices.buffer,
+                             static_cast<u32>(plan.indices.offset +
+                                              u64{draw} * plan.capacity * sizeof(u32)));
+        scheduler.BindBuffer(ShaderStage::Compute, 2, plan.control.buffer,
+                             static_cast<u32>(control));
+        scheduler.DispatchIndirect(plan.control.buffer,
+                                   control + Indirect::ControlGroupsWord * sizeof(u32),
+                                   {strip ? IndexConvert::StripRestartThreads : 64U, 1, 1});
     }
     return true;
 }
@@ -1573,9 +1820,12 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     if (tess != nullptr) {
         ApplyTessellation(state_desc, *tess);
     }
-    void* const state = pipeline.RenderState(device, state_desc);
+    bool state_building = false;
+    void* const state = pipeline_cache.RenderState(pipeline, state_desc, state_building);
     if (state == nullptr) {
-        if (native != nullptr && pipeline.Native() == nullptr) {
+        if (state_building) {
+            prepare_refusal = "render pipeline state still building";
+        } else if (native != nullptr && pipeline.Native() == nullptr) {
             prepare_refusal = "mesh render pipeline state refused by Metal";
         }
         return false;
@@ -1612,6 +1862,14 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     };
     if (index_rewrite.wanted) {
         RewriteIndices(record_ahead(false));
+    }
+    if (indirect_plan.wanted && !PrepareIndirect(record_ahead(false))) {
+        prepare_refusal = "indirect draw arguments not bound";
+        return false;
+    }
+    if (grid_draw.wanted && !PrepareGridDraw(record_ahead(false))) {
+        prepare_refusal = "GPU-counted draw whose count is not in a buffer";
+        return false;
     }
     if (mesh_indirect.wanted && native != nullptr) {
         ConvertMeshIndirect(record_ahead(false));
@@ -1727,18 +1985,27 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             return staging_pool.Stream((std::max)(size, u64{16}), 16);
         };
         if (tess_draw->index_size != 0) {
-            if (tess_draw->widen_indices) {
-                // 8-bit indices (Metal reads 16- and 32-bit ones), widened from guest memory.
+            if (tess_draw->widen_indices || tess_draw->base_vertex != 0) {
+                // 8-bit indices (Metal reads 16- and 32-bit ones) widened from guest memory, and
+                // the base vertex added: the stage-in fetch and VertexIndex both read the index.
                 const auto& draw_state = maxwell3d->draw_manager.draw_state;
-                converted_source.resize(tess_draw->count);
+                const u32 source_size =
+                    static_cast<u32>(draw_state.index_buffer.FormatSizeInBytes());
+                converted_source.resize(size_t{tess_draw->count} * source_size);
                 gpu_memory->ReadBlockUnsafe(draw_state.index_buffer.StartAddress() +
-                                                tess_draw->first_index,
+                                                u64{tess_draw->first_index} * source_size,
                                             converted_source.data(), converted_source.size());
                 const StagingBufferRef widened = stream(u64{tess_draw->count} * sizeof(u32));
-                IndexConvert::Convert(Maxwell::PrimitiveTopology::Patches, converted_source, 1, 0,
-                                      tess_draw->count, regs.primitive_restart.enabled != 0,
-                                      std::span(reinterpret_cast<u32*>(widened.mapped_span.data()),
-                                                tess_draw->count));
+                const std::span<u32> out(reinterpret_cast<u32*>(widened.mapped_span.data()),
+                                         tess_draw->count);
+                const bool restart = regs.primitive_restart.enabled != 0;
+                IndexConvert::Convert(Maxwell::PrimitiveTopology::Patches, converted_source,
+                                      source_size, 0, tess_draw->count, restart, out);
+                for (u32& index : out) {
+                    if (!restart || index != 0xFFFFFFFFU) {
+                        index = static_cast<u32>(static_cast<s32>(index) + tess_draw->base_vertex);
+                    }
+                }
                 tess_draw->index_buffer = widened.buffer;
                 tess_draw->index_offset = widened.offset;
             } else {
@@ -1823,46 +2090,54 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     DrawState draw{};
     draw.pipeline = state;
     draw.depth_stencil = depth_stencil_state.Get();
-    // Viewport 0, as Vulkan's GetViewportState makes it (the shader flips y for Metal).
-    const auto& transform = regs.viewport_transform[0];
-    if (regs.viewport_scale_offset_enabled) {
-        draw.viewport.x = transform.translate_x - transform.scale_x;
-        draw.viewport.width = transform.scale_x * 2.0f;
-        draw.viewport.y = transform.translate_y - transform.scale_y;
-        draw.viewport.height = transform.scale_y * 2.0f;
-        if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
-            draw.viewport.y += static_cast<f32>(regs.surface_clip.height);
-            draw.viewport.height = -draw.viewport.height;
+    // Viewport i, as Vulkan's GetViewportState makes it (the shader flips y for Metal).
+    const auto make_viewport = [&](size_t index) {
+        Viewport viewport{};
+        const auto& transform = regs.viewport_transform[index];
+        if (regs.viewport_scale_offset_enabled) {
+            viewport.x = transform.translate_x - transform.scale_x;
+            viewport.width = transform.scale_x * 2.0f;
+            viewport.y = transform.translate_y - transform.scale_y;
+            viewport.height = transform.scale_y * 2.0f;
+            if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
+                viewport.y += static_cast<f32>(regs.surface_clip.height);
+                viewport.height = -viewport.height;
+            }
+            if (transform.swizzle.y == Maxwell::ViewportSwizzle::NegativeY) {
+                viewport.y += viewport.height;
+                viewport.height = -viewport.height;
+            }
+            const f32 reduce_z =
+                regs.depth_mode == Maxwell::DepthMode::MinusOneToOne ? 1.0f : 0.0f;
+            viewport.znear = transform.translate_z - transform.scale_z * reduce_z;
+            viewport.zfar = transform.translate_z + transform.scale_z;
+        } else {
+            viewport.x = static_cast<f32>(regs.surface_clip.x);
+            viewport.y = static_cast<f32>(regs.surface_clip.y);
+            viewport.width = static_cast<f32>(regs.surface_clip.width);
+            viewport.height = static_cast<f32>(regs.surface_clip.height);
         }
-        if (transform.swizzle.y == Maxwell::ViewportSwizzle::NegativeY) {
-            draw.viewport.y += draw.viewport.height;
-            draw.viewport.height = -draw.viewport.height;
+        if (is_rescaling) {
+            // As Vulkan's GetViewportState: the guest's viewport in scaled pixels.
+            const f32 scale = resolution.up_factor;
+            viewport.x *= scale;
+            viewport.y *= scale;
+            viewport.width *= scale;
+            viewport.height *= scale;
         }
-        const f32 reduce_z = regs.depth_mode == Maxwell::DepthMode::MinusOneToOne ? 1.0f : 0.0f;
-        draw.viewport.znear = transform.translate_z - transform.scale_z * reduce_z;
-        draw.viewport.zfar = transform.translate_z + transform.scale_z;
-    } else {
-        draw.viewport.x = static_cast<f32>(regs.surface_clip.x);
-        draw.viewport.y = static_cast<f32>(regs.surface_clip.y);
-        draw.viewport.width = static_cast<f32>(regs.surface_clip.width);
-        draw.viewport.height = static_cast<f32>(regs.surface_clip.height);
-    }
-    if (is_rescaling) {
-        // As Vulkan's GetViewportState: the guest's viewport in scaled pixels.
-        const f32 scale = resolution.up_factor;
-        draw.viewport.x *= scale;
-        draw.viewport.y *= scale;
-        draw.viewport.width *= scale;
-        draw.viewport.height *= scale;
-    }
-    if (draw.viewport.width == 0.0f) {
-        draw.viewport.width = 1.0f;
-    }
-    if (draw.viewport.height == 0.0f) {
-        draw.viewport.height = 1.0f;
-    }
-    const auto& scissor = regs.scissor_test[0];
-    if (scissor.enable) {
+        if (viewport.width == 0.0f) {
+            viewport.width = 1.0f;
+        }
+        if (viewport.height == 0.0f) {
+            viewport.height = 1.0f;
+        }
+        return viewport;
+    };
+    const auto make_scissor = [&](size_t index) -> Scissor {
+        const auto& scissor = regs.scissor_test[index];
+        if (!scissor.enable) {
+            return {0, 0, targets.width, targets.height};
+        }
         const bool lower_left = regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft;
         const s32 clip_height = static_cast<s32>(regs.surface_clip.height);
         const s32 min_y = (std::max)(lower_left ? clip_height - static_cast<s32>(scissor.max_y)
@@ -1878,11 +2153,32 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         const u32 max_x = scale(static_cast<u32>(scissor.max_x.Value()));
         const u32 scaled_min_y = scale(static_cast<u32>(min_y));
         const u32 scaled_max_y = scale(static_cast<u32>((std::max)(max_y, min_y)));
-        draw.scissor = {min_x, scaled_min_y, max_x > min_x ? max_x - min_x : 0U,
-                        scaled_max_y - scaled_min_y};
-    } else {
-        draw.scissor = {0, 0, targets.width, targets.height};
+        return {min_x, scaled_min_y, max_x > min_x ? max_x - min_x : 0U,
+                scaled_max_y - scaled_min_y};
+    };
+    draw.viewport = make_viewport(0);
+    draw.scissor = make_scissor(0);
+    // A program that picks the viewport gets all 16 with their scissors, as Vulkan sets them
+    // (EDEN_NX2_METAL_VIEWPORTS=0: viewport 0 only, as before).
+    static const bool all_viewports = EnvironmentOn("EDEN_NX2_METAL_VIEWPORTS");
+    if (all_viewports && pipeline.Vertex().info.stores[Shader::IR::Attribute::ViewportIndex]) {
+        draw.viewport_count = static_cast<u8>(Maxwell::NumViewports);
+        for (size_t index = 1; index < Maxwell::NumViewports; ++index) {
+            draw.more_viewports[index - 1] = make_viewport(index);
+            draw.more_scissors[index - 1] = make_scissor(index);
+        }
     }
+    // Triangles drawn as lines when the faces the draw keeps are (Metal has one fill mode for
+    // both; a point fill mode it has not).
+    const bool front_lines = regs.polygon_mode_front == Maxwell::PolygonMode::Line;
+    const bool back_lines = regs.polygon_mode_back == Maxwell::PolygonMode::Line;
+    const bool culls = regs.gl_cull_test_enabled != 0;
+    static const bool fill_lines = EnvironmentOn("EDEN_NX2_METAL_FILL_LINES");
+    draw.fill_lines =
+        fill_lines &&
+        ((front_lines && back_lines) ||
+         (culls && regs.gl_cull_face == Maxwell::CullFace::Back && front_lines) ||
+         (culls && regs.gl_cull_face == Maxwell::CullFace::Front && back_lines));
     if (regs.gl_cull_test_enabled != 0) {
         switch (regs.gl_cull_face) {
         case Maxwell::CullFace::Front:
@@ -1968,11 +2264,16 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
 
 void RasterizerMetal::DrawIndirect() {
     ++draws;
+    skip_valid = false;
+    grid_draw = {};
     SCOPE_EXIT {
         if (CachePathsEnabled()) {
             gpu.TickWork();
         }
     };
+    if (InvalidateBeforeUse()) {
+        gpu.InvalidateGPUCache();
+    }
     gpu_memory->FlushCaching();
     FlushWork();
     GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
@@ -1991,6 +2292,10 @@ void RasterizerMetal::DrawIndirect() {
     TrackOotTonemappedImage();
     const auto& params = maxwell3d->draw_manager.indirect_state;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (!ConditionHoldsOnCpu()) {
+        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        return;
+    }
     if (params.is_byte_count) {
         RefuseDraw("transform feedback draw");
         return;
@@ -2006,12 +2311,59 @@ void RasterizerMetal::DrawIndirect() {
     }
     const bool u8_indices = params.is_indexed && maxwell3d->regs.index_buffer.format ==
                                                      Maxwell::IndexFormat::UnsignedByte;
-    const std::optional<u32> primitive = PrimitiveType(draw_state.topology);
-    if (!primitive || u8_indices) {
-        // The arguments are on the GPU: rewriting their indices needs a compute pass.
-        RefuseDraw(u8_indices ? "indirect draw with 8-bit indices"
-                              : "indirect draw of a topology Metal can't draw");
+    const bool provoking_last = ProvokingLastWanted(*pipeline);
+    const bool rewrite =
+        u8_indices || provoking_last || IndexConvert::NeedsConversion(draw_state.topology);
+    const std::optional<u32> primitive =
+        PrimitiveType(IndexConvert::ConvertedTopology(draw_state.topology, provoking_last));
+    // EDEN_NX2_METAL_GPU_INDIRECT=0: a count is read from guest memory on the CPU and draws whose
+    // indices need rewriting are refused, as before.
+    static const bool on_gpu = EnvironmentOn("EDEN_NX2_METAL_GPU_INDIRECT");
+    if (!primitive || (rewrite && !on_gpu)) {
+        RefuseDraw(!primitive ? "indirect draw of a topology Metal can't draw"
+                   : u8_indices ? "indirect draw with 8-bit indices"
+                                : "indirect draw whose indices must be rewritten");
         return;
+    }
+    const u32 stride_bytes = static_cast<u32>(
+        params.stride != 0 ? params.stride : (params.is_indexed ? 5 : 4) * sizeof(u32));
+    indirect_plan = {};
+    if (on_gpu && (rewrite || params.include_count)) {
+        EnsureIndexKernels();
+        const u32 index_size = static_cast<u32>(draw_state.index_buffer.FormatSizeInBytes());
+        const bool restart = maxwell3d->regs.primitive_restart.enabled != 0;
+        u32 capacity = 0;
+        if (rewrite) {
+            // Indexed: the rewrite of the whole bound index buffer at most; plain: up to 256K.
+            const u32 elements = params.is_indexed
+                                     ? static_cast<u32>(draw_state.index_buffer.EndAddress() -
+                                                        draw_state.index_buffer.StartAddress()) /
+                                           (std::max)(index_size, 1U)
+                                     : 1U << 18;
+            capacity = (std::max)(
+                IndexConvert::ConvertedCount(draw_state.topology, elements, provoking_last), 6U);
+        }
+        constexpr u64 MaxRewriteBytes = u64{64} << 20;
+        if (indirect_kernels_failed || index_kernel_failed ||
+            u64{capacity} * params.max_draw_counts * sizeof(u32) > MaxRewriteBytes ||
+            stride_bytes % sizeof(u32) != 0) {
+            RefuseDraw("indirect draw the GPU can't prepare");
+            return;
+        }
+        indirect_plan = IndirectPlan{
+            .wanted = true,
+            .rewrite = rewrite,
+            .indexed = params.is_indexed,
+            .has_count = params.include_count,
+            .restart = restart && params.is_indexed,
+            .mode = rewrite ? IndexConvert::RewriteMode(draw_state.topology, provoking_last,
+                                                        restart && params.is_indexed)
+                            : 0U,
+            .index_size = params.is_indexed ? index_size : 0U,
+            .max_draws = static_cast<u32>(params.max_draw_counts),
+            .stride_words = stride_bytes / static_cast<u32>(sizeof(u32)),
+            .capacity = capacity,
+        };
     }
     gpu_memory->FlushCaching();
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
@@ -2023,12 +2375,42 @@ void RasterizerMetal::DrawIndirect() {
     buffer_cache.SetDrawIndirect(&params);
     SCOPE_EXIT {
         buffer_cache.SetDrawIndirect(nullptr);
+        indirect_plan = {};
     };
     if (!PrepareDraw(*pipeline, params.is_indexed)) {
         NoteUnprepared();
         return;
     }
     CountOcclusion();
+    if (indirect_plan.wanted) {
+        Coverage::Note(Coverage::Work::Draw, rewrite ? Coverage::Path::RewrittenIndices
+                                                     : Coverage::Path::IndirectLoop);
+        const BufferCacheRuntime::IndexState& index = buffer_cache_runtime.Index();
+        const u32 index_size = index.format == Maxwell::IndexFormat::UnsignedShort ? 2U : 4U;
+        const u32 words = params.is_indexed ? Indirect::IndexedWords : Indirect::PlainWords;
+        for (u32 draw = 0; draw < indirect_plan.max_draws; ++draw) {
+            if (rewrite) {
+                const u64 control = indirect_plan.control.offset +
+                                    (u64{draw} * Indirect::ControlWords +
+                                     Indirect::ControlDrawWord) * sizeof(u32);
+                scheduler.DrawIndexedIndirect(
+                    *primitive, 4, indirect_plan.indices.buffer,
+                    indirect_plan.indices.offset + u64{draw} * indirect_plan.capacity * sizeof(u32),
+                    indirect_plan.control.buffer, control);
+                continue;
+            }
+            const u64 offset = indirect_plan.arguments.offset + u64{draw} * words * sizeof(u32);
+            if (params.is_indexed) {
+                scheduler.DrawIndexedIndirect(*primitive, index_size, index.buffer, index.offset,
+                                              indirect_plan.arguments.buffer, offset);
+            } else {
+                scheduler.DrawIndirect(*primitive, indirect_plan.arguments.buffer, offset);
+            }
+        }
+        ++indirect_draws_on_gpu;
+        ++draws_encoded;
+        return;
+    }
     const auto [indirect, indirect_offset] = buffer_cache.GetDrawIndirectBuffer();
     size_t count = params.max_draw_counts;
     // Metal has no multi draw: one call per draw, and a count read on the CPU.
@@ -2059,7 +2441,58 @@ void RasterizerMetal::DrawIndirect() {
 
 void RasterizerMetal::DrawTexture() {
     ++draws;
-    RefuseDraw("DrawTexture");
+    SCOPE_EXIT {
+        if (CachePathsEnabled()) {
+            gpu.TickWork();
+        }
+    };
+    // EDEN_NX2_METAL_DRAW_TEXTURE=0: refused, as this backend started.
+    static const bool enabled = EnvironmentOn("EDEN_NX2_METAL_DRAW_TEXTURE");
+    if (!enabled) {
+        RefuseDraw("DrawTexture");
+        return;
+    }
+    if (!ConditionHoldsOnCpu()) {
+        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        return;
+    }
+    gpu_memory->FlushCaching();
+    FlushWork();
+    // As Vulkan's: the texture's rectangle drawn scaled over the target's (BlitColor), filtered
+    // as its sampler's magnification filter says.
+    const auto& state = maxwell3d->draw_manager.draw_texture_state;
+    std::scoped_lock lock{texture_cache.mutex};
+    texture_cache.SynchronizeDescriptors(false);
+    texture_cache.UpdateRenderTargets(false);
+    const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
+    if (framebuffer == nullptr || framebuffer->Colors()[0].texture == nullptr) {
+        RefuseDraw("DrawTexture without a colour target");
+        return;
+    }
+    ImageView& texture = texture_cache.GetImageView(state.src_texture);
+    Tegra::Texture::TSCEntry sampler{};
+    const auto& regs = maxwell3d->regs;
+    gpu_memory->ReadBlockUnsafe(regs.tex_sampler.Address() + u64{state.src_sampler} * sizeof(sampler),
+                                &sampler, sizeof(sampler));
+    const BlitPass pass{
+        .src = texture.Handle(Shader::TextureType::Color2D),
+        .src_rect = {static_cast<s32>(state.src_x0), static_cast<s32>(state.src_y0),
+                     static_cast<s32>(state.src_x1), static_cast<s32>(state.src_y1)},
+        .dst = framebuffer->Colors()[0],
+        .dst_format = framebuffer->ColorFormats()[0],
+        .dst_rect = {static_cast<s32>(state.dst_x0), static_cast<s32>(state.dst_y0),
+                     static_cast<s32>(state.dst_x1), static_cast<s32>(state.dst_y1)},
+        .dst_width = framebuffer->Width(),
+        .dst_height = framebuffer->Height(),
+        .linear = sampler.mag_filter == Tegra::Texture::TextureFilter::Linear,
+        .keep_dst = true,
+    };
+    if (pass.src == nullptr || !scheduler.Blit(pass)) {
+        RefuseDraw("DrawTexture into a format the blit can't draw");
+        return;
+    }
+    ++draws_encoded;
+    Coverage::Note(Coverage::Work::Draw, Coverage::Path::Native);
 }
 
 namespace {
@@ -2330,34 +2763,43 @@ void RasterizerMetal::CountOcarinaTemporal(bool replaced, const char* reason) {
     oot_decline_reasons = {};
 }
 
-bool RasterizerMetal::ProvokingLastWanted(const GraphicsPipeline& pipeline, bool is_indexed,
-                                          u32 count, u32 index_size, bool restart) {
-    // EDEN_NX2_METAL_PROVOKING_LAST=1: flat inputs take the last vertex when the game asks for it.
-    // Off by default, as MoltenVK (no VK_EXT_provoking_vertex): every such draw is rewritten.
-    static const bool enabled = [] {
-        const char* const value = std::getenv("EDEN_NX2_METAL_PROVOKING_LAST");
-        return value != nullptr && value[0] == '1';
-    }();
+bool RasterizerMetal::ProvokingLastWanted(const GraphicsPipeline& pipeline) {
+    // Metal has no provoking vertex setting (flat inputs take the first vertex), so the draws of
+    // pipelines with flat inputs are rewritten to start each primitive with the vertex Vulkan's
+    // last vertex convention takes them from, as Vulkan draws them on a desktop GPU.
+    // EDEN_NX2_METAL_PROVOKING_LAST=0: they take the first vertex, as MoltenVK draws them.
+    static const bool enabled = EnvironmentOn("EDEN_NX2_METAL_PROVOKING_LAST");
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    if (!enabled || maxwell3d->regs.provoking_vertex != Maxwell::ProvokingVertex::Last ||
-        !IndexConvert::RotatesForProvokingVertex(draw_state.topology) ||
-        !pipeline.HasFlatInputs()) {
+    return enabled && maxwell3d->regs.provoking_vertex == Maxwell::ProvokingVertex::Last &&
+           IndexConvert::RotatesForProvokingVertex(draw_state.topology) &&
+           pipeline.HasFlatInputs();
+}
+
+bool RasterizerMetal::DrawMayBeSkipped() {
+    if (skip_valid) {
+        return skip_decision;
+    }
+    skip_valid = true;
+    // EDEN_NX2_ASYNC_DISCARD as Vulkan reads it: 2 (default) skips native draws only into
+    // targets cleared every frame, 1 by the legacy heuristic, 0 never.
+    static const int mode = [] {
+        const char* const value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
+        return value == nullptr ? 2 : value[0] == '0' ? 0 : value[0] == '1' ? 1 : 2;
+    }();
+    if (!Settings::values.use_asynchronous_shaders.GetValue()) {
+        skip_decision = false;
         return false;
     }
-    if (is_indexed && restart && draw_state.topology == Maxwell::PrimitiveTopology::TriangleStrip &&
-        draw_state.inline_index_draw_indexes.empty()) {
-        // Where such a strip starts again is only found on the CPU, from guest memory: indices
-        // the GPU wrote are not there yet.
-        const GPUVAddr start = draw_state.index_buffer.StartAddress() +
-                               GPUVAddr{draw_state.index_buffer.first} * index_size;
-        const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(start);
-        std::scoped_lock lock{buffer_cache.mutex};
-        if (!device_addr ||
-            buffer_cache.IsRegionGpuModified(*device_addr, size_t{count} * index_size)) {
-            return false;
-        }
+    const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
+    bool recurring = true;
+    if (mode == 2 && native) {
+        recurring = texture_cache.ClassifyDrawTargets().kind ==
+                    VideoCommon::DrawTargetClass::Recurring;
     }
-    return true;
+    const u32 elements = maxwell3d->draw_manager.draw_state.draw_element_count;
+    skip_decision = Vulkan::CanDiscardPendingDraw(native, maxwell3d->regs.zeta_enable != 0,
+                                                  elements, elements, mode != 0, recurring);
+    return skip_decision;
 }
 
 void RasterizerMetal::NoteUnprepared() {
@@ -2400,6 +2842,10 @@ void RasterizerMetal::Clear(u32 layer_count) {
     }
     gpu_memory->FlushCaching();
     FlushWork();
+    if (!ConditionHoldsOnCpu()) {
+        // A clear under a condition the GPU decides is decided on the CPU.
+        return;
+    }
     const auto& regs = maxwell3d->regs;
     const bool any_color = regs.clear_surface.R || regs.clear_surface.G ||
                            regs.clear_surface.B || regs.clear_surface.A;
@@ -2493,6 +2939,59 @@ void RasterizerMetal::Clear(u32 layer_count) {
         pass.stencil_value = static_cast<u32>(regs.clear_stencil);
         whole = true;
     }
+    // The layers the clear names (clear_surface.layer, layer_count) of the targets' views, one
+    // pass or draw each; EDEN_NX2_METAL_CLEAR_LAYERS=0: the bound layer only, as before.
+    static const bool clear_layers = EnvironmentOn("EDEN_NX2_METAL_CLEAR_LAYERS");
+    const u32 first_layer = clear_layers ? static_cast<u32>(regs.clear_surface.layer) : 0U;
+    const u32 layers = clear_layers ? (std::max)(layer_count, 1U) : 1U;
+    if (first_layer != 0 || layers > 1) {
+        const u32 available = (std::max)(
+            use_color ? framebuffer->ColorLayers()[rt] : 0U,
+            use_depth || use_stencil ? framebuffer->DepthLayers() : 0U);
+        // A view's layers follow its slice (a 3D slice target has one layer: only layer 0).
+        const auto at_layer = [](Attachment attachment, u32 layer) {
+            if (attachment.texture != nullptr) {
+                attachment.slice += layer;
+            }
+            return attachment;
+        };
+        for (u32 layer = first_layer; layer < first_layer + layers && layer < available; ++layer) {
+            ClearPass layer_pass = pass;
+            for (Attachment& color : layer_pass.color) {
+                color = at_layer(color, layer);
+            }
+            layer_pass.depth = at_layer(layer_pass.depth, layer);
+            layer_pass.stencil = at_layer(layer_pass.stencil, layer);
+            if (whole) {
+                scheduler.Clear(layer_pass);
+            }
+            if (drawn_clears && needs_draw) {
+                ClearRect draw{};
+                if (draw_color) {
+                    draw.color = at_layer(framebuffer->Colors()[rt], layer);
+                    draw.color_mask = static_cast<u8>(
+                        regs.clear_surface.R | regs.clear_surface.G << 1 |
+                        regs.clear_surface.B << 2 | regs.clear_surface.A << 3);
+                    draw.color_value = color_value;
+                }
+                if (draw_depth || draw_stencil) {
+                    draw.depth = at_layer(framebuffer->Depth(), layer);
+                    draw.clear_depth = draw_depth;
+                    draw.clear_stencil = draw_stencil;
+                    draw.depth_value = regs.clear_depth;
+                    draw.stencil_value = static_cast<u32>(regs.clear_stencil);
+                    draw.stencil_mask = stencil_partial ? regs.stencil_front_mask : 0xFFU;
+                }
+                draw.rect = rect;
+                draw.width = framebuffer->Width();
+                draw.height = framebuffer->Height();
+                static_cast<void>(scheduler.ClearRectangle(draw));
+            }
+        }
+        Coverage::Note(Coverage::Work::Clear, Coverage::Path::ClearDraw);
+        ++clears;
+        return;
+    }
     if (whole) {
         scheduler.Clear(pass);
     }
@@ -2529,6 +3028,9 @@ void RasterizerMetal::Clear(u32 layer_count) {
 
 void RasterizerMetal::DispatchCompute() {
     ++dispatches;
+    if (InvalidateBeforeUse()) {
+        gpu.InvalidateGPUCache();
+    }
     gpu_memory->FlushCaching();
     FlushWork();
     ComputePipeline* const pipeline = pipeline_cache.CurrentComputePipeline();
@@ -2569,9 +3071,17 @@ void RasterizerMetal::DispatchCompute() {
     const Shader::Info& info = program.info;
     const auto& qmd = kepler_compute->launch_description;
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // Command list pages the dispatch writes are copied after it, for the split's front to read
+    // without a full sync (EDEN_NX2_METAL_LIST_COPIES, as Vulkan's ReadGpuWrittenCommandList).
+    const bool list_copies = ListCopiesEnabled();
+    buffer_cache.Nx2CollectListCopies(list_copies);
     // Written texel buffers read through aligned copies go back once the work is encoded.
     SCOPE_EXIT {
         FinishTexelWritebacks();
+        if (list_copies) {
+            SubmitListCopies(pipeline->Key().unique_hash);
+            buffer_cache.Nx2CollectListCopies(false);
+        }
     };
 
     VideoCommon::ComputeUniformBufferSizes uniform_sizes{};
@@ -2794,15 +3304,29 @@ void RasterizerMetal::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
     }
     ++occlusion_queries;
     const bool wide = True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
+    // A condition that reads the report before its fence decides on the GPU from these slots.
+    const u64 serial = ++report_serial;
+    {
+        std::scoped_lock lock{pending_reports_mutex};
+        pending_reports.insert_or_assign(*address, PendingReport{.slots = occlusion_slots,
+                                                                 .wide = wide,
+                                                                 .tick = scheduler.CurrentTick(),
+                                                                 .serial = serial});
+    }
     // Written once the GPU has finished the draws counted so far (the fence's command buffer
     // ends their render pass, so later draws count into new slots).
-    SignalFence([this, address = *address, wide, slots = occlusion_slots] {
+    SignalFence([this, address = *address, wide, serial, slots = occlusion_slots] {
         const u64* const results = scheduler.VisibilityResults();
         u64 samples = 0;
         for (const u32 slot : slots) {
             samples += results[slot];
         }
         WriteQueryResult(address, wide, samples);
+        std::scoped_lock lock{pending_reports_mutex};
+        if (const auto it = pending_reports.find(address);
+            it != pending_reports.end() && it->second.serial == serial) {
+            pending_reports.erase(it);
+        }
     });
 }
 
@@ -2869,6 +3393,46 @@ void RasterizerMetal::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
 }
 
 void RasterizerMetal::FlushAll() {}
+
+void RasterizerMetal::SubmitListCopies(u64 writer) {
+    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick(), writer)) {
+        scheduler.Flush();
+    }
+}
+
+VideoCore::RasterizerInterface::GpuWrittenList RasterizerMetal::ReadGpuWrittenCommandList(
+    DAddr addr, std::span<u8> out, bool past_sync) {
+    if (!ListCopiesEnabled()) {
+        return GpuWrittenList::Unknown;
+    }
+    // No cache lock: the front only reads the copies, under their own lock.
+    switch (buffer_cache.Nx2ReadListCopy(addr, out, past_sync)) {
+    case BufferCache::Nx2ListRead::Copied:
+        return GpuWrittenList::Copied;
+    case BufferCache::Nx2ListRead::Synced:
+        return GpuWrittenList::Synced;
+    case BufferCache::Nx2ListRead::NeedsSync:
+        return GpuWrittenList::NeedsSync;
+    default:
+        return GpuWrittenList::Unknown;
+    }
+}
+
+void RasterizerMetal::NoteGpuWrittenCommandListSynced(DAddr page) {
+    if (ListCopiesEnabled()) {
+        buffer_cache.Nx2NoteListSynced(page);
+    }
+}
+
+void RasterizerMetal::FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
+    if (!ListCopiesEnabled()) {
+        RasterizerInterface::FlushGpuWrittenCommandListPages(pages);
+        return;
+    }
+    gpu.InvalidateGPUCache();
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.Nx2FlushListPages(pages);
+}
 
 void RasterizerMetal::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     if (addr == 0 || size == 0) {
@@ -3238,8 +3802,14 @@ void RasterizerMetal::FragmentBarrier() {
 void RasterizerMetal::TiledCacheBarrier() {}
 
 bool RasterizerMetal::AccelerateConditionalRendering() {
-    // Metal has no predicate rendering: the caller compares the report values on the CPU, as it
-    // does for Vulkan without VK_EXT_conditional_rendering (MoltenVK), after the same flush.
+    // Metal has no predicate rendering. A condition on values in guest memory is compared on the
+    // CPU by the caller, as for Vulkan without VK_EXT_conditional_rendering (MoltenVK), after the
+    // same flush. One that reads an occlusion report whose fence has not signalled (its value is
+    // not in memory yet) is decided on the GPU (metal_condition.h): EDEN_NX2_METAL_GPU_CONDITION=0
+    // compares what memory holds then, as before.
+    static const bool on_gpu = EnvironmentOn("EDEN_NX2_METAL_GPU_CONDITION");
+    gpu_condition.active = false;
+    gpu_condition.region = {};
     const auto& regs = maxwell3d->regs;
     const bool reads_memory =
         regs.render_enable_override == Maxwell::RenderEnable::Override::UseRenderEnable &&
@@ -3248,7 +3818,210 @@ bool RasterizerMetal::AccelerateConditionalRendering() {
     if (reads_memory && CachePathsEnabled()) {
         gpu_memory->FlushCaching();
     }
-    return false;
+    if (!reads_memory || !on_gpu) {
+        return false;
+    }
+    const GPUVAddr condition = regs.render_enable.Address();
+    const std::optional<DAddr> first = gpu_memory->GpuToCpuAddress(condition);
+    const std::optional<DAddr> second = gpu_memory->GpuToCpuAddress(condition + 16);
+    if (!first || !second) {
+        return false;
+    }
+    Condition::Params params{};
+    params.mode = static_cast<u32>(
+        regs.render_enable.mode == Maxwell::RenderEnable::Mode::Conditional ? Condition::Mode::BothWordsNonZero
+        : regs.render_enable.mode == Maxwell::RenderEnable::Mode::IfEqual   ? Condition::Mode::Equal
+                                                                            : Condition::Mode::NotEqual);
+    const size_t values = params.mode == 0 ? 1 : 2;
+    std::array<u64, 2> ticks{};
+    std::array<std::vector<u32>, 2> long_reports;
+    bool pending = false;
+    {
+        std::scoped_lock lock{pending_reports_mutex};
+        for (size_t value = 0; value < values; ++value) {
+            const DAddr address = value == 0 ? *first : *second;
+            std::array<u32, 2> words{};
+            if (const u8* const pointer = device_memory.GetPointer<u8>(address)) {
+                std::memcpy(words.data(), pointer, sizeof(words));
+            }
+            params.memory[value] = words;
+            const auto it = pending_reports.find(address);
+            if (it == pending_reports.end()) {
+                continue;
+            }
+            pending = true;
+            ticks[value] = it->second.tick;
+            params.write_mask[value] = {~0U, it->second.wide ? ~0U : 0U};
+            if (it->second.slots.size() > Condition::MaxSlots) {
+                long_reports[value] = it->second.slots;
+                continue;
+            }
+            params.slot_count[value] = static_cast<u32>(it->second.slots.size());
+            std::copy(it->second.slots.begin(), it->second.slots.end(),
+                      params.slots[value].begin());
+        }
+    }
+    if (!pending) {
+        // Every value is in memory: the caller's comparison is exact.
+        return false;
+    }
+    gpu_condition = GpuCondition{.active = true, .params = params, .ticks = ticks};
+    if (!long_reports[0].empty() || !long_reports[1].empty()) {
+        // More passes than the kernel sums: the CPU waits for them and decides.
+        for (size_t value = 0; value < 2; ++value) {
+            gpu_condition.params.slot_count[value] = 0;
+            if (!long_reports[value].empty()) {
+                gpu_condition.params.slots[value] = {};
+            }
+        }
+        for (const u64 tick : ticks) {
+            if (tick != 0) {
+                scheduler.Wait(tick);
+            }
+        }
+        const u64* const results = scheduler.VisibilityResults();
+        for (size_t value = 0; value < values; ++value) {
+            Condition::Params& resolved = gpu_condition.params;
+            u64 sum = 0;
+            const std::vector<u32>& slots =
+                !long_reports[value].empty()
+                    ? long_reports[value]
+                    : std::vector<u32>(params.slots[value].begin(),
+                                       params.slots[value].begin() + params.slot_count[value]);
+            for (const u32 slot : slots) {
+                sum += results[slot];
+            }
+            const u64 memory =
+                u64{params.memory[value][0]} | (u64{params.memory[value][1]} << 32);
+            const u64 mask =
+                u64{params.write_mask[value][0]} | (u64{params.write_mask[value][1]} << 32);
+            const u64 merged = (memory & ~mask) | (sum & mask);
+            resolved.memory[value] = {static_cast<u32>(merged), static_cast<u32>(merged >> 32)};
+            resolved.write_mask[value] = {};
+        }
+        gpu_condition.holds = Condition::Evaluate(gpu_condition.params, results);
+        gpu_condition.resolved = true;
+        ++conditions_on_cpu;
+        return true;
+    }
+    ++conditions_on_gpu;
+    return true;
+}
+
+std::string RasterizerMetal::TakeGpuDecisionLine() {
+    const u64 on_gpu = std::exchange(conditions_on_gpu, 0);
+    const u64 on_cpu = std::exchange(conditions_on_cpu, 0);
+    const u64 under = std::exchange(draws_under_condition, 0);
+    const u64 indirect = std::exchange(indirect_draws_on_gpu, 0);
+    const u64 counts_read = std::exchange(indirect_counts_read, 0);
+    const u64 grid = std::exchange(grid_draws_on_gpu, 0);
+    if (on_gpu + on_cpu + under + indirect + counts_read + grid == 0) {
+        return {};
+    }
+    return fmt::format("conditions on pending reports {} on the GPU ({} draws under them), {} "
+                       "waited for on the CPU; indirect draws prepared on the GPU {}, counts "
+                       "read on the CPU {}; GPU-counted draws drawn from GPU arguments {}",
+                       on_gpu, under, on_cpu, indirect, counts_read, grid);
+}
+
+bool RasterizerMetal::ConditionHoldsOnCpu() {
+    if (!gpu_condition.active) {
+        return true;
+    }
+    if (!gpu_condition.resolved) {
+        for (const u64 tick : gpu_condition.ticks) {
+            if (tick != 0) {
+                scheduler.Wait(tick);
+            }
+        }
+        gpu_condition.holds =
+            Condition::Evaluate(gpu_condition.params, scheduler.VisibilityResults());
+        gpu_condition.resolved = true;
+    }
+    return gpu_condition.holds;
+}
+
+bool RasterizerMetal::PrepareConditionRegion() {
+    if (gpu_condition.resolved) {
+        // Waited for already: the CPU knows the answer.
+        return false;
+    }
+    if (gpu_condition.region.buffer != nullptr && gpu_condition.draws < Condition::RegionDraws &&
+        gpu_condition.region_tick == scheduler.CurrentTick()) {
+        return true;
+    }
+    if (!condition_kernel && !condition_kernel_failed) {
+        std::string error;
+        const Object library = CreateLibrary(device, Condition::KernelSource(), error);
+        const Object function =
+            library ? CreateFunction(library.Get(), "condition_arguments") : Object{};
+        condition_kernel =
+            function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
+        if (!condition_kernel) {
+            condition_kernel_failed = true;
+            LOG_ERROR(Render_Metal, "Metal: condition kernel failed to build: {}", error);
+        }
+    }
+    if (!condition_kernel) {
+        return false;
+    }
+    constexpr size_t RegionBytes =
+        (Condition::HeaderWords + size_t{Condition::RegionDraws} * Condition::ArgumentWords) *
+        sizeof(u32);
+    gpu_condition.region = staging_pool.Stream(RegionBytes, 16);
+    gpu_condition.region_words = reinterpret_cast<u32*>(gpu_condition.region.mapped_span.data());
+    gpu_condition.region_words[0] = 0;
+    gpu_condition.draws = 0;
+    // After the render passes that counted the samples (not ahead of the segment), before the
+    // draws: the draw count and their arguments are written before the commit.
+    scheduler.BeginCompute(condition_kernel.Get(), false);
+    scheduler.BindBuffer(ShaderStage::Compute, 0, scheduler.VisibilityBuffer(), 0);
+    scheduler.BindBytes(ShaderStage::Compute, 1, &gpu_condition.params,
+                        static_cast<u32>(sizeof(gpu_condition.params)));
+    scheduler.BindBuffer(ShaderStage::Compute, 2, gpu_condition.region.buffer,
+                         static_cast<u32>(gpu_condition.region.offset));
+    constexpr u32 GroupSize = 64;
+    scheduler.Dispatch({Condition::RegionDraws / GroupSize, 1, 1}, {GroupSize, 1, 1});
+    gpu_condition.region_tick = scheduler.CurrentTick();
+    return true;
+}
+
+bool RasterizerMetal::DrawUnderCondition(u32 primitive, bool indexed, u32 count, u32 index_size,
+                                         BufferHandle index_buffer, u64 index_offset, u32 first,
+                                         u32 instance_count, s32 base_vertex,
+                                         u32 base_instance) {
+    if (gpu_condition.region.buffer == nullptr ||
+        gpu_condition.region_tick != scheduler.CurrentTick() ||
+        gpu_condition.draws >= Condition::RegionDraws) {
+        return false;
+    }
+    const u32 draw = gpu_condition.draws++;
+    u32* const arguments =
+        gpu_condition.region_words + Condition::HeaderWords + draw * Condition::ArgumentWords;
+    if (indexed) {
+        arguments[0] = count;
+        arguments[1] = instance_count;
+        arguments[2] = first;
+        arguments[3] = static_cast<u32>(base_vertex);
+        arguments[4] = base_instance;
+    } else {
+        arguments[0] = count;
+        arguments[1] = instance_count;
+        arguments[2] = first;
+        arguments[3] = base_instance;
+        arguments[4] = 0;
+    }
+    gpu_condition.region_words[0] = gpu_condition.draws;
+    const u64 offset = gpu_condition.region.offset +
+                       (Condition::HeaderWords + u64{draw} * Condition::ArgumentWords) * sizeof(u32);
+    if (indexed) {
+        scheduler.DrawIndexedIndirect(primitive, index_size, index_buffer, index_offset,
+                                      gpu_condition.region.buffer, offset);
+    } else {
+        scheduler.DrawIndirect(primitive, gpu_condition.region.buffer, offset);
+    }
+    ++draws_under_condition;
+    return true;
 }
 
 void RasterizerMetal::FlushCommands() {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "video_core/renderer_metal/metal_draw_desc.h"
 
@@ -50,7 +51,15 @@ void FillRegisterState(RenderPipelineDesc& desc, const Maxwell& regs,
     }
     desc.topology_class = TopologyClass(topology);
     desc.rasterize = regs.rasterize_enable != 0 ? 1U : 0U;
-    desc.alpha_to_coverage = regs.anti_alias_alpha_control.alpha_to_coverage != 0 ? 1U : 0U;
+    // Alpha to one in bit 1 (EDEN_NX2_METAL_ALPHA_TO_ONE=0: not set, as before).
+    static const bool alpha_to_one = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_ALPHA_TO_ONE");
+        return value == nullptr || value[0] != '0';
+    }();
+    desc.alpha_to_coverage = (regs.anti_alias_alpha_control.alpha_to_coverage != 0 ? 1U : 0U) |
+                             (alpha_to_one && regs.anti_alias_alpha_control.alpha_to_one != 0
+                                  ? 2U
+                                  : 0U);
     for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
         const auto& input = regs.vertex_attrib_format[index];
         VertexAttributeState& attribute = desc.attributes[index];

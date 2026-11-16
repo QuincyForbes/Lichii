@@ -254,6 +254,21 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// streams than buffer slots, and reads integer 10:10:10:2 attributes as normalized ones, as
 /// before (EDEN_NX2_METAL_ADJACENCY=0, EDEN_NX2_METAL_VERTEX_UNPACK=0,
 /// EDEN_NX2_METAL_VERTEX_GATHER=0).
+/// "metal_async_off": the Metal renderer builds a pipeline first seen during a run on the draw's
+/// thread, as before (EDEN_NX2_METAL_ASYNC_PIPELINES=0). "metal_provoking_first": flat inputs take
+/// each primitive's first vertex, as before (EDEN_NX2_METAL_PROVOKING_LAST=0).
+/// "metal_condition_cpu": conditional rendering is decided on the CPU from guest memory only, as
+/// before (EDEN_NX2_METAL_GPU_CONDITION=0). "metal_indirect_cpu": indirect draw counts and
+/// GPU-written vertex counts are read on the CPU and indirect draws whose indices need rewriting
+/// are refused, as before (EDEN_NX2_METAL_GPU_INDIRECT=0). "metal_draw_texture_off": DrawTexture is
+/// refused, as before (EDEN_NX2_METAL_DRAW_TEXTURE=0). "metal_clear_layers_off": a clear covers
+/// only the bound layer, as before (EDEN_NX2_METAL_CLEAR_LAYERS=0). "metal_list_copies_off":
+/// command lists the GPU wrote are read after a full sync, as before
+/// (EDEN_NX2_METAL_LIST_COPIES=0). "metal_viewports_off": only viewport and scissor 0 are set, as
+/// before (EDEN_NX2_METAL_VIEWPORTS=0). "metal_fill_lines_off": triangles are always filled, as
+/// before (EDEN_NX2_METAL_FILL_LINES=0). "metal_tess_base_off": the base vertex of indexed
+/// tessellated draws is ignored, as before (EDEN_NX2_METAL_TESS_BASE_VERTEX=0).
+/// "metal_alpha_to_one_off": alpha to one stays off, as before (EDEN_NX2_METAL_ALPHA_TO_ONE=0).
 /// "pipeline_holds_old": the pipeline build a draw waits for stays queued on the builder pool, as
 /// before (EDEN_NX2_PIPELINE_HOLD_BOOST=0). "pipeline_list_old": the used pipelines list is
 /// written only on a first use 15 s after the last save and at shutdown, as before

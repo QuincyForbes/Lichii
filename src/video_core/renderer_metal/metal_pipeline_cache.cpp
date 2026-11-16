@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <mutex>
 #include <thread>
@@ -22,6 +23,7 @@
 #include "common/logging.h"
 #include "common/platform_events.h"
 #include "common/thread_worker.h"
+#include "video_core/async_translate.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
@@ -50,7 +52,34 @@ void ReleaseSource(StageProgram& program) {
     }
 }
 
+u64 NanosecondsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+}
+
 } // Anonymous namespace
+
+u32 AsyncPipelineThreads() {
+    static const u32 threads = [] {
+        // Vulkan's switches apply too: EDEN_NX2_ASYNC_TRANSLATE other than 1 translates on the
+        // draw's thread; EDEN_NX2_ASYNC_TRANSLATE_THREADS sets the count unless the Metal one does.
+        if (VideoCommon::AsyncTranslateMode() != 1) {
+            return 0U;
+        }
+        const u32 automatic = (std::max)(std::thread::hardware_concurrency(), 2U) - 1;
+        const char* value = std::getenv("EDEN_NX2_METAL_ASYNC_PIPELINES");
+        if (value == nullptr || value[0] == '\0') {
+            value = std::getenv("EDEN_NX2_ASYNC_TRANSLATE_THREADS");
+        }
+        if (value == nullptr || value[0] == '\0') {
+            return automatic;
+        }
+        const long parsed = std::strtol(value, nullptr, 10);
+        return parsed <= 0 ? 0U : (std::min)(static_cast<u32>(parsed), 16U);
+    }();
+    return threads;
+}
 
 std::string_view PipelineCache::NoteRefusal(u64 key_hash) {
     const auto [it, is_new] = refusal_causes.try_emplace(key_hash);
@@ -218,60 +247,87 @@ bool GraphicsPipeline::BuildFunctions(const Device& device) {
     return true;
 }
 
-void* GraphicsPipeline::RenderState(const Device& device, RenderPipelineDesc& desc) {
-    NativeMesh* const native = Native();
-    if (native != nullptr) {
-        desc.vertex_function = native->mesh.function.Get();
-        desc.fragment_function = native->fragment.function.Get();
+std::optional<MeshFunctions> GraphicsPipeline::NativeFunctions() const noexcept {
+    if (!native_mesh || native_mesh->failed) {
+        return std::nullopt;
+    }
+    return MeshFunctions{
+        .object_function = native_mesh->object.function.Get(),
+        .mesh_function = native_mesh->mesh.function.Get(),
+        .fragment_function = native_mesh->fragment.function.Get(),
+        .payload_bytes = native_mesh->payload_bytes,
+        .object_threads = native_mesh->object_threads,
+        .mesh_threads = native_mesh->mesh_threads,
+    };
+}
+
+u64 GraphicsPipeline::StateHash(RenderPipelineDesc& desc) const noexcept {
+    if (const std::optional<MeshFunctions> native = NativeFunctions()) {
+        desc.vertex_function = native->mesh_function;
+        desc.fragment_function = native->fragment_function;
     } else {
         desc.vertex_function = vertex.function.Get();
         desc.fragment_function = fragment.function.Get();
     }
-    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(&desc), sizeof(desc));
-    const auto [it, is_new] = render_states.try_emplace(hash);
-    if (is_new && native != nullptr) {
-        std::string error;
-        it->second = CreateMeshRenderPipelineState(
-            device, desc,
-            MeshFunctions{
-                .object_function = native->object.function.Get(),
-                .mesh_function = native->mesh.function.Get(),
-                .fragment_function = native->fragment.function.Get(),
-                .payload_bytes = native->payload_bytes,
-                .object_threads = native->object_threads,
-                .mesh_threads = native->mesh_threads,
-            },
-            error, archive);
-        if (!it->second) {
-            render_states.erase(it);
+    return Common::CityHash64(reinterpret_cast<const char*>(&desc), sizeof(desc));
+}
+
+std::optional<void*> GraphicsPipeline::FindState(u64 hash) const {
+    const auto it = render_states.find(hash);
+    if (it == render_states.end()) {
+        return std::nullopt;
+    }
+    return it->second.Get();
+}
+
+void* GraphicsPipeline::RenderState(const Device& device, RenderPipelineDesc& desc) {
+    const u64 hash = StateHash(desc);
+    if (const std::optional<void*> found = FindState(hash)) {
+        return *found;
+    }
+    const std::optional<MeshFunctions> native = NativeFunctions();
+    std::string error;
+    if (native) {
+        Object state = CreateMeshRenderPipelineState(device, desc, *native, error, archive);
+        return AdoptState(hash, desc, std::move(state), error, true);
+    }
+    // The boot trace: what the first pipelines ask of Metal, written before Metal sees it.
+    static std::atomic<u32> traced{};
+    if (BootTraceEnabled() && traced.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_INFO(Render_Metal, "Metal: render pipeline {:016x} fragment {:016x}: {}",
+                 key.unique_hashes[1], key.unique_hashes[5], Describe(desc));
+    }
+    Object state = CreateRenderPipelineState(device, desc, error, archive);
+    return AdoptState(hash, desc, std::move(state), error, false);
+}
+
+void* GraphicsPipeline::AdoptState(u64 hash, const RenderPipelineDesc& desc, Object state,
+                                   std::string_view error, bool mesh_state) {
+    if (mesh_state) {
+        // A refused mesh state is not kept: the pipeline's draws go through the emulation.
+        if (!state) {
             FailNative(fmt::format("mesh render pipeline refused: {}; {}", error, Describe(desc)));
             return nullptr;
         }
-        if (recorder != nullptr) {
-            recorder->RecordState(key, desc);
-        }
-    } else if (is_new) {
-        // The boot trace: what the first pipelines ask of Metal, written before Metal sees it.
-        static std::atomic<u32> traced{};
-        if (BootTraceEnabled() && traced.fetch_add(1, std::memory_order_relaxed) < 16) {
-            LOG_INFO(Render_Metal, "Metal: render pipeline {:016x} fragment {:016x}: {}",
-                     key.unique_hashes[1], key.unique_hashes[5], Describe(desc));
-        }
-        std::string error;
-        it->second = CreateRenderPipelineState(device, desc, error, archive);
-        if (!it->second) {
-            static std::atomic<u32> logged{};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_WARNING(Render_Metal,
-                            "Metal: render pipeline {:016x} refused: {}; fragment {:016x}, {}",
-                            key.unique_hashes[1], error, key.unique_hashes[5], Describe(desc));
-            }
-        } else if (recorder != nullptr) {
-            // Only states Metal made are kept: boot never asks for one it has not seen made.
-            recorder->RecordState(key, desc);
+        if (Native() == nullptr) {
+            // Refused natively while this state was being built.
+            return nullptr;
         }
     }
-    return it->second.Get();
+    if (!state) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Metal,
+                        "Metal: render pipeline {:016x} refused: {}; fragment {:016x}, {}",
+                        key.unique_hashes[1], error, key.unique_hashes[5], Describe(desc));
+        }
+    } else if (recorder != nullptr) {
+        // Only states Metal made are kept: boot never asks for one it has not seen made.
+        recorder->RecordState(key, desc);
+    }
+    Object& slot = render_states[hash];
+    slot = std::move(state);
+    return slot.Get();
 }
 
 ComputePipeline::ComputePipeline(const ComputePipelineKey& key_, StageProgram program_)
@@ -314,6 +370,17 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory,
         files.Wait();
         archive.Save();
     });
+    if (const u32 threads = AsyncPipelineThreads(); threads != 0) {
+        // Background QoS: a draw that waits for a build runs it itself or lends it its own.
+        const u32 apple_family = DeviceAppleFamily(device);
+        builders = std::make_unique<Common::StatefulThreadWorker<PipelineTranslator>>(
+            threads, "MetalPipelineBuilder",
+            [apple_family] { return PipelineTranslator{TranslateForIos, apple_family}; },
+            Common::ThreadPlacement::Background);
+        LOG_INFO(Render_Metal, "Metal: pipelines first seen in a run are built on {} threads "
+                               "(EDEN_NX2_METAL_ASYNC_PIPELINES)",
+                 threads);
+    }
 }
 
 PipelineCache::~PipelineCache() {
@@ -540,6 +607,7 @@ std::array<u64, 3> PipelineCache::TakeCounts() noexcept {
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
+    building = false;
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         refusal = "shader programs not in guest memory";
@@ -550,14 +618,27 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     if (current_pipeline != nullptr && current_pipeline->Key() == graphics_key) {
         return current_pipeline;
     }
-    const auto [it, is_new] = graphics_cache.try_emplace(graphics_key);
-    if (is_new) {
-        it->second = CreateGraphicsPipeline();
-        it->second ? ++graphics_made : ++refused;
-        if (it->second) {
-            it->second->SetArchive(&archive);
-            it->second->SetRecorder(&files);
+    auto it = graphics_cache.find(graphics_key);
+    if (it == graphics_cache.end()) {
+        std::unique_ptr<GraphicsPipeline> made;
+        if (builders) {
+            bool pending = false;
+            made = BuildInBackground(pending);
+            if (pending) {
+                current_pipeline = nullptr;
+                building = true;
+                refusal = "pipeline still building";
+                return nullptr;
+            }
+        } else {
+            made = CreateGraphicsPipeline();
         }
+        made ? ++graphics_made : ++refused;
+        if (made) {
+            made->SetArchive(&archive);
+            made->SetRecorder(&files);
+        }
+        it = graphics_cache.emplace(graphics_key, std::move(made)).first;
     }
     current_pipeline = it->second.get();
     if (current_pipeline == nullptr) {
@@ -596,6 +677,209 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     return it->second.get();
 }
 
+void PipelineCache::StoreRecord(const GraphicsPipelineKey& key,
+                                const std::array<VideoCommon::GraphicsEnvironment, 6>& envs) {
+    if (!files.IsOpen() || !disk_graphics.insert(key).second) {
+        return;
+    }
+    files.Queue([this, key, envs] {
+        boost::container::static_vector<const VideoCommon::GenericEnvironment*, MaxPrograms>
+            env_ptrs;
+        for (size_t index = 0; index < MaxPrograms; ++index) {
+            if (key.unique_hashes[index] != 0) {
+                env_ptrs.push_back(&envs[index]);
+            }
+        }
+        VideoCommon::SerializePipeline(key, env_ptrs, files.Records(),
+                                       PipelineFiles::RecordsVersion);
+    });
+}
+
+void PipelineCache::Hold(PipelineBuildJob& job) {
+    const auto begin = std::chrono::steady_clock::now();
+    bool boosted = false;
+    const bool here = job.Wait(translator, boosted);
+    const u64 waited = NanosecondsSince(begin);
+    ++build_stats.held;
+    build_stats.held_here += here ? 1 : 0;
+    build_stats.boosted += boosted ? 1 : 0;
+    build_stats.held_ns += waited;
+    build_stats.held_max_ns = (std::max)(build_stats.held_max_ns, waited);
+}
+
+std::shared_ptr<PipelineCache::GraphicsBuild> PipelineCache::QueueGraphicsBuild() {
+    auto build = std::make_shared<GraphicsBuild>();
+    build->key = graphics_key;
+    build->queued = std::chrono::steady_clock::now();
+    {
+        // Snapshots: what the translation reads of the engine and the constant buffers is
+        // copied now, as EDEN_NX2_ASYNC_TRANSLATE does on Vulkan.
+        GraphicsEnvironments environments;
+        GetGraphicsEnvironments(environments, graphics_key.unique_hashes, true);
+        build->envs = environments.envs;
+    }
+    GraphicsBuild* const raw = build.get();
+    build->job = std::make_shared<PipelineBuildJob>([this, raw](PipelineTranslator& worker) {
+        InAutoreleasePool([&] {
+            boost::container::static_vector<Shader::Environment*, MaxPrograms> env_ptrs;
+            for (size_t index = 0; index < MaxPrograms; ++index) {
+                if (raw->key.unique_hashes[index] != 0) {
+                    env_ptrs.push_back(&raw->envs[index]);
+                }
+            }
+            std::optional<TranslatedPipeline> translated =
+                worker.Graphics(raw->key, {env_ptrs.data(), env_ptrs.size()});
+            if (!translated) {
+                raw->cause = worker.Cause();
+                return;
+            }
+            auto pipeline = std::make_unique<GraphicsPipeline>(
+                raw->key, std::move(translated->vertex), std::move(translated->fragment),
+                std::move(translated->mesh), std::move(translated->tessellation),
+                std::move(translated->native_mesh));
+            pipeline->SetArchive(&archive);
+            if (pipeline->BuildFunctions(device)) {
+                MeshEmulation* const mesh = pipeline->Mesh();
+                if (mesh != nullptr && pipeline->Native() == nullptr) {
+                    static_cast<void>(pipeline->KernelState(device, mesh->first));
+                    if (mesh->has_task) {
+                        static_cast<void>(pipeline->KernelState(device, mesh->mesh));
+                        static_cast<void>(pipeline->KernelState(device, mesh->distribution));
+                    }
+                }
+                if (Tessellation* const tess = pipeline->Tess()) {
+                    static_cast<void>(pipeline->KernelState(device, tess->control));
+                }
+            }
+            raw->pipeline = std::move(pipeline);
+        });
+    });
+    builders->QueueWork([build](PipelineTranslator* worker) { build->job->Run(*worker); });
+    graphics_builds.insert_or_assign(graphics_key, build);
+    ++build_stats.queued;
+    return build;
+}
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::AdoptBuild(GraphicsBuild& build, bool& retry) {
+    retry = false;
+    for (size_t index = 0; index < MaxPrograms; ++index) {
+        // A texture descriptor the translation read changed since the snapshot.
+        if (build.key.unique_hashes[index] != 0 && !build.envs[index].TextureReadsStillMatch()) {
+            retry = true;
+            return nullptr;
+        }
+    }
+    ++build_stats.adopted;
+    const u64 ready = NanosecondsSince(build.queued);
+    build_stats.ready_ns += ready;
+    build_stats.ready_max_ns = (std::max)(build_stats.ready_max_ns, ready);
+    if (!build.pipeline) {
+        refusal_causes.try_emplace(build.key.Hash(),
+                                   build.cause.empty() ? "pipeline not made" : build.cause);
+        return nullptr;
+    }
+    StoreRecord(build.key, build.envs);
+    return std::move(build.pipeline);
+}
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::BuildInBackground(bool& pending) {
+    pending = false;
+    std::shared_ptr<GraphicsBuild> build;
+    if (const auto found = graphics_builds.find(graphics_key); found != graphics_builds.end()) {
+        build = found->second;
+    } else {
+        build = QueueGraphicsBuild();
+    }
+    if (!build->job->IsDone()) {
+        if (MayBeSkipped()) {
+            ++build_stats.skipped;
+            pending = true;
+            return nullptr;
+        }
+        Hold(*build->job);
+    }
+    graphics_builds.erase(graphics_key);
+    bool retry = false;
+    std::unique_ptr<GraphicsPipeline> pipeline = AdoptBuild(*build, retry);
+    if (!retry) {
+        return pipeline;
+    }
+    ++build_stats.stale;
+    if (MayBeSkipped()) {
+        // Again from what the guest holds now.
+        static_cast<void>(QueueGraphicsBuild());
+        ++build_stats.skipped;
+        pending = true;
+        return nullptr;
+    }
+    return CreateGraphicsPipeline();
+}
+
+void* PipelineCache::RenderState(GraphicsPipeline& pipeline, RenderPipelineDesc& desc,
+                                 bool& building_state) {
+    building_state = false;
+    if (!builders) {
+        return pipeline.RenderState(device, desc);
+    }
+    const u64 hash = pipeline.StateHash(desc);
+    if (const std::optional<void*> found = pipeline.FindState(hash)) {
+        return *found;
+    }
+    const std::pair<const GraphicsPipeline*, u64> state_key{&pipeline, hash};
+    auto it = state_builds.find(state_key);
+    if (it == state_builds.end()) {
+        if (!MayBeSkipped()) {
+            // Nothing queued and the draw waits: built here as before.
+            return pipeline.RenderState(device, desc);
+        }
+        auto build = std::make_shared<StateBuild>();
+        build->desc = desc;
+        build->native = pipeline.NativeFunctions();
+        StateBuild* const raw = build.get();
+        build->job = std::make_shared<PipelineBuildJob>([this, raw](PipelineTranslator&) {
+            InAutoreleasePool([&] {
+                raw->state = raw->native ? CreateMeshRenderPipelineState(device, raw->desc,
+                                                                         *raw->native, raw->error,
+                                                                         &archive)
+                                         : CreateRenderPipelineState(device, raw->desc,
+                                                                     raw->error, &archive);
+            });
+        });
+        builders->QueueWork([build](PipelineTranslator* worker) { build->job->Run(*worker); });
+        it = state_builds.emplace(state_key, std::move(build)).first;
+        ++build_stats.states_queued;
+    }
+    if (!it->second->job->IsDone()) {
+        if (MayBeSkipped()) {
+            ++build_stats.skipped;
+            building_state = true;
+            return nullptr;
+        }
+        Hold(*it->second->job);
+    }
+    const std::shared_ptr<StateBuild> build = std::move(it->second);
+    state_builds.erase(it);
+    return pipeline.AdoptState(hash, build->desc, std::move(build->state), build->error,
+                               build->native.has_value());
+}
+
+std::string PipelineCache::TakeBuildLine() {
+    const BuildStats stats = std::exchange(build_stats, BuildStats{});
+    if (stats.queued + stats.states_queued + stats.held + stats.skipped == 0) {
+        return {};
+    }
+    const auto ms = [](u64 ns) { return static_cast<f64>(ns) / 1e6; };
+    return fmt::format(
+        "{} pipelines and {} render states queued, {} adopted (ready after {:.0f} ms on average, "
+        "{:.0f} max), {} stale; draws skipped {}, held {} for {:.0f} ms, max {:.0f} ({} built by "
+        "the waiting thread, {} builders lent its QoS); {} building",
+        stats.queued, stats.states_queued, stats.adopted,
+        stats.adopted != 0 ? ms(stats.ready_ns) / static_cast<f64>(stats.adopted) : 0.0,
+        ms(stats.ready_max_ns), stats.stale, stats.skipped, stats.held, ms(stats.held_ns),
+        ms(stats.held_max_ns), stats.held_here, stats.boosted,
+        graphics_builds.size() + state_builds.size());
+}
+
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
@@ -604,19 +888,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     if (!translated) {
         return nullptr;
     }
-    if (files.IsOpen() && disk_graphics.insert(graphics_key).second) {
-        files.Queue([this, key = graphics_key, envs = environments.envs] {
-            boost::container::static_vector<const VideoCommon::GenericEnvironment*, MaxPrograms>
-                env_ptrs;
-            for (size_t index = 0; index < MaxPrograms; ++index) {
-                if (key.unique_hashes[index] != 0) {
-                    env_ptrs.push_back(&envs[index]);
-                }
-            }
-            VideoCommon::SerializePipeline(key, env_ptrs, files.Records(),
-                                           PipelineFiles::RecordsVersion);
-        });
-    }
+    StoreRecord(graphics_key, environments.envs);
     return std::make_unique<GraphicsPipeline>(
         graphics_key, std::move(translated->vertex), std::move(translated->fragment),
         std::move(translated->mesh), std::move(translated->tessellation),

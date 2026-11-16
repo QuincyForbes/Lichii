@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -42,11 +44,14 @@
 #include "translate_smoke_comp_spv.h"
 #include "video_core/renderer_metal/metal_archive.h"
 #include "video_core/renderer_metal/metal_bridge.h"
+#include "video_core/renderer_metal/metal_condition.h"
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_mesh_indirect.h"
+#include "video_core/renderer_metal/metal_indirect.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
+#include "video_core/renderer_metal/metal_build_job.h"
 #include "video_core/renderer_metal/metal_pipeline_files.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
@@ -1126,7 +1131,12 @@ int RunIndexRewrite() {
     const Metal::Object state =
         function ? Metal::CreateComputePipelineState(device, function.Get(), error)
                  : Metal::Object{};
-    if (!state) {
+    const Metal::Object strip_function =
+        library ? Metal::CreateFunction(library.Get(), "rewrite_restart_strip") : Metal::Object{};
+    const Metal::Object strip_state =
+        strip_function ? Metal::CreateComputePipelineState(device, strip_function.Get(), error)
+                       : Metal::Object{};
+    if (!state || !strip_state) {
         std::printf("metal-smoke: FAIL index rewrite kernel: %s\n", error.c_str());
         return 1;
     }
@@ -1153,10 +1163,16 @@ int RunIndexRewrite() {
             cases.push_back({topology, index_size, topology == Topology::TriangleStrip});
         }
     }
-    // Rewritten for the provoking vertex (EDEN_NX2_METAL_PROVOKING_LAST): strips without restarts.
-    for (const Topology topology : {Topology::Triangles, Topology::TriangleStrip}) {
+    // Rewritten for the last vertex convention (EDEN_NX2_METAL_PROVOKING_LAST): every line and
+    // triangle topology, strips also with restarts (kernel rewrite_restart_strip).
+    for (const Topology topology :
+         {Topology::Triangles, Topology::TriangleStrip, Topology::Quads, Topology::QuadStrip,
+          Topology::TriangleFan, Topology::Lines, Topology::LineStrip, Topology::LineLoop}) {
         for (const uint32_t index_size : {1U, 2U, 4U}) {
             cases.push_back({topology, index_size, false, true});
+            if (topology == Topology::TriangleStrip) {
+                cases.push_back({topology, index_size, true, true});
+            }
         }
     }
     // One source for all: bytes that make different values at each size, with restart values.
@@ -1164,22 +1180,27 @@ int RunIndexRewrite() {
         source[SourceOffset + byte] = static_cast<uint8_t>(byte * 37 + 5);
     }
     std::memset(source + SourceOffset + 4 * 2, 0xFF, 4);
-    scheduler.BeginCompute(state.Get());
     for (Case& test : cases) {
         test.converted = IndexConvert::ConvertedCount(test.topology, Count, test.provoking_last);
         test.output = Metal::CreateBuffer(device, test.converted * 4, true, &test.contents);
         const IndexConvert::RewriteParams params{
-            .mode = IndexConvert::RewriteMode(test.topology, test.provoking_last),
+            .mode = IndexConvert::RewriteMode(test.topology, test.provoking_last, test.restart),
             .index_size = test.index_size,
             .count = Count,
             .restart = test.restart ? 1U : 0U,
             .converted = test.converted,
             .source_offset = SourceOffset,
         };
+        const bool strip = params.mode == IndexConvert::StripRestartMode;
+        scheduler.BeginCompute(strip ? strip_state.Get() : state.Get());
         scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, source_buffer.Get(), 0);
         scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, test.output.Get(), 0);
         scheduler.BindBytes(Metal::ShaderStage::Compute, 2, &params, sizeof(params));
-        scheduler.Dispatch({(test.converted + 63) / 64, 1, 1}, {64, 1, 1});
+        if (strip) {
+            scheduler.Dispatch({1, 1, 1}, {IndexConvert::StripRestartThreads, 1, 1});
+        } else {
+            scheduler.Dispatch({(test.converted + 63) / 64, 1, 1}, {64, 1, 1});
+        }
     }
     scheduler.Finish();
     uint32_t wrong = 0;
@@ -1198,9 +1219,11 @@ int RunIndexRewrite() {
         total += test.converted;
     }
     // A strip with a restart, rewritten for the provoking vertex on the CPU: each part on its own,
-    // every triangle starting with its last vertex and keeping its winding.
+    // every triangle starting with its last vertex and keeping its winding, the triangles across
+    // the restart degenerate.
     const std::array<uint16_t, 9> strip{0, 1, 2, 3, 0xFFFF, 4, 5, 6, 7};
-    const std::array<uint32_t, 12> strip_expected{2, 0, 1, 3, 2, 1, 6, 4, 5, 7, 6, 5};
+    const std::array<uint32_t, 21> strip_expected{2, 0, 1, 3, 2, 1, 0, 0, 0, 0, 0, 0,
+                                                  0, 0, 0, 6, 4, 5, 7, 6, 5};
     std::array<uint32_t, 21> strip_out{};
     const uint32_t strip_written = IndexConvert::Convert(
         Topology::TriangleStrip,
@@ -2828,10 +2851,11 @@ int RunStateCache() {
                           Near(scene.At(1, 4, upper), {0, 0, 255, 255}) &&
                           Near(scene.At(1, Size - 4, upper), {0, 255, 0, 255}) &&
                           Near(scene.At(1, Size - 4, lower), {0, 0, 255, 255});
-    // A draw is ten pieces of state and one buffer. The first of a pass sets them all (11); the
-    // second sets the scissor and the offset (2 set, 9 left); the third nothing (11 left).
+    // A draw is eleven pieces of state (the fill mode the last) and one buffer. The first of a
+    // pass sets them all (12); the second sets the scissor and the offset (2 set, 10 left); the
+    // third nothing (12 left).
     const bool caching = SwitchOn("EDEN_NX2_METAL_STATE_CACHE");
-    const bool counted = caching ? sets == 24 && skips == 20 : sets == 44 && skips == 0;
+    const bool counted = caching ? sets == 26 && skips == 22 : sets == 48 && skips == 0;
     std::printf("metal-smoke: state cache (%s): pictures %s; %llu set, %llu left as they were: "
                 "%s\n",
                 caching ? "on" : "off", pictures ? "PASS" : "FAIL",
@@ -3199,13 +3223,19 @@ int RunPipelineFiles() {
     std::error_code ec;
     std::filesystem::remove_all(directory, ec);
     constexpr size_t Variants = 8;
+    // Variants of other GPU code: the archive keys on it, so variants differing only in state it
+    // does not compile in (the write mask) hit each other's entries once one of them was added.
+    constexpr std::array<MTLPixelFormat, Variants> formats{
+        MTLPixelFormatR8Unorm,    MTLPixelFormatRG8Unorm,  MTLPixelFormatRGBA8Unorm,
+        MTLPixelFormatR16Float,   MTLPixelFormatRG16Float, MTLPixelFormatRGBA16Float,
+        MTLPixelFormatR32Float,   MTLPixelFormatRG32Float};
     std::vector<Metal::RenderPipelineDesc> descs;
     for (size_t index = 0; index < Variants; ++index) {
         auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
         desc.vertex_function = vertex.Get();
         desc.fragment_function = fragment.Get();
-        desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
-        desc.blend[0].write_mask = static_cast<uint32_t>(index + 1);
+        desc.color_formats[0] = static_cast<uint32_t>(formats[index]);
+        desc.blend[0].write_mask = 0xF;
         desc.samples = 1;
         desc.topology_class = 2;
         desc.rasterize = 1;
@@ -3288,21 +3318,444 @@ int RunPipelineFiles() {
     Metal::PipelineArchive reopened;
     const bool second_built = reopened.Open(device, archive_path) && build_all(reopened);
     const Metal::PipelineArchive::Counts second = reopened.Totals();
+    // Checked without timing: every build is a hit or a miss (counted under the archive's lock),
+    // every miss is added, the reopened archive serves all. Should Metal still find two variants
+    // equal, a thread may hit the other's entry in the first run; that is a real hit, not a race.
     const bool passed = boot_marked && rebooted && states_read == Variants && functions_cleared &&
-                        listed && unlisted && first_built && second_built &&
-                        first.misses == Variants && first.added == Variants &&
+                        listed && unlisted && first_built && second_built && first.misses != 0 &&
+                        first.misses + first.hits == Variants && first.added == first.misses &&
                         second.hits == Variants && second.misses == 0;
     std::printf("metal-smoke: pipeline files: %zu of %zu render states read back (written twice "
                 "each), functions cleared %s; used list %s/%s; unfinished boot seen %s; %zu "
-                "pipelines on %zu threads: first %llu misses, %llu added, second %llu hits, %llu "
-                "misses: %s\n",
+                "pipelines on %zu threads: first %llu misses, %llu hits, %llu added, second %llu "
+                "hits, %llu misses: %s\n",
                 states_read, Variants, functions_cleared ? "yes" : "no",
                 listed ? "listed" : "missing", unlisted ? "others not" : "others too",
                 rebooted ? "yes" : "no", Variants, Variants,
                 static_cast<unsigned long long>(first.misses),
+                static_cast<unsigned long long>(first.hits),
                 static_cast<unsigned long long>(first.added),
                 static_cast<unsigned long long>(second.hits),
                 static_cast<unsigned long long>(second.misses), passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+constexpr const char* ProvokingSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct FlatOut {
+    float4 position [[position]];
+    float4 colour [[flat]];
+};
+
+vertex FlatOut flat_vertex(uint id [[vertex_id]], constant float2* positions [[buffer(0)]]) {
+    FlatOut out;
+    out.position = float4(positions[id], 0.0, 1.0);
+    out.colour = float4(float(id + 1) * 0.1, 0.0, 0.0, 1.0);
+    return out;
+}
+
+fragment float4 flat_fragment(FlatOut in [[stage_in]]) {
+    return in.colour;
+}
+)";
+
+/// Flat inputs and the provoking vertex: Metal takes them from a primitive's first vertex (it has
+/// no setting); IndexConvert's rewrite for the last vertex convention makes them the last one's,
+/// as Vulkan draws them with VK_EXT_provoking_vertex. Triangle lists, strips and fans, each drawn
+/// as the guest's indices and rewritten, two triangles sampled per draw.
+int RunProvokingVertex() {
+    using Topology = Metal::IndexConvert::Topology;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    NSError* error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:@(ProvokingSource)
+                                                  options:[MTLCompileOptions new]
+                                                    error:&error];
+    MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+    desc.vertexFunction = [library newFunctionWithName:@"flat_vertex"];
+    desc.fragmentFunction = [library newFunctionWithName:@"flat_fragment"];
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> pipeline =
+        library != nil ? [device newRenderPipelineStateWithDescriptor:desc error:&error] : nil;
+    if (pipeline == nil) {
+        std::printf("metal-smoke: FAIL provoking vertex pipeline: %s\n",
+                    error != nil ? error.localizedDescription.UTF8String : "no library");
+        return 1;
+    }
+    struct Case {
+        const char* name;
+        Topology topology;
+        std::vector<float> positions;
+        /// Pixels (x, y) inside the first and the second triangle, and the vertex each takes
+        /// flat inputs from under the first and the last vertex convention (Vulkan's tables).
+        std::array<std::array<uint32_t, 2>, 2> pixels;
+        std::array<uint32_t, 2> first;
+        std::array<uint32_t, 2> last;
+    };
+    constexpr uint32_t Near = 4;
+    constexpr uint32_t Far = Size - 4;
+    const std::vector<Case> cases{
+        {"triangles",
+         Topology::Triangles,
+         {-1, -1, -1, 1, 0, -1, 0, 1, 1, 1, 1, -1},
+         {{{Near, Size / 2}, {Far, Size / 2}}},
+         {0, 3},
+         {2, 5}},
+        {"triangle strip",
+         Topology::TriangleStrip,
+         {-1, -1, -1, 1, 1, -1, 1, 1},
+         {{{Near, Far}, {Far, Near}}},
+         // Metal's own strip: reported only (which vertex of an odd triangle it takes is its own).
+         {~0U, ~0U},
+         {2, 3}},
+        {"triangle fan",
+         Topology::TriangleFan,
+         {-1, -1, 1, -1, 1, 1, -1, 1},
+         {{{Far, Far}, {Near, Near}}},
+         {1, 2},
+         {2, 3}},
+    };
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    MTLTextureDescriptor* texture_desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                           width:Size
+                                                          height:Size
+                                                       mipmapped:NO];
+    texture_desc.usage = MTLTextureUsageRenderTarget;
+    texture_desc.storageMode = MTLStorageModeShared;
+    uint32_t wrong = 0;
+    std::string report;
+    for (const Case& test : cases) {
+        const uint32_t count = static_cast<uint32_t>(test.positions.size() / 2);
+        id<MTLBuffer> positions =
+            [device newBufferWithBytes:test.positions.data()
+                                length:test.positions.size() * sizeof(float)
+                               options:MTLResourceStorageModeShared];
+        for (const bool provoking_last : {false, true}) {
+            std::vector<uint8_t> guest(count);
+            for (uint32_t vertex = 0; vertex < count; ++vertex) {
+                guest[vertex] = static_cast<uint8_t>(vertex);
+            }
+            const auto topology = Metal::IndexConvert::ConvertedTopology(test.topology, provoking_last);
+            std::vector<uint32_t> indices(
+                Metal::IndexConvert::ConvertedCount(test.topology, count, provoking_last));
+            const uint32_t written = Metal::IndexConvert::Convert(
+                test.topology, guest, 1, 0, count, false, indices, provoking_last);
+            id<MTLBuffer> index_buffer =
+                [device newBufferWithBytes:indices.data()
+                                    length:std::max<size_t>(indices.size(), 1) * sizeof(uint32_t)
+                                   options:MTLResourceStorageModeShared];
+            id<MTLTexture> target = [device newTextureWithDescriptor:texture_desc];
+            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = target;
+            pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+            id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+            id<MTLRenderCommandEncoder> encoder =
+                [command_buffer renderCommandEncoderWithDescriptor:pass];
+            [encoder setRenderPipelineState:pipeline];
+            [encoder setVertexBuffer:positions offset:0 atIndex:0];
+            const bool native = !Metal::IndexConvert::NeedsConversion(test.topology) && !provoking_last;
+            if (native) {
+                [encoder drawPrimitives:static_cast<MTLPrimitiveType>(
+                                            *Metal::PrimitiveType(test.topology))
+                            vertexStart:0
+                            vertexCount:count];
+            } else {
+                [encoder drawIndexedPrimitives:static_cast<MTLPrimitiveType>(
+                                                   *Metal::PrimitiveType(topology))
+                                    indexCount:written
+                                     indexType:MTLIndexTypeUInt32
+                                   indexBuffer:index_buffer
+                             indexBufferOffset:0];
+            }
+            [encoder endEncoding];
+            [command_buffer commit];
+            [command_buffer waitUntilCompleted];
+            std::vector<Texel> texels(Size * Size);
+            [target getBytes:texels.data()
+                 bytesPerRow:Size * 4
+                  fromRegion:MTLRegionMake2D(0, 0, Size, Size)
+                 mipmapLevel:0];
+            const std::array<uint32_t, 2>& expected = provoking_last ? test.last : test.first;
+            for (size_t triangle = 0; triangle < 2; ++triangle) {
+                const auto [x, y] = test.pixels[triangle];
+                const uint8_t red = texels[y * Size + x].r;
+                const uint8_t want =
+                    static_cast<uint8_t>(std::lround(float(expected[triangle] + 1) * 0.1f * 255.0f));
+                const bool ok = expected[triangle] == ~0U ||
+                                (red > want ? red - want : want - red) <= 1;
+                wrong += ok ? 0 : 1;
+                char line[96];
+                std::snprintf(line, sizeof(line), " %s %s #%zu: vertex %ld%s", test.name,
+                              provoking_last ? "last" : "first", triangle,
+                              std::lround(float(red) / 25.5f) - 1, ok ? "" : " WRONG");
+                report += line;
+            }
+        }
+    }
+    std::printf("metal-smoke: provoking vertex (first: as Metal draws, last: rewritten):%s: %s\n",
+                report.c_str(), wrong == 0 ? "PASS" : "FAIL");
+    return wrong == 0 ? 0 : 1;
+}
+
+/// Conditional rendering on the GPU (metal_condition.h): a render pass counts the samples of a
+/// full-target quad into a visibility slot, then the condition kernel, recorded after it in the
+/// same command buffer, reads the slot and zeroes the instance counts of a region's draws when
+/// the condition fails. Equal and not-equal against the expected count, and a 32-bit report.
+int RunCondition() {
+    using Maxwell = Metal::Maxwell;
+    namespace Condition = Metal::Condition;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    std::string error;
+    const Metal::Object quad_library = Metal::CreateLibrary(device, QuadSource, error);
+    const Metal::Object vertex =
+        quad_library ? Metal::CreateFunction(quad_library.Get(), "quad_vertex") : Metal::Object{};
+    const Metal::Object fragment = quad_library
+                                       ? Metal::CreateFunction(quad_library.Get(), "quad_fragment")
+                                       : Metal::Object{};
+    const Metal::Object library = Metal::CreateLibrary(device, Condition::KernelSource(), error);
+    const Metal::Object function =
+        library ? Metal::CreateFunction(library.Get(), "condition_arguments") : Metal::Object{};
+    const Metal::Object kernel =
+        function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                 : Metal::Object{};
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = vertex.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    desc.attributes[0] = {1, 0, 0, Maxwell::VertexAttribute::Type::Float,
+                          Maxwell::VertexAttribute::Size::Size_R32_G32};
+    desc.streams[0] = {1, 8, 0};
+    const Metal::Object pipeline =
+        vertex && fragment ? Metal::CreateRenderPipelineState(device, desc, error)
+                           : Metal::Object{};
+    const Metal::Object depth_stencil =
+        Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+    if (!kernel || !pipeline) {
+        std::printf("metal-smoke: FAIL condition kernel or quad pipeline: %s\n", error.c_str());
+        return 1;
+    }
+    uint8_t* vertices = nullptr;
+    const Metal::Object vertex_buffer = Metal::CreateBuffer(device, 48, true, &vertices);
+    const float positions[12]{-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1};
+    std::memcpy(vertices, positions, sizeof(positions));
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm),
+                 .width = Size,
+                 .height = Size,
+                 .render_target = true});
+    constexpr uint32_t Slot = 7;
+    scheduler.VisibilityResults()[Slot] = 0;
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = Size;
+    targets.height = Size;
+    scheduler.BeginRendering(targets);
+    Metal::DrawState state{};
+    state.pipeline = pipeline.Get();
+    state.depth_stencil = depth_stencil.Get();
+    state.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+    state.scissor = {0, 0, Size, Size};
+    scheduler.SetDrawState(state);
+    scheduler.BindVertexBuffer(Metal::VertexBufferSlot(0), vertex_buffer.Get(), 0);
+    scheduler.SetVisibility(Slot);
+    scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 6, 1, 0);
+
+    struct Case {
+        const char* name;
+        Condition::Params params;
+        bool holds;
+        Metal::Object region;
+        uint32_t* words{};
+    };
+    const uint64_t samples = uint64_t{Size} * Size;
+    const auto make = [&](const char* name, Condition::Mode mode, uint64_t other, bool wide,
+                          bool holds) {
+        Case test{.name = name, .holds = holds};
+        test.params.mode = static_cast<uint32_t>(mode);
+        test.params.slot_count[0] = 1;
+        test.params.slots[0][0] = Slot;
+        // A 32-bit report keeps the high word memory holds.
+        test.params.memory[0] = {0x1234U, 0x5678U};
+        test.params.write_mask[0] = {~0U, wide ? ~0U : 0U};
+        const uint64_t expected_first = wide ? samples : (uint64_t{0x5678U} << 32) | samples;
+        const uint64_t compare = other == 0 ? expected_first : other;
+        test.params.memory[1] = {static_cast<uint32_t>(compare),
+                                 static_cast<uint32_t>(compare >> 32)};
+        return test;
+    };
+    std::vector<Case> cases;
+    cases.push_back(make("equal", Condition::Mode::Equal, 0, true, true));
+    cases.push_back(make("equal, other count", Condition::Mode::Equal, samples + 1, true, false));
+    cases.push_back(make("not equal", Condition::Mode::NotEqual, 0, true, false));
+    cases.push_back(make("equal, 32-bit report", Condition::Mode::Equal, 0, false, true));
+    cases.push_back(make("both words", Condition::Mode::BothWordsNonZero, 0, false, true));
+    constexpr uint32_t Draws = 3;
+    for (Case& test : cases) {
+        uint8_t* contents = nullptr;
+        test.region = Metal::CreateBuffer(
+            device, (Condition::HeaderWords + Condition::RegionDraws * Condition::ArgumentWords) * 4,
+            true, &contents);
+        test.words = reinterpret_cast<uint32_t*>(contents);
+        scheduler.BeginCompute(kernel.Get(), false);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, scheduler.VisibilityBuffer(), 0);
+        scheduler.BindBytes(Metal::ShaderStage::Compute, 1, &test.params, sizeof(test.params));
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, 2, test.region.Get(), 0);
+        scheduler.Dispatch({Condition::RegionDraws / 64, 1, 1}, {64, 1, 1});
+        // Written after the kernel was recorded, before the commit, as the rasterizer does.
+        test.words[0] = Draws;
+        for (uint32_t draw = 0; draw < Draws; ++draw) {
+            uint32_t* const arguments =
+                test.words + Condition::HeaderWords + draw * Condition::ArgumentWords;
+            arguments[0] = 6;
+            arguments[1] = 2 + draw;
+        }
+    }
+    scheduler.Finish();
+    const uint64_t counted = scheduler.VisibilityResults()[Slot];
+    uint32_t wrong = 0;
+    std::string report;
+    for (const Case& test : cases) {
+        bool ok = Condition::Evaluate(test.params, scheduler.VisibilityResults()) == test.holds;
+        for (uint32_t draw = 0; draw < Draws; ++draw) {
+            const uint32_t instances =
+                test.words[Condition::HeaderWords + draw * Condition::ArgumentWords + 1];
+            ok = ok && instances == (test.holds ? 2 + draw : 0U);
+        }
+        wrong += ok ? 0 : 1;
+        report += std::string(" ") + test.name + (ok ? " ok," : " WRONG,");
+    }
+    const bool passed = wrong == 0 && counted == samples;
+    std::printf("metal-smoke: GPU condition (%llu samples counted, %llu expected):%s %s\n",
+                static_cast<unsigned long long>(counted),
+                static_cast<unsigned long long>(samples), report.c_str(),
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// Indirect draws prepared on the GPU (metal_indirect.h): all three kernels build, and
+/// indirect_arguments packs the guest's draws (stride of 8 words) with a draw count of 2 from a
+/// buffer, the third draw left with no instances.
+int RunIndirectArguments() {
+    namespace Indirect = Metal::Indirect;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, Indirect::KernelSource(), error);
+    const auto make = [&](const char* name) {
+        const Metal::Object function =
+            library ? Metal::CreateFunction(library.Get(), name) : Metal::Object{};
+        return function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                        : Metal::Object{};
+    };
+    const Metal::Object arguments = make("indirect_arguments");
+    const Metal::Object setup = make("indirect_rewrite_setup");
+    const Metal::Object grid = make("grid_arguments");
+    if (!arguments || !setup || !grid) {
+        std::printf("metal-smoke: FAIL indirect kernels: %s\n", error.c_str());
+        return 1;
+    }
+    constexpr uint32_t Draws = 3;
+    constexpr uint32_t Stride = 8;
+    uint8_t* source_bytes = nullptr;
+    uint8_t* count_bytes = nullptr;
+    uint8_t* out_bytes = nullptr;
+    const Metal::Object source = Metal::CreateBuffer(device, Draws * Stride * 4, true, &source_bytes);
+    const Metal::Object count = Metal::CreateBuffer(device, 16, true, &count_bytes);
+    const Metal::Object out =
+        Metal::CreateBuffer(device, Draws * Indirect::IndexedWords * 4, true, &out_bytes);
+    auto* const words = reinterpret_cast<uint32_t*>(source_bytes);
+    for (uint32_t draw = 0; draw < Draws; ++draw) {
+        for (uint32_t word = 0; word < Indirect::IndexedWords; ++word) {
+            words[draw * Stride + word] = 100 * (draw + 1) + word;
+        }
+    }
+    reinterpret_cast<uint32_t*>(count_bytes)[0] = 2;
+    const Indirect::CopyParams params{
+        .stride_words = Stride, .max_draws = Draws, .has_count = 1, .words = Indirect::IndexedWords};
+    scheduler.BeginCompute(arguments.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, source.Get(), 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, count.Get(), 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 2, out.Get(), 0);
+    scheduler.BindBytes(Metal::ShaderStage::Compute, 3, &params, sizeof(params));
+    scheduler.Dispatch({1, 1, 1}, {64, 1, 1});
+    scheduler.Finish();
+    const auto* const packed = reinterpret_cast<const uint32_t*>(out_bytes);
+    uint32_t wrong = 0;
+    for (uint32_t draw = 0; draw < Draws; ++draw) {
+        for (uint32_t word = 0; word < Indirect::IndexedWords; ++word) {
+            const uint32_t expected = draw == 2 && word == 1 ? 0U : 100 * (draw + 1) + word;
+            wrong += packed[draw * Indirect::IndexedWords + word] != expected ? 1 : 0;
+        }
+    }
+    std::printf("metal-smoke: indirect arguments (count 2 of 3 draws from a buffer): %u of %u "
+                "words wrong: %s\n",
+                wrong, Draws * Indirect::IndexedWords, wrong == 0 ? "PASS" : "FAIL");
+    return wrong == 0 ? 0 : 1;
+}
+
+/// Pipelines built off the draw's thread (EDEN_NX2_METAL_ASYNC_PIPELINES, PipelineBuildJob): a
+/// job nobody claimed runs on the thread that waits for it; one a builder thread runs is waited
+/// for (lent the waiter's QoS) and runs once; a finished one is not waited for.
+int RunPipelineJobs() {
+    using Job = Metal::BuildJob<int>;
+    int translator = 0;
+    std::atomic<uint32_t> runs{0};
+    std::atomic<bool> release{false};
+    std::thread::id ran_on{};
+    // Unclaimed: the waiter runs it.
+    Job unclaimed([&](int&) {
+        ran_on = std::this_thread::get_id();
+        ++runs;
+    });
+    bool boosted = false;
+    const bool ran_here = unclaimed.Wait(translator, boosted);
+    const bool unclaimed_ok = ran_here && unclaimed.IsDone() && !boosted &&
+                              ran_on == std::this_thread::get_id();
+    // Claimed by a builder that runs until released: the waiter waits, the task runs once.
+    Job claimed([&](int&) {
+        while (!release.load()) {
+            std::this_thread::yield();
+        }
+        ++runs;
+    });
+    std::atomic<bool> builder_started{false};
+    std::thread builder([&] {
+        int builder_translator = 1;
+        builder_started = true;
+        static_cast<void>(claimed.Run(builder_translator));
+    });
+    while (!builder_started.load()) {
+        std::this_thread::yield();
+    }
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        release = true;
+    });
+    // The builder may not have claimed it yet: then this thread runs it (and releaser frees it).
+    bool claimed_boosted = false;
+    const bool claimed_here = claimed.Wait(translator, claimed_boosted);
+    builder.join();
+    releaser.join();
+    const bool claimed_ok = claimed.IsDone() && runs.load() == 2;
+    bool done_boosted = false;
+    const bool done_ok = !claimed.Wait(translator, done_boosted) && !done_boosted &&
+                         runs.load() == 2;
+    const bool passed = unclaimed_ok && claimed_ok && done_ok;
+    std::printf("metal-smoke: pipeline jobs: unclaimed ran on the waiter %s; claimed ran %s "
+                "(QoS lent %s), once %s; done not waited for %s: %s\n",
+                unclaimed_ok ? "yes" : "no", claimed_here ? "on the waiter" : "on the builder",
+                claimed_boosted ? "yes" : "no", claimed_ok ? "yes" : "no",
+                done_ok ? "yes" : "no", passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
 
@@ -3328,6 +3781,7 @@ int main(int argc, char** argv) {
                                  RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
                                  RunStagingBound, RunPipelineFiles, RunOcarinaTemporal,
+                                 RunProvokingVertex, RunCondition, RunIndirectArguments, RunPipelineJobs,
                                  SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;

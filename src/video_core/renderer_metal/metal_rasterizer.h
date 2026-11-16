@@ -6,6 +6,7 @@
 #include <array>
 #include <chrono>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -21,9 +22,11 @@
 #include "video_core/oot_network.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_metal/metal_buffer_cache.h"
+#include "video_core/renderer_metal/metal_condition.h"
 #include "video_core/renderer_metal/metal_fence_manager.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
+#include "video_core/renderer_metal/metal_indirect.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_pipeline_cache.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
@@ -41,7 +44,8 @@ class Scheduler;
 
 class AccelerateDMA : public Tegra::Engines::AccelerateDMAInterface {
 public:
-    explicit AccelerateDMA(BufferCache& buffer_cache, TextureCache& texture_cache);
+    explicit AccelerateDMA(BufferCache& buffer_cache, TextureCache& texture_cache,
+                           Scheduler& scheduler);
 
     bool BufferCopy(GPUVAddr start_address, GPUVAddr end_address, u64 amount) override;
     bool BufferClear(GPUVAddr src_address, u64 amount, u32 value) override;
@@ -58,6 +62,7 @@ private:
 
     BufferCache& buffer_cache;
     TextureCache& texture_cache;
+    Scheduler& scheduler;
 };
 
 /// The guest framebuffer a present shows, found in the texture cache.
@@ -90,6 +95,10 @@ public:
     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size) override;
     void DisableGraphicsUniformBuffer(size_t stage, u32 index) override;
     void FlushAll() override;
+    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out,
+                                             bool past_sync) override;
+    void NoteGpuWrittenCommandListSynced(DAddr page) override;
+    void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
     void FlushRegion(DAddr addr, u64 size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     bool MustFlushRegion(DAddr addr, u64 size,
@@ -195,6 +204,10 @@ public:
                 std::exchange(native_mesh_indirect, 0), std::exchange(emulated_mesh_draws, 0)};
     }
 
+    /// What was decided on the GPU since the last call (conditions, indirect counts, GPU-counted
+    /// draws), for the renderer's 10 s report; empty when nothing was.
+    [[nodiscard]] std::string TakeGpuDecisionLine();
+
     [[nodiscard]] PipelineCache& Pipelines() noexcept {
         return pipeline_cache;
     }
@@ -221,6 +234,8 @@ private:
         u32 first_index;
         BufferHandle index_buffer;
         u64 index_offset;
+        /// Added to every index (the indices are then read from guest memory and widened).
+        s32 base_vertex;
     };
 
     /// Before a draw, clear or dispatch: commits the command buffer being recorded once the
@@ -269,10 +284,28 @@ private:
     /// Counts the draw PrepareDraw skipped.
     void NoteUnprepared();
 
+    /// While a condition is decided on the GPU (gpu_condition): whether the condition holds, read
+    /// on the CPU after waiting for the reports it reads (work the kernel can't skip: clears,
+    /// indirect, mesh and tessellated draws). True otherwise.
+    [[nodiscard]] bool ConditionHoldsOnCpu();
+
+    /// While a condition is decided on the GPU: the region the next draw's arguments go to, its
+    /// kernel recorded first; false when the draw must be decided on the CPU instead.
+    bool PrepareConditionRegion();
+
+    /// Encodes the draw at hand through the condition region's arguments (after PrepareDraw);
+    /// false when the region was committed meanwhile and the draw is decided on the CPU.
+    bool DrawUnderCondition(u32 primitive, bool indexed, u32 count, u32 index_size,
+                            BufferHandle index_buffer, u64 index_offset, u32 first,
+                            u32 instance_count, s32 base_vertex, u32 base_instance);
+
+    /// Vulkan's DrawMayBeSkipped for the draw at hand: whether it may be skipped while its
+    /// pipeline is built (asynchronous shaders, EDEN_NX2_ASYNC_DISCARD as on Vulkan).
+    [[nodiscard]] bool DrawMayBeSkipped();
+
     /// Whether the draw's indices are rewritten so flat inputs take the last vertex, as the
-    /// game asks (EDEN_NX2_METAL_PROVOKING_LAST=1, pipelines with flat inputs).
-    [[nodiscard]] bool ProvokingLastWanted(const GraphicsPipeline& pipeline, bool is_indexed,
-                                           u32 count, u32 index_size, bool restart);
+    /// game asks (pipelines with flat inputs; EDEN_NX2_METAL_PROVOKING_LAST=0: never).
+    [[nodiscard]] bool ProvokingLastWanted(const GraphicsPipeline& pipeline);
 
     /// Counts a draw not done, and logs the cause with the draw's state the first time.
     void RefuseDraw(std::string_view cause);
@@ -325,6 +358,24 @@ private:
     /// Encodes the copies of the attributes VertexSources gathered into gathered_vertices (left
     /// empty, zeros bound, when the kernel can't be made). ahead: as RewriteIndices.
     void GatherVertices(const VertexSources& sources, bool ahead);
+
+    /// Records the copies of the command list pages the dispatch just encoded wrote, and commits
+    /// them at once (the front waits on them), as Vulkan's SubmitNx2ListCopies.
+    void SubmitListCopies(u64 writer);
+
+    /// Builds the index rewrite and indirect argument kernels on first use.
+    void EnsureIndexKernels();
+
+    /// The vertex count (and first vertex) of grid_draw read on the CPU into the draw state,
+    /// waiting for the GPU; grid_draw is cleared.
+    void ReadGridWords();
+
+    /// Encodes grid_arguments for grid_draw; false when its words are in no buffer.
+    bool PrepareGridDraw(bool ahead);
+
+    /// Encodes the kernels of indirect_plan (metal_indirect.h) for the indirect draw being
+    /// prepared; false when its argument buffers are not bound.
+    bool PrepareIndirect(bool ahead);
 
     /// Binds mesh_buffers to the program's slots of the emulation's bindings.
     void BindMeshBuffers(const StageProgram& program, ShaderStage metal_stage,
@@ -431,6 +482,34 @@ private:
     u64 unmapped_reports{};
     /// Indirect draws whose count was read from guest memory (Metal has no count buffer).
     u64 indirect_counts_read{};
+    /// Occlusion reports not written to guest memory yet, by address (their fence clears them).
+    struct PendingReport {
+        std::vector<u32> slots;
+        bool wide{};
+        u64 tick{};
+        u64 serial{};
+    };
+    std::mutex pending_reports_mutex;
+    std::unordered_map<DAddr, PendingReport> pending_reports;
+    u64 report_serial{};
+    /// The condition decided on the GPU (EDEN_NX2_METAL_GPU_CONDITION).
+    struct GpuCondition {
+        bool active{};
+        /// The waits of ConditionHoldsOnCpu are done and `holds` is the answer.
+        bool resolved{};
+        bool holds{};
+        Condition::Params params{};
+        std::array<u64, 2> ticks{};
+        StagingBufferRef region;
+        u32* region_words{};
+        u32 draws{};
+        u64 region_tick{};
+    } gpu_condition;
+    Object condition_kernel;
+    bool condition_kernel_failed{};
+    u64 conditions_on_gpu{};
+    u64 conditions_on_cpu{};
+    u64 draws_under_condition{};
     ::Common::unordered_map<u64, Object> depth_stencil_states;
     /// What an attribute of a vertex stream without a buffer reads, made on first use.
     Object zero_vertices;
@@ -443,6 +522,9 @@ private:
     u64 mesh_groups{};
     /// Why PrepareDraw skipped the draw; empty for a draw of nothing.
     std::string_view prepare_refusal;
+    /// DrawMayBeSkipped's answer, while skip_valid (reset by every draw).
+    bool skip_valid{};
+    bool skip_decision{};
     /// Shader::Backend::SPIRV::RescalingLayout of the draw or dispatch being bound.
     std::array<u32, 8> rescaling_words{};
 
@@ -454,7 +536,40 @@ private:
     } index_rewrite;
     Object index_kernel_library;
     Object index_kernel;
+    Object index_strip_kernel;
     bool index_kernel_failed{};
+    /// The indirect draw being prepared on the GPU (EDEN_NX2_METAL_GPU_INDIRECT): a count from a
+    /// buffer, or indices rewritten per draw.
+    struct IndirectPlan {
+        bool wanted{};
+        bool rewrite{};
+        bool indexed{};
+        bool has_count{};
+        bool restart{};
+        u32 mode{};
+        u32 index_size{};
+        u32 max_draws{};
+        u32 stride_words{};
+        u32 capacity{}; ///< Indices of each draw's rewrite
+        StagingBufferRef arguments;
+        StagingBufferRef control;
+        StagingBufferRef indices;
+    } indirect_plan;
+    /// A plain draw whose vertex count GPU work wrote, drawn from arguments built on the GPU.
+    struct GridDraw {
+        bool wanted{};
+        GPUVAddr source{};
+        bool first_from_gpu{};
+        u32 instances{};
+        StagingBufferRef arguments;
+    } grid_draw;
+    Object indirect_library;
+    Object indirect_arguments_kernel;
+    Object indirect_setup_kernel;
+    Object grid_arguments_kernel;
+    bool indirect_kernels_failed{};
+    u64 indirect_draws_on_gpu{};
+    u64 grid_draws_on_gpu{};
     u64 indices_rewritten_on_gpu{};
 
     /// The buffers between the tessellation stages of the draw being prepared.
