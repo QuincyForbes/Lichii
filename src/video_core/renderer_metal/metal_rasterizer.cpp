@@ -1728,7 +1728,7 @@ void RasterizerMetal::Clear(u32 layer_count) {
     }
     const bool covers = rect[0] == 0 && rect[1] == 0 && rect[2] >= framebuffer->Width() &&
                         rect[3] >= framebuffer->Height();
-    const bool draws = ClearDrawsEnabled();
+    const bool drawn_clears = ClearDrawsEnabled();
     // What a load action can't do (a rectangle, some colour channels, some stencil bits) is a
     // draw; EDEN_NX2_METAL_CLEAR_DRAWS=0 clears the whole of it instead and counts that.
     const bool draw_color = use_color && (!covers || !all_color);
@@ -1739,7 +1739,7 @@ void RasterizerMetal::Clear(u32 layer_count) {
     if (use_color) {
         const auto format =
             VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[rt].format);
-        const bool is_integer = draws && VideoCore::Surface::IsPixelFormatInteger(format);
+        const bool is_integer = drawn_clears && VideoCore::Surface::IsPixelFormatInteger(format);
         const f32 bits =
             static_cast<f32>(VideoCore::Surface::PixelComponentSizeBitsInteger(format));
         for (size_t component = 0; component < 4; ++component) {
@@ -1754,7 +1754,7 @@ void RasterizerMetal::Clear(u32 layer_count) {
             }
         }
     }
-    if (!draws && needs_draw) {
+    if (!drawn_clears && needs_draw) {
         Coverage::Refuse(Coverage::Work::Clear,
                          !covers ? "clear of part of the target (scissor), whole target cleared"
                                  : draw_color ? "clear of some colour channels"
@@ -1765,19 +1765,19 @@ void RasterizerMetal::Clear(u32 layer_count) {
     pass.width = framebuffer->Width();
     pass.height = framebuffer->Height();
     bool whole = false;
-    if (use_color && all_color && (!draw_color || !draws)) {
+    if (use_color && all_color && (!draw_color || !drawn_clears)) {
         pass.color[rt] = framebuffer->Colors()[rt];
         pass.clear_color[rt] = true;
         pass.color_value[rt] = color_value;
         whole = true;
     }
-    if (use_depth && (!draw_depth || !draws)) {
+    if (use_depth && (!draw_depth || !drawn_clears)) {
         pass.depth = framebuffer->Depth();
         pass.clear_depth = true;
         pass.depth_value = regs.clear_depth;
         whole = true;
     }
-    if (use_stencil && (!draw_stencil || !draws)) {
+    if (use_stencil && (!draw_stencil || !drawn_clears)) {
         pass.stencil = framebuffer->Depth();
         pass.clear_stencil = true;
         pass.stencil_value = static_cast<u32>(regs.clear_stencil);
@@ -1786,7 +1786,7 @@ void RasterizerMetal::Clear(u32 layer_count) {
     if (whole) {
         scheduler.Clear(pass);
     }
-    if (draws && needs_draw) {
+    if (drawn_clears && needs_draw) {
         ClearRect draw{};
         if (draw_color) {
             draw.color = framebuffer->Colors()[rt];
