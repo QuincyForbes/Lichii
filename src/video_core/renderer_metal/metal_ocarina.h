@@ -217,8 +217,8 @@ private:
     void Run(const Pass& pass, std::span<const TextureHandle> inputs, TextureHandle output,
              std::span<const u8> push_constants, std::array<u32, 2> size);
     void Run(const Pass& pass, TextureHandle input, TextureHandle output,
-             std::span<const u8> push_constants, std::array<u32, 2> size) {
-        Run(pass, std::span(&input, 1), output, push_constants, size);
+             std::span<const u8> push_constants, std::array<u32, 2> pass_size) {
+        Run(pass, std::span(&input, 1), output, push_constants, pass_size);
     }
     bool DrawActor(TextureHandle depth, std::array<u32, 2> extent, const ActorMotion& actor);
     [[nodiscard]] ActorSlot* AcquireActorSlot(const OcarinaActorMesh& mesh);

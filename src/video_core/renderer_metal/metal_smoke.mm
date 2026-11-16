@@ -1131,7 +1131,7 @@ int RunPresentFilters() {
         Case{"MMPX", Settings::AntiAliasing::None, Filter::Mmpx},
         Case{"SMAA + FSR", Settings::AntiAliasing::Smaa, Filter::Fsr},
     };
-    const auto close = [](uint8_t a, uint8_t b) { return (a > b ? a - b : b - a) <= 6; };
+    const auto within = [](uint8_t a, uint8_t b) { return (a > b ? a - b : b - a) <= 6; };
     uint32_t failed = 0;
     for (const Case& test : Cases) {
         (void)present.TakePasses();
@@ -1186,8 +1186,8 @@ int RunPresentFilters() {
             Texel texel;
             std::memcpy(&texel, readback + (y * Target + x) * 4, 4);
             const auto& want = Quadrants[quadrant];
-            colours = colours && close(texel.r, want[0]) && close(texel.g, want[1]) &&
-                      close(texel.b, want[2]) && close(texel.a, want[3]);
+            colours = colours && within(texel.r, want[0]) && within(texel.g, want[1]) &&
+                      within(texel.b, want[2]) && within(texel.a, want[3]);
             seen += (quadrant != 0 ? " " : "") + std::to_string(texel.r) + "," +
                     std::to_string(texel.g) + "," + std::to_string(texel.b);
         }
@@ -2991,41 +2991,41 @@ int RunOcarinaTemporal() {
 int RunOcarinaActorEffects() {
     Metal::Device device;
     Metal::Scheduler scheduler(device);
-    constexpr uint32_t Size = 16;
+    constexpr uint32_t Side = 16;
     const Metal::Object depth = Metal::CreateTexture(
         device, {.kind = Metal::TextureKind::e2D,
                  .format = static_cast<uint32_t>(MTLPixelFormatDepth32Float),
-                 .width = Size,
-                 .height = Size,
+                 .width = Side,
+                 .height = Side,
                  .render_target = true});
     const Metal::Object scene = Metal::CreateTexture(
         device, {.kind = Metal::TextureKind::e2D,
                  .format = static_cast<uint32_t>(MTLPixelFormatRGBA16Float),
-                 .width = Size,
-                 .height = Size});
+                 .width = Side,
+                 .height = Side});
     uint8_t* upload = nullptr;
-    const Metal::Object upload_buffer = Metal::CreateBuffer(device, Size * Size * 8, true, &upload);
+    const Metal::Object upload_buffer = Metal::CreateBuffer(device, Side * Side * 8, true, &upload);
     uint8_t* bright = nullptr;
-    const Metal::Object bright_buffer = Metal::CreateBuffer(device, Size * Size * 8, true, &bright);
+    const Metal::Object bright_buffer = Metal::CreateBuffer(device, Side * Side * 8, true, &bright);
     uint8_t* readback = nullptr;
     const Metal::Object readback_buffer =
-        Metal::CreateBuffer(device, Size * Size * 4, true, &readback);
+        Metal::CreateBuffer(device, Side * Side * 4, true, &readback);
     uint8_t* bias_readback = nullptr;
-    const Metal::Object bias_buffer = Metal::CreateBuffer(device, Size * Size * 2, true,
+    const Metal::Object bias_buffer = Metal::CreateBuffer(device, Side * Side * 2, true,
                                                           &bias_readback);
     if (!depth || !scene || upload == nullptr || bright == nullptr || readback == nullptr ||
         bias_readback == nullptr) {
         std::printf("metal-smoke: FAIL Ocarina actor/effects textures\n");
         return 1;
     }
-    for (uint32_t y = 0; y < Size; ++y) {
-        for (uint32_t x = 0; x < Size; ++x) {
-            const float value = x < Size / 2 ? 0.5f : 0.25f;
-            std::memcpy(upload + (y * Size + x) * 4, &value, 4);
+    for (uint32_t y = 0; y < Side; ++y) {
+        for (uint32_t x = 0; x < Side; ++x) {
+            const float value = x < Side / 2 ? 0.5f : 0.25f;
+            std::memcpy(upload + (y * Side + x) * 4, &value, 4);
         }
     }
-    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Size * 4, 0, depth.Get(), 0, 0, {},
-                                  {Size, Size, 1});
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Side * 4, 0, depth.Get(), 0, 0, {},
+                                  {Side, Side, 1});
     // One vertex layout of Link's: position, joints, extra joints, weights, extra weights.
     std::vector<uint8_t> vertices(3 * Metal::OcarinaActorMesh::Stride);
     const std::array<std::array<float, 3>, 3> positions{{{-1, -1, 0}, {3, -1, 0}, {-1, 3, 0}}};
@@ -3053,38 +3053,38 @@ int RunOcarinaActorEffects() {
     const VideoCommon::OcarinaMatrix identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     Metal::OcarinaTemporal temporal(device, scheduler);
     const Metal::OcarinaTemporal::ActorMotion actor{mesh, identity, identity};
-    const bool encoded = temporal.EncodeMotion(depth.Get(), {Size, Size}, identity, &actor);
+    const bool encoded = temporal.EncodeMotion(depth.Get(), {Side, Side}, identity, &actor);
     if (encoded) {
-        scheduler.CopyTextureToBuffer(temporal.Motion(), 0, 0, {}, {Size, Size, 1},
-                                      readback_buffer.Get(), 0, Size * 4, 0);
+        scheduler.CopyTextureToBuffer(temporal.Motion(), 0, 0, {}, {Side, Side, 1},
+                                      readback_buffer.Get(), 0, Side * 4, 0);
     }
     // The effects: the saved scene at 0.2, a 4x4 block at 1.0 after it.
     const auto half = [](float value) {
         // 0.2 and 1.0 only (the test's two values).
         return static_cast<uint16_t>(value == 1.0f ? 0x3C00 : 0x3266);
     };
-    for (uint32_t texel = 0; texel < Size * Size; ++texel) {
+    for (uint32_t texel = 0; texel < Side * Side; ++texel) {
         const uint16_t dim = half(0.2f);
         const std::array<uint16_t, 4> pixel{dim, dim, dim, 0x3C00};
         std::memcpy(upload + texel * 8, pixel.data(), 8);
-        const uint32_t x = texel % Size;
-        const uint32_t y = texel / Size;
+        const uint32_t x = texel % Side;
+        const uint32_t y = texel / Side;
         const bool lit = x >= 4 && x < 8 && y >= 4 && y < 8;
         const uint16_t value = lit ? half(1.0f) : dim;
         const std::array<uint16_t, 4> after{value, value, value, 0x3C00};
         std::memcpy(bright + texel * 8, after.data(), 8);
     }
     constexpr uint64_t Frame = 5;
-    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Size * 8, 0, scene.Get(), 0, 0, {},
-                                  {Size, Size, 1});
-    temporal.SaveEffectsBase(scene.Get(), {Size, Size}, Frame);
-    scheduler.CopyBufferToTexture(bright_buffer.Get(), 0, Size * 8, 0, scene.Get(), 0, 0, {},
-                                  {Size, Size, 1});
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Side * 8, 0, scene.Get(), 0, 0, {},
+                                  {Side, Side, 1});
+    temporal.SaveEffectsBase(scene.Get(), {Side, Side}, Frame);
+    scheduler.CopyBufferToTexture(bright_buffer.Get(), 0, Side * 8, 0, scene.Get(), 0, 0, {},
+                                  {Side, Side, 1});
     temporal.MarkEffects(scene.Get(), Frame);
-    const bool biased = temporal.EncodeEffectsBias(Frame, {Size, Size});
+    const bool biased = temporal.EncodeEffectsBias(Frame, {Side, Side});
     if (biased) {
-        scheduler.CopyTextureToBuffer(temporal.EffectsBias(), 0, 0, {}, {Size, Size, 1},
-                                      bias_buffer.Get(), 0, Size * 2, 0);
+        scheduler.CopyTextureToBuffer(temporal.EffectsBias(), 0, 0, {}, {Side, Side, 1},
+                                      bias_buffer.Get(), 0, Side * 2, 0);
     }
     scheduler.Finish();
     const auto to_float = [](uint16_t bits) {
@@ -3095,11 +3095,11 @@ int RunOcarinaActorEffects() {
     uint32_t camera_wrong = 0;
     std::array<float, 2> left{};
     std::array<float, 2> right{};
-    for (uint32_t texel = 0; encoded && texel < Size * Size; ++texel) {
+    for (uint32_t texel = 0; encoded && texel < Side * Side; ++texel) {
         std::array<uint16_t, 2> bits{};
         std::memcpy(bits.data(), readback + texel * 4, 4);
         const std::array<float, 2> value{to_float(bits[0]), to_float(bits[1])};
-        const bool is_left = texel % Size < Size / 2;
+        const bool is_left = texel % Side < Side / 2;
         const float expected = is_left ? 4.0f : 0.0f;
         const bool right_value =
             std::abs(value[0] - expected) < 0.05f && std::abs(value[1]) < 0.05f;
@@ -3107,11 +3107,11 @@ int RunOcarinaActorEffects() {
         (is_left ? left : right) = value;
     }
     uint32_t bias_wrong = 0;
-    for (uint32_t texel = 0; biased && texel < Size * Size; ++texel) {
+    for (uint32_t texel = 0; biased && texel < Side * Side; ++texel) {
         uint16_t bits;
         std::memcpy(&bits, bias_readback + texel * 2, 2);
-        const uint32_t x = texel % Size;
-        const uint32_t y = texel / Size;
+        const uint32_t x = texel % Side;
+        const uint32_t y = texel / Side;
         const bool near = x >= 3 && x < 9 && y >= 3 && y < 9;
         bias_wrong += std::abs(to_float(bits) - (near ? 1.0f : 0.0f)) < 0.01f ? 0 : 1;
     }
@@ -3121,8 +3121,8 @@ int RunOcarinaActorEffects() {
                 "%u of %u wrong, hidden pixels %.3f,%.3f (expected 0,0) %u wrong; effects mask "
                 "%s, %u of %u wrong: %s\n",
                 encoded ? "motion encoded" : "motion NOT encoded", left[0], left[1], actor_wrong,
-                Size * Size / 2, right[0], right[1], camera_wrong,
-                biased ? "made" : "NOT made", bias_wrong, Size * Size, passed ? "PASS" : "FAIL");
+                Side * Side / 2, right[0], right[1], camera_wrong,
+                biased ? "made" : "NOT made", bias_wrong, Side * Side, passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
 
