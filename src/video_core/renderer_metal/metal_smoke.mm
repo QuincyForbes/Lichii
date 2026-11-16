@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -45,7 +47,9 @@
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_indirect.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
+#include "video_core/renderer_metal/metal_pipeline_cache.h"
 #include "video_core/renderer_metal/metal_pipeline_files.h"
+#include "video_core/renderer_metal/metal_pipeline_translate.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
@@ -3222,6 +3226,61 @@ int RunIndirectArguments() {
     return wrong == 0 ? 0 : 1;
 }
 
+/// Pipelines built off the draw's thread (EDEN_NX2_METAL_ASYNC_PIPELINES, PipelineBuildJob): a
+/// job nobody claimed runs on the thread that waits for it; one a builder thread runs is waited
+/// for (lent the waiter's QoS) and runs once; a finished one is not waited for.
+int RunPipelineJobs() {
+    Metal::PipelineTranslator translator(false, 0);
+    std::atomic<uint32_t> runs{0};
+    std::atomic<bool> release{false};
+    std::thread::id ran_on{};
+    // Unclaimed: the waiter runs it.
+    Metal::PipelineBuildJob unclaimed([&](Metal::PipelineTranslator&) {
+        ran_on = std::this_thread::get_id();
+        ++runs;
+    });
+    bool boosted = false;
+    const bool ran_here = unclaimed.Wait(translator, boosted);
+    const bool unclaimed_ok = ran_here && unclaimed.IsDone() && !boosted &&
+                              ran_on == std::this_thread::get_id();
+    // Claimed by a builder that runs until released: the waiter waits, the task runs once.
+    Metal::PipelineBuildJob claimed([&](Metal::PipelineTranslator&) {
+        while (!release.load()) {
+            std::this_thread::yield();
+        }
+        ++runs;
+    });
+    std::atomic<bool> builder_started{false};
+    std::thread builder([&] {
+        Metal::PipelineTranslator builder_translator(false, 0);
+        builder_started = true;
+        static_cast<void>(claimed.Run(builder_translator));
+    });
+    while (!builder_started.load()) {
+        std::this_thread::yield();
+    }
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        release = true;
+    });
+    // The builder may not have claimed it yet: then this thread runs it (and releaser frees it).
+    bool claimed_boosted = false;
+    const bool claimed_here = claimed.Wait(translator, claimed_boosted);
+    builder.join();
+    releaser.join();
+    const bool claimed_ok = claimed.IsDone() && runs.load() == 2;
+    bool done_boosted = false;
+    const bool done_ok = !claimed.Wait(translator, done_boosted) && !done_boosted &&
+                         runs.load() == 2;
+    const bool passed = unclaimed_ok && claimed_ok && done_ok;
+    std::printf("metal-smoke: pipeline jobs: unclaimed ran on the waiter %s; claimed ran %s "
+                "(QoS lent %s), once %s; done not waited for %s: %s\n",
+                unclaimed_ok ? "yes" : "no", claimed_here ? "on the waiter" : "on the builder",
+                claimed_boosted ? "yes" : "no", claimed_ok ? "yes" : "no",
+                done_ok ? "yes" : "no", passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main(int argc, char** argv) {
@@ -3241,7 +3300,7 @@ int main(int argc, char** argv) {
                                  RunPipelineCheck, RunDeviceMsl, RunBlockCopy, RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
                                  RunStagingBound, RunPipelineFiles, RunOcarinaTemporal,
-                                 RunProvokingVertex, RunCondition, RunIndirectArguments,
+                                 RunProvokingVertex, RunCondition, RunIndirectArguments, RunPipelineJobs,
                                  SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
