@@ -202,6 +202,8 @@ void ApplyFragmentState(Shader::RuntimeInfo& info, const GraphicsPipelineKey& ke
     }
 }
 
+std::atomic<u64> visual_workaround_edits{};
+
 /// Vulkan's EDEN_NX2_OOT_VISUAL_WORKAROUND=1 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): its
 /// opt-in edit of two of Ocarina of Time's programs (the fog dispatch, the exposure pass).
 void ApplyVisualWorkaround(Shader::IR::Program& program, u64 hash) {
@@ -211,12 +213,17 @@ void ApplyVisualWorkaround(Shader::IR::Program& program, u64 hash) {
     }();
     if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
             program, Settings::GetCurrentProgramID(), hash, enabled)) {
+        visual_workaround_edits.fetch_add(1, std::memory_order_relaxed);
         LOG_WARNING(Render_Metal, "Metal: Ocarina visual workaround edited {} instructions of {:016x}",
                     *edits, hash);
     }
 }
 
 } // Anonymous namespace
+
+u64 PipelineTranslator::VisualWorkaroundEdits() noexcept {
+    return visual_workaround_edits.load(std::memory_order_relaxed);
+}
 
 void PipelineTranslator::Refuse(std::atomic<u32>& count, u64 hash, std::string_view cause_,
                                 std::string_view detail_) {
