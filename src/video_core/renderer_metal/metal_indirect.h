@@ -130,8 +130,8 @@ kernel void indirect_rewrite_setup(device const uint* source [[buffer(0)]],
                                    device const uint* count [[buffer(1)]],
                                    constant SetupParams& params [[buffer(2)]],
                                    device uint* control [[buffer(4)]],
-                                   uint thread [[thread_position_in_grid]]) {
-    if (thread != 0) {
+                                   uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) {
         return;
     }
     device const uint* arguments = source + params.draw * params.stride_words;
@@ -173,8 +173,8 @@ struct GridParams {
 kernel void grid_arguments(device const uint* words [[buffer(0)]],
                            device uint* out [[buffer(1)]],
                            constant GridParams& params [[buffer(2)]],
-                           uint thread [[thread_position_in_grid]]) {
-    if (thread != 0) {
+                           uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) {
         return;
     }
     out[0] = words[0];

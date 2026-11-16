@@ -391,9 +391,9 @@ kernel void rewrite_restart_strip(device const uchar* source [[buffer(0)]],
     const uint begin = min(lane * run, count);
     const uint end = min(begin + run, count);
     uint found = 0;
-    for (uint vertex = begin; vertex < end; ++vertex) {
-        if (read_index(source, params, vertex) == 0xFFFFFFFFu) {
-            found = vertex + 1;
+    for (uint element = begin; element < end; ++element) {
+        if (read_index(source, params, element) == 0xFFFFFFFFu) {
+            found = element + 1;
         }
     }
     run_starts[lane] = found;
@@ -402,18 +402,18 @@ kernel void rewrite_restart_strip(device const uchar* source [[buffer(0)]],
     for (uint other = 0; other < lane; ++other) {
         start = max(start, run_starts[other]);
     }
-    for (uint vertex = begin; vertex < end; ++vertex) {
-        const uint value = read_index(source, params, vertex);
+    for (uint element = begin; element < end; ++element) {
+        const uint value = read_index(source, params, element);
         const bool is_restart = value == 0xFFFFFFFFu;
         if (is_restart) {
-            start = vertex + 1;
+            start = element + 1;
         }
-        if (vertex < 2 || (vertex - 2) * 3 + 3 > params.converted) {
+        if (element < 2 || (element - 2) * 3 + 3 > params.converted) {
             continue;
         }
-        const uint at = (vertex - 2) * 3;
-        const uint first = vertex - 2;
-        if (is_restart || vertex < start + 2) {
+        const uint at = (element - 2) * 3;
+        const uint first = element - 2;
+        if (is_restart || element < start + 2) {
             indices[at] = 0;
             indices[at + 1] = 0;
             indices[at + 2] = 0;

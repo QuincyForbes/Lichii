@@ -43,6 +43,7 @@
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
+#include "video_core/renderer_metal/metal_indirect.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_pipeline_files.h"
 #include "video_core/renderer_metal/metal_resources.h"
@@ -2836,18 +2837,21 @@ int RunPipelineFiles() {
     Metal::PipelineArchive reopened;
     const bool second_built = reopened.Open(device, archive_path) && build_all(reopened);
     const Metal::PipelineArchive::Counts second = reopened.Totals();
+    // A build can hit in the first run when another thread just added the same GPU code (which
+    // depends on timing): every build is a hit or a miss, and every miss is added.
     const bool passed = boot_marked && rebooted && states_read == Variants && functions_cleared &&
-                        listed && unlisted && first_built && second_built &&
-                        first.misses == Variants && first.added == Variants &&
+                        listed && unlisted && first_built && second_built && first.misses != 0 &&
+                        first.misses + first.hits == Variants && first.added == first.misses &&
                         second.hits == Variants && second.misses == 0;
     std::printf("metal-smoke: pipeline files: %zu of %zu render states read back (written twice "
                 "each), functions cleared %s; used list %s/%s; unfinished boot seen %s; %zu "
-                "pipelines on %zu threads: first %llu misses, %llu added, second %llu hits, %llu "
-                "misses: %s\n",
+                "pipelines on %zu threads: first %llu misses, %llu hits, %llu added, second %llu "
+                "hits, %llu misses: %s\n",
                 states_read, Variants, functions_cleared ? "yes" : "no",
                 listed ? "listed" : "missing", unlisted ? "others not" : "others too",
                 rebooted ? "yes" : "no", Variants, Variants,
                 static_cast<unsigned long long>(first.misses),
+                static_cast<unsigned long long>(first.hits),
                 static_cast<unsigned long long>(first.added),
                 static_cast<unsigned long long>(second.hits),
                 static_cast<unsigned long long>(second.misses), passed ? "PASS" : "FAIL");
@@ -3156,6 +3160,67 @@ int RunCondition() {
     return passed ? 0 : 1;
 }
 
+/// Indirect draws prepared on the GPU (metal_indirect.h): all three kernels build, and
+/// indirect_arguments packs the guest's draws (stride of 8 words) with a draw count of 2 from a
+/// buffer, the third draw left with no instances.
+int RunIndirectArguments() {
+    namespace Indirect = Metal::Indirect;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, Indirect::KernelSource(), error);
+    const auto make = [&](const char* name) {
+        const Metal::Object function =
+            library ? Metal::CreateFunction(library.Get(), name) : Metal::Object{};
+        return function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                        : Metal::Object{};
+    };
+    const Metal::Object arguments = make("indirect_arguments");
+    const Metal::Object setup = make("indirect_rewrite_setup");
+    const Metal::Object grid = make("grid_arguments");
+    if (!arguments || !setup || !grid) {
+        std::printf("metal-smoke: FAIL indirect kernels: %s\n", error.c_str());
+        return 1;
+    }
+    constexpr uint32_t Draws = 3;
+    constexpr uint32_t Stride = 8;
+    uint8_t* source_bytes = nullptr;
+    uint8_t* count_bytes = nullptr;
+    uint8_t* out_bytes = nullptr;
+    const Metal::Object source = Metal::CreateBuffer(device, Draws * Stride * 4, true, &source_bytes);
+    const Metal::Object count = Metal::CreateBuffer(device, 16, true, &count_bytes);
+    const Metal::Object out =
+        Metal::CreateBuffer(device, Draws * Indirect::IndexedWords * 4, true, &out_bytes);
+    auto* const words = reinterpret_cast<uint32_t*>(source_bytes);
+    for (uint32_t draw = 0; draw < Draws; ++draw) {
+        for (uint32_t word = 0; word < Indirect::IndexedWords; ++word) {
+            words[draw * Stride + word] = 100 * (draw + 1) + word;
+        }
+    }
+    reinterpret_cast<uint32_t*>(count_bytes)[0] = 2;
+    const Indirect::CopyParams params{
+        .stride_words = Stride, .max_draws = Draws, .has_count = 1, .words = Indirect::IndexedWords};
+    scheduler.BeginCompute(arguments.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, source.Get(), 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, count.Get(), 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 2, out.Get(), 0);
+    scheduler.BindBytes(Metal::ShaderStage::Compute, 3, &params, sizeof(params));
+    scheduler.Dispatch({1, 1, 1}, {64, 1, 1});
+    scheduler.Finish();
+    const auto* const packed = reinterpret_cast<const uint32_t*>(out_bytes);
+    uint32_t wrong = 0;
+    for (uint32_t draw = 0; draw < Draws; ++draw) {
+        for (uint32_t word = 0; word < Indirect::IndexedWords; ++word) {
+            const uint32_t expected = draw == 2 && word == 1 ? 0U : 100 * (draw + 1) + word;
+            wrong += packed[draw * Indirect::IndexedWords + word] != expected ? 1 : 0;
+        }
+    }
+    std::printf("metal-smoke: indirect arguments (count 2 of 3 draws from a buffer): %u of %u "
+                "words wrong: %s\n",
+                wrong, Draws * Indirect::IndexedWords, wrong == 0 ? "PASS" : "FAIL");
+    return wrong == 0 ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main(int argc, char** argv) {
@@ -3175,7 +3240,8 @@ int main(int argc, char** argv) {
                                  RunPipelineCheck, RunDeviceMsl, RunBlockCopy, RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
                                  RunStagingBound, RunPipelineFiles, RunOcarinaTemporal,
-                                 RunProvokingVertex, RunCondition, SmokeProbe::RunAll}) {
+                                 RunProvokingVertex, RunCondition, RunIndirectArguments,
+                                 SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }
