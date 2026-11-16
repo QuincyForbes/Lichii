@@ -3027,6 +3027,8 @@ int RunOcarinaActorEffects() {
     }
     scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Side * 4, 0, depth.Get(), 0, 0, {},
                                   {Side, Side, 1});
+    // The effects' pictures go into the same upload buffer below.
+    scheduler.Finish();
     // One vertex layout of Link's: position, joints, extra joints, weights, extra weights.
     std::vector<uint8_t> vertices(3 * Metal::OcarinaActorMesh::Stride);
     const std::array<std::array<float, 3>, 3> positions{{{-1, -1, 0}, {3, -1, 0}, {-1, 3, 0}}};
