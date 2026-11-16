@@ -730,7 +730,7 @@ void RendererMetal::Impl::RenderAppletCapture(
         return;
     }
     const Attachment target{.texture = applet_capture.Get()};
-    if (!DrawLayers(layers, target, Fmt::RGBA8Unorm, Layout, false)) {
+    if (!DrawLayers(layers, target, Fmt::RGBA8Unorm, VideoCore::Capture::Layout, false)) {
         ClearPass clear{};
         clear.color[0] = target;
         clear.clear_color[0] = true;
