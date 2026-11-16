@@ -250,6 +250,17 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
       ocarina{device_, scheduler_}, ocarina_temporal{device_, scheduler_},
       accelerate_dma{buffer_cache, texture_cache},
       fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_} {
+    // Fence work left pending (EDEN_NX2_FENCE_FLUSH_US) is committed when the split's back goes
+    // idle, as Vulkan's deferred flushes; EDEN_NX2_IDLE_GRACE_US and EDEN_NX2_IDLE_HOLD_US work
+    // through the same hooks.
+    VideoCommon::GpuSplit::Get().SetIdleHook(
+        [](void* argument, bool requested) {
+            return static_cast<Scheduler*>(argument)->FlushDeferredFromIdle(requested);
+        },
+        [](void* argument) { return static_cast<Scheduler*>(argument)->DeferredFlushMayWait(); },
+        &scheduler);
+    VideoCommon::GpuSplit::Get().SetIdleBusy(
+        [](void* argument) { return static_cast<Scheduler*>(argument)->GpuBehind(); });
     if (!CachePathsEnabled()) {
         LOG_WARNING(Render_Metal, "Metal: plain cache paths (EDEN_NX2_METAL_CACHE_PATHS=0)");
         return;
@@ -287,6 +298,8 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
 }
 
 RasterizerMetal::~RasterizerMetal() {
+    VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr, nullptr);
+    VideoCommon::GpuSplit::Get().SetIdleBusy(nullptr);
     if (CachePathsEnabled()) {
         VideoCommon::GpuSplit::Get().SetFenceQuietCheck(nullptr, nullptr);
     }

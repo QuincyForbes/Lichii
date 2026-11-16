@@ -22,11 +22,14 @@
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "video_core/gpu_split.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
+#include "video_core/renderer_metal/metal_switches.h"
 
 namespace Metal {
 
@@ -186,6 +189,27 @@ bool StateCacheEnabled() {
     return enabled;
 }
 
+// Vulkan's EDEN_NX2_DYNSTATE_CACHE=0 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): every draw sets
+// its draw state (pipeline, depth-stencil state, viewport, scissor, culling, depth bias, stencil
+// references, blend colour) again, its bindings staying cached.
+bool DrawStateCacheEnabled() {
+    static const bool enabled = [] {
+        const char* const value = VulkanSwitch("EDEN_NX2_DYNSTATE_CACHE");
+        return StateCacheEnabled() && !(value != nullptr && value[0] == '0');
+    }();
+    return enabled;
+}
+
+// Vulkan's EDEN_NX2_VERTEX_INPUT_CACHE=0 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): every draw
+// binds its vertex buffers again.
+bool VertexInputCacheEnabled() {
+    static const bool enabled = [] {
+        const char* const value = VulkanSwitch("EDEN_NX2_VERTEX_INPUT_CACHE");
+        return StateCacheEnabled() && !(value != nullptr && value[0] == '0');
+    }();
+    return enabled;
+}
+
 // EDEN_NX2_METAL_AHEAD=0: uploads and kernels are recorded where they come, ending the open
 // render encoder.
 bool AheadEnabled() {
@@ -212,6 +236,36 @@ bool FenceIdleEnabled() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_FENCE_IDLE");
         return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// Vulkan's EDEN_NX2_FENCE_FLUSH_US (read under EDEN_NX2_METAL_VULKAN_SWITCHES; phones get 2000
+// from their device profile, else 0 unless the FenceFlush perf option is on); 0 with
+// EDEN_NX2_METAL_FENCE_BATCH=0, as before.
+s64 FenceFlushIntervalUs() {
+    static const s64 interval_us = [] {
+        const char* const batch = std::getenv("EDEN_NX2_METAL_FENCE_BATCH");
+        if (batch != nullptr && batch[0] == '0') {
+            return s64{0};
+        }
+        if (const char* const value = VulkanSwitch("EDEN_NX2_FENCE_FLUSH_US")) {
+            return static_cast<s64>(std::atoll(value));
+        }
+        return VulkanSwitchesEnabled() &&
+                       VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush)
+                   ? s64{5000}
+                   : s64{0};
+    }();
+    return interval_us;
+}
+
+// EDEN_NX2_METAL_FENCE_BATCH=2: fence work is left pending off the split's back too, where only
+// the caller commits it (the smoke test).
+bool FenceBatchAnyThread() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_FENCE_BATCH");
+        return value != nullptr && value[0] == '2';
     }();
     return enabled;
 }
@@ -910,6 +964,12 @@ struct Scheduler::Impl {
     u64 ahead_copies{};
     u64 ahead_kernels{};
     u64 idle_fences{};
+    /// EDEN_NX2_METAL_FENCE_BATCH: work a fence left pending, since when, and the last commit.
+    bool flush_pending{};
+    std::chrono::steady_clock::time_point flush_pending_since{};
+    std::chrono::steady_clock::time_point last_commit{};
+    u64 deferred_fences{};
+    u64 idle_commits{};
     id<MTLBuffer> visibility = nil;
     u64 render_pass_serial{};
     /// The open render encoder's counting slot (-1: not counting).
@@ -1041,6 +1101,8 @@ u64 Scheduler::Flush() {
     impl->command_buffer = nil;
     impl->NextSegment();
     impl->tick_splits = 0;
+    impl->flush_pending = false;
+    impl->last_commit = std::chrono::steady_clock::now();
     impl->in_flight.emplace_back(tick, command_buffer);
     while (!impl->in_flight.empty() && IsFree(impl->in_flight.front().first)) {
         impl->in_flight.pop_front();
@@ -1058,7 +1120,49 @@ u64 Scheduler::FenceTick() {
         ++impl->idle_fences;
         return impl->current_tick - 1;
     }
+    const s64 interval_us = FenceFlushIntervalUs();
+    const auto now = std::chrono::steady_clock::now();
+    if (interval_us > 0 && (VideoCommon::GpuSplit::OnBackThread() || FenceBatchAnyThread()) &&
+        now - impl->last_commit < std::chrono::microseconds{interval_us}) {
+        // The tick being recorded: committed with whatever comes next, at the latest when the
+        // back goes idle.
+        if (!impl->flush_pending) {
+            impl->flush_pending = true;
+            impl->flush_pending_since = now;
+        }
+        ++impl->deferred_fences;
+        return impl->current_tick;
+    }
     return Flush();
+}
+
+bool Scheduler::FlushDeferredFromIdle(bool) {
+    if (!impl->flush_pending) {
+        return false;
+    }
+    ++impl->idle_commits;
+    Flush();
+    return true;
+}
+
+void Scheduler::FlushDeferred() {
+    if (impl->flush_pending) {
+        Flush();
+    }
+}
+
+bool Scheduler::DeferredFlushMayWait() const {
+    return impl->flush_pending &&
+           std::chrono::steady_clock::now() - impl->flush_pending_since <
+               std::chrono::microseconds{FenceFlushIntervalUs()};
+}
+
+bool Scheduler::GpuBehind() const noexcept {
+    return impl->completed_tick.load(std::memory_order_acquire) + 1 < impl->current_tick;
+}
+
+std::array<u64, 2> Scheduler::TakeDeferredFences() noexcept {
+    return {std::exchange(impl->deferred_fences, 0), std::exchange(impl->idle_commits, 0)};
 }
 
 void Scheduler::CopyBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u64 dst_offset,
@@ -1533,7 +1637,7 @@ void Scheduler::SetDrawState(const DrawState& state) {
         return;
     }
     // What the encoder has from the draw before stays as it is (EDEN_NX2_METAL_STATE_CACHE).
-    const bool cached = StateCacheEnabled() && impl->render_state_valid;
+    const bool cached = DrawStateCacheEnabled() && impl->render_state_valid;
     const DrawState& last = impl->render_state;
     const auto changed = [&](bool differs) {
         if (cached && !differs) {
@@ -1601,6 +1705,10 @@ void Scheduler::SetDrawState(const DrawState& state) {
 
 void Scheduler::BindVertexBuffer(u32 slot, BufferHandle buffer, u32 offset) {
     if (SlotFits(slot, BufferSlots, "vertex buffer")) {
+        if (!VertexInputCacheEnabled()) {
+            // Bound again whatever the encoder has.
+            impl->vertex_bound.buffers[slot] = &InlineBytes;
+        }
         impl->SetBuffer(ShaderStage::Vertex, slot, buffer, offset);
     }
 }

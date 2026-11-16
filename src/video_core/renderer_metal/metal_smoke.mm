@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <span>
 #include <string>
 #include <system_error>
@@ -26,8 +27,13 @@
 #include <utility>
 #include <vector>
 
+#include <mach-o/dyld.h>
+#include <spawn.h>
+#include <sys/wait.h>
+
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/attribute.h"
+#include "common/settings_enums.h"
 #include "shader_recompiler/shader_info.h"
 #include "device_msl_smoke_frag_spv.h"
 #include "device_msl_smoke_vert_spv.h"
@@ -44,11 +50,14 @@
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_pipeline_files.h"
+#include "video_core/renderer_metal/metal_present.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
 #include "video_core/renderer_metal/metal_smoke_probe.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
+
+extern char** environ;
 
 namespace {
 
@@ -1044,6 +1053,157 @@ int RunOcarinaBilinear() {
                 sample[0], sample[1], sample[2], wrong, (TargetSize - 2) * (TargetSize - 2),
                 wrong == 0 ? "PASS" : "FAIL");
     return wrong == 0 ? 0 : 1;
+}
+
+/// The Vulkan present filters on Metal (EDEN_NX2_METAL_PRESENT_FILTERS): every shader
+/// translated and built, then a 32x32 picture of four coloured quadrants through FXAA, SMAA and
+/// each scaling filter to a 64x64 target. Each quadrant's centre keeps its colour: wrong
+/// bindings, constants or a flipped picture show there.
+int RunPresentFilters() {
+    using Filter = Settings::ScalingFilter;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Metal::PresentPasses present(device, scheduler);
+    uint32_t shaders_failed = 0;
+    for (size_t shader = 0; shader < static_cast<size_t>(Metal::PresentPasses::Shader::Count);
+         ++shader) {
+        if (!present.Prepare(static_cast<Metal::PresentPasses::Shader>(shader))) {
+            std::printf("metal-smoke: present shader %zu not built (see the log)\n", shader);
+            ++shaders_failed;
+        }
+    }
+    constexpr uint32_t Source = 32;
+    constexpr uint32_t Target = 64;
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    const Metal::Object picture = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D, .format = rgba8, .width = Source, .height = Source});
+    const Metal::Object target = Metal::CreateTexture(device, {.kind = Metal::TextureKind::e2D,
+                                                               .format = rgba8,
+                                                               .width = Target,
+                                                               .height = Target,
+                                                               .render_target = true});
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer = Metal::CreateBuffer(device, Source * Source * 4, true, &upload);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Target * Target * 4, true, &readback);
+    if (!picture || !target || upload == nullptr || readback == nullptr) {
+        std::printf("metal-smoke: FAIL present filter textures\n");
+        return 1;
+    }
+    // Top left, top right, bottom left, bottom right.
+    constexpr std::array<std::array<uint8_t, 4>, 4> Quadrants{{
+        {200, 40, 40, 255},
+        {40, 200, 40, 255},
+        {40, 40, 200, 255},
+        {200, 200, 200, 255},
+    }};
+    for (uint32_t y = 0; y < Source; ++y) {
+        for (uint32_t x = 0; x < Source; ++x) {
+            const size_t quadrant = (y >= Source / 2 ? 2 : 0) + (x >= Source / 2 ? 1 : 0);
+            std::memcpy(upload + (y * Source + x) * 4, Quadrants[quadrant].data(), 4);
+        }
+    }
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Source * 4, 0, picture.Get(), 0, 0, {},
+                                  {Source, Source, 1});
+    scheduler.Finish();
+
+    struct Case {
+        const char* name;
+        Settings::AntiAliasing anti_aliasing;
+        Filter filter;
+    };
+    constexpr std::array Cases{
+        Case{"FXAA", Settings::AntiAliasing::Fxaa, Filter::Bilinear},
+        Case{"SMAA", Settings::AntiAliasing::Smaa, Filter::Bilinear},
+        Case{"FSR", Settings::AntiAliasing::None, Filter::Fsr},
+        Case{"SGSR", Settings::AntiAliasing::None, Filter::Sgsr},
+        Case{"SGSR edge", Settings::AntiAliasing::None, Filter::SgsrEdge},
+        Case{"bicubic", Settings::AntiAliasing::None, Filter::Bicubic},
+        Case{"zero tangent", Settings::AntiAliasing::None, Filter::ZeroTangent},
+        Case{"B-spline", Settings::AntiAliasing::None, Filter::BSpline},
+        Case{"Mitchell", Settings::AntiAliasing::None, Filter::Mitchell},
+        Case{"spline", Settings::AntiAliasing::None, Filter::Spline1},
+        Case{"Gaussian", Settings::AntiAliasing::None, Filter::Gaussian},
+        Case{"Lanczos", Settings::AntiAliasing::None, Filter::Lanczos},
+        Case{"ScaleForce", Settings::AntiAliasing::None, Filter::ScaleForce},
+        Case{"area", Settings::AntiAliasing::None, Filter::Area},
+        Case{"MMPX", Settings::AntiAliasing::None, Filter::Mmpx},
+        Case{"SMAA + FSR", Settings::AntiAliasing::Smaa, Filter::Fsr},
+    };
+    const auto close = [](uint8_t a, uint8_t b) { return (a > b ? a - b : b - a) <= 6; };
+    uint32_t failed = 0;
+    for (const Case& test : Cases) {
+        (void)present.TakePasses();
+        Metal::PresentPasses::Source source{.texture = picture.Get(),
+                                            .size = {Source, Source},
+                                            .render = {Source, Source}};
+        source = present.AntiAlias(source, test.anti_aliasing);
+        source = present.Upscale(source, test.filter, {Target, Target});
+        const Metal::Attachment attachment{.texture = target.Get()};
+        bool drawn = false;
+        if (Metal::PresentPasses::HasWindowShader(test.filter)) {
+            drawn = present.DrawWindow(source, test.filter, attachment, rgba8, {Target, Target},
+                                       {0, 0, static_cast<int32_t>(Target),
+                                        static_cast<int32_t>(Target)},
+                                       false, Metal::BlitBlend::None);
+        } else {
+            const float width = static_cast<float>(source.size[0]);
+            const float height = static_cast<float>(source.size[1]);
+            drawn = scheduler.Blit({
+                .src = source.texture,
+                .src_rect = {static_cast<int32_t>(source.crop[0] * width),
+                             static_cast<int32_t>(source.crop[1] * height),
+                             static_cast<int32_t>(source.crop[2] * width),
+                             static_cast<int32_t>(source.crop[3] * height)},
+                .dst = attachment,
+                .dst_format = rgba8,
+                .dst_rect = {0, 0, static_cast<int32_t>(Target), static_cast<int32_t>(Target)},
+                .dst_width = Target,
+                .dst_height = Target,
+                .linear = true,
+                .keep_dst = false,
+            });
+        }
+        const uint64_t passes = present.TakePasses();
+        scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Target, Target, 1},
+                                      readback_buffer.Get(), 0, Target * 4, 0);
+        scheduler.Finish();
+        // The anti-aliasing passes (1 or 3) and the scaler's (FSR 2, SGSR 1, a window filter 1).
+        const uint64_t expected_passes =
+            (test.anti_aliasing == Settings::AntiAliasing::Fxaa   ? 1
+             : test.anti_aliasing == Settings::AntiAliasing::Smaa ? 3
+                                                                  : 0) +
+            (test.filter == Filter::Fsr                                   ? 2
+             : test.filter == Filter::Sgsr || test.filter == Filter::SgsrEdge ? 1
+             : Metal::PresentPasses::HasWindowShader(test.filter)         ? 1
+                                                                          : 0);
+        bool colours = true;
+        std::string seen;
+        for (size_t quadrant = 0; quadrant < 4; ++quadrant) {
+            const uint32_t x = (quadrant & 1) != 0 ? Target * 3 / 4 : Target / 4;
+            const uint32_t y = (quadrant & 2) != 0 ? Target * 3 / 4 : Target / 4;
+            Texel texel;
+            std::memcpy(&texel, readback + (y * Target + x) * 4, 4);
+            const auto& want = Quadrants[quadrant];
+            colours = colours && close(texel.r, want[0]) && close(texel.g, want[1]) &&
+                      close(texel.b, want[2]) && close(texel.a, want[3]);
+            seen += (quadrant != 0 ? " " : "") + std::to_string(texel.r) + "," +
+                    std::to_string(texel.g) + "," + std::to_string(texel.b);
+        }
+        const bool passed = drawn && colours && passes == expected_passes;
+        failed += passed ? 0 : 1;
+        std::printf("metal-smoke: present %s: %llu passes (expected %llu), quadrant centres %s: "
+                    "%s\n",
+                    test.name, static_cast<unsigned long long>(passes),
+                    static_cast<unsigned long long>(expected_passes), seen.c_str(),
+                    passed ? "PASS" : "FAIL");
+    }
+    std::printf("metal-smoke: present filters: %u of %zu shaders not built, %u of %zu cases "
+                "failed: %s\n",
+                shaders_failed, static_cast<size_t>(Metal::PresentPasses::Shader::Count), failed,
+                Cases.size(), shaders_failed == 0 && failed == 0 ? "PASS" : "FAIL");
+    return shaders_failed == 0 && failed == 0 ? 0 : 1;
 }
 
 /// The pipeline archive: a compute and a render pipeline built into a new archive file (misses,
@@ -2359,14 +2519,70 @@ int RunStateCache() {
                           Near(scene.At(1, Size - 4, lower), {0, 0, 255, 255});
     // A draw is ten pieces of state and one buffer. The first of a pass sets them all (11); the
     // second sets the scissor and the offset (2 set, 9 left); the third nothing (11 left).
+    // Vulkan's EDEN_NX2_DYNSTATE_CACHE=0 sets the ten every draw, EDEN_NX2_VERTEX_INPUT_CACHE=0
+    // the buffer (both read under EDEN_NX2_METAL_VULKAN_SWITCHES).
     const bool caching = SwitchOn("EDEN_NX2_METAL_STATE_CACHE");
-    const bool counted = caching ? sets == 24 && skips == 20 : sets == 44 && skips == 0;
-    std::printf("metal-smoke: state cache (%s): pictures %s; %llu set, %llu left as they were: "
-                "%s\n",
-                caching ? "on" : "off", pictures ? "PASS" : "FAIL",
+    const bool vulkan = SwitchOn("EDEN_NX2_METAL_VULKAN_SWITCHES");
+    const bool state_cached = caching && !(vulkan && !SwitchOn("EDEN_NX2_DYNSTATE_CACHE"));
+    const bool buffers_cached = caching && !(vulkan && !SwitchOn("EDEN_NX2_VERTEX_INPUT_CACHE"));
+    const uint64_t state_sets = state_cached ? 10 + 1 + 0 + 10 : 40;
+    const uint64_t buffer_sets = buffers_cached ? 1 + 1 + 0 + 1 : 4;
+    const bool counted = sets == state_sets + buffer_sets && skips == 44 - sets;
+    std::printf("metal-smoke: state cache (%s, draw state %s, vertex buffers %s): pictures %s; "
+                "%llu set, %llu left as they were: %s\n",
+                caching ? "on" : "off", state_cached ? "cached" : "set every draw",
+                buffers_cached ? "cached" : "bound every draw", pictures ? "PASS" : "FAIL",
                 static_cast<unsigned long long>(sets), static_cast<unsigned long long>(skips),
                 counted ? "PASS" : "FAIL");
     return pictures && counted ? 0 : 1;
+}
+
+/// Runs this program again with `--child <name>` and `variables` (NAME=VALUE) added to its
+/// environment; the child's exit code, -1 when it could not run.
+int RunChildWith(const char* name, std::initializer_list<const char*> variables) {
+    char path[4096];
+    uint32_t path_size = sizeof(path);
+    if (_NSGetExecutablePath(path, &path_size) != 0) {
+        return -1;
+    }
+    std::vector<std::string> owned(variables.begin(), variables.end());
+    std::vector<char*> environment;
+    for (char** entry = environ; *entry != nullptr; ++entry) {
+        environment.push_back(*entry);
+    }
+    for (std::string& variable : owned) {
+        environment.push_back(variable.data());
+    }
+    environment.push_back(nullptr);
+    char child_flag[] = "--child";
+    std::string child_name = name;
+    char* const arguments[] = {path, child_flag, child_name.data(), nullptr};
+    pid_t child = 0;
+    if (posix_spawn(&child, path, nullptr, nullptr, arguments, environment.data()) != 0) {
+        return -1;
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/// Vulkan's switches the Metal renderer reads (EDEN_NX2_METAL_VULKAN_SWITCHES), each read once
+/// per process: the state cache test in children with EDEN_NX2_DYNSTATE_CACHE=0,
+/// EDEN_NX2_VERTEX_INPUT_CACHE=0, and both with the Vulkan switches ignored.
+int RunVulkanSwitches() {
+    const int draw_state = RunChildWith("state-cache", {"EDEN_NX2_DYNSTATE_CACHE=0"});
+    const int vertex_input = RunChildWith("state-cache", {"EDEN_NX2_VERTEX_INPUT_CACHE=0"});
+    const int ignored =
+        RunChildWith("state-cache", {"EDEN_NX2_DYNSTATE_CACHE=0", "EDEN_NX2_VERTEX_INPUT_CACHE=0",
+                                     "EDEN_NX2_METAL_VULKAN_SWITCHES=0"});
+    const int fence_batch = RunChildWith(
+        "fence-batch", {"EDEN_NX2_FENCE_FLUSH_US=10000000", "EDEN_NX2_METAL_FENCE_BATCH=2"});
+    const bool passed = draw_state == 0 && vertex_input == 0 && ignored == 0 && fence_batch == 0;
+    std::printf("metal-smoke: Vulkan switches in children: EDEN_NX2_DYNSTATE_CACHE=0 %d, "
+                "EDEN_NX2_VERTEX_INPUT_CACHE=0 %d, ignored %d, EDEN_NX2_FENCE_FLUSH_US %d (0 "
+                "each): %s\n",
+                draw_state, vertex_input, ignored, fence_batch, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
 }
 
 /// Uploads and kernels ahead of their segment (EDEN_NX2_METAL_AHEAD): a copy and a compute
@@ -2518,6 +2734,46 @@ int RunFenceIdle() {
     return results && counted ? 0 : 1;
 }
 
+/// Fences batched (EDEN_NX2_METAL_FENCE_BATCH with Vulkan's EDEN_NX2_FENCE_FLUSH_US, run in a
+/// child with a 10 s window and =2 so it applies off the split's back): two fences after draws
+/// within the window share the tick being recorded and commit nothing, the idle hook commits it.
+int RunFenceBatch() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const QuadScene scene(device);
+    if (!scene.valid) {
+        std::printf("metal-smoke: FAIL fence batch setup: %s\n", scene.error.c_str());
+        return 1;
+    }
+    scheduler.Flush();
+    (void)scheduler.TakeCounts();
+    (void)scheduler.TakeDeferredFences();
+    scene.Draw(scheduler, 0, 0, Size);
+    const uint64_t first = scheduler.FenceTick();
+    const bool first_pending = !scheduler.IsSubmitted(first) && scheduler.HasPendingWork();
+    scene.Draw(scheduler, 0, 1, Size / 2);
+    const uint64_t second = scheduler.FenceTick();
+    const bool may_wait = scheduler.DeferredFlushMayWait();
+    const bool idle_committed = scheduler.FlushDeferredFromIdle(false);
+    const bool submitted = scheduler.IsSubmitted(second);
+    const bool nothing_left = !scheduler.FlushDeferredFromIdle(false);
+    scheduler.Wait(second);
+    scheduler.WaitSubmitted(second);
+    const auto counts = scheduler.TakeCounts();
+    const auto [deferred, idle_commits] = scheduler.TakeDeferredFences();
+    const bool passed = first == second && first_pending && may_wait && idle_committed &&
+                        submitted && nothing_left && scheduler.IsFree(second) &&
+                        counts[1] == 1 && deferred == 2 && idle_commits == 1;
+    std::printf("metal-smoke: fence batch: ticks %llu/%llu, pending %d, may wait %d, idle commit "
+                "%d, %llu command buffers, %llu fences left pending, %llu idle commits: %s\n",
+                static_cast<unsigned long long>(first), static_cast<unsigned long long>(second),
+                first_pending ? 1 : 0, may_wait ? 1 : 0, idle_committed ? 1 : 0,
+                static_cast<unsigned long long>(counts[1]),
+                static_cast<unsigned long long>(deferred),
+                static_cast<unsigned long long>(idle_commits), passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 /// Staging buffers bounded (EDEN_NX2_METAL_STAGING_BOUND): a command buffer that took its mark's
 /// worth asks to be committed, over the cap the buffers the GPU is done with go, a slot freed is
 /// used again, and a deferred buffer stays through all of it.
@@ -2565,24 +2821,40 @@ int RunStagingBound() {
     std::memset(kept.mapped_span.data(), 0x5A, kept.mapped_span.size());
     pool.FreeDeferred(kept);
 
-    const bool passed =
+    // EDEN_NX2_STREAM_BUFFER_MIB=8: a ring of 8 MiB, regions of 512 KiB; a larger slice is a
+    // buffer of its own, a smaller one is in the ring.
+    setenv("EDEN_NX2_STREAM_BUFFER_MIB", "8", 1);
+    Metal::StagingBufferPool small_ring(device, scheduler);
+    unsetenv("EDEN_NX2_STREAM_BUFFER_MIB");
+    const Metal::StagingBufferPool default_ring(device, scheduler);
+    const Metal::StagingBufferRef in_ring = small_ring.Stream(Chunk, 16);
+    const Metal::StagingBufferRef own = small_ring.Stream(Chunk + 16, 16);
+    constexpr size_t NotPooled = (std::numeric_limits<size_t>::max)();
+    const bool stream_sized = small_ring.StreamSize() == 8 * MiB &&
+                              default_ring.StreamSize() == 32 * MiB && in_ring.index == NotPooled &&
+                              own.index != NotPooled;
+    finish();
+
+    const bool bound_passed =
         bounded ? !asked_early && asked && over && held_taken == 3 * MiB && !asked_after &&
                       held_trimmed == MiB && freed_trimmed == 4 && held_again == MiB &&
                       held_ticked == 2 * MiB && freed_ticked == 2
                 : !asked_early && !asked && !over && held_taken == 3 * MiB && !asked_after &&
                       held_trimmed == 3 * MiB && freed_trimmed == 0 && held_again == 3 * MiB &&
                       held_ticked == 5 * MiB && freed_ticked == 0;
+    const bool passed = bound_passed && stream_sized;
     std::printf("metal-smoke: staging bound (%s): 6 buffers of 512 KiB in one command buffer "
                 "ask for a commit %d, over the cap %d; held %llu KiB, %llu after the trim (%llu "
                 "freed), %llu with one more, %llu after 10 frames with 2 MiB deferred (%llu "
-                "freed): %s\n",
+                "freed); stream ring %s for EDEN_NX2_STREAM_BUFFER_MIB: %s\n",
                 bounded ? "on" : "off", asked ? 1 : 0, over ? 1 : 0,
                 static_cast<unsigned long long>(held_taken >> 10),
                 static_cast<unsigned long long>(held_trimmed >> 10),
                 static_cast<unsigned long long>(freed_trimmed),
                 static_cast<unsigned long long>(held_again >> 10),
                 static_cast<unsigned long long>(held_ticked >> 10),
-                static_cast<unsigned long long>(freed_ticked), passed ? "PASS" : "FAIL");
+                static_cast<unsigned long long>(freed_ticked), stream_sized ? "sized" : "NOT sized",
+                passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
 
@@ -2988,6 +3260,15 @@ int main(int argc, char** argv) {
         if (argc == 3 && std::strcmp(argv[1], "--probe") == 0) {
             return SmokeProbe::RunChild(argv[2]);
         }
+        if (argc == 3 && std::strcmp(argv[1], "--child") == 0) {
+            if (std::strcmp(argv[2], "state-cache") == 0) {
+                return RunStateCache();
+            }
+            if (std::strcmp(argv[2], "fence-batch") == 0) {
+                return RunFenceBatch();
+            }
+            return 4;
+        }
         const int draw = Run();
         if (draw == 2) {
             return 2;
@@ -3000,7 +3281,8 @@ int main(int argc, char** argv) {
                                  RunPipelineCheck, RunDeviceMsl, RunBlockCopy, RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
                                  RunStagingBound, RunPipelineFiles, RunOcarinaTemporal,
-                                 RunOcarinaActorEffects, SmokeProbe::RunAll}) {
+                                 RunOcarinaActorEffects, RunVulkanSwitches, RunPresentFilters,
+                                 SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }

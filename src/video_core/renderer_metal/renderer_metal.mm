@@ -35,6 +35,7 @@
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_device.h"
+#include "video_core/renderer_metal/metal_present.h"
 #include "video_core/renderer_metal/metal_rasterizer.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
@@ -319,6 +320,7 @@ struct RendererMetal::Impl {
     };
     std::vector<MemoryLayer> memory_layers;
     SpatialUpscaler spatial;
+    PresentPasses present{device, scheduler};
     std::vector<u8> unswizzled;
 
     std::chrono::steady_clock::time_point report_start = std::chrono::steady_clock::now();
@@ -463,8 +465,43 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                                             static_cast<s32>(crop.bottom * height)};
                 TextureHandle texture = source.texture;
                 bool linear = true;
-                if (!drawn && Settings::values.scaling_filter.GetValue() ==
-                                  Settings::ScalingFilter::MetalFxSpatial) {
+                const Settings::ScalingFilter filter = Settings::values.scaling_filter.GetValue();
+                const s32 screen_width = static_cast<s32>(screen.right - screen.left);
+                const s32 screen_height = static_cast<s32>(screen.bottom - screen.top);
+                if (PresentPasses::Enabled() && screen_width > 0 && screen_height > 0) {
+                    // Vulkan's Layer::ConfigureDraw: anti-aliasing over the layer's texture,
+                    // then FSR or SGSR to the screen's size, then the window filter.
+                    PresentPasses::Source passes_source{
+                        .texture = texture,
+                        .size = {source.scaled_width, source.scaled_height},
+                        .render = {source.scaled_width, source.scaled_height},
+                        .crop = {crop.left, crop.top, crop.right, crop.bottom},
+                    };
+                    passes_source = impl->present.AntiAlias(
+                        passes_source, Settings::values.anti_aliasing.GetValue());
+                    passes_source = impl->present.Upscale(
+                        passes_source, filter,
+                        {static_cast<u32>(screen_width), static_cast<u32>(screen_height)});
+                    if (PresentPasses::HasWindowShader(filter) &&
+                        impl->present.DrawWindow(
+                            passes_source, filter, target, DrawableFormat(),
+                            {layout.width, layout.height},
+                            {static_cast<s32>(screen.left), static_cast<s32>(screen.top),
+                             static_cast<s32>(screen.right), static_cast<s32>(screen.bottom)},
+                            drawn, blend)) {
+                        drawn = true;
+                        continue;
+                    }
+                    texture = passes_source.texture;
+                    const f32 pass_width = static_cast<f32>(passes_source.size[0]);
+                    const f32 pass_height = static_cast<f32>(passes_source.size[1]);
+                    src_rect = {static_cast<s32>(passes_source.crop[0] * pass_width),
+                                static_cast<s32>(passes_source.crop[1] * pass_height),
+                                static_cast<s32>(passes_source.crop[2] * pass_width),
+                                static_cast<s32>(passes_source.crop[3] * pass_height)};
+                    linear = filter != Settings::ScalingFilter::NearestNeighbor;
+                }
+                if (!drawn && filter == Settings::ScalingFilter::MetalFxSpatial) {
                     const u32 out_width = screen.right - screen.left;
                     const u32 out_height = screen.bottom - screen.top;
                     if (TextureHandle upscaled = impl->spatial.Upscale(
@@ -585,6 +622,21 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                  static_cast<f64>(impl->scheduler.TakeGpuNanoseconds()) / 1e6 / frames,
                  static_cast<f64>(command_buffers) / frames, static_cast<f64>(encoders) / frames,
                  static_cast<f64>(passes) / frames, static_cast<f64>(work.draws_encoded) / frames);
+        if (const u64 present_passes = impl->present.TakePasses(); present_passes != 0) {
+            LOG_INFO(Render_Metal,
+                     "Metal present filters: {:.1f} passes per frame (scaling filter {}, "
+                     "anti-aliasing {})",
+                     static_cast<f64>(present_passes) / frames,
+                     Settings::CanonicalizeEnum(Settings::values.scaling_filter.GetValue()),
+                     Settings::CanonicalizeEnum(Settings::values.anti_aliasing.GetValue()));
+        }
+        if (const auto [deferred, idle_commits] = impl->scheduler.TakeDeferredFences();
+            deferred != 0) {
+            LOG_INFO(Render_Metal,
+                     "Metal fences: {} left pending to go with later work "
+                     "(EDEN_NX2_FENCE_FLUSH_US), {} commits of such work by the idle GPU thread",
+                     deferred, idle_commits);
+        }
         impl->report_start = now;
         impl->presented = 0;
         impl->skipped = 0;
