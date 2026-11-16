@@ -6,13 +6,18 @@
 #include <bit>
 #include <cstdlib>
 
+#include <fmt/format.h>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/dlss_contract.h"
+#include "video_core/ocarina_upscale.h"
+#include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_graphics.h"
+#include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_texture_cache.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/decode_bc.h"
@@ -58,6 +63,99 @@ namespace {
         return value == nullptr || value[0] != '0';
     }();
     return enabled;
+}
+
+// EDEN_NX2_METAL_SAMPLERS=0: one sampler state per guest sampler, without LOD bias, reduction
+// or the variants a view asks for, Clamp and the mirror-once modes as this backend started.
+[[nodiscard]] bool SamplersEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_SAMPLERS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// EDEN_NX2_METAL_MSAA=0: multisampled images are neither uploaded, downloaded, copied to or from
+// single-sampled ones nor resolved, and one bound where a shader reads a plain texture is bound
+// as it is, as this backend started.
+[[nodiscard]] bool MsaaEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_MSAA");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// The conversion Vulkan's ConvertImage draws for these formats (vk_texture_cache.cpp).
+[[nodiscard]] std::optional<ConvertKind> ConversionFor(PixelFormat dst, PixelFormat src) {
+    const bool abgr8 = src == PixelFormat::A8B8G8R8_UNORM || src == PixelFormat::B8G8R8A8_UNORM;
+    const bool abgr8_any = abgr8 || src == PixelFormat::A8B8G8R8_SRGB ||
+                           src == PixelFormat::B8G8R8A8_SRGB;
+    switch (dst) {
+    case PixelFormat::R16_UNORM:
+        if (src == PixelFormat::D16_UNORM) {
+            return ConvertKind::DepthToColor;
+        }
+        break;
+    case PixelFormat::A8B8G8R8_SRGB:
+    case PixelFormat::B8G8R8A8_SRGB:
+    case PixelFormat::B8G8R8A8_UNORM:
+        if (src == PixelFormat::D32_FLOAT) {
+            return ConvertKind::DepthToColor;
+        }
+        break;
+    case PixelFormat::A8B8G8R8_UNORM:
+        switch (src) {
+        case PixelFormat::X8_D24_UNORM: return ConvertKind::X8d24ToAbgr8;
+        case PixelFormat::S8_UINT_D24_UNORM: return ConvertKind::D24s8ToAbgr8;
+        case PixelFormat::D24_UNORM_S8_UINT: return ConvertKind::S8d24ToAbgr8;
+        case PixelFormat::D32_FLOAT: return ConvertKind::DepthToColor;
+        default: break;
+        }
+        break;
+    case PixelFormat::R32_FLOAT:
+        if (src == PixelFormat::D32_FLOAT) {
+            return ConvertKind::DepthToColor;
+        }
+        break;
+    case PixelFormat::D16_UNORM:
+        if (src == PixelFormat::R16_UNORM) {
+            return ConvertKind::ColorToDepth;
+        }
+        break;
+    case PixelFormat::X8_D24_UNORM:
+        if (src == PixelFormat::A8B8G8R8_UNORM) {
+            return ConvertKind::Abgr8ToX8d24;
+        }
+        break;
+    case PixelFormat::S8_UINT_D24_UNORM:
+        if (abgr8) {
+            return ConvertKind::Abgr8ToD24s8;
+        }
+        break;
+    case PixelFormat::D32_FLOAT:
+        if (abgr8_any) {
+            return ConvertKind::Abgr8ToD32f;
+        }
+        if (src == PixelFormat::R32_FLOAT) {
+            return ConvertKind::ColorToDepth;
+        }
+        break;
+    case PixelFormat::D24_UNORM_S8_UINT:
+        if (abgr8_any) {
+            return ConvertKind::Abgr8ToD24s8;
+        }
+        break;
+    default:
+        break;
+    }
+    // Vulkan's fallback: a depth image into a colour one (the bloom fix, B5G6R5).
+    if (src == PixelFormat::D32_FLOAT &&
+        VideoCore::Surface::GetFormatType(dst) == VideoCore::Surface::SurfaceType::ColorTexture &&
+        (dst == PixelFormat::B5G6R5_UNORM || Settings::values.fix_bloom_effects.GetValue())) {
+        return ConvertKind::DepthToColor;
+    }
+    return std::nullopt;
 }
 
 [[nodiscard]] TextureKind KindOf(const ImageInfo& info) {
@@ -117,7 +215,8 @@ namespace {
 
 TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
                                          StagingBufferPool& staging_buffer_pool_)
-    : device{device_}, scheduler{scheduler_}, staging_buffer_pool{staging_buffer_pool_} {}
+    : device{device_}, scheduler{scheduler_}, staging_buffer_pool{staging_buffer_pool_},
+      sample_limits{DevicePipelineLimits(device_)} {}
 
 TextureCacheRuntime::~TextureCacheRuntime() = default;
 
@@ -181,10 +280,56 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
     }
 }
 
+bool TextureCacheRuntime::CanUploadMSAA() const noexcept {
+    return MsaaEnabled();
+}
+
+bool TextureCacheRuntime::CanDownloadMsaa(const ImageInfo&) const {
+    return MsaaEnabled();
+}
+
 void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src,
-                                        std::span<const VideoCommon::ImageCopy> copies) {
-    LOG_ONCE(warned, "Metal: copies between sample counts ({} -> {}) are not done yet",
-             src.info.num_samples, dst.info.num_samples);
+                                        std::span<const VideoCommon::ImageCopy>) {
+    // Whole images, as Vulkan's MSAA copy passes: every sample becomes a texel of the
+    // single-sampled image, or every texel a sample.
+    const bool expand = src.HostSamples() > 1 && dst.HostSamples() == 1;
+    const bool compress = src.HostSamples() == 1 && dst.HostSamples() > 1;
+    Image& multisampled = expand ? src : dst;
+    Image& single = expand ? dst : src;
+    if (!MsaaEnabled() || (!expand && !compress) || src.Handle() == nullptr ||
+        dst.Handle() == nullptr || ClassOf(src.HostFormat().format) != ClassOf(dst.HostFormat().format) ||
+        !dst.HostFormat().attachable) {
+        LOG_ONCE(warned, "Metal: a copy of {} x{} into {} x{} is not done", src.info.format,
+                 src.info.num_samples, dst.info.format, dst.info.num_samples);
+        return;
+    }
+    const auto [shift_x, shift_y] = VideoCommon::SamplesLog2(multisampled.info.num_samples);
+    const u32 layers = static_cast<u32>(
+        (std::min)(src.info.resources.layers, dst.info.resources.layers));
+    for (u32 layer = 0; layer < layers; ++layer) {
+        SampleCopy copy{
+            .src = src.Handle(),
+            .src_layer = layer,
+            .dst = {.texture = dst.Handle(), .slice = layer},
+            .dst_format = dst.HostFormat().format,
+            .dst_width = (std::max)(dst.info.size.width >> (compress ? shift_x : 0), 1U),
+            .dst_height = (std::max)(dst.info.size.height >> (compress ? shift_y : 0), 1U),
+            .samples = multisampled.HostSamples(),
+            .shift = {static_cast<u32>(shift_x), static_cast<u32>(shift_y)},
+        };
+        Object view;
+        if (compress) {
+            view = CreateTextureView(single.Handle(), single.HostFormat().format,
+                                     TextureKind::e2D, 0, 1, layer, 1, IdentitySwizzle);
+            copy.src = view.Get();
+            copy.src_layer = 0;
+        }
+        if (!scheduler.CopySamples(copy, expand)) {
+            LOG_ONCE(warned_copy, "Metal: a sample copy of {} into {} failed", src.info.format,
+                     dst.info.format);
+            return;
+        }
+    }
 }
 
 void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
@@ -206,10 +351,14 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
         (CopiesEnabled() && (src_texels || dst_texels ||
                              (src_block_width == dst_block_width &&
                               src_block_height == dst_block_height)));
+    // Depth and stencil go through the buffer in the guest's bytes too (Image::DepthBytesLayout).
+    const auto copyable = [](const Image& image) {
+        return IsColor(image.HostFormat().format_class) ||
+               (CopiesEnabled() && image.CanCopyWithBuffers());
+    };
     if (dst.Handle() == nullptr || src.Handle() == nullptr || converted ||
-        src.info.num_samples != 1 || dst.info.num_samples != 1 ||
-        !IsColor(src.HostFormat().format_class) || !IsColor(dst.HostFormat().format_class) ||
-        !blocks_fit ||
+        src.info.num_samples != 1 || dst.info.num_samples != 1 || !copyable(src) ||
+        !copyable(dst) || !blocks_fit ||
         VideoCore::Surface::BytesPerBlock(src_format) !=
             VideoCore::Surface::BytesPerBlock(dst_format)) {
         LOG_ONCE(warned, "Metal: reinterpreting {} as {} is not done yet", src_format,
@@ -254,18 +403,36 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
         const bool src_3d = src.info.type == ImageType::e3D;
         const bool dst_3d = dst.info.type == ImageType::e3D;
         const s32 layers = (std::max)(copy.src_subresource.num_layers, 1);
+        const std::optional<DepthLayout> src_depth = src.DepthBytesLayout();
+        const std::optional<DepthLayout> dst_depth = dst.DepthBytesLayout();
         for (s32 layer = 0; layer < layers; ++layer) {
-            scheduler.CopyTextureToBuffer(
-                src.Handle(), static_cast<u32>(copy.src_subresource.base_level),
-                src_3d ? 0U : static_cast<u32>(copy.src_subresource.base_layer + layer),
-                ToOffset(copy.src_offset), extent, reinterpret_buffer.Get(), 0, bytes_per_row,
-                src_3d ? bytes_per_image : 0U);
+            const u32 src_level = static_cast<u32>(copy.src_subresource.base_level);
+            const u32 src_slice =
+                src_3d ? 0U : static_cast<u32>(copy.src_subresource.base_layer + layer);
+            const u32 dst_level = static_cast<u32>(copy.dst_subresource.base_level);
+            const u32 dst_slice =
+                dst_3d ? 0U : static_cast<u32>(copy.dst_subresource.base_layer + layer);
+            if (src_depth) {
+                scheduler.DepthToBuffer(src.Handle(), src_level, src_slice,
+                                        ToOffset(copy.src_offset), extent,
+                                        reinterpret_buffer.Get(), 0, bytes_per_row, *src_depth);
+            } else {
+                scheduler.CopyTextureToBuffer(src.Handle(), src_level, src_slice,
+                                              ToOffset(copy.src_offset), extent,
+                                              reinterpret_buffer.Get(), 0, bytes_per_row,
+                                              src_3d ? bytes_per_image : 0U);
+            }
             scheduler.BreakBlits();
-            scheduler.CopyBufferToTexture(
-                reinterpret_buffer.Get(), 0, bytes_per_row, dst_3d ? bytes_per_image : 0U,
-                dst.Handle(), static_cast<u32>(copy.dst_subresource.base_level),
-                dst_3d ? 0U : static_cast<u32>(copy.dst_subresource.base_layer + layer),
-                ToOffset(copy.dst_offset), dst_extent);
+            if (dst_depth) {
+                scheduler.DepthFromBuffer(reinterpret_buffer.Get(), 0, bytes_per_row,
+                                          dst.Handle(), dst_level, dst_slice,
+                                          ToOffset(copy.dst_offset), dst_extent, *dst_depth);
+            } else {
+                scheduler.CopyBufferToTexture(reinterpret_buffer.Get(), 0, bytes_per_row,
+                                              dst_3d ? bytes_per_image : 0U, dst.Handle(),
+                                              dst_level, dst_slice, ToOffset(copy.dst_offset),
+                                              dst_extent);
+            }
             scheduler.BreakBlits();
         }
     }
@@ -273,6 +440,23 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
 
 void TextureCacheRuntime::ConvertImage(Framebuffer* dst, ImageView& dst_view,
                                        ImageView& src_view) {
+    if (const std::optional<ConvertKind> kind = ConversionFor(dst_view.format, src_view.format);
+        kind && CopiesEnabled()) {
+        // Metal aborts on a render pass into a texture made without render target use.
+        if (!SurfaceFormat(device, dst_view.format, false).attachable ||
+            !scheduler.Convert(ConvertPass{
+                .src = src_view.Handle(Shader::TextureType::Color2D),
+                .dst = dst_view.RenderTarget(),
+                .dst_format = dst_view.HostFormat(),
+                .width = dst != nullptr ? dst->Width() : dst_view.size.width,
+                .height = dst != nullptr ? dst->Height() : dst_view.size.height,
+                .kind = *kind,
+            })) {
+            LOG_ONCE(warned_convert, "Metal: a conversion of {} into {} was dropped",
+                     src_view.format, dst_view.format);
+        }
+        return;
+    }
     const Region2D region{
         .start = {0, 0},
         .end = {static_cast<s32>(dst_view.size.width), static_cast<s32>(dst_view.size.height)},
@@ -285,6 +469,35 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                                     const Region2D& dst_region, const Region2D& src_region,
                                     Tegra::Engines::Fermi2D::Filter filter,
                                     Tegra::Engines::Fermi2D::Operation operation) {
+    TextureHandle source = src.Handle(Shader::TextureType::Color2D);
+    std::array<s32, 4> src_rect{src_region.start.x, src_region.start.y, src_region.end.x,
+                                src_region.end.y};
+    if (src.Samples() > 1 && dst.Samples() == 1 && MsaaEnabled()) {
+        // A resolve, as Vulkan's vkCmdResolveImage, when both rectangles are the whole of one
+        // size: Metal's resolve store action takes the whole render area.
+        const bool whole = src_region.start.x == 0 && src_region.start.y == 0 &&
+                           dst_region.start.x == 0 && dst_region.start.y == 0 &&
+                           src_region.end.x == dst_region.end.x &&
+                           src_region.end.y == dst_region.end.y &&
+                           dst_region.end.x == static_cast<s32>(dst.size.width) &&
+                           dst_region.end.y == static_cast<s32>(dst.size.height);
+        if (whole && src.HostFormat() == dst.HostFormat() &&
+            scheduler.Resolve(src.ImageHandle(), static_cast<u32>(src.range.base.layer),
+                              dst.RenderTarget(), dst.size.width, dst.size.height)) {
+            return;
+        }
+        // Else the samples as texels, scaled into the rectangle (the filter averages them).
+        if (!src.PrepareSampleGrid()) {
+            LOG_ONCE(warned_msaa, "Metal: a blit from a multisampled {} image was dropped",
+                     src.format);
+            return;
+        }
+        source = src.SampledHandle(Shader::TextureType::Color2D, false);
+        const auto [shift_x, shift_y] = VideoCommon::SamplesLog2(src.GuestSamples());
+        src_rect = {src_rect[0] << shift_x, src_rect[1] << shift_y, src_rect[2] << shift_x,
+                    src_rect[3] << shift_y};
+        Coverage::NoteGuard("multisampled blit through its samples");
+    }
     const FormatClass dst_class = dst.HostClass();
     const FormatClass src_class = src.HostClass();
     // Depth to depth: the fragment writes the depth it reads, and the stencil between images
@@ -298,10 +511,9 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                  dst.format);
         return;
     }
-    const TextureHandle source = src.Handle(Shader::TextureType::Color2D);
     const BlitPass pass{
         .src = source,
-        .src_rect = {src_region.start.x, src_region.start.y, src_region.end.x, src_region.end.y},
+        .src_rect = src_rect,
         .dst = dst.RenderTarget(),
         .dst_format = dst.HostFormat(),
         .dst_rect = {dst_region.start.x, dst_region.start.y, dst_region.end.x, dst_region.end.y},
@@ -416,7 +628,9 @@ void TextureCacheRuntime::AccelerateImageUpload(Image&, const StagingBufferRef&,
 Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
              VAddr cpu_addr_)
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), runtime{&runtime_} {
-    const bool converted = IsConverted(runtime->device, info.format);
+    // Texel buffers read the buffer cache's bytes as they are.
+    const bool converted =
+        info.type != ImageType::Buffer && IsConverted(runtime->device, info.format);
     if (converted) {
         flags |= ImageFlagBits::Converted;
         flags |= ImageFlagBits::CostlyLoad;
@@ -432,6 +646,19 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     }
     kind = KindOf(info);
     const auto [samples_x, samples_y] = VideoCommon::SamplesLog2(info.num_samples);
+    // The pixel grid stays the guest's; only the samples per pixel drop to what the device has.
+    u32 samples = info.num_samples;
+    if (PipelineCheckEnabled()) {
+        samples = SupportedSamples(samples, runtime->sample_limits);
+        if (samples != info.num_samples) {
+            Coverage::NoteGuard("fewer samples per pixel",
+                                fmt::format("{} samples drawn at {}, the GPU's most",
+                                            info.num_samples, samples));
+        }
+    }
+    if (samples == 1 && kind == TextureKind::e2DMultisampleArray) {
+        kind = TextureKind::e2DArray;
+    }
     desc = TextureDesc{
         .kind = kind,
         .format = host_format.format,
@@ -440,9 +667,9 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         .depth = info.type == ImageType::e3D ? info.size.depth : 1U,
         .levels = static_cast<u32>(info.resources.levels),
         .layers = info.type == ImageType::e3D ? 1U : static_cast<u32>(info.resources.layers),
-        .samples = info.num_samples,
+        .samples = samples,
         .render_target = host_format.attachable,
-        .shader_write = host_format.storage && info.num_samples == 1,
+        .shader_write = host_format.storage && samples == 1,
     };
     texture = CreateTexture(runtime->device, desc);
     if (!texture) {
@@ -589,24 +816,98 @@ std::pair<u32, u32> Image::CopyPitches(const VideoCommon::BufferImageCopy& copy)
     return {bytes_per_row, Common::DivCeil(image_rows, block_height) * bytes_per_row};
 }
 
+TextureHandle Image::SampleGrid() {
+    if (!sample_grid && texture && runtime != nullptr) {
+        TextureDesc grid = desc;
+        grid.kind = TextureKind::e2DArray;
+        grid.width = info.size.width;
+        grid.height = info.size.height;
+        grid.levels = 1;
+        grid.samples = 1;
+        grid.render_target = true;
+        grid.shader_write = false;
+        sample_grid = CreateTexture(runtime->device, grid);
+        if (sample_grid) {
+            bytes += AllocatedSize(sample_grid.Get());
+            runtime->allocated_bytes += AllocatedSize(sample_grid.Get());
+        }
+    }
+    return sample_grid.Get();
+}
+
+bool Image::CopySampleGrid(bool expand) {
+    const TextureHandle grid = SampleGrid();
+    if (grid == nullptr || desc.samples < 2) {
+        return false;
+    }
+    const auto [shift_x, shift_y] = VideoCommon::SamplesLog2(info.num_samples);
+    for (u32 layer = 0; layer < desc.layers; ++layer) {
+        SampleCopy copy{
+            .src = texture.Get(),
+            .src_layer = layer,
+            .dst = {.texture = grid, .slice = layer},
+            .dst_format = host_format.format,
+            .dst_width = info.size.width,
+            .dst_height = info.size.height,
+            .samples = desc.samples,
+            .shift = {static_cast<u32>(shift_x), static_cast<u32>(shift_y)},
+        };
+        Object view;
+        if (!expand) {
+            view = CreateTextureView(grid, host_format.format, TextureKind::e2D, 0, 1, layer, 1,
+                                     IdentitySwizzle);
+            copy.src = view.Get();
+            copy.src_layer = 0;
+            copy.dst = {.texture = texture.Get(), .slice = layer};
+            copy.dst_width = desc.width;
+            copy.dst_height = desc.height;
+        }
+        if (!runtime->scheduler.CopySamples(copy, expand)) {
+            LOG_ONCE(warned, "Metal: samples of a multisampled {} image not copied", info.format);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool Image::CanCopyWithBuffers() const {
-    if (!texture || info.num_samples != 1) {
+    if (!texture || (info.num_samples != 1 && !MsaaEnabled())) {
+        return false;
+    }
+    if (desc.samples > 1 && (host_format.format_class == FormatClass::Stencil ||
+                             host_format.format_class == FormatClass::DepthStencil)) {
+        LOG_ONCE(warned_stencil, "Metal: multisampled stencil ({}) is not uploaded or downloaded",
+                 info.format);
         return false;
     }
     switch (host_format.format_class) {
     case FormatClass::Depth:
-        // Depth32Float and Depth16Unorm hold the guest's bytes; 24-bit depth does not.
-        if (info.format == PixelFormat::D32_FLOAT || info.format == PixelFormat::D16_UNORM) {
-            return true;
-        }
-        [[fallthrough]];
     case FormatClass::Stencil:
     case FormatClass::DepthStencil:
-        LOG_ONCE(warned, "Metal: depth and stencil uploads and downloads ({}) are not done yet",
+        // Depth32Float and Depth16Unorm hold the guest's bytes; the rest go through
+        // Scheduler::DepthFromBuffer / DepthToBuffer (or are stencil bytes).
+        if (info.format == PixelFormat::D32_FLOAT || info.format == PixelFormat::D16_UNORM ||
+            CopiesEnabled()) {
+            return true;
+        }
+        LOG_ONCE(warned, "Metal: depth and stencil uploads and downloads ({}) are skipped",
                  info.format);
         return false;
     default:
         return true;
+    }
+}
+
+std::optional<DepthLayout> Image::DepthBytesLayout() const {
+    switch (info.format) {
+    case PixelFormat::X8_D24_UNORM:
+    case PixelFormat::D24_UNORM_S8_UINT:
+    case PixelFormat::S8_UINT_D24_UNORM:
+        return DepthLayout::Packed24_8;
+    case PixelFormat::D32_FLOAT_S8_UINT:
+        return DepthLayout::Float32_X24S8;
+    default:
+        return std::nullopt;
     }
 }
 
@@ -615,6 +916,13 @@ void Image::UploadMemory(BufferHandle buffer, size_t offset,
     if (!CanCopyWithBuffers()) {
         return;
     }
+    // A multisampled image takes its samples as texels of the grid (the guest's layout).
+    const bool multisampled = desc.samples > 1;
+    const TextureHandle target = multisampled ? SampleGrid() : texture.Get();
+    if (target == nullptr) {
+        return;
+    }
+    const std::optional<DepthLayout> depth_layout = DepthBytesLayout();
     const bool is_3d = info.type == ImageType::e3D;
     for (const VideoCommon::BufferImageCopy& copy : copies) {
         if (copy.image_subresource.base_level >= info.resources.levels) {
@@ -628,13 +936,27 @@ void Image::UploadMemory(BufferHandle buffer, size_t offset,
         const auto [bytes_per_row, bytes_per_image] = CopyPitches(copy);
         const s32 layers = is_3d ? 1 : (std::max)(copy.image_subresource.num_layers, 1);
         for (s32 layer = 0; layer < layers; ++layer) {
+            if (depth_layout) {
+                if (!runtime->scheduler.DepthFromBuffer(
+                        buffer, offset + copy.buffer_offset + u64{bytes_per_image} * layer,
+                        bytes_per_row, target, static_cast<u32>(copy.image_subresource.base_level),
+                        static_cast<u32>(copy.image_subresource.base_layer + layer),
+                        ToOffset(copy.image_offset), extent, *depth_layout)) {
+                    LOG_ONCE(warned_depth, "Metal: an upload of {} was dropped", info.format);
+                }
+                continue;
+            }
             runtime->scheduler.CopyBufferToTexture(
                 buffer, offset + copy.buffer_offset + u64{bytes_per_image} * layer, bytes_per_row,
-                is_3d ? bytes_per_image : 0U, texture.Get(),
+                is_3d ? bytes_per_image : 0U, target,
                 static_cast<u32>(copy.image_subresource.base_level),
                 is_3d ? 0U : static_cast<u32>(copy.image_subresource.base_layer + layer),
                 ToOffset(copy.image_offset), extent);
         }
+    }
+    if (multisampled) {
+        runtime->scheduler.BreakBlits();
+        CopySampleGrid(false);
     }
     // Uploads go to the native texture; a rescaled image draws from the scaled one.
     if (rescaled) {
@@ -663,6 +985,12 @@ void Image::DownloadMemory(std::span<BufferHandle> buffers, std::span<size_t> of
     if (rescaled) {
         CopyScaled(false);
     }
+    const bool multisampled = desc.samples > 1;
+    if (multisampled && !CopySampleGrid(true)) {
+        return;
+    }
+    const TextureHandle source = multisampled ? sample_grid.Get() : texture.Get();
+    const std::optional<DepthLayout> depth_layout = DepthBytesLayout();
     const bool is_3d = info.type == ImageType::e3D;
     for (size_t index = 0; index < buffers.size(); ++index) {
         for (const VideoCommon::BufferImageCopy& copy : copies) {
@@ -677,8 +1005,20 @@ void Image::DownloadMemory(std::span<BufferHandle> buffers, std::span<size_t> of
             const auto [bytes_per_row, bytes_per_image] = CopyPitches(copy);
             const s32 layers = is_3d ? 1 : (std::max)(copy.image_subresource.num_layers, 1);
             for (s32 layer = 0; layer < layers; ++layer) {
+                if (depth_layout) {
+                    if (!runtime->scheduler.DepthToBuffer(
+                            source, static_cast<u32>(copy.image_subresource.base_level),
+                            static_cast<u32>(copy.image_subresource.base_layer + layer),
+                            ToOffset(copy.image_offset), extent, buffers[index],
+                            offsets[index] + copy.buffer_offset + u64{bytes_per_image} * layer,
+                            bytes_per_row, *depth_layout)) {
+                        LOG_ONCE(warned_depth, "Metal: a download of {} was dropped",
+                                 info.format);
+                    }
+                    continue;
+                }
                 runtime->scheduler.CopyTextureToBuffer(
-                    texture.Get(), static_cast<u32>(copy.image_subresource.base_level),
+                    source, static_cast<u32>(copy.image_subresource.base_level),
                     is_3d ? 0U : static_cast<u32>(copy.image_subresource.base_layer + layer),
                     ToOffset(copy.image_offset), extent, buffers[index],
                     offsets[index] + copy.buffer_offset + u64{bytes_per_image} * layer,
@@ -694,9 +1034,11 @@ void Image::DownloadMemory(const StagingBufferRef& map,
 }
 
 ImageView::ImageView(TextureCacheRuntime& runtime, const ImageViewInfo& info, ImageId image_id_,
-                     Image& image, const SlotVector<Image>&)
+                     Image& image, const SlotVector<Image>& slot_images_)
     : VideoCommon::ImageViewBase{info, image.info, image_id_, image.gpu_addr},
-      image_texture{image.Handle()}, samples{image.info.num_samples}, image_kind{image.Kind()} {
+      // The texture cache owns the images; views reach theirs for the sample grid.
+      slot_images{const_cast<SlotVector<Image>*>(&slot_images_)}, image_texture{image.Handle()}, samples{image.HostSamples()},
+      guest_samples{image.info.num_samples}, image_kind{image.Kind()} {
     const bool converted = True(image.flags & ImageFlagBits::Converted);
     const FormatInfo host = SurfaceFormat(runtime.device, format, converted);
     host_format = host.format;
@@ -791,6 +1133,40 @@ TextureHandle ImageView::Handle(Shader::TextureType texture_type) {
     return view.Get();
 }
 
+bool ImageView::PrepareSampleGrid() {
+    if (samples == 1 || !MsaaEnabled() || slot_images == nullptr || !image_id) {
+        return false;
+    }
+    Image& image = (*slot_images)[image_id];
+    if (!image.CopySampleGrid(true)) {
+        return false;
+    }
+    if (const TextureHandle grid = image.SampleGrid(); grid != sample_grid) {
+        sample_grid = grid;
+        grid_views = {};
+    }
+    return true;
+}
+
+TextureHandle ImageView::SampledHandle(Shader::TextureType texture_type, bool multisample_read) {
+    if (samples == 1 || multisample_read || sample_grid == nullptr || !MsaaEnabled()) {
+        return Handle(texture_type);
+    }
+    const bool array = texture_type == Shader::TextureType::ColorArray2D;
+    if (texture_type != Shader::TextureType::Color2D &&
+        texture_type != Shader::TextureType::Color2DRect && !array) {
+        return Handle(texture_type);
+    }
+    Object& view = grid_views[array ? 1 : 0];
+    if (!view) {
+        view = CreateTextureView(sample_grid, host_format,
+                                 array ? TextureKind::e2DArray : TextureKind::e2D, 0, 1,
+                                 static_cast<u32>(range.base.layer),
+                                 array ? static_cast<u32>(range.extent.layers) : 1U, swizzle);
+    }
+    return view.Get();
+}
+
 Attachment ImageView::RenderTarget() const noexcept {
     if (is_3d_slice) {
         return Attachment{
@@ -807,8 +1183,98 @@ Attachment ImageView::RenderTarget() const noexcept {
     };
 }
 
-Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& config)
-    : sampler{CreateSampler(runtime.device, config)} {}
+f32 TextureCacheRuntime::OcarinaLodBias() {
+    if (!ocarina_lod_bias) {
+        const bool ocarina = Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
+        // MetalFX temporal takes Vulkan's Dlss backend (RasterizerMetal::OcarinaTemporalEnabled);
+        // FSR 3.1 has no Metal path.
+        ocarina_lod_bias = ocarina && OcarinaTemporal::Enabled() &&
+                                   Settings::MetalFxTemporalChosen()
+                               ? VideoCommon::OcarinaFsrLodBias(
+                                     VideoCommon::OcarinaUpscaleBackend::Dlss,
+                                     Settings::OcarinaDlssModeFor(
+                                         Settings::values.oot_resolution.GetValue()))
+                               : 0.0f;
+    }
+    return *ocarina_lod_bias;
+}
+
+Sampler::Sampler(TextureCacheRuntime& runtime_, const Tegra::Texture::TSCEntry& config)
+    : device{&runtime_.device}, runtime{&runtime_}, tsc{config} {
+    using Tegra::Texture::SamplerReduction;
+    using Tegra::Texture::TextureFilter;
+    using Tegra::Texture::TextureMipmapFilter;
+    if (!SamplersEnabled()) {
+        sampler = CreateSampler(*device, tsc, SamplerOptions{.plain = true});
+        return;
+    }
+    if (const f32 bias = runtime->OcarinaLodBias();
+        bias != 0.0f && tsc.mipmap_filter.Value() != TextureMipmapFilter::None) {
+        added_lod_bias = bias;
+    }
+    has_added_anisotropy = std::clamp(tsc.MaxAnisotropy(), 1.0f, 16.0f) >
+                           static_cast<f32>(1U << tsc.max_anisotropy.Value());
+    has_linear_filtering = tsc.mag_filter.Value() == TextureFilter::Linear ||
+                           tsc.min_filter.Value() == TextureFilter::Linear ||
+                           tsc.mipmap_filter.Value() == TextureMipmapFilter::Linear;
+    has_depth_comparison = tsc.depth_compare_enabled != 0;
+    has_srgb_border = tsc.srgb_conversion != 0 && tsc.SrgbBorderColor() != tsc.BorderColor();
+    sampler = CreateSampler(*device, tsc, SamplerOptions{.added_lod_bias = added_lod_bias});
+    with_variants = true;
+    if (!SamplerBiasSupported() &&
+        (tsc.LodBias() != 0.0f || added_lod_bias != 0.0f ||
+         tsc.reduction_filter.Value() != SamplerReduction::WeightedAverage)) {
+        LOG_ONCE(warned_bias, "Metal: sampler LOD bias {} and reduction {} need macOS / iOS 26; "
+                 "sampled without them", tsc.LodBias() + added_lod_bias,
+                 static_cast<u32>(tsc.reduction_filter.Value()));
+    }
+}
+
+void* Sampler::HandleFor(const ImageView& view, bool is_depth) {
+    if (!with_variants) {
+        return sampler.Get();
+    }
+    enum : u8 { ReduceAnisotropy = 1, ForceNearest = 2, DropCompare = 4, DropBias = 8, Srgb = 16 };
+    u8 key = 0;
+    if (has_added_anisotropy && !view.SupportsAnisotropy()) {
+        key |= ReduceAnisotropy;
+    }
+    if (has_linear_filtering && VideoCore::Surface::IsPixelFormatInteger(view.format)) {
+        key |= ForceNearest;
+    }
+    // A compare sampler read by a plain sample: Maxwell ignores the comparison.
+    if (has_depth_comparison && !is_depth) {
+        key |= DropCompare;
+    }
+    if (added_lod_bias != 0.0f) {
+        const Image* const image = view.BackingImage();
+        if (!VideoCommon::KeepOcarinaFsrLodBias(
+                Settings::IsDockedMode(), false,
+                image != nullptr && True(image->flags & ImageFlagBits::GpuModified))) {
+            key |= DropBias;
+        }
+    }
+    if (has_srgb_border && VideoCore::Surface::IsPixelFormatSRGB(view.format)) {
+        key |= Srgb;
+    }
+    if (key == 0) {
+        return sampler.Get();
+    }
+    if (const auto it = std::ranges::find(variants, key, &Variant::key); it != variants.end()) {
+        return it->state.Get();
+    }
+    Object state = CreateSampler(*device, tsc,
+                                 SamplerOptions{
+                                     .added_lod_bias = (key & DropBias) != 0 ? 0.0f : added_lod_bias,
+                                     .reduce_anisotropy = (key & ReduceAnisotropy) != 0,
+                                     .force_nearest = (key & ForceNearest) != 0,
+                                     .drop_compare = (key & DropCompare) != 0,
+                                     .srgb_border = (key & Srgb) != 0,
+                                 });
+    void* const handle = state.Get();
+    variants.push_back(Variant{.key = key, .state = std::move(state)});
+    return handle;
+}
 
 Framebuffer::Framebuffer(TextureCacheRuntime&, std::span<ImageView*, NUM_RT> color_buffers,
                          ImageView* depth_buffer, const VideoCommon::RenderTargets& key)

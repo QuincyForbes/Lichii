@@ -34,6 +34,8 @@ struct State {
     std::mutex mutex;
     /// By cause: refusals since the last line.
     std::array<std::map<std::string, u64, std::less<>>, NumWork> refused;
+    /// By name: guards since the last line.
+    std::map<std::string, u64, std::less<>> guards;
 };
 
 State& Get() {
@@ -75,10 +77,39 @@ void LogRefused(Work work, std::string_view cause, std::string_view state) {
     }
 }
 
+void NoteGuard(std::string_view name, std::string_view detail) {
+    State& state = Get();
+    {
+        std::scoped_lock lock{state.mutex};
+        if (const auto it = state.guards.find(name); it != state.guards.end()) {
+            ++it->second;
+            return;
+        }
+        if (state.guards.size() >= MaxCauses) {
+            ++state.guards["other"];
+            return;
+        }
+        state.guards.emplace(std::string{name}, 1);
+    }
+    if (detail.empty()) {
+        LOG_WARNING(Render_Metal, "Metal: guard: {}", name);
+    } else {
+        LOG_WARNING(Render_Metal, "Metal: guard: {} ({})", name, detail);
+    }
+}
+
 std::string TakeLine() {
     State& state = Get();
     std::string line;
     std::scoped_lock lock{state.mutex};
+    std::string guards;
+    for (auto& [name, count] : state.guards) {
+        if (count != 0) {
+            guards += fmt::format("{}{} {}", guards.empty() ? "" : ", ", name, count);
+            count = 0;
+        }
+    }
+
     for (size_t work = 0; work < NumWork; ++work) {
         std::array<u64, NumPaths> paths;
         u64 emulated = 0;
@@ -125,6 +156,9 @@ std::string TakeLine() {
             line += fmt::format(" ({})", causes);
         }
         line += fmt::format(" + {} empty", empty);
+    }
+    if (!guards.empty()) {
+        line += fmt::format("{}guards: {}", line.empty() ? "" : "; ", guards);
     }
     return line;
 }

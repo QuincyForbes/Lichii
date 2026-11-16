@@ -11,9 +11,11 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include "shader_recompiler/shader_info.h"
 #include "video_core/game_dlss_status.h"
+#include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_object.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
@@ -68,9 +70,11 @@ public:
     /// Metal copies texels only between textures of one format: any other pair is reinterpreted.
     [[nodiscard]] bool ShouldReinterpret(Image& dst, Image& src) const noexcept;
 
-    [[nodiscard]] bool CanUploadMSAA() const noexcept {
-        return false;
-    }
+    /// Multisampled images go through a single-sampled texture holding their samples as texels
+    /// (EDEN_NX2_METAL_MSAA).
+    [[nodiscard]] bool CanUploadMSAA() const noexcept;
+
+    [[nodiscard]] bool CanDownloadMsaa(const VideoCommon::ImageInfo& info) const;
 
     void CopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
 
@@ -121,9 +125,15 @@ public:
 
     void BarrierFeedbackLoop() const noexcept {}
 
+    /// The LOD bias Ocarina of Time's mipmapped samplers get while a jittered temporal upscaler
+    /// runs (VideoCommon::OcarinaFsrLodBias with MetalFX as Vulkan's Dlss backend), else 0.
+    [[nodiscard]] f32 OcarinaLodBias();
+
     const Device& device;
     Scheduler& scheduler;
     StagingBufferPool& staging_buffer_pool;
+    /// The sample counts the device's textures take.
+    PipelineLimits sample_limits;
 
     /// GPU bytes the texture cache's textures hold.
     u64 allocated_bytes{};
@@ -134,6 +144,8 @@ public:
     /// Shared buffer for reinterpreting copies, grown as needed.
     Object reinterpret_buffer;
     u64 reinterpret_buffer_size{};
+
+    std::optional<f32> ocarina_lod_bias;
 };
 
 class Image : public VideoCommon::ImageBase {
@@ -179,6 +191,11 @@ public:
         return kind;
     }
 
+    /// Samples per pixel of the texture (the guest's, or the device's most when it has fewer).
+    [[nodiscard]] u32 HostSamples() const noexcept {
+        return desc.samples;
+    }
+
     [[nodiscard]] bool IsRescaled() const noexcept {
         return rescaled;
     }
@@ -189,6 +206,22 @@ public:
 
     bool ScaleDown(bool ignore = false);
 
+    /// A multisampled image's samples as texels of a single-sampled 2D array texture, as the
+    /// guest sees the image (made on first use; uploads, downloads and plain sampling go through
+    /// it).
+    [[nodiscard]] TextureHandle SampleGrid();
+
+    /// Copies the samples into the grid (`expand`) or the grid into the samples.
+    bool CopySampleGrid(bool expand);
+
+    /// Whether the image's data is copied to and from buffers (multisampled stencil is not;
+    /// 24-bit depth and the formats with stencil only under EDEN_NX2_METAL_COPIES). Logs once.
+    [[nodiscard]] bool CanCopyWithBuffers() const;
+
+    /// How the guest lays out the image's depth and stencil when Metal's blit copies can't take
+    /// its bytes (24-bit depth, depth with stencil), else nothing.
+    [[nodiscard]] std::optional<DepthLayout> DepthBytesLayout() const;
+
     u64 allocation_tick{};
 
 private:
@@ -198,14 +231,11 @@ private:
     /// Bytes a row of the copy holds in the buffer, and a layer (2D) or slice (3D).
     [[nodiscard]] std::pair<u32, u32> CopyPitches(const VideoCommon::BufferImageCopy& copy) const;
 
-    /// Depth and stencil data are not copied to or from buffers yet (Metal needs per-aspect
-    /// copies and has no 24-bit depth). Logs once.
-    [[nodiscard]] bool CanCopyWithBuffers() const;
-
     TextureCacheRuntime* runtime{};
     Object texture;
     /// The texture at the scaled size, made on the first ScaleUp.
     Object scaled_texture;
+    Object sample_grid;
     TextureDesc desc{};
     FormatInfo host_format{};
     TextureKind kind{TextureKind::e2D};
@@ -235,6 +265,16 @@ public:
     /// The view shaders sample as `texture_type`, made on first use. Null for null views.
     [[nodiscard]] TextureHandle Handle(Shader::TextureType texture_type);
 
+    /// What a program reads as `texture_type`: a multisampled image read as a plain texture
+    /// (`multisample_read` false) reads the grid of its samples (UseSampleGrid) with
+    /// EDEN_NX2_METAL_MSAA, as the guest sees it.
+    [[nodiscard]] TextureHandle SampledHandle(Shader::TextureType texture_type,
+                                              bool multisample_read);
+
+    /// Fills the image's sample grid (Image::SampleGrid) for a draw that reads this
+    /// multisampled view as a plain texture; false when it can't (the view is bound as it is).
+    bool PrepareSampleGrid();
+
     /// The attachment that renders into this view's first level and layer.
     [[nodiscard]] Attachment RenderTarget() const noexcept;
 
@@ -262,13 +302,27 @@ public:
         return samples;
     }
 
+    /// The guest's samples per pixel (Samples() may be fewer on this GPU).
+    [[nodiscard]] u32 GuestSamples() const noexcept {
+        return guest_samples;
+    }
+
+    /// The image the view shows (null for null and buffer views).
+    [[nodiscard]] const Image* BackingImage() const noexcept {
+        return slot_images != nullptr && image_id ? &(*slot_images)[image_id] : nullptr;
+    }
+
 private:
+    SlotVector<Image>* slot_images{};
     TextureHandle image_texture{};
     u32 samples{1};
+    u32 guest_samples{1};
     TextureKind image_kind{TextureKind::e2D};
     u32 host_format{};
     std::array<u8, 4> swizzle{IdentitySwizzle};
     std::array<Object, Shader::NUM_TEXTURE_TYPES> views;
+    TextureHandle sample_grid{};
+    std::array<Object, 2> grid_views; ///< 2D and 2D array views of sample_grid
     Object render_view; ///< Only when the view's format is not its image's
     bool is_render_target{};
     bool is_3d_slice{};
@@ -281,12 +335,34 @@ class Sampler {
 public:
     explicit Sampler(TextureCacheRuntime&, const Tegra::Texture::TSCEntry&);
 
+    /// The sampler state without the changes a view asks for.
     [[nodiscard]] void* Handle() const noexcept {
         return sampler.Get();
     }
 
+    /// The sampler state for sampling `view` (`is_depth`: a depth comparison), as Vulkan's
+    /// Sampler::HandleFor picks its variants: no added anisotropy where the view takes none, no
+    /// filtering of integer views, no comparison for a plain sample, no Ocarina upscaler bias for
+    /// images the GPU wrote, the sRGB border colour for sRGB views.
+    [[nodiscard]] void* HandleFor(const ImageView& view, bool is_depth);
+
 private:
+    struct Variant {
+        u8 key{};
+        Object state;
+    };
+
+    const Device* device{};
+    TextureCacheRuntime* runtime{};
+    Tegra::Texture::TSCEntry tsc{};
     Object sampler;
+    std::vector<Variant> variants;
+    f32 added_lod_bias{};
+    bool has_added_anisotropy{};
+    bool has_linear_filtering{};
+    bool has_depth_comparison{};
+    bool has_srgb_border{};
+    bool with_variants{};
 };
 
 class Framebuffer {
@@ -356,7 +432,7 @@ struct TextureCacheParams {
     static constexpr bool HAS_EMULATED_COPIES = false;
     static constexpr bool HAS_DEVICE_MEMORY_INFO = true;
     static constexpr bool IMPLEMENTS_ASYNC_DOWNLOADS = false;
-    static constexpr bool HAS_MSAA_DOWNLOADS = false;
+    static constexpr bool HAS_MSAA_DOWNLOADS = true;
 
     using Runtime = Metal::TextureCacheRuntime;
     using Image = Metal::Image;

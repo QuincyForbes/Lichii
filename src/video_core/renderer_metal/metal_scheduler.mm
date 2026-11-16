@@ -23,6 +23,7 @@
 
 #include "common/logging.h"
 #include "video_core/renderer_metal/metal_bridge.h"
+#include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_resources.h"
@@ -138,6 +139,208 @@ fragment uint4 clear_uint(constant uint4& color [[buffer(0)]]) {
 fragment int4 clear_sint(constant int4& color [[buffer(0)]]) {
     return color;
 }
+
+// Sample copies: the guest sees a multisampled image as a plain one holding sample s of pixel p
+// at texel (p << shift) | (s & (2^shift.x - 1), s >> shift.x), as Vulkan's MSAA copy passes.
+struct SampleParams {
+    uint2 shift;
+    uint samples;
+    uint layer;
+};
+
+uint SampleOf(uint2 texel, constant SampleParams& p) {
+    const uint2 mask = (uint2(1) << p.shift) - 1;
+    return min((texel.x & mask.x) | ((texel.y & mask.y) << p.shift.x), p.samples - 1);
+}
+
+uint2 TexelOf(uint2 pixel, uint sample_index, constant SampleParams& p) {
+    const uint mask_x = (1u << p.shift.x) - 1;
+    return (pixel << p.shift) | uint2(sample_index & mask_x, sample_index >> p.shift.x);
+}
+
+fragment float4 expand_float(ClearOut in [[stage_in]], texture2d_ms_array<float> src [[texture(0)]],
+                             constant SampleParams& p [[buffer(0)]]) {
+    const uint2 texel = uint2(in.position.xy);
+    return src.read(texel >> p.shift, p.layer, SampleOf(texel, p));
+}
+
+fragment uint4 expand_uint(ClearOut in [[stage_in]], texture2d_ms_array<uint> src [[texture(0)]],
+                           constant SampleParams& p [[buffer(0)]]) {
+    const uint2 texel = uint2(in.position.xy);
+    return src.read(texel >> p.shift, p.layer, SampleOf(texel, p));
+}
+
+fragment int4 expand_sint(ClearOut in [[stage_in]], texture2d_ms_array<int> src [[texture(0)]],
+                          constant SampleParams& p [[buffer(0)]]) {
+    const uint2 texel = uint2(in.position.xy);
+    return src.read(texel >> p.shift, p.layer, SampleOf(texel, p));
+}
+
+fragment DepthOut expand_depth(ClearOut in [[stage_in]],
+                               depth2d_ms_array<float> src [[texture(0)]],
+                               constant SampleParams& p [[buffer(0)]]) {
+    const uint2 texel = uint2(in.position.xy);
+    DepthOut out;
+    out.depth = src.read(texel >> p.shift, p.layer, SampleOf(texel, p));
+    return out;
+}
+
+fragment float4 compress_float(ClearOut in [[stage_in]], uint sample_index [[sample_id]],
+                               texture2d<float> src [[texture(0)]],
+                               constant SampleParams& p [[buffer(0)]]) {
+    return src.read(TexelOf(uint2(in.position.xy), sample_index, p));
+}
+
+fragment uint4 compress_uint(ClearOut in [[stage_in]], uint sample_index [[sample_id]],
+                             texture2d<uint> src [[texture(0)]],
+                             constant SampleParams& p [[buffer(0)]]) {
+    return src.read(TexelOf(uint2(in.position.xy), sample_index, p));
+}
+
+fragment int4 compress_sint(ClearOut in [[stage_in]], uint sample_index [[sample_id]],
+                            texture2d<int> src [[texture(0)]],
+                            constant SampleParams& p [[buffer(0)]]) {
+    return src.read(TexelOf(uint2(in.position.xy), sample_index, p));
+}
+
+// Format conversions between depth and colour images, as Vulkan's convert_*.frag: texel for
+// texel, the destination's size.
+fragment float4 convert_depth_to_color(ClearOut in [[stage_in]], depth2d<float> src [[texture(0)]]) {
+    const float depth = src.read(uint2(in.position.xy));
+    return float4(depth, depth, depth, 1.0);
+}
+
+fragment DepthOut convert_color_to_depth(ClearOut in [[stage_in]],
+                                         texture2d<float> src [[texture(0)]]) {
+    DepthOut out;
+    out.depth = src.read(uint2(in.position.xy)).r;
+    return out;
+}
+
+fragment DepthOut convert_abgr8_to_d32f(ClearOut in [[stage_in]],
+                                        texture2d<float> src [[texture(0)]]) {
+    const float4 color = src.read(uint2(in.position.xy)).abgr;
+    DepthOut out;
+    out.depth = color.a * (color.r + color.g + color.b) / 3.0;
+    return out;
+}
+
+fragment float4 convert_x8d24_to_abgr8(ClearOut in [[stage_in]],
+                                       depth2d<float> src [[texture(0)]]) {
+    const uint depth = uint(round(src.read(uint2(in.position.xy)) * 16777215.0));
+    return unpack_unorm4x8_to_float(depth);
+}
+
+fragment DepthOut convert_abgr8_to_x8d24(ClearOut in [[stage_in]],
+                                         texture2d<float> src [[texture(0)]]) {
+    const float4 color = src.read(uint2(in.position.xy));
+    const uint depth = uint(round(color.r * 255.0)) | (uint(round(color.g * 255.0)) << 8) |
+                       (uint(round(color.b * 255.0)) << 16);
+    const uint scaled = as_type<uint>(float(depth) * (1.0 / 16777216.0));
+    DepthOut out;
+    out.depth = as_type<float>(scaled + uint(depth != 0u));
+    return out;
+}
+
+uint4 DepthStencilBytes(float depth, uint stencil, bool stencil_first) {
+    const uint depth_bits = uint(min(depth * 4294967295.0, 4294967040.0));
+    const uint3 bytes = (uint3(depth_bits) >> uint3(24, 16, 8)) & 0xFFu;
+    return stencil_first ? uint4(stencil, bytes) : uint4(bytes, stencil);
+}
+
+fragment float4 convert_d24s8_to_abgr8(ClearOut in [[stage_in]],
+                                       depth2d<float> src [[texture(0)]],
+                                       texture2d<uint> src_stencil [[texture(1)]]) {
+    const uint2 texel = uint2(in.position.xy);
+    const uint4 bytes = DepthStencilBytes(src.read(texel), src_stencil.read(texel).r, true);
+    return float4(bytes.wzyx) / 255.0;
+}
+
+fragment float4 convert_s8d24_to_abgr8(ClearOut in [[stage_in]],
+                                       depth2d<float> src [[texture(0)]],
+                                       texture2d<uint> src_stencil [[texture(1)]]) {
+    const uint2 texel = uint2(in.position.xy);
+    return float4(DepthStencilBytes(src.read(texel), src_stencil.read(texel).r, false)) / 255.0;
+}
+
+fragment DepthStencilOut convert_abgr8_to_d24s8(ClearOut in [[stage_in]],
+                                                texture2d<float> src [[texture(0)]]) {
+    const uint4 color = uint4(src.read(uint2(in.position.xy)).abgr * 255.0);
+    const uint4 bytes = color << uint4(24, 16, 8, 0);
+    const uint value = bytes.x | bytes.y | bytes.z | bytes.w;
+    DepthStencilOut out;
+    out.depth = float(value & 0x00FFFFFFu) / 16777215.0;
+    out.stencil = value >> 24;
+    return out;
+}
+
+// Guest depth and stencil bytes (DepthLayout) to and from depth textures.
+struct DepthCopyParams {
+    int2 origin;
+    uint row_words;
+    uint layout; // 0: depth << 8 | stencil, 1: float depth, then the stencil word
+    uint2 extent;
+    uint has_stencil;
+    uint pad;
+};
+
+DepthStencilOut DepthFromWords(uint2 texel, device const uint* words,
+                               constant DepthCopyParams& p) {
+    DepthStencilOut out;
+    if (p.layout == 0) {
+        const uint word = words[texel.y * p.row_words + texel.x];
+        out.depth = float(word >> 8) / 16777215.0;
+        out.stencil = word & 0xFFu;
+    } else {
+        const uint index = texel.y * p.row_words + texel.x * 2;
+        out.depth = as_type<float>(words[index]);
+        out.stencil = words[index + 1] & 0xFFu;
+    }
+    return out;
+}
+
+fragment DepthOut depth_from_buffer(ClearOut in [[stage_in]],
+                                    device const uint* words [[buffer(0)]],
+                                    constant DepthCopyParams& p [[buffer(1)]]) {
+    DepthOut out;
+    out.depth = DepthFromWords(uint2(int2(in.position.xy) - p.origin), words, p).depth;
+    return out;
+}
+
+fragment DepthStencilOut depth_stencil_from_buffer(ClearOut in [[stage_in]],
+                                                   device const uint* words [[buffer(0)]],
+                                                   constant DepthCopyParams& p [[buffer(1)]]) {
+    return DepthFromWords(uint2(int2(in.position.xy) - p.origin), words, p);
+}
+
+kernel void depth_to_buffer(uint2 id [[thread_position_in_grid]],
+                            depth2d<float> depth [[texture(0)]],
+                            texture2d<uint> stencil [[texture(1)]],
+                            device uint* words [[buffer(0)]],
+                            constant DepthCopyParams& p [[buffer(1)]]) {
+    if (any(id >= p.extent)) {
+        return;
+    }
+    const uint2 texel = uint2(p.origin) + id;
+    const float value = depth.read(texel);
+    const uint stencil_value = p.has_stencil != 0 ? stencil.read(texel).r : 0u;
+    if (p.layout == 0) {
+        words[id.y * p.row_words + id.x] =
+            (uint(round(saturate(value) * 16777215.0)) << 8) | stencil_value;
+    } else {
+        const uint index = id.y * p.row_words + id.x * 2;
+        words[index] = as_type<uint>(value);
+        words[index + 1] = stencil_value;
+    }
+}
+
+fragment DepthOut compress_depth(ClearOut in [[stage_in]], uint sample_index [[sample_id]],
+                                 depth2d<float> src [[texture(0)]],
+                                 constant SampleParams& p [[buffer(0)]]) {
+    DepthOut out;
+    out.depth = src.read(TexelOf(uint2(in.position.xy), sample_index, p));
+    return out;
+}
 )";
 
 /// The stencil-only view format of a depth-stencil format (invalid when it has none).
@@ -152,6 +355,38 @@ MTLPixelFormat StencilViewFormat(MTLPixelFormat format) {
     default:
         return MTLPixelFormatInvalid;
     }
+}
+
+/// The stencil-only view of a depth-stencil texture a blit reads, or nil. With the pipeline check
+/// the texture is checked first, as CreateTextureView checks its views: Metal aborts on a view
+/// of a texture made without MTLTextureUsagePixelFormatView, of another type family or of a
+/// multisampled texture.
+id<MTLTexture> StencilView(id<MTLTexture> texture) {
+    const MTLPixelFormat format = StencilViewFormat(texture.pixelFormat);
+    if (format == MTLPixelFormatInvalid) {
+        return nil;
+    }
+    if (PipelineCheckEnabled()) {
+        const char* reason = nullptr;
+        if ((texture.usage & MTLTextureUsagePixelFormatView) == 0) {
+            reason = "made without format views";
+        } else if (texture.sampleCount != 1) {
+            reason = "multisampled";
+        } else if (texture.textureType != MTLTextureType2D &&
+                   texture.textureType != MTLTextureType2DArray) {
+            reason = "not a 2D texture";
+        }
+        if (reason != nullptr) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Render_Metal, "Metal: stencil view refused: {}; format {} type {}",
+                            reason, static_cast<u32>(texture.pixelFormat),
+                            static_cast<u32>(texture.textureType));
+            }
+            return nil;
+        }
+    }
+    return [texture newTextureViewWithPixelFormat:format];
 }
 
 void ApplyAttachment(MTLRenderPassAttachmentDescriptor* descriptor, const Attachment& attachment) {
@@ -472,6 +707,15 @@ struct Scheduler::Impl {
         return std::find(wanted.begin(), end, targets) != end;
     }
 
+    /// 64 KiB of zeros bound in place of what Metal must not be given.
+    id<MTLBuffer> ZeroBuffer() {
+        if (zero_buffer == nil) {
+            zero_buffer = [device.GetDevice() newBufferWithLength:64 * 1024
+                                                          options:MTLResourceStorageModePrivate];
+        }
+        return zero_buffer;
+    }
+
     /// What binding `buffer` at `offset` takes, with `bound` as the encoder has it.
     Bound NoteBuffer(StageBindings& bound, u32 slot, const void* buffer, u32 offset) {
         if (!StateCacheEnabled() || slot >= bound.buffers.size()) {
@@ -506,6 +750,15 @@ struct Scheduler::Impl {
     }
 
     void SetBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset) {
+        // Metal checks an offset past the buffer's end only in its validation layer; without it
+        // the GPU reads past the allocation. Zeros instead.
+        if (buffer != nullptr && PipelineCheckEnabled() && offset >= AsBuffer(buffer).length) {
+            Coverage::NoteGuard("buffer offset past its end",
+                                fmt::format("offset {} of a {}-byte buffer", offset,
+                                            static_cast<u64>(AsBuffer(buffer).length)));
+            buffer = (__bridge BufferHandle)ZeroBuffer();
+            offset = 0;
+        }
         switch (stage) {
         case ShaderStage::Vertex:
             if (render == nil) {
@@ -832,6 +1085,104 @@ struct Scheduler::Impl {
         return pipeline;
     }
 
+    /// The pipeline of a sample copy into `format` with `samples` per pixel (CopySamples).
+    id<MTLRenderPipelineState> SamplePipeline(MTLPixelFormat format, NSUInteger samples,
+                                              bool expand) {
+        const u64 key = (static_cast<u64>(format) << 8) | (static_cast<u64>(samples) << 1) |
+                        (expand ? 1U : 0U);
+        if (const auto it = sample_pipelines.find(key); it != sample_pipelines.end()) {
+            return it->second;
+        }
+        id<MTLRenderPipelineState> pipeline = nil;
+        const FormatClass format_class = ClassOf(static_cast<u32>(format));
+        NSString* fragment = nil;
+        switch (format_class) {
+        case FormatClass::Float: fragment = expand ? @"expand_float" : @"compress_float"; break;
+        case FormatClass::Uint: fragment = expand ? @"expand_uint" : @"compress_uint"; break;
+        case FormatClass::Sint: fragment = expand ? @"expand_sint" : @"compress_sint"; break;
+        case FormatClass::Depth:
+        case FormatClass::DepthStencil:
+            fragment = expand ? @"expand_depth" : @"compress_depth";
+            break;
+        default: break;
+        }
+        if (library != nil && fragment != nil) {
+            MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+            desc.label = @"Sample copy";
+            desc.vertexFunction = [library newFunctionWithName:@"clear_vertex"];
+            desc.fragmentFunction = [library newFunctionWithName:fragment];
+            desc.rasterSampleCount = samples;
+            if (format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil) {
+                desc.depthAttachmentPixelFormat = format;
+                if (format_class == FormatClass::DepthStencil) {
+                    desc.stencilAttachmentPixelFormat = format;
+                }
+            } else {
+                desc.colorAttachments[0].pixelFormat = format;
+            }
+            NSError* error = nil;
+            pipeline = [device.GetDevice() newRenderPipelineStateWithDescriptor:desc error:&error];
+            if (pipeline == nil) {
+                LOG_ERROR(Render_Metal, "Metal: sample copy pipeline for format {} failed: {}",
+                          static_cast<u32>(format), error.localizedDescription.UTF8String);
+            }
+        }
+        sample_pipelines.emplace(key, pipeline);
+        return pipeline;
+    }
+
+    /// The pipeline of a format conversion into `format` (Convert).
+    id<MTLRenderPipelineState> ConvertPipeline(ConvertKind kind, MTLPixelFormat format) {
+        const u64 key = (static_cast<u64>(format) << 8) | static_cast<u64>(kind);
+        if (const auto it = convert_pipelines.find(key); it != convert_pipelines.end()) {
+            return it->second;
+        }
+        NSString* fragment = nil;
+        switch (kind) {
+        case ConvertKind::DepthToColor: fragment = @"convert_depth_to_color"; break;
+        case ConvertKind::ColorToDepth: fragment = @"convert_color_to_depth"; break;
+        case ConvertKind::Abgr8ToD32f: fragment = @"convert_abgr8_to_d32f"; break;
+        case ConvertKind::X8d24ToAbgr8: fragment = @"convert_x8d24_to_abgr8"; break;
+        case ConvertKind::Abgr8ToX8d24: fragment = @"convert_abgr8_to_x8d24"; break;
+        case ConvertKind::D24s8ToAbgr8: fragment = @"convert_d24s8_to_abgr8"; break;
+        case ConvertKind::S8d24ToAbgr8: fragment = @"convert_s8d24_to_abgr8"; break;
+        case ConvertKind::Abgr8ToD24s8: fragment = @"convert_abgr8_to_d24s8"; break;
+        }
+        const FormatClass format_class = ClassOf(static_cast<u32>(format));
+        const bool depth_target =
+            format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil;
+        const bool to_depth = kind == ConvertKind::ColorToDepth ||
+                              kind == ConvertKind::Abgr8ToD32f ||
+                              kind == ConvertKind::Abgr8ToX8d24 || kind == ConvertKind::Abgr8ToD24s8;
+        id<MTLRenderPipelineState> pipeline = nil;
+        // The destination has to be what the conversion writes.
+        if (library != nil && depth_target == to_depth &&
+            (format_class == FormatClass::Float || depth_target) &&
+            (kind != ConvertKind::Abgr8ToD24s8 || format_class == FormatClass::DepthStencil)) {
+            MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+            desc.label = @"Convert";
+            desc.vertexFunction = [library newFunctionWithName:@"clear_vertex"];
+            desc.fragmentFunction = [library newFunctionWithName:fragment];
+            if (depth_target) {
+                desc.depthAttachmentPixelFormat = format;
+                if (format_class == FormatClass::DepthStencil) {
+                    desc.stencilAttachmentPixelFormat = format;
+                }
+            } else {
+                desc.colorAttachments[0].pixelFormat = format;
+            }
+            NSError* error = nil;
+            pipeline = [device.GetDevice() newRenderPipelineStateWithDescriptor:desc error:&error];
+            if (pipeline == nil) {
+                LOG_ERROR(Render_Metal, "Metal: conversion {} into format {} failed: {}",
+                          static_cast<u32>(kind), static_cast<u32>(format),
+                          error.localizedDescription.UTF8String);
+            }
+        }
+        convert_pipelines.emplace(key, pipeline);
+        return pipeline;
+    }
+
     /// The state of a drawn clear: depth written or kept, the stencil bits of `mask` replaced.
     id<MTLDepthStencilState> ClearDepthState(bool depth, bool stencil, u32 mask) {
         const u32 key = (depth ? 0x200U : 0U) | (stencil ? 0x100U | (mask & 0xFFU) : 0U);
@@ -862,6 +1213,11 @@ struct Scheduler::Impl {
     /// By ClearPipeline's formats, mask and sample count.
     std::unordered_map<u64, id<MTLRenderPipelineState>> clear_pipelines;
     std::unordered_map<u32, id<MTLDepthStencilState>> clear_depth_states;
+    std::unordered_map<u64, id<MTLRenderPipelineState>> sample_pipelines;
+    std::unordered_map<u64, id<MTLRenderPipelineState>> convert_pipelines;
+    std::unordered_map<u64, id<MTLRenderPipelineState>> depth_upload_pipelines;
+    id<MTLComputePipelineState> depth_download = nil;
+    id<MTLBuffer> zero_buffer = nil;
     id<MTLCommandBuffer> command_buffer = nil;
     id<MTLBlitCommandEncoder> blit = nil;
     /// The render encoder draws go to, open until other work needs the command buffer.
@@ -1389,7 +1745,7 @@ bool Scheduler::Blit(const BlitPass& blit) {
     id<MTLTexture> src_stencil = nil;
     if (format_class == FormatClass::DepthStencil &&
         StencilViewFormat(format) != MTLPixelFormatInvalid) {
-        src_stencil = [src newTextureViewWithPixelFormat:StencilViewFormat(src.pixelFormat)];
+        src_stencil = StencilView(src);
         if (src_stencil == nil) {
             return false;
         }
@@ -1420,6 +1776,320 @@ bool Scheduler::Blit(const BlitPass& blit) {
     [encoder setFragmentTexture:src atIndex:0];
     [encoder setFragmentSamplerState:blit.linear ? impl->linear : impl->nearest atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [encoder endEncoding];
+    return true;
+}
+
+bool Scheduler::CopySamples(const SampleCopy& copy, bool expand) {
+    impl->FlushClear();
+    const id<MTLTexture> src = AsTexture(copy.src);
+    const id<MTLTexture> dst = AsTexture(copy.dst.texture);
+    if (src == nil || dst == nil || copy.samples == 0) {
+        return false;
+    }
+    const MTLPixelFormat format = static_cast<MTLPixelFormat>(copy.dst_format);
+    const id<MTLRenderPipelineState> pipeline =
+        impl->SamplePipeline(format, dst.sampleCount, expand);
+    if (pipeline == nil) {
+        return false;
+    }
+    const u32 width = std::clamp(copy.dst_width, 1U, MaxRenderTargetSize);
+    const u32 height = std::clamp(copy.dst_height, 1U, MaxRenderTargetSize);
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    const FormatClass format_class = ClassOf(copy.dst_format);
+    const bool depth =
+        format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil;
+    if (depth) {
+        ApplyAttachment(pass.depthAttachment, copy.dst);
+        pass.depthAttachment.loadAction = MTLLoadActionDontCare;
+        pass.depthAttachment.storeAction = MTLStoreActionStore;
+        if (format_class == FormatClass::DepthStencil) {
+            // The stencil stays as it was: only depth is copied.
+            ApplyAttachment(pass.stencilAttachment, copy.dst);
+            pass.stencilAttachment.loadAction = MTLLoadActionLoad;
+            pass.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+    } else {
+        ApplyAttachment(pass.colorAttachments[0], copy.dst);
+        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+    pass.renderTargetWidth = width;
+    pass.renderTargetHeight = height;
+    const id<MTLRenderCommandEncoder> encoder = impl->RenderEncoder(pass);
+    if (encoder == nil) {
+        return false;
+    }
+    [encoder setRenderPipelineState:pipeline];
+    if (depth) {
+        // Depth written, stencil kept.
+        [encoder setDepthStencilState:impl->ClearDepthState(true, false, 0)];
+    }
+    [encoder setViewport:MTLViewport{0.0, 0.0, static_cast<f64>(width), static_cast<f64>(height),
+                                     0.0, 1.0}];
+    const f32 depth_value = 0.0f;
+    [encoder setVertexBytes:&depth_value length:sizeof(depth_value) atIndex:0];
+    const std::array<u32, 4> params{copy.shift[0], copy.shift[1], copy.samples, copy.src_layer};
+    [encoder setFragmentBytes:params.data() length:sizeof(params) atIndex:0];
+    [encoder setFragmentTexture:src atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [encoder endEncoding];
+    return true;
+}
+
+bool Scheduler::Convert(const ConvertPass& convert) {
+    impl->FlushClear();
+    const id<MTLTexture> src = AsTexture(convert.src);
+    if (src == nil || convert.dst.texture == nullptr) {
+        return false;
+    }
+    const MTLPixelFormat format = static_cast<MTLPixelFormat>(convert.dst_format);
+    const id<MTLRenderPipelineState> pipeline = impl->ConvertPipeline(convert.kind, format);
+    if (pipeline == nil) {
+        return false;
+    }
+    id<MTLTexture> src_stencil = nil;
+    if (convert.kind == ConvertKind::D24s8ToAbgr8 || convert.kind == ConvertKind::S8d24ToAbgr8) {
+        src_stencil = StencilView(src);
+        if (src_stencil == nil) {
+            return false;
+        }
+    }
+    const u32 width = std::clamp(convert.width, 1U, MaxRenderTargetSize);
+    const u32 height = std::clamp(convert.height, 1U, MaxRenderTargetSize);
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    const FormatClass format_class = ClassOf(convert.dst_format);
+    const bool depth =
+        format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil;
+    if (depth) {
+        ApplyAttachment(pass.depthAttachment, convert.dst);
+        pass.depthAttachment.loadAction = MTLLoadActionLoad;
+        pass.depthAttachment.storeAction = MTLStoreActionStore;
+        if (format_class == FormatClass::DepthStencil) {
+            ApplyAttachment(pass.stencilAttachment, convert.dst);
+            pass.stencilAttachment.loadAction = MTLLoadActionLoad;
+            pass.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+    } else {
+        ApplyAttachment(pass.colorAttachments[0], convert.dst);
+        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+    pass.renderTargetWidth = width;
+    pass.renderTargetHeight = height;
+    const id<MTLRenderCommandEncoder> encoder = impl->RenderEncoder(pass);
+    if (encoder == nil) {
+        return false;
+    }
+    [encoder setRenderPipelineState:pipeline];
+    if (depth) {
+        // Only the D24S8 conversion writes stencil; the others keep it.
+        [encoder setDepthStencilState:convert.kind == ConvertKind::Abgr8ToD24s8
+                                          ? impl->DepthWriteAlways()
+                                          : impl->ClearDepthState(true, false, 0)];
+    }
+    [encoder setViewport:MTLViewport{0.0, 0.0, static_cast<f64>(width), static_cast<f64>(height),
+                                     0.0, 1.0}];
+    const f32 depth_value = 0.0f;
+    [encoder setVertexBytes:&depth_value length:sizeof(depth_value) atIndex:0];
+    [encoder setFragmentTexture:src atIndex:0];
+    if (src_stencil != nil) {
+        [encoder setFragmentTexture:src_stencil atIndex:1];
+    }
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [encoder endEncoding];
+    return true;
+}
+
+bool Scheduler::DepthFromBuffer(BufferHandle src, u64 offset, u32 bytes_per_row,
+                                TextureHandle dst_handle, u32 level, u32 slice, Offset3D origin,
+                                Extent3D extent, DepthLayout layout) {
+    impl->FlushClear();
+    const id<MTLTexture> dst = AsTexture(dst_handle);
+    if (src == nullptr || dst == nil || extent.width == 0 || extent.height == 0 ||
+        offset % 4 != 0 || bytes_per_row % 4 != 0) {
+        return false;
+    }
+    const FormatClass format_class = ClassOf(static_cast<u32>(dst.pixelFormat));
+    const bool stencil = format_class == FormatClass::DepthStencil;
+    if (format_class != FormatClass::Depth && !stencil) {
+        return false;
+    }
+    Impl& state = *impl;
+    const u64 key = static_cast<u64>(dst.pixelFormat);
+    auto it = state.depth_upload_pipelines.find(key);
+    if (it == state.depth_upload_pipelines.end()) {
+        id<MTLRenderPipelineState> pipeline = nil;
+        if (state.library != nil) {
+            MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+            desc.label = @"Depth upload";
+            desc.vertexFunction = [state.library newFunctionWithName:@"clear_vertex"];
+            desc.fragmentFunction = [state.library
+                newFunctionWithName:stencil ? @"depth_stencil_from_buffer" : @"depth_from_buffer"];
+            desc.depthAttachmentPixelFormat = dst.pixelFormat;
+            if (stencil) {
+                desc.stencilAttachmentPixelFormat = dst.pixelFormat;
+            }
+            NSError* error = nil;
+            pipeline = [state.device.GetDevice() newRenderPipelineStateWithDescriptor:desc
+                                                                                error:&error];
+            if (pipeline == nil) {
+                LOG_ERROR(Render_Metal, "Metal: depth upload pipeline failed: {}",
+                          error.localizedDescription.UTF8String);
+            }
+        }
+        it = state.depth_upload_pipelines.emplace(key, pipeline).first;
+    }
+    if (it->second == nil) {
+        return false;
+    }
+    const u32 width = (std::max)(static_cast<u32>(dst.width) >> level, 1U);
+    const u32 height = (std::max)(static_cast<u32>(dst.height) >> level, 1U);
+    const u32 x = (std::min)(origin.x, width);
+    const u32 y = (std::min)(origin.y, height);
+    const u32 w = (std::min)(extent.width, width - x);
+    const u32 h = (std::min)(extent.height, height - y);
+    if (w == 0 || h == 0) {
+        return true;
+    }
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    ApplyAttachment(pass.depthAttachment, Attachment{.texture = dst_handle, .level = level,
+                                                     .slice = slice});
+    pass.depthAttachment.loadAction = MTLLoadActionLoad;
+    pass.depthAttachment.storeAction = MTLStoreActionStore;
+    if (stencil) {
+        ApplyAttachment(pass.stencilAttachment, Attachment{.texture = dst_handle, .level = level,
+                                                           .slice = slice});
+        pass.stencilAttachment.loadAction = MTLLoadActionLoad;
+        pass.stencilAttachment.storeAction = MTLStoreActionStore;
+    }
+    pass.renderTargetWidth = width;
+    pass.renderTargetHeight = height;
+    state.NoteInOrder(src);
+    const id<MTLRenderCommandEncoder> encoder = state.RenderEncoder(pass);
+    if (encoder == nil) {
+        return false;
+    }
+    [encoder setRenderPipelineState:it->second];
+    [encoder setDepthStencilState:state.DepthWriteAlways()];
+    [encoder setViewport:MTLViewport{static_cast<f64>(x), static_cast<f64>(y), static_cast<f64>(w),
+                                     static_cast<f64>(h), 0.0, 1.0}];
+    [encoder setScissorRect:MTLScissorRect{x, y, w, h}];
+    const f32 depth_value = 0.0f;
+    [encoder setVertexBytes:&depth_value length:sizeof(depth_value) atIndex:0];
+    const std::array<u32, 8> params{x, y, bytes_per_row / 4, static_cast<u32>(layout), w, h,
+                                    stencil ? 1U : 0U, 0};
+    // The region's first texel is at offset: the origin is subtracted in the shader.
+    [encoder setFragmentBuffer:AsBuffer(src) offset:offset atIndex:0];
+    [encoder setFragmentBytes:params.data() length:sizeof(params) atIndex:1];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [encoder endEncoding];
+    return true;
+}
+
+bool Scheduler::DepthToBuffer(TextureHandle src_handle, u32 level, u32 slice, Offset3D origin,
+                              Extent3D extent, BufferHandle dst, u64 offset, u32 bytes_per_row,
+                              DepthLayout layout) {
+    impl->FlushClear();
+    const id<MTLTexture> src = AsTexture(src_handle);
+    if (src == nil || dst == nullptr || extent.width == 0 || extent.height == 0 ||
+        offset % 4 != 0 || bytes_per_row % 4 != 0) {
+        return false;
+    }
+    const FormatClass format_class = ClassOf(static_cast<u32>(src.pixelFormat));
+    const bool has_stencil = format_class == FormatClass::DepthStencil;
+    if (format_class != FormatClass::Depth && !has_stencil) {
+        return false;
+    }
+    Impl& state = *impl;
+    if (state.depth_download == nil && state.library != nil) {
+        NSError* error = nil;
+        state.depth_download = [state.device.GetDevice()
+            newComputePipelineStateWithFunction:[state.library newFunctionWithName:@"depth_to_buffer"]
+                                          error:&error];
+        if (state.depth_download == nil) {
+            LOG_ERROR(Render_Metal, "Metal: depth download kernel failed: {}",
+                      error.localizedDescription.UTF8String);
+        }
+    }
+    if (state.depth_download == nil) {
+        return false;
+    }
+    if (src.textureType != MTLTextureType2D && src.textureType != MTLTextureType2DArray) {
+        return false;
+    }
+    // A 2D view of the level and slice (the depth, and the stencil through its own view).
+    const id<MTLTexture> depth =
+        [src newTextureViewWithPixelFormat:src.pixelFormat
+                               textureType:MTLTextureType2D
+                                    levels:NSMakeRange(level, 1)
+                                    slices:NSMakeRange(slice, 1)];
+    id<MTLTexture> stencil = nil;
+    if (has_stencil) {
+        stencil = StencilView(depth);
+        if (stencil == nil) {
+            return false;
+        }
+    }
+    if (depth == nil) {
+        return false;
+    }
+    state.EndEncoder();
+    state.NoteInOrder(dst);
+    ++state.encoders;
+    ++state.segment_encoders;
+    const id<MTLComputeCommandEncoder> encoder = [state.Commands() computeCommandEncoder];
+    encoder.label = @"Depth download";
+    [encoder setComputePipelineState:state.depth_download];
+    [encoder setTexture:depth atIndex:0];
+    [encoder setTexture:stencil atIndex:1];
+    [encoder setBuffer:AsBuffer(dst) offset:offset atIndex:0];
+    const std::array<u32, 8> params{origin.x, origin.y, bytes_per_row / 4,
+                                    static_cast<u32>(layout), extent.width, extent.height,
+                                    has_stencil ? 1U : 0U, 0};
+    [encoder setBytes:params.data() length:sizeof(params) atIndex:1];
+    [encoder dispatchThreadgroups:MTLSizeMake((extent.width + 7) / 8, (extent.height + 7) / 8, 1)
+            threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [encoder endEncoding];
+    return true;
+}
+
+bool Scheduler::Resolve(TextureHandle src_handle, u32 src_slice, const Attachment& dst, u32 width,
+                        u32 height) {
+    impl->FlushClear();
+    const id<MTLTexture> src = AsTexture(src_handle);
+    const id<MTLTexture> target = AsTexture(dst.texture);
+    if (src == nil || target == nil || src.sampleCount < 2 || target.sampleCount != 1 ||
+        src.pixelFormat != target.pixelFormat) {
+        return false;
+    }
+    const FormatClass format_class = ClassOf(static_cast<u32>(src.pixelFormat));
+    if (format_class == FormatClass::Stencil) {
+        return false;
+    }
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    MTLRenderPassAttachmentDescriptor* attachment = nil;
+    if (format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil) {
+        MTLRenderPassDepthAttachmentDescriptor* depth = pass.depthAttachment;
+        depth.depthResolveFilter = MTLMultisampleDepthResolveFilterSample0;
+        attachment = depth;
+    } else {
+        attachment = pass.colorAttachments[0];
+    }
+    attachment.texture = src;
+    attachment.slice = src_slice;
+    attachment.loadAction = MTLLoadActionLoad;
+    attachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+    attachment.resolveTexture = target;
+    attachment.resolveLevel = dst.level;
+    attachment.resolveSlice = dst.slice;
+    attachment.resolveDepthPlane = dst.depth_plane;
+    pass.renderTargetWidth = std::clamp(width, 1U, MaxRenderTargetSize);
+    pass.renderTargetHeight = std::clamp(height, 1U, MaxRenderTargetSize);
+    const id<MTLRenderCommandEncoder> encoder = impl->RenderEncoder(pass);
+    if (encoder == nil) {
+        return false;
+    }
     [encoder endEncoding];
     return true;
 }

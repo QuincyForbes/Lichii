@@ -107,8 +107,26 @@ void InAutoreleasePool(const std::function<void()>& work);
 /// A buffer in shared (CPU-visible, `contents` set) or private storage.
 [[nodiscard]] Object CreateBuffer(const Device& device, u64 size, bool shared, u8** contents);
 
+/// What a sampler state takes besides the guest's descriptor: Vulkan's sampler variants
+/// (vk_texture_cache.cpp, Sampler::MakeKey) for the view it samples.
+struct SamplerOptions {
+    /// EDEN_NX2_METAL_SAMPLERS=0: the guest's descriptor as this backend first read it (no LOD
+    /// bias, reduction or variants; Clamp and the mirror-once modes clamp without mirroring).
+    bool plain{};
+    f32 added_lod_bias{};      ///< Added to the guest's bias (the Ocarina upscalers')
+    bool reduce_anisotropy{};  ///< Only the guest's own anisotropy (the view takes no more)
+    bool force_nearest{};      ///< No filtering (integer views)
+    bool drop_compare{};       ///< No comparison (a plain sample of a compare sampler)
+    bool srgb_border{};        ///< The sRGB border colour (sRGB views)
+};
+
 /// A sampler for a guest sampler descriptor (TSC entry).
-[[nodiscard]] Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc);
+[[nodiscard]] Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc,
+                                   const SamplerOptions& options = {});
+
+/// Whether sampler states take a LOD bias and a min / max reduction: Metal has both from
+/// macOS / iOS 26 (MTLSamplerDescriptor lodBias, reductionMode), built with that SDK.
+[[nodiscard]] bool SamplerBiasSupported();
 
 /// A bilinear sampler clamping to the edge, for the renderer's own passes.
 [[nodiscard]] Object CreateLinearClampSampler(const Device& device);
@@ -126,6 +144,17 @@ void InAutoreleasePool(const std::function<void()>& work);
 [[nodiscard]] Object CreateComputePipelineState(const Device& device, const void* function,
                                                 std::string& error,
                                                 PipelineArchive* archive = nullptr);
+
+/// What a texture is, for checks before Metal is given it.
+struct TextureFacts {
+    u32 format{};  ///< MTLPixelFormat, 0 for a null texture
+    u32 samples{1};
+    u32 levels{1};
+    u32 slices{1}; ///< Array slices (cube faces count), 1 for 3D
+    u32 depth{1};  ///< Of level 0 (3D)
+};
+
+[[nodiscard]] TextureFacts DescribeTexture(TextureHandle texture);
 
 /// Bytes the resource (texture or buffer) holds on the GPU.
 [[nodiscard]] u64 AllocatedSize(const void* resource);

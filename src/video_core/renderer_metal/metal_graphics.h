@@ -142,6 +142,17 @@ struct PipelineLimits {
 /// Why Metal would reject the texture by assertion, or nothing.
 [[nodiscard]] std::string CheckTexture(const TextureDesc& desc, const PipelineLimits& limits);
 
+/// The sample count a texture asking for `samples` gets: the largest the device takes up to it
+/// (Apple GPUs take 4 at most, so the guest's 8 draw at 4 instead of being refused).
+[[nodiscard]] inline u32 SupportedSamples(u32 samples, const PipelineLimits& limits) {
+    for (u32 count = samples < 31 ? samples : 31; count > 1; --count) {
+        if (((limits.sample_counts >> count) & 1) != 0) {
+            return count;
+        }
+    }
+    return 1;
+}
+
 /// Why Metal would reject by assertion a view of kind `view` with `layers` slices of a texture
 /// of kind `base`, or nothing.
 [[nodiscard]] std::string CheckTextureView(TextureKind base, TextureKind view, u32 layers);

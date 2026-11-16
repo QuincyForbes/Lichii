@@ -62,6 +62,11 @@ inline void Refuse(Work work, std::string_view cause) {
     }
 }
 
+/// Counts a guard that changed what Metal was given (an offset past a buffer bound as zeros,
+/// a refused pipeline drawn through its fallback, ...), by a short fixed name; logged the first
+/// time with `detail`. They follow the work on the report line as "guards: <name> <count>".
+void NoteGuard(std::string_view name, std::string_view detail = {});
+
 /// The counts since the last call as the report line's text; empty when there was no work.
 [[nodiscard]] std::string TakeLine();
 

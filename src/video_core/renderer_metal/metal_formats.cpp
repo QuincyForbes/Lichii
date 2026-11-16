@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <cstdlib>
 #include <string>
 
 #include <fmt/format.h>
@@ -157,6 +158,14 @@ Entry Lookup(PixelFormat format) {
 
 } // Anonymous namespace
 
+bool FormatsExpanded() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_FORMATS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 FormatInfo SurfaceFormat(PixelFormat format, bool converted) {
     if (converted) {
         const bool srgb = VideoCore::Surface::IsPixelFormatSRGB(format);
@@ -168,6 +177,9 @@ FormatInfo SurfaceFormat(PixelFormat format, bool converted) {
         case PixelFormat::BC5_SNORM: decoded = Fmt::RG8Snorm; break;
         case PixelFormat::BC6H_UFLOAT:
         case PixelFormat::BC6H_SFLOAT: decoded = Fmt::RGBA16Float; break;
+        // VideoCommon::ExpandTexels.
+        case PixelFormat::R32G32B32_FLOAT: decoded = Fmt::RGBA32Float; break;
+        case PixelFormat::G4R4_UNORM: decoded = Fmt::RG8Unorm; break;
         default: break;
         }
         return FormatInfo{

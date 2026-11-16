@@ -43,6 +43,7 @@
 #include "video_core/oot_network.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_draw_desc.h"
+#include "video_core/renderer_metal/metal_formats.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
@@ -840,6 +841,157 @@ void RasterizerMetal::AddRescalingBits(const Shader::Info& info,
     }
 }
 
+namespace {
+
+/// The pass's attachments as Metal must get them (its validation layer checks these; release
+/// builds have none): a level or slice past the texture becomes its last one, and an attachment
+/// whose format or sample count the pipeline does not have takes the texture's format when it is
+/// of the same kind, else is left out of the pass and the pipeline.
+void FitAttachments(RenderPipelineDesc& desc, RenderTargetSet& targets) {
+    const auto fit = [](Attachment& attachment) {
+        const TextureFacts facts = DescribeTexture(attachment.texture);
+        if (facts.format == 0) {
+            return facts;
+        }
+        if (attachment.level >= facts.levels) {
+            Coverage::NoteGuard("attachment level past the texture",
+                                fmt::format("level {} of {}", attachment.level, facts.levels));
+            attachment.level = facts.levels - 1;
+        }
+        const u32 planes = (std::max)(facts.depth >> attachment.level, 1U);
+        if (facts.depth > 1 && attachment.depth_plane >= planes) {
+            Coverage::NoteGuard("attachment slice past the texture",
+                                fmt::format("plane {} of {}", attachment.depth_plane, planes));
+            attachment.depth_plane = planes - 1;
+        } else if (facts.depth == 1 && attachment.slice >= facts.slices) {
+            Coverage::NoteGuard("attachment slice past the texture",
+                                fmt::format("slice {} of {}", attachment.slice, facts.slices));
+            attachment.slice = facts.slices - 1;
+        }
+        return facts;
+    };
+    for (size_t rt = 0; rt < targets.color.size(); ++rt) {
+        if (targets.color[rt].texture == nullptr) {
+            continue;
+        }
+        const TextureFacts facts = fit(targets.color[rt]);
+        if (facts.format == desc.color_formats[rt] && facts.samples == desc.samples) {
+            continue;
+        }
+        Coverage::NoteGuard("pipeline and pass formats differ",
+                            fmt::format("colour {}: format {} x{} drawn as {} x{}", rt,
+                                        facts.format, facts.samples, desc.color_formats[rt],
+                                        desc.samples));
+        if (facts.samples == desc.samples &&
+            ClassOf(facts.format) == ClassOf(desc.color_formats[rt])) {
+            desc.color_formats[rt] = facts.format;
+        } else {
+            targets.color[rt] = {};
+            desc.color_formats[rt] = 0;
+        }
+    }
+    if (targets.has_depth || targets.has_stencil) {
+        const TextureFacts facts = fit(targets.depth);
+        const u32 wanted = desc.depth_format != 0 ? desc.depth_format : desc.stencil_format;
+        if (facts.format != wanted || facts.samples != desc.samples) {
+            Coverage::NoteGuard("pipeline and pass formats differ",
+                                fmt::format("depth: format {} x{} drawn as {} x{}", facts.format,
+                                            facts.samples, wanted, desc.samples));
+            targets.has_depth = false;
+            targets.has_stencil = false;
+            targets.depth = {};
+            desc.depth_format = 0;
+            desc.stencil_format = 0;
+        }
+    }
+}
+
+} // Anonymous namespace
+
+TextureHandle RasterizerMetal::OrPlaceholder(const ImageView& view, TextureHandle handle,
+                                             Shader::TextureType type) {
+    if (handle != nullptr || !PipelineCheckEnabled() || type == Shader::TextureType::Buffer) {
+        return handle;
+    }
+    // A texture or view Metal refused (or a null descriptor) reads zeros, as Vulkan's null
+    // image, instead of a texture Metal leaves undefined.
+    if (view.image_id != VideoCommon::NULL_IMAGE_ID) {
+        Coverage::NoteGuard("refused texture read as zeros");
+    }
+    const size_t index = static_cast<size_t>(type);
+    return index < placeholders.size() ? placeholders[index].Get() : nullptr;
+}
+
+void RasterizerMetal::MakePlaceholders() {
+    if (placeholders_made || !PipelineCheckEnabled()) {
+        return;
+    }
+    // Made before any render pass is open: filling them takes a blit encoder.
+    placeholders_made = true;
+    for (size_t index = 0; index < placeholders.size(); ++index) {
+        const auto type = static_cast<Shader::TextureType>(index);
+        if (type == Shader::TextureType::Buffer) {
+            continue;
+        }
+        Object& placeholder = placeholders[index];
+        TextureKind kind = TextureKind::e2D;
+        u32 layers = 1;
+        switch (type) {
+        case Shader::TextureType::Color1D:
+            kind = PipelineCheckEnabled() ? TextureKind::e2D : TextureKind::e1D;
+            break;
+        case Shader::TextureType::ColorArray1D:
+            kind = PipelineCheckEnabled() ? TextureKind::e2DArray : TextureKind::e1DArray;
+            break;
+        case Shader::TextureType::ColorArray2D: kind = TextureKind::e2DArray; break;
+        case Shader::TextureType::Color3D: kind = TextureKind::e3D; break;
+        case Shader::TextureType::ColorCube:
+            kind = TextureKind::Cube;
+            layers = 6;
+            break;
+        case Shader::TextureType::ColorArrayCube:
+            kind = TextureKind::CubeArray;
+            layers = 6;
+            break;
+        default: break;
+        }
+        placeholder = CreateTexture(device, TextureDesc{
+                                                .kind = kind,
+                                                .format = Fmt::RGBA8Unorm,
+                                                .layers = layers,
+                                                .shader_write = true,
+                                            });
+        if (!placeholder_zeros) {
+            // Metal hands out buffers zeroed.
+            placeholder_zeros = CreateBuffer(device, 256, false, nullptr);
+        }
+        for (u32 layer = 0; layer < layers && placeholder; ++layer) {
+            scheduler.CopyBufferToTexture(placeholder_zeros.Get(), 0, 4, 4, placeholder.Get(), 0,
+                                          layer, {}, {});
+        }
+    }
+}
+
+void RasterizerMetal::PrepareSampleGrids(const Shader::Info& info,
+                                         std::span<const VideoCommon::ImageViewInOut> views) {
+    // A multisampled image a program reads as a plain texture reads its samples as texels, as
+    // the guest sees it: the grid is filled before the draw's render pass.
+    size_t view = Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                  Shader::NumDescriptors(info.image_buffer_descriptors);
+    for (const auto& desc : info.texture_descriptors) {
+        for (u32 element = 0; element < desc.count; ++element, ++view) {
+            if (view >= views.size()) {
+                return;
+            }
+            ImageView& image_view = texture_cache.GetImageView(views[view].id);
+            if (image_view.Samples() > 1 && !desc.is_multisample &&
+                image_view.PrepareSampleGrid()) {
+                Coverage::NoteGuard("multisampled image read as its samples");
+            }
+        }
+    }
+}
+
 void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage metal_stage,
                                          std::span<const Binding> pending,
                                          std::span<const TextureHandle> texel_buffer_views,
@@ -903,15 +1055,18 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
         for (u32 element = 0; element < desc.count; ++element) {
             ImageView& image_view = texture_cache.GetImageView(views[view++].id);
             if (texture_slot < texture_slots.size()) {
-                scheduler.BindTexture(metal_stage, texture_slots[texture_slot],
-                                      image_view.Handle(desc.type));
+                scheduler.BindTexture(
+                    metal_stage, texture_slots[texture_slot],
+                    OrPlaceholder(image_view, image_view.SampledHandle(desc.type,
+                                                                       desc.is_multisample),
+                                  desc.type));
             }
             ++texture_slot;
             if (sampler < sampler_slots.size()) {
                 scheduler.BindSampler(
                     metal_stage, sampler_slots[sampler],
                     texture_cache.GetSampler(samplers[sampler])
-                        .Handle());
+                        .HandleFor(image_view, desc.is_depth));
             }
             ++sampler;
         }
@@ -923,8 +1078,9 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                 texture_cache.MarkModification(image_view.image_id);
             }
             if (texture_slot < texture_slots.size()) {
-                scheduler.BindTexture(metal_stage, texture_slots[texture_slot],
-                                      image_view.Handle(desc.type));
+                scheduler.BindTexture(
+                    metal_stage, texture_slots[texture_slot],
+                    OrPlaceholder(image_view, image_view.Handle(desc.type), desc.type));
             }
             ++texture_slot;
         }
@@ -978,6 +1134,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                             uniform_buffer_sizes[stages[index]].size(),
                             uniform_buffer_sizes[stages[index]].begin());
     }
+    MakePlaceholders();
     texture_cache.SynchronizeDescriptors(false);
     buffer_cache.SetUniformBuffersState(uniform_masks, &uniform_buffer_sizes);
 
@@ -1053,6 +1210,11 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         }
     }
     texture_cache.FillImageViews(views, false, true);
+    for (size_t index = 0; index < stages.size(); ++index) {
+        if (!absent(index)) {
+            PrepareSampleGrids(programs[index]->info, std::span(views).subspan(first_view[index]));
+        }
+    }
     texture_cache.UpdateRenderTargets(false);
     TrackOcarinaCamera();
     if (TargetlessReachEnabled() && texture_cache.HasNoRenderTargets()) {
@@ -1182,6 +1344,9 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     state_desc.depth_format = targets.has_depth ? framebuffer->DepthFormat() : 0U;
     state_desc.stencil_format = targets.has_stencil ? framebuffer->DepthFormat() : 0U;
     state_desc.samples = framebuffer->Samples();
+    if (PipelineCheckEnabled()) {
+        FitAttachments(state_desc, targets);
+    }
     FillRegisterState(state_desc, regs, topology, mesh != nullptr);
     const auto& vertex_states = buffer_cache_runtime.Vertices();
     for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
@@ -1241,7 +1406,20 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     if (tess != nullptr) {
         ApplyTessellation(state_desc, *tess);
     }
-    void* const state = pipeline.RenderState(device, state_desc);
+    void* state = pipeline.RenderState(device, state_desc);
+    if (state == nullptr && PipelineCheckEnabled()) {
+        // A state Metal refused is drawn without blending and alpha to coverage, what a target
+        // format most often refuses, rather than leaving a hole.
+        RenderPipelineDesc fallback = state_desc;
+        for (BlendTargetState& blend : fallback.blend) {
+            blend.enable = 0;
+        }
+        fallback.alpha_to_coverage = 0;
+        state = pipeline.RenderState(device, fallback);
+        if (state != nullptr) {
+            Coverage::NoteGuard("refused pipeline drawn without blending");
+        }
+    }
     if (state == nullptr) {
         return false;
     }
@@ -2292,6 +2470,8 @@ void RasterizerMetal::DispatchCompute() {
         }
     }
     texture_cache.FillImageViews(views, true);
+    MakePlaceholders();
+    PrepareSampleGrids(info, views);
     if (pipeline->Key().unique_hash == OcarinaTemporal::DepthReader) {
         TrackOcarinaDepth();
     }
