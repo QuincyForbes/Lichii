@@ -335,7 +335,8 @@ struct GPU::Impl {
             ReadStats::Add(stats.core_refused, 1);
         }
         const size_t cause = (std::min<size_t>)(raster_area.cause, ReadStats::CauseCount - 1);
-        const u64 fence = RequestSyncOperation([this, raster_area, ask_end, cause, &stats]() {
+        const u64 fence = RequestSyncOperation([this, raster_area, ask_end, cause]() {
+            auto& stats = ReadStats::g_counters;
             const u64 flush_begin = ReadStats::NowNs();
             ReadStats::Add(stats.queue_ns[cause], flush_begin - ask_end);
             // Apply collected guest writes before downloading GPU data over guest memory.
