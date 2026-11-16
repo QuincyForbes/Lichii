@@ -10,9 +10,10 @@ struct PerformanceOverlaySettingsSection: View {
     @AppStorage("overlayVoiceOver") private var voiceOver = false
 
     var body: some View {
+        let overlayTitle = SettingLabels.title(for: "show_fps_overlay")
         Group {
             Section {
-                Picker("Performance Overlay", selection: Binding(
+                Picker(overlayTitle, selection: Binding(
                     get: { OverlayPreset.resolve(presetName) },
                     set: { OverlayPreset.store($0) }
                 )) {
@@ -22,7 +23,7 @@ struct PerformanceOverlaySettingsSection: View {
                     ForEach(HUDPosition.allCases) { Text($0.title).tag($0.rawValue) }
                 }
             } header: {
-                Text("Performance Overlay")
+                Text(overlayTitle)
             } footer: {
                 Text("Shown over the game, with the same numbers as the desktop overlay. The in-game menu changes it too.")
             }
@@ -51,7 +52,7 @@ struct PerformanceOverlaySettingsSection: View {
 struct PerformanceOverlaySettingsView: View {
     var body: some View {
         Form { PerformanceOverlaySettingsSection() }
-            .navigationTitle("Performance Overlay")
+            .navigationTitle(SettingLabels.title(for: "show_fps_overlay"))
     }
 }
 

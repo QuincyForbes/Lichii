@@ -58,7 +58,7 @@ final class PlatformCenter: ObservableObject {
         uncleanExit = GameSession.takeUncleanExit()
         if let session = uncleanExit {
             let file = session.fileGuest.map { $0 ? "on" : "off" } ?? "unknown"
-            lichii_platform_log_memory("the last session (\(session.title), started \(Int(-session.started.timeIntervalSinceNow)) s ago) ended without a clean stop; memory warning \(session.memoryWarning ? "yes" : "no"), Keep Guest Memory in a File \(file): shown the Last Session sheet")
+            lichii_platform_log_memory("the last session (\(session.title), started \(Int(-session.started.timeIntervalSinceNow)) s ago) ended without a clean stop; memory warning \(session.memoryWarning ? "yes" : "no"), \(UiText.experimentLabel("file_guest")) \(file): shown the Last Session sheet")
         }
         lichii_platform_init()
         lichii_platform_set_event_handler(platformEvent, nil)
@@ -132,7 +132,7 @@ final class PlatformCenter: ObservableObject {
                 // The way out once per game; iOS sends several warnings in a row.
                 if memoryHintShown == nil, !GuestMemoryFile.enabled {
                     memoryHintShown = Date()
-                    ControlsCenter.shared.show(toast: "Memory is low: caches trimmed. If iOS closes the game, turn on Keep Guest Memory in a File in Settings > Memory & Experiments.")
+                    ControlsCenter.shared.show(toast: "Memory is low: caches trimmed. If iOS closes the game, turn on \(UiText.experimentLabel("file_guest")) in Settings > \(UiText.text("page.experiments")).")
                 } else if memoryHintShown.map({ -$0.timeIntervalSinceNow > 6 }) ?? true {
                     ControlsCenter.shared.show(toast: "Memory is low: caches trimmed")
                 }
@@ -294,14 +294,15 @@ enum GuestMemoryFile {
 
     /// One line for the log before a game starts, so the next device log shows the decision.
     static func logLaunchCheck(title: String, storage: LichiiFileGuestStorage?, askedUser: Bool) {
+        let name = UiText.experimentLabel("file_guest")
         let line: String
         if !enabled {
-            line = "launch check for \(title): Keep Guest Memory in a File off"
+            line = "launch check for \(title): \(name) off"
         } else if let storage {
-            line = "launch check for \(title): Keep Guest Memory in a File on, \(storage.free_mib) MiB free, \(storage.needed_mib) MiB needed, \(storage.full_mib) MiB for the whole file" +
+            line = "launch check for \(title): \(name) on, \(storage.free_mib) MiB free, \(storage.needed_mib) MiB needed, \(storage.full_mib) MiB for the whole file" +
                 (askedUser ? ": too little, asked whether to start anyway" : "")
         } else {
-            line = "launch check for \(title): Keep Guest Memory in a File on, free storage unknown"
+            line = "launch check for \(title): \(name) on, free storage unknown"
         }
         lichii_platform_log_memory(line)
     }

@@ -53,7 +53,7 @@ struct LogsView: View {
                 }
             }
         }
-        .navigationTitle("Logs")
+        .navigationTitle(UiText.text("page.logs"))
         .onAppear { ContentBridge.run({ ContentBridge.logs }) { logs = $0 } }
         .refreshable { ContentBridge.run({ ContentBridge.logs }) { logs = $0 } }
         .sheet(item: $share) { item in
@@ -79,7 +79,7 @@ struct LogsView: View {
             if ok {
                 share = ShareItem(url: url)
             } else {
-                alert = ContentAlert(title: "Logs", message: message)
+                alert = ContentAlert(title: UiText.text("page.logs"), message: message)
             }
         }
     }

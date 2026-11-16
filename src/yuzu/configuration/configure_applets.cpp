@@ -7,12 +7,14 @@
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_applets.h"
 #include "yuzu/configuration/shared_widget.h"
+#include "qt_common/config/catalog_text.h"
 
 ConfigureApplets::ConfigureApplets(Core::System& system_,
                                    std::shared_ptr<std::vector<ConfigurationShared::Tab*>> group_,
                                    const ConfigurationShared::Builder& builder, QWidget* parent)
     : Tab(group_, parent), ui{std::make_unique<Ui::ConfigureApplets>()}, system{system_} {
     ui->setupUi(this);
+    UiText::ApplyCatalogue(this);
 
     Setup(builder);
 
@@ -31,6 +33,7 @@ void ConfigureApplets::changeEvent(QEvent* event) {
 
 void ConfigureApplets::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }
 
 void ConfigureApplets::Setup(const ConfigurationShared::Builder& builder) {

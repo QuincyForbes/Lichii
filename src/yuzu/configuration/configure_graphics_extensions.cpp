@@ -16,6 +16,7 @@
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_graphics_extensions.h"
 #include "yuzu/configuration/shared_widget.h"
+#include "qt_common/config/catalog_text.h"
 
 ConfigureGraphicsExtensions::ConfigureGraphicsExtensions(
     const Core::System& system_, std::shared_ptr<std::vector<ConfigurationShared::Tab*>> group_,
@@ -24,6 +25,8 @@ ConfigureGraphicsExtensions::ConfigureGraphicsExtensions(
       system{system_} {
 
     ui->setupUi(this);
+
+    UiText::ApplyCatalogue(this);
 
     Setup(builder);
 
@@ -115,4 +118,5 @@ void ConfigureGraphicsExtensions::changeEvent(QEvent* event) {
 
 void ConfigureGraphicsExtensions::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }

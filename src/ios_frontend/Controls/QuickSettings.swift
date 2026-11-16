@@ -66,23 +66,15 @@ enum QuickSettings {
     }
 
     static func choices(_ key: String) -> [Choice] {
+        let catalogChoices = UiText.choices(for: key)
+        if !catalogChoices.isEmpty {
+            return catalogChoices.map { Choice(value: $0.value, name: $0.name) }
+        }
         guard let info = info(key) else { return [] }
         return (0..<info.enum_count).map { index in
             let value = key.withCString { lichii_settings_enum_value($0, index) }
             let name = Bridge.constant(key.withCString { lichii_settings_enum_name($0, index) })
-            return Choice(value: String(value), name: displayName(key, name))
+            return Choice(value: String(value), name: SettingLabels.choice(name, for: key))
         }
-    }
-
-    /// "Res3_2X" -> "1.5x (1080p)" and so on; other enum names as the settings list names them.
-    private static func displayName(_ key: String, _ name: String) -> String {
-        guard key == "resolution_setup" else { return SettingLabels.choice(name, for: key) }
-        let table: [String: String] = [
-            "Res1_4X": "0.25x (180p)", "Res1_2X": "0.5x (360p)", "Res3_4X": "0.75x (540p)",
-            "Res1X": "1x (720p)", "Res5_4X": "1.25x (900p)", "Res3_2X": "1.5x (1080p)",
-            "Res2X": "2x (1440p)", "Res3X": "3x (2160p)", "Res4X": "4x (2880p)",
-            "Res5X": "5x (3600p)", "Res6X": "6x (4320p)", "Res7X": "7x (5040p)", "Res8X": "8x (5760p)",
-        ]
-        return table[name] ?? name
     }
 }

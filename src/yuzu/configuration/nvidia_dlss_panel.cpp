@@ -37,6 +37,7 @@
 #include "common/fs/fs_util.h"
 #include "common/logging.h"
 #include "video_core/vulkan_common/streamline.h"
+#include "qt_common/config/catalog_text.h"
 #include "yuzu/configuration/nvidia_dlss_panel.h"
 
 #ifdef YUZU_BUNDLED_OPENSSL
@@ -59,6 +60,10 @@ constexpr const char* DLSS_LICENSE_ENTRY = "bin/x64/nvngx_dlss.license.txt";
 
 QString Tr(const char* text) {
     return QCoreApplication::translate("NvidiaDlssPanel", text);
+}
+
+QString DlssName() {
+    return UiText::ChoiceNames<Settings::Upscaler>()[Settings::Upscaler::Dlss];
 }
 
 u16 U16(const std::string& data, size_t at) {
@@ -475,7 +480,7 @@ void NvidiaDlssPanel::Download() {
     const std::filesystem::path folder = files.folder;
     const auto fail = [this](const std::string& error) {
         LOG_ERROR(Frontend, "NVIDIA DLSS download failed: {}", error);
-        QMessageBox::warning(this, Tr("NVIDIA DLSS"),
+        QMessageBox::warning(this, DlssName(),
                              Tr("Could not download NVIDIA's files: %1")
                                  .arg(QString::fromStdString(error)));
         Refresh();
@@ -485,7 +490,7 @@ void NvidiaDlssPanel::Download() {
     std::string licences;
     {
         QProgressDialog busy(Tr("Contacting NVIDIA's download..."), QString{}, 0, 0, this);
-        busy.setWindowTitle(Tr("NVIDIA DLSS"));
+        busy.setWindowTitle(DlssName());
         busy.setWindowModality(Qt::WindowModal);
         busy.setMinimumDuration(0);
         busy.show();
@@ -498,7 +503,7 @@ void NvidiaDlssPanel::Download() {
         std::vector<std::pair<QString, const char*>> texts{
             {Tr("NVIDIA Streamline"), STREAMLINE_LICENSE_ENTRY}};
         if (std::ranges::find(wanted, MODEL_ENTRY) != wanted.end()) {
-            texts.emplace_back(Tr("NVIDIA DLSS"), DLSS_LICENSE_ENTRY);
+            texts.emplace_back(DlssName(), DLSS_LICENSE_ENTRY);
         }
         for (const auto& [title, entry_name] : texts) {
             const ZipEntry* const entry = zip.Find(entry_name);
@@ -556,7 +561,7 @@ void NvidiaDlssPanel::Download() {
 
     QProgressDialog progress(Tr("Downloading NVIDIA's DLSS files..."), Tr("Cancel"), 0, 1000,
                              this);
-    progress.setWindowTitle(Tr("NVIDIA DLSS"));
+    progress.setWindowTitle(DlssName());
     progress.setWindowModality(Qt::WindowModal);
     progress.setMinimumDuration(0);
     progress.setValue(0);
@@ -626,8 +631,8 @@ void NvidiaDlssPanel::Download() {
     progress.setValue(1000);
     progress.close();
     Refresh();
-    QMessageBox::information(this, Tr("NVIDIA DLSS"),
-                             Tr("NVIDIA DLSS is ready. It is used the next time a game starts."));
+    QMessageBox::information(this, DlssName(),
+                             Tr("%1 is ready. It is used the next time a game starts.").arg(DlssName()));
 }
 
 #endif

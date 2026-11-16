@@ -101,6 +101,7 @@
 
 // Qt Common //
 #include "qt_common/config/shared_translation.h"
+#include "qt_common/config/catalog_text.h"
 #include "qt_common/config/uisettings.h"
 
 #include "qt_common/abstract/frontend.h"
@@ -1035,10 +1036,10 @@ void MainWindow::WebBrowserOpenWebPage(const std::string& main_url,
     bool exit_check = false;
 
     // TODO (Morph): Remove this
-    QAction* exit_action = new QAction(tr("Disable Web Applet"), this);
+    QAction* exit_action = new QAction(UiText::SettingLabel("disable_web_applet"), this);
     connect(exit_action, &QAction::triggered, this, [this] {
         const auto result = QMessageBox::warning(
-            this, tr("Disable Web Applet"),
+            this, UiText::SettingLabel("disable_web_applet"),
             tr("Disabling the web applet can lead to undefined behavior and should only be used "
                "with Super Mario 3D All-Stars. Are you sure you want to disable the web "
                "applet?\n(This can be re-enabled in the Debug settings.)"),
@@ -1301,7 +1302,7 @@ void MainWindow::InitializeWidgets() {
     connect(aa_status_button, &QPushButton::customContextMenuRequested,
             [this](const QPoint& menu_location) {
                 QMenu context_menu;
-                for (auto const& aa_text_pair : ConfigurationShared::anti_aliasing_texts_map) {
+                for (auto const& aa_text_pair : UiText::ChoiceNames<Settings::AntiAliasing>()) {
                     context_menu.addAction(aa_text_pair.second, [this, aa_text_pair] {
                         Settings::values.anti_aliasing.SetValue(aa_text_pair.first);
                         UpdateAAText();
@@ -1324,7 +1325,7 @@ void MainWindow::InitializeWidgets() {
     connect(filter_status_button, &QPushButton::customContextMenuRequested,
             [this](const QPoint& menu_location) {
                 QMenu context_menu;
-                for (auto const& filter_text_pair : ConfigurationShared::scaling_filter_texts_map) {
+                for (auto const& filter_text_pair : UiText::ChoiceNames<Settings::ScalingFilter>()) {
                     context_menu.addAction(filter_text_pair.second, [this, filter_text_pair] {
                         Settings::values.scaling_filter.SetValue(filter_text_pair.first);
                         UpdateFilterText();
@@ -1347,8 +1348,8 @@ void MainWindow::InitializeWidgets() {
             [this](const QPoint& menu_location) {
                 QMenu context_menu;
 
-                for (auto const& pair : ConfigurationShared::use_docked_mode_texts_map) {
-                    context_menu.addAction(pair.second, [this, &pair] {
+                for (auto const& pair : UiText::ChoiceNames<Settings::ConsoleMode>()) {
+                    context_menu.addAction(pair.second, [this, pair] {
                         if (pair.first != Settings::values.use_docked_mode.GetValue()) {
                             OnToggleDockedMode();
                         }
@@ -1371,7 +1372,7 @@ void MainWindow::InitializeWidgets() {
             [this](const QPoint& menu_location) {
                 QMenu context_menu;
 
-                for (auto const& gpu_accuracy_pair : ConfigurationShared::gpu_accuracy_texts_map) {
+                for (auto const& gpu_accuracy_pair : UiText::ChoiceNames<Settings::GpuAccuracy>()) {
                     context_menu.addAction(gpu_accuracy_pair.second, [this, gpu_accuracy_pair] {
                         Settings::values.gpu_accuracy.SetValue(gpu_accuracy_pair.first);
                         UpdateGPUAccuracyButton();
@@ -1407,7 +1408,7 @@ void MainWindow::InitializeWidgets() {
                 QMenu context_menu;
 
                 for (auto const& renderer_backend_pair :
-                     ConfigurationShared::renderer_backend_texts_map) {
+                     UiText::ChoiceNames<Settings::RendererBackend>()) {
                     if (renderer_backend_pair.first == Settings::RendererBackend::Null) {
                         continue;
                     }
@@ -3191,7 +3192,7 @@ void MainWindow::OnGameListOpenPerGameProperties(const std::string& file) {
         const auto loader = Loader::GetLoader(*QtCommon::system, v_file);
 
         if (loader == nullptr || loader->ReadProgramId(title_id) != Loader::ResultStatus::Success) {
-            QMessageBox::information(this, tr("Game Settings"),
+            QMessageBox::information(this, UiText::Text("page.game_settings"),
                                      tr("The game properties could not be loaded."));
             return;
         }
@@ -5315,15 +5316,7 @@ void MainWindow::UpdateStatusBar() {
     }
 
     const auto fg_method_name = [] {
-        switch (Settings::values.frame_gen_type.GetValue()) {
-        case Settings::FrameGenType::Lsfg:
-            return QStringLiteral("LSFG");
-        case Settings::FrameGenType::MetalFx:
-            return QStringLiteral("MetalFX");
-        case Settings::FrameGenType::Fsr3:
-        default:
-            return QStringLiteral("FSR3");
-        }
+        return UiText::ChoiceNames<Settings::FrameGenType>()[Settings::values.frame_gen_type.GetValue()];
     };
 
     QString fpsText;
@@ -5366,7 +5359,7 @@ void MainWindow::UpdateStatusBar() {
 void MainWindow::UpdateGPUAccuracyButton() {
     const auto gpu_accuracy = Settings::values.gpu_accuracy.GetValue();
     const auto gpu_accuracy_text =
-        ConfigurationShared::gpu_accuracy_texts_map.find(gpu_accuracy)->second;
+        UiText::ChoiceNames<Settings::GpuAccuracy>().find(gpu_accuracy)->second;
     gpu_accuracy_button->setText(gpu_accuracy_text.toUpper());
     gpu_accuracy_button->setChecked(gpu_accuracy != Settings::GpuAccuracy::Low);
 }
@@ -5386,26 +5379,31 @@ void MainWindow::UpdateOotFpsButton() {
     if (unlocked) {
         oot_fps_button->setEnabled(false);
         oot_fps_button->setText(tr("FPS UNLOCKED"));
-        oot_fps_button->setToolTip(tr("Ocarina of Time frame rate: the speed limit is off, so the "
-                                      "frame rate choice has no effect. Turn the speed limit back "
-                                      "on (Toggle Framerate Limit hotkey or Configure > General)."));
+        oot_fps_button->setToolTip(tr("Ocarina of Time %1: %2 is off, so it has no effect. Turn "
+                                      "it back on (Toggle Framerate Limit hotkey or Settings > "
+                                      "%3).")
+                                       .arg(UiText::SettingLabel("oot_frame_rate"),
+                                            UiText::SettingLabel("speed_limit"),
+                                            UiText::Text("page.system")));
         return;
     }
     oot_fps_button->setEnabled(true);
+    const auto names = UiText::ChoiceNames<OotFrameRate>();
     switch (rate) {
     case OotFrameRate::Fps30:
-        oot_fps_button->setText(tr("30 FPS"));
-        break;
     case OotFrameRate::Fps60:
-        oot_fps_button->setText(tr("60 FPS"));
+        oot_fps_button->setText(names.at(rate).toUpper());
         break;
     case OotFrameRate::Unlocked:
         oot_fps_button->setText(tr("%1 FPS MAX").arg(limit_hz));
         break;
     }
     oot_fps_button->setToolTip(
-        tr("Ocarina of Time frame rate. Click to switch: 60 FPS, 30 FPS (lower-end PCs), "
-           "Unlocked (Frame rate limit (Switch 2) = %1 Hz%2). It takes effect at once.")
+        tr("Ocarina of Time %1. Click to switch: %2, %3, %4 (%5 = %6 Hz%7). It takes effect at "
+           "once.")
+            .arg(UiText::SettingLabel("oot_frame_rate"), names.at(OotFrameRate::Fps60),
+                 names.at(OotFrameRate::Fps30), names.at(OotFrameRate::Unlocked),
+                 UiText::SettingLabel("frame_rate_limit"))
             .arg(limit_hz)
             .arg(forced_hz != nullptr ? tr(", EDEN_NX2_VSYNC_HZ") : QString{}));
 }
@@ -5433,25 +5431,25 @@ void MainWindow::UpdateDockedButton() {
     const auto console_mode = Settings::values.use_docked_mode.GetValue();
     dock_status_button->setChecked(Settings::IsDockedMode());
     dock_status_button->setText(
-        ConfigurationShared::use_docked_mode_texts_map.find(console_mode)->second.toUpper());
+        UiText::ChoiceNames<Settings::ConsoleMode>().find(console_mode)->second.toUpper());
 }
 
 void MainWindow::UpdateAPIText() {
     const auto api = Settings::values.renderer_backend.GetValue();
     const auto renderer_status_text =
-        ConfigurationShared::renderer_backend_texts_map.find(api)->second;
+        UiText::ChoiceNames<Settings::RendererBackend>().find(api)->second;
     renderer_status_button->setText(renderer_status_text.toUpper());
 }
 
 void MainWindow::UpdateFilterText() {
     const auto filter = Settings::values.scaling_filter.GetValue();
-    const auto filter_text = ConfigurationShared::scaling_filter_texts_map.find(filter)->second;
+    const auto filter_text = UiText::ChoiceNames<Settings::ScalingFilter>().find(filter)->second;
     filter_status_button->setText(filter_text.toUpper());
 }
 
 void MainWindow::UpdateAAText() {
     const auto aa_mode = Settings::values.anti_aliasing.GetValue();
-    const auto aa_text = ConfigurationShared::anti_aliasing_texts_map.find(aa_mode)->second;
+    const auto aa_text = UiText::ChoiceNames<Settings::AntiAliasing>().find(aa_mode)->second;
     aa_status_button->setText(aa_mode == Settings::AntiAliasing::None
                                   ? QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "NO AA"))
                                   : aa_text.toUpper());

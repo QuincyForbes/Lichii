@@ -51,6 +51,8 @@
 #include "yuzu/configuration/configure_graphics.h"
 #include "yuzu/configuration/nvidia_dlss_panel.h"
 #include "yuzu/configuration/shared_widget.h"
+#include "core/file_sys/patch_manager.h"
+#include "qt_common/config/catalog_text.h"
 #include "yuzu/util/lichii_style.h"
 
 #ifdef HAS_LSFG
@@ -60,6 +62,45 @@
 #ifdef HAS_RESHADE
 #include "yuzu/configuration/configure_post_processing.h"
 #endif
+
+namespace {
+
+template <typename E>
+std::vector<std::pair<u32, QString>> EnumItems(const std::map<E, QString>& names) {
+    std::vector<std::pair<u32, QString>> items;
+    for (const auto& [value, name] : names) {
+        items.emplace_back(static_cast<u32>(value), name);
+    }
+    return items;
+}
+
+QString JoinOrNone(const QStringList& names) {
+    return names.isEmpty() ? UiText::Text("list.none_yet") : names.join(QStringLiteral(", "));
+}
+
+// The games with a Resolution of their own, as the iOS app's Resolution & Textures footer.
+QString GamesWithResolution() {
+    QStringList names;
+    for (const auto& game : Settings::GamesWithSettings()) {
+        for (const auto key : game.keys) {
+            if (key.ends_with("_resolution")) {
+                names << QString::fromUtf8(game.name.data(), static_cast<qsizetype>(game.name.size()));
+                break;
+            }
+        }
+    }
+    return JoinOrNone(names);
+}
+
+QString BuiltinPatchGames() {
+    QStringList names;
+    for (const auto& name : FileSys::BuiltinPatchGames()) {
+        names << QString::fromStdString(name);
+    }
+    return JoinOrNone(names);
+}
+
+} // namespace
 
 ConfigureGraphics::ConfigureGraphics(
     const Core::System& system_, std::vector<VkDeviceInfo::Record>& records_,
@@ -76,6 +117,7 @@ ConfigureGraphics::ConfigureGraphics(
     RetrieveVulkanDevices();
 
     ui->setupUi(this);
+    UiText::ApplyCatalogue(this);
 
     Setup(builder);
 
@@ -254,7 +296,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     const bool runtime_lock = !system.IsPoweredOn();
     const auto make_enum_row = [&](Settings::BasicSetting* s, const QString& label_text,
                                    const QString& tooltip_text,
-                                   std::initializer_list<std::pair<u32, QString>> items,
+                                   const std::vector<std::pair<u32, QString>>& items,
                                    QComboBox*& out_combobox) -> QWidget* {
         if (!Settings::IsConfiguringGlobal() && !s->Switchable()) {
             return nullptr;
@@ -318,13 +360,12 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         bool enable = runtime_lock || s->RuntimeModifiable();
         QString reason;
         if (!enable) {
-            reason = tr("Stop the game to change this.");
+            reason = UiText::Text("note.stop_game");
         }
         if (s->Switchable() && Settings::IsConfiguringGlobal() && !runtime_lock &&
             !s->UsingGlobal()) {
             enable = false;
-            reason = tr("The running game's Game Settings override this setting: change it there "
-                        "(right-click the game > Game Settings).");
+            reason = UiText::Text("note.game_overrides");
         }
         row->setEnabled(enable);
         row->setToolTip(reason.isEmpty() ? tooltip_text
@@ -336,13 +377,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     for (const auto setting : Settings::values.linkage.by_category[Settings::Category::Renderer]) {
         if (setting->Id() == Settings::values.frame_gen_motion.Id()) {
             if (QWidget* row = make_enum_row(
-                    setting, tr("Frame Generation Motion"),
-                    tr("Where the built-in frame generation gets its motion from. Auto uses "
-                       "NVIDIA's optical flow hardware (RTX 20 series and newer) when available, "
-                       "and the flow shader otherwise."),
-                    {{static_cast<u32>(Settings::FrameGenMotion::Auto),
-                      tr("Auto (optical flow hardware)")},
-                     {static_cast<u32>(Settings::FrameGenMotion::Shader), tr("Flow shader")}},
+                    setting, UiText::SettingLabel("frame_gen_motion"),
+                    UiText::SettingHelp("frame_gen_motion"),
+                    EnumItems(UiText::ChoiceNames<Settings::FrameGenMotion>()),
                     frame_gen_motion_combobox)) {
                 hold_graphics.emplace(setting->Id(), row);
             }
@@ -351,13 +388,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         if (setting->Id() == Settings::values.frame_gen_flow_quality.Id()) {
             QComboBox* quality_cb = nullptr;
             if (QWidget* row = make_enum_row(
-                    setting, tr("Optical Flow Quality"),
-                    tr("Quality of the optical flow hardware's motion estimate. Higher quality "
-                       "costs more GPU time."),
-                    {{static_cast<u32>(Settings::FrameGenFlowQuality::Fast), tr("Fast")},
-                     {static_cast<u32>(Settings::FrameGenFlowQuality::Medium), tr("Medium")},
-                     {static_cast<u32>(Settings::FrameGenFlowQuality::Best), tr("Best")}},
-                    quality_cb)) {
+                    setting, UiText::SettingLabel("frame_gen_flow_quality"),
+                    UiText::SettingHelp("frame_gen_flow_quality"),
+                    EnumItems(UiText::ChoiceNames<Settings::FrameGenFlowQuality>()), quality_cb)) {
                 hold_graphics.emplace(setting->Id(), row);
             }
             continue;
@@ -523,19 +556,15 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         const auto& v = Settings::values;
         // The section names and footers of the iOS app's Graphics page.
         std::vector<std::tuple<QString, QString, std::vector<u32>>> sections{
-            {tr("Resolution & Textures"),
+            {UiText::Text("category.Resolution"),
              Settings::ConfiguringProgramId() == 0
-                 ? tr("The size games draw at and their texture detail. Games with their own "
-                      "Resolution have it in their section below.")
+                 ? UiText::Text("category.Resolution.footer").arg(GamesWithResolution())
                  : QString(),
              {v.resolution_setup.Id(), v.texture_quality.Id(), v.aspect_ratio.Id()}},
-            {tr("Upscaling"),
-             tr("The game's picture goes through the upscaler, then the screen filter."),
+            {UiText::Text("category.Upscaling"), UiText::Text("category.Upscaling.footer"),
              {v.upscaler.Id(), v.nvidia_dlss_preset.Id(), v.scaling_filter.Id(),
               v.fsr_sharpening_slider.Id(), v.anti_aliasing.Id()}},
-            {tr("Frame Rate"),
-             tr("The Switch 2 frame rate limit paces every game without its own choice. Frame "
-                "generation adds frames on top of the game's."),
+            {UiText::Text("category.FrameRate"), UiText::Text("category.FrameRate.footer"),
              {v.frame_rate_limit.Id(), v.vsync_mode.Id(), v.frame_gen.Id(), v.frame_gen_type.Id(),
               v.frame_gen_multiplier.Id(), v.frame_gen_target_rate.Id(),
               v.frame_gen_flow_scale_auto.Id(), v.frame_gen_flow_scale.Id(),
@@ -554,16 +583,16 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             sections.emplace_back(QString::fromUtf8(game.name.data(),
                                                     static_cast<qsizetype>(game.name.size())),
                                   Settings::ConfiguringProgramId() == 0
-                                      ? tr("Game-specific: these apply to this game only.")
+                                      ? UiText::Text("category.Game.footer")
                                       : QString(),
                                   std::move(ids));
         }
-        sections.emplace_back(tr("Game Enhancements"),
-                              tr("Built-in patches by kind, with a trade-off. A game's own choice "
-                                 "in its Updates, DLC & Mods overrides these. Changes apply the "
-                                 "next time a game starts."),
+        sections.emplace_back(UiText::Text("category.GameEnhancements"),
+                              UiText::Text("category.GameEnhancements.footer")
+                                  .arg(BuiltinPatchGames()),
                               std::vector<u32>{v.patch_performance.Id(), v.patch_image.Id()});
-        sections.emplace_back(tr("Image"), QString(), std::vector<u32>{});
+        sections.emplace_back(UiText::Text("category.Renderer"), QString(),
+                              std::vector<u32>{});
         std::map<u32, QWidget*> rest = hold_graphics;
         // The group box only holds the sections: each is a header, a rounded group of rows and a
         // footer, as the iOS app's grouped lists.
@@ -885,6 +914,7 @@ void ConfigureGraphics::changeEvent(QEvent* event) {
 
 void ConfigureGraphics::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }
 
 void ConfigureGraphics::UpdateBackgroundColorButton(QColor color) {

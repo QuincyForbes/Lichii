@@ -152,30 +152,30 @@ struct InGameMenuView: View {
                 .font(.subheadline.weight(.semibold))
 
             if !resolutions.isEmpty {
-                Picker("Resolution", selection: $resolution) {
+                Picker(SettingLabels.title(for: "resolution_setup"), selection: $resolution) {
                     ForEach(resolutions) { Text($0.name).tag($0.value) }
                 }
                 .onChange(of: resolution) { value in change(InGameMenuView.resolutionKey, value) }
             }
 
             if frameGenAvailable {
-                Toggle("Frame Generation", isOn: $frameGen)
+                Toggle(SettingLabels.title(for: "frame_gen"), isOn: $frameGen)
                     .onChange(of: frameGen) { value in change("frame_gen", value ? "true" : "false") }
                 if frameGen {
-                    Stepper("Multiplier: \(frameGenMultiplier)x", value: $frameGenMultiplier, in: 2...4)
+                    Stepper("\(SettingLabels.title(for: "frame_gen_multiplier")): \(frameGenMultiplier)x", value: $frameGenMultiplier, in: 2...4)
                         .onChange(of: frameGenMultiplier) { value in change("frame_gen_multiplier", String(value)) }
                     // Apple's interpolation (iOS 26) makes the 2x frame; 3x and 4x stay built-in.
                     if #available(iOS 26, *) {
-                        Toggle("MetalFX Interpolation", isOn: $frameGenMetalFx)
+                        Toggle("\(SettingLabels.choice("MetalFx", for: "frame_gen_type")) Interpolation", isOn: $frameGenMetalFx)
                             .onChange(of: frameGenMetalFx) { value in change("frame_gen_type", value ? "MetalFx" : "Fsr3") }
                     }
                 }
             }
 
-            Toggle("Limit Speed", isOn: $speedLimit)
+            Toggle(SettingLabels.title(for: "use_speed_limit"), isOn: $speedLimit)
                 .onChange(of: speedLimit) { value in change("use_speed_limit", value ? "true" : "false") }
             if speedLimit {
-                Stepper("Speed Limit: \(speedPercent)%", value: $speedPercent, in: 25...400, step: 25)
+                Stepper("\(SettingLabels.title(for: "speed_limit")): \(speedPercent)%", value: $speedPercent, in: 25...400, step: 25)
                     .onChange(of: speedPercent) { value in change("speed_limit", String(value)) }
             }
 

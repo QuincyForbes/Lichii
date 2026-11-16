@@ -12,11 +12,14 @@
 #include "qt_common/config/uisettings.h"
 #include "ui_configure_tas.h"
 #include "yuzu/configuration/configure_tas.h"
+#include "qt_common/config/catalog_text.h"
 
 ConfigureTasDialog::ConfigureTasDialog(QWidget* parent)
     : QDialog(parent), ui(std::make_unique<Ui::ConfigureTas>()) {
 
     ui->setupUi(this);
+
+    UiText::ApplyCatalogue(this);
 
     setFocusPolicy(Qt::ClickFocus);
     setWindowTitle(tr("TAS Configuration"));
@@ -79,6 +82,7 @@ void ConfigureTasDialog::changeEvent(QEvent* event) {
 
 void ConfigureTasDialog::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }
 
 void ConfigureTasDialog::HandleApplyButtonClicked() {

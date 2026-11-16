@@ -30,8 +30,8 @@
          <verstretch>0</verstretch>
         </sizepolicy>
        </property>
-       <property name="title">
-        <string>Game Info</string>
+       <property name="catalogueText" stdset="0">
+        <string notr="true">game.info</string>
        </property>
        <layout class="QVBoxLayout" name="verticalLayout">
         <item alignment="Qt::AlignHCenter">

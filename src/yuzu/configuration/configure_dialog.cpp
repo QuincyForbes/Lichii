@@ -45,6 +45,7 @@
 #include "yuzu/configuration/configure_web.h"
 #include "yuzu/configuration/recommended_settings.h"
 #include "yuzu/hotkeys.h"
+#include "qt_common/config/catalog_text.h"
 #include "yuzu/util/lichii_style.h"
 
 Q_DECLARE_METATYPE(QList<QWidget*>);
@@ -97,7 +98,7 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
         sidebar_layout->setSpacing(6);
         search_field = new QLineEdit(sidebar);
         search_field->setObjectName(QStringLiteral("settingsSearch"));
-        search_field->setPlaceholderText(tr("Search settings"));
+        search_field->setPlaceholderText(UiText::Text("search.settings"));
         search_field->setClearButtonEnabled(true);
         search_field->addAction(LichiiStyle::Icon(QStringLiteral("search"),
                                                   LichiiStyle::Current().secondary),
@@ -163,10 +164,10 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
     // The recommended settings for this PC replace the global values, then the dialog closes so
     // its pages don't write their old values back.
     QPushButton* recommended = ui->buttonBox->addButton(
-        tr("Use Recommended Settings for This Device..."), QDialogButtonBox::ResetRole);
+        UiText::Text("recommended.use") + QStringLiteral("..."), QDialogButtonBox::ResetRole);
     recommended->setEnabled(!system.IsPoweredOn());
     recommended->setToolTip(system.IsPoweredOn()
-                                ? tr("Stop the game first: it has its own values loaded.")
+                                ? UiText::Text("recommended.stop_game")
                                 : tr("Shows what changes, and why, before anything is set."));
     connect(recommended, &QAbstractButton::clicked, this, [this, &vk_device_records] {
         if (RecommendedSettings::ConfirmAndApply(this, *builder, vk_device_records)) {
@@ -303,42 +304,47 @@ void ConfigureDialog::HandleApplyButtonClicked() {
 void ConfigureDialog::PopulateSelectionList() {
     // The iOS app's settings root: Graphics, Controls, Audio, System, then Games & Data, then the
     // desktop app's own pages, and Advanced last. Each page shows its tabs one under the other.
+    using UiText::Text;
     std::vector<Page> fresh{
-        {tr("Graphics"),
+        {Text("page.graphics"),
          QStringLiteral("monitor"),
          {},
          {},
-         {{tr("Graphics"), graphics_tab.get()},
-          {tr("Advanced Graphics"), graphics_advanced_tab.get()}}},
-        {tr("Controls"), QStringLiteral("gamepad-2"), {}, {}, {{tr("Hotkeys"), hotkeys_tab.get()}},
+         {{Text("page.graphics"), graphics_tab.get()},
+          {Text("section.advanced_graphics"), graphics_advanced_tab.get()}}},
+        {Text("page.controls"),
+         QStringLiteral("gamepad-2"),
+         {},
+         {},
+         {{Text("section.hotkeys"), hotkeys_tab.get()}},
          true},
-        {tr("Audio"), QStringLiteral("volume-2"), {}, {}, {{tr("Audio"), audio_tab.get()}}},
-        {tr("System"),
+        {Text("page.audio"), QStringLiteral("volume-2"), {}, {},
+         {{Text("page.audio"), audio_tab.get()}}},
+        {Text("page.system"),
          QStringLiteral("cpu"),
          {},
          {},
-         {{tr("System"), system_tab.get()},
-          {tr("CPU"), cpu_tab.get()},
-          {tr("System Applets"), applets_tab.get()},
-          {tr("Network"), network_tab.get()}}},
-        {tr("Users"), QStringLiteral("users"), tr("Games & Data"), {},
-         {{tr("Users"), profile_tab.get()}}},
-        {tr("Storage"), QStringLiteral("hard-drive"), {}, {},
-         {{tr("Storage"), filesystem_tab.get()}}},
-        {tr("General"),
+         {{Text("page.system"), system_tab.get()},
+          {Text("section.cpu"), cpu_tab.get()},
+          {Text("category.LibraryApplet"), applets_tab.get()},
+          {Text("section.network"), network_tab.get()}}},
+        {Text("page.users"), QStringLiteral("users"), Text("group.games_data"), {},
+         {{Text("page.users"), profile_tab.get()}}},
+        {Text("page.storage"), QStringLiteral("hard-drive"), {}, {},
+         {{Text("page.storage"), filesystem_tab.get()}}},
+        {Text("page.general"),
          QStringLiteral("settings"),
-         tr("App"),
+         Text("group.app"),
          {},
-         {{tr("General"), general_tab.get()},
-          {tr("Interface"), ui_tab.get()},
-          {tr("Web Service"), web_tab.get()}}},
-        {tr("Advanced"),
+         {{Text("page.general"), general_tab.get()},
+          {Text("section.interface"), ui_tab.get()},
+          {Text("section.web_service"), web_tab.get()}}},
+        {Text("page.advanced"),
          QStringLiteral("wrench"),
          {},
-         tr("These settings are for testing and troubleshooting. If a game stops starting after a "
-            "change here, set it back."),
-         {{tr("Graphics Hacks & Extensions"), graphics_extensions_tab.get()},
-          {tr("Debug"), debug_tab_tab.get()}}},
+         Text("advanced.warning"),
+         {{Text("section.hacks_extensions"), graphics_extensions_tab.get()},
+          {Text("section.debug"), debug_tab_tab.get()}}},
     };
     if (pages.empty()) {
         pages = std::move(fresh);
@@ -502,7 +508,7 @@ void ConfigureDialog::OnSearchChanged(const QString& text) {
                     place += QStringLiteral(" \u203A ") + title;
                 }
                 if (!widget->isVisibleTo(content)) {
-                    place += tr(" (shown when it applies)");
+                    place += QStringLiteral(" (%1)").arg(UiText::Text("search.hidden_now"));
                 }
                 auto* const item = new QListWidgetItem(LichiiStyle::Icon(page.icon),
                                                        widget->Label() + QLatin1Char('\n') + place);
@@ -533,13 +539,13 @@ void ConfigureDialog::OnSearchChanged(const QString& text) {
         }
     }
     if (search_results->count() == 0) {
-        auto* const none = new QListWidgetItem(tr("No Results for \u201C%1\u201D").arg(query));
+        auto* const none = new QListWidgetItem(UiText::Text("search.no_results").arg(query));
         none->setFlags(Qt::NoItemFlags);
         search_results->addItem(none);
     }
     if (!unavailable.isEmpty()) {
         auto* const heading =
-            new QListWidgetItem(tr("Not Available on %1").arg(LichiiStyle::PlatformName()));
+            new QListWidgetItem(UiText::Text("search.unavailable").arg(LichiiStyle::PlatformName()));
         heading->setFlags(Qt::NoItemFlags);
         QFont font = heading->font();
         font.setBold(true);

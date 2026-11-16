@@ -64,8 +64,8 @@
        <property name="visible">
         <bool>false</bool>
        </property>
-       <property name="title">
-        <string>CPU Backend</string>
+       <property name="catalogueKey" stdset="0">
+        <string notr="true">cpu_backend</string>
        </property>
        <layout class="QVBoxLayout">
         <item>
@@ -91,8 +91,8 @@
      </item>
      <item>
       <widget class="QGroupBox" name="unsafe_group">
-       <property name="title">
-        <string>CPU Unsafe Optimizations</string>
+       <property name="catalogueText" stdset="0">
+        <string notr="true">category.CpuUnsafe</string>
        </property>
        <layout class="QVBoxLayout">
         <item>

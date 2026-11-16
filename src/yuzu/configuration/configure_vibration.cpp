@@ -7,10 +7,12 @@
 #include "hid_core/hid_types.h"
 #include "ui_configure_vibration.h"
 #include "yuzu/configuration/configure_vibration.h"
+#include "qt_common/config/catalog_text.h"
 
 ConfigureVibration::ConfigureVibration(QWidget* parent, Core::HID::HIDCore& hid_core_)
     : QDialog(parent), ui(std::make_unique<Ui::ConfigureVibration>()), hid_core{hid_core_} {
     ui->setupUi(this);
+    UiText::ApplyCatalogue(this);
 
     vibration_groupboxes = {
         ui->vibrationGroupPlayer1, ui->vibrationGroupPlayer2, ui->vibrationGroupPlayer3,
@@ -79,6 +81,7 @@ void ConfigureVibration::changeEvent(QEvent* event) {
 
 void ConfigureVibration::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }
 
 void ConfigureVibration::VibrateController(Core::HID::ControllerTriggerType type,

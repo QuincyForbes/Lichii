@@ -39,8 +39,8 @@
          <layout class="QHBoxLayout" name="horizontalLayout_2">
           <item>
            <widget class="QLabel" name="language_label">
-            <property name="text">
-             <string>Interface language:</string>
+            <property name="catalogueKey" stdset="0">
+             <string notr="true">language</string>
             </property>
            </widget>
           </item>
@@ -78,29 +78,29 @@
        <layout class="QVBoxLayout" name="GeneralVerticalLayout">
         <item>
          <widget class="QCheckBox" name="show_add_ons">
-          <property name="text">
-           <string>Show Add-Ons Column</string>
+          <property name="catalogueKey" stdset="0">
+           <string notr="true">show_add_ons</string>
           </property>
          </widget>
         </item>
         <item>
          <widget class="QCheckBox" name="show_size">
-          <property name="text">
-           <string>Show Size Column</string>
+          <property name="catalogueKey" stdset="0">
+           <string notr="true">show_size</string>
           </property>
          </widget>
         </item>
         <item>
          <widget class="QCheckBox" name="show_types">
-          <property name="text">
-           <string>Show File Types Column</string>
+          <property name="catalogueKey" stdset="0">
+           <string notr="true">show_types</string>
           </property>
          </widget>
         </item>
         <item>
          <widget class="QCheckBox" name="show_play_time">
-          <property name="text">
-           <string>Show Play Time Column</string>
+          <property name="catalogueKey" stdset="0">
+           <string notr="true">show_play_time</string>
           </property>
          </widget>
         </item>
@@ -108,8 +108,8 @@
          <layout class="QHBoxLayout" name="folder_icon_size_qhbox_layout_2">
           <item>
            <widget class="QLabel" name="folder_icon_size_label">
-            <property name="text">
-             <string>Folder Icon Size:</string>
+            <property name="catalogueKey" stdset="0">
+             <string notr="true">folder_icon_size</string>
             </property>
            </widget>
           </item>
@@ -122,8 +122,8 @@
          <layout class="QHBoxLayout" name="row_1_qhbox_layout">
           <item>
            <widget class="QLabel" name="row_1_label">
-            <property name="text">
-             <string>Row 1 Text:</string>
+            <property name="catalogueKey" stdset="0">
+             <string notr="true">row_1_text_id</string>
             </property>
            </widget>
           </item>
@@ -136,8 +136,8 @@
          <layout class="QHBoxLayout" name="row_2_qhbox_layout">
           <item>
            <widget class="QLabel" name="row_2_label">
-            <property name="text">
-             <string>Row 2 Text:</string>
+            <property name="catalogueKey" stdset="0">
+             <string notr="true">row_2_text_id</string>
             </property>
            </widget>
           </item>
@@ -161,8 +161,8 @@
        <layout class="QVBoxLayout" name="verticalLayout_3">
         <item>
          <widget class="QCheckBox" name="enable_screenshot_save_as">
-          <property name="text">
-           <string>Ask Where To Save Screenshots (Windows Only)</string>
+          <property name="catalogueKey" stdset="0">
+           <string notr="true">enable_screenshot_save_as</string>
           </property>
          </widget>
         </item>
@@ -215,8 +215,8 @@
           </item>
           <item row="0" column="0">
            <widget class="QLabel" name="label_3">
-            <property name="text">
-             <string>Resolution:</string>
+            <property name="catalogueKey" stdset="0">
+             <string notr="true">screenshot_height</string>
             </property>
            </widget>
           </item>

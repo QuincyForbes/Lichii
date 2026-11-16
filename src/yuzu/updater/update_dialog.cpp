@@ -166,7 +166,7 @@ UpdateDialog::UpdateDialog(const Common::Net::Release& release,
         ui->groupBox->setHidden(true);
         m_asset = assets[0];
 
-        if (m_asset.name == "Standard" &&
+        if (m_asset.name == "Standard" && // catalog-check: ok
             std::string_view{Common::g_build_release_platform}.ends_with("-pgo")) {
             ui->version->setText(
                 ui->version->text() +

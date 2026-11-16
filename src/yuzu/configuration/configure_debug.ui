@@ -81,8 +81,8 @@
                 <verstretch>0</verstretch>
                </sizepolicy>
               </property>
-              <property name="text">
-               <string>Enable GDB Stub</string>
+              <property name="catalogueKey" stdset="0">
+               <string notr="true">use_gdbstub</string>
               </property>
              </widget>
             </item>
@@ -115,8 +115,8 @@
                    <verstretch>0</verstretch>
                   </sizepolicy>
                  </property>
-                 <property name="text">
-                  <string>Port:</string>
+                 <property name="catalogueKey" stdset="0">
+                  <string notr="true">gdbstub_port</string>
                  </property>
                 </widget>
                </item>
@@ -186,8 +186,8 @@
                 <verstretch>0</verstretch>
                </sizepolicy>
               </property>
-              <property name="text">
-               <string>Global Log Filter</string>
+              <property name="catalogueKey" stdset="0">
+               <string notr="true">log_filter</string>
               </property>
              </widget>
             </item>
@@ -220,41 +220,16 @@
             </property>
             <item>
              <widget class="QLabel" name="gpu_log_level_label">
-              <property name="text">
-               <string>GPU Logging/Level</string>
+              <property name="catalogueKey" stdset="0">
+               <string notr="true">gpu_log_level</string>
               </property>
              </widget>
             </item>
             <item>
              <widget class="QComboBox" name="gpu_log_level">
-              <property name="toolTip">
-               <string>Detail level for GPU logs. Off disables logging entirely.</string>
+              <property name="catalogueKey" stdset="0">
+               <string notr="true">gpu_log_level</string>
               </property>
-              <item>
-               <property name="text">
-                <string>Off</string>
-               </property>
-              </item>
-              <item>
-               <property name="text">
-                <string>Errors</string>
-               </property>
-              </item>
-              <item>
-               <property name="text">
-                <string>Standard</string>
-               </property>
-              </item>
-              <item>
-               <property name="text">
-                <string>Verbose</string>
-               </property>
-              </item>
-              <item>
-               <property name="text">
-                <string>All</string>
-               </property>
-              </item>
              </widget>
             </item>
            </layout>
@@ -272,11 +247,8 @@
            <property name="enabled">
             <bool>true</bool>
            </property>
-           <property name="toolTip">
-            <string>When checked, the max size of the log increases from 100 MB to 1 GB</string>
-           </property>
-           <property name="text">
-            <string>Enable Extended Logging**</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">extended_logging</string>
            </property>
           </widget>
          </item>
@@ -314,8 +286,8 @@
         <layout class="QHBoxLayout" name="horizontalLayout_4">
          <item>
           <widget class="QLabel" name="label_3">
-           <property name="text">
-            <string>Arguments String</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">program_args</string>
            </property>
           </widget>
          </item>
@@ -337,11 +309,8 @@
         <layout class="QGridLayout" name="gridLayout_2">
          <item row="4" column="0">
           <widget class="QCheckBox" name="disable_loop_safety_checks">
-           <property name="toolTip">
-            <string>When checked, it executes shaders without loop logic changes</string>
-           </property>
-           <property name="text">
-            <string>Disable Loop safety checks</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">disable_shader_loop_safety_checks</string>
            </property>
           </widget>
          </item>
@@ -350,21 +319,15 @@
            <property name="enabled">
             <bool>true</bool>
            </property>
-           <property name="toolTip">
-            <string>When checked, it will dump all the macro programs of the GPU</string>
-           </property>
-           <property name="text">
-            <string>Dump Maxwell Macros</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">dump_macros</string>
            </property>
           </widget>
          </item>
          <item row="3" column="0">
           <widget class="QCheckBox" name="enable_nsight_aftermath">
-           <property name="toolTip">
-            <string>When checked, it enables Nsight Aftermath crash dumps</string>
-           </property>
-           <property name="text">
-            <string>Enable Nsight Aftermath</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">nsight_aftermath</string>
            </property>
           </widget>
          </item>
@@ -373,18 +336,15 @@
            <property name="enabled">
             <bool>true</bool>
            </property>
-           <property name="toolTip">
-            <string>When checked, it will dump original Maxwell guest shader bytecode (the input to the recompiler) as .ash files under DumpDir/shaders/. Useful for inspection with nvdisasm.</string>
-           </property>
-           <property name="text">
-            <string>Dump Guest (Maxwell) Shaders</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">dump_guest_shaders</string>
            </property>
           </widget>
          </item>
          <item row="1" column="0">
           <widget class="QCheckBox" name="enable_renderdoc_hotkey">
-           <property name="text">
-            <string>Enable Renderdoc Hotkey</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">renderdoc_hotkey</string>
            </property>
           </widget>
          </item>
@@ -393,11 +353,8 @@
            <property name="enabled">
             <bool>true</bool>
            </property>
-           <property name="toolTip">
-            <string>When checked, it disables the macro Just In Time compiler. Enabling this makes games run slower</string>
-           </property>
-           <property name="text">
-            <string>Disable Macro JIT</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">disable_macro_jit</string>
            </property>
           </widget>
          </item>
@@ -406,11 +363,8 @@
            <property name="enabled">
             <bool>true</bool>
            </property>
-           <property name="toolTip">
-            <string>When checked, it disables the macro HLE functions. Enabling this makes games run slower</string>
-           </property>
-           <property name="text">
-            <string>Disable Macro HLE</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">disable_macro_hle</string>
            </property>
           </widget>
          </item>
@@ -419,21 +373,15 @@
            <property name="enabled">
             <bool>true</bool>
            </property>
-           <property name="toolTip">
-            <string>When checked, the graphics API enters a slower debugging mode</string>
-           </property>
-           <property name="text">
-            <string>Enable Graphics Debugging</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">debug</string>
            </property>
           </widget>
          </item>
          <item row="11" column="0">
           <widget class="QCheckBox" name="frame_gen_dump_flow">
-           <property name="toolTip">
-            <string>When checked, frame generation writes its optical flow fields to the dump folder. Very slow; for debugging frame generation only.</string>
-           </property>
-           <property name="text">
-            <string>Dump Frame Generation Optical Flow</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">frame_gen_dump_flow</string>
            </property>
           </widget>
          </item>
@@ -455,31 +403,22 @@
          </item>
          <item row="2" column="0">
           <widget class="QCheckBox" name="enable_shader_feedback">
-           <property name="toolTip">
-            <string>When checked, Lichii will log statistics about the compiled pipeline cache</string>
-           </property>
-           <property name="text">
-            <string>Enable Shader Feedback</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">shader_feedback</string>
            </property>
           </widget>
          </item>
          <item row="5" column="0">
           <widget class="QCheckBox" name="disable_buffer_reorder">
-           <property name="toolTip">
-            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;When checked, disables reordering of mapped memory uploads which allows to associate uploads with specific draws. May reduce performance in some cases.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-           </property>
-           <property name="text">
-            <string>Disable Buffer Reorder</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">disable_buffer_reorder</string>
            </property>
           </widget>
          </item>
          <item row="7" column="0">
           <widget class="QCheckBox" name="gpu_log_shader_dumps">
-           <property name="toolTip">
-            <string>When checked, it will dump the recompiler's output SPIR-V binaries (.spv) under LogDir/shaders/. Inspect via SPIRV-Tools (spirv-dis / spirv-cross / spirv-val) or RenderDoc.</string>
-           </property>
-           <property name="text">
-            <string>Dump SPIR-V Shaders</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">gpu_log_shader_dumps</string>
            </property>
           </widget>
          </item>
@@ -494,53 +433,50 @@
         <layout class="QGridLayout" name="gridLayout_4">
          <item row="3" column="0">
           <widget class="QCheckBox" name="perform_vulkan_check">
-           <property name="toolTip">
-            <string>Enables Lichii to check for a working Vulkan environment when the program starts up. Disable this if this is causing issues with external programs seeing Lichii.</string>
-           </property>
-           <property name="text">
-            <string>Perform Startup Vulkan Check</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">perform_vulkan_check</string>
            </property>
           </widget>
          </item>
          <item row="4" column="0">
           <widget class="QCheckBox" name="disable_web_applet">
-           <property name="text">
-            <string>Disable Web Applet</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">disable_web_applet</string>
            </property>
           </widget>
          </item>
          <item row="5" column="0">
           <widget class="QCheckBox" name="enable_all_controllers">
-           <property name="text">
-            <string>Enable All Controller Types</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">enable_all_controllers</string>
            </property>
           </widget>
          </item>
          <item row="6" column="0">
           <widget class="QCheckBox" name="use_auto_stub">
-           <property name="text">
-            <string>Enable Auto-Stub</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">use_auto_stub</string>
            </property>
           </widget>
          </item>
          <item row="0" column="0">
           <widget class="QCheckBox" name="quest_flag">
-           <property name="text">
-            <string>Kiosk (Quest) Mode</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">quest_flag</string>
            </property>
           </widget>
          </item>
          <item row="1" column="0">
           <widget class="QCheckBox" name="use_dev_keys">
-           <property name="text">
-            <string>Use dev.keys</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">use_dev_keys</string>
            </property>
           </widget>
          </item>
          <item row="2" column="0">
           <widget class="QCheckBox" name="use_debug_asserts">
-           <property name="text">
-            <string>Enable Debug Asserts</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">use_debug_asserts</string>
            </property>
           </widget>
          </item>
@@ -598,8 +534,8 @@
                 <verstretch>0</verstretch>
                </sizepolicy>
               </property>
-              <property name="text">
-               <string>Battery Serial:</string>
+              <property name="catalogueKey" stdset="0">
+               <string notr="true">serial_battery</string>
               </property>
              </widget>
             </item>
@@ -638,8 +574,8 @@
                 <verstretch>0</verstretch>
                </sizepolicy>
               </property>
-              <property name="text">
-               <string>Debug Knobs:</string>
+              <property name="catalogueKey" stdset="0">
+               <string notr="true">debug_knobs</string>
               </property>
              </widget>
             </item>
@@ -651,9 +587,6 @@
               <property name="maximum">
                <number>65535</number>
               </property>
-              <property name="toolTip">
-               <string>Bitmask for quick development toggles</string>
-              </property>
               <property name="statusTip">
                <string>Set debug knobs (bitmask)</string>
               </property>
@@ -662,6 +595,9 @@
               </property>
               <property name="suffix">
                <string> (bitmask)</string>
+              </property>
+              <property name="catalogueKey" stdset="0">
+               <string notr="true">debug_knobs</string>
               </property>
              </widget>
             </item>
@@ -697,8 +633,8 @@
                 <verstretch>0</verstretch>
                </sizepolicy>
               </property>
-              <property name="text">
-               <string>Unit Serial:</string>
+              <property name="catalogueKey" stdset="0">
+               <string notr="true">serial_unit</string>
               </property>
              </widget>
             </item>
@@ -726,39 +662,36 @@
          </item>
          <item row="1" column="0">
           <widget class="QCheckBox" name="dump_audio_commands">
-           <property name="toolTip">
-            <string>Enable this to output the latest generated audio command list to the console. Only affects games using the audio renderer.</string>
-           </property>
-           <property name="text">
-            <string>Dump Audio Commands To Console**</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">dump_audio_commands</string>
            </property>
           </widget>
          </item>
          <item row="2" column="0">
           <widget class="QCheckBox" name="flush_line">
-           <property name="text">
-            <string>Flush log output on each line</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">flush_line</string>
            </property>
           </widget>
          </item>
          <item row="3" column="0">
           <widget class="QCheckBox" name="fs_access_log">
-           <property name="text">
-            <string>Enable FS Access Log</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">enable_fs_access_log</string>
            </property>
           </widget>
          </item>
          <item row="4" column="0">
           <widget class="QCheckBox" name="reporting_services">
-           <property name="text">
-            <string>Enable Verbose Reporting Services**</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">reporting_services</string>
            </property>
           </widget>
          </item>
          <item row="5" column="0">
           <widget class="QCheckBox" name="censor_username">
-           <property name="text">
-            <string>Censor username in logs</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">censor_username</string>
            </property>
           </widget>
          </item>

@@ -149,7 +149,10 @@ void GatherDeviceInfo() {
     utsname name{};
     uname(&name);
     CopyString(info.machine, sizeof(info.machine), name.machine);
-    info.is_ipad = std::strncmp(name.machine, "iPad", 4) == 0 ? 1 : 0;
+    info.is_ipad = (std::strncmp(name.machine, "iPad", 4) == 0 ||
+                    UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad)
+                       ? 1
+                       : 0;
 
     const NSOperatingSystemVersion os = [[NSProcessInfo processInfo] operatingSystemVersion];
     info.os_major = static_cast<int>(os.majorVersion);

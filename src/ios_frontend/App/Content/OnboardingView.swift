@@ -190,7 +190,7 @@ struct OnboardingView: View {
             if let progress = library.importProgress {
                 ImportProgressBanner(progress: progress)
             }
-            ActionButton(title: "Import Games", busy: false) {
+            ActionButton(title: UiText.text("library.import"), busy: false) {
                 importer = .games
             }
             Text("\(library.games.count) game\(library.games.count == 1 ? "" : "s") in the library")

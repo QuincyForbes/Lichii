@@ -10,10 +10,12 @@
 #include "core/internal_network/network_interface.h"
 #include "ui_configure_network.h"
 #include "yuzu/configuration/configure_network.h"
+#include "qt_common/config/catalog_text.h"
 
 ConfigureNetwork::ConfigureNetwork(const Core::System& system_, QWidget* parent)
     : QWidget(parent), ui(std::make_unique<Ui::ConfigureNetwork>()), system{system_} {
     ui->setupUi(this);
+    UiText::ApplyCatalogue(this);
     for (const auto& iface : Network::GetAvailableNetworkInterfaces())
         ui->network_interface->addItem(QString::fromStdString(iface.name));
     this->SetConfiguration();
@@ -36,6 +38,7 @@ void ConfigureNetwork::changeEvent(QEvent* event) {
 
 void ConfigureNetwork::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }
 
 void ConfigureNetwork::SetConfiguration() {

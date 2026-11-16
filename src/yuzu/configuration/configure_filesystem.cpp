@@ -16,10 +16,12 @@
 #include "qt_common/util/game.h"
 #include "ui_configure_filesystem.h"
 #include "yuzu/configuration/configure_filesystem.h"
+#include "qt_common/config/catalog_text.h"
 
 ConfigureFilesystem::ConfigureFilesystem(QWidget* parent)
     : QWidget(parent), ui(std::make_unique<Ui::ConfigureFilesystem>()) {
     ui->setupUi(this);
+    UiText::ApplyCatalogue(this);
     SetConfiguration();
 
     connect(ui->nand_directory_button, &QToolButton::pressed, this,
@@ -279,4 +281,5 @@ void ConfigureFilesystem::UpdateEnabledControls() {
 
 void ConfigureFilesystem::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }

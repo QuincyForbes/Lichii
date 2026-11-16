@@ -16,6 +16,7 @@
 #include "ui_configure_cpu.h"
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_cpu.h"
+#include "qt_common/config/catalog_text.h"
 
 ConfigureCpu::ConfigureCpu(const Core::System& system_,
                            std::shared_ptr<std::vector<ConfigurationShared::Tab*>> group_,
@@ -23,6 +24,7 @@ ConfigureCpu::ConfigureCpu(const Core::System& system_,
     : Tab(group_, parent), ui{std::make_unique<Ui::ConfigureCpu>()}, system{system_},
       combobox_translations(builder.ComboboxTranslations()) {
     ui->setupUi(this);
+    UiText::ApplyCatalogue(this);
 
     Setup(builder);
 
@@ -116,4 +118,5 @@ void ConfigureCpu::changeEvent(QEvent* event) {
 
 void ConfigureCpu::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }

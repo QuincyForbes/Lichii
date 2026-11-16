@@ -134,8 +134,8 @@
           <height>16777215</height>
          </size>
         </property>
-        <property name="title">
-         <string>Console Mode</string>
+        <property name="catalogueKey" stdset="0">
+         <string notr="true">use_docked_mode</string>
         </property>
         <layout class="QHBoxLayout" name="horizontalLayout">
          <property name="spacing">
@@ -175,11 +175,11 @@
       </item>
       <item>
        <widget class="QGroupBox" name="vibrationGroup">
-        <property name="title">
-         <string>Vibration</string>
-        </property>
         <property name="checkable">
          <bool>true</bool>
+        </property>
+        <property name="catalogueKey" stdset="0">
+         <string notr="true">vibration_enabled</string>
         </property>
         <layout class="QHBoxLayout" name="horizontalLayout_2">
          <property name="leftMargin">
@@ -221,11 +221,11 @@
       </item>
       <item>
        <widget class="QGroupBox" name="motionGroup">
-        <property name="title">
-         <string>Motion</string>
-        </property>
         <property name="checkable">
          <bool>true</bool>
+        </property>
+        <property name="catalogueKey" stdset="0">
+         <string notr="true">motion_enabled</string>
         </property>
         <layout class="QHBoxLayout" name="horizontalLayout_3">
          <property name="leftMargin">

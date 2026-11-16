@@ -18,10 +18,12 @@
 #include "common/settings.h"
 #include "qt_common/config/uisettings.h"
 #include "ui_configure_web.h"
+#include "qt_common/config/catalog_text.h"
 
 ConfigureWeb::ConfigureWeb(QWidget* parent)
     : QWidget(parent), ui(std::make_unique<Ui::ConfigureWeb>()), m_rng{QRandomGenerator::system()} {
     ui->setupUi(this);
+    UiText::ApplyCatalogue(this);
 
     QString user_regex = QStringLiteral(".{4,20}");
     QString token_regex = QStringLiteral("[a-z]{48}");
@@ -65,6 +67,7 @@ void ConfigureWeb::changeEvent(QEvent* event) {
 
 void ConfigureWeb::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }
 
 void ConfigureWeb::SetConfiguration() {

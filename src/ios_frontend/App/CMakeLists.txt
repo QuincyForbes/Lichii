@@ -25,6 +25,7 @@ add_library(lichii_ios_app STATIC
     SettingsModel.swift
     SettingsView.swift
     Theme.swift
+    UiText.swift
     Content/AddonsView.swift
     Content/CheatsView.swift
     Content/ContentBridge.swift

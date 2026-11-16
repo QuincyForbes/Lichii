@@ -12,10 +12,12 @@
 #include "qt_common/qt_compat.h"
 #include "ui_configure_input_advanced.h"
 #include "yuzu/configuration/configure_input_advanced.h"
+#include "qt_common/config/catalog_text.h"
 
 ConfigureInputAdvanced::ConfigureInputAdvanced(Core::HID::HIDCore& hid_core_, QWidget* parent)
     : QWidget(parent), ui(std::make_unique<Ui::ConfigureInputAdvanced>()), hid_core{hid_core_} {
     ui->setupUi(this);
+    UiText::ApplyCatalogue(this);
 
     controllers_color_buttons = {{
         {
@@ -198,6 +200,7 @@ void ConfigureInputAdvanced::changeEvent(QEvent* event) {
 
 void ConfigureInputAdvanced::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }
 
 void ConfigureInputAdvanced::UpdateUIEnabled() {

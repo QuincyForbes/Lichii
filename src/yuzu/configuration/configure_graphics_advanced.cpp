@@ -14,6 +14,7 @@
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_graphics_advanced.h"
 #include "yuzu/configuration/shared_widget.h"
+#include "qt_common/config/catalog_text.h"
 
 ConfigureGraphicsAdvanced::ConfigureGraphicsAdvanced(
     const Core::System& system_, std::shared_ptr<std::vector<ConfigurationShared::Tab*>> group_,
@@ -21,6 +22,8 @@ ConfigureGraphicsAdvanced::ConfigureGraphicsAdvanced(
     : Tab(group_, parent), ui{std::make_unique<Ui::ConfigureGraphicsAdvanced>()}, system{system_} {
 
     ui->setupUi(this);
+
+    UiText::ApplyCatalogue(this);
 
     Setup(builder);
 
@@ -93,6 +96,7 @@ void ConfigureGraphicsAdvanced::changeEvent(QEvent* event) {
 
 void ConfigureGraphicsAdvanced::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }
 
 void ConfigureGraphicsAdvanced::ExposeComputeOption() {

@@ -10,14 +10,14 @@ import UIKit
 enum PlatformEntries {
     static var settingsLinks: [SettingsLink] {
         [
-            SettingsLink(id: "experiments", title: "Memory & Experiments", systemImage: "memorychip",
+            SettingsLink(id: "experiments", title: UiText.text("page.experiments"), systemImage: "memorychip.fill",
                          view: { AnyView(ExperimentsView()) }),
         ]
     }
 
     static var gameActions: [GameAction] {
         [
-            GameAction(id: "shaders", title: "Shader Cache", systemImage: "archivebox",
+            GameAction(id: "shaders", title: UiText.text("page.shader_cache"), systemImage: "archivebox",
                        view: { AnyView(ShaderCacheView(game: $0)) }),
         ]
     }
@@ -34,10 +34,12 @@ private func flag(_ value: Int32) -> String {
 /// Device rows of the settings header: model, GPU, memory budget and the defaults tier.
 struct DeviceInfoRows: View {
     var body: some View {
+        let memTitle = UiText.text("experiments.memory.title")
         if let info = PlatformCenter.deviceInfo {
-            LabeledContent("Model", value: "\(PlatformCenter.text(info.machine)), iOS \(info.os_major).\(info.os_minor)")
+            let osName = info.is_ipad != 0 ? "iPadOS" : "iOS"
+            LabeledContent("Model", value: "\(PlatformCenter.text(info.machine)), \(osName) \(info.os_major).\(info.os_minor)")
             LabeledContent("GPU", value: PlatformCenter.text(info.gpu_name))
-            LabeledContent("Memory", value: "\(mib(info.physical_memory_mib)), \(mib(info.available_memory_mib)) free for Lichii")
+            LabeledContent(memTitle, value: "\(mib(info.physical_memory_mib)), \(mib(info.available_memory_mib)) free for Lichii")
             LabeledContent("Increased Memory Limit", value: flag(info.increased_memory_limit))
             LabeledContent("Extended Virtual Addressing", value: flag(info.extended_virtual_addressing))
             if let defaults = PlatformCenter.deviceDefaults {
@@ -50,8 +52,9 @@ struct DeviceInfoRows: View {
                 }
             }
         } else {
-            LabeledContent("Model", value: "\(UIDevice.current.model), iOS \(UIDevice.current.systemVersion)")
-            LabeledContent("Memory", value: UInt64(ProcessInfo.processInfo.physicalMemory).byteCount)
+            let osName = Theme.isPad ? "iPadOS" : "iOS"
+            LabeledContent("Model", value: "\(UIDevice.current.model), \(osName) \(UIDevice.current.systemVersion)")
+            LabeledContent(memTitle, value: UInt64(ProcessInfo.processInfo.physicalMemory).byteCount)
         }
     }
 }
@@ -232,7 +235,7 @@ struct UncleanExitView: View {
     /// Off when the sheet opened; stays in view once switched on here.
     @State private var fileGuestWasOff = !GuestMemoryFile.enabled
 
-    /// The run was without Keep Guest Memory in a File: offered to switch it on here.
+    /// The run was without file_guest: offered to switch it on here.
     private var offerFile: Bool {
         session.fileGuest != true && fileGuestWasOff
     }
@@ -314,7 +317,7 @@ struct ShaderCacheView: View {
                 Text(status).foregroundStyle(.secondary)
             }
         }
-        .navigationTitle("Shader Cache")
+        .navigationTitle(UiText.text("page.shader_cache"))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
@@ -344,11 +347,17 @@ struct ShaderCacheSettingsSection: View {
 
     var body: some View {
         Section {
-            LabeledContent("Shader Caches", value: bytes.map { $0.byteCount } ?? "...")
+            HStack(spacing: 12) {
+                SettingsIconBadge(systemImage: "archivebox.fill", color: Theme.badgeColor(for: "shaders"))
+                Text("Shader Caches")
+                Spacer()
+                Text(bytes.map { $0.byteCount } ?? "...")
+                    .foregroundStyle(.secondary)
+            }
             Button("Clear All Shader Caches", role: .destructive) { confirm = true }
                 .disabled(bytes == 0 || !PlatformCenter.canClearShaderCache(0))
         } header: {
-            Text("Storage")
+            Text(UiText.text("page.storage"))
         } footer: {
             Text("Games build their shaders again the next time they run.")
         }
@@ -363,8 +372,8 @@ struct ShaderCacheSettingsSection: View {
     }
 }
 
-/// Experiments > Keep Guest Memory in a File: what it does, and the storage it needs against what
-/// is free. Also offered after a game was closed by iOS.
+/// Experiments > file_guest: what it does, and the storage it needs against what is free.
+/// Also offered after a game was closed by iOS.
 struct GuestMemoryFileSection: View {
     @State private var enabled = GuestMemoryFile.enabled
     @State private var storage = GuestMemoryFile.storage
@@ -374,8 +383,8 @@ struct GuestMemoryFileSection: View {
         Section {
             Toggle(isOn: $enabled) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Keep Guest Memory in a File")
-                    Text("Recommended for large games")
+                    Text(UiText.experimentLabel("file_guest"))
+                    Text(UiText.text("experiments.large_games.subtitle"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -395,9 +404,14 @@ struct GuestMemoryFileSection: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         } header: {
-            Text("Large Games")
+            Text(UiText.text("experiments.large_games.title"))
         } footer: {
-            Text("A game's own memory is most of what Lichii uses while it runs, and iOS closes Lichii when it uses too much. This moves that memory into a temporary file in storage, which iOS doesn't count: large games such as Ocarina of Time need it to get past their first areas.\n\nThe file can grow to \(GuestMemoryFile.size(storage?.file_mib ?? 14336)) and needs \(GuestMemoryFile.size(storage?.needed_mib ?? 10240)) of free storage when the game starts. Expect some stutter while a game loads, and a few GB written to storage per session (about 2.5 GB in Ocarina of Time). The file is deleted when the game stops. Takes effect the next time a game starts\(Bridge.emuState.inGame ? "; quit the game to change it" : "").")
+            Text(UiText.format(
+                "experiments.large_games.footer",
+                GuestMemoryFile.size(storage?.file_mib ?? 14336),
+                GuestMemoryFile.size(storage?.needed_mib ?? 10240),
+                Bridge.emuState.inGame ? UiText.text("experiments.large_games.quit_first") : ""
+            ))
         }
         .onAppear { storage = GuestMemoryFile.storage }
     }
@@ -406,569 +420,100 @@ struct GuestMemoryFileSection: View {
         switch fit {
         case .full: return "Enough free storage: the whole file is reserved when a game starts."
         case .partial: return "Enough free storage to start. With less than \(GuestMemoryFile.size(storage?.full_mib ?? 16384)) free, part of the file is reserved as the game uses it."
-        case .short: return "Not enough free storage: games start without the file, and iOS may close Lichii in large games. Free up storage in the Settings app > General > iPhone Storage."
+        case .short:
+            let storageSetting = Theme.isPad ? "iPad Storage" : "iPhone Storage"
+            return "Not enough free storage: games start without the file, and iOS may close Lichii in large games. Free up storage in the Settings app > General > \(storageSetting)."
         case .unknown: return "Free storage couldn't be read; Lichii checks again when a game starts."
         }
     }
 }
 
-/// Opt-in switches of the platform layer, audio mixing and the per-device defaults.
+/// One toggle row for a `UiText.ExperimentEntry`.
+private struct ExperimentToggleRow: View {
+    let entry: UiText.ExperimentEntry
+    @State private var enabled: Bool
+
+    init(entry: UiText.ExperimentEntry) {
+        self.entry = entry
+        _enabled = State(initialValue: entry.id.withCString { lichii_platform_experiment($0) != 0 })
+    }
+
+    var body: some View {
+        Toggle(entry.label, isOn: $enabled)
+            .onChange(of: enabled) { _, value in
+                entry.id.withCString { lichii_platform_set_experiment($0, value ? 1 : 0) }
+            }
+    }
+}
+
+/// Opt-in switches of the platform layer, audio mixing and the per-device defaults, generated
+/// from `common/ui_catalog`.
 struct ExperimentsView: View {
     @ObservedObject private var platform = PlatformCenter.shared
-    @State private var untaggedGuest = lichii_platform_experiment("untagged_guest") != 0
-    @State private var noZeroTrim = lichii_platform_experiment("no_zero_trim") != 0
-    @State private var chunkedGuest = lichii_platform_experiment("chunked_guest") != 0
-    @State private var nupInMemory = lichii_platform_experiment("nup_in_memory") != 0
-    @State private var mallocCensus = lichii_platform_experiment("malloc_census") != 0
-    @State private var noEarlySubmits = lichii_platform_experiment("no_early_submits") != 0
-    @State private var noMeshEmulation = lichii_platform_experiment("no_mesh_emulation") != 0
-    @State private var mvkUint8Indices = lichii_platform_experiment("mvk_uint8_indices") != 0
-    @State private var nativePerPrimitive = lichii_platform_experiment("native_per_primitive") != 0
-    @State private var mvkShaderDump = lichii_platform_experiment("mvk_shader_dump") != 0
-    @State private var tcOldEviction = lichii_platform_experiment("tc_old_eviction") != 0
-    @State private var helperQosOff = lichii_platform_experiment("helper_qos_off") != 0
-    @State private var frameDeadlines = lichii_platform_experiment("frame_deadlines") != 0
-    @State private var jitOldTables = lichii_platform_experiment("jit_old_tables") != 0
-    @State private var fenceSubmitEach = lichii_platform_experiment("fence_submit_each") != 0
-    @State private var renderPassesOld = lichii_platform_experiment("render_passes_old") != 0
-    @State private var ootGameUpscale = lichii_platform_experiment("oot_game_upscale") != 0
-    @State private var guestCoresFirst = lichii_platform_experiment("guest_cores_first") != 0
-    @State private var ootNarrowAffinity = lichii_platform_experiment("oot_narrow_affinity") != 0
-    @State private var ootIdealAffinity = lichii_platform_experiment("oot_ideal_affinity") != 0
-    @State private var guestIdleSpin = lichii_platform_experiment("guest_idle_spin") != 0
-    @State private var perfSchedOff = lichii_platform_experiment("perf_sched_off") != 0
-    @State private var frameTimeOff = lichii_platform_experiment("frame_time_off") != 0
-    @State private var frameTimeGuest = lichii_platform_experiment("frame_time_guest") != 0
-    @State private var splitStdWaits = lichii_platform_experiment("split_std_waits") != 0
-    @State private var pollYield = lichii_platform_experiment("poll_yield") != 0
-    @State private var targetlessFull = lichii_platform_experiment("targetless_full") != 0
-    @State private var jitInlineExclusives = lichii_platform_experiment("jit_inline_exclusives") != 0
-    @State private var jitLoadFaults = lichii_platform_experiment("jit_load_faults") != 0
-    @State private var cpuWritesOld = lichii_platform_experiment("cpu_writes_old") != 0
-    @State private var gpuReadsOld = lichii_platform_experiment("gpu_reads_old") != 0
-    @State private var hotPagesOff = lichii_platform_experiment("hot_pages_off") != 0
-    @State private var uboZeroTails = lichii_platform_experiment("ubo_zero_tails") != 0
-    @State private var releaseSubmit = lichii_platform_experiment("release_submit") != 0
-    @State private var idleSubmitGrace = lichii_platform_experiment("idle_submit_grace") != 0
-    @State private var idleHoldOff = lichii_platform_experiment("idle_hold_off") != 0
-    @State private var meshComputeInPass = lichii_platform_experiment("mesh_compute_in_pass") != 0
-    @State private var dispatchChain = lichii_platform_experiment("dispatch_chain") != 0
-    @State private var emulateAllMesh = lichii_platform_experiment("emulate_all_mesh") != 0
-    @State private var dispatchDeps = lichii_platform_experiment("dispatch_deps") != 0
-    @State private var metalTraceOff = lichii_platform_experiment("metal_trace_off") != 0
-    @State private var metalCheckOff = lichii_platform_experiment("metal_check_off") != 0
-    @State private var metalFixedStateOff = lichii_platform_experiment("metal_fixed_state_off") != 0
-    @State private var metalCachePlain = lichii_platform_experiment("metal_cache_plain") != 0
-    @State private var metalMslPlain = lichii_platform_experiment("metal_msl_plain") != 0
-    @State private var metalCopiesPlain = lichii_platform_experiment("metal_copies_plain") != 0
-    @State private var metalSamplersPlain = lichii_platform_experiment("metal_samplers_plain") != 0
-    @State private var metalMsaaOff = lichii_platform_experiment("metal_msaa_off") != 0
-    @State private var metalFormatsPlain = lichii_platform_experiment("metal_formats_plain") != 0
-    @State private var metalLayersOff = lichii_platform_experiment("metal_layers_off") != 0
-    @State private var metalMultiRangeOff = lichii_platform_experiment("metal_multirange_off") != 0
-    @State private var metalClearsPlain = lichii_platform_experiment("metal_clears_plain") != 0
-    @State private var metalBarrierOff = lichii_platform_experiment("metal_barrier_off") != 0
-    @State private var metalStatePlain = lichii_platform_experiment("metal_state_plain") != 0
-    @State private var metalAheadOff = lichii_platform_experiment("metal_ahead_off") != 0
-    @State private var metalFencesPlain = lichii_platform_experiment("metal_fences_plain") != 0
-    @State private var metalStagingPlain = lichii_platform_experiment("metal_staging_plain") != 0
-    @State private var metalNetworkRuns = lichii_platform_experiment("metal_network_runs") != 0
-    @State private var metalPrebuildOff = lichii_platform_experiment("metal_prebuild_off") != 0
-    @State private var metalTemporalOff = lichii_platform_experiment("metal_temporal_off") != 0
-    @State private var metalMeshEmulated = lichii_platform_experiment("metal_mesh_emulated") != 0
-    @State private var metalVertexPlain = lichii_platform_experiment("metal_vertex_plain") != 0
-    @State private var metalAsyncOff = lichii_platform_experiment("metal_async_off") != 0
-    @State private var metalProvokingFirst = lichii_platform_experiment("metal_provoking_first") != 0
-    @State private var metalConditionCpu = lichii_platform_experiment("metal_condition_cpu") != 0
-    @State private var metalIndirectCpu = lichii_platform_experiment("metal_indirect_cpu") != 0
-    @State private var metalDrawTextureOff = lichii_platform_experiment("metal_draw_texture_off") != 0
-    @State private var metalClearLayersOff = lichii_platform_experiment("metal_clear_layers_off") != 0
-    @State private var metalListCopiesOff = lichii_platform_experiment("metal_list_copies_off") != 0
-    @State private var metalViewportsOff = lichii_platform_experiment("metal_viewports_off") != 0
-    @State private var metalFillLinesOff = lichii_platform_experiment("metal_fill_lines_off") != 0
-    @State private var metalTessBaseOff = lichii_platform_experiment("metal_tess_base_off") != 0
-    @State private var metalAlphaToOneOff = lichii_platform_experiment("metal_alpha_to_one_off") != 0
-    @State private var metalActorOff = lichii_platform_experiment("metal_actor_off") != 0
-    @State private var metalEffectsOff = lichii_platform_experiment("metal_effects_off") != 0
-    @State private var metalVulkanSwitchesOff = lichii_platform_experiment("metal_vulkan_switches_off") != 0
-    @State private var metalFenceBatchOff = lichii_platform_experiment("metal_fence_batch_off") != 0
-    @State private var metalFiltersOff = lichii_platform_experiment("metal_filters_off") != 0
-    @State private var metalStandinOff = lichii_platform_experiment("metal_standin_off") != 0
-    @State private var metalBindmemoOff = lichii_platform_experiment("metal_bindmemo_off") != 0
-    @State private var metalPacingOff = lichii_platform_experiment("metal_pacing_off") != 0
-    @State private var metalColorspaceOff = lichii_platform_experiment("metal_colorspace_off") != 0
-    @State private var metalEvictOff = lichii_platform_experiment("metal_evict_off") != 0
-    @State private var pipelineHoldsOld = lichii_platform_experiment("pipeline_holds_old") != 0
-    @State private var pipelineListOld = lichii_platform_experiment("pipeline_list_old") != 0
-    @State private var mvkStatsOff = lichii_platform_experiment("mvk_stats_off") != 0
-    @State private var queryCutsOff = lichii_platform_experiment("query_cuts_off") != 0
-    @State private var fenceCutsOff = lichii_platform_experiment("fence_cuts_off") != 0
-    @State private var protectLocked = lichii_platform_experiment("protect_locked") != 0
-    @State private var wordsPoolOff = lichii_platform_experiment("words_pool_off") != 0
-    @State private var resumePublishOff = lichii_platform_experiment("resume_publish_off") != 0
-    @State private var collectSplitOff = lichii_platform_experiment("collect_split_off") != 0
-    @State private var usageResetFull = lichii_platform_experiment("usage_reset_full") != 0
+    @State private var query = ""
+
+    private func matchingExperiments(in section: String) -> [UiText.ExperimentEntry] {
+        let items = UiText.experiments(in: section)
+        guard !query.isEmpty else { return items }
+        return items.filter {
+            $0.label.localizedCaseInsensitiveContains(query) ||
+                $0.id.localizedCaseInsensitiveContains(query)
+        }
+    }
 
     var body: some View {
         List {
-            GuestMemoryFileSection()
-
-            Section {
-                Toggle("Give Back Zeroed Guest Memory", isOn: $chunkedGuest)
-                    .onChange(of: chunkedGuest) { value in
-                        lichii_platform_set_experiment("chunked_guest", value ? 1 : 0)
-                    }
-            } header: {
-                Text("Memory Savings")
-            } footer: {
-                Text("Untested on a device; applies the next time Lichii starts. Splits guest memory into 2 MB pieces and returns the ones holding only zeros to iOS (about 0.5 GB in Ocarina of Time). To do that safely Lichii stops all of its threads for about a millisecond at a time, which may show as a stutter. No effect while Keep Guest Memory in a File or Count Guest Memory per Mapping is on.")
+            if query.isEmpty {
+                GuestMemoryFileSection()
             }
 
-            Section {
-                Toggle("Count Guest Memory per Mapping", isOn: $untaggedGuest)
-                    .onChange(of: untaggedGuest) { value in
-                        lichii_platform_set_experiment("untagged_guest", value ? 1 : 0)
+            ForEach(UiText.experimentSections, id: \.self) { section in
+                let items = matchingExperiments(in: section)
+                if !items.isEmpty {
+                    Section {
+                        ForEach(items) { entry in
+                            ExperimentToggleRow(entry: entry)
+                        }
+                    } header: {
+                        Text(UiText.text("experiments.\(section).title"))
+                    } footer: {
+                        if query.isEmpty {
+                            Text(UiText.text("experiments.\(section).footer"))
+                        }
                     }
-                Toggle("Zero Page Trimming Off", isOn: $noZeroTrim)
-                    .onChange(of: noZeroTrim) { value in
-                        lichii_platform_set_experiment("no_zero_trim", value ? 1 : 0)
-                    }
-                Toggle("Keep Decompressed Game Files in Memory", isOn: $nupInMemory)
-                    .onChange(of: nupInMemory) { value in
-                        lichii_platform_set_experiment("nup_in_memory", value ? 1 : 0)
-                    }
-                Toggle("Count Memory Blocks in the Log", isOn: $mallocCensus)
-                    .onChange(of: mallocCensus) { value in
-                        lichii_platform_set_experiment("malloc_census", value ? 1 : 0)
-                    }
-            } header: {
-                Text("Memory")
-            } footer: {
-                Text("Guest memory normally counts once toward the limit iOS closes Lichii at. Per mapping is the old accounting: pages both the game and the emulator touch count twice, and all-zero pages are trimmed.\n\nCompressed files of a .nup game are normally kept in memory up to 96 MB once read, and files over 48 MB (a movie, a texture archive) are unpacked to temporary files in storage instead. Keep Decompressed Game Files in Memory is the old behaviour: up to 512 MB in memory. Turn it on if a game that used to start no longer does.\n\nCount Memory Blocks in the Log writes what Lichii's own memory holds, by block size, to the log 60 s and 180 s into a game (always once when memory runs low). While it counts, threads that need memory wait.\n\nLink Moves With the Camera Only: with MetalFX Temporal in Ocarina of Time, the Metal renderer now tells MetalFX how Link himself moved (his animation from one frame to the next), as the Vulkan renderer does, so he trails less. On, his pixels get the camera's motion only, as before; turn it on if Link smears or flickers with a new build.\n\nNo Effects Mask for MetalFX: with MetalFX Temporal in Ocarina of Time (iOS 18 and later), the Metal renderer now marks where Navi's glow, fireflies and dust were drawn so MetalFX takes those pixels from this frame instead of blending in earlier ones, as the Vulkan renderer does. On, no such mask is made, as before; turn it on if glows flicker or the game got slower with a new build.\n\nAll six apply the next time Lichii starts.")
+                }
             }
 
-            Section {
-                Toggle("Early Submits During Loads Off", isOn: $noEarlySubmits)
-                    .onChange(of: noEarlySubmits) { value in
-                        lichii_platform_set_experiment("no_early_submits", value ? 1 : 0)
-                    }
-                Toggle("Mesh Shader Emulation Off", isOn: $noMeshEmulation)
-                    .onChange(of: noMeshEmulation) { value in
-                        lichii_platform_set_experiment("no_mesh_emulation", value ? 1 : 0)
-                    }
-                Toggle("MoltenVK Converts 8-bit Indices", isOn: $mvkUint8Indices)
-                    .onChange(of: mvkUint8Indices) { value in
-                        lichii_platform_set_experiment("mvk_uint8_indices", value ? 1 : 0)
-                    }
-                Toggle("Native Per-Primitive Mesh Attributes", isOn: $nativePerPrimitive)
-                    .onChange(of: nativePerPrimitive) { value in
-                        lichii_platform_set_experiment("native_per_primitive", value ? 1 : 0)
-                    }
-                Toggle("MoltenVK Writes Its Shaders to Storage", isOn: $mvkShaderDump)
-                    .onChange(of: mvkShaderDump) { value in
-                        lichii_platform_set_experiment("mvk_shader_dump", value ? 1 : 0)
-                    }
-                Toggle("No Metal Crash Log Lines", isOn: $metalTraceOff)
-                    .onChange(of: metalTraceOff) { value in
-                        lichii_platform_set_experiment("metal_trace_off", value ? 1 : 0)
-                    }
-                Toggle("Metal Takes the Game's Draw State Unchecked", isOn: $metalCheckOff)
-                    .onChange(of: metalCheckOff) { value in
-                        lichii_platform_set_experiment("metal_check_off", value ? 1 : 0)
-                    }
-            } header: {
-                Text("Graphics")
-            } footer: {
-                Text("For tracking down crashes. Early submits hand the GPU a scene load's texture uploads in parts, which keeps graphics memory down while a level loads; off, a large load can run out of memory. Mesh shader emulation draws some of Ocarina of Time's foliage and walls; off, they are missing. MoltenVK Converts 8-bit Indices is the old way of drawing models stored with 8-bit indices, which crashed Ocarina of Time entering Kokiri Forest; Lichii now converts them itself. Native Per-Primitive Mesh Attributes builds one of Ocarina of Time's mesh shaders the way it was built before, which the iPhone's shader compiler refused at every start; Lichii now draws it with the emulation. MoltenVK Writes Its Shaders to Storage saves every shader as MoltenVK hands it to Metal in dump/mvk-shaders (thousands of files, slower start), to find out why that one is refused; turn both on for that. No Metal Crash Log Lines is for the Metal renderer (Graphics API): normally Lichii writes a log line when the app aborts or an exception goes uncaught, and asks Metal which step of a failed command buffer failed; on, it does neither, as before. Metal Takes the Game's Draw State Unchecked is for the Metal renderer too: Metal closes the app when a draw's vertex layout, targets or a texture are outside what it takes (Ocarina of Time's first draw was), so Lichii now rewrites the vertex layout to what the shader reads, keeps 1D textures as 2D ones a pixel high and skips a draw or a texture view Metal would still reject, with a line in the log; on, Metal gets the state as the game set it, as before.\n\nAll seven apply the next time Lichii starts.")
-            }
-
-            Section {
-                Toggle("Old Texture Eviction", isOn: $tcOldEviction)
-                    .onChange(of: tcOldEviction) { value in
-                        lichii_platform_set_experiment("tc_old_eviction", value ? 1 : 0)
-                    }
-                Toggle("Helper Threads at Full Priority", isOn: $helperQosOff)
-                    .onChange(of: helperQosOff) { value in
-                        lichii_platform_set_experiment("helper_qos_off", value ? 1 : 0)
-                    }
-                Toggle("Frame Deadlines for the CPU", isOn: $frameDeadlines)
-                    .onChange(of: frameDeadlines) { value in
-                        lichii_platform_set_experiment("frame_deadlines", value ? 1 : 0)
-                    }
-                Toggle("Old JIT Tables", isOn: $jitOldTables)
-                    .onChange(of: jitOldTables) { value in
-                        lichii_platform_set_experiment("jit_old_tables", value ? 1 : 0)
-                    }
-                Toggle("Submit at Every Fence", isOn: $fenceSubmitEach)
-                    .onChange(of: fenceSubmitEach) { value in
-                        lichii_platform_set_experiment("fence_submit_each", value ? 1 : 0)
-                    }
-                Toggle("Render Passes as Before", isOn: $renderPassesOld)
-                    .onChange(of: renderPassesOld) { value in
-                        lichii_platform_set_experiment("render_passes_old", value ? 1 : 0)
-                    }
-                Toggle("Game's Own Upscale Pass", isOn: $ootGameUpscale)
-                    .onChange(of: ootGameUpscale) { value in
-                        lichii_platform_set_experiment("oot_game_upscale", value ? 1 : 0)
-                    }
-                Toggle("Full-Size Passes Without Targets", isOn: $targetlessFull)
-                    .onChange(of: targetlessFull) { value in
-                        lichii_platform_set_experiment("targetless_full", value ? 1 : 0)
-                    }
-                Toggle("Zero Uniform Buffer Tails", isOn: $uboZeroTails)
-                    .onChange(of: uboZeroTails) { value in
-                        lichii_platform_set_experiment("ubo_zero_tails", value ? 1 : 0)
-                    }
-                Toggle("Submit at Every Fence Release", isOn: $releaseSubmit)
-                    .onChange(of: releaseSubmit) { value in
-                        lichii_platform_set_experiment("release_submit", value ? 1 : 0)
-                    }
-                Toggle("GPU Thread Waits for More Work", isOn: $idleSubmitGrace)
-                    .onChange(of: idleSubmitGrace) { value in
-                        lichii_platform_set_experiment("idle_submit_grace", value ? 1 : 0)
-                    }
-                Toggle("GPU Thread Submits When Idle", isOn: $idleHoldOff)
-                    .onChange(of: idleHoldOff) { value in
-                        lichii_platform_set_experiment("idle_hold_off", value ? 1 : 0)
-                    }
-                Toggle("Mesh Emulation Ends Its Pass", isOn: $meshComputeInPass)
-                    .onChange(of: meshComputeInPass) { value in
-                        lichii_platform_set_experiment("mesh_compute_in_pass", value ? 1 : 0)
-                    }
-                Toggle("Back-to-Back Dispatches Without Barriers", isOn: $dispatchChain)
-                    .onChange(of: dispatchChain) { value in
-                        lichii_platform_set_experiment("dispatch_chain", value ? 1 : 0)
-                    }
-                Toggle("Emulate Every Mesh Shader", isOn: $emulateAllMesh)
-                    .onChange(of: emulateAllMesh) { value in
-                        lichii_platform_set_experiment("emulate_all_mesh", value ? 1 : 0)
-                    }
-                Toggle("Log What Ties Dispatches to Render Passes", isOn: $dispatchDeps)
-                    .onChange(of: dispatchDeps) { value in
-                        lichii_platform_set_experiment("dispatch_deps", value ? 1 : 0)
-                    }
-            } header: {
-                Text("Performance")
-            } footer: {
-                Text("For comparing builds. Old Texture Eviction reads textures the GPU drew back from the GPU before freeing them, a wait for the GPU each time, even when the game draws them again anyway. Helper Threads at Full Priority gives the timing and present threads the same priority as the game's. Frame Deadlines for the CPU tells iOS each frame's deadline, which may keep the game on the performance cores; untested on a device. Old JIT Tables keeps the translated code's bookkeeping as it was (about 0.3 GB more memory in Ocarina of Time); turn it on if a game that used to run crashes. Submit at Every Fence hands the GPU the game's work at every game fence, as before, instead of in batches of up to 2 ms (76-95 command buffers a frame in Ocarina of Time's Kokiri Forest on an iPhone); turn it on if the screen flashes white. Render Passes as Before ends the GPU's render pass for every buffer copy and parked clear, as before, instead of moving copies ahead of the pass (each ended pass stores and loads the whole screen again); turn it on if parts of the picture show stale or wrong data. Game's Own Upscale Pass runs Ocarina of Time's own upscale from its scene to the screen size, as before, instead of one bilinear tap whenever MetalFX Temporal doesn't take the frame (the game's pass was about 40 % of the phone's GPU time in Kokiri Forest); turn it on if the picture looks wrong. Full-Size Passes Without Targets gives a draw that writes no image a render pass of the game's full surface size, as before (32768x32768 in Ocarina of Time, about 6-7 % of the phone's GPU time), instead of only the pixels it can reach; turn it on if lens flares or glows behave differently. Zero Uniform Buffer Tails fills the unused rest of each uniform buffer a shader indexes with zeros, as before (about 75 % of the uniform bytes Lichii wrote in Kokiri Forest); turn it on if models or effects look wrong. Submit at Every Fence Release hands the GPU its work every time the game waits on a GPU value, as before, even when nothing waits for that work (about 11 command buffers a frame in Kokiri Forest); turn it on if the screen flashes or stutters. GPU Thread Waits for More Work lets the GPU thread, once it runs out of commands, wait up to 0.25 ms for more before it hands the GPU what it has (about 5 fewer command buffers a frame on a PC, but it keeps a CPU core busy meanwhile); untested on a device. GPU Thread Submits When Idle hands the GPU what the GPU thread has as soon as it runs out of commands, as before, instead of keeping it, asleep, up to 0.5 ms while the GPU still runs what it was handed earlier (about half of the phone's command buffers a frame in Kokiri Forest were such hand-overs; on a PC 2 of 3 of them went away); turn it on if the game stutters or runs slower than before. Mesh Emulation Ends Its Pass ends the render pass for each emulated mesh draw's compute, as before, instead of running that compute just before the pass; turn it on if foliage looks wrong. Back-to-Back Dispatches Without Barriers lets the game's consecutive compute dispatches share one Metal compute pass (the ~150 dispatches a frame in Ocarina of Time otherwise get a pass each); untested on a device, turn it on to compare and off if effects flicker. Emulate Every Mesh Shader draws all mesh shaders (most foliage) through the compute emulation instead of Metal mesh shaders, which hold their outputs in scarce GPU tile memory; untested on a device, for comparing the two. Log What Ties Dispatches to Render Passes writes a \"Dispatch deps\" line every 10 s naming each compute dispatch that ends the screen's render pass and whether it reads that pass's images; it changes nothing that is drawn.\n\nAll sixteen apply the next time Lichii starts.")
-            }
-
-            Section {
-                Toggle("Two Guest Cores First", isOn: $guestCoresFirst)
-                    .onChange(of: guestCoresFirst) { value in
-                        lichii_platform_set_experiment("guest_cores_first", value ? 1 : 0)
-                    }
-                Toggle("Game's Own Thread Cores", isOn: $ootNarrowAffinity)
-                    .onChange(of: ootNarrowAffinity) { value in
-                        lichii_platform_set_experiment("oot_narrow_affinity", value ? 1 : 0)
-                    }
-                Toggle("One Core per Game Thread", isOn: $ootIdealAffinity)
-                    .onChange(of: ootIdealAffinity) { value in
-                        lichii_platform_set_experiment("oot_ideal_affinity", value ? 1 : 0)
-                    }
-                Toggle("Idle Guest Cores Wait Briefly", isOn: $guestIdleSpin)
-                    .onChange(of: guestIdleSpin) { value in
-                        lichii_platform_set_experiment("guest_idle_spin", value ? 1 : 0)
-                    }
-                Toggle("No CPU Scheduling Log Lines", isOn: $perfSchedOff)
-                    .onChange(of: perfSchedOff) { value in
-                        lichii_platform_set_experiment("perf_sched_off", value ? 1 : 0)
-                    }
-                Toggle("Graphics Threads Declare No Frame Time", isOn: $frameTimeOff)
-                    .onChange(of: frameTimeOff) { value in
-                        lichii_platform_set_experiment("frame_time_off", value ? 1 : 0)
-                    }
-                Toggle("Guest Cores Declare Frame Time Too", isOn: $frameTimeGuest)
-                    .onChange(of: frameTimeGuest) { value in
-                        lichii_platform_set_experiment("frame_time_guest", value ? 1 : 0)
-                    }
-                Toggle("Graphics Threads Poll Before Sleeping", isOn: $splitStdWaits)
-                    .onChange(of: splitStdWaits) { value in
-                        lichii_platform_set_experiment("split_std_waits", value ? 1 : 0)
-                    }
-                Toggle("Polling Threads Yield", isOn: $pollYield)
-                    .onChange(of: pollYield) { value in
-                        lichii_platform_set_experiment("poll_yield", value ? 1 : 0)
-                    }
-            } header: {
-                Text("CPU Scheduling")
-            } footer: {
-                Text("For finding out why the game's CPU threads run on the efficiency cores. Two Guest Cores First leaves the top priority to two of the six emulated CPU cores and the graphics threads, and runs the other four one step lower, so iOS has fewer threads asking for its two performance cores (on a computer limited to four CPUs this gave Ocarina of Time 25 % more frames). Game's Own Thread Cores lets Ocarina of Time's main threads run only on the cores the game asks for, instead of on any core. One Core per Game Thread keeps each such thread on one core, so one host thread does its work; wins over Game's Own Thread Cores. Idle Guest Cores Wait Briefly keeps an emulated core that runs out of work polling for 20 µs before it sleeps, as on a computer, which saves a wake-up per hand-off but keeps a CPU busy. No CPU Scheduling Log Lines stops the \"Perf threads:\" and \"Perf sched:\" log lines and the counting behind them (thread listing every 10 s, a 20 Hz thread sampler, timestamps at each guest thread switch). Graphics Threads Declare No Frame Time stops Lichii's three graphics threads from telling iOS how much CPU time they need each frame, as before; with it iOS schedules them like audio threads, which on another emulator kept the performance cores faster and busier (\"frame deadlines:\" in the log's Perf line shows what each declared). Turn it on if the game stutters or runs slower than before. Guest Cores Declare Frame Time Too does the same for the emulated CPU cores; untested, and iOS may take it back from a core that never rests. Graphics Threads Poll Before Sleeping lets the two graphics threads poll for up to 64 µs before they sleep waiting on each other, as before. Polling Threads Yield lets the graphics thread that waits for the game to release a GPU value, and threads waiting for the graphics thread to send its work, give up the CPU between checks instead of sleeping 50 µs, as before; when other threads are waiting for a CPU, iOS then runs the yielding thread last for up to 10 ms. It covers the other short waits too (frame pacing, the present hold, a guest write waiting for GPU data to land, shader handover, ring space, kernel thread starts).\n\nAll nine apply the next time Lichii starts.")
-            }
-
-            Section {
-                Toggle("Exclusive Accesses in Fastmem", isOn: $jitInlineExclusives)
-                    .onChange(of: jitInlineExclusives) { value in
-                        lichii_platform_set_experiment("jit_inline_exclusives", value ? 1 : 0)
-                    }
-                Toggle("Loads Keep Fastmem After a Fault", isOn: $jitLoadFaults)
-                    .onChange(of: jitLoadFaults) { value in
-                        lichii_platform_set_experiment("jit_load_faults", value ? 1 : 0)
-                    }
-                Toggle("Writes Next to GPU Data as Before", isOn: $cpuWritesOld)
-                    .onChange(of: cpuWritesOld) { value in
-                        lichii_platform_set_experiment("cpu_writes_old", value ? 1 : 0)
-                    }
-                Toggle("Reads of GPU Data as Before", isOn: $gpuReadsOld)
-                    .onChange(of: gpuReadsOld) { value in
-                        lichii_platform_set_experiment("gpu_reads_old", value ? 1 : 0)
-                    }
-                Toggle("Watch Every Rewritten Page", isOn: $hotPagesOff)
-                    .onChange(of: hotPagesOff) { value in
-                        lichii_platform_set_experiment("hot_pages_off", value ? 1 : 0)
-                    }
-            } header: {
-                Text("Guest Memory Access")
-            } footer: {
-                Text("Exclusive Accesses in Fastmem runs the game's exclusive loads and stores (LDXR/STXR, for locks and counters) directly on guest memory, as on a computer, instead of a call into the emulator each; Ocarina of Time uses none on a computer, other games may. Loads Keep Fastmem After a Fault lets a game load that hit protected memory (a page the GPU wrote) keep reading guest memory directly, and take the slow path only after its eighth such fault instead of the first; on a computer it cut Ocarina of Time's slow loads of GPU pages by 70 % but saved little time. Both are off by default. The \"Perf memory callbacks:\" log line counts both.\n\nWrites Next to GPU Data as Before keeps every game write to a memory page that also holds data the GPU wrote on the slow path until the next GPU sync, as before. Normally Lichii copies the GPU's data on such a page back first and then lets the game write the page directly (on a computer this halved Ocarina of Time's slow writes in Kokiri Forest); turn it on if objects flicker or show stale data. The \"Perf CPU writes:\" log line counts these pages.\n\nReads of GPU Data as Before: when the game reads data the GPU wrote and that data is still on its way back, the graphics thread copies that memory page again and waits until the GPU has finished everything, page after page, as before. Normally the game's thread waits only for the copy that is already under way and takes the data itself, so the graphics thread keeps working (on a computer this cut the time the graphics thread was held by such reads in Kokiri Forest by 93 %); turn it on if the picture's brightness jumps or objects show stale data. The \"Perf CPU reads:\" log line counts these reads and their waits.\n\nWatch Every Rewritten Page write-protects every memory page the game rewrote after each copy to the GPU, as before, so each new write takes the slow path. Normally a page the game rewrites over and over is left unprotected and copied again once per command list it is used in (on a computer this halved Ocarina of Time's slow writes in Kokiri Forest, for about 40 % more buffer copies); turn it on if objects jump, flicker or show stale data. The \"Perf CPU writes:\" log line counts these hot pages.\n\nAll five apply the next time Lichii starts.")
-            }
-
-            Section {
-                Toggle("Shaders Without the Draw's State", isOn: $metalFixedStateOff)
-                    .onChange(of: metalFixedStateOff) { value in
-                        lichii_platform_set_experiment("metal_fixed_state_off", value ? 1 : 0)
-                    }
-                Toggle("Game Memory Access as Before", isOn: $metalCachePlain)
-                    .onChange(of: metalCachePlain) { value in
-                        lichii_platform_set_experiment("metal_cache_plain", value ? 1 : 0)
-                    }
-                Toggle("Shaders Translated as Before", isOn: $metalMslPlain)
-                    .onChange(of: metalMslPlain) { value in
-                        lichii_platform_set_experiment("metal_msl_plain", value ? 1 : 0)
-                    }
-                Toggle("Image Copies as Before", isOn: $metalCopiesPlain)
-                    .onChange(of: metalCopiesPlain) { value in
-                        lichii_platform_set_experiment("metal_copies_plain", value ? 1 : 0)
-                    }
-                Toggle("Samplers as Before", isOn: $metalSamplersPlain)
-                    .onChange(of: metalSamplersPlain) { value in
-                        lichii_platform_set_experiment("metal_samplers_plain", value ? 1 : 0)
-                    }
-                Toggle("No Multisampled Image Copies", isOn: $metalMsaaOff)
-                    .onChange(of: metalMsaaOff) { value in
-                        lichii_platform_set_experiment("metal_msaa_off", value ? 1 : 0)
-                    }
-                Toggle("Formats Metal Lacks as Before", isOn: $metalFormatsPlain)
-                    .onChange(of: metalFormatsPlain) { value in
-                        lichii_platform_set_experiment("metal_formats_plain", value ? 1 : 0)
-                    }
-                Toggle("One Layer per Render Pass", isOn: $metalLayersOff)
-                    .onChange(of: metalLayersOff) { value in
-                        lichii_platform_set_experiment("metal_layers_off", value ? 1 : 0)
-                    }
-                Toggle("Split Storage Buffers as Before", isOn: $metalMultiRangeOff)
-                    .onChange(of: metalMultiRangeOff) { value in
-                        lichii_platform_set_experiment("metal_multirange_off", value ? 1 : 0)
-                    }
-                Toggle("Clears as Before", isOn: $metalClearsPlain)
-                    .onChange(of: metalClearsPlain) { value in
-                        lichii_platform_set_experiment("metal_clears_plain", value ? 1 : 0)
-                    }
-                Toggle("Ignore the Game's Draw Barriers", isOn: $metalBarrierOff)
-                    .onChange(of: metalBarrierOff) { value in
-                        lichii_platform_set_experiment("metal_barrier_off", value ? 1 : 0)
-                    }
-                Toggle("Set All Draw State Every Draw", isOn: $metalStatePlain)
-                    .onChange(of: metalStatePlain) { value in
-                        lichii_platform_set_experiment("metal_state_plain", value ? 1 : 0)
-                    }
-                Toggle("Uploads and Kernels in Their Place", isOn: $metalAheadOff)
-                    .onChange(of: metalAheadOff) { value in
-                        lichii_platform_set_experiment("metal_ahead_off", value ? 1 : 0)
-                    }
-                Toggle("A Command Buffer for Every Fence", isOn: $metalFencesPlain)
-                    .onChange(of: metalFencesPlain) { value in
-                        lichii_platform_set_experiment("metal_fences_plain", value ? 1 : 0)
-                    }
-                Toggle("Upload Buffers Without Bounds", isOn: $metalStagingPlain)
-                    .onChange(of: metalStagingPlain) { value in
-                        lichii_platform_set_experiment("metal_staging_plain", value ? 1 : 0)
-                    }
-                Toggle("Always Run the Anti-Aliasing Network", isOn: $metalNetworkRuns)
-                    .onChange(of: metalNetworkRuns) { value in
-                        lichii_platform_set_experiment("metal_network_runs", value ? 1 : 0)
-                    }
-                Toggle("Build Shaders at First Use Only", isOn: $metalPrebuildOff)
-                    .onChange(of: metalPrebuildOff) { value in
-                        lichii_platform_set_experiment("metal_prebuild_off", value ? 1 : 0)
-                    }
-                Toggle("No MetalFX Temporal in Ocarina of Time", isOn: $metalTemporalOff)
-                    .onChange(of: metalTemporalOff) { value in
-                        lichii_platform_set_experiment("metal_temporal_off", value ? 1 : 0)
-                    }
-                Toggle("Mesh Shaders Through the Emulation", isOn: $metalMeshEmulated)
-                    .onChange(of: metalMeshEmulated) { value in
-                        lichii_platform_set_experiment("metal_mesh_emulated", value ? 1 : 0)
-                    }
-                Toggle("Vertex Input as Before", isOn: $metalVertexPlain)
-                    .onChange(of: metalVertexPlain) { value in
-                        lichii_platform_set_experiment("metal_vertex_plain", value ? 1 : 0)
-                    }
-                Toggle("Build New Shaders on the Draw's Thread", isOn: $metalAsyncOff)
-                    .onChange(of: metalAsyncOff) { value in
-                        lichii_platform_set_experiment("metal_async_off", value ? 1 : 0)
-                    }
-                Toggle("Flat Colours From the First Vertex", isOn: $metalProvokingFirst)
-                    .onChange(of: metalProvokingFirst) { value in
-                        lichii_platform_set_experiment("metal_provoking_first", value ? 1 : 0)
-                    }
-                Toggle("Conditional Draws Decided as Before", isOn: $metalConditionCpu)
-                    .onChange(of: metalConditionCpu) { value in
-                        lichii_platform_set_experiment("metal_condition_cpu", value ? 1 : 0)
-                    }
-                Toggle("Indirect Draws as Before", isOn: $metalIndirectCpu)
-                    .onChange(of: metalIndirectCpu) { value in
-                        lichii_platform_set_experiment("metal_indirect_cpu", value ? 1 : 0)
-                    }
-                Toggle("Skip Texture Draws", isOn: $metalDrawTextureOff)
-                    .onChange(of: metalDrawTextureOff) { value in
-                        lichii_platform_set_experiment("metal_draw_texture_off", value ? 1 : 0)
-                    }
-                Toggle("Clear the Bound Layer Only", isOn: $metalClearLayersOff)
-                    .onChange(of: metalClearLayersOff) { value in
-                        lichii_platform_set_experiment("metal_clear_layers_off", value ? 1 : 0)
-                    }
-                Toggle("GPU-Written Command Lists as Before", isOn: $metalListCopiesOff)
-                    .onChange(of: metalListCopiesOff) { value in
-                        lichii_platform_set_experiment("metal_list_copies_off", value ? 1 : 0)
-                    }
-                Toggle("One Viewport Only", isOn: $metalViewportsOff)
-                    .onChange(of: metalViewportsOff) { value in
-                        lichii_platform_set_experiment("metal_viewports_off", value ? 1 : 0)
-                    }
-                Toggle("Always Fill Triangles", isOn: $metalFillLinesOff)
-                    .onChange(of: metalFillLinesOff) { value in
-                        lichii_platform_set_experiment("metal_fill_lines_off", value ? 1 : 0)
-                    }
-                Toggle("Tessellation Without Base Vertex", isOn: $metalTessBaseOff)
-                    .onChange(of: metalTessBaseOff) { value in
-                        lichii_platform_set_experiment("metal_tess_base_off", value ? 1 : 0)
-                    }
-                Toggle("No Alpha to One", isOn: $metalAlphaToOneOff)
-                    .onChange(of: metalAlphaToOneOff) { value in
-                        lichii_platform_set_experiment("metal_alpha_to_one_off", value ? 1 : 0)
-                    }
-                Toggle("Link Moves With the Camera Only", isOn: $metalActorOff)
-                    .onChange(of: metalActorOff) { value in
-                        lichii_platform_set_experiment("metal_actor_off", value ? 1 : 0)
-                    }
-                Toggle("No Effects Mask for MetalFX", isOn: $metalEffectsOff)
-                    .onChange(of: metalEffectsOff) { value in
-                        lichii_platform_set_experiment("metal_effects_off", value ? 1 : 0)
-                    }
-                Toggle("Ignore Vulkan's Switches", isOn: $metalVulkanSwitchesOff)
-                    .onChange(of: metalVulkanSwitchesOff) { value in
-                        lichii_platform_set_experiment("metal_vulkan_switches_off", value ? 1 : 0)
-                    }
-                Toggle("Commit at Every Fence With Work", isOn: $metalFenceBatchOff)
-                    .onChange(of: metalFenceBatchOff) { value in
-                        lichii_platform_set_experiment("metal_fence_batch_off", value ? 1 : 0)
-                    }
-                Toggle("Plain Window Scaling", isOn: $metalFiltersOff)
-                    .onChange(of: metalFiltersOff) { value in
-                        lichii_platform_set_experiment("metal_filters_off", value ? 1 : 0)
-                    }
-                Toggle("Game's DLSS Without MetalFX", isOn: $metalStandinOff)
-                    .onChange(of: metalStandinOff) { value in
-                        lichii_platform_set_experiment("metal_standin_off", value ? 1 : 0)
-                    }
-                Toggle("Resolve Every Binding Every Draw", isOn: $metalBindmemoOff)
-                    .onChange(of: metalBindmemoOff) { value in
-                        lichii_platform_set_experiment("metal_bindmemo_off", value ? 1 : 0)
-                    }
-                Toggle("No Frame Pacing", isOn: $metalPacingOff)
-                    .onChange(of: metalPacingOff) { value in
-                        lichii_platform_set_experiment("metal_pacing_off", value ? 1 : 0)
-                    }
-                Toggle("Untagged Screen Colours", isOn: $metalColorspaceOff)
-                    .onChange(of: metalColorspaceOff) { value in
-                        lichii_platform_set_experiment("metal_colorspace_off", value ? 1 : 0)
-                    }
-                Toggle("Keep Every Pipeline", isOn: $metalEvictOff)
-                    .onChange(of: metalEvictOff) { value in
-                        lichii_platform_set_experiment("metal_evict_off", value ? 1 : 0)
-                    }
-            } header: {
-                Text("Metal Renderer")
-            } footer: {
-                Text("Only for the Metal renderer (Graphics API). Shaders Without the Draw's State builds the game's shaders as before, without what the draw sets outside the shader: the depth range the game uses, the size of points, the alpha test, blending with two colours and whole-number colour targets. Turn it on if the picture got worse with a new build.\n\nGame Memory Access as Before: when the game reads or writes memory the graphics side also uses, the Metal renderer now handles it the way the Vulkan renderer does (the game's threads wait less for the graphics thread, and the switches under Guest Memory Access apply to it too). On, it handles every such read and write the slow way it did before; turn it on if objects flicker, show stale data or the game hangs with a new build.\n\nShaders Translated as Before: the game's shaders are now turned into Metal shaders with what this iPhone's GPU can do, as the Vulkan renderer's MoltenVK does it. Before, every shader that reads which copy of a model it is drawing was refused (about a fifth of Ocarina of Time's, their draws skipped), and shaders that share values between neighbouring pixels did it in groups of four. On, they are translated as before; turn it on if shaders fail to build or the picture got worse with a new build.\n\nImage Copies as Before: the Metal renderer now copies one depth image into another when the game asks for it, and copies between a compressed image and a plain one whose pixels hold a compressed block each (Ocarina of Time does both). Before, both kinds of copy were skipped. On, they are skipped again; turn it on if the game stops with a new build.\n\nSamplers as Before: the Metal renderer now gives each texture read the sampler Vulkan would: the game's level-of-detail bias and minimum or maximum filtering (on iOS 26), border colours and mirror modes as close as Metal has them, and a variant for each kind of image read. On, every guest sampler is one plain sampler, as before; turn it on if textures look blurred, too sharp or wrongly tiled with a new build.\n\nNo Multisampled Image Copies: images with several samples per pixel are now uploaded, read back, copied and resolved as on Vulkan (Ocarina of Time uses none). On, none of that is done, as before.\n\nFormats Metal Lacks as Before: images in two formats Metal has no texture for (three 32-bit floats, and two 4-bit channels) are now converted to the nearest format it has. On, they get no texture or the wrong one, as before.\n\nOne Layer per Render Pass: drawing into images with layers now reaches every layer a shader picks. On, a render pass gets one layer of each image, as before.\n\nSplit Storage Buffers as Before: a buffer the game reads from several places in memory is now gathered into one. On, only its first part is read, as before.\n\nClears as Before: when the game clears only a rectangle of an image, only some of its colour channels or only some stencil bits, the Metal renderer now does exactly that (Ocarina of Time clears rectangles many times a frame). Before, it cleared the whole image. A clear of a whole image now also waits for the drawing that follows it and is done as that drawing starts, instead of as a step of its own. On, it clears the whole image again, each clear as its own step; turn it on if parts of the picture go missing with a new build.\n\nIgnore the Game's Draw Barriers: when the game draws into an image and then reads that same image in a later draw, it tells the graphics chip so first. The Metal renderer now finishes the drawing done so far at that point, so the later draw reads it. Before, such a draw read the image as it was before any of that drawing. On, the barriers are ignored again; turn it on if the game got slower with a new build.\n\nSet All Draw State Every Draw: the Metal renderer now tells the graphics chip only what changed since the draw before (which shader, which buffers and images, the drawing area and so on). On, it sets everything again for every draw, as before; turn it on if objects are drawn with the wrong image or in the wrong place with a new build.\n\nUploads and Kernels in Their Place: data the game changed, and the small programs that prepare some draws (grass and other models built on the graphics chip, some index lists), used to interrupt the drawing into an image each time; the image was put away and fetched again. Now they are sent ahead of that drawing where nothing in between depends on the order. On, they interrupt the drawing again, as before; turn it on if objects flicker, show stale data or parts of the picture go missing with a new build.\n\nA Command Buffer for Every Fence: the game marks points in its drawing and waits for the graphics chip to reach them. When nothing was drawn since the last such point, the Metal renderer now waits for the work already sent instead of sending an empty batch. On, it sends one every time, as before; turn it on if the game hangs or stutters with a new build.\n\nUpload Buffers Without Bounds: while a place loads, the game sends thousands of images and models at once. The Metal renderer now sends what it has to the graphics chip every 24 MiB so the memory can be used again, waits for it when 96 MiB are held, and gives unused memory back after a few frames. On, there are no such bounds, as before; turn it on if loading got slower or stutters with a new build (Lichii then needs more memory while loading).\n\nAlways Run the Anti-Aliasing Network: with Ocarina of Time's anti-aliasing set to No sharpening, the Metal renderer now skips the game's anti-aliasing network and shows the picture from before it, as the Vulkan renderer does. Before, the setting did nothing on Metal. On, the network runs again whatever the setting says; turn it on if the picture is wrong or stays black with that setting and a new build.\n\nBuild Shaders at First Use Only: the Metal renderer now notes every shader it builds and, when the game starts the next time, builds them all again while the game loads, on several cores, so play does not stop for them. On, nothing is noted or built ahead, as before: each shader is built when it is first drawn, and play waits for it; turn it on if the game stops while loading with a new build.\n\nNo MetalFX Temporal in Ocarina of Time: with the upscaler set to MetalFX Temporal, the Metal renderer now hands Ocarina of Time's picture to MetalFX as the Vulkan renderer does. On, the game's own upscaling (or the simple one) runs instead, as before; turn it on if the picture is wrong or stutters with a new build.\n\nMesh Shaders Through the Emulation: Ocarina of Time draws its grass and some other models with mesh shaders. The Metal renderer now hands them to the iPhone's own mesh shader stage. Before, each was run as a compute program whose output a second draw then drew. On, they go through that emulation again; turn it on if grass or other models are missing or wrong with a new build.\n\nVertex Input as Before: the Metal renderer now draws models stored in three forms Metal can't read directly (with neighbouring-vertex data, with 10-bit whole numbers, or spread over more buffers than Metal takes), converting them first. Ocarina of Time uses none of them. On, such draws are skipped or read wrongly again, as before; turn it on if models are wrong with a new build.\n\nBuild New Shaders on the Draw's Thread: a shader the game uses for the first time is now built on other cores; draws that may be left out meanwhile are, the others wait for it at full priority. On, it is built where the draw is and the game waits, as before; turn it on if objects go missing for longer with a new build.\n\nFlat Colours From the First Vertex: values the game does not blend across a triangle are now taken from the corner the game asks for, as on a PC. On, they come from the first corner, as before and as on MoltenVK; turn it on if draws got slower or look wrong with a new build.\n\nConditional Draws Decided as Before: draws the game makes only if an earlier one showed any pixels are now decided by the graphics chip once it has counted them. On, they are decided from what memory holds at the time, as before; turn it on if objects flicker or the game stutters with a new build.\n\nIndirect Draws as Before: draws whose sizes the graphics chip wrote are now prepared on it (their count, their index lists). On, the sizes are read on the CPU, which waits for the chip, and some of those draws are skipped, as before; turn it on if objects go missing or flicker with a new build.\n\nSkip Texture Draws: when the game draws a picture straight onto the screen image, the Metal renderer now does it. On, such draws are skipped, as before.\n\nClear the Bound Layer Only: a clear of an image with layers now clears the layers the game names. On, only the first, as before.\n\nGPU-Written Command Lists as Before: drawing commands the graphics chip writes for itself are now read from copies made right after they are written, as the Vulkan renderer does. On, the CPU waits for all work first, as before; turn it on if the game hangs or draws the wrong things with a new build.\n\nOne Viewport Only: shaders that pick one of several drawing areas now get all sixteen. On, only the first, as before.\n\nAlways Fill Triangles: triangles the game asks to draw as outlines are now drawn so. On, they are filled, as before.\n\nTessellation Without Base Vertex: tessellated models now start at the vertex the game names. On, they start at vertex 0, as before; turn it on if tessellated ground or water looks torn with a new build.\n\nNo Alpha to One: when the game asks for the alpha of drawn pixels to be set to one, the Metal renderer now does it. On, it is left as drawn, as before.\n\nIgnore Vulkan's Switches: the Metal renderer now follows the Vulkan renderer's switches that it has a counterpart for (on this iPhone that changes one thing: fences sent together, below). On, they are ignored, as before.\n\nCommit at Every Fence With Work: the game's fences that come within 2 ms of the last batch sent to the graphics chip now go with the next one, as on the Vulkan renderer, instead of each in a batch of its own. On, each is sent at once, as before; turn it on if the game hangs or flashes with a new build.\n\nPlain Window Scaling: the scaling filter and anti-aliasing settings (FSR, SGSR, FXAA, SMAA, bicubic, Lanczos and the others) now apply under the Metal renderer as under Vulkan. Before, the picture was always scaled to the screen bilinearly. On, it is again; turn it on if the picture is wrong with one of these settings and a new build.\n\nGame's DLSS Without MetalFX: where the upscaler is not MetalFX Temporal, or MetalFX cannot run, the game's own DLSS is now replaced by the Vulkan renderer's temporal upscaler. On, the game's DLSS runs again, as before; turn it on if the picture is wrong or slower with a new build.\n\nResolve Every Binding Every Draw: the Metal renderer now remembers which image and sampler each of the game's texture slots stood for, as the Vulkan renderer does, and looks again only when the game changed them. On, it looks every draw, as before; turn it on if objects show the wrong image with a new build.\n\nNo Frame Pacing: a game running below the screen's rate now shows every frame for the same number of refreshes, as under the Vulkan renderer (30 fps on a 120 Hz screen: four each, not three and five by turns). On, each frame is shown as soon as it is ready, as before; turn it on if the game feels slower to respond with a new build.\n\nUntagged Screen Colours: the picture is now marked as sRGB, as the Vulkan renderer marks it, so the screen shows its colours as meant. On, it is left unmarked, as before.\n\nKeep Every Pipeline: when iOS says memory is low, the Metal renderer now frees the drawing pipelines no draw used for 10 s or more, as the Vulkan renderer does. On, it keeps them all, as before; turn it on if the game stutters after a memory warning with a new build.\n\nAll of them apply the next time Lichii starts.")
-            }
-
-            Section {
-                Toggle("Held Draws Wait in the Queue", isOn: $pipelineHoldsOld)
-                    .onChange(of: pipelineHoldsOld) { value in
-                        lichii_platform_set_experiment("pipeline_holds_old", value ? 1 : 0)
-                    }
-                Toggle("Used Shader List Saved as Before", isOn: $pipelineListOld)
-                    .onChange(of: pipelineListOld) { value in
-                        lichii_platform_set_experiment("pipeline_list_old", value ? 1 : 0)
-                    }
-                Toggle("No MoltenVK Compile Times", isOn: $mvkStatsOff)
-                    .onChange(of: mvkStatsOff) { value in
-                        lichii_platform_set_experiment("mvk_stats_off", value ? 1 : 0)
-                    }
-            } header: {
-                Text("Shader Builds")
-            } footer: {
-                Text("A draw whose shaders are not built yet either is left out for a frame or waits. Normally the build a draw waits for runs at once on two threads of its own at the waiting thread's priority, and the background builds pause meanwhile. Held Draws Wait in the Queue leaves it in line behind the other builds on the low-priority build threads, as before (waits of 0.1-2.2 s each in Kokiri Forest on an iPhone); turn it on if the game stutters more than before.\n\nLichii keeps a list of the shaders a game really drew and builds those on the loading screen. Normally the list is saved within 10 s of a new shader's first use and when Lichii leaves the foreground. Used Shader List Saved as Before saves it only when a new shader is first drawn 15 s or more after the last save or the game is stopped from the menu, so the shaders first drawn since the last save are missing from it when Lichii is closed from the app switcher.\n\nNo MoltenVK Compile Times stops MoltenVK timing its work (a few timestamps per command buffer), which the \"Perf pipelines:\" log line reports per stage.\n\nAll three apply the next time Lichii starts.")
-            }
-
-            Section {
-                Toggle("GPU Reports Kept as Before", isOn: $queryCutsOff)
-                    .onChange(of: queryCutsOff) { value in
-                        lichii_platform_set_experiment("query_cuts_off", value ? 1 : 0)
-                    }
-                Toggle("Every Fence Wakes the Fence Thread", isOn: $fenceCutsOff)
-                    .onChange(of: fenceCutsOff) { value in
-                        lichii_platform_set_experiment("fence_cuts_off", value ? 1 : 0)
-                    }
-                Toggle("Page Protection Inside the Lock", isOn: $protectLocked)
-                    .onChange(of: protectLocked) { value in
-                        lichii_platform_set_experiment("protect_locked", value ? 1 : 0)
-                    }
-                Toggle("Command Copies Freed at Once", isOn: $wordsPoolOff)
-                    .onChange(of: wordsPoolOff) { value in
-                        lichii_platform_set_experiment("words_pool_off", value ? 1 : 0)
-                    }
-                Toggle("Resumed Lists Sent After Their Copy", isOn: $resumePublishOff)
-                    .onChange(of: resumePublishOff) { value in
-                        lichii_platform_set_experiment("resume_publish_off", value ? 1 : 0)
-                    }
-                Toggle("Page-Crossing Writes as One", isOn: $collectSplitOff)
-                    .onChange(of: collectSplitOff) { value in
-                        lichii_platform_set_experiment("collect_split_off", value ? 1 : 0)
-                    }
-                Toggle("Buffer Use Cleared in Full", isOn: $usageResetFull)
-                    .onChange(of: usageResetFull) { value in
-                        lichii_platform_set_experiment("usage_reset_full", value ? 1 : 0)
-                    }
-            } header: {
-                Text("Graphics Thread Cuts")
-            } footer: {
-                Text("Small savings on the graphics threads, ported from another Lichii fork; none was tried on an iPhone yet. Each switch turns one back to how it was.\n\nGPU Reports Kept as Before: occlusion and counter reports are again looked up, freed and numbered one at a time under a lock. Every Fence Wakes the Fence Thread: each new fence wakes the thread that waits for fences even when it is busy anyway. Page Protection Inside the Lock: when the game writes memory the GPU caches use, the page protection system call runs while the buffer cache stays locked for everyone else. Command Copies Freed at Once: the copies of the game's command lists go back to the system heap instead of being kept for reuse. Resumed Lists Sent After Their Copy: after the game releases a GPU wait, the graphics thread copies the waiting lists before it hands over what it already decoded. Page-Crossing Writes as One: a game write crossing a 2 KB boundary is noted as one piece, as before, which can lose part of it (turn it on only to compare). Buffer Use Cleared in Full: the per-frame record of which parts of a buffer were used is cleared whole instead of only where it was set.\n\nTurn one on if the picture shows stale data, objects flicker or the game stops; all apply the next time Lichii starts.")
-            }
-
-            Section {
-                Toggle("Mix with Other Audio", isOn: $platform.mixWithOtherAudio)
-            } header: {
-                Text("Audio")
-            } footer: {
-                Text("Music or podcasts from other apps keep playing under the game.")
-            }
-
-            if let defaults = PlatformCenter.deviceDefaults {
+            if query.isEmpty {
                 Section {
-                    LabeledContent("Tier", value: PlatformCenter.text(defaults.tier_name))
-                    NavigationLink("Recommended Settings") {
-                        RecommendedSettingsView()
-                    }
+                    Toggle(UiText.text("experiments.mix_audio"), isOn: $platform.mixWithOtherAudio)
                 } header: {
-                    Text("Device")
+                    Text(UiText.text("experiments.audio.title"))
                 } footer: {
-                    Text(PlatformCenter.text(defaults.note))
+                    Text(UiText.text("experiments.audio.footer"))
+                }
+
+                if let defaults = PlatformCenter.deviceDefaults {
+                    Section {
+                        LabeledContent("Tier", value: PlatformCenter.text(defaults.tier_name))
+                        NavigationLink {
+                            RecommendedSettingsView()
+                        } label: {
+                            SettingsRowLabel(
+                                title: UiText.text("page.recommended"),
+                                systemImage: "wand.and.stars",
+                                color: Theme.badgeColor(for: "recommended")
+                            )
+                        }
+                    } header: {
+                        Text(UiText.text("section.device"))
+                    } footer: {
+                        Text(PlatformCenter.text(defaults.note))
+                    }
                 }
             }
         }
-        .navigationTitle("Memory & Experiments")
+        .navigationTitle(UiText.text("page.experiments"))
+        .searchable(text: $query, prompt: UiText.text("search.settings"))
     }
 }

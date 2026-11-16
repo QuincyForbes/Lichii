@@ -22,7 +22,7 @@ struct RecommendedValue: Identifiable {
     @MainActor
     var label: String {
         switch key {
-        case "guest_memory_file": return "Keep Guest Memory in a File"
+        case "guest_memory_file": return UiText.experimentLabel("file_guest")
         case "auto_cool": return "Auto-Cool (Thermal Pacing)"
         default:
             guard let item else { return SettingLabels.title(for: key) }
@@ -35,15 +35,15 @@ struct RecommendedValue: Identifiable {
 
     @MainActor
     var recommendedText: String {
-        item?.displayName(of: value) ?? (value == "true" ? "On" : "Off")
+        item?.displayName(of: value) ?? UiText.text(value == "true" ? "value.on" : "value.off")
     }
 
     /// The value now, in the same words.
     @MainActor
     var currentText: String {
         switch key {
-        case "guest_memory_file": return GuestMemoryFile.enabled ? "On" : "Off"
-        case "auto_cool": return PlatformCenter.shared.autoCool ? "On" : "Off"
+        case "guest_memory_file": return UiText.text(GuestMemoryFile.enabled ? "value.on" : "value.off")
+        case "auto_cool": return UiText.text(PlatformCenter.shared.autoCool ? "value.on" : "value.off")
         default:
             guard let item else { return "" }
             return item.displayName(of: item.value())
@@ -120,11 +120,11 @@ struct RecommendedSettingsView: View {
                 .disabled(Bridge.emuState.inGame || changes.isEmpty)
             } footer: {
                 if Bridge.emuState.inGame {
-                    Text("Quit the game first: it has its own values loaded.")
+                    Text(UiText.text("recommended.stop_game"))
                 } else if done {
-                    Text("Applied. Games use them from their next start; a game's own overrides stay until you reset that game in its settings.")
+                    Text("Applied. \(UiText.text("recommended.applies"))")
                 } else if changes.isEmpty {
-                    Text("Everything is already set as recommended.")
+                    Text(UiText.text("recommended.all_set"))
                 } else {
                     Text("\(changes.count) setting\(changes.count == 1 ? "" : "s") differ from the recommendation (marked below).")
                 }
@@ -152,16 +152,18 @@ struct RecommendedSettingsView: View {
             }
             .id(generation)
         }
-        .navigationTitle("Recommended Settings")
+        .navigationTitle(UiText.text("page.recommended"))
         .onAppear(perform: reload)
-        .confirmationDialog("Change these settings?", isPresented: $confirm, titleVisibility: .visible) {
-            Button("Use Recommended Settings") {
+        .confirmationDialog(UiText.text("recommended.question"), isPresented: $confirm, titleVisibility: .visible) {
+            Button(UiText.text("recommended.use")) {
                 done = RecommendedSettings.apply(values)
                 generation += 1
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(changes.map { "\($0.label): \($0.currentText) → \($0.recommendedText)" }.joined(separator: "\n"))
+            Text(changes.map {
+                UiText.format("change.line", $0.label, $0.currentText, $0.recommendedText)
+            }.joined(separator: "\n"))
         }
     }
 

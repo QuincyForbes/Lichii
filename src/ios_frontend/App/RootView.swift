@@ -12,18 +12,17 @@ struct RootView: View {
     @State private var recommendedPrompt: RecommendedPrompt?
 
     var body: some View {
+        let storageSetting = Theme.isPad ? "iPad Storage" : "iPhone Storage"
         TabView {
             NavigationStack {
                 LibraryView()
             }
             .clearsTabBar()
-            .tabItem { Label("Library", systemImage: "square.grid.2x2") }
+            .tabItem { Label(UiText.text("page.library"), systemImage: "square.grid.2x2") }
 
-            NavigationStack {
-                SettingsView(scope: .global)
-            }
-            .clearsTabBar()
-            .tabItem { Label("Settings", systemImage: "gearshape") }
+            SettingsTabView()
+                .clearsTabBar()
+                .tabItem { Label("Settings", systemImage: "gearshape") }
 
             NavigationStack {
                 JitView()
@@ -54,7 +53,7 @@ struct RootView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: { warning in
-            Text("Keep Guest Memory in a File needs \(GuestMemoryFile.size(warning.storage.needed_mib)) of free storage; \(GuestMemoryFile.size(warning.storage.free_mib)) is free. \(warning.game.title) would start with its memory in RAM, and iOS may close Lichii in a large game. Free up storage in the Settings app > General > iPhone Storage, or start anyway.")
+            Text("\(UiText.experimentLabel("file_guest")) needs \(GuestMemoryFile.size(warning.storage.needed_mib)) of free storage; \(GuestMemoryFile.size(warning.storage.free_mib)) is free. \(warning.game.title) would start with its memory in RAM, and iOS may close Lichii in a large game. Free up storage in the Settings app > General > \(storageSetting), or start anyway.")
         }
         .alert("Use Recommended Settings?", isPresented: Binding(get: { recommendedPrompt != nil },
                                                                  set: { if !$0 { recommendedPrompt = nil } }),
@@ -64,7 +63,7 @@ struct RootView: View {
             }
             Button("Not Now", role: .cancel) {}
         } message: { prompt in
-            Text("These settings differ from what \(prompt.device) should use:\n\n\(prompt.summary)\n\nSettings > Recommended Settings has the reasons and the button for later.")
+            Text("These settings differ from what \(prompt.device) should use:\n\n\(prompt.summary)\n\nSettings > \(UiText.text("page.recommended")) has the reasons and the button for later.")
         }
         .onAppear(perform: offerRecommended)
     }
@@ -81,7 +80,10 @@ struct RootView: View {
         promptedDevice = loaded.device
         recommendedPrompt = RecommendedPrompt(
             device: loaded.device, values: loaded.values,
-            summary: changes.map { "\($0.label): \($0.currentText) → \($0.recommendedText)" }.joined(separator: "\n"))
+            summary: changes.map {
+                UiText.format("change.line", $0.label, $0.currentText, $0.recommendedText)
+            }.joined(separator: "\n")
+        )
     }
 }
 

@@ -32,8 +32,9 @@ struct AppleModel {
     int gpu_family;
 };
 
-// Phones Lichii is run on, newest first (Metal GPU family: 8 A15/A16, 9 A17 Pro/A18, 10 A19).
-constexpr std::array<AppleModel, 18> AppleModels{{
+// Phones and iPads Lichii is run on, newest first (Metal GPU family: 7 M1, 8 A15/A16/M2,
+// 9 A17 Pro/A18/M3/M4, 10 A19/M5).
+constexpr auto AppleModels = std::to_array<AppleModel>({
     {"iPhone18,1", "iPhone 17 Pro", "A19 Pro", 10},
     {"iPhone18,2", "iPhone 17 Pro Max", "A19 Pro", 10},
     {"iPhone18,3", "iPhone 17", "A19", 10},
@@ -52,7 +53,43 @@ constexpr std::array<AppleModel, 18> AppleModels{{
     {"iPhone14,7", "iPhone 14", "A15", 8},
     {"iPhone14,8", "iPhone 14 Plus", "A15", 8},
     {"iPhone14,2", "iPhone 13 Pro", "A15", 8},
-}};
+    {"iPad17,1", "iPad Pro 11-inch (M5)", "M5", 10},
+    {"iPad17,2", "iPad Pro 11-inch (M5)", "M5", 10},
+    {"iPad17,3", "iPad Pro 13-inch (M5)", "M5", 10},
+    {"iPad17,4", "iPad Pro 13-inch (M5)", "M5", 10},
+    {"iPad16,3", "iPad Pro 11-inch (M4)", "M4", 9},
+    {"iPad16,4", "iPad Pro 11-inch (M4)", "M4", 9},
+    {"iPad16,5", "iPad Pro 13-inch (M4)", "M4", 9},
+    {"iPad16,6", "iPad Pro 13-inch (M4)", "M4", 9},
+    {"iPad16,1", "iPad mini (A17 Pro)", "A17 Pro", 9},
+    {"iPad16,2", "iPad mini (A17 Pro)", "A17 Pro", 9},
+    {"iPad15,3", "iPad Air 11-inch (M3)", "M3", 9},
+    {"iPad15,4", "iPad Air 11-inch (M3)", "M3", 9},
+    {"iPad15,5", "iPad Air 13-inch (M3)", "M3", 9},
+    {"iPad15,6", "iPad Air 13-inch (M3)", "M3", 9},
+    {"iPad15,7", "iPad (A16)", "A16", 8},
+    {"iPad15,8", "iPad (A16)", "A16", 8},
+    {"iPad14,8", "iPad Air 11-inch (M2)", "M2", 8},
+    {"iPad14,9", "iPad Air 11-inch (M2)", "M2", 8},
+    {"iPad14,10", "iPad Air 13-inch (M2)", "M2", 8},
+    {"iPad14,11", "iPad Air 13-inch (M2)", "M2", 8},
+    {"iPad14,3", "iPad Pro 11-inch (M2)", "M2", 8},
+    {"iPad14,4", "iPad Pro 11-inch (M2)", "M2", 8},
+    {"iPad14,5", "iPad Pro 12.9-inch (M2)", "M2", 8},
+    {"iPad14,6", "iPad Pro 12.9-inch (M2)", "M2", 8},
+    {"iPad14,1", "iPad mini (6th generation)", "A15", 8},
+    {"iPad14,2", "iPad mini (6th generation)", "A15", 8},
+    {"iPad13,16", "iPad Air (5th generation)", "M1", 7},
+    {"iPad13,17", "iPad Air (5th generation)", "M1", 7},
+    {"iPad13,11", "iPad Pro 12.9-inch (M1)", "M1", 7},
+    {"iPad13,10", "iPad Pro 12.9-inch (M1)", "M1", 7},
+    {"iPad13,9", "iPad Pro 12.9-inch (M1)", "M1", 7},
+    {"iPad13,8", "iPad Pro 12.9-inch (M1)", "M1", 7},
+    {"iPad13,7", "iPad Pro 11-inch (M1)", "M1", 7},
+    {"iPad13,6", "iPad Pro 11-inch (M1)", "M1", 7},
+    {"iPad13,5", "iPad Pro 11-inch (M1)", "M1", 7},
+    {"iPad13,4", "iPad Pro 11-inch (M1)", "M1", 7},
+});
 
 const AppleModel* FindAppleModel(std::string_view model) {
     for (const AppleModel& entry : AppleModels) {
@@ -134,10 +171,13 @@ u64 MarketedGb(u64 memory_mib) {
 
 void RecommendApple(const Device& device, Profile& p) {
     auto& v = values;
+    // M1 is Apple GPU family 7 with an 8-core tablet GPU and 8-16 GB RAM, unlike A14 phones.
+    const int gpu_family = device.chip.starts_with("M") ? std::max(device.apple_gpu_family, 8)
+                                                        : device.apple_gpu_family;
     const MobileTier* row = nullptr;
     for (const MobileTier& candidate : MobileTiers) {
         if (device.memory_mib >= candidate.min_memory_mib &&
-            device.apple_gpu_family >= candidate.min_gpu_family) {
+            gpu_family >= candidate.min_gpu_family) {
             row = &candidate;
             break;
         }

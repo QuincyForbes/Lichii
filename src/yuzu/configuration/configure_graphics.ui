@@ -21,8 +21,8 @@
     <layout class="QVBoxLayout" name="verticalLayout_2">
      <item>
       <widget class="QGroupBox" name="groupBox_2">
-       <property name="title">
-        <string>Renderer</string>
+       <property name="catalogueText" stdset="0">
+        <string notr="true">category.Renderer.desktop</string>
        </property>
        <layout class="QVBoxLayout" name="verticalLayout_3">
         <item>

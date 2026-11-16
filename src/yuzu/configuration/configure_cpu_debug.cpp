@@ -5,10 +5,12 @@
 #include "core/core.h"
 #include "ui_configure_cpu_debug.h"
 #include "yuzu/configuration/configure_cpu_debug.h"
+#include "qt_common/config/catalog_text.h"
 
 ConfigureCpuDebug::ConfigureCpuDebug(const Core::System& system_, QWidget* parent)
     : QWidget(parent), ui{std::make_unique<Ui::ConfigureCpuDebug>()}, system{system_} {
     ui->setupUi(this);
+    UiText::ApplyCatalogue(this);
 
     SetConfiguration();
 }
@@ -75,4 +77,5 @@ void ConfigureCpuDebug::changeEvent(QEvent* event) {
 
 void ConfigureCpuDebug::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }

@@ -226,7 +226,7 @@ struct KeysFirmwareView: View {
                     .disabled(model.firmware?.present != true)
             }
         }
-        .navigationTitle("Keys & Firmware")
+        .navigationTitle(UiText.text("page.keys_firmware"))
         .onAppear { model.refresh() }
         .fileImporter(isPresented: Binding(get: { importer != nil }, set: { if !$0 { importer = nil } }),
                       allowedContentTypes: importer == .firmware ? ContentTypes.firmware : ContentTypes.keys,

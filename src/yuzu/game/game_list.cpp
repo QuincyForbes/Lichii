@@ -27,6 +27,7 @@
 #include "core/file_sys/nup_writer.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
+#include "qt_common/config/catalog_text.h"
 #include "qt_common/config/uisettings.h"
 #include "qt_common/game_list/game_list_p.h"
 #include "qt_common/game_list/model.h"
@@ -161,9 +162,9 @@ void GameList::UpdateHeader() {
     list_button->setIcon(LichiiStyle::Icon(QStringLiteral("list")));
     list_button->setToolTip(tr("Show as List"));
     add_button->setIcon(LichiiStyle::Icon(QStringLiteral("folder-plus")));
-    add_button->setToolTip(tr("Add Game Folder..."));
+    add_button->setToolTip(UiText::Text("library.add_folder"));
     settings_button->setIcon(LichiiStyle::Icon(QStringLiteral("settings")));
-    settings_button->setToolTip(tr("Settings"));
+    settings_button->setToolTip(UiText::Text("page.settings"));
     const auto mode = UISettings::values.game_list_mode.GetValue();
     grid_button->setChecked(mode == Settings::GameListMode::GridView);
     list_button->setChecked(mode == Settings::GameListMode::TreeView);
@@ -594,7 +595,7 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
         edit_nup = context_menu.addAction(tr("Edit NUP Metadata..."));
         edit_nup->setEnabled(!nup_conversion_running);
     }
-    QAction* properties = context_menu.addAction(tr("Game Settings"));
+    QAction* properties = context_menu.addAction(UiText::Text("page.game_settings"));
 
     favorite->setVisible(program_id != 0);
     favorite->setCheckable(true);
@@ -877,7 +878,7 @@ bool GameList::eventFilter(QObject* obj, QEvent* event) {
     return QWidget::eventFilter(obj, event);
 }
 
-// The iOS library's empty state: an icon, "No games yet", what to add, and one button.
+// The iOS library's empty state: an icon, the empty text, what to add, and one button.
 GameListPlaceholder::GameListPlaceholder(MainWindow* parent) : QWidget{parent} {
     layout = new QVBoxLayout;
     image = new QLabel;
@@ -933,8 +934,7 @@ void GameListPlaceholder::changeEvent(QEvent* event) {
 }
 
 void GameListPlaceholder::RetranslateUI() {
-    text->setText(tr("No games yet"));
-    detail->setText(tr("Add a folder with your .nsp, .xci, .nup, .nca or .nro files: Lichii lists "
-                       "every game in it. Double-clicking here does the same."));
-    add_button->setText(tr("Add Game Folder..."));
+    text->setText(UiText::Text("library.empty"));
+    detail->setText(UiText::Text("library.empty.desktop"));
+    add_button->setText(UiText::Text("library.add_folder"));
 }

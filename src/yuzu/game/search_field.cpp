@@ -7,6 +7,7 @@
 #include <QKeyEvent>
 #include <QToolButton>
 
+#include "qt_common/config/catalog_text.h"
 #include "yuzu/util/lichii_style.h"
 
 // TODO: Remove GameList dependence?
@@ -133,5 +134,5 @@ void GameListSearchField::changeEvent(QEvent* event) {
 
 void GameListSearchField::RetranslateUI() {
     label_filter->setText(tr("Filter:"));
-    edit_filter->setPlaceholderText(tr("Search games"));
+    edit_filter->setPlaceholderText(UiText::Text("search.games"));
 }

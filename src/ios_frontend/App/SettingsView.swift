@@ -10,6 +10,81 @@ enum SettingsScope: Equatable {
     case game(Game)
 }
 
+/// Top-level destinations in global Settings (pushed on iPhone, split-view sidebar on iPad).
+enum SettingsRoute: Hashable {
+    case recommended
+    case group(SettingsGroup)
+    case link(String)
+    case about
+}
+
+/// Adaptive Settings container for the Settings tab: two-column sidebar + detail on regular-width
+/// iPads, push stack on iPhone and compact Split View / Slide Over windows.
+struct SettingsTabView: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @State private var selectedRoute: SettingsRoute? = .group(.graphics)
+    @State private var query = ""
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+
+    var body: some View {
+        if Theme.isPad && horizontalSizeClass == .regular {
+            NavigationSplitView(columnVisibility: $columnVisibility) {
+                List(selection: $selectedRoute) {
+                    GlobalSettingsRoot(splitSidebar: true)
+                }
+                .navigationTitle("Settings")
+                .searchable(text: $query, prompt: UiText.text("search.settings"))
+            } detail: {
+                NavigationStack {
+                    if !query.isEmpty {
+                        List {
+                            SettingSectionsList(
+                                sections: SettingsCatalog.sections(group: .graphics, query: query),
+                                perGame: false
+                            )
+                        }
+                        .navigationTitle("Settings")
+                    } else {
+                        SettingsRouteDetail(route: selectedRoute ?? .group(.graphics))
+                            .id(selectedRoute ?? .group(.graphics))
+                    }
+                }
+            }
+            .navigationSplitViewStyle(.balanced)
+            .onDisappear { lichii_settings_save() }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+                lichii_settings_save()
+            }
+        } else {
+            NavigationStack {
+                SettingsView(scope: .global)
+            }
+        }
+    }
+}
+
+/// Detail screen for a selected `SettingsRoute`.
+private struct SettingsRouteDetail: View {
+    let route: SettingsRoute
+
+    var body: some View {
+        switch route {
+        case .recommended:
+            RecommendedSettingsView()
+        case .group(let group):
+            SettingsGroupView(group: group)
+        case .about:
+            DiagnosticsView()
+        case .link(let id):
+            if let entry = AppExtensions.settingsLinks.first(where: { $0.id == id }) {
+                entry.view()
+            } else {
+                SettingsGroupView(group: .graphics)
+            }
+        }
+    }
+}
+
 /// Every setting the core saves, generated from the bridge's metadata. The per-game scope lists the
 /// settings a game can override, each with a switch back to the global value. Settings that do
 /// nothing on iOS are not listed (SettingsCatalog.availability); debug switches and hacks are on
@@ -34,14 +109,15 @@ struct SettingsView: View {
                 if let game {
                     Section {
                         HStack(spacing: 12) {
-                            GameIcon(game: game, size: 44)
-                            VStack(alignment: .leading) {
+                            GameIcon(game: game, size: 48)
+                            VStack(alignment: .leading, spacing: 3) {
                                 Text(game.title).font(.headline)
-                                Text("Overrides apply to this game only. Tap the globe next to a setting to override it. Only settings that apply to this game are listed.")
+                                Text("\(UiText.text("game.note")) \(UiText.text("game.note.ios"))")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                         }
+                        .padding(.vertical, 2)
                     }
                     SettingSectionsList(sections: SettingsCatalog.sections(perGame: true, query: query,
                                                                            programId: game.programId),
@@ -51,9 +127,9 @@ struct SettingsView: View {
                         // Inline rather than pushed: the game's settings scope ends when this view
                         // disappears.
                         Section {
-                            Toggle("Show Advanced Settings", isOn: $showAdvanced)
+                            Toggle(UiText.text("advanced.show"), isOn: $showAdvanced)
                         } footer: {
-                            Text("Debug switches, CPU and GPU hacks. Changing them can stop the game from starting.")
+                            Text(UiText.text("advanced.show.footer"))
                         }
                         if showAdvanced {
                             SettingSectionsList(sections: SettingsCatalog.sections(perGame: true, query: "", advanced: true,
@@ -63,20 +139,20 @@ struct SettingsView: View {
                         }
                     }
                     Section {
-                        Button("Reset This Game to Recommended", role: .destructive) { showReset = true }
+                        Button(UiText.text("reset.button"), role: .destructive) { showReset = true }
                     } footer: {
-                        Text("Gives this game the recommended settings for this device (Settings > Recommended Settings lists them with reasons) and removes its other overrides.")
+                        Text(UiText.text("reset.footer"))
                     }
                 } else if !query.isEmpty {
                     SettingSectionsList(sections: SettingsCatalog.sections(group: .graphics, query: query),
                                         perGame: false)
                 } else {
-                    GlobalSettingsRoot()
+                    GlobalSettingsRoot(splitSidebar: false)
                 }
             }
         }
-        .navigationTitle(game == nil ? "Settings" : "Game Settings")
-        .searchable(text: $query, prompt: "Search settings")
+        .navigationTitle(game == nil ? "Settings" : UiText.text("page.game_settings"))
+        .searchable(text: $query, prompt: UiText.text("search.settings"))
         .toolbar {
             if game != nil {
                 ToolbarItem(placement: .confirmationAction) {
@@ -84,9 +160,9 @@ struct SettingsView: View {
                 }
             }
         }
-        .confirmationDialog("Use the recommended settings for this game?", isPresented: $showReset,
+        .confirmationDialog(UiText.text("reset.question"), isPresented: $showReset,
                             titleVisibility: .visible) {
-            Button("Reset to Recommended", role: .destructive) {
+            Button(UiText.text("reset.confirm"), role: .destructive) {
                 lichii_settings_reset_game()
                 generation += 1
             }
@@ -112,12 +188,12 @@ struct SettingsView: View {
                 guard parts.count == 3 else { return nil }
                 let item = SettingsCatalog.all.first { $0.key == parts[0] }
                 let name = { (value: String) -> String in
-                    value == "global" ? "Global" : (item?.displayName(of: value) ?? value)
+                    value == "global" ? UiText.text("value.global") : (item?.displayName(of: value) ?? value)
                 }
-                return "\(item?.label ?? parts[0]): \(name(parts[1])) → \(name(parts[2]))"
+                return UiText.format("change.line", item?.label ?? parts[0], name(parts[1]), name(parts[2]))
             }
         if lines.isEmpty {
-            return "This game already has the recommended settings."
+            return UiText.text("reset.already")
         }
         return lines.joined(separator: "\n")
     }
@@ -168,17 +244,21 @@ private struct SettingSectionsList: View {
 /// The global settings' first page: a compact header, the setting pages, then the screens for
 /// game data and help. Links other areas add (AppExtensions.settingsLinks) are placed by id.
 private struct GlobalSettingsRoot: View {
+    let splitSidebar: Bool
     private static let dataLinks = ["keys", "users"]
     private static let helpLinks = ["setup", "logs", "experiments"]
 
     var body: some View {
         let links = AppExtensions.settingsLinks
-        SettingsHeader()
+        SettingsHeader(splitSidebar: splitSidebar)
         Section {
-            NavigationLink {
+            routeRow(
+                route: .recommended,
+                title: UiText.text("page.recommended"),
+                systemImage: "wand.and.stars",
+                colorId: "recommended"
+            ) {
                 RecommendedSettingsView()
-            } label: {
-                Label("Recommended Settings", systemImage: "wand.and.stars")
             }
         } footer: {
             Text("What this device should use, and one button to set it.")
@@ -189,16 +269,19 @@ private struct GlobalSettingsRoot: View {
             groupLink(.audio)
             groupLink(.system)
         }
-        Section("Games & Data") {
+        Section(UiText.text("group.games_data")) {
             ForEach(links.filter { Self.dataLinks.contains($0.id) }) { link(for: $0) }
         }
         ShaderCacheSettingsSection()
-        Section("Help") {
+        Section(UiText.text("group.help")) {
             ForEach(links.filter { Self.helpLinks.contains($0.id) }) { link(for: $0) }
-            NavigationLink {
+            routeRow(
+                route: .about,
+                title: UiText.text("page.about_device"),
+                systemImage: "info.circle.fill",
+                colorId: "about"
+            ) {
                 DiagnosticsView()
-            } label: {
-                Label("About This Device", systemImage: "info.circle")
             }
         }
         let others = links.filter { !(["controls"] + Self.dataLinks + Self.helpLinks).contains($0.id) }
@@ -210,23 +293,49 @@ private struct GlobalSettingsRoot: View {
         Section {
             groupLink(.advanced)
         } footer: {
-            Text("Debug switches, CPU and GPU hacks. Changing them can stop games from starting.")
+            Text(UiText.text("advanced.footer"))
+        }
+    }
+
+    @ViewBuilder
+    private func routeRow<Destination: View>(
+        route: SettingsRoute,
+        title: String,
+        systemImage: String,
+        colorId: String,
+        @ViewBuilder destination: () -> Destination
+    ) -> some View {
+        let rowLabel = SettingsRowLabel(
+            title: title,
+            systemImage: systemImage,
+            color: Theme.badgeColor(for: colorId)
+        )
+        if splitSidebar {
+            NavigationLink(value: route) { rowLabel }
+        } else {
+            NavigationLink(destination: destination) { rowLabel }
         }
     }
 
     private func groupLink(_ group: SettingsGroup) -> some View {
-        NavigationLink {
+        routeRow(
+            route: .group(group),
+            title: group.title,
+            systemImage: group.systemImage,
+            colorId: group.rawValue
+        ) {
             SettingsGroupView(group: group)
-        } label: {
-            Label(group.title, systemImage: group.systemImage)
         }
     }
 
     private func link(for link: SettingsLink) -> some View {
-        NavigationLink {
+        routeRow(
+            route: .link(link.id),
+            title: link.title,
+            systemImage: link.systemImage,
+            colorId: link.id
+        ) {
             link.view()
-        } label: {
-            Label(link.title, systemImage: link.systemImage)
         }
     }
 }
@@ -240,7 +349,7 @@ private struct SettingsGroupView: View {
             if group == .advanced {
                 Section {
                 } footer: {
-                    Label("These settings are for testing and troubleshooting. If a game stops starting after a change here, set it back.",
+                    Label(UiText.text("advanced.warning"),
                           systemImage: "exclamationmark.triangle")
                 }
             }
@@ -257,51 +366,114 @@ private struct SettingsGroupView: View {
     }
 }
 
-/// App version and JIT state; opens the device details.
+/// App version, device summary and JIT state; opens the device details.
 private struct SettingsHeader: View {
     /// Follows LICHII_EVENT_JIT_CHANGED.
     @ObservedObject private var app = AppController.shared
+    let splitSidebar: Bool
+
+    private var cleanVersion: String {
+        let raw = Bridge.buildVersion
+        if raw.hasPrefix("Lichii | ") {
+            return String(raw.dropFirst("Lichii | ".count))
+        }
+        return raw
+    }
+
+    private var deviceSummary: String? {
+        guard let defaults = PlatformCenter.deviceDefaults else { return nil }
+        let tier = PlatformCenter.text(defaults.tier_name)
+        if let info = PlatformCenter.deviceInfo {
+            let gpu = PlatformCenter.text(info.gpu_name).replacingOccurrences(of: " GPU", with: "")
+            if !gpu.isEmpty, !tier.isEmpty {
+                return "\(gpu) · \(tier) Tier"
+            }
+        }
+        return tier.isEmpty ? nil : "\(tier) Tier"
+    }
+
+    private var content: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "gamecontroller.fill")
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 46, height: 46)
+                .background(
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.63, green: 0.44, blue: 0.99),
+                            Color(red: 0.45, green: 0.27, blue: 0.90)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.22), lineWidth: 0.75)
+                )
+                .shadow(color: Theme.accent.opacity(0.28), radius: 5, y: 2)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Lichii")
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                Text(cleanVersion)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let deviceSummary {
+                    Text(deviceSummary)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 8)
+            JitPill(status: app.jit)
+        }
+        .padding(.vertical, 3)
+    }
 
     var body: some View {
         Section {
-            NavigationLink {
-                DiagnosticsView()
-            } label: {
-                HStack(spacing: 12) {
-                    Image(systemName: "gamecontroller.fill")
-                        .font(.title2)
-                        .foregroundStyle(.white)
-                        .frame(width: 44, height: 44)
-                        .background(Theme.accent, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Lichii").font(.headline)
-                        Text(Bridge.buildVersion)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    Spacer(minLength: 8)
-                    JitPill(status: app.jit)
+            if splitSidebar {
+                NavigationLink(value: SettingsRoute.about) {
+                    content
                 }
+                .accessibilityElement(children: .combine)
+            } else {
+                NavigationLink {
+                    DiagnosticsView()
+                } label: {
+                    content
+                }
+                .accessibilityElement(children: .combine)
             }
-            .accessibilityElement(children: .combine)
         }
     }
 }
 
-/// The JIT state in a few words.
+/// Compact horizontal pill showing JIT state. Uses explicit HStack instead of Label so SwiftUI
+/// List never overrides its label style into an icon-only vertical cell.
 struct JitPill: View {
     let status: JitStatus
 
     var body: some View {
-        Label(text, systemImage: status.symbol)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(status.color)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(status.color.opacity(0.15), in: Capsule())
-            .fixedSize()
+        HStack(spacing: 5) {
+            Image(systemName: status.symbol)
+                .font(.system(size: 11, weight: .bold))
+            Text(text)
+                .lineLimit(1)
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(status.color)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(status.color.opacity(0.15), in: Capsule())
+        .overlay(Capsule().strokeBorder(status.color.opacity(0.25), lineWidth: 0.75))
+        .fixedSize(horizontal: true, vertical: true)
     }
 
     private var text: String {
@@ -320,6 +492,23 @@ struct DiagnosticsView: View {
     private let info = PlatformCenter.deviceInfo
     private let defaults = PlatformCenter.deviceDefaults
 
+    private var osLabel: String {
+        guard let info else {
+            return "\(Theme.isPad ? "iPadOS" : "iOS") \(UIDevice.current.systemVersion)"
+        }
+        return "\(info.is_ipad != 0 ? "iPadOS" : "iOS") \(info.os_major).\(info.os_minor)"
+    }
+
+    private var modelSummary: String {
+        guard let info else { return "\(UIDevice.current.model), \(osLabel)" }
+        let machine = PlatformCenter.text(info.machine)
+        let friendly = RecommendedSettings.load().device
+        if !friendly.isEmpty, !friendly.hasPrefix(machine) {
+            return "\(friendly) (\(machine)), \(osLabel)"
+        }
+        return "\(machine), \(osLabel)"
+    }
+
     var body: some View {
         List {
             Section {
@@ -327,18 +516,19 @@ struct DiagnosticsView: View {
                 LabeledContent("JIT", value: jitText)
             }
             if let info {
+                let memTitle = UiText.text("experiments.memory.title")
                 Section {
-                    LabeledContent("Memory", value: "\(gigabytes(info.launch_available_memory_mib)) available to games")
+                    LabeledContent(memTitle, value: "\(gigabytes(info.launch_available_memory_mib)) available to games")
                     LabeledContent("Installed memory", value: gigabytes(info.physical_memory_mib))
                     LabeledContent("Increased Memory Limit", value: entitlement(info.increased_memory_limit))
                     LabeledContent("Extended Virtual Addressing", value: entitlement(info.extended_virtual_addressing))
                 } header: {
-                    Text("Memory")
+                    Text(memTitle)
                 } footer: {
-                    Text("Games need both entitlements. Without them iOS gives Lichii too little memory to start a game.")
+                    Text("Games need both entitlements. Without them \(info.is_ipad != 0 ? "iPadOS" : "iOS") gives Lichii too little memory to start a game.")
                 }
-                Section("Device") {
-                    LabeledContent("Model", value: "\(PlatformCenter.text(info.machine)), iOS \(info.os_major).\(info.os_minor)")
+                Section(UiText.text("section.device")) {
+                    LabeledContent("Model", value: modelSummary)
                     LabeledContent("GPU", value: PlatformCenter.text(info.gpu_name))
                     if let defaults {
                         LabeledContent("Performance Tier", value: PlatformCenter.text(defaults.tier_name))
@@ -352,12 +542,12 @@ struct DiagnosticsView: View {
                     }
                 }
             } else {
-                Section("Device") {
+                Section(UiText.text("section.device")) {
                     DeviceInfoRows()
                 }
             }
         }
-        .navigationTitle("About This Device")
+        .navigationTitle(UiText.text("page.about_device"))
         .navigationBarTitleDisplayMode(.inline)
     }
 
@@ -427,7 +617,7 @@ struct SettingRow: View {
                 Caption(text: note, systemImage: "info.circle", color: .secondary)
             }
             if !item.runtimeModifiable, Bridge.emuState.inGame {
-                Caption(text: "Applies the next time the game starts.", systemImage: "arrow.clockwise",
+                Caption(text: UiText.text("note.next_start"), systemImage: "arrow.clockwise",
                         color: .secondary)
             }
         }

@@ -28,6 +28,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check UI catalogue
+        run: python3 -I tools/ui/catalog_check.py -v
+
       - name: Install Linux dependencies
         run: |
           sudo apt-get update

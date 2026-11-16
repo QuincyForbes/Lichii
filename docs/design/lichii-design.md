@@ -168,8 +168,23 @@ Desktop-only pages: General `settings`, Storage `hard-drive`.
   **Use Recommended Settings**; "Delete <game>?" with **Delete**.
 - Changes listed as `Name: old → new`, one per line.
 
-`tools/ui/settings_labels.py` compares the setting names of both apps (exit 1 when one differs) and
-lists choice names that differ (descriptive desktop names such as "1X (720p/1080p)" are expected).
+`src/common/ui_catalog.h` and `src/common/ui_catalog.cpp` hold every setting label, enum choice
+name, help text, unavailability reason, page and section title, performance overlay line, and
+experiment switch label in one place. Qt reads it through `src/qt_common/config/catalog_text.h`
+(keeping `QT_TRANSLATE_NOOP` translations), and the iOS/iPadOS app reads it through the C bridge
+`src/ios_frontend/lichii_bridge_ui.h` and Swift wrapper `src/ios_frontend/App/UiText.swift`.
+`tools/ui/catalog_check.py` fails (exit 1) when any setting, enum value or experiment lacks a
+catalogue entry or when any Swift, C++ or `.ui` file duplicates a catalogue string.
+
+## iPhone and iPad layout
+
+- **iPhone** (and compact iPad Split View / Slide Over): Settings uses a `NavigationStack` with a
+  gradient app-icon header (`SettingsHeader`), a horizontal `HStack`-based `JitPill`, and uniform
+  29×29 rounded-square `SettingsIconBadge` (`SettingsRowLabel`) tints across every navigation row.
+- **iPad** (`Theme.isPad` with `.regular` horizontal size class): `SettingsTabView` switches to a
+  two-column `NavigationSplitView` (sidebar + detail `NavigationStack`, defaulting to Graphics),
+  `LibraryView` widens its adaptive card grid (`185...260` pt columns) and margins, and
+  `common/device_profile.cpp` identifies M1–M5 and A15–A17 Pro iPads with tablet-appropriate tiers.
 
 ## iOS pattern → Qt equivalent
 

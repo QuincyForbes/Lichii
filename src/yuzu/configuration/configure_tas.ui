@@ -56,15 +56,15 @@
        <layout class="QGridLayout" name="gridLayout_2">
         <item row="0" column="0" colspan="4">
          <widget class="QCheckBox" name="tas_enable">
-          <property name="text">
-           <string>Enable TAS features</string>
+          <property name="catalogueKey" stdset="0">
+           <string notr="true">tas_enable</string>
           </property>
          </widget>
         </item>
         <item row="1" column="0" colspan="4">
          <widget class="QCheckBox" name="tas_loop_script">
-          <property name="text">
-           <string>Loop script</string>
+          <property name="catalogueKey" stdset="0">
+           <string notr="true">tas_loop</string>
           </property>
          </widget>
         </item>
@@ -73,15 +73,15 @@
           <property name="enabled">
            <bool>false</bool>
           </property>
-          <property name="text">
-           <string>Pause execution during loads</string>
+          <property name="catalogueKey" stdset="0">
+           <string notr="true">pause_tas_on_load</string>
           </property>
          </widget>
         </item>
         <item row="3" column="0" colspan="4">
          <widget class="QCheckBox" name="tas_show_recording_dialog">
-          <property name="text">
-           <string>Show recording dialog</string>
+          <property name="catalogueKey" stdset="0">
+           <string notr="true">tas_show_recording_dialog</string>
           </property>
          </widget>
         </item>

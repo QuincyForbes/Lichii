@@ -28,6 +28,7 @@
 
 #include "qt_common/config/uisettings.h"
 #include "qt_common/qt_compat.h"
+#include "qt_common/config/catalog_text.h"
 
 namespace {
 
@@ -92,6 +93,7 @@ ConfigureUi::ConfigureUi(Core::System& system_, QWidget* parent)
       ratio{Settings::values.aspect_ratio.GetValue()},
       resolution_setting{Settings::values.resolution_setup.GetValue()}, system{system_} {
     ui->setupUi(this);
+    UiText::ApplyCatalogue(this);
 
     InitializeLanguageComboBox();
 
@@ -218,6 +220,7 @@ void ConfigureUi::changeEvent(QEvent* event) {
 
 void ConfigureUi::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 
     for (int i = 0; i < ui->folder_icon_size_combobox->count(); i++) {
         ui->folder_icon_size_combobox->setItemText(

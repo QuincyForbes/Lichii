@@ -99,7 +99,7 @@ bool HasTxm() {
         return major > 14 || (major == 14 && minor >= 2); // iPhone 13 (A15) and newer
     }
     if (ParseModel(hw, "iPad", major, minor)) {
-        return major > 14 || (major == 14 && minor >= 5); // M1 iPads and newer
+        return major > 13 || (major == 13 && minor >= 4); // M1/A15 iPads and newer
     }
     return false;
 }

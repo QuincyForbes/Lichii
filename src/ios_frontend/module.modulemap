@@ -5,5 +5,6 @@ module LichiiBridge {
     header "lichii_bridge_controls.h"
     header "lichii_bridge_perf.h"
     header "lichii_bridge_platform.h"
+    header "lichii_bridge_ui.h"
     export *
 }

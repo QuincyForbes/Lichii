@@ -27,6 +27,7 @@
 #include "yuzu/configuration/input_profiles.h"
 #include "yuzu/main_window.h"
 #include "yuzu/util/controller_navigation.h"
+#include "qt_common/config/catalog_text.h"
 
 namespace {
 
@@ -71,6 +72,7 @@ QtControllerSelectorDialog::QtControllerSelectorDialog(
       parameters(std::move(parameters_)), input_subsystem{input_subsystem_},
       input_profiles(std::make_unique<InputProfiles>()), system{system_} {
     ui->setupUi(this);
+    UiText::ApplyCatalogue(this);
 
     player_widgets = {
         ui->widgetPlayer1, ui->widgetPlayer2, ui->widgetPlayer3, ui->widgetPlayer4,

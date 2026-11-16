@@ -73,47 +73,51 @@ struct PerformanceOverlayView: View {
 
     private func headline(_ r: OverlayReading) -> String {
         if r.frameGenActive {
-            return String(format: "%.0f → %.0f FPS", r.realFps, r.displayedFps)
+            return UiText.format("overlay.fps_generated",
+                                 String(format: "%.0f", r.realFps),
+                                 String(format: "%.0f", r.displayedFps))
         }
-        return String(format: "%.0f FPS", r.realFps)
+        return UiText.format("overlay.fps", String(format: "%.0f", r.realFps))
     }
 
     @ViewBuilder
     private func frameLines(_ r: OverlayReading) -> some View {
-        Text(String(format: "Real %.1f FPS", r.realFps))
+        Text(UiText.format("overlay.real", String(format: "%.1f", r.realFps)))
             .foregroundStyle(Self.realColor)
         if r.frameGenActive {
-            Text(String(format: "Generated +%.1f", r.generatedFps))
-            Text(String(format: "Displayed %.1f FPS", r.displayedFps))
+            Text(UiText.format("overlay.generated", String(format: "%.1f", r.generatedFps)))
+            Text(UiText.format("overlay.displayed", String(format: "%.1f", r.displayedFps)))
                 .foregroundStyle(Self.displayedColor)
         }
         Text(frameTimeLine(r))
         if r.low10Fps > 0 {
-            Text(String(format: "10%% low %.0f", r.low10Fps))
+            Text(UiText.format("overlay.low10", String(format: "%.0f", r.low10Fps)))
         }
     }
 
     private func frameTimeLine(_ r: OverlayReading) -> String {
         if r.frameGenActive, r.displayedFps > 0.5 {
-            return String(format: "Frame %.1f ms (%.1f out)", r.frameTimeMs, 1000 / r.displayedFps)
+            return UiText.format("overlay.frame_out",
+                                 String(format: "%.1f", r.frameTimeMs),
+                                 String(format: "%.1f", 1000 / r.displayedFps))
         }
-        return String(format: "Frame %.1f ms", r.frameTimeMs)
+        return UiText.format("overlay.frame", String(format: "%.1f", r.frameTimeMs))
     }
 
     @ViewBuilder
     private func infoLines(_ r: OverlayReading) -> some View {
-        Text("Frame gen \(r.frameGen)")
+        Text(UiText.format("overlay.frame_gen", r.frameGen))
         Text(scaleLine(r))
-        Text(String(format: "Speed %.0f%%", r.speedPercent))
+        Text(UiText.format("overlay.speed", String(format: "%.0f", r.speedPercent)))
             .foregroundStyle(r.speedPercent > 0 && r.speedPercent < 90 ? Color.orange : Color.white)
         if r.shadersBuilding > 0 {
-            Text("Shaders \(r.shadersBuilding) building")
+            Text(UiText.format("overlay.shaders", String(r.shadersBuilding)))
                 .foregroundStyle(.yellow)
         }
     }
 
     private func scaleLine(_ r: OverlayReading) -> String {
-        let scale = String(format: "Scale %.2gx", r.resolutionScale)
+        let scale = UiText.format("overlay.scale", String(format: "%.2g", r.resolutionScale))
         return r.upscaler.isEmpty ? scale : "\(scale) \(r.upscaler)"
     }
 
@@ -121,27 +125,29 @@ struct PerformanceOverlayView: View {
     private func detailLines(_ r: OverlayReading) -> some View {
         // The 3D scene, the game's finished picture (HUD and menus) and the screen.
         if !r.sceneSize.isEmpty {
-            Text("3D \(r.sceneSize)")
+            Text(UiText.format("overlay.scene", r.sceneSize))
         }
         if !r.renderSize.isEmpty {
-            Text("Game \(r.renderSize)")
+            Text(UiText.format("overlay.game", r.renderSize))
             if !r.outputSize.isEmpty {
-                Text("Screen \(r.outputSize)")
+                Text(UiText.format("overlay.screen", r.outputSize))
             }
         }
         if !r.gpuAccuracy.isEmpty {
-            Text("GPU accuracy \(r.gpuAccuracy)")
+            Text(UiText.format("overlay.gpu_accuracy", r.gpuAccuracy))
         }
         if r.cpuPercent >= 0 {
-            Text(String(format: "CPU %.0f%%", r.cpuPercent))
+            Text(UiText.format("overlay.cpu", String(format: "%.0f", r.cpuPercent)))
         }
         if r.footprint > 0 {
-            Text(r.memoryLimit > 0 ? "RAM \(Self.gigabytes(r.footprint)) / \(Self.gigabytes(r.memoryLimit)) GB"
-                                   : "RAM \(Self.gigabytes(r.footprint)) GB")
+            Text(r.memoryLimit > 0
+                 ? UiText.format("overlay.ram", Self.gigabytes(r.footprint), Self.gigabytes(r.memoryLimit))
+                 : UiText.format("overlay.ram_used", Self.gigabytes(r.footprint)))
         }
         if r.textureBytes > 0 {
-            Text(r.textureExpected > 0 ? "Textures \(Self.megabytes(r.textureBytes)) / \(Self.megabytes(r.textureExpected)) MB"
-                                       : "Textures \(Self.megabytes(r.textureBytes)) MB")
+            Text(r.textureExpected > 0
+                 ? UiText.format("overlay.textures", Self.megabytes(r.textureBytes), Self.megabytes(r.textureExpected))
+                 : UiText.format("overlay.textures_used", Self.megabytes(r.textureBytes)))
         }
     }
 

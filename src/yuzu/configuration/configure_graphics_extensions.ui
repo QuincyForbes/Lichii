@@ -19,8 +19,8 @@
   <layout class="QVBoxLayout" name="verticalLayout_4">
    <item>
     <widget class="QGroupBox" name="hacks">
-     <property name="title">
-      <string>Graphics Hacks</string>
+     <property name="catalogueText" stdset="0">
+      <string notr="true">category.RendererHacks</string>
      </property>
      <layout class="QVBoxLayout" name="verticalLayout_6">
       <item>
@@ -58,8 +58,8 @@
     <layout class="QVBoxLayout" name="verticalLayout_2">
      <item>
       <widget class="QGroupBox" name="groupBox_1">
-       <property name="title">
-        <string>Vulkan Extensions</string>
+       <property name="catalogueText" stdset="0">
+        <string notr="true">category.RendererExtensions</string>
        </property>
        <layout class="QVBoxLayout" name="verticalLayout_3">
         <item>

@@ -16,10 +16,12 @@
 #include "ui_configure_debug.h"
 #include "yuzu/configuration/configure_debug.h"
 #include "yuzu/debugger/console.h"
+#include "qt_common/config/catalog_text.h"
 
 ConfigureDebug::ConfigureDebug(const Core::System& system_, QWidget* parent)
     : QScrollArea(parent), ui{std::make_unique<Ui::ConfigureDebug>()}, system{system_} {
     ui->setupUi(this);
+    UiText::ApplyCatalogue(this);
     SetConfiguration();
 
     connect(ui->open_log_button, &QPushButton::clicked, []() {
@@ -173,4 +175,5 @@ void ConfigureDebug::changeEvent(QEvent* event) {
 
 void ConfigureDebug::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }

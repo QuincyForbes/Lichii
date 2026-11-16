@@ -91,7 +91,7 @@ private:
     struct Page {
         QString title;
         QString icon;
-        /// Sidebar group heading shown before this page, if any ("Games & Data").
+        /// Sidebar group heading shown before this page, if any.
         QString group;
         QString footer;
         std::vector<std::pair<QString, QWidget*>> sections;

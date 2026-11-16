@@ -9,6 +9,8 @@ on:
     # src/tests included.
     paths:
       - "src/**"
+      - "dist/nx2_switches.txt"
+      - "tools/ui/catalog_check.py"
       - "CMakeLists.txt"
       - "CMakeModules/**"
       - "externals/**"
@@ -41,6 +43,10 @@ jobs:
         uses: actions/checkout@v5
         with:
           persist-credentials: false
+
+      - name: Check UI catalogue
+        shell: bash
+        run: python3 -I tools/ui/catalog_check.py -v
 
       # The Linux packages of release-binaries.yml without Qt: no test program links the Qt frontend.
       - name: Install Linux dependencies

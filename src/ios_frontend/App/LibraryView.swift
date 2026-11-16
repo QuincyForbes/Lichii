@@ -21,9 +21,10 @@ struct LibraryView: View {
         let games = library.sorted(sort, matching: query)
         // Only where it adds something: a small library shows every game in the grid anyway.
         let recent = query.isEmpty && sort != .recent && library.games.count > 3 ? library.recentlyPlayed : []
+        let isPad = Theme.isPad
         ScrollView {
             if app.libraryVisible {
-                VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: isPad ? 22 : 18) {
                     MemoryEntitlementBanner()
                     JitLibraryBanner()
                     ThermalBanner()
@@ -40,9 +41,11 @@ struct LibraryView: View {
                     } else if grid {
                         // Columns fill the width: two on a phone in portrait, more in landscape and
                         // on iPad.
-                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 240), spacing: 16,
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: isPad ? 185 : 150,
+                                                               maximum: isPad ? 260 : 240),
+                                                     spacing: isPad ? 20 : 16,
                                                      alignment: .top)],
-                                  spacing: 20) {
+                                  spacing: isPad ? 24 : 20) {
                             ForEach(games) { game in
                                 GameCard(game: game, play: { app.launch(game) }, info: { infoGame = game }) {
                                     menu(for: game)
@@ -70,11 +73,12 @@ struct LibraryView: View {
                         }
                     }
                 }
-                .padding()
+                .padding(.horizontal, isPad ? 24 : 16)
+                .padding(.vertical, 16)
             }
         }
-        .navigationTitle("Library")
-        .searchable(text: $query, prompt: "Search games")
+        .navigationTitle(UiText.text("page.library"))
+        .searchable(text: $query, prompt: UiText.text("search.games"))
         .refreshable { await library.refresh() }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
@@ -86,8 +90,8 @@ struct LibraryView: View {
                     }
                     Section("Show As") {
                         Picker("Show As", selection: $grid) {
-                            Label("Grid", systemImage: "square.grid.2x2").tag(true)
-                            Label("List", systemImage: "list.bullet").tag(false)
+                            Label(UiText.text("library.grid"), systemImage: "square.grid.2x2").tag(true)
+                            Label(UiText.text("library.list"), systemImage: "list.bullet").tag(false)
                         }
                     }
                     Section {
@@ -225,12 +229,12 @@ struct LibraryView: View {
             Button {
                 infoGame = game
             } label: {
-                Label("Game Info", systemImage: "info.circle")
+                Label(UiText.text("game.info"), systemImage: "info.circle")
             }
             Button {
                 settingsGame = game
             } label: {
-                Label("Game Settings", systemImage: "slider.horizontal.3")
+                Label(UiText.text("page.game_settings"), systemImage: "slider.horizontal.3")
             }
         }
         Section {
@@ -262,7 +266,7 @@ private extension View {
         accessibilityElement(children: .combine)
             .accessibilityLabel(game.title)
             .accessibilityHint("Starts the game")
-            .accessibilityAction(named: "Game Info", info)
+            .accessibilityAction(named: UiText.text("game.info"), info)
     }
 }
 
@@ -278,13 +282,14 @@ private struct GameCard<MenuContent: View>: View {
         VStack(alignment: .leading, spacing: 8) {
             Button(action: play) {
                 GameIcon(game: game, fills: true)
-                    .shadow(color: .black.opacity(0.25), radius: 6, y: 3)
+                    .shadow(color: .black.opacity(0.22), radius: 7, y: 3)
                     .overlay(alignment: .bottomTrailing) {
                         Image(systemName: "play.fill")
                             .font(.body.weight(.bold))
                             .foregroundStyle(.white)
                             .frame(width: 40, height: 40)
                             .background(Theme.accent, in: Circle())
+                            .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 0.75))
                             .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
                             .padding(8)
                     }
@@ -362,6 +367,7 @@ private struct RecentRow: View {
     let open: @MainActor (Game) -> Void
 
     var body: some View {
+        let iconSize: CGFloat = Theme.isPad ? 112 : 96
         VStack(alignment: .leading, spacing: 10) {
             Text("Recently Played").font(.title3.bold())
             ScrollView(.horizontal, showsIndicators: false) {
@@ -371,11 +377,11 @@ private struct RecentRow: View {
                             open(game)
                         } label: {
                             VStack(alignment: .leading, spacing: 4) {
-                                GameIcon(game: game, size: 96)
+                                GameIcon(game: game, size: iconSize)
                                 Text(game.title)
                                     .font(.caption.weight(.medium))
                                     .lineLimit(1)
-                                    .frame(width: 96, alignment: .leading)
+                                    .frame(width: iconSize, alignment: .leading)
                             }
                         }
                         .buttonStyle(.plain)
@@ -397,19 +403,24 @@ private struct EmptyLibraryView: View {
             if scanning {
                 ProgressView("Looking for games...")
             } else {
-                Image(systemName: "gamecontroller")
-                    .font(.system(size: 48))
-                    .foregroundStyle(.secondary)
-                Text("No games yet").font(.title3.bold())
-                Text("Import .nsp, .xci, .nup, .nca or .nro files, or copy them into Lichii's folder with the Files app.")
+                Image(systemName: "gamecontroller.fill")
+                    .font(.system(size: 32, weight: .semibold))
+                    .foregroundStyle(Theme.accent)
+                    .frame(width: 72, height: 72)
+                    .background(Theme.accent.opacity(0.14),
+                                in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                Text(UiText.text("library.empty")).font(.title3.bold())
+                Text(UiText.text("library.empty.ios"))
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
-                Button("Import Games", action: importAction)
+                    .frame(maxWidth: 420)
+                Button(UiText.text("library.import"), action: importAction)
                     .buttonStyle(.borderedProminent)
+                    .controlSize(.regular)
             }
         }
         .frame(maxWidth: .infinity)
-        .padding(.top, 60)
+        .padding(.top, 56)
     }
 }
 
@@ -452,18 +463,26 @@ struct GameInfoView: View {
                 NavigationLink {
                     SettingsView(scope: .game(game))
                 } label: {
-                    Label("Game Settings", systemImage: "slider.horizontal.3")
+                    SettingsRowLabel(
+                        title: UiText.text("page.game_settings"),
+                        systemImage: "slider.horizontal.3",
+                        color: Theme.accent
+                    )
                 }
                 ForEach(AppExtensions.gameActions) { action in
                     NavigationLink {
                         action.view(game)
                     } label: {
-                        Label(action.title, systemImage: action.systemImage)
+                        SettingsRowLabel(
+                            title: action.title,
+                            systemImage: action.systemImage,
+                            color: Theme.badgeColor(for: action.id)
+                        )
                     }
                 }
             }
         }
-        .navigationTitle("Game Info")
+        .navigationTitle(UiText.text("game.info"))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {

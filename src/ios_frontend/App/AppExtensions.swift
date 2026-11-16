@@ -41,7 +41,7 @@ enum AppExtensions {
         let links = ContentEntries.settingsLinks
         func content(_ id: String) -> [SettingsLink] { links.filter { $0.id == id } }
         return content("keys") + [
-            SettingsLink(id: "controls", title: "Controls", systemImage: "gamecontroller", view: { AnyView(ControlsView()) }),
+            SettingsLink(id: "controls", title: UiText.text("page.controls"), systemImage: "gamecontroller.fill", view: { AnyView(ControlsView()) }),
         ] + content("logs") + content("users") + PlatformEntries.settingsLinks + content("setup")
     }
 

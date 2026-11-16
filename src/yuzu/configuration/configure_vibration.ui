@@ -505,8 +505,8 @@
      <layout class="QVBoxLayout" name="verticalLayout">
       <item>
        <widget class="QCheckBox" name="checkBoxAccurateVibration">
-        <property name="text">
-         <string>Enable Accurate Vibration</string>
+        <property name="catalogueKey" stdset="0">
+         <string notr="true">enable_accurate_vibrations</string>
         </property>
        </widget>
       </item>

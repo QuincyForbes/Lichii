@@ -2268,8 +2268,8 @@
              <height>16777215</height>
             </size>
            </property>
-           <property name="title">
-            <string>Console Mode</string>
+           <property name="catalogueKey" stdset="0">
+            <string notr="true">use_docked_mode</string>
            </property>
            <layout class="QHBoxLayout" name="horizontalLayout_3">
             <property name="spacing">

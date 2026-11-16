@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common/settings.h"
+#include "qt_common/config/catalog_text.h"
 #include "core/perf_stats.h"
 #include "video_core/render_probe.h"
 #include "performance_overlay.h"
@@ -70,15 +71,7 @@ bool LosslessMissing() {
 }
 
 QString FrameGenMethodLabel() {
-    switch (Settings::values.frame_gen_type.GetValue()) {
-    case Settings::FrameGenType::Lsfg:
-        return QStringLiteral("LSFG");
-    case Settings::FrameGenType::MetalFx:
-        return QStringLiteral("MetalFX");
-    case Settings::FrameGenType::Fsr3:
-    default:
-        return QStringLiteral("FSR3");
-    }
+    return UiText::ChoiceNames<Settings::FrameGenType>()[Settings::values.frame_gen_type.GetValue()];
 }
 
 bool QueryProcessRam(double& used_gb, double& free_gb) {
@@ -229,41 +222,27 @@ const QColor DisplayedColor{74, 222, 128};
 const QColor WarningColor{255, 159, 10};
 const QColor BuildingColor{255, 214, 10};
 
-// What draws the picture, in the iOS overlay's short names.
+// What draws the picture, by the names Settings gives it.
 QString UpscalerLabel() {
     if (Settings::values.upscaler.GetValue() == Settings::Upscaler::MetalFx) {
-        return QStringLiteral("MetalFX Temporal");
+        return UiText::ChoiceNames<Settings::Upscaler>()[Settings::Upscaler::MetalFx];
     }
     if (Settings::GameDlssNetworkChosen()) {
-        return QStringLiteral("Game DLSS");
+        return UiText::Text("overlay.game_dlss");
     }
     if (Settings::NvidiaDlssChosen()) {
+        const QString dlss_name = UiText::ChoiceNames<Settings::Upscaler>()[Settings::Upscaler::Dlss];
 #ifdef EGLANTINE_STREAMLINE
         // What NVIDIA DLSS does in this game, not just the setting.
         const auto dlss = Vulkan::Streamline::GetSessionStatus();
-        return dlss.available && dlss.frames > 0 ? QStringLiteral("DLSS")
-               : dlss.available                  ? PerformanceOverlay::tr("DLSS idle")
-                                                 : PerformanceOverlay::tr("DLSS off");
+        return dlss.available && dlss.frames > 0 ? dlss_name
+               : dlss.available                  ? UiText::Text("overlay.dlss_idle").arg(dlss_name)
+                                                 : UiText::Text("overlay.dlss_off").arg(dlss_name);
 #else
-        return QStringLiteral("DLSS");
+        return dlss_name;
 #endif
     }
-    static const std::map<std::string_view, const char*> short_names{
-        {"Fsr", "FSR 1"},
-        {"Fsr3", "FSR3"},
-        {"NearestNeighbor", "Nearest"},
-        {"ZeroTangent", "Zero Tangent"},
-        {"BSpline", "B-Spline"},
-        {"Mmpx", "MMPX"},
-        {"Sgsr", "Snapdragon GSR"},
-        {"SgsrEdge", "Snapdragon GSR Edge"},
-        {"MetalFxSpatial", "MetalFX Spatial"},
-    };
-    const auto name = Settings::CanonicalizeEnum(Settings::values.scaling_filter.GetValue());
-    if (const auto it = short_names.find(name); it != short_names.end()) {
-        return QString::fromUtf8(it->second);
-    }
-    return QString::fromUtf8(name.data(), static_cast<qsizetype>(name.size()));
+    return UiText::ChoiceNames<Settings::ScalingFilter>()[Settings::values.scaling_filter.GetValue()];
 }
 
 } // namespace
@@ -418,9 +397,9 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
     const bool generating = gen_fps > 0.5 && fps > 0.5;
 
     // Frames: the same lines as the iOS overlay.
-    setLine(m_real, tr("Real %1 FPS").arg(fps, 0, 'f', 1), RealColor);
-    setLine(m_generated, generating ? tr("Generated +%1").arg(gen_fps, 0, 'f', 1) : QString());
-    setLine(m_displayed, generating ? tr("Displayed %1 FPS").arg(total_fps, 0, 'f', 1) : QString(),
+    setLine(m_real, UiText::Text("overlay.real").arg(fps, 0, 'f', 1), RealColor);
+    setLine(m_generated, generating ? UiText::Text("overlay.generated").arg(gen_fps, 0, 'f', 1) : QString());
+    setLine(m_displayed, generating ? UiText::Text("overlay.displayed").arg(total_fps, 0, 'f', 1) : QString(),
             DisplayedColor);
 
     static constexpr double FPS_SAMPLE_THRESHOLD = 3.0;
@@ -444,10 +423,10 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
     const double real_ft_ms =
         (!std::isnan(ft) && ft > 0.0) ? ft * 1000.0 : (fps > 0.1 ? 1000.0 / fps : 0.0);
     setLine(m_frametime, generating && total_fps > 0.5
-                             ? tr("Frame %1 ms (%2 out)")
+                             ? UiText::Text("overlay.frame_out")
                                    .arg(real_ft_ms, 0, 'f', 1)
                                    .arg(1000.0 / total_fps, 0, 'f', 1)
-                             : tr("Frame %1 ms").arg(real_ft_ms, 0, 'f', 1));
+                             : UiText::Text("overlay.frame").arg(real_ft_ms, 0, 'f', 1));
 
     if (!m_fpsSamples.empty()) {
         // Average of the lowest 10% of the real FPS samples
@@ -456,7 +435,7 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
         const size_t low_count = std::max<size_t>(1, sorted.size() / 10);
         const double low10_fps = std::accumulate(sorted.begin(), sorted.begin() + low_count, 0.0) /
                                  static_cast<double>(low_count);
-        setLine(m_low10, tr("10% low %1").arg(low10_fps, 0, 'f', 0));
+        setLine(m_low10, UiText::Text("overlay.low10").arg(low10_fps, 0, 'f', 0));
 
         double peak_chart_fps = *std::max_element(m_fpsSamples.begin(), m_fpsSamples.end());
         if (!m_totalFpsSamples.empty()) {
@@ -472,30 +451,30 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
     }
 
     // What draws the frames.
-    QString frame_gen = tr("Off");
+    QString frame_gen = UiText::Text("value.off");
     if (Settings::values.frame_gen.GetValue()) {
         if (LosslessMissing()) {
-            frame_gen = tr("LSFG needs Lossless.dll");
+            frame_gen = UiText::Text("overlay.lossless_missing").arg(FrameGenMethodLabel());
         } else if (generating) {
             frame_gen =
-                QStringLiteral("%1 %2x").arg(FrameGenMethodLabel()).arg(total_fps / fps, 0, 'f', 1);
+                UiText::Text("overlay.frame_gen_rate").arg(FrameGenMethodLabel()).arg(total_fps / fps, 0, 'f', 1);
         } else {
-            frame_gen = tr("%1 warming up").arg(FrameGenMethodLabel());
+            frame_gen = UiText::Text("overlay.warming_up").arg(FrameGenMethodLabel());
         }
     }
-    setLine(m_frameGen, tr("Frame gen %1").arg(frame_gen));
+    setLine(m_frameGen, UiText::Text("overlay.frame_gen").arg(frame_gen));
 
     const f32 res_scale = Settings::values.resolution_info.up_factor;
     const QString upscaler = UpscalerLabel();
-    const QString scale = tr("Scale %1x").arg(res_scale, 0, 'g', 2);
+    const QString scale = UiText::Text("overlay.scale").arg(res_scale, 0, 'g', 2);
     setLine(m_scale, upscaler.isEmpty() ? scale : scale + QLatin1Char(' ') + upscaler);
 
     const double speed_pct =
         std::isnan(results.emulation_speed) ? 100.0 : results.emulation_speed * 100.0;
-    setLine(m_speed, tr("Speed %1%").arg(speed_pct, 0, 'f', 0),
+    setLine(m_speed, UiText::Text("overlay.speed").arg(speed_pct, 0, 'f', 0),
             speed_pct > 0.0 && speed_pct < 90.0 ? WarningColor : QColor{});
     const int building = const_cast<VideoCore::ShaderNotify&>(shaders).ShadersBuilding();
-    setLine(m_shaders, building > 0 ? tr("Shaders %1 building").arg(building) : QString(),
+    setLine(m_shaders, building > 0 ? UiText::Text("overlay.shaders").arg(building) : QString(),
             BuildingColor);
 
     // The 3D scene, the game's finished picture (HUD and menus) and the screen.
@@ -512,24 +491,23 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
                                    scaling.ScaleUp(static_cast<u32>((extents >> 16) & 0xFFFF)));
     const QString screen_size = size(static_cast<u32>((extents >> 32) & 0xFFFF),
                                      static_cast<u32>((extents >> 48) & 0xFFFF));
-    setLine(m_scene, scene_size.isEmpty() ? QString() : tr("3D %1").arg(scene_size));
-    setLine(m_game, game_size.isEmpty() ? QString() : tr("Game %1").arg(game_size));
+    setLine(m_scene, scene_size.isEmpty() ? QString() : UiText::Text("overlay.scene").arg(scene_size));
+    setLine(m_game, game_size.isEmpty() ? QString() : UiText::Text("overlay.game").arg(game_size));
     setLine(m_screen, game_size.isEmpty() || screen_size.isEmpty()
                           ? QString()
-                          : tr("Screen %1").arg(screen_size));
-    const auto accuracy = Settings::CanonicalizeEnum(Settings::values.current_gpu_accuracy);
+                          : UiText::Text("overlay.screen").arg(screen_size));
     setLine(m_gpuAccuracy,
-            tr("GPU accuracy %1")
-                .arg(QString::fromUtf8(accuracy.data(), static_cast<qsizetype>(accuracy.size()))));
+            UiText::Text("overlay.gpu_accuracy")
+                .arg(UiText::ChoiceNames<Settings::GpuAccuracy>()[Settings::values.current_gpu_accuracy]));
 
     double ram_used = -1.0;
     double ram_free = -1.0;
     if (QueryProcessRam(ram_used, ram_free) && ram_used >= 0.0) {
         setLine(m_ram,
-                ram_free >= 0.0 ? tr("RAM %1 / %2 GB")
+                ram_free >= 0.0 ? UiText::Text("overlay.ram")
                                       .arg(ram_used, 0, 'f', 1)
                                       .arg(ram_used + ram_free, 0, 'f', 1)
-                                : tr("RAM %1 GB").arg(ram_used, 0, 'f', 1),
+                                : UiText::Text("overlay.ram_used").arg(ram_used, 0, 'f', 1),
                 ram_free >= 0.0 && ram_free < 2.0 ? WarningColor : QColor{});
     } else {
         setLine(m_ram, QString());
@@ -538,10 +516,10 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
     double vram_free = -1.0;
     if (QueryProcessVram(vram_used, vram_free) && vram_used >= 0.0) {
         setLine(m_vram,
-                vram_free >= 0.0 ? tr("VRAM %1 / %2 GB")
+                vram_free >= 0.0 ? UiText::Text("overlay.vram")
                                        .arg(vram_used, 0, 'f', 1)
                                        .arg(vram_used + vram_free, 0, 'f', 1)
-                                 : tr("VRAM %1 GB").arg(vram_used, 0, 'f', 1),
+                                 : UiText::Text("overlay.vram_used").arg(vram_used, 0, 'f', 1),
                 vram_free >= 0.0 && vram_free < 1.0 ? WarningColor : QColor{});
     } else {
         setLine(m_vram, QString());
@@ -553,9 +531,9 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
         setLine(m_textures, QString());
     } else if (texture_expected > 0) {
         setLine(m_textures,
-                tr("Textures %1 / %2 MB").arg(texture_bytes >> 20).arg(texture_expected >> 20));
+                UiText::Text("overlay.textures").arg(texture_bytes >> 20).arg(texture_expected >> 20));
     } else {
-        setLine(m_textures, tr("Textures %1 MB").arg(texture_bytes >> 20));
+        setLine(m_textures, UiText::Text("overlay.textures_used").arg(texture_bytes >> 20));
     }
     adjustSize();
 }

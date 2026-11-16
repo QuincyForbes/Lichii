@@ -45,6 +45,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Check UI catalogue
+        run: python3 -I tools/ui/catalog_check.py -v
+
       - name: Install tools
         env:
           HOMEBREW_NO_INSTALL_CLEANUP: 1

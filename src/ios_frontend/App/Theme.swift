@@ -8,6 +8,60 @@ import UIKit
 enum Theme {
     static let accent = Color(red: 0.55, green: 0.36, blue: 0.96)
     static let cornerRadius: CGFloat = 14
+    @MainActor static var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
+
+    /// Badge tint for a settings link or page id, keeping a cohesive Apple-Settings visual rhythm.
+    static func badgeColor(for id: String) -> Color {
+        switch id {
+        case "recommended", "graphics": return accent
+        case "controls": return .indigo
+        case "audio": return .pink
+        case "system", "about": return .blue
+        case "keys": return .orange
+        case "users": return .teal
+        case "shaders": return .cyan
+        case "setup": return .green
+        case "logs": return .secondary
+        case "experiments": return .purple
+        case "advanced": return .orange
+        default: return accent
+        }
+    }
+}
+
+/// Uniform 29x29 rounded-square icon badge for Settings rows (avoids SwiftUI List's uneven symbol
+/// widths and Label overrides).
+struct SettingsIconBadge: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let systemImage: String
+    var color: Color = Theme.accent
+
+    var body: some View {
+        Image(systemName: systemImage)
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(color)
+            .frame(width: 29, height: 29)
+            .background(
+                color.opacity(colorScheme == .dark ? 0.24 : 0.14),
+                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            )
+            .accessibilityHidden(true)
+    }
+}
+
+/// Settings navigation row with a fixed-width icon badge so every row title aligns cleanly.
+struct SettingsRowLabel: View {
+    let title: String
+    let systemImage: String
+    var color: Color = Theme.accent
+
+    var body: some View {
+        HStack(spacing: 12) {
+            SettingsIconBadge(systemImage: systemImage, color: color)
+            Text(title)
+                .foregroundStyle(.primary)
+        }
+    }
 }
 
 extension Notification.Name {
@@ -183,6 +237,10 @@ struct GameIcon: View {
         }
         .frame(width: side, height: side)
         .clipShape(RoundedRectangle(cornerRadius: side * 0.12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: side * 0.12, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.75)
+        )
     }
 
     private var initials: String {

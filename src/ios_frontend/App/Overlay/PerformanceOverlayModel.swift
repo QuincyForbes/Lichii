@@ -13,12 +13,7 @@ enum OverlayPreset: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 
     var title: String {
-        switch self {
-        case .off: return "Off"
-        case .minimal: return "Minimal"
-        case .standard: return "Standard"
-        case .detailed: return "Detailed"
-        }
+        UiText.text("overlay.preset.\(rawValue)")
     }
 
     var summary: String {
@@ -86,7 +81,7 @@ struct OverlayReading: Equatable {
     var low10Fps = 0.0
     var speedPercent = 0.0
 
-    var frameGen = "Off"
+    var frameGen = UiText.text("value.off")
     var frameGenActive = false
     var frameGenMultiplier = 1.0
     var resolutionScale = 1.0
@@ -109,17 +104,10 @@ struct OverlayReading: Equatable {
     var charging = false
 }
 
-/// Enum values of the settings bridge as short names: "frame_gen_type" 2 -> "MetalFX". A value a
-/// later build adds shows its own name.
+/// Enum values of the settings bridge resolved through `common/ui_catalog`.
 @MainActor
 enum OverlayNames {
     private static var tables: [String: [Int32: String]] = [:]
-
-    private static let short: [String: String] = [
-        "Lsfg": "LSFG", "Fsr3": "FSR3", "MetalFx": "MetalFX", "MetalFxSpatial": "MetalFX Spatial",
-        "Fsr": "FSR 1", "NearestNeighbor": "Nearest", "ScaleForce": "ScaleForce", "ZeroTangent": "Zero Tangent",
-        "BSpline": "B-Spline", "Mmpx": "MMPX", "Sgsr": "Snapdragon GSR", "SgsrEdge": "Snapdragon GSR Edge",
-    ]
 
     static func name(_ key: String, _ value: Int32) -> String {
         if tables[key] == nil {
@@ -134,7 +122,10 @@ enum OverlayNames {
             tables[key] = table
         }
         guard let raw = tables[key]?[value] else { return "" }
-        return short[raw] ?? raw.replacingOccurrences(of: "_", with: " ")
+        if let catalogLabel = UiText.choiceLabel(key, raw), !catalogLabel.isEmpty {
+            return catalogLabel
+        }
+        return raw.replacingOccurrences(of: "_", with: " ")
     }
 }
 
@@ -269,11 +260,12 @@ final class PerformanceOverlayMonitor: ObservableObject {
                                              : Double(snapshot.frame_gen_multiplier)
         let type = OverlayNames.name("frame_gen_type", snapshot.frame_gen_type)
         if !snapshot.frame_gen_enabled {
-            next.frameGen = "Off"
+            next.frameGen = UiText.text("value.off")
         } else if generating {
-            next.frameGen = String(format: "%@ %.1fx", type, next.frameGenMultiplier)
+            next.frameGen = UiText.format("overlay.frame_gen_rate", type,
+                                          String(format: "%.1f", next.frameGenMultiplier))
         } else {
-            next.frameGen = "\(type) warming up"
+            next.frameGen = UiText.format("overlay.warming_up", type)
         }
 
         next.resolutionScale = Double(snapshot.resolution_scale)
@@ -289,13 +281,13 @@ final class PerformanceOverlayMonitor: ObservableObject {
 
     private func upscaler(_ snapshot: LichiiPerfSnapshot) -> String {
         if QuickSettings.canonical("upscaler") == "MetalFx" {
-            return "MetalFX Temporal"
+            return UiText.choiceLabel("upscaler", "MetalFx") ?? ""
         }
         if snapshot.game_dlss_network {
-            return "Game DLSS"
+            return UiText.text("overlay.game_dlss")
         }
         if snapshot.nvidia_dlss {
-            return "DLSS"
+            return UiText.choiceLabel("upscaler", "Dlss") ?? "DLSS"
         }
         return OverlayNames.name("scaling_filter", snapshot.scaling_filter)
     }

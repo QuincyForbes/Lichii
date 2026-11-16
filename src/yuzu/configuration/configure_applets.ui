@@ -21,8 +21,8 @@
     <layout class="QVBoxLayout" name="verticalLayout">
      <item>
       <widget class="QGroupBox" name="group_library_applet_modes">
-       <property name="title">
-        <string>System Applets</string>
+       <property name="catalogueText" stdset="0">
+        <string notr="true">category.LibraryApplet</string>
        </property>
        <layout class="QVBoxLayout">
         <item>

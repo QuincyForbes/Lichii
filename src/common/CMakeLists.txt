@@ -152,6 +152,8 @@ add_library(
     thread.h
     thread_pinning.cpp
     thread_pinning.h
+    ui_catalog.cpp
+    ui_catalog.h
     nx2_sample_profile.cpp
     nx2_timeline.cpp
     nx2_timeline.h

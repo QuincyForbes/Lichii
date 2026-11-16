@@ -8,13 +8,13 @@ import SwiftUI
 enum ContentEntries {
     static var settingsLinks: [SettingsLink] {
         [
-            SettingsLink(id: "keys", title: "Keys & Firmware", systemImage: "key",
+            SettingsLink(id: "keys", title: UiText.text("page.keys_firmware"), systemImage: "key.fill",
                          view: { AnyView(KeysFirmwareView()) }),
-            SettingsLink(id: "users", title: "Users", systemImage: "person.2",
+            SettingsLink(id: "users", title: UiText.text("page.users"), systemImage: "person.2.fill",
                          view: { AnyView(ProfilesView()) }),
-            SettingsLink(id: "logs", title: "Logs", systemImage: "doc.text.magnifyingglass",
+            SettingsLink(id: "logs", title: UiText.text("page.logs"), systemImage: "doc.text.magnifyingglass",
                          view: { AnyView(LogsView()) }),
-            SettingsLink(id: "setup", title: "Setup Assistant", systemImage: "checklist",
+            SettingsLink(id: "setup", title: UiText.text("page.setup_assistant"), systemImage: "checklist",
                          view: { AnyView(SetupAssistantView()) }),
         ]
     }
@@ -22,7 +22,7 @@ enum ContentEntries {
     static var gameActions: [GameAction] {
         [
             // One screen with Updates, DLC and Mods tabs.
-            GameAction(id: "addons", title: "Updates, DLC & Mods", systemImage: "square.stack.3d.up",
+            GameAction(id: "addons", title: UiText.text("game.addons"), systemImage: "square.stack.3d.up",
                        view: { AnyView(AddonsView(game: $0)) }),
             GameAction(id: "cheats", title: "Cheats", systemImage: "wand.and.rays",
                        view: { AnyView(CheatsView(game: $0)) }),
@@ -66,7 +66,7 @@ struct SetupAssistantView: View {
                 }
             }
         }
-        .navigationTitle("Setup Assistant")
+        .navigationTitle(UiText.text("page.setup_assistant"))
         .onAppear { files.refresh() }
     }
 }

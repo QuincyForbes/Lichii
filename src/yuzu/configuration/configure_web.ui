@@ -29,8 +29,8 @@
          <layout class="QGridLayout" name="gridLayoutYuzuUsername">
           <item row="1" column="0">
            <widget class="QLabel" name="label_token">
-            <property name="text">
-             <string>Token: </string>
+            <property name="catalogueKey" stdset="0">
+             <string notr="true">eden_token</string>
             </property>
            </widget>
           </item>
@@ -42,8 +42,8 @@
               <verstretch>0</verstretch>
              </sizepolicy>
             </property>
-            <property name="text">
-             <string>Username: </string>
+            <property name="catalogueKey" stdset="0">
+             <string notr="true">eden_username</string>
             </property>
            </widget>
           </item>
@@ -144,8 +144,8 @@
      <layout class="QVBoxLayout" name="verticalLayout_21">
       <item>
        <widget class="QCheckBox" name="toggle_discordrpc">
-        <property name="text">
-         <string>Show Current Game in your Discord Status</string>
+        <property name="catalogueKey" stdset="0">
+         <string notr="true">enable_discord_presence</string>
         </property>
        </widget>
       </item>

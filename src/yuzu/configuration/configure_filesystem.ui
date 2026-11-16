@@ -113,15 +113,15 @@
         </item>
         <item row="0" column="1">
          <widget class="QCheckBox" name="gamecard_inserted">
-          <property name="text">
-           <string>Inserted</string>
+          <property name="catalogueKey" stdset="0">
+           <string notr="true">gamecard_inserted</string>
           </property>
          </widget>
         </item>
         <item row="1" column="1">
          <widget class="QCheckBox" name="gamecard_current_game">
-          <property name="text">
-           <string>Current Game</string>
+          <property name="catalogueKey" stdset="0">
+           <string notr="true">gamecard_current_game</string>
           </property>
          </widget>
         </item>
@@ -165,15 +165,15 @@
          <layout class="QHBoxLayout" name="horizontalLayout">
           <item>
            <widget class="QCheckBox" name="dump_nso">
-            <property name="text">
-             <string>Dump Decompressed NSOs</string>
+            <property name="catalogueKey" stdset="0">
+             <string notr="true">dump_nso</string>
             </property>
            </widget>
           </item>
           <item>
            <widget class="QCheckBox" name="dump_exefs">
-            <property name="text">
-             <string>Dump ExeFS</string>
+            <property name="catalogueKey" stdset="0">
+             <string notr="true">dump_exefs</string>
             </property>
            </widget>
           </item>
@@ -222,8 +222,8 @@
          <layout class="QHBoxLayout" name="horizontalLayout_2">
           <item>
            <widget class="QCheckBox" name="cache_game_list">
-            <property name="text">
-             <string>Cache Game List Metadata</string>
+            <property name="catalogueKey" stdset="0">
+             <string notr="true">cache_game_list</string>
             </property>
            </widget>
           </item>

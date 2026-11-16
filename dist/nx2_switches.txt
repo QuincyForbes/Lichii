@@ -662,3 +662,37 @@ EDEN_NX2_FENCE_BATCH=1
 # Diagnostics: keep the bytes of each hot page upload and compare them at each later use in the
 # epoch ("hot verify: stale" = uses write protection would have uploaded first).
 #EDEN_NX2_HOT_PAGES_VERIFY=1
+
+# --- Switches the iOS app's Memory & Experiments sets (src/ios_frontend/lichii_bridge_platform.cpp) ---
+# An idle guest core polls this long (us) before it blocks (default: the device profile's).
+#EDEN_NX2_IDLE_SPIN_US=20
+
+# 0: no zero page trimming of guest memory.
+#EDEN_NX2_TRIM_ZERO=0
+
+# 1: the driver's 8-bit indices, MoltenVK too; 0: Lichii widens them on any device.
+#EDEN_NX2_UINT8_INDICES=1
+
+# 1: mesh programs writing per-primitive attributes are built natively instead of emulated.
+#EDEN_NX2_NATIVE_PER_PRIMITIVE=1
+
+# Texture cache: a render target the game drew in this many frames is freed without a read back
+# (0: off); 1: textures that upload again from guest memory are freed first. The iOS device
+# profile sets 8 and 1.
+#EDEN_NX2_TC_REDRAWN_FRAMES=0
+#EDEN_NX2_TC_REUPLOAD_FIRST=0
+
+# arm64 JIT block tables: packed lists (1, iOS profile), per-core fault markers (1: as before),
+# compact ranges (0: as before).
+#EDEN_NX2_JIT_PACKED_LISTS=0
+#EDEN_NX2_JIT_FAULT_LOCAL=1
+#EDEN_NX2_JIT_RANGE_COMPACT=0
+
+# Apple: 0 logs no malloc census; 1 also logs one 60 s and 180 s into a game.
+#EDEN_NX2_MALLOC_CENSUS=1
+
+# Render passes of at least this many pixels (default 65536, 0: off) begin on a command buffer of
+# their own, after one copies can go to instead of ending the pass. KEEP_DEFERRED_CLEAR=0: a
+# pass's deferred clear is not kept, as before.
+#EDEN_NX2_BEFORE_PASS=0
+#EDEN_NX2_KEEP_DEFERRED_CLEAR=0

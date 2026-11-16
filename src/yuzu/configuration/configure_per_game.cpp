@@ -82,6 +82,7 @@
 #include "yuzu/configuration/recommended_settings.h"
 #include "yuzu/util/lichii_style.h"
 #include "yuzu/util/util.h"
+#include "qt_common/config/catalog_text.h"
 
 namespace {
 
@@ -399,6 +400,8 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
 
     ui->setupUi(this);
 
+    UiText::ApplyCatalogue(this);
+
     const auto make_scroll_page = [this](QWidget* page) {
         auto* area = new QScrollArea(this);
         area->setFrameShape(QFrame::NoFrame);
@@ -420,31 +423,35 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
 
     // The iOS app's Game Settings order and names: the settings pages as in Settings, then the
     // game's content.
-    ui->tabWidget->addTab(make_scroll_page(graphics_tab.get()), tr("Graphics"));
-    ui->tabWidget->addTab(make_scroll_page(graphics_advanced_tab.get()), tr("Advanced Graphics"));
-    ui->tabWidget->addTab(make_scroll_page(audio_tab.get()), tr("Audio"));
-    ui->tabWidget->addTab(make_scroll_page(system_tab.get()), tr("System"));
-    ui->tabWidget->addTab(make_scroll_page(cpu_tab.get()), tr("CPU"));
-    ui->tabWidget->addTab(make_scroll_page(input_tab.get()), tr("Controls"));
-    ui->tabWidget->addTab(make_scroll_page(addons_tab.get()), tr("Updates, DLC && Mods"));
-    ui->tabWidget->addTab(make_scroll_page(network_tab.get()), tr("Network"));
-    ui->tabWidget->addTab(make_scroll_page(applets_tab.get()), tr("System Applets"));
+    // A tab title shows "&" as "&&".
+    const auto tab = [](std::string_view id) {
+        return UiText::Text(id).replace(QLatin1Char('&'), QStringLiteral("&&"));
+    };
+    ui->tabWidget->addTab(make_scroll_page(graphics_tab.get()), tab("page.graphics"));
+    ui->tabWidget->addTab(make_scroll_page(graphics_advanced_tab.get()),
+                          tab("section.advanced_graphics"));
+    ui->tabWidget->addTab(make_scroll_page(audio_tab.get()), tab("page.audio"));
+    ui->tabWidget->addTab(make_scroll_page(system_tab.get()), tab("page.system"));
+    ui->tabWidget->addTab(make_scroll_page(cpu_tab.get()), tab("section.cpu"));
+    ui->tabWidget->addTab(make_scroll_page(input_tab.get()), tab("page.controls"));
+    ui->tabWidget->addTab(make_scroll_page(addons_tab.get()), tab("game.addons"));
+    ui->tabWidget->addTab(make_scroll_page(network_tab.get()), tab("section.network"));
+    ui->tabWidget->addTab(make_scroll_page(applets_tab.get()), tab("category.LibraryApplet"));
     ui->tabWidget->addTab(make_scroll_page(graphics_extensions_tab.get()),
-                          tr("Graphics Hacks && Extensions"));
+                          tab("section.hacks_extensions"));
     ui->tabWidget->setUsesScrollButtons(true);
 
     // What the iOS app says at the top of a game's settings.
     QLabel* const overrides_note =
-        LichiiStyle::Footer(tr("Changes here apply to this game only. A changed setting gets a "
-                               "button next to it that sets it back to the global value. Only "
-                               "settings that apply to this game are listed."),
+        LichiiStyle::Footer(QStringLiteral("%1 %2").arg(UiText::Text("game.note"),
+                                                        UiText::Text("game.note.desktop")),
                             this);
     ui->verticalLayout_2->addWidget(overrides_note);
 
     // Only true while a game runs.
     ui->label_8->setVisible(system.IsPoweredOn());
     setFocusPolicy(Qt::ClickFocus);
-    setWindowTitle(tr("Game Settings"));
+    setWindowTitle(UiText::Text("page.game_settings"));
 
     addons_tab->SetTitleId(title_id);
 
@@ -608,6 +615,7 @@ void ConfigurePerGame::FitToAvailableScreen() {
 
 void ConfigurePerGame::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }
 
 void ConfigurePerGame::HandleApplyButtonClicked() {

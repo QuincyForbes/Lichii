@@ -31,6 +31,7 @@
 #include "yuzu/configuration/configure_touchscreen_advanced.h"
 #include "yuzu/configuration/configure_vibration.h"
 #include "yuzu/configuration/input_profiles.h"
+#include "qt_common/config/catalog_text.h"
 
 namespace {
 template <typename Dialog, typename... Args>
@@ -60,6 +61,7 @@ ConfigureInput::ConfigureInput(Core::System& system_, QWidget* parent)
     : QWidget(parent), ui(std::make_unique<Ui::ConfigureInput>()),
       profiles(std::make_unique<InputProfiles>()), system{system_} {
     ui->setupUi(this);
+    UiText::ApplyCatalogue(this);
 }
 
 ConfigureInput::~ConfigureInput() = default;
@@ -247,6 +249,7 @@ void ConfigureInput::changeEvent(QEvent* event) {
 
 void ConfigureInput::RetranslateUI() {
     ui->retranslateUi(this);
+    UiText::ApplyCatalogue(this);
 }
 
 void ConfigureInput::LoadConfiguration() {

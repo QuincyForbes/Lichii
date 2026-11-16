@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "yuzu/configuration/shared_widget.h"
+#include "qt_common/config/catalog_text.h"
 
 #include <functional>
 #include <limits>
@@ -799,7 +800,7 @@ Widget::Widget(Settings::BasicSetting* setting_, const TranslationMap& translati
     if (UISettings::IsLichiiTheme()) {
         caption = QString(tooltip).replace(QLatin1Char('\n'), QLatin1Char(' ')).simplified();
         if (locked) {
-            const QString stop = tr("Stop the game to change this.");
+            const QString stop = UiText::Text("note.stop_game");
             caption = caption.isEmpty() ? stop : caption + QLatin1Char(' ') + stop;
         }
     }
@@ -820,13 +821,12 @@ Widget::Widget(Settings::BasicSetting* setting_, const TranslationMap& translati
     bool enable = runtime_lock || setting.RuntimeModifiable();
     QString reason;
     if (!enable) {
-        reason = tr("Stop the game to change this.");
+        reason = UiText::Text("note.stop_game");
     }
     if (setting.Switchable() && Settings::IsConfiguringGlobal() && !runtime_lock &&
         !setting.UsingGlobal()) {
         enable = false;
-        reason = tr("The running game's Game Settings override this setting: change it there "
-                    "(right-click the game > Game Settings).");
+        reason = UiText::Text("note.game_overrides");
     }
 
     this->setEnabled(enable);
@@ -846,25 +846,15 @@ Builder::~Builder() = default;
 // Settings that do nothing on this platform or in this build get no widget. Their values still load
 // and save, so a config written on another platform keeps them.
 QString PlatformUnavailableReason(const Settings::BasicSetting& setting) {
-    const u32 id = setting.Id();
-    const auto& values = Settings::values;
-    if (id == values.emulate_bgr565.Id()) {
-        return QObject::tr("Only for some GPUs on Android.");
+    const auto* entry = UiCatalog::FindSetting(setting.GetLabel());
+    if (entry != nullptr && entry->reason != nullptr &&
+        (entry->shown & UiCatalog::ThisPlatform()) == 0) {
+        return UiText::SettingReason(entry->key);
     }
 #ifndef EGLANTINE_STREAMLINE
     // NVIDIA DLSS runs through NVIDIA Streamline: Windows x64 builds made with it.
-    if (id == values.nvidia_dlss_preset.Id()) {
-        return QObject::tr("NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.");
-    }
-#endif
-#ifndef __APPLE__
-    if (id == values.moltenvk_driver.Id() || id == values.mesh_direct_outputs.Id()) {
-        return QObject::tr("MoltenVK runs on macOS and iOS only.");
-    }
-#endif
-#ifndef __linux__
-    if (id == UISettings::values.enable_gamemode.Id()) {
-        return QObject::tr("Feral GameMode exists on Linux only.");
+    if (setting.Id() == Settings::values.nvidia_dlss_preset.Id()) {
+        return UiText::Text("reason.dlss_build");
     }
 #endif
     return {};

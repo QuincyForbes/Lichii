@@ -73,7 +73,7 @@ struct ControlsView: View {
             }
 
             Section {
-                NavigationLink("Performance Overlay") { PerformanceOverlaySettingsView() }
+                NavigationLink(SettingLabels.title(for: "show_fps_overlay")) { PerformanceOverlaySettingsView() }
             }
 
             Section {
@@ -89,7 +89,7 @@ struct ControlsView: View {
                         "With a display or AirPlay connected, the game moves there and this device shows the controls.")
             }
         }
-        .navigationTitle("Controls")
+        .navigationTitle(UiText.text("page.controls"))
         .fullScreenCover(isPresented: $editing) {
             LayoutEditorScreen(gameId: nil, gameName: nil)
         }

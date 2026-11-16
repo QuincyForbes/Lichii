@@ -7,6 +7,7 @@
 #include "common/game_presets.h"
 #include "common/game_settings.h"
 #include "common/settings.h"
+#include "common/ui_catalog.h"
 
 namespace {
 
@@ -93,9 +94,18 @@ TEST_CASE("Apple tiers follow memory and GPU family", "[device_profile]") {
     device.memory_mib = 15800;
     profile = Profile::Recommend(device);
     CHECK(profile.tier == Profile::Tier::Ultra);
+    CHECK(profile.device_name == "iPad Pro 13-inch (M4) (M4, 16 GB)");
     CHECK(Value(profile, "frame_gen") == "On");
     CHECK(Value(profile, "oot_frame_rate") == "Fps60");
     CHECK(Value(profile, "texture_quality") == "Full");
+
+    device.model = "iPad13,16"; // M1 iPad Air: Apple GPU family 7, 8 GB
+    device.chip = "M1";
+    device.apple_gpu_family = 7;
+    device.memory_mib = 7900;
+    profile = Profile::Recommend(device);
+    CHECK(profile.tier == Profile::Tier::Mid);
+    CHECK(Value(profile, "oot_frame_rate") == "Fps60");
 }
 
 TEST_CASE("Desktop profile follows the GPU when it is known", "[device_profile]") {
@@ -280,4 +290,40 @@ TEST_CASE("Ocarina of Time's dynamic resolution is fixed under a temporal upscal
     // A resolution the player picked stays.
     CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Percent56, Upscaler::MetalFx, false) ==
           OotResolution::Percent56);
+}
+
+TEST_CASE("UiCatalog covers every core setting and resolves cross-references", "[ui_catalog]") {
+    for (const auto& [key, basic] : Settings::values.linkage.by_key) {
+        INFO(key);
+        CHECK(UiCatalog::FindSetting(key) != nullptr);
+    }
+    const auto* renderer = UiCatalog::FindSetting("backend");
+    REQUIRE(renderer != nullptr);
+    CHECK(std::string_view{renderer->label} == "Graphics API");
+    const auto* fsr_filter =
+        UiCatalog::FindChoice(Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
+                              static_cast<u32>(Settings::ScalingFilter::Fsr3));
+    REQUIRE(fsr_filter != nullptr);
+    CHECK(std::string_view{fsr_filter->label} == "AMD FSR 1 Soft");
+    const auto* optical_flow =
+        UiCatalog::FindChoice(Settings::EnumMetadata<Settings::FrameGenType>::Index(),
+                              static_cast<u32>(Settings::FrameGenType::Fsr3));
+    REQUIRE(optical_flow != nullptr);
+    CHECK(std::string_view{optical_flow->label} == "Optical Flow");
+    CHECK(std::string_view{UiCatalog::GetText("page.experiments")} == "Memory & Experiments");
+    const auto* file_guest = UiCatalog::FindExperiment("file_guest");
+    REQUIRE(file_guest != nullptr);
+    CHECK(std::string_view{file_guest->label} == "Keep Guest Memory in a File");
+    const std::string resolved = UiCatalog::Resolve(
+        "Use {exp:file_guest} with {setting:backend}",
+        [](std::string_view kind, std::string_view ref) -> std::string {
+            if (kind == "exp") {
+                return UiCatalog::FindExperiment(ref)->label;
+            }
+            if (kind == "setting") {
+                return UiCatalog::FindSetting(ref)->label;
+            }
+            return {};
+        });
+    CHECK(resolved == "Use Keep Guest Memory in a File with Graphics API");
 }

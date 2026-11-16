@@ -2541,8 +2541,8 @@
                    <height>23</height>
                   </size>
                  </property>
-                 <property name="text">
-                  <string>Keyboard</string>
+                 <property name="catalogueKey" stdset="0">
+                  <string notr="true">keyboard_enabled</string>
                  </property>
                 </widget>
                </item>
@@ -2554,9 +2554,9 @@
                         <height>23</height>
                       </size>
                     </property>
-                    <property name="text">
-                      <string>Mouse</string>
-                    </property>
+                   <property name="catalogueKey" stdset="0">
+                    <string notr="true">mouse_enabled</string>
+                   </property>
                   </widget>
                 </item>
                 <item row="2" column="0">
@@ -2591,8 +2591,8 @@
                 </item>
                <item row="3" column="0">
                 <widget class="QCheckBox" name="debug_enabled">
-                 <property name="text">
-                  <string>Debug Controller</string>
+                 <property name="catalogueKey" stdset="0">
+                  <string notr="true">debug_pad_enabled</string>
                  </property>
                 </widget>
                </item>
@@ -2605,8 +2605,8 @@
                </item>
                <item row="4" column="0">
                 <widget class="QCheckBox" name="enable_ring_controller">
-                 <property name="text">
-                  <string>Ring Controller</string>
+                 <property name="catalogueKey" stdset="0">
+                  <string notr="true">enable_ring_controller</string>
                  </property>
                 </widget>
                </item>
@@ -2619,8 +2619,8 @@
                </item>
                <item row="5" column="0">
                 <widget class="QCheckBox" name="enable_ir_sensor">
-                 <property name="text">
-                  <string>Infrared Camera</string>
+                 <property name="catalogueKey" stdset="0">
+                  <string notr="true">enable_ir_sensor</string>
                  </property>
                 </widget>
                </item>
@@ -2648,25 +2648,22 @@
                            <height>23</height>
                          </size>
                        </property>
-                       <property name="text">
-                         <string>Emulate Analog with Keyboard Input</string>
-                       </property>
+                      <property name="catalogueKey" stdset="0">
+                       <string notr="true">emulate_analog_keyboard</string>
+                      </property>
                      </widget>
                    </item>
                    <item row="2" column="0">
                      <widget class="QCheckBox" name="enable_raw_input">
-                       <property name="toolTip">
-                         <string>Requires restarting Lichii</string>
-                       </property>
                        <property name="minimumSize">
                          <size>
                            <width>0</width>
                            <height>23</height>
                          </size>
                        </property>
-                       <property name="text">
-                         <string>Enable XInput 8 player support (disables web applet)</string>
-                       </property>
+                      <property name="catalogueKey" stdset="0">
+                       <string notr="true">enable_raw_input</string>
+                      </property>
                      </widget>
                    </item>
                    <item row="3" column="0">
@@ -2677,9 +2674,9 @@
                            <height>23</height>
                          </size>
                        </property>
-                       <property name="text">
-                         <string>Enable UDP controllers (not needed for motion)</string>
-                       </property>
+                      <property name="catalogueKey" stdset="0">
+                       <string notr="true">enable_udp_controller</string>
+                      </property>
                      </widget>
                    </item>
                    <item row="4" column="0">
@@ -2690,57 +2687,48 @@
                            <height>23</height>
                          </size>
                        </property>
-                       <property name="text">
-                         <string>Controller navigation</string>
-                       </property>
+                      <property name="catalogueKey" stdset="0">
+                       <string notr="true">controller_navigation</string>
+                      </property>
                      </widget>
                    </item>
                    <item row="5" column="0">
                       <widget class="QCheckBox" name="enable_joycon_driver">
-                       <property name="toolTip">
-                         <string>Requires restarting Lichii</string>
-                       </property>
                        <property name="minimumSize">
                          <size>
                            <width>0</width>
                            <height>23</height>
                          </size>
                        </property>
-                       <property name="text">
-                         <string>Enable direct JoyCon driver</string>
+                       <property name="catalogueKey" stdset="0">
+                        <string notr="true">enable_joycon_driver</string>
                        </property>
                      </widget>
                    </item>
                    <item row="6" column="0">
                       <widget class="QCheckBox" name="enable_procon_driver">
-                       <property name="toolTip">
-                         <string>Requires restarting Lichii</string>
-                       </property>
                        <property name="minimumSize">
                          <size>
                            <width>0</width>
                            <height>23</height>
                          </size>
                        </property>
-                       <property name="text">
-                         <string>Enable direct Pro Controller driver [EXPERIMENTAL]</string>
+                       <property name="catalogueKey" stdset="0">
+                        <string notr="true">enable_procon_driver</string>
                        </property>
                      </widget>
                    </item>
                    <item row="7" column="0">
                      <widget class="QCheckBox" name="random_amiibo_id">
-                       <property name="toolTip">
-                         <string>Allows unlimited uses of the same Amiibo in games that would otherwise limit you to one use.</string>
-                       </property>
                        <property name="minimumSize">
                          <size>
                            <width>0</width>
                            <height>23</height>
                          </size>
                        </property>
-                       <property name="text">
-                         <string>Use random Amiibo ID</string>
-                       </property>
+                      <property name="catalogueKey" stdset="0">
+                       <string notr="true">random_amiibo_id</string>
+                      </property>
                      </widget>
                    </item>
                    <item row="8" column="0">
