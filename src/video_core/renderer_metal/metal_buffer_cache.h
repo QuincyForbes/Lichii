@@ -13,6 +13,7 @@
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
+#include "video_core/buffer_cache/usage_tracker.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_metal/metal_object.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
@@ -42,12 +43,19 @@ public:
         return buffer.Get();
     }
 
-    void MarkUsage(u64, u64) noexcept {}
+    /// The bytes are read or written by what the scheduler's segment records in order: an
+    /// upload of them does not go ahead of it (EDEN_NX2_METAL_AHEAD).
+    void MarkUsage(u64 offset, u64 size) noexcept;
+
+    [[nodiscard]] bool IsRegionUsed(u64 offset, u64 size) const noexcept;
 
 private:
     BufferCacheRuntime* runtime{};
     Object buffer;
     u64 bytes{};
+    VideoCommon::UsageTracker tracker;
+    /// The scheduler segment the tracker holds the uses of.
+    u64 usage_serial{};
 };
 
 /// One resource the next draw or dispatch binds, in binding order.
@@ -127,10 +135,9 @@ public:
 
     [[nodiscard]] StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
 
-    [[nodiscard]] bool CanReorderUpload(const Buffer&,
-                                        std::span<const VideoCommon::BufferCopy>) const noexcept {
-        return false;
-    }
+    /// Whether the upload may go ahead of the segment: nothing recorded in it uses the bytes.
+    [[nodiscard]] bool CanReorderUpload(
+        const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies) const noexcept;
 
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 

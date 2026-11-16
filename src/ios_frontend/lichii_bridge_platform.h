@@ -232,7 +232,11 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// stencil bit where the game clears a part, and gives every clear a render pass of its own, as
 /// before (EDEN_NX2_METAL_CLEAR_DRAWS=0, EDEN_NX2_METAL_CLEAR_FOLD=0).
 /// "metal_barrier_off": the Metal renderer ignores the game's fragment barrier, as before
-/// (EDEN_NX2_METAL_FRAGMENT_BARRIER=0).
+/// (EDEN_NX2_METAL_FRAGMENT_BARRIER=0). "metal_state_plain": the Metal renderer sets all state
+/// and bindings for every draw and dispatch, as before (EDEN_NX2_METAL_STATE_CACHE=0).
+/// "metal_ahead_off": the Metal renderer records uploads and a draw's kernels where they come,
+/// ending the open render pass, and commits nothing early, as before (EDEN_NX2_METAL_AHEAD=0,
+/// EDEN_NX2_METAL_AHEAD_SPLIT=0).
 /// "pipeline_holds_old": the pipeline build a draw waits for stays queued on the builder pool, as
 /// before (EDEN_NX2_PIPELINE_HOLD_BOOST=0). "pipeline_list_old": the used pipelines list is
 /// written only on a first use 15 s after the last save and at shutdown, as before

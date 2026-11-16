@@ -2184,6 +2184,270 @@ int RunClearFold() {
     return pictures && counted ? 0 : 1;
 }
 
+/// What the two-quad cases below share: a pipeline drawing QuadSource into RGBA8, a vertex
+/// buffer of two quads (the left half of the target, then the right half) and read-backs.
+struct QuadScene {
+    explicit QuadScene(const Metal::Device& device) {
+        using Maxwell = Metal::Maxwell;
+        const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+        for (size_t index = 0; index < textures.size(); ++index) {
+            textures[index] = Metal::CreateTexture(device, {.kind = Metal::TextureKind::e2D,
+                                                            .format = rgba8,
+                                                            .width = Size,
+                                                            .height = Size,
+                                                            .render_target = true});
+            readbacks[index] = Metal::CreateBuffer(device, Size * Size * 4, true, &pixels[index]);
+        }
+        library = Metal::CreateLibrary(device, QuadSource, error);
+        if (library) {
+            vertex = Metal::CreateFunction(library.Get(), "quad_vertex");
+            fragment = Metal::CreateFunction(library.Get(), "quad_fragment");
+        }
+        auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+        desc.vertex_function = vertex.Get();
+        desc.fragment_function = fragment.Get();
+        desc.color_formats[0] = rgba8;
+        desc.blend[0].write_mask = 0xF;
+        desc.samples = 1;
+        desc.topology_class = 2;
+        desc.rasterize = 1;
+        desc.attributes[0] = {1, 0, 0, Maxwell::VertexAttribute::Type::Float,
+                              Maxwell::VertexAttribute::Size::Size_R32_G32};
+        desc.streams[0] = {1, 8, 0};
+        pipeline = Metal::CreateRenderPipelineState(device, desc, error);
+        depth_stencil =
+            Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+        vertex_buffer = Metal::CreateBuffer(device, 2 * QuadBytes, true, &vertices);
+        staging = Metal::CreateBuffer(device, QuadBytes, true, &staged);
+        valid = textures[0] && textures[1] && pipeline && depth_stencil && pixels[0] != nullptr &&
+                pixels[1] != nullptr && vertices != nullptr && staged != nullptr;
+        if (valid) {
+            std::memset(vertices, 0, 2 * QuadBytes);
+            std::memcpy(vertices, Left.data(), QuadBytes);
+            std::memcpy(staged, Right.data(), QuadBytes);
+        }
+    }
+
+    Metal::RenderTargetSet Targets(size_t index) const {
+        Metal::RenderTargetSet targets{};
+        targets.color[0] = {.texture = textures[index].Get()};
+        targets.width = Size;
+        targets.height = Size;
+        return targets;
+    }
+
+    void Clear(Metal::Scheduler& scheduler, size_t index, std::array<double, 4> value) const {
+        Metal::ClearPass pass{};
+        pass.color[0] = {.texture = textures[index].Get()};
+        pass.clear_color[0] = true;
+        pass.color_value[0] = value;
+        pass.width = Size;
+        pass.height = Size;
+        scheduler.Clear(pass);
+    }
+
+    /// One quad of the vertex buffer, within the upper `rows` rows of the target.
+    void Draw(Metal::Scheduler& scheduler, size_t index, uint32_t quad, uint32_t rows) const {
+        scheduler.BeginRendering(Targets(index));
+        Metal::DrawState state{};
+        state.pipeline = pipeline.Get();
+        state.depth_stencil = depth_stencil.Get();
+        state.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+        state.scissor = {0, 0, Size, rows};
+        scheduler.SetDrawState(state);
+        scheduler.BindVertexBuffer(Metal::VertexBufferSlot(0), vertex_buffer.Get(),
+                                   quad * QuadBytes);
+        scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 6, 1, 0);
+    }
+
+    void Read(Metal::Scheduler& scheduler, size_t index) const {
+        scheduler.CopyTextureToBuffer(textures[index].Get(), 0, 0, {}, {Size, Size, 1},
+                                      readbacks[index].Get(), 0, Size * 4, 0);
+    }
+
+    Texel At(size_t index, uint32_t x, uint32_t y) const {
+        return reinterpret_cast<const Texel*>(pixels[index])[y * Size + x];
+    }
+
+    static constexpr uint32_t QuadBytes = 48;
+    static constexpr std::array<float, 12> Left{-1, -1, 0, -1, 0, 1, -1, -1, 0, 1, -1, 1};
+    static constexpr std::array<float, 12> Right{0, -1, 1, -1, 1, 1, 0, -1, 1, 1, 0, 1};
+
+    std::array<Metal::Object, 2> textures;
+    std::array<Metal::Object, 2> readbacks;
+    std::array<uint8_t*, 2> pixels{};
+    Metal::Object library;
+    Metal::Object vertex;
+    Metal::Object fragment;
+    Metal::Object pipeline;
+    Metal::Object depth_stencil;
+    Metal::Object vertex_buffer;
+    Metal::Object staging;
+    uint8_t* vertices{};
+    uint8_t* staged{};
+    std::string error;
+    bool valid{};
+};
+
+bool SwitchOn(const char* name) {
+    const char* const value = std::getenv(name);
+    return value == nullptr || value[0] != '0';
+}
+
+/// State and bindings an encoder already has are not set again (EDEN_NX2_METAL_STATE_CACHE):
+/// draws of one pass differing in the scissor and the vertex buffer's offset, then the same
+/// state in a new pass, which has nothing yet.
+int RunStateCache() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const QuadScene scene(device);
+    if (!scene.valid) {
+        std::printf("metal-smoke: FAIL state cache setup: %s\n", scene.error.c_str());
+        return 1;
+    }
+    std::memcpy(scene.vertices + QuadScene::QuadBytes, QuadScene::Right.data(),
+                QuadScene::QuadBytes);
+    (void)scheduler.TakeCounts();
+    scene.Clear(scheduler, 0, {1.0, 0.0, 0.0, 1.0});
+    scene.Draw(scheduler, 0, 0, Size);
+    // The right half, upper rows only: another scissor, the same buffer further in.
+    scene.Draw(scheduler, 0, 1, Size / 2);
+    scene.Draw(scheduler, 0, 1, Size / 2);
+    scene.Clear(scheduler, 1, {0.0, 0.0, 1.0, 1.0});
+    scene.Draw(scheduler, 1, 1, Size / 2);
+    scene.Read(scheduler, 0);
+    scene.Read(scheduler, 1);
+    scheduler.Finish();
+    const auto counts = scheduler.TakeCounts();
+    const uint64_t sets = counts[5];
+    const uint64_t skips = counts[6];
+
+    const uint32_t upper = Size / 4;
+    const uint32_t lower = Size - Size / 4;
+    const bool pictures = Near(scene.At(0, 4, upper), {0, 255, 0, 255}) &&
+                          Near(scene.At(0, 4, lower), {0, 255, 0, 255}) &&
+                          Near(scene.At(0, Size - 4, upper), {0, 255, 0, 255}) &&
+                          Near(scene.At(0, Size - 4, lower), {255, 0, 0, 255}) &&
+                          Near(scene.At(1, 4, upper), {0, 0, 255, 255}) &&
+                          Near(scene.At(1, Size - 4, upper), {0, 255, 0, 255}) &&
+                          Near(scene.At(1, Size - 4, lower), {0, 0, 255, 255});
+    // A draw is ten pieces of state and one buffer. The first of a pass sets them all (11); the
+    // second sets the scissor and the offset (2 set, 9 left); the third nothing (11 left).
+    const bool caching = SwitchOn("EDEN_NX2_METAL_STATE_CACHE");
+    const bool counted = caching ? sets == 24 && skips == 20 : sets == 44 && skips == 0;
+    std::printf("metal-smoke: state cache (%s): pictures %s; %llu set, %llu left as they were: "
+                "%s\n",
+                caching ? "on" : "off", pictures ? "PASS" : "FAIL",
+                static_cast<unsigned long long>(sets), static_cast<unsigned long long>(skips),
+                counted ? "PASS" : "FAIL");
+    return pictures && counted ? 0 : 1;
+}
+
+/// Uploads and kernels ahead of their segment (EDEN_NX2_METAL_AHEAD): a copy and a compute
+/// dispatch recorded while a render pass is open leave it open and run before it; a pass that
+/// wanted its own segment gets one (EDEN_NX2_METAL_AHEAD_SPLIT).
+int RunAhead() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const QuadScene scene(device);
+    constexpr uint32_t Marks = 16;
+    uint8_t* marks = nullptr;
+    uint8_t* late = nullptr;
+    const Metal::Object mark_buffer = Metal::CreateBuffer(device, Marks * 4, true, &marks);
+    const Metal::Object late_buffer =
+        Metal::CreateBuffer(device, QuadScene::QuadBytes, true, &late);
+    std::string error;
+    const Metal::Object mark_library = Metal::CreateLibrary(device, GroupMarkSource, error);
+    const Metal::Object mark_function =
+        mark_library ? Metal::CreateFunction(mark_library.Get(), "mark_groups") : Metal::Object{};
+    const Metal::Object mark_state =
+        mark_function ? Metal::CreateComputePipelineState(device, mark_function.Get(), error)
+                      : Metal::Object{};
+    if (!scene.valid || !mark_state || marks == nullptr || late == nullptr) {
+        std::printf("metal-smoke: FAIL ahead setup: %s %s\n", scene.error.c_str(), error.c_str());
+        return 1;
+    }
+    std::memset(marks, 0, Marks * 4);
+    std::memset(late, 0, QuadScene::QuadBytes);
+    const Metal::RenderTargetSet first = scene.Targets(0);
+    const Metal::RenderTargetSet second = scene.Targets(1);
+
+    (void)scheduler.TakeCounts();
+    scene.Draw(scheduler, 0, 0, Size);
+    // The second quad's vertices arrive while the pass is open, as the buffer cache's uploads
+    // do; then a kernel, as the index rewrite, mesh and tessellation kernels of a draw.
+    scheduler.CopyBuffer(scene.staging.Get(), 0, scene.vertex_buffer.Get(), QuadScene::QuadBytes,
+                         QuadScene::QuadBytes, true);
+    const bool open_after_copy = scheduler.IsRenderingTo(first);
+    const bool noted_ahead = scheduler.UsedInOrder(scene.vertex_buffer.Get());
+    scheduler.BeginCompute(mark_state.Get(), scheduler.CanRecordAhead(first));
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, mark_buffer.Get(), 0);
+    scheduler.Dispatch({Marks, 1, 1}, {1, 1, 1});
+    const bool open_after_kernel = scheduler.IsRenderingTo(first);
+    scene.Draw(scheduler, 0, 1, Size);
+    // The other target's pass asked for a segment of its own; a pass that did not gets none.
+    scene.Clear(scheduler, 1, {0.0, 0.0, 1.0, 1.0});
+    scheduler.WantSplitBefore(second);
+    const uint64_t before_split = scheduler.SegmentSerial();
+    scheduler.SplitBefore(second);
+    const bool split = scheduler.SegmentSerial() != before_split;
+    scene.Draw(scheduler, 1, 0, Size);
+    scheduler.SplitBefore(second);
+    scheduler.SplitBefore(first);
+    // A copy in its place: the buffer takes no copy ahead for the rest of the segment.
+    scheduler.CopyBuffer(scene.staging.Get(), 0, late_buffer.Get(), 0, QuadScene::QuadBytes);
+    const bool noted_in_order = scheduler.UsedInOrder(late_buffer.Get());
+    scene.Read(scheduler, 0);
+    scene.Read(scheduler, 1);
+    scheduler.Finish();
+    const bool noted_after = scheduler.UsedInOrder(late_buffer.Get());
+    const auto counts = scheduler.TakeCounts();
+    const uint64_t command_buffers = counts[1];
+    const uint64_t passes = counts[3];
+    const uint64_t splits = counts[7];
+    const uint64_t ahead_copies = counts[8];
+    const uint64_t ahead_kernels = counts[9];
+
+    uint32_t marked = 0;
+    for (uint32_t index = 0; index < Marks; ++index) {
+        uint32_t mark;
+        std::memcpy(&mark, marks + index * 4, sizeof(mark));
+        marked += mark == 1 ? 1 : 0;
+    }
+    const uint32_t row = Size / 2;
+    const bool results = Near(scene.At(0, 4, row), {0, 255, 0, 255}) &&
+                         Near(scene.At(0, Size - 4, row), {0, 255, 0, 255}) &&
+                         Near(scene.At(1, 4, row), {0, 255, 0, 255}) &&
+                         Near(scene.At(1, Size - 4, row), {0, 0, 255, 255}) && marked == Marks &&
+                         std::memcmp(late, QuadScene::Right.data(), QuadScene::QuadBytes) == 0 &&
+                         noted_in_order && !noted_after;
+    // Ahead: the first target's pass stays one (2 with the other target's), the copy and the
+    // kernel have a command buffer each, and so has the segment split off (4 with the last).
+    // In order: the copy ends the pass, the second quad begins another (3), one command buffer.
+    // A clear that does not wait for its pass (EDEN_NX2_METAL_CLEAR_FOLD=0) is one pass more.
+    const bool ahead = SwitchOn("EDEN_NX2_METAL_AHEAD");
+    const bool splitting = ahead && SwitchOn("EDEN_NX2_METAL_AHEAD_SPLIT");
+    const uint64_t clear_passes = SwitchOn("EDEN_NX2_METAL_CLEAR_FOLD") ? 0 : 1;
+    const bool counted =
+        ahead ? open_after_copy && open_after_kernel && !noted_ahead &&
+                    passes == 2 + clear_passes && ahead_copies == 1 && ahead_kernels == 1 &&
+                    split == splitting && splits == (splitting ? 1U : 0U) &&
+                    command_buffers == (splitting ? 4U : 3U)
+              : !open_after_copy && !open_after_kernel && noted_ahead &&
+                    passes == 3 + clear_passes && ahead_copies == 0 && ahead_kernels == 0 &&
+                    !split && splits == 0 && command_buffers == 1;
+    std::printf("metal-smoke: ahead of the segment (%s, split %s): results %s; %llu render "
+                "passes, %llu copies and %llu kernels ahead, %llu segments split off, %llu "
+                "command buffers: %s\n",
+                ahead ? "on" : "off", splitting ? "on" : "off", results ? "PASS" : "FAIL",
+                static_cast<unsigned long long>(passes),
+                static_cast<unsigned long long>(ahead_copies),
+                static_cast<unsigned long long>(ahead_kernels),
+                static_cast<unsigned long long>(splits),
+                static_cast<unsigned long long>(command_buffers), counted ? "PASS" : "FAIL");
+    return results && counted ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main(int argc, char** argv) {
@@ -2201,7 +2465,7 @@ int main(int argc, char** argv) {
                                  RunOcarinaBilinear, RunPipelineArchive,
                                  RunDepthBlit, RunTessellation, RunDepthStencilBlit,
                                  RunPipelineCheck, RunDeviceMsl, RunBlockCopy, RunClearRect,
-                                 RunClearFold, SmokeProbe::RunAll}) {
+                                 RunClearFold, RunStateCache, RunAhead, SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }

@@ -232,7 +232,8 @@ private:
     void FinishTexelWritebacks();
 
     /// Encodes the GPU rewrite of index_rewrite (fills its output; left empty when it can't).
-    void RewriteIndices();
+    /// ahead: before the segment, leaving the open render pass as it is.
+    void RewriteIndices(bool ahead);
 
     /// Binds mesh_buffers to the program's slots of the emulation's bindings.
     void BindMeshBuffers(const StageProgram& program, ShaderStage metal_stage,

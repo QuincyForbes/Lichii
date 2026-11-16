@@ -177,6 +177,76 @@ bool ClearFoldEnabled() {
     return enabled;
 }
 
+// EDEN_NX2_METAL_STATE_CACHE=0: every draw and dispatch sets all its state and bindings again.
+bool StateCacheEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_STATE_CACHE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// EDEN_NX2_METAL_AHEAD=0: uploads and kernels are recorded where they come, ending the open
+// render encoder.
+bool AheadEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_AHEAD");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// EDEN_NX2_METAL_AHEAD_SPLIT=0: no command buffer is committed early to let a render pass begin
+// a segment.
+bool AheadSplitEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_AHEAD_SPLIT");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// What one stage of an encoder has bound; a new encoder has nothing bound, as this starts.
+struct StageBindings {
+    std::array<const void*, BufferSlots> buffers{};
+    std::array<u32, BufferSlots> offsets{};
+    std::array<const void*, TextureSlots> textures{};
+    std::array<const void*, SamplerSlots> samplers{};
+};
+
+/// A buffer slot holding bytes (setBytes): its address stands for a buffer no other equals.
+const char InlineBytes{};
+
+enum class Bound {
+    Same,   ///< Nothing to set
+    Offset, ///< The same buffer at another offset
+    Other,
+};
+
+void ReportFailure(id<MTLCommandBuffer> finished, u64 tick, std::atomic<u32>* errors_logged) {
+    if (finished.status != MTLCommandBufferStatusError || errors_logged->fetch_add(1) >= 16) {
+        return;
+    }
+    NSError* const error = finished.error;
+    std::string encoders;
+    NSArray* const infos = error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+    for (id<MTLCommandBufferEncoderInfo> info in infos) {
+        // MTLCommandEncoderErrorState: 0 unknown, 1 completed, 2 affected, 3 pending, 4 faulted.
+        if (info.errorState != MTLCommandEncoderErrorStateCompleted) {
+            encoders += fmt::format("{}{} (state {})", encoders.empty() ? "" : ", ",
+                                    info.label.UTF8String != nullptr ? info.label.UTF8String : "?",
+                                    static_cast<int>(info.errorState));
+        }
+    }
+    LOG_ERROR(Render_Metal, "Metal: command buffer {} ({}) failed: code {}: {}; encoders: {}", tick,
+              finished.label.UTF8String != nullptr ? finished.label.UTF8String : "?",
+              static_cast<long>(error.code),
+              error.localizedDescription.UTF8String != nullptr
+                  ? error.localizedDescription.UTF8String
+                  : "no description",
+              encoders.empty() ? "none reported" : encoders);
+}
+
 /// Adds `clear` to the waiting `pending` when one render pass can do both.
 bool MergeClear(ClearPass& pending, const ClearPass& clear) {
     if (pending.width != clear.width || pending.height != clear.height) {
@@ -263,23 +333,216 @@ struct Scheduler::Impl {
         std::memset(visibility.contents, 0, VisibilitySlots * sizeof(u64));
     }
 
+    id<MTLCommandBuffer> NewCommandBuffer(NSString* label) {
+        // EDEN_NX2_METAL_ENCODER_STATUS=0: no per-encoder status in command buffer errors.
+        static const bool encoder_status = [] {
+            const char* const value = std::getenv("EDEN_NX2_METAL_ENCODER_STATUS");
+            return value == nullptr || value[0] != '0';
+        }();
+        id<MTLCommandBuffer> buffer = nil;
+        if (encoder_status) {
+            MTLCommandBufferDescriptor* descriptor = [MTLCommandBufferDescriptor new];
+            descriptor.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+            buffer = [queue commandBufferWithDescriptor:descriptor];
+        } else {
+            buffer = [queue commandBuffer];
+        }
+        buffer.label = label;
+        return buffer;
+    }
+
     id<MTLCommandBuffer> Commands() {
         if (command_buffer == nil) {
-            // EDEN_NX2_METAL_ENCODER_STATUS=0: no per-encoder status in command buffer errors.
-            static const bool encoder_status = [] {
-                const char* const value = std::getenv("EDEN_NX2_METAL_ENCODER_STATUS");
-                return value == nullptr || value[0] != '0';
-            }();
-            if (encoder_status) {
-                MTLCommandBufferDescriptor* descriptor = [MTLCommandBufferDescriptor new];
-                descriptor.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
-                command_buffer = [queue commandBufferWithDescriptor:descriptor];
-            } else {
-                command_buffer = [queue commandBuffer];
-            }
-            command_buffer.label = [NSString stringWithFormat:@"Lichii %llu", current_tick];
+            command_buffer =
+                NewCommandBuffer([NSString stringWithFormat:@"Lichii %llu", current_tick]);
         }
         return command_buffer;
+    }
+
+    /// The blit encoder of the copies recorded ahead of the segment, in a command buffer
+    /// committed before the kernels' and the segment's.
+    id<MTLBlitCommandEncoder> UploadEncoder() {
+        if (upload_blit == nil) {
+            upload_buffer =
+                NewCommandBuffer([NSString stringWithFormat:@"Lichii %llu uploads", current_tick]);
+            upload_blit = [upload_buffer blitCommandEncoder];
+            upload_blit.label = @"Uploads";
+            ++encoders;
+        }
+        ++blit_commands;
+        ++ahead_copies;
+        return upload_blit;
+    }
+
+    /// The compute encoder of the kernels recorded ahead of the segment.
+    id<MTLComputeCommandEncoder> KernelEncoder() {
+        if (kernel_compute == nil) {
+            kernel_buffer =
+                NewCommandBuffer([NSString stringWithFormat:@"Lichii %llu kernels", current_tick]);
+            kernel_compute = [kernel_buffer computeCommandEncoder];
+            kernel_compute.label = @"Kernels";
+            kernel_bound = {};
+            kernel_pipeline = nullptr;
+            ++encoders;
+        }
+        return kernel_compute;
+    }
+
+    /// Commits a command buffer of the tick being recorded that is not its last one: the tick
+    /// is done when the one Flush commits is.
+    void CommitEarly(id<MTLCommandBuffer> buffer, u64 tick) {
+        if (buffer == nil) {
+            return;
+        }
+        std::atomic<u64>* const gpu_time = &gpu_ns;
+        std::atomic<u32>* const errors = &errors_logged;
+        [buffer addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+            const CFTimeInterval busy = finished.GPUEndTime - finished.GPUStartTime;
+            if (busy > 0.0) {
+                gpu_time->fetch_add(static_cast<u64>(busy * 1e9), std::memory_order_relaxed);
+            }
+            ReportFailure(finished, tick, errors);
+        }];
+        [buffer commit];
+        ++command_buffers;
+        in_flight.emplace_back(tick, buffer);
+    }
+
+    /// The uploads and kernels recorded ahead, before the segment they belong to.
+    void CommitAhead(u64 tick) {
+        if (upload_blit != nil) {
+            [upload_blit endEncoding];
+            upload_blit = nil;
+        }
+        if (kernel_compute != nil) {
+            if (active_compute == kernel_compute) {
+                active_compute = nil;
+                active_bound = nullptr;
+            }
+            [kernel_compute endEncoding];
+            kernel_compute = nil;
+        }
+        const id<MTLCommandBuffer> uploads = upload_buffer;
+        const id<MTLCommandBuffer> kernels = kernel_buffer;
+        upload_buffer = nil;
+        kernel_buffer = nil;
+        CommitEarly(uploads, tick);
+        CommitEarly(kernels, tick);
+    }
+
+    void NextSegment() {
+        ++segment_serial;
+        segment_encoders = 0;
+        ahead_blocked = false;
+        in_order_buffers.clear();
+    }
+
+    /// A copy recorded in order reads or writes `buffer`: no copy into it goes ahead any more.
+    void NoteInOrder(BufferHandle buffer) {
+        if (std::find(in_order_buffers.rbegin(), in_order_buffers.rend(), buffer) ==
+            in_order_buffers.rend()) {
+            in_order_buffers.push_back(buffer);
+        }
+    }
+
+    /// Commits what the tick recorded so far; the tick goes on in a new segment.
+    void Split() {
+        EndEncoder();
+        CommitAhead(current_tick);
+        const id<MTLCommandBuffer> segment = command_buffer;
+        command_buffer = nil;
+        CommitEarly(segment, current_tick);
+        NextSegment();
+        ++splits;
+        ++tick_splits;
+    }
+
+    bool Wanted(const RenderTargetSet& targets) const {
+        const auto end = wanted.begin() + (std::min)(wanted_count, wanted.size());
+        return std::find(wanted.begin(), end, targets) != end;
+    }
+
+    /// What binding `buffer` at `offset` takes, with `bound` as the encoder has it.
+    Bound NoteBuffer(StageBindings& bound, u32 slot, const void* buffer, u32 offset) {
+        if (!StateCacheEnabled() || slot >= bound.buffers.size()) {
+            ++state_sets;
+            return Bound::Other;
+        }
+        const bool same_buffer = bound.buffers[slot] == buffer;
+        if (same_buffer && (buffer == nullptr || bound.offsets[slot] == offset)) {
+            ++state_skips;
+            return Bound::Same;
+        }
+        bound.buffers[slot] = buffer;
+        bound.offsets[slot] = offset;
+        ++state_sets;
+        return same_buffer ? Bound::Offset : Bound::Other;
+    }
+
+    /// Whether `object` has to be set where `bound` is.
+    template <size_t N>
+    bool NoteObject(std::array<const void*, N>& bound, u32 slot, const void* object) {
+        if (!StateCacheEnabled() || slot >= N) {
+            ++state_sets;
+            return true;
+        }
+        if (bound[slot] == object) {
+            ++state_skips;
+            return false;
+        }
+        bound[slot] = object;
+        ++state_sets;
+        return true;
+    }
+
+    void SetBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset) {
+        switch (stage) {
+        case ShaderStage::Vertex:
+            if (render == nil) {
+                return;
+            }
+            switch (NoteBuffer(vertex_bound, slot, buffer, offset)) {
+            case Bound::Same:
+                break;
+            case Bound::Offset:
+                [render setVertexBufferOffset:offset atIndex:slot];
+                break;
+            case Bound::Other:
+                [render setVertexBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
+                break;
+            }
+            break;
+        case ShaderStage::Fragment:
+            if (render == nil) {
+                return;
+            }
+            switch (NoteBuffer(fragment_bound, slot, buffer, offset)) {
+            case Bound::Same:
+                break;
+            case Bound::Offset:
+                [render setFragmentBufferOffset:offset atIndex:slot];
+                break;
+            case Bound::Other:
+                [render setFragmentBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
+                break;
+            }
+            break;
+        case ShaderStage::Compute:
+            if (active_compute == nil) {
+                return;
+            }
+            switch (NoteBuffer(*active_bound, slot, buffer, offset)) {
+            case Bound::Same:
+                break;
+            case Bound::Offset:
+                [active_compute setBufferOffset:offset atIndex:slot];
+                break;
+            case Bound::Other:
+                [active_compute setBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
+                break;
+            }
+            break;
+        }
     }
 
     /// The progress trace: the first of each kind of work at Info, so a log that stops shows how
@@ -308,6 +571,10 @@ struct Scheduler::Impl {
             render = nil;
         }
         if (compute != nil) {
+            if (active_compute == compute) {
+                active_compute = nil;
+                active_bound = nullptr;
+            }
             [compute endEncoding];
             compute = nil;
         }
@@ -319,6 +586,7 @@ struct Scheduler::Impl {
             blit = [Commands() blitCommandEncoder];
             blit.label = @"Blit";
             ++encoders;
+            ++segment_encoders;
         }
         ++blit_commands;
         return blit;
@@ -327,6 +595,7 @@ struct Scheduler::Impl {
     id<MTLRenderCommandEncoder> RenderEncoder(MTLRenderPassDescriptor* pass) {
         EndEncoder();
         ++encoders;
+        ++segment_encoders;
         ++render_passes;
         const id<MTLRenderCommandEncoder> encoder =
             [Commands() renderCommandEncoderWithDescriptor:pass];
@@ -594,6 +863,42 @@ struct Scheduler::Impl {
     std::vector<id<MTLTexture>> pending_clear_textures;
     u64 clears_folded{};
     id<MTLComputeCommandEncoder> compute = nil;
+    /// EDEN_NX2_METAL_STATE_CACHE: what the open encoders have set, so a draw or dispatch sets
+    /// only what differs from the one before it.
+    StageBindings vertex_bound;
+    StageBindings fragment_bound;
+    DrawState render_state{};
+    bool render_state_valid{};
+    StageBindings compute_bound;
+    const void* compute_pipeline{};
+    StageBindings kernel_bound;
+    const void* kernel_pipeline{};
+    /// The compute encoder binds and dispatches go to (the segment's or the kernels'), and what
+    /// it has bound.
+    id<MTLComputeCommandEncoder> active_compute = nil;
+    StageBindings* active_bound{};
+    u64 state_sets{};
+    u64 state_skips{};
+    /// EDEN_NX2_METAL_AHEAD: the command buffers committed before the segment's, with the one
+    /// encoder each has.
+    id<MTLCommandBuffer> upload_buffer = nil;
+    id<MTLBlitCommandEncoder> upload_blit = nil;
+    id<MTLCommandBuffer> kernel_buffer = nil;
+    id<MTLComputeCommandEncoder> kernel_compute = nil;
+    u64 segment_serial{1};
+    /// Encoders the segment's command buffer got so far.
+    u32 segment_encoders{};
+    bool ahead_blocked{};
+    /// Buffers the segment's copies read or write in order.
+    std::vector<const void*> in_order_buffers;
+    /// Segments the tick being recorded committed already.
+    u32 tick_splits{};
+    /// Render passes that are to begin a segment (WantSplitBefore).
+    std::array<RenderTargetSet, 8> wanted{};
+    size_t wanted_count{};
+    u64 splits{};
+    u64 ahead_copies{};
+    u64 ahead_kernels{};
     id<MTLBuffer> visibility = nil;
     u64 render_pass_serial{};
     /// The open render encoder's counting slot (-1: not counting).
@@ -668,7 +973,8 @@ void Scheduler::WaitSubmitted(u64 tick) {
 }
 
 bool Scheduler::HasPendingWork() const noexcept {
-    return impl->command_buffer != nil || impl->pending_clear.has_value();
+    return impl->command_buffer != nil || impl->pending_clear.has_value() ||
+           impl->upload_buffer != nil || impl->kernel_buffer != nil || impl->tick_splits != 0;
 }
 
 u64 Scheduler::Flush() {
@@ -692,28 +998,7 @@ u64 Scheduler::Flush() {
                                    "GPU {:.2f} ms)",
                      tick, static_cast<int>(finished.status), busy * 1e3);
         }
-        if (finished.status == MTLCommandBufferStatusError &&
-            errors_logged->fetch_add(1) < 16) {
-            NSError* const error = finished.error;
-            std::string encoders;
-            NSArray* const infos = error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
-            for (id<MTLCommandBufferEncoderInfo> info in infos) {
-                // MTLCommandEncoderErrorState: 0 unknown, 1 completed, 2 affected, 3 pending,
-                // 4 faulted.
-                if (info.errorState != MTLCommandEncoderErrorStateCompleted) {
-                    encoders += fmt::format("{}{} (state {})", encoders.empty() ? "" : ", ",
-                                            info.label.UTF8String != nullptr ? info.label.UTF8String
-                                                                             : "?",
-                                            static_cast<int>(info.errorState));
-                }
-            }
-            LOG_ERROR(Render_Metal, "Metal: command buffer {} failed: code {}: {}; encoders: {}",
-                      tick, static_cast<long>(error.code),
-                      error.localizedDescription.UTF8String != nullptr
-                          ? error.localizedDescription.UTF8String
-                          : "no description",
-                      encoders.empty() ? "none reported" : encoders);
-        }
+        ReportFailure(finished, tick, errors_logged);
         u64 previous = completed->load(std::memory_order_relaxed);
         while (previous < tick &&
                !completed->compare_exchange_weak(previous, tick, std::memory_order_release)) {
@@ -723,6 +1008,7 @@ u64 Scheduler::Flush() {
         }
         completed_cv->notify_all();
     }];
+    impl->CommitAhead(tick);
     [command_buffer commit];
     impl->submitted_tick.store(tick, std::memory_order_release);
     ++impl->command_buffers;
@@ -742,6 +1028,8 @@ u64 Scheduler::Flush() {
         }
     }
     impl->command_buffer = nil;
+    impl->NextSegment();
+    impl->tick_splits = 0;
     impl->in_flight.emplace_back(tick, command_buffer);
     while (!impl->in_flight.empty() && IsFree(impl->in_flight.front().first)) {
         impl->in_flight.pop_front();
@@ -754,21 +1042,83 @@ void Scheduler::Finish() {
 }
 
 void Scheduler::CopyBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u64 dst_offset,
-                           u64 size) {
+                           u64 size, bool ahead) {
     if (size == 0 || src == nullptr || dst == nullptr) {
         return;
     }
-    [impl->BlitEncoder() copyFromBuffer:AsBuffer(src)
-                           sourceOffset:src_offset
-                               toBuffer:AsBuffer(dst)
-                      destinationOffset:dst_offset
-                                   size:size];
+    const bool goes_ahead = ahead && CanUploadAhead();
+    if (!goes_ahead) {
+        impl->NoteInOrder(src);
+        impl->NoteInOrder(dst);
+    }
+    const id<MTLBlitCommandEncoder> encoder =
+        goes_ahead ? impl->UploadEncoder() : impl->BlitEncoder();
+    [encoder copyFromBuffer:AsBuffer(src)
+               sourceOffset:src_offset
+                   toBuffer:AsBuffer(dst)
+          destinationOffset:dst_offset
+                       size:size];
+}
+
+u64 Scheduler::SegmentSerial() const noexcept {
+    return impl->segment_serial;
+}
+
+bool Scheduler::CanUploadAhead() const noexcept {
+    return AheadEnabled() && !impl->ahead_blocked;
+}
+
+bool Scheduler::UsedInOrder(BufferHandle buffer) const noexcept {
+    return std::find(impl->in_order_buffers.begin(), impl->in_order_buffers.end(), buffer) !=
+           impl->in_order_buffers.end();
+}
+
+bool Scheduler::CanRecordAhead(const RenderTargetSet& targets) const noexcept {
+    if (!AheadEnabled() || impl->ahead_blocked) {
+        return false;
+    }
+    if (impl->pending_clear && !ClearFitsTargets(*impl->pending_clear, targets)) {
+        return false;
+    }
+    return impl->segment_encoders == 0 || (impl->segment_encoders == 1 && IsRenderingTo(targets));
+}
+
+void Scheduler::BlockAhead() noexcept {
+    impl->ahead_blocked = true;
+}
+
+bool Scheduler::IsRenderingTo(const RenderTargetSet& targets) const noexcept {
+    return impl->render != nil && impl->render_targets == targets;
+}
+
+void Scheduler::WantSplitBefore(const RenderTargetSet& targets) {
+    if (!AheadEnabled() || !AheadSplitEnabled() || impl->Wanted(targets)) {
+        return;
+    }
+    impl->wanted[impl->wanted_count++ % impl->wanted.size()] = targets;
+}
+
+void Scheduler::SplitBefore(const RenderTargetSet& targets) {
+    // A pass that other work keeps ending is not given a command buffer each time.
+    constexpr u32 MaxTickSplits = 8;
+    if (!AheadEnabled() || !AheadSplitEnabled() || IsRenderingTo(targets) ||
+        impl->tick_splits >= MaxTickSplits || !impl->Wanted(targets)) {
+        return;
+    }
+    // A clear waiting for this pass stays its load actions, in the new segment.
+    if (impl->pending_clear && !ClearFitsTargets(*impl->pending_clear, targets)) {
+        impl->FlushClear();
+    }
+    if (impl->segment_encoders != 0) {
+        impl->Split();
+    }
 }
 
 void Scheduler::FillBuffer(BufferHandle dst, u64 offset, u64 size, u8 value) {
     if (size == 0 || dst == nullptr) {
         return;
     }
+    impl->NoteInOrder(dst);
     [impl->BlitEncoder() fillBuffer:AsBuffer(dst) range:NSMakeRange(offset, size) value:value];
 }
 
@@ -779,6 +1129,7 @@ void Scheduler::CopyBufferToTexture(BufferHandle src, u64 offset, u32 bytes_per_
         return;
     }
     impl->Touch(dst);
+    impl->NoteInOrder(src);
     [impl->BlitEncoder() copyFromBuffer:AsBuffer(src)
                            sourceOffset:offset
                       sourceBytesPerRow:bytes_per_row
@@ -797,6 +1148,7 @@ void Scheduler::CopyTextureToBuffer(TextureHandle src, u32 level, u32 slice, Off
         return;
     }
     impl->Touch(src);
+    impl->NoteInOrder(dst);
     [impl->BlitEncoder() copyFromTexture:AsTexture(src)
                              sourceSlice:slice
                              sourceLevel:level
@@ -1116,6 +1468,10 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
     impl->render = impl->RenderEncoder(pass);
     impl->render_targets = targets;
     impl->visibility_slot = -1;
+    impl->vertex_bound = {};
+    impl->fragment_bound = {};
+    impl->render_state = {};
+    impl->render_state_valid = false;
     ++impl->render_pass_serial;
 }
 
@@ -1156,54 +1512,82 @@ void Scheduler::SetDrawState(const DrawState& state) {
     if (encoder == nil) {
         return;
     }
-    [encoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)state.pipeline];
-    if (state.depth_stencil != nullptr) {
+    // What the encoder has from the draw before stays as it is (EDEN_NX2_METAL_STATE_CACHE).
+    const bool cached = StateCacheEnabled() && impl->render_state_valid;
+    const DrawState& last = impl->render_state;
+    const auto changed = [&](bool differs) {
+        if (cached && !differs) {
+            ++impl->state_skips;
+            return false;
+        }
+        ++impl->state_sets;
+        return true;
+    };
+    if (changed(last.pipeline != state.pipeline)) {
+        [encoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)state.pipeline];
+    }
+    if (state.depth_stencil != nullptr && changed(last.depth_stencil != state.depth_stencil)) {
         [encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)state.depth_stencil];
     }
-    [encoder setViewport:MTLViewport{state.viewport.x, state.viewport.y, state.viewport.width,
-                                     state.viewport.height, state.viewport.znear,
-                                     state.viewport.zfar}];
-    // Metal rejects scissors past the attachments.
-    const u32 target_width = std::clamp(impl->render_targets.width, 1U, MaxRenderTargetSize);
-    const u32 target_height = std::clamp(impl->render_targets.height, 1U, MaxRenderTargetSize);
-    const u32 x = (std::min)(state.scissor.x, target_width - 1);
-    const u32 y = (std::min)(state.scissor.y, target_height - 1);
-    const u32 width = (std::min)(state.scissor.width, target_width - x);
-    const u32 height = (std::min)(state.scissor.height, target_height - y);
-    [encoder setScissorRect:MTLScissorRect{x, y, (std::max)(width, 1U), (std::max)(height, 1U)}];
-    [encoder setCullMode:static_cast<MTLCullMode>(state.cull_mode)];
-    [encoder setFrontFacingWinding:state.front_ccw ? MTLWindingCounterClockwise
-                                                   : MTLWindingClockwise];
-    [encoder setDepthClipMode:state.depth_clamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
-    [encoder setDepthBias:state.depth_bias slopeScale:state.slope_scale clamp:state.bias_clamp];
-    [encoder setStencilFrontReferenceValue:state.stencil_front_ref
-                        backReferenceValue:state.stencil_back_ref];
-    [encoder setBlendColorRed:state.blend_color[0]
-                        green:state.blend_color[1]
-                         blue:state.blend_color[2]
-                        alpha:state.blend_color[3]];
+    if (changed(last.viewport != state.viewport)) {
+        [encoder setViewport:MTLViewport{state.viewport.x, state.viewport.y, state.viewport.width,
+                                         state.viewport.height, state.viewport.znear,
+                                         state.viewport.zfar}];
+    }
+    if (changed(last.scissor != state.scissor)) {
+        // Metal rejects scissors past the attachments.
+        const u32 target_width = std::clamp(impl->render_targets.width, 1U, MaxRenderTargetSize);
+        const u32 target_height = std::clamp(impl->render_targets.height, 1U, MaxRenderTargetSize);
+        const u32 x = (std::min)(state.scissor.x, target_width - 1);
+        const u32 y = (std::min)(state.scissor.y, target_height - 1);
+        const u32 width = (std::min)(state.scissor.width, target_width - x);
+        const u32 height = (std::min)(state.scissor.height, target_height - y);
+        [encoder
+            setScissorRect:MTLScissorRect{x, y, (std::max)(width, 1U), (std::max)(height, 1U)}];
+    }
+    if (changed(last.cull_mode != state.cull_mode)) {
+        [encoder setCullMode:static_cast<MTLCullMode>(state.cull_mode)];
+    }
+    if (changed(last.front_ccw != state.front_ccw)) {
+        [encoder setFrontFacingWinding:state.front_ccw ? MTLWindingCounterClockwise
+                                                       : MTLWindingClockwise];
+    }
+    if (changed(last.depth_clamp != state.depth_clamp)) {
+        [encoder setDepthClipMode:state.depth_clamp ? MTLDepthClipModeClamp
+                                                    : MTLDepthClipModeClip];
+    }
+    if (changed(last.depth_bias != state.depth_bias || last.slope_scale != state.slope_scale ||
+                last.bias_clamp != state.bias_clamp)) {
+        [encoder setDepthBias:state.depth_bias slopeScale:state.slope_scale clamp:state.bias_clamp];
+    }
+    if (changed(last.stencil_front_ref != state.stencil_front_ref ||
+                last.stencil_back_ref != state.stencil_back_ref)) {
+        [encoder setStencilFrontReferenceValue:state.stencil_front_ref
+                            backReferenceValue:state.stencil_back_ref];
+    }
+    if (changed(last.blend_color != state.blend_color)) {
+        [encoder setBlendColorRed:state.blend_color[0]
+                            green:state.blend_color[1]
+                             blue:state.blend_color[2]
+                            alpha:state.blend_color[3]];
+    }
+    // A draw without a depth-stencil state leaves the encoder's.
+    const void* const depth_stencil =
+        state.depth_stencil != nullptr ? state.depth_stencil : last.depth_stencil;
+    impl->render_state = state;
+    impl->render_state.depth_stencil = depth_stencil;
+    impl->render_state_valid = true;
 }
 
 void Scheduler::BindVertexBuffer(u32 slot, BufferHandle buffer, u32 offset) {
-    if (impl->render != nil && SlotFits(slot, BufferSlots, "vertex buffer")) {
-        [impl->render setVertexBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
+    if (SlotFits(slot, BufferSlots, "vertex buffer")) {
+        impl->SetBuffer(ShaderStage::Vertex, slot, buffer, offset);
     }
 }
 
 void Scheduler::BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset) {
-    if (!SlotFits(slot, BufferSlots, "buffer")) {
-        return;
-    }
-    switch (stage) {
-    case ShaderStage::Vertex:
-        [impl->render setVertexBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
-        break;
-    case ShaderStage::Fragment:
-        [impl->render setFragmentBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
-        break;
-    case ShaderStage::Compute:
-        [impl->compute setBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
-        break;
+    if (SlotFits(slot, BufferSlots, "buffer")) {
+        impl->SetBuffer(stage, slot, buffer, offset);
     }
 }
 
@@ -1211,15 +1595,28 @@ void Scheduler::BindBytes(ShaderStage stage, u32 slot, const void* data, u32 siz
     if (!SlotFits(slot, BufferSlots, "buffer")) {
         return;
     }
+    ++impl->state_sets;
     switch (stage) {
     case ShaderStage::Vertex:
+        if (slot < BufferSlots) {
+            impl->vertex_bound.buffers[slot] = &InlineBytes;
+        }
         [impl->render setVertexBytes:data length:size atIndex:slot];
         break;
     case ShaderStage::Fragment:
+        if (slot < BufferSlots) {
+            impl->fragment_bound.buffers[slot] = &InlineBytes;
+        }
         [impl->render setFragmentBytes:data length:size atIndex:slot];
         break;
     case ShaderStage::Compute:
-        [impl->compute setBytes:data length:size atIndex:slot];
+        if (impl->active_compute == nil) {
+            return;
+        }
+        if (slot < BufferSlots) {
+            impl->active_bound->buffers[slot] = &InlineBytes;
+        }
+        [impl->active_compute setBytes:data length:size atIndex:slot];
         break;
     }
 }
@@ -1230,13 +1627,21 @@ void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture) 
     }
     switch (stage) {
     case ShaderStage::Vertex:
-        [impl->render setVertexTexture:AsTexture(texture) atIndex:slot];
+        if (impl->render != nil && impl->NoteObject(impl->vertex_bound.textures, slot, texture)) {
+            [impl->render setVertexTexture:AsTexture(texture) atIndex:slot];
+        }
         break;
     case ShaderStage::Fragment:
-        [impl->render setFragmentTexture:AsTexture(texture) atIndex:slot];
+        if (impl->render != nil &&
+            impl->NoteObject(impl->fragment_bound.textures, slot, texture)) {
+            [impl->render setFragmentTexture:AsTexture(texture) atIndex:slot];
+        }
         break;
     case ShaderStage::Compute:
-        [impl->compute setTexture:AsTexture(texture) atIndex:slot];
+        if (impl->active_compute != nil &&
+            impl->NoteObject(impl->active_bound->textures, slot, texture)) {
+            [impl->active_compute setTexture:AsTexture(texture) atIndex:slot];
+        }
         break;
     }
 }
@@ -1247,13 +1652,21 @@ void Scheduler::BindSampler(ShaderStage stage, u32 slot, void* sampler) {
     }
     switch (stage) {
     case ShaderStage::Vertex:
-        [impl->render setVertexSamplerState:AsSampler(sampler) atIndex:slot];
+        if (impl->render != nil && impl->NoteObject(impl->vertex_bound.samplers, slot, sampler)) {
+            [impl->render setVertexSamplerState:AsSampler(sampler) atIndex:slot];
+        }
         break;
     case ShaderStage::Fragment:
-        [impl->render setFragmentSamplerState:AsSampler(sampler) atIndex:slot];
+        if (impl->render != nil &&
+            impl->NoteObject(impl->fragment_bound.samplers, slot, sampler)) {
+            [impl->render setFragmentSamplerState:AsSampler(sampler) atIndex:slot];
+        }
         break;
     case ShaderStage::Compute:
-        [impl->compute setSamplerState:AsSampler(sampler) atIndex:slot];
+        if (impl->active_compute != nil &&
+            impl->NoteObject(impl->active_bound->samplers, slot, sampler)) {
+            [impl->active_compute setSamplerState:AsSampler(sampler) atIndex:slot];
+        }
         break;
     }
 }
@@ -1282,44 +1695,66 @@ void Scheduler::DrawIndexedIndirect(u32 primitive, u32 index_size, BufferHandle 
     impl->CountDraw();
 }
 
-void Scheduler::BeginCompute(void* pipeline) {
-    impl->FlushClear();
-    if (impl->compute == nil) {
-        impl->EndEncoder();
-        impl->compute = [impl->Commands() computeCommandEncoder];
-        impl->compute.label = @"Compute";
-        ++impl->encoders;
+void Scheduler::BeginCompute(void* pipeline, bool ahead) {
+    const void** bound_pipeline = &impl->compute_pipeline;
+    if (ahead && AheadEnabled()) {
+        impl->active_compute = impl->KernelEncoder();
+        impl->active_bound = &impl->kernel_bound;
+        bound_pipeline = &impl->kernel_pipeline;
+        ++impl->ahead_kernels;
+    } else {
+        impl->FlushClear();
+        if (impl->compute == nil) {
+            impl->EndEncoder();
+            impl->compute = [impl->Commands() computeCommandEncoder];
+            impl->compute.label = @"Compute";
+            impl->compute_bound = {};
+            impl->compute_pipeline = nullptr;
+            ++impl->encoders;
+            ++impl->segment_encoders;
+        }
+        impl->active_compute = impl->compute;
+        impl->active_bound = &impl->compute_bound;
     }
-    [impl->compute setComputePipelineState:(__bridge id<MTLComputePipelineState>)pipeline];
+    if (StateCacheEnabled() && *bound_pipeline == pipeline) {
+        ++impl->state_skips;
+        return;
+    }
+    *bound_pipeline = pipeline;
+    ++impl->state_sets;
+    [impl->active_compute setComputePipelineState:(__bridge id<MTLComputePipelineState>)pipeline];
 }
 
 void Scheduler::Dispatch(std::array<u32, 3> groups, std::array<u32, 3> group_size) {
-    if (impl->compute == nil || groups[0] == 0 || groups[1] == 0 || groups[2] == 0) {
+    const id<MTLComputeCommandEncoder> encoder = impl->active_compute;
+    if (encoder == nil || groups[0] == 0 || groups[1] == 0 || groups[2] == 0) {
         return;
     }
-    [impl->compute dispatchThreadgroups:MTLSizeMake(groups[0], groups[1], groups[2])
-                  threadsPerThreadgroup:MTLSizeMake(group_size[0], group_size[1], group_size[2])];
+    [encoder dispatchThreadgroups:MTLSizeMake(groups[0], groups[1], groups[2])
+            threadsPerThreadgroup:MTLSizeMake(group_size[0], group_size[1], group_size[2])];
     impl->CountDispatch();
 }
 
 void Scheduler::DispatchIndirect(BufferHandle buffer, u64 offset, std::array<u32, 3> group_size) {
-    if (impl->compute == nil || buffer == nullptr) {
+    const id<MTLComputeCommandEncoder> encoder = impl->active_compute;
+    if (encoder == nil || buffer == nullptr) {
         return;
     }
-    [impl->compute dispatchThreadgroupsWithIndirectBuffer:AsBuffer(buffer)
-                                     indirectBufferOffset:offset
-                                    threadsPerThreadgroup:MTLSizeMake(group_size[0], group_size[1],
-                                                                      group_size[2])];
+    [encoder dispatchThreadgroupsWithIndirectBuffer:AsBuffer(buffer)
+                               indirectBufferOffset:offset
+                              threadsPerThreadgroup:MTLSizeMake(group_size[0], group_size[1],
+                                                                group_size[2])];
     impl->CountDispatch();
 }
 
 void Scheduler::DispatchStageIn(u32 first, u32 count, u32 first_instance, u32 instances) {
-    if (impl->compute == nil || count == 0 || instances == 0) {
+    const id<MTLComputeCommandEncoder> encoder = impl->active_compute;
+    if (encoder == nil || count == 0 || instances == 0) {
         return;
     }
-    [impl->compute setStageInRegion:MTLRegionMake2D(first, first_instance, count, instances)];
-    [impl->compute dispatchThreads:MTLSizeMake(count, instances, 1)
-             threadsPerThreadgroup:MTLSizeMake((std::min)(count, 64U), 1, 1)];
+    [encoder setStageInRegion:MTLRegionMake2D(first, first_instance, count, instances)];
+    [encoder dispatchThreads:MTLSizeMake(count, instances, 1)
+       threadsPerThreadgroup:MTLSizeMake((std::min)(count, 64U), 1, 1)];
     impl->CountDispatch();
 }
 
@@ -1377,6 +1812,8 @@ void Scheduler::DrawIndexed(u32 primitive, u32 index_count, u32 index_size,
 void* Scheduler::CommandBuffer() {
     impl->FlushClear();
     impl->EndEncoder();
+    // What the caller encodes is not known here: nothing goes ahead of it by its targets.
+    ++impl->segment_encoders;
     return (__bridge void*)impl->Commands();
 }
 
@@ -1398,10 +1835,12 @@ void Scheduler::NotePresent(bool guest_picture) {
     }
 }
 
-std::array<u64, 5> Scheduler::TakeCounts() noexcept {
-    return {std::exchange(impl->encoders, 0), std::exchange(impl->command_buffers, 0),
+std::array<u64, 10> Scheduler::TakeCounts() noexcept {
+    return {std::exchange(impl->encoders, 0),      std::exchange(impl->command_buffers, 0),
             std::exchange(impl->blit_commands, 0), std::exchange(impl->render_passes, 0),
-            std::exchange(impl->clears_folded, 0)};
+            std::exchange(impl->clears_folded, 0), std::exchange(impl->state_sets, 0),
+            std::exchange(impl->state_skips, 0),   std::exchange(impl->splits, 0),
+            std::exchange(impl->ahead_copies, 0),  std::exchange(impl->ahead_kernels, 0)};
 }
 
 } // namespace Metal

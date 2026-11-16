@@ -408,6 +408,15 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_METAL_FRAGMENT_BARRIER", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment metal_barrier_off on");
     }
+    if (lichii_platform_experiment("metal_state_plain")) {
+        setenv("EDEN_NX2_METAL_STATE_CACHE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_state_plain on");
+    }
+    if (lichii_platform_experiment("metal_ahead_off")) {
+        setenv("EDEN_NX2_METAL_AHEAD", "0", 1);
+        setenv("EDEN_NX2_METAL_AHEAD_SPLIT", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_ahead_off on");
+    }
     if (lichii_platform_experiment("pipeline_holds_old")) {
         setenv("EDEN_NX2_PIPELINE_HOLD_BOOST", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment pipeline_holds_old on");

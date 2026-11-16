@@ -111,6 +111,8 @@ struct Viewport {
     f32 height{};
     f32 znear{};
     f32 zfar{1.0f};
+
+    bool operator==(const Viewport&) const noexcept = default;
 };
 
 struct Scissor {
@@ -118,6 +120,8 @@ struct Scissor {
     u32 y{};
     u32 width{};
     u32 height{};
+
+    bool operator==(const Scissor&) const noexcept = default;
 };
 
 enum class ShaderStage : u8 {
@@ -179,7 +183,39 @@ public:
     /// Flush, then wait for the GPU to finish everything.
     void Finish();
 
-    void CopyBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u64 dst_offset, u64 size);
+    /// ahead: recorded before everything else of the segment (see CanUploadAhead), leaving the
+    /// open encoder as it is.
+    void CopyBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u64 dst_offset, u64 size,
+                    bool ahead = false);
+
+    /// EDEN_NX2_METAL_AHEAD: a segment is what one command buffer of a tick records in order.
+    /// Uploads and kernels that do not depend on it go into two command buffers of their own,
+    /// committed before it (uploads, then kernels), so they do not end its render encoder.
+    [[nodiscard]] u64 SegmentSerial() const noexcept;
+
+    /// Whether a copy may go ahead of the segment. The caller answers for the destination not
+    /// being read or written in the segment so far.
+    [[nodiscard]] bool CanUploadAhead() const noexcept;
+
+    /// Whether a copy, fill or texture copy of the segment reads or writes `buffer` in order.
+    [[nodiscard]] bool UsedInOrder(BufferHandle buffer) const noexcept;
+
+    /// Whether a kernel of a draw into `targets` may go ahead of the segment: nothing but the
+    /// render pass on them was recorded in it, so the kernel sees what it would see in order.
+    [[nodiscard]] bool CanRecordAhead(const RenderTargetSet& targets) const noexcept;
+
+    /// Nothing more goes ahead in this segment (its record of what was used is incomplete).
+    void BlockAhead() noexcept;
+
+    [[nodiscard]] bool IsRenderingTo(const RenderTargetSet& targets) const noexcept;
+
+    /// A render pass on `targets` was ended by a kernel that could have gone ahead of it, had
+    /// the pass begun its segment: SplitBefore gives the next one a segment of its own.
+    void WantSplitBefore(const RenderTargetSet& targets);
+
+    /// Before the first draw of a render pass on `targets`: when such a pass was wanted at the
+    /// start of a segment, commits what was recorded (same tick) and starts the next segment.
+    void SplitBefore(const RenderTargetSet& targets);
 
     void FillBuffer(BufferHandle dst, u64 offset, u64 size, u8 value);
 
@@ -252,8 +288,10 @@ public:
                              u64 index_offset, BufferHandle buffer, u64 offset);
 
     /// Opens a compute encoder (or keeps the open one) running pipeline
-    /// (an id<MTLComputePipelineState>).
-    void BeginCompute(void* pipeline);
+    /// (an id<MTLComputePipelineState>). ahead: the encoder of the kernels recorded ahead of
+    /// the segment (see CanRecordAhead); the binds and dispatches up to the next BeginCompute
+    /// go to it.
+    void BeginCompute(void* pipeline, bool ahead = false);
 
     void Dispatch(std::array<u32, 3> groups, std::array<u32, 3> group_size);
 
@@ -283,9 +321,11 @@ public:
     /// since the last call.
     [[nodiscard]] u64 TakeGpuNanoseconds() noexcept;
 
-    /// Encoders, command buffers, blit commands, render passes and clears made the load actions
-    /// of a pass since the last call (the renderer's 10 s report).
-    [[nodiscard]] std::array<u64, 5> TakeCounts() noexcept;
+    /// Since the last call (the renderer's 10 s report): encoders, command buffers, blit
+    /// commands, render passes, clears made the load actions of a pass, state and bindings set,
+    /// those left as they were (EDEN_NX2_METAL_STATE_CACHE), segments split off, copies and
+    /// kernels recorded ahead (EDEN_NX2_METAL_AHEAD).
+    [[nodiscard]] std::array<u64, 10> TakeCounts() noexcept;
 
     /// A drawable was presented, with a guest layer on it or not (the progress trace: the first
     /// of each, and the heartbeat that runs until the first guest frame).

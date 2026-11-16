@@ -675,7 +675,7 @@ std::vector<TextureHandle> RasterizerMetal::PrepareTexelBuffers(std::span<const 
     return result;
 }
 
-void RasterizerMetal::RewriteIndices() {
+void RasterizerMetal::RewriteIndices(bool ahead) {
     const BufferCacheRuntime::IndexState& index = buffer_cache_runtime.Index();
     if (!index_kernel && !index_kernel_failed) {
         std::string error;
@@ -698,7 +698,7 @@ void RasterizerMetal::RewriteIndices() {
     IndexConvert::RewriteParams params = index_rewrite.params;
     params.source_offset += index.offset;
     index_rewrite.output = staging_pool.Stream(size_t{params.converted} * sizeof(u32), 4);
-    scheduler.BeginCompute(index_kernel.Get());
+    scheduler.BeginCompute(index_kernel.Get(), ahead);
     scheduler.BindBuffer(ShaderStage::Compute, 0, index.buffer, 0);
     scheduler.BindBuffer(ShaderStage::Compute, 1, index_rewrite.output.buffer,
                          static_cast<u32>(index_rewrite.output.offset));
@@ -1066,6 +1066,18 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         prepare_refusal = "no framebuffer";
         return false;
     }
+    RenderTargetSet targets{};
+    for (size_t rt = 0; rt < Maxwell::NumRenderTargets; ++rt) {
+        targets.color[rt] = framebuffer->Colors()[rt];
+    }
+    targets.depth = framebuffer->Depth();
+    targets.has_depth = framebuffer->HasDepth();
+    targets.has_stencil = framebuffer->HasStencil();
+    targets.width = framebuffer->Width();
+    targets.height = framebuffer->Height();
+    // Before the buffer cache notes what this draw uses in the segment.
+    scheduler.SplitBefore(targets);
+    const u64 draw_segment = scheduler.SegmentSerial();
     // The stages' texture and image scaling indices count on through the pipeline, as their
     // bindings do.
     const bool is_rescaling = texture_cache.IsRescaling();
@@ -1132,19 +1144,12 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     prepare_refusal = "render pipeline state refused by Metal";
 
     // The render pipeline state: targets, blending, vertex layout.
-    RenderTargetSet targets{};
     auto state_desc = Zeroed<RenderPipelineDesc>();
     for (size_t rt = 0; rt < Maxwell::NumRenderTargets; ++rt) {
-        targets.color[rt] = framebuffer->Colors()[rt];
         state_desc.color_formats[rt] = framebuffer->Colors()[rt].texture != nullptr
                                      ? framebuffer->ColorFormats()[rt]
                                      : 0U;
     }
-    targets.depth = framebuffer->Depth();
-    targets.has_depth = framebuffer->HasDepth();
-    targets.has_stencil = framebuffer->HasStencil();
-    targets.width = framebuffer->Width();
-    targets.height = framebuffer->Height();
     state_desc.depth_format = targets.has_depth ? framebuffer->DepthFormat() : 0U;
     state_desc.stencil_format = targets.has_stencil ? framebuffer->DepthFormat() : 0U;
     state_desc.samples = framebuffer->Samples();
@@ -1222,8 +1227,27 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         depth_stencil_state = CreateDepthStencilState(device, depth_stencil);
     }
 
+    // A kernel goes ahead of the segment (leaving the render pass open) when it reads nothing
+    // the segment writes: the pass is all the segment holds, and neither stored to what the
+    // kernel reads nor draws into it.
+    const bool pass_stored = scheduler.IsRendering() && pass_stores == scheduler.RenderPassSerial();
+    const auto record_ahead = [&](bool reads_resources) {
+        if (scheduler.SegmentSerial() != draw_segment || pass_stored) {
+            return false;
+        }
+        if (reads_resources && (writes_storage || texture_cache.SamplesRenderTarget(views))) {
+            return false;
+        }
+        if (scheduler.CanRecordAhead(targets)) {
+            return true;
+        }
+        if (scheduler.CanUploadAhead() && scheduler.IsRenderingTo(targets)) {
+            scheduler.WantSplitBefore(targets);
+        }
+        return false;
+    };
     if (index_rewrite.wanted) {
-        RewriteIndices();
+        RewriteIndices(record_ahead(false));
     }
     if (mesh != nullptr) {
         void* const first = pipeline.KernelState(device, mesh->first);
@@ -1257,8 +1281,10 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             mesh_buffers.output = staging_pool.Stream(
                 (std::max)(u64{mesh_workgroups} * mesh->block_words * sizeof(u32), u64{16}), 16);
         }
+        // After the arena: getting one may wait for a command buffer.
+        const bool mesh_ahead = record_ahead(true);
         const auto begin_kernel = [&](size_t index, MeshKernel& kernel, void* kernel_state) {
-            scheduler.BeginCompute(kernel_state);
+            scheduler.BeginCompute(kernel_state, mesh_ahead);
             BindStageResources(kernel.program, ShaderStage::Compute, stage_bindings[index],
                                texel_views[index], std::span(views).subspan(first_view[index]),
                                std::span(samplers).subspan(first_sampler[index]), targets.width,
@@ -1282,7 +1308,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             const std::array<const StagingBufferRef*, 4> distribution_buffers{
                 &mesh_buffers.payload, &mesh_buffers.offsets, &mesh_buffers.args,
                 &mesh_buffers.counter};
-            scheduler.BeginCompute(distribution);
+            scheduler.BeginCompute(distribution, mesh_ahead);
             for (const ShaderTranslate::ResourceSlot& slot : mesh->distribution.program.slots) {
                 if (slot.kind != ShaderTranslate::ResourceKind::Buffer) {
                     continue;
@@ -1371,7 +1397,8 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                                      static_cast<u32>(buffer.offset));
             }
         };
-        scheduler.BeginCompute(vertex_kernel);
+        const bool tess_ahead = record_ahead(true);
+        scheduler.BeginCompute(vertex_kernel, tess_ahead);
         BindStageResources(*programs[0], ShaderStage::Compute, stage_bindings[0], texel_views[0],
                            std::span(views).subspan(first_view[0]),
                            std::span(samplers).subspan(first_sampler[0]), targets.width,
@@ -1390,7 +1417,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                                   tess_draw->count, tess_draw->first_instance,
                                   tess_draw->instances);
 
-        scheduler.BeginCompute(control_kernel);
+        scheduler.BeginCompute(control_kernel, tess_ahead);
         BindStageResources(*programs[1], ShaderStage::Compute, stage_bindings[1], texel_views[1],
                            std::span(views).subspan(first_view[1]),
                            std::span(samplers).subspan(first_sampler[1]), targets.width,
@@ -1408,6 +1435,10 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         scheduler.Dispatch({groups, 1, 1}, {group_size, 1, 1});
     }
 
+    if (scheduler.SegmentSerial() != draw_segment) {
+        // Committed in the middle of the draw: what the buffer cache noted as used is gone.
+        scheduler.BlockAhead();
+    }
     scheduler.BeginRendering(targets);
     if (writes_storage) {
         pass_stores = scheduler.RenderPassSerial();
@@ -1978,6 +2009,7 @@ void RasterizerMetal::DispatchCompute() {
     for (const auto& desc : info.image_buffer_descriptors) {
         add_buffer(desc, true);
     }
+    const u64 dispatch_segment = scheduler.SegmentSerial();
     buffer_cache.UpdateComputeBuffers();
     buffer_cache_runtime.PendingBindings().clear();
     buffer_cache.BindHostComputeBuffers();
@@ -1989,15 +2021,27 @@ void RasterizerMetal::DispatchCompute() {
     u32 texture_bit = 0;
     u32 image_bit = 0;
     AddRescalingBits(info, views, texture_bit, image_bit);
+    // The group counts' buffer first: bringing it up to date may end the open encoder.
+    const auto indirect = kepler_compute->GetIndirectComputeAddress();
+    BufferHandle indirect_buffer{};
+    u64 indirect_offset{};
+    if (indirect) {
+        const auto [buffer, offset] = buffer_cache.ObtainBuffer(
+            *indirect, 12, VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+            VideoCommon::ObtainBufferOperation::DiscardWrite);
+        indirect_buffer = buffer->Handle();
+        indirect_offset = offset;
+    }
+    if (scheduler.SegmentSerial() != dispatch_segment) {
+        // Committed in the middle of the dispatch: what the buffer cache noted as used is gone.
+        scheduler.BlockAhead();
+    }
     scheduler.BeginCompute(state);
     BindStageResources(program, ShaderStage::Compute, bindings, texel_views, views, samplers, 0,
                        0);
     const std::array<u32, 3> group_size{qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z};
-    if (const auto indirect = kepler_compute->GetIndirectComputeAddress()) {
-        const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-            *indirect, 12, VideoCommon::ObtainBufferSynchronize::FullSynchronize,
-            VideoCommon::ObtainBufferOperation::DiscardWrite);
-        scheduler.DispatchIndirect(buffer->Handle(), offset, group_size);
+    if (indirect) {
+        scheduler.DispatchIndirect(indirect_buffer, indirect_offset, group_size);
     } else {
         scheduler.Dispatch({qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z}, group_size);
     }

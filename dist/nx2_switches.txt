@@ -224,6 +224,31 @@ EDEN_NX2_FENCE_BATCH=1
 # "Metal:" line counts the passes ended this way.
 #EDEN_NX2_METAL_FRAGMENT_BARRIER=0
 
+# Metal renderer: 0 sets every piece of state (pipeline, depth-stencil state, viewport,
+# scissor, culling, depth bias, stencil references, blend colour) and every buffer, texture and
+# sampler again for each draw and dispatch, as before. By default what the open encoder already
+# has stays as it is, and a buffer bound again at another offset only gets the offset. The
+# 10 s "Metal:" line counts state and bindings set and left as they were.
+#EDEN_NX2_METAL_STATE_CACHE=0
+
+# Metal renderer: 0 records the buffer cache's uploads and the kernels of a draw (index
+# rewrite, mesh and tessellation emulation) where they come, as before: each ends the open
+# render pass, and the draw opens it again (the pass stores its images and loads them). By
+# default they go into two command buffers of their own, committed before the one with the
+# passes, as Vulkan's renderer records its uploads and its mesh compute before the pass: an
+# upload when nothing recorded since the last commit uses the bytes, a kernel when the pass it
+# belongs to is the first thing recorded since then and has not written storage (a mesh or
+# tessellation kernel also not when the draw writes storage or samples its own targets). The
+# 10 s "Metal:" line counts the copies and kernels "ahead of their segment".
+#EDEN_NX2_METAL_AHEAD=0
+
+# Metal renderer: 0 commits nothing early for the sake of the above. By default a render pass
+# whose kernels had to end it (because other work came before the pass since the last commit)
+# has that earlier work committed just before it begins the next time, at most 8 times between
+# two flushes, so its kernels can go ahead of it. The 10 s "Metal:" line counts the
+# "segments split off".
+#EDEN_NX2_METAL_AHEAD_SPLIT=0
+
 # Either renderer: 0 makes the GPU thread's front wait for the GPU and read a compute dispatch's
 # size the GPU wrote (Ocarina of Time's light tiles, once a frame). By default it passes
 # placeholders on; the dispatch takes its size from the GPU's buffer, and the copy of the size
