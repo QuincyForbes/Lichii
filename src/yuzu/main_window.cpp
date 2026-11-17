@@ -73,6 +73,7 @@
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
 #include <QStyleHints>
+#include <QTimer>
 #endif
 
 #include <QActionGroup>
@@ -3162,20 +3163,30 @@ void MainWindow::OnGameListOpenDirectory(const QString& directory) {
 }
 
 void MainWindow::OnGameListAddDirectory() {
-    const QString dir_path = QFileDialog::getExistingDirectory(this, tr("Select Directory"));
-    if (dir_path.isEmpty()) {
-        return;
-    }
+    // Open the dialog from the event loop rather than from inside the click that triggered it,
+    // and window-modally, so the native macOS panel actually appears.
+    QTimer::singleShot(0, this, [this] {
+        auto* dialog = new QFileDialog(this, tr("Select Directory"));
+        dialog->setFileMode(QFileDialog::Directory);
+        dialog->setOption(QFileDialog::ShowDirsOnly, true);
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        connect(dialog, &QFileDialog::fileSelected, this, [this](const QString& dir_path) {
+            if (dir_path.isEmpty()) {
+                return;
+            }
 
-    UISettings::GameDir game_dir{dir_path.toStdString(), false, true};
-    if (!UISettings::values.game_dirs.contains(game_dir)) {
-        UISettings::values.game_dirs.append(game_dir);
-        game_list->PopulateAsync(UISettings::values.game_dirs);
-    } else {
-        LOG_WARNING(Frontend, "Selected directory is already in the game list");
-    }
+            UISettings::GameDir game_dir{dir_path.toStdString(), false, true};
+            if (!UISettings::values.game_dirs.contains(game_dir)) {
+                UISettings::values.game_dirs.append(game_dir);
+                game_list->PopulateAsync(UISettings::values.game_dirs);
+            } else {
+                LOG_WARNING(Frontend, "Selected directory is already in the game list");
+            }
 
-    OnSaveConfig();
+            OnSaveConfig();
+        });
+        dialog->open();
+    });
 }
 
 void MainWindow::OnGameListShowList(bool show) {
