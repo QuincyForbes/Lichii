@@ -2590,6 +2590,14 @@ const Text kTexts[] = {
                                     "it keeps them all, as before; turn it on if the game "
                                     "stutters after a memory warning with a new build.\n"
                                     "\n"
+                                    "{exp:metal_pace_arrival}: frame pacing now follows the "
+                                    "frame rate the game asks for instead of how fast frames "
+                                    "arrived (which locked a 60 fps screen at 26.7 fps after "
+                                    "loading). {exp:metal_eager_applet} draws the applet "
+                                    "capture texture every frame again instead of only when an "
+                                    "applet asks for it. {exp:metal_tiling_old} reads guest "
+                                    "framebuffers without Switch 2 native tiling.\n"
+                                    "\n"
                                     "All of them apply the next time Lichii starts.\n"
                                     "\n"
                                     "{exp:metal_actor_off}: with MetalFX Temporal in Ocarina "
@@ -2750,6 +2758,9 @@ const Experiment kExperiments[] = {
     {"metal_pacing_off", "metal", QT_TRANSLATE_NOOP("UiCatalog", "No Frame Pacing")},
     {"metal_colorspace_off", "metal", QT_TRANSLATE_NOOP("UiCatalog", "Untagged Screen Colours")},
     {"metal_evict_off", "metal", QT_TRANSLATE_NOOP("UiCatalog", "Keep Every Pipeline")},
+    {"metal_pace_arrival", "metal", QT_TRANSLATE_NOOP("UiCatalog", "Pace Frames by Their Arrival Time")},
+    {"metal_eager_applet", "metal", QT_TRANSLATE_NOOP("UiCatalog", "Draw Applet Capture Every Frame")},
+    {"metal_tiling_old", "metal", QT_TRANSLATE_NOOP("UiCatalog", "Guest Framebuffers Without Switch 2 Tiling")},
     {"pipeline_holds_old", "shader_builds", QT_TRANSLATE_NOOP("UiCatalog", "Held Draws Wait in the Queue")},
     {"pipeline_list_old", "shader_builds", QT_TRANSLATE_NOOP("UiCatalog", "Used Shader List Saved as Before")},
     {"mvk_stats_off", "shader_builds", QT_TRANSLATE_NOOP("UiCatalog", "No MoltenVK Compile Times")},

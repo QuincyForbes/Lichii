@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <span>
 #include <utility>
@@ -89,9 +90,20 @@ struct PresentPacer {
     }
 
     /// The minimum time from the previous frame's present to this one's, in nanoseconds; 0 to
-    /// present at once (refresh unknown, a frame every refresh, or not enough frames yet).
-    [[nodiscard]] f64 MinimumDurationNs() const {
-        if (refresh_ns <= 0.0 || frames < 8) {
+    /// present at once (refresh unknown, a frame every refresh, or no requested period).
+    /// When `requested_ns` > 0 (Nx2Perf::g_guest_frame_interval_ns, the period the game asks for),
+    /// k comes from that period as Vulkan's HostPacer::Target does: pacing from arrival times
+    /// (`use_arrival`, EDEN_NX2_METAL_PACE_ARRIVAL=1) locked a 60 fps title screen at 4.5
+    /// refreshes = 37.5 ms (26.7 fps) on a 120 Hz screen with three drawables.
+    [[nodiscard]] f64 MinimumDurationNs(f64 requested_ns = 0.0, bool use_arrival = true) const {
+        if (refresh_ns <= 0.0) {
+            return 0.0;
+        }
+        if (requested_ns > 0.0) {
+            const f64 k = std::floor(requested_ns / refresh_ns + 0.02);
+            return k < 2.0 ? 0.0 : (k - 0.5) * refresh_ns;
+        }
+        if (!use_arrival || frames < 8) {
             return 0.0;
         }
         const f64 refreshes = content_ns / refresh_ns;

@@ -43,6 +43,7 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/oot_network.h"
+#include "video_core/render_probe.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_draw_desc.h"
 #include "video_core/renderer_metal/metal_formats.h"
@@ -1607,7 +1608,8 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
             if (texture_slot < texture_slots.size()) {
                 scheduler.BindTexture(
                     metal_stage, texture_slots[texture_slot],
-                    OrPlaceholder(image_view, image_view.Handle(desc.type), desc.type));
+                    OrPlaceholder(image_view, image_view.StorageHandle(desc.type, desc.format),
+                                  desc.type));
             }
             ++texture_slot;
         }
@@ -3589,7 +3591,11 @@ void RasterizerMetal::DispatchCompute() {
         OcarinaTemporal::IsTemporalPass(pipeline->Key().unique_hash, info) &&
         OcarinaTemporalEnabled()) {
         if (TryOcarinaTemporal(pipeline->Key().unique_hash, views)) {
-            texture_cache.MarkModification(texture_cache.GetImageView(views[1].id).image_id);
+            const ImageView& color = texture_cache.GetImageView(views[0].id);
+            const ImageView& target = texture_cache.GetImageView(views[1].id);
+            VideoCore::Probe::StoreScene(color.size.width, color.size.height, target.size.width,
+                                         target.size.height, "MetalFX");
+            texture_cache.MarkModification(target.image_id);
             Coverage::Note(Coverage::Work::Dispatch, Coverage::Path::Replaced);
             return;
         }
@@ -3615,6 +3621,8 @@ void RasterizerMetal::DispatchCompute() {
                              {color.size.width, color.size.height},
                              target.Handle(Shader::TextureType::Color2D),
                              {target.size.width, target.size.height})) {
+            VideoCore::Probe::StoreScene(color.size.width, color.size.height, target.size.width,
+                                         target.size.height, "Bilinear");
             texture_cache.MarkModification(target.image_id);
             Coverage::Note(Coverage::Work::Dispatch, Coverage::Path::Replaced);
             return;
@@ -4713,6 +4721,14 @@ std::optional<DisplayTexture> RasterizerMetal::AccelerateDisplay(
     const auto [image_view, scaled] =
         texture_cache.TryFindFramebufferImageView(config, framebuffer_addr);
     if (image_view == nullptr) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+            LOG_INFO(Render_Metal,
+                     "Metal: display layer at {:#x} ({}x{} stride {} format {} native_tiling {}) "
+                     "has no cached image view; reading guest memory",
+                     framebuffer_addr, config.width, config.height, config.stride,
+                     static_cast<u32>(config.pixel_format), config.native_tiling);
+        }
         return std::nullopt;
     }
     const auto& resolution = Settings::values.resolution_info;

@@ -8,6 +8,7 @@
 #pragma once
 
 #include "common/common_types.h"
+#include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/surface.h"
 
@@ -143,6 +144,10 @@ enum : u8 { Zero = 0, One = 1, Red = 2, Green = 3, Blue = 4, Alpha = 5 };
 /// texture from a shader): textures of it get shader-write usage under EDEN_NX2_METAL_FORMATS.
 /// 0 for every other format.
 [[nodiscard]] u32 LinearTwin(u32 mtl_format);
+
+/// Metal pixel format for a typed storage image declaration (`Shader::ImageFormat`), or 0 for
+/// `Typeless` (which uses the view's own linear format).
+[[nodiscard]] u32 StorageFormat(Shader::ImageFormat image_format);
 
 /// The host format of a guest format on any device (SurfaceFormat in metal_resources.h).
 [[nodiscard]] FormatInfo SurfaceFormat(VideoCore::Surface::PixelFormat format, bool converted);

@@ -292,6 +292,11 @@ public:
     /// The view shaders sample as `texture_type`, made on first use. Null for null views.
     [[nodiscard]] TextureHandle Handle(Shader::TextureType texture_type);
 
+    /// The view shaders read/write as a storage image (`info.image_descriptors`), using a linear
+    /// format for sRGB images and the declared `image_format` when typed, with identity swizzle.
+    [[nodiscard]] TextureHandle StorageHandle(Shader::TextureType texture_type,
+                                              Shader::ImageFormat image_format);
+
     /// What a program reads as `texture_type`: a multisampled image read as a plain texture
     /// (`multisample_read` false) reads the grid of its samples (UseSampleGrid) with
     /// EDEN_NX2_METAL_MSAA, as the guest sees it.
@@ -340,6 +345,12 @@ public:
     }
 
 private:
+    struct StorageVariant {
+        Shader::TextureType type{};
+        u32 format{};
+        Object view;
+    };
+
     SlotVector<Image>* slot_images{};
     TextureHandle image_texture{};
     u32 samples{1};
@@ -348,6 +359,7 @@ private:
     u32 host_format{};
     std::array<u8, 4> swizzle{IdentitySwizzle};
     std::array<Object, Shader::NUM_TEXTURE_TYPES> views;
+    std::vector<StorageVariant> storage_views;
     TextureHandle sample_grid{};
     std::array<Object, 2> grid_views; ///< 2D and 2D array views of sample_grid
     Object render_view; ///< Only when the view's format is not its image's

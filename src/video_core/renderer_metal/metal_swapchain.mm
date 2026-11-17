@@ -9,6 +9,7 @@
 
 #include "common/logging.h"
 #include "common/settings.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_swapchain.h"
 #include "video_core/renderer_metal/metal_switches.h"
@@ -73,6 +74,14 @@ bool HostPaceEnabled() {
     return enabled;
 }
 
+bool PaceArrivalEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_PACE_ARRIVAL");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 // The main screen's refresh rate (UIScreen on iOS, NSScreen on macOS 12 and later), looked up
 // by name so video_core links neither UIKit nor AppKit; 0 when it can't be read.
 f64 ScreenRefreshNs() {
@@ -103,6 +112,9 @@ void Swapchain::Present(id<MTLCommandBuffer> command_buffer, id<CAMetalDrawable>
             pacer.refresh_ns = ScreenRefreshNs();
             LOG_INFO(Render_Metal, "Metal pacing: display refresh {:.2f} ms",
                      pacer.refresh_ns / 1e6);
+            VideoCommon::Nx2Perf::g_host_refresh_ns.store(
+                pacer.refresh_ns > 0.0 ? static_cast<long long>(pacer.refresh_ns) : 0,
+                std::memory_order_relaxed);
             if (pacer.refresh_ns == 0.0) {
                 pacer.refresh_ns = -1.0; // unknown: presented at once
             }
@@ -114,8 +126,13 @@ void Swapchain::Present(id<MTLCommandBuffer> command_buffer, id<CAMetalDrawable>
                     .count()));
         }
         last_guest_frame = now;
-        minimum_ns = pacer.MinimumDurationNs();
+        const bool pace_arrival = PaceArrivalEnabled();
+        const f64 requested_ns = static_cast<f64>((std::max)(
+            VideoCommon::Nx2Perf::g_guest_frame_interval_ns.load(std::memory_order_relaxed), 0LL));
+        minimum_ns = pacer.MinimumDurationNs(pace_arrival ? 0.0 : requested_ns, pace_arrival);
         ++paced_frames;
+    } else {
+        VideoCommon::Nx2Perf::g_host_refresh_ns.store(0, std::memory_order_relaxed);
     }
     if (minimum_ns > 0.0) {
         ++held_frames;
@@ -130,11 +147,15 @@ std::string Swapchain::TakePacingLine() {
     if (paced_frames == 0) {
         return {};
     }
+    const f64 requested_ms =
+        static_cast<f64>((std::max)(
+            VideoCommon::Nx2Perf::g_guest_frame_interval_ns.load(std::memory_order_relaxed), 0LL)) /
+        1e6;
     const std::string line = fmt::format(
-        "{} guest frames, {} held to whole refreshes ({:.1f} refreshes each), game frame {:.2f} "
-        "ms, refresh {:.2f} ms",
+        "{} guest frames, {} held to whole refreshes ({:.1f} refreshes each), target {:.2f} ms, "
+        "game frame {:.2f} ms, refresh {:.2f} ms",
         paced_frames, held_frames, held_frames != 0 ? held_refreshes / held_frames : 0.0,
-        pacer.content_ns / 1e6, pacer.refresh_ns / 1e6);
+        requested_ms, pacer.content_ns / 1e6, pacer.refresh_ns / 1e6);
     paced_frames = 0;
     held_frames = 0;
     held_refreshes = 0.0;

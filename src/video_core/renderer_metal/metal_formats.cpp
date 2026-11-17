@@ -166,6 +166,28 @@ u32 LinearTwin(u32 mtl_format) {
     }
 }
 
+u32 StorageFormat(Shader::ImageFormat image_format) {
+    switch (image_format) {
+    case Shader::ImageFormat::Typeless:
+        return 0;
+    case Shader::ImageFormat::R8_UINT:
+        return Fmt::R8Uint;
+    case Shader::ImageFormat::R8_SINT:
+        return Fmt::R8Sint;
+    case Shader::ImageFormat::R16_UINT:
+        return Fmt::R16Uint;
+    case Shader::ImageFormat::R16_SINT:
+        return Fmt::R16Sint;
+    case Shader::ImageFormat::R32_UINT:
+        return Fmt::R32Uint;
+    case Shader::ImageFormat::R32G32_UINT:
+        return Fmt::RG32Uint;
+    case Shader::ImageFormat::R32G32B32A32_UINT:
+        return Fmt::RGBA32Uint;
+    }
+    return 0;
+}
+
 bool FormatsExpanded() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_FORMATS");

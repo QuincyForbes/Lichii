@@ -556,6 +556,18 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_METAL_PIPELINE_EVICT", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment metal_evict_off on");
     }
+    if (lichii_platform_experiment("metal_pace_arrival")) {
+        setenv("EDEN_NX2_METAL_PACE_ARRIVAL", "1", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_pace_arrival on");
+    }
+    if (lichii_platform_experiment("metal_eager_applet")) {
+        setenv("EDEN_NX2_METAL_LAZY_APPLET_CAPTURE", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_eager_applet on");
+    }
+    if (lichii_platform_experiment("metal_tiling_old")) {
+        setenv("EDEN_NX2_METAL_NATIVE_TILING", "0", 1);
+        LOG_WARNING(Frontend, "iOS: experiment metal_tiling_old on");
+    }
     if (lichii_platform_experiment("pipeline_holds_old")) {
         setenv("EDEN_NX2_PIPELINE_HOLD_BOOST", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment pipeline_holds_old on");

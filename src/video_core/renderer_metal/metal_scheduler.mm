@@ -968,10 +968,10 @@ struct Scheduler::Impl {
         if (render != nil) {
             [render endEncoding];
             render = nil;
-            if (pass_open) {
-                pass_open = false;
-                pass_records.back().draws = draws - pass_records.back().draws_begin;
-            }
+        }
+        if (pass_open) {
+            pass_open = false;
+            pass_records.back().draws = draws - pass_records.back().draws_begin;
         }
         if (compute != nil) {
             if (active_compute == compute) {
@@ -1020,9 +1020,22 @@ struct Scheduler::Impl {
             if (encoder != nil) {
                 const id<MTLTexture> color = pass.colorAttachments[0].texture;
                 const id<MTLTexture> depth = pass.depthAttachment.texture;
+                u32 pass_width = static_cast<u32>(pass.renderTargetWidth);
+                u32 pass_height = static_cast<u32>(pass.renderTargetHeight);
+                if (pass_width == 0 || pass_height == 0) {
+                    if (color != nil) {
+                        const u32 level = static_cast<u32>(pass.colorAttachments[0].level);
+                        pass_width = (std::max)(static_cast<u32>(color.width) >> level, 1U);
+                        pass_height = (std::max)(static_cast<u32>(color.height) >> level, 1U);
+                    } else if (depth != nil) {
+                        const u32 level = static_cast<u32>(pass.depthAttachment.level);
+                        pass_width = (std::max)(static_cast<u32>(depth.width) >> level, 1U);
+                        pass_height = (std::max)(static_cast<u32>(depth.height) >> level, 1U);
+                    }
+                }
                 pass_records.push_back({
-                    .width = static_cast<u32>(pass.renderTargetWidth),
-                    .height = static_cast<u32>(pass.renderTargetHeight),
+                    .width = pass_width,
+                    .height = pass_height,
                     .color_format = color != nil ? static_cast<u32>(color.pixelFormat) : 0U,
                     .depth_format = depth != nil ? static_cast<u32>(depth.pixelFormat) : 0U,
                     .draws_begin = draws,

@@ -143,6 +143,17 @@ TEST_CASE("MetalWorkPolicy[PresentPacer]", "[video_core]") {
     // A stall restarts the average: nothing held until eight frames came again.
     uneven.NoteFrame(2e9);
     REQUIRE(uneven.MinimumDurationNs() == 0.0);
+
+    // Pacing from the game's requested period (use_arrival = false) never locks to slow boot
+    // frames: 87 ms loading frames followed by 60 fps (16.67 ms) or 30 fps (33.33 ms) hold for
+    // 1.5 and 3.5 refreshes on 120 Hz, and 0 (uncapped) presents at once.
+    PresentPacer requested{.refresh_ns = 1e9 / 120.0};
+    for (int frame = 0; frame < 20; ++frame) {
+        requested.NoteFrame(87.4e6);
+    }
+    REQUIRE(requested.MinimumDurationNs(0.0, false) == 0.0);
+    REQUIRE(std::abs(requested.MinimumDurationNs(1e9 / 60.0, false) - 1.5 * 1e9 / 120.0) < 1e3);
+    REQUIRE(std::abs(requested.MinimumDurationNs(1e9 / 30.0, false) - 3.5 * 1e9 / 120.0) < 1e3);
 }
 
 TEST_CASE("MetalWorkPolicy[OcarinaJitter]", "[video_core]") {

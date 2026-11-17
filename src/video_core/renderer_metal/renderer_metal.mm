@@ -32,6 +32,7 @@
 #include "video_core/capture.h"
 #include "video_core/framebuffer_config.h"
 #include "video_core/gpu.h"
+#include "video_core/render_probe.h"
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_device.h"
@@ -60,6 +61,22 @@ namespace {
     default:
         return MTLPixelFormatRGBA8Unorm;
     }
+}
+
+[[nodiscard]] bool LazyAppletCaptureEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_LAZY_APPLET_CAPTURE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool NativeLayerTilingEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_NATIVE_TILING");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
 }
 
 /// MetalFX spatial upscaling of the first layer (the MetalFxSpatial scaling filter), on the
@@ -318,6 +335,7 @@ struct RendererMetal::Impl {
 
     Object applet_capture;
     std::vector<Tegra::FramebufferConfig> applet_layers;
+    std::vector<Tegra::FramebufferConfig> last_framebuffers;
     Object screenshot_target;
     u32 screenshot_width{};
     u32 screenshot_height{};
@@ -334,11 +352,16 @@ struct RendererMetal::Impl {
 
     /// A layer read from guest memory (no texture cache image at its address).
     struct MemoryLayer {
+        static constexpr size_t UploadSlots = 3;
+        struct UploadSlot {
+            Object buffer;
+            u8* contents{};
+            u64 size{};
+            u64 tick{};
+        };
         Object texture;
-        Object upload;
-        u8* upload_contents{};
-        u64 upload_size{};
-        u64 upload_tick{};
+        std::array<UploadSlot, UploadSlots> uploads{};
+        size_t next_upload{};
         u32 width{};
         u32 height{};
         Service::android::PixelFormat format{};
@@ -346,7 +369,6 @@ struct RendererMetal::Impl {
     std::vector<MemoryLayer> memory_layers;
     SpatialUpscaler spatial;
     PresentPasses present{device, scheduler};
-    std::vector<u8> unswizzled;
 
     std::chrono::steady_clock::time_point report_start = std::chrono::steady_clock::now();
     u64 presented{};
@@ -382,7 +404,8 @@ std::optional<DisplayTexture> RendererMetal::Impl::PrepareLayer(
         state.height = framebuffer.height;
         state.format = framebuffer.pixel_format;
     }
-    // The guest's framebuffers are block linear with 16-GOB blocks (as OpenGL reads them).
+    // The guest's framebuffers are block linear with 16-GOB blocks (Switch 2: native GOB tiling,
+    // matching Vulkan's Layer::UpdateRawImage).
     constexpr u32 block_height_log2 = 4;
     const auto pixel_format =
         VideoCore::Surface::PixelFormatFromGPUPixelFormat(framebuffer.pixel_format);
@@ -393,26 +416,26 @@ std::optional<DisplayTexture> RendererMetal::Impl::PrepareLayer(
     if (host_ptr == nullptr || !state.texture) {
         return std::nullopt;
     }
-    const u64 bytes_per_row = u64{framebuffer.stride} * bytes_per_pixel;
+    const u64 bytes_per_row = u64{framebuffer.width} * bytes_per_pixel;
     const u64 linear_size = bytes_per_row * framebuffer.height;
-    unswizzled.resize(linear_size);
-    Tegra::Texture::UnswizzleTexture(unswizzled, std::span<const u8>(host_ptr, size_in_bytes),
-                                     bytes_per_pixel, framebuffer.stride, framebuffer.height, 1,
-                                     block_height_log2, 0);
-    // One upload buffer a layer: the previous frame's copy must be done before it is written.
-    scheduler.Wait(state.upload_tick);
-    if (linear_size > state.upload_size) {
-        state.upload = CreateBuffer(device, linear_size, true, &state.upload_contents);
-        state.upload_size = state.upload_contents != nullptr ? linear_size : 0;
+    MemoryLayer::UploadSlot& slot = state.uploads[state.next_upload];
+    state.next_upload = (state.next_upload + 1) % MemoryLayer::UploadSlots;
+    scheduler.Wait(slot.tick);
+    if (linear_size > slot.size) {
+        slot.buffer = CreateBuffer(device, linear_size, true, &slot.contents);
+        slot.size = slot.contents != nullptr ? linear_size : 0;
     }
-    if (state.upload_contents == nullptr) {
+    if (slot.contents == nullptr) {
         return std::nullopt;
     }
-    std::memcpy(state.upload_contents, unswizzled.data(), linear_size);
-    scheduler.CopyBufferToTexture(state.upload.Get(), 0, static_cast<u32>(bytes_per_row), 0,
+    Tegra::Texture::UnswizzleTexture(
+        std::span<u8>(slot.contents, linear_size), std::span<const u8>(host_ptr, size_in_bytes),
+        bytes_per_pixel, framebuffer.width, framebuffer.height, 1, block_height_log2, 0, 1,
+        NativeLayerTilingEnabled() && framebuffer.native_tiling);
+    scheduler.CopyBufferToTexture(slot.buffer.Get(), 0, static_cast<u32>(bytes_per_row), 0,
                                   state.texture.Get(), 0, 0, Offset3D{},
                                   Extent3D{framebuffer.width, framebuffer.height, 1});
-    state.upload_tick = scheduler.CurrentTick();
+    slot.tick = scheduler.CurrentTick();
     ++from_memory;
     return DisplayTexture{
         .texture = state.texture.Get(),
@@ -544,8 +567,12 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
         render_window.OnFrameDisplayed();
     };
     @autoreleasepool {
-        // The last frame for the applet capture (LayerStackId::LastFrame), shown or not.
-        impl->RenderAppletCapture(framebuffers);
+        if (LazyAppletCaptureEnabled()) {
+            impl->last_framebuffers.assign(framebuffers.begin(), framebuffers.end());
+        } else {
+            // The last frame for the applet capture (LayerStackId::LastFrame), shown or not.
+            impl->RenderAppletCapture(framebuffers);
+        }
     }
     if (!render_window.IsShown()) {
         return;
@@ -554,6 +581,16 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
     @autoreleasepool {
         RenderScreenshot(framebuffers);
         const auto& layout = render_window.GetFramebufferLayout();
+        if (!framebuffers.empty()) {
+            const auto& guest = framebuffers.front();
+            const bool cropped = !guest.crop_rect.IsEmpty();
+            const u32 game_width =
+                cropped ? static_cast<u32>(guest.crop_rect.GetWidth()) : guest.width;
+            const u32 game_height =
+                cropped ? static_cast<u32>(guest.crop_rect.GetHeight()) : guest.height;
+            VideoCore::Probe::StoreFrameExtents(game_width, game_height, layout.width,
+                                                layout.height);
+        }
         const id<CAMetalDrawable> drawable =
             impl->swapchain.NextDrawable(layout.width, layout.height);
         if (drawable != nil) {
@@ -759,6 +796,11 @@ void RendererMetal::Impl::RenderAppletCapture(
 std::vector<u8> RendererMetal::GetAppletCaptureBuffer() {
     using namespace VideoCore::Capture;
     std::vector<u8> out(TiledSize);
+    if (LazyAppletCaptureEnabled() && !impl->last_framebuffers.empty()) {
+        @autoreleasepool {
+            impl->RenderAppletCapture(impl->last_framebuffers);
+        }
+    }
     if (!impl->applet_capture) {
         return out;
     }

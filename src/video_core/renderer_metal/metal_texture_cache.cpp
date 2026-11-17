@@ -1285,6 +1285,86 @@ TextureHandle ImageView::Handle(Shader::TextureType texture_type) {
     return view.Get();
 }
 
+TextureHandle ImageView::StorageHandle(Shader::TextureType texture_type,
+                                       Shader::ImageFormat image_format) {
+    if (!FormatsExpanded()) {
+        return Handle(texture_type);
+    }
+    if (image_texture == nullptr || texture_type == Shader::TextureType::Buffer) {
+        return nullptr;
+    }
+    u32 view_format = StorageFormat(image_format);
+    if (view_format == 0) {
+        const u32 linear = LinearTwin(host_format);
+        view_format = linear != 0 ? linear : host_format;
+    }
+    if (view_format == host_format && swizzle == IdentitySwizzle) {
+        return Handle(texture_type);
+    }
+    for (const StorageVariant& existing : storage_views) {
+        if (existing.type == texture_type && existing.format == view_format) {
+            return existing.view ? existing.view.Get() : Handle(texture_type);
+        }
+    }
+    const bool multisample = image_kind == TextureKind::e2DMultisampleArray;
+    TextureKind view_kind = TextureKind::e2D;
+    u32 base_layer = static_cast<u32>(range.base.layer);
+    u32 layers = static_cast<u32>(range.extent.layers);
+    switch (texture_type) {
+    case Shader::TextureType::Color1D:
+        view_kind = PipelineCheckEnabled() ? TextureKind::e2D : TextureKind::e1D;
+        layers = 1;
+        break;
+    case Shader::TextureType::ColorArray1D:
+        view_kind = PipelineCheckEnabled() ? TextureKind::e2DArray : TextureKind::e1DArray;
+        break;
+    case Shader::TextureType::Color2D:
+    case Shader::TextureType::Color2DRect:
+        view_kind = multisample ? TextureKind::e2DMultisample : TextureKind::e2D;
+        layers = 1;
+        break;
+    case Shader::TextureType::ColorArray2D:
+        view_kind = multisample ? TextureKind::e2DMultisampleArray : TextureKind::e2DArray;
+        break;
+    case Shader::TextureType::Color3D:
+        view_kind = TextureKind::e3D;
+        base_layer = 0;
+        layers = 1;
+        break;
+    case Shader::TextureType::ColorCube:
+        view_kind = TextureKind::Cube;
+        layers = 6;
+        break;
+    case Shader::TextureType::ColorArrayCube:
+        view_kind = TextureKind::CubeArray;
+        layers = (std::max)(layers / 6, 1U) * 6;
+        break;
+    default:
+        return nullptr;
+    }
+    if ((image_kind == TextureKind::e3D) != (view_kind == TextureKind::e3D)) {
+        view_kind = image_kind == TextureKind::e3D ? TextureKind::e3D : TextureKind::e2D;
+        base_layer = image_kind == TextureKind::e3D ? 0 : base_layer;
+        layers = 1;
+    }
+    if (multisample && PipelineCheckEnabled() && view_kind != TextureKind::e2DMultisample &&
+        view_kind != TextureKind::e2DMultisampleArray) {
+        view_kind = TextureKind::e2DMultisample;
+        layers = 1;
+    }
+    Object storage = CreateTextureView(image_texture, view_format, view_kind,
+                                       static_cast<u32>(range.base.level),
+                                       static_cast<u32>(range.extent.levels), base_layer, layers,
+                                       IdentitySwizzle);
+    const TextureHandle result = storage ? storage.Get() : Handle(texture_type);
+    storage_views.push_back(StorageVariant{
+        .type = texture_type,
+        .format = view_format,
+        .view = std::move(storage),
+    });
+    return result;
+}
+
 bool ImageView::PrepareSampleGrid() {
     if (samples == 1 || !MsaaEnabled() || slot_images == nullptr || !image_id) {
         return false;
