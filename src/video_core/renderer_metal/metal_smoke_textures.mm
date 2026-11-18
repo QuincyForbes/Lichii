@@ -1525,7 +1525,7 @@ int RunPacked5551() {
     clear.height = 8;
     scheduler.Clear(clear);
     scheduler.BreakBlits();
-    const bool down = scheduler.Pack5551(true, target.Get(), 0, 0, {}, {8, 8, 1}, words.Get(), 0, 16);
+    const bool down = scheduler.Pack16(1, true, target.Get(), 0, 0, {}, {8, 8, 1}, words.Get(), 0, 16);
     scheduler.Finish();
     uint16_t rendered{};
     std::memcpy(&rendered, word_bytes, 2);
@@ -1534,7 +1534,7 @@ int RunPacked5551() {
         const uint16_t value = 0x0842;
         std::memcpy(word_bytes + index * 2, &value, 2);
     }
-    const bool up = scheduler.Pack5551(false, target.Get(), 0, 0, {}, {8, 8, 1}, words.Get(), 0, 16);
+    const bool up = scheduler.Pack16(1, false, target.Get(), 0, 0, {}, {8, 8, 1}, words.Get(), 0, 16);
     scheduler.BreakBlits();
     scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {8, 8, 1}, back.Get(), 0, 32, 0);
     scheduler.Finish();
@@ -1548,6 +1548,119 @@ int RunPacked5551() {
     return passed ? 0 : 1;
 }
 
+/// E21: the five 16-bit packed formats as RGBA8 stand-ins (what a GPU without them uses,
+/// EDEN_NX2_METAL_PACKED=rgba8 forces it here): drawn, downloaded to the guest's words, uploaded
+/// from them and copied between images.
+int RunPacked16Forced() {
+    using VideoCore::Surface::PixelFormat;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    setenv("EDEN_NX2_METAL_PACKED", "rgba8", 1);
+    struct Case {
+        PixelFormat format;
+        uint16_t word; ///< the guest's bits for red 1, green 0, blue 0, alpha 1
+        const char* name;
+    };
+    const std::array<Case, 5> cases{{
+        {PixelFormat::R5G6B5_UNORM, 0xF800, "R5G6B5"},
+        {PixelFormat::B5G6R5_UNORM, 0x001F, "B5G6R5"},
+        {PixelFormat::A1R5G5B5_UNORM, 0xFC00, "A1R5G5B5"},
+        {PixelFormat::A1B5G5R5_UNORM, 0x801F, "A1B5G5R5"},
+        {PixelFormat::A4B4G4R4_UNORM, 0xF00F, "A4B4G4R4"},
+    }};
+    int failed = 0;
+    std::string report;
+    for (const Case& test : cases) {
+        const Metal::FormatInfo host = Metal::SurfaceFormat(device, test.format, false);
+        const bool stand_in = Metal::FallbackOf(device, test.format) ==
+                                  Metal::FormatFallback::Stand_in &&
+                              host.format == Metal::Fmt::RGBA8Unorm && host.attachable;
+        const uint32_t mode = Metal::Pack16Mode(test.format);
+        const Metal::TextureDesc desc{.kind = TextureKind::e2D, .format = host.format, .width = 8,
+                                      .height = 8, .render_target = true, .shader_write = true};
+        const Object image = Metal::CreateTexture(device, desc);
+        const Object copy = Metal::CreateTexture(device, desc);
+        auto [words, word_bytes] = SharedBuffer(device, 8 * 8 * 2);
+        auto [back, back_bytes] = SharedBuffer(device, 8 * 8 * 4);
+        if (!stand_in || !image || !copy || word_bytes == nullptr || back_bytes == nullptr) {
+            report += std::string{" "} + test.name + " NOT A STAND-IN";
+            ++failed;
+            continue;
+        }
+        Metal::ClearPass clear{};
+        clear.color[0] = {.texture = image.Get()};
+        clear.clear_color[0] = true;
+        clear.color_value[0] = {1, 0, 0, 1};
+        clear.width = 8;
+        clear.height = 8;
+        scheduler.Clear(clear);
+        scheduler.BreakBlits();
+        scheduler.Pack16(mode, true, image.Get(), 0, 0, {}, {8, 8, 1}, words.Get(), 0, 16);
+        scheduler.Finish();
+        uint16_t rendered{};
+        std::memcpy(&rendered, word_bytes, 2);
+        // Copied to another image, then packed from that one.
+        scheduler.CopyTexture(image.Get(), 0, 0, {}, {8, 8, 1}, copy.Get(), 0, 0, {});
+        scheduler.BreakBlits();
+        std::memset(word_bytes, 0, 128);
+        scheduler.Pack16(mode, true, copy.Get(), 0, 0, {}, {8, 8, 1}, words.Get(), 0, 16);
+        scheduler.Finish();
+        uint16_t copied{};
+        std::memcpy(&copied, word_bytes, 2);
+        // Uploaded from the words, read back as RGBA8.
+        scheduler.Pack16(mode, false, image.Get(), 0, 0, {}, {8, 8, 1}, words.Get(), 0, 16);
+        scheduler.BreakBlits();
+        scheduler.CopyTextureToBuffer(image.Get(), 0, 0, {}, {8, 8, 1}, back.Get(), 0, 32, 0);
+        scheduler.Finish();
+        const std::array<uint8_t, 4> red{255, 0, 0, 255};
+        const bool uploaded = std::memcmp(back_bytes, red.data(), 4) == 0;
+        if (rendered != test.word || copied != test.word || !uploaded) {
+            ++failed;
+            report += fmt::format(" {} WRONG (drawn {:04x}, copied {:04x}, want {:04x}, uploaded {})",
+                                  test.name, rendered, copied, test.word, uploaded ? "ok" : "bad");
+        }
+    }
+    unsetenv("EDEN_NX2_METAL_PACKED");
+    std::printf("metal-smoke: 16-bit packed formats as RGBA8 stand-ins (R5G6B5, B5G6R5, A1R5G5B5, "
+                "A1B5G5R5, A4B4G4R4; forced by EDEN_NX2_METAL_PACKED=rgba8): drawn, copied, "
+                "downloaded and uploaded:%s %s\n",
+                report.c_str(), failed == 0 ? "PASS" : "FAIL");
+    return failed == 0 ? 0 : 1;
+}
+
+/// E21: the substitution table (Metal::FallbackOf), as this GPU answers and with the switches.
+int RunFallbackTable() {
+    using VideoCore::Surface::PixelFormat;
+    using Metal::FormatFallback;
+    Metal::Device device;
+    const auto of = [&](PixelFormat format) { return Metal::FallbackOf(device, format); };
+    const bool apple = device.AppleFamily() != 0;
+    bool ok = of(PixelFormat::R32G32B32_FLOAT) == FormatFallback::Expanded &&
+              of(PixelFormat::G4R4_UNORM) == FormatFallback::Expanded &&
+              of(PixelFormat::X8_D24_UNORM) == FormatFallback::Widened &&
+              of(PixelFormat::D24_UNORM_S8_UINT) == FormatFallback::Widened &&
+              of(PixelFormat::A5B5G5R1_UNORM) == FormatFallback::Stand_in &&
+              of(PixelFormat::A8B8G8R8_UNORM) == FormatFallback::Native;
+    ok = ok && (of(PixelFormat::ASTC_2D_4X4_UNORM) == FormatFallback::Native) == apple;
+    ok = ok && (of(PixelFormat::ETC2_RGB_UNORM) == FormatFallback::Native) == apple;
+    ok = ok && (of(PixelFormat::B5G6R5_UNORM) == FormatFallback::Native) == apple;
+    ok = ok && (of(PixelFormat::BC1_RGBA_UNORM) == FormatFallback::Native) ==
+                   device.SupportsBCTextures();
+    setenv("EDEN_NX2_METAL_ETC", "cpu", 1);
+    setenv("EDEN_NX2_METAL_PACKED", "rgba8", 1);
+    ok = ok && of(PixelFormat::ETC2_RGBA_UNORM) == FormatFallback::Decoded &&
+         of(PixelFormat::EAC_R11_UNORM) == FormatFallback::Decoded &&
+         of(PixelFormat::A4B4G4R4_UNORM) == FormatFallback::Stand_in;
+    unsetenv("EDEN_NX2_METAL_ETC");
+    unsetenv("EDEN_NX2_METAL_PACKED");
+    std::printf("metal-smoke: format fallbacks on this GPU (Apple family %u, BC %s): ASTC, ETC2 "
+                "and packed formats native on Apple GPUs, decoded / stand-in under the switches, "
+                "R32G32B32 and G4R4 expanded, 24-bit depth widened: %s\n",
+                device.AppleFamily(), device.SupportsBCTextures() ? "yes" : "no",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int RunAll() {
     int result = 0;
     for (const auto test : {RunSampleCopies, RunScaleNearest, RunDepthBytes, RunConversions, RunGuards,
@@ -1555,7 +1668,7 @@ int RunAll() {
                             RunLayeredTarget, RunMultiRange, RunCrossThreadWait,
                             RunSamplers, RunPackedTargets, RunByteShadow, RunSparseTiles,
                             RunUnwrittenStore, RunEtcDecode,
-                            RunPacked5551}) {
+                            RunPacked5551, RunPacked16Forced, RunFallbackTable}) {
         const int outcome = test();
         result = result != 0 ? result : outcome;
     }

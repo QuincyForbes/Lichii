@@ -48,7 +48,7 @@ Entry Lookup(PixelFormat format) {
     case PixelFormat::A2R10G10B10_UNORM: return {Fmt::BGR10A2Unorm, A, N};
     case PixelFormat::A1B5G5R5_UNORM: return {Fmt::BGR5A1Unorm, A, N};
     // 5 bits of alpha on top and a 1-bit red: no Metal format has them, so an RGBA8 texture
-    // converted to and from the guest's words by kernels (Scheduler::Pack5551).
+    // converted to and from the guest's words by kernels (Scheduler::Pack16).
     case PixelFormat::A5B5G5R1_UNORM: return {Fmt::RGBA8Unorm, A, S};
     case PixelFormat::R8_UNORM: return {Fmt::R8Unorm, A, S};
     case PixelFormat::R8_SNORM: return {Fmt::R8Snorm, A, S};
@@ -158,6 +158,18 @@ Entry Lookup(PixelFormat format) {
 }
 
 } // Anonymous namespace
+
+u32 Pack16Mode(PixelFormat format) {
+    switch (format) {
+    case PixelFormat::A5B5G5R1_UNORM: return 1;
+    case PixelFormat::R5G6B5_UNORM: return 2;
+    case PixelFormat::B5G6R5_UNORM: return 3;
+    case PixelFormat::A1R5G5B5_UNORM: return 4;
+    case PixelFormat::A1B5G5R5_UNORM: return 5;
+    case PixelFormat::A4B4G4R4_UNORM: return 6;
+    default: return 0;
+    }
+}
 
 u32 PackedSwapShift(PixelFormat format) {
     switch (format) {

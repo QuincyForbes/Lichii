@@ -379,9 +379,9 @@ public:
     /// recorded before and after it.
     bool UpdateSparseTiles(TextureHandle texture, std::span<const SparseTileOp> ops);
 
-    /// A5B5G5R1 (an RGBA8 texture on the host) from or to the guest's 16-bit words in `buffer`:
-    /// a region of one level and slice. `to_buffer` reads the texture.
-    bool Pack5551(bool to_buffer, TextureHandle texture, u32 level, u32 slice, Offset3D origin,
+    /// A 16-bit packed format (Pack16Mode `mode`, an RGBA8 texture on the host) from or to the
+    /// guest's words in `buffer`: a region of one level and slice. `to_buffer` reads the texture.
+    bool Pack16(u32 mode, bool to_buffer, TextureHandle texture, u32 level, u32 slice, Offset3D origin,
                   Extent3D extent, BufferHandle buffer, u64 offset, u32 bytes_per_row);
 
     /// Exchanges red and blue (or reverses the nibbles, shift 4) of 16-bit texels in place in

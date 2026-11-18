@@ -406,41 +406,67 @@ kernel void swap_packed(uint3 id [[thread_position_in_grid]],
                  : ushort((v & ~m) | (v & 31u) << p.shift | (v >> p.shift & 31u));
 }
 
-// A5B5G5R1 (guest bits: alpha 15-11, blue 10-6, green 5-1, a 1-bit red at 0) is an RGBA8 texture
-// on the host; these two move whole regions between it and the guest's 16-bit words.
+// The 16-bit packed formats as RGBA8 on the host (Pack16Mode); these move whole regions between
+// the texture and the guest's words. 1 A5B5G5R1 (alpha 15-11, blue 10-6, green 5-1, red 0),
+// 2 R5G6B5, 3 B5G6R5, 4 A1R5G5B5, 5 A1B5G5R5, 6 A4B4G4R4.
 struct PackParams {
     uint2 origin;
     uint2 extent;
     uint row_words;
+    uint mode;
 };
 
-kernel void pack5551_from_buffer(uint2 id [[thread_position_in_grid]],
-                                 texture2d<float, access::write> dst [[texture(0)]],
-                                 device const ushort* words [[buffer(0)]],
-                                 constant PackParams& p [[buffer(1)]]) {
-    if (any(id >= p.extent)) {
-        return;
+float4 Unpack16(uint v, uint mode) {
+    switch (mode) {
+    case 1: return float4(float(v & 1u), float((v >> 1) & 31u) / 31.0, float((v >> 6) & 31u) / 31.0,
+                          float((v >> 11) & 31u) / 31.0);
+    case 2: return float4(float(v >> 11) / 31.0, float((v >> 5) & 63u) / 63.0, float(v & 31u) / 31.0, 1.0);
+    case 3: return float4(float(v & 31u) / 31.0, float((v >> 5) & 63u) / 63.0, float(v >> 11) / 31.0, 1.0);
+    case 4: return float4(float((v >> 10) & 31u) / 31.0, float((v >> 5) & 31u) / 31.0,
+                          float(v & 31u) / 31.0, float(v >> 15));
+    case 5: return float4(float(v & 31u) / 31.0, float((v >> 5) & 31u) / 31.0,
+                          float((v >> 10) & 31u) / 31.0, float(v >> 15));
+    default: return float4(float(v & 15u), float((v >> 4) & 15u), float((v >> 8) & 15u),
+                           float(v >> 12)) / 15.0;
     }
-    const uint v = words[id.y * p.row_words + id.x];
-    const float a = float((v >> 11) & 31u) / 31.0;
-    const float b = float((v >> 6) & 31u) / 31.0;
-    const float g = float((v >> 1) & 31u) / 31.0;
-    dst.write(float4(float(v & 1u), g, b, a), p.origin + id);
 }
 
-kernel void pack5551_to_buffer(uint2 id [[thread_position_in_grid]],
-                               texture2d<float> src [[texture(0)]],
-                               device ushort* words [[buffer(0)]],
+uint Pack16(float4 c, uint mode) {
+    c = saturate(c);
+    switch (mode) {
+    case 1: return (uint(round(c.a * 31.0)) << 11) | (uint(round(c.b * 31.0)) << 6) |
+                   (uint(round(c.g * 31.0)) << 1) | (c.r >= 0.5 ? 1u : 0u);
+    case 2: return (uint(round(c.r * 31.0)) << 11) | (uint(round(c.g * 63.0)) << 5) |
+                   uint(round(c.b * 31.0));
+    case 3: return (uint(round(c.b * 31.0)) << 11) | (uint(round(c.g * 63.0)) << 5) |
+                   uint(round(c.r * 31.0));
+    case 4: return (c.a >= 0.5 ? 0x8000u : 0u) | (uint(round(c.r * 31.0)) << 10) |
+                   (uint(round(c.g * 31.0)) << 5) | uint(round(c.b * 31.0));
+    case 5: return (c.a >= 0.5 ? 0x8000u : 0u) | (uint(round(c.b * 31.0)) << 10) |
+                   (uint(round(c.g * 31.0)) << 5) | uint(round(c.r * 31.0));
+    default: return (uint(round(c.a * 15.0)) << 12) | (uint(round(c.b * 15.0)) << 8) |
+                    (uint(round(c.g * 15.0)) << 4) | uint(round(c.r * 15.0));
+    }
+}
+
+kernel void pack16_from_buffer(uint2 id [[thread_position_in_grid]],
+                               texture2d<float, access::write> dst [[texture(0)]],
+                               device const ushort* words [[buffer(0)]],
                                constant PackParams& p [[buffer(1)]]) {
     if (any(id >= p.extent)) {
         return;
     }
-    const float4 c = src.read(p.origin + id);
-    const uint r = c.r >= 0.5 ? 1u : 0u;
-    const uint g = uint(round(saturate(c.g) * 31.0));
-    const uint b = uint(round(saturate(c.b) * 31.0));
-    const uint a = uint(round(saturate(c.a) * 31.0));
-    words[id.y * p.row_words + id.x] = ushort((a << 11) | (b << 6) | (g << 1) | r);
+    dst.write(Unpack16(words[id.y * p.row_words + id.x], p.mode), p.origin + id);
+}
+
+kernel void pack16_to_buffer(uint2 id [[thread_position_in_grid]],
+                             texture2d<float> src [[texture(0)]],
+                             device ushort* words [[buffer(0)]],
+                             constant PackParams& p [[buffer(1)]]) {
+    if (any(id >= p.extent)) {
+        return;
+    }
+    words[id.y * p.row_words + id.x] = ushort(Pack16(src.read(p.origin + id), p.mode));
 }
 
 kernel void depth_to_buffer(uint2 id [[thread_position_in_grid]],
@@ -1550,8 +1576,8 @@ struct Scheduler::Impl {
     std::unordered_map<u64, id<MTLRenderPipelineState>> depth_upload_pipelines;
     id<MTLComputePipelineState> depth_download = nil;
     id<MTLComputePipelineState> swap_packed = nil;
-    id<MTLComputePipelineState> pack5551_from = nil;
-    id<MTLComputePipelineState> pack5551_to = nil;
+    id<MTLComputePipelineState> pack16_from = nil;
+    id<MTLComputePipelineState> pack16_to = nil;
     id<MTLBuffer> zero_buffer = nil;
     id<MTLCommandBuffer> command_buffer = nil;
     id<MTLBlitCommandEncoder> blit = nil;
@@ -2497,7 +2523,7 @@ bool Scheduler::UpdateSparseTiles(TextureHandle texture_handle,
     return true;
 }
 
-bool Scheduler::Pack5551(bool to_buffer, TextureHandle texture_handle, u32 level, u32 slice,
+bool Scheduler::Pack16(u32 mode, bool to_buffer, TextureHandle texture_handle, u32 level, u32 slice,
                          Offset3D origin, Extent3D extent, BufferHandle buffer, u64 offset,
                          u32 bytes_per_row) {
     const id<MTLTexture> texture = AsTexture(texture_handle);
@@ -2508,21 +2534,21 @@ bool Scheduler::Pack5551(bool to_buffer, TextureHandle texture_handle, u32 level
     }
     impl->FlushClear();
     Impl& state = *impl;
-    id<MTLComputePipelineState> pipeline = to_buffer ? state.pack5551_to : state.pack5551_from;
+    id<MTLComputePipelineState> pipeline = to_buffer ? state.pack16_to : state.pack16_from;
     if (pipeline == nil && state.library != nil) {
         NSError* error = nil;
         pipeline = [state.device.GetDevice()
             newComputePipelineStateWithFunction:
-                [state.library newFunctionWithName:to_buffer ? @"pack5551_to_buffer"
-                                                             : @"pack5551_from_buffer"]
+                [state.library newFunctionWithName:to_buffer ? @"pack16_to_buffer"
+                                                             : @"pack16_from_buffer"]
                                           error:&error];
         if (pipeline == nil) {
-            LOG_ERROR(Render_Metal, "Metal: A5B5G5R1 kernel failed: {}",
+            LOG_ERROR(Render_Metal, "Metal: Packed 16-bit kernel failed: {}",
                       error.localizedDescription.UTF8String);
         } else if (to_buffer) {
-            state.pack5551_to = pipeline;
+            state.pack16_to = pipeline;
         } else {
-            state.pack5551_from = pipeline;
+            state.pack16_from = pipeline;
         }
     }
     const id<MTLTexture> view = [texture newTextureViewWithPixelFormat:texture.pixelFormat
@@ -2537,12 +2563,12 @@ bool Scheduler::Pack5551(bool to_buffer, TextureHandle texture_handle, u32 level
     ++state.encoders;
     ++state.segment_encoders;
     const id<MTLComputeCommandEncoder> encoder = [state.Commands() computeCommandEncoder];
-    encoder.label = @"A5B5G5R1 copy";
+    encoder.label = @"Packed 16-bit copy";
     [encoder setComputePipelineState:pipeline];
     [encoder setTexture:view atIndex:0];
     [encoder setBuffer:AsBuffer(buffer) offset:offset atIndex:0];
     const std::array<u32, 6> params{origin.x, origin.y, extent.width, extent.height,
-                                    bytes_per_row / 2, 0};
+                                    bytes_per_row / 2, mode};
     [encoder setBytes:params.data() length:sizeof(params) atIndex:1];
     [encoder dispatchThreadgroups:MTLSizeMake((extent.width + 7) / 8, (extent.height + 7) / 8, 1)
             threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];

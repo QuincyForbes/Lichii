@@ -264,7 +264,34 @@ bool IsConverted(const Device& device, PixelFormat format) {
     return false;
 }
 
-FormatInfo SurfaceFormat(const Device&, PixelFormat format, bool converted) {
+bool PackedAsRgba8(const Device& device) {
+    const char* const value = std::getenv("EDEN_NX2_METAL_PACKED");
+    return device.AppleFamily() == 0 || (value != nullptr && std::strcmp(value, "rgba8") == 0);
+}
+
+FormatFallback FallbackOf(const Device& device, PixelFormat format) {
+    if (Pack16Mode(format) != 0 &&
+        (Pack16Mode(format) == 1 || PackedAsRgba8(device))) {
+        return FormatFallback::Stand_in;
+    }
+    if (IsConverted(device, format)) {
+        return VideoCommon::IsExpandedFormat(format) ? FormatFallback::Expanded
+                                                     : FormatFallback::Decoded;
+    }
+    switch (format) {
+    case PixelFormat::X8_D24_UNORM:
+    case PixelFormat::D24_UNORM_S8_UINT:
+    case PixelFormat::S8_UINT_D24_UNORM: return FormatFallback::Widened;
+    default: return FormatFallback::Native;
+    }
+}
+
+FormatInfo SurfaceFormat(const Device& device, PixelFormat format, bool converted) {
+    const u32 mode = Pack16Mode(format);
+    if (!converted && mode > 1 && PackedAsRgba8(device)) {
+        return FormatInfo{.format = Fmt::RGBA8Unorm, .attachable = true, .storage = true,
+                          .format_class = FormatClass::Float};
+    }
     return SurfaceFormat(format, converted);
 }
 

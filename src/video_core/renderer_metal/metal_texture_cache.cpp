@@ -302,7 +302,7 @@ u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
 bool TextureCacheRuntime::ShouldReinterpret(Image& dst, Image& src) const noexcept {
     // Two formats of one Metal format keep their guest bits apart when one of them is swapped.
     return dst.HostFormat().format != src.HostFormat().format ||
-           dst.PackedShift() != src.PackedShift() || dst.IsPack5551() != src.IsPack5551();
+           dst.PackedShift() != src.PackedShift() || dst.Pack16() != src.Pack16();
 }
 
 void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
@@ -424,8 +424,7 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
         return IsColor(image.HostFormat().format_class) ||
                (CopiesEnabled() && image.CanCopyWithBuffers());
     };
-    if (dst.Handle() == nullptr || src.Handle() == nullptr || converted || src.IsPack5551() ||
-        dst.IsPack5551() ||
+    if (dst.Handle() == nullptr || src.Handle() == nullptr || converted ||
         src.info.num_samples != 1 || dst.info.num_samples != 1 || !copyable(src) ||
         !copyable(dst) || !blocks_fit ||
         VideoCore::Surface::BytesPerBlock(src_format) !=
@@ -485,6 +484,10 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
                 scheduler.DepthToBuffer(src.Handle(), src_level, src_slice,
                                         ToOffset(copy.src_offset), extent,
                                         reinterpret_buffer.Get(), 0, bytes_per_row, *src_depth);
+            } else if (src.Pack16() != 0 && !src_3d) {
+                scheduler.Pack16(src.Pack16(), true, src.Handle(), src_level, src_slice,
+                                 ToOffset(copy.src_offset), extent, reinterpret_buffer.Get(), 0,
+                                 bytes_per_row);
             } else {
                 scheduler.CopyTextureToBuffer(src.Handle(), src_level, src_slice,
                                               ToOffset(copy.src_offset), extent,
@@ -506,6 +509,10 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
                 scheduler.DepthFromBuffer(reinterpret_buffer.Get(), 0, bytes_per_row,
                                           dst.Handle(), dst_level, dst_slice,
                                           ToOffset(copy.dst_offset), dst_extent, *dst_depth);
+            } else if (dst.Pack16() != 0 && !dst_3d) {
+                scheduler.Pack16(dst.Pack16(), false, dst.Handle(), dst_level, dst_slice,
+                                 ToOffset(copy.dst_offset), dst_extent, reinterpret_buffer.Get(),
+                                 0, bytes_per_row);
             } else {
                 scheduler.CopyBufferToTexture(reinterpret_buffer.Get(), 0, bytes_per_row,
                                               dst_3d ? bytes_per_image : 0U, dst.Handle(),
@@ -798,8 +805,12 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     }
     host_format = SurfaceFormat(runtime->device, info.format, converted);
     if (info.type != ImageType::Buffer && !converted) {
-        packed_shift = PackedSwapShift(info.format);
-        pack5551 = info.format == PixelFormat::A5B5G5R1_UNORM;
+        const u32 mode = Pack16Mode(info.format);
+        if (mode == 1 || (mode != 0 && PackedAsRgba8(runtime->device))) {
+            pack16 = mode;
+        } else {
+            packed_shift = PackedSwapShift(info.format);
+        }
     }
     if (info.type == ImageType::Buffer) {
         // Texel buffers are views of the buffer cache's buffers (milestone 3).
@@ -1242,9 +1253,9 @@ void Image::UploadMemory(BufferHandle buffer, size_t offset,
         const auto [bytes_per_row, bytes_per_image] = CopyPitches(copy);
         const s32 layers = is_3d ? 1 : (std::max)(copy.image_subresource.num_layers, 1);
         for (s32 layer = 0; layer < layers; ++layer) {
-            if (pack5551 && !is_3d && !multisampled) {
-                if (!runtime->scheduler.Pack5551(
-                        false, target, static_cast<u32>(copy.image_subresource.base_level),
+            if (pack16 != 0 && !is_3d && !multisampled) {
+                if (!runtime->scheduler.Pack16(
+                        pack16, false, target, static_cast<u32>(copy.image_subresource.base_level),
                         static_cast<u32>(copy.image_subresource.base_layer + layer),
                         ToOffset(copy.image_offset), extent, buffer,
                         offset + copy.buffer_offset + u64{bytes_per_image} * layer,
@@ -1356,9 +1367,9 @@ void Image::DownloadMemory(std::span<BufferHandle> buffers, std::span<size_t> of
             const auto [bytes_per_row, bytes_per_image] = CopyPitches(copy);
             const s32 layers = is_3d ? 1 : (std::max)(copy.image_subresource.num_layers, 1);
             for (s32 layer = 0; layer < layers; ++layer) {
-                if (pack5551 && !is_3d && !multisampled) {
-                    if (!runtime->scheduler.Pack5551(
-                            true, source, static_cast<u32>(copy.image_subresource.base_level),
+                if (pack16 != 0 && !is_3d && !multisampled) {
+                    if (!runtime->scheduler.Pack16(
+                            pack16, true, source, static_cast<u32>(copy.image_subresource.base_level),
                             static_cast<u32>(copy.image_subresource.base_layer + layer),
                             ToOffset(copy.image_offset), extent, buffers[index],
                             offsets[index] + copy.buffer_offset + u64{bytes_per_image} * layer,

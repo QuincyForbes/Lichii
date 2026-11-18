@@ -85,6 +85,20 @@ void InAutoreleasePool(const std::function<void()>& work);
 [[nodiscard]] FormatInfo SurfaceFormat(const Device& device, VideoCore::Surface::PixelFormat format,
                                        bool converted);
 
+/// Whether the 16-bit packed formats are RGBA8 textures here (Pack16Mode): GPUs without an Apple
+/// family have none of them, EDEN_NX2_METAL_PACKED=rgba8 does it on any GPU.
+[[nodiscard]] bool PackedAsRgba8(const Device& device);
+
+/// How a device holds a guest format (Vulkan's GetSupportedFormat chain with Metal's queries).
+enum class FormatFallback : u8 {
+    Native,      ///< The format itself (or the one Metal has for it, FormatInfo)
+    Decoded,     ///< Decoded on the CPU into RGBA8 / R / RG (ASTC, BC, ETC2, EAC)
+    Expanded,    ///< Texels widened on the CPU (R32G32B32, G4R4)
+    Stand_in,    ///< RGBA8 moved to and from the guest's words by kernels (16-bit packed)
+    Widened,     ///< A wider format of the same channels (24-bit depth as 32-bit float)
+};
+[[nodiscard]] FormatFallback FallbackOf(const Device& device, VideoCore::Surface::PixelFormat format);
+
 /// Whether the guest format is decoded on the CPU before upload (no native ASTC / BC).
 [[nodiscard]] bool IsConverted(const Device& device, VideoCore::Surface::PixelFormat format);
 
