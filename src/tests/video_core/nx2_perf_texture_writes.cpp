@@ -130,8 +130,6 @@ TEST_CASE("Nx2Perf texture-writes: switches can be disabled independently", "[vi
     const char* disabled = std::getenv("EDEN_NX2_PERF_OFF");
     const bool enabled = master == nullptr || master[0] != '0';
     const std::string list = "," + std::string{disabled ? disabled : ""} + ",";
-    REQUIRE(On(Opt::WriteIntersections) ==
-            (enabled && list.find(",write_intersections,") == std::string::npos));
     REQUIRE(On(Opt::SortedPageBatches) ==
             (enabled && list.find(",sorted_page_batches,") == std::string::npos));
 }

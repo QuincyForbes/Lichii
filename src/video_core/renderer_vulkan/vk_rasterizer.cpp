@@ -112,6 +112,8 @@ using VideoCommon::ImageViewType;
 
 
 namespace {
+/// EDEN_NX2_DIAG_SAMPLES: the occlusion queries that count the samples each captured draw passes.
+vk::QueryPool* g_diag_pool{};
 
 // EXPERIMENT EDEN_NX2_INVALIDATE_BEFORE_DISPATCH=1: apply collected guest CPU writes before every
 // dispatch and draw (=list does it once per command list, in DmaPusher).
@@ -676,6 +678,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
+    delete std::exchange(g_diag_pool, nullptr);
     Common::PlatformEvents::SetGraphicsMemoryReport({});
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr, nullptr);
     VideoCommon::GpuSplit::Get().SetIdleBusy(nullptr);
@@ -1340,11 +1343,29 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
     const std::optional<u32> probe =
         frame_dump.CapturingSampled() ? frame_dump.BeginProbe() : std::nullopt;
+    // EDEN_NX2_DIAG_SAMPLES: count the samples this draw passes while a draw list is captured. The
+    // game's own occlusion counting is left alone (one occlusion query can be active at a time).
+    int diag_query = -1;
+    if (diag_active && VideoCommon::Nx2Diag::SamplesEnabled() && g_diag_pool != nullptr &&
+        !maxwell3d->regs.zpass_pixel_count_enable) {
+        diag_query = VideoCommon::Nx2Diag::Diagnostics::Get().NextQuery();
+    }
+    if (diag_query >= 0) {
+        scheduler.Record([pool = **g_diag_pool, diag_query](vk::CommandBuffer cmdbuf) {
+            cmdbuf.BeginQuery(pool, static_cast<u32>(diag_query), 0);
+        });
+    }
     {
         Profile::Scope scope{Profile::Zone::DrawRecord};
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
         trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
         draw_func();
+    }
+    if (diag_query >= 0) {
+        scheduler.Record([pool = **g_diag_pool, diag_query](vk::CommandBuffer cmdbuf) {
+            cmdbuf.EndQuery(pool, static_cast<u32>(diag_query));
+        });
+        g_diag_query = diag_query;
     }
     if (probe) {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
@@ -4344,9 +4365,46 @@ void RasterizerVulkan::TickFrame() {
     frame_dump.TickFrame();
     if (VideoCommon::Nx2Diag::Active()) {
         auto& diag = VideoCommon::Nx2Diag::Diagnostics::Get();
+        if (const u32 count = diag.QueryCount();
+            diag.Capturing() && count > 0 && g_diag_pool != nullptr) {
+            // The capture ends here: wait for its draws and read what the probes counted.
+            scheduler.Finish();
+            std::vector<u64> samples(count);
+            const VkResult result = device.GetLogical().GetQueryResults(
+                **g_diag_pool, 0, count, sizeof(u64) * count, samples.data(), sizeof(u64),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            if (result == VK_SUCCESS) {
+                diag.SetSamples(std::move(samples));
+            } else {
+                LOG_ERROR(Render_Vulkan, "diag: reading the draw probe failed ({})",
+                          static_cast<int>(result));
+            }
+        }
         diag.TickFrame();
         if (DiagLite() && VideoCommon::Nx2Perf::Verify()) {
             DiagLiteVerifyFrame();
+        }
+        if (diag.Capturing() && VideoCommon::Nx2Diag::SamplesEnabled()) {
+            // A capture just began: (re)create and reset the probe pool.
+            if (g_diag_pool == nullptr) {
+                g_diag_pool = new vk::QueryPool(device.GetLogical().CreateQueryPool({
+                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .queryType = VK_QUERY_TYPE_OCCLUSION,
+                    .queryCount = VideoCommon::Nx2Diag::MaxProbeQueries,
+                    .pipelineStatistics = 0,
+                }));
+            }
+            if (device.IsHostQueryResetSupported()) {
+                device.GetLogical().ResetQueryPool(**g_diag_pool, 0,
+                                                   VideoCommon::Nx2Diag::MaxProbeQueries);
+            } else {
+                scheduler.RequestOutsideRenderPassOperationContext();
+                scheduler.Record([pool = **g_diag_pool](vk::CommandBuffer cmdbuf) {
+                    cmdbuf.ResetQueryPool(pool, 0, VideoCommon::Nx2Diag::MaxProbeQueries);
+                });
+            }
         }
     }
     flash_watch.TickFrame();

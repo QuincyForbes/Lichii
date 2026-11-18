@@ -78,13 +78,10 @@ enum class Opt : unsigned {
     /// skip depth-only draws for the same geometry for up to 2 frames or until the material
     /// pipeline is built
     GeometryConsistency,
-    /// Native 64 KiB banks: per-frame set checked first
-    BankCheck,
     /// Quarantined (never on): pending writes are not a proof of safe early MME reads
     SplitOverlap,
     /// Ocarina presents a frame ahead
     FramesAhead,
-    WriteIntersections,
     /// Native graphics SPIR-V emitted by the pipeline worker, not the back
     AsyncPipelines,
     UnswizzleWorkers,
@@ -100,8 +97,8 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "macro_state", "download_batch", "pipeline_fast_cache", "draw_preamble", "bind_memo",
     "submit_while_waited", "bank_once_per_frame", "dirty_gather_fast",
     "dma_forward", "draw_begin_coalesce", "pending_wake", "diag_draw_lite",
-    "geometry_consistency", "bank_check",
-    "split_overlap", "frames_ahead", "write_intersections", "async_pipelines",
+    "geometry_consistency",
+    "split_overlap", "frames_ahead", "async_pipelines",
     "unswizzle_workers",
 };
 
