@@ -92,6 +92,9 @@ public:
     void Clear(u32 layer_count) override;
     void DispatchCompute() override;
     void ResetCounter(VideoCommon::QueryType type) override;
+    bool HasDrawTransformFeedback() override {
+        return true;
+    }
     void Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) override;
     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size) override;
@@ -449,7 +452,22 @@ private:
     [[nodiscard]] u32 AllocateVisibilitySlot();
 
     void QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType type,
-                       VideoCommon::QueryPropertiesFlags flags, u32 payload);
+                       VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport);
+
+    /// The value of a counter the draws made so far give (the primitive and vertex counters, the
+    /// transform feedback byte and primitive counters); nothing for the ones that are not kept.
+    [[nodiscard]] std::optional<u64> CounterValue(VideoCommon::QueryType type, u32 subreport) const;
+
+    /// Adds a plain draw to the counters.
+    void CountDraw(u32 vertices, u32 instances);
+
+    /// The transform feedback capture of the draw about to be prepared: what PrepareDraw runs the
+    /// capture kernels over; left unwanted when nothing is captured.
+    void PrepareXfbDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 instance_count);
+
+    /// A draw of the vertices a transform feedback captured (DrawIndirectByteCountEXT): the byte
+    /// count the guest's counter holds over the stride.
+    void DrawByteCount();
 
     /// Writes a query result to the device address its report resolved to (as Vulkan's query
     /// cache does): `wide` writes the 64-bit value and the timestamp after it.
@@ -616,6 +634,37 @@ private:
         u32 patches{};
         u32 output_points{};
     } tess_buffers;
+
+    /// The transform feedback capture of the draw being prepared (PrepareXfbDraw).
+    struct XfbDraw {
+        bool wanted{};
+        u32 first{};
+        u32 count{};         ///< Vertices or indices of the draw
+        u32 first_instance{};
+        u32 instances{};
+        u32 index_size{};    ///< 2 or 4, 0 for a draw without indices
+        bool widen_indices{};
+        s32 base_vertex{};
+        u32 first_index{};
+        u32 captured{};      ///< Vertices captured (the clamp of CapturedVertices)
+        std::array<u32, Xfb::MaxBuffers> offsets{}; ///< Bytes in each buffer before the draw
+    } xfb_draw;
+    /// Where the capture stands, per transform feedback buffer: the guest address the bytes count
+    /// from (the buffer's address plus its start offset), the bytes captured since, and the start
+    /// offset register they were captured at.
+    struct XfbState {
+        std::array<GPUVAddr, Xfb::MaxBuffers> base{};
+        std::array<u32, Xfb::MaxBuffers> written{};
+        std::array<u32, Xfb::MaxBuffers> start{};
+        std::array<u32, Xfb::MaxBuffers> stride{};
+        Maxwell::PrimitiveTopology topology{Maxwell::PrimitiveTopology::Points};
+        u32 patch_vertices{1};
+    } xfb_state;
+    /// Counters of the draws made, by VideoCommon::QueryType.
+    std::array<u64, 32> counters{};
+    u64 xfb_captures{};
+    u64 xfb_byte_count_draws{};
+    u64 xfb_vertices_captured{};
     u64 tessellated_draws{};
     u64 tessellated_patches{};
 

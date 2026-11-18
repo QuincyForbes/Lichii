@@ -252,6 +252,12 @@ public:
         return vertex_states;
     }
 
+    /// The transform feedback buffers the draw bound (a buffer without a layout is null).
+    [[nodiscard]] const std::array<VertexState, VideoCommon::NUM_TRANSFORM_FEEDBACK_BUFFERS>&
+    TransformFeedbacks() const noexcept {
+        return feedback_states;
+    }
+
 private:
     const Device& device;
     Scheduler& scheduler;

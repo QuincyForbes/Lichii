@@ -55,6 +55,26 @@ namespace {
     }
 }
 
+/// The member of an output struct the MSL gives a built-in (SPIRV-Cross's builtin_to_glsl name).
+[[nodiscard]] std::string BuiltinMember(spv::BuiltIn builtin) {
+    switch (builtin) {
+    case spv::BuiltInPosition:
+        return "gl_Position";
+    case spv::BuiltInPointSize:
+        return "gl_PointSize";
+    case spv::BuiltInClipDistance:
+        return "gl_ClipDistance";
+    case spv::BuiltInCullDistance:
+        return "gl_CullDistance";
+    case spv::BuiltInLayer:
+        return "gl_Layer";
+    case spv::BuiltInViewportIndex:
+        return "gl_ViewportIndex";
+    default:
+        return {};
+    }
+}
+
 /// What a vertex or tessellation control stage writes for the next stage.
 [[nodiscard]] std::vector<InterfaceVariable> StageOutputs(spirv_cross::CompilerMSL& compiler,
                                                           const spirv_cross::ShaderResources& resources) {
@@ -65,6 +85,7 @@ namespace {
             .location = compiler.get_decoration(resource.id, spv::DecorationLocation),
             .vecsize = (std::max)(type.vecsize, 1U),
             .per_patch = compiler.has_decoration(resource.id, spv::DecorationPatch),
+            .name = resource.name,
         });
     }
     for (const spirv_cross::BuiltInResource& builtin : resources.builtin_outputs) {
@@ -81,6 +102,7 @@ namespace {
             .builtin = static_cast<u32>(builtin.builtin),
             .vecsize = (std::max)(type.vecsize, 1U) * elements,
             .per_patch = compiler.has_decoration(builtin.resource.id, spv::DecorationPatch),
+            .name = BuiltinMember(builtin.builtin),
         });
     }
     return outputs;

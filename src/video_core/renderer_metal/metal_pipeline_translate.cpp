@@ -7,6 +7,9 @@
 #include <bitset>
 #include <cmath>
 #include <cstdlib>
+#include <iterator>
+
+#include <boost/container/small_vector.hpp>
 
 #include "common/cityhash.h"
 #include "common/logging.h"
@@ -15,6 +18,8 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/attribute.h"
+#include "shader_recompiler/frontend/ir/basic_block.h"
+#include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/ir_opt/oot_visual_workaround.h"
@@ -293,6 +298,7 @@ void PipelineTranslator::RefreshKey(GraphicsPipelineKey& key, const Maxwell& reg
                                  (static_cast<u32>(tessellation.output_primitives.Value()) << 4)
                            : 0U;
     RefreshFixedState(key, regs);
+    key.xfb = Xfb::MakeLayout(regs, topology);
 }
 
 size_t GraphicsPipelineKey::Hash() const noexcept {
@@ -366,7 +372,9 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
         .needs_demote_reorder = false,
         .support_snorm_render_buffer = true,
         .support_viewport_index_layer = true,
-        .support_geometry_shader_passthrough = false,
+        // A guest geometry passthrough program stays as it is (its stores are all the fold into
+        // the vertex program reads); one that can't fold is refused with the geometry stage.
+        .support_geometry_shader_passthrough = true,
         .support_conditional_barrier = false,
     };
     host_info.ApplyDescriptorLimitPolicy();
@@ -380,8 +388,14 @@ std::optional<StageProgram> PipelineTranslator::Translate(
     const ShaderTranslate::Options* options) {
     ConvertLegacyToGeneric(program, runtime_info);
     const std::vector<u32> spirv = EmitSPIRV(profile, runtime_info, program, bindings);
-    ShaderTranslate::Result result = ShaderTranslate::SpirvToMsl(
-        spirv, stage, options != nullptr ? *options : translate_options);
+    return FromSpirv(spirv, program, stage, options != nullptr ? *options : translate_options);
+}
+
+std::optional<StageProgram> PipelineTranslator::FromSpirv(std::span<const u32> spirv,
+                                                          const Shader::IR::Program& program,
+                                                          ShaderTranslate::Stage stage,
+                                                          const ShaderTranslate::Options& options) {
+    ShaderTranslate::Result result = ShaderTranslate::SpirvToMsl(spirv, stage, options);
     if (result.source.empty()) {
         static std::atomic<u32> logged{};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -430,7 +444,8 @@ bool PipelineTranslator::TranslatePrograms(const GraphicsPipelineKey& key,
         } else if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
             Refuse(unsupported_logged, hash, "task or mesh program out of place");
             return false;
-        } else if (index == 4) {
+        } else if (index == 4 && (stage != Shader::Stage::Geometry ||
+                                  env.SPH().common0.geometry_passthrough == 0)) {
             // Apple GPUs have no geometry stage (MoltenVK skips these pipelines too).
             Refuse(unsupported_logged, hash, "geometry stage");
             return false;
@@ -454,6 +469,10 @@ bool PipelineTranslator::TranslatePrograms(const GraphicsPipelineKey& key,
     }
     if (key.unique_hashes[1] == 0) {
         Refuse(unsupported_logged, hash, "no vertex program");
+        return false;
+    }
+    if (key.unique_hashes[4] != 0 && !FoldGeometryPassthrough(programs[1], programs[4])) {
+        Refuse(unsupported_logged, hash, "geometry stage");
         return false;
     }
     if (task && mesh_index == 0) {
@@ -519,7 +538,20 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
         vertex_info.generic_input_types[attribute] = types[(key.attribute_types >> (attribute * 2)) & 3];
     }
     ApplyVertexState(vertex_info, key);
-    auto vertex = Translate(programs[1], ShaderTranslate::Stage::Vertex, bindings, vertex_info);
+    std::optional<StageProgram> vertex;
+    std::optional<XfbCapture> xfb;
+    if (key.xfb.Active()) {
+        // The vertex program once more as capture kernels, from the same SPIR-V.
+        ConvertLegacyToGeneric(programs[1], vertex_info);
+        const std::vector<u32> spirv = EmitSPIRV(profile, vertex_info, programs[1], bindings);
+        vertex = FromSpirv(spirv, programs[1], ShaderTranslate::Stage::Vertex, translate_options);
+        xfb = XfbPrograms(key, spirv, programs[1]);
+        if (!xfb) {
+            vertex.reset();
+        }
+    } else {
+        vertex = Translate(programs[1], ShaderTranslate::Stage::Vertex, bindings, vertex_info);
+    }
     if (!vertex) {
         return std::nullopt;
     }
@@ -540,12 +572,148 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
     return TranslatedPipeline{
         .vertex = std::move(*vertex),
         .fragment = std::move(fragment),
+        .xfb = std::move(xfb),
     };
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Metal, "Metal: {}", exception.what());
     cause = "shader recompiler exception";
     detail = exception.what();
     return std::nullopt;
+}
+
+namespace {
+
+/// Bytes per element a buffer between tessellation stages needs at most for these variables
+/// (MSL lays them out in structs of 16-byte aligned vectors).
+[[nodiscard]] u32 OutputStride(std::span<const ShaderTranslate::InterfaceVariable> variables) {
+    u32 locations = 0;
+    u32 builtin_bytes = 0;
+    for (const ShaderTranslate::InterfaceVariable& variable : variables) {
+        if (variable.builtin == ShaderTranslate::InterfaceVariable::NoBuiltin) {
+            locations = (std::max)(locations, variable.location + 1);
+        } else {
+            builtin_bytes += (variable.vecsize * 4 + 15) / 16 * 16;
+        }
+    }
+    return locations * 16 + builtin_bytes + 16;
+}
+
+} // Anonymous namespace
+
+std::optional<XfbCapture> PipelineTranslator::XfbPrograms(const GraphicsPipelineKey& key,
+                                                          std::span<const u32> spirv,
+                                                          const Shader::IR::Program& vertex) {
+    XfbCapture xfb;
+    for (u32 buffer = 0; buffer < Xfb::MaxBuffers; ++buffer) {
+        xfb.stride[buffer] = key.xfb.Stride(buffer);
+    }
+    for (size_t variant = 0; variant < XfbCapture::IndexSizes.size(); ++variant) {
+        ShaderTranslate::Options options = translate_options;
+        options.vertex_index_size = XfbCapture::IndexSizes[variant];
+        auto program = FromSpirv(spirv, vertex, ShaderTranslate::Stage::VertexForTessellation, options);
+        if (!program) {
+            return std::nullopt;
+        }
+        program->msl += Xfb::GatherSource(key.xfb, program->entry_point, program->outputs,
+                                          vertex.info.legacy_stores_mapping);
+        xfb.vertex_stride = (std::max)(xfb.vertex_stride, OutputStride(program->outputs));
+        xfb.capture[variant] = std::move(*program);
+    }
+    return xfb;
+}
+
+bool PipelineTranslator::FoldGeometryPassthrough(Shader::IR::Program& vertex,
+                                                 const Shader::IR::Program& geometry) {
+    namespace IR = Shader::IR;
+    if (!geometry.is_geometry_passthrough || vertex.info.requires_layer_emulation) {
+        return false;
+    }
+    // What the passthrough program sets (the layer, the viewport index), each from a vertex
+    // output it reads back: the value (bits) the vertex program stored there.
+    struct Fold {
+        IR::Attribute target;
+        IR::Attribute source;
+    };
+    boost::container::small_vector<Fold, 2> folds;
+    for (IR::Block* const block : geometry.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            switch (inst.GetOpcode()) {
+            case IR::Opcode::Prologue:
+            case IR::Opcode::Epilogue:
+            case IR::Opcode::Identity:
+            case IR::Opcode::BitCastF32U32:
+            case IR::Opcode::BitCastU32F32:
+            case IR::Opcode::GetAttribute:
+            case IR::Opcode::GetAttributeU32:
+                break;
+            case IR::Opcode::SetAttribute: {
+                const IR::Attribute target = inst.Arg(0).Attribute();
+                if (target != IR::Attribute::Layer && target != IR::Attribute::ViewportIndex) {
+                    return false;
+                }
+                // Bits only: casts down to the attribute read.
+                IR::Value value = inst.Arg(1);
+                const IR::Inst* leaf = nullptr;
+                while (!value.IsImmediate()) {
+                    leaf = value.InstRecursive();
+                    if (leaf->GetOpcode() != IR::Opcode::BitCastF32U32 &&
+                        leaf->GetOpcode() != IR::Opcode::BitCastU32F32) {
+                        break;
+                    }
+                    value = leaf->Arg(0);
+                }
+                if (leaf == nullptr || value.IsImmediate() ||
+                    (leaf->GetOpcode() != IR::Opcode::GetAttribute &&
+                     leaf->GetOpcode() != IR::Opcode::GetAttributeU32)) {
+                    return false;
+                }
+                folds.push_back({target, leaf->Arg(0).Attribute()});
+                break;
+            }
+            default:
+                // Anything else reads state the geometry stage has its own copy of (constant
+                // buffers are bound per stage) or builds a value from it.
+                return false;
+            }
+        }
+    }
+    if (folds.empty()) {
+        return false;
+    }
+    // Each source must be written by exactly one store of the vertex program: the layer is set
+    // there, from the same value.
+    struct Store {
+        IR::Block* block;
+        IR::Inst* inst;
+        IR::Attribute target;
+    };
+    boost::container::small_vector<Store, 2> stores;
+    for (const Fold& fold : folds) {
+        Store found{nullptr, nullptr, fold.target};
+        for (IR::Block* const block : vertex.blocks) {
+            for (IR::Inst& inst : block->Instructions()) {
+                if (inst.GetOpcode() == IR::Opcode::SetAttribute &&
+                    inst.Arg(0).Attribute() == fold.source) {
+                    if (found.inst != nullptr) {
+                        return false;
+                    }
+                    found.block = block;
+                    found.inst = &inst;
+                }
+            }
+        }
+        if (found.inst == nullptr) {
+            return false;
+        }
+        stores.push_back(found);
+    }
+    for (const Store& store : stores) {
+        IR::IREmitter ir{*store.block,
+                         std::next(IR::Block::InstructionList::s_iterator_to(*store.inst))};
+        ir.SetAttribute(store.target, IR::F32{store.inst->Arg(1)}, ir.Imm32(0));
+        vertex.info.stores.Set(store.target, true);
+    }
+    return true;
 }
 
 std::optional<TranslatedPipeline> PipelineTranslator::Mesh(

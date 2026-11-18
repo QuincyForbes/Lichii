@@ -708,6 +708,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_present.h
         renderer_metal/metal_pipeline_files.h
         renderer_metal/metal_pipeline_translate.h
+        renderer_metal/metal_xfb.h
         renderer_metal/metal_rasterizer.h
         renderer_metal/metal_resources.h
         renderer_metal/metal_scheduler.h
@@ -736,7 +737,7 @@ if (ENABLE_METAL)
         set(METAL_SMOKE_DIR ${CMAKE_CURRENT_BINARY_DIR}/metal_smoke)
         set(METAL_SMOKE_HEADERS)
         foreach (SMOKE_FILE translate_smoke.comp texel_buffer_smoke.comp texture_1d_smoke.comp
-                            tess_smoke.vert tess_smoke.tesc tess_smoke.tese
+                            tess_smoke.vert tess_smoke.tesc tess_smoke.tese xfb_smoke.vert
                             device_msl_smoke.vert device_msl_smoke.frag
                             native_mesh_smoke.task native_mesh_smoke.mesh native_mesh_smoke.frag)
             string(REPLACE "." "_" SMOKE_SHADER "${SMOKE_FILE}")
