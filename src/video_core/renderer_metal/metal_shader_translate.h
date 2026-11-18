@@ -51,7 +51,7 @@ struct ResourceSlot {
     u32 index{};
     u32 count{1}; ///< Slots from index on (descriptor arrays)
     /// Spilled buffers (Options::spill_buffers): the entry of the table of addresses the program
-    /// reads it through, ~0 for the others.
+    /// reads it through; spilled samplers: the entry of the sampler table. ~0 for the others.
     u32 spill{~0U};
 };
 
@@ -144,6 +144,9 @@ struct Result {
     u32 reduction_slot{~0U};
     /// The table of spilled buffers' addresses (Options::spill_buffers), ~0 without spills.
     u32 spill_slot{~0U};
+    /// The table of spilled samplers (past Metal's 16 sampler slots): one MTLResourceID (8 bytes)
+    /// each, in ResourceSlot::spill order of the sampler slots; ~0 without spills.
+    u32 sampler_spill_slot{~0U};
     std::string error;
 };
 

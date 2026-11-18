@@ -125,6 +125,8 @@ struct StageProgram {
     u32 reduction_slot{~0U};
     /// Buffer slot of the table of spilled buffers' addresses (Options::spill_buffers), ~0 without.
     u32 spill_slot{~0U};
+    /// Buffer slot of the table of spilled samplers' resource IDs, ~0 without.
+    u32 sampler_spill_slot{~0U};
     /// The MTLLibrary and MTLFunction, made on first use (BuildFunctions).
     Object library;
     Object function;

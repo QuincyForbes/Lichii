@@ -478,6 +478,7 @@ std::optional<StageProgram> PipelineTranslator::FromSpirv(std::span<const u32> s
         .tessellation_slots = result.tessellation_slots,
         .reduction_slot = result.reduction_slot,
         .spill_slot = result.spill_slot,
+        .sampler_spill_slot = result.sampler_spill_slot,
     };
 }
 

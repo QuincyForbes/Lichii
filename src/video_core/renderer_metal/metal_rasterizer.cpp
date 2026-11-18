@@ -1645,6 +1645,9 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     std::vector<u32> texture_slots;
     std::vector<u32> sampler_slots;
     std::vector<u64> spill_table;
+    std::vector<u64> sampler_table;
+    /// Marks a sampler_slots entry as an entry of the spilled samplers' table.
+    constexpr u32 SpilledSamplerFlag = 0x8000'0000U;
     size_t next_buffer = 0;
     for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
         for (u32 element = 0; element < slot.count; ++element) {
@@ -1694,7 +1697,9 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                 texture_slots.push_back(slot_index);
                 break;
             case ShaderTranslate::ResourceKind::Sampler:
-                sampler_slots.push_back(slot_index);
+                // A spilled sampler is read from the table (an entry, flagged).
+                sampler_slots.push_back(slot.spill != ~0U ? SpilledSamplerFlag | slot.spill
+                                                          : slot_index);
                 break;
             }
         }
@@ -1728,10 +1733,17 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
             }
             ++texture_slot;
             if (sampler < sampler_slots.size()) {
-                scheduler.BindSampler(
-                    metal_stage, sampler_slots[sampler],
-                    texture_cache.GetSampler(samplers[sampler])
-                        .HandleFor(image_view, desc.is_depth));
+                void* const handle = texture_cache.GetSampler(samplers[sampler])
+                                         .HandleFor(image_view, desc.is_depth);
+                if ((sampler_slots[sampler] & SpilledSamplerFlag) != 0) {
+                    const u32 entry = sampler_slots[sampler] & ~SpilledSamplerFlag;
+                    if (sampler_table.size() <= entry) {
+                        sampler_table.resize(entry + 1, 0);
+                    }
+                    sampler_table[entry] = Scheduler::SamplerResourceId(handle);
+                } else {
+                    scheduler.BindSampler(metal_stage, sampler_slots[sampler], handle);
+                }
             }
             if (sampler < sampler_slots.size() && sampler_slots[sampler] < 16) {
                 reduction_modes |= texture_cache.GetSampler(samplers[sampler]).ReductionBits()
@@ -1743,6 +1755,10 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     if (program.reduction_slot != ~0U) {
         scheduler.BindBytes(metal_stage, program.reduction_slot, &reduction_modes,
                             static_cast<u32>(sizeof(reduction_modes)));
+    }
+    if (program.sampler_spill_slot != ~0U && !sampler_table.empty()) {
+        scheduler.BindBytes(metal_stage, program.sampler_spill_slot, sampler_table.data(),
+                            static_cast<u32>(sampler_table.size() * sizeof(u64)));
     }
     for (const auto& desc : info.image_descriptors) {
         for (u32 element = 0; element < desc.count; ++element) {

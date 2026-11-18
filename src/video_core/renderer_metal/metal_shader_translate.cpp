@@ -26,6 +26,13 @@ namespace {
 [[nodiscard]] bool SpillBuffers(std::string& source, const std::string& entry_point, u32 spilled,
                                 u32 table_slot);
 constexpr u32 SpillBase = 1000;
+/// Moves the entry function's spilled samplers (MSL sampler indices from SamplerSpillBase) to
+/// reads from a table of their resource IDs at `table_slot` (Metal 3 argument buffer).
+[[nodiscard]] bool SpillSamplers(std::string& source, const std::string& entry_point,
+                                 u32 spilled, u32 table_slot);
+constexpr u32 SamplerSpillBase = 2000;
+/// Metal's sampler slots per stage (0-15).
+constexpr u32 MetalSamplerSlots = 16;
 
 [[nodiscard]] u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point,
                                           bool fragment, u32 buffer_slot);
@@ -347,14 +354,40 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
         // program with more buffers failed to build ("'buffer' attribute parameter is out of
         // bounds"), its dispatch was skipped, and the command list it writes was read as garbage.
         constexpr u32 MetalBufferSlots = 31;
-        constexpr u32 ReservedSlots = 7;
+        constexpr u32 ReservedSlots = 8;
+        // A program with more samplers than Metal's 16 slots keeps the first 16 there and reads
+        // the others from a table of their resource IDs (an argument buffer, one more buffer
+        // slot). Without, its MSL did not build ("'sampler' attribute parameter is out of bounds")
+        // and its draws were skipped: Ocarina's lighting passes sample more than 16 textures.
+        u32 textures = 0;
+        u32 samplers = 0;
+        u32 total_samplers = 0;
+        for (const Declared& resource : declared) {
+            const bool takes_sampler = resource.kind == ResourceKind::Sampler ||
+                                       (resource.kind == ResourceKind::Texture && resource.combined);
+            total_samplers += takes_sampler ? resource.count : 0;
+        }
+        const bool spill_samplers = total_samplers > MetalSamplerSlots;
+        u32 spilled_samplers = 0;
+        const auto assign_sampler = [&](spirv_cross::MSLResourceBinding& binding,
+                                        const Declared& resource) {
+            if (spill_samplers && resource.count == 1 && samplers >= MetalSamplerSlots) {
+                binding.msl_sampler = SamplerSpillBase + spilled_samplers;
+                result.slots.push_back({resource.set, resource.binding, ResourceKind::Sampler, 0,
+                                        1, spilled_samplers});
+                ++spilled_samplers;
+                return;
+            }
+            binding.msl_sampler = samplers;
+            result.slots.push_back(
+                {resource.set, resource.binding, ResourceKind::Sampler, samplers, resource.count});
+            samplers += resource.count;
+        };
         const bool vertex = stage == Stage::Vertex;
         const bool spill =
             options.spill_buffers && (vertex ? total_buffers > SpillThreshold
                                              : total_buffers + ReservedSlots > MetalBufferSlots);
         const u32 spill_cutoff = vertex ? SpillCutoff : MetalBufferSlots - ReservedSlots;
-        u32 textures = 0;
-        u32 samplers = 0;
         for (const Declared& resource : declared) {
             spirv_cross::MSLResourceBinding binding{};
             binding.stage = model;
@@ -381,17 +414,11 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
                     {resource.set, resource.binding, resource.kind, textures, resource.count});
                 textures += resource.count;
                 if (resource.combined) {
-                    binding.msl_sampler = samplers;
-                    result.slots.push_back({resource.set, resource.binding, ResourceKind::Sampler,
-                                            samplers, resource.count});
-                    samplers += resource.count;
+                    assign_sampler(binding, resource);
                 }
                 break;
             case ResourceKind::Sampler:
-                binding.msl_sampler = samplers;
-                result.slots.push_back(
-                    {resource.set, resource.binding, resource.kind, samplers, resource.count});
-                samplers += resource.count;
+                assign_sampler(binding, resource);
                 break;
             }
             compiler.add_msl_resource_binding(binding);
@@ -408,6 +435,9 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
         }
         if (spilled != 0) {
             result.spill_slot = buffers++;
+        }
+        if (spilled_samplers != 0) {
+            result.sampler_spill_slot = buffers++;
         }
         // The tessellation stages' own buffers, after their resources (the vertex kernel's
         // vertex buffers take slots from first_vertex_buffer_slot down, as a vertex stage's).
@@ -453,9 +483,22 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
                 return result;
             }
         }
+        if (spilled_samplers != 0) {
+            const auto points = compiler.get_entry_points_and_stages();
+            if (points.empty() ||
+                !SpillSamplers(result.source,
+                               compiler.get_cleansed_entry_point_name(points.front().name, model),
+                               spilled_samplers, result.sampler_spill_slot)) {
+                result.source.clear();
+                result.error = "samplers spilled to a table not understood";
+                return result;
+            }
+        }
         const bool reducible = stage == Stage::Vertex || stage == Stage::Fragment ||
                                stage == Stage::Compute;
+        // The reduction rewrite reads the entry's [[sampler(n)]] parameters: not with spills.
         if (reducible && options.sampler_reduction && !resources.sampled_images.empty() &&
+            spilled_samplers == 0 &&
             !(stage == Stage::Vertex && buffers + 1 > options.first_vertex_buffer_slot)) {
             const auto points = compiler.get_entry_points_and_stages();
             if (!points.empty()) {
@@ -1101,6 +1144,63 @@ bool SpillBuffers(std::string& source, const std::string& entry_point, u32 spill
     source.replace(open + 1, close - open - 1, parameters);
     const size_t brace = source.find('{', open + 1 + parameters.size());
     source.insert(source.find('\n', brace) + 1, declarations);
+    return true;
+}
+
+bool SpillSamplers(std::string& source, const std::string& entry_point, u32 spilled,
+                   u32 table_slot) {
+    const std::string needle = " " + entry_point + "(";
+    const size_t at = source.find(needle);
+    if (at == std::string::npos) {
+        return false;
+    }
+    const size_t open = at + needle.size() - 1;
+    const size_t close = MatchingBracket(source, open);
+    if (close == std::string::npos || source.find('{', close) == std::string::npos) {
+        return false;
+    }
+    std::string parameters;
+    std::string declarations;
+    u32 found = 0;
+    for (const std::string_view text :
+         SplitParameters(std::string_view(source).substr(open + 1, close - open - 1))) {
+        const auto parameter = ParseParameter(text);
+        if (!parameter) {
+            return false;
+        }
+        if (parameter->attribute.starts_with("sampler(")) {
+            const u32 index = static_cast<u32>(std::atoi(parameter->attribute.c_str() + 8));
+            if (index >= SamplerSpillBase && index < SamplerSpillBase + spilled) {
+                if (parameter->type != "sampler") {
+                    return false;
+                }
+                // A local copy of the table's sampler under the parameter's name (Metal 3:
+                // samplers made with supportArgumentBuffers, their gpuResourceID in the table).
+                declarations += "    sampler " + parameter->name + " = spvSamplerTable.s[" +
+                                std::to_string(index - SamplerSpillBase) + "];\n";
+                ++found;
+                continue;
+            }
+        }
+        parameters += (parameters.empty() ? "" : ", ") + std::string(text);
+    }
+    if (found != spilled) {
+        return false;
+    }
+    parameters += (parameters.empty() ? "" : ", ") +
+                  std::string("constant spvSamplerSpill& spvSamplerTable [[buffer(") +
+                  std::to_string(table_slot) + ")]]";
+    source.replace(open + 1, close - open - 1, parameters);
+    const size_t brace = source.find('{', open + 1 + parameters.size());
+    source.insert(source.find('\n', brace) + 1, declarations);
+    // The table's type, before any function.
+    const std::string table_type = "struct spvSamplerSpill\n{\n    array<sampler, " +
+                                   std::to_string(spilled) + "> s [[id(0)]];\n};\n\n";
+    constexpr std::string_view using_line = "using namespace metal;\n";
+    const size_t using_at = source.find(using_line);
+    const size_t insert_at =
+        using_at != std::string::npos ? using_at + using_line.size() : source.rfind('\n', at) + 1;
+    source.insert(insert_at, "\n" + table_type);
     return true;
 }
 

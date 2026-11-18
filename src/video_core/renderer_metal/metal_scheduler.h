@@ -450,6 +450,9 @@ public:
     [[nodiscard]] u64 UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset);
     void BindTexture(ShaderStage stage, u32 slot, TextureHandle texture);
     void BindSampler(ShaderStage stage, u32 slot, void* sampler);
+    /// The sampler's MTLResourceID, what a program reads from a table of spilled samplers
+    /// (ShaderTranslate::Result::sampler_spill_slot). 0 for none.
+    [[nodiscard]] static u64 SamplerResourceId(void* sampler) noexcept;
 
     /// primitive: MTLPrimitiveType.
     void Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 instance_count,

@@ -3319,6 +3319,14 @@ void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture) 
     }
 }
 
+u64 Scheduler::SamplerResourceId(void* sampler) noexcept {
+    if (sampler == nullptr) {
+        return 0;
+    }
+    // Guest samplers are made with supportArgumentBuffers (CreateSampler).
+    return AsSampler(sampler).gpuResourceID._impl;
+}
+
 void Scheduler::BindSampler(ShaderStage stage, u32 slot, void* sampler) {
     if (!SlotFits(slot, SamplerSlots, "sampler")) {
         return;
