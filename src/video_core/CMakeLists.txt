@@ -655,6 +655,8 @@ set(METAL_RENDERER_CXX_SOURCES
     renderer_metal/metal_pipeline_files.cpp
     renderer_metal/metal_pipeline_translate.cpp
     renderer_metal/metal_present.cpp
+    renderer_metal/metal_raster_expand.cpp
+    renderer_metal/metal_raster_patch.cpp
     renderer_metal/metal_rasterizer.cpp
     renderer_metal/metal_shader_translate.cpp
     renderer_metal/metal_staging_buffer_pool.cpp
@@ -708,6 +710,9 @@ if (ENABLE_METAL)
         renderer_metal/metal_present.h
         renderer_metal/metal_pipeline_files.h
         renderer_metal/metal_pipeline_translate.h
+        renderer_metal/metal_raster_expand.h
+        renderer_metal/metal_raster_patch.h
+        renderer_metal/metal_xfb.h
         renderer_metal/metal_rasterizer.h
         renderer_metal/metal_resources.h
         renderer_metal/metal_scheduler.h
@@ -736,11 +741,13 @@ if (ENABLE_METAL)
         set(METAL_SMOKE_DIR ${CMAKE_CURRENT_BINARY_DIR}/metal_smoke)
         set(METAL_SMOKE_HEADERS)
         foreach (SMOKE_FILE translate_smoke.comp texel_buffer_smoke.comp texture_1d_smoke.comp
-                            tess_smoke.vert tess_smoke.tesc tess_smoke.tese
+                            tess_smoke.vert tess_smoke.tesc tess_smoke.tese xfb_smoke.vert
                             tess_isolines.tesc tess_isolines.tese tess_points.tese tess_direct.vert
                             point_size_smoke.vert subgroup_smoke.comp sampler_smoke.frag spill_smoke.vert
                             device_msl_smoke.vert device_msl_smoke.frag
-                            native_mesh_smoke.task native_mesh_smoke.mesh native_mesh_smoke.frag)
+                            native_mesh_smoke.task native_mesh_smoke.mesh native_mesh_smoke.frag
+                            raster_smoke.vert raster_smoke.frag raster_smoke_uint.frag
+                            raster_smoke_sint.frag raster_line.vert raster_line.frag)
             string(REPLACE "." "_" SMOKE_SHADER "${SMOKE_FILE}")
             string(TOUPPER "${SMOKE_SHADER}_SPV" SMOKE_VARIABLE)
             set(SMOKE_HEADER ${METAL_SMOKE_DIR}/${SMOKE_SHADER}_spv.h)
@@ -760,10 +767,12 @@ if (ENABLE_METAL)
         endforeach()
         add_executable(lichii-metal-smoke renderer_metal/metal_smoke.mm
                        renderer_metal/metal_smoke_probe.h renderer_metal/metal_smoke_probe.mm
+                       renderer_metal/metal_smoke_raster.h renderer_metal/metal_smoke_raster.mm
                        renderer_metal/metal_smoke_textures.h renderer_metal/metal_smoke_textures.mm
                        ${METAL_SMOKE_HEADERS})
         set_source_files_properties(renderer_metal/metal_smoke.mm
                                     renderer_metal/metal_smoke_probe.mm
+                                    renderer_metal/metal_smoke_raster.mm
                                     renderer_metal/metal_smoke_textures.mm PROPERTIES
             LANGUAGE CXX
             COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
@@ -791,6 +800,8 @@ elseif (LICHII_METAL_COMPILE_CHECK)
         renderer_metal/metal_index_convert.cpp
         renderer_metal/metal_pipeline_check.cpp
         renderer_metal/metal_pipeline_translate.cpp
+        renderer_metal/metal_raster_expand.cpp
+        renderer_metal/metal_raster_patch.cpp
         renderer_metal/metal_shader_translate.cpp)
     target_link_libraries(lichii-metal-replay PRIVATE common core video_core spirv-cross-msl
                           ${PLATFORM_LIBRARIES})

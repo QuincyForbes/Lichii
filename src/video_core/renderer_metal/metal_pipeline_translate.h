@@ -30,6 +30,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_metal/metal_object.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
+#include "video_core/renderer_metal/metal_xfb.h"
 
 namespace Metal {
 
@@ -65,6 +66,16 @@ struct GraphicsPipelineKey {
     u32 state{};
     u32 alpha_test_ref{}; ///< float bits, zero unless the test compares with it
     u32 point_size{};     ///< float bits, zero unless points are drawn
+    /// Raster state the programs are patched for (metal_raster_patch.h). Bits 0-3: the logic
+    /// operation (VkLogicOp) when `logic_formats` is not zero; bits 8-19: viewport 0's swizzle
+    /// when the vertex program does it.
+    u32 raster{};
+    u32 logic_formats{}; ///< 4 bits per colour target: RasterPatch::LogicFormat
+    /// RasterExpand bits: lines as quads, stipple, smooth lines, conservative triangles.
+    u32 expand{};
+    u32 expand_unused{};
+    /// What the draw captures into the guest's transform feedback buffers (zero: nothing).
+    Xfb::Layout xfb;
 
     bool operator==(const GraphicsPipelineKey&) const noexcept = default;
 
@@ -228,6 +239,25 @@ struct Tessellation {
     bool factors_from_registers{};
 };
 
+/// A pipeline that captures its vertex outputs (transform feedback, metal_xfb.h): the vertex
+/// program as a stage-in kernel once per index size, each with the gather kernel appended to its
+/// MSL (the vertex kernel's resources are the buffer cache's stage 0, as the pipeline's vertex
+/// program's).
+struct XfbCapture {
+    static constexpr std::array<u32, 3> IndexSizes{0, 2, 4};
+
+    std::array<StageProgram, 3> capture;
+    /// The gather kernels' MTLComputePipelineStates by variant.
+    std::array<Object, 3> gather;
+    /// Bytes per captured vertex between the kernels (an upper bound of the output struct).
+    u32 vertex_stride{};
+    std::array<u32, Xfb::MaxBuffers> stride{};
+    /// The pipeline expands lines and triangles (RasterExpand): `capture` are its vertex kernels
+    /// (no varyings gathered), `render` the generated vertex function that pulls their output.
+    bool expand{};
+    StageProgram render;
+};
+
 /// What a graphics key's programs translate to (GraphicsPipeline's stages).
 struct TranslatedPipeline {
     StageProgram vertex;
@@ -237,6 +267,8 @@ struct TranslatedPipeline {
     /// A task/mesh pipeline Metal draws with mesh functions; `mesh` is its fallback, when the
     /// emulation can take it.
     std::optional<NativeMesh> native_mesh;
+    /// A vertex pipeline whose key has a transform feedback layout.
+    std::optional<XfbCapture> xfb;
 };
 
 class PipelineTranslator {
@@ -298,14 +330,42 @@ private:
                                            std::span<Shader::IR::Program> programs,
                                            size_t mesh_index);
 
+public:
+    /// A guest geometry passthrough program that only sets the layer or the viewport index from a
+    /// vertex output it passes on (what Maxwell's passthrough does for cube and cascade targets),
+    /// folded into the vertex program: that program sets it from the value it stored there.
+    /// False, nothing changed, for anything else (the geometry stage is refused then).
+    [[nodiscard]] static bool FoldGeometryPassthrough(Shader::IR::Program& vertex,
+                                                      const Shader::IR::Program& geometry);
+
+private:
     /// A pipeline with tessellation control (2) and evaluation (3) programs.
     std::optional<TranslatedPipeline> Tessellated(const GraphicsPipelineKey& key,
                                                   std::span<Shader::IR::Program> programs);
+
+    /// The raster state of `key` done in the program's MSL (logic operation, viewport swizzle).
+    void PatchRasterState(std::string& msl, ShaderTranslate::Stage stage,
+                          const GraphicsPipelineKey& key);
 
     [[nodiscard]] std::optional<StageProgram> Translate(
         Shader::IR::Program& program, ShaderTranslate::Stage stage,
         Shader::Backend::Bindings& bindings, const Shader::RuntimeInfo& runtime_info,
         const ShaderTranslate::Options* options = nullptr);
+
+    /// The key Graphics is translating: its raster state patches the MSL Translate makes.
+    const GraphicsPipelineKey* patch_key{};
+    /// The pipeline being translated is expanded: its pixel program reads the line coordinate.
+    bool expand_active{};
+    /// A stage's SPIR-V as MSL; nothing (Cause() set) when SPIRV-Cross fails.
+    [[nodiscard]] std::optional<StageProgram> FromSpirv(std::span<const u32> spirv,
+                                                        const Shader::IR::Program& program,
+                                                        ShaderTranslate::Stage stage,
+                                                        const ShaderTranslate::Options& options);
+
+    /// The capture kernels of a vertex pipeline whose key has a transform feedback layout.
+    [[nodiscard]] std::optional<XfbCapture> XfbPrograms(const GraphicsPipelineKey& key,
+                                                        std::span<const u32> spirv,
+                                                        const Shader::IR::Program& vertex);
 
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;

@@ -213,6 +213,9 @@ struct DrawState {
     std::array<Scissor, 15> more_scissors{};
     /// Triangles drawn as their edges (MTLTriangleFillModeLines).
     bool fill_lines{};
+    /// The depth bounds test (Apple10 GPUs: setDepthTestMinBound:maxBound:); 0 and 1 are off.
+    f32 depth_bounds_min{0.0f};
+    f32 depth_bounds_max{1.0f};
 };
 
 /// Records Metal work in submission order on one command queue. Copies go to one blit encoder

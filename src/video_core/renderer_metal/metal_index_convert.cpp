@@ -63,6 +63,10 @@ bool RotatesForProvokingVertex(Topology topology) noexcept {
     }
 }
 
+bool RestartsStrips(Topology topology) noexcept {
+    return topology == Topology::TriangleStrip || topology == Topology::LineStrip;
+}
+
 Topology ConvertedTopology(Topology topology, bool provoking_last) noexcept {
     if (provoking_last && RotatesForProvokingVertex(topology)) {
         switch (topology) {

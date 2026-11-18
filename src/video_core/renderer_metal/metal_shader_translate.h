@@ -63,6 +63,9 @@ struct InterfaceVariable {
     u32 builtin{NoBuiltin}; ///< spv::BuiltIn
     u32 vecsize{4};
     bool per_patch{};
+    /// The member's name in the MSL output struct of a vertex kernel (transform feedback reads
+    /// it by name).
+    std::string name;
 };
 
 /// Execution modes the tessellation control and evaluation programs share; each declares only

@@ -105,7 +105,7 @@ The frontends already hand a `CAMetalLayer` to the renderer for MoltenVK
 | `present/metalfx_*` | direct | MetalFX takes our `MTLTexture`s and our command buffer: no `VK_EXT_metal_objects`, no shared-event bridge |
 | `metal_gpu_time.mm` | `MTLCommandBuffer GPUStartTime/GPUEndTime` | Same `Perf:` GPU ms; `Perf passes:` from counter samples per encoder |
 | mesh pipelines (MoltenVK mesh fork / compute emulation) | Metal mesh pipelines on Apple9+/M3+ via `MTLMeshRenderPipelineDescriptor`, compute pre-pass otherwise | The compute pre-pass is preferred for the grass (nxnative: occupancy) |
-| transform feedback | compute vertex capture | Only where a game needs it |
+| transform feedback | vertex program as a stage-in kernel + gather kernel (`metal_xfb.h`) | Capture state on the CPU; byte count draws read the guest's counter |
 
 ### Shaders
 
@@ -190,8 +190,17 @@ of the pipelines a run builds. The macOS CI smoke test runs the translator, a re
 and an indirect draw through the renderer's pipeline builder and render pass with occlusion
 counts, a texel buffer read, the mesh emulation's draw side and distribution pass, the GPU index
 rewrite against the CPU one, the Ocarina bilinear pass, the pipeline archive across a reopen, the
-depth and depth-stencil blits, and a tessellated triangle through all three stages. Geometry
-programs are refused as on MoltenVK. Isolines, point mode, evaluation programs without a control program and indirect tessellated draws are emulated (see metal-coverage.md J02, J03, J06, A07). Open: Ocarina's live MetalFX
+depth and depth-stencil blits, and a tessellated triangle through all three stages. Transform
+feedback is emulated (`metal_xfb.h`): a draw whose pipeline key carries the guest's capture
+layout also runs its vertex program as a stage-in kernel (the tessellation vertex kernel) writing
+every vertex's outputs to a buffer, and a gather kernel appended to that MSL copies the varyings
+the layout names into the guest's buffers at the byte offsets the capture has reached (the
+offsets, the capacity clamp and whole primitives only are nxnative's `tf_prepare`, kept on the
+CPU); the byte count draw reads the guest's counter, which the report wrote on the CPU. Lists
+only (points, lines, triangles), a draw of at most 1M vertices, counts known on the CPU. The
+primitive and vertex counters are kept from the sizes of the draws. A guest geometry passthrough
+program that only sets the layer or viewport index from a vertex output is folded into the vertex
+program; other geometry programs are refused as on MoltenVK. Isolines, point mode, evaluation programs without a control program and indirect tessellated draws are emulated (see metal-coverage.md J02, J03, J06, A07). Open: Ocarina's live MetalFX
 temporal path, frame generation, the M5 AOT pack.
 Switches: `EDEN_NX2_METAL_DRAW=0` (build pipelines, draw nothing), `EDEN_NX2_METAL_DISPATCH=0`,
 `EDEN_NX2_METAL_SPLIT=0` (one GPU thread), `EDEN_NX2_METAL_GPU_INDICES=1|0` (every indexed
