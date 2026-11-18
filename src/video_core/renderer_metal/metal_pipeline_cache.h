@@ -54,7 +54,8 @@ public:
                               std::optional<MeshEmulation> mesh = std::nullopt,
                               std::optional<Tessellation> tessellation = std::nullopt,
                               std::optional<NativeMesh> native_mesh = std::nullopt,
-                              std::optional<XfbCapture> xfb = std::nullopt);
+                              std::optional<XfbCapture> xfb = std::nullopt,
+                              std::optional<GeometryCompute> geometry = std::nullopt);
 
     /// The Metal mesh functions of a task/mesh pipeline while Metal takes them, else null (the
     /// pipeline draws through Mesh(), when it has one).
@@ -95,6 +96,16 @@ public:
     /// vertex layout, and the gather kernel's; both null when either fails.
     [[nodiscard]] std::pair<void*, void*> XfbKernelStates(const Device& device, size_t variant,
                                                           const RenderPipelineDesc& layout);
+
+    /// The compute path of a pipeline with a geometry program, or null.
+    [[nodiscard]] GeometryCompute* Geo() noexcept {
+        return geometry ? &*geometry : nullptr;
+    }
+
+    /// The vertex capture kernel's state for an index size variant and the draw's vertex layout,
+    /// and the records kernel's (appended to its MSL); both null when either fails.
+    [[nodiscard]] std::pair<void*, void*> GeometryKernelStates(const Device& device, size_t variant,
+                                                               const RenderPipelineDesc& layout);
 
     /// The mesh emulation of a task/mesh pipeline, or null.
     [[nodiscard]] MeshEmulation* Mesh() noexcept {
@@ -182,6 +193,7 @@ private:
     std::optional<Tessellation> tessellation;
     std::optional<NativeMesh> native_mesh;
     std::optional<XfbCapture> xfb;
+    std::optional<GeometryCompute> geometry;
     PipelineArchive* archive{};
     PipelineFiles* recorder{};
     bool used{};

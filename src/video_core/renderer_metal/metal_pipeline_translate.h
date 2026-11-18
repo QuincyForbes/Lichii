@@ -28,6 +28,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/renderer_metal/metal_geometry.h"
 #include "video_core/renderer_metal/metal_object.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
 #include "video_core/renderer_metal/metal_xfb.h"
@@ -258,6 +259,24 @@ struct XfbCapture {
     StageProgram render;
 };
 
+/// A pipeline with a geometry program, drawn through metal_geometry.h's compute path: the vertex
+/// program's capture kernels (with the records kernel appended), the geometry kernel (its extra
+/// storage buffers, the input records, the output records and the index regions, are the last
+/// buffer slots of its program), and the plan of the buffers' layouts. The pipeline's own vertex
+/// program is the reader.
+struct GeometryCompute {
+    static constexpr std::array<u32, 3> IndexSizes{0, 2, 4};
+
+    Geometry::Plan plan;
+    std::array<StageProgram, 3> capture;
+    std::array<Object, 3> records;
+    MeshKernel kernel;
+    /// The buffer slots (ShaderStage::Compute) of the geometry kernel's extra buffers.
+    std::array<u32, Geometry::ExtraBuffers> extra_slots{};
+    /// Bytes per captured vertex between the capture and records kernels (an upper bound).
+    u32 vertex_stride{};
+};
+
 /// What a graphics key's programs translate to (GraphicsPipeline's stages).
 struct TranslatedPipeline {
     StageProgram vertex;
@@ -269,6 +288,8 @@ struct TranslatedPipeline {
     std::optional<NativeMesh> native_mesh;
     /// A vertex pipeline whose key has a transform feedback layout.
     std::optional<XfbCapture> xfb;
+    /// A pipeline with a geometry program (its `vertex` is the reader).
+    std::optional<GeometryCompute> geometry;
 };
 
 class PipelineTranslator {
@@ -335,6 +356,14 @@ public:
     /// vertex output it passes on (what Maxwell's passthrough does for cube and cascade targets),
     /// folded into the vertex program: that program sets it from the value it stored there.
     /// False, nothing changed, for anything else (the geometry stage is refused then).
+    /// A pipeline with a geometry program (4) through the compute path; `programs` are the key's
+    /// translated programs (the smoke test makes them by hand).
+    [[nodiscard]] std::optional<TranslatedPipeline> GeometryPipeline(
+        const GraphicsPipelineKey& key, std::span<Shader::IR::Program> programs);
+
+    /// A transformed geometry program (Geometry::Transform) as its compute kernel.
+    [[nodiscard]] std::optional<StageProgram> GeometryKernel(Shader::IR::Program& program);
+
     [[nodiscard]] static bool FoldGeometryPassthrough(Shader::IR::Program& vertex,
                                                       const Shader::IR::Program& geometry);
 
@@ -375,6 +404,8 @@ private:
     std::string detail;
     std::string native_cause;
     bool native_mesh{};
+    /// TranslatePrograms folded the key's geometry program into the vertex program.
+    bool folded_geometry{};
 };
 
 } // namespace Metal

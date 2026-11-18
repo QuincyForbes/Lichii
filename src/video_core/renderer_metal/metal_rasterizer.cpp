@@ -626,7 +626,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         if (pipeline->IsMeshPipeline() || pipeline->Tess() != nullptr || gpu_condition.active ||
             indirect_kernels_failed || IndexConvert::NeedsConversion(DrawTopology(*maxwell3d)) ||
             ProvokingLastWanted(*pipeline) || RestartOffWidens(is_indexed) ||
-            pipeline->Xfb() != nullptr) {
+            pipeline->Xfb() != nullptr || pipeline->Geo() != nullptr) {
             ReadGridWords();
         }
         grid_draw.instances = instance_count;
@@ -634,6 +634,10 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     if ((pipeline->IsMeshPipeline() || pipeline->Tess() != nullptr) && !ConditionHoldsOnCpu()) {
         // Their kernels run whatever the condition: it is decided on the CPU.
         Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        return;
+    }
+    if (pipeline->Geo() != nullptr) {
+        DrawGeometry(*pipeline, is_indexed, instance_count);
         return;
     }
     if (pipeline->IsMeshPipeline()) {
@@ -1765,6 +1769,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     NativeMesh* const native = pipeline.Native();
     MeshEmulation* const mesh = native != nullptr ? nullptr : pipeline.Mesh();
     Tessellation* const tess = pipeline.Tess();
+    GeometryCompute* const geo = pipeline.Geo();
     const bool native_task = native != nullptr && !native->object.entry_point.empty();
     const bool has_task = (mesh != nullptr && mesh->has_task) || native_task;
     const u32 mesh_stage = native != nullptr ? native->mesh_stage
@@ -1772,17 +1777,21 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                                              : 0U;
     const size_t vertex_variant =
         tess_draw == nullptr || tess_draw->index_size == 0 ? 0 : tess_draw->index_size == 2 ? 1 : 2;
+    const size_t geo_variant =
+        xfb_draw.index_size == 0 ? 0 : xfb_draw.index_size == 2 ? 1 : 2;
     const std::array<size_t, 4> stages{
-        0, has_task ? size_t{mesh_stage} : tess != nullptr ? size_t{1} : 0,
+        0, has_task ? size_t{mesh_stage} : tess != nullptr ? size_t{1} : geo != nullptr ? size_t{3} : 0,
         tess != nullptr ? size_t{2} : 0, 4};
     const std::array<StageProgram*, 4> programs{
         native != nullptr ? (native_task ? &native->object : &native->mesh)
         : mesh != nullptr ? &mesh->first.program
         : tess != nullptr ? &tess->vertex[vertex_variant]
+        : geo != nullptr  ? &geo->capture[geo_variant]
                           : &pipeline.Vertex(),
         native_task       ? &native->mesh
         : has_task        ? &mesh->mesh.program
         : tess != nullptr ? &tess->control.program
+        : geo != nullptr  ? &geo->kernel.program
                           : nullptr,
         tess != nullptr ? (tess->domain ? &tess->domain->evaluate.program : &pipeline.Vertex())
                         : nullptr,
@@ -1799,7 +1808,10 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     const Maxwell::PrimitiveTopology topology =
         native != nullptr ? static_cast<Maxwell::PrimitiveTopology>(native->topology)
         : mesh != nullptr ? static_cast<Maxwell::PrimitiveTopology>(mesh->topology)
-                          : DrawTopology(*maxwell3d);
+        : geo != nullptr ? (geo->plan.output_topology == 1   ? Maxwell::PrimitiveTopology::Points
+                            : geo->plan.output_topology == 6 ? Maxwell::PrimitiveTopology::Lines
+                                                             : Maxwell::PrimitiveTopology::Triangles)
+                         : DrawTopology(*maxwell3d);
     const bool mesh_pipeline = native != nullptr || mesh != nullptr;
 
     std::array<u32, VideoCommon::NUM_STAGES> uniform_masks{};
@@ -2132,6 +2144,11 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     // A tessellation pipeline's vertex kernel reads the vertex layout as stage-in data; its
     // post-tessellation vertex function reads buffers.
     const RenderPipelineDesc layout_desc = state_desc;
+    if (geo != nullptr) {
+        // The render pass draws from the reader's buffer: no vertex streams.
+        std::ranges::fill(state_desc.attributes, VertexAttributeState{});
+        std::ranges::fill(state_desc.streams, VertexStreamState{});
+    }
     if (tess != nullptr) {
         ApplyTessellation(state_desc, *tess);
     }
@@ -2493,6 +2510,172 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         }
     }
 
+    // The index buffer a capture or geometry kernel reads: the bound one, or a widened copy
+    // (8-bit indices, a base vertex) read from guest memory.
+    const auto resolve_capture_indices = [&](BufferHandle& index_buffer, u64& index_offset) {
+        if (xfb_draw.widen_indices || xfb_draw.base_vertex != 0) {
+            // 8-bit indices widened and the base vertex added, from guest memory.
+            const auto& draw_state = maxwell3d->draw_manager.draw_state;
+            const u32 source_size =
+                static_cast<u32>(draw_state.index_buffer.FormatSizeInBytes());
+            converted_source.resize(size_t{xfb_draw.count} * source_size);
+            gpu_memory->ReadBlockUnsafe(draw_state.index_buffer.StartAddress() +
+                                            u64{xfb_draw.first_index} * source_size,
+                                        converted_source.data(), converted_source.size());
+            const StagingBufferRef widened =
+                staging_pool.Stream(u64{xfb_draw.count} * sizeof(u32), 16);
+            const std::span<u32> out(reinterpret_cast<u32*>(widened.mapped_span.data()),
+                                     xfb_draw.count);
+            const bool restart = regs.primitive_restart.enabled != 0;
+            IndexConvert::Convert(Maxwell::PrimitiveTopology::Patches, converted_source,
+                                  source_size, 0, xfb_draw.count, restart, out);
+            for (u32& index : out) {
+                if (!restart || index != 0xFFFFFFFFU) {
+                    index = static_cast<u32>(static_cast<s32>(index) + xfb_draw.base_vertex);
+                }
+            }
+            index_buffer = widened.buffer;
+            index_offset = widened.offset;
+        } else {
+            const BufferCacheRuntime::IndexState& index = buffer_cache_runtime.Index();
+            index_buffer = index.buffer;
+            index_offset =
+                u64{index.offset} + u64{xfb_draw.first_index} * xfb_draw.index_size;
+        }
+        return index_buffer != nullptr;
+    };
+    if (geo != nullptr) {
+        // A geometry program through metal_geometry.h: the vertex kernel and its records kernel,
+        // the geometry kernel over the input primitives, and the compaction of its strips.
+        const Geometry::Plan& plan = geo->plan;
+        const auto [capture_kernel, records_kernel] =
+            pipeline.GeometryKernelStates(device, geo_variant, layout_desc);
+        void* const geometry_kernel = pipeline.KernelState(device, geo->kernel);
+        EnsureGeometryKernels();
+        if (!xfb_draw.wanted || capture_kernel == nullptr || records_kernel == nullptr ||
+            geometry_kernel == nullptr || geometry_count_kernel.Get() == nullptr) {
+            prepare_refusal = "geometry kernel not built by Metal";
+            return false;
+        }
+        BufferHandle index_buffer{};
+        u64 index_offset = 0;
+        if (xfb_draw.index_size != 0 && !resolve_capture_indices(index_buffer, index_offset)) {
+            prepare_refusal = "geometry draw without an index buffer";
+            return false;
+        }
+        const u32 instances = xfb_draw.instances;
+        const u32 vertices = xfb_draw.count * instances;
+        const u32 per_instance = plan.Primitives(xfb_draw.count);
+        const u32 input_primitives = per_instance * instances;
+        const u32 groups = input_primitives * plan.invocations;
+        const u32 rounded = (input_primitives + Geometry::GroupSize - 1) / Geometry::GroupSize *
+                            Geometry::GroupSize;
+        const u64 record_count = u64{rounded} * plan.input_vertices;
+        const u64 record_words = record_count * plan.InputStride();
+        const u64 output_words = u64{rounded} * plan.invocations * plan.max_vertices * plan.OutputStride();
+        const u64 index_words = u64{rounded} * plan.invocations * plan.IndexStride();
+        const u64 list_words = u64{groups} * plan.max_vertices * 3;
+        const u64 total = u64{vertices} * geo->vertex_stride + (record_words + output_words +
+                                                                  index_words + list_words +
+                                                                  groups) * 4;
+        if (input_primitives == 0) {
+            prepare_refusal = {};
+            return false;
+        }
+        if (total > Geometry::MaxScratchBytes) {
+            prepare_refusal = "geometry draw past the scratch limit";
+            return false;
+        }
+        const auto stream = [&](u64 size) {
+            return staging_pool.Stream((std::max)(size, u64{16}), 16);
+        };
+        const StagingBufferRef captured = stream(u64{vertices} * geo->vertex_stride);
+        const StagingBufferRef records = stream(record_words * 4);
+        geo_draw.output = stream(output_words * 4);
+        const StagingBufferRef regions = stream(index_words * 4);
+        geo_draw.indices = stream(list_words * 4);
+        const StagingBufferRef counts = stream(u64{groups} * 4);
+        geo_draw.args = stream(32);
+        const auto bind = [&](u32 slot, const StagingBufferRef& buffer) {
+            scheduler.BindBuffer(ShaderStage::Compute, slot, buffer.buffer,
+                                 static_cast<u32>(buffer.offset));
+        };
+        // 1. Every vertex of the draw through the vertex program.
+        scheduler.BeginCompute(capture_kernel, false);
+        BindStageResources(geo->capture[geo_variant], ShaderStage::Compute, stage_bindings[0],
+                           texel_views[0], std::span(views).subspan(first_view[0]),
+                           std::span(samplers).subspan(first_sampler[0]), targets.width,
+                           targets.height);
+        bind_vertex_streams([&](u32 slot, BufferHandle buffer, u32 offset) {
+            scheduler.BindBuffer(ShaderStage::Compute, slot, buffer, offset);
+        });
+        const ShaderTranslate::TessellationSlots& slots =
+            geo->capture[geo_variant].tessellation_slots;
+        if (slots.output != ~0U) {
+            bind(slots.output, captured);
+        }
+        if (xfb_draw.index_size != 0 && slots.index != ~0U) {
+            scheduler.BindBuffer(ShaderStage::Compute, slots.index, index_buffer,
+                                 static_cast<u32>(index_offset));
+        }
+        scheduler.DispatchStageIn(xfb_draw.index_size != 0 ? 0U : xfb_draw.first, xfb_draw.count,
+                                  xfb_draw.first_instance, instances);
+        // 2. The attributes the geometry program reads, as records.
+        scheduler.BeginCompute(records_kernel, false);
+        bind(Geometry::RecordsSourceSlot, captured);
+        bind(Geometry::RecordsOutputSlot, records);
+        const Geometry::RecordsParams records_params{
+            .records = static_cast<u32>(u64{input_primitives} * plan.input_vertices),
+            .vertices = plan.input_vertices,
+            .step = plan.input_step,
+            .count = xfb_draw.count,
+            .primitives = per_instance,
+        };
+        scheduler.BindBytes(ShaderStage::Compute, Geometry::RecordsCountSlot, &records_params,
+                            static_cast<u32>(sizeof(records_params)));
+        scheduler.Dispatch(
+            {(records_params.records + Geometry::GroupSize - 1) / Geometry::GroupSize, 1, 1},
+            {Geometry::GroupSize, 1, 1});
+        // 3. The geometry program, a thread for each input primitive.
+        scheduler.BeginCompute(geometry_kernel, false);
+        BindStageResources(geo->kernel.program, ShaderStage::Compute, stage_bindings[1],
+                           texel_views[1], std::span(views).subspan(first_view[1]),
+                           std::span(samplers).subspan(first_sampler[1]), targets.width,
+                           targets.height);
+        bind(geo->extra_slots[0], records);
+        bind(geo->extra_slots[1], geo_draw.output);
+        bind(geo->extra_slots[2], regions);
+        scheduler.Dispatch({rounded / Geometry::GroupSize, plan.invocations, 1},
+                           {Geometry::GroupSize, 1, 1});
+        // 4. The strips of every primitive's region, in order, as one list and the draw's
+        // arguments.
+        const Geometry::GeometryParams params{
+            .groups = groups,
+            .stride = plan.IndexStride(),
+            .topology = plan.output_topology,
+            .capacity = static_cast<u32>(list_words),
+        };
+        const auto pack = [&](const Object& kernel, u32 threads) {
+            scheduler.BeginCompute(kernel.Get(), false);
+            bind(0, regions);
+            bind(1, geo_draw.indices);
+            bind(2, geo_draw.args);
+            bind(3, counts);
+            scheduler.BindBytes(ShaderStage::Compute, 4, &params, static_cast<u32>(sizeof(params)));
+            scheduler.Dispatch({(threads + Geometry::GroupSize - 1) / Geometry::GroupSize, 1, 1},
+                               {Geometry::GroupSize, 1, 1});
+        };
+        pack(geometry_count_kernel, groups);
+        pack(geometry_scan_kernel, 1);
+        pack(geometry_write_kernel, groups);
+        ++geometry_draws;
+        geometry_primitives += input_primitives;
+        if (geometry_readbacks.size() >= 4096) {
+            ResolveGeometryCounters();
+        }
+        geometry_readbacks.push_back({geo_draw.args, scheduler.CurrentTick(), plan.output_topology});
+    }
+
     if (xfb_draw.wanted && (pipeline.Xfb() != nullptr || pipeline.Expand() != nullptr)) {
         // Transform feedback: the vertex program as a kernel writing every vertex's outputs, then
         // the gather kernel copying the captured varyings into the guest's buffers. An expanded
@@ -2513,36 +2696,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         BufferHandle index_buffer{};
         u64 index_offset = 0;
         if (captures && xfb_draw.index_size != 0) {
-            if (xfb_draw.widen_indices || xfb_draw.base_vertex != 0) {
-                // 8-bit indices widened and the base vertex added, from guest memory.
-                const auto& draw_state = maxwell3d->draw_manager.draw_state;
-                const u32 source_size =
-                    static_cast<u32>(draw_state.index_buffer.FormatSizeInBytes());
-                converted_source.resize(size_t{xfb_draw.count} * source_size);
-                gpu_memory->ReadBlockUnsafe(draw_state.index_buffer.StartAddress() +
-                                                u64{xfb_draw.first_index} * source_size,
-                                            converted_source.data(), converted_source.size());
-                const StagingBufferRef widened =
-                    staging_pool.Stream(u64{xfb_draw.count} * sizeof(u32), 16);
-                const std::span<u32> out(reinterpret_cast<u32*>(widened.mapped_span.data()),
-                                         xfb_draw.count);
-                const bool restart = regs.primitive_restart.enabled != 0;
-                IndexConvert::Convert(Maxwell::PrimitiveTopology::Patches, converted_source,
-                                      source_size, 0, xfb_draw.count, restart, out);
-                for (u32& index : out) {
-                    if (!restart || index != 0xFFFFFFFFU) {
-                        index = static_cast<u32>(static_cast<s32>(index) + xfb_draw.base_vertex);
-                    }
-                }
-                index_buffer = widened.buffer;
-                index_offset = widened.offset;
-            } else {
-                const BufferCacheRuntime::IndexState& index = buffer_cache_runtime.Index();
-                index_buffer = index.buffer;
-                index_offset =
-                    u64{index.offset} + u64{xfb_draw.first_index} * xfb_draw.index_size;
-            }
-            captures = index_buffer != nullptr;
+            captures = resolve_capture_indices(index_buffer, index_offset);
         }
         if (!captures) {
             LOG_ONCE(warned_xfb_unbuilt,
@@ -2775,7 +2929,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                              xfb_draw.outputs.buffer, static_cast<u32>(xfb_draw.outputs.offset));
         scheduler.BindBytes(ShaderStage::Vertex, RasterExpand::ParamsSlot, &params,
                             static_cast<u32>(sizeof(params)));
-    } else if (!mesh_pipeline && tess == nullptr) {
+    } else if (!mesh_pipeline && tess == nullptr && geo == nullptr) {
         bind_vertex_streams([&](u32 slot, BufferHandle buffer, u32 offset) {
             scheduler.BindVertexBuffer(slot, buffer, offset);
         });
@@ -2790,7 +2944,8 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     // and images, into the slots the translator gave them.
     for (size_t index = 0; index < stages.size(); ++index) {
         // Kernels were bound when they were dispatched.
-        if (absent(index) || (index == 1 && native == nullptr) || (index == 0 && tess != nullptr) ||
+        if (absent(index) || (index == 1 && native == nullptr) ||
+            (index == 0 && (tess != nullptr || geo != nullptr)) ||
             (index == 2 && tess != nullptr && tess->domain)) {
             continue;
         }
@@ -2859,6 +3014,10 @@ void RasterizerMetal::DrawIndirect() {
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     if (!ConditionHoldsOnCpu()) {
         Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        return;
+    }
+    if (pipeline->Geo() != nullptr) {
+        DrawGeometryIndirect(*pipeline);
         return;
     }
     if (pipeline->IsMeshPipeline()) {
@@ -3002,6 +3161,117 @@ void RasterizerMetal::DrawIndirect() {
         }
     }
     ++draws_encoded;
+}
+
+void RasterizerMetal::EnsureGeometryKernels() {
+    if (geometry_count_kernel || geometry_kernels_failed) {
+        return;
+    }
+    std::string error;
+    geometry_library = CreateLibrary(device, std::string{Geometry::PackSource}, error);
+    const auto make = [&](const char* name) {
+        const Object function =
+            geometry_library ? CreateFunction(geometry_library.Get(), name) : Object{};
+        return function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
+    };
+    geometry_count_kernel = make("geo_count");
+    geometry_scan_kernel = make("geo_scan");
+    geometry_write_kernel = make("geo_write");
+    if (!geometry_count_kernel || !geometry_scan_kernel || !geometry_write_kernel) {
+        geometry_count_kernel = {};
+        geometry_kernels_failed = true;
+        LOG_ERROR(Render_Metal, "Metal: geometry compaction kernels failed to build: {}", error);
+    }
+}
+
+void RasterizerMetal::DrawGeometry(GraphicsPipeline& pipeline, bool is_indexed,
+                                   u32 instance_count) {
+    GeometryCompute& geo = *pipeline.Geo();
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const u32 count = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+    geometry_input_primitives = geo.plan.Primitives(count) * instance_count;
+    CountDraw(count, instance_count);
+    geometry_input_primitives = 0;
+    if (geo.plan.Primitives(count) == 0 || instance_count == 0) {
+        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        return;
+    }
+    const std::optional<u32> primitive = PrimitiveType(
+        geo.plan.output_topology == 1   ? Maxwell::PrimitiveTopology::Points
+        : geo.plan.output_topology == 6 ? Maxwell::PrimitiveTopology::Lines
+                                        : Maxwell::PrimitiveTopology::Triangles);
+    if (!primitive || !ConditionHoldsOnCpu()) {
+        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        return;
+    }
+    xfb_draw = XfbDraw{
+        .wanted = true,
+        .first = draw_state.vertex_buffer.first,
+        .count = count,
+        .first_instance = draw_state.base_instance,
+        .instances = instance_count,
+        .index_size = !is_indexed ? 0U
+                      : draw_state.index_buffer.format == Maxwell::IndexFormat::UnsignedShort ? 2U
+                                                                                             : 4U,
+        .widen_indices =
+            is_indexed && draw_state.index_buffer.format == Maxwell::IndexFormat::UnsignedByte,
+        .base_vertex = is_indexed ? static_cast<s32>(draw_state.base_index) : 0,
+        .first_index = draw_state.index_buffer.first,
+    };
+    geo_draw = {};
+    gpu_memory->FlushCaching();
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    SCOPE_EXIT {
+        FinishTexelWritebacks();
+        xfb_draw = {};
+        geo_draw = {};
+    };
+    if (!PrepareDraw(pipeline, is_indexed)) {
+        NoteUnprepared();
+        return;
+    }
+    CountOcclusion();
+    // The reader takes its vertices from the geometry kernel's records.
+    scheduler.BindBuffer(ShaderStage::Vertex, 0, geo_draw.output.buffer,
+                         static_cast<u32>(geo_draw.output.offset));
+    scheduler.DrawIndexedIndirect(*primitive, 4, geo_draw.indices.buffer, geo_draw.indices.offset,
+                                  geo_draw.args.buffer, geo_draw.args.offset);
+    ++draws_encoded;
+    Coverage::Note(Coverage::Work::Draw, Coverage::Path::GeometryKernels);
+}
+
+void RasterizerMetal::DrawGeometryIndirect(GraphicsPipeline& pipeline) {
+    // The compute path sizes its buffers from the vertex count: the arguments are read on the CPU
+    // (after the caches hand over what the GPU wrote), a draw each.
+    const auto& params = maxwell3d->draw_manager.indirect_state;
+    auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const bool indexed = params.is_indexed;
+    const u32 words = indexed ? 5U : 4U;
+    const u64 stride = params.stride != 0 ? params.stride : u64{words} * sizeof(u32);
+    u32 draws = static_cast<u32>(params.max_draw_counts);
+    if (params.include_count) {
+        draws = (std::min)(draws, gpu_memory->Read<u32>(params.count_start_address));
+    }
+    for (u32 draw = 0; draw < draws; ++draw) {
+        const GPUVAddr address = params.indirect_start_address + draw * stride;
+        if (const std::optional<DAddr> device_address = gpu_memory->GpuToCpuAddress(address)) {
+            FlushRegion(*device_address, words * sizeof(u32), VideoCommon::CacheType::BufferCache);
+        }
+        std::array<u32, 5> record{};
+        gpu_memory->ReadBlockUnsafe(address, record.data(), words * sizeof(u32));
+        if (indexed) {
+            draw_state.index_buffer.count = record[0];
+            draw_state.index_buffer.first = record[2];
+            draw_state.base_index = record[3];
+            draw_state.base_instance = record[4];
+        } else {
+            draw_state.vertex_buffer.count = record[0];
+            draw_state.vertex_buffer.first = record[2];
+            draw_state.base_instance = record[3];
+        }
+        ++geometry_indirect_draws;
+        DrawGeometry(pipeline, indexed, record[1]);
+    }
 }
 
 void RasterizerMetal::DrawByteCount() {
@@ -4121,6 +4391,7 @@ void RasterizerMetal::CountDraw(u32 vertices, u32 instances) {
     add(Type::VtgPrimitivesOut, primitives);
     add(Type::ClipperInvocations, primitives);
     add(Type::ClipperPrimitivesGenerated, primitives);
+    add(Type::GeometryShaderInvocations, geometry_input_primitives);
     if (regs.transform_feedback_enabled != 0) {
         add(Type::StreamingPrimitivesNeeded, primitives);
     }
@@ -4262,6 +4533,9 @@ std::optional<u64> RasterizerMetal::CounterValue(VideoCommon::QueryType type,
     case Type::ClipperInvocations:
     case Type::ClipperPrimitivesGenerated:
     case Type::VtgPrimitivesOut:
+    case Type::GeometryShaderInvocations:
+    case Type::GeometryShaderPrimitivesGenerated:
+    case Type::PixelShaderInvocations:
         return counters[static_cast<size_t>(type)];
     default:
         return std::nullopt;
@@ -4281,16 +4555,67 @@ u32 RasterizerMetal::AllocateVisibilitySlot() {
 }
 
 void RasterizerMetal::CountOcclusion() {
-    if (maxwell3d->regs.zpass_pixel_count_enable == 0) {
+    const bool zpass = maxwell3d->regs.zpass_pixel_count_enable != 0;
+    if (!zpass && !count_pixels) {
         scheduler.SetVisibility(std::nullopt);
         return;
     }
-    // A slot per render pass of the counting segment: results are summed at the query.
+    // A slot per render pass of the counting segment: results are summed at the query. The pixel
+    // program invocation counter (once a report asks for it) reads the same slots.
     if (occlusion_pass != scheduler.RenderPassSerial()) {
-        occlusion_slots.push_back(AllocateVisibilitySlot());
+        visibility_slot = AllocateVisibilitySlot();
         occlusion_pass = scheduler.RenderPassSerial();
+        slot_in_occlusion = slot_in_pixels = false;
     }
-    scheduler.SetVisibility(occlusion_slots.back());
+    if (zpass && !slot_in_occlusion) {
+        occlusion_slots.push_back(visibility_slot);
+        slot_in_occlusion = true;
+    }
+    if (count_pixels && !slot_in_pixels) {
+        if (pixel_slots.size() >= 4096) {
+            ResolvePixelCounter();
+        }
+        pixel_slots.push_back(visibility_slot);
+        slot_in_pixels = true;
+    }
+    if (const Framebuffer* const framebuffer = texture_cache.GetFramebuffer()) {
+        pixel_samples = (std::max)(framebuffer->Samples(), 1U);
+    }
+    scheduler.SetVisibility(visibility_slot);
+}
+
+void RasterizerMetal::ResolvePixelCounter() {
+    // The samples that passed, over the samples a pixel has: the invocations of the pixel
+    // program as far as a visibility counter says (early depth and stencil kills are not
+    // counted as invocations, a draw's helper invocations are).
+    if (pixel_slots.empty()) {
+        return;
+    }
+    scheduler.Wait(visibility_ticks[pixel_slots.back()]);
+    const u64* const results = scheduler.VisibilityResults();
+    u64 samples = 0;
+    for (const u32 slot : pixel_slots) {
+        samples += results[slot];
+    }
+    counters[static_cast<size_t>(VideoCommon::QueryType::PixelShaderInvocations)] +=
+        samples / pixel_samples;
+    pixel_slots.clear();
+    // The slot the pass in progress still counts into: its samples so far were taken.
+    slot_in_pixels = false;
+    occlusion_pass = ~u64{0};
+}
+
+void RasterizerMetal::ResolveGeometryCounters() {
+    // The primitives the geometry draws' compactions listed: read once the GPU is done with them.
+    for (const GeometryReadback& readback : geometry_readbacks) {
+        scheduler.Wait(readback.tick);
+        u32 indices = 0;
+        std::memcpy(&indices, readback.args.mapped_span.data(), sizeof(indices));
+        const u32 per_primitive = readback.topology == 1 ? 1U : readback.topology == 6 ? 2U : 3U;
+        counters[static_cast<size_t>(VideoCommon::QueryType::GeometryShaderPrimitivesGenerated)] +=
+            indices / per_primitive;
+    }
+    geometry_readbacks.clear();
 }
 
 void RasterizerMetal::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
@@ -4379,6 +4704,13 @@ void RasterizerMetal::QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType ty
     // so the value is already final); the others read as 1 (something passed), as OpenGL's
     // fallback does.
     u64 value = payload;
+    if (type == VideoCommon::QueryType::PixelShaderInvocations) {
+        // Counting starts with the first report that asks.
+        count_pixels = true;
+        ResolvePixelCounter();
+    } else if (type == VideoCommon::QueryType::GeometryShaderPrimitivesGenerated) {
+        ResolveGeometryCounters();
+    }
     if (type != VideoCommon::QueryType::Payload) {
         value = CounterValue(type, subreport).value_or(1U);
     }

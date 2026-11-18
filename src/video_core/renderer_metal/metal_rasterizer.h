@@ -474,6 +474,12 @@ private:
     /// capture kernels over; left unwanted when nothing is captured.
     void PrepareXfbDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 instance_count);
 
+    /// A draw of a pipeline with a geometry program (metal_geometry.h).
+    void DrawGeometry(GraphicsPipeline& pipeline, bool is_indexed, u32 instance_count);
+    void EnsureGeometryKernels();
+    /// An indirect draw of a geometry program: its arguments read on the CPU, a draw each.
+    void DrawGeometryIndirect(GraphicsPipeline& pipeline);
+
     /// A draw of the vertices a transform feedback captured (DrawIndirectByteCountEXT): the byte
     /// count the guest's counter holds over the stride.
     void DrawByteCount();
@@ -537,6 +543,25 @@ private:
 
     /// The visibility slots of the occlusion counter since its last reset, one per render pass.
     std::vector<u32> occlusion_slots;
+    /// The visibility slot of the pass being counted, and whether the occlusion and pixel lists
+    /// have it.
+    u32 visibility_slot{};
+    bool slot_in_occlusion{};
+    bool slot_in_pixels{};
+    /// Pixel program invocations (PixelShaderInvocations): counted once a report asks, from the
+    /// passes' visibility slots over the samples per pixel.
+    bool count_pixels{};
+    std::vector<u32> pixel_slots;
+    u32 pixel_samples{1};
+    /// The compaction counts of the geometry draws not yet read back.
+    struct GeometryReadback {
+        StagingBufferRef args;
+        u64 tick;
+        u32 topology;
+    };
+    std::vector<GeometryReadback> geometry_readbacks;
+    void ResolvePixelCounter();
+    void ResolveGeometryCounters();
     u64 occlusion_pass{~u64{0}};
     u32 next_visibility_slot{};
     std::array<u64, Scheduler::VisibilitySlots> visibility_ticks{};
@@ -679,6 +704,23 @@ private:
         Maxwell::PrimitiveTopology topology{Maxwell::PrimitiveTopology::Points};
         u32 patch_vertices{1};
     } xfb_state;
+    /// The geometry draw being prepared: the output records the reader draws from, the compacted
+    /// index list and the draw's indirect arguments.
+    struct GeometryDraw {
+        StagingBufferRef output;
+        StagingBufferRef indices;
+        StagingBufferRef args;
+    } geo_draw;
+    Object geometry_library;
+    Object geometry_count_kernel;
+    Object geometry_scan_kernel;
+    Object geometry_write_kernel;
+    bool geometry_kernels_failed{};
+    u64 geometry_draws{};
+    u64 geometry_primitives{};
+    u64 geometry_indirect_draws{};
+    /// Input primitives of the draw CountDraw is counting for a geometry pipeline (else 0).
+    u32 geometry_input_primitives{};
     /// Counters of the draws made, by VideoCommon::QueryType.
     std::array<u64, 32> counters{};
     u64 xfb_captures{};

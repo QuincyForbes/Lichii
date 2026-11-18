@@ -200,7 +200,11 @@ CPU); the byte count draw reads the guest's counter, which the report wrote on t
 only (points, lines, triangles), a draw of at most 1M vertices, counts known on the CPU. The
 primitive and vertex counters are kept from the sizes of the draws. A guest geometry passthrough
 program that only sets the layer or viewport index from a vertex output is folded into the vertex
-program; other geometry programs are refused as on MoltenVK. Isolines, point mode, evaluation programs without a control program and indirect tessellated draws are emulated (see metal-coverage.md J02, J03, J06, A07). Open: Ocarina's live MetalFX
+program. Other geometry programs run as nxnative's geometry-to-compute (`metal_geometry.h`): the
+vertex capture kernel and a records kernel, the geometry program rewritten to a compute program
+(one thread an input primitive, vertices and strip indices written to its own region), the ported
+ordered compaction and a reader vertex function drawing the compacted list with the pixel
+program; the limits are in the K01 row. Isolines, point mode, evaluation programs without a control program and indirect tessellated draws are emulated (see metal-coverage.md J02, J03, J06, A07). Open: Ocarina's live MetalFX
 temporal path, frame generation, the M5 AOT pack.
 Switches: `EDEN_NX2_METAL_DRAW=0` (build pipelines, draw nothing), `EDEN_NX2_METAL_DISPATCH=0`,
 `EDEN_NX2_METAL_SPLIT=0` (one GPU thread), `EDEN_NX2_METAL_GPU_INDICES=1|0` (every indexed
