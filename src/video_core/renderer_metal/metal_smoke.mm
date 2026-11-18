@@ -45,6 +45,8 @@
 #include "native_mesh_smoke_frag_spv.h"
 #include "native_mesh_smoke_mesh_spv.h"
 #include "native_mesh_smoke_task_spv.h"
+#include "point_size_smoke_vert_spv.h"
+#include "subgroup_smoke_comp_spv.h"
 #include "tess_direct_vert_spv.h"
 #include "tess_isolines_tesc_spv.h"
 #include "tess_isolines_tese_spv.h"
@@ -2187,6 +2189,39 @@ int RunTessellationDirect() {
                 "draw, factors from registers): inside %u,%u,%u outside %u,%u,%u, %llu samples: %s\n",
                 inside.r, inside.g, inside.b, outside.r, outside.g, outside.b,
                 static_cast<unsigned long long>(samples), passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// MoltenVK's translation options for Apple GPUs: a point size written only by programs that
+/// draw points (Metal's validation refuses one next to triangles), and a fixed SIMD group size.
+int RunMslOptions() {
+    namespace Translate = Metal::ShaderTranslate;
+    Translate::Options options;
+    options.apple_family = 9;
+    const Translate::Result with_size = Translate::SpirvToMsl(
+        std::span<const uint32_t>(POINT_SIZE_SMOKE_VERT_SPV), Translate::Stage::Vertex, options);
+    options.point_size_builtin = false;
+    const Translate::Result without_size = Translate::SpirvToMsl(
+        std::span<const uint32_t>(POINT_SIZE_SMOKE_VERT_SPV), Translate::Stage::Vertex, options);
+    const Translate::Result subgroup = Translate::SpirvToMsl(
+        std::span<const uint32_t>(SUBGROUP_SMOKE_COMP_SPV), Translate::Stage::Compute, options);
+    const bool sized = with_size.source.find("[[point_size]]") != std::string::npos;
+    const bool unsized = !without_size.source.empty() &&
+                         without_size.source.find("[[point_size]]") == std::string::npos;
+    const bool fixed = subgroup.source.find("= 32;") != std::string::npos &&
+                       subgroup.source.find("threads_per_simdgroup") == std::string::npos;
+    // The program without the point size builds for a triangle pipeline.
+    Metal::Device device;
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, without_size.source, error);
+    const Metal::Object function =
+        library ? Metal::CreateFunction(library.Get(), without_size.entry_point) : Metal::Object{};
+    const bool passed = sized && unsized && fixed && function;
+    std::printf("metal-smoke: MSL options: point size %s drawing points, %s otherwise; subgroup "
+                "size %s; builds %d: %s\n",
+                sized ? "written" : "MISSING", unsized ? "dropped" : "STILL WRITTEN",
+                fixed ? "fixed at 32" : "NOT FIXED", function ? 1 : 0,
+                passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
 
@@ -4981,7 +5016,7 @@ int main(int argc, char** argv) {
                                  RunMeshEmulation, RunMeshDistribution, RunIndexRewrite,
                                  RunOcarinaBilinear, RunPipelineArchive,
                                  RunDepthBlit, RunTessellation, RunTessellationIsolines,
-                                 RunTessellationPoints, RunTessellationDirect, RunDepthStencilBlit,
+                                 RunTessellationPoints, RunTessellationDirect, RunMslOptions, RunDepthStencilBlit,
                                  RunPipelineCheck, RunDeviceMsl, RunNativeMesh, RunBlockCopy,
                                  RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,

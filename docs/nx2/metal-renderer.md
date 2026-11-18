@@ -191,7 +191,7 @@ and an indirect draw through the renderer's pipeline builder and render pass wit
 counts, a texel buffer read, the mesh emulation's draw side and distribution pass, the GPU index
 rewrite against the CPU one, the Ocarina bilinear pass, the pipeline archive across a reopen, the
 depth and depth-stencil blits, and a tessellated triangle through all three stages. Geometry
-programs are refused as on MoltenVK. Open: indirect tessellated draws, Ocarina's live MetalFX
+programs are refused as on MoltenVK. Isolines, point mode, evaluation programs without a control program and indirect tessellated draws are emulated (see metal-coverage.md J02, J03, J06, A07). Open: Ocarina's live MetalFX
 temporal path, frame generation, the M5 AOT pack.
 Switches: `EDEN_NX2_METAL_DRAW=0` (build pipelines, draw nothing), `EDEN_NX2_METAL_DISPATCH=0`,
 `EDEN_NX2_METAL_SPLIT=0` (one GPU thread), `EDEN_NX2_METAL_GPU_INDICES=1|0` (every indexed
