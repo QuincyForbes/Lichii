@@ -278,7 +278,15 @@ struct GeometryCompute {
     /// Transform feedback of the geometry output: the strides of the buffers it captures into
     /// (all zero without), the kernel is Geometry::XfbEntry in the geometry kernel's MSL.
     std::array<u32, Xfb::MaxBuffers> xfb_stride{};
-    Object xfb_state;
+    /// Which streams (bit s) have buffers; the kernel of stream s is Geometry::XfbEntryOf(s).
+    u32 xfb_streams{};
+    std::array<Object, Geometry::MaxStreams> xfb_states;
+    /// A geometry program after tessellation: the stages before it are in the pipeline's
+    /// `tessellation` (its domain emulation lists triangles, lines or points), and the records
+    /// kernel reads the evaluated vertices of that emulation (`tess_records`, `geo_records` in
+    /// its MSL) instead of a vertex capture kernel's.
+    bool from_tess{};
+    MeshKernel tess_records;
 };
 
 /// What a graphics key's programs translate to (GraphicsPipeline's stages).
@@ -373,8 +381,14 @@ public:
 
 private:
     /// A pipeline with tessellation control (2) and evaluation (3) programs.
+    /// `feeds_geometry`: a geometry program follows (4): the domain is always emulated, as a list
+    /// of triangles, lines or points, no pixel program is made, the evaluation's outputs stay
+    /// those a geometry program reads (no flip, no depth conversion: the reader does them), and
+    /// `feed_bindings` is where the next stage's bindings continue.
     std::optional<TranslatedPipeline> Tessellated(const GraphicsPipelineKey& key,
-                                                  std::span<Shader::IR::Program> programs);
+                                                  std::span<Shader::IR::Program> programs,
+                                                  bool feeds_geometry = false);
+    Shader::Backend::Bindings feed_bindings;
 
     /// The raster state of `key` done in the program's MSL (logic operation, viewport swizzle).
     void PatchRasterState(std::string& msl, ShaderTranslate::Stage stage,

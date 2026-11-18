@@ -41,6 +41,9 @@ namespace Metal::Geometry {
 inline constexpr u32 GroupSize = 64;
 /// The geometry kernel's extra storage buffers, after the program's own.
 inline constexpr u32 ExtraBuffers = 3;
+/// Output streams a geometry program can emit to (EmitStreamVertex); stream 0 is rasterized, the
+/// others only feed transform feedback buffers.
+inline constexpr u32 MaxStreams = 4;
 /// Most bytes one draw's records and indices take (a bigger one is refused).
 inline constexpr u64 MaxScratchBytes = u64{192} << 20;
 
@@ -60,6 +63,9 @@ struct Plan {
     u32 index_slots{};
     /// Compaction topology: 1 points, 6 lines, 3 triangles (what the strips are cut into).
     u32 output_topology{};
+    /// Streams the program emits to (the highest used + 1). Every stream has its own vertex
+    /// records and index region in a primitive's region, one after the other.
+    u32 streams{1};
 
     [[nodiscard]] u32 InputStride() const noexcept {
         return static_cast<u32>(input_words.size());
@@ -70,6 +76,10 @@ struct Plan {
     /// Words of a primitive's index region: its count, then the slots.
     [[nodiscard]] u32 IndexStride() const noexcept {
         return index_slots + 1;
+    }
+    /// Words of a primitive's index regions of all the streams.
+    [[nodiscard]] u32 RegionStride() const noexcept {
+        return IndexStride() * streams;
     }
     /// Input primitives of `count` vertices of one instance.
     [[nodiscard]] u32 Primitives(u32 count) const noexcept {
@@ -129,7 +139,7 @@ struct Plan {
 
 /// Rewrites a geometry program (points, lines, triangles or their adjacency in, points, line
 /// strips or triangle strips out, position, point size, layer, viewport index, clip distances and
-/// generic attributes; output streams past 0 are dropped) into a compute
+/// generic attributes; streams 1-3 are kept for transform feedback) into a compute
 /// program in place; its extra storage buffers (input records, output records, indices) are the
 /// last descriptors. Nothing is changed and `why` says so when it can't.
 [[nodiscard]] std::optional<Plan> Transform(Shader::IR::Program& program, u32 input_vertices,
@@ -150,10 +160,13 @@ struct RecordsParams {
     u32 count;      ///< Vertices of one instance
     u32 primitives; ///< Primitives of one instance
 };
+/// `source_type`: the struct the records are read from, when it is not the capture kernel's
+/// (`<entry>_out`): the evaluated vertices of a tessellation program's domain emulation.
 [[nodiscard]] std::string RecordsSource(
     const Plan& plan, std::string_view entry,
     std::span<const ShaderTranslate::InterfaceVariable> outputs,
-    const std::map<Shader::IR::Attribute, Shader::IR::Attribute>& legacy_mapping);
+    const std::map<Shader::IR::Attribute, Shader::IR::Attribute>& legacy_mapping,
+    std::string_view source_type = {});
 
 /// The reader vertex function: vertex `vertex_id` is record vertex_id of buffer 0; its outputs
 /// are what the pixel program reads (`generics`, the generic attributes the geometry program
@@ -169,6 +182,10 @@ inline constexpr std::string_view ReaderEntry = "geo_reader";
 /// records, 1 the list, 2-5 the capture buffers (bound at their current offset), 6 the draw's
 /// arguments (the list's length first), 7 XfbParams.
 inline constexpr std::string_view XfbEntry = "geo_xfb";
+/// The kernel of stream 1-3 is `geo_xfb<stream>`.
+[[nodiscard]] inline std::string XfbEntryOf(u32 stream) {
+    return stream == 0 ? std::string{XfbEntry} : std::string{XfbEntry} + std::to_string(stream);
+}
 inline constexpr u32 XfbRecordsSlot = 0;
 inline constexpr u32 XfbListSlot = 1;
 inline constexpr u32 XfbBufferSlot = 2;
@@ -181,7 +198,8 @@ struct XfbParams {
     u32 pad[3];
 };
 [[nodiscard]] std::string XfbSource(const Plan& plan, const Xfb::Layout& layout,
-                                    const std::map<Shader::IR::Attribute, Shader::IR::Attribute>& legacy_mapping);
+                                    const std::map<Shader::IR::Attribute, Shader::IR::Attribute>& legacy_mapping,
+                                    u32 stream = 0);
 
 /// The compaction kernels (nxnative's geo_pack_count, geo_pack_scan_legacy and geo_pack_write):
 /// buffers 0 the index regions, 1 the list, 2 the draw's indirect arguments, 3 the per-primitive
@@ -189,16 +207,20 @@ struct XfbParams {
 inline constexpr std::string_view PackSource = R"(#include <metal_stdlib>
 using namespace metal;
 // Ported from nxnative dm/gfx/msl/geo_pack.metal (MIT License, Copyright (c) 2026 seedds).
-struct GeometryParams { uint groups, stride, topology, capacity; };
+struct GeometryParams { uint groups, stride, topology, capacity, base, width; };
 static bool geo_room(constant GeometryParams& j, uint o, uint k, uint n) {
     return o <= j.capacity && k <= j.capacity - o && n <= j.capacity - o - k;
 }
 static uint geo_group(device const uint* src, device uint* dst, constant GeometryParams& j, uint g,
                       bool w, uint o) {
     uint a = 0, b = 0, n = 0, k = 0;
-    const uint count = min(src[g * j.stride], j.stride - 1);
+    // A stream's index region starts `base` words into a primitive's, `width` words long
+    // (width 0: the stride, one stream).
+    const uint w_ = j.width != 0 ? j.width : j.stride;
+    const uint at = j.base + g * j.stride;
+    const uint count = min(src[at], w_ - 1);
     for (uint i = 0; i < count; i++) {
-        const uint v = src[g * j.stride + 1 + i];
+        const uint v = src[at + 1 + i];
         if (v == 0xffffffffu) { n = 0; continue; }
         if (j.topology == 1) {
             if (w && geo_room(j, o, k, 1)) dst[o + k] = v;
@@ -219,6 +241,23 @@ static uint geo_group(device const uint* src, device uint* dst, constant Geometr
         a = b; b = v; n++;
     }
     return k;
+}
+struct GeometryFeed { uint iv, inv, streams, stride, width, topology, capacity, max_primitives; };
+kernel void geo_feed(device const uint* targs [[buffer(0)]], device uint* out [[buffer(1)]],
+                     constant GeometryFeed& f [[buffer(2)]], uint t [[thread_position_in_grid]]) {
+    if (t != 0) return;
+    const uint p = min(targs[0] / f.iv, f.max_primitives);
+    const uint groups = p * f.inv;
+    out[0] = p * f.iv; out[1] = f.iv; out[2] = f.iv; out[3] = p * f.iv; out[4] = max(p, 1u);
+    for (uint s = 0; s < f.streams; s++) {
+        device uint* q = out + 64 * (1 + s);
+        q[0] = groups; q[1] = f.stride; q[2] = f.topology; q[3] = f.capacity;
+        q[4] = s * f.width; q[5] = f.width;
+    }
+    device uint* d = out + 64 * 5;
+    d[0] = (p * f.iv + 63) / 64; d[1] = 1; d[2] = 1;
+    d[4] = (p + 63) / 64; d[5] = f.inv; d[6] = 1;
+    d[8] = (groups + 63) / 64; d[9] = 1; d[10] = 1;
 }
 kernel void geo_count(device const uint* src [[buffer(0)]], device uint* dst [[buffer(1)]],
                       device uint* args [[buffer(2)]], device uint* cnt [[buffer(3)]],
@@ -242,11 +281,42 @@ kernel void geo_write(device const uint* src [[buffer(0)]], device uint* dst [[b
 }
 )";
 
+/// A geometry program fed by tessellation: the evaluated vertices' count is only on the GPU (the
+/// domain emulation's count kernel), so one thread turns it into everything the later kernels
+/// are sized by: the records kernel's parameters, a stream's compaction parameters each, and the
+/// threadgroups of the records, geometry and compaction dispatches. Buffers: 0 the draw's
+/// arguments (the vertex count first), 1 the prepared words, 2 GeometryFeed.
+inline constexpr std::string_view FeedEntry = "geo_feed";
+/// Where the words are in the prepared buffer (a parameter block each: a buffer binding of
+/// constants needs the offset 256 aligned).
+inline constexpr u32 FeedRecordsWord = 0;
+[[nodiscard]] constexpr u32 FeedStreamWord(u32 stream) {
+    return 64 * (1 + stream);
+}
+inline constexpr u32 FeedDispatchWord = 64 * 5;
+inline constexpr u32 FeedBytes = 64 * 6 * 4;
+/// Threadgroup counts of the three dispatches, three words each, four apart.
+inline constexpr u32 FeedRecordsDispatch = FeedDispatchWord;
+inline constexpr u32 FeedGeometryDispatch = FeedDispatchWord + 4;
+inline constexpr u32 FeedPackDispatch = FeedDispatchWord + 8;
+struct GeometryFeed {
+    u32 input_vertices;
+    u32 invocations;
+    u32 streams;
+    u32 stride; ///< Words of a primitive's regions (Plan::RegionStride)
+    u32 width;  ///< Words of a stream's region (Plan::IndexStride)
+    u32 topology;
+    u32 capacity; ///< Words of a compacted list
+    u32 max_primitives;
+};
+
 struct GeometryParams {
     u32 groups;
-    u32 stride;
+    u32 stride; ///< Words of a primitive's regions (all the streams)
     u32 topology;
     u32 capacity;
+    u32 base;  ///< Where a stream's region starts in a primitive's
+    u32 width; ///< Words of a stream's region, 0 for the stride
 };
 
 } // namespace Metal::Geometry

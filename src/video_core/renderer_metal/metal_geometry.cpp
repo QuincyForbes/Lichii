@@ -172,6 +172,11 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, u32 inpu
                     why = "geometry program with a computed output stream";
                     return std::nullopt;
                 }
+                if (inst.Arg(0).U32() >= MaxStreams) {
+                    why = "geometry program with an output stream past 3";
+                    return std::nullopt;
+                }
+                plan.streams = (std::max)(plan.streams, inst.Arg(0).U32() + 1);
                 break;
             default:
                 break;
@@ -180,9 +185,11 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, u32 inpu
     }
 
     const u32 old_local = Common::DivCeil(program.local_memory_size, 4U);
-    const u32 vertex_cursor = old_local;
-    const u32 index_cursor = old_local + 1;
-    const u32 output_base = old_local + 2;
+    const u32 streams = plan.streams;
+    // Each stream keeps its own vertex and index cursors; the staging words follow them.
+    const auto vertex_cursor_of = [&](u32 stream) { return old_local + stream * 2; };
+    const auto index_cursor_of = [&](u32 stream) { return old_local + stream * 2 + 1; };
+    const u32 output_base = old_local + streams * 2;
     const u32 first_binding = static_cast<u32>(info.storage_buffers_descriptors.size());
     const u32 input_binding = first_binding;
     const u32 output_binding = first_binding + 1;
@@ -203,8 +210,10 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, u32 inpu
                                    entry_ir.IMul(primitive, entry_ir.Imm32(plan.invocations)),
                                    invocation)}
                              : primitive};
-    entry_ir.WriteLocal(entry_ir.Imm32(vertex_cursor), entry_ir.Imm32(0U));
-    entry_ir.WriteLocal(entry_ir.Imm32(index_cursor), entry_ir.Imm32(0U));
+    for (u32 stream = 0; stream < streams; ++stream) {
+        entry_ir.WriteLocal(entry_ir.Imm32(vertex_cursor_of(stream)), entry_ir.Imm32(0U));
+        entry_ir.WriteLocal(entry_ir.Imm32(index_cursor_of(stream)), entry_ir.Imm32(0U));
+    }
     for (u32 slot = 0; slot < ostride; ++slot) {
         entry_ir.WriteLocal(entry_ir.Imm32(output_base + slot), entry_ir.Imm32(0U));
     }
@@ -215,9 +224,14 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, u32 inpu
         block.PrependNewInst(at, IR::Opcode::WriteStorage32,
                              {IR::Value{binding}, IR::Value{byte}, IR::Value{value}});
     };
-    const auto index_word = [&](IR::IREmitter& ir, const IR::U32& slot) {
-        return IR::U32{ir.IAdd(ir.IMul(region, ir.Imm32(plan.IndexStride())),
-                               ir.IAdd(ir.Imm32(1U), slot))};
+    // Word `slot` of the index region of `stream` of the thread's region (the streams' regions
+    // follow one another a primitive at a time, Plan::RegionStride).
+    const auto region_start = [&](IR::IREmitter& ir, u32 stream) {
+        return IR::U32{ir.IAdd(ir.IMul(region, ir.Imm32(plan.RegionStride())),
+                               ir.Imm32(stream * plan.IndexStride()))};
+    };
+    const auto index_word = [&](IR::IREmitter& ir, u32 stream, const IR::U32& slot) {
+        return IR::U32{ir.IAdd(region_start(ir, stream), ir.IAdd(ir.Imm32(1U), slot))};
     };
 
     for (IR::Block* const block : program.blocks) {
@@ -263,16 +277,15 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, u32 inpu
                 break;
             }
             case IR::Opcode::EmitVertex: {
-                if (inst.Arg(0).U32() != 0) {
-                    // Only stream 0 is rasterized; the others are for transform feedback.
-                    inst.Invalidate();
-                    break;
-                }
-                const IR::U32 vertex_count{ir.LoadLocal(ir.Imm32(vertex_cursor))};
-                const IR::U32 index_count{ir.LoadLocal(ir.Imm32(index_cursor))};
+                const u32 stream = inst.Arg(0).U32();
+                const IR::U32 vertex_count{ir.LoadLocal(ir.Imm32(vertex_cursor_of(stream)))};
+                const IR::U32 index_count{ir.LoadLocal(ir.Imm32(index_cursor_of(stream)))};
                 const IR::U32 slot{ir.UMin(vertex_count, ir.Imm32(plan.max_vertices - 1))};
-                const IR::U32 vertex_id{
-                    ir.IAdd(ir.IMul(region, ir.Imm32(plan.max_vertices)), slot)};
+                // The streams' vertex regions follow one another a primitive at a time too.
+                const IR::U32 vertex_id{ir.IAdd(
+                    ir.IMul(IR::U32{ir.IAdd(ir.IMul(region, ir.Imm32(streams)), ir.Imm32(stream))},
+                            ir.Imm32(plan.max_vertices)),
+                    slot)};
                 const IR::U32 base{ir.IMul(vertex_id, ir.Imm32(ostride))};
                 const auto at = IR::Block::InstructionList::s_iterator_to(inst);
                 for (u32 s = 0; s < ostride; ++s) {
@@ -281,32 +294,35 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, u32 inpu
                           at);
                 }
                 const IR::U32 index_slot{ir.UMin(index_count, ir.Imm32(plan.index_slots - 1))};
-                store(ir, index_binding, index_word(ir, index_slot), vertex_id, *block, at);
-                ir.WriteLocal(ir.Imm32(vertex_cursor), IR::U32{ir.IAdd(vertex_count, ir.Imm32(1U))});
-                ir.WriteLocal(ir.Imm32(index_cursor), IR::U32{ir.IAdd(index_count, ir.Imm32(1U))});
+                store(ir, index_binding, index_word(ir, stream, index_slot), vertex_id, *block, at);
+                ir.WriteLocal(ir.Imm32(vertex_cursor_of(stream)),
+                              IR::U32{ir.IAdd(vertex_count, ir.Imm32(1U))});
+                ir.WriteLocal(ir.Imm32(index_cursor_of(stream)),
+                              IR::U32{ir.IAdd(index_count, ir.Imm32(1U))});
                 inst.Invalidate();
                 break;
             }
             case IR::Opcode::EndPrimitive:
             case IR::Opcode::Epilogue: {
-                if (inst.GetOpcode() == IR::Opcode::EndPrimitive && inst.Arg(0).U32() != 0) {
-                    inst.Invalidate();
-                    break;
-                }
-                const IR::U32 index_count{ir.LoadLocal(ir.Imm32(index_cursor))};
-                const IR::U32 index_slot{ir.UMin(index_count, ir.Imm32(plan.index_slots - 1))};
+                const bool epilogue = inst.GetOpcode() == IR::Opcode::Epilogue;
                 const auto at = IR::Block::InstructionList::s_iterator_to(inst);
-                store(ir, index_binding, index_word(ir, index_slot), ir.Imm32(0xFFFFFFFFU), *block,
-                      at);
-                const IR::U32 next{ir.IAdd(index_count, ir.Imm32(1U))};
-                ir.WriteLocal(ir.Imm32(index_cursor), next);
-                if (inst.GetOpcode() == IR::Opcode::Epilogue) {
-                    // The count of the thread's index region, what the compaction reads.
-                    const IR::U32 count{ir.UMin(next, ir.Imm32(plan.index_slots))};
-                    store(ir, index_binding,
-                          IR::U32{ir.IMul(region, ir.Imm32(plan.IndexStride()))}, count, *block,
-                          at);
-                } else {
+                // An EndPrimitive ends its stream's strip; the epilogue ends every stream's and
+                // writes the count of its index region, what the compaction reads.
+                for (u32 stream = epilogue ? 0 : inst.Arg(0).U32();
+                     stream < (epilogue ? streams : inst.Arg(0).U32() + 1); ++stream) {
+                    const IR::U32 index_count{ir.LoadLocal(ir.Imm32(index_cursor_of(stream)))};
+                    const IR::U32 index_slot{
+                        ir.UMin(index_count, ir.Imm32(plan.index_slots - 1))};
+                    store(ir, index_binding, index_word(ir, stream, index_slot),
+                          ir.Imm32(0xFFFFFFFFU), *block, at);
+                    const IR::U32 next{ir.IAdd(index_count, ir.Imm32(1U))};
+                    ir.WriteLocal(ir.Imm32(index_cursor_of(stream)), next);
+                    if (epilogue) {
+                        const IR::U32 count{ir.UMin(next, ir.Imm32(plan.index_slots))};
+                        store(ir, index_binding, region_start(ir, stream), count, *block, at);
+                    }
+                }
+                if (!epilogue) {
                     inst.Invalidate();
                 }
                 break;
@@ -341,7 +357,8 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, u32 inpu
 
 std::string RecordsSource(const Plan& plan, std::string_view entry,
                           std::span<const ShaderTranslate::InterfaceVariable> outputs,
-                          const std::map<IR::Attribute, IR::Attribute>& legacy_mapping) {
+                          const std::map<IR::Attribute, IR::Attribute>& legacy_mapping,
+                          std::string_view source_type) {
     std::string body;
     for (u32 slot = 0; slot < plan.InputStride(); ++slot) {
         body += fmt::format("    r[{}] = {};\n", slot,
@@ -349,7 +366,7 @@ std::string RecordsSource(const Plan& plan, std::string_view entry,
     }
     return fmt::format(R"(
 struct GeometryRecordsParams {{ uint records, vertices, step, count, primitives; }};
-kernel void geo_records(device const {0}_out* src [[buffer({1})]], device float* dst [[buffer({2})]],
+kernel void geo_records(device const {7}* src [[buffer({1})]], device float* dst [[buffer({2})]],
                         constant GeometryRecordsParams& j [[buffer({3})]],
                         uint n [[thread_position_in_grid]]) {{
     if (n >= j.records) {{
@@ -385,18 +402,27 @@ kernel void geo_records(device const {0}_out* src [[buffer({1})]], device float*
         }}
         s = (p / j.primitives) * j.count + uint(v[c]);
     }}
-    device const {0}_out& v = src[s];
+    device const {7}& v = src[s];
     device float* r = dst + ulong(n) * {4}u;
 {5}}}
 )",
                        entry, RecordsSourceSlot, RecordsOutputSlot, RecordsCountSlot,
-                       plan.InputStride(), body);
+                       plan.InputStride(), body, "",
+                       source_type.empty() ? fmt::format("{}_out", entry) : std::string{source_type});
 }
 
 std::string XfbSource(const Plan& plan, const Xfb::Layout& layout,
-                      const std::map<IR::Attribute, IR::Attribute>& legacy_mapping) {
+                      const std::map<IR::Attribute, IR::Attribute>& legacy_mapping, u32 stream) {
     std::string body;
+    // The buffers of this stream only; the strides of the others are zero here.
+    std::array<u32, Xfb::MaxBuffers> stride{};
+    for (u32 buffer = 0; buffer < Xfb::MaxBuffers; ++buffer) {
+        stride[buffer] = layout.State().layouts[buffer].stream == stream ? layout.Stride(buffer) : 0U;
+    }
     for (const Xfb::Varying& varying : Xfb::Varyings(layout)) {
+        if (stride[varying.buffer] == 0) {
+            continue;
+        }
         for (u32 component = 0; component < varying.components; ++component) {
             u32 word = varying.attribute + component;
             const auto mapped = legacy_mapping.find(static_cast<IR::Attribute>(word));
@@ -411,8 +437,11 @@ std::string XfbSource(const Plan& plan, const Xfb::Layout& layout,
         }
     }
     return fmt::format(R"(
+#ifndef GEO_XFB_PARAMS
+#define GEO_XFB_PARAMS
 struct GeometryXfbParams {{ uint capacity[4]; uint written[4]; uint vertices; }};
-kernel void geo_xfb(device const float* rec [[buffer(0)]], device const uint* list [[buffer(1)]],
+#endif
+kernel void {6}(device const float* rec [[buffer(0)]], device const uint* list [[buffer(1)]],
                     device uchar* dst0 [[buffer(2)]], device uchar* dst1 [[buffer(3)]],
                     device uchar* dst2 [[buffer(4)]], device uchar* dst3 [[buffer(5)]],
                     device const uint* args [[buffer(6)]], constant GeometryXfbParams& j [[buffer(7)]],
@@ -432,8 +461,8 @@ kernel void geo_xfb(device const float* rec [[buffer(0)]], device const uint* li
     device const float* r = rec + ulong(list[n]) * {4}u;
 {5}}}
 )",
-                       layout.Stride(0), layout.Stride(1), layout.Stride(2), layout.Stride(3),
-                       plan.OutputStride(), body);
+                       stride[0], stride[1], stride[2], stride[3], plan.OutputStride(), body,
+                       XfbEntryOf(stream));
 }
 
 std::string ReaderSource(const Plan& plan, bool convert_depth, bool flip_y,

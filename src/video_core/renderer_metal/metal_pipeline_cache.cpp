@@ -268,23 +268,25 @@ std::pair<void*, void*> GraphicsPipeline::GeometryKernelStates(const Device& dev
     return {it->second.Get(), geometry->records[variant].Get()};
 }
 
-void* GraphicsPipeline::GeometryXfbState(const Device& device) {
-    if (!geometry || !geometry->kernel.program.library) {
+void* GraphicsPipeline::GeometryXfbState(const Device& device, u32 stream) {
+    if (!geometry || !geometry->kernel.program.library || stream >= Geometry::MaxStreams) {
         return nullptr;
     }
-    if (!geometry->xfb_state) {
+    Object& state = geometry->xfb_states[stream];
+    if (!state) {
         std::string error;
         const Object function = CreateFunction(geometry->kernel.program.library.Get(),
-                                               std::string{Geometry::XfbEntry});
+                                               Geometry::XfbEntryOf(stream));
         if (function) {
-            geometry->xfb_state = CreateComputePipelineState(device, function.Get(), error, archive);
+            state = CreateComputePipelineState(device, function.Get(), error, archive);
         }
-        if (!geometry->xfb_state) {
-            LOG_ERROR(Render_Metal, "Metal: geometry transform feedback kernel of {:016x} failed: {}",
-                      key.unique_hashes[4], error);
+        if (!state) {
+            LOG_ERROR(Render_Metal,
+                      "Metal: geometry transform feedback kernel of {:016x} stream {} failed: {}",
+                      key.unique_hashes[4], stream, error);
         }
     }
-    return geometry->xfb_state.Get();
+    return state.Get();
 }
 
 void* GraphicsPipeline::KernelState(const Device& device, MeshKernel& kernel) {

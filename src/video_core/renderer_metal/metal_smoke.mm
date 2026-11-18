@@ -2933,6 +2933,744 @@ int RunGeometryCompute() {
     return passed ? 0 : 1;
 }
 
+/// The triangle lists the domain emulation makes for a geometry program, checked on the GPU
+/// without a draw: for patches of both domains, the three spacings and uneven edge and inside
+/// factors, every triangle of a patch must wind the same way and their areas must add up to the
+/// patch's (1/2 of the (u, v) plane for triangles, 1 for quads), with the triangle count the
+/// emulation's own formula gives (the count kernel's).
+int RunTessellationTriangleLists() {
+    namespace Translate = Metal::ShaderTranslate;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    struct Case {
+        bool quads;
+        Translate::TessellationModes::Spacing spacing;
+        std::array<float, 6> levels; ///< Edges 0-3 (triangles use 0-2), then the inside ones
+    };
+    using Spacing = Translate::TessellationModes::Spacing;
+    const std::array<Case, 20> cases{{
+        {false, Spacing::Equal, {4, 4, 4, 0, 4, 0}},
+        {false, Spacing::Equal, {3, 5, 7, 0, 6, 0}},
+        {false, Spacing::Equal, {1, 1, 1, 0, 1, 0}},
+        {false, Spacing::Equal, {2, 2, 2, 0, 2, 0}},
+        {false, Spacing::Equal, {8, 3, 5, 0, 2, 0}},
+        {false, Spacing::Equal, {64, 64, 64, 0, 63, 0}},
+        {false, Spacing::FractionalOdd, {3.3f, 5.7f, 2.2f, 0, 5.1f, 0}},
+        {false, Spacing::FractionalEven, {2.5f, 6.5f, 4.2f, 0, 7.7f, 0}},
+        {false, Spacing::Equal, {7, 7, 7, 0, 3, 0}},
+        {true, Spacing::Equal, {4, 4, 4, 4, 4, 4}},
+        {true, Spacing::Equal, {3, 5, 7, 2, 6, 3}},
+        {true, Spacing::Equal, {1, 1, 1, 1, 1, 1}},
+        {true, Spacing::Equal, {2, 2, 2, 2, 2, 2}},
+        {true, Spacing::Equal, {6, 6, 6, 6, 1, 5}},
+        {true, Spacing::Equal, {6, 6, 6, 6, 5, 1}},
+        {true, Spacing::Equal, {5, 9, 3, 4, 2, 9}},
+        {true, Spacing::Equal, {64, 64, 64, 64, 64, 64}},
+        {true, Spacing::FractionalOdd, {3.3f, 5.7f, 2.2f, 4.4f, 5.1f, 2.6f}},
+        {true, Spacing::FractionalEven, {2.5f, 6.5f, 4.2f, 3.1f, 7.7f, 4.4f}},
+        {true, Spacing::Equal, {16, 3, 16, 3, 8, 8}},
+    }};
+    std::string error;
+    uint32_t wrong_area = 0;
+    uint32_t wrong_winding = 0;
+    uint32_t wrong_count = 0;
+    uint32_t built = 0;
+    uint64_t triangles_total = 0;
+    for (const Case& test : cases) {
+        Translate::Options options;
+        options.tessellation.primitive = test.quads ? Translate::TessellationModes::Primitive::Quads
+                                                    : Translate::TessellationModes::Primitive::Triangles;
+        options.tessellation.spacing = test.spacing;
+        options.tessellation.clockwise = true;
+        options.tessellation.output_vertices = 3;
+        const Translate::Result vertex = Translate::SpirvToMsl(
+            std::span<const uint32_t>(TESS_SMOKE_VERT_SPV),
+            Translate::Stage::VertexForTessellation, options);
+        options.inputs = vertex.outputs;
+        const Translate::Result control = Translate::SpirvToMsl(
+            std::span<const uint32_t>(TESS_SMOKE_TESC_SPV),
+            Translate::Stage::TessellationControl, options);
+        options.inputs = control.outputs;
+        const Translate::Result evaluation = Translate::SpirvToMsl(
+            std::span<const uint32_t>(TESS_SMOKE_TESE_SPV),
+            Translate::Stage::TessellationEvaluation, options);
+        Translate::DomainEmulation emulation = Translate::EmulateDomain(
+            evaluation.source, evaluation.entry_point, options.tessellation, true);
+        if (!emulation.error.empty()) {
+            std::printf("metal-smoke: FAIL triangle lists: %s\n", emulation.error.c_str());
+            return 1;
+        }
+        const std::string source = emulation.source + R"(
+kernel void spvAreaTest(const device spvFactors_t* f [[buffer(0)]], device float* out [[buffer(1)]],
+                        uint p [[thread_position_in_grid]]) {
+    const spvFactors_t fac = f[p];
+    const uint t = spvPatchTriangles(fac);
+    float area = 0.0f;
+    uint negative = 0;
+    for (uint i = 0; i < t; ++i) {
+        const float3 a = spvTriangleCorner(fac, i, 0u);
+        const float3 b = spvTriangleCorner(fac, i, 1u);
+        const float3 c = spvTriangleCorner(fac, i, 2u);
+        const float ar = 0.5f * ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x));
+        area += abs(ar);
+        negative += ar < -1e-7f ? 1u : 0u;
+    }
+    out[p * 4u] = area;
+    out[p * 4u + 1u] = float(t);
+    out[p * 4u + 2u] = float(negative);
+    out[p * 4u + 3u] = float(spvPatchPoints(fac));
+}
+)";
+        const Metal::Object library = Metal::CreateLibrary(device, source, error);
+        const Metal::Object function =
+            library ? Metal::CreateFunction(library.Get(), "spvAreaTest") : Metal::Object{};
+        const Metal::Object kernel =
+            function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                     : Metal::Object{};
+        if (!kernel) {
+            std::printf("metal-smoke: FAIL triangle lists build: %s\n", error.c_str());
+            return 1;
+        }
+        ++built;
+        uint8_t* factors = nullptr;
+        uint8_t* result = nullptr;
+        const Metal::Object factor_buffer = Metal::CreateBuffer(device, 64, true, &factors);
+        const Metal::Object result_buffer = Metal::CreateBuffer(device, 64, true, &result);
+        std::memset(factors, 0, 64);
+        std::array<_Float16, 6> half_levels{};
+        for (size_t i = 0; i < 6; ++i) {
+            half_levels[i] = static_cast<_Float16>(test.levels[i]);
+        }
+        if (test.quads) {
+            std::memcpy(factors, half_levels.data(), 12);
+        } else {
+            // MTLTriangleTessellationFactorsHalf: three edges, then the inside one.
+            const std::array<_Float16, 4> triangle{half_levels[0], half_levels[1], half_levels[2],
+                                                   half_levels[4]};
+            std::memcpy(factors, triangle.data(), 8);
+        }
+        scheduler.BeginCompute(kernel.Get());
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, factor_buffer.Get(), 0);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, result_buffer.Get(), 0);
+        scheduler.Dispatch({1, 1, 1}, {1, 1, 1});
+        scheduler.Finish();
+        const auto* values = reinterpret_cast<const float*>(result);
+        const float expected_area = test.quads ? 1.0f : 0.5f;
+        triangles_total += static_cast<uint64_t>(values[1]);
+        if (std::abs(values[0] - expected_area) > 2e-4f * expected_area) {
+            ++wrong_area;
+            std::printf("  triangle list case %s %zu: area %f (expected %f), %f triangles\n",
+                        test.quads ? "quads" : "triangles", &test - cases.data(), values[0],
+                        expected_area, values[1]);
+        }
+        wrong_winding += values[2] != 0.0f ? 1U : 0U;
+        wrong_count += values[1] <= 0.0f ? 1U : 0U;
+    }
+    const bool passed = wrong_area == 0 && wrong_winding == 0 && wrong_count == 0 &&
+                        built == cases.size();
+    std::printf("metal-smoke: tessellation triangle lists (%u patches over both domains, three "
+                "spacings, uneven factors, %llu triangles: %u with a wrong total area, %u with "
+                "reversed triangles, %u empty): %s\n",
+                built, static_cast<unsigned long long>(triangles_total), wrong_area, wrong_winding,
+                wrong_count, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// A geometry program after tessellation, as the renderer runs it: a triangle patch through the
+/// vertex kernel, the control kernel, the domain emulation's count and evaluate kernels in
+/// triangle-list mode (every triangle of the tessellation as three evaluated corners), the feed
+/// kernel that turns the GPU-side vertex count into the later kernels' parameters and dispatch
+/// sizes, the records kernel over the evaluated vertices, the geometry kernel (each input triangle
+/// out again moved right by 0.15) and the compaction, then the indirect indexed draw. The pixels
+/// say the whole patch was tessellated (no holes: about the patch's area), and that the geometry
+/// program ran on it (the moved edges).
+int RunTessellationGeometry() {
+    namespace IR = Shader::IR;
+    namespace Translate = Metal::ShaderTranslate;
+    using Maxwell = Metal::Maxwell;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Metal::PipelineTranslator translator(false, 0, false);
+    Translate::Options options;
+    const Translate::Result vertex = Translate::SpirvToMsl(
+        std::span<const uint32_t>(TESS_SMOKE_VERT_SPV), Translate::Stage::VertexForTessellation,
+        options);
+    options.inputs = vertex.outputs;
+    options.tessellation.output_vertices = 3;
+    const Translate::Result control = Translate::SpirvToMsl(
+        std::span<const uint32_t>(TESS_SMOKE_TESC_SPV), Translate::Stage::TessellationControl,
+        options);
+    options.inputs = control.outputs;
+    // The geometry program reads the evaluation's own outputs: the reader does the flip.
+    options.flip_vertex_y = false;
+    const Translate::Result evaluation = Translate::SpirvToMsl(
+        std::span<const uint32_t>(TESS_SMOKE_TESE_SPV), Translate::Stage::TessellationEvaluation,
+        options);
+    if (vertex.source.empty() || control.source.empty() || evaluation.source.empty()) {
+        std::printf("metal-smoke: FAIL tessellation geometry SPIR-V -> MSL: %s %s %s\n",
+                    vertex.error.c_str(), control.error.c_str(), evaluation.error.c_str());
+        return 1;
+    }
+    Translate::DomainEmulation emulation = Translate::EmulateDomain(
+        evaluation.source, evaluation.entry_point, options.tessellation, true);
+    if (!emulation.error.empty() || !emulation.triangles) {
+        std::printf("metal-smoke: FAIL tessellation geometry domain emulation: %s\n",
+                    emulation.error.c_str());
+        return 1;
+    }
+
+    // The geometry program: each input triangle out again, moved right.
+    Shader::ObjectPool<IR::Inst> insts{512};
+    Shader::ObjectPool<IR::Block> blocks{16};
+    IR::Program program;
+    program.stage = Shader::Stage::Geometry;
+    program.invocations = 1;
+    program.output_topology = Shader::OutputTopology::TriangleStrip;
+    program.output_vertices = 3;
+    IR::Block* const body = blocks.Create(insts);
+    IR::Block* const tail = blocks.Create(insts);
+    IR::IREmitter ir{*body};
+    for (uint32_t corner = 0; corner < 3; ++corner) {
+        const IR::F32 x = ir.GetAttribute(IR::Attribute::PositionX, ir.Imm32(corner));
+        const IR::F32 y = ir.GetAttribute(IR::Attribute::PositionY, ir.Imm32(corner));
+        ir.SetAttribute(IR::Attribute::PositionX, ir.FPAdd(x, ir.Imm32(0.15f)), ir.Imm32(0U));
+        ir.SetAttribute(IR::Attribute::PositionY, y, ir.Imm32(0U));
+        ir.SetAttribute(IR::Attribute::PositionZ, ir.Imm32(0.0f), ir.Imm32(0U));
+        ir.SetAttribute(IR::Attribute::PositionW, ir.Imm32(1.0f), ir.Imm32(0U));
+        ir.SetAttribute(IR::Attribute::Generic0X, ir.Imm32(0.0f), ir.Imm32(0U));
+        ir.SetAttribute(IR::Attribute::Generic0Y, ir.Imm32(1.0f), ir.Imm32(0U));
+        ir.SetAttribute(IR::Attribute::Generic0Z, ir.Imm32(0.0f), ir.Imm32(0U));
+        ir.SetAttribute(IR::Attribute::Generic0W, ir.Imm32(1.0f), ir.Imm32(0U));
+        ir.EmitVertex(ir.Imm32(0U));
+    }
+    IR::IREmitter{*tail}.Epilogue();
+    body->AddBranch(tail);
+    program.syntax_list.emplace_back().type = IR::AbstractSyntaxNode::Type::Block;
+    program.syntax_list.back().data.block = body;
+    program.syntax_list.emplace_back().type = IR::AbstractSyntaxNode::Type::Block;
+    program.syntax_list.back().data.block = tail;
+    program.syntax_list.emplace_back().type = IR::AbstractSyntaxNode::Type::Return;
+    program.blocks = {body, tail};
+    program.post_order_blocks = {tail, body};
+    program.info.loads.Set(IR::Attribute::PositionX);
+    program.info.loads.Set(IR::Attribute::PositionY);
+    for (u32 element = 0; element < 4; ++element) {
+        program.info.stores.Set(IR::Attribute::PositionX + element);
+        program.info.stores.Set(IR::Attribute::Generic0X + element);
+    }
+    std::string why;
+    const std::optional<Metal::Geometry::Plan> plan = Metal::Geometry::Transform(program, 3, 3, why);
+    if (!plan) {
+        std::printf("metal-smoke: FAIL tessellation geometry transform: %s\n", why.c_str());
+        return 1;
+    }
+    std::optional<Metal::StageProgram> kernel = translator.GeometryKernel(program);
+    if (!kernel) {
+        std::printf("metal-smoke: FAIL tessellation geometry kernel: %s %s\n",
+                    std::string{translator.Cause()}.c_str(), std::string{translator.Detail()}.c_str());
+        return 1;
+    }
+    std::vector<Translate::ResourceSlot> buffers;
+    for (const auto& slot : kernel->slots) {
+        if (slot.kind == Translate::ResourceKind::Buffer && slot.set != Translate::PushConstantSet) {
+            buffers.push_back(slot);
+        }
+    }
+    std::ranges::sort(buffers, {}, &Translate::ResourceSlot::binding);
+    if (buffers.size() != Metal::Geometry::ExtraBuffers) {
+        std::printf("metal-smoke: FAIL tessellation geometry kernel has %zu buffers\n", buffers.size());
+        return 1;
+    }
+
+    std::string error;
+    const auto library_of = [&](const std::string& source) {
+        return Metal::CreateLibrary(device, source, error);
+    };
+    const auto state_of = [&](const Metal::Object& library, const std::string& entry) {
+        const Metal::Object function =
+            library ? Metal::CreateFunction(library.Get(), entry) : Metal::Object{};
+        return function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                        : Metal::Object{};
+    };
+    const Metal::Object vertex_library = library_of(vertex.source);
+    const Metal::Object control_library = library_of(control.source);
+    // The domain emulation's kernels and the records kernel over the evaluated vertices.
+    const std::string domain_source =
+        emulation.source +
+        Metal::Geometry::RecordsSource(*plan, "spvDomain", evaluation.outputs, {}, "spvDomainVertex");
+    const Metal::Object domain_library = library_of(domain_source);
+    const Metal::Object geometry_library = library_of(kernel->msl);
+    const Metal::Object pack_library = library_of(std::string{Metal::Geometry::PackSource});
+    const Metal::Object quad_library = library_of(QuadSource);
+    const std::string reader_source = Metal::Geometry::ReaderSource(*plan, false, false, 1.0f);
+    const Metal::Object reader_library = library_of(reader_source);
+    const Metal::Object vertex_function =
+        vertex_library ? Metal::CreateFunction(vertex_library.Get(), vertex.entry_point)
+                       : Metal::Object{};
+    auto layout = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    layout.attributes[0] = {1, 0, 0, Maxwell::VertexAttribute::Type::Float,
+                            Maxwell::VertexAttribute::Size::Size_R32_G32};
+    layout.streams[0] = {1, 8, 0};
+    const Metal::Object vertex_kernel =
+        vertex_function ? Metal::CreateStageInComputePipelineState(
+                              device, vertex_function.Get(), layout, 0,
+                              vertex.tessellation_slots.index, error)
+                        : Metal::Object{};
+    const Metal::Object control_kernel = state_of(control_library, control.entry_point);
+    const Metal::Object count_kernel = state_of(domain_library, emulation.count_entry);
+    const Metal::Object evaluate_kernel = state_of(domain_library, emulation.evaluate_entry);
+    const Metal::Object records_kernel =
+        state_of(domain_library, std::string{Metal::Geometry::RecordsEntry});
+    const Metal::Object geometry_kernel = state_of(geometry_library, kernel->entry_point);
+    const Metal::Object feed_kernel = state_of(pack_library, std::string{Metal::Geometry::FeedEntry});
+    const Metal::Object pack_count = state_of(pack_library, "geo_count");
+    const Metal::Object pack_scan = state_of(pack_library, "geo_scan");
+    const Metal::Object pack_write = state_of(pack_library, "geo_write");
+    const Metal::Object fragment =
+        quad_library ? Metal::CreateFunction(quad_library.Get(), "quad_fragment") : Metal::Object{};
+    const Metal::Object reader =
+        reader_library ? Metal::CreateFunction(reader_library.Get(),
+                                               std::string{Metal::Geometry::ReaderEntry})
+                       : Metal::Object{};
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = reader.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    const Metal::Object pipeline =
+        reader ? Metal::CreateRenderPipelineState(device, desc, error) : Metal::Object{};
+    const Metal::Object depth_stencil =
+        Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+    if (!vertex_kernel || !control_kernel || !count_kernel || !evaluate_kernel || !records_kernel ||
+        !geometry_kernel || !feed_kernel || !pack_count || !pack_scan || !pack_write || !pipeline ||
+        !depth_stencil) {
+        std::printf("metal-smoke: FAIL tessellation geometry functions: %s\n%s\n", error.c_str(),
+                    domain_source.c_str());
+        return 1;
+    }
+
+    const auto buffer = [&](uint64_t bytes, uint8_t** contents) {
+        Metal::Object object = Metal::CreateBuffer(device, bytes, true, contents);
+        std::memset(*contents, 0, bytes);
+        return object;
+    };
+    constexpr uint32_t Capacity = 1024;
+    const uint32_t max_primitives = Capacity / 3;
+    const uint32_t rounded = (max_primitives + 63) / 64 * 64;
+    const uint32_t list_words = max_primitives * plan->max_vertices * 3;
+    uint8_t* positions = nullptr;
+    uint8_t* scratch = nullptr;
+    uint8_t* arguments = nullptr;
+    uint8_t* tess_arguments = nullptr;
+    uint8_t* tess_factors = nullptr;
+    uint8_t* readback = nullptr;
+    const Metal::Object position_buffer = buffer(24, &positions);
+    const float corners[6]{-0.8f, -0.8f, 0.8f, -0.8f, -0.8f, 0.8f};
+    std::memcpy(positions, corners, sizeof(corners));
+    const Metal::Object vertex_out = buffer(4 * 128, &scratch);
+    const Metal::Object control_out = buffer(32 * 128, &scratch);
+    const Metal::Object patch_out = buffer(64, &scratch);
+    const Metal::Object factors_out = buffer(64, &tess_factors);
+    const Metal::Object captured_out = buffer(uint64_t{Capacity} * emulation.vertex_stride, &scratch);
+    const Metal::Object offsets_out = buffer(64, &scratch);
+    const Metal::Object tess_args = buffer(16, &tess_arguments);
+    const Metal::Object records = buffer(uint64_t{rounded} * plan->input_vertices * plan->InputStride() * 4, &scratch);
+    const Metal::Object output = buffer(uint64_t{rounded} * plan->max_vertices * plan->OutputStride() * 4, &scratch);
+    const Metal::Object regions = buffer(uint64_t{rounded} * plan->RegionStride() * 4, &scratch);
+    const Metal::Object list = buffer(list_words * 4, &scratch);
+    const Metal::Object counts = buffer(max_primitives * 4, &scratch);
+    const Metal::Object args = buffer(32, &arguments);
+    const Metal::Object prepared = buffer(Metal::Geometry::FeedBytes, &scratch);
+    const auto bind = [&](uint32_t slot, const Metal::Object& object, uint64_t offset = 0) {
+        if (slot != ~0U) {
+            scheduler.BindBuffer(Metal::ShaderStage::Compute, slot, object.Get(), offset);
+        }
+    };
+    scheduler.BeginCompute(vertex_kernel.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::VertexBufferSlot(0),
+                         position_buffer.Get(), 0);
+    bind(vertex.tessellation_slots.output, vertex_out);
+    scheduler.DispatchStageIn(0, 3, 0, 1);
+    scheduler.BeginCompute(control_kernel.Get());
+    bind(control.tessellation_slots.input, vertex_out);
+    bind(control.tessellation_slots.output, control_out);
+    bind(control.tessellation_slots.patch_output, patch_out);
+    bind(control.tessellation_slots.tess_factors, factors_out);
+    const std::array<uint32_t, 2> control_params{3, 1};
+    scheduler.BindBytes(Metal::ShaderStage::Compute, control.tessellation_slots.indirect_params,
+                        control_params.data(), sizeof(control_params));
+    const uint32_t per_group = (std::max)(32U / options.tessellation.output_vertices, 1U);
+    scheduler.Dispatch({1, 1, 1}, {per_group * options.tessellation.output_vertices, 1, 1});
+    const Translate::DomainParams domain_params{1, Capacity, {0, 0}};
+    scheduler.BeginCompute(count_kernel.Get());
+    bind(emulation.factors_slot, factors_out);
+    scheduler.BindBytes(Metal::ShaderStage::Compute, emulation.params_slot, &domain_params,
+                        sizeof(domain_params));
+    bind(emulation.offsets_slot, offsets_out);
+    bind(emulation.args_slot, tess_args);
+    scheduler.Dispatch({1, 1, 1}, {1, 1, 1});
+    scheduler.BeginCompute(evaluate_kernel.Get());
+    bind(evaluation.tessellation_slots.input, control_out);
+    bind(evaluation.tessellation_slots.patch_input, patch_out);
+    bind(emulation.level_slot, factors_out);
+    bind(emulation.factors_slot, factors_out);
+    scheduler.BindBytes(Metal::ShaderStage::Compute, emulation.params_slot, &domain_params,
+                        sizeof(domain_params));
+    bind(emulation.offsets_slot, offsets_out);
+    bind(emulation.output_slot, captured_out);
+    scheduler.Dispatch({1, 1, 1}, {Translate::DomainThreads, 1, 1});
+    // The feed kernel: the vertex count the count kernel wrote, as everything after it is sized.
+    const Metal::Geometry::GeometryFeed feed{
+        .input_vertices = plan->input_vertices,
+        .invocations = plan->invocations,
+        .streams = plan->streams,
+        .stride = plan->RegionStride(),
+        .width = plan->IndexStride(),
+        .topology = plan->output_topology,
+        .capacity = list_words,
+        .max_primitives = max_primitives,
+    };
+    scheduler.BeginCompute(feed_kernel.Get());
+    bind(0, tess_args);
+    bind(1, prepared);
+    scheduler.BindBytes(Metal::ShaderStage::Compute, 2, &feed, sizeof(feed));
+    scheduler.Dispatch({1, 1, 1}, {1, 1, 1});
+    scheduler.BeginCompute(records_kernel.Get());
+    bind(Metal::Geometry::RecordsSourceSlot, captured_out);
+    bind(Metal::Geometry::RecordsOutputSlot, records);
+    bind(Metal::Geometry::RecordsCountSlot, prepared, Metal::Geometry::FeedRecordsWord * 4);
+    scheduler.DispatchIndirect(prepared.Get(), Metal::Geometry::FeedRecordsDispatch * 4, {64, 1, 1});
+    scheduler.BeginCompute(geometry_kernel.Get());
+    bind(buffers[0].index, records);
+    bind(buffers[1].index, output);
+    bind(buffers[2].index, regions);
+    scheduler.DispatchIndirect(prepared.Get(), Metal::Geometry::FeedGeometryDispatch * 4, {64, 1, 1});
+    for (const Metal::Object* pack : {&pack_count, &pack_scan, &pack_write}) {
+        scheduler.BeginCompute(pack->Get());
+        bind(0, regions);
+        bind(1, list);
+        bind(2, args);
+        bind(3, counts);
+        bind(4, prepared, Metal::Geometry::FeedStreamWord(0) * 4);
+        if (pack == &pack_scan) {
+            scheduler.Dispatch({1, 1, 1}, {64, 1, 1});
+        } else {
+            scheduler.DispatchIndirect(prepared.Get(), Metal::Geometry::FeedPackDispatch * 4,
+                                       {64, 1, 1});
+        }
+    }
+
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm),
+                 .width = Size,
+                 .height = Size,
+                 .render_target = true});
+    const Metal::Object readback_buffer = buffer(Size * Size * 4, &readback);
+    Metal::ClearPass clear{};
+    clear.color[0] = {.texture = target.Get()};
+    clear.clear_color[0] = true;
+    clear.color_value[0] = {1.0, 0.0, 0.0, 1.0};
+    clear.width = Size;
+    clear.height = Size;
+    scheduler.Clear(clear);
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = Size;
+    targets.height = Size;
+    scheduler.BeginRendering(targets);
+    Metal::DrawState state{};
+    state.pipeline = pipeline.Get();
+    state.depth_stencil = depth_stencil.Get();
+    state.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+    state.scissor = {0, 0, Size, Size};
+    scheduler.SetDrawState(state);
+    scheduler.VisibilityResults()[2] = 0;
+    scheduler.SetVisibility(2);
+    scheduler.BindBuffer(Metal::ShaderStage::Vertex, 0, output.Get(), 0);
+    scheduler.DrawIndexedIndirect(*Metal::PrimitiveType(Maxwell::PrimitiveTopology::Triangles), 4,
+                                  list.Get(), 0, args.Get(), 0);
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Size, Size, 1}, readback_buffer.Get(), 0,
+                                  Size * 4, 0);
+    scheduler.Finish();
+    const auto* texels = reinterpret_cast<const Texel*>(readback);
+    const uint64_t samples = scheduler.VisibilityResults()[2];
+    const uint32_t evaluated = reinterpret_cast<const uint32_t*>(tess_arguments)[0];
+    const uint32_t listed = reinterpret_cast<const uint32_t*>(arguments)[0];
+    const auto at = [&](float x, float y) {
+        return texels[static_cast<uint32_t>((1.0f - y) / 2.0f * Size) * Size +
+                      static_cast<uint32_t>((x + 1.0f) / 2.0f * Size)];
+    };
+    // The patch (-0.8,-0.8), (0.8,-0.8), (-0.8,0.8) moved right by 0.15: its left edge is at
+    // x = -0.65, its hypotenuse x + y = 0.15.
+    const Texel gone = at(-0.75f, -0.5f);    // in the patch, not in the moved copy
+    const Texel kept = at(0.05f, -0.6f);     // in both
+    const Texel gained = at(0.5f, -0.45f);   // only in the moved copy
+    const Texel outside = at(0.5f, 0.5f);
+    // 16 triangles of 3 corners; the area of the patch (1.28 of 4) over 4096 pixels is 1311.
+    const bool counts_ok = evaluated == 48 && listed == 48;
+    const bool passed = counts_ok && Near(gone, {255, 0, 0, 255}) && Near(kept, {0, 255, 0, 255}) &&
+                        Near(gained, {0, 255, 0, 255}) && Near(outside, {255, 0, 0, 255}) &&
+                        samples > 1250 && samples < 1370;
+    std::printf("metal-smoke: tessellation + geometry (triangle patch level 4 -> %u evaluated "
+                "corners -> geometry program -> %u list indices): left edge %u,%u,%u inside "
+                "%u,%u,%u moved hypotenuse %u,%u,%u outside %u,%u,%u, %llu samples (about 1311): %s\n",
+                evaluated, listed, gone.r, gone.g, gone.b, kept.r, kept.g, kept.b, gained.r,
+                gained.g, gained.b, outside.r, outside.g, outside.b,
+                static_cast<unsigned long long>(samples), passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// Geometry output streams (EmitStreamVertex 1-3): a program that emits a triangle to stream 0
+/// and another to stream 1, with a capture buffer for each stream. The compaction runs once per
+/// stream over the stream's own index regions, and each stream's gather kernel (Geometry::
+/// XfbSource) fills only its buffers; nothing of one stream may reach the other's buffer.
+int RunGeometryStreams() {
+    namespace IR = Shader::IR;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Metal::PipelineTranslator translator(false, 0, false);
+    Shader::ObjectPool<IR::Inst> insts{512};
+    Shader::ObjectPool<IR::Block> blocks{16};
+    IR::Program program;
+    program.stage = Shader::Stage::Geometry;
+    program.invocations = 1;
+    program.output_topology = Shader::OutputTopology::TriangleStrip;
+    program.output_vertices = 3;
+    IR::Block* const body = blocks.Create(insts);
+    IR::Block* const tail = blocks.Create(insts);
+    IR::IREmitter ir{*body};
+    const IR::F32 cx = ir.GetAttribute(IR::Attribute::PositionX, ir.Imm32(0U));
+    const IR::F32 cy = ir.GetAttribute(IR::Attribute::PositionY, ir.Imm32(0U));
+    const auto emit = [&](uint32_t stream, float dx, float dy, float generic) {
+        // Generic 0 xy repeat the position, so each stream's buffer shows where its vertex was.
+        ir.SetAttribute(IR::Attribute::PositionX, ir.FPAdd(cx, ir.Imm32(dx)), ir.Imm32(0U));
+        ir.SetAttribute(IR::Attribute::PositionY, ir.FPAdd(cy, ir.Imm32(dy)), ir.Imm32(0U));
+        ir.SetAttribute(IR::Attribute::PositionZ, ir.Imm32(0.0f), ir.Imm32(0U));
+        ir.SetAttribute(IR::Attribute::PositionW, ir.Imm32(1.0f), ir.Imm32(0U));
+        ir.SetAttribute(IR::Attribute::Generic0X, ir.FPAdd(cx, ir.Imm32(dx)), ir.Imm32(0U));
+        ir.SetAttribute(IR::Attribute::Generic0Y, ir.FPAdd(cy, ir.Imm32(dy)), ir.Imm32(0U));
+        ir.SetAttribute(IR::Attribute::Generic0Z, ir.Imm32(0.0f), ir.Imm32(0U));
+        ir.SetAttribute(IR::Attribute::Generic0W, ir.Imm32(1.0f), ir.Imm32(0U));
+        ir.EmitVertex(ir.Imm32(stream));
+    };
+    // The streams interleave: the staging attributes are the last ones set before each emit.
+    emit(0, -0.2f, -0.2f, 10.0f);
+    emit(1, 0.0f, 0.5f, 20.0f);
+    emit(0, 0.2f, -0.2f, 11.0f);
+    emit(1, 0.1f, 0.5f, 21.0f);
+    emit(0, 0.0f, 0.2f, 12.0f);
+    emit(1, 0.2f, 0.5f, 22.0f);
+    IR::IREmitter{*tail}.Epilogue();
+    body->AddBranch(tail);
+    program.syntax_list.emplace_back().type = IR::AbstractSyntaxNode::Type::Block;
+    program.syntax_list.back().data.block = body;
+    program.syntax_list.emplace_back().type = IR::AbstractSyntaxNode::Type::Block;
+    program.syntax_list.back().data.block = tail;
+    program.syntax_list.emplace_back().type = IR::AbstractSyntaxNode::Type::Return;
+    program.blocks = {body, tail};
+    program.post_order_blocks = {tail, body};
+    program.info.loads.Set(IR::Attribute::PositionX);
+    program.info.loads.Set(IR::Attribute::PositionY);
+    for (u32 element = 0; element < 4; ++element) {
+        program.info.stores.Set(IR::Attribute::PositionX + element);
+        program.info.stores.Set(IR::Attribute::Generic0X + element);
+    }
+    std::string why;
+    const std::optional<Metal::Geometry::Plan> plan = Metal::Geometry::Transform(program, 1, 1, why);
+    if (!plan || plan->streams != 2) {
+        std::printf("metal-smoke: FAIL geometry streams transform: %s (streams %u)\n", why.c_str(),
+                    plan ? plan->streams : 0U);
+        return 1;
+    }
+    // Buffer 0 takes stream 0's position xyz (12 bytes); buffer 1 stream 1's generic 0 xy (8).
+    VideoCommon::TransformFeedbackState state{};
+    state.layouts[0] = {.stream = 0, .varying_count = 3, .stride = 12};
+    state.layouts[1] = {.stream = 1, .varying_count = 2, .stride = 8};
+    const std::array<std::array<uint32_t, 3>, 2> attributes{{{28, 29, 30}, {32, 33, 0}}};
+    for (size_t buffer = 0; buffer < 2; ++buffer) {
+        const auto& words = attributes[buffer];
+        for (size_t index = 0; index < (buffer == 0 ? 3U : 2U); ++index) {
+            auto& layout = state.varyings[buffer][index / 4];
+            switch (index % 4) {
+            case 0:
+                layout.attribute0.Assign(words[index]);
+                break;
+            case 1:
+                layout.attribute1.Assign(words[index]);
+                break;
+            case 2:
+                layout.attribute2.Assign(words[index]);
+                break;
+            default:
+                layout.attribute3.Assign(words[index]);
+                break;
+            }
+        }
+    }
+    Metal::Xfb::Layout layout;
+    std::memcpy(layout.words.data(), &state, sizeof(state));
+    std::optional<Metal::StageProgram> kernel = translator.GeometryKernel(program);
+    if (!kernel) {
+        std::printf("metal-smoke: FAIL geometry streams kernel: %s %s\n",
+                    std::string{translator.Cause()}.c_str(), std::string{translator.Detail()}.c_str());
+        return 1;
+    }
+    std::vector<Metal::ShaderTranslate::ResourceSlot> buffers;
+    for (const auto& slot : kernel->slots) {
+        if (slot.kind == Metal::ShaderTranslate::ResourceKind::Buffer &&
+            slot.set != Metal::ShaderTranslate::PushConstantSet) {
+            buffers.push_back(slot);
+        }
+    }
+    std::ranges::sort(buffers, {}, &Metal::ShaderTranslate::ResourceSlot::binding);
+    if (buffers.size() != Metal::Geometry::ExtraBuffers) {
+        std::printf("metal-smoke: FAIL geometry streams kernel has %zu buffers\n", buffers.size());
+        return 1;
+    }
+    kernel->msl += Metal::Geometry::XfbSource(*plan, layout, {}, 0);
+    kernel->msl += Metal::Geometry::XfbSource(*plan, layout, {}, 1);
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, kernel->msl, error);
+    const auto state_of = [&](const std::string& entry) {
+        const Metal::Object function =
+            library ? Metal::CreateFunction(library.Get(), entry) : Metal::Object{};
+        return function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                        : Metal::Object{};
+    };
+    const Metal::Object geometry_kernel = state_of(kernel->entry_point);
+    const Metal::Object xfb0 = state_of(Metal::Geometry::XfbEntryOf(0));
+    const Metal::Object xfb1 = state_of(Metal::Geometry::XfbEntryOf(1));
+    const Metal::Object pack_library =
+        Metal::CreateLibrary(device, std::string{Metal::Geometry::PackSource}, error);
+    const auto pack_state = [&](const char* name) {
+        const Metal::Object function =
+            pack_library ? Metal::CreateFunction(pack_library.Get(), name) : Metal::Object{};
+        return function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                        : Metal::Object{};
+    };
+    const Metal::Object count_kernel = pack_state("geo_count");
+    const Metal::Object scan_kernel = pack_state("geo_scan");
+    const Metal::Object write_kernel = pack_state("geo_write");
+    if (!geometry_kernel || !xfb0 || !xfb1 || !count_kernel || !scan_kernel || !write_kernel) {
+        std::printf("metal-smoke: FAIL geometry streams functions: %s\n%s\n", error.c_str(),
+                    kernel->msl.c_str());
+        return 1;
+    }
+    constexpr uint32_t Rounded = Metal::Geometry::GroupSize;
+    const auto buffer = [&](uint64_t bytes, uint8_t** contents) {
+        Metal::Object object = Metal::CreateBuffer(device, bytes, true, contents);
+        std::memset(*contents, 0, bytes);
+        return object;
+    };
+    uint8_t* records_data = nullptr;
+    uint8_t* scratch = nullptr;
+    uint8_t* arguments0 = nullptr;
+    uint8_t* arguments1 = nullptr;
+    uint8_t* captured0 = nullptr;
+    uint8_t* captured1 = nullptr;
+    const Metal::Object records = buffer(uint64_t{Rounded + 1} * plan->InputStride() * 4, &records_data);
+    const float point[2]{-0.5f, 0.25f};
+    std::memcpy(records_data, point, sizeof(point));
+    const Metal::Object output = buffer(
+        uint64_t{Rounded} * plan->streams * plan->max_vertices * plan->OutputStride() * 4, &scratch);
+    const Metal::Object regions =
+        buffer(uint64_t{Rounded} * plan->RegionStride() * 4, &scratch);
+    const uint32_t capacity = plan->max_vertices * 3;
+    const Metal::Object list0 = buffer(capacity * 4, &scratch);
+    const Metal::Object list1 = buffer(capacity * 4, &scratch);
+    const Metal::Object counts = buffer(4, &scratch);
+    const Metal::Object args0 = buffer(32, &arguments0);
+    const Metal::Object args1 = buffer(32, &arguments1);
+    const Metal::Object capture0 = buffer(256, &captured0);
+    const Metal::Object capture1 = buffer(256, &captured1);
+    const Metal::Object unused = buffer(16, &scratch);
+
+    scheduler.BeginCompute(geometry_kernel.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, buffers[0].index, records.Get(), 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, buffers[1].index, output.Get(), 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, buffers[2].index, regions.Get(), 0);
+    scheduler.Dispatch({1, 1, 1}, {Metal::Geometry::GroupSize, 1, 1});
+    const auto compact = [&](uint32_t stream, const Metal::Object& list, const Metal::Object& args) {
+        const Metal::Geometry::GeometryParams params{
+            .groups = 1,
+            .stride = plan->RegionStride(),
+            .topology = plan->output_topology,
+            .capacity = capacity,
+            .base = stream * plan->IndexStride(),
+            .width = plan->IndexStride(),
+        };
+        for (const Metal::Object* pack : {&count_kernel, &scan_kernel, &write_kernel}) {
+            scheduler.BeginCompute(pack->Get());
+            scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, regions.Get(), 0);
+            scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, list.Get(), 0);
+            scheduler.BindBuffer(Metal::ShaderStage::Compute, 2, args.Get(), 0);
+            scheduler.BindBuffer(Metal::ShaderStage::Compute, 3, counts.Get(), 0);
+            scheduler.BindBytes(Metal::ShaderStage::Compute, 4, &params, sizeof(params));
+            scheduler.Dispatch({1, 1, 1}, {64, 1, 1});
+        }
+    };
+    compact(0, list0, args0);
+    compact(1, list1, args1);
+    const auto capture = [&](const Metal::Object& kernel_state, const Metal::Object& list,
+                             const Metal::Object& args, const Metal::Object& buffer0,
+                             const Metal::Object& buffer1) {
+        Metal::Geometry::XfbParams params{};
+        params.capacity = {256, 256, 0, 0};
+        params.vertices = 3;
+        scheduler.BeginCompute(kernel_state.Get());
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::Geometry::XfbRecordsSlot, output.Get(), 0);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::Geometry::XfbListSlot, list.Get(), 0);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::Geometry::XfbBufferSlot, buffer0.Get(), 0);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::Geometry::XfbBufferSlot + 1, buffer1.Get(), 0);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::Geometry::XfbBufferSlot + 2, unused.Get(), 0);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::Geometry::XfbBufferSlot + 3, unused.Get(), 0);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::Geometry::XfbArgsSlot, args.Get(), 0);
+        scheduler.BindBytes(Metal::ShaderStage::Compute, Metal::Geometry::XfbParamsSlot, &params,
+                            sizeof(params));
+        scheduler.Dispatch({1, 1, 1}, {64, 1, 1});
+    };
+    // Stream 0's kernel gathers into buffer 0, stream 1's into buffer 1.
+    capture(xfb0, list0, args0, capture0, capture1);
+    capture(xfb1, list1, args1, capture0, capture1);
+    scheduler.Finish();
+    const auto* first = reinterpret_cast<const float*>(captured0);
+    const auto* second = reinterpret_cast<const float*>(captured1);
+    const uint32_t listed0 = reinterpret_cast<const uint32_t*>(arguments0)[0];
+    const uint32_t listed1 = reinterpret_cast<const uint32_t*>(arguments1)[0];
+    const auto equals = [](const float* got, std::initializer_list<float> want) {
+        size_t index = 0;
+        for (const float value : want) {
+            if (std::abs(got[index++] - value) > 1e-5f) {
+                return false;
+            }
+        }
+        return true;
+    };
+    // Stream 0: x, y, z a vertex (12 bytes); stream 1: x, y (8 bytes). A fourth vertex is not
+    // written, and neither buffer holds the other stream's vertices.
+    const bool stream0_ok =
+        listed0 == 3 && equals(first, {-0.7f, 0.05f, 0.0f, -0.3f, 0.05f, 0.0f, -0.5f, 0.45f, 0.0f}) &&
+        equals(first + 9, {0, 0, 0});
+    const bool stream1_ok =
+        listed1 == 3 && equals(second, {-0.5f, 0.75f, -0.4f, 0.75f, -0.3f, 0.75f}) &&
+        equals(second + 6, {0, 0});
+    const bool passed = stream0_ok && stream1_ok;
+    if (!passed) {
+        for (int i = 0; i < 20; ++i) {
+            std::printf("  %d: %f %f\n", i, first[i], second[i]);
+        }
+    }
+    std::printf("metal-smoke: geometry output streams (stream 0 listed %u vertices, captured: %s; "
+                "stream 1 listed %u, captured: %s): %s\n",
+                listed0, stream0_ok ? "ok" : "WRONG", listed1, stream1_ok ? "ok" : "WRONG",
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 /// Guest-style geometry pipelines end to end: a vertex program and a geometry program as IR, the
 /// translator's GeometryPipeline (the capture kernel with the records kernel appended, the
 /// geometry kernel, the reader), then the renderer's sequence on real buffers: stage-in vertex
@@ -6258,7 +6996,7 @@ int main(int argc, char** argv) {
                                  RunOcarinaBilinear, RunPipelineArchive,
                                  RunDepthBlit, RunTessellation, RunTessellationIsolines,
                                  RunTessellationPoints, RunTessellationDirect, RunMslOptions, RunSpilledBuffers,
-                                 RunTransformFeedback, RunGeometryPassthrough, RunGeometryCompute, RunGeometryPipelines, RunGeometryAdjacencyStrip, RunDepthStencilBlit,
+                                 RunTransformFeedback, RunGeometryPassthrough, RunGeometryCompute, RunGeometryPipelines, RunGeometryStreams, RunTessellationTriangleLists, RunTessellationGeometry, RunGeometryAdjacencyStrip, RunDepthStencilBlit,
                                  RunPipelineCheck, RunDeviceMsl, RunNativeMesh, RunBlockCopy,
                                  RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,

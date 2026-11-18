@@ -500,7 +500,7 @@ private:
     /// Transform feedback of a geometry draw's compacted output (the pipeline's xfb layout).
     void CaptureGeometryOutput(GraphicsPipeline& pipeline, GeometryCompute& geo,
                                const StagingBufferRef& output, const StagingBufferRef& list,
-                               const StagingBufferRef& args, u32 primitives);
+                               const StagingBufferRef& args, u32 primitives, u32 stream = 0);
     /// An indirect draw of a geometry program: its arguments read on the CPU, a draw each.
     void DrawGeometryIndirect(GraphicsPipeline& pipeline);
 
@@ -740,6 +740,7 @@ private:
         StagingBufferRef args;
     } geo_draw;
     Object geometry_library;
+    Object geometry_feed_kernel;
     Object geometry_count_kernel;
     Object geometry_scan_kernel;
     Object geometry_write_kernel;

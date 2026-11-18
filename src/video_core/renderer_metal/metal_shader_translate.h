@@ -161,6 +161,9 @@ struct DomainEmulation {
     u32 vertex_stride{};        ///< Bytes of an evaluated vertex
     u32 max_vertices_per_patch{};
     bool lines{};               ///< Else points
+    /// The patch's triangles as a list of corners (three vertices a triangle, evaluated from the
+    /// corners' domain points): what a geometry program reads. Else lines or points as above.
+    bool triangles{};
     u32 factors_slot{};         ///< Patch factors (the Metal layout of the domain, half floats)
     u32 params_slot{};          ///< DomainParams
     u32 offsets_slot{};         ///< A u32 for each patch and one more: where its vertices start
@@ -185,7 +188,8 @@ inline constexpr u32 DomainThreads = 64;
 /// mode; lines are drawn for isolines unless the point mode is on.
 [[nodiscard]] DomainEmulation EmulateDomain(const std::string& evaluation_msl,
                                             const std::string& entry_point,
-                                            const TessellationModes& modes);
+                                            const TessellationModes& modes,
+                                            bool triangle_list = false);
 
 /// Resources are numbered per kind in (set, binding) order, which is the order the recompiler
 /// emits them and the buffer cache appends their bindings, so the pipeline binds in sequence.

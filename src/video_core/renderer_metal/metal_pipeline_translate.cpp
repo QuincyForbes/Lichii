@@ -540,11 +540,17 @@ bool PipelineTranslator::TranslatePrograms(const GraphicsPipelineKey& key,
         return false;
     }
     if (key.unique_hashes[4] != 0) {
-        if (key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0 || mesh_index != 0 || task) {
-            Refuse(unsupported_logged, hash, "geometry program with tessellation or mesh programs");
+        // A mesh pipeline has no vertex, tessellation or geometry stages to follow (Vulkan's
+        // VK_EXT_mesh_shader pipelines refuse them too); a control program needs its evaluation.
+        if (mesh_index != 0 || task ||
+            (key.unique_hashes[2] != 0 && key.unique_hashes[3] == 0)) {
+            Refuse(unsupported_logged, hash,
+                   "geometry program with mesh programs or a control program alone");
             return false;
         }
-        folded_geometry = programs[4].is_geometry_passthrough &&
+        // The passthrough fold edits the vertex program: not after tessellation.
+        const bool after_tess = key.unique_hashes[3] != 0;
+        folded_geometry = !after_tess && programs[4].is_geometry_passthrough &&
                           FoldGeometryPassthrough(programs[1], programs[4]);
         if (!folded_geometry && programs[4].is_geometry_passthrough) {
             // The passthrough as a geometry program that emits its input primitive.
@@ -748,15 +754,36 @@ std::optional<TranslatedPipeline> PipelineTranslator::GeometryPipeline(
     const GraphicsPipelineKey& key, std::span<Shader::IR::Program> programs) {
     const u64 hash = key.Hash();
     static std::atomic<u32> refused_logged{};
+    // After tessellation the geometry program reads the evaluation program's vertices, which the
+    // tessellation's domain emulation lists as triangles, lines or points.
+    const bool after_tess = key.unique_hashes[3] != 0;
     u32 input_vertices = 0;
     u32 input_step = 0;
-    if (!Geometry::InputTopology(static_cast<Maxwell::PrimitiveTopology>(key.topology),
-                                 input_vertices, input_step)) {
+    std::optional<Tessellation> tessellation;
+    std::vector<ShaderTranslate::InterfaceVariable> feed_outputs;
+    Shader::Backend::Bindings bindings;
+    if (after_tess) {
+        using Domain = Maxwell::Tessellation::DomainType;
+        using OutputPrimitives = Maxwell::Tessellation::OutputPrimitives;
+        std::optional<TranslatedPipeline> tessellated = Tessellated(key, programs, true);
+        if (!tessellated) {
+            return std::nullopt;
+        }
+        tessellation = std::move(tessellated->tessellation);
+        feed_outputs = std::move(tessellated->vertex.outputs);
+        bindings = feed_bindings;
+        const auto domain = static_cast<Domain>(key.tessellation & 3);
+        const auto output = static_cast<OutputPrimitives>((key.tessellation >> 4) & 3);
+        input_vertices = output == OutputPrimitives::Points ? 1 : domain == Domain::Isolines ? 2 : 3;
+        input_step = input_vertices;
+    } else if (!Geometry::InputTopology(static_cast<Maxwell::PrimitiveTopology>(key.topology),
+                                        input_vertices, input_step)) {
         Refuse(refused_logged, hash,
                "geometry program with an input topology the compute path can't take");
         return std::nullopt;
     }
-    Shader::IR::Program& vertex_program = programs[1];
+    // The program before the geometry stage: the vertex program, or the evaluation program.
+    Shader::IR::Program& vertex_program = programs[after_tess ? 3 : 1];
     Shader::IR::Program& geometry_program = programs[4];
     // The vertex program's legacy outputs become generics, which the geometry program's legacy
     // inputs read; its own legacy outputs become generics for the pixel program.
@@ -769,7 +796,9 @@ std::optional<TranslatedPipeline> PipelineTranslator::GeometryPipeline(
         vertex_info.generic_input_types[attribute] =
             types[(key.attribute_types >> (attribute * 2)) & 3];
     }
-    ConvertLegacyToGeneric(vertex_program, vertex_info);
+    if (!after_tess) {
+        ConvertLegacyToGeneric(vertex_program, vertex_info);
+    }
     Shader::RuntimeInfo geometry_info;
     geometry_info.previous_stage_stores = vertex_program.info.stores;
     geometry_info.previous_stage_legacy_stores_mapping = vertex_program.info.legacy_stores_mapping;
@@ -784,24 +813,41 @@ std::optional<TranslatedPipeline> PipelineTranslator::GeometryPipeline(
         Refuse(refused_logged, hash, "geometry program the compute path can't take", why);
         return std::nullopt;
     }
-    Shader::Backend::Bindings bindings;
-    // The vertex program as capture kernels only: its depth conversion and Y flip belong to the
-    // reader, which draws what the geometry program emits.
-    const std::vector<u32> vertex_spirv = EmitSPIRV(profile, vertex_info, vertex_program, bindings);
     GeometryCompute geometry;
     geometry.plan = *plan;
-    for (size_t variant = 0; variant < GeometryCompute::IndexSizes.size(); ++variant) {
-        ShaderTranslate::Options options = translate_options;
-        options.vertex_index_size = GeometryCompute::IndexSizes[variant];
-        auto capture = FromSpirv(vertex_spirv, vertex_program,
-                                 ShaderTranslate::Stage::VertexForTessellation, options);
-        if (!capture) {
-            return std::nullopt;
+    if (after_tess) {
+        // The records kernel joins the domain emulation's kernels (its MSL defines the evaluated
+        // vertex struct); the count kernel's MSL is that source.
+        geometry.from_tess = true;
+        const ShaderTranslate::DomainEmulation& emulation = tessellation->domain->emulation;
+        geometry.tess_records = MeshKernel{
+            .program = {.stage = ShaderTranslate::Stage::Compute,
+                        .msl = tessellation->domain->count.program.msl +
+                               Geometry::RecordsSource(*plan, "spvDomain", feed_outputs,
+                                                       vertex_program.info.legacy_stores_mapping,
+                                                       "spvDomainVertex"),
+                        .entry_point = std::string{Geometry::RecordsEntry}},
+        };
+        static_cast<void>(emulation);
+    } else {
+        // The vertex program as capture kernels only: its depth conversion and Y flip belong to
+        // the reader, which draws what the geometry program emits.
+        const std::vector<u32> vertex_spirv =
+            EmitSPIRV(profile, vertex_info, vertex_program, bindings);
+        for (size_t variant = 0; variant < GeometryCompute::IndexSizes.size(); ++variant) {
+            ShaderTranslate::Options options = translate_options;
+            options.vertex_index_size = GeometryCompute::IndexSizes[variant];
+            auto capture = FromSpirv(vertex_spirv, vertex_program,
+                                     ShaderTranslate::Stage::VertexForTessellation, options);
+            if (!capture) {
+                return std::nullopt;
+            }
+            capture->msl += Geometry::RecordsSource(*plan, capture->entry_point, capture->outputs,
+                                                    vertex_program.info.legacy_stores_mapping);
+            geometry.vertex_stride =
+                (std::max)(geometry.vertex_stride, OutputStride(capture->outputs));
+            geometry.capture[variant] = std::move(*capture);
         }
-        capture->msl += Geometry::RecordsSource(*plan, capture->entry_point, capture->outputs,
-                                                vertex_program.info.legacy_stores_mapping);
-        geometry.vertex_stride = (std::max)(geometry.vertex_stride, OutputStride(capture->outputs));
-        geometry.capture[variant] = std::move(*capture);
     }
     Shader::RuntimeInfo kernel_info;
     auto kernel = Translate(geometry_program, ShaderTranslate::Stage::Compute, bindings, kernel_info);
@@ -831,9 +877,18 @@ std::optional<TranslatedPipeline> PipelineTranslator::GeometryPipeline(
     }
     if (key.xfb.Active()) {
         // The capture of the geometry output: the compacted list's vertices into the buffers.
-        kernel->msl += Geometry::XfbSource(*plan, key.xfb, geometry_legacy);
         for (u32 buffer = 0; buffer < Xfb::MaxBuffers; ++buffer) {
             geometry.xfb_stride[buffer] = key.xfb.Stride(buffer);
+            if (key.xfb.Stride(buffer) != 0) {
+                geometry.xfb_streams |= 1U << (std::min)(key.xfb.State().layouts[buffer].stream,
+                                                         Geometry::MaxStreams - 1);
+            }
+        }
+        for (u32 stream = 0; stream < Geometry::MaxStreams; ++stream) {
+            if ((geometry.xfb_streams >> stream) & 1) {
+                // A stream the program never emits to captures nothing: its list is empty.
+                kernel->msl += Geometry::XfbSource(*plan, key.xfb, geometry_legacy, stream);
+            }
         }
     }
     geometry.kernel = MeshKernel{.program = std::move(*kernel),
@@ -872,6 +927,7 @@ std::optional<TranslatedPipeline> PipelineTranslator::GeometryPipeline(
     return TranslatedPipeline{
         .vertex = std::move(reader),
         .fragment = std::move(fragment),
+        .tessellation = std::move(tessellation),
         .geometry = std::move(geometry),
     };
 }
@@ -1339,7 +1395,8 @@ namespace {
 } // Anonymous namespace
 
 std::optional<TranslatedPipeline> PipelineTranslator::Tessellated(
-    const GraphicsPipelineKey& key, std::span<Shader::IR::Program> programs) {
+    const GraphicsPipelineKey& key, std::span<Shader::IR::Program> programs,
+    bool feeds_geometry) {
     const u64 hash = key.Hash();
     static std::atomic<u32> refused_logged{};
     using Domain = Maxwell::Tessellation::DomainType;
@@ -1430,9 +1487,12 @@ std::optional<TranslatedPipeline> PipelineTranslator::Tessellated(
     evaluation_options.inputs = has_control ? control_program->outputs : vertex.outputs;
     evaluation_options.tessellation = tessellation.modes;
     const bool emulated_domain =
-        domain == Domain::Isolines || tessellation.modes.point_mode;
-    // Only points take a point size (the emulated point mode writes the fixed state's).
-    evaluation_options.point_size_builtin = tessellation.modes.point_mode;
+        domain == Domain::Isolines || tessellation.modes.point_mode || feeds_geometry;
+    // Only points take a point size (the emulated point mode writes the fixed state's); a
+    // geometry program may read it whatever follows.
+    evaluation_options.point_size_builtin = tessellation.modes.point_mode || feeds_geometry;
+    // A geometry program reads the evaluation's own outputs: the reader flips and converts.
+    evaluation_options.flip_vertex_y = !feeds_geometry && evaluation_options.flip_vertex_y;
     Shader::RuntimeInfo evaluation_info;
     if (FixedStateEnabled() && tessellation.modes.point_mode) {
         evaluation_info.fixed_state_point_size = std::bit_cast<float>(key.point_size);
@@ -1448,15 +1508,22 @@ std::optional<TranslatedPipeline> PipelineTranslator::Tessellated(
                                        ? Shader::TessSpacing::FractionalEven
                                        : Shader::TessSpacing::Equal;
     evaluation_info.tess_clockwise = tessellation.modes.clockwise;
-    evaluation_info.y_negate = (key.state & StateLowerLeftOrigin) != 0;
+    evaluation_info.y_negate = !feeds_geometry && (key.state & StateLowerLeftOrigin) != 0;
+    // The raster state patches are for the stage the rasterizer sees.
+    const GraphicsPipelineKey* const saved_patch_key = patch_key;
+    if (feeds_geometry) {
+        patch_key = nullptr;
+    }
     auto evaluation = Translate(programs[3], ShaderTranslate::Stage::TessellationEvaluation,
                                 bindings, evaluation_info, &evaluation_options);
+    patch_key = saved_patch_key;
     if (!evaluation) {
         return std::nullopt;
     }
 
     StageProgram fragment{};
-    if (key.unique_hashes[5] != 0) {
+    // After a geometry program the pixel program is translated with it.
+    if (key.unique_hashes[5] != 0 && !feeds_geometry) {
         Shader::RuntimeInfo fragment_info;
         fragment_info.previous_stage_stores = programs[3].info.stores;
         fragment_info.previous_stage_legacy_stores_mapping = programs[3].info.legacy_stores_mapping;
@@ -1491,7 +1558,7 @@ std::optional<TranslatedPipeline> PipelineTranslator::Tessellated(
     }
     if (emulated_domain) {
         ShaderTranslate::DomainEmulation emulation = ShaderTranslate::EmulateDomain(
-            evaluation->msl, evaluation->entry_point, tessellation.modes);
+            evaluation->msl, evaluation->entry_point, tessellation.modes, feeds_geometry);
         if (!emulation.error.empty()) {
             Refuse(refused_logged, hash, "tessellation domain emulation", emulation.error);
             return std::nullopt;
@@ -1518,6 +1585,7 @@ std::optional<TranslatedPipeline> PipelineTranslator::Tessellated(
         domain_kernels.emulation = std::move(emulation);
         tessellation.domain = std::move(domain_kernels);
     }
+    feed_bindings = bindings;
     return TranslatedPipeline{
         .vertex = std::move(*evaluation),
         .fragment = std::move(fragment),

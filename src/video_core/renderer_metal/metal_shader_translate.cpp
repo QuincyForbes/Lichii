@@ -454,7 +454,7 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
                     stage == Stage::Fragment, buffers);
             }
         }
-        if (tess_vertex || tess_control) {
+        if (tess_vertex || tess_control || tess_evaluation) {
             result.outputs = StageOutputs(compiler, resources);
         }
         const auto entry_points = compiler.get_entry_points_and_stages();
@@ -626,6 +626,242 @@ static float3 spvDomainPoint(spvFactors_t f, uint k) {
     return float3(spvSplit(s, segments, detail), float(line) / float(line_count), 0.0f);
 #endif
 }
+
+#if SPV_TRIANGLE_LIST
+// The patch as a list of triangles (what a geometry program reads), from the same points: the
+// loop of the outer edges' points and the loop of the inside lattice's outermost nodes, side by
+// side (the sides of the two loops correspond, corner to corner), the strip between each pair of
+// sides stitched by walking both chains in step, and the inside lattice's own triangles. Triangle
+// t of the patch is found without walking: the side by the counts, the strip's events by a
+// search, the lattice's by arithmetic.
+#if SPV_DOMAIN == SPV_TRIANGLES
+#define SPV_SIDES 3u
+#else
+#define SPV_SIDES 4u
+#endif
+
+// Segments of the outer loop's side s (in the order spvDomainPoint walks it).
+static uint spvSideOuter(spvFactors_t f, uint s) {
+#if SPV_DOMAIN == SPV_TRIANGLES
+    return spvSegments(float(f.edgeTessellationFactor[s]));
+#else
+    const uint edges[4] = {1u, 2u, 3u, 0u};
+    return spvSegments(float(f.edgeTessellationFactor[edges[s]]));
+#endif
+}
+
+static uint spvOuterCount(spvFactors_t f) {
+    uint count = 0u;
+    for (uint s = 0u; s < SPV_SIDES; ++s) {
+        count += spvSideOuter(f, s);
+    }
+    return count;
+}
+
+#if SPV_DOMAIN == SPV_TRIANGLES
+static uint spvInnerSegments(spvFactors_t f) {
+    return spvSegments(float(f.insideTessellationFactor));
+}
+
+// Segments of the inner loop's sides: the lattice's outermost ring, a single node (or the centre)
+// when the lattice has one or none.
+static uint spvSideInner(spvFactors_t f, uint s) {
+    const uint n = spvInnerSegments(f);
+    return n >= 3u ? n - 3u : 0u;
+}
+
+static uint spvInteriorTriangles(spvFactors_t f) {
+    const uint n = spvInnerSegments(f);
+    return n >= 4u ? (n - 3u) * (n - 3u) : 0u;
+}
+
+static float3 spvLattice(uint n, uint a, uint b) {
+    return float3(float(a), float(b), float(n - a - b)) / float(n);
+}
+
+static float3 spvSideInnerNode(spvFactors_t f, uint s, uint t) {
+    const uint n = spvInnerSegments(f);
+    if (n < 3u) {
+        return float3(1.0f / 3.0f);
+    }
+    if (s == 0u) {
+        return spvLattice(n, 1u, n - 2u - t);
+    }
+    if (s == 1u) {
+        return spvLattice(n, 1u + t, 1u);
+    }
+    return spvLattice(n, n - 2u - t, 1u + t);
+}
+
+static void spvInterior(spvFactors_t f, uint k, thread float3* c) {
+    const uint n = spvInnerSegments(f);
+    const uint s = n - 3u;
+    uint row = 0u;
+    while (row + 1u < s && k >= 2u * (s - row) - 1u) {
+        k -= 2u * (s - row) - 1u;
+        ++row;
+    }
+    const uint b = 1u + row;
+    if ((k & 1u) == 0u) {
+        const uint a = 1u + k / 2u;
+        c[0] = spvLattice(n, a, b);
+        c[1] = spvLattice(n, a + 1u, b);
+        c[2] = spvLattice(n, a, b + 1u);
+    } else {
+        const uint a = 1u + k / 2u;
+        c[0] = spvLattice(n, a + 1u, b);
+        c[1] = spvLattice(n, a + 1u, b + 1u);
+        c[2] = spvLattice(n, a, b + 1u);
+    }
+}
+#else
+static float3 spvQuadNode(spvFactors_t f, uint a, uint b) {
+    const float in_u = float(f.insideTessellationFactor[0]);
+    const float in_v = float(f.insideTessellationFactor[1]);
+    return float3(spvSplit(a, spvSegments(in_u), in_u), spvSplit(b, spvSegments(in_v), in_v), 0.0f);
+}
+
+static uint spvInnerWidth(spvFactors_t f) {
+    return spvSegments(float(f.insideTessellationFactor[0])) - 1u;
+}
+
+static uint spvInnerHeight(spvFactors_t f) {
+    return spvSegments(float(f.insideTessellationFactor[1])) - 1u;
+}
+
+static uint spvSideInner(spvFactors_t f, uint s) {
+    const uint w = spvInnerWidth(f);
+    const uint h = spvInnerHeight(f);
+    if (w < 1u || h < 1u) {
+        return 0u;
+    }
+    return (s & 1u) == 0u ? w - 1u : h - 1u;
+}
+
+static uint spvInteriorTriangles(spvFactors_t f) {
+    const uint w = spvInnerWidth(f);
+    const uint h = spvInnerHeight(f);
+    return w >= 2u && h >= 2u ? 2u * (w - 1u) * (h - 1u) : 0u;
+}
+
+static float3 spvSideInnerNode(spvFactors_t f, uint s, uint t) {
+    const uint w = spvInnerWidth(f);
+    const uint h = spvInnerHeight(f);
+    if (w < 1u || h < 1u) {
+        return float3(0.5f, 0.5f, 0.0f);
+    }
+    if (s == 0u) {
+        return spvQuadNode(f, 1u + t, 1u);
+    }
+    if (s == 1u) {
+        return spvQuadNode(f, w, 1u + t);
+    }
+    if (s == 2u) {
+        return spvQuadNode(f, w - t, h);
+    }
+    return spvQuadNode(f, 1u, h - t);
+}
+
+static void spvInterior(spvFactors_t f, uint k, thread float3* c) {
+    const uint w = spvInnerWidth(f);
+    const uint q = k >> 1u;
+    const uint a = 1u + q % (w - 1u);
+    const uint b = 1u + q / (w - 1u);
+    if ((k & 1u) == 0u) {
+        c[0] = spvQuadNode(f, a, b);
+        c[1] = spvQuadNode(f, a + 1u, b);
+        c[2] = spvQuadNode(f, a + 1u, b + 1u);
+    } else {
+        c[0] = spvQuadNode(f, a, b);
+        c[1] = spvQuadNode(f, a + 1u, b + 1u);
+        c[2] = spvQuadNode(f, a, b + 1u);
+    }
+}
+#endif
+
+static uint spvInnerCount(spvFactors_t f) {
+    uint count = 0u;
+    for (uint s = 0u; s < SPV_SIDES; ++s) {
+        count += spvSideInner(f, s);
+    }
+    return count;
+}
+
+// Position of the outer event k (1..n) of a strip of n outer and m inner segments among the
+// strip's events, the two chains walked in step (the outer first when they meet).
+static uint spvStitchPosition(uint k, uint n, uint m) {
+    return k - 2u + (k * m + n - 1u) / n;
+}
+
+static void spvStitch(spvFactors_t f, uint t, thread float3* c) {
+    const uint outer = spvOuterCount(f);
+    uint offset = 0u;
+    uint s = 0u;
+    uint n = spvSideOuter(f, 0u);
+    uint m = spvSideInner(f, 0u);
+    while (t >= n + m && s + 1u < SPV_SIDES) {
+        t -= n + m;
+        offset += n;
+        ++s;
+        n = spvSideOuter(f, s);
+        m = spvSideInner(f, s);
+    }
+    uint i;
+    uint j;
+    bool outer_event;
+    if (m == 0u) {
+        i = t;
+        j = 0u;
+        outer_event = true;
+    } else {
+        uint lo = 0u;
+        uint hi = n;
+        while (lo < hi) {
+            const uint mid = (lo + hi + 1u) >> 1u;
+            if (spvStitchPosition(mid, n, m) <= t) {
+                lo = mid;
+            } else {
+                hi = mid - 1u;
+            }
+        }
+        outer_event = lo >= 1u && spvStitchPosition(lo, n, m) == t;
+        i = outer_event ? lo - 1u : lo;
+        j = t - i;
+    }
+    c[0] = spvDomainPoint(f, (offset + i) % outer);
+    c[2] = spvSideInnerNode(f, s, j);
+    c[1] = outer_event ? spvDomainPoint(f, (offset + i + 1u) % outer)
+                       : spvSideInnerNode(f, s, j + 1u);
+}
+
+static uint spvPatchTriangles(spvFactors_t f) {
+    if (spvPatchPoints(f) == 0u) {
+        return 0u;
+    }
+    return spvOuterCount(f) + spvInnerCount(f) + spvInteriorTriangles(f);
+}
+
+static float3 spvTriangleCorner(spvFactors_t f, uint tri, uint corner) {
+    float3 c[3];
+    const uint ring = spvOuterCount(f) + spvInnerCount(f);
+    if (tri < ring) {
+        spvStitch(f, tri, c);
+    } else {
+        spvInterior(f, tri - ring, c);
+    }
+    // Counter-clockwise in (u, v) when the domain's winding is clockwise (Metal's domain origin
+    // is the lower left, Vulkan's the upper left), else the other way round.
+    const float2 ab = c[1].xy - c[0].xy;
+    const float2 ac = c[2].xy - c[0].xy;
+    const float area = ab.x * ac.y - ab.y * ac.x;
+    if ((SPV_CLOCKWISE != 0 && area < 0.0f) || (SPV_CLOCKWISE == 0 && area > 0.0f)) {
+        const float3 swap = c[1];
+        c[1] = c[2];
+        c[2] = swap;
+    }
+    return c[corner];
+}
+#endif
 )msl";
 
 [[nodiscard]] std::string_view Trim(std::string_view text) {
@@ -954,7 +1190,7 @@ u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point,
 } // Anonymous namespace
 
 DomainEmulation EmulateDomain(const std::string& evaluation_msl, const std::string& entry_point,
-                              const TessellationModes& modes) {
+                              const TessellationModes& modes, bool triangle_list) {
     DomainEmulation result;
     const auto fail = [&](std::string error) {
         result.error = std::move(error);
@@ -1134,10 +1370,16 @@ DomainEmulation EmulateDomain(const std::string& evaluation_msl, const std::stri
     using Primitive = TessellationModes::Primitive;
     const u32 domain = modes.primitive == Primitive::Triangles ? 0 : modes.primitive == Primitive::Quads ? 1 : 2;
     result.lines = domain == 2 && !modes.point_mode;
+    result.triangles = triangle_list && domain != 2 && !modes.point_mode;
     result.max_vertices_per_patch = domain == 0   ? 3 * 64 + 63 * 62 / 2
                                     : domain == 1 ? 4 * 64 + 63 * 63
                                     : result.lines ? 64 * 64 * 2
                                                    : 64 * 65;
+    if (result.triangles) {
+        // Three corners a triangle: a ring of outer and inner loops, then the inside lattice.
+        result.max_vertices_per_patch = domain == 0 ? 3 * (192 + 183 + 61 * 61)
+                                                    : 3 * (256 + 248 + 2 * 62 * 62);  // ring and lattice
+    }
     const u32 spacing = modes.spacing == TessellationModes::Spacing::FractionalOdd    ? 1
                         : modes.spacing == TessellationModes::Spacing::FractionalEven ? 2
                                                                                       : 0;
@@ -1152,7 +1394,9 @@ DomainEmulation EmulateDomain(const std::string& evaluation_msl, const std::stri
     source += evaluation_msl.substr(body_open, body_close + 1 - body_open);
     source += evaluation_msl.substr(body_close + 1);
     source += "\n#define SPV_DOMAIN " + std::to_string(domain) + "\n#define SPV_SPACING " +
-              std::to_string(spacing) + "\n#define SPV_LINES " + (result.lines ? "1" : "0") + "\n";
+              std::to_string(spacing) + "\n#define SPV_LINES " + (result.lines ? "1" : "0") +
+              "\n#define SPV_TRIANGLE_LIST " + (result.triangles ? "1" : "0") +
+              "\n#define SPV_CLOCKWISE " + (modes.clockwise ? "1" : "0") + "\n";
     source += "typedef " + factors_type + " spvFactors_t;\n";
     source += "struct spvDomainParams\n{\n    uint patches;\n    uint capacity;\n    uint reserved0;\n"
               "    uint reserved1;\n};\n";
@@ -1167,7 +1411,12 @@ DomainEmulation EmulateDomain(const std::string& evaluation_msl, const std::stri
               "    if (spvThread != 0u) {\n        return;\n    }\n    uint total = 0u;\n"
               "    for (uint patch = 0u; patch < spvParams.patches; ++patch) {\n"
               "        spvOffsets[patch] = total;\n"
+              "#if SPV_TRIANGLE_LIST\n"
+              "        uint count = min(3u * spvPatchTriangles(spvFactors[patch]), spvParams.capacity - total);\n"
+              "        count -= count % 3u;\n"
+              "#else\n"
               "        uint count = min(spvPatchPoints(spvFactors[patch]), spvParams.capacity - total);\n"
+              "#endif\n"
               "#if SPV_LINES\n        count &= ~1u;\n#endif\n        total += count;\n    }\n"
               "    spvOffsets[spvParams.patches] = total;\n    spvArgs[0] = total;\n"
               "    spvArgs[1] = 1u;\n    spvArgs[2] = 0u;\n    spvArgs[3] = 0u;\n}\n";
@@ -1182,7 +1431,12 @@ DomainEmulation EmulateDomain(const std::string& evaluation_msl, const std::stri
               "    const uint first = spvOffsets[spvPatch];\n"
               "    const uint count = spvOffsets[spvPatch + 1u] - first;\n"
               "    for (uint k = spvLane; k < count; k += " + std::to_string(DomainThreads) +
-              "u) {\n        const float3 spvCoordinate = spvDomainPoint(factors, k);\n"
+              "u) {\n"
+              "#if SPV_TRIANGLE_LIST\n"
+              "        const float3 spvCoordinate = spvTriangleCorner(factors, k / 3u, k % 3u);\n"
+              "#else\n"
+              "        const float3 spvCoordinate = spvDomainPoint(factors, k);\n"
+              "#endif\n"
               "        spvOut[first + k] = spvDomainStore(spvEvaluate(" + call_arguments + "));\n"
               "    }\n}\n";
     source += "\nvertex " + return_type +
