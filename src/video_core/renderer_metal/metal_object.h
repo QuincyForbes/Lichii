@@ -9,6 +9,8 @@ namespace Metal {
 
 /// Releases an object retained by Object (metal_object.mm).
 void ReleaseObject(void* object) noexcept;
+/// Adds a reference (CFRetain) and returns the object.
+void* RetainObject(void* object) noexcept;
 
 /// A retained Objective-C object (an MTLTexture, MTLBuffer, ...) owned by plain C++ code. C++
 /// passes the pointer around; the Objective-C++ files bridge it back (metal_bridge.h). Keeping

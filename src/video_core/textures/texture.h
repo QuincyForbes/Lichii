@@ -172,8 +172,14 @@ static_assert(sizeof(TextureHandle) == 4, "TextureHandle has wrong size");
 /// the texture header's byte offset in the pool, index * 32, where the handle normally has the
 /// index. Read it as an offset only on Switch 2 (native tiling), when the plain index falls past
 /// the pool and the offset lands inside it, so handles that already resolve are left alone.
-[[nodiscard]] constexpr u32 TextureHeaderIndex(u32 index, u32 limit, bool switch2) {
-    if (switch2 && index > limit && index % 32 == 0 && index / 32 <= limit) {
+/// Whether bindless texture handles may hold the header's byte offset (see TextureHeaderIndex).
+/// Only Nintendo Switch Sports Resort is known to use them. Ocarina of Time samples an
+/// out-of-range handle (0xbe000) that would read as header 24320, a slot it reuses for render
+/// targets, so lit surfaces flashed with whatever image was there (upstream ae926ec957).
+[[nodiscard]] bool UsesHeaderByteOffsetHandles(bool native_tiling);
+
+[[nodiscard]] constexpr u32 TextureHeaderIndex(u32 index, u32 limit, bool byte_offsets) {
+    if (byte_offsets && index > limit && index % 32 == 0 && index / 32 <= limit) {
         return index / 32;
     }
     return index;

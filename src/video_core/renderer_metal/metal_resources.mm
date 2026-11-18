@@ -618,7 +618,14 @@ namespace {
 Object CreateLibrary(const Device& device, std::string_view source, std::string& error) {
     MTLCompileOptions* options = [MTLCompileOptions new];
     // The recompiler marks what must stay exact (NoContraction); the rest may use fast math.
-    options.fastMathEnabled = YES;
+    if (@available(iOS 18.0, macOS 15.0, *)) {
+        // Relaxed keeps fast math's reassociation but still honours NaN and Inf, as MoltenVK
+        // does; full fast math let one NaN (normalize(0), 0 * inf in specular terms) spread
+        // through the lighting and bloom passes into white blobs.
+        options.mathMode = MTLMathModeRelaxed;
+    } else {
+        options.fastMathEnabled = YES;
+    }
     NSError* ns_error = nil;
     const id<MTLLibrary> library = [device.GetDevice() newLibraryWithSource:ToNSString(source)
                                                                     options:options
@@ -650,7 +657,15 @@ Object CreateComputeState(const Device& device, MTLComputePipelineDescriptor* de
                                        reflection:nil
                                             error:nil];
     }
+    if (building.owns_lock()) {
+        // Release right after the probe: holding the archive lock across the fallback compile
+        // (and the writer-preferring lock of an addition) serialized every builder.
+        building.unlock();
+    }
     const bool hit = state != nil;
+    if (!hit && descriptor.binaryArchives != nil) {
+        descriptor.binaryArchives = nil;
+    }
     NSError* ns_error = nil;
     if (!hit) {
         state = [device.GetDevice() newComputePipelineStateWithDescriptor:descriptor
@@ -670,12 +685,10 @@ Object CreateComputeState(const Device& device, MTLComputePipelineDescriptor* de
                                                      std::chrono::steady_clock::now() - start)
                                                      .count()));
         if (!hit) {
-            BOOL added = NO;
-            {
-                std::unique_lock adding{archive->BuildMutex()};
-                added = [binary addComputePipelineFunctionsWithDescriptor:descriptor error:nil];
-            }
-            archive->NoteAdded(added);
+            auto* const copy = [descriptor copy];
+                archive->DeferAdd([binary, copy] {
+                    return [binary addComputePipelineFunctionsWithDescriptor:copy error:nil] == YES;
+                });
         }
     }
     return Retain(state);

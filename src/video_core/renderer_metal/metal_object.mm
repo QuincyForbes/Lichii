@@ -11,4 +11,8 @@ void ReleaseObject(void* object) noexcept {
     CFRelease(object);
 }
 
+void* RetainObject(void* object) noexcept {
+    return object != nullptr ? const_cast<void*>(CFRetain(object)) : nullptr;
+}
+
 } // namespace Metal

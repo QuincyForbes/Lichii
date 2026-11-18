@@ -272,7 +272,8 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             builder.CreateTemplate(*descriptor_set_layout, *pipeline_layout, uses_push_descriptor);
         if (!uses_push_descriptor) {
             descriptor_allocator =
-                descriptor_pool.Allocator(device, scheduler, *descriptor_set_layout, info);
+                descriptor_pool.Allocator(device, scheduler, *descriptor_set_layout, info,
+                                          builder.UsesUpdateAfterBindPool());
         }
     }
 

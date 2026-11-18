@@ -672,6 +672,7 @@ private:
     u32 trace_captures{};
     u32 trace_capture_dropped{};
     u32 trace_failure_details{};
+    bool depth_bias_rescaling = false;
 };
 
 } // namespace Vulkan

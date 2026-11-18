@@ -20,11 +20,22 @@ void MOV(TranslatorVisitor& v, u64 insn, const IR::U32& src, bool is_mov32i = fa
     } const mov{insn};
 
     u64 mask = is_mov32i ? mov.mov32i_mask : mov.mask;
-    if (mask != 0xf && mask != 0x1) {
-        LOG_WARNING(Shader, "(STUBBED) Masked Mov");
+    if (mask == 0xf || mask == 0x1) {
+        v.X(mov.dest_reg, src);
         return;
     }
-    v.X(mov.dest_reg, src);
+    if (mask == 0) {
+        return;
+    }
+    // Quad lane mask: bit N enables the move for lane N of each quad (lane id & 3); the other
+    // lanes keep the destination's previous value. Dropping the move entirely left the
+    // destination stale in every lane, which broke shaders that build per-quad values this way
+    // (derivative and lighting math).
+    const IR::U32 quad_lane{v.ir.BitwiseAnd(v.ir.LaneId(), v.ir.Imm32(3))};
+    const IR::U32 lane_bit{IR::U32{v.ir.ShiftLeftLogical(v.ir.Imm32(1), quad_lane)}};
+    const IR::U1 enabled{v.ir.INotEqual(
+        v.ir.BitwiseAnd(lane_bit, v.ir.Imm32(static_cast<u32>(mask))), v.ir.Imm32(0))};
+    v.X(mov.dest_reg, IR::U32{v.ir.Select(enabled, src, v.X(mov.dest_reg))});
 }
 } // Anonymous namespace
 

@@ -26,5 +26,8 @@ namespace Metal {
 
 // The replay makes no Metal objects.
 void ReleaseObject(void*) noexcept {}
+void* RetainObject(void* object) noexcept {
+    return object;
+}
 
 } // namespace Metal

@@ -910,6 +910,20 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .single_lane_geometry_subgroups = !profile.SupportsSubgroupStage(Shader::Stage::Geometry),
         .support_byte_addressed_r16 = true,
     };
+    // MoltenVK allows 16 samplers a stage, but more in sets from update-after-bind pools, which
+    // it puts in Metal argument buffers. Layouts over the core limits take such a pool
+    // (DescriptorLayoutBuilder; zortos293/Lichii#1862): OoT's character shaders use 17-25.
+    if (const auto limits = device.UpdateAfterBindSampledLimits()) {
+        host_info.max_per_stage_descriptor_sampled_images = limits->per_stage_sampled_images;
+        host_info.max_per_stage_resources = limits->per_stage_resources;
+        host_info.max_descriptor_set_samplers = limits->set_samplers;
+        host_info.max_descriptor_set_sampled_images = limits->set_sampled_images;
+        LOG_INFO(Render_Vulkan,
+                 "Descriptor sets over the core limits ({} samplers a stage) use update-after-bind "
+                 "pools: up to {} samplers and {} sampled images a stage",
+                 device.CoreSampledLimits().per_stage_samplers, limits->per_stage_samplers,
+                 limits->per_stage_sampled_images);
+    }
     host_info.ApplyDescriptorLimitPolicy();
 
     if (device.GetMaxVertexInputAttributes() < Maxwell::NumVertexAttributes) {
@@ -4464,8 +4478,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     const bool fits_compute{compute_storage_buffers <=
                                 device.GetMaxPerStageDescriptorStorageBuffers() &&
                             compute_sampled_images <=
-                                device.GetMaxPerStageDescriptorSampledImages() &&
-                            compute_resources <= device.GetMaxPerStageResources()};
+                                host_info.max_per_stage_descriptor_sampled_images &&
+                            compute_resources <= host_info.max_per_stage_resources};
     // A pipeline the device could build natively but that takes the emulation.
     bool routed_from_native{};
     if (!mesh_unsupported && device.IsExtMeshShaderSupported()) {

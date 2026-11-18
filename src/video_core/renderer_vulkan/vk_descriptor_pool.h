@@ -36,6 +36,7 @@ struct DescriptorBankInfo {
     u32 sampled_images{};  ///< Number of sampled image descriptors (without a sampler)
     u32 samplers{};        ///< Number of sampler descriptors
     s32 score{};           ///< Number of descriptors in total
+    bool update_after_bind{}; ///< Pools for layouts made for update-after-bind pools
 };
 
 /// Live descriptor pools, the descriptors they were sized for and the sets taken from them.
@@ -84,8 +85,8 @@ public:
     DescriptorPool& operator=(const DescriptorPool&) = delete;
     DescriptorPool(const DescriptorPool&) = delete;
 
-    DescriptorAllocator Allocator(const Device& device, Scheduler& scheduler, VkDescriptorSetLayout layout, std::span<const Shader::Info> infos);
-    DescriptorAllocator Allocator(const Device& device, Scheduler& scheduler, VkDescriptorSetLayout layout, const Shader::Info& info);
+    DescriptorAllocator Allocator(const Device& device, Scheduler& scheduler, VkDescriptorSetLayout layout, std::span<const Shader::Info> infos, bool update_after_bind);
+    DescriptorAllocator Allocator(const Device& device, Scheduler& scheduler, VkDescriptorSetLayout layout, const Shader::Info& info, bool update_after_bind);
     DescriptorAllocator Allocator(const Device& device, Scheduler& scheduler, VkDescriptorSetLayout layout, const DescriptorBankInfo& info);
 
 private:

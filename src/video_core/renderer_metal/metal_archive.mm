@@ -3,8 +3,12 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <pthread.h>
 
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -19,12 +23,61 @@ struct PipelineArchive::Impl {
     id<MTLBinaryArchive> archive = nil;
     NSURL* url = nil;
     std::string path;
+
+    std::mutex add_mutex;
+    std::condition_variable add_cv;
+    std::deque<std::function<bool()>> adds;
+    std::thread add_thread;
+    bool stop = false;
 };
 
 PipelineArchive::PipelineArchive() : impl{std::make_unique<Impl>()} {}
 
 PipelineArchive::~PipelineArchive() {
+    {
+        std::scoped_lock lock{impl->add_mutex};
+        impl->stop = true;
+    }
+    impl->add_cv.notify_all();
+    if (impl->add_thread.joinable()) {
+        impl->add_thread.join();
+    }
     Save();
+}
+
+void PipelineArchive::DeferAdd(std::function<bool()> add) {
+    {
+        std::scoped_lock lock{impl->add_mutex};
+        if (impl->stop) {
+            return;
+        }
+        impl->adds.push_back(std::move(add));
+        if (!impl->add_thread.joinable()) {
+            impl->add_thread = std::thread([this] {
+                pthread_setname_np("MetalArchive");
+                pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+                for (;;) {
+                    std::function<bool()> next;
+                    {
+                        std::unique_lock lock{impl->add_mutex};
+                        impl->add_cv.wait(lock, [this] { return impl->stop || !impl->adds.empty(); });
+                        if (impl->adds.empty()) {
+                            return;
+                        }
+                        next = std::move(impl->adds.front());
+                        impl->adds.pop_front();
+                    }
+                    bool added = false;
+                    @autoreleasepool {
+                        std::unique_lock adding{build_mutex};
+                        added = next();
+                    }
+                    NoteAdded(added);
+                }
+            });
+        }
+    }
+    impl->add_cv.notify_one();
 }
 
 bool PipelineArchive::Open(const Device& device, const std::filesystem::path& path) {

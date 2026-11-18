@@ -657,10 +657,13 @@ s64 FenceFlushIntervalUs() {
         if (const char* const value = VulkanSwitch("EDEN_NX2_FENCE_FLUSH_US")) {
             return static_cast<s64>(std::atoll(value));
         }
-        return VulkanSwitchesEnabled() &&
-                       VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush)
-                   ? s64{5000}
-                   : s64{0};
+        if (VulkanSwitchesEnabled() &&
+            VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush)) {
+            return s64{5000};
+        }
+        // Batch by default as phones do (2000 us from their profile): committing on every
+        // guest fence produced dozens of command buffers per frame on desktop.
+        return s64{2000};
     }();
     return interval_us;
 }
@@ -2044,7 +2047,7 @@ void Scheduler::WantSplitBefore(const RenderTargetSet& targets) {
 
 void Scheduler::SplitBefore(const RenderTargetSet& targets) {
     // A pass that other work keeps ending is not given a command buffer each time.
-    constexpr u32 MaxTickSplits = 8;
+    constexpr u32 MaxTickSplits = 2;
     if (!AheadEnabled() || !AheadSplitEnabled() || IsRenderingTo(targets) ||
         impl->tick_splits >= MaxTickSplits || !impl->Wanted(targets)) {
         return;

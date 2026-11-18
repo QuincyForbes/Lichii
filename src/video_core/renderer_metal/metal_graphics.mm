@@ -453,7 +453,15 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
                                                               reflection:nil
                                                                    error:nil];
     }
+    if (building.owns_lock()) {
+        // Release right after the probe: holding the archive lock across the fallback compile
+        // (and the writer-preferring lock of an addition) serialized every builder.
+        building.unlock();
+    }
     const bool hit = state != nil;
+    if (!hit && descriptor.binaryArchives != nil) {
+        descriptor.binaryArchives = nil;
+    }
     NSError* ns_error = nil;
     if (!hit) {
         state = [device.GetDevice() newRenderPipelineStateWithDescriptor:descriptor
@@ -470,12 +478,10 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
                                                      std::chrono::steady_clock::now() - start)
                                                      .count()));
         if (!hit) {
-            BOOL added = NO;
-            {
-                std::unique_lock adding{archive->BuildMutex()};
-                added = [binary addRenderPipelineFunctionsWithDescriptor:descriptor error:nil];
-            }
-            archive->NoteAdded(added);
+            auto* const copy = [descriptor copy];
+                archive->DeferAdd([binary, copy] {
+                    return [binary addRenderPipelineFunctionsWithDescriptor:copy error:nil] == YES;
+                });
         }
     }
     return Retain(state);
@@ -526,7 +532,15 @@ Object CreateMeshRenderPipelineState(const Device& device, const RenderPipelineD
                                                    error:nil];
         }
     }
+    if (building.owns_lock()) {
+        // Release right after the probe: holding the archive lock across the fallback compile
+        // (and the writer-preferring lock of an addition) serialized every builder.
+        building.unlock();
+    }
     const bool hit = state != nil;
+    if (!hit && descriptor.binaryArchives != nil) {
+        descriptor.binaryArchives = nil;
+    }
     NSError* ns_error = nil;
     if (!hit) {
         state = [device.GetDevice() newRenderPipelineStateWithMeshDescriptor:descriptor
@@ -546,13 +560,10 @@ Object CreateMeshRenderPipelineState(const Device& device, const RenderPipelineD
                                                      .count()));
         if (!hit) {
             if (@available(iOS 18.0, macOS 15.0, *)) {
-                BOOL added = NO;
-                {
-                    std::unique_lock adding{archive->BuildMutex()};
-                    added = [binary addMeshRenderPipelineFunctionsWithDescriptor:descriptor
-                                                                           error:nil];
-                }
-                archive->NoteAdded(added);
+                auto* const copy = [descriptor copy];
+                archive->DeferAdd([binary, copy] {
+                    return [binary addMeshRenderPipelineFunctionsWithDescriptor:copy error:nil] == YES;
+                });
             }
         }
     }

@@ -2130,7 +2130,7 @@ void TextureCache<P>::PrefetchBinding(const BindingLookup& lookup, const Binding
     }
     const u32 header_index =
         Tegra::Texture::TextureHeaderIndex(tic_handle, lookup.tic_limit,
-                                           gpu_memory->UsesNativeTiling());
+                                           Tegra::Texture::UsesHeaderByteOffsetHandles(gpu_memory->UsesNativeTiling()));
     if (header_index <= lookup.tic_limit) {
         if (const u8* const host = lookup.pages.Get(
                 *gpu_memory, lookup.tic_pool + u64{header_index} * sizeof(TICEntry),
@@ -2290,7 +2290,7 @@ void TextureCache<P>::RecordBinding(const BindingLookup& lookup, u32 tic_handle,
     }
     u32 tic_entry = ~0U;
     const u32 header_index = Tegra::Texture::TextureHeaderIndex(
-        tic_handle, image_table.current_limit, gpu_memory->UsesNativeTiling());
+        tic_handle, image_table.current_limit, Tegra::Texture::UsesHeaderByteOffsetHandles(gpu_memory->UsesNativeTiling()));
     if (header_index <= image_table.current_limit) {
         if (!read_entry(image_table, header_index, view_id)) {
             return;
@@ -2845,7 +2845,7 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
     auto& table =
         compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
     index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit,
-                                               gpu_memory->UsesNativeTiling());
+                                               Tegra::Texture::UsesHeaderByteOffsetHandles(gpu_memory->UsesNativeTiling()));
     if (index > table.current_limit || index >= table.bound_ids.size()) {
         LOG_TRACE(HW_GPU, "Invalid image view index={}", index);
         return NULL_IMAGE_VIEW_ID;

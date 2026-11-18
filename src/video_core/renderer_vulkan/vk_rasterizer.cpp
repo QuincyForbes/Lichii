@@ -6364,9 +6364,13 @@ void RasterizerVulkan::UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs
 }
 
 void RasterizerVulkan::UpdateDepthBias(Tegra::Engines::Maxwell3D::Regs& regs) {
-    if (!state_tracker.TouchDepthBias()) {
+    // The slope factor depends on whether the target is rescaled, so a change of that
+    // re-records the bias even when the guest registers did not change.
+    const bool bias_rescaling = texture_cache.IsRescaling();
+    if (!state_tracker.TouchDepthBias() && bias_rescaling == depth_bias_rescaling) {
         return;
     }
+    depth_bias_rescaling = bias_rescaling;
     float units = regs.depth_bias / 2.0f;
     const bool is_d24 = regs.zeta.format == Tegra::DepthFormat::Z24_UNORM_S8_UINT ||
                         regs.zeta.format == Tegra::DepthFormat::X8Z24_UNORM ||
@@ -6389,9 +6393,15 @@ void RasterizerVulkan::UpdateDepthBias(Tegra::Engines::Maxwell3D::Regs& regs) {
             units = static_cast<float>(static_cast<double>(units) * rescale_factor);
         }
     }
+    float factor = regs.slope_scale_depth_bias;
+    if (texture_cache.IsRescaling()) {
+        // The slope term is per pixel, so a rescaled target needs it scaled back to guest pixels
+        // (zortos293/Lichii#1925): shadow maps showed self-shadow stripes above 1x.
+        factor *= Settings::values.resolution_info.up_factor;
+    }
 
-    scheduler.Record([constant = units, clamp = regs.depth_bias_clamp,
-                      factor = regs.slope_scale_depth_bias, this](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([constant = units, clamp = regs.depth_bias_clamp, factor,
+                      this](vk::CommandBuffer cmdbuf) {
         if (device.IsExtDepthBiasControlSupported()) {
             static VkDepthBiasRepresentationInfoEXT bias_info{
                 .sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT,

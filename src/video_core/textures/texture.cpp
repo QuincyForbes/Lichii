@@ -67,6 +67,11 @@ float TSCEntry::MaxAnisotropy() const noexcept {
     return float(1U << (max_anisotropy + added_anisotropic));
 }
 
+bool UsesHeaderByteOffsetHandles(bool native_tiling) {
+    constexpr u64 SwitchSportsResortProgramId = 0x0400000000000849ULL;
+    return native_tiling && Settings::GetCurrentProgramID() == SwitchSportsResortProgramId;
+}
+
 } // namespace Tegra::Texture
 
 size_t std::hash<TICEntry>::operator()(const TICEntry& tic) const noexcept {

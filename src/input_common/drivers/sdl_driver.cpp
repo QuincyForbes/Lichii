@@ -99,7 +99,40 @@ public:
                                 SDL_Gamepad* game_controller)
                 : guid{guid_}, port{port_}, sdl_joystick{joystick, &SDL_CloseJoystick},
                     sdl_controller{game_controller, &SDL_CloseGamepad} {
+        UpdateAxisSigns();
         EnableMotion();
+    }
+
+    /// Stick axes are read from joystick events, which skip the gamepad mapping's axis
+    /// inversion ("lefty:a1~"). Controllers whose mapping inverts an axis (Xbox pads on macOS)
+    /// then had their sticks reversed up and down; the sign puts the mapping's inversion back.
+    void UpdateAxisSigns() {
+        axis_signs.fill(1.0f);
+        if (!sdl_controller) {
+            return;
+        }
+        for (const SDL_GamepadBinding& binding : GetBindings(sdl_controller.get())) {
+            if (binding.input_type != SDL_GAMEPAD_BINDTYPE_AXIS ||
+                binding.output_type != SDL_GAMEPAD_BINDTYPE_AXIS) {
+                continue;
+            }
+            const auto output = binding.output.axis.axis;
+            if (output != SDL_GAMEPAD_AXIS_LEFTX && output != SDL_GAMEPAD_AXIS_LEFTY &&
+                output != SDL_GAMEPAD_AXIS_RIGHTX && output != SDL_GAMEPAD_AXIS_RIGHTY) {
+                continue;
+            }
+            const int axis = binding.input.axis.axis;
+            if (axis >= 0 && static_cast<size_t>(axis) < axis_signs.size() &&
+                binding.input.axis.axis_min > binding.input.axis.axis_max) {
+                axis_signs[static_cast<size_t>(axis)] = -1.0f;
+            }
+        }
+    }
+
+    float AxisSign(int axis) const {
+        return axis >= 0 && static_cast<size_t>(axis) < axis_signs.size()
+                   ? axis_signs[static_cast<size_t>(axis)]
+                   : 1.0f;
     }
 
     void EnableMotion() {
@@ -332,6 +365,7 @@ public:
     void SetSDLJoystick(SDL_Joystick* joystick, SDL_Gamepad* controller) {
         sdl_joystick.reset(joystick);
         sdl_controller.reset(controller);
+        UpdateAxisSigns();
     }
 
     bool IsJoyconLeft() const {
@@ -428,6 +462,7 @@ private:
     int port;
     std::unique_ptr<SDL_Joystick, decltype(&SDL_CloseJoystick)> sdl_joystick;
     std::unique_ptr<SDL_Gamepad, decltype(&SDL_CloseGamepad)> sdl_controller;
+    std::array<float, 16> axis_signs{};
     mutable std::mutex mutex;
 
     u64 last_motion_update{};
@@ -663,7 +698,8 @@ void SDLDriver::HandleGameControllerEvent(const SDL_Event& event) {
     case SDL_EVENT_JOYSTICK_AXIS_MOTION: {
         if (const auto joystick = GetSDLJoystickBySDLID(event.jaxis.which)) {
             const PadIdentifier identifier = joystick->GetPadIdentifier();
-            SetAxis(identifier, event.jaxis.axis, event.jaxis.value / 32767.0f);
+            SetAxis(identifier, event.jaxis.axis,
+                    joystick->AxisSign(event.jaxis.axis) * (event.jaxis.value / 32767.0f));
         }
         break;
     }

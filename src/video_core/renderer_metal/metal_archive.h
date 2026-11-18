@@ -8,6 +8,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -56,6 +57,11 @@ public:
     /// A pipeline built with the archive attached: found in it or not, and how long it took.
     void NoteBuild(bool hit, u64 nanoseconds) noexcept;
     void NoteAdded(bool added) noexcept;
+
+    /// Queues an archive addition (it compiles the pipeline again into the archive) for one
+    /// background thread, so builders never wait on it or block one another; the function
+    /// returns whether the addition succeeded. It runs alone against BuildMutex.
+    void DeferAdd(std::function<bool()> add);
 
     /// Counts since the last call (the renderer's 10 s report).
     [[nodiscard]] Counts TakeCounts() noexcept;

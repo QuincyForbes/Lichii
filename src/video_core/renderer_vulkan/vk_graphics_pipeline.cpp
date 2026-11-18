@@ -569,7 +569,8 @@ GraphicsPipeline::GraphicsPipeline(
                 stage_templates[stage] =
                     stage_builder.CreateTemplate(set_layouts[stage], VK_NULL_HANDLE, false);
                 stage_allocators[stage] = descriptor_pool.Allocator(
-                    device, scheduler, set_layouts[stage], stage_infos[stage]);
+                    device, scheduler, set_layouts[stage], stage_infos[stage],
+                    stage_builder.UsesUpdateAfterBindPool());
             }
         }
         pipeline_layout =
@@ -617,7 +618,8 @@ GraphicsPipeline::GraphicsPipeline(
                     .is_written = true,
                 });
                 descriptor_allocator =
-                    descriptor_pool.Allocator(device, scheduler, set_layout, bank_infos);
+                    descriptor_pool.Allocator(device, scheduler, set_layout, bank_infos,
+                                              builder.UsesUpdateAfterBindPool());
                 if (mesh_emulation->has_task) {
                     // The distribution pass: payload, offsets, map and arguments, plus its push
                     // constants (Shader::Backend::SPIRV::MeshEmulationDistributionConstants).
@@ -661,7 +663,8 @@ GraphicsPipeline::GraphicsPipeline(
                 }
             } else if (!uses_push_descriptor) {
                 descriptor_allocator =
-                    descriptor_pool.Allocator(device, scheduler, set_layout, stage_infos);
+                    descriptor_pool.Allocator(device, scheduler, set_layout, stage_infos,
+                                              builder.UsesUpdateAfterBindPool());
             }
         }
     }

@@ -3190,7 +3190,10 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         regs.polygon_offset_point_enable != 0) {
         // The hardware halves the depth bias units (as OpenGL and Vulkan apply it).
         draw.depth_bias = regs.depth_bias / 2.0f;
-        draw.slope_scale = regs.slope_scale_depth_bias;
+        // Per-pixel slope term: scaled back to guest pixels on a rescaled target, or shadow
+        // maps get self-shadow stripes above 1x (zortos293/Lichii#1925).
+        draw.slope_scale =
+            regs.slope_scale_depth_bias * (is_rescaling ? resolution.up_factor : 1.0f);
         draw.bias_clamp = regs.depth_bias_clamp;
     }
     draw.stencil_front_ref = regs.stencil_front_ref;

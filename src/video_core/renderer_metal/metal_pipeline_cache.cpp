@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <memory>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
@@ -78,8 +80,63 @@ void DumpRefusedProgram(const std::string& msl, const std::string& error) {
     file << msl << "\n// Metal refused it: " << error << '\n';
 }
 
+/// Libraries by MSL text, shared by every pipeline using the same program (a fragment program
+/// is often part of dozens of pipelines) so the slow source compile runs once; concurrent
+/// builders of the same text wait for the first one.
+Object SharedLibrary(const Device& device, const std::string& source, std::string& error) {
+    struct Entry {
+        std::mutex mutex;
+        std::condition_variable done_cv;
+        bool done = false;
+        Object library;
+        std::string error;
+    };
+    static std::mutex cache_mutex;
+    static std::unordered_map<u64, std::shared_ptr<Entry>> cache;
+    const u64 key = Common::CityHash64(source.data(), source.size()) ^ (u64{source.size()} << 40);
+    std::shared_ptr<Entry> entry;
+    bool owner = false;
+    {
+        std::scoped_lock lock{cache_mutex};
+        auto& slot = cache[key];
+        if (!slot) {
+            if (cache.size() > 8192) {
+                // Bound the cache; pipelines keep their own references.
+                std::erase_if(cache, [](const auto& item) {
+                    std::scoped_lock entry_lock{item.second->mutex};
+                    return item.second->done;
+                });
+            }
+            auto& fresh = cache[key];
+            fresh = std::make_shared<Entry>();
+            owner = true;
+            entry = fresh;
+        } else {
+            entry = slot;
+        }
+    }
+    if (owner) {
+        std::string build_error;
+        Object library = CreateLibrary(device, source, build_error);
+        {
+            std::scoped_lock lock{entry->mutex};
+            entry->library = std::move(library);
+            entry->error = build_error;
+            entry->done = true;
+        }
+        entry->done_cv.notify_all();
+    }
+    std::unique_lock lock{entry->mutex};
+    entry->done_cv.wait(lock, [&] { return entry->done; });
+    if (!entry->library) {
+        error = entry->error;
+        return {};
+    }
+    return Object{RetainObject(entry->library.Get())};
+}
+
 void BuildProgramLibrary(const Device& device, StageProgram& program, std::string& error) {
-    program.library = CreateLibrary(device, program.msl, error);
+    program.library = SharedLibrary(device, program.msl, error);
     if (!program.library) {
         DumpRefusedProgram(program.msl, error);
     }
@@ -87,7 +144,7 @@ void BuildProgramLibrary(const Device& device, StageProgram& program, std::strin
         return;
     }
     std::string retry_error;
-    program.library = CreateLibrary(device, program.msl_without_reduction, retry_error);
+    program.library = SharedLibrary(device, program.msl_without_reduction, retry_error);
     if (program.library) {
         program.reduction_slot = ~0U;
         static std::atomic<u32> logged{};
