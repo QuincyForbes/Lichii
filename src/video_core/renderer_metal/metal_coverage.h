@@ -27,6 +27,9 @@ enum class Path : u32 {
     MeshCompute,
     /// Vertex and control programs as compute kernels ahead of Metal's tessellator.
     TessellationKernels,
+    /// A geometry program as a compute kernel over the vertex kernel's records, its strips
+    /// compacted into one indexed draw.
+    GeometryKernels,
     /// A topology or index size Metal lacks (quads, fans, loops, 8-bit), through rewritten indices.
     RewrittenIndices,
     /// A multi-draw whose count was read from guest memory, one call per draw.

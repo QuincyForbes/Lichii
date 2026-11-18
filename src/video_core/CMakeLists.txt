@@ -648,6 +648,7 @@ set(METAL_RENDERER_CXX_SOURCES
     renderer_metal/metal_draw_desc.cpp
     renderer_metal/metal_fence_manager.cpp
     renderer_metal/metal_formats.cpp
+    renderer_metal/metal_geometry.cpp
     renderer_metal/metal_index_convert.cpp
     renderer_metal/metal_ocarina.cpp
     renderer_metal/metal_pipeline_cache.cpp
@@ -698,6 +699,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_draw_desc.h
         renderer_metal/metal_fence_manager.h
         renderer_metal/metal_formats.h
+        renderer_metal/metal_geometry.h
         renderer_metal/metal_graphics.h
         renderer_metal/metal_index_convert.h
         renderer_metal/metal_mesh_indirect.h
@@ -787,6 +789,7 @@ elseif (LICHII_METAL_COMPILE_CHECK)
         renderer_metal/metal_coverage.cpp
         renderer_metal/metal_draw_desc.cpp
         renderer_metal/metal_formats.cpp
+        renderer_metal/metal_geometry.cpp
         renderer_metal/metal_index_convert.cpp
         renderer_metal/metal_pipeline_check.cpp
         renderer_metal/metal_pipeline_translate.cpp

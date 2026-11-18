@@ -427,6 +427,8 @@ bool PipelineTranslator::TranslatePrograms(const GraphicsPipelineKey& key,
     size_t env_index = 0;
     bool task = false;
     mesh_index = 0;
+    folded_geometry = false;
+    Shader::Environment* geometry_env = nullptr;
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
         if (key.unique_hashes[index] == 0) {
             continue;
@@ -444,15 +446,16 @@ bool PipelineTranslator::TranslatePrograms(const GraphicsPipelineKey& key,
         } else if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
             Refuse(unsupported_logged, hash, "task or mesh program out of place");
             return false;
-        } else if (index == 4 && (stage != Shader::Stage::Geometry ||
-                                  env.SPH().common0.geometry_passthrough == 0)) {
-            // Apple GPUs have no geometry stage (MoltenVK skips these pipelines too).
-            Refuse(unsupported_logged, hash, "geometry stage");
+        } else if (index == 4 && stage != Shader::Stage::Geometry) {
+            Refuse(unsupported_logged, hash, "unexpected stage in the geometry slot");
             return false;
         } else if ((index == 2 && stage != Shader::Stage::TessellationControl) ||
                    (index == 3 && stage != Shader::Stage::TessellationEval)) {
             Refuse(unsupported_logged, hash, "unexpected stage in a tessellation slot");
             return false;
+        }
+        if (index == 4) {
+            geometry_env = &env;
         }
         const u32 cfg_offset = static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader));
         Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
@@ -471,9 +474,22 @@ bool PipelineTranslator::TranslatePrograms(const GraphicsPipelineKey& key,
         Refuse(unsupported_logged, hash, "no vertex program");
         return false;
     }
-    if (key.unique_hashes[4] != 0 && !FoldGeometryPassthrough(programs[1], programs[4])) {
-        Refuse(unsupported_logged, hash, "geometry stage");
-        return false;
+    if (key.unique_hashes[4] != 0) {
+        if (key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0 || mesh_index != 0 || task) {
+            Refuse(unsupported_logged, hash, "geometry program with tessellation or mesh programs");
+            return false;
+        }
+        folded_geometry = programs[4].is_geometry_passthrough &&
+                          FoldGeometryPassthrough(programs[1], programs[4]);
+        if (!folded_geometry && programs[4].is_geometry_passthrough) {
+            // The passthrough as a geometry program that emits its input primitive.
+            Shader::HostTranslateInfo lowered = host_info;
+            lowered.support_geometry_shader_passthrough = false;
+            const u32 cfg_offset =
+                static_cast<u32>(geometry_env->StartAddress() + sizeof(Shader::ProgramHeader));
+            Shader::Maxwell::Flow::CFG cfg(*geometry_env, pools.flow_block, cfg_offset, false);
+            programs[4] = TranslateProgram(pools.inst, pools.block, *geometry_env, cfg, lowered);
+        }
     }
     if (task && mesh_index == 0) {
         Refuse(unsupported_logged, hash, "task program without a mesh program");
@@ -491,6 +507,9 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
     size_t mesh_index = 0;
     if (!TranslatePrograms(key, envs, programs, mesh_index)) {
         return std::nullopt;
+    }
+    if (key.unique_hashes[4] != 0 && !folded_geometry) {
+        return GeometryPipeline(key, programs);
     }
     if (mesh_index != 0) {
         std::optional<NativeMesh> native;
@@ -620,6 +639,134 @@ std::optional<XfbCapture> PipelineTranslator::XfbPrograms(const GraphicsPipeline
         xfb.capture[variant] = std::move(*program);
     }
     return xfb;
+}
+
+std::optional<TranslatedPipeline> PipelineTranslator::GeometryPipeline(
+    const GraphicsPipelineKey& key, std::span<Shader::IR::Program> programs) {
+    const u64 hash = key.Hash();
+    static std::atomic<u32> refused_logged{};
+    u32 input_vertices = 0;
+    bool input_strip = false;
+    if (!Geometry::InputTopology(static_cast<Maxwell::PrimitiveTopology>(key.topology),
+                                 input_vertices, input_strip)) {
+        Refuse(refused_logged, hash, "geometry program with an input topology the compute path can't take");
+        return std::nullopt;
+    }
+    Shader::IR::Program& vertex_program = programs[1];
+    Shader::IR::Program& geometry_program = programs[4];
+    const Shader::VaryingState geometry_stores = geometry_program.info.stores;
+    const auto geometry_legacy = geometry_program.info.legacy_stores_mapping;
+    std::string why;
+    const std::optional<Geometry::Plan> plan =
+        Geometry::Transform(geometry_program, input_vertices, input_strip, why);
+    if (!plan) {
+        Refuse(refused_logged, hash, "geometry program the compute path can't take", why);
+        return std::nullopt;
+    }
+    Shader::Backend::Bindings bindings;
+    // The vertex program as capture kernels only: its depth conversion and Y flip belong to the
+    // reader, which draws what the geometry program emits.
+    Shader::RuntimeInfo vertex_info;
+    vertex_info.previous_stage_stores.mask.set();
+    for (size_t attribute = 0; attribute < vertex_info.generic_input_types.size(); ++attribute) {
+        constexpr std::array types{Shader::AttributeType::Disabled, Shader::AttributeType::Float,
+                                   Shader::AttributeType::SignedInt,
+                                   Shader::AttributeType::UnsignedInt};
+        vertex_info.generic_input_types[attribute] =
+            types[(key.attribute_types >> (attribute * 2)) & 3];
+    }
+    ConvertLegacyToGeneric(vertex_program, vertex_info);
+    const std::vector<u32> vertex_spirv = EmitSPIRV(profile, vertex_info, vertex_program, bindings);
+    GeometryCompute geometry;
+    geometry.plan = *plan;
+    for (size_t variant = 0; variant < GeometryCompute::IndexSizes.size(); ++variant) {
+        ShaderTranslate::Options options = translate_options;
+        options.vertex_index_size = GeometryCompute::IndexSizes[variant];
+        auto capture = FromSpirv(vertex_spirv, vertex_program,
+                                 ShaderTranslate::Stage::VertexForTessellation, options);
+        if (!capture) {
+            return std::nullopt;
+        }
+        capture->msl += Geometry::RecordsSource(*plan, capture->entry_point, capture->outputs,
+                                                vertex_program.info.legacy_stores_mapping);
+        geometry.vertex_stride = (std::max)(geometry.vertex_stride, OutputStride(capture->outputs));
+        geometry.capture[variant] = std::move(*capture);
+    }
+    Shader::RuntimeInfo kernel_info;
+    auto kernel = Translate(geometry_program, ShaderTranslate::Stage::Compute, bindings, kernel_info);
+    if (!kernel) {
+        return std::nullopt;
+    }
+    // The extra buffers are not guest storage buffers: out of the descriptors the draw binds.
+    auto& descriptors = kernel->info.storage_buffers_descriptors;
+    descriptors.resize(descriptors.size() - Geometry::ExtraBuffers);
+    {
+        std::vector<ShaderTranslate::ResourceSlot> buffers;
+        for (const ShaderTranslate::ResourceSlot& slot : kernel->slots) {
+            if (slot.kind == ShaderTranslate::ResourceKind::Buffer &&
+                slot.set != ShaderTranslate::PushConstantSet) {
+                buffers.push_back(slot);
+            }
+        }
+        std::ranges::sort(buffers, {}, &ShaderTranslate::ResourceSlot::binding);
+        if (buffers.size() < Geometry::ExtraBuffers) {
+            Refuse(refused_logged, hash, "geometry kernel without its buffers");
+            return std::nullopt;
+        }
+        for (u32 buffer = 0; buffer < Geometry::ExtraBuffers; ++buffer) {
+            geometry.extra_slots[buffer] =
+                buffers[buffers.size() - Geometry::ExtraBuffers + buffer].index;
+        }
+    }
+    geometry.kernel = MeshKernel{.program = std::move(*kernel),
+                                 .workgroup_size = {Geometry::GroupSize, 1, 1}};
+
+    StageProgram fragment{};
+    if (key.unique_hashes[5] != 0) {
+        Shader::RuntimeInfo fragment_info;
+        fragment_info.previous_stage_stores = geometry_stores;
+        fragment_info.previous_stage_legacy_stores_mapping = geometry_legacy;
+        ApplyFragmentState(fragment_info, key);
+        auto translated =
+            Translate(programs[5], ShaderTranslate::Stage::Fragment, bindings, fragment_info);
+        if (!translated) {
+            return std::nullopt;
+        }
+        fragment = std::move(*translated);
+    }
+    const float point_size = FixedStateEnabled() && static_cast<Maxwell::PrimitiveTopology>(key.topology) ==
+                                                         Maxwell::PrimitiveTopology::Points
+                                 ? std::bit_cast<float>(key.point_size)
+                                 : 1.0f;
+    StageProgram reader{
+        .stage = ShaderTranslate::Stage::Vertex,
+        .msl = Geometry::ReaderSource(*plan, (key.state & StateDepthMinusOneToOne) != 0,
+                                      translate_options.flip_vertex_y, point_size),
+        .entry_point = std::string{Geometry::ReaderEntry},
+    };
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+        LOG_INFO(Render_Metal, "Metal: geometry pipeline {:016x} (geometry {:016x}) through the compute "
+                        "path: {} in, {} out vertices, {} input and {} output words",
+                 hash, key.unique_hashes[4], input_vertices, plan->max_vertices, plan->InputStride(),
+                 plan->OutputStride());
+    }
+    return TranslatedPipeline{
+        .vertex = std::move(reader),
+        .fragment = std::move(fragment),
+        .geometry = std::move(geometry),
+    };
+}
+
+std::optional<StageProgram> PipelineTranslator::GeometryKernel(Shader::IR::Program& program) {
+    Shader::Backend::Bindings bindings;
+    try {
+        return Translate(program, ShaderTranslate::Stage::Compute, bindings, Shader::RuntimeInfo{});
+    } catch (const Shader::Exception& exception) {
+        cause = "shader recompiler exception";
+        detail = exception.what();
+        return std::nullopt;
+    }
 }
 
 bool PipelineTranslator::FoldGeometryPassthrough(Shader::IR::Program& vertex,

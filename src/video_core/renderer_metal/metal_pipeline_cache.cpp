@@ -96,10 +96,11 @@ GraphicsPipeline::GraphicsPipeline(const GraphicsPipelineKey& key_, StageProgram
                                    StageProgram fragment_, std::optional<MeshEmulation> mesh_,
                                    std::optional<Tessellation> tessellation_,
                                    std::optional<NativeMesh> native_mesh_,
-                                   std::optional<XfbCapture> xfb_)
+                                   std::optional<XfbCapture> xfb_,
+                                   std::optional<GeometryCompute> geometry_)
     : key{key_}, vertex{std::move(vertex_)}, fragment{std::move(fragment_)},
       mesh{std::move(mesh_)}, tessellation{std::move(tessellation_)},
-      native_mesh{std::move(native_mesh_)}, xfb{std::move(xfb_)} {
+      native_mesh{std::move(native_mesh_)}, xfb{std::move(xfb_)}, geometry{std::move(geometry_)} {
     if (!fragment.entry_point.empty()) {
         for (size_t index = 0; index < fragment.info.interpolation.size(); ++index) {
             flat_inputs = flat_inputs ||
@@ -208,6 +209,62 @@ std::pair<void*, void*> GraphicsPipeline::XfbKernelStates(const Device& device, 
         }
     }
     return {it->second.Get(), xfb->gather[variant].Get()};
+}
+
+std::pair<void*, void*> GraphicsPipeline::GeometryKernelStates(const Device& device,
+                                                               size_t variant,
+                                                               const RenderPipelineDesc& layout) {
+    if (!geometry || variant >= GeometryCompute::IndexSizes.size()) {
+        return {};
+    }
+    StageProgram& program = geometry->capture[variant];
+    if (program.build_failed) {
+        return {};
+    }
+    std::string error;
+    if (!program.function) {
+        program.library = CreateLibrary(device, program.msl, error);
+        const Object records =
+            program.library
+                ? CreateFunction(program.library.Get(), std::string{Geometry::RecordsEntry})
+                : Object{};
+        program.function = program.library
+                               ? CreateFunction(program.library.Get(), program.entry_point)
+                               : Object{};
+        if (program.function && records) {
+            geometry->records[variant] =
+                CreateComputePipelineState(device, records.Get(), error, archive);
+        }
+        if (!program.function || !geometry->records[variant]) {
+            program.build_failed = true;
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(Render_Metal, "Metal: geometry capture kernels of {:016x} failed to build: {}",
+                          key.unique_hashes[1], error);
+            }
+            return {};
+        }
+        ReleaseSource(program);
+    }
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(layout.attributes.data()),
+                                        sizeof(layout.attributes)) ^
+                     Common::CityHash64(reinterpret_cast<const char*>(layout.streams.data()),
+                                        sizeof(layout.streams)) ^
+                     (u64{variant} << 60);
+    const auto [it, is_new] = vertex_kernel_states.try_emplace(hash);
+    if (is_new) {
+        it->second = CreateStageInComputePipelineState(
+            device, program.function.Get(), layout, GeometryCompute::IndexSizes[variant],
+            program.tessellation_slots.index, error, archive);
+        if (!it->second) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(Render_Metal, "Metal: geometry capture kernel state of {:016x} refused: {}; {}",
+                          key.unique_hashes[1], error, Describe(layout));
+            }
+        }
+    }
+    return {it->second.Get(), geometry->records[variant].Get()};
 }
 
 void* GraphicsPipeline::KernelState(const Device& device, MeshKernel& kernel) {
@@ -670,7 +727,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                     pipeline = std::make_unique<GraphicsPipeline>(
                         key, std::move(translated->vertex), std::move(translated->fragment),
                         std::move(translated->mesh), std::move(translated->tessellation),
-                        std::move(translated->native_mesh), std::move(translated->xfb));
+                        std::move(translated->native_mesh), std::move(translated->xfb),
+                std::move(translated->geometry));
                     pipeline->SetArchive(&archive);
                     if (!pipeline->BuildFunctions(device)) {
                         return;
@@ -871,7 +929,8 @@ std::shared_ptr<PipelineCache::GraphicsBuild> PipelineCache::QueueGraphicsBuild(
             auto pipeline = std::make_unique<GraphicsPipeline>(
                 raw->key, std::move(translated->vertex), std::move(translated->fragment),
                 std::move(translated->mesh), std::move(translated->tessellation),
-                std::move(translated->native_mesh), std::move(translated->xfb));
+                std::move(translated->native_mesh), std::move(translated->xfb),
+                std::move(translated->geometry));
             pipeline->SetArchive(&archive);
             if (pipeline->BuildFunctions(device)) {
                 MeshEmulation* const mesh = pipeline->Mesh();
@@ -1027,7 +1086,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     return std::make_unique<GraphicsPipeline>(
         graphics_key, std::move(translated->vertex), std::move(translated->fragment),
         std::move(translated->mesh), std::move(translated->tessellation),
-        std::move(translated->native_mesh), std::move(translated->xfb));
+        std::move(translated->native_mesh), std::move(translated->xfb),
+                std::move(translated->geometry));
 }
 
 std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(

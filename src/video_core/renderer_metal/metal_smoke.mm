@@ -60,6 +60,7 @@
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_condition.h"
 #include "video_core/renderer_metal/metal_device.h"
+#include "video_core/renderer_metal/metal_geometry.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_mesh_indirect.h"
@@ -2142,6 +2143,285 @@ int RunGeometryPassthrough() {
                 "arithmetic %d, stored twice %d, not stored %d): %s\n",
                 fold_ok, after_store, arithmetic_refused, twice_refused, missing_refused,
                 passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// Geometry programs through the compute path (metal_geometry.h), with hand-built IR: a point
+/// expanded to a quad (a four vertex strip) at each of two input points, and a triangle strip
+/// emitter that ends its primitive between two triangles. The geometry program is rewritten
+/// (Geometry::Transform), translated as a compute kernel and run on records filled here, its
+/// regions compacted by the ported kernels, and the list drawn through the reader; the pixels
+/// say where the primitives went.
+int RunGeometryCompute() {
+    namespace IR = Shader::IR;
+    using Maxwell = Metal::Maxwell;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Metal::PipelineTranslator translator(false, 0, false);
+    Shader::ObjectPool<IR::Inst> insts{512};
+    Shader::ObjectPool<IR::Block> blocks{16};
+
+    // kind 0: each point to the quad around it; kind 1: two triangles, an EndPrimitive between.
+    const auto make_program = [&](int kind) {
+        IR::Program program;
+        program.stage = Shader::Stage::Geometry;
+        program.invocations = 1;
+        program.output_topology = Shader::OutputTopology::TriangleStrip;
+        program.output_vertices = kind == 0 ? 4 : kind == 1 ? 6 : 3;
+        IR::Block* const body = blocks.Create(insts);
+        IR::Block* const tail = blocks.Create(insts);
+        IR::IREmitter ir{*body};
+        const auto emit = [&](IR::F32 x, IR::F32 y) {
+            ir.SetAttribute(IR::Attribute::PositionX, x, ir.Imm32(0U));
+            ir.SetAttribute(IR::Attribute::PositionY, y, ir.Imm32(0U));
+            ir.SetAttribute(IR::Attribute::PositionZ, ir.Imm32(0.0f), ir.Imm32(0U));
+            ir.SetAttribute(IR::Attribute::PositionW, ir.Imm32(1.0f), ir.Imm32(0U));
+            ir.SetAttribute(IR::Attribute::Generic0X, ir.Imm32(0.0f), ir.Imm32(0U));
+            ir.SetAttribute(IR::Attribute::Generic0Y, ir.Imm32(1.0f), ir.Imm32(0U));
+            ir.SetAttribute(IR::Attribute::Generic0Z, ir.Imm32(0.0f), ir.Imm32(0U));
+            ir.SetAttribute(IR::Attribute::Generic0W, ir.Imm32(1.0f), ir.Imm32(0U));
+            ir.EmitVertex(ir.Imm32(0U));
+        };
+        if (kind == 2) {
+            // A passthrough: the input triangle's three vertices out again.
+            for (uint32_t vertex = 0; vertex < 3; ++vertex) {
+                emit(ir.GetAttribute(IR::Attribute::PositionX, ir.Imm32(vertex)),
+                     ir.GetAttribute(IR::Attribute::PositionY, ir.Imm32(vertex)));
+            }
+        }
+        const IR::F32 cx = ir.GetAttribute(IR::Attribute::PositionX, ir.Imm32(0U));
+        const IR::F32 cy = ir.GetAttribute(IR::Attribute::PositionY, ir.Imm32(0U));
+        const auto offset = [&](IR::F32 base, float delta) {
+            return IR::F32{ir.FPAdd(base, ir.Imm32(delta))};
+        };
+        if (kind == 2) {
+        } else if (kind == 0) {
+            emit(offset(cx, -0.2f), offset(cy, -0.2f));
+            emit(offset(cx, 0.2f), offset(cy, -0.2f));
+            emit(offset(cx, -0.2f), offset(cy, 0.2f));
+            emit(offset(cx, 0.2f), offset(cy, 0.2f));
+        } else {
+            // Two triangles, one above the point and one below it.
+            emit(offset(cx, -0.2f), offset(cy, 0.1f));
+            emit(offset(cx, 0.2f), offset(cy, 0.1f));
+            emit(offset(cx, 0.0f), offset(cy, 0.4f));
+            ir.EndPrimitive(ir.Imm32(0U));
+            emit(offset(cx, -0.2f), offset(cy, -0.1f));
+            emit(offset(cx, 0.2f), offset(cy, -0.1f));
+            emit(offset(cx, 0.0f), offset(cy, -0.4f));
+        }
+        IR::IREmitter{*tail}.Epilogue();
+        body->AddBranch(tail);
+        program.syntax_list.emplace_back().type = IR::AbstractSyntaxNode::Type::Block;
+        program.syntax_list.back().data.block = body;
+        program.syntax_list.emplace_back().type = IR::AbstractSyntaxNode::Type::Block;
+        program.syntax_list.back().data.block = tail;
+        program.syntax_list.emplace_back().type = IR::AbstractSyntaxNode::Type::Return;
+        program.blocks = {body, tail};
+        program.post_order_blocks = {tail, body};
+        program.info.loads.Set(IR::Attribute::PositionX);
+        program.info.loads.Set(IR::Attribute::PositionY);
+        for (u32 element = 0; element < 4; ++element) {
+            program.info.stores.Set(IR::Attribute::PositionX + element);
+            program.info.stores.Set(IR::Attribute::Generic0X + element);
+        }
+        return program;
+    };
+    constexpr float points[2][2]{{-0.5f, 0.0f}, {0.5f, 0.0f}};
+    const auto run = [&](int kind, std::array<Texel, 4>& probes) -> bool {
+        IR::Program program = make_program(kind);
+        std::string why;
+        const std::optional<Metal::Geometry::Plan> plan =
+            Metal::Geometry::Transform(program, kind == 2 ? 3 : 1, false, why);
+        if (!plan) {
+            std::printf("metal-smoke: FAIL geometry transform: %s\n", why.c_str());
+            return false;
+        }
+
+        std::optional<Metal::StageProgram> kernel = translator.GeometryKernel(program);
+
+        if (!kernel) {
+            std::printf("metal-smoke: FAIL geometry kernel: %s %s\n",
+                        std::string{translator.Cause()}.c_str(),
+                        std::string{translator.Detail()}.c_str());
+            return false;
+        }
+        std::vector<Metal::ShaderTranslate::ResourceSlot> buffers;
+        for (const auto& slot : kernel->slots) {
+            if (slot.kind == Metal::ShaderTranslate::ResourceKind::Buffer &&
+                slot.set != Metal::ShaderTranslate::PushConstantSet) {
+                buffers.push_back(slot);
+            }
+        }
+        std::ranges::sort(buffers, {}, &Metal::ShaderTranslate::ResourceSlot::binding);
+        if (buffers.size() != Metal::Geometry::ExtraBuffers) {
+            std::printf("metal-smoke: FAIL geometry kernel has %zu buffers\n%s\n", buffers.size(),
+                        kernel->msl.c_str());
+            return false;
+        }
+        std::string error;
+        const Metal::Object library = Metal::CreateLibrary(device, kernel->msl, error);
+        const Metal::Object function =
+            library ? Metal::CreateFunction(library.Get(), kernel->entry_point) : Metal::Object{};
+        const Metal::Object geometry_kernel =
+            function ? Metal::CreateComputePipelineState(device, function.Get(), error)
+                     : Metal::Object{};
+        const Metal::Object pack_library =
+            Metal::CreateLibrary(device, std::string{Metal::Geometry::PackSource}, error);
+        const auto pack_kernel = [&](const char* name) {
+            const Metal::Object pack_function =
+                pack_library ? Metal::CreateFunction(pack_library.Get(), name) : Metal::Object{};
+            return pack_function ? Metal::CreateComputePipelineState(device, pack_function.Get(), error)
+                                 : Metal::Object{};
+        };
+        const Metal::Object count_kernel = pack_kernel("geo_count");
+        const Metal::Object scan_kernel = pack_kernel("geo_scan");
+        const Metal::Object write_kernel = pack_kernel("geo_write");
+        const Metal::Object quad_library = Metal::CreateLibrary(device, QuadSource, error);
+        const Metal::Object fragment =
+            quad_library ? Metal::CreateFunction(quad_library.Get(), "quad_fragment")
+                         : Metal::Object{};
+        const std::string reader_source = Metal::Geometry::ReaderSource(*plan, false, false, 1.0f);
+        const Metal::Object reader_library = Metal::CreateLibrary(device, reader_source, error);
+        const Metal::Object reader =
+            reader_library
+                ? Metal::CreateFunction(reader_library.Get(), std::string{Metal::Geometry::ReaderEntry})
+                : Metal::Object{};
+        if (!geometry_kernel || !count_kernel || !scan_kernel || !write_kernel || !fragment ||
+            !reader) {
+            std::printf("metal-smoke: FAIL geometry functions: %s\n%s\n%s\n", error.c_str(),
+                        kernel->msl.c_str(), reader_source.c_str());
+            return false;
+        }
+        auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+        desc.vertex_function = reader.Get();
+        desc.fragment_function = fragment.Get();
+        desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+        desc.blend[0].write_mask = 0xF;
+        desc.samples = 1;
+        desc.topology_class = 2;
+        desc.rasterize = 1;
+        const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
+        const Metal::Object depth_stencil =
+            Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+        if (!pipeline || !depth_stencil) {
+            std::printf("metal-smoke: FAIL geometry render pipeline: %s\n", error.c_str());
+            return false;
+        }
+        const uint32_t Primitives = kind == 2 ? 1 : 2;
+        constexpr uint32_t Rounded = Metal::Geometry::GroupSize;
+        const auto buffer = [&](uint64_t bytes, uint8_t** contents) {
+            Metal::Object object = Metal::CreateBuffer(device, bytes, true, contents);
+            std::memset(*contents, 0, bytes);
+            return object;
+        };
+        uint8_t* records_data = nullptr;
+        uint8_t *scratch = nullptr;
+        const Metal::Object records = buffer(uint64_t{Rounded + 1} * plan->InputStride() * 4, &records_data);
+        constexpr float triangle[3][2]{{-0.8f, -0.8f}, {0.8f, -0.8f}, {0.0f, 0.8f}};
+        for (uint32_t point = 0; point < (kind == 2 ? 3U : 2U); ++point) {
+            std::memcpy(records_data + point * plan->InputStride() * 4,
+                        kind == 2 ? triangle[point] : points[point], 2 * sizeof(float));
+        }
+        const Metal::Object output =
+            buffer(uint64_t{Rounded} * plan->max_vertices * plan->OutputStride() * 4, &scratch);
+        const Metal::Object regions = buffer(uint64_t{Rounded} * plan->IndexStride() * 4, &scratch);
+        const uint32_t capacity = Primitives * plan->max_vertices * 3;
+        const Metal::Object list = buffer(capacity * 4, &scratch);
+        const Metal::Object counts = buffer(Primitives * 4, &scratch);
+        uint8_t* arguments = nullptr;
+        const Metal::Object args = buffer(32, &arguments);
+
+        scheduler.BeginCompute(geometry_kernel.Get());
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, buffers[0].index, records.Get(), 0);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, buffers[1].index, output.Get(), 0);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, buffers[2].index, regions.Get(), 0);
+        scheduler.Dispatch({1, 1, 1}, {Metal::Geometry::GroupSize, 1, 1});
+        const Metal::Geometry::GeometryParams params{
+            .groups = Primitives,
+            .stride = plan->IndexStride(),
+            .topology = plan->output_topology,
+            .capacity = capacity,
+        };
+        const auto pack = [&](const Metal::Object& pack_kernel_state, uint32_t threads) {
+            scheduler.BeginCompute(pack_kernel_state.Get());
+            scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, regions.Get(), 0);
+            scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, list.Get(), 0);
+            scheduler.BindBuffer(Metal::ShaderStage::Compute, 2, args.Get(), 0);
+            scheduler.BindBuffer(Metal::ShaderStage::Compute, 3, counts.Get(), 0);
+            scheduler.BindBytes(Metal::ShaderStage::Compute, 4, &params, sizeof(params));
+            scheduler.Dispatch({(threads + 63) / 64, 1, 1}, {64, 1, 1});
+        };
+        pack(count_kernel, Primitives);
+        pack(scan_kernel, 1);
+        pack(write_kernel, Primitives);
+
+        const Metal::Object target = Metal::CreateTexture(
+            device, {.kind = Metal::TextureKind::e2D,
+                     .format = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm),
+                     .width = Size,
+                     .height = Size,
+                     .render_target = true});
+        uint8_t* readback = nullptr;
+        const Metal::Object readback_buffer = buffer(Size * Size * 4, &readback);
+        Metal::ClearPass clear{};
+        clear.color[0] = {.texture = target.Get()};
+        clear.clear_color[0] = true;
+        clear.color_value[0] = {1.0, 0.0, 0.0, 1.0};
+        clear.width = Size;
+        clear.height = Size;
+        scheduler.Clear(clear);
+        Metal::RenderTargetSet targets{};
+        targets.color[0] = {.texture = target.Get()};
+        targets.width = Size;
+        targets.height = Size;
+        scheduler.BeginRendering(targets);
+        Metal::DrawState state{};
+        state.pipeline = pipeline.Get();
+        state.depth_stencil = depth_stencil.Get();
+        state.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+        state.scissor = {0, 0, Size, Size};
+        scheduler.SetDrawState(state);
+        scheduler.BindBuffer(Metal::ShaderStage::Vertex, 0, output.Get(), 0);
+        scheduler.DrawIndexedIndirect(*Metal::PrimitiveType(Maxwell::PrimitiveTopology::Triangles), 4,
+                                      list.Get(), 0, args.Get(), 0);
+        scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Size, Size, 1}, readback_buffer.Get(),
+                                      0, Size * 4, 0);
+        scheduler.Finish();
+        const auto* texels = reinterpret_cast<const Texel*>(readback);
+        // Texel at clip position (x, y): column (x + 1) / 2 * Size, row (1 - y) / 2 * Size.
+        const auto at = [&](float x, float y) {
+            return texels[static_cast<uint32_t>((1.0f - y) / 2.0f * Size) * Size +
+                          static_cast<uint32_t>((x + 1.0f) / 2.0f * Size)];
+        };
+        if (kind == 2) {
+            probes = {at(0.0f, -0.3f), at(-0.7f, 0.7f), at(0.0f, 0.5f), at(0.7f, 0.7f)};
+        } else if (kind == 0) {
+            probes = {at(-0.5f, 0.0f), at(0.5f, 0.0f), at(0.0f, 0.0f), at(-0.5f, 0.6f)};
+        } else {
+            probes = {at(-0.5f, 0.2f), at(0.5f, -0.2f), at(-0.5f, 0.0f), at(0.0f, 0.0f)};
+        }
+        std::printf("metal-smoke: geometry kernel kind %d: %u list indices\n", kind,
+                    reinterpret_cast<const uint32_t*>(arguments)[0]);
+        return true;
+    };
+    std::array<Texel, 4> quads{}, triangles{}, passthrough{};
+    const bool ran = run(0, quads) && run(1, triangles) && run(2, passthrough);
+    const bool passthrough_ok = ran && Near(passthrough[0], {0, 255, 0, 255}) &&
+                                Near(passthrough[1], {255, 0, 0, 255}) &&
+                                Near(passthrough[2], {0, 255, 0, 255}) &&
+                                Near(passthrough[3], {255, 0, 0, 255});
+    const bool quads_ok = ran && Near(quads[0], {0, 255, 0, 255}) && Near(quads[1], {0, 255, 0, 255}) &&
+                          Near(quads[2], {255, 0, 0, 255}) && Near(quads[3], {255, 0, 0, 255});
+    // Both triangles of each point (above and below it), and nothing between the points.
+    const bool triangles_ok =
+        ran && Near(triangles[0], {0, 255, 0, 255}) && Near(triangles[1], {0, 255, 0, 255}) &&
+        Near(triangles[2], {255, 0, 0, 255}) && Near(triangles[3], {255, 0, 0, 255});
+    const bool passed = quads_ok && triangles_ok && passthrough_ok;
+    std::printf("metal-smoke: geometry compute path (point to quad strip: %s, two triangles ended "
+                "by EndPrimitive: %s, triangle passed through: %s): %s\n",
+                quads_ok ? "ok" : "WRONG", triangles_ok ? "ok" : "WRONG",
+                passthrough_ok ? "ok" : "WRONG", passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
 
@@ -4935,7 +5215,7 @@ int main(int argc, char** argv) {
                                  RunTexture1D,
                                  RunMeshEmulation, RunMeshDistribution, RunIndexRewrite,
                                  RunOcarinaBilinear, RunPipelineArchive,
-                                 RunDepthBlit, RunTessellation, RunTransformFeedback, RunGeometryPassthrough, RunDepthStencilBlit,
+                                 RunDepthBlit, RunTessellation, RunTransformFeedback, RunGeometryPassthrough, RunGeometryCompute, RunDepthStencilBlit,
                                  RunPipelineCheck, RunDeviceMsl, RunNativeMesh, RunBlockCopy,
                                  RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,

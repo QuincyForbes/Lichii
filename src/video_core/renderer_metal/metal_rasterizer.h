@@ -465,6 +465,10 @@ private:
     /// capture kernels over; left unwanted when nothing is captured.
     void PrepareXfbDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 instance_count);
 
+    /// A draw of a pipeline with a geometry program (metal_geometry.h).
+    void DrawGeometry(GraphicsPipeline& pipeline, bool is_indexed, u32 instance_count);
+    void EnsureGeometryKernels();
+
     /// A draw of the vertices a transform feedback captured (DrawIndirectByteCountEXT): the byte
     /// count the guest's counter holds over the stride.
     void DrawByteCount();
@@ -660,6 +664,22 @@ private:
         Maxwell::PrimitiveTopology topology{Maxwell::PrimitiveTopology::Points};
         u32 patch_vertices{1};
     } xfb_state;
+    /// The geometry draw being prepared: the output records the reader draws from, the compacted
+    /// index list and the draw's indirect arguments.
+    struct GeometryDraw {
+        StagingBufferRef output;
+        StagingBufferRef indices;
+        StagingBufferRef args;
+    } geo_draw;
+    Object geometry_library;
+    Object geometry_count_kernel;
+    Object geometry_scan_kernel;
+    Object geometry_write_kernel;
+    bool geometry_kernels_failed{};
+    u64 geometry_draws{};
+    u64 geometry_primitives{};
+    /// Input primitives of the draw CountDraw is counting for a geometry pipeline (else 0).
+    u32 geometry_input_primitives{};
     /// Counters of the draws made, by VideoCommon::QueryType.
     std::array<u64, 32> counters{};
     u64 xfb_captures{};
