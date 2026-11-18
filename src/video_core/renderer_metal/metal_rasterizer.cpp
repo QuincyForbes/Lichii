@@ -2458,6 +2458,10 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         pack(geometry_write_kernel, groups);
         ++geometry_draws;
         geometry_primitives += input_primitives;
+        if (geometry_readbacks.size() >= 4096) {
+            ResolveGeometryCounters();
+        }
+        geometry_readbacks.push_back({geo_draw.args, scheduler.CurrentTick(), plan.output_topology});
     }
 
     if (xfb_draw.wanted && pipeline.Xfb() != nullptr) {
@@ -4237,6 +4241,8 @@ std::optional<u64> RasterizerMetal::CounterValue(VideoCommon::QueryType type,
     case Type::ClipperPrimitivesGenerated:
     case Type::VtgPrimitivesOut:
     case Type::GeometryShaderInvocations:
+    case Type::GeometryShaderPrimitivesGenerated:
+    case Type::PixelShaderInvocations:
         return counters[static_cast<size_t>(type)];
     default:
         return std::nullopt;
@@ -4256,16 +4262,67 @@ u32 RasterizerMetal::AllocateVisibilitySlot() {
 }
 
 void RasterizerMetal::CountOcclusion() {
-    if (maxwell3d->regs.zpass_pixel_count_enable == 0) {
+    const bool zpass = maxwell3d->regs.zpass_pixel_count_enable != 0;
+    if (!zpass && !count_pixels) {
         scheduler.SetVisibility(std::nullopt);
         return;
     }
-    // A slot per render pass of the counting segment: results are summed at the query.
+    // A slot per render pass of the counting segment: results are summed at the query. The pixel
+    // program invocation counter (once a report asks for it) reads the same slots.
     if (occlusion_pass != scheduler.RenderPassSerial()) {
-        occlusion_slots.push_back(AllocateVisibilitySlot());
+        visibility_slot = AllocateVisibilitySlot();
         occlusion_pass = scheduler.RenderPassSerial();
+        slot_in_occlusion = slot_in_pixels = false;
     }
-    scheduler.SetVisibility(occlusion_slots.back());
+    if (zpass && !slot_in_occlusion) {
+        occlusion_slots.push_back(visibility_slot);
+        slot_in_occlusion = true;
+    }
+    if (count_pixels && !slot_in_pixels) {
+        if (pixel_slots.size() >= 4096) {
+            ResolvePixelCounter();
+        }
+        pixel_slots.push_back(visibility_slot);
+        slot_in_pixels = true;
+    }
+    if (const Framebuffer* const framebuffer = texture_cache.GetFramebuffer()) {
+        pixel_samples = (std::max)(framebuffer->Samples(), 1U);
+    }
+    scheduler.SetVisibility(visibility_slot);
+}
+
+void RasterizerMetal::ResolvePixelCounter() {
+    // The samples that passed, over the samples a pixel has: the invocations of the pixel
+    // program as far as a visibility counter says (early depth and stencil kills are not
+    // counted as invocations, a draw's helper invocations are).
+    if (pixel_slots.empty()) {
+        return;
+    }
+    scheduler.Wait(visibility_ticks[pixel_slots.back()]);
+    const u64* const results = scheduler.VisibilityResults();
+    u64 samples = 0;
+    for (const u32 slot : pixel_slots) {
+        samples += results[slot];
+    }
+    counters[static_cast<size_t>(VideoCommon::QueryType::PixelShaderInvocations)] +=
+        samples / pixel_samples;
+    pixel_slots.clear();
+    // The slot the pass in progress still counts into: its samples so far were taken.
+    slot_in_pixels = false;
+    occlusion_pass = ~u64{0};
+}
+
+void RasterizerMetal::ResolveGeometryCounters() {
+    // The primitives the geometry draws' compactions listed: read once the GPU is done with them.
+    for (const GeometryReadback& readback : geometry_readbacks) {
+        scheduler.Wait(readback.tick);
+        u32 indices = 0;
+        std::memcpy(&indices, readback.args.mapped_span.data(), sizeof(indices));
+        const u32 per_primitive = readback.topology == 1 ? 1U : readback.topology == 6 ? 2U : 3U;
+        counters[static_cast<size_t>(VideoCommon::QueryType::GeometryShaderPrimitivesGenerated)] +=
+            indices / per_primitive;
+    }
+    geometry_readbacks.clear();
 }
 
 void RasterizerMetal::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
@@ -4354,6 +4411,13 @@ void RasterizerMetal::QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType ty
     // so the value is already final); the others read as 1 (something passed), as OpenGL's
     // fallback does.
     u64 value = payload;
+    if (type == VideoCommon::QueryType::PixelShaderInvocations) {
+        // Counting starts with the first report that asks.
+        count_pixels = true;
+        ResolvePixelCounter();
+    } else if (type == VideoCommon::QueryType::GeometryShaderPrimitivesGenerated) {
+        ResolveGeometryCounters();
+    }
     if (type != VideoCommon::QueryType::Payload) {
         value = CounterValue(type, subreport).value_or(1U);
     }

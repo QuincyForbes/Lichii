@@ -534,6 +534,25 @@ private:
 
     /// The visibility slots of the occlusion counter since its last reset, one per render pass.
     std::vector<u32> occlusion_slots;
+    /// The visibility slot of the pass being counted, and whether the occlusion and pixel lists
+    /// have it.
+    u32 visibility_slot{};
+    bool slot_in_occlusion{};
+    bool slot_in_pixels{};
+    /// Pixel program invocations (PixelShaderInvocations): counted once a report asks, from the
+    /// passes' visibility slots over the samples per pixel.
+    bool count_pixels{};
+    std::vector<u32> pixel_slots;
+    u32 pixel_samples{1};
+    /// The compaction counts of the geometry draws not yet read back.
+    struct GeometryReadback {
+        StagingBufferRef args;
+        u64 tick;
+        u32 topology;
+    };
+    std::vector<GeometryReadback> geometry_readbacks;
+    void ResolvePixelCounter();
+    void ResolveGeometryCounters();
     u64 occlusion_pass{~u64{0}};
     u32 next_visibility_slot{};
     std::array<u64, Scheduler::VisibilitySlots> visibility_ticks{};
