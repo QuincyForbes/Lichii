@@ -96,10 +96,11 @@ std::string_view PipelineCache::NoteRefusal(u64 key_hash) {
 GraphicsPipeline::GraphicsPipeline(const GraphicsPipelineKey& key_, StageProgram vertex_,
                                    StageProgram fragment_, std::optional<MeshEmulation> mesh_,
                                    std::optional<Tessellation> tessellation_,
-                                   std::optional<NativeMesh> native_mesh_)
+                                   std::optional<NativeMesh> native_mesh_,
+                                   std::optional<XfbCapture> xfb_)
     : key{key_}, vertex{std::move(vertex_)}, fragment{std::move(fragment_)},
       mesh{std::move(mesh_)}, tessellation{std::move(tessellation_)},
-      native_mesh{std::move(native_mesh_)} {
+      native_mesh{std::move(native_mesh_)}, xfb{std::move(xfb_)} {
     if (!fragment.entry_point.empty()) {
         for (size_t index = 0; index < fragment.info.interpolation.size(); ++index) {
             flat_inputs = flat_inputs ||
@@ -154,6 +155,60 @@ void* GraphicsPipeline::VertexKernelState(const Device& device, size_t variant,
         }
     }
     return it->second.Get();
+}
+
+std::pair<void*, void*> GraphicsPipeline::XfbKernelStates(const Device& device, size_t variant,
+                                                          const RenderPipelineDesc& layout) {
+    if (!xfb || variant >= XfbCapture::IndexSizes.size()) {
+        return {};
+    }
+    StageProgram& program = xfb->capture[variant];
+    if (program.build_failed) {
+        return {};
+    }
+    std::string error;
+    if (!program.function) {
+        program.library = CreateLibrary(device, program.msl, error);
+        const Object gather =
+            program.library ? CreateFunction(program.library.Get(), std::string{Xfb::GatherEntry})
+                            : Object{};
+        program.function = program.library
+                               ? CreateFunction(program.library.Get(), program.entry_point)
+                               : Object{};
+        if (program.function && gather) {
+            xfb->gather[variant] = CreateComputePipelineState(device, gather.Get(), error, archive);
+        }
+        if (!program.function || !xfb->gather[variant]) {
+            program.build_failed = true;
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(Render_Metal, "Metal: transform feedback kernels of {:016x} failed to build: {}",
+                          key.unique_hashes[1], error);
+            }
+            return {};
+        }
+        ReleaseSource(program);
+    }
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(layout.attributes.data()),
+                                        sizeof(layout.attributes)) ^
+                     Common::CityHash64(reinterpret_cast<const char*>(layout.streams.data()),
+                                        sizeof(layout.streams)) ^
+                     (u64{variant} << 60);
+    const auto [it, is_new] = vertex_kernel_states.try_emplace(hash);
+    if (is_new) {
+        it->second = CreateStageInComputePipelineState(
+            device, program.function.Get(), layout, XfbCapture::IndexSizes[variant],
+            program.tessellation_slots.index, error, archive);
+        if (!it->second) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(Render_Metal,
+                          "Metal: transform feedback kernel state of {:016x} refused: {}; {}",
+                          key.unique_hashes[1], error, Describe(layout));
+            }
+        }
+    }
+    return {it->second.Get(), xfb->gather[variant].Get()};
 }
 
 void* GraphicsPipeline::KernelState(const Device& device, MeshKernel& kernel) {
@@ -225,11 +280,15 @@ bool GraphicsPipeline::BuildFunctions(const Device& device) {
         // Refused natively and not emulated.
         return false;
     }
-    for (StageProgram* const stage : {&vertex, &fragment}) {
-        if (stage->function || stage->entry_point.empty()) {
+    StageProgram* const expansion = xfb && xfb->expand ? &xfb->render : nullptr;
+    for (StageProgram* const stage : {&vertex, &fragment, expansion}) {
+        if (stage == nullptr || stage->function || stage->entry_point.empty()) {
             continue;
         }
         if (stage->build_failed) {
+            if (stage == expansion) {
+                continue;
+            }
             return false;
         }
         std::string error;
@@ -242,6 +301,10 @@ bool GraphicsPipeline::BuildFunctions(const Device& device) {
             if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
                 LOG_ERROR(Render_Metal, "Metal: {:016x} stage MSL failed to build: {}",
                           key.unique_hashes[stage == &vertex ? 1 : 5], error);
+            }
+            if (stage == expansion) {
+                // The draws stay plain (lines 1 pixel wide, triangles as they are).
+                continue;
             }
             return false;
         }
@@ -269,7 +332,9 @@ u64 GraphicsPipeline::StateHash(RenderPipelineDesc& desc) const noexcept {
         desc.vertex_function = native->mesh_function;
         desc.fragment_function = native->fragment_function;
     } else {
-        desc.vertex_function = vertex.function.Get();
+        desc.vertex_function = desc.expand != 0 && xfb && xfb->expand
+                                   ? xfb->render.function.Get()
+                                   : vertex.function.Get();
         desc.fragment_function = fragment.function.Get();
     }
     return Common::CityHash64(reinterpret_cast<const char*>(&desc), sizeof(desc));
@@ -616,7 +681,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                     pipeline = std::make_unique<GraphicsPipeline>(
                         key, std::move(translated->vertex), std::move(translated->fragment),
                         std::move(translated->mesh), std::move(translated->tessellation),
-                        std::move(translated->native_mesh));
+                        std::move(translated->native_mesh), std::move(translated->xfb));
                     pipeline->SetArchive(&archive);
                     if (!pipeline->BuildFunctions(device)) {
                         return;
@@ -816,7 +881,7 @@ std::shared_ptr<PipelineCache::GraphicsBuild> PipelineCache::QueueGraphicsBuild(
             auto pipeline = std::make_unique<GraphicsPipeline>(
                 raw->key, std::move(translated->vertex), std::move(translated->fragment),
                 std::move(translated->mesh), std::move(translated->tessellation),
-                std::move(translated->native_mesh));
+                std::move(translated->native_mesh), std::move(translated->xfb));
             pipeline->SetArchive(&archive);
             if (pipeline->BuildFunctions(device)) {
                 MeshEmulation* const mesh = pipeline->Mesh();
@@ -972,7 +1037,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     return std::make_unique<GraphicsPipeline>(
         graphics_key, std::move(translated->vertex), std::move(translated->fragment),
         std::move(translated->mesh), std::move(translated->tessellation),
-        std::move(translated->native_mesh));
+        std::move(translated->native_mesh), std::move(translated->xfb));
 }
 
 std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(

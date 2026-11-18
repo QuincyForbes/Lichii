@@ -37,6 +37,10 @@
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/attribute.h"
+#include "shader_recompiler/frontend/ir/basic_block.h"
+#include "shader_recompiler/frontend/ir/ir_emitter.h"
+#include "shader_recompiler/frontend/ir/program.h"
+#include "shader_recompiler/object_pool.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "shader_recompiler/shader_info.h"
@@ -48,6 +52,7 @@
 #include "tess_smoke_tesc_spv.h"
 #include "tess_smoke_tese_spv.h"
 #include "tess_smoke_vert_spv.h"
+#include "xfb_smoke_vert_spv.h"
 #include "texel_buffer_smoke_comp_spv.h"
 #include "texture_1d_smoke_comp_spv.h"
 #include "translate_smoke_comp_spv.h"
@@ -62,7 +67,9 @@
 #include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_build_job.h"
 #include "video_core/renderer_metal/metal_pipeline_files.h"
+#include "video_core/renderer_metal/metal_pipeline_translate.h"
 #include "video_core/renderer_metal/metal_present.h"
+#include "video_core/renderer_metal/metal_xfb.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
@@ -1828,6 +1835,314 @@ int RunTessellation() {
         std::printf("%s\n%s\n%s\n", vertex.source.c_str(), control.source.c_str(),
                     evaluation.source.c_str());
     }
+    return passed ? 0 : 1;
+}
+
+/// Transform feedback as the renderer runs it: a GLSL vertex program through the translator as a
+/// stage-in capture kernel (two instances of three vertices), the gather kernel Xfb::GatherSource
+/// appends to its MSL copying the guest's varyings (position xyz and generic 0 xy into buffer 0,
+/// generic 3 into buffer 1) at each buffer's stride, and the capture arithmetic (capacity clamp,
+/// whole primitives only, appending past what is written).
+int RunTransformFeedback() {
+    namespace Translate = Metal::ShaderTranslate;
+    using Maxwell = Metal::Maxwell;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Translate::Options options;
+    const Translate::Result vertex = Translate::SpirvToMsl(
+        std::span<const uint32_t>(XFB_SMOKE_VERT_SPV), Translate::Stage::VertexForTessellation,
+        options);
+    if (vertex.source.empty()) {
+        std::printf("metal-smoke: FAIL transform feedback SPIR-V -> MSL: %s\n",
+                    vertex.error.c_str());
+        return 1;
+    }
+    // Buffer 0: position xyz (28..30) and generic 0 xy (32, 33), 20 bytes a vertex; buffer 1:
+    // generic 3 (44..47), 16 bytes.
+    VideoCommon::TransformFeedbackState state{};
+    state.layouts[0] = {.stream = 0, .varying_count = 5, .stride = 20};
+    state.layouts[1] = {.stream = 0, .varying_count = 4, .stride = 16};
+    const std::array<uint32_t, 5> first{28, 29, 30, 32, 33};
+    const std::array<uint32_t, 4> second{44, 45, 46, 47};
+    const auto set = [&](size_t buffer, size_t index, uint32_t attribute) {
+        auto& layout = state.varyings[buffer][index / 4];
+        switch (index % 4) {
+        case 0:
+            layout.attribute0.Assign(attribute);
+            break;
+        case 1:
+            layout.attribute1.Assign(attribute);
+            break;
+        case 2:
+            layout.attribute2.Assign(attribute);
+            break;
+        default:
+            layout.attribute3.Assign(attribute);
+            break;
+        }
+    };
+    for (size_t index = 0; index < first.size(); ++index) {
+        set(0, index, first[index]);
+    }
+    for (size_t index = 0; index < second.size(); ++index) {
+        set(1, index, second[index]);
+    }
+    Metal::Xfb::Layout layout;
+    std::memcpy(layout.words.data(), &state, sizeof(state));
+    const std::string source =
+        vertex.source + Metal::Xfb::GatherSource(layout, vertex.entry_point, vertex.outputs, {});
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, source, error);
+    const Metal::Object capture_function =
+        library ? Metal::CreateFunction(library.Get(), vertex.entry_point) : Metal::Object{};
+    const Metal::Object gather_function =
+        library ? Metal::CreateFunction(library.Get(), std::string{Metal::Xfb::GatherEntry})
+                : Metal::Object{};
+    if (!capture_function || !gather_function) {
+        std::printf("metal-smoke: FAIL transform feedback functions: %s\n%s\n", error.c_str(),
+                    source.c_str());
+        return 1;
+    }
+    auto vertex_layout = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    vertex_layout.attributes[0] = {1, 0, 0, Maxwell::VertexAttribute::Type::Float,
+                                   Maxwell::VertexAttribute::Size::Size_R32_G32_B32};
+    vertex_layout.streams[0] = {1, 12, 0};
+    const Metal::Object capture_kernel = Metal::CreateStageInComputePipelineState(
+        device, capture_function.Get(), vertex_layout, 0, vertex.tessellation_slots.index, error);
+    const Metal::Object gather_kernel =
+        Metal::CreateComputePipelineState(device, gather_function.Get(), error);
+    if (!capture_kernel || !gather_kernel) {
+        std::printf("metal-smoke: FAIL transform feedback pipelines: %s\n%s\n", error.c_str(),
+                    source.c_str());
+        return 1;
+    }
+
+    const auto buffer = [&](uint32_t bytes, uint8_t** contents, uint8_t fill) {
+        Metal::Object object = Metal::CreateBuffer(device, bytes, true, contents);
+        std::memset(*contents, fill, bytes);
+        return object;
+    };
+    uint8_t* positions = nullptr;
+    const Metal::Object position_buffer = buffer(36, &positions, 0);
+    // The lower-left half of the target, as clip space corners.
+    const float corners[9]{-1, -1, 0, 1, -1, 0, -1, 1, 0};
+    std::memcpy(positions, corners, sizeof(corners));
+    uint8_t* outputs = nullptr;
+    uint8_t* first_out = nullptr;
+    uint8_t* second_out = nullptr;
+    const Metal::Object output_buffer = buffer(6 * 256, &outputs, 0);
+    // Seven vertices of room each, filled with a marker.
+    const Metal::Object first_buffer = buffer(7 * 20, &first_out, 0xAB);
+    const Metal::Object second_buffer = buffer(7 * 16, &second_out, 0xAB);
+
+    // The clamp: 6 vertices, room for 7 (all of them); then 1 more vertex of room left (no whole
+    // triangle); with room for 5, a triangle's worth.
+    const std::array<uint32_t, 4> stride{20, 16, 0, 0};
+    const uint32_t all = Metal::Xfb::CapturedVertices(6, 3, stride, {140, 112, 0, 0}, {});
+    const uint32_t none = Metal::Xfb::CapturedVertices(6, 3, stride, {140, 112, 0, 0}, {120, 96, 0, 0});
+    const uint32_t part = Metal::Xfb::CapturedVertices(6, 3, stride, {100, 96, 0, 0}, {});
+    const bool clamp_ok = all == 6 && none == 0 && part == 3;
+
+    scheduler.BeginCompute(capture_kernel.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::VertexBufferSlot(0),
+                         position_buffer.Get(), 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, vertex.tessellation_slots.output,
+                         output_buffer.Get(), 0);
+    scheduler.DispatchStageIn(0, 3, 0, 2);
+    scheduler.BeginCompute(gather_kernel.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::Xfb::GatherSourceSlot,
+                         output_buffer.Get(), 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::Xfb::GatherBufferSlot,
+                         first_buffer.Get(), 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::Xfb::GatherBufferSlot + 1,
+                         second_buffer.Get(), 0);
+    const uint32_t count = all;
+    scheduler.BindBytes(Metal::ShaderStage::Compute, Metal::Xfb::GatherCountSlot, &count,
+                        sizeof(count));
+    scheduler.Dispatch({(count + Metal::Xfb::GatherGroupSize - 1) / Metal::Xfb::GatherGroupSize, 1, 1},
+                       {Metal::Xfb::GatherGroupSize, 1, 1});
+    scheduler.Finish();
+
+    bool data_ok = true;
+    for (uint32_t n = 0; n < 6; ++n) {
+        const uint32_t v = n % 3;
+        const uint32_t i = n / 3;
+        const float want_first[5]{corners[v * 3], corners[v * 3 + 1], corners[v * 3 + 2],
+                                  corners[v * 3], corners[v * 3 + 1]};
+        const float want_second[4]{float(v), float(i), 2.0f, 3.0f};
+        float got_first[5];
+        float got_second[4];
+        std::memcpy(got_first, first_out + n * 20, sizeof(got_first));
+        std::memcpy(got_second, second_out + n * 16, sizeof(got_second));
+        data_ok = data_ok && std::memcmp(got_first, want_first, sizeof(got_first)) == 0 &&
+                  std::memcmp(got_second, want_second, sizeof(got_second)) == 0;
+    }
+    // The seventh vertex's room was not touched.
+    bool untouched = true;
+    for (uint32_t byte = 6 * 20; byte < 7 * 20; ++byte) {
+        untouched = untouched && first_out[byte] == 0xAB;
+    }
+    for (uint32_t byte = 6 * 16; byte < 7 * 16; ++byte) {
+        untouched = untouched && second_out[byte] == 0xAB;
+    }
+    const bool counts_ok =
+        Metal::Xfb::PrimitiveCount(Maxwell::PrimitiveTopology::Triangles, 7, 1) == 2 &&
+        Metal::Xfb::PrimitiveCount(Maxwell::PrimitiveTopology::TriangleStrip, 7, 1) == 5 &&
+        Metal::Xfb::PrimitiveCount(Maxwell::PrimitiveTopology::Points, 7, 1) == 7;
+
+    // The draw of the captured vertices (a byte-count draw): buffer 0 as the vertex stream, the
+    // bytes written over the stride as the vertex count; the triangle covers the lower-left half.
+    const uint32_t bytes_written = all * stride[0];
+    const uint32_t drawn_vertices = bytes_written / stride[0];
+    const Metal::Object quad_library = Metal::CreateLibrary(device, QuadSource, error);
+    const Metal::Object quad_vertex =
+        quad_library ? Metal::CreateFunction(quad_library.Get(), "quad_vertex") : Metal::Object{};
+    const Metal::Object quad_fragment =
+        quad_library ? Metal::CreateFunction(quad_library.Get(), "quad_fragment") : Metal::Object{};
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = quad_vertex.Get();
+    desc.fragment_function = quad_fragment.Get();
+    desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.rasterize = 1;
+    desc.attributes[0] = {1, 0, 0, Maxwell::VertexAttribute::Type::Float,
+                          Maxwell::VertexAttribute::Size::Size_R32_G32};
+    desc.streams[0] = {1, stride[0], 0};
+    const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
+    const Metal::Object depth_stencil =
+        Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+    if (!pipeline || !depth_stencil) {
+        std::printf("metal-smoke: FAIL transform feedback draw pipeline: %s\n", error.c_str());
+        return 1;
+    }
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm),
+                 .width = Size,
+                 .height = Size,
+                 .render_target = true});
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, Size * Size * 4, true, &readback);
+    Metal::ClearPass clear{};
+    clear.color[0] = {.texture = target.Get()};
+    clear.clear_color[0] = true;
+    clear.color_value[0] = {1.0, 0.0, 0.0, 1.0};
+    clear.width = Size;
+    clear.height = Size;
+    scheduler.Clear(clear);
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = Size;
+    targets.height = Size;
+    scheduler.BeginRendering(targets);
+    Metal::DrawState draw_state{};
+    draw_state.pipeline = pipeline.Get();
+    draw_state.depth_stencil = depth_stencil.Get();
+    draw_state.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+    draw_state.scissor = {0, 0, Size, Size};
+    scheduler.SetDrawState(draw_state);
+    scheduler.BindVertexBuffer(Metal::VertexBufferSlot(0), first_buffer.Get(), 0);
+    scheduler.Draw(*Metal::PrimitiveType(Maxwell::PrimitiveTopology::Triangles), 0, drawn_vertices,
+                   1, 0);
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Size, Size, 1}, readback_buffer.Get(), 0,
+                                  Size * 4, 0);
+    scheduler.Finish();
+    const auto* texels = reinterpret_cast<const Texel*>(readback);
+    const Texel inside = texels[(Size - 8) * Size + 8];
+    const Texel outside = texels[8 * Size + Size - 8];
+    const bool draw_ok = Near(inside, {0, 255, 0, 255}) && Near(outside, {255, 0, 0, 255});
+
+    const bool passed = clamp_ok && data_ok && untouched && counts_ok && draw_ok;
+    std::printf("metal-smoke: transform feedback (capture kernel -> gather kernel, 2 instances x 3 "
+                "vertices, clamp %u/%u/%u, draw of the captured vertices inside %u,%u,%u outside "
+                "%u,%u,%u): %s\n",
+                all, none, part, inside.r, inside.g, inside.b, outside.r, outside.g, outside.b,
+                passed ? "PASS" : "FAIL");
+    if (!passed) {
+        std::printf("%s\n", source.c_str());
+    }
+    return passed ? 0 : 1;
+}
+
+/// A guest geometry passthrough program folded into the vertex program (IR built by hand): the
+/// passthrough sets the layer from the vertex output it reads, so the vertex program sets it from
+/// the value it stored there; a passthrough that does more, or a vertex output stored twice, is
+/// refused and leaves the vertex program as it was.
+int RunGeometryPassthrough() {
+    namespace IR = Shader::IR;
+    Shader::ObjectPool<IR::Inst> insts{64};
+    Shader::ObjectPool<IR::Block> blocks{8};
+    const auto layer_stores = [](const IR::Program& program) {
+        int count = 0;
+        for (IR::Block* const block : program.blocks) {
+            for (const IR::Inst& inst : block->Instructions()) {
+                count += inst.GetOpcode() == IR::Opcode::SetAttribute &&
+                                 inst.Arg(0).Attribute() == IR::Attribute::Layer
+                             ? 1
+                             : 0;
+            }
+        }
+        return count;
+    };
+    const auto vertex_program = [&](int stores) {
+        IR::Program program;
+        IR::Block* const block = blocks.Create(insts);
+        IR::IREmitter ir{*block};
+        for (int store = 0; store < stores; ++store) {
+            ir.SetAttribute(IR::Attribute::Generic1X, ir.Imm32(float(store + 1)), ir.Imm32(0));
+        }
+        ir.Epilogue();
+        program.blocks.push_back(block);
+        return program;
+    };
+    const auto geometry_program = [&](bool adds) {
+        IR::Program program;
+        program.is_geometry_passthrough = true;
+        IR::Block* const block = blocks.Create(insts);
+        IR::IREmitter ir{*block};
+        IR::U32 layer = ir.GetAttributeU32(IR::Attribute::Generic1X, ir.Imm32(0));
+        if (adds) {
+            layer = ir.IAdd(layer, ir.Imm32(1U));
+        }
+        ir.SetAttribute(IR::Attribute::Layer, ir.BitCast<IR::F32>(layer), ir.Imm32(0));
+        ir.Epilogue();
+        program.blocks.push_back(block);
+        return program;
+    };
+    IR::Program folded = vertex_program(1);
+    const bool fold_ok =
+        Metal::PipelineTranslator::FoldGeometryPassthrough(folded, geometry_program(false)) &&
+        layer_stores(folded) == 1 && folded.info.stores[IR::Attribute::Layer];
+    // The layer store follows the vertex output's store.
+    bool after_store = false;
+    for (const IR::Inst& inst : folded.blocks.front()->Instructions()) {
+        if (inst.GetOpcode() == IR::Opcode::SetAttribute &&
+            inst.Arg(0).Attribute() == IR::Attribute::Layer) {
+            const auto previous = std::prev(IR::Block::InstructionList::s_iterator_to(inst));
+            after_store = previous->GetOpcode() == IR::Opcode::SetAttribute &&
+                          previous->Arg(0).Attribute() == IR::Attribute::Generic1X;
+        }
+    }
+    IR::Program arithmetic = vertex_program(1);
+    const bool arithmetic_refused =
+        !Metal::PipelineTranslator::FoldGeometryPassthrough(arithmetic, geometry_program(true)) &&
+        layer_stores(arithmetic) == 0;
+    IR::Program twice = vertex_program(2);
+    const bool twice_refused =
+        !Metal::PipelineTranslator::FoldGeometryPassthrough(twice, geometry_program(false)) &&
+        layer_stores(twice) == 0;
+    IR::Program missing = vertex_program(0);
+    const bool missing_refused =
+        !Metal::PipelineTranslator::FoldGeometryPassthrough(missing, geometry_program(false)) &&
+        layer_stores(missing) == 0;
+    const bool passed =
+        fold_ok && after_store && arithmetic_refused && twice_refused && missing_refused;
+    std::printf("metal-smoke: geometry passthrough fold (folded %d, after its store %d, refused: "
+                "arithmetic %d, stored twice %d, not stored %d): %s\n",
+                fold_ok, after_store, arithmetic_refused, twice_refused, missing_refused,
+                passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
 
@@ -4621,7 +4936,7 @@ int main(int argc, char** argv) {
                                  RunTexture1D,
                                  RunMeshEmulation, RunMeshDistribution, RunIndexRewrite,
                                  RunOcarinaBilinear, RunPipelineArchive,
-                                 RunDepthBlit, RunTessellation, RunDepthStencilBlit,
+                                 RunDepthBlit, RunTessellation, RunTransformFeedback, RunGeometryPassthrough, RunDepthStencilBlit,
                                  RunPipelineCheck, RunDeviceMsl, RunNativeMesh, RunBlockCopy,
                                  RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,

@@ -27,8 +27,9 @@ class PipelineFiles {
 public:
     /// Versions of the records and the states file; a file of another version is started again.
     /// The states version changes with RenderPipelineDesc's meaning (its size is checked too).
-    static constexpr u32 RecordsVersion = 1;
-    static constexpr u32 StatesVersion = 1;
+    /// The records hold GraphicsPipelineKey's bytes: 2 added the transform feedback layout.
+    static constexpr u32 RecordsVersion = 2;
+    static constexpr u32 StatesVersion = 2;
     /// Runs a pipeline stays on the used list without being used, and is still built at boot
     /// (Vulkan on MoltenVK builds what the last 8 runs used).
     static constexpr u8 MaxListedAge = 16;

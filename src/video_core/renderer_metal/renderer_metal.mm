@@ -453,8 +453,8 @@ RendererMetal::RendererMetal(Core::Frontend::EmuWindow& emu_window,
       impl{std::make_unique<Impl>(emu_window, gpu_, device_memory)} {
     LOG_WARNING(Render_Metal,
                 "Metal renderer (experimental): draws, compute dispatches, occlusion queries, "
-                "tessellation and mesh shaders (emulated) run on Metal; geometry shaders and "
-                "transform feedback do not yet");
+                "tessellation, mesh shaders and transform feedback (emulated) run on Metal; "
+                "geometry shaders do not yet");
 }
 
 RendererMetal::~RendererMetal() = default;

@@ -90,6 +90,8 @@ struct RenderPipelineDesc {
     u32 tessellation;
     u32 tess_partition;
     u32 tess_winding;
+    /// 1: drawn with the pipeline's expansion vertex function (RasterExpand), no vertex layout.
+    u32 expand;
 };
 
 /// Where the buffer of a sanitised vertex layout's stream comes from (SanitizeVertexLayout).

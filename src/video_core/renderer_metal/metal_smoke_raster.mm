@@ -10,6 +10,7 @@
 #import <Metal/Metal.h>
 
 #include <array>
+#include <fmt/format.h>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -19,13 +20,20 @@
 #include <string>
 #include <vector>
 
+#include "raster_line_frag_spv.h"
+#include "raster_line_vert_spv.h"
 #include "raster_smoke_frag_spv.h"
 #include "raster_smoke_sint_frag_spv.h"
 #include "raster_smoke_uint_frag_spv.h"
 #include "raster_smoke_vert_spv.h"
 #include "video_core/renderer_metal/metal_draw_desc.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
+#include "video_core/renderer_metal/metal_graphics.h"
+#include "video_core/renderer_metal/metal_raster_expand.h"
 #include "video_core/renderer_metal/metal_raster_patch.h"
+#include "video_core/renderer_metal/metal_resources.h"
+#include "video_core/renderer_metal/metal_scheduler.h"
+#include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
 #include "video_core/renderer_metal/metal_smoke_raster.h"
 
@@ -635,6 +643,203 @@ int RunDepthBounds(const Context& context) {
     return 0;
 }
 
+
+/// Lines and triangles expanded from the vertex program's outputs (RasterExpand): the program
+/// runs as a stage-in kernel writing every vertex's outputs, the generated vertex function pulls
+/// the ends of each primitive from them. Each case draws one primitive into a 32x32 target and
+/// checks pixels.
+struct ExpandCase {
+    const char* name;
+    std::vector<float> positions; ///< NDC x, y per vertex (the guest's y down)
+    uint32_t bits;
+    uint32_t prim;
+    float width;
+    float factor;
+    uint32_t pattern;
+    /// Reads the target: returns "" when right, else what was wrong.
+    std::string (*check)(const std::vector<uint8_t>&);
+};
+
+uint8_t Pixel(const std::vector<uint8_t>& pixels, uint32_t x, uint32_t y, uint32_t channel) {
+    return pixels[(size_t{y} * Size + x) * 4 + channel];
+}
+
+std::string CheckWide(const std::vector<uint8_t>& p) {
+    // A line at row 16 (y 0) from x 4 to 28, 6 pixels wide: rows 13 to 18, its ends on its axis.
+    std::string wrong;
+    const auto expect = [&](uint32_t x, uint32_t y, bool drawn) {
+        if ((Pixel(p, x, y, 1) != 0) != drawn) {
+            wrong += fmt::format(" ({},{}) {}", x, y, drawn ? "empty" : "drawn");
+        }
+    };
+    expect(16, 13, true);
+    expect(16, 18, true);
+    expect(16, 12, false);
+    expect(16, 19, false);
+    expect(5, 15, true);
+    expect(3, 15, false);
+    expect(28, 15, false);
+    return wrong;
+}
+
+std::string CheckStipple(const std::vector<uint8_t>& p) {
+    // Pattern 0x00FF, factor 1: along the line (from x 4) pixels 0-7 on, 8-15 off, 16-23 on.
+    std::string wrong;
+    const auto expect = [&](uint32_t x, bool drawn) {
+        if ((Pixel(p, x, 15, 1) != 0 || Pixel(p, x, 16, 1) != 0) != drawn) {
+            wrong += fmt::format(" x {} {}", x, drawn ? "empty" : "drawn");
+        }
+    };
+    expect(6, true);
+    expect(14, false);
+    expect(22, true);
+    return wrong;
+}
+
+std::string CheckSmooth(const std::vector<uint8_t>& p) {
+    // A line 2 pixels wide centred 0.25 below the row boundary 16: row 16 (distance 0.25) has full
+    // coverage, row 15 (distance 0.75) three quarters.
+    const uint32_t full = Pixel(p, 16, 16, 3);
+    const uint32_t edge = Pixel(p, 16, 15, 3);
+    if (full < 250 || edge < 170 || edge > 215) {
+        return fmt::format(" alpha {} and {} (want 255 and about 191)", full, edge);
+    }
+    return {};
+}
+
+std::string CheckConservative(const std::vector<uint8_t>& p) {
+    // A triangle inside one pixel, covering no pixel centre: the pixel is drawn, the others not.
+    std::string wrong;
+    if (Pixel(p, 14, 14, 1) == 0) {
+        wrong += " (14,14) empty";
+    }
+    if (Pixel(p, 17, 17, 1) != 0 || Pixel(p, 10, 10, 1) != 0) {
+        wrong += " far pixel drawn";
+    }
+    return wrong;
+}
+
+int RunRasterExpand(const Context& context) {
+    namespace Expand = Metal::RasterExpand;
+    const Translate::Options options;
+    const std::span<const uint32_t> vertex_spirv{RASTER_LINE_VERT_SPV};
+    const Translate::Result normal =
+        Translate::SpirvToMsl(vertex_spirv, Translate::Stage::Vertex, options);
+    const Translate::Result kernel =
+        Translate::SpirvToMsl(vertex_spirv, Translate::Stage::VertexForTessellation, options);
+    const Translate::Result fragment = Translate::SpirvToMsl(
+        std::span<const uint32_t>{RASTER_LINE_FRAG_SPV}, Translate::Stage::Fragment, options);
+    if (normal.source.empty() || kernel.source.empty() || fragment.source.empty()) {
+        std::printf("metal-smoke: FAIL raster expansion: the translation failed: %s%s%s\n",
+                    normal.error.c_str(), kernel.error.c_str(), fragment.error.c_str());
+        return 1;
+    }
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    std::string error;
+    const Metal::Object kernel_library = Metal::CreateLibrary(device, kernel.source, error);
+    const Metal::Object kernel_function =
+        kernel_library ? Metal::CreateFunction(kernel_library.Get(), kernel.entry_point)
+                       : Metal::Object{};
+    auto layout = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    layout.attributes[0] = {1, 0, 0, Metal::Maxwell::VertexAttribute::Type::Float,
+                            Metal::Maxwell::VertexAttribute::Size::Size_R32_G32};
+    layout.streams[0] = {1, 8, 0};
+    const Metal::Object kernel_state =
+        kernel_function ? Metal::CreateStageInComputePipelineState(
+                              device, kernel_function.Get(), layout, 0,
+                              kernel.tessellation_slots.index, error)
+                        : Metal::Object{};
+    if (!kernel_state) {
+        std::printf("metal-smoke: FAIL raster expansion: capture kernel: %s\n%s\n", error.c_str(),
+                    kernel.source.c_str());
+        return 1;
+    }
+    const std::vector<ExpandCase> cases{
+        {"wide line", {-0.75f, 0.0f, 0.75f, 0.0f}, Expand::Wide, Expand::PrimLines, 6.0f, 1.0f,
+         0xFFFF, CheckWide},
+        {"stippled line", {-0.75f, 0.0f, 0.75f, 0.0f}, Expand::Wide | Expand::Stipple,
+         Expand::PrimLines, 2.0f, 1.0f, 0x00FF, CheckStipple},
+        {"smooth line", {-0.75f, 0.015625f, 0.75f, 0.015625f}, Expand::Wide | Expand::Smooth,
+         Expand::PrimLines, 2.0f, 1.0f, 0xFFFF, CheckSmooth},
+        {"conservative triangle",
+         {14.1f / 16 - 1, 14.1f / 16 - 1, 14.4f / 16 - 1, 14.1f / 16 - 1, 14.1f / 16 - 1,
+          14.4f / 16 - 1},
+         Expand::Conservative, Expand::PrimTriangles, 1.0f, 1.0f, 0xFFFF, CheckConservative},
+    };
+    uint32_t wrong = 0;
+    std::string report;
+    for (const ExpandCase& test : cases) {
+        std::string fragment_source = fragment.source;
+        const std::string generated =
+            Expand::Generate(normal.source, kernel.source, test.bits, test.prim, 0);
+        if (generated.empty() || !Expand::PatchFragment(fragment_source, test.bits)) {
+            std::printf("metal-smoke: FAIL raster expansion %s: not generated (%s)\n%s\n", test.name,
+                        generated.empty() ? "vertex function" : "pixel program",
+                        normal.source.c_str());
+            return 1;
+        }
+        const Library vertex_library = Compile(context, generated);
+        const Library fragment_library = Compile(context, fragment_source);
+        if (vertex_library.library == nil || fragment_library.library == nil) {
+            std::printf("metal-smoke: FAIL raster expansion %s: does not build: %s%s\n%s\n%s\n",
+                        test.name, vertex_library.error.c_str(), fragment_library.error.c_str(),
+                        generated.c_str(), fragment_source.c_str());
+            return 1;
+        }
+        std::string pipeline_error;
+        id<MTLRenderPipelineState> pipeline =
+            Pipeline(context, vertex_library, Expand::Entry, fragment_library,
+                     fragment.entry_point, MTLPixelFormatRGBA8Unorm,
+                     MTLPrimitiveTopologyClassTriangle, pipeline_error);
+        if (pipeline == nil) {
+            std::printf("metal-smoke: FAIL raster expansion %s: pipeline: %s\n%s\n%s\n", test.name,
+                        pipeline_error.c_str(), generated.c_str(), fragment_source.c_str());
+            return 1;
+        }
+        const uint32_t count = static_cast<uint32_t>(test.positions.size() / 2);
+        uint8_t* position_data = nullptr;
+        const Metal::Object position_buffer =
+            Metal::CreateBuffer(device, test.positions.size() * sizeof(float), true, &position_data);
+        std::memcpy(position_data, test.positions.data(), test.positions.size() * sizeof(float));
+        uint8_t* output_data = nullptr;
+        const Metal::Object output_buffer =
+            Metal::CreateBuffer(device, size_t{count} * 512, true, &output_data);
+        scheduler.BeginCompute(kernel_state.Get());
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::VertexBufferSlot(0),
+                             position_buffer.Get(), 0);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, kernel.tessellation_slots.output,
+                             output_buffer.Get(), 0);
+        scheduler.DispatchStageIn(0, count, 0, 1);
+        scheduler.Finish();
+        Expand::Params params{};
+        params.half_viewport[0] = params.half_viewport[1] = Size / 2.0f;
+        params.width = test.width;
+        params.prim = test.prim;
+        params.count = count;
+        params.factor = test.factor;
+        params.pattern = test.pattern;
+        const uint32_t vertices = Expand::VerticesOf(test.prim, count);
+        const Target target = MakeTarget(context, MTLPixelFormatRGBA8Unorm);
+        const MTLClearColor black = MTLClearColorMake(0, 0, 0, 0);
+        Pass(context, target, &black, nil, [&](id<MTLRenderCommandEncoder> encoder) {
+            [encoder setRenderPipelineState:pipeline];
+            [encoder setCullMode:MTLCullModeNone];
+            [encoder setVertexBuffer:(__bridge id<MTLBuffer>)output_buffer.Get()
+                              offset:0
+                             atIndex:Expand::SourceSlot];
+            [encoder setVertexBytes:&params length:sizeof(params) atIndex:Expand::ParamsSlot];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertices];
+        });
+        const std::string problem = test.check(Read(target, 4));
+        wrong += problem.empty() ? 0 : 1;
+        report += fmt::format(" {}{}{};", test.name, problem.empty() ? "" : " WRONG:", problem);
+    }
+    std::printf("metal-smoke: raster expansion from the vertex kernel's outputs:%s %s\n",
+                report.c_str(), wrong == 0 ? "PASS" : "FAIL");
+    return wrong == 0 ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int RunAll() {
@@ -645,7 +850,7 @@ int RunAll() {
     context.queue = [context.device newCommandQueue];
     int result = 0;
     for (const auto test : {RunLogicOps, RunViewportSwizzle, RunPointFill, RunRestartOff,
-                            RunDepthBounds}) {
+                            RunDepthBounds, RunRasterExpand}) {
         const int outcome = test(context);
         result = result != 0 ? result : outcome;
     }

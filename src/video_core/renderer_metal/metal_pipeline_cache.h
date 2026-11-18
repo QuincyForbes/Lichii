@@ -53,7 +53,8 @@ public:
                               StageProgram fragment,
                               std::optional<MeshEmulation> mesh = std::nullopt,
                               std::optional<Tessellation> tessellation = std::nullopt,
-                              std::optional<NativeMesh> native_mesh = std::nullopt);
+                              std::optional<NativeMesh> native_mesh = std::nullopt,
+                              std::optional<XfbCapture> xfb = std::nullopt);
 
     /// The Metal mesh functions of a task/mesh pipeline while Metal takes them, else null (the
     /// pipeline draws through Mesh(), when it has one).
@@ -78,6 +79,22 @@ public:
     /// vertex layout (layout's attributes and streams), made on first use; null when it fails.
     [[nodiscard]] void* VertexKernelState(const Device& device, size_t variant,
                                           const RenderPipelineDesc& layout);
+
+    /// The transform feedback capture of a pipeline whose key has a layout, or null.
+    [[nodiscard]] XfbCapture* Xfb() noexcept {
+        return xfb && !xfb->expand ? &*xfb : nullptr;
+    }
+
+    /// The line and triangle expansion of a pipeline that has one (its capture kernels are
+    /// XfbKernelStates' with no gathering), or null.
+    [[nodiscard]] XfbCapture* Expand() noexcept {
+        return xfb && xfb->expand && !xfb->render.build_failed ? &*xfb : nullptr;
+    }
+
+    /// The capture kernel's MTLComputePipelineState for an index size variant and the draw's
+    /// vertex layout, and the gather kernel's; both null when either fails.
+    [[nodiscard]] std::pair<void*, void*> XfbKernelStates(const Device& device, size_t variant,
+                                                          const RenderPipelineDesc& layout);
 
     /// The mesh emulation of a task/mesh pipeline, or null.
     [[nodiscard]] MeshEmulation* Mesh() noexcept {
@@ -164,6 +181,7 @@ private:
     std::optional<MeshEmulation> mesh;
     std::optional<Tessellation> tessellation;
     std::optional<NativeMesh> native_mesh;
+    std::optional<XfbCapture> xfb;
     PipelineArchive* archive{};
     PipelineFiles* recorder{};
     bool used{};
