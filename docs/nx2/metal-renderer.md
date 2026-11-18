@@ -204,7 +204,11 @@ program. Other geometry programs run as nxnative's geometry-to-compute (`metal_g
 vertex capture kernel and a records kernel, the geometry program rewritten to a compute program
 (one thread an input primitive, vertices and strip indices written to its own region), the ported
 ordered compaction and a reader vertex function drawing the compacted list with the pixel
-program; the limits are in the K01 row. Isolines, point mode, evaluation programs without a control program and indirect tessellated draws are emulated (see metal-coverage.md J02, J03, J06, A07). Open: Ocarina's live MetalFX
+program; the limits are in the K01 row. The output streams 1-3 of such a program feed transform
+feedback buffers through a compaction of their own (K08). After tessellation the evaluation
+program's domain emulation lists the patches' triangles (lines, points) as evaluated vertices whose
+count only the GPU knows, a feed kernel sizes the geometry kernels from it and they run on
+indirect dispatches (K06); a geometry program in a mesh pipeline cannot exist (K07). Isolines, point mode, evaluation programs without a control program and indirect tessellated draws are emulated (see metal-coverage.md J02, J03, J06, A07). Open: Ocarina's live MetalFX
 temporal path, frame generation, the M5 AOT pack.
 Switches: `EDEN_NX2_METAL_DRAW=0` (build pipelines, draw nothing), `EDEN_NX2_METAL_DISPATCH=0`,
 `EDEN_NX2_METAL_SPLIT=0` (one GPU thread), `EDEN_NX2_METAL_GPU_INDICES=1|0` (every indexed
