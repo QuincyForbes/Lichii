@@ -1431,9 +1431,12 @@ static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& w
         return false;
     }
     if (mode >= 2) {
-        const u64 since = split.ConsumedNow();
-        word = dma_pusher.memory_manager.Read<u32>(address);
-        if (split.OverlayQueuedWrites(since, *device, &word, 1)) {
+        // Not only the noted writes: a queued compute or copy writer, an unranged writer or a
+        // queued release may change the word too (CurrentReleaseWord declines those, reading
+        // memory with the noted writes overlaid otherwise).
+        if (const auto current =
+                split.CurrentReleaseWord(dma_pusher.memory_manager, *device, address, 0, nullptr)) {
+            word = *current;
             return true;
         }
     }

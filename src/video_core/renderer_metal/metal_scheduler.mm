@@ -3222,7 +3222,21 @@ u64 Scheduler::UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset) {
                                         usage:MTLResourceUsageRead | MTLResourceUsageWrite];
         }
         break;
-    default:
+    case ShaderStage::Object:
+        // A mesh pipeline's spilled buffers are read through their addresses too: without this
+        // they were neither resident nor hazard-tracked for the object and mesh functions.
+        if (impl->render != nil) {
+            [impl->render useResource:metal_buffer
+                                usage:MTLResourceUsageRead | MTLResourceUsageWrite
+                               stages:MTLRenderStageObject];
+        }
+        break;
+    case ShaderStage::Mesh:
+        if (impl->render != nil) {
+            [impl->render useResource:metal_buffer
+                                usage:MTLResourceUsageRead | MTLResourceUsageWrite
+                               stages:MTLRenderStageMesh];
+        }
         break;
     }
     return metal_buffer.gpuAddress + offset;

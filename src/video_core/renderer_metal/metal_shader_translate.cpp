@@ -341,8 +341,18 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
         for (const Declared& resource : declared) {
             total_buffers += resource.kind == ResourceKind::Buffer ? resource.count : 0;
         }
-        const bool spill = options.spill_buffers && stage == Stage::Vertex &&
-                           total_buffers > SpillThreshold;
+        // Metal has 31 buffer slots (0-30). A vertex program spills early to leave slots for the
+        // vertex streams. Any other program spills once its buffers plus the slots kept after
+        // them (push constants, the spill table, tessellation buffers) would not fit: a compute
+        // program with more buffers failed to build ("'buffer' attribute parameter is out of
+        // bounds"), its dispatch was skipped, and the command list it writes was read as garbage.
+        constexpr u32 MetalBufferSlots = 31;
+        constexpr u32 ReservedSlots = 7;
+        const bool vertex = stage == Stage::Vertex;
+        const bool spill =
+            options.spill_buffers && (vertex ? total_buffers > SpillThreshold
+                                             : total_buffers + ReservedSlots > MetalBufferSlots);
+        const u32 spill_cutoff = vertex ? SpillCutoff : MetalBufferSlots - ReservedSlots;
         u32 textures = 0;
         u32 samplers = 0;
         for (const Declared& resource : declared) {
@@ -353,7 +363,7 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
             binding.count = resource.count;
             switch (resource.kind) {
             case ResourceKind::Buffer:
-                if (spill && resource.count == 1 && buffers >= SpillCutoff) {
+                if (spill && resource.count == 1 && buffers >= spill_cutoff) {
                     binding.msl_buffer = SpillBase + spilled;
                     result.slots.push_back(
                         {resource.set, resource.binding, resource.kind, 0, 1, spilled});

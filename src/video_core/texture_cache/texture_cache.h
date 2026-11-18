@@ -1965,11 +1965,11 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
         LOG_TRACE(HW_GPU, "Invalid sampler index={}", index);
         return NULL_SAMPLER_ID;
     }
-    if (table.IsVerified(index, frame_tick)) [[likely]] {
+    if (table.IsVerified(index, DescriptorTick())) [[likely]] {
         return table.bound_ids[index];
     }
     VideoCommon::Nx2DrawStats::Timer probe{VideoCommon::Nx2DrawStats::Site::SamplerLookup};
-    auto const [descriptor, is_new] = table.Read(*gpu_memory, index, frame_tick);
+    auto const [descriptor, is_new] = table.Read(*gpu_memory, index, DescriptorTick());
     probe.hit = !is_new;
     if (is_new) {
         auto const id = FindSampler(descriptor, compute);
@@ -2803,12 +2803,12 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         LOG_TRACE(HW_GPU, "Invalid image view index={}", index);
         return NULL_IMAGE_VIEW_ID;
     }
-    if (table.IsPrepared(index, frame_tick)) [[likely]] {
+    if (table.IsPrepared(index, DescriptorTick())) [[likely]] {
         return table.bound_ids[index];
     }
-    if (!table.IsVerified(index, frame_tick)) {
+    if (!table.IsVerified(index, DescriptorTick())) {
         VideoCommon::Nx2DrawStats::Timer probe{VideoCommon::Nx2DrawStats::Site::ImageViewLookup};
-        auto const [descriptor, is_new] = table.Read(*gpu_memory, index, frame_tick);
+        auto const [descriptor, is_new] = table.Read(*gpu_memory, index, DescriptorTick());
         probe.hit = !is_new;
         if (is_new) {
             if (IsValidEntry(*gpu_memory, descriptor)) {
@@ -2855,7 +2855,7 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
             }
         }
     }
-    table.MarkPrepared(index, frame_tick);
+    table.MarkPrepared(index, DescriptorTick());
     return id;
 }
 

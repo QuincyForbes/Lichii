@@ -572,6 +572,14 @@ public:
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
 
+    /// Guest memory was written (a batch of CPU writes, an invalidation, a GPU-side write).
+    /// Texture and sampler pool entries checked earlier in the frame are read again: the guest
+    /// may have rewritten one, and the per-frame trust kept handing out the old view or sampler.
+    /// A re-read of an unchanged entry is a 32-byte copy and compare. Callable from any thread.
+    void NoteGuestWrite() noexcept {
+        descriptor_epoch.fetch_add(1, std::memory_order_relaxed);
+    }
+
     /// Download contents of host images to guest memory in a region
     void DownloadMemory(DAddr cpu_addr, size_t size);
 
@@ -1041,6 +1049,12 @@ private:
         binding_memo_epoch = ++binding_clock;
     }
     u64 last_feedback_loop_serial = 0;
+    /// NoteGuestWrite's count: part of the tick that pool entries are trusted for.
+    std::atomic<u64> descriptor_epoch{0};
+    [[nodiscard]] u64 DescriptorTick() const noexcept {
+        // Never ~0 (DescriptorTable::Read's "no tick") in practice: frame ticks stay far below 2^32.
+        return frame_tick ^ (descriptor_epoch.load(std::memory_order_relaxed) << 32);
+    }
     u64 last_feedback_texture_serial = 0; ///< Hash of the views of the last check
     bool last_feedback_loop_result = false;
     bool feedback_depth_dirty = true;

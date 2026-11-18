@@ -825,8 +825,18 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 }
             }
             ImageView& image_view{texture_cache.GetImageView(view->id)};
-            const VkImageView vk_image_view{
+            VkImageView vk_image_view{
                 image_view.StorageView(desc.type, desc.format, desc.is_byte_addressed)};
+            if (vk_image_view == VK_NULL_HANDLE) {
+                // As the sampled branch: no storage view for this format (MoltenVK lacks some),
+                // and a null descriptor needs robustness2's nullDescriptor, which it may not have.
+                const VkImageView null_storage_view{
+                    texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID)
+                        .StorageView(desc.type, desc.format, desc.is_byte_addressed)};
+                if (null_storage_view != VK_NULL_HANDLE) {
+                    vk_image_view = null_storage_view;
+                }
+            }
             if (desc.is_written) {
                 texture_cache.MarkModification(image_view.image_id);
             }

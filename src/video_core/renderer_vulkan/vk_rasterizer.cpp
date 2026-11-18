@@ -3186,6 +3186,7 @@ void RasterizerVulkan::PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::Cac
 }
 
 void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    texture_cache.NoteGuestWrite();
     if (addr == 0 || size == 0) {
         return;
     }
@@ -3279,6 +3280,7 @@ void CountGuestWrite(std::atomic<u64>& counter) {
 } // Anonymous namespace
 
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
+    texture_cache.NoteGuestWrite();
     DEBUG_ASSERT(addr != 0 || size != 0);
     // EDEN_NX2_EXP35 (live; from Fritchii v5.5, a34e72fec1/e423d1bd17): collect the write for the
     // next InvalidateGPUCache without either cache's mutex, which the split's back holds through
@@ -3359,6 +3361,7 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    texture_cache.NoteGuestWrite();
     // Out of the GPU-written ranges first: applying one write downloads the GPU's bytes elsewhere
     // on its pages (WriteMemory), which would write over the next collected write.
     {
@@ -3398,6 +3401,7 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
 }
 
 void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
+    texture_cache.NoteGuestWrite();
     if (addr == 0 || size == 0) {
         return;
     }

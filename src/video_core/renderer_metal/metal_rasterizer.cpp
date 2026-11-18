@@ -5742,6 +5742,7 @@ void RasterizerMetal::PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::Cach
 }
 
 void RasterizerMetal::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    texture_cache.NoteGuestWrite();
     if (addr == 0 || size == 0) {
         return;
     }
@@ -5795,6 +5796,7 @@ void RasterizerMetal::InnerInvalidation(
 }
 
 bool RasterizerMetal::OnCPUWrite(DAddr addr, u64 size) {
+    texture_cache.NoteGuestWrite();
     if (!CachePathsEnabled()) {
         {
             std::scoped_lock lock{buffer_cache.mutex};
@@ -5854,6 +5856,7 @@ bool RasterizerMetal::OnCPUWrite(DAddr addr, u64 size) {
 }
 
 void RasterizerMetal::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    texture_cache.NoteGuestWrite();
     if (!CachePathsEnabled()) {
         RasterizerInterface::OnCacheInvalidations(ranges);
         return;
@@ -5927,6 +5930,7 @@ u64 RasterizerMetal::FenceWorkEpoch() const {
 }
 
 void RasterizerMetal::OnCacheInvalidation(DAddr addr, u64 size) {
+    texture_cache.NoteGuestWrite();
     if (addr == 0 || size == 0) {
         return;
     }
@@ -6005,7 +6009,12 @@ void RasterizerMetal::FragmentBarrier() {
                                 : 0;
 }
 
-void RasterizerMetal::TiledCacheBarrier() {}
+void RasterizerMetal::TiledCacheBarrier() {
+    // Vulkan barriers the attachments here. Apple GPUs keep a pass's attachments in tile memory,
+    // so a later draw of the same pass that samples one sees it only from a new encoder: the same
+    // treatment as FragmentBarrier (the next reading draw ends the encoder).
+    FragmentBarrier();
+}
 
 bool RasterizerMetal::AccelerateConditionalRendering() {
     // Metal has no predicate rendering. A condition on values in guest memory is compared on the

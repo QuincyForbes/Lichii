@@ -2331,6 +2331,10 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             return alignment > 1 && (offset % alignment) != 0;
         }
     }();
+    if (needs_alignment_stream && memory_tracker.IsRegionGpuModified(device_addr, size)) {
+        // A misaligned bind is streamed from guest memory: bring the GPU's bytes there first.
+        DownloadMemory(device_addr, size);
+    }
     const bool not_gpu_modified =
         has_host_buffer && !memory_tracker.IsRegionGpuModified(device_addr, size);
     // Native programs keep tables next to their code in uniform banks read with indirect offsets
@@ -3032,6 +3036,11 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
                 return alignment > 1 && (offset % alignment) != 0;
             }
         }();
+        if (needs_alignment_stream &&
+            memory_tracker.IsRegionGpuModified(binding.device_addr, size)) {
+            // As the graphics path: the stream reads guest memory, so it must hold the GPU's bytes.
+            DownloadMemory(binding.device_addr, size);
+        }
         // Small buffers the GPU has not written are streamed, as graphics ones are: synchronizing
         // them made every dispatch re-protect pages an inline upload had just unprotected (two
         // VirtualProtect calls per dispatch, ~4,000 dispatches a second in title 1).
