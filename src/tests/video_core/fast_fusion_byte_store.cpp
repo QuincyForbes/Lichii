@@ -310,7 +310,13 @@ TEST_CASE("Image backends preserve raw B32 storage and add one conditional image
           "[video_core][fast_fusion_byte_store]") {
     for (const bool image_coherent : {false, true}) {
         for (const bool global_coherent : {false, true}) {
-            for (const unsigned backend : {0U, 1U, 2U}) {
+#ifdef HAS_OPENGL
+            constexpr std::array<unsigned, 3> backends{0U, 1U, 2U};
+#else
+            // The GLSL and GLASM backends are only built with OpenGL (HAS_OPENGL).
+            constexpr std::array<unsigned, 1> backends{0U};
+#endif
+            for (const unsigned backend : backends) {
                 ByteStoreProgram fixture;
                 IR::IREmitter ir{fixture.block};
                 IR::TextureInstInfo read_flags{};
@@ -344,6 +350,7 @@ TEST_CASE("Image backends preserve raw B32 storage and add one conditional image
                     CHECK(constants.at(barriers.front()[2]) ==
                           (0x108U | (image_coherent ? 0x800U : 0U) |
                            (global_coherent ? 0x40U : 0U)));
+#ifdef HAS_OPENGL
                 } else if (backend == 1) {
                     const auto glsl{Backend::GLSL::EmitGLSL(fixture.profile, fixture.program)};
                     CHECK((glsl.find("coherent ") != std::string::npos) == image_coherent);
@@ -367,6 +374,7 @@ TEST_CASE("Image backends preserve raw B32 storage and add one conditional image
                     if (membar != std::string::npos) {
                         CHECK(glasm.find("MEMBAR.CTA;", membar + 1) == std::string::npos);
                     }
+#endif
                 }
             }
         }

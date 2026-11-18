@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -24,6 +27,7 @@ private:
     FileSys::VirtualFile backend;
 
     static constexpr s64 ReadBytesPerSecond = 40'000'000;
+    static constexpr s64 Switch2ReadBytesPerSecond = 100'000'000;
     static constexpr s64 MaxChargedReadSize = 64 * 1024;
     std::atomic<s64> next_read_tick_ns{0};
 

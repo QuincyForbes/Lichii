@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -199,6 +202,9 @@ public:
     [[nodiscard]] bool IsMeshPipeline() const noexcept {
         return stage_infos[0].is_task || stage_infos[0].is_mesh;
     }
+    /// Whether any stage may write guest memory or images: storage buffer, global memory or
+    /// image stores and atomics (Nx2Perf MacroReadWriterSet; conservative).
+    [[nodiscard]] bool Nx2MayWriteMemory() const noexcept;
 
     /// Mesh pipeline drawn through the compute emulation (MeshEmulationSetup).
     [[nodiscard]] bool IsEmulatedMesh() const noexcept {
@@ -323,6 +329,10 @@ public:
     /// pipeline prebuilt from the disk cache that no draw has used yet.
     [[nodiscard]] bool WasUsed() const noexcept {
         return used;
+    }
+
+    [[nodiscard]] const GraphicsPipelineCacheKey& Key() const noexcept {
+        return key;
     }
 
     /// Forgets the transitions, which may point to pipelines the cache evicted.
@@ -454,6 +464,7 @@ private:
 
     DescriptorBufferLayout descriptor_buffer_layout;
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
+    std::vector<u8> last_descriptor_bytes;
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};

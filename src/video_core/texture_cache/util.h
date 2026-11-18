@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -36,7 +39,7 @@ struct OverlapResult {
     SubresourceExtent resources;
 };
 
-[[nodiscard]] u32 CalculateGuestSizeInBytes(const ImageInfo& info) noexcept;
+[[nodiscard]] u64 CalculateGuestSizeInBytes(const ImageInfo& info) noexcept;
 
 [[nodiscard]] u32 CalculateUnswizzledSizeBytes(const ImageInfo& info) noexcept;
 
@@ -161,9 +164,16 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
                                                           GPUVAddr gpu_addr, VAddr cpu_addr,
                                                           const ImageBase& overlap,
                                                           bool strict_size, bool broken_views,
-                                                          bool native_bgr);
+                                                          bool native_bgr,
+                                                          bool single_layer_padding = false);
 
-[[nodiscard]] bool IsLayerStrideCompatible(const ImageInfo& lhs, const ImageInfo& rhs);
+[[nodiscard]] bool CanShareAttachmentStorage(const ImageInfo& lhs, const ImageInfo& rhs);
+[[nodiscard]] bool IsAttachmentBackingUsable(const ImageBase& image);
+[[nodiscard]] std::optional<Extent3D> GrowAttachmentExtent(const ImageInfo& candidate,
+                                                         const ImageInfo& existing);
+
+[[nodiscard]] bool IsLayerStrideCompatible(const ImageInfo& lhs, const ImageInfo& rhs,
+                                           bool single_layer_padding = false);
 
 [[nodiscard]] std::optional<SubresourceBase> FindSubresource(const ImageInfo& candidate,
                                                              const ImageBase& image,
@@ -181,6 +191,6 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
 void DeduceBlitImages(ImageInfo& dst_info, ImageInfo& src_info, const ImageBase* dst,
                       const ImageBase* src);
 
-[[nodiscard]] u32 MapSizeBytes(const ImageBase& image);
+[[nodiscard]] u64 MapSizeBytes(const ImageBase& image);
 
 } // namespace VideoCommon

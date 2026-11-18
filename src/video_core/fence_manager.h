@@ -88,11 +88,11 @@ public:
         work_epoch.fetch_add(1, std::memory_order_release);
     }
 
-    void SignalFence(std::function<void()>&& func) {
+    void SignalFence(std::function<void()>&& func, bool force_completion = false) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
         // The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
         // at each command list end): read once, every decision of this fence uses one value.
-        const bool delay_fence = DelayFences();
+        const bool delay_fence = force_completion || DelayFences();
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
@@ -107,7 +107,7 @@ public:
             return;
         }
         skipped_fences = 0;
-        should_flush |= query_cache.HasUncommittedFlushes();
+        should_flush |= force_completion || query_cache.HasUncommittedFlushes();
         query_cache.CommitAsyncFlushes();
         const bool stubbed = !should_flush && committed_flushes == 0;
         if constexpr (can_async_check) {
@@ -416,8 +416,14 @@ private:
             }
             if (buffer_pops != 0) {
                 std::scoped_lock lock{buffer_cache.mutex};
+                const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
                 for (size_t i = 0; i < buffer_pops; ++i) {
                     buffer_cache.PopAsyncFlushes();
+                }
+                if (Nx2Profile::Enabled()) {
+                    Nx2Profile::g_fencing_lock_ns.fetch_add(Nx2Profile::Now() - start,
+                                                            std::memory_order_relaxed);
+                    Nx2Profile::g_fencing_pops.fetch_add(buffer_pops, std::memory_order_relaxed);
                 }
             }
             // Queries and operations keep their per-fence order.

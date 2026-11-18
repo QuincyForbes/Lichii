@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: Copyright 2018 Citra Emulator Project
@@ -87,6 +90,8 @@ signals:
     void NetworkError(const Network::RoomMember::Error&);
     void AnnounceFailed(const WebService::WebResult&);
     void SaveConfig();
+    /// Asks the main window to open Configuration > System > Profiles.
+    void RequestProfileConfiguration();
 
 private:
     Lobby* lobby = nullptr;

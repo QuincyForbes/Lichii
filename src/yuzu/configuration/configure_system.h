@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -8,6 +11,7 @@
 #include <vector>
 
 #include <QWidget>
+#include "common/common_types.h"
 #include "yuzu/configuration/configuration_shared.h"
 
 class QCheckBox;
@@ -24,6 +28,7 @@ class ConfigureSystem;
 
 namespace ConfigurationShared {
 class Builder;
+class Widget;
 }
 
 class ConfigureSystem : public ConfigurationShared::Tab {
@@ -56,8 +61,10 @@ private:
 
     QComboBox* combo_region;
     QComboBox* combo_language;
-    QCheckBox* checkbox_rtc;
-    QDateTimeEdit* date_rtc;
-    QSpinBox* date_rtc_offset;
+    ConfigurationShared::Widget* widget_rtc{nullptr};
+    QCheckBox* checkbox_rtc{nullptr};
+    QDateTimeEdit* date_rtc{nullptr};
+    s64 rtc_offset{0};
+    bool rtc_using_global{true};
     u64 previous_time;
 };

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -132,6 +135,7 @@ void AudioRenderer::CreateSinkStreams() {
 void AudioRenderer::Main(std::stop_token stop_token) {
     Common::SetCurrentThreadName("DSP_AudioRenderer_Main");
     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+    Common::SetCurrentThreadToPerformanceCores();
 
     // TODO: Create buffer map/unmap thread + mailbox
     // TODO: Create gMix devices, initialize them here

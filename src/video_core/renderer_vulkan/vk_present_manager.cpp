@@ -5,7 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <thread>
+#include <vector>
 
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"

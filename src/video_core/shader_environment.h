@@ -24,12 +24,29 @@
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ampere/instruction.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/host1x/gpu_device_memory_manager.h"
 
 namespace Tegra {
 class Memorymanager;
 }
 
+namespace Shader::Ampere {
+struct Instruction;
+struct LoweredProgram;
+} // namespace Shader::Ampere
+
 namespace VideoCommon {
+
+/// The shader hash of lowered native code (frame dump "shaders", pipeline cache keys).
+u64 NativeShaderHash(std::span<const u64> code);
+
+/// The code an environment holds for a lowered native program: `header` (the shader header,
+/// zero for compute), the instructions with a Maxwell scheduling word before every fourth word,
+/// a zero word and the native address map. Applies the per-program workarounds to `lowered`
+/// first. The runtime and the shader precache builder must lay programs out the same way.
+std::vector<u64> LayOutLoweredNativeCode(std::span<const u64> header,
+                                         std::span<const Shader::Ampere::Instruction> native,
+                                         Shader::Ampere::LoweredProgram& lowered);
 
 /// A native (Switch 2) program after capture and lowering to Maxwell code. The shader cache keeps
 /// it so the environments built for the program's pipelines don't capture and lower it again.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -107,7 +110,7 @@ struct ImageBase {
 
     ImageInfo info;
 
-    u32 guest_size_bytes = 0;
+    u64 guest_size_bytes = 0;
     u32 unswizzled_size_bytes = 0;
     u32 converted_size_bytes = 0;
     u32 scale_rating = 0;
@@ -130,6 +133,11 @@ struct ImageBase {
     VAddr cpu_addr_end = 0;
 
     u64 modification_tick = 0;
+    /// Tick of the latest CPU write: an upload of that data is as new as the write, not newer.
+    u64 cpu_modification_tick = 0;
+    u64 first_written_frame = 0; ///< First frame_tick+1 a non-clear GPU write modified this image.
+    u64 last_written_frame = 0;  ///< Last frame_tick+1 a non-clear GPU write modified this image.
+    u64 cleared_frame = 0;       ///< Last frame_tick+1 a full clear invalidated this image.
     size_t lru_index = SIZE_MAX;
 
     /// Render target relocation guard (EXP43): the frame the GPU last wrote the image (~0 =

@@ -1,0 +1,21 @@
+name: Remove obsolete label on activity
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+
+jobs:
+  unmark:
+    if: >
+      github.event.issue.pull_request == null &&
+      github.event.comment.user.type != 'Bot' &&
+      contains(github.event.issue.labels.*.name, 'obsolete')
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh issue edit ${{ github.event.issue.number }} --remove-label obsolete

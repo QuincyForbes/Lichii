@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -188,12 +191,15 @@ elseif (MANAGARM)
 endif()
 
 if (YUZU_USE_BUNDLED_FFMPEG)
-    # Windows (MSVC and MinGW) and Linux x86_64 get the same FFmpeg with libdav1d, for Switch 2
-    # titles' AV1 movies; crueter-ci's packages, used elsewhere, have no AV1 decoder.
+    # Windows (MSVC and MinGW) and Linux get FFmpeg with libdav1d, for Switch 2 titles' AV1 movies;
+    # crueter-ci's packages, used elsewhere, have no AV1 decoder. The Linux ones are built on Ubuntu
+    # 24.04, so they only need libva 2.20.
     if (IOS AND LICHII_FFMPEG_DIR)
         add_subdirectory("${LICHII_FFMPEG_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/lichii-ffmpeg")
         set(FFmpeg_SOURCE_DIR "${LICHII_FFMPEG_DIR}")
-    elseif ((MSVC OR LINUX) AND CPMUTIL_AMD64)
+    elseif (LINUX AND (CPMUTIL_AMD64 OR CPMUTIL_ARM64))
+        AddJsonPackage(ffmpeg-ci-av1-linux)
+    elseif (MSVC AND CPMUTIL_AMD64)
         AddJsonPackage(ffmpeg-ci-av1)
     elseif (MINGW AND CPMUTIL_AMD64)
         AddJsonPackage(ffmpeg-ci-av1-mingw)

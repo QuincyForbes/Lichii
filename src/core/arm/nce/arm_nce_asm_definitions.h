@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -28,6 +31,7 @@
 #define BreakFromRunCodeSignal SIGURG
 #define GuestAccessFaultSignal SIGSEGV
 #define GuestAlignmentFaultSignal SIGBUS
+#define GuestIllegalInstructionSignal SIGILL
 
 #define GuestContextSp 0xF8
 #define GuestContextHostContext 0x320

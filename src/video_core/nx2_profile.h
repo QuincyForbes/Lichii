@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -10,10 +13,19 @@
 #elif defined(ARCHITECTURE_x86_64)
 #include <x86intrin.h>
 #endif
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <numeric>
+#include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "common/common_types.h"
 #include "video_core/gpu_split.h"
@@ -63,6 +75,14 @@ enum class Zone : u32 {
     WriterWait,
     ListSubmitWait,
     ListGpuWait,
+    SignalOrdering, ///< SignalOrdering: mostly waiting for the buffer cache lock
+    ListCopyWait,   ///< Nx2ReadListCopy: the host GPU finishing a command list copy
+    BindUniformBank,   ///< Of bind stage buffers: native 64 KiB bank page diffing
+    BindUniformStream, ///< Of bind stage buffers: uniforms streamed (small or misaligned)
+    BindUniformCached, ///< Of bind stage buffers: cached uniforms (touch, sync, usage, bind)
+    BindStorage,       ///< Of bind stage buffers: storage buffers (touch, sync, usage, bind)
+    BackReplay,   ///< Split back: decoding ring entries (Execute) outside the zones it calls
+    BackIdleHook, ///< Split back: the idle hook (deferred submits) outside the zones it calls
     Count,
 };
 
@@ -74,22 +94,68 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
     "fence skipped", "method", "split drain", "split wait",
-    "writer wait", "list submit wait", "list GPU wait",
+    "writer wait", "list submit wait", "list GPU wait", "signal ordering",
+    "list copy wait",
+    "bind uniform bank", "bind uniform stream", "bind uniform cached", "bind storage",
+    "back replay", "back idle hook",
 };
 
-// Read once, when the GPU thread starts (Initialize): Enabled() runs several times per method
-// write (no guard to check). Not at static initialization: nx2_switches.txt is only applied in
-// main(). Off while EDEN_NX2_SAMPLE_PROFILE samples (common/nx2_sample_profile.h): the zone timers
-// would show up in the samples.
-inline bool g_enabled = false;
+// Off until Initialize() (GPU thread start: nx2_switches.txt is only applied in main(), so not at
+// static initialization) finds EDEN_NX2_GPU_PROFILE, and not then while EDEN_NX2_SAMPLE_PROFILE
+// samples (common/nx2_sample_profile.h): the zone timers would show up in the samples. The MCP
+// server and the spike recorder toggle it at runtime (SetEnabled). Enabled() runs several times
+// per method write: a relaxed load is as cheap as the plain bool it replaced.
+inline std::atomic<bool> g_enabled{false};
+/// Report window (each thread logs and publishes its totals this often).
+inline std::atomic<u64> g_window_ns{10'000'000'000ULL};
 
 inline void Initialize() {
-    g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr &&
-                std::getenv("EDEN_NX2_SAMPLE_PROFILE") == nullptr;
+    if (std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr &&
+        std::getenv("EDEN_NX2_SAMPLE_PROFILE") == nullptr) {
+        g_enabled.store(true, std::memory_order_relaxed);
+    }
 }
 
 inline bool Enabled() {
-    return g_enabled;
+    return g_enabled.load(std::memory_order_relaxed);
+}
+
+/// Bumped on every toggle: threads drop totals from before it (thread_local, so they reset
+/// themselves at their next Report).
+inline std::atomic<u32> g_generation{0};
+
+/// Turns the profiler on or off at runtime (thread-safe). Each thread restarts its window at
+/// its next Report, so the first numbers after a toggle take one full window.
+inline void SetEnabled(bool enabled) {
+    g_generation.fetch_add(1, std::memory_order_relaxed);
+    g_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+/// One thread's last report, per second of wall time (for the MCP gpu_profile tool).
+struct Snapshot {
+    std::string thread;
+    u64 when_ns{};   ///< Now() at the report
+    u64 window_ns{};
+    /// Exclusive time (ms) and entries of one zone, both per second.
+    struct ZoneStat {
+        const char* name;
+        double ms;
+        double calls;
+    };
+    std::vector<ZoneStat> zones;
+    std::vector<std::pair<const char*, double>> counters;
+};
+
+/// Guards Snapshots(): Report writes under it from each profiled thread.
+inline std::mutex& SnapshotMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+/// Last report per thread name. Lock SnapshotMutex() while reading.
+inline std::map<std::string, Snapshot>& Snapshots() {
+    static std::map<std::string, Snapshot> snapshots;
+    return snapshots;
 }
 
 // Nanoseconds; from the host's own counter where the wall clock reads it directly (the zones
@@ -132,17 +198,49 @@ inline u64 Ticks() {
 #endif
 }
 
+/// One 3D macro start id's ((method - 0xe00) / 2) calls on the split front (FrontRunMacro).
+struct MacroCounts {
+    u64 calls;
+    u64 writes;     ///< Methods the macro emitted
+    u64 same_value; ///< Of those, dropped as same-value writes
+    u64 ring_words; ///< Ring words sent during the call (writes, DMA read flushes, draws)
+    u64 dma_reads;  ///< MME_DMA_READ(_FIFOED) emits
+};
+
+/// Why the Vulkan scheduler submitted (Scheduler::Flush): the caller tags it with FlushOriginTag.
+enum class FlushOrigin : u32 {
+    Other,
+    Waited,   ///< Nx2Perf submit_while_waited: the front waited for the back
+    GpuIdle,  ///< Nx2Perf submit_while_waited: the host GPU had finished everything submitted
+    Budget,   ///< FlushWork's draw budget
+    Fence,    ///< FlushCommands (fences with downloads or queries), not deferred
+    ListCopy, ///< Command list copies (SubmitNx2ListCopies, DMA copies)
+    IdleHook, ///< The split back's idle hook submitting deferred work
+    Count,
+};
+
+inline constexpr std::array<const char*, static_cast<size_t>(FlushOrigin::Count)>
+    flush_origin_names{"other", "waited", "gpu idle", "budget", "fence", "list copy", "idle hook"};
+
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 64> counters{}; ///< See Counter (static_assert below)
+    std::array<u64, 80> counters{}; ///< See Counter
     std::array<u64, static_cast<size_t>(DmaWaitCause::Count)> dma_wait_causes{};
+    std::array<u64, static_cast<size_t>(FlushOrigin::Count)> flushes{};
+    u64 list_copy_done_ns{}; ///< Command list copies the front waited for: recorded to done
+    u64 list_copy_done_count{};
+    /// Executable methods the front sent with the value the register held (approximate top 16,
+    /// space-saving: a new method takes the least counted slot and inherits its count).
+    std::array<std::pair<u32, u64>, 16> same_executable{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
+    std::array<MacroCounts, 128> macros{};
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
     u64 window_start_ticks{};
     std::optional<u64> cpu_start_ns;
+    u32 generation{};
 };
 
 inline thread_local ThreadData t_data;
@@ -166,9 +264,78 @@ inline thread_local ThreadData t_data;
     case Zone::WriterWait:
     case Zone::ListSubmitWait:
     case Zone::ListGpuWait:
+    case Zone::SignalOrdering:
+    case Zone::ListCopyWait:
         return true;
     default:
         return false;
+    }
+}
+
+/// Totals since the thread started, never reset by the report window: the frame spike recorder
+/// (nx2_spikes.h) takes their difference over one frame.
+struct Totals {
+    std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
+    std::array<u64, static_cast<size_t>(Zone::Count)> count{};
+    std::array<u64, 10> counters{};
+};
+inline thread_local Totals t_totals;
+
+/// A thread's totals as other threads read them, refreshed by Report while g_publish is set.
+struct PublishedTotals {
+    explicit PublishedTotals(std::string thread_) : thread{std::move(thread_)} {}
+    std::string thread;
+    std::array<std::atomic<u64>, static_cast<size_t>(Zone::Count)> exclusive_ns{};
+    std::array<std::atomic<u64>, static_cast<size_t>(Zone::Count)> count{};
+    std::array<std::atomic<u64>, 10> counters{};
+};
+
+inline std::atomic<bool> g_publish{false};
+
+inline std::mutex& PublishedMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+/// One entry per profiled thread name; entries are never removed (stable addresses).
+inline std::deque<PublishedTotals>& PublishedThreads() {
+    static std::deque<PublishedTotals> threads;
+    return threads;
+}
+
+/// Nanoseconds per Ticks() unit, measured since the first call (the zones run in ticks; the
+/// published totals are nanoseconds).
+inline double NsPerTick() {
+    static const u64 start_ticks = Ticks();
+    static const u64 start_ns = Now();
+    const u64 ticks = Ticks() - start_ticks;
+    return ticks != 0 ? static_cast<double>(Now() - start_ns) / static_cast<double>(ticks) : 1.0;
+}
+
+inline void Publish(const char* thread_name, u64 now) {
+    // Report runs between commands, far more often than a frame needs.
+    static thread_local u64 last_publish{};
+    static thread_local PublishedTotals* published{};
+    if (now - last_publish < 500'000) {
+        return;
+    }
+    last_publish = now;
+    if (published == nullptr) {
+        std::scoped_lock lock{PublishedMutex()};
+        auto& threads = PublishedThreads();
+        const auto it = std::find_if(threads.begin(), threads.end(),
+                                     [&](const PublishedTotals& t) { return t.thread == thread_name; });
+        published = it != threads.end() ? &*it : &threads.emplace_back(thread_name);
+    }
+    const double ns_per_tick = NsPerTick();
+    for (size_t i = 0; i < t_totals.exclusive_ns.size(); ++i) {
+        published->exclusive_ns[i].store(
+            static_cast<u64>(static_cast<double>(t_totals.exclusive_ns[i]) * ns_per_tick),
+            std::memory_order_relaxed);
+        published->count[i].store(t_totals.count[i], std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < t_totals.counters.size(); ++i) {
+        published->counters[i].store(t_totals.counters[i], std::memory_order_relaxed);
     }
 }
 
@@ -202,6 +369,8 @@ public:
         const auto index = static_cast<size_t>(zone);
         data.exclusive_ns[index] += elapsed - data.child_ns;
         ++data.count[index];
+        t_totals.exclusive_ns[index] += elapsed - data.child_ns;
+        ++t_totals.count[index];
         data.child_ns = parent_child_ns + elapsed;
     }
 
@@ -227,6 +396,10 @@ enum class Counter : u32 {
     SameValueWrites, ///< Of MethodWrites: the register already held the value
     AcquireChecks,  ///< Semaphore acquires evaluated
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    DmaReadsEarly,  ///< MME DMA reads without a drain (Maxwell3D::FrontDmaReadEarly)
+    DmaReadsWaitUnknown, ///< Of those, waited for a write the front can't place
+    DmaReadsWaitGpu,     ///< waited for all queued GPU work with unknown destinations
+    DmaReadsWaitWrite,   ///< waited for a noted write to the words' pages
     AcquiresFast,   ///< EDEN_NX2_ACQUIRE_PRECHECK: acquires met without draining the split
     AcquiresQueued, ///< Acquires met by a release still queued for the split's back
     PtrCacheHits,   ///< EDEN_NX2_HANDLE_PTR_CACHE: handle/descriptor reads, page pointer cached
@@ -239,20 +412,58 @@ enum class Counter : u32 {
     AcquirePayloadMiss, ///< Drained acquires: the queued release's payload does not meet it
     AcquireMetAfterDrain, ///< Drained acquires met at once after the drain
     DmaReadsForwarded, ///< MME DMA reads served from a queued constant buffer upload
-    DmaReadsEarly,  ///< MME DMA reads without a drain (Maxwell3D::FrontDmaReadEarly)
-    DmaReadsWaitUnknown, ///< Of those, waited for a write the front can't place
-    DmaReadsWaitGpu,     ///< waited for all queued GPU work with unknown destinations
-    DmaReadsWaitWrite,   ///< waited for a noted write to the words' pages
-    AcquirePolls,   ///< Polls of a waiting acquire (Puller::CanResumeAcquire)
+    AcquirePolls,        ///< Pending semaphore acquires polled (Puller::CanResumeAcquire)
     AcquirePollsFast, ///< Of AcquirePolls: answered from the word without draining the back
     SemNoFastPath,    ///< SemaphoreReadableNow false: split off or EDEN_NX2_SEM_FAST=0
     SemGpuWrittenPage, ///< SemaphoreReadableNow false: the word's page is marked GPU-written
     SemAsyncPending,  ///< SemaphoreReadableNow false: a counter report or timed release is pending
     SemWritersWait,   ///< SemaphoreReadableNow false: WaitForWritesTo gave up
     AcquireNoDrain,   ///< Acquires of a current word not met yet that registered without a drain
+    AcquirePollsMet,     ///< Of those, met (the channel resumes)
+    DirectWrites,        ///< 3D register writes the split front sent from command lists
+    MacroWrites,         ///< 3D register writes the split front's macros sent
+    SameExecutableWrites, ///< Executable writes the front sent with the register's value
+    /// Of DownloadBytes, by the age in frames of their 64 KiB block's preflush stamp
+    /// (BufferCache::nx2_preflush_blocks): < 60, < 120, < 600, < 3600, older, no stamp
+    DownloadAge60,
+    DownloadAge120,
+    DownloadAge600,
+    DownloadAge3600,
+    DownloadAgeOlder,
+    DownloadAgeNone,
+    BindMemoHits,        ///< Nx2Perf bind_memo: binds that skipped touch, sync and usage
+    BindMemoMisses,      ///< Nx2Perf bind_memo: binds that took the full path
+    DmaReadsWriterSet,   ///< Of DmaReadsEarly: read with proven draws still queued (MacroReadWriterSet)
+    DmaReadsWriterSetFallback, ///< Drained instead: a queued proven draw's proof no longer held
+    DmaReadsOverlayNoWait, ///< Of DmaReadsEarly: constant buffer overlay reads with no wait
+    DmaReadsOverlayWaited, ///< Of DmaReadsEarly: constant buffer overlay reads after a wait
+    /// Of DmaReadsWaitWrite, why the overlay did not apply: an Other write to the pages is
+    /// queued, queued constant buffer words were not kept, or the constant buffer write is
+    /// older than the unknown and GPU target
+    DmaReadsWaitWriteOther,
+    DmaReadsWaitWriteCbLost,
+    DmaReadsWaitWriteCbOlder,
+    DmaReadsOverlayFallback, ///< Overlay reads drained instead: a queued proven draw's proof changed
+    /// Native 64 KiB banks: draws whose guest byte compare Nx2Perf bank_once_per_frame skipped
+    /// (the per-draw path would have compared); in Verify, pages that compare found changed
+    /// after the frame's first bind (bytes the default path uploads one frame late)
+    BankRechecksSkippedByFrame,
+    BankLateChanges,
+    /// Nx2Perf draw_begin_coalesce: draw.begin writes counted into the entry before them (with
+    /// EDEN_NX2_PERF_VERIFY: that would have been)
+    DrawBeginCoalesced,
+    /// Nx2Perf pending_wake: pending 1 ms sleeps, those ended by a submit, a latch or the
+    /// timeout
+    PendingWaits,
+    PendingWakePush,
+    PendingWakeLatch,
+    PendingWakeTimeout,
+    /// Of MethodWrites: constant buffer words (const_buffer.buffer .. +16), the uniform stream
+    CbWords,
+    /// Of MethodWrites: writes the front dropped as a same-value state write before any other work
+    DroppedSameFirst,
     Count,
 };
-static_assert(static_cast<size_t>(Counter::Count) <= 64, "Counter outgrew the counters array");
 static_assert(static_cast<size_t>(Counter::Count) <= std::tuple_size_v<decltype(ThreadData::counters)>);
 
 /// Method calls on this thread by method (3D registers on the back, macros on the front), and
@@ -300,6 +511,12 @@ inline std::string TopMethods(const std::array<u32, 0x2000>& counts,
     return text;
 }
 
+/// The fencing thread's buffer downloads (BufferCache::PopAsyncBuffers): logged by the thread
+/// that makes the fences.
+inline std::atomic<u64> g_fencing_lock_ns{};       ///< Holding the buffer cache lock
+inline std::atomic<u64> g_fencing_written_bytes{}; ///< Written back to guest memory
+inline std::atomic<u64> g_fencing_pops{};          ///< Fences popped
+
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
 /// while profiling): which buffer downloads anything on the GPU thread reads back.
 inline std::unordered_set<u64>& DmaReadPages() {
@@ -310,6 +527,85 @@ inline std::unordered_set<u64>& DmaReadPages() {
 inline void Add(Counter counter, u64 amount) {
     if (Enabled()) {
         t_data.counters[static_cast<size_t>(counter)] += amount;
+        // The spike recorder follows only the first counters (Totals).
+        if (static_cast<size_t>(counter) < t_totals.counters.size()) {
+            t_totals.counters[static_cast<size_t>(counter)] += amount;
+        }
+    }
+}
+
+/// An executable 3D method the front sent with the value the register held (same_executable).
+inline void AddSameExecutable(u32 method) {
+    if (!Enabled()) {
+        return;
+    }
+    auto& slots = t_data.same_executable;
+    ++t_data.counters[static_cast<size_t>(Counter::SameExecutableWrites)];
+    size_t least = 0;
+    for (size_t i = 0; i < slots.size(); ++i) {
+        if (slots[i].second != 0 && slots[i].first == method) {
+            ++slots[i].second;
+            return;
+        }
+        if (slots[i].second < slots[least].second) {
+            least = i;
+        }
+    }
+    slots[least].first = method;
+    ++slots[least].second;
+}
+
+inline u64 CounterValue(Counter counter) {
+    return t_data.counters[static_cast<size_t>(counter)];
+}
+
+inline void AddMacro(u32 id, u64 writes, u64 same_value, u64 ring_words, u64 dma_reads) {
+    MacroCounts& counts = t_data.macros[id % t_data.macros.size()];
+    ++counts.calls;
+    counts.writes += writes;
+    counts.same_value += same_value;
+    counts.ring_words += ring_words;
+    counts.dma_reads += dma_reads;
+}
+
+inline thread_local FlushOrigin t_flush_origin{FlushOrigin::Other};
+
+/// Tags the scheduler submissions made in its scope (only while profiling); nests.
+class FlushOriginTag {
+public:
+    explicit FlushOriginTag(FlushOrigin origin) : enabled{Enabled()} {
+        if (enabled) {
+            previous = t_flush_origin;
+            t_flush_origin = origin;
+        }
+    }
+    ~FlushOriginTag() {
+        if (enabled) {
+            t_flush_origin = previous;
+        }
+    }
+
+    FlushOriginTag(const FlushOriginTag&) = delete;
+    FlushOriginTag& operator=(const FlushOriginTag&) = delete;
+
+private:
+    bool enabled;
+    FlushOrigin previous{};
+};
+
+/// Scheduler::Flush: one submission, counted by the current tag.
+inline void AddFlush() {
+    if (Enabled()) {
+        ++t_data.flushes[static_cast<size_t>(t_flush_origin)];
+    }
+}
+
+/// The front waited for a command list copy recorded at `recorded` (Now; 0 when not profiling)
+/// and it is done now.
+inline void AddListCopyDone(u64 recorded) {
+    if (Enabled() && recorded != 0) {
+        t_data.list_copy_done_ns += Now() - recorded;
+        ++t_data.list_copy_done_count;
     }
 }
 
@@ -336,15 +632,22 @@ inline void Report(const char* thread_name = "GPU thread") {
     }
     auto& data = t_data;
     const u64 now = Now();
-    if (data.window_start == 0) {
+    (void)NsPerTick(); // Starts its measurement with the first report
+    if (g_publish.load(std::memory_order_relaxed)) {
+        Publish(thread_name, now);
+    }
+    const u32 generation = g_generation.load(std::memory_order_relaxed);
+    if (data.window_start == 0 || data.generation != generation) {
+        data = {};
         data.window_start = now;
         data.window_start_ticks = Ticks();
         data.cpu_start_ns = Common::CurrentThreadCpuTimeNs();
         data.child_ns = 0;
+        data.generation = generation;
         return;
     }
     const u64 window = now - data.window_start;
-    if (window < 10'000'000'000ULL) {
+    if (window < g_window_ns.load(std::memory_order_relaxed)) {
         return;
     }
     const auto cpu_now = Common::CurrentThreadCpuTimeNs();
@@ -418,16 +721,6 @@ inline void Report(const char* thread_name = "GPU thread") {
                             static_cast<double>(same) * 1e9 / window,
                             static_cast<double>(changed) * 1e9 / window);
     }
-    if (const u64 early = data.counters[static_cast<size_t>(Counter::DmaReadsEarly)]; early != 0) {
-        const auto rate = [&](Counter counter) {
-            return static_cast<double>(data.counters[static_cast<size_t>(counter)]) * 1e9 / window;
-        };
-        line += fmt::format(" | MME DMA reads without a drain {:.0f} (waited for: unknown writes "
-                            "{:.0f}, GPU work {:.0f}, writes to the words {:.0f})",
-                            static_cast<double>(early) * 1e9 / window,
-                            rate(Counter::DmaReadsWaitUnknown), rate(Counter::DmaReadsWaitGpu),
-                            rate(Counter::DmaReadsWaitWrite));
-    }
     {
         const auto rate = [&](Counter counter) {
             return static_cast<double>(data.counters[static_cast<size_t>(counter)]) * 1e9 / window;
@@ -443,6 +736,105 @@ inline void Report(const char* thread_name = "GPU thread") {
                                 rate(Counter::SemGpuWrittenPage), rate(Counter::SemAsyncPending),
                                 rate(Counter::SemWritersWait));
         }
+    }
+    const auto per_second = [&](Counter counter) {
+        return static_cast<double>(data.counters[static_cast<size_t>(counter)]) * 1e9 / window;
+    };
+    line += fmt::format(" | acquire polls {:.0f} ({:.0f} met)", per_second(Counter::AcquirePolls),
+                        per_second(Counter::AcquirePollsMet));
+    if (data.counters[static_cast<size_t>(Counter::PendingWaits)] != 0) {
+        line += fmt::format(" | pending_wake sleeps {:.0f} (ended by push {:.0f}, latch {:.0f}, "
+                            "timeout {:.0f})",
+                            per_second(Counter::PendingWaits),
+                            per_second(Counter::PendingWakePush),
+                            per_second(Counter::PendingWakeLatch),
+                            per_second(Counter::PendingWakeTimeout));
+    }
+    line += fmt::format(" | MME DMA reads without a drain {:.0f} (waited for: unknown writes "
+                        "{:.0f}, GPU work {:.0f}, writes to the words {:.0f})",
+                        static_cast<double>(data.counters[8]) * 1e9 / window,
+                        static_cast<double>(data.counters[9]) * 1e9 / window,
+                        static_cast<double>(data.counters[10]) * 1e9 / window,
+                        static_cast<double>(data.counters[11]) * 1e9 / window);
+    if (data.counters[static_cast<size_t>(Counter::DirectWrites)] != 0 || data.counters[static_cast<size_t>(Counter::MacroWrites)] != 0) {
+        line += fmt::format(" | front 3D writes: direct {:.0f}, from macros {:.0f}",
+                            static_cast<double>(data.counters[static_cast<size_t>(Counter::DirectWrites)]) * 1e9 / window,
+                            static_cast<double>(data.counters[static_cast<size_t>(Counter::MacroWrites)]) * 1e9 / window);
+    }
+    if (data.counters[static_cast<size_t>(Counter::DrawBeginCoalesced)] != 0) {
+        line += fmt::format(" | draw.begin coalesced {:.0f}",
+                            per_second(Counter::DrawBeginCoalesced));
+    }
+    if (data.counters[static_cast<size_t>(Counter::SameExecutableWrites)] != 0) {
+        auto slots = data.same_executable;
+        std::sort(slots.begin(), slots.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        line += fmt::format(" | same-value executable writes sent {:.0f}, top:",
+                            static_cast<double>(data.counters[static_cast<size_t>(Counter::SameExecutableWrites)]) * 1e9 / window);
+        for (const auto& [method, count] : slots) {
+            if (count != 0) {
+                line += fmt::format(" {:#x} {:.0f},", method,
+                                    static_cast<double>(count) * 1e9 / window);
+            }
+        }
+        line.pop_back();
+    }
+    const auto per_second_kib = [&](size_t counter) {
+        return static_cast<double>(data.counters[counter]) * 1e9 / 1024.0 / window;
+    };
+    line += fmt::format(" | downloads by preflush stamp age (KiB): <60f {:.0f}, <120f {:.0f}, "
+                        "<600f {:.0f}, <3600f {:.0f}, older {:.0f}, none {:.0f}",
+                        per_second_kib(static_cast<size_t>(Counter::DownloadAge60)), per_second_kib(static_cast<size_t>(Counter::DownloadAge120)), per_second_kib(static_cast<size_t>(Counter::DownloadAge600)),
+                        per_second_kib(static_cast<size_t>(Counter::DownloadAge3600)), per_second_kib(static_cast<size_t>(Counter::DownloadAgeOlder)), per_second_kib(static_cast<size_t>(Counter::DownloadAgeNone)));
+    if (data.count[static_cast<size_t>(Zone::Fence)] != 0) {
+        const u64 lock_ns = g_fencing_lock_ns.exchange(0, std::memory_order_relaxed);
+        const u64 written = g_fencing_written_bytes.exchange(0, std::memory_order_relaxed);
+        const u64 pops = g_fencing_pops.exchange(0, std::memory_order_relaxed);
+        line += fmt::format(" | fencing thread: buffer cache held {:.1f} ms for {:.0f} pops, "
+                            "{:.0f} KiB written back",
+                            static_cast<double>(lock_ns) * 1000.0 / window,
+                            static_cast<double>(pops) * 1e9 / window,
+                            static_cast<double>(written) * 1e9 / 1024.0 / window);
+    }
+    if (data.counters[static_cast<size_t>(Counter::BankRechecksSkippedByFrame)] != 0 ||
+        data.counters[static_cast<size_t>(Counter::BankLateChanges)] != 0) {
+        line += fmt::format(" | bank rechecks skipped by frame {:.0f}, bank late changes {:.0f}",
+                            per_second(Counter::BankRechecksSkippedByFrame),
+                            per_second(Counter::BankLateChanges));
+    }
+    if (data.counters[static_cast<size_t>(Counter::BindMemoHits)] != 0 || data.counters[static_cast<size_t>(Counter::BindMemoMisses)] != 0) {
+        line += fmt::format(" | bind memo {:.0f} hits, {:.0f} misses",
+                            static_cast<double>(data.counters[static_cast<size_t>(Counter::BindMemoHits)]) * 1e9 / window,
+                            static_cast<double>(data.counters[static_cast<size_t>(Counter::BindMemoMisses)]) * 1e9 / window);
+    }
+    line += fmt::format(" | MME DMA reads past proven draws {:.0f} ({:.0f} drained: proof changed)",
+                        static_cast<double>(data.counters[static_cast<size_t>(Counter::DmaReadsWriterSet)]) * 1e9 / window,
+                        static_cast<double>(data.counters[static_cast<size_t>(Counter::DmaReadsWriterSetFallback)]) * 1e9 / window);
+    line += fmt::format(" | MME DMA overlay reads {:.0f} without a wait, {:.0f} after one ({:.0f} "
+                        "drained: proof changed) | writes to the words waits: other write {:.0f}, "
+                        "constant buffer words lost {:.0f}, constant buffer write older {:.0f}",
+                        per_second(Counter::DmaReadsOverlayNoWait),
+                        per_second(Counter::DmaReadsOverlayWaited),
+                        per_second(Counter::DmaReadsOverlayFallback),
+                        per_second(Counter::DmaReadsWaitWriteOther),
+                        per_second(Counter::DmaReadsWaitWriteCbLost),
+                        per_second(Counter::DmaReadsWaitWriteCbOlder));
+    std::string flushes;
+    for (size_t i = 0; i < data.flushes.size(); ++i) {
+        if (data.flushes[i] != 0) {
+            flushes += fmt::format(" {} {:.0f},", flush_origin_names[i],
+                                   static_cast<double>(data.flushes[i]) * 1e9 / window);
+        }
+    }
+    if (!flushes.empty()) {
+        flushes.pop_back();
+        line += " | submits by origin:" + flushes;
+    }
+    if (data.list_copy_done_count != 0) {
+        line += fmt::format(" | list copy: {:.0f} us from submit to done ({:.0f}/s)",
+                            static_cast<double>(data.list_copy_done_ns) / 1000.0 /
+                                static_cast<double>(data.list_copy_done_count),
+                            static_cast<double>(data.list_copy_done_count) * 1e9 / window);
     }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
@@ -485,10 +877,65 @@ inline void Report(const char* thread_name = "GPU thread") {
     t_method_count = {};
     t_method_same = {};
     t_dma_reads = {};
+    {
+        // The first Counter entries, in order.
+        static constexpr std::array counter_names{
+            "download_bytes",  "download_copies",   "mme_dma_read_bytes",
+            "download_bytes_on_dma_pages", "method_writes", "same_value_writes",
+            "acquire_checks",  "acquire_waits",     "dma_reads_early"};
+        const double per_s = 1e9 / static_cast<double>(window);
+        Snapshot snap{.thread = thread_name, .when_ns = now, .window_ns = window};
+        for (size_t i = 0; i < data.exclusive_ns.size(); ++i) {
+            if (data.exclusive_ns[i] != 0 || data.count[i] != 0) {
+                snap.zones.push_back({zone_names[i],
+                                      static_cast<double>(data.exclusive_ns[i]) * 1000.0 /
+                                          static_cast<double>(window_ticks),
+                                      static_cast<double>(data.count[i]) * per_s});
+            }
+        }
+        for (size_t i = 0; i < counter_names.size(); ++i) {
+            snap.counters.emplace_back(counter_names[i],
+                                       static_cast<double>(data.counters[i]) * per_s);
+        }
+        // Counters added after the first nine, named here so the array above keeps its order.
+        for (const auto& [name, counter] : {
+                 std::pair{"direct_writes", Counter::DirectWrites},
+                 std::pair{"macro_writes", Counter::MacroWrites},
+                 std::pair{"same_executable_writes", Counter::SameExecutableWrites},
+                 std::pair{"cb_words", Counter::CbWords},
+                 std::pair{"dropped_same_first", Counter::DroppedSameFirst},
+             }) {
+            snap.counters.emplace_back(
+                name, static_cast<double>(data.counters[static_cast<size_t>(counter)]) * per_s);
+        }
+        std::scoped_lock lock{SnapshotMutex()};
+        Snapshots()[thread_name] = std::move(snap);
+    }
+    std::array<u32, std::tuple_size_v<decltype(data.macros)>> order;
+    std::iota(order.begin(), order.end(), 0U);
+    std::partial_sort(order.begin(), order.begin() + 12, order.end(), [&data](u32 a, u32 b) {
+        return data.macros[a].calls > data.macros[b].calls;
+    });
+    std::string macros;
+    for (size_t i = 0; i < 12 && data.macros[order[i]].calls != 0; ++i) {
+        const MacroCounts& counts = data.macros[order[i]];
+        const double calls = static_cast<double>(counts.calls);
+        macros += fmt::format("\n  macro {:#04x}: {:>9.0f} calls/s, {:5.2f} writes/call ({:5.2f} same "
+                              "value), {:5.2f} ring words/call, {:7.0f} DMA reads/s",
+                              order[i], calls * 1e9 / window,
+                              static_cast<double>(counts.writes) / calls,
+                              static_cast<double>(counts.same_value) / calls,
+                              static_cast<double>(counts.ring_words) / calls,
+                              static_cast<double>(counts.dma_reads) * 1e9 / window);
+    }
+    if (!macros.empty()) {
+        LOG_INFO(HW_GPU, "{} macros per second (top 12 by calls):{}", thread_name, macros);
+    }
     data = {};
     data.window_start = now;
     data.window_start_ticks = now_ticks;
     data.cpu_start_ns = cpu_now;
+    data.generation = generation;
 }
 
 } // namespace VideoCommon::Nx2Profile

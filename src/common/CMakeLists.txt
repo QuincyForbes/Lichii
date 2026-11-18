@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -17,6 +20,35 @@ if(DEFINED ENV{DISPLAYVERSION})
     set(DISPLAY_VERSION $ENV{DISPLAYVERSION})
 endif()
 
+# The display identity: what the window title and the About dialog show. CI
+# writes it next to the GIT-* files GetSCMRev reads (.github/actions/setup-build
+# for the plain legs, the Nix job's "Write SCM files" step for the flake). A
+# local build has no such file and falls back to the version composed from those
+# files, so nothing here can produce an empty title.
+set(EGLANTINE_DISPLAY_VERSION "")
+if(EXISTS "${CMAKE_SOURCE_DIR}/GIT-DISPLAY")
+    file(READ "${CMAKE_SOURCE_DIR}/GIT-DISPLAY" EGLANTINE_DISPLAY_VERSION)
+    string(STRIP "${EGLANTINE_DISPLAY_VERSION}" EGLANTINE_DISPLAY_VERSION)
+elseif(DEFINED ENV{DISPLAYVERSION})
+    set(EGLANTINE_DISPLAY_VERSION $ENV{DISPLAYVERSION})
+endif()
+
+# Where the binary came from, when the packaging layer wants to say so (the Nix
+# package sets this to "nix"). Rendered in parentheses after the identity.
+set(EGLANTINE_BUILD_FLAVOUR "")
+if(DEFINED ENV{EGLANTINE_FLAVOUR})
+    set(EGLANTINE_BUILD_FLAVOUR $ENV{EGLANTINE_FLAVOUR})
+endif()
+
+# Both values end up inside C string literals. Git allows quotes and backslashes
+# in a ref name, and configure_file would paste them through verbatim.
+foreach(_var EGLANTINE_DISPLAY_VERSION EGLANTINE_BUILD_FLAVOUR)
+    if(${_var})
+        string(REPLACE "\\" "\\\\" ${_var} "${${_var}}")
+        string(REPLACE "\"" "\\\"" ${_var} "${${_var}}")
+    endif()
+endforeach()
+
 include(GenerateSCMRev)
 
 add_library(
@@ -32,10 +64,12 @@ add_library(
     bit_field.h
     bit_util.h
     bounded_threadsafe_queue.h
+    progress_counter.h
     cityhash.cpp
     cityhash.h
     common_funcs.h
     common_types.h
+    cpu_layout.h
     concepts.h
     console_capture.cpp
     console_capture.h
@@ -160,6 +194,8 @@ add_library(
     nx2_sample_profile.h
     thread_cpu_clock.cpp
     thread_cpu_clock.h
+    driver_shader_cache.cpp
+    driver_shader_cache.h
     adpf.cpp
     adpf.h
     thread_queue_list.h
@@ -186,7 +222,7 @@ add_library(
     cpu_features.cpp
     cpu_features.h
     httplib.h
-    net/net.h net/net.cpp
+    net/ca_store.h net/net.h net/net.cpp
     container/unordered_map.h container/unordered_set.h)
 
 # The ZBIC decoder runs once per module at load, so a profile buys it nothing, and the aarch64
@@ -197,7 +233,7 @@ set_source_files_properties(zbic_compression.cpp PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>;$<$<CXX_COMPILER_ID:MSVC>:/wd4505;/wd5245>;$<$<CXX_COMPILER_ID:AppleClang,Clang>:-fno-profile-instr-use>")
 
 if(WIN32)
-    target_sources(common PRIVATE windows/timer_resolution.cpp
+    target_sources(common PRIVATE windows/cpu_layout.cpp windows/cpu_layout.h windows/timer_resolution.cpp
         windows/timer_resolution.h)
     target_link_libraries(common PRIVATE ntdll)
 endif()

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -153,6 +156,8 @@ private:
     void ProcessSemaphoreRelease(DmaPusher& dma_pusher);
     void ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher);
     void ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument);
+    /// CanResumeAcquire's check of the pending acquire.
+    [[nodiscard]] bool PollAcquire(DmaPusher& dma_pusher);
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
     std::optional<PendingAcquire> pending_acquire;

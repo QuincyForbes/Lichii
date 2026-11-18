@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -274,6 +277,9 @@ PixelFormat PixelFormatFromTextureInfo(TextureFormat format, ComponentType red, 
         return PixelFormat::ASTC_2D_6X5_UNORM;
     case Hash(TextureFormat::ASTC_2D_6X5, UNORM, SRGB):
         return PixelFormat::ASTC_2D_6X5_SRGB;
+    }
+    if (static_cast<int>(format) == 0) {
+        return PixelFormat::A8B8G8R8_UNORM;
     }
     UNIMPLEMENTED_MSG("texture format={} srgb={} components={{{} {} {} {}}}",
                       static_cast<int>(format), is_srgb, static_cast<int>(red),

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -48,6 +51,9 @@ public:
 
     /// Returns if window is shown (not minimized)
     bool IsShown() const override;
+
+    /// Advances TAS playback/recording once per presented frame, as the Qt render window does.
+    void OnFrameDisplayed() override;
 
     /// Wait for the next event on the main thread.
     void OnEvent(SDL_Event& event);

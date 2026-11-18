@@ -51,6 +51,21 @@ sl::DLSSMode ModeFor(VkExtent2D render, VkExtent2D upscale) {
     return sl::DLSSMode::eUltraPerformance;
 }
 
+sl::DLSSMode ConfiguredMode(VkExtent2D render, VkExtent2D upscale) {
+    switch (Settings::values.nvidia_dlss_quality.GetValue()) {
+    case Settings::DlssQuality::Performance:
+        return sl::DLSSMode::eMaxPerformance;
+    case Settings::DlssQuality::Balanced:
+        return sl::DLSSMode::eBalanced;
+    case Settings::DlssQuality::Quality:
+        return sl::DLSSMode::eMaxQuality;
+    case Settings::DlssQuality::DLAA:
+        return sl::DLSSMode::eDLAA;
+    default:
+        return ModeFor(render, upscale);
+    }
+}
+
 // Preset K for every mode: NVIDIA's defaults for Performance/Ultra Performance (M, L) draw thin
 // horizontal lines in Fire Emblem at 2x resolution scale. EDEN_NX2_DLSS_PRESET=J|K|L|M picks
 // another model, EDEN_NX2_DLSS_PRESET=default leaves the choice to NVIDIA.
@@ -137,6 +152,8 @@ StreamlineDlssUpscaler::StreamlineDlssUpscaler(const Device& device_, Scheduler&
         Streamline::SetProblem("This DLSS plugin has no slDLSSSetOptions; FSR 3.1 is used.");
         throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
     }
+    void(Streamline::GetApi().get_feature_function(sl::kFeatureDLSS, "slDLSSGetOptimalSettings",
+                                                   get_optimal_settings));
     point_sampler = device.GetLogical().CreateSampler(VkSamplerCreateInfo{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext = nullptr,
@@ -251,7 +268,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     // Keep the existing HDR controls for linear input such as Fortune's Weave. Tonemapped
     // input such as Ocarina's already has its exposure applied.
     sl::DLSSOptions options{};
-    options.mode = ModeFor(in.render_size, in.upscale_size);
+    options.mode = ConfiguredMode(in.render_size, in.upscale_size);
     options.outputWidth = in.upscale_size.width;
     options.outputHeight = in.upscale_size.height;
     static const bool env_hdr = EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0;
@@ -265,6 +282,23 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     options.performancePreset = preset;
     options.ultraPerformancePreset = preset;
     options.ultraQualityPreset = preset;
+    if (get_optimal_settings) {
+        const auto get_optimal =
+            reinterpret_cast<PFun_slDLSSGetOptimalSettings*>(get_optimal_settings);
+        sl::DLSSOptimalSettings optimal{};
+        if (get_optimal(options, optimal) != sl::Result::eOk ||
+            in.render_size.width < optimal.renderWidthMin ||
+            in.render_size.width > optimal.renderWidthMax ||
+            in.render_size.height < optimal.renderHeightMin ||
+            in.render_size.height > optimal.renderHeightMax) {
+            options.mode = ModeFor(in.render_size, in.upscale_size);
+        }
+    }
+    if (static_cast<u32>(options.mode) != current_mode) {
+        current_mode = static_cast<u32>(options.mode);
+        options_changed = true;
+        reset = true;
+    }
     if (options_changed) {
         LOG_INFO(Render_Vulkan, "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {}, {}",
                  in.render_size.width, in.render_size.height, in.upscale_size.width,

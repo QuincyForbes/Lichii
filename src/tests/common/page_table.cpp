@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -6,10 +9,17 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "common/page_table.h"
+#include "common/sparse_large_vector.h"
+
+namespace {
+
+using Entry = Common::PageTable::PageEntryData;
+
+const std::size_t EntriesPerHostPage = Common::HostPageSize / sizeof(Entry);
+
+} // namespace
 
 TEST_CASE("Page table block ids do not wrap", "[common]") {
-    using Entry = Common::PageTable::PageEntryData;
-
     REQUIRE(Entry::BlockIdForMapping(0) == 0);
     REQUIRE(Entry::BlockIdForMapping(65534) == 65534);
     REQUIRE(Entry::BlockIdForMapping(65535) == Entry::INVALID_BLOCK_ID);
@@ -19,15 +29,12 @@ TEST_CASE("Page table block ids do not wrap", "[common]") {
 }
 
 TEST_CASE("Page table fast spans reject exhausted block ids", "[common]") {
-    using Entry = Common::PageTable::PageEntryData;
-
     REQUIRE(Entry::CanFastSpan(7, 7));
     REQUIRE_FALSE(Entry::CanFastSpan(7, 8));
     REQUIRE_FALSE(Entry::CanFastSpan(Entry::INVALID_BLOCK_ID, Entry::INVALID_BLOCK_ID));
 }
 
 TEST_CASE("Page table SIGN_BIT matches ATTRIBUTE_MASK and sign-extends negative deltas", "[common]") {
-    using Entry = Common::PageTable::PageEntryData;
 
     STATIC_REQUIRE(Common::PageTable::SIGN_BIT == 55);
     STATIC_REQUIRE((1ULL << Common::PageTable::SIGN_BIT) ==

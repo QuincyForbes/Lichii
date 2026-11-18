@@ -718,6 +718,65 @@ const Setting kSettings[] = {
                                               "64 KiB cap marks at most 64 KiB, which can miss data a "
                                               "large dispatch really wrote."),
      Desktop | IOS},
+    {"use_mesh_shaders",
+     QT_TRANSLATE_NOOP("ConfigurationShared", "Use mesh shaders"),
+     QT_TRANSLATE_NOOP("ConfigurationShared", "Draws the task and mesh shader geometry of Switch 2 "
+                                              "games with the GPU's own mesh shaders "
+                                              "(VK_EXT_mesh_shader).\nTurn it off to use the slower "
+                                              "compute fallback, for example if a driver draws that "
+                                              "geometry wrong or crashes.\n"
+                                              "Takes effect when a game starts."),
+     Desktop},
+    {"cold_hint_mode",
+     QT_TRANSLATE_NOOP("ConfigurationShared", "Release uploaded guest memory"),
+     QT_TRANSLATE_NOOP("ConfigurationShared", "Hands the guest memory of textures and buffers already "
+                                              "on the GPU back to the operating system (Mario Kart "
+                                              "World: about 1.2 GB).\n"
+                                              "When RAM is low: only marks it to be reclaimed first, "
+                                              "and pages it out only while the system is short of "
+                                              "memory.\n"
+                                              "Always: pages it out every few seconds, which stalls "
+                                              "rendering for tens to hundreds of milliseconds each "
+                                              "time."),
+     Desktop},
+    {"prefer_3d_vcache",
+     QT_TRANSLATE_NOOP("ConfigurationShared", "Pin Emulation Threads to 3D V-Cache CCD"),
+     QT_TRANSLATE_NOOP("ConfigurationShared", "On dual-CCD processors with asymmetric L3 cache (such "
+                                              "as AMD Ryzen 9 X3D), pins emulated CPU and GPU threads "
+                                              "to the 3D V-Cache CCD and offloads background "
+                                              "shader/worker threads to the secondary CCD to prevent "
+                                              "cross-CCD latency and cache thrashing."),
+     Windows | Linux,
+     QT_TRANSLATE_NOOP("ConfigurationShared", "Only Windows and Linux PCs have a 3D V-Cache CCD.")},
+    {"driver_shader_cache_size",
+     QT_TRANSLATE_NOOP("ConfigurationShared", "Separate driver shader cache (Linux only)"),
+     QT_TRANSLATE_NOOP("ConfigurationShared", "Keeps the NVIDIA driver's shader cache for this "
+                                              "emulator in its own folder, up to this size, so other "
+                                              "applications can't evict it.\nTurn it off to use the "
+                                              "driver's shared cache instead.\nTakes effect at the "
+                                              "next start."),
+     Linux,
+     QT_TRANSLATE_NOOP("ConfigurationShared", "The NVIDIA driver's shader cache is separate on Linux "
+                                              "only.")},
+    {"private_driver_shader_cache", nullptr, nullptr},
+    {"hyrule_dynamic_fps",
+     QT_TRANSLATE_NOOP("ConfigurationShared",
+                       "Hyrule Warriors: Age of Imprisonment: dynamic FPS (experimental)"),
+     QT_TRANSLATE_NOOP("ConfigurationShared", "Drops to 30 FPS with the game's split-screen time step "
+                                              "while the game runs below about 50 FPS, so heavy "
+                                              "slowdowns don't slow down the game, and tries 60 FPS "
+                                              "again every few seconds."),
+     Desktop | IOS},
+    {"hyrule_30fps",
+     QT_TRANSLATE_NOOP("ConfigurationShared", "Hyrule Warriors: Age of Imprisonment: 30 FPS mode"),
+     QT_TRANSLATE_NOOP("ConfigurationShared", "Always runs at 30 FPS with the game's split-screen "
+                                              "time step, at normal game speed. Takes precedence over "
+                                              "dynamic FPS."),
+     Desktop | IOS},
+    {"enable_mcp_server", nullptr, nullptr},
+    {"mcp_allow_writes", nullptr, nullptr},
+    {"mcp_port", nullptr, nullptr},
+    {"mcp_token", nullptr, nullptr},
     {"use_asynchronous_shaders",
      QT_TRANSLATE_NOOP("ConfigurationShared", "Asynchronous Shader Building"),
      QT_TRANSLATE_NOOP("ConfigurationShared", "Builds new shaders in the background: less stutter, but "
@@ -1699,6 +1758,9 @@ const Choice kChoices[] = {
     CHOICE(OotFrameRate, Fps30, QT_TRANSLATE_NOOP("ConfigurationShared", "30 FPS")),
     CHOICE(OotFrameRate, Fps60, QT_TRANSLATE_NOOP("ConfigurationShared", "60 FPS")),
     CHOICE(OotFrameRate, Unlocked, QT_TRANSLATE_NOOP("ConfigurationShared", "Unlocked")),
+    CHOICE(ColdHintMode, Off, QT_TRANSLATE_NOOP("ConfigurationShared", "Off")),
+    CHOICE(ColdHintMode, WhenRamIsLow, QT_TRANSLATE_NOOP("ConfigurationShared", "When RAM is low")),
+    CHOICE(ColdHintMode, Always, QT_TRANSLATE_NOOP("ConfigurationShared", "Always")),
     CHOICE(MkwFrameRate, Game, QT_TRANSLATE_NOOP("ConfigurationShared", "Game's Own")),
     CHOICE(MkwFrameRate, Fps30, QT_TRANSLATE_NOOP("ConfigurationShared", "30 FPS")),
     CHOICE(MkwFrameRate, Dynamic, QT_TRANSLATE_NOOP("ConfigurationShared", "Dynamic 30-60 FPS")),

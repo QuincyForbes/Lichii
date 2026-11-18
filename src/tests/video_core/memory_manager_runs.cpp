@@ -7,6 +7,7 @@
 #include <limits>
 #include <random>
 #include <thread>
+
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
@@ -30,7 +31,7 @@ public:
                u32) override {}
     void BindGraphicsUniformBuffer(size_t, u32, GPUVAddr, u32) override {}
     void DisableGraphicsUniformBuffer(size_t, u32) override {}
-    void SignalFence(std::function<void()>&&) override {}
+    void SignalFence(std::function<void()>&&, bool) override {}
     void SyncOperation(std::function<void()>&&) override {}
     void SignalSyncPoint(u32) override {}
     void SignalReference() override {}
@@ -214,4 +215,31 @@ TEST_CASE("Device unmaps wait for deferred page count changes", "[memory_manager
     device_memory.EndDeferredCachedUpdates();
     unmapper.join();
     REQUIRE(unmapped);
+}
+
+TEST_CASE("ReadU32 with a page cache reads what Read<u32> reads", "[memory_manager]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    NullRasterizer rasterizer;
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31, 16};
+    memory.BindRasterizer(&rasterizer);
+
+    constexpr GPUVAddr window = 0x4000'0000;
+    constexpr u64 small_page = 0x1000;
+    // Two pages next to each other in GPU space but not in device memory, then a hole.
+    memory.Map(window, 0x1000'0000, small_page, Tegra::PTEKind::PITCH, false);
+    memory.Map(window + small_page, 0x3000'0000, small_page, Tegra::PTEKind::PITCH, false);
+    for (u64 offset = 0; offset < 2 * small_page; offset += sizeof(u32)) {
+        memory.Write<u32>(window + offset, static_cast<u32>(0xa5a50000 + offset));
+    }
+
+    Tegra::MemoryManager::ReadPageCache cache{};
+    // In order, back and forth between the pages, across the boundary and into the hole.
+    for (const u64 offset : {u64{0}, u64{4}, u64{0xffc}, u64{0x1000}, u64{0x10}, u64{0x1ffc},
+                             u64{0xffe}, u64{0x1ffe}, u64{0x2000}, u64{0x8}}) {
+        CAPTURE(offset);
+        CHECK(memory.ReadU32(window + offset, cache) == memory.Read<u32>(window + offset));
+    }
 }

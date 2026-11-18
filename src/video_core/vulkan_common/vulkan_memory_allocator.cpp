@@ -27,6 +27,7 @@
 #include <ranges>
 #include "video_core/vulkan_common/unbacked_fallback.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/vulkan_common/unbacked_image_policy.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_memory_tags.h"
@@ -274,7 +275,19 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     VmaAllocation allocation{};
     VmaAllocationInfo alloc_info{};
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
-    const bool huge = texels > MaxBackedImageTexels;
+    bool huge = false;
+    if (texels > UnbackedImageTexelThreshold) {
+        // What counts is the memory the image needs, not its texels (see the policy header).
+        const auto& dld = device.GetDispatchLoader();
+        VkMemoryRequirements requirements{};
+        VkImage probe{};
+        if (dld.vkCreateImage(*device.GetLogical(), &ci, nullptr, &probe) == VK_SUCCESS) {
+            dld.vkGetImageMemoryRequirements(*device.GetLogical(), probe, &requirements);
+            dld.vkDestroyImage(*device.GetLogical(), probe, nullptr);
+        }
+        huge = ShouldLeaveImageUnbacked(texels, requirements.size,
+                                        device.GetDeviceLocalMemory());
+    }
     if (!huge && !dedicated &&
         CreateImageInMediumPool(ci, alloc_ci, handle, allocation, alloc_info)) {
         MemoryTags::Tag(allocator, allocation, alloc_info.size);

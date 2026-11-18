@@ -38,9 +38,12 @@
 #include "core/gpu_dirty_memory_manager.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/buffer_dependency_trace.h"
 #include "video_core/buffer_cache/cpu_read_stats.h"
 #include "video_core/buffer_cache/cpu_write_stats.h"
 #include "video_core/buffer_cache/hot_pages.h"
+#include "video_core/buffer_cache/list_copy_demand.h"
+#include "video_core/buffer_cache/list_writer_trace.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
@@ -52,6 +55,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_download_trace.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
 
@@ -67,6 +71,8 @@ constexpr u32 NUM_VERTEX_BUFFERS = 16;
 #else
 constexpr u32 NUM_VERTEX_BUFFERS = 32;
 #endif
+constexpr u32 VERTEX_BUFFER_MASK =
+    NUM_VERTEX_BUFFERS >= 32 ? ~0u : (1u << NUM_VERTEX_BUFFERS) - 1;
 constexpr u32 NUM_TRANSFORM_FEEDBACK_BUFFERS = 4;
 constexpr u32 NUM_GRAPHICS_UNIFORM_BUFFERS = 18;
 constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
@@ -74,13 +80,22 @@ constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
 // shifts all following descriptor payloads into the wrong descriptor types.
 constexpr u32 NUM_STORAGE_BUFFERS = Shader::Info::MAX_SSBOS;
 static_assert(NUM_STORAGE_BUFFERS <= 64, "storage binding masks must fit u64");
+constexpr u32 NUM_COMPUTE_STORAGE_BUFFERS = NUM_STORAGE_BUFFERS;
 constexpr u32 NUM_TEXTURE_BUFFERS = 32;
 constexpr u32 NUM_STAGES = 5;
 
 static_assert(NUM_GRAPHICS_UNIFORM_BUFFERS <= 32, "fast bitmask must fit u32");
+static_assert(NUM_STORAGE_BUFFERS <= 64, "storage binding masks must fit u64");
 
 using UniformBufferSizes = std::array<std::array<u32, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>;
 using ComputeUniformBufferSizes = std::array<u32, NUM_COMPUTE_UNIFORM_BUFFERS>;
+
+struct Nx2ResetRun {
+    GPUVAddr gpu_addr{};
+    DAddr cpu_addr{};
+    u32 count{};
+    bool uploaded{};
+};
 
 enum class ObtainBufferSynchronize : u32 {
     NoSynchronize = 0,
@@ -101,10 +116,12 @@ static constexpr u32 DEFAULT_SKIP_CACHE_SIZE = static_cast<u32>(4_KiB);
 struct Binding {
     DAddr device_addr{};
     GPUVAddr gpu_addr{};
+    u64 map_serial{};
     u32 size{};
     BufferId buffer_id;
     u32 segment_first{};
     u32 segment_count{};
+    bool single_range{};
 };
 
 struct MultiRangeSegment {
@@ -186,6 +203,9 @@ public:
     bool has_deleted_buffers = false;
 
     std::array<u32, NUM_STAGES> dirty_uniform_buffers{};
+    std::array<u32, NUM_STAGES> unresolved_uniform_buffers{
+        ~u32{0}, ~u32{0}, ~u32{0}, ~u32{0}, ~u32{0},
+    };
     std::array<u32, NUM_STAGES> fast_bound_uniform_buffers{};
     std::array<std::array<u32, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
         uniform_buffer_binding_sizes{};
@@ -312,6 +332,14 @@ public:
     /// finished ones around it. wait: waits for that download's submission (the thread that
     /// records); otherwise lands only what the GPU has finished. Any thread, under the mutex.
     void LandInFlightForCpuRead(DAddr device_addr, u64 size, bool wait);
+    /// The core consumed the read traps of these pages for a read the texture cache answered:
+    /// the next GPU write here must arm them again (GetFlushArea forgets them otherwise).
+    void ForgetReadTraps(DAddr device_addr, u64 size) {
+        read_trapped_ranges.Subtract(
+            Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE),
+            Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE) -
+                Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE));
+    }
 
     /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
     /// data reaches guest memory, so reads must ask the buffer cache (GetFlushArea).
@@ -322,9 +350,51 @@ public:
     bool InlineMemory(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer,
                       bool* pages_clean = nullptr);
 
-    void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size);
+    void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size) {
+        auto& current = channel_state->uniform_buffers[stage][index];
+        const u64 map_serial = gpu_memory->GetMapSerial();
+        if (!channel_state->has_deleted_buffers && current.buffer_id &&
+            current.buffer_id != NULL_BUFFER_ID && current.gpu_addr == gpu_addr &&
+            current.size == size && current.map_serial == map_serial && current.device_addr != 0)
+            [[likely]] {
+            return;
+        }
+        const std::optional<DAddr> device_addr =
+            (current.gpu_addr == gpu_addr && current.map_serial == map_serial &&
+             current.device_addr != 0)
+                ? std::optional<DAddr>{current.device_addr}
+                : gpu_memory->GpuToCpuAddress(gpu_addr);
+        if (!device_addr) {
+            current = NULL_BINDING;
+            channel_state->unresolved_uniform_buffers[stage] |= 1U << index;
+            return;
+        }
+        if (!channel_state->has_deleted_buffers && current.buffer_id &&
+            current.buffer_id != NULL_BUFFER_ID && current.device_addr == *device_addr &&
+            current.size == size) {
+            current.gpu_addr = gpu_addr;
+            current.map_serial = map_serial;
+            return;
+        }
+        current = Binding{
+            .device_addr = *device_addr,
+            .gpu_addr = gpu_addr,
+            .map_serial = map_serial,
+            .size = size,
+            .buffer_id = BufferId{},
+        };
+        channel_state->unresolved_uniform_buffers[stage] |= 1U << index;
+    }
 
-    void DisableGraphicsUniformBuffer(size_t stage, u32 index);
+    void DisableGraphicsUniformBuffer(size_t stage, u32 index) {
+        auto& current = channel_state->uniform_buffers[stage][index];
+        if (current.device_addr == 0 && current.size == 0 && current.buffer_id == NULL_BUFFER_ID)
+            [[likely]] {
+            return;
+        }
+        current = NULL_BINDING;
+        channel_state->unresolved_uniform_buffers[stage] &= ~(1U << index);
+    }
 
     void UpdateGraphicsBuffers(bool is_indexed);
 
@@ -337,28 +407,85 @@ public:
     void BindHostComputeBuffers();
 
     void SetUniformBuffersState(const std::array<u32, NUM_STAGES>& mask,
-                                const UniformBufferSizes* sizes);
+                                const UniformBufferSizes* sizes) {
+        if (channel_state->enabled_uniform_buffer_masks == mask &&
+            channel_state->uniform_buffer_sizes == sizes) [[likely]] {
+            return;
+        }
+        if (channel_state->enabled_uniform_buffer_masks != mask) {
+            channel_state->fast_bound_uniform_buffers.fill(0);
+            if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
+                channel_state->dirty_uniform_buffers.fill(~u32{0});
+                channel_state->uniform_buffer_binding_sizes.fill({});
+            }
+            channel_state->enabled_uniform_buffer_masks = mask;
+        }
+        channel_state->uniform_buffer_sizes = sizes;
+    }
 
-    void SetComputeUniformBufferState(u32 mask, const ComputeUniformBufferSizes* sizes);
+    void SetComputeUniformBufferState(u32 mask, const ComputeUniformBufferSizes* sizes) {
+        channel_state->enabled_compute_uniform_buffer_mask = mask;
+        channel_state->compute_uniform_buffer_sizes = sizes;
+    }
 
-    void UnbindGraphicsStorageBuffers(size_t stage);
+    void UnbindGraphicsStorageBuffers(size_t stage) {
+        if (channel_state->enabled_storage_buffers[stage] == 0) {
+            return;
+        }
+        if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
+            if (runtime.ShouldLimitDynamicStorageBuffers()) {
+                channel_state->total_graphics_storage_buffers -=
+                    static_cast<u32>(std::popcount(channel_state->enabled_storage_buffers[stage]));
+            }
+        }
+        channel_state->enabled_storage_buffers[stage] = 0;
+        channel_state->written_storage_buffers[stage] = 0;
+    }
 
     bool BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                    bool is_written, u32 indirect_offset = ~0U);
 
-    void UnbindGraphicsTextureBuffers(size_t stage);
+    void UnbindGraphicsTextureBuffers(size_t stage) {
+        if (channel_state->enabled_texture_buffers[stage] == 0) {
+            return;
+        }
+        channel_state->enabled_texture_buffers[stage] = 0;
+        channel_state->written_texture_buffers[stage] = 0;
+        channel_state->image_texture_buffers[stage] = 0;
+    }
 
     void BindGraphicsTextureBuffer(size_t stage, size_t tbo_index, GPUVAddr gpu_addr, u32 size,
                                    PixelFormat format, bool is_written, bool is_image);
 
-    void UnbindComputeStorageBuffers();
+    void UnbindComputeStorageBuffers() {
+        if (channel_state->enabled_compute_storage_buffers == 0 &&
+            channel_state->image_compute_texture_buffers == 0) {
+            return;
+        }
+        if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
+            if (runtime.ShouldLimitDynamicStorageBuffers()) {
+                channel_state->total_compute_storage_buffers -=
+                    static_cast<u32>(std::popcount(channel_state->enabled_compute_storage_buffers));
+            }
+        }
+        channel_state->enabled_compute_storage_buffers = 0;
+        channel_state->written_compute_storage_buffers = 0;
+        channel_state->image_compute_texture_buffers = 0;
+    }
 
     /// write_extent: how far the program's stores reach past the pointer (native programs).
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                   bool is_written, u32 indirect_offset = ~0U,
                                   const Shader::StorageWriteExtent& write_extent = {});
 
-    void UnbindComputeTextureBuffers();
+    void UnbindComputeTextureBuffers() {
+        if (channel_state->enabled_compute_texture_buffers == 0) {
+            return;
+        }
+        channel_state->enabled_compute_texture_buffers = 0;
+        channel_state->written_compute_texture_buffers = 0;
+        channel_state->image_compute_texture_buffers = 0;
+    }
 
     void BindComputeTextureBuffer(size_t tbo_index, GPUVAddr gpu_addr, u32 size, PixelFormat format,
                                   bool is_written, bool is_image);
@@ -410,14 +537,53 @@ public:
     bool DMAClear(GPUVAddr src_address, u64 amount, u32 value);
 
     /// Switch 2 GPU-written command lists (nx2.h, g_nx2_command_list_pages). While collecting (a
-    /// compute dispatch or a DMA copy being recorded), writes to command list pages are noted;
+    /// compute dispatch, DMA copy, or draw being recorded), writes to command list pages are noted;
     /// Nx2CopyListPages then records copies of those pages into host memory after the work.
     void Nx2CollectListCopies(bool collect) {
         nx2_collect_list_copies = collect;
-        if (!collect) {
-            nx2_list_copy_requests.clear();
+    }
+    [[nodiscard]] bool HasPendingNx2ListCopies() const noexcept {
+        return !nx2_list_copy_requests.empty();
+    }
+    void Nx2BeginWriterTrace(u64 shader) {
+        if (nx2_list_copy_demand) {
+            nx2_list_copy_shader = shader;
+        }
+        if (nx2_buffer_deps) {
+            nx2_buffer_deps->BeginDispatch(shader);
+        }
+        if (nx2_writer_trace) {
+            std::scoped_lock lock{nx2_list_mutex};
+            nx2_writer_trace->BeginDispatch(shader);
         }
     }
+    void Nx2EndWriterTrace() {
+        nx2_list_copy_shader = 0;
+        if (nx2_buffer_deps) {
+            nx2_buffer_deps->EndDispatch();
+        }
+        if (nx2_writer_trace) {
+            std::scoped_lock lock{nx2_list_mutex};
+            nx2_writer_trace->EndDispatch();
+        }
+    }
+    [[nodiscard]] bool Nx2WriterTraceHasWrites() const {
+        return nx2_writer_trace && nx2_writer_trace->HasScopeWrites();
+    }
+    void Nx2WriterTraceInput(bool recent) {
+        if (nx2_writer_trace) {
+            std::scoped_lock lock{nx2_list_mutex};
+            nx2_writer_trace->SetRecentInput(recent);
+        }
+    }
+    void Nx2CommitBufferDependencies() {
+        if (nx2_buffer_deps) {
+            nx2_buffer_deps->CommitWriter();
+        }
+    }
+    void Nx2TraceComputeBufferInputs();
+    bool Nx2TracingBufferDependencies() const { return nx2_buffer_deps.has_value(); }
+    void Nx2TraceBufferInput(DAddr addr, u64 size, BufferDependencyTrace::Input input);
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     /// `writer`: the dispatch's shader hash, 0 for a DMA copy (EDEN_NX2_LIST_WAIT_TRACE).
     bool Nx2CopyListPages(u64 tick, u64 writer = 0);
@@ -440,8 +606,8 @@ public:
     /// lists then read guest memory instead of draining and flushing one page at a time.
     void Nx2FlushListPages(std::span<const DAddr> pages);
     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
-    /// no longer holds the page.
-    void Nx2NoteListHostWrite(DAddr device_addr, u64 size);
+    /// no longer holds the page unless updated in place.
+    void Nx2NoteListHostWrite(DAddr device_addr, u64 size, std::span<const u8> data = {});
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
@@ -590,6 +756,65 @@ public:
         std::chrono::steady_clock::time_point last_log{};
     } native_bank_tracked_stats;
 
+    /// Indirectly read banks of native programs already uploaded this frame.
+    std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
+    struct NativeUniformBankShadow {
+        u64 last_draw_ticket{};
+        u64 last_frame_tick{~u64{0}};
+        u64 last_skipped_draw_ticket{~u64{0}}; ///< Profiler only: bank_once_per_frame skips
+        u32 initialized_mask{};
+        std::array<u8, 0x10000> bytes{};
+    };
+    std::unordered_map<DAddr, NativeUniformBankShadow> native_indirect_uniform_shadow;
+    std::array<std::pair<DAddr, NativeUniformBankShadow*>, 8> native_indirect_uniform_cache{};
+    DAddr native_indirect_uniform_last_bank = ~DAddr{0};
+    NativeUniformBankShadow* native_indirect_uniform_last_ptr = nullptr;
+    u64 native_indirect_uniform_draw_ticket = 0;
+
+    struct LastSyncedRange {
+        DAddr begin{};
+        DAddr end{};
+    };
+    u64 last_synced_draw_ticket = 0;
+    u32 last_synced_count = 0;
+    std::array<LastSyncedRange, 8> last_synced_ranges{};
+    bool last_sync_deduped = false; ///< The last SynchronizeBuffer returned on last_synced_ranges
+
+    /// Nx2Perf bind_memo: the last full bind of each non-written uniform and storage buffer. A
+    /// bind of the same range with the same tracker epochs, scheduler tick and frame skips the
+    /// touch, sync and usage mark: the range was clean after the sync and nothing marked it since.
+    struct BindMemo {
+        const void* channel{};
+        BufferId buffer_id{};
+        DAddr device_addr{};
+        u32 size{};
+        bool valid{};
+        bool usage_marked{};
+        u64 cpu_epoch{};
+        u64 gpu_epoch{};
+        u64 tick{};
+        u64 frame{};
+    };
+    /// Named uniform_sync_memo here: uniform_bind_memo below is the EXP18 binding memo.
+    std::array<std::array<BindMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES> uniform_sync_memo{};
+    std::array<std::array<BindMemo, NUM_STORAGE_BUFFERS>, NUM_STAGES> storage_bind_memo{};
+    u64 bind_memo_mismatches = 0;
+
+    static constexpr size_t ResolvedStorageAddrCacheSize = 4096;
+    struct ResolvedStorageAddrCacheEntry {
+        GPUVAddr gpu_addr{};
+        GPUVAddr aligned_gpu_addr{};
+        DAddr device_addr{};
+        u64 map_serial{};
+        size_t memory_id{};
+        u32 binding_size{};
+        u8 flags{};
+        bool single_range{};
+        bool valid{};
+    };
+    mutable std::array<ResolvedStorageAddrCacheEntry, ResolvedStorageAddrCacheSize>
+        resolved_storage_addr_cache{};
+
 private:
     template <typename Mask, typename Func>
     static void ForEachEnabledBit(Mask enabled_mask, Func&& func) {
@@ -713,9 +938,21 @@ private:
     template <bool insert>
     void ChangeRegister(BufferId buffer_id);
 
-    void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept;
+    void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
+        if (buffer_id != NULL_BUFFER_ID) {
+            lru_cache.Touch(buffer.getLRUID(), frame_tick);
+        }
+    }
 
     bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
+
+    [[nodiscard]] static bool BindMemoEnabled();
+    [[nodiscard]] bool BindMemoHit(const BindMemo& memo, Buffer& buffer, BufferId buffer_id,
+                                   DAddr device_addr, u32 size, u32 offset, const char* kind,
+                                   size_t stage, u32 index);
+    void BindMemoNote(BindMemo& memo, BufferId buffer_id, DAddr device_addr, u32 size,
+                      u64 cpu_epoch_before);
+    void BindMemoNoteUsage(BindMemo& memo);
 
     void UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                       std::span<BufferCopy> copies);
@@ -992,6 +1229,17 @@ private:
         return static_cast<u32>((std::min<u64>)(size, cap));
     }
 
+    /// EDEN_NX2_DOWNLOAD_SMALL=<bytes>: GPU writes up to this size are also copied back at the
+    /// next fence, not just trapped when read. With the guest running a frame ahead it can read a
+    /// small GPU result (an exposure value) before the trap is armed and get very old data.
+    static u64 SmallDownloadLimit() {
+        static const u64 limit = [] {
+            const char* value = std::getenv("EDEN_NX2_DOWNLOAD_SMALL");
+            return value != nullptr ? std::strtoull(value, nullptr, 0) : u64{0};
+        }();
+        return limit;
+    }
+
     /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
     /// has read (Preflushable, set by the first reactive flush) always are: later reads skip the
     /// flush and rely on these downloads, e.g. collision meshes skinned by compute shaders.
@@ -1007,7 +1255,7 @@ private:
             const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
             return value == nullptr || value[0] != '0';
         }();
-        if (AsyncBufferDownloads()) {
+        if (AsyncBufferDownloads() || size <= SmallDownloadLimit()) {
             uncommitted_gpu_modified_ranges.Add(device_addr, size);
             return;
         }
@@ -1043,11 +1291,42 @@ private:
     void ArmReadTraps(DAddr device_addr, u64 size) {
         const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
-        if (!read_trapped_ranges.Arm(begin, end - begin)) {
-            return;
-        }
-        device_memory.ArmReadTraps(begin, end - begin);
+        // Only the parts not armed yet: the core visits each page it is given, and a buffer the
+        // GPU rewrites every frame is mostly still armed (the guest read a few of its pages).
+        read_trapped_ranges.Arm(begin, end - begin, [this](DAddr part, u64 part_size) {
+            device_memory.ArmReadTraps(part, part_size);
+        });
     }
+
+    /// Fence-time downloads: the range of a buffer (src_offset) and its place in staging.
+    using Nx2Downloads = boost::container::small_vector<std::pair<BufferCopy, BufferId>, 16>;
+    /// Opt::DownloadBatch: `downloads` per buffer with nearby ranges merged into `batched`
+    /// (staging offsets from 0); returns the staging size.
+    u64 Nx2BatchDownloads(const Nx2Downloads& downloads, Nx2Downloads& batched);
+    /// PERF_VERIFY: whether `batched` copies every byte of `downloads` and writes back the same.
+    bool Nx2VerifyDownloadBatch(const Nx2Downloads& downloads, const Nx2Downloads& batched);
+    /// Profiling: counts a download's bytes by the age of their blocks' preflush stamps.
+    void Nx2CountDownloadAges(DAddr device_addr, u64 size);
+    /// The guest CPU read [begin, end): `marked` when GetFlushArea marked it Preflushable after a
+    /// flush, else (PreflushAging) a trapped read of a marked range.
+    void Nx2StampPreflushBlocks(DAddr begin, DAddr end, bool marked);
+    /// PreflushAging, every 60 frames: drops the marks of blocks the CPU stopped reading.
+    void Nx2AgePreflushBlocks();
+
+    static constexpr u64 NX2_PREFLUSH_BLOCK_BITS = 16; ///< 64 KiB blocks
+    static constexpr u32 NX2_PREFLUSH_MIN_LIMIT = 120;  ///< Frames unread before a drop
+    static constexpr u32 NX2_PREFLUSH_MAX_LIMIT = 3600;
+    /// A 64 KiB block with Preflushable marks. Without PreflushAging reads of marked ranges are
+    /// not trapped, so `last_read_frame` is when the block was first marked. Guarded by `mutex`.
+    struct Nx2PreflushBlock {
+        u64 last_read_frame{};
+        u64 limit_frame{};  ///< Dropped: start of the decay period (the drop or the last halving)
+        u32 limit_frames{NX2_PREFLUSH_MIN_LIMIT};
+        bool dropped{};     ///< Marks dropped (PreflushAging) and not marked again since
+    };
+    std::unordered_map<u64, Nx2PreflushBlock> nx2_preflush_blocks;
+    u64 nx2_preflush_drops{};   ///< Blocks dropped since start
+    u64 nx2_preflush_remarks{}; ///< Reads of dropped blocks that flushed (stalled) and marked them
 
     ReadTrapTracker read_trapped_ranges;
     /// Ranges the guest CPU read after GPU writes. A read that must flush downloads the GPU
@@ -1232,6 +1511,7 @@ private:
         u64 writes{};      ///< GPU and host writes noted to the page
         u64 copy_writes{}; ///< `writes` when the copy was made: the copy is current while equal
         u64 copy_tick{};   ///< GPU tick that completes the copy
+        u64 copy_time{};   ///< Nx2Profile::Now when the copy was recorded (0 unless profiling)
         /// `writes` when the front last flushed the page: guest memory holds it while equal
         u64 synced_writes{~u64{0}};
         u32 copy_begin{};  ///< Bytes of the page the copy holds (a buffer can end inside it)
@@ -1245,6 +1525,8 @@ private:
         bool draw_written{};
         std::bitset<Nx2ListPageWords> gpu_words;
         bool flushed{};
+        bool copy_read{};
+        ListCopyDemand demand;
         std::optional<Nx2Staging> copy;
     };
     static void Nx2MarkListWords(Nx2ListPage& entry, u64 begin, u64 end, bool set);
@@ -1252,6 +1534,34 @@ private:
     void Nx2ReadListWords(const Nx2ListPage& entry, DAddr device_addr, u64 offset,
                           std::span<u8> out);
     std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies
+    std::optional<ListWriterTrace> nx2_writer_trace = []() -> std::optional<ListWriterTrace> {
+        const char* value = std::getenv("EDEN_NX2_WRITER_DEPS");
+        if (value != nullptr && value[0] == '1') {
+            return std::optional<ListWriterTrace>{std::in_place};
+        }
+        return std::nullopt;
+    }();
+    std::optional<BufferDependencyTrace> nx2_buffer_deps = []()
+        -> std::optional<BufferDependencyTrace> {
+        const char* value = std::getenv("EDEN_NX2_BUFFER_DEPS");
+        if (value != nullptr && value[0] == '1') {
+            return std::optional<BufferDependencyTrace>{std::in_place};
+        }
+        return std::nullopt;
+    }();
+    const bool nx2_list_copy_log = [] {
+        const char* value = std::getenv("EDEN_NX2_LIST_COPY_LOG");
+        return value != nullptr && value[0] == '1';
+    }();
+    const bool nx2_list_copy_demand = [] {
+        const char* value = std::getenv("EDEN_NX2_LIST_COPY_DEMAND");
+        return value != nullptr && value[0] == '1';
+    }();
+    u64 nx2_list_copy_shader{}; ///< Back thread only; zero also covers DMA and inline writes.
+    struct Nx2ListCopyStats {
+        u64 copies{}, bytes{}, replaced_unread{}, copied{}, synced{}, misses{}, waits{};
+        u64 demand_skipped{}, demand_promoted{};
+    } nx2_list_copy_stats; ///< Protected by nx2_list_mutex.
     std::unordered_map<DAddr, Nx2ListPage> nx2_list_pages;
     /// A mesh task count word's slot in the mirror (Nx2MeshCountSlot).
     struct Nx2MeshSlot {
@@ -1266,6 +1576,7 @@ private:
     std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;
     boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;
     bool nx2_collect_list_copies{};
+    int nx2_graphics_stage{-1};
 };
 
 } // namespace VideoCommon

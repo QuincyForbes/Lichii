@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -119,6 +122,10 @@ void HostRoomWindow::Host() {
     }
     if (!ui->username->hasAcceptableInput()) {
         NetworkMessage::ErrorManager::ShowError(NetworkMessage::ErrorManager::USERNAME_NOT_VALID);
+        return;
+    }
+    if (!NetworkMessage::ConfirmDisplayName(this, system, ui->username,
+                                            [this] { emit RequestProfileConfiguration(); })) {
         return;
     }
     if (!ui->room_name->hasAcceptableInput()) {

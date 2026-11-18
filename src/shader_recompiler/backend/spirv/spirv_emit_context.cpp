@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -1001,6 +1004,11 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                                          : spv::FunctionControlMask::MaskNone);
     }();
     const Id zero{u32_zero_value};
+    const bool inline_mesh_loads{profile.has_broken_mesh_global_memory_calls &&
+                                 runtime_info.mesh_as_compute &&
+                                 (stage == Stage::Task || stage == Stage::Mesh)};
+    const spv::FunctionControlMask load_control{
+        inline_mesh_loads ? spv::FunctionControlMask::Inline : function_control};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
                                auto&& callback) {
         AddLabel();
@@ -1123,7 +1131,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     }};
     const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
         const Id function_type{TypeFunction(type, U64)};
-        const Id func_id{OpFunction(type, function_control, function_type)};
+        const Id func_id{OpFunction(type, load_control, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         if (!profile.support_descriptor_aliasing && shift > 2) {
             AddLabel();

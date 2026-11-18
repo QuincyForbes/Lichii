@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -89,8 +92,8 @@ public:
     /// Signal disabling of a uniform buffer
     virtual void DisableGraphicsUniformBuffer(size_t stage, u32 index) = 0;
 
-    /// Signal a GPU based semaphore as a fence
-    virtual void SignalFence(std::function<void()>&& func) = 0;
+    /// Signal a GPU based semaphore as a fence. force_completion also waits at low accuracy.
+    virtual void SignalFence(std::function<void()>&& func, bool force_completion = false) = 0;
 
     /// Send an operation to be done after a certain amount of flushes.
     virtual void SyncOperation(std::function<void()>&& func) = 0;
@@ -115,17 +118,17 @@ public:
         return 0;
     }
 
-    /// Writes the region's query reports to guest memory, waiting for pending host results.
-    virtual void FlushQueryResults(DAddr addr, u64 size) {
-        FlushRegion(addr, size, VideoCommon::CacheType::QueryCache);
-    }
-
     /// Notify rasterizer that all caches should be flushed to Switch memory
     virtual void FlushAll() = 0;
 
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     virtual void FlushRegion(DAddr addr, u64 size,
                              VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
+
+    /// Writes the region's query reports to guest memory, waiting for pending host results.
+    virtual void FlushQueryResults(DAddr addr, u64 size) {
+        FlushRegion(addr, size, VideoCommon::CacheType::QueryCache);
+    }
 
     /// Switch 2, from the GPU thread's front: where a GPU-written command list's words are.
     enum class GpuWrittenList {
@@ -265,6 +268,22 @@ public:
         const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
         std::array<f32, 2> motion_scale, bool use_history = true) {
         return false;
+    }
+
+    /// NVIDIA DLSS (DLAA or Super Resolution) in place of a game's own anti-aliasing / upscaling
+    /// of src into dst (Ocarina of Time; ocarina_upscale.h), with jitter and camera motion from
+    /// the host. False when it can't run; the caller retains its native dispatch.
+    [[nodiscard]] virtual bool AccelerateCameraMotionUpscale(
+        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
+        return false;
+    }
+
+    /// Whether the camera-motion upscale above replaces Ocarina's anti-aliasing here: NVIDIA DLSS
+    /// running (the default) or a renderer's own temporal upscaler (Metal's
+    /// EDEN_NX2_METAL_OOT_CAMERA_MOTION). Apart from UsesNvidiaDlss so the games' own DLSS
+    /// networks keep their behaviour.
+    [[nodiscard]] virtual bool UsesCameraMotionUpscale() const {
+        return UsesNvidiaDlss();
     }
 
     /// Whether a game's own DLSS network can run here: its matrix multiplies are emulated with

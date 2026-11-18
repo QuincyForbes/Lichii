@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -80,6 +83,9 @@ public:
         // Not a hardware operation: a copy that decodes sRGB-encoded values to linear, for the
         // nx2 upscale fallback standing in for a program that decodes its output.
         SrcCopySrgbToLinear = 7,
+        // Not a hardware operation either: a copy that squares each color channel, standing in
+        // for a program whose input stores their square roots.
+        SrcCopySquare = 8,
     };
 
     enum class MemoryLayout : u32 {

@@ -14,6 +14,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -24,6 +25,7 @@
 #include <utility>
 #include <vector>
 #include <bit>
+#include <condition_variable>
 #include <cstring>
 #include <numeric>
 #if defined(_M_X64) || defined(__x86_64__)
@@ -55,6 +57,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_spikes.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/pipeline_cache_policy.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
@@ -65,9 +68,11 @@
 #include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
+#include "video_core/renderer_vulkan/pipeline_cache_dir.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_cooperative_hmma_test.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_driver_build_report.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_translate_queue.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -191,6 +196,29 @@ Shader::AttributeType AttributeType(const FixedPipelineState& state, size_t inde
         return Shader::AttributeType::UnsignedInt;
     }
     return Shader::AttributeType::Disabled;
+}
+
+// Switch 2 geometry shaders may write all 32 generic outputs next to Position and Layer: 133
+// components where Vulkan devices allow 128 (maxGeometryOutputComponents). AMD's Windows driver
+// closed the emulator compiling such a shader at the Mario Tennis Fever match start. Drop the
+// outputs the fragment shader never reads; skipped where it can't tell (legacy, indexed, XFB) and
+// for passthrough shaders the host runs natively (no IR writes the outputs there).
+void PruneUnreadGeometryOutputs(Shader::IR::Program& geometry, const Shader::IR::Program& fragment,
+                                const GraphicsPipelineCacheKey& key, bool native_passthrough) {
+    const Shader::Info& fs{fragment.info};
+    Shader::VaryingState& stores{geometry.info.stores};
+    if (fragment.stage != Shader::Stage::Fragment || key.state.xfb_enabled ||
+        (geometry.is_geometry_passthrough && native_passthrough) || fs.loads_indexed_attributes ||
+        fs.loads.Legacy() || stores.Legacy()) {
+        return;
+    }
+    for (size_t index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
+        if (!fs.loads.Generic(index)) {
+            for (size_t element = 0; element < 4; ++element) {
+                stores.Set(Shader::IR::Attribute::Generic0X + index * 4 + element, false);
+            }
+        }
+    }
 }
 
 Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
@@ -362,6 +390,16 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
 }
 
 std::array<std::atomic<std::chrono::nanoseconds::rep>, 2> runtime_spirv_ns{};
+// EDEN_NX2_PARALLEL_STAGES=0: with the stage cache on, a queued pipeline's stages are translated
+// one after another.
+bool ParallelStagesEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_PARALLEL_STAGES");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 /// Set while a translation thread builds (EDEN_NX2_ASYNC_TRANSLATE).
 thread_local bool t_translate_worker{};
 
@@ -405,6 +443,9 @@ size_t TranslateThreads() {
     return static_cast<size_t>(std::clamp(threads, 1, 8));
 }
 
+vk::ShaderModule FinishShaderModule(const Device& device, std::span<const u32> code,
+                                   u64 shader_hash, size_t stage_index, u128* spirv_hash);
+
 vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& profile,
                                  const Shader::RuntimeInfo& runtime_info,
                                  Shader::IR::Program& program, Shader::Backend::Bindings& binding,
@@ -413,6 +454,11 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
                                  u128* spirv_hash = nullptr) {
     const auto code =
         EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
+    return FinishShaderModule(device, code, shader_hash, stage_index, spirv_hash);
+}
+
+vk::ShaderModule FinishShaderModule(const Device& device, std::span<const u32> code,
+                                   u64 shader_hash, size_t stage_index, u128* spirv_hash) {
     if (spirv_hash) {
         // Graphics pipeline libraries are keyed by the SPIR-V the stage was emitted to.
         *spirv_hash = Common::CityHash128(reinterpret_cast<const char*>(code.data()),
@@ -467,7 +513,88 @@ void PrepareStageBindings(Shader::Backend::Bindings& binding, size_t stage_index
     }
 }
 
+/// What the stage cache (EDEN_NX2_STAGE_CACHE) gave or took for the stages of one pipeline.
+struct StageReuse {
+    using Cache = VideoCommon::StageCache;
+    std::array<std::shared_ptr<const Cache::Translation>, Maxwell::MaxShaderProgram> reused;
+    std::array<std::shared_ptr<Cache::Translation>, Maxwell::MaxShaderProgram> recorded;
+    std::vector<std::pair<std::shared_ptr<Cache::Translation>, std::shared_ptr<const Cache::Emitted>>>
+        new_translations;
+};
+
+/// Whether a stage may go through the stage cache: not mesh emulation's stages, whose emission
+/// is shaped per pipeline, nor the geometry stage, whose outputs are pruned per pipeline.
+bool StageCacheable(const Shader::IR::Program& program, bool mesh_emulation, size_t index) {
+    const bool emulated_mesh_stage =
+        mesh_emulation &&
+        (program.stage == Shader::Stage::Mesh || program.stage == Shader::Stage::Task);
+    return !emulated_mesh_stage && index != static_cast<size_t>(Maxwell::ShaderType::Geometry);
+}
+
+/// EmitShaderModule through the stage cache: the SPIR-V (and the program's metadata and bindings
+/// after emission) of a stage emitted before for the same translation, runtime info and incoming
+/// bindings is reused; otherwise the stage is emitted and kept. `program` is always the stage's
+/// fresh IR; a reused stage replaces it with the cached metadata, as the emission would leave it.
+/// Stages the cache cannot shape per pipeline (mesh emulation, pruned geometry, a reference
+/// build) are emitted every time.
+vk::ShaderModule EmitShaderModuleCached(VideoCommon::StageCache& cache, StageReuse& reuse,
+                                        size_t index, bool allow, const Device& device,
+                                        const Shader::Profile& profile,
+                                        const Shader::RuntimeInfo& runtime_info,
+                                        Shader::IR::Program& program,
+                                        Shader::Backend::Bindings& binding, u64 shader_hash,
+                                        size_t stage_index, std::span<const u32> reference,
+                                        u128* spirv_hash) {
+    using Cache = VideoCommon::StageCache;
+    const Cache::Translation* const translation{
+        !allow || !reference.empty()
+            ? nullptr
+            : (reuse.reused[index] ? reuse.reused[index].get() : reuse.recorded[index].get())};
+    if (translation == nullptr) {
+        return EmitShaderModule(device, profile, runtime_info, program, binding, shader_hash,
+                                stage_index, reference, spirv_hash);
+    }
+    std::vector<u8> runtime_key{Cache::RuntimeKey(runtime_info, binding)};
+    std::shared_ptr<const Cache::Emitted> emitted;
+    if (reuse.reused[index]) {
+        emitted = cache.FindEmitted(*reuse.reused[index], runtime_key);
+    }
+    if (emitted && !cache.Verify()) {
+        program = emitted->program;
+        binding = emitted->bindings_out;
+        cache.CountReuse(true);
+        return FinishShaderModule(device, emitted->spirv, shader_hash, stage_index, spirv_hash);
+    }
+    const auto code =
+        EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
+    if (emitted) {
+        // Verifying: the metadata too, it says where descriptors are read from at bind time.
+        if (code != emitted->spirv ||
+            std::memcmp(&binding, &emitted->bindings_out, sizeof(binding)) != 0 ||
+            !Cache::SameSummary(program, emitted->program)) {
+            cache.CountVerifyMismatch(shader_hash);
+        }
+        cache.CountReuse(true);
+    } else {
+        auto entry = std::make_shared<Cache::Emitted>();
+        entry->runtime_key = std::move(runtime_key);
+        entry->spirv = code;
+        entry->program = Cache::Summary(program);
+        entry->bindings_out = binding;
+        if (reuse.reused[index]) {
+            cache.AddEmitted(*reuse.reused[index], std::move(entry));
+            cache.CountReuse(false);
+        } else {
+            reuse.new_translations.emplace_back(reuse.recorded[index], std::move(entry));
+        }
+    }
+    return FinishShaderModule(device, code, shader_hash, stage_index, spirv_hash);
+}
+
 struct DeferredStages {
+    StageReuse reuse;
+    bool mesh_emulated{};
+    std::array<std::unique_ptr<ShaderPools>, Maxwell::MaxShaderProgram> stage_pools;
     std::unique_ptr<EmissionBudget::Reservation> reservation;
     std::shared_ptr<ShaderPools> pools;
     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
@@ -734,6 +861,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .has_broken_fp16_float_controls = driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY,
         .max_compute_shared_memory_size = device.GetMaxComputeSharedMemorySize(),
         .has_broken_fp32_denorm_flush = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
+        .has_broken_mesh_global_memory_calls =
+            device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
         .ignore_nan_fp_comparisons = false,
         .has_broken_spirv_subgroup_mask_vector_extract_dynamic =
             driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
@@ -874,6 +1003,13 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         });
         serialization_thread.WaitForRequests();
     });
+    if (stage_cache.Enabled() && ParallelStagesEnabled()) {
+        const size_t threads = std::clamp<size_t>(GetTotalPipelineWorkers(), 2, 4);
+        translation_workers.reset(new Common::ThreadWorker(
+            threads, "VkStageTranslator", {}, Common::ThreadPlacement::Background));
+        LOG_INFO(Render_Vulkan, "Stage cache: stages of queued pipelines translate on {} threads",
+                 threads);
+    }
     // EDEN_NX2_ASYNC_TRANSLATE=1/2: new pipelines of draws that may be skipped are translated on
     // threads of their own. It relies on the asynchronous shaders' draw skipping.
     if (VideoCommon::AsyncTranslateWorkers()) {
@@ -1443,6 +1579,7 @@ PipelineCache::~PipelineCache() {
     background_stop_callback.reset();
     // Its threads build with the members below (a translation in progress finishes).
     translate_queue.reset();
+    translation_workers.reset();
     StopBackgroundPipelines();
     // A precache build left to its thread uses the cache: what returns soon is waited for.
     for (int wait = 0; *precache_threads_left > 0 && wait < 100; ++wait) {
@@ -1936,6 +2073,15 @@ void PipelineCache::RefreshGraphicsKey() {
         vertex_attribute_types, graphics_key.unique_hashes, vertex_attribute_masks);
 }
 
+bool PipelineCache::IsIndirectResetShader() const {
+    constexpr size_t vertex_b = static_cast<size_t>(Maxwell::ShaderType::VertexB);
+    constexpr u64 reset_key = 0x72fd62555e7196cdULL;
+    const auto* info = shader_infos[vertex_b];
+    return maxwell3d->regs.IsShaderConfigEnabled(vertex_b) && info && info->lowered_native &&
+           info->lowered_native->source_size == 128 + 11 * 16 &&
+           info->lowered_native->native_program_key == reset_key;
+}
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     GraphicsPipeline* const pipeline = CurrentGraphicsPipelineLookup();
     if (pipeline != nullptr && pipeline->IsMeshPipeline() && !pipeline->IsEmulatedMesh() &&
@@ -2089,12 +2235,13 @@ bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry)
     return false;
 }
 
-ComputePipeline* PipelineCache::CurrentComputePipeline() {
+ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
 
     const ShaderInfo* const shader{ComputeShader()};
     if (!shader) {
         return nullptr;
     }
+    native_key = shader->lowered_native ? shader->lowered_native->native_program_key : 0;
     const auto& qmd{kepler_compute->launch_description};
     const ComputePipelineCacheKey key{
         .unique_hash = shader->unique_hash,
@@ -2201,10 +2348,16 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
     }
 
-    const auto shader_dir{Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir)};
-    const auto base_dir{shader_dir / fmt::format("{:016x}", title_id)};
-    if (!Common::FS::CreateDir(shader_dir) || !Common::FS::CreateDir(base_dir)) {
+    // The folder the Qt side's shader cache actions use too (Common::FS::GetVulkanPipelineCacheDir:
+    // a subfolder for games whose cache an earlier build wrote wrong).
+    const auto base_dir{
+        CreatePipelineCacheDir(Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir), title_id)};
+    if (base_dir.empty()) {
         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
+        // Do not keep writing to the previous title's cache files.
+        pipeline_cache_filename.clear();
+        used_pipelines_filename.clear();
+        vulkan_pipeline_cache_filename.clear();
         return;
     }
     // This fork's files: its records carry task/mesh state other builds of the same cache version
@@ -2328,6 +2481,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                      key.unique_hash),
                 .build = [this, key, envs_ = std::move(candidates)]() mutable {
                     ShaderPools pools;
+                    // Built and dropped, never bound: only the driver's cache keeps it, and the
+                    // build report counts it apart from the game's own builds.
+                    const DriverBuildReport::PrecacheScope precache_scope;
                     for (auto& env : envs_) {
                         pools.ReleaseContents();
                         if (CreateComputePipeline(pools, key, env, nullptr, false).pipeline) {
@@ -2515,6 +2671,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+    DriverBuildReport::LogSummary("at boot");
     const auto boot_build_seconds = std::chrono::steady_clock::now() - boot_build_begin;
     LOG_INFO(Render_Vulkan,
              "Boot pipelines: {} built in {:.1f} s on {} threads ({} driver pipeline cache)",
@@ -3357,6 +3514,53 @@ bool PipelineCache::WarmGraphicsLibraries(ShaderPools& pools, const GraphicsPipe
     return pipeline && !pipeline->Failed();
 }
 
+void PipelineCache::RunInParallel(size_t count, const std::function<void(size_t)>& task) {
+    // Workers that start after every task was claimed return at once, so the caller never waits
+    // for a worker that hasn't started: when all are busy it runs the tasks itself.
+    struct State {
+        std::atomic<size_t> next{};
+        size_t count{};
+        const std::function<void(size_t)>* task{};
+        std::mutex mutex;
+        std::condition_variable done_cv;
+        size_t done{};
+        std::vector<std::exception_ptr> errors;
+    };
+    const auto state = std::make_shared<State>();
+    state->count = count;
+    state->task = &task;
+    state->errors.resize(count);
+    const auto run = [](State& shared) {
+        for (;;) {
+            const size_t index{shared.next.fetch_add(1, std::memory_order_relaxed)};
+            if (index >= shared.count) {
+                return;
+            }
+            try {
+                (*shared.task)(index);
+            } catch (...) {
+                shared.errors[index] = std::current_exception();
+            }
+            std::scoped_lock lock{shared.mutex};
+            ++shared.done;
+            shared.done_cv.notify_all();
+        }
+    };
+    for (size_t helper = 1; helper < count; ++helper) {
+        translation_workers->QueueWork([state, run] { run(*state); });
+    }
+    run(*state);
+    {
+        std::unique_lock lock{state->mutex};
+        state->done_cv.wait(lock, [&] { return state->done == state->count; });
+    }
+    for (const std::exception_ptr& error : state->errors) {
+        if (error) {
+            std::rethrow_exception(error);
+        }
+    }
+}
+
 void PipelineCache::TickFrame() {
     ++frame_count;
     if (translate_queue) {
@@ -3636,16 +3840,147 @@ void PipelineCache::ReportBuilds(double seconds) {
              report.used_entries, moltenvk);
 }
 
+namespace {
+u32 ActiveColorTargetCount(const Maxwell& regs) noexcept {
+    const u32 count = (std::min)(static_cast<u32>(regs.rt_control.count),
+                                 static_cast<u32>(Maxwell::NumRenderTargets));
+    u32 active = 0;
+    for (u32 i = 0; i < count; ++i) {
+        const u32 rt_index = regs.rt_control.Map(i);
+        if (rt_index < Maxwell::NumRenderTargets &&
+            regs.rt[rt_index].format != Tegra::RenderTargetFormat::NONE &&
+            regs.color_mask[regs.color_mask_common ? 0 : rt_index].raw != 0) {
+            ++active;
+        }
+    }
+    return active;
+}
+
+bool IsDepthTestedColorDraw(const Maxwell& regs) noexcept {
+    return regs.zeta_enable != 0 && ActiveColorTargetCount(regs) > 0;
+}
+
+bool IsDepthOnlyDraw(const Maxwell& regs) noexcept {
+    return regs.zeta_enable != 0 && ActiveColorTargetCount(regs) == 0;
+}
+
+/// A hash of the geometry a draw reads (its index or vertex range), 0 for indirect draws.
+u64 DrawGeometryKey(const Tegra::Engines::Maxwell3D& maxwell3d) noexcept {
+    const auto& draw_state = maxwell3d.draw_manager.draw_state;
+    if (draw_state.draw_element_count == 0) {
+        return 0;
+    }
+    u64 hash = 0x9e3779b97f4a7c15ULL;
+    const auto mix = [&](u64 word) noexcept {
+        hash = (hash ^ word) * 0xff51afd7ed558ccdULL;
+        hash ^= hash >> 33;
+    };
+    if (draw_state.draw_indexed) {
+        mix(draw_state.index_buffer.StartAddress());
+        mix((u64{draw_state.index_buffer.first} << 32) | draw_state.index_buffer.count);
+        mix(draw_state.base_index);
+    } else {
+        mix(maxwell3d.regs.vertex_streams[0].Address());
+        mix((u64{draw_state.vertex_buffer.first} << 32) | draw_state.vertex_buffer.count);
+    }
+    return hash == 0 ? 1ULL : hash;
+}
+
+bool GeometryConsistencyOn() {
+    return VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::GeometryConsistency);
+}
+} // Anonymous namespace
+
+void PipelineCache::RecordSkippedGeometry(const GraphicsPipeline* pipeline) const noexcept {
+    if (!maxwell3d || !GeometryConsistencyOn() || !IsDepthTestedColorDraw(maxwell3d->regs)) {
+        return;
+    }
+    const u64 geom_key = DrawGeometryKey(*maxwell3d);
+    if (geom_key == 0) {
+        return;
+    }
+    const size_t base =
+        static_cast<size_t>(geom_key ^ (geom_key >> 29)) & (SkippedGeometryTableSize - 1);
+    size_t target_slot = base;
+    for (size_t probe = 0; probe < 4; ++probe) {
+        const size_t slot = (base + probe) & (SkippedGeometryTableSize - 1);
+        const auto& entry = skipped_geometry[slot];
+        if (entry.key == geom_key || entry.key == 0 || frame_count > entry.frame + 1 ||
+            (entry.pipeline != nullptr && entry.pipeline->IsBuilt())) {
+            target_slot = slot;
+            break;
+        }
+    }
+    skipped_geometry[target_slot] = {.key = geom_key, .frame = frame_count, .pipeline = pipeline};
+    last_skipped_geometry_frame = frame_count;
+}
+
+bool PipelineCache::ShouldSkipDepthOnlyGeometry() const noexcept {
+    if (!maxwell3d || last_skipped_geometry_frame == ~u64{} ||
+        frame_count > last_skipped_geometry_frame + 1 || !GeometryConsistencyOn() ||
+        !IsDepthOnlyDraw(maxwell3d->regs)) {
+        return false;
+    }
+    const u64 geom_key = DrawGeometryKey(*maxwell3d);
+    if (geom_key == 0) {
+        return false;
+    }
+    const size_t base =
+        static_cast<size_t>(geom_key ^ (geom_key >> 29)) & (SkippedGeometryTableSize - 1);
+    for (size_t probe = 0; probe < 4; ++probe) {
+        auto& entry = skipped_geometry[(base + probe) & (SkippedGeometryTableSize - 1)];
+        if (entry.key != geom_key) {
+            continue;
+        }
+        if (frame_count <= entry.frame + 1 &&
+            (entry.pipeline == nullptr || !entry.pipeline->IsBuilt())) {
+            return true;
+        }
+        entry = {};
+        return false;
+    }
+    return false;
+}
+
+void PipelineCache::ClearSkippedGeometryIfDrawn() const noexcept {
+    if (!maxwell3d || last_skipped_geometry_frame == ~u64{} ||
+        frame_count > last_skipped_geometry_frame + 1 || !GeometryConsistencyOn() ||
+        !IsDepthTestedColorDraw(maxwell3d->regs)) {
+        return;
+    }
+    const u64 geom_key = DrawGeometryKey(*maxwell3d);
+    if (geom_key == 0) {
+        return;
+    }
+    const size_t base =
+        static_cast<size_t>(geom_key ^ (geom_key >> 29)) & (SkippedGeometryTableSize - 1);
+    for (size_t probe = 0; probe < 4; ++probe) {
+        auto& entry = skipped_geometry[(base + probe) & (SkippedGeometryTableSize - 1)];
+        if (entry.key == geom_key) {
+            entry = {};
+            return;
+        }
+    }
+}
+
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
     if (pipeline->IsBuilt()) {
+        if (ShouldSkipDepthOnlyGeometry()) {
+            NoteSkippedLookup();
+            return nullptr;
+        }
+        ClearSkippedGeometryIfDrawn();
         return pipeline;
     }
     if (!use_asynchronous_shaders) {
+        ClearSkippedGeometryIfDrawn();
         return pipeline;
     }
     const bool discard = DrawMayBeSkipped();
     if (discard) {
+        RecordSkippedGeometry(pipeline);
         NoteSkippedLookup();
+        VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::DrawSkipped);
     }
     return discard ? nullptr : pipeline;
 }
@@ -3876,13 +4211,76 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
     bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools,
     std::unique_ptr<EmissionBudget::Reservation> reservation, bool libraries_only,
-    bool held_build) try {
+    bool held_build, bool parallel_stages) try {
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     size_t env_index{0};
     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
     const bool uses_vertex_a{key.unique_hashes[0] != 0};
     const bool uses_vertex_b{key.unique_hashes[1] != 0};
+
+    // EDEN_NX2_STAGE_CACHE: the SPIR-V of native stages emitted before for other pipelines is
+    // reused (VideoCommon::StageCache). Translation still gives every stage its fresh IR; a reused
+    // stage's reads are replayed against the environment first. A merged VertexA/VertexB pair and
+    // titles whose shaders are edited after translation are left out.
+    using StageCache = VideoCommon::StageCache;
+    const bool cache_stages{stage_cache.Enabled() && !uses_vertex_a && !oot_visual_workaround};
+    StageReuse reuse;
+    std::array<std::vector<u8>, Maxwell::MaxShaderProgram> signatures;
+    std::array<bool, Maxwell::MaxShaderProgram> looked_up{};
+    std::array<bool, Maxwell::MaxShaderProgram> translated_ahead{};
+    std::array<std::unique_ptr<ShaderPools>, Maxwell::MaxShaderProgram> stage_pools;
+    // The stages of a queued pipeline translated at once, each with pools of its own.
+    if (parallel_stages && cache_stages && translation_workers && ParallelStagesEnabled()) {
+        boost::container::static_vector<size_t, Maxwell::MaxShaderProgram> ahead;
+        std::array<Shader::Environment*, Maxwell::MaxShaderProgram> ahead_envs{};
+        size_t ahead_env_index{};
+        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+            if (key.unique_hashes[index] == 0) {
+                continue;
+            }
+            Shader::Environment& env{*envs[ahead_env_index++]};
+            if (!env.IsNativeProgram()) {
+                continue;
+            }
+            signatures[index] = StageCache::Signature(env, key.unique_hashes[index], index);
+            reuse.reused[index] = stage_cache.Find(signatures[index], env);
+            // A layer emulation source is needed with its IR (GenerateGeometryPassthrough).
+            if (reuse.reused[index] && reuse.reused[index]->program.info.requires_layer_emulation) {
+                reuse.reused[index] = nullptr;
+            }
+            looked_up[index] = true;
+            ahead.push_back(index);
+            ahead_envs[index] = &env;
+        }
+        if (ahead.size() >= 2) {
+            RunInParallel(ahead.size(), [&](size_t task) {
+                const size_t index{ahead[task]};
+                Shader::Environment& env{*ahead_envs[index]};
+                stage_pools[index] = std::make_unique<ShaderPools>();
+                ShaderPools& own{*stage_pools[index]};
+                const u32 cfg_offset{
+                    static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+                if (reuse.reused[index]) {
+                    Shader::Maxwell::Flow::CFG cfg(env, own.flow_block, cfg_offset, index == 0);
+                    programs[index] = TranslateProgram(own.inst, own.block, env, cfg, host_info);
+                    return;
+                }
+                StageCache::Recorder recorder{env};
+                Shader::Maxwell::Flow::CFG cfg(recorder, own.flow_block, cfg_offset, index == 0);
+                programs[index] = TranslateProgram(own.inst, own.block, recorder, cfg, host_info);
+                auto translation = std::make_shared<StageCache::Translation>();
+                translation->signature = signatures[index];
+                translation->reads = recorder.TakeReads();
+                translation->program = StageCache::Summary(programs[index]);
+                reuse.recorded[index] = std::move(translation);
+            });
+            for (const size_t index : ahead) {
+                translated_ahead[index] = true;
+            }
+            parallel_stage_pipelines.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 
     // Layer passthrough generation for devices without VK_EXT_shader_viewport_index_layer
     Shader::IR::Program* layer_source_program{};
@@ -3932,11 +4330,31 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
 
         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
-        if (!uses_vertex_a || index != 1) {
+        const bool cacheable{cache_stages && env.IsNativeProgram()};
+        if (cacheable && !looked_up[index]) {
+            signatures[index] = StageCache::Signature(env, key.unique_hashes[index], index);
+            reuse.reused[index] = stage_cache.Find(signatures[index], env);
+            if (reuse.reused[index] && reuse.reused[index]->program.info.requires_layer_emulation) {
+                reuse.reused[index] = nullptr;
+            }
+        }
+        if (translated_ahead[index]) {
+            // programs[index] and reuse.recorded[index] came from the parallel translation above.
+        } else if (cacheable && !reuse.reused[index]) {
+            StageCache::Recorder recorder{env};
+            Shader::Maxwell::Flow::CFG cfg(recorder, pools.flow_block, cfg_offset, index == 0);
+            programs[index] = TranslateProgram(pools.inst, pools.block, recorder, cfg, host_info);
+            auto translation = std::make_shared<StageCache::Translation>();
+            translation->signature = std::move(signatures[index]);
+            translation->reads = recorder.TakeReads();
+            translation->program = StageCache::Summary(programs[index]);
+            reuse.recorded[index] = std::move(translation);
+        } else if (!uses_vertex_a || index != 1) {
             // Normal path
+            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
             programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
         } else {
+            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
             // VertexB path when VertexA is present.
             auto& program_va{programs[0]};
             auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
@@ -4330,6 +4748,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             runtime_info.mesh_emulation_inputs = mesh_emulation.has_value();
         }
         ConvertLegacyToGeneric(program, runtime_info);
+        if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry)) {
+            PruneUnreadGeometryOutputs(program,
+                                       programs[static_cast<size_t>(Maxwell::ShaderType::Pixel)],
+                                       key, device.IsNvGeometryShaderPassthroughSupported());
+        }
         // EDEN_NX2_MESH_EMULATION_DUMP=<dir>: write the emulation's vertex shader for spirv-val.
         // (Emitting the mesh program a second time here to dump its compute shader crashed the
         // build that followed, so only the vertex shader is written.)
@@ -4350,7 +4773,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         } else {
             const auto begin = std::chrono::steady_clock::now();
-            modules[stage_index] = EmitShaderModule(
+            modules[stage_index] = EmitShaderModuleCached(
+                stage_cache, reuse, index, StageCacheable(program, mesh_emulation.has_value(), index),
                 device, profile, runtime_info, program, binding, key.unique_hashes[index],
                 stage_index, {}, use_libraries ? &spirv_hashes[stage_index] : nullptr);
             if (build_in_parallel) {
@@ -4359,14 +4783,22 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         previous_stage = &program;
     }
+    if (!emit_pools) {
+        for (auto& [new_translation, entry] : reuse.new_translations) {
+            stage_cache.Insert(std::move(new_translation), std::move(entry));
+        }
+    }
     GraphicsPipeline::EmitStagesFunc emit_stages;
     if (emit_pools) {
         auto job = std::make_shared<DeferredStages>();
         job->reservation = std::move(reservation);
         job->pools = emit_pools;
+        job->reuse = std::move(reuse);
+        job->stage_pools = std::move(stage_pools);
         job->programs = std::move(programs);
         job->runtime_infos = std::move(deferred_runtime_infos);
         job->reference_spirv = std::move(reference_spirv);
+        job->mesh_emulated = mesh_emulation.has_value();
         for (size_t stage = 0; stage < infos.size(); ++stage) {
             if (infos[stage]) {
                 infos[stage] = &job->programs[stage + 1].info;
@@ -4380,11 +4812,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             for (size_t stage = 0; stage < stage_modules.size(); ++stage) {
                 if (job->runtime_infos[stage]) {
                     PrepareStageBindings(stage_binding, stage, use_libraries);
-                    stage_modules[stage] = EmitShaderModule(
+                    stage_modules[stage] = EmitShaderModuleCached(
+                        stage_cache, job->reuse, stage + 1,
+                        StageCacheable(job->programs[stage + 1], job->mesh_emulated, stage + 1),
                         device, profile, *job->runtime_infos[stage], job->programs[stage + 1],
                         stage_binding, hashes[stage + 1], stage, job->reference_spirv[stage],
                         use_libraries ? &stage_hashes[stage] : nullptr);
                 }
+            }
+            for (auto& [new_translation, entry] : job->reuse.new_translations) {
+                stage_cache.Insert(std::move(new_translation), std::move(entry));
             }
             auto job_pools = std::move(job->pools);
             job.reset();
@@ -4449,6 +4886,7 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
     static auto window = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     const auto elapsed = now - begin;
+    VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::RuntimePipeline, elapsed);
     total += elapsed;
     ++count;
     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
@@ -4752,7 +5190,8 @@ void PipelineCache::TranslateOnWorker(TranslationJob& job) {
         t_translate_worker = false;
     };
     job.pipeline = CreateGraphicsPipeline(pools, job.key, MakeSpan(env_ptrs), nullptr, true,
-                                          std::move(emit_pools), std::move(reservation));
+                                          std::move(emit_pools), std::move(reservation), false,
+                                          false, true);
     if (std::ranges::any_of(job.envs, [](const GraphicsEnvironment& env) {
             return env.GuardedReadFailed();
         })) {

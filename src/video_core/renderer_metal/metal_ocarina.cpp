@@ -15,6 +15,7 @@
 
 #include "common/logging.h"
 #include "video_core/ocarina_upscale.h"
+#include "video_core/host_shaders/camera_motion_vectors_comp_spv.h"
 #include "video_core/host_shaders/ocarina_actor_motion_frag_spv.h"
 #include "video_core/host_shaders/ocarina_actor_motion_vert_spv.h"
 #include "video_core/host_shaders/ocarina_bilinear_upscale_comp_spv.h"
@@ -201,6 +202,118 @@ bool OcarinaUpscale::Bilinear(TextureHandle color, std::array<u32, 2> color_size
 
 u64 OcarinaUpscale::TakePasses() noexcept {
     return std::exchange(passes, 0);
+}
+
+CameraMotionPass::CameraMotionPass(const Device& device_, Scheduler& scheduler_)
+    : device{device_}, scheduler{scheduler_} {}
+
+CameraMotionPass::~CameraMotionPass() = default;
+
+namespace {
+/// camera_motion_vectors.comp's options: the depth (set 0, binding 0) is a depth texture.
+ShaderTranslate::Options CameraMotionOptions() {
+    ShaderTranslate::Options options{};
+    options.depth_images = {{0, 0}};
+    return options;
+}
+
+/// camera_motion_vectors.comp's push constants: the matrix, then the size, padded as MSL lays the
+/// block out.
+struct CameraMotionParameters {
+    std::array<f32, 16> reprojection;
+    std::array<s32, 2> size;
+    std::array<s32, 2> padding;
+};
+static_assert(sizeof(CameraMotionParameters) == 80);
+} // Anonymous namespace
+
+std::string CameraMotionPass::Msl(u32 apple_family) {
+    ShaderTranslate::Options options = CameraMotionOptions();
+    options.ios = TranslateForIos;
+    options.apple_family = apple_family;
+    const ShaderTranslate::Result result = ShaderTranslate::SpirvToMsl(
+        std::span<const u32>(CAMERA_MOTION_VECTORS_COMP_SPV), ShaderTranslate::Stage::Compute,
+        options);
+    std::string text = result.source.empty() ? "error: " + result.error : result.source;
+    for (const ShaderTranslate::ResourceSlot& slot : result.slots) {
+        text += "\n// slot set " + std::to_string(slot.set) + " binding " +
+                std::to_string(slot.binding) + " kind " +
+                std::to_string(static_cast<int>(slot.kind)) + " index " +
+                std::to_string(slot.index);
+    }
+    return text;
+}
+
+bool CameraMotionPass::Prepare() {
+    if (state || failed) {
+        return !failed;
+    }
+    failed = true;
+    const ShaderTranslate::Result msl = ShaderTranslate::SpirvToMsl(
+        std::span<const u32>(CAMERA_MOTION_VECTORS_COMP_SPV), ShaderTranslate::Stage::Compute,
+        CameraMotionOptions());
+    std::string error = msl.error;
+    if (!msl.source.empty()) {
+        library = CreateLibrary(device, msl.source, error);
+        function = library ? CreateFunction(library.Get(), msl.entry_point) : Object{};
+        state = function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
+    }
+    // The shader fetches texels (Vulkan binds a nearest sampler for it).
+    sampler = CreateLinearClampSampler(device);
+    if (!state || !sampler) {
+        LOG_WARNING(Render_Metal, "Metal: camera motion vectors unavailable: {}", error);
+        state = {};
+        return false;
+    }
+    slots = msl.slots;
+    failed = false;
+    return true;
+}
+
+bool CameraMotionPass::Record(TextureHandle depth, std::array<u32, 2> extent,
+                              const std::array<f32, 16>& reprojection) {
+    if (depth == nullptr || extent[0] == 0 || extent[1] == 0 || !Prepare()) {
+        return false;
+    }
+    if (extent != size || !motion) {
+        motion = CreateTexture(device, {.kind = TextureKind::e2D,
+                                        .format = Fmt::RG16Float,
+                                        .width = extent[0],
+                                        .height = extent[1],
+                                        .shader_write = true});
+        size = extent;
+        if (!motion) {
+            return false;
+        }
+    }
+    const CameraMotionParameters parameters{
+        .reprojection = reprojection,
+        .size = {static_cast<s32>(extent[0]), static_cast<s32>(extent[1])},
+        .padding = {},
+    };
+    // camera_motion_vectors.comp: depth_image (binding 0), motion_image (binding 1).
+    scheduler.BeginCompute(state.Get());
+    for (const ShaderTranslate::ResourceSlot& slot : slots) {
+        switch (slot.kind) {
+        case ShaderTranslate::ResourceKind::Buffer:
+            if (slot.set == ShaderTranslate::PushConstantSet) {
+                scheduler.BindBytes(ShaderStage::Compute, slot.index, &parameters,
+                                    static_cast<u32>(sizeof(parameters)));
+            }
+            break;
+        case ShaderTranslate::ResourceKind::Texture:
+            scheduler.BindTexture(ShaderStage::Compute, slot.index,
+                                  slot.binding == 0 ? depth : motion.Get());
+            break;
+        case ShaderTranslate::ResourceKind::Sampler:
+            scheduler.BindSampler(ShaderStage::Compute, slot.index, sampler.Get());
+            break;
+        }
+    }
+    scheduler.Dispatch({(extent[0] + GroupSize - 1) / GroupSize,
+                        (extent[1] + GroupSize - 1) / GroupSize, 1},
+                       {GroupSize, GroupSize, 1});
+    return true;
 }
 
 OcarinaTemporal::OcarinaTemporal(const Device& device_, Scheduler& scheduler_)

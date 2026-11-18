@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -80,8 +83,8 @@ ICommonStateGetter::ICommonStateGetter(Core::System& system_, std::shared_ptr<Ap
         {600, &ICommonStateGetter::StubReplyZeroed, "SetHidInputMagnificationForApplication"}, //20.0.0+
         {610, D<&ICommonStateGetter::Unknown610>, "Unknown610"}, //21.0.0+
         {611, D<&ICommonStateGetter::Unknown611>, "Unknown611"}, //22.0.0+
-        {650, &ICommonStateGetter::StubReplyZeroed, "Unknown650"},
-        {651, &ICommonStateGetter::StubReplyZeroed, "Unknown651"},
+        {650, &ICommonStateGetter::StubReplyZeroed, "BeginUsingCameraResource"},
+        {651, &ICommonStateGetter::StubReplyZeroed, "EndUsingCameraResource"},
         {900, D<&ICommonStateGetter::SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled>, "SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled"}, //11.0.0+
         {910, &ICommonStateGetter::StubReplyZeroed, "GetLaunchRequiredTick"}, //17.0.0+
         {1000, D<&ICommonStateGetter::BeginVrMode3d>, "BeginVrMode3d"}, //19.0.0+
@@ -90,8 +93,8 @@ ICommonStateGetter::ICommonStateGetter(Core::System& system_, std::shared_ptr<Ap
         {1003, D<&ICommonStateGetter::GetVrLaboGoggleViewport>, "GetVrLaboGoggleViewport"}, //21.0.0+
         {1004, D<&ICommonStateGetter::GetPanelPhysicalSizeForSpecificTitle>, "GetPanelPhysicalSizeForSpecificTitle"}, //21.0.0+
         {1005, D<&ICommonStateGetter::GetPanelResolutionForSpecificTitle>, "GetPanelResolutionForSpecificTitle"}, //21.0.0+
-        {2000, &ICommonStateGetter::StubReplyZeroed, "Unknown2000"},
-        {2010, &ICommonStateGetter::StubReplyZeroed, "Unknown2010"},
+        {2000, &ICommonStateGetter::StubReplyZeroed, "SetRtcModeChangedMessageEnabled"},
+        {2010, &ICommonStateGetter::StubReplyZeroed, "GetCurrentDisplayLayoutRatio"},
     };
     // clang-format on
 

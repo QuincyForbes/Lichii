@@ -9,6 +9,7 @@
 #endif
 
 #include <boost/algorithm/string/split.hpp>
+#include "common/driver_shader_cache.h"
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
 #include "common/shutdown_progress.h"
@@ -39,6 +40,7 @@
 
 #include "bootmanager.h"
 #include "loading_screen.h"
+#include "recommended_settings_dialog.h"
 #include "qt_common/util/vk.h"
 #include "ryujinx_dialog.h"
 #include "set_play_time_dialog.h"
@@ -47,6 +49,16 @@
 #include "yuzu/nup_dialogs.h"
 #include "yuzu/shader_warm_dialog.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
+#ifdef YUZU_ENABLE_MCP
+#include <atomic>
+#include <thread>
+#include <QClipboard>
+#include <QCoreApplication>
+#include <QGuiApplication>
+#include <QSignalBlocker>
+#include "mcp/server.h"
+#include "yuzu/mcp_host_qt.h"
+#endif
 
 #include "applets/qt_amiibo_settings.h"
 #include "applets/qt_controller.h"
@@ -76,10 +88,12 @@
 #include <QTimer>
 #endif
 
+#include <QAbstractButton>
 #include <QActionGroup>
 #include <QCheckBox>
 #include <QClipboard>
 #include <QDesktopServices>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
@@ -88,12 +102,14 @@
 #include <QFutureWatcher>
 #include <QGuiApplication>
 #include <QInputDialog>
+#include <QLabel>
 #include <QMimeData>
 #include <QPalette>
 #include <QProgressDialog>
 #include <QScreen>
 #include <QShortcut>
 #include <QStatusBar>
+#include <QVBoxLayout>
 #include <QtConcurrentRun>
 
 #ifdef __APPLE__
@@ -381,12 +397,14 @@ inline static bool isDarkMode() {
 }
 #endif // _WIN32
 
+
 MainWindow::MainWindow(bool has_broken_vulkan)
     : ui{std::make_unique<Ui::MainWindow>()},
       input_subsystem{std::make_shared<InputCommon::InputSubsystem>()}, user_data_migrator{this} {
     QtCommon::Init(this);
 
     Common::FS::CreateEdenPaths();
+    Common::CreateDriverShaderCacheFolder();
     this->config = std::make_unique<QtConfig>();
     MigrateFriztiSettings();
 
@@ -585,6 +603,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     if (launch_params) {
         auto const& lp = *launch_params;
 
+        // Before booting, so the server records the boot.
+        MaybeStartMcpServer(lp.mcp_enable, lp.mcp_port, lp.mcp_allow_writes);
+
         // Override fullscreen setting if gamepath or argument is provided
         if (!lp.filepath.empty() || lp.fullscreen) {
             ui->action_Fullscreen->setChecked(lp.fullscreen);
@@ -592,7 +613,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
         if (!lp.filepath.empty()) {
             launched_with_game = true;
-            BootGame(QString::fromStdString(lp.filepath), ApplicationAppletParameters());
+            // Frontend launches must be able to use saved settings without an interactive prompt.
+            BootGame(QString::fromStdString(lp.filepath), ApplicationAppletParameters(),
+                     StartGameType::Normal, false);
         } else if (lp.launch_setup) {
             LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::Starter), std::nullopt);
         } else if (lp.launch_qlaunch) {
@@ -605,6 +628,8 @@ MainWindow::MainWindow(bool has_broken_vulkan)
                 QString::fromStdString(hbl_path),
                 LibraryAppletParameters(0x010000000000100Dull, Service::AM::AppletId::QLaunch));
         }
+    } else {
+        MaybeStartMcpServer(false, std::nullopt, false);
     }
 
     // The first launch asks for Ocarina of Time's frame rate (not when started with a game,
@@ -744,11 +769,397 @@ void MainWindow::AskOotFrameRate() {
     config->SaveAllValues();
 }
 
+/// Sets up the MCP menu and status timer, and starts the server if enabled by CLI or setting.
+void MainWindow::MaybeStartMcpServer([[maybe_unused]] bool cli_enable,
+                                     [[maybe_unused]] std::optional<u16> cli_port,
+                                     [[maybe_unused]] bool cli_allow_writes) {
+#ifdef YUZU_ENABLE_MCP
+    mcp_cli_port = cli_port;
+    mcp_cli_allow_writes = cli_allow_writes;
+    SetupMcpMenu();
+    // Always-on indicator (created in InitializeWidgets; the game status labels only update
+    // while a game runs, this one every second).
+    connect(&mcp_status_timer, &QTimer::timeout, this, &MainWindow::UpdateMcpStatusLabel);
+    mcp_status_timer.start(1000);
+    if (cli_enable || Settings::values.enable_mcp_server.GetValue()) {
+        StartMcpServer();
+    }
+    UpdateMcpMenu();
+#endif
+}
+
+#ifdef YUZU_ENABLE_MCP
+/// Creates the host and server from the settings and starts it, keeping any error for the UI.
+void MainWindow::StartMcpServer() {
+    if (mcp_server || mcp_stopping) {
+        return;
+    }
+    Mcp::ServerConfig mcp_config;
+    mcp_config.port = mcp_cli_port.value_or(Settings::values.mcp_port.GetValue());
+    mcp_config.allow_writes = mcp_cli_allow_writes || Settings::values.mcp_allow_writes.GetValue();
+    mcp_config.bearer_token = Settings::values.mcp_token.GetValue();
+
+    if (!mcp_host) {
+        mcp_host = std::make_unique<QtMcpHost>(*this);
+        connect(this, &MainWindow::statsUpdated, this,
+                [this](const Core::PerfStatsResults& results,
+                       const VideoCore::ShaderNotify& shaders) {
+                    if (mcp_host) {
+                        mcp_host->OnStatsUpdated(results, shaders);
+                    }
+                });
+    }
+    mcp_server = std::make_unique<Mcp::Server>(*QtCommon::system, *mcp_host, mcp_config);
+    if (const std::string error = mcp_server->Start(); !error.empty()) {
+        mcp_last_error = error;
+        mcp_server.reset();
+        statusBar()->showMessage(
+            tr("MCP server failed to start: %1").arg(QString::fromStdString(error)), 15000);
+        return;
+    }
+    mcp_last_error.clear();
+}
+
+/// Stops the server on a helper thread while this thread keeps processing events.
+void MainWindow::StopMcpServer() {
+    if (!mcp_server) {
+        return;
+    }
+    // Stopping waits for in-flight requests, and some of those (pause, boot, TAS...) wait for
+    // this GUI thread: stop on a helper thread and keep handling events until it is done.
+    // The member is cleared here first, so the events handled meanwhile see no server.
+    std::unique_ptr<Mcp::Server> stopping = std::move(mcp_server);
+    mcp_stopping = true;
+    std::atomic<bool> done{false};
+    std::thread stopper{[&stopping, &done] {
+        stopping.reset();
+        done = true;
+    }};
+    while (!done) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    }
+    stopper.join();
+    mcp_stopping = false;
+}
+
+/// Applies MCP settings changed in the configuration dialog to the running server.
+void MainWindow::ApplyMcpSettings(bool old_enabled, u16 old_port, const std::string& old_token,
+                                  bool old_writes) {
+    const bool enabled = Settings::values.enable_mcp_server.GetValue();
+    const bool port_changed = Settings::values.mcp_port.GetValue() != old_port;
+    const bool token_changed = Settings::values.mcp_token.GetValue() != old_token;
+    if (port_changed) {
+        mcp_cli_port.reset(); // the settings page wins over --mcp-port
+    }
+    if (Settings::values.mcp_allow_writes.GetValue() != old_writes) {
+        mcp_cli_allow_writes = false;
+        if (mcp_server) {
+            mcp_server->SetWritesAllowed(Settings::values.mcp_allow_writes.GetValue());
+        }
+    }
+    if (old_enabled && !enabled) {
+        StopMcpServer();
+    } else if (!old_enabled && enabled) {
+        StartMcpServer();
+    } else if ((mcp_server || (enabled && !mcp_last_error.empty())) &&
+               (port_changed || token_changed)) {
+        // Port and token are fixed while serving: restart with the new ones. Also retries a start
+        // that failed (e.g. port in use) once the port or token was changed.
+        StopMcpServer();
+        StartMcpServer();
+    }
+    UpdateMcpMenu();
+    UpdateMcpStatusLabel();
+}
+
+/// Builds the Tools > MCP Server menu once: enable, writes, routes, dashboard and copy actions.
+void MainWindow::SetupMcpMenu() {
+    if (mcp_menu) {
+        return;
+    }
+    ui->menu_Tools->addSeparator();
+    mcp_menu = ui->menu_Tools->addMenu(tr("MCP Server"));
+    mcp_status_action = mcp_menu->addAction(QString{});
+    mcp_status_action->setEnabled(false);
+    mcp_menu->addSeparator();
+
+    mcp_enable_action = mcp_menu->addAction(tr("Enabled"));
+    mcp_enable_action->setCheckable(true);
+    connect(mcp_enable_action, &QAction::toggled, this, [this](bool enabled) {
+        Settings::values.enable_mcp_server.SetValue(enabled);
+        if (enabled) {
+            StartMcpServer();
+        } else {
+            StopMcpServer();
+        }
+        UpdateMcpMenu();
+    });
+
+    mcp_writes_action = mcp_menu->addAction(tr("Allow Writes (input, memory, settings)"));
+    mcp_writes_action->setCheckable(true);
+    connect(mcp_writes_action, &QAction::toggled, this, [this](bool allowed) {
+        // --mcp-allow-writes only sets the starting state: the menu overrides it.
+        mcp_cli_allow_writes = false;
+        Settings::values.mcp_allow_writes.SetValue(allowed);
+        if (mcp_server) {
+            mcp_server->SetWritesAllowed(allowed);
+        }
+        UpdateMcpMenu();
+    });
+
+    mcp_menu->addSeparator();
+    mcp_routes_menu = mcp_menu->addMenu(tr("Routes"));
+    connect(mcp_routes_menu, &QMenu::aboutToShow, this, &MainWindow::PopulateMcpRoutesMenu);
+
+    mcp_menu->addSeparator();
+    const auto url = [this] {
+        const u16 port = mcp_cli_port.value_or(Settings::values.mcp_port.GetValue());
+        return QStringLiteral("http://127.0.0.1:%1/mcp").arg(port);
+    };
+    connect(mcp_menu->addAction(tr("Open Dashboard")), &QAction::triggered, this, [this] {
+        const u16 port = mcp_cli_port.value_or(Settings::values.mcp_port.GetValue());
+        QDesktopServices::openUrl(QUrl{QStringLiteral("http://127.0.0.1:%1/").arg(port)});
+    });
+    connect(mcp_menu->addAction(tr("Copy Connection URL")), &QAction::triggered, this,
+            [url] { QGuiApplication::clipboard()->setText(url()); });
+    connect(mcp_menu->addAction(tr("Copy Claude Code Command")), &QAction::triggered, this,
+            [url] {
+                QGuiApplication::clipboard()->setText(
+                    QStringLiteral("claude mcp add --transport http lichii %1").arg(url()));
+            });
+}
+
+/// Syncs the MCP menu checkboxes and status text with the server state.
+void MainWindow::UpdateMcpMenu() {
+    if (!mcp_menu) {
+        return;
+    }
+    const QSignalBlocker block_enable{mcp_enable_action};
+    const QSignalBlocker block_writes{mcp_writes_action};
+    mcp_enable_action->setChecked(mcp_server != nullptr);
+    mcp_writes_action->setChecked(mcp_cli_allow_writes ||
+                                  Settings::values.mcp_allow_writes.GetValue());
+    if (mcp_server) {
+        mcp_status_action->setText(
+            tr("Listening on %1").arg(QString::fromStdString(mcp_server->Url())));
+    } else if (!mcp_last_error.empty()) {
+        mcp_status_action->setText(
+            tr("Failed: %1").arg(QString::fromStdString(mcp_last_error)));
+    } else {
+        mcp_status_action->setText(tr("Stopped"));
+    }
+    UpdateMcpStatusLabel();
+}
+
+/// Rebuilt each time the menu opens. Calls the route tools through Server::CallTool on the GUI
+/// thread, so those tools must not wait on this thread.
+void MainWindow::PopulateMcpRoutesMenu() {
+    mcp_routes_menu->clear();
+    const auto disabled = [this](const QString& text) {
+        mcp_routes_menu->addAction(text)->setEnabled(false);
+    };
+    const auto open_folder = [this] {
+        connect(mcp_routes_menu->addAction(tr("Open Routes Folder")), &QAction::triggered, this,
+                [] {
+                    const auto dir =
+                        Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "mcp" / "routes";
+                    std::error_code ec;
+                    std::filesystem::create_directories(dir, ec);
+                    QDesktopServices::openUrl(QUrl::fromLocalFile(
+                        QString::fromStdString(Common::FS::PathToUTF8String(dir))));
+                });
+    };
+    if (!mcp_server) {
+        disabled(tr("The MCP server is off"));
+        return;
+    }
+    if (!emulation_running) {
+        disabled(tr("Start a game to record or run its routes"));
+        mcp_routes_menu->addSeparator();
+        open_folder();
+        return;
+    }
+    const auto activity = mcp_server->GetSummary().activity;
+    const auto show_error = [this](const Mcp::ToolResult& r) {
+        if (r.is_error && !r.content.empty()) {
+            QMessageBox::warning(this, tr("Routes"),
+                                 QString::fromStdString(r.content[0].value("text", "")));
+            return true;
+        }
+        return false;
+    };
+    // The server can be stopped while this menu is open.
+    const auto call = [this](const std::string& tool, const Mcp::json& args) {
+        return mcp_server ? mcp_server->CallTool(tool, args)
+                          : Mcp::ToolResult::Error("The MCP server is off.");
+    };
+
+    if (activity.recording) {
+        connect(mcp_routes_menu->addAction(
+                    tr("Stop Recording \"%1\"").arg(QString::fromStdString(activity.record_name))),
+                &QAction::triggered, this, [this, show_error, call] {
+                    const auto r = call("route_record_stop", Mcp::json::object());
+                    if (show_error(r) || !r.structured) {
+                        return;
+                    }
+                    const auto& s = *r.structured;
+                    QStringList lines;
+                    for (const auto& step : s.value("steps", Mcp::json::array())) {
+                        lines << QString::fromStdString(step.get<std::string>());
+                    }
+                    QMessageBox::information(
+                        this, tr("Route saved"),
+                        tr("Saved \"%1\": %2 checkpoints, %3 timed steps.\n\n%4")
+                            .arg(QString::fromStdString(s.value("route", "")))
+                            .arg(s.value("checkpoints", 0))
+                            .arg(s.value("timed_steps", 0))
+                            .arg(lines.join(QStringLiteral("\n"))));
+                });
+    } else {
+        connect(mcp_routes_menu->addAction(tr("Record New Route...")), &QAction::triggered, this,
+                [this, show_error, call] {
+                    bool ok = false;
+                    const QString name = QInputDialog::getText(
+                        this, tr("Record Route"),
+                        tr("Route name (e.g. to_gameplay). Pause briefly on each screen before "
+                           "pressing; stop from this menu when done:"),
+                        QLineEdit::Normal, QStringLiteral("to_gameplay"), &ok)
+                                             .trimmed();
+                    if (!ok || name.isEmpty()) {
+                        return;
+                    }
+                    const auto r = call("route_record_start", {{"name", name.toStdString()}});
+                    if (!show_error(r)) {
+                        statusBar()->showMessage(
+                            tr("Recording route \"%1\"... stop it in Tools > MCP Server > Routes")
+                                .arg(name),
+                            8000);
+                    }
+                });
+    }
+    if (activity.route_state == "running") {
+        connect(mcp_routes_menu->addAction(tr("Stop Route \"%1\"")
+                                               .arg(QString::fromStdString(activity.route))),
+                &QAction::triggered, this,
+                [call] { call("route_stop", Mcp::json::object()); });
+    }
+
+    mcp_routes_menu->addSeparator();
+    const auto list = mcp_server->CallTool("route_list", {{"summary", true}});
+    const auto routes = list.structured ? list.structured->value("routes", Mcp::json::array())
+                                        : Mcp::json::array();
+    if (routes.empty()) {
+        disabled(tr("No routes for this game yet"));
+    }
+    for (const auto& route : routes) {
+        const std::string name = route.value("name", "");
+        const QString qname = QString::fromStdString(name);
+        auto* sub = mcp_routes_menu->addMenu(
+            tr("%1 (%2 steps%3)")
+                .arg(qname)
+                .arg(route.value("step_count", 0))
+                .arg(route.value("recorded", false) ? tr(", recorded") : QString{}));
+        connect(sub->addAction(tr("Run")), &QAction::triggered, this, [name, show_error, call] {
+            show_error(
+                call("route_run", {{"name", name}, {"background", true}, {"screenshot", false}}));
+        });
+        connect(sub->addAction(tr("Delete...")), &QAction::triggered, this,
+                [this, name, qname, call] {
+            if (QMessageBox::question(this, tr("Delete Route"),
+                                      tr("Delete the route \"%1\"?").arg(qname)) ==
+                QMessageBox::Yes) {
+                call("route_list", {{"remove", name}, {"summary", true}});
+            }
+        });
+    }
+    mcp_routes_menu->addSeparator();
+    open_folder();
+}
+
+/// Refreshes the status bar MCP indicator: clients, recording, route and last tool call.
+void MainWindow::UpdateMcpStatusLabel() {
+    if (!mcp_status_label) {
+        return;
+    }
+    // Shown only while the server runs, or when it was turned on but could not start.
+    if (!mcp_server) {
+        mcp_status_label->setVisible(!mcp_last_error.empty());
+        mcp_status_label->setText(tr("MCP failed"));
+        mcp_status_label->setStyleSheet(QStringLiteral("color: #e05555;"));
+        mcp_status_label->setToolTip(QString::fromStdString(mcp_last_error));
+        return;
+    }
+    mcp_status_label->setVisible(true);
+    const auto s = mcp_server->GetSummary();
+    const auto& a = s.activity;
+    const auto idle_s =
+        a.tool_calls == 0
+            ? -1
+            : std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
+                                                               a.last_tool_time)
+                  .count();
+    const bool active = idle_s >= 0 && idle_s < 10;
+
+    QStringList parts;
+    parts << QStringLiteral("MCP :%1").arg(mcp_server->Config().port);
+    if (!s.controller.empty()) {
+        parts << tr("agent: %1").arg(QString::fromStdString(s.controller));
+    } else if (s.sessions > 0) {
+        parts << tr("%n client(s)", "", static_cast<int>(s.sessions));
+    }
+    if (a.recording) {
+        parts << tr("REC %1 (%2 frames, %3 checkpoints)")
+                     .arg(QString::fromStdString(a.record_name))
+                     .arg(a.record_frames)
+                     .arg(a.record_checkpoints);
+    }
+    // A finished route stays visible for 30 s, then the indicator goes back to idle.
+    const bool route_recent =
+        a.route_state == "running" ||
+        std::chrono::steady_clock::now() - a.route_changed < std::chrono::seconds{30};
+    if (!a.route.empty() && !a.route_state.empty() && route_recent) {
+        parts << tr("route %1 %2/%3 %4")
+                     .arg(QString::fromStdString(a.route))
+                     .arg(a.route_step)
+                     .arg(a.route_total)
+                     .arg(QString::fromStdString(a.route_state));
+    }
+    if (active) {
+        parts << tr("last: %1").arg(QString::fromStdString(a.last_tool));
+    }
+    mcp_status_label->setText(parts.join(QStringLiteral(" · ")));
+    // Red while recording, accent while an agent is acting, plain when idle.
+    mcp_status_label->setStyleSheet(a.recording ? QStringLiteral("color: #e05555;")
+                                    : active    ? QStringLiteral("color: #4aa3ff;")
+                                                : QString{});
+    QString tip = tr("MCP server %1\nClients: %2\nWrites: %3\nControl: %4\nTool calls: %5")
+                      .arg(QString::fromStdString(s.url))
+                      .arg(s.sessions)
+                      .arg(s.writes ? tr("allowed") : tr("off"))
+                      .arg(s.controller.empty() ? tr("free") : QString::fromStdString(s.controller))
+                      .arg(a.tool_calls);
+    if (idle_s >= 0) {
+        tip += tr("\nLast call: %1 (%2 s ago)").arg(QString::fromStdString(a.last_tool)).arg(idle_s);
+    }
+    if (!a.route_detail.empty()) {
+        tip += QStringLiteral("\n") + QString::fromStdString(a.route_detail);
+    }
+    tip += tr("\nDashboard: %1").arg(QString::fromStdString(s.url.substr(0, s.url.size() - 3)));
+    mcp_status_label->setToolTip(tip);
+}
+#endif
+
+/// Cancels pending work, releases the MCP server and frees the render window.
 MainWindow::~MainWindow() {
     if (nup_cancel) {
         nup_cancel->store(true);
     }
     nup_watcher.waitForFinished();
+#ifdef YUZU_ENABLE_MCP
+    // Normally stopped in closeEvent already; this is the fallback.
+    mcp_server.reset();
+    mcp_host.reset();
+#endif
 #ifdef __APPLE__
     AllowOSSleep();
 #endif
@@ -1119,6 +1530,7 @@ void MainWindow::WebBrowserRequestExit() {
 #endif
 }
 
+/// Creates the render window, game list, loading screen and status bar widgets.
 void MainWindow::InitializeWidgets() {
     render_window = new GRenderWindow(this, input_subsystem);
     render_window->hide();
@@ -1190,6 +1602,16 @@ void MainWindow::InitializeWidgets() {
 
     statusBar()->addPermanentWidget(multiplayer_state->GetStatusText(), 0);
     statusBar()->addPermanentWidget(multiplayer_state->GetStatusIcon(), 0);
+
+#ifdef YUZU_ENABLE_MCP
+    // The widgets below are each inserted at 0, so this first one ends up rightmost of the group
+    // (after TAS, volume and the other toggles).
+    mcp_status_label = new QLabel();
+    mcp_status_label->setObjectName(QStringLiteral("McpStatusLabel"));
+    mcp_status_label->setFocusPolicy(Qt::NoFocus);
+    mcp_status_label->setContentsMargins(4, 0, 4, 0);
+    statusBar()->insertPermanentWidget(0, mcp_status_label);
+#endif
 
     tas_label = new QLabel();
     tas_label->setObjectName(QStringLiteral("TASlabel"));
@@ -1700,6 +2122,14 @@ void MainWindow::ConnectWidgetEvents() {
 
     connect(game_list, &GameList::OpenPerGameGeneralRequested, this,
             &MainWindow::OnGameListOpenPerGameProperties);
+    connect(game_list, &GameList::ResetRecommendedSettingsPromptRequested, this,
+            [this](u64 program_id) {
+                UISettings::values.skipped_recommended_settings.erase(program_id);
+                asked_recommended_settings.erase(program_id);
+                const bool players_were_global = Settings::values.players.UsingGlobal();
+                config->SaveAllValues();
+                Settings::values.players.SetGlobal(players_were_global);
+            });
     connect(game_list, &GameList::LinkToRyujinxRequested, this, &MainWindow::OnLinkToRyujinx);
 
     connect(this, &MainWindow::UpdateInstallProgress, this, &MainWindow::IncrementInstallProgress);
@@ -1804,6 +2234,8 @@ void MainWindow::ConnectMenuEvents() {
     connect(ui->action_Show_Room, &QAction::triggered, multiplayer_state,
             &MultiplayerState::OnOpenNetworkRoom);
     connect(multiplayer_state, &MultiplayerState::SaveConfig, this, &MainWindow::OnSaveConfig);
+    connect(multiplayer_state, &MultiplayerState::RequestProfileConfiguration, this,
+            &MainWindow::OnConfigureProfiles);
 
     // Tools
     connect_menu(ui->action_Launch_PhotoViewer, [this] {
@@ -2165,7 +2597,7 @@ bool MainWindow::SelectAndSetCurrentUser(
 }
 
 void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletParameters params,
-                          StartGameType type) {
+                          StartGameType type, bool allow_recommended_settings_prompt) {
     if (nup_running && filename.toStdString() == nup_source_path) {
         QMessageBox::information(this, tr("Conversion in Progress"),
                                  tr("This game cannot be started while its dump is being "
@@ -2226,6 +2658,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     const auto loader =
         Loader::GetLoader(*QtCommon::system, v_file, params.program_id, params.program_index);
 
+    std::optional<QtConfig> per_game_config;
     if (loader != nullptr && loader->ReadProgramId(title_id) == Loader::ResultStatus::Success &&
         type == StartGameType::Normal) {
         // Load per game settings
@@ -2234,31 +2667,48 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         const auto config_file_name = title_id == 0
                                           ? Common::FS::PathToUTF8String(file_path.filename())
                                           : fmt::format("{:016X}", title_id);
-        QtConfig per_game_config(config_file_name, Config::ConfigType::PerGameConfig);
+        per_game_config.emplace(config_file_name, Config::ConfigType::PerGameConfig);
         QtCommon::system->HIDCore().ReloadInputDevices();
         QtCommon::system->ApplySettings();
     }
 
-    if (title_id == Settings::MarioKartWorldProgramId && !asked_recommended_mkw_settings) {
-        asked_recommended_mkw_settings = true;
-        use_recommended_mkw_settings =
-            QMessageBox::question(
-                this, tr("Recommended Mario Kart World settings"),
-                tr("Use the recommended settings for Mario Kart World?\n\n"
-                   "Vulkan, 1x resolution, GPU Fast, asynchronous shaders, BC3, conservative VRAM, "
-                   "reactive flushing off, FIFO Relaxed VSync, handheld mode, ScaleForce, and "
-                   "FXAA.\n\n"
-                   "They apply to Mario Kart World until Lichii is closed. Your saved settings "
-                   "are not changed."),
-                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
-        LOG_INFO(Config, "MKW recommended settings accepted: {}", use_recommended_mkw_settings);
+    const auto* preset = Settings::FindGamePreset(title_id);
+    if (preset != nullptr && allow_recommended_settings_prompt &&
+        !UISettings::values.skipped_recommended_settings.contains(title_id) &&
+        asked_recommended_settings.insert(title_id).second) {
+        RecommendedSettingsDialog dialog(*preset, per_game_config.has_value(),
+                                         QtCommon::system->HIDCore(), this);
+        const int choice = dialog.exec();
+        if (choice == QDialog::Rejected) {
+            LOG_INFO(Config, "Recommended settings prompt for {:016X} closed; boot cancelled",
+                     title_id);
+            asked_recommended_settings.erase(title_id);
+            Settings::RestoreGlobalState(QtCommon::system->IsPoweredOn());
+            QtCommon::system->HIDCore().ReloadInputDevices();
+            return;
+        }
+        const bool accepted = choice == RecommendedSettingsDialog::Apply;
+        const auto selected_keys = dialog.SelectedKeys();
+        if (dialog.SkipPrompt()) {
+            UISettings::values.skipped_recommended_settings.insert(title_id);
+        }
+        const bool players_were_global = Settings::values.players.UsingGlobal();
+        config->SaveAllValues();
+        Settings::values.players.SetGlobal(players_were_global);
+        LOG_INFO(Config, "Recommended settings for {:016X} accepted: {} ({} selected)", title_id,
+                 accepted, selected_keys.size());
+        if (Settings::ApplyGamePreset(Settings::values, title_id, accepted, &selected_keys)) {
+            QtCommon::system->ApplySettings();
+            Settings::UpdateGPUAccuracy();
+            if (dialog.SaveForGame() && per_game_config) {
+                per_game_config->SaveAllValues();
+            }
+            LOG_INFO(Config,
+                     "Applied recommended settings for {:016X} after per-game configuration",
+                     title_id);
+        }
     }
-    if (Settings::ApplyMarioKartWorldPreset(Settings::values, title_id,
-                                            use_recommended_mkw_settings)) {
-        QtCommon::system->ApplySettings();
-        Settings::UpdateGPUAccuracy();
-        LOG_INFO(Config, "Applied recommended MKW settings after per-game configuration");
-    }
+
     PrepareShaderPrecache(title_id, std::filesystem::path{filename.toStdU16String()});
     speed_limit_before_hotkeys.reset();
     Settings::LogSettings();
@@ -3928,12 +4378,26 @@ void MainWindow::ToggleShowGameName() {
 }
 
 void MainWindow::OnConfigure() {
+    OpenConfigureDialog(false);
+}
+
+void MainWindow::OnConfigureProfiles() {
+    OpenConfigureDialog(true);
+}
+
+void MainWindow::OpenConfigureDialog(bool select_profiles) {
     const auto old_theme = UISettings::values.theme;
     const bool old_discord_presence = UISettings::values.enable_discord_presence.GetValue();
     const auto old_language_index = Settings::values.language_index.GetValue();
     const bool old_gamemode = UISettings::values.enable_gamemode.GetValue();
 #ifdef __unix__
     const bool old_force_x11 = UISettings::values.gui_force_x11.GetValue();
+#endif
+#ifdef YUZU_ENABLE_MCP
+    const bool old_mcp_enabled = Settings::values.enable_mcp_server.GetValue();
+    const u16 old_mcp_port = Settings::values.mcp_port.GetValue();
+    const std::string old_mcp_token = Settings::values.mcp_token.GetValue();
+    const bool old_mcp_writes = Settings::values.mcp_allow_writes.GetValue();
 #endif
 
     if (std::exchange(vk_records_pending, false)) {
@@ -3947,6 +4411,10 @@ void MainWindow::OnConfigure() {
             &MainWindow::OnLanguageChanged);
     connect(&configure_dialog, &ConfigureDialog::ExternalContentDirsChanged, this,
             &MainWindow::OnGameListRefresh);
+
+    if (select_profiles) {
+        configure_dialog.SelectProfilesTab();
+    }
 
     const auto result = configure_dialog.exec();
     if (result != QDialog::Accepted && !UISettings::values.configuration_applied &&
@@ -3993,6 +4461,9 @@ void MainWindow::OnConfigure() {
     }
     speed_limit_before_hotkeys.reset();
     InitializeHotkeys();
+#ifdef YUZU_ENABLE_MCP
+    ApplyMcpSettings(old_mcp_enabled, old_mcp_port, old_mcp_token, old_mcp_writes);
+#endif
 
     if (UISettings::values.theme != old_theme) {
         UpdateUITheme();
@@ -4023,6 +4494,7 @@ void MainWindow::OnConfigure() {
     UISettings::values.configuration_applied = false;
 
     config->SaveAllValues();
+
 
     if ((UISettings::values.hide_mouse || Settings::values.mouse_panning) && emulation_running) {
         render_window->installEventFilter(render_window);
@@ -4659,7 +5131,11 @@ void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& 
         return;
     }
 
-    const auto path = std::filesystem::path{std::u8string{game_path.begin(), game_path.end()}};
+    auto path = std::filesystem::path{std::u8string{game_path.begin(), game_path.end()}};
+    // Loose dumps are listed by their exefs folder (FormatGameName); the loader opens its main.
+    if (std::error_code ec; std::filesystem::is_directory(path, ec)) {
+        path /= "main";
+    }
     shader_warm_dialog =
         new ShaderWarmDialog(*QtCommon::system, path, program_id, GameTitleName(game_path), this);
     connect(shader_warm_dialog, &QDialog::finished, shader_warm_dialog, &QObject::deleteLater);
@@ -5722,6 +6198,7 @@ bool MainWindow::ConfirmClose() {
     return question(this, tr("Lichii"), text);
 }
 
+/// Confirms closing, waits for emulation to stop, then saves state and shuts down.
 void MainWindow::closeEvent(QCloseEvent* event) {
     if (!close_pending && !ConfirmClose()) {
         event->ignore();
@@ -5729,6 +6206,15 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     }
     close_pending = true;
     game_list->SetScanEnabled(false);
+    if (shader_warm_dialog && shader_warm_dialog->IsRunning()) {
+        // Joining the build on destruction would freeze the window: stop it, close once it ends.
+        event->ignore();
+        connect(shader_warm_dialog, &ShaderWarmDialog::BuildFinished, this, &MainWindow::close,
+                static_cast<Qt::ConnectionType>(Qt::QueuedConnection | Qt::UniqueConnection |
+                                               Qt::SingleShotConnection));
+        shader_warm_dialog->close(); // Stops the build (ShaderWarmDialog::reject)
+        return;
+    }
     if (boot_in_progress) {
         event->ignore();
         return;
@@ -5745,6 +6231,11 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         return;
     }
     LOG_INFO(Frontend, "Closing frontend after emulation cleanup");
+
+#ifdef YUZU_ENABLE_MCP
+    // While the event loop still runs: in-flight requests may be waiting for this thread.
+    StopMcpServer();
+#endif
 
     UpdateUISettings();
     game_list->SaveInterfaceLayout();
@@ -5941,15 +6432,23 @@ void MainWindow::UpdateUITheme() {
 }
 
 void MainWindow::LoadTranslation() {
-    bool loaded;
+    bool loaded = false;
+    const auto lang = UISettings::values.language.GetValue();
+    const QString lang_str = QString::fromStdString(lang);
 
-    if (UISettings::values.language.GetValue().empty()) {
-        // If the selected language is empty, use system locale
-        loaded = translator.load(QLocale(), {}, {}, QStringLiteral(":/languages/"));
-    } else {
-        // Otherwise load from the specified file
-        loaded = translator.load(QString::fromStdString(UISettings::values.language.GetValue()),
-                                 QStringLiteral(":/languages/"));
+    for (const auto& dir : GetLanguageSearchDirectories()) {
+        const bool is_resource = dir.startsWith(QLatin1Char{':'});
+        if (is_resource || QDir(dir).exists()) {
+            const QString path = dir.endsWith(QLatin1Char{'/'}) ? dir : dir + QLatin1Char{'/'};
+            if (lang.empty()) {
+                loaded = translator.load(QLocale(), {}, {}, path);
+            } else {
+                loaded = translator.load(lang_str, path);
+            }
+            if (loaded) {
+                break;
+            }
+        }
     }
 
     if (loaded)

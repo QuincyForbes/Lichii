@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -14,6 +17,7 @@
 #include "qt_common/config/shared_translation.h"
 #include "ui_configure_graphics_extensions.h"
 #include "yuzu/configuration/configuration_shared.h"
+#include "yuzu/configuration/configure_performance.h"
 #include "yuzu/configuration/configure_graphics_extensions.h"
 #include "yuzu/configuration/shared_widget.h"
 #include "qt_common/config/catalog_text.h"
@@ -82,6 +86,11 @@ void ConfigureGraphicsExtensions::Setup(const ConfigurationShared::Builder& buil
     std::map<u32, QWidget*> hacks_hold{}; // A map will sort the data for us
 
     for (auto setting : Settings::values.linkage.by_category[Settings::Category::RendererHacks]) {
+        // The global configuration shows these under Performance > Shaders.
+        if (Settings::IsConfiguringGlobal() &&
+            ConfigureShaders::IsShaderSetting(setting->Id())) {
+            continue;
+        }
         auto* widget = builder.BuildWidget(setting, apply_funcs);
 
         if (widget == nullptr) {

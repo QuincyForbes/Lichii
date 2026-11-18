@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -10,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 #include <fmt/format.h>
@@ -161,7 +165,14 @@ struct RingLine {
 };
 /// Keeps the last `capacity` formatted lines in memory; 0 turns the ring off and empties it.
 void SetRingCapacity(std::size_t capacity);
+[[nodiscard]] std::size_t RingCapacity();
+/// The number of the newest line kept (0 before the first).
+[[nodiscard]] u64 RingNewestSequence();
 /// The kept lines numbered above `after`, oldest first.
 [[nodiscard]] std::vector<RingLine> ReadRing(u64 after);
+/// Optional extra sink (used by the built-in MCP server's timeline). Called synchronously, on the
+/// thread that logs, for every message that passes the global filter. Pass nullptr to remove it.
+using ExternalSink = void (*)(const char* class_name, Level level, std::string_view message);
+void SetExternalSink(ExternalSink sink);
 
 } // namespace Common::Log

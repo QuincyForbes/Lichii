@@ -912,6 +912,89 @@ bool TextureCacheRuntime::MetalFxTemporalUpscale(Framebuffer* dst_framebuffer, I
     return true;
 }
 
+bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
+                                                  ImageView& input_color, ImageView& depth,
+                                                  std::array<u32, 2> render_size,
+                                                  const std::array<f32, 16>& reprojection,
+                                                  std::array<f32, 2> jitter, bool reset) {
+    if (dst_framebuffer == nullptr || temporal_unsupported) {
+        return false;
+    }
+    // Images are never rescaled on Metal: each view's size is its texture's. Vulkan's checks
+    // (TextureCacheRuntime::UpscaleWithCameraMotion): the output at least the render size, both
+    // inputs single-sampled.
+    const std::array<u32, 2> output_size{dst_framebuffer->Width(), dst_framebuffer->Height()};
+    if (output_size[0] < render_size[0] || output_size[1] < render_size[1] ||
+        dst_framebuffer->Samples() != 1 || !IsColor(input_color.HostClass()) ||
+        input_color.size.width < render_size[0] || input_color.size.height < render_size[1] ||
+        depth.size.width < render_size[0] || depth.size.height < render_size[1]) {
+        return false;
+    }
+    const Attachment target = dst_framebuffer->Colors()[0];
+    if (target.texture == nullptr) {
+        return false;
+    }
+    if (!temporal) {
+        if (!TemporalUpscaler::IsSupported(device)) {
+            LOG_WARNING(Render_Metal, "MetalFX temporal: not supported on this GPU");
+            temporal_unsupported = true;
+            return false;
+        }
+        temporal = std::make_unique<TemporalUpscaler>();
+    }
+    if (!camera_motion_pass) {
+        camera_motion_pass = std::make_unique<CameraMotionPass>(device, scheduler);
+    }
+    if (!camera_motion_pass->Record(depth.Handle(Shader::TextureType::Color2D), render_size,
+                                    reprojection)) {
+        temporal_unsupported = true;
+        return false;
+    }
+    const TextureHandle output = temporal->Upscale(
+        device, scheduler,
+        {
+            .color = input_color.Handle(Shader::TextureType::Color2D),
+            .depth = depth.Handle(Shader::TextureType::Color2D),
+            .motion = camera_motion_pass->Motion(),
+            .render_size = render_size,
+            .output_size = output_size,
+            .jitter = jitter,
+            // The motion vectors are in render pixels.
+            .motion_vector_scale = {1.0f, 1.0f},
+            .reset = reset,
+            // Ocarina's scene has its depth at 0 at the camera and is tonemapped already.
+            .depth_reversed = false,
+            .auto_exposure = false,
+        });
+    if (output == nullptr) {
+        temporal_unsupported = true;
+        return false;
+    }
+    const s32 width = static_cast<s32>(output_size[0]);
+    const s32 height = static_cast<s32>(output_size[1]);
+    if (!scheduler.Blit(BlitPass{
+            .src = output,
+            .src_rect = {0, 0, width, height},
+            .dst = target,
+            .dst_format = dst_framebuffer->ColorFormats()[0],
+            .dst_rect = {0, 0, width, height},
+            .dst_width = output_size[0],
+            .dst_height = output_size[1],
+            .linear = false,
+            .keep_dst = true,
+        })) {
+        temporal_unsupported = true;
+        return false;
+    }
+    static bool logged{};
+    if (!logged) {
+        logged = true;
+        LOG_INFO(Render_Metal, "Metal: anti-aliasing replaced by MetalFX temporal: {}x{} -> {}x{}",
+                 render_size[0], render_size[1], output_size[0], output_size[1]);
+    }
+    return true;
+}
+
 void TextureCacheRuntime::AccelerateImageUpload(Image&, const StagingBufferRef&,
                                                 std::span<const VideoCommon::SwizzleParameters>,
                                                 u32, u32) {
@@ -1595,7 +1678,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const ImageViewInfo& info, Im
 ImageView::ImageView(TextureCacheRuntime&, const ImageInfo& info, const ImageViewInfo& view_info,
                      GPUVAddr gpu_addr_)
     : VideoCommon::ImageViewBase{info, view_info, gpu_addr_},
-      buffer_size{VideoCommon::CalculateGuestSizeInBytes(info)} {}
+      buffer_size{static_cast<u32>(VideoCommon::CalculateGuestSizeInBytes(info))} {}
 
 ImageView::ImageView(TextureCacheRuntime&, const ImageInfo& info, const ImageViewInfo& view_info)
     : VideoCommon::ImageViewBase{info, view_info, 0} {}

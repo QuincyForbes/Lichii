@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -40,9 +43,7 @@
 #include "qt_common/config/catalog_text.h"
 #include "yuzu/configuration/nvidia_dlss_panel.h"
 
-#ifdef YUZU_BUNDLED_OPENSSL
-#include <openssl/cert.h>
-#endif
+#include "common/net/ca_store.h"
 
 namespace {
 
@@ -268,9 +269,7 @@ private:
         client->set_connection_timeout(30);
         client->set_read_timeout(30);
         client->set_write_timeout(30);
-#ifdef YUZU_BUNDLED_OPENSSL
-        client->load_ca_cert_store(kCert, sizeof(kCert));
-#endif
+        Common::Net::ConfigureCaStore(*client);
         return client;
     }
 

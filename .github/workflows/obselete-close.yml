@@ -1,0 +1,29 @@
+name: Close obsolete issues
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # daily
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          stale-issue-label: obsolete
+          days-before-issue-stale: -1 # never auto-mark, the release workflow does that
+          days-before-issue-close: 7
+          exempt-issue-labels: pinned,enhancement,accessibility,deferred,help-wanted
+          exempt-all-issue-assignees: true # anything assigned to someone
+          exempt-all-issue-milestones: true # anything in a milestone
+          close-issue-reason: not_planned
+          close-issue-message: >
+            Closing as not planned: no activity for 7 days after the latest release.
+            Feel free to reopen if this is still relevant.
+          days-before-pr-stale: -1 # ignore PRs
+          days-before-pr-close: -1
+          operations-per-run: 500

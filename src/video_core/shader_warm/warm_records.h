@@ -23,6 +23,10 @@ namespace VideoCommon::ShaderWarm {
 /// Precache files use the pipeline cache version: the emulator loads one only when it matches,
 /// so the two must move together.
 constexpr u32 WarmCacheVersion = VideoCommon::VulkanPipelineCacheVersion;
+/// What the builder finds in the game files, recorded in the precache's count file. A file built by
+/// an older builder is stale (WarmFilesStale). 2: Mario Kart World's .esetb effects.
+/// 3: .ptcl particle effects (Fire Emblem).
+constexpr u32 WarmBuilderVersion = 3;
 /// Other runtime cache versions with the same record layout, newest first (zortos293/Lichii
 /// builds write 53 and 54; 52 to 54 are identical). Their records still give the draw state
 /// guesses when this version has no cache yet.
@@ -65,6 +69,10 @@ struct LoweredCode {
 /// map, its count and the magic. Returns the error text when the program cannot be lowered.
 std::optional<std::string> LowerProgram(std::span<const u8> program, bool graphics,
                                         LoweredCode& out);
+/// A compute program: LowerProgram(program, false, out).
+inline std::optional<std::string> LowerProgram(std::span<const u8> program, LoweredCode& out) {
+    return LowerProgram(program, false, out);
+}
 
 /// NativeShaderHash: CityHash64(code) ^ 0x4f554e4345000002.
 u64 StageHash(std::span<const u8> code);

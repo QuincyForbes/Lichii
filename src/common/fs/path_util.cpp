@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -10,6 +13,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <fmt/format.h>
 #include "common/container/unordered_map.h"
 
 #include "common/assert.h"
@@ -19,6 +23,7 @@
 #endif
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
+#include "common/game_presets.h"
 #include "common/logging.h"
 
 #ifdef _WIN32
@@ -335,6 +340,14 @@ static fs::path RebaseToCurrentContainer(const fs::path& path) {
     return rebased == path ? path : rebased;
 }
 #endif
+
+fs::path GetVulkanPipelineCacheDir(const fs::path& shader_dir, u64 title_id) {
+    auto dir = shader_dir / fmt::format("{:016x}", title_id);
+    if (title_id == Settings::MarioKartWorldProgramId) {
+        dir /= "mkw_zero_depth_v1";
+    }
+    return dir;
+}
 
 void SetEdenPath(EdenPath eden_path, const fs::path& stored_path) {
     auto& instance = PathManagerImpl::GetInstance();

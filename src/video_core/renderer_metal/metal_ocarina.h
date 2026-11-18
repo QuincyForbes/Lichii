@@ -59,6 +59,43 @@ private:
     u64 passes{};
 };
 
+/// Motion vectors from the camera alone (host_shaders/camera_motion_vectors.comp through the
+/// translator), as Vulkan's CameraMotionPass: each pixel's depth put back in the world and taken
+/// through the previous frame's camera, written as the offset in render pixels (RG16Float).
+/// The motion input of the DLSS camera-motion upscale (TextureCacheRuntime::UpscaleWithCameraMotion).
+class CameraMotionPass {
+public:
+    explicit CameraMotionPass(const Device& device, Scheduler& scheduler);
+    ~CameraMotionPass();
+
+    /// Encodes the pass over `depth` (`size` texels, any depth format a shader reads as float).
+    /// `reprojection` maps (pixel x, pixel y, device depth, 1) of this frame to the previous
+    /// frame's pixel, row-major as the shader's push constants read it. False when it can't run.
+    bool Record(TextureHandle depth, std::array<u32, 2> size, const std::array<f32, 16>& reprojection);
+
+    /// The motion image of the last Record (RG16Float, its size).
+    [[nodiscard]] TextureHandle Motion() const noexcept {
+        return motion.Get();
+    }
+
+    /// The pass as the translator makes it, with its resource slots appended; for the smoke test.
+    [[nodiscard]] static std::string Msl(u32 apple_family);
+
+private:
+    bool Prepare();
+
+    const Device& device;
+    Scheduler& scheduler;
+    Object library;
+    Object function;
+    Object state;
+    Object sampler;
+    Object motion;
+    std::vector<ShaderTranslate::ResourceSlot> slots;
+    std::array<u32, 2> size{};
+    bool failed{};
+};
+
 /// Link's skinned mesh and his poses of this frame and the one before (Vulkan's
 /// OcarinaActorMesh): vertices of 48 bytes from the lowest index the draw reads, indices rebased
 /// to it, and 280 row-major 4x3 bone matrices per pose.

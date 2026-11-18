@@ -23,11 +23,7 @@
 namespace ShaderWarm = VideoCommon::ShaderWarm;
 
 bool ShaderWarmFilesExist(u64 title_id) {
-    if (title_id == 0) {
-        return false;
-    }
-    std::error_code ec;
-    return std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec);
+    return title_id != 0 && ShaderWarm::HasWarmFile(title_id);
 }
 
 bool DeleteShaderWarmFiles(u64 title_id, std::string& error) {

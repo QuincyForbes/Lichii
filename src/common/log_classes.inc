@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -16,6 +19,7 @@ SUB(Debug, Emulated)
 SUB(Debug, GPU)
 SUB(Debug, Breakpoint)
 SUB(Debug, GDBStub)
+SUB(Debug, MCP)
 CLS(Kernel)
 SUB(Kernel, SVC)
 CLS(Service)

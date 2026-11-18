@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
@@ -46,8 +50,14 @@ TEST_CASE("Ampere surface reductions preserve every U32 atomic operation",
                 CHECK(lowered.instructions[0] == (0xeb48000000000400ULL | (u64{guard} << 16) |
                     (u64{op} << 24) | (u64{dimension} << 33) | (0x84ULL << 36)));
                 auto invalid = instruction;
-                invalid.words[2] |= 1U << 9;
-                CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+                invalid.words[2] |= 1U << 9; // S32: lowered to SUATOM with the result in RZ
+                const auto signed_lowered = LowerToMaxwell(std::array{invalid, Exit});
+                if (op == 3 || op == 4) {
+                    CHECK_FALSE(signed_lowered);
+                } else {
+                    REQUIRE(signed_lowered);
+                    CHECK((signed_lowered.instructions[0] >> 56) == 0xea);
+                }
             }
         }
     }

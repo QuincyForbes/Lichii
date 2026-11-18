@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -114,7 +117,6 @@ add_executable(tests
     video_core/shader_translate_bench.cpp
     video_core/storage_binding_capacity.cpp
     video_core/native_indirect_reset.cpp
-    video_core/native_qmd.cpp
     video_core/gpu_command_safety.cpp
     video_core/syncpoint_actions.cpp
     video_core/nx2_video_av1.cpp
@@ -125,10 +127,21 @@ add_executable(tests
     video_core/spirv_nan_safe_min_max.cpp
     video_core/virtual_range_cache.cpp
     video_core/ocarina_upscale.cpp
+    core/nx2_frame_interval.cpp
+    video_core/upload_batch.cpp
+    video_core/texture_swizzle.cpp
+    video_core/unbacked_image_policy.cpp
+    core/gpu_dirty_memory_manager.cpp
+    video_core/macro_dma_forward.cpp
+    video_core/list_writer_trace.cpp
+    video_core/list_copy_demand.cpp
+    video_core/buffer_dependency_trace.cpp
+    video_core/nx2_written_pages.cpp
     common/bit_field.cpp
     common/bit_util.cpp
     common/cityhash.cpp
     common/container_hash.cpp
+    common/cpu_layout.cpp
     common/event.cpp
     common/fibers.cpp
     common/frame_deadline.cpp
@@ -142,6 +155,7 @@ add_executable(tests
     common/jit_block_lists.cpp
     common/multi_level_page_table.cpp
     common/page_table.cpp
+    common/progress_counter.cpp
     common/param_package.cpp
     common/range_map.cpp
     common/ring_buffer.cpp
@@ -163,6 +177,7 @@ add_executable(tests
     core/ldn.cpp
     core/internal_network/socket_proxy.cpp
     core/nx2_movie_pacing.cpp
+    core/nx2_gpu_memory_registry.cpp
     core/priority_queue.cpp
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
@@ -171,10 +186,19 @@ add_executable(tests
     video_core/memory_manager_runs.cpp
     video_core/nx2_perf_draw_binds.cpp
     video_core/nx2_perf_texture_writes.cpp
+    video_core/nx2_perf.cpp
+    video_core/nx2_perf_native_qmd.cpp
+    video_core/nx2_perf_query_callback.cpp
+    video_core/nx2_perf_switches.cpp
+    video_core/nx2_sparse_residency.cpp
+    video_core/pipeline_cache_dir.cpp
     video_core/ampere_depth_compare.cpp
+    video_core/shader_bench.cpp
+    video_core/shader_precache_identity.cpp
     video_core/h264_packet.cpp
     video_core/nx2_gpu_mapping.cpp
     video_core/vertex_repack.cpp
+    video_core/query_copy.cpp
     video_core/ampere_lowering.cpp
     video_core/ampere_geometry.cpp
     video_core/ampere_i2f.cpp
@@ -185,6 +209,11 @@ add_executable(tests
     video_core/ampere_bindless_surfaces.cpp
     video_core/native_macro_fifo.cpp
     video_core/turing_macro_ram.cpp
+    video_core/native_image_matching.cpp
+    video_core/texture_cache_budget.cpp
+    video_core/native_swizzle.cpp
+    video_core/image_allocation_pool.cpp
+    video_core/plain_unswizzle.cpp
     video_core/uniform_stream_reuse.cpp
     video_core/host_memory_limit.cpp
     video_core/unbacked_fallback.cpp
@@ -214,6 +243,11 @@ if (NOT ENABLE_METAL)
                                  ../video_core/renderer_metal/metal_coverage.cpp
                                  ../video_core/renderer_metal/metal_formats.cpp
                                  ../video_core/renderer_metal/metal_pipeline_check.cpp)
+endif()
+
+if (ENABLE_MCP_SERVER)
+    target_sources(tests PRIVATE mcp/protocol.cpp)
+    target_link_libraries(tests PRIVATE mcp)
 endif()
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
@@ -263,7 +297,7 @@ if (NOT ANDROID)
 endif()
 
 # needed for vma
-if (NOT MSVC)
+if(NOT MSVC)
     target_compile_options(tests PRIVATE
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-conversion>
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unused-variable>

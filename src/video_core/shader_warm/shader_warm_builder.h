@@ -150,6 +150,10 @@ struct Progress {
     std::string stage;   ///< "Reading game files", "Extracting shaders", "Converting", "Writing"
     size_t done{};       ///< Items done in this stage
     size_t total{};      ///< Items in this stage, 0 when unknown
+    /// The whole build, 0 to 1: archive bytes read, weighted with programs converted. Never
+    /// decreases.
+    double fraction{};
+    size_t programs{};   ///< Programs found so far
 };
 
 struct Result {
@@ -161,6 +165,18 @@ struct Result {
     size_t fragment_programs{};  ///< Fragment entries written to the graphics file
     size_t skipped{};            ///< Programs that failed to extract or convert
 };
+
+/// True when the title has a precache file.
+bool HasWarmFile(u64 title_id);
+
+/// Why the precache file of `warm_file` must be built again: missing, of another cache version,
+/// written by an older builder (WarmBuilderVersion) or changed since. Empty when it is current.
+std::optional<std::string> WarmFilesStale(const std::filesystem::path& warm_file);
+
+/// Before the disk cache loads: builds the precache file of the running Switch 2 program from its
+/// game file when it is WarmFilesStale and precache_shaders is Always (Off and Ask leave building
+/// to the loading screen flow). Returns true when it built one.
+bool RefreshWarmFiles(Core::System& system, u64 title_id, std::stop_token stop);
 
 /// Builds the precache file for the game at `game_path` (any format the loader opens, Switch 2
 /// .nup first), from the user's own copy and keys, with no external tools. Runs on the calling

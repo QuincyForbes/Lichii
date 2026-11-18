@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -222,6 +225,12 @@ else()
             $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-stringop-overread>
             $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-stringop-overflow>)
     endif()
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "13" AND CXX_GCC)
+        # GCC 13.3 at -O3 unswitches the switch in Maxwell3D::FrontCallMultiMethod's word loop
+        # and loses its load_mme.instruction case: macro code is never stored and every
+        # Switch 2 title renders black. GCC 13 is where switch unswitching was added.
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fno-unswitch-loops>)
+    endif()
 
     # GCC 13+ unswitches loops on switch statements and can drop cases from the unswitched copy
     # (same pass as https://gcc.gnu.org/PR128356). It dropped the split front's macro uploads
@@ -290,7 +299,11 @@ add_subdirectory(input_common)
 add_subdirectory(frontend_common)
 add_subdirectory(shader_recompiler)
 
-if(YUZU_TESTS)
+if (ENABLE_MCP_SERVER)
+    add_subdirectory(mcp)
+endif()
+
+if (YUZU_TESTS)
     add_subdirectory(tests)
 endif()
 
@@ -324,6 +337,9 @@ endif()
 if(ENABLE_QT)
     add_subdirectory(qt_common)
     add_subdirectory(yuzu)
+    if (WIN32 AND ENABLE_UPDATE_CHECKER)
+        add_subdirectory(updater)
+    endif()
 endif()
 
 if(ENABLE_WEB_SERVICE)

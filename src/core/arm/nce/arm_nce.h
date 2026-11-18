@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -63,6 +66,7 @@ private:
     static void BreakFromRunCodeSignalHandler(int sig, void* info, void* raw_context);
     static void GuestAlignmentFaultSignalHandler(int sig, void* info, void* raw_context);
     static void GuestAccessFaultSignalHandler(int sig, void* info, void* raw_context);
+    static void GuestIllegalInstructionSignalHandler(int sig, void* info, void* raw_context);
 
     static void LockThreadParameters(void* tpidr);
     static void UnlockThreadParameters(void* tpidr);
@@ -74,8 +78,10 @@ private:
     static bool HandleFailedGuestFault(GuestContext* ctx, void* info, void* raw_context);
     static bool HandleGuestAlignmentFault(GuestContext* ctx, void* info, void* raw_context);
     static bool HandleGuestAccessFault(GuestContext* ctx, void* info, void* raw_context);
+    static bool HandleGuestIllegalInstruction(GuestContext* ctx, void* info, void* raw_context);
     static void HandleHostAlignmentFault(int sig, void* info, void* raw_context);
     static void HandleHostAccessFault(int sig, void* info, void* raw_context);
+    static void HandleHostIllegalInstruction(int sig, void* info, void* raw_context);
 
 public:
     Core::System& m_system;
