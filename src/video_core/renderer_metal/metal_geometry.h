@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <array>
 #include <map>
 #include <optional>
 #include <string>
@@ -32,6 +33,7 @@
 #include "shader_recompiler/frontend/ir/program.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
+#include "video_core/renderer_metal/metal_xfb.h"
 
 namespace Metal::Geometry {
 
@@ -71,13 +73,20 @@ struct Plan {
     }
     /// Input primitives of `count` vertices of one instance.
     [[nodiscard]] u32 Primitives(u32 count) const noexcept {
+        if (AdjacencyStrip()) {
+            return count < 4 ? 0U : (count - 4) / 2;
+        }
         return count < input_vertices ? 0U : (count - input_vertices) / input_step + 1;
+    }
+    /// Triangle strips with adjacency: six records a primitive, the first vertex two on.
+    [[nodiscard]] bool AdjacencyStrip() const noexcept {
+        return input_vertices == 6 && input_step == 2;
     }
 };
 
 /// The records of an input primitive for a draw topology: `vertices` of them, the first moving
-/// `step` a primitive. Triangle strips with adjacency (their vertex order alternates) are not
-/// taken.
+/// `step` a primitive. Triangle strips with adjacency are six and two (Vulkan's table of vertex
+/// orders, in the records kernel).
 [[nodiscard]] inline bool InputTopology(Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology topology,
                                         u32& vertices, u32& step) {
     using Topology = Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology;
@@ -108,6 +117,10 @@ struct Plan {
         return true;
     case Topology::TrianglesAdjacency:
         vertices = step = 6;
+        return true;
+    case Topology::TriangleStripAdjacency:
+        vertices = 6;
+        step = 2;
         return true;
     default:
         return false;
@@ -148,6 +161,27 @@ struct RecordsParams {
 inline constexpr std::string_view ReaderEntry = "geo_reader";
 [[nodiscard]] std::string ReaderSource(const Plan& plan, bool convert_depth, bool flip_y,
                                        float default_point_size);
+
+/// The transform feedback kernel appended to the geometry kernel's MSL: thread n takes the n-th
+/// vertex of the compacted list (a triangle strip is captured as separate triangles) and writes
+/// the layout's varyings from its output record into the capture buffers, clamped as nxnative's
+/// tf_prepare does (the room left in each buffer, whole primitives). Buffers: 0 the output
+/// records, 1 the list, 2-5 the capture buffers (bound at their current offset), 6 the draw's
+/// arguments (the list's length first), 7 XfbParams.
+inline constexpr std::string_view XfbEntry = "geo_xfb";
+inline constexpr u32 XfbRecordsSlot = 0;
+inline constexpr u32 XfbListSlot = 1;
+inline constexpr u32 XfbBufferSlot = 2;
+inline constexpr u32 XfbArgsSlot = 6;
+inline constexpr u32 XfbParamsSlot = 7;
+struct XfbParams {
+    std::array<u32, 4> capacity;
+    std::array<u32, 4> written;
+    u32 vertices; ///< Vertices of an output primitive
+    u32 pad[3];
+};
+[[nodiscard]] std::string XfbSource(const Plan& plan, const Xfb::Layout& layout,
+                                    const std::map<Shader::IR::Attribute, Shader::IR::Attribute>& legacy_mapping);
 
 /// The compaction kernels (nxnative's geo_pack_count, geo_pack_scan_legacy and geo_pack_write):
 /// buffers 0 the index regions, 1 the list, 2 the draw's indirect arguments, 3 the per-primitive

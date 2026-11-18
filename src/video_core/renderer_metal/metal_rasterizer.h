@@ -497,6 +497,10 @@ private:
     /// A draw of a pipeline with a geometry program (metal_geometry.h).
     void DrawGeometry(GraphicsPipeline& pipeline, bool is_indexed, u32 instance_count);
     void EnsureGeometryKernels();
+    /// Transform feedback of a geometry draw's compacted output (the pipeline's xfb layout).
+    void CaptureGeometryOutput(GraphicsPipeline& pipeline, GeometryCompute& geo,
+                               const StagingBufferRef& output, const StagingBufferRef& list,
+                               const StagingBufferRef& args, u32 primitives);
     /// An indirect draw of a geometry program: its arguments read on the CPU, a draw each.
     void DrawGeometryIndirect(GraphicsPipeline& pipeline);
 

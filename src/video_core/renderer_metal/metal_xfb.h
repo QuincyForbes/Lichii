@@ -79,12 +79,15 @@ struct Layout {
 /// layout has no stride), or nothing (`Active()` false) when transform feedback is off or the
 /// topology is one the capture can't take (it takes lists: points, lines, triangles).
 [[nodiscard]] inline Layout MakeLayout(const Tegra::Engines::Maxwell3D::Regs& regs,
-                                       Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology topology) {
+                                       Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology topology,
+                                       bool geometry = false) {
     using Regs = Tegra::Engines::Maxwell3D::Regs;
     Layout layout;
-    if (regs.transform_feedback_enabled == 0 || (topology != Regs::PrimitiveTopology::Points &&
-                                                 topology != Regs::PrimitiveTopology::Lines &&
-                                                 topology != Regs::PrimitiveTopology::Triangles)) {
+    // A geometry program's capture is of its output, whatever the draw's topology.
+    if (regs.transform_feedback_enabled == 0 ||
+        (!geometry && topology != Regs::PrimitiveTopology::Points &&
+         topology != Regs::PrimitiveTopology::Lines &&
+         topology != Regs::PrimitiveTopology::Triangles)) {
         return layout;
     }
     VideoCommon::TransformFeedbackState state{};

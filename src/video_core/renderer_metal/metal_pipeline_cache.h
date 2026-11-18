@@ -107,6 +107,10 @@ public:
     [[nodiscard]] std::pair<void*, void*> GeometryKernelStates(const Device& device, size_t variant,
                                                                const RenderPipelineDesc& layout);
 
+    /// The transform feedback kernel of the geometry output (after KernelState built the geometry
+    /// kernel's library), or null.
+    [[nodiscard]] void* GeometryXfbState(const Device& device);
+
     /// The mesh emulation of a task/mesh pipeline, or null.
     [[nodiscard]] MeshEmulation* Mesh() noexcept {
         return mesh ? &*mesh : nullptr;
