@@ -3491,6 +3491,21 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
     // TODO: Properly implement this
     const auto it = page_table.find(cpu_addr >> YUZU_PAGEBITS);
     if (it == page_table.end()) {
+        static std::atomic<u32> logged_empty{};
+        if (logged_empty.fetch_add(1, std::memory_order_relaxed) < 3) {
+            u32 listed = 0;
+            for (const auto& [id, image_ptr] : slot_images) {
+                const ImageBase& image = *image_ptr;
+                if (image.info.size.width >= 1280 && listed++ < 24) {
+                    LOG_INFO(HW_GPU,
+                             "Display {:#x} has no image; image {:#x} gpu {:#x} {}x{} format {} "
+                             "type {} flags {:#x}",
+                             cpu_addr, image.cpu_addr, image.gpu_addr, image.info.size.width,
+                             image.info.size.height, image.info.format,
+                             static_cast<u32>(image.info.type), static_cast<u32>(image.flags));
+                }
+            }
+        }
         return {};
     }
     const auto view_format = [&]() {
@@ -3553,6 +3568,19 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
         return GetImageViewForFramebuffer(*most_recent);
     }
 
+    // Nothing usable at the display address: list what is there (the first few misses).
+    static std::atomic<u32> logged_misses{};
+    if (logged_misses.fetch_add(1, std::memory_order_relaxed) < 4) {
+        for (const ImageMapId map_id : image_map_ids) {
+            const ImageMapView& map = slot_map_views[map_id];
+            const ImageBase& image = slot_images[map.image_id];
+            LOG_INFO(HW_GPU,
+                     "Display {:#x} ({}x{} {}): image at {:#x} {}x{} format {} views {} flags {:#x}",
+                     cpu_addr, config.width, config.height, view_format, image.cpu_addr,
+                     image.info.size.width, image.info.size.height, image.info.format,
+                     image.image_view_ids.size(), static_cast<u32>(image.flags));
+        }
+    }
     return {};
 }
 

@@ -42,6 +42,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_indirect_grid.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/dirty_flags.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/oot_network.h"
 #include "video_core/render_probe.h"
@@ -6637,6 +6638,11 @@ void RasterizerMetal::InitializeChannel(Tegra::Control::ChannelState& channel) {
     texture_cache.CreateChannel(channel);
     buffer_cache.CreateChannel(channel);
     pipeline_cache.CreateChannel(channel);
+    // As Vulkan's and OpenGL's state trackers: the register writes that mark render targets,
+    // vertex and index buffers, descriptors and shaders dirty. Without them the texture cache kept
+    // the first render targets for every later draw (Ocarina's composite into its display buffers
+    // drew into the scene image instead, so the screen stayed black).
+    VideoCommon::Dirty::SetupDirtyFlags(channel.payload->maxwell_3d.dirty.tables);
 }
 
 void RasterizerMetal::BindChannel(Tegra::Control::ChannelState& channel) {

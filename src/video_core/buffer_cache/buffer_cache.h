@@ -4820,6 +4820,19 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
     if constexpr (USE_MEMORY_MAPS) {
         auto upload_staging = runtime.UploadStagingBuffer(total_size_bytes);
         const std::span<u8> staging_pointer = upload_staging.mapped_span;
+        if (staging_pointer.data() == nullptr || staging_pointer.size_bytes() < total_size_bytes)
+            [[unlikely]] {
+            // As TextureCache's StagingUsable: copying through an unmapped staging buffer writes
+            // to address 0. Skip this upload instead of crashing the GPU thread.
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+                LOG_ERROR(HW_GPU,
+                          "Buffer upload skipped: staging buffer {} ({} of {} bytes mapped)",
+                          staging_pointer.data() == nullptr ? "is not host-mapped" : "is too small",
+                          staging_pointer.size_bytes(), total_size_bytes);
+            }
+            return;
+        }
         for (BufferCopy& copy : copies) {
             u8* const src_pointer = staging_pointer.data() + copy.src_offset;
             const DAddr device_addr = buffer.CpuAddr() + copy.dst_offset;
