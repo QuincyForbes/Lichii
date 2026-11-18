@@ -3749,6 +3749,165 @@ int RunOcarinaDepthJitter() {
     return passed ? 0 : 1;
 }
 
+/// The DLSS camera-motion upscale on Metal (TextureCacheRuntime::UpscaleWithCameraMotion, as
+/// Vulkan's CameraMotionPass and DLSS evaluation): camera_motion_vectors.comp through the
+/// translator over a 16x16 Depth32Float scene whose depth grows across it ((x + 0.5) / 16), with a
+/// column-major reprojection taking (x, y, depth, 1) to (x + 4 depth + 1, y - 2): the motion is
+/// (4 depth + 1, -2), different for every column, so a wrong depth read or a transposed matrix
+/// changes the result. Where MetalFX temporal upscaling runs, the evaluation as the runtime
+/// issues it (RG11B10Float colour in, depth not reversed, no auto exposure, motion in render
+/// pixels) of a flat scene into 32x32: the colour everywhere.
+int RunCameraMotionUpscale() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr uint32_t Side = 16;
+    constexpr uint32_t TargetSide = 32;
+    const Metal::Object depth = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatDepth32Float),
+                 .width = Side,
+                 .height = Side,
+                 .render_target = true});
+    uint8_t* upload = nullptr;
+    const Metal::Object upload_buffer = Metal::CreateBuffer(device, Side * Side * 4, true, &upload);
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer =
+        Metal::CreateBuffer(device, TargetSide * TargetSide * 8, true, &readback);
+    if (!depth || upload == nullptr || readback == nullptr) {
+        std::printf("metal-smoke: FAIL camera motion upscale textures\n");
+        return 1;
+    }
+    for (uint32_t y = 0; y < Side; ++y) {
+        for (uint32_t x = 0; x < Side; ++x) {
+            const float value = (static_cast<float>(x) + 0.5f) / Side;
+            std::memcpy(upload + (y * Side + x) * 4, &value, 4);
+        }
+    }
+    scheduler.CopyBufferToTexture(upload_buffer.Get(), 0, Side * 4, 0, depth.Get(), 0, 0, {},
+                                  {Side, Side, 1});
+    // Column-major: column 0 holds the x row's x coefficient and so on; [8] is the depth
+    // column's x row, [12] the translation column's x row, [13] its y row.
+    std::array<float, 16> reprojection{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    reprojection[8] = 4.0f;
+    reprojection[12] = 1.0f;
+    reprojection[13] = -2.0f;
+    Metal::CameraMotionPass pass(device, scheduler);
+    const bool encoded = pass.Record(depth.Get(), {Side, Side}, reprojection);
+    if (encoded) {
+        scheduler.CopyTextureToBuffer(pass.Motion(), 0, 0, {}, {Side, Side, 1},
+                                      readback_buffer.Get(), 0, Side * 4, 0);
+    }
+    scheduler.Finish();
+    if (!encoded) {
+        std::printf("metal-smoke: FAIL camera motion pass not encoded (see the log)\n");
+        return 1;
+    }
+    const auto half = [](uint16_t bits) {
+        const float magnitude = PackedFloat(bits & 0x7FFFU, 10);
+        return (bits & 0x8000U) != 0 ? -magnitude : magnitude;
+    };
+    uint32_t motion_wrong = 0;
+    std::array<float, 2> first{};
+    std::array<float, 2> last{};
+    for (uint32_t texel = 0; texel < Side * Side; ++texel) {
+        std::array<uint16_t, 2> bits{};
+        std::memcpy(bits.data(), readback + texel * 4, 4);
+        const std::array<float, 2> value{half(bits[0]), half(bits[1])};
+        const float scene_depth = (static_cast<float>(texel % Side) + 0.5f) / Side;
+        motion_wrong += std::abs(value[0] - (4.0f * scene_depth + 1.0f)) < 0.01f &&
+                                std::abs(value[1] + 2.0f) < 0.01f
+                            ? 0
+                            : 1;
+        (texel == 0 ? first : last) = value;
+    }
+    std::string upscale = "MetalFX temporal not on this device";
+    bool upscale_passed = true;
+    if (Metal::TemporalUpscaler::IsSupported(device)) {
+        const Metal::Object color = Metal::CreateTexture(
+            device, {.kind = Metal::TextureKind::e2D,
+                     .format = static_cast<uint32_t>(MTLPixelFormatRG11B10Float),
+                     .width = Side,
+                     .height = Side,
+                     .shader_write = true});
+        // The scene's colour (0.5, 0.25, 1.0) packed as RG11B10Float.
+        uint32_t packed = 0;
+        {
+            const auto encode = [](float value, uint32_t mantissa_bits) {
+                int exponent = 0;
+                const float fraction = std::frexp(value, &exponent); // value = fraction * 2^exp
+                const uint32_t biased = static_cast<uint32_t>(exponent - 1 + 15);
+                const uint32_t mantissa = static_cast<uint32_t>(
+                    std::lround((fraction * 2.0f - 1.0f) * static_cast<float>(1U << mantissa_bits)));
+                return (biased << mantissa_bits) | mantissa;
+            };
+            packed = encode(0.5f, 6) | (encode(0.25f, 6) << 11) | (encode(1.0f, 5) << 22);
+        }
+        uint8_t* color_upload = nullptr;
+        const Metal::Object color_buffer =
+            Metal::CreateBuffer(device, Side * Side * 4, true, &color_upload);
+        const Metal::Object target = Metal::CreateTexture(
+            device, {.kind = Metal::TextureKind::e2D,
+                     .format = static_cast<uint32_t>(MTLPixelFormatRGBA16Float),
+                     .width = TargetSide,
+                     .height = TargetSide,
+                     .shader_write = true});
+        if (color_upload == nullptr || !color || !target) {
+            std::printf("metal-smoke: FAIL camera motion upscale colour textures\n");
+            return 1;
+        }
+        for (uint32_t texel = 0; texel < Side * Side; ++texel) {
+            std::memcpy(color_upload + texel * 4, &packed, 4);
+        }
+        scheduler.CopyBufferToTexture(color_buffer.Get(), 0, Side * 4, 0, color.Get(), 0, 0, {},
+                                      {Side, Side, 1});
+        Metal::TemporalUpscaler upscaler;
+        Metal::TextureHandle output = nullptr;
+        for (uint32_t frame = 0; frame < 4; ++frame) {
+            output = upscaler.Upscale(device, scheduler,
+                                      {.color = color.Get(),
+                                       .depth = depth.Get(),
+                                       .motion = pass.Motion(),
+                                       .render_size = {Side, Side},
+                                       .output_size = {TargetSide, TargetSide},
+                                       .jitter = {0.0f, 0.0f},
+                                       .motion_vector_scale = {1.0f, 1.0f},
+                                       .reset = frame == 0,
+                                       .depth_reversed = false,
+                                       .auto_exposure = false});
+            if (output == nullptr) {
+                break;
+            }
+        }
+        uint32_t wrong = 0;
+        if (output != nullptr) {
+            scheduler.CopyTextureToBuffer(output, 0, 0, {}, {TargetSide, TargetSide, 1},
+                                          readback_buffer.Get(), 0, TargetSide * 8, 0);
+        }
+        scheduler.Finish();
+        for (uint32_t texel = 0; output != nullptr && texel < TargetSide * TargetSide; ++texel) {
+            std::array<uint16_t, 4> bits{};
+            std::memcpy(bits.data(), readback + texel * 8, 8);
+            wrong += std::abs(half(bits[0]) - 0.5f) < 0.03f &&
+                             std::abs(half(bits[1]) - 0.25f) < 0.03f
+                         ? 0
+                         : 1;
+        }
+        upscale_passed = output != nullptr && wrong == 0;
+        upscale = output != nullptr
+                      ? "4 frames through MetalFX into 32x32 RGBA16F, " + std::to_string(wrong) +
+                            " of " + std::to_string(TargetSide * TargetSide) + " wrong"
+                      : std::string{"declined by MetalFX (see the log)"};
+    }
+    const bool translated = Metal::CameraMotionPass::Msl(Metal::DeviceAppleFamily(device))
+                                .find("error:") == std::string::npos;
+    const bool passed = motion_wrong == 0 && upscale_passed && translated;
+    std::printf("metal-smoke: camera motion upscale: motion column 0 %.3f,%.3f (expected 1.125,-2), "
+                "column 15 %.3f,%.3f (expected 4.875,-2), %u of %u wrong; %s; translated %s: %s\n",
+                first[0], first[1], last[0], last[1], motion_wrong, Side * Side, upscale.c_str(),
+                translated ? "yes" : "NO", passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 /// Vulkan's temporal stand-in for the game's DLSS on Metal (EDEN_NX2_METAL_TEMPORAL_STANDIN): a
 /// 32x32 picture of four quadrants, still (no motion), upscaled to 64x64 twice: the first frame
 /// starts the history, the second blends into it. Each quadrant's centre keeps its colour.
@@ -4626,7 +4785,8 @@ int main(int argc, char** argv) {
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
                                  RunStagingBound, RunPipelineFiles, RunOcarinaTemporal,
                                  RunProvokingVertex, RunCondition, RunIndirectArguments, RunPipelineJobs,
-                                 RunOcarinaActorEffects, RunOcarinaDepthJitter, RunTemporalStandIn, RunForceLod0,
+                                 RunOcarinaActorEffects, RunOcarinaDepthJitter, RunCameraMotionUpscale,
+                                 RunTemporalStandIn, RunForceLod0,
                                  RunSwapchain,
                                  RunVulkanSwitches, RunPresentFilters,
                                  SmokeTextures::RunAll, SmokeProbe::RunAll}) {

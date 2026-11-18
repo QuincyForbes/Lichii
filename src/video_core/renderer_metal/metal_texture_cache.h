@@ -29,6 +29,7 @@ namespace Metal {
 
 class Device;
 class Framebuffer;
+class CameraMotionPass;
 class Image;
 class ImageView;
 class PresentPasses;
@@ -91,11 +92,14 @@ public:
                    Tegra::Engines::Fermi2D::Filter filter,
                    Tegra::Engines::Fermi2D::Operation operation);
 
-    /// Not available on Metal (the Vulkan runtime's DLSS camera-motion pass): the caller keeps its own.
-    bool UpscaleWithCameraMotion(Framebuffer*, ImageView&, ImageView&, std::array<u32, 2>,
-                                 const std::array<f32, 16>&, std::array<f32, 2>, bool) {
-        return false;
-    }
+    /// MetalFX temporal upscaling in place of Ocarina of Time's anti-aliasing, as the Vulkan
+    /// runtime's DLSS camera-motion upscale: motion vectors from the scene depth and the camera
+    /// (`reprojection`; host_shaders/camera_motion_vectors.comp through the translator), MetalFX
+    /// with the host's jitter, the result drawn into `dst_framebuffer`. False leaves the game's own.
+    bool UpscaleWithCameraMotion(Framebuffer* dst_framebuffer, ImageView& input_color,
+                                 ImageView& depth, std::array<u32, 2> render_size,
+                                 const std::array<f32, 16>& reprojection,
+                                 std::array<f32, 2> jitter, bool reset);
 
     /// MetalFX temporal upscaling in place of the game's DLSS (the MetalFX Temporal scaling
     /// filter), else Vulkan's temporal stand-in (EDEN_NX2_METAL_TEMPORAL_STANDIN); false leaves
@@ -155,6 +159,7 @@ public:
     /// GPU bytes the texture cache's textures hold.
     u64 allocated_bytes{};
     std::unique_ptr<TemporalUpscaler> temporal;
+    std::unique_ptr<CameraMotionPass> camera_motion_pass;
     bool temporal_unsupported{};
     std::optional<std::chrono::steady_clock::time_point> temporal_last_evaluation;
     std::unique_ptr<PresentPasses> present_passes;
