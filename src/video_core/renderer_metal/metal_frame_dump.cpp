@@ -11,6 +11,7 @@
 
 #include <fmt/format.h>
 
+#include "common/cityhash.h"
 #include "common/logging.h"
 #include "common/stb.h"
 #include "common/zstd_compression.h"
@@ -215,9 +216,12 @@ FrameDump::FrameDump(const Device& device_, Scheduler& scheduler_)
         return;
     }
     enabled = true;
-    if (std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED") != nullptr) {
-        LOG_WARNING(Render_Metal, "Frame dump: EDEN_NX2_FRAME_DUMP_SAMPLED is not ported to "
-                                  "Metal; passes, dispatches and the presented image only");
+    if (const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
+        value != nullptr && *value != '\0' && *value != '0') {
+        env_sampled = sampled = buffers = true;
+    }
+    if (const char* const from = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED_FROM")) {
+        sampled_from_pass = static_cast<u32>(std::strtoul(from, nullptr, 10));
     }
     directory = dir;
     base_directory = directory;
@@ -257,9 +261,12 @@ void FrameDump::StopWriter() {
     stop_writer = false;
 }
 
-void FrameDump::Arm(u64 id, std::filesystem::path capture_directory) {
+void FrameDump::Arm(u64 id, std::filesystem::path capture_directory, bool with_sampled,
+                    bool with_buffers) {
     std::scoped_lock lock{request_mutex};
     request_id = id;
+    request_sampled = with_sampled;
+    request_buffers = with_buffers;
     request_directory = std::move(capture_directory);
     requested = true;
 }
@@ -272,6 +279,8 @@ bool FrameDump::BeginPass(const void* key, std::span<const Source> colors) {
     pass_key = key;
     pass_sources.assign(colors.begin(), colors.end());
     pass_hashes.clear();
+    pass_sampled.clear();
+    pass_null_sampled.clear();
     pass_first_draw = draws;
     return recorded;
 }
@@ -359,7 +368,8 @@ bool FrameDump::Record(const Source& source, std::string name, std::string tags)
                                   buffer.Get(), 0, source.width * texel,
                                   static_cast<u32>(size));
     pending_bytes += size;
-    readbacks.push_back({.buffer = std::move(buffer),
+    readbacks.push_back({.raw = false,
+                         .buffer = std::move(buffer),
                          .contents = contents,
                          .source = source,
                          .name = std::move(name),
@@ -371,6 +381,184 @@ bool FrameDump::Record(const Source& source, std::string name, std::string tags)
     return true;
 }
 
+bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string name,
+                              std::string tags) {
+    tags += texture.sampler;
+    if (texture.source && texture.source->host_format != 0 && !texture.block_compressed) {
+        Source source = *texture.source;
+        source.slot = index;
+        return Record(source, std::move(name), std::move(tags));
+    }
+    Enqueue({.tags = fmt::format(
+                 R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"gpu_addr":"{:#x}","skipped":"format"}})",
+                 name, tags, texture.source ? texture.source->format : VideoCore::Surface::PixelFormat{},
+                 texture.width, texture.height, texture.key_addr)});
+    return false;
+}
+
+bool FrameDump::NoteSampled(std::span<const Sampled> textures) {
+    bool recorded = false;
+    if (!sampled || pass_index < sampled_from_pass) {
+        return false;
+    }
+    for (const Sampled& texture : textures) {
+        if (texture.null) {
+            const std::pair stage_tic{texture.stage, texture.tic};
+            if (std::ranges::find(pass_null_sampled, stage_tic) == pass_null_sampled.end()) {
+                pass_null_sampled.push_back(stage_tic);
+                Enqueue({.tags = fmt::format(
+                             R"({{"kind":"sampled","pass":{},"draw":{},"stage":{},"tic":{},"null":true}})",
+                             pass_index, draws - 1, texture.stage, texture.tic)});
+            }
+            continue;
+        }
+        const std::pair key{texture.key_addr, texture.key_extra};
+        if (std::ranges::find(pass_sampled, key) != pass_sampled.end()) {
+            continue;
+        }
+        const u32 index = static_cast<u32>(pass_sampled.size());
+        pass_sampled.push_back(key);
+        recorded |= RecordSampled(
+            texture, index,
+            fmt::format("{:04}_pass{:03}_tex{:02}_s{}_tic{}", sequence++, pass_index, index,
+                        texture.stage, texture.tic),
+            fmt::format(R"("kind":"sampled","pass":{},"draw":{},"stage":{},"tic":{},"index":{})",
+                        pass_index, draws - 1, texture.stage, texture.tic, index));
+    }
+    return recorded;
+}
+
+void FrameDump::NoteDispatchSampled(u64 shader_hash, std::span<const Sampled> textures) {
+    if (!sampled || pass_index < sampled_from_pass) {
+        return;
+    }
+    for (u32 index = 0; index < textures.size(); ++index) {
+        const Sampled& texture = textures[index];
+        if (texture.null) {
+            continue;
+        }
+        const std::tuple<u64, GPUVAddr, u32> seen{shader_hash, texture.key_addr, texture.key_extra};
+        if (std::ranges::find(dispatch_sampled, seen) != dispatch_sampled.end()) {
+            continue;
+        }
+        dispatch_sampled.push_back(seen);
+        RecordSampled(
+            texture, index,
+            fmt::format("{:04}_dispatch{:04}_{:016x}_tex{:02}_tic{}", sequence++, dispatches,
+                        shader_hash, index, texture.tic),
+            fmt::format(
+                R"("kind":"sampled","dispatch":{},"after_draws":{},"stage":{},"tic":{},"index":{},"shaders":["{:016x}"])",
+                dispatches, draws, texture.stage, texture.tic, index, shader_hash));
+    }
+}
+
+bool FrameDump::RecordBuffer(BufferHandle source, u32 offset, u32 size, std::string tags) {
+    if (recorded_bytes + size > size_cap) {
+        truncated = true;
+        return false;
+    }
+    u8* contents = nullptr;
+    Object buffer = CreateBuffer(device, size, true, &contents);
+    if (!buffer || contents == nullptr) {
+        return false;
+    }
+    recorded_bytes += size;
+    scheduler.CopyBuffer(source, offset, buffer.Get(), 0, size);
+    pending_bytes += size;
+    readbacks.push_back({.raw = true,
+                         .buffer = std::move(buffer),
+                         .contents = contents,
+                         .source = {},
+                         .name = {},
+                         .tags = std::move(tags),
+                         .bytes = size});
+    return true;
+}
+
+bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
+                            std::span<BoundBuffer> bound) {
+    if (!buffers) {
+        return false;
+    }
+    bool recorded = false;
+    const auto owner = [&] {
+        return compute ? fmt::format(R"("dispatch":{},"after_draws":{})", dispatches, draws)
+                       : fmt::format(R"("pass":{},"draw":{})", pass_index, draws - 1);
+    };
+    for (BoundBuffer& buffer : bound) {
+        const size_t program = compute ? 0 : buffer.stage + 1;
+        const u64 shader = program < shader_hashes.size() ? shader_hashes[program] : 0;
+        const std::tuple<u64, bool, u32, u64, u32> key{shader, buffer.storage, buffer.index,
+                                                       buffer.device_addr, buffer.size};
+        if (std::ranges::find(seen_buffers, key) != seen_buffers.end()) {
+            continue;
+        }
+        seen_buffers.push_back(key);
+        const bool from_host = buffer.guest.empty();
+        std::string tags = fmt::format(
+            R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","type":"{}","index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}","bound_size":{},"size":{},"gpu_modified":{},"source":"{}")",
+            owner(), buffer.stage, shader, buffer.storage ? "storage" : "uniform", buffer.index,
+            buffer.written, buffer.gpu_addr, buffer.device_addr, buffer.bound_size, buffer.size,
+            buffer.gpu_modified, from_host ? "host" : "guest");
+        if (!from_host) {
+            Enqueue({.tags = std::move(tags), .data = std::move(buffer.guest), .raw = true});
+            continue;
+        }
+        recorded |= RecordBuffer(buffer.host, buffer.host_offset, buffer.size, std::move(tags));
+    }
+    for (const BoundBuffer& buffer : bound) {
+        if (!buffer.also_host || buffer.host == nullptr) {
+            continue;
+        }
+        const size_t program = compute ? 0 : buffer.stage + 1;
+        const u64 shader = program < shader_hashes.size() ? shader_hashes[program] : 0;
+        recorded |= RecordBuffer(
+            buffer.host, buffer.host_offset, buffer.size,
+            fmt::format(
+                R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","type":"{}","index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}","bound_size":{},"size":{},"gpu_modified":{},"source":"host_copy")",
+                owner(), buffer.stage, shader, buffer.storage ? "storage" : "uniform",
+                buffer.index, buffer.written, buffer.gpu_addr, buffer.device_addr,
+                buffer.bound_size, buffer.size, buffer.gpu_modified));
+    }
+    return recorded;
+}
+
+void FrameDump::NoteLaunch(u64 shader_hash, const std::array<u32, 3>& grid,
+                           const std::array<u32, 3>& block, std::optional<GPUVAddr> indirect,
+                           std::optional<std::array<u32, 3>> indirect_grid) {
+    std::string tags = fmt::format(
+        R"({{"kind":"launch","dispatch":{},"after_draws":{},"shaders":["{:016x}"],"grid":[{},{},{}],"block":[{},{},{}])",
+        dispatches, draws, shader_hash, grid[0], grid[1], grid[2], block[0], block[1], block[2]);
+    if (indirect) {
+        tags += fmt::format(R"(,"indirect":"{:#x}")", *indirect);
+    }
+    if (indirect_grid) {
+        tags += fmt::format(R"(,"indirect_grid_guest":[{},{},{}])", (*indirect_grid)[0],
+                            (*indirect_grid)[1], (*indirect_grid)[2]);
+    }
+    Enqueue({.tags = tags + "}"});
+}
+
+void FrameDump::NoteDrawRecord(const DrawRecord& draw) {
+    // Metal has no pipeline statistics: the primitive and fragment counts are null.
+    Enqueue({.tags = fmt::format(
+                 R"({{"kind":"draw","draw":{},"primitives_in":null,"primitives":null,"fragments":null,"mesh":{},"indirect":{},"first":{},"elements":{},"instances":{},"alpha_test":{},"alpha_ref":{},"alpha_to_coverage":{}}})",
+                 draws - 1, draw.mesh, draw.indirect, draw.first, draw.elements, draw.instances,
+                 draw.alpha_test, JsonNumber(draw.alpha_ref), draw.alpha_to_coverage)});
+}
+
+void FrameDump::WriteBuffer(const Job& job) {
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(job.data.data()),
+                                        job.data.size());
+    const std::string name = fmt::format("buffer_{:016x}.bin.zst", hash);
+    if (std::ranges::find(written_buffers, hash) == written_buffers.end()) {
+        written_buffers.push_back(hash);
+        WriteFile(name, Common::Compression::CompressDataZSTDDefault(job.data.data(),
+                                                                     job.data.size()));
+    }
+    manifest << fmt::format(R"({{{},"hash":"{:016x}","raw":"{}"}})", job.tags, hash, name) << '\n';
+}
+
 void FrameDump::Drain() {
     if (readbacks.empty()) {
         return;
@@ -380,7 +568,8 @@ void FrameDump::Drain() {
         Enqueue({.source = readback.source,
                  .name = std::move(readback.name),
                  .tags = std::move(readback.tags),
-                 .data = {readback.contents, readback.contents + readback.bytes}});
+                 .data = {readback.contents, readback.contents + readback.bytes},
+                 .raw = readback.raw});
     }
     readbacks.clear();
     pending_bytes = 0;
@@ -421,7 +610,9 @@ void FrameDump::WriterLoop() {
             }
             continue;
         }
-        if (job.name.empty()) {
+        if (job.raw) {
+            WriteBuffer(job);
+        } else if (job.name.empty()) {
             manifest << job.tags << '\n';
         } else {
             Write(job);
@@ -527,6 +718,12 @@ void FrameDump::ResetCapture() {
     pass_sources.clear();
     pass_hashes.clear();
     pass_index = pass_first_draw = draws = dispatches = 0;
+    pass_sampled.clear();
+    pass_null_sampled.clear();
+    dispatch_sampled.clear();
+    recorded_blocks.clear();
+    seen_buffers.clear();
+    written_buffers.clear();
     readbacks.clear();
 }
 
@@ -573,6 +770,7 @@ void FrameDump::TickFrame() {
         StopWriter();
         ResetCapture();
         if (was_request) {
+            sampled = buffers = env_sampled;
             directory = env_directory;
         } else if (trigger_file.empty()) {
             done = true;
@@ -594,6 +792,8 @@ void FrameDump::TickFrame() {
     if (requested) {
         std::scoped_lock lock{request_mutex};
         active_id = request_id;
+        sampled = request_sampled || env_sampled;
+        buffers = request_buffers || env_sampled;
         directory = request_directory;
         requested = false;
         StartCapture(elapsed);

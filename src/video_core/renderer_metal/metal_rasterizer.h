@@ -446,6 +446,11 @@ private:
 
     /// A colour image the frame dump reads back (null when it can't).
     [[nodiscard]] std::optional<FrameDump::Source> DumpSource(const ImageView& view, u32 slot);
+    /// A texture a draw or dispatch samples, as the frame dump records it.
+    [[nodiscard]] FrameDump::Sampled DumpSampled(u32 stage, u32 tic, VideoCommon::ImageViewId view,
+                                                 VideoCommon::SamplerId sampler);
+    /// The uniform and storage buffers bound for the last draw or dispatch.
+    bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
     /// Starts the frame dump's pass for the draw about to open its render pass.
     void FrameDumpPass(const Framebuffer* framebuffer, std::span<const u64> shader_hashes);
 

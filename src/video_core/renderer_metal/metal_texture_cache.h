@@ -374,6 +374,10 @@ class Sampler {
 public:
     explicit Sampler(TextureCacheRuntime&, const Tegra::Texture::TSCEntry&);
 
+    [[nodiscard]] const Tegra::Texture::TSCEntry& Descriptor() const noexcept {
+        return tsc;
+    }
+
     /// The sampler state without the changes a view asks for.
     [[nodiscard]] void* Handle() const noexcept {
         return sampler.Get();

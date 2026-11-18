@@ -301,12 +301,82 @@ int RunFrameDump() {
         const std::string requested_manifest = ReadFile(requested / "manifest.jsonl");
         const bool server = has && taken && started && answer && answer->error.empty() &&
                             Count(requested_manifest, "\"kind\":\"present\"") == 1 &&
-                            requested_manifest.find("\"kind\":\"summary\"") != std::string::npos;
+                            requested_manifest.find("\"kind\":\"summary\"") != std::string::npos &&
+                            Count(requested_manifest, "\"kind\":\"sampled\"") == 0;
         std::printf("metal-smoke: frame dump (debug server capture_frame): request %d, taken %d, "
                     "answered %d, manifest with the present: %s\n",
                     has, taken.has_value(), answer.has_value(), server ? "PASS" : "FAIL");
-        VideoCore::Nx2Debug::EndSession();
         passed = passed && server;
+
+        // The sampled capture (capture_frame with sampled and buffers): a texture a draw samples
+        // (and a null one), a uniform buffer from guest bytes, a storage buffer the GPU wrote
+        // (read from the host buffer), a dispatch's texture and group counts, a draw record and
+        // a skipped draw.
+        const std::filesystem::path sampled_dir = root / "sampled";
+        std::filesystem::create_directories(sampled_dir);
+        uint8_t* host_bytes = nullptr;
+        const Object host_buffer = Metal::CreateBuffer(device, 64, true, &host_bytes);
+        for (uint32_t i = 0; i < 64; ++i) {
+            host_bytes[i] = static_cast<uint8_t>(i * 3);
+        }
+        VideoCore::Nx2Debug::RequestCapture({.id = 8, .directory = sampled_dir, .sampled = true,
+                                             .buffers = true});
+        const auto sampled_request = VideoCore::Nx2Debug::TakeCapture();
+        if (sampled_request) {
+            dump.Arm(sampled_request->id, sampled_request->directory, sampled_request->sampled,
+                     sampled_request->buffers);
+        }
+        dump.TickFrame();
+        const std::array<Metal::FrameDump::Source, 1> colors2{source};
+        dump.BeginPass(&source, colors2);
+        const std::array<uint64_t, 6> hashes2{0, 0x1111, 0, 0, 0, 0x2222};
+        dump.NoteDraw(hashes2);
+        Metal::FrameDump::Sampled texture{.stage = 4, .tic = 9, .source = source,
+                                          .sampler = ",\"sampler\":{\"tsc\":[\"00000000\"]}",
+                                          .key_addr = 0x1000, .key_extra = 1};
+        Metal::FrameDump::Sampled missing{.stage = 4, .tic = 10, .null = true};
+        const std::array<Metal::FrameDump::Sampled, 3> textures{texture, missing, texture};
+        dump.NoteSampled(textures);
+        std::vector<Metal::FrameDump::BoundBuffer> bound(2);
+        bound[0] = {.stage = 4, .storage = false, .index = 2, .gpu_addr = 0x2000,
+                    .device_addr = 0x3000, .bound_size = 16, .size = 16};
+        bound[0].guest.assign(16, 0x5a);
+        bound[1] = {.stage = 4, .storage = true, .index = 0, .written = true, .gpu_addr = 0x4000,
+                    .device_addr = 0x5000, .bound_size = 64, .size = 64, .gpu_modified = true,
+                    .host = host_buffer.Get(), .host_offset = 0};
+        dump.NoteBuffers(false, hashes2, bound);
+        dump.NoteDrawRecord({.first = 0, .elements = 6, .instances = 1});
+        dump.NoteSkipped(false, 0x3333, 0x1000, "program not built");
+        dump.NoteDispatchSampled(0x4444, std::array{texture});
+        dump.NoteLaunch(0x4444, {8, 4, 1}, {16, 16, 1}, std::nullopt, std::nullopt);
+        dump.TickFrame();
+        const auto sampled_answer = VideoCore::Nx2Debug::WaitCapture(8, std::chrono::seconds{10});
+        const std::string sampled_manifest = ReadFile(sampled_dir / "manifest.jsonl");
+        const bool sampled_ok =
+            sampled_request && sampled_answer && sampled_answer->error.empty() &&
+            Count(sampled_manifest, "\"kind\":\"sampled\"") == 3 && // texture, null, dispatch
+            sampled_manifest.find("\"null\":true") != std::string::npos &&
+            Count(sampled_manifest, "\"kind\":\"buffer\"") == 2 &&
+            sampled_manifest.find("\"source\":\"host\"") != std::string::npos &&
+            sampled_manifest.find("\"source\":\"guest\"") != std::string::npos &&
+            Count(sampled_manifest, "\"kind\":\"launch\"") == 1 &&
+            sampled_manifest.find("\"grid\":[8,4,1]") != std::string::npos &&
+            Count(sampled_manifest, "\"kind\":\"draw\"") == 1 &&
+            Count(sampled_manifest, "\"kind\":\"skipped\"") == 1;
+        size_t buffer_files = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(sampled_dir)) {
+            buffer_files += entry.path().filename().string().starts_with("buffer_");
+        }
+        std::printf("metal-smoke: frame dump (sampled): %zu sampled, %zu buffers (%zu files), %zu "
+                    "launch, %zu draw, %zu skipped: %s\n",
+                    Count(sampled_manifest, "\"kind\":\"sampled\""),
+                    Count(sampled_manifest, "\"kind\":\"buffer\""), buffer_files,
+                    Count(sampled_manifest, "\"kind\":\"launch\""),
+                    Count(sampled_manifest, "\"kind\":\"draw\""),
+                    Count(sampled_manifest, "\"kind\":\"skipped\""),
+                    sampled_ok && buffer_files == 2 ? "PASS" : "FAIL");
+        passed = passed && sampled_ok && buffer_files == 2;
+        VideoCore::Nx2Debug::EndSession();
     }
     unsetenv("EDEN_NX2_FRAME_DUMP");
     unsetenv("EDEN_NX2_FRAME_DUMP_AT");
