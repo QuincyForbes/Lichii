@@ -87,7 +87,7 @@ VertexProgramUse VertexUse(const StageProgram& program) {
         use.loaded |= program.info.loads.Generic(index) ? 1U << index : 0U;
     }
     for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
-        if (slot.kind == ShaderTranslate::ResourceKind::Buffer) {
+        if (slot.kind == ShaderTranslate::ResourceKind::Buffer && slot.spill == ~0U) {
             use.resource_slots = (std::max)(use.resource_slots, slot.index + slot.count);
         }
     }

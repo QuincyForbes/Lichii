@@ -111,6 +111,8 @@ struct StageProgram {
     ShaderTranslate::TessellationSlots tessellation_slots{};
     /// Buffer slot of the sampler reduction mask (Options::sampler_reduction), ~0 without.
     u32 reduction_slot{~0U};
+    /// Buffer slot of the table of spilled buffers' addresses (Options::spill_buffers), ~0 without.
+    u32 spill_slot{~0U};
     /// The MTLLibrary and MTLFunction, made on first use (BuildFunctions).
     Object library;
     Object function;

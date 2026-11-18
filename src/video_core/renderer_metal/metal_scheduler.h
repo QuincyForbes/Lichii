@@ -391,6 +391,10 @@ public:
     void BindVertexBuffer(u32 slot, BufferHandle buffer, u32 offset);
     void BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset);
     void BindBytes(ShaderStage stage, u32 slot, const void* data, u32 size);
+    /// Makes `buffer` resident for `stage`'s next draws or dispatches without binding it (a
+    /// program reads it through an address: ShaderTranslate::Options::spill_buffers); returns the
+    /// address `offset` bytes into it.
+    [[nodiscard]] u64 UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset);
     void BindTexture(ShaderStage stage, u32 slot, TextureHandle texture);
     void BindSampler(ShaderStage stage, u32 slot, void* sampler);
 

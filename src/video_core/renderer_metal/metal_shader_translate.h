@@ -50,6 +50,9 @@ struct ResourceSlot {
     ResourceKind kind{};
     u32 index{};
     u32 count{1}; ///< Slots from index on (descriptor arrays)
+    /// Spilled buffers (Options::spill_buffers): the entry of the table of addresses the program
+    /// reads it through, ~0 for the others.
+    u32 spill{~0U};
 };
 
 /// A stage output the next tessellation stage reads from a buffer: a location, or a builtin.
@@ -112,6 +115,11 @@ struct Options {
     /// MTLSamplerReductionMode is ignored on some devices): the bits of each sampler in a buffer
     /// at Result::reduction_slot (SamplerReductionBits).
     bool sampler_reduction{};
+    /// A vertex program with many buffers keeps the first SpillCutoff of them in buffer slots and
+    /// reads the others through a table of their addresses (one buffer at Result::spill_slot, 8
+    /// bytes each, in ResourceSlot::spill order), so the vertex streams find slots left. The
+    /// buffers are made resident by the caller (Scheduler::UseBuffer).
+    bool spill_buffers{};
     /// (set, binding) of sampled images that are bound to depth textures: they become
     /// depth2d<float>, the type Metal declares depth formats with (as the blit shaders do).
     /// A shared image type changes for all its users.
@@ -128,6 +136,8 @@ struct Result {
     /// The 64-bit mask of sampler reduction bits (four per MSL sampler slot) the program reads,
     /// ~0 when no sample was rewritten.
     u32 reduction_slot{~0U};
+    /// The table of spilled buffers' addresses (Options::spill_buffers), ~0 without spills.
+    u32 spill_slot{~0U};
     std::string error;
 };
 
@@ -174,6 +184,11 @@ inline constexpr u32 DomainThreads = 64;
 /// Resources are numbered per kind in (set, binding) order, which is the order the recompiler
 /// emits them and the buffer cache appends their bindings, so the pipeline binds in sequence.
 [[nodiscard]] Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& options);
+
+/// Buffers a vertex program may keep in slots when it spills (Options::spill_buffers).
+inline constexpr u32 SpillCutoff = 12;
+/// Buffers from which a vertex program spills.
+inline constexpr u32 SpillThreshold = 14;
 
 /// EDEN_NX2_METAL_SAMPLER_REDUCTION (default on): Options::sampler_reduction for the guest's programs.
 [[nodiscard]] bool SamplerReductionEnabled();

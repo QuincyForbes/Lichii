@@ -2709,6 +2709,38 @@ void Scheduler::BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32
     }
 }
 
+u64 Scheduler::UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset) {
+    if (buffer == nullptr) {
+        return 0;
+    }
+    const id<MTLBuffer> metal_buffer = AsBuffer(buffer);
+    switch (stage) {
+    case ShaderStage::Vertex:
+        if (impl->render != nil) {
+            [impl->render useResource:metal_buffer
+                                usage:MTLResourceUsageRead | MTLResourceUsageWrite
+                               stages:MTLRenderStageVertex];
+        }
+        break;
+    case ShaderStage::Fragment:
+        if (impl->render != nil) {
+            [impl->render useResource:metal_buffer
+                                usage:MTLResourceUsageRead | MTLResourceUsageWrite
+                               stages:MTLRenderStageFragment];
+        }
+        break;
+    case ShaderStage::Compute:
+        if (impl->active_compute != nil) {
+            [impl->active_compute useResource:metal_buffer
+                                        usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        }
+        break;
+    default:
+        break;
+    }
+    return metal_buffer.gpuAddress + offset;
+}
+
 void Scheduler::BindBytes(ShaderStage stage, u32 slot, const void* data, u32 size) {
     if (!SlotFits(slot, BufferSlots, "buffer")) {
         return;

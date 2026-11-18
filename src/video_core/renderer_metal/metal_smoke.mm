@@ -46,6 +46,7 @@
 #include "native_mesh_smoke_mesh_spv.h"
 #include "native_mesh_smoke_task_spv.h"
 #include "point_size_smoke_vert_spv.h"
+#include "spill_smoke_vert_spv.h"
 #include "subgroup_smoke_comp_spv.h"
 #include "tess_direct_vert_spv.h"
 #include "tess_isolines_tesc_spv.h"
@@ -2221,6 +2222,115 @@ int RunMslOptions() {
                 "size %s; builds %d: %s\n",
                 sized ? "written" : "MISSING", unsized ? "dropped" : "STILL WRITTEN",
                 fixed ? "fixed at 32" : "NOT FIXED", function ? 1 : 0,
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// L03: a vertex program with sixteen uniform buffers keeps twelve in buffer slots and reads the
+/// other four through a table of their addresses; the sums of the first eight (red) and the last
+/// eight (green) are half each, which a wrong or missing buffer changes.
+int RunSpilledBuffers() {
+    namespace Translate = Metal::ShaderTranslate;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Translate::Options options;
+    options.spill_buffers = true;
+    const Translate::Result vertex = Translate::SpirvToMsl(
+        std::span<const uint32_t>(SPILL_SMOKE_VERT_SPV), Translate::Stage::Vertex, options);
+    if (vertex.source.empty() || vertex.spill_slot == ~0U) {
+        std::printf("metal-smoke: FAIL spilled buffers: %s (spill slot %u)\n", vertex.error.c_str(),
+                    vertex.spill_slot);
+        return 1;
+    }
+    uint32_t direct = 0;
+    uint32_t spilled = 0;
+    uint32_t highest = 0;
+    for (const Translate::ResourceSlot& slot : vertex.slots) {
+        if (slot.spill == ~0U) {
+            ++direct;
+            highest = (std::max)(highest, slot.index);
+        } else {
+            ++spilled;
+        }
+    }
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, vertex.source, error);
+    const Metal::Object function =
+        library ? Metal::CreateFunction(library.Get(), vertex.entry_point) : Metal::Object{};
+    const Metal::Object fragment_library = Metal::CreateLibrary(device, MeshColorSource, error);
+    const Metal::Object fragment =
+        fragment_library ? Metal::CreateFunction(fragment_library.Get(), "mesh_color_fragment")
+                         : Metal::Object{};
+    if (!function || !fragment) {
+        std::printf("metal-smoke: FAIL spilled buffers: %s\n%s\n", error.c_str(),
+                    vertex.source.c_str());
+        return 1;
+    }
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = function.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.rasterize = 1;
+    desc.topology_class = 2;
+    const Metal::Object pipeline = Metal::CreateRenderPipelineState(device, desc, error);
+    const Metal::Object depth_stencil =
+        Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+    if (!pipeline || !depth_stencil) {
+        std::printf("metal-smoke: FAIL spilled buffers pipeline: %s\n", error.c_str());
+        return 1;
+    }
+    std::array<Metal::Object, 16> buffers;
+    for (uint32_t index = 0; index < 16; ++index) {
+        uint8_t* contents = nullptr;
+        buffers[index] = Metal::CreateBuffer(device, 16, true, &contents);
+        // Blocks 0-7 hold (index + 1) / 72, blocks 8-15 (index + 1) / 200.
+        const float value = float(index + 1) / (index < 8 ? 72.0f : 200.0f);
+        const float block[4] = {value, 0.0f, 0.0f, 0.0f};
+        std::memcpy(contents, block, sizeof(block));
+    }
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D,
+                 .format = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm),
+                 .width = 4,
+                 .height = 4,
+                 .render_target = true});
+    uint8_t* readback = nullptr;
+    const Metal::Object readback_buffer = Metal::CreateBuffer(device, 64, true, &readback);
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = 4;
+    targets.height = 4;
+    scheduler.BeginRendering(targets);
+    Metal::DrawState state{};
+    state.pipeline = pipeline.Get();
+    state.depth_stencil = depth_stencil.Get();
+    state.viewport = {0.0f, 0.0f, 4.0f, 4.0f, 0.0f, 1.0f};
+    state.scissor = {0, 0, 4, 4};
+    scheduler.SetDrawState(state);
+    // The slots in the order the buffers were declared, as the renderer's binding does.
+    std::array<uint64_t, 16> table{};
+    uint32_t index = 0;
+    for (const Translate::ResourceSlot& slot : vertex.slots) {
+        if (slot.spill == ~0U) {
+            scheduler.BindBuffer(Metal::ShaderStage::Vertex, slot.index, buffers[index].Get(), 0);
+        } else {
+            table[slot.spill] = scheduler.UseBuffer(Metal::ShaderStage::Vertex, buffers[index].Get(), 0);
+        }
+        ++index;
+    }
+    scheduler.BindBytes(Metal::ShaderStage::Vertex, vertex.spill_slot, table.data(),
+                        static_cast<uint32_t>(spilled * sizeof(uint64_t)));
+    scheduler.Draw(MTLPrimitiveTypeTriangle, 0, 3, 1, 0);
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {4, 4, 1}, readback_buffer.Get(), 0, 16, 0);
+    scheduler.Finish();
+    const Texel texel = reinterpret_cast<const Texel*>(readback)[5];
+    const bool passed = spilled == 4 && direct == 12 && highest < 13 && vertex.spill_slot < 13 &&
+                        Near(texel, {128, 128, 0, 255}) ;
+    std::printf("metal-smoke: spilled vertex buffers (16 uniform buffers: %u in slots up to %u, %u "
+                "through a table at slot %u): texel %u,%u,%u (expected 128,128,0): %s\n",
+                direct, highest, spilled, vertex.spill_slot, texel.r, texel.g, texel.b,
                 passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
@@ -5016,7 +5126,7 @@ int main(int argc, char** argv) {
                                  RunMeshEmulation, RunMeshDistribution, RunIndexRewrite,
                                  RunOcarinaBilinear, RunPipelineArchive,
                                  RunDepthBlit, RunTessellation, RunTessellationIsolines,
-                                 RunTessellationPoints, RunTessellationDirect, RunMslOptions, RunDepthStencilBlit,
+                                 RunTessellationPoints, RunTessellationDirect, RunMslOptions, RunSpilledBuffers, RunDepthStencilBlit,
                                  RunPipelineCheck, RunDeviceMsl, RunNativeMesh, RunBlockCopy,
                                  RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,

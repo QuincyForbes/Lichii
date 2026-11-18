@@ -1607,12 +1607,29 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     const Shader::Info& info = program.info;
     std::vector<u32> texture_slots;
     std::vector<u32> sampler_slots;
+    std::vector<u64> spill_table;
     size_t next_buffer = 0;
     for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
         for (u32 element = 0; element < slot.count; ++element) {
             const u32 slot_index = slot.index + element;
             switch (slot.kind) {
             case ShaderTranslate::ResourceKind::Buffer:
+                if (slot.spill != ~0U) {
+                    // Read through the table of addresses bound after the loop.
+                    while (next_buffer < pending.size() &&
+                           pending[next_buffer].kind != Binding::Kind::Buffer) {
+                        ++next_buffer;
+                    }
+                    if (spill_table.size() <= slot.spill) {
+                        spill_table.resize(slot.spill + 1, 0);
+                    }
+                    if (next_buffer < pending.size()) {
+                        spill_table[slot.spill] = scheduler.UseBuffer(
+                            metal_stage, pending[next_buffer].buffer, pending[next_buffer].offset);
+                        ++next_buffer;
+                    }
+                    break;
+                }
                 if (slot.set == ShaderTranslate::PushConstantSet) {
                     // Shader::Backend::SPIRV::RescalingLayout (rescaling_words) or
                     // RenderAreaLayout.
@@ -1646,6 +1663,10 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
         }
     }
 
+    if (program.spill_slot != ~0U && !spill_table.empty()) {
+        scheduler.BindBytes(metal_stage, program.spill_slot, spill_table.data(),
+                            static_cast<u32>(spill_table.size() * sizeof(u64)));
+    }
     // Texture slots in binding order: texel buffers, image buffers, textures, images.
     const size_t texel_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors) +
                                  Shader::NumDescriptors(info.image_buffer_descriptors);

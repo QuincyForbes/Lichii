@@ -21,6 +21,12 @@ namespace {
 
 /// Routes the 2D samples of an entry function through spvReducedSample (see
 /// Options::sampler_reduction); the buffer slot of the mask, or ~0 when nothing was rewritten.
+/// Moves the entry function's spilled buffers (MSL buffer indices from SpillBase) to reads
+/// through a table of addresses at `table_slot`; false when a parameter is not understood.
+[[nodiscard]] bool SpillBuffers(std::string& source, const std::string& entry_point, u32 spilled,
+                                u32 table_slot);
+constexpr u32 SpillBase = 1000;
+
 [[nodiscard]] u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point,
                                           bool fragment, u32 buffer_slot);
 
@@ -308,6 +314,13 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
         });
 
         u32 buffers = 0;
+        u32 spilled = 0;
+        u32 total_buffers = 0;
+        for (const Declared& resource : declared) {
+            total_buffers += resource.kind == ResourceKind::Buffer ? resource.count : 0;
+        }
+        const bool spill = options.spill_buffers && stage == Stage::Vertex &&
+                           total_buffers > SpillThreshold;
         u32 textures = 0;
         u32 samplers = 0;
         for (const Declared& resource : declared) {
@@ -318,6 +331,13 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
             binding.count = resource.count;
             switch (resource.kind) {
             case ResourceKind::Buffer:
+                if (spill && resource.count == 1 && buffers >= SpillCutoff) {
+                    binding.msl_buffer = SpillBase + spilled;
+                    result.slots.push_back(
+                        {resource.set, resource.binding, resource.kind, 0, 1, spilled});
+                    ++spilled;
+                    break;
+                }
                 binding.msl_buffer = buffers;
                 result.slots.push_back(
                     {resource.set, resource.binding, resource.kind, buffers, resource.count});
@@ -354,6 +374,9 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
             compiler.add_msl_resource_binding(binding);
             result.slots.push_back({PushConstantSet, 0, ResourceKind::Buffer, buffers++, 1});
         }
+        if (spilled != 0) {
+            result.spill_slot = buffers++;
+        }
         // The tessellation stages' own buffers, after their resources (the vertex kernel's
         // vertex buffers take slots from first_vertex_buffer_slot down, as a vertex stage's).
         TessellationSlots& tess_slots = result.tessellation_slots;
@@ -387,6 +410,17 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
         }
 
         result.source = compiler.compile();
+        if (spilled != 0) {
+            const auto points = compiler.get_entry_points_and_stages();
+            if (points.empty() ||
+                !SpillBuffers(result.source,
+                              compiler.get_cleansed_entry_point_name(points.front().name, model),
+                              spilled, result.spill_slot)) {
+                result.source.clear();
+                result.error = "buffers spilled to a table not understood";
+                return result;
+            }
+        }
         const bool reducible = stage == Stage::Vertex || stage == Stage::Fragment ||
                                stage == Stage::Compute;
         if (reducible && options.sampler_reduction && !resources.sampled_images.empty() &&
@@ -731,6 +765,76 @@ static float4 spvReducedSample(texture2d<float> t, sampler s, float2 uv, float l
     return spvReduceTaps(t, s, uv, min(uint(floor(lod + 0.5f)), last), use_max);
 }
 )msl";
+
+
+bool SpillBuffers(std::string& source, const std::string& entry_point, u32 spilled,
+                  u32 table_slot) {
+    const std::string needle = " " + entry_point + "(";
+    const size_t at = source.find(needle);
+    if (at == std::string::npos) {
+        return false;
+    }
+    const size_t open = at + needle.size() - 1;
+    const size_t close = MatchingBracket(source, open);
+    const size_t body_open = close == std::string::npos ? close : source.find('{', close);
+    if (close == std::string::npos || body_open == std::string::npos) {
+        return false;
+    }
+    std::string parameters;
+    std::string declarations;
+    u32 found = 0;
+    for (const std::string_view text :
+         SplitParameters(std::string_view(source).substr(open + 1, close - open - 1))) {
+        const auto parameter = ParseParameter(text);
+        if (!parameter) {
+            return false;
+        }
+        if (parameter->attribute.starts_with("buffer(")) {
+            const u32 index = static_cast<u32>(std::atoi(parameter->attribute.c_str() + 7));
+            if (index >= SpillBase && index < SpillBase + spilled) {
+                // constant U& / const device S& / device S* ...: the same name and shape over an
+                // address read from the table.
+                std::string base;
+                bool is_const = false;
+                size_t cursor = 0;
+                const std::string& type = parameter->type;
+                while (cursor < type.size()) {
+                    const size_t end = type.find(' ', cursor);
+                    const std::string word =
+                        type.substr(cursor, end == std::string::npos ? end : end - cursor);
+                    if (word == "constant" || word == "const") {
+                        is_const = true;
+                    } else if (word != "device") {
+                        base += (base.empty() ? "" : " ") + word;
+                    }
+                    cursor = end == std::string::npos ? type.size() : end + 1;
+                }
+                if (base.empty() || (base.back() != '&' && base.back() != '*')) {
+                    return false;
+                }
+                const bool is_reference = base.back() == '&';
+                base.pop_back();
+                const std::string qualifier = is_const ? "const device " : "device ";
+                const std::string cast = "reinterpret_cast<" + qualifier + base + "*>(spvSpill[" +
+                                         std::to_string(index - SpillBase) + "])";
+                declarations += "    " + qualifier + base + (is_reference ? "& " : "* ") +
+                                parameter->name + " = " + (is_reference ? "*" : "") + cast + ";\n";
+                ++found;
+                continue;
+            }
+        }
+        parameters += (parameters.empty() ? "" : ", ") + std::string(text);
+    }
+    if (found != spilled) {
+        return false;
+    }
+    parameters += (parameters.empty() ? "" : ", ") + std::string("constant ulong* spvSpill [[buffer(") +
+                  std::to_string(table_slot) + ")]]";
+    source.replace(open + 1, close - open - 1, parameters);
+    const size_t brace = source.find('{', open + 1 + parameters.size());
+    source.insert(source.find('\n', brace) + 1, declarations);
+    return true;
+}
 
 u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point, bool fragment,
                             u32 buffer_slot) {

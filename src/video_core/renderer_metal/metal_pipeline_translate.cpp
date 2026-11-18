@@ -382,6 +382,7 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
     translate_options.ios = ios;
     translate_options.apple_family = apple_family;
     translate_options.sampler_reduction = ShaderTranslate::SamplerReductionEnabled();
+    translate_options.spill_buffers = true;
 }
 
 std::optional<StageProgram> PipelineTranslator::Translate(
@@ -410,6 +411,7 @@ std::optional<StageProgram> PipelineTranslator::Translate(
         .outputs = std::move(result.outputs),
         .tessellation_slots = result.tessellation_slots,
         .reduction_slot = result.reduction_slot,
+        .spill_slot = result.spill_slot,
     };
 }
 
