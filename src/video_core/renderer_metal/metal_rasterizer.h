@@ -468,6 +468,8 @@ private:
     /// A draw of a pipeline with a geometry program (metal_geometry.h).
     void DrawGeometry(GraphicsPipeline& pipeline, bool is_indexed, u32 instance_count);
     void EnsureGeometryKernels();
+    /// An indirect draw of a geometry program: its arguments read on the CPU, a draw each.
+    void DrawGeometryIndirect(GraphicsPipeline& pipeline);
 
     /// A draw of the vertices a transform feedback captured (DrawIndirectByteCountEXT): the byte
     /// count the guest's counter holds over the stride.
@@ -678,6 +680,7 @@ private:
     bool geometry_kernels_failed{};
     u64 geometry_draws{};
     u64 geometry_primitives{};
+    u64 geometry_indirect_draws{};
     /// Input primitives of the draw CountDraw is counting for a geometry pipeline (else 0).
     u32 geometry_input_primitives{};
     /// Counters of the draws made, by VideoCommon::QueryType.

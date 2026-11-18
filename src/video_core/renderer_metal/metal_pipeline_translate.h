@@ -323,6 +323,11 @@ public:
     /// vertex output it passes on (what Maxwell's passthrough does for cube and cascade targets),
     /// folded into the vertex program: that program sets it from the value it stored there.
     /// False, nothing changed, for anything else (the geometry stage is refused then).
+    /// A pipeline with a geometry program (4) through the compute path; `programs` are the key's
+    /// translated programs (the smoke test makes them by hand).
+    [[nodiscard]] std::optional<TranslatedPipeline> GeometryPipeline(
+        const GraphicsPipelineKey& key, std::span<Shader::IR::Program> programs);
+
     /// A transformed geometry program (Geometry::Transform) as its compute kernel.
     [[nodiscard]] std::optional<StageProgram> GeometryKernel(Shader::IR::Program& program);
 
@@ -330,11 +335,6 @@ public:
                                                       const Shader::IR::Program& geometry);
 
 private:
-    /// A pipeline with a geometry program (4) through the compute path; `programs` are the key's
-    /// translated programs.
-    std::optional<TranslatedPipeline> GeometryPipeline(const GraphicsPipelineKey& key,
-                                                       std::span<Shader::IR::Program> programs);
-
     /// A pipeline with tessellation control (2) and evaluation (3) programs.
     std::optional<TranslatedPipeline> Tessellated(const GraphicsPipelineKey& key,
                                                   std::span<Shader::IR::Program> programs);

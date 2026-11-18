@@ -2351,19 +2351,25 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             prepare_refusal = "geometry draw without an index buffer";
             return false;
         }
-        const u32 vertices = xfb_draw.count;
-        const u32 primitives = plan.input_strip ? vertices - (plan.input_vertices - 1)
-                                                : vertices / plan.input_vertices;
-        const u32 rounded = (primitives + Geometry::GroupSize - 1) / Geometry::GroupSize *
+        const u32 instances = xfb_draw.instances;
+        const u32 vertices = xfb_draw.count * instances;
+        const u32 per_instance = plan.Primitives(xfb_draw.count);
+        const u32 input_primitives = per_instance * instances;
+        const u32 groups = input_primitives * plan.invocations;
+        const u32 rounded = (input_primitives + Geometry::GroupSize - 1) / Geometry::GroupSize *
                             Geometry::GroupSize;
-        const u64 record_words = u64{rounded + plan.input_vertices} * plan.input_vertices *
-                                 plan.InputStride();
-        const u64 output_words = u64{rounded} * plan.max_vertices * plan.OutputStride();
-        const u64 index_words = u64{rounded} * plan.IndexStride();
-        const u64 list_words = u64{primitives} * plan.max_vertices * 3;
+        const u64 record_count = u64{rounded} * plan.input_vertices;
+        const u64 record_words = record_count * plan.InputStride();
+        const u64 output_words = u64{rounded} * plan.invocations * plan.max_vertices * plan.OutputStride();
+        const u64 index_words = u64{rounded} * plan.invocations * plan.IndexStride();
+        const u64 list_words = u64{groups} * plan.max_vertices * 3;
         const u64 total = u64{vertices} * geo->vertex_stride + (record_words + output_words +
                                                                   index_words + list_words +
-                                                                  primitives) * 4;
+                                                                  groups) * 4;
+        if (input_primitives == 0) {
+            prepare_refusal = {};
+            return false;
+        }
         if (total > Geometry::MaxScratchBytes) {
             prepare_refusal = "geometry draw past the scratch limit";
             return false;
@@ -2376,7 +2382,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         geo_draw.output = stream(output_words * 4);
         const StagingBufferRef regions = stream(index_words * 4);
         geo_draw.indices = stream(list_words * 4);
-        const StagingBufferRef counts = stream(u64{primitives} * 4);
+        const StagingBufferRef counts = stream(u64{groups} * 4);
         geo_draw.args = stream(32);
         const auto bind = [&](u32 slot, const StagingBufferRef& buffer) {
             scheduler.BindBuffer(ShaderStage::Compute, slot, buffer.buffer,
@@ -2400,15 +2406,24 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             scheduler.BindBuffer(ShaderStage::Compute, slots.index, index_buffer,
                                  static_cast<u32>(index_offset));
         }
-        scheduler.DispatchStageIn(xfb_draw.index_size != 0 ? 0U : xfb_draw.first, vertices, 0, 1);
+        scheduler.DispatchStageIn(xfb_draw.index_size != 0 ? 0U : xfb_draw.first, xfb_draw.count,
+                                  xfb_draw.first_instance, instances);
         // 2. The attributes the geometry program reads, as records.
         scheduler.BeginCompute(records_kernel, false);
         bind(Geometry::RecordsSourceSlot, captured);
         bind(Geometry::RecordsOutputSlot, records);
-        scheduler.BindBytes(ShaderStage::Compute, Geometry::RecordsCountSlot, &vertices,
-                            static_cast<u32>(sizeof(u32)));
-        scheduler.Dispatch({(vertices + Geometry::GroupSize - 1) / Geometry::GroupSize, 1, 1},
-                           {Geometry::GroupSize, 1, 1});
+        const Geometry::RecordsParams records_params{
+            .records = static_cast<u32>(u64{input_primitives} * plan.input_vertices),
+            .vertices = plan.input_vertices,
+            .step = plan.input_step,
+            .count = xfb_draw.count,
+            .primitives = per_instance,
+        };
+        scheduler.BindBytes(ShaderStage::Compute, Geometry::RecordsCountSlot, &records_params,
+                            static_cast<u32>(sizeof(records_params)));
+        scheduler.Dispatch(
+            {(records_params.records + Geometry::GroupSize - 1) / Geometry::GroupSize, 1, 1},
+            {Geometry::GroupSize, 1, 1});
         // 3. The geometry program, a thread for each input primitive.
         scheduler.BeginCompute(geometry_kernel, false);
         BindStageResources(geo->kernel.program, ShaderStage::Compute, stage_bindings[1],
@@ -2418,11 +2433,12 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         bind(geo->extra_slots[0], records);
         bind(geo->extra_slots[1], geo_draw.output);
         bind(geo->extra_slots[2], regions);
-        scheduler.Dispatch({rounded / Geometry::GroupSize, 1, 1}, {Geometry::GroupSize, 1, 1});
+        scheduler.Dispatch({rounded / Geometry::GroupSize, plan.invocations, 1},
+                           {Geometry::GroupSize, 1, 1});
         // 4. The strips of every primitive's region, in order, as one list and the draw's
         // arguments.
         const Geometry::GeometryParams params{
-            .groups = primitives,
+            .groups = groups,
             .stride = plan.IndexStride(),
             .topology = plan.output_topology,
             .capacity = static_cast<u32>(list_words),
@@ -2437,11 +2453,11 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             scheduler.Dispatch({(threads + Geometry::GroupSize - 1) / Geometry::GroupSize, 1, 1},
                                {Geometry::GroupSize, 1, 1});
         };
-        pack(geometry_count_kernel, primitives);
+        pack(geometry_count_kernel, groups);
         pack(geometry_scan_kernel, 1);
-        pack(geometry_write_kernel, primitives);
+        pack(geometry_write_kernel, groups);
         ++geometry_draws;
-        geometry_primitives += primitives;
+        geometry_primitives += input_primitives;
     }
 
     if (xfb_draw.wanted && pipeline.Xfb() != nullptr) {
@@ -2743,7 +2759,7 @@ void RasterizerMetal::DrawIndirect() {
         return;
     }
     if (pipeline->Geo() != nullptr) {
-        RefuseDraw("indirect draw of a geometry program");
+        DrawGeometryIndirect(*pipeline);
         return;
     }
     if (pipeline->IsMeshPipeline()) {
@@ -2915,18 +2931,11 @@ void RasterizerMetal::DrawGeometry(GraphicsPipeline& pipeline, bool is_indexed,
     GeometryCompute& geo = *pipeline.Geo();
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     const u32 count = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
-    geometry_input_primitives =
-        count < geo.plan.input_vertices ? 0U
-        : geo.plan.input_strip          ? count - (geo.plan.input_vertices - 1)
-                                        : count / geo.plan.input_vertices;
+    geometry_input_primitives = geo.plan.Primitives(count) * instance_count;
     CountDraw(count, instance_count);
     geometry_input_primitives = 0;
-    if (geo.plan.input_vertices > count || count == 0 || instance_count == 0) {
+    if (geo.plan.Primitives(count) == 0 || instance_count == 0) {
         Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
-        return;
-    }
-    if (instance_count != 1) {
-        RefuseDraw("instanced draw of a geometry program");
         return;
     }
     const std::optional<u32> primitive = PrimitiveType(
@@ -2942,7 +2951,7 @@ void RasterizerMetal::DrawGeometry(GraphicsPipeline& pipeline, bool is_indexed,
         .first = draw_state.vertex_buffer.first,
         .count = count,
         .first_instance = draw_state.base_instance,
-        .instances = 1,
+        .instances = instance_count,
         .index_size = !is_indexed ? 0U
                       : draw_state.index_buffer.format == Maxwell::IndexFormat::UnsignedShort ? 2U
                                                                                              : 4U,
@@ -2971,6 +2980,40 @@ void RasterizerMetal::DrawGeometry(GraphicsPipeline& pipeline, bool is_indexed,
                                   geo_draw.args.buffer, geo_draw.args.offset);
     ++draws_encoded;
     Coverage::Note(Coverage::Work::Draw, Coverage::Path::GeometryKernels);
+}
+
+void RasterizerMetal::DrawGeometryIndirect(GraphicsPipeline& pipeline) {
+    // The compute path sizes its buffers from the vertex count: the arguments are read on the CPU
+    // (after the caches hand over what the GPU wrote), a draw each.
+    const auto& params = maxwell3d->draw_manager.indirect_state;
+    auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const bool indexed = params.is_indexed;
+    const u32 words = indexed ? 5U : 4U;
+    const u64 stride = params.stride != 0 ? params.stride : u64{words} * sizeof(u32);
+    u32 draws = static_cast<u32>(params.max_draw_counts);
+    if (params.include_count) {
+        draws = (std::min)(draws, gpu_memory->Read<u32>(params.count_start_address));
+    }
+    for (u32 draw = 0; draw < draws; ++draw) {
+        const GPUVAddr address = params.indirect_start_address + draw * stride;
+        if (const std::optional<DAddr> device_address = gpu_memory->GpuToCpuAddress(address)) {
+            FlushRegion(*device_address, words * sizeof(u32), VideoCommon::CacheType::BufferCache);
+        }
+        std::array<u32, 5> record{};
+        gpu_memory->ReadBlockUnsafe(address, record.data(), words * sizeof(u32));
+        if (indexed) {
+            draw_state.index_buffer.count = record[0];
+            draw_state.index_buffer.first = record[2];
+            draw_state.base_index = record[3];
+            draw_state.base_instance = record[4];
+        } else {
+            draw_state.vertex_buffer.count = record[0];
+            draw_state.vertex_buffer.first = record[2];
+            draw_state.base_instance = record[3];
+        }
+        ++geometry_indirect_draws;
+        DrawGeometry(pipeline, indexed, record[1]);
+    }
 }
 
 void RasterizerMetal::DrawByteCount() {

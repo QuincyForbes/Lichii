@@ -646,26 +646,17 @@ std::optional<TranslatedPipeline> PipelineTranslator::GeometryPipeline(
     const u64 hash = key.Hash();
     static std::atomic<u32> refused_logged{};
     u32 input_vertices = 0;
-    bool input_strip = false;
+    u32 input_step = 0;
     if (!Geometry::InputTopology(static_cast<Maxwell::PrimitiveTopology>(key.topology),
-                                 input_vertices, input_strip)) {
-        Refuse(refused_logged, hash, "geometry program with an input topology the compute path can't take");
+                                 input_vertices, input_step)) {
+        Refuse(refused_logged, hash,
+               "geometry program with an input topology the compute path can't take");
         return std::nullopt;
     }
     Shader::IR::Program& vertex_program = programs[1];
     Shader::IR::Program& geometry_program = programs[4];
-    const Shader::VaryingState geometry_stores = geometry_program.info.stores;
-    const auto geometry_legacy = geometry_program.info.legacy_stores_mapping;
-    std::string why;
-    const std::optional<Geometry::Plan> plan =
-        Geometry::Transform(geometry_program, input_vertices, input_strip, why);
-    if (!plan) {
-        Refuse(refused_logged, hash, "geometry program the compute path can't take", why);
-        return std::nullopt;
-    }
-    Shader::Backend::Bindings bindings;
-    // The vertex program as capture kernels only: its depth conversion and Y flip belong to the
-    // reader, which draws what the geometry program emits.
+    // The vertex program's legacy outputs become generics, which the geometry program's legacy
+    // inputs read; its own legacy outputs become generics for the pixel program.
     Shader::RuntimeInfo vertex_info;
     vertex_info.previous_stage_stores.mask.set();
     for (size_t attribute = 0; attribute < vertex_info.generic_input_types.size(); ++attribute) {
@@ -676,6 +667,23 @@ std::optional<TranslatedPipeline> PipelineTranslator::GeometryPipeline(
             types[(key.attribute_types >> (attribute * 2)) & 3];
     }
     ConvertLegacyToGeneric(vertex_program, vertex_info);
+    Shader::RuntimeInfo geometry_info;
+    geometry_info.previous_stage_stores = vertex_program.info.stores;
+    geometry_info.previous_stage_legacy_stores_mapping = vertex_program.info.legacy_stores_mapping;
+    geometry_info.generic_input_types.fill(Shader::AttributeType::Float);
+    ConvertLegacyToGeneric(geometry_program, geometry_info);
+    const Shader::VaryingState geometry_stores = geometry_program.info.stores;
+    const auto geometry_legacy = geometry_program.info.legacy_stores_mapping;
+    std::string why;
+    const std::optional<Geometry::Plan> plan =
+        Geometry::Transform(geometry_program, input_vertices, input_step, why);
+    if (!plan) {
+        Refuse(refused_logged, hash, "geometry program the compute path can't take", why);
+        return std::nullopt;
+    }
+    Shader::Backend::Bindings bindings;
+    // The vertex program as capture kernels only: its depth conversion and Y flip belong to the
+    // reader, which draws what the geometry program emits.
     const std::vector<u32> vertex_spirv = EmitSPIRV(profile, vertex_info, vertex_program, bindings);
     GeometryCompute geometry;
     geometry.plan = *plan;

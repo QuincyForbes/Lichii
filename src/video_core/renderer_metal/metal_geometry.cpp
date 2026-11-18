@@ -32,6 +32,16 @@ constexpr u32 PrimitiveIdWord = static_cast<u32>(IR::Attribute::PrimitiveId);
            (word >= Generic0X && word < Generic0X + 32 * 4);
 }
 
+constexpr u32 ClipDistance0Word = static_cast<u32>(IR::Attribute::ClipDistance0);
+
+/// What a geometry program may write: the record words, the layer, the viewport index and the
+/// clip distances.
+[[nodiscard]] bool StoreWord(u32 word) {
+    return RecordWord(word) || word == static_cast<u32>(IR::Attribute::Layer) ||
+           word == static_cast<u32>(IR::Attribute::ViewportIndex) ||
+           (word >= ClipDistance0Word && word < ClipDistance0Word + 8);
+}
+
 [[nodiscard]] std::optional<u32> SlotOf(const std::vector<u32>& words, u32 word) {
     const auto it = std::ranges::find(words, word);
     if (it == words.end()) {
@@ -86,14 +96,14 @@ constexpr u32 PrimitiveIdWord = static_cast<u32>(IR::Attribute::PrimitiveId);
 
 } // Anonymous namespace
 
-std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, bool input_strip,
+std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, u32 input_step,
                               std::string& why) {
     if (program.stage != Shader::Stage::Geometry) {
         why = "not a geometry program";
         return std::nullopt;
     }
-    if (program.invocations > 1) {
-        why = "geometry program with several invocations";
+    if (program.invocations > 32) {
+        why = "geometry program with more than 32 invocations";
         return std::nullopt;
     }
     if (program.output_vertices == 0 || program.output_vertices > 256) {
@@ -102,7 +112,8 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, bool inp
     }
     Plan plan;
     plan.input_vertices = input_vertices;
-    plan.input_strip = input_strip;
+    plan.input_step = input_step;
+    plan.invocations = (std::max)(program.invocations, 1U);
     plan.max_vertices = program.output_vertices;
     plan.index_slots = 2 * program.output_vertices + 2;
     switch (program.output_topology) {
@@ -134,7 +145,7 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, bool inp
         if (!info.stores.mask[word]) {
             continue;
         }
-        if (!RecordWord(word)) {
+        if (!StoreWord(word)) {
             why = fmt::format("geometry program writes attribute {}", word);
             return std::nullopt;
         }
@@ -157,8 +168,8 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, bool inp
                 return std::nullopt;
             case IR::Opcode::EmitVertex:
             case IR::Opcode::EndPrimitive:
-                if (!inst.Arg(0).IsImmediate() || inst.Arg(0).U32() != 0) {
-                    why = "geometry program with output streams";
+                if (!inst.Arg(0).IsImmediate()) {
+                    why = "geometry program with a computed output stream";
                     return std::nullopt;
                 }
                 break;
@@ -184,6 +195,14 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, bool inp
     const IR::U32 primitive{
         entry_ir.IAdd(entry_ir.IMul(entry_ir.WorkgroupIdX(), entry_ir.Imm32(GroupSize)),
                       entry_ir.LocalInvocationIdX())};
+    // The invocation is the grid's second dimension; a thread's region is the primitive's
+    // invocations after one another.
+    const IR::U32 invocation{entry_ir.WorkgroupIdY()};
+    const IR::U32 region{plan.invocations > 1
+                             ? IR::U32{entry_ir.IAdd(
+                                   entry_ir.IMul(primitive, entry_ir.Imm32(plan.invocations)),
+                                   invocation)}
+                             : primitive};
     entry_ir.WriteLocal(entry_ir.Imm32(vertex_cursor), entry_ir.Imm32(0U));
     entry_ir.WriteLocal(entry_ir.Imm32(index_cursor), entry_ir.Imm32(0U));
     for (u32 slot = 0; slot < ostride; ++slot) {
@@ -197,7 +216,7 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, bool inp
                              {IR::Value{binding}, IR::Value{byte}, IR::Value{value}});
     };
     const auto index_word = [&](IR::IREmitter& ir, const IR::U32& slot) {
-        return IR::U32{ir.IAdd(ir.IMul(primitive, ir.Imm32(plan.IndexStride())),
+        return IR::U32{ir.IAdd(ir.IMul(region, ir.Imm32(plan.IndexStride())),
                                ir.IAdd(ir.Imm32(1U), slot))};
     };
 
@@ -215,9 +234,7 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, bool inp
                     value = primitive;
                 } else {
                     const IR::U32 vertex{inst.Arg(1)};
-                    const IR::U32 first{
-                        plan.input_strip ? primitive
-                                         : IR::U32{ir.IMul(primitive, ir.Imm32(plan.input_vertices))}};
+                    const IR::U32 first{ir.IMul(primitive, ir.Imm32(plan.input_vertices))};
                     const IR::U32 record{ir.IAdd(first, vertex)};
                     const IR::U32 slot_word{ir.IAdd(ir.IMul(record, ir.Imm32(istride)),
                                                     ir.Imm32(*SlotOf(plan.input_words, word)))};
@@ -233,7 +250,7 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, bool inp
                 break;
             }
             case IR::Opcode::InvocationId:
-                inst.ReplaceUsesWith(IR::Value{0U});
+                inst.ReplaceUsesWith(IR::Value{invocation});
                 break;
             case IR::Opcode::SetAttribute: {
                 const u32 word = static_cast<u32>(inst.Arg(0).Attribute());
@@ -246,11 +263,16 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, bool inp
                 break;
             }
             case IR::Opcode::EmitVertex: {
+                if (inst.Arg(0).U32() != 0) {
+                    // Only stream 0 is rasterized; the others are for transform feedback.
+                    inst.Invalidate();
+                    break;
+                }
                 const IR::U32 vertex_count{ir.LoadLocal(ir.Imm32(vertex_cursor))};
                 const IR::U32 index_count{ir.LoadLocal(ir.Imm32(index_cursor))};
                 const IR::U32 slot{ir.UMin(vertex_count, ir.Imm32(plan.max_vertices - 1))};
                 const IR::U32 vertex_id{
-                    ir.IAdd(ir.IMul(primitive, ir.Imm32(plan.max_vertices)), slot)};
+                    ir.IAdd(ir.IMul(region, ir.Imm32(plan.max_vertices)), slot)};
                 const IR::U32 base{ir.IMul(vertex_id, ir.Imm32(ostride))};
                 const auto at = IR::Block::InstructionList::s_iterator_to(inst);
                 for (u32 s = 0; s < ostride; ++s) {
@@ -267,6 +289,10 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, bool inp
             }
             case IR::Opcode::EndPrimitive:
             case IR::Opcode::Epilogue: {
+                if (inst.GetOpcode() == IR::Opcode::EndPrimitive && inst.Arg(0).U32() != 0) {
+                    inst.Invalidate();
+                    break;
+                }
                 const IR::U32 index_count{ir.LoadLocal(ir.Imm32(index_cursor))};
                 const IR::U32 index_slot{ir.UMin(index_count, ir.Imm32(plan.index_slots - 1))};
                 const auto at = IR::Block::InstructionList::s_iterator_to(inst);
@@ -278,7 +304,7 @@ std::optional<Plan> Transform(IR::Program& program, u32 input_vertices, bool inp
                     // The count of the thread's index region, what the compaction reads.
                     const IR::U32 count{ir.UMin(next, ir.Imm32(plan.index_slots))};
                     store(ir, index_binding,
-                          IR::U32{ir.IMul(primitive, ir.Imm32(plan.IndexStride()))}, count, *block,
+                          IR::U32{ir.IMul(region, ir.Imm32(plan.IndexStride()))}, count, *block,
                           at);
                 } else {
                     inst.Invalidate();
@@ -322,12 +348,16 @@ std::string RecordsSource(const Plan& plan, std::string_view entry,
                             OutputExpression(plan.input_words[slot], outputs, legacy_mapping));
     }
     return fmt::format(R"(
+struct GeometryRecordsParams {{ uint records, vertices, step, count, primitives; }};
 kernel void geo_records(device const {0}_out* src [[buffer({1})]], device float* dst [[buffer({2})]],
-                        constant uint& count [[buffer({3})]], uint n [[thread_position_in_grid]]) {{
-    if (n >= count) {{
+                        constant GeometryRecordsParams& j [[buffer({3})]],
+                        uint n [[thread_position_in_grid]]) {{
+    if (n >= j.records) {{
         return;
     }}
-    device const {0}_out& v = src[n];
+    const uint p = n / j.vertices;
+    const uint s = (p / j.primitives) * j.count + (p % j.primitives) * j.step + n % j.vertices;
+    device const {0}_out& v = src[s];
     device float* r = dst + ulong(n) * {4}u;
 {5}}}
 )",
@@ -351,6 +381,29 @@ std::string ReaderSource(const Plan& plan, bool convert_depth, bool flip_y,
             if (std::ranges::find(locations, location) == locations.end()) {
                 locations.push_back(location);
             }
+        }
+    }
+    const u32 layer_word = static_cast<u32>(IR::Attribute::Layer);
+    const u32 viewport_word = static_cast<u32>(IR::Attribute::ViewportIndex);
+    if (const auto slot = SlotOf(plan.output_words, layer_word)) {
+        members += "    uint layer [[render_target_array_index]];\n";
+        assignments += fmt::format("    o.layer = as_type<uint>(r[{}]);\n", *slot);
+    }
+    if (const auto slot = SlotOf(plan.output_words, viewport_word)) {
+        members += "    uint viewport [[viewport_array_index]];\n";
+        assignments += fmt::format("    o.viewport = as_type<uint>(r[{}]);\n", *slot);
+    }
+    u32 clip_count = 0;
+    for (u32 index = 0; index < 8; ++index) {
+        if (SlotOf(plan.output_words, ClipDistance0Word + index)) {
+            clip_count = index + 1;
+        }
+    }
+    if (clip_count != 0) {
+        members += fmt::format("    float clip [[clip_distance]] [{}];\n", clip_count);
+        for (u32 index = 0; index < clip_count; ++index) {
+            assignments += fmt::format("    o.clip[{}] = {};\n", index,
+                                       word(ClipDistance0Word + index, "1.0f"));
         }
     }
     for (const u32 location : locations) {
