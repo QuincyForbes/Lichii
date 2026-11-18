@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Portions from nxnative (https://github.com/seedds/nxnative), Copyright (c) 2026 seedds, MIT
+// License (LICENSES/MIT.txt): rb_swap, rb_swap_rows and the unwritten-attachment store rule.
 
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 #include <fmt/format.h>
@@ -15,12 +18,6 @@ using VideoCore::Surface::PixelFormat;
 
 namespace {
 
-constexpr std::array<u8, 4> SwapRedBlue{Swizzle::Blue, Swizzle::Green, Swizzle::Red,
-                                        Swizzle::Alpha};
-// zortos293's TryTransformSwizzleIfNeeded: A5B5G5R1 as R5G5B5A1 read A<->R, G<->B.
-constexpr std::array<u8, 4> SwapSpecial{Swizzle::Alpha, Swizzle::Blue, Swizzle::Green,
-                                        Swizzle::Red};
-constexpr std::array<u8, 4> Reversed{Swizzle::Alpha, Swizzle::Blue, Swizzle::Green, Swizzle::Red};
 
 struct Entry {
     u32 format;
@@ -41,13 +38,18 @@ Entry Lookup(PixelFormat format) {
     case PixelFormat::A8B8G8R8_SINT: return {Fmt::RGBA8Sint, A, S};
     case PixelFormat::A8B8G8R8_UINT: return {Fmt::RGBA8Uint, A, S};
     case PixelFormat::R5G6B5_UNORM: return {Fmt::B5G6R5Unorm, A, N};
-    case PixelFormat::B5G6R5_UNORM: return {Fmt::B5G6R5Unorm, N, N, SwapRedBlue};
+    // The 16-bit packed formats Metal has only with red and blue exchanged (or, for RGBA4, the
+    // nibbles reversed) hold Metal's order in the host texture: bytes are converted where they
+    // cross to guest memory (PackedSwapShift), so the texture is a render target with no swizzle.
+    case PixelFormat::B5G6R5_UNORM: return {Fmt::B5G6R5Unorm, A, N};
     case PixelFormat::A1R5G5B5_UNORM: return {Fmt::BGR5A1Unorm, A, N};
     case PixelFormat::A2B10G10R10_UNORM: return {Fmt::RGB10A2Unorm, A, S};
     case PixelFormat::A2B10G10R10_UINT: return {Fmt::RGB10A2Uint, A, S};
     case PixelFormat::A2R10G10B10_UNORM: return {Fmt::BGR10A2Unorm, A, N};
-    case PixelFormat::A1B5G5R5_UNORM: return {Fmt::BGR5A1Unorm, A, N, SwapRedBlue};
-    case PixelFormat::A5B5G5R1_UNORM: return {Fmt::A1BGR5Unorm, N, N, SwapSpecial};
+    case PixelFormat::A1B5G5R5_UNORM: return {Fmt::BGR5A1Unorm, A, N};
+    // 5 bits of alpha on top and a 1-bit red: no Metal format has them, so an RGBA8 texture
+    // converted to and from the guest's words by kernels (Scheduler::Pack16).
+    case PixelFormat::A5B5G5R1_UNORM: return {Fmt::RGBA8Unorm, A, S};
     case PixelFormat::R8_UNORM: return {Fmt::R8Unorm, A, S};
     case PixelFormat::R8_SNORM: return {Fmt::R8Snorm, A, S};
     case PixelFormat::R8_SINT: return {Fmt::R8Sint, A, S};
@@ -105,8 +107,7 @@ Entry Lookup(PixelFormat format) {
     case PixelFormat::BC2_SRGB: return {Fmt::BC2_RGBA_sRGB, N, N};
     case PixelFormat::BC3_SRGB: return {Fmt::BC3_RGBA_sRGB, N, N};
     case PixelFormat::BC7_SRGB: return {Fmt::BC7_RGBAUnorm_sRGB, N, N};
-    // Vulkan's R4G4B4A4 with the components reversed, as MoltenVK's ABGR4Unorm.
-    case PixelFormat::A4B4G4R4_UNORM: return {Fmt::ABGR4Unorm, N, N, Reversed};
+    case PixelFormat::A4B4G4R4_UNORM: return {Fmt::ABGR4Unorm, A, N};
     // Metal has no 8-bit 4:4 format: approximated (only the high nibble survives).
     case PixelFormat::G4R4_UNORM: return {Fmt::R8Unorm, N, N};
     case PixelFormat::ASTC_2D_4X4_SRGB: return {Fmt::ASTC_4x4_sRGB, N, N};
@@ -157,6 +158,48 @@ Entry Lookup(PixelFormat format) {
 }
 
 } // Anonymous namespace
+
+u32 Pack16Mode(PixelFormat format) {
+    switch (format) {
+    case PixelFormat::A5B5G5R1_UNORM: return 1;
+    case PixelFormat::R5G6B5_UNORM: return 2;
+    case PixelFormat::B5G6R5_UNORM: return 3;
+    case PixelFormat::A1R5G5B5_UNORM: return 4;
+    case PixelFormat::A1B5G5R5_UNORM: return 5;
+    case PixelFormat::A4B4G4R4_UNORM: return 6;
+    default: return 0;
+    }
+}
+
+u32 PackedSwapShift(PixelFormat format) {
+    switch (format) {
+    case PixelFormat::B5G6R5_UNORM: return 11;
+    case PixelFormat::A1B5G5R5_UNORM: return 10;
+    case PixelFormat::A4B4G4R4_UNORM: return 4;
+    default: return 0;
+    }
+}
+
+void SwapPackedTexels(u8* data, u32 width, u32 rows, u32 images, size_t row_pitch,
+                      size_t image_pitch, u32 shift) {
+    // nxnative dm/gfx/nvn/nvn_mtl.m rb_swap_rows (MIT).
+    const u16 mask = static_cast<u16>(31U | 31U << shift);
+    for (u32 z = 0; z < images; ++z) {
+        for (u32 y = 0; y < rows; ++y) {
+            u8* const row = data + z * image_pitch + y * row_pitch;
+            for (u32 x = 0; x < width; ++x) {
+                u16 v;
+                std::memcpy(&v, row + x * 2, 2);
+                if (shift == 4) {
+                    v = static_cast<u16>(v << 12 | (v & 0xf0U) << 4 | (v >> 4 & 0xf0U) | v >> 12);
+                } else {
+                    v = static_cast<u16>((v & ~mask) | (v & 31U) << shift | (v >> shift & 31U));
+                }
+                std::memcpy(row + x * 2, &v, 2);
+            }
+        }
+    }
+}
 
 u32 LinearTwin(u32 mtl_format) {
     switch (mtl_format) {
@@ -210,6 +253,11 @@ FormatInfo SurfaceFormat(PixelFormat format, bool converted) {
         // VideoCommon::ExpandTexels.
         case PixelFormat::R32G32B32_FLOAT: decoded = Fmt::RGBA32Float; break;
         case PixelFormat::G4R4_UNORM: decoded = Fmt::RG8Unorm; break;
+        // VideoCommon::DecodeEtc.
+        case PixelFormat::EAC_R11_UNORM: decoded = Fmt::R16Unorm; break;
+        case PixelFormat::EAC_R11_SNORM: decoded = Fmt::R16Snorm; break;
+        case PixelFormat::EAC_R11G11_UNORM: decoded = Fmt::RG16Unorm; break;
+        case PixelFormat::EAC_R11G11_SNORM: decoded = Fmt::RG16Snorm; break;
         default: break;
         }
         return FormatInfo{

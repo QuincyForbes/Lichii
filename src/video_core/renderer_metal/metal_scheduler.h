@@ -6,6 +6,7 @@
 #include <array>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 
 #include "common/common_types.h"
@@ -216,6 +217,23 @@ struct DrawState {
     /// The depth bounds test (Apple10 GPUs: setDepthTestMinBound:maxBound:); 0 and 1 are off.
     f32 depth_bounds_min{0.0f};
     f32 depth_bounds_max{1.0f};
+    /// What the draw can write of the pass's attachments (colour targets by index, depth,
+    /// stencil); what no draw of a pass writes and the pass did not clear is not stored again
+    /// (P07, EDEN_NX2_METAL_UNWRITTEN_STORE).
+    u8 color_written{0xFF};
+    bool depth_written{true};
+    bool stencil_written{true};
+};
+
+/// A region of a sparse texture's tiles to map to its heap or unmap (G18); in tiles. At a mip
+/// tail's level the region is the tail's tiles in x, one row.
+struct SparseTileOp {
+    u32 x{};
+    u32 y{};
+    u32 width{1};
+    u32 height{1};
+    u32 level{};
+    bool map{true};
 };
 
 /// Records Metal work in submission order on one command queue. Copies go to one blit encoder
@@ -356,6 +374,38 @@ public:
     /// The other way: a kernel reads depth (and stencil) and writes the guest's bytes.
     bool DepthToBuffer(TextureHandle src, u32 level, u32 slice, Offset3D origin, Extent3D extent,
                        BufferHandle dst, u64 offset, u32 bytes_per_row, DepthLayout layout);
+
+    /// Q27: `shadow` (single-sampled, 2D array, the same format and size) is `msaa`'s resolve
+    /// shadow: passes drawing into the multisampled texture resolve into it, and a pass that
+    /// begins with a clear does not store the samples (EDEN_NX2_MSAA_DISCARD); whatever needs
+    /// the samples later gets them restored from the shadow. A null shadow removes it.
+    void SetResolveShadow(TextureHandle msaa, TextureHandle shadow);
+
+    /// The shadow of `msaa` while it holds the resolve of its samples (nothing wrote them since
+    /// its last pass), else null.
+    [[nodiscard]] TextureHandle ResolveShadow(TextureHandle msaa) const noexcept;
+
+    /// Passes that did not store their samples, and the restores that followed.
+    [[nodiscard]] u64 SamplesDropped() const noexcept;
+    [[nodiscard]] u64 SamplesRestored() const noexcept;
+
+    /// Store actions dropped so far for attachments a pass loaded and no draw of it wrote (P07).
+    [[nodiscard]] u64 StoresDropped() const noexcept;
+
+    /// Maps or unmaps tiles of a sparse texture (CreateSparseTexture), in order with the work
+    /// recorded before and after it.
+    bool UpdateSparseTiles(TextureHandle texture, std::span<const SparseTileOp> ops);
+
+    /// A 16-bit packed format (Pack16Mode `mode`, an RGBA8 texture on the host) from or to the
+    /// guest's words in `buffer`: a region of one level and slice. `to_buffer` reads the texture.
+    bool Pack16(u32 mode, bool to_buffer, TextureHandle texture, u32 level, u32 slice, Offset3D origin,
+                  Extent3D extent, BufferHandle buffer, u64 offset, u32 bytes_per_row);
+
+    /// Exchanges red and blue (or reverses the nibbles, shift 4) of 16-bit texels in place in
+    /// `buffer`: `images` images of `rows` rows of `width` texels (PackedSwapShift), on the GPU
+    /// timeline: after the copies recorded before it, before those recorded after it.
+    bool SwapPacked(BufferHandle buffer, u64 offset, u32 width, u32 rows, u32 images,
+                    u32 bytes_per_row, u32 bytes_per_image, u32 shift);
 
     /// Resolves layer `src_slice` of multisampled `src` into dst with a render pass's resolve
     /// store action (the average of colour samples; sample 0 of depth, stencil kept). The

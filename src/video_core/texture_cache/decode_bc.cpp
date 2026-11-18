@@ -57,6 +57,10 @@ u32 ConvertedBytesPerBlock(VideoCore::Surface::PixelFormat pixel_format) {
     case PixelFormat::BC6H_SFLOAT:
     case PixelFormat::BC6H_UFLOAT:
         return 8;
+    // ETC2 and EAC (DecodeEtc): R16 for R11, RG16 for RG11, RGBA8 for the rest.
+    case PixelFormat::EAC_R11_UNORM:
+    case PixelFormat::EAC_R11_SNORM:
+        return 2;
     // Plain formats a backend has no counterpart for (ExpandTexels): RGBA32F and RG8.
     case PixelFormat::R32G32B32_FLOAT:
         return 16;

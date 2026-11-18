@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Portions from nxnative (https://github.com/seedds/nxnative), Copyright (c) 2026 seedds, MIT
+// License (LICENSES/MIT.txt): rb_swap, rb_swap_rows and the unwritten-attachment store rule.
 
 #include <algorithm>
 #include <array>
@@ -44,6 +46,27 @@ constexpr u32 MaxRenderTargetSize = 16384;
 constexpr u32 BufferSlots = 31;
 constexpr u32 TextureSlots = 96;
 constexpr u32 SamplerSlots = 16;
+
+/// EDEN_NX2_METAL_UNWRITTEN_STORE (on unless 0), on Apple GPUs: an attachment a pass loads and
+/// no draw of it can write is not stored again (MTLStoreActionDontCare; the tile it would write
+/// back holds what memory has already). nxnative's DM_NVN_UNWRITTEN_DC (MIT, nvn_mtl.m sd_finish).
+bool UnwrittenStoresEnabled(const Device& device) {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_UNWRITTEN_STORE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled && device.AppleFamily() != 0;
+}
+
+/// EDEN_NX2_MSAA_DISCARD=0 (as Vulkan's): MSAA passes keep their samples even when they begin
+/// with a clear; otherwise such a pass resolves into the image's shadow and does not store them.
+bool MsaaDiscardEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_MSAA_DISCARD");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
 
 /// Metal checks a slot past a stage's tables in its validation layer only.
 bool SlotFits(u32 slot, u32 slots, const char* kind) {
@@ -365,6 +388,102 @@ fragment DepthStencilOut depth_stencil_from_buffer(ClearOut in [[stage_in]],
                                                    device const uint* words [[buffer(0)]],
                                                    constant DepthCopyParams& p [[buffer(1)]]) {
     return DepthFromWords(uint2(int2(in.position.xy) - p.origin), words, p);
+}
+
+// nxnative dm/gfx/msl/rb_swap.metal (MIT, Copyright (c) 2026 seedds): the red / blue exchange of
+// the 565 family, or reversed nibbles (shift 4), in place on rows of 16-bit texels.
+struct SwapParams {
+    uint offset;
+    uint width;
+    uint height;
+    uint row_bytes;
+    uint image_bytes;
+    uint shift;
+};
+
+kernel void swap_packed(uint3 id [[thread_position_in_grid]],
+                        device uchar* bytes [[buffer(0)]],
+                        constant SwapParams& p [[buffer(1)]]) {
+    if (id.x >= p.width || id.y >= p.height) {
+        return;
+    }
+    device ushort* texel = (device ushort*)(bytes + p.offset + id.z * p.image_bytes +
+                                            id.y * p.row_bytes) + id.x;
+    const uint v = *texel;
+    const uint m = 31u | (31u << p.shift);
+    *texel = p.shift == 4
+                 ? ushort(v << 12 | (v & 0xf0u) << 4 | (v >> 4 & 0xf0u) | v >> 12)
+                 : ushort((v & ~m) | (v & 31u) << p.shift | (v >> p.shift & 31u));
+}
+
+// A resolve shadow's colour into every sample of its multisampled texture (RestoreSamples).
+fragment float4 restore_samples_float(ClearOut in [[stage_in]],
+                                      texture2d_array<float> src [[texture(0)]],
+                                      constant uint& layer [[buffer(0)]]) {
+    return src.read(uint2(in.position.xy), layer);
+}
+
+// The 16-bit packed formats as RGBA8 on the host (Pack16Mode); these move whole regions between
+// the texture and the guest's words. 1 A5B5G5R1 (alpha 15-11, blue 10-6, green 5-1, red 0),
+// 2 R5G6B5, 3 B5G6R5, 4 A1R5G5B5, 5 A1B5G5R5, 6 A4B4G4R4.
+struct PackParams {
+    uint2 origin;
+    uint2 extent;
+    uint row_words;
+    uint mode;
+};
+
+float4 Unpack16(uint v, uint mode) {
+    switch (mode) {
+    case 1: return float4(float(v & 1u), float((v >> 1) & 31u) / 31.0, float((v >> 6) & 31u) / 31.0,
+                          float((v >> 11) & 31u) / 31.0);
+    case 2: return float4(float(v >> 11) / 31.0, float((v >> 5) & 63u) / 63.0, float(v & 31u) / 31.0, 1.0);
+    case 3: return float4(float(v & 31u) / 31.0, float((v >> 5) & 63u) / 63.0, float(v >> 11) / 31.0, 1.0);
+    case 4: return float4(float((v >> 10) & 31u) / 31.0, float((v >> 5) & 31u) / 31.0,
+                          float(v & 31u) / 31.0, float(v >> 15));
+    case 5: return float4(float(v & 31u) / 31.0, float((v >> 5) & 31u) / 31.0,
+                          float((v >> 10) & 31u) / 31.0, float(v >> 15));
+    default: return float4(float(v & 15u), float((v >> 4) & 15u), float((v >> 8) & 15u),
+                           float(v >> 12)) / 15.0;
+    }
+}
+
+uint Pack16(float4 c, uint mode) {
+    c = saturate(c);
+    switch (mode) {
+    case 1: return (uint(round(c.a * 31.0)) << 11) | (uint(round(c.b * 31.0)) << 6) |
+                   (uint(round(c.g * 31.0)) << 1) | (c.r >= 0.5 ? 1u : 0u);
+    case 2: return (uint(round(c.r * 31.0)) << 11) | (uint(round(c.g * 63.0)) << 5) |
+                   uint(round(c.b * 31.0));
+    case 3: return (uint(round(c.b * 31.0)) << 11) | (uint(round(c.g * 63.0)) << 5) |
+                   uint(round(c.r * 31.0));
+    case 4: return (c.a >= 0.5 ? 0x8000u : 0u) | (uint(round(c.r * 31.0)) << 10) |
+                   (uint(round(c.g * 31.0)) << 5) | uint(round(c.b * 31.0));
+    case 5: return (c.a >= 0.5 ? 0x8000u : 0u) | (uint(round(c.b * 31.0)) << 10) |
+                   (uint(round(c.g * 31.0)) << 5) | uint(round(c.r * 31.0));
+    default: return (uint(round(c.a * 15.0)) << 12) | (uint(round(c.b * 15.0)) << 8) |
+                    (uint(round(c.g * 15.0)) << 4) | uint(round(c.r * 15.0));
+    }
+}
+
+kernel void pack16_from_buffer(uint2 id [[thread_position_in_grid]],
+                               texture2d<float, access::write> dst [[texture(0)]],
+                               device const ushort* words [[buffer(0)]],
+                               constant PackParams& p [[buffer(1)]]) {
+    if (any(id >= p.extent)) {
+        return;
+    }
+    dst.write(Unpack16(words[id.y * p.row_words + id.x], p.mode), p.origin + id);
+}
+
+kernel void pack16_to_buffer(uint2 id [[thread_position_in_grid]],
+                             texture2d<float> src [[texture(0)]],
+                             device ushort* words [[buffer(0)]],
+                             constant PackParams& p [[buffer(1)]]) {
+    if (any(id >= p.extent)) {
+        return;
+    }
+    words[id.y * p.row_words + id.x] = ushort(Pack16(src.read(p.origin + id), p.mode));
 }
 
 kernel void depth_to_buffer(uint2 id [[thread_position_in_grid]],
@@ -963,12 +1082,141 @@ struct Scheduler::Impl {
         }
     }
 
+    /// Sets the store actions BeginRendering left open (EDEN_NX2_METAL_UNWRITTEN_STORE).
+    void FinishStores() {
+        if (deferred_color == 0 && !deferred_depth && !deferred_stencil) {
+            return;
+        }
+        // A pass whose draws never set their state is taken to write everything.
+        const u8 color = pass_state_set ? written_color : 0xFF;
+        const bool depth = !pass_state_set || written_depth;
+        const bool stencil = !pass_state_set || written_stencil;
+        const auto action = [this](bool written) {
+            if (!written) {
+                ++stores_dropped;
+            }
+            return written ? MTLStoreActionStore : MTLStoreActionDontCare;
+        };
+        for (u32 index = 0; index < 8; ++index) {
+            if ((deferred_color >> index) & 1U) {
+                [render setColorStoreAction:action((color >> index) & 1U) atIndex:index];
+            }
+        }
+        if (deferred_depth) {
+            [render setDepthStoreAction:action(depth)];
+        }
+        if (deferred_stencil) {
+            [render setStencilStoreAction:action(stencil)];
+        }
+        deferred_color = 0;
+        deferred_depth = false;
+        deferred_stencil = false;
+    }
+
+    /// Q27: a multisampled colour texture's single-sampled resolve shadow. `valid`: it holds the
+    /// resolve of the samples as they are; `dropped`: the samples were not stored (the pass
+    /// cleared them and resolved, MTLStoreActionMultisampleResolve), so anything that needs them
+    /// restores them from the shadow first.
+    struct ShadowEntry {
+        void* shadow{};
+        bool valid{};
+        bool dropped{};
+    };
+    std::unordered_map<void*, ShadowEntry> shadows;
+    u64 samples_dropped{};
+    u64 samples_restored{};
+
+    id<MTLRenderPipelineState> RestorePipeline(MTLPixelFormat format, NSUInteger samples) {
+        const u64 key = (u64{1} << 62) | (static_cast<u64>(format) << 8) | static_cast<u64>(samples);
+        if (const auto it = scale_pipelines.find(key); it != scale_pipelines.end()) {
+            return it->second;
+        }
+        id<MTLRenderPipelineState> pipeline = nil;
+        if (library != nil) {
+            MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+            desc.label = @"Restore samples";
+            desc.vertexFunction = [library newFunctionWithName:@"clear_vertex"];
+            desc.fragmentFunction = [library newFunctionWithName:@"restore_samples_float"];
+            desc.rasterSampleCount = samples;
+            desc.colorAttachments[0].pixelFormat = format;
+            NSError* error = nil;
+            pipeline = [device.GetDevice() newRenderPipelineStateWithDescriptor:desc error:&error];
+        }
+        scale_pipelines.emplace(key, pipeline);
+        return pipeline;
+    }
+
+    /// The samples of `texture` written back from its shadow (each sample the resolved colour).
+    void RestoreSamples(void* texture, ShadowEntry& entry) {
+        entry.dropped = false;
+        const id<MTLTexture> dst = AsTexture(texture);
+        const id<MTLTexture> src = AsTexture(entry.shadow);
+        if (dst == nil || src == nil) {
+            return;
+        }
+        FlushClear();
+        const id<MTLRenderPipelineState> pipeline = RestorePipeline(dst.pixelFormat, dst.sampleCount);
+        if (pipeline == nil) {
+            return;
+        }
+        ++samples_restored;
+        const u32 width = static_cast<u32>(dst.width);
+        const u32 height = static_cast<u32>(dst.height);
+        for (u32 layer = 0; layer < dst.arrayLength; ++layer) {
+            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            ApplyAttachment(pass.colorAttachments[0],
+                            Attachment{.texture = texture, .level = 0, .slice = layer});
+            pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            pass.renderTargetWidth = width;
+            pass.renderTargetHeight = height;
+            const id<MTLRenderCommandEncoder> encoder = RenderEncoder(pass);
+            if (encoder == nil) {
+                return;
+            }
+            [encoder setRenderPipelineState:pipeline];
+            [encoder setViewport:MTLViewport{0.0, 0.0, static_cast<f64>(width),
+                                             static_cast<f64>(height), 0.0, 1.0}];
+            const f32 depth_value = 0.0f;
+            [encoder setVertexBytes:&depth_value length:sizeof(depth_value) atIndex:0];
+            [encoder setFragmentTexture:src atIndex:0];
+            [encoder setFragmentBytes:&layer length:sizeof(layer) atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [encoder endEncoding];
+        }
+    }
+
+    /// Something reads the samples of `texture`.
+    void SamplesNeeded(const void* texture) {
+        if (shadows.empty()) {
+            return;
+        }
+        if (const auto it = shadows.find(const_cast<void*>(texture));
+            it != shadows.end() && it->second.dropped) {
+            RestoreSamples(it->first, it->second);
+        }
+    }
+
+    /// Something writes part or all of the samples of `texture`: the resolve no longer holds.
+    void Written(const void* texture) {
+        if (shadows.empty()) {
+            return;
+        }
+        if (const auto it = shadows.find(const_cast<void*>(texture)); it != shadows.end()) {
+            if (it->second.dropped) {
+                RestoreSamples(it->first, it->second);
+            }
+            it->second.valid = false;
+        }
+    }
+
     void EndEncoder() {
         if (blit != nil) {
             [blit endEncoding];
             blit = nil;
         }
         if (render != nil) {
+            FinishStores();
             [render endEncoding];
             render = nil;
         }
@@ -1075,6 +1323,10 @@ struct Scheduler::Impl {
             }
             MTLRenderPassColorAttachmentDescriptor* color = pass.colorAttachments[index];
             ApplyAttachment(color, clear.color[index]);
+            if (const auto shadow = shadows.find(clear.color[index].texture); shadow != shadows.end()) {
+                shadow->second.valid = false;
+                shadow->second.dropped = false;
+            }
             const auto& value = clear.color_value[index];
             color.loadAction = MTLLoadActionClear;
             color.storeAction = MTLStoreActionStore;
@@ -1444,6 +1696,9 @@ struct Scheduler::Impl {
     std::unordered_map<u64, id<MTLRenderPipelineState>> scale_pipelines;
     std::unordered_map<u64, id<MTLRenderPipelineState>> depth_upload_pipelines;
     id<MTLComputePipelineState> depth_download = nil;
+    id<MTLComputePipelineState> swap_packed = nil;
+    id<MTLComputePipelineState> pack16_from = nil;
+    id<MTLComputePipelineState> pack16_to = nil;
     id<MTLBuffer> zero_buffer = nil;
     id<MTLCommandBuffer> command_buffer = nil;
     id<MTLBlitCommandEncoder> blit = nil;
@@ -1466,6 +1721,17 @@ struct Scheduler::Impl {
     bool render_state_valid{};
     /// The device's GPU has the depth bounds test (the Apple10 family).
     bool depth_bounds{};
+    /// P07: attachments the open pass loaded (not cleared) have their store action decided when
+    /// it ends: stored when a draw could write them, dropped otherwise. Bits are colour
+    /// targets; the pass's draws OR what they can write into `written_*`.
+    u8 deferred_color{};
+    bool deferred_depth{};
+    bool deferred_stencil{};
+    u8 written_color{};
+    bool written_depth{};
+    bool written_stencil{};
+    bool pass_state_set{};
+    u64 stores_dropped{};
     StageBindings compute_bound;
     const void* compute_pipeline{};
     StageBindings kernel_bound;
@@ -1803,6 +2069,7 @@ void Scheduler::FillBuffer(BufferHandle dst, u64 offset, u64 size, u8 value) {
 void Scheduler::CopyBufferToTexture(BufferHandle src, u64 offset, u32 bytes_per_row,
                                     u32 bytes_per_image, TextureHandle dst, u32 level, u32 slice,
                                     Offset3D origin, Extent3D extent) {
+    impl->Written(dst);
     if (src == nullptr || dst == nullptr) {
         return;
     }
@@ -1841,6 +2108,8 @@ void Scheduler::CopyTextureToBuffer(TextureHandle src, u32 level, u32 slice, Off
 void Scheduler::CopyTexture(TextureHandle src, u32 src_level, u32 src_slice, Offset3D src_origin,
                             Extent3D extent, TextureHandle dst, u32 dst_level, u32 dst_slice,
                             Offset3D dst_origin) {
+    impl->SamplesNeeded(src);
+    impl->Written(dst);
     if (src == nullptr || dst == nullptr) {
         return;
     }
@@ -1909,6 +2178,8 @@ void Scheduler::Clear(const ClearPass& clear) {
 }
 
 bool Scheduler::ClearRectangle(const ClearRect& clear) {
+    impl->Written(clear.color.texture);
+    impl->Written(clear.depth.texture);
     impl->FlushClear();
     const id<MTLTexture> color = clear.color_mask != 0 ? AsTexture(clear.color.texture) : nil;
     const id<MTLTexture> depth =
@@ -1992,6 +2263,8 @@ bool Scheduler::ClearRectangle(const ClearRect& clear) {
 }
 
 bool Scheduler::Blit(const BlitPass& blit) {
+    impl->Written(blit.dst.texture);
+    impl->SamplesNeeded(blit.src);
     impl->FlushClear();
     const id<MTLTexture> src = AsTexture(blit.src);
     if (src == nil || blit.dst.texture == nullptr) {
@@ -2083,6 +2356,8 @@ bool Scheduler::Blit(const BlitPass& blit) {
 }
 
 bool Scheduler::CopySamples(const SampleCopy& copy, bool expand) {
+    impl->SamplesNeeded(copy.src);
+    impl->Written(copy.dst.texture);
     impl->FlushClear();
     const id<MTLTexture> src = AsTexture(copy.src);
     const id<MTLTexture> dst = AsTexture(copy.dst.texture);
@@ -2140,6 +2415,8 @@ bool Scheduler::CopySamples(const SampleCopy& copy, bool expand) {
 }
 
 bool Scheduler::Convert(const ConvertPass& convert) {
+    impl->Written(convert.dst.texture);
+    impl->SamplesNeeded(convert.src);
     impl->FlushClear();
     const id<MTLTexture> src = AsTexture(convert.src);
     if (src == nil || convert.dst.texture == nullptr) {
@@ -2356,7 +2633,124 @@ bool Scheduler::DepthToBuffer(TextureHandle src_handle, u32 level, u32 slice, Of
     return true;
 }
 
+bool Scheduler::UpdateSparseTiles(TextureHandle texture_handle,
+                                  std::span<const SparseTileOp> ops) {
+    const id<MTLTexture> texture = AsTexture(texture_handle);
+    if (texture == nil || ops.empty()) {
+        return texture != nil;
+    }
+    impl->FlushClear();
+    impl->EndEncoder();
+    ++impl->encoders;
+    ++impl->segment_encoders;
+    const id<MTLResourceStateCommandEncoder> encoder = [impl->Commands() resourceStateCommandEncoder];
+    encoder.label = @"Sparse tiles";
+    for (const SparseTileOp& op : ops) {
+        [encoder updateTextureMapping:texture
+                                 mode:op.map ? MTLSparseTextureMappingModeMap
+                                             : MTLSparseTextureMappingModeUnmap
+                               region:MTLRegionMake2D(op.x, op.y, op.width, op.height)
+                             mipLevel:op.level
+                                slice:0];
+    }
+    [encoder endEncoding];
+    return true;
+}
+
+bool Scheduler::Pack16(u32 mode, bool to_buffer, TextureHandle texture_handle, u32 level, u32 slice,
+                         Offset3D origin, Extent3D extent, BufferHandle buffer, u64 offset,
+                         u32 bytes_per_row) {
+    const id<MTLTexture> texture = AsTexture(texture_handle);
+    if (texture == nil || buffer == nullptr || extent.width == 0 || extent.height == 0 ||
+        offset % 2 != 0 || bytes_per_row % 2 != 0 ||
+        (texture.textureType != MTLTextureType2D && texture.textureType != MTLTextureType2DArray)) {
+        return false;
+    }
+    impl->FlushClear();
+    Impl& state = *impl;
+    id<MTLComputePipelineState> pipeline = to_buffer ? state.pack16_to : state.pack16_from;
+    if (pipeline == nil && state.library != nil) {
+        NSError* error = nil;
+        pipeline = [state.device.GetDevice()
+            newComputePipelineStateWithFunction:
+                [state.library newFunctionWithName:to_buffer ? @"pack16_to_buffer"
+                                                             : @"pack16_from_buffer"]
+                                          error:&error];
+        if (pipeline == nil) {
+            LOG_ERROR(Render_Metal, "Metal: Packed 16-bit kernel failed: {}",
+                      error.localizedDescription.UTF8String);
+        } else if (to_buffer) {
+            state.pack16_to = pipeline;
+        } else {
+            state.pack16_from = pipeline;
+        }
+    }
+    const id<MTLTexture> view = [texture newTextureViewWithPixelFormat:texture.pixelFormat
+                                                           textureType:MTLTextureType2D
+                                                                levels:NSMakeRange(level, 1)
+                                                                slices:NSMakeRange(slice, 1)];
+    if (pipeline == nil || view == nil) {
+        return false;
+    }
+    state.EndEncoder();
+    state.NoteInOrder(buffer);
+    ++state.encoders;
+    ++state.segment_encoders;
+    const id<MTLComputeCommandEncoder> encoder = [state.Commands() computeCommandEncoder];
+    encoder.label = @"Packed 16-bit copy";
+    [encoder setComputePipelineState:pipeline];
+    [encoder setTexture:view atIndex:0];
+    [encoder setBuffer:AsBuffer(buffer) offset:offset atIndex:0];
+    const std::array<u32, 6> params{origin.x, origin.y, extent.width, extent.height,
+                                    bytes_per_row / 2, mode};
+    [encoder setBytes:params.data() length:sizeof(params) atIndex:1];
+    [encoder dispatchThreadgroups:MTLSizeMake((extent.width + 7) / 8, (extent.height + 7) / 8, 1)
+            threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [encoder endEncoding];
+    return true;
+}
+
+bool Scheduler::SwapPacked(BufferHandle buffer, u64 offset, u32 width, u32 rows, u32 images,
+                           u32 bytes_per_row, u32 bytes_per_image, u32 shift) {
+    if (buffer == nullptr || width == 0 || rows == 0 || images == 0 || offset % 2 != 0 ||
+        offset + u64{images} * bytes_per_image > UINT32_MAX) {
+        return false;
+    }
+    impl->FlushClear();
+    Impl& state = *impl;
+    if (state.swap_packed == nil && state.library != nil) {
+        NSError* error = nil;
+        state.swap_packed = [state.device.GetDevice()
+            newComputePipelineStateWithFunction:[state.library newFunctionWithName:@"swap_packed"]
+                                          error:&error];
+        if (state.swap_packed == nil) {
+            LOG_ERROR(Render_Metal, "Metal: packed texel swap kernel failed: {}",
+                      error.localizedDescription.UTF8String);
+        }
+    }
+    if (state.swap_packed == nil) {
+        return false;
+    }
+    state.EndEncoder();
+    state.NoteInOrder(buffer);
+    ++state.encoders;
+    ++state.segment_encoders;
+    const id<MTLComputeCommandEncoder> encoder = [state.Commands() computeCommandEncoder];
+    encoder.label = @"Packed texel swap";
+    [encoder setComputePipelineState:state.swap_packed];
+    [encoder setBuffer:AsBuffer(buffer) offset:0 atIndex:0];
+    const std::array<u32, 6> params{static_cast<u32>(offset), width, rows, bytes_per_row,
+                                    bytes_per_image, shift};
+    [encoder setBytes:params.data() length:sizeof(params) atIndex:1];
+    [encoder dispatchThreadgroups:MTLSizeMake((width + 31) / 32, (rows + 7) / 8, images)
+            threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+    [encoder endEncoding];
+    return true;
+}
+
 bool Scheduler::ScaleNearest(const ScalePass& scale) {
+    impl->SamplesNeeded(scale.src);
+    impl->Written(scale.dst.texture);
     impl->FlushClear();
     const id<MTLTexture> src = AsTexture(scale.src);
     const id<MTLTexture> dst = AsTexture(scale.dst.texture);
@@ -2411,6 +2805,7 @@ bool Scheduler::ScaleNearest(const ScalePass& scale) {
 bool Scheduler::Resolve(TextureHandle src_handle, u32 src_slice, const Attachment& dst, u32 width,
                         u32 height) {
     impl->FlushClear();
+    impl->SamplesNeeded(src_handle);
     const id<MTLTexture> src = AsTexture(src_handle);
     const id<MTLTexture> target = AsTexture(dst.texture);
     if (src == nil || target == nil || src.sampleCount < 2 || target.sampleCount != 1 ||
@@ -2463,6 +2858,10 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
             impl->FlushClear();
         }
     }
+    const bool defer_stores = UnwrittenStoresEnabled(impl->device);
+    u8 defer_color = 0;
+    bool defer_depth = false;
+    bool defer_stencil = false;
     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
     for (size_t index = 0; index < targets.color.size(); ++index) {
         if (targets.color[index].texture == nullptr) {
@@ -2472,10 +2871,41 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
         ApplyAttachment(color, targets.color[index]);
         color.loadAction = MTLLoadActionLoad;
         color.storeAction = MTLStoreActionStore;
-        if (clear && clear->clear_color[index]) {
+        const bool cleared = clear && clear->clear_color[index];
+        // Q27: a multisampled colour target with a resolve shadow resolves in the pass.
+        bool resolving = false;
+        if (!impl->shadows.empty()) {
+            if (const auto shadow = impl->shadows.find(targets.color[index].texture);
+                shadow != impl->shadows.end()) {
+                Impl::ShadowEntry& entry = shadow->second;
+                if (!cleared && entry.dropped) {
+                    impl->RestoreSamples(shadow->first, entry);
+                }
+                if (targets.layers == 1) {
+                    resolving = true;
+                    color.resolveTexture = AsTexture(entry.shadow);
+                    color.resolveLevel = 0;
+                    color.resolveSlice = targets.color[index].slice;
+                    const bool drop = MsaaDiscardEnabled() && cleared;
+                    color.storeAction = drop ? MTLStoreActionMultisampleResolve
+                                             : MTLStoreActionStoreAndMultisampleResolve;
+                    entry.valid = true;
+                    entry.dropped = drop;
+                    if (drop) {
+                        ++impl->samples_dropped;
+                    }
+                } else {
+                    entry.valid = false;
+                }
+            }
+        }
+        if (cleared) {
             const auto& value = clear->color_value[index];
             color.loadAction = MTLLoadActionClear;
             color.clearColor = MTLClearColorMake(value[0], value[1], value[2], value[3]);
+        } else if (defer_stores && !resolving) {
+            color.storeAction = MTLStoreActionUnknown;
+            defer_color |= static_cast<u8>(1U << index);
         }
     }
     if (targets.has_depth) {
@@ -2485,6 +2915,9 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
         if (clear && clear->clear_depth) {
             pass.depthAttachment.loadAction = MTLLoadActionClear;
             pass.depthAttachment.clearDepth = clear->depth_value;
+        } else if (defer_stores) {
+            pass.depthAttachment.storeAction = MTLStoreActionUnknown;
+            defer_depth = true;
         }
     }
     if (targets.has_stencil) {
@@ -2494,6 +2927,9 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
         if (clear && clear->clear_stencil) {
             pass.stencilAttachment.loadAction = MTLLoadActionClear;
             pass.stencilAttachment.clearStencil = clear->stencil_value;
+        } else if (defer_stores) {
+            pass.stencilAttachment.storeAction = MTLStoreActionUnknown;
+            defer_stencil = true;
         }
     }
     // Draws without attachments (occlusion queries) still need a size, within Metal's limit.
@@ -2547,6 +2983,13 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
     }
     pass.visibilityResultBuffer = impl->visibility;
     impl->render = impl->RenderEncoder(pass);
+    impl->deferred_color = defer_color;
+    impl->deferred_depth = defer_depth;
+    impl->deferred_stencil = defer_stencil;
+    impl->written_color = 0;
+    impl->written_depth = false;
+    impl->written_stencil = false;
+    impl->pass_state_set = false;
     impl->render_targets = targets;
     impl->visibility_slot = -1;
     impl->vertex_bound = {};
@@ -2590,6 +3033,34 @@ u64* Scheduler::VisibilityResults() noexcept {
     return static_cast<u64*>(impl->visibility.contents);
 }
 
+void Scheduler::SetResolveShadow(TextureHandle msaa, TextureHandle shadow) {
+    if (msaa == nullptr) {
+        return;
+    }
+    if (shadow == nullptr) {
+        impl->shadows.erase(msaa);
+    } else {
+        impl->shadows[msaa] = Impl::ShadowEntry{.shadow = shadow};
+    }
+}
+
+TextureHandle Scheduler::ResolveShadow(TextureHandle msaa) const noexcept {
+    const auto it = impl->shadows.find(msaa);
+    return it != impl->shadows.end() && it->second.valid ? it->second.shadow : nullptr;
+}
+
+u64 Scheduler::SamplesDropped() const noexcept {
+    return impl->samples_dropped;
+}
+
+u64 Scheduler::SamplesRestored() const noexcept {
+    return impl->samples_restored;
+}
+
+u64 Scheduler::StoresDropped() const noexcept {
+    return impl->stores_dropped;
+}
+
 u64 Scheduler::RenderPassSerial() const noexcept {
     return impl->render_pass_serial;
 }
@@ -2599,6 +3070,10 @@ void Scheduler::SetDrawState(const DrawState& state) {
     if (encoder == nil) {
         return;
     }
+    impl->pass_state_set = true;
+    impl->written_color |= state.color_written;
+    impl->written_depth = impl->written_depth || state.depth_written;
+    impl->written_stencil = impl->written_stencil || state.stencil_written;
     // What the encoder has from the draw before stays as it is (EDEN_NX2_METAL_STATE_CACHE).
     const bool cached = DrawStateCacheEnabled() && impl->render_state_valid;
     const DrawState& last = impl->render_state;

@@ -249,16 +249,67 @@ public:
     /// its bytes (24-bit depth, depth with stencil), else nothing.
     [[nodiscard]] std::optional<DepthLayout> DepthBytesLayout() const;
 
+    /// SparseTiles images (G18, as Vulkan's): maps the tiles under `rects` (and the mip tail) of
+    /// the sparse texture; false (nothing mapped) when its heap is full.
+    bool BindTiles(std::span<const VideoCommon::LevelRect> rects);
+
+    /// The sparse tile in texels, the first level of the mip tail, and what the image holds.
+    [[nodiscard]] u32 SparseTileWidth() const noexcept {
+        return sparse.tile_width;
+    }
+    [[nodiscard]] u32 SparseTileHeight() const noexcept {
+        return sparse.tile_height;
+    }
+    [[nodiscard]] s32 SparseTailLevel() const noexcept {
+        return static_cast<s32>(sparse.tail_level);
+    }
+    [[nodiscard]] u64 SparseBoundBytes() const noexcept {
+        return sparse.heap_bytes;
+    }
+
+    /// PackedSwapShift of the guest format (0: the texture holds the guest's bytes).
+    [[nodiscard]] u32 PackedShift() const noexcept {
+        return packed_shift;
+    }
+
+    /// Pack16Mode of a packed format held as RGBA8 (moved to and from the guest's words by
+    /// kernels), else 0.
+    [[nodiscard]] u32 Pack16() const noexcept {
+        return pack16;
+    }
+
     u64 allocation_tick{};
 
 private:
+    /// Calls `region(buffer offset, width, rows, images, bytes per row, bytes per image)` for
+    /// every run of texels a list of buffer copies moves (Image::PackedShift images).
+    template <typename F>
+    void ForEachCopyRegion(std::span<const VideoCommon::BufferImageCopy> copies, F&& region) const;
+
     /// Copies every level and layer between the native and the scaled texture (scaled to fit).
     bool CopyScaled(bool scale_up);
 
     /// Bytes a row of the copy holds in the buffer, and a layer (2D) or slice (3D).
     [[nodiscard]] std::pair<u32, u32> CopyPitches(const VideoCommon::BufferImageCopy& copy) const;
 
+    struct SparseTiles {
+        Object heap;
+        u32 tile_width{};
+        u32 tile_height{};
+        u32 tile_bytes{};
+        u32 tail_level{};
+        u32 tail_tiles{};
+        u64 heap_bytes{};
+        u64 bound_bytes{};
+        bool tail_mapped{};
+        std::vector<std::vector<bool>> mapped; ///< Per level before the tail, per tile
+    };
+
     TextureCacheRuntime* runtime{};
+    u32 packed_shift{};
+    u32 pack16{};
+    Object resolve_shadow; ///< Q27: the single-sampled resolve of a multisampled colour image
+    SparseTiles sparse;
     Object texture;
     /// The texture at the scaled size, made on the first ScaleUp.
     Object scaled_texture;

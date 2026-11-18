@@ -4,11 +4,16 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
 
+#include "common/alignment.h"
+#include "common/div_ceil.h"
 #include "common/logging.h"
+#include "video_core/texture_cache/decode_etc.h"
 #include "video_core/renderer_metal/metal_archive.h"
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_device.h"
@@ -189,6 +194,35 @@ const char* ViewFormatReason(MTLPixelFormat from, MTLPixelFormat to) {
     return nullptr;
 }
 
+MTLTextureDescriptor* MakeTextureDescriptor(const TextureDesc& desc) {
+    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor new];
+    descriptor.textureType = TextureType(desc.kind);
+    descriptor.pixelFormat = static_cast<MTLPixelFormat>(desc.format);
+    descriptor.width = (std::max)(desc.width, 1U);
+    descriptor.height = (std::max)(desc.height, 1U);
+    descriptor.depth = (std::max)(desc.depth, 1U);
+    descriptor.mipmapLevelCount = (std::max)(desc.levels, 1U);
+    // Cube textures count faces in arrayLength / 6.
+    const bool cube = desc.kind == TextureKind::Cube || desc.kind == TextureKind::CubeArray;
+    descriptor.arrayLength = (std::max)(cube ? desc.layers / 6 : desc.layers, 1U);
+    descriptor.sampleCount = (std::max)(desc.samples, 1U);
+    descriptor.storageMode = MTLStorageModePrivate;
+    // Format views reinterpret texture cache images (ImageView formats, copies between
+    // compatible formats). It costs lossless compression on some GPUs; narrowing it to images
+    // that need it is a later step (docs/nx2/metal-renderer.md).
+    MTLTextureUsage usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    if (desc.render_target) {
+        usage |= MTLTextureUsageRenderTarget;
+    }
+    if (desc.shader_write) {
+        usage |= MTLTextureUsageShaderWrite;
+    }
+    descriptor.usage = usage;
+    // Metal orders the encoders until the scheduler tracks hazards itself (untracked heaps).
+    descriptor.hazardTrackingMode = MTLHazardTrackingModeTracked;
+    return descriptor;
+}
+
 } // Anonymous namespace
 
 u64 DeviceMemoryBudget(const Device& device) {
@@ -217,6 +251,12 @@ bool IsConverted(const Device& device, PixelFormat format) {
     if (VideoCore::Surface::IsPixelFormatBCn(format)) {
         return !device.SupportsBCTextures();
     }
+    if (VideoCommon::IsEtcFormat(format)) {
+        // Apple GPUs read ETC2 and EAC; Intel and AMD Macs don't (decoded on the CPU,
+        // VideoCommon::DecodeEtc). EDEN_NX2_METAL_ETC=cpu decodes them on any GPU.
+        const char* const value = std::getenv("EDEN_NX2_METAL_ETC");
+        return device.AppleFamily() == 0 || (value != nullptr && std::strcmp(value, "cpu") == 0);
+    }
     // Metal has no 96-bit and no 8-bit 4:4 format.
     if (VideoCommon::IsExpandedFormat(format)) {
         return FormatsExpanded();
@@ -224,7 +264,34 @@ bool IsConverted(const Device& device, PixelFormat format) {
     return false;
 }
 
-FormatInfo SurfaceFormat(const Device&, PixelFormat format, bool converted) {
+bool PackedAsRgba8(const Device& device) {
+    const char* const value = std::getenv("EDEN_NX2_METAL_PACKED");
+    return device.AppleFamily() == 0 || (value != nullptr && std::strcmp(value, "rgba8") == 0);
+}
+
+FormatFallback FallbackOf(const Device& device, PixelFormat format) {
+    if (Pack16Mode(format) != 0 &&
+        (Pack16Mode(format) == 1 || PackedAsRgba8(device))) {
+        return FormatFallback::Stand_in;
+    }
+    if (IsConverted(device, format)) {
+        return VideoCommon::IsExpandedFormat(format) ? FormatFallback::Expanded
+                                                     : FormatFallback::Decoded;
+    }
+    switch (format) {
+    case PixelFormat::X8_D24_UNORM:
+    case PixelFormat::D24_UNORM_S8_UINT:
+    case PixelFormat::S8_UINT_D24_UNORM: return FormatFallback::Widened;
+    default: return FormatFallback::Native;
+    }
+}
+
+FormatInfo SurfaceFormat(const Device& device, PixelFormat format, bool converted) {
+    const u32 mode = Pack16Mode(format);
+    if (!converted && mode > 1 && PackedAsRgba8(device)) {
+        return FormatInfo{.format = Fmt::RGBA8Unorm, .attachable = true, .storage = true,
+                          .format_class = FormatClass::Float};
+    }
     return SurfaceFormat(format, converted);
 }
 
@@ -247,32 +314,75 @@ Object CreateTexture(const Device& device, const TextureDesc& desc) {
             return {};
         }
     }
-    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor new];
-    descriptor.textureType = TextureType(desc.kind);
-    descriptor.pixelFormat = static_cast<MTLPixelFormat>(desc.format);
-    descriptor.width = (std::max)(desc.width, 1U);
-    descriptor.height = (std::max)(desc.height, 1U);
-    descriptor.depth = (std::max)(desc.depth, 1U);
-    descriptor.mipmapLevelCount = (std::max)(desc.levels, 1U);
-    // Cube textures count faces in arrayLength / 6.
-    const bool cube = desc.kind == TextureKind::Cube || desc.kind == TextureKind::CubeArray;
-    descriptor.arrayLength = (std::max)(cube ? desc.layers / 6 : desc.layers, 1U);
-    descriptor.sampleCount = (std::max)(desc.samples, 1U);
-    descriptor.storageMode = MTLStorageModePrivate;
-    // Format views reinterpret texture cache images (ImageView formats, copies between
-    // compatible formats). It costs lossless compression on some GPUs; narrowing it to images
-    // that need it is a later step (docs/nx2/metal-renderer.md).
-    MTLTextureUsage usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-    if (desc.render_target) {
-        usage |= MTLTextureUsageRenderTarget;
-    }
-    if (desc.shader_write) {
-        usage |= MTLTextureUsageShaderWrite;
-    }
-    descriptor.usage = usage;
-    // Metal orders the encoders until the scheduler tracks hazards itself (untracked heaps).
-    descriptor.hazardTrackingMode = MTLHazardTrackingModeTracked;
+    MTLTextureDescriptor* descriptor = MakeTextureDescriptor(desc);
     return Retain([device.GetDevice() newTextureWithDescriptor:descriptor]);
+}
+
+bool SupportsSparseTextures(const Device& device) {
+    // Apple6 and later (A13, M1) have sparse textures; tier 2 (unmapped tiles read zero, no
+    // residency query needed) is told by Metal 4's SDK and OS.
+    if (device.AppleFamily() < 6) {
+        return false;
+    }
+    if (@available(macOS 26.0, iOS 26.0, *)) {
+        return true;
+    }
+    return false;
+}
+
+std::optional<SparseTexture> CreateSparseTexture(const Device& device, const TextureDesc& desc,
+                                                 u64 heap_bytes) {
+    if (!SupportsSparseTextures(device) || desc.kind != TextureKind::e2D || desc.samples != 1) {
+        return std::nullopt;
+    }
+    const id<MTLDevice> mtl = device.GetDevice();
+    MTLTextureDescriptor* descriptor = MakeTextureDescriptor(desc);
+    const MTLSize tile = [mtl sparseTileSizeWithTextureType:descriptor.textureType
+                                                pixelFormat:descriptor.pixelFormat
+                                                sampleCount:1];
+    const u32 tile_bytes = static_cast<u32>([mtl sparseTileSizeInBytes]);
+    if (tile.width == 0 || tile.height == 0 || tile_bytes == 0) {
+        return std::nullopt;
+    }
+    MTLHeapDescriptor* heap_descriptor = [MTLHeapDescriptor new];
+    heap_descriptor.type = MTLHeapTypeSparse;
+    heap_descriptor.storageMode = MTLStorageModePrivate;
+    heap_descriptor.hazardTrackingMode = MTLHazardTrackingModeTracked;
+    heap_descriptor.size = Common::AlignUp(heap_bytes, u64{tile_bytes});
+    const id<MTLHeap> heap = [mtl newHeapWithDescriptor:heap_descriptor];
+    if (heap == nil) {
+        return std::nullopt;
+    }
+    const id<MTLTexture> texture = [heap newTextureWithDescriptor:descriptor];
+    if (texture == nil) {
+        return std::nullopt;
+    }
+    if (@available(macOS 26.0, iOS 26.0, *)) {
+        if (texture.sparseTextureTier != MTLTextureSparseTier2) {
+            return std::nullopt;
+        }
+    }
+    const u32 levels = desc.levels;
+    const u32 tail_level = static_cast<u32>((std::min)(static_cast<u32>(texture.firstMipmapInTail),
+                                                       levels));
+    return SparseTexture{
+        .texture = Retain(texture),
+        .heap = Retain(heap),
+        .tile_width = static_cast<u32>(tile.width),
+        .tile_height = static_cast<u32>(tile.height),
+        .tile_bytes = tile_bytes,
+        .tail_level = tail_level,
+        .tail_tiles = tail_level < levels ? (std::max)(1U, static_cast<u32>(
+                                                               Common::DivCeil(
+                                                                   u64{texture.tailSizeInBytes},
+                                                                   u64{tile_bytes})))
+                                          : 0U,
+        .heap_bytes = static_cast<u64>(heap.size),
+    };
+}
+
+u64 SparseHeapUsedBytes(const void* heap) {
+    return heap != nullptr ? static_cast<u64>(((__bridge id<MTLHeap>)heap).usedSize) : 0;
 }
 
 Object CreateTextureView(TextureHandle texture, u32 format, TextureKind kind, u32 base_level,

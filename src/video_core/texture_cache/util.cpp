@@ -32,6 +32,7 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/decode_bc.h"
+#include "video_core/texture_cache/decode_etc.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/texture_cache/samples_helper.h"
@@ -1378,7 +1379,9 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
                 bpp_div;
             output_offset += static_cast<u32>(copy.buffer_size);
         } else {
-            if (IsExpandedFormat(info.format)) {
+            if (IsEtcFormat(info.format)) {
+                DecodeEtc(input_offset, output.subspan(output_offset), copy, info.format);
+            } else if (IsExpandedFormat(info.format)) {
                 ExpandTexels(input_offset, output.subspan(output_offset), copy, info.format);
             } else {
                 DecompressBCn(input_offset, output.subspan(output_offset), copy, info.format);

@@ -269,6 +269,17 @@ EDEN_NX2_FENCE_BATCH=1
 # Vulkan's R4G4_UNORM_PACK8); texel buffers of them keep the guest's bytes.
 #EDEN_NX2_METAL_FORMATS=0
 
+# Metal renderer: 0 stores every attachment of every pass, as before. By default, on Apple GPUs, an
+# attachment a pass loads and no draw of the pass can write (colour write mask 0, depth and stencil
+# writes off) is not stored again (MTLStoreActionDontCare); nxnative's unwritten-attachment rule.
+#EDEN_NX2_METAL_UNWRITTEN_STORE=0
+
+# Metal renderer: 0 makes large images over Switch 2 sparse regions whole, as before. By default,
+# with tier 2 sparse textures (Apple6+, OS 26), such an image is a texture of a sparse heap mapped
+# by tile as the guest memory under it can hold data. EDEN_NX2_METAL_SPARSE_MIB=<n> sets the
+# heap's size (default an eighth of the image, 16 to 256 MiB).
+#EDEN_NX2_METAL_SPARSE=0
+
 # Metal renderer: 0 gives a render pass the bound slice of each attachment only, as before: a
 # program that picks the layer (its layer output) draws into the first. By default a pass of a
 # layered framebuffer has renderTargetArrayLength set to the fewest layers among its attachments'
