@@ -186,6 +186,7 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
         msl.enable_decoration_binding = false;
         // Texel buffers as MSL texture_buffer (MSL 2.1+), not emulated with 2D textures.
         msl.texture_buffer_native = true;
+        msl.enable_point_size_builtin = !options.drop_point_size;
         // Metal's 1D textures take no levels and no views as 2D ones: with the pipeline check
         // the texture cache keeps 1D images as 2D ones a texel high, as MoltenVK does.
         msl.texture_1D_as_2D = PipelineCheckEnabled();

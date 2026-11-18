@@ -66,6 +66,7 @@
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
+#include "video_core/renderer_metal/metal_smoke_present.h"
 #include "video_core/renderer_metal/metal_smoke_probe.h"
 #include "video_core/renderer_metal/metal_smoke_textures.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
@@ -4629,7 +4630,8 @@ int main(int argc, char** argv) {
                                  RunOcarinaActorEffects, RunOcarinaDepthJitter, RunTemporalStandIn, RunForceLod0,
                                  RunSwapchain,
                                  RunVulkanSwitches, RunPresentFilters,
-                                 SmokeTextures::RunAll, SmokeProbe::RunAll}) {
+                                 SmokeTextures::RunAll, SmokePresent::RunAll,
+                                 SmokeProbe::RunAll}) {
             const int outcome = test();
             result = result != 0 ? result : outcome;
         }

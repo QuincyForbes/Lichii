@@ -25,6 +25,7 @@
 #include "video_core/renderer_metal/metal_buffer_cache.h"
 #include "video_core/renderer_metal/metal_condition.h"
 #include "video_core/renderer_metal/metal_fence_manager.h"
+#include "video_core/renderer_metal/metal_frame_dump.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
 #include "video_core/renderer_metal/metal_indirect.h"
@@ -443,6 +444,11 @@ private:
                             std::span<const VideoCommon::SamplerId> samplers, u32 render_width,
                             u32 render_height);
 
+    /// A colour image the frame dump reads back (null when it can't).
+    [[nodiscard]] std::optional<FrameDump::Source> DumpSource(const ImageView& view, u32 slot);
+    /// Starts the frame dump's pass for the draw about to open its render pass.
+    void FrameDumpPass(const Framebuffer* framebuffer, std::span<const u64> shader_hashes);
+
     /// Sets the open render pass's occlusion counting for the next draw.
     void CountOcclusion();
 
@@ -476,6 +482,8 @@ private:
     QueryCache query_cache;
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
+    /// EDEN_NX2_FRAME_DUMP and the debug server's capture_frame.
+    FrameDump frame_dump;
     /// Guest writes that found the buffer cache's lock held (EDEN_NX2_WRITE_HANDOFF).
     VideoCommon::Nx2WriteHandoff write_handoff;
 

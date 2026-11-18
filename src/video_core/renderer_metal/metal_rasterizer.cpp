@@ -288,7 +288,8 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
       buffer_cache{device_memory_, buffer_cache_runtime}, pipeline_cache{device_memory_, device_},
       ocarina{device_, scheduler_}, ocarina_temporal{device_, scheduler_},
       accelerate_dma{buffer_cache, texture_cache, scheduler_},
-      fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_} {
+      fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_},
+      frame_dump{device_, scheduler_} {
     pipeline_cache.SetSkipCheck([this] { return DrawMayBeSkipped(); });
     Common::PlatformEvents::SetGraphicsMemoryReport([this] { return GraphicsMemoryReport(); });
     // Fence work left pending (EDEN_NX2_FENCE_FLUSH_US) is committed when the split's back goes
@@ -2272,6 +2273,9 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         // Committed in the middle of the draw: what the buffer cache noted as used is gone.
         scheduler.BlockAhead();
     }
+    if (frame_dump.Capturing()) {
+        FrameDumpPass(framebuffer, {&pipeline.Key().unique_hashes[1], 5});
+    }
     scheduler.BeginRendering(targets);
     if (writes_storage) {
         pass_stores = scheduler.RenderPassSerial();
@@ -3686,6 +3690,35 @@ void RasterizerMetal::DispatchCompute() {
     } else {
         scheduler.Dispatch({qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z}, group_size);
     }
+    if (frame_dump.Capturing()) {
+        // The images the program writes, read back after it (the storage images are the last
+        // views, after the texel buffers and the sampled textures).
+        size_t view_index = 0;
+        for (const auto& desc : info.texture_buffer_descriptors) {
+            view_index += desc.count;
+        }
+        for (const auto& desc : info.image_buffer_descriptors) {
+            view_index += desc.count;
+        }
+        for (const auto& desc : info.texture_descriptors) {
+            view_index += desc.count;
+        }
+        std::vector<FrameDump::Source> written;
+        u32 slot = 0;
+        for (const auto& desc : info.image_descriptors) {
+            for (u32 element = 0; element < desc.count; ++element, ++slot) {
+                if (desc.is_written && view_index + element < views.size() &&
+                    views[view_index + element].id) {
+                    if (const auto source = DumpSource(
+                            texture_cache.GetImageView(views[view_index + element].id), slot)) {
+                        written.push_back(*source);
+                    }
+                }
+            }
+            view_index += desc.count;
+        }
+        frame_dump.CaptureDispatch(pipeline->Key().unique_hash, written);
+    }
     Coverage::Note(Coverage::Work::Dispatch, Coverage::Path::Native);
 }
 
@@ -4467,8 +4500,123 @@ void RasterizerMetal::FlushCommands() {
     }
 }
 
+std::optional<FrameDump::Source> RasterizerMetal::DumpSource(const ImageView& view,
+                                                              u32 slot) {
+    const Image* const image = view.BackingImage();
+    if (image == nullptr || image->info.type == VideoCommon::ImageType::Buffer ||
+        image->info.type == VideoCommon::ImageType::e3D) {
+        return std::nullopt;
+    }
+    const auto& info = image->info;
+    const TextureHandle texture = image->Handle();
+    if (texture == nullptr) {
+        return std::nullopt;
+    }
+    const bool rescaled = image->IsRescaled();
+    const auto& resolution = Settings::values.resolution_info;
+    const u32 width = rescaled ? resolution.ScaleUp(info.size.width) : info.size.width;
+    const u32 height = rescaled ? resolution.ScaleUp(info.size.height) : info.size.height;
+    const u32 level = static_cast<u32>(view.range.base.level);
+    return FrameDump::Source{
+        .texture = texture,
+        .format = VideoCore::Surface::BytesPerBlock(view.format) ==
+                          VideoCore::Surface::BytesPerBlock(info.format)
+                      ? view.format
+                      : info.format,
+        .width = std::max(1U, width >> level),
+        .height = std::max(1U, height >> level),
+        .gpu_addr = image->gpu_addr,
+        .slot = slot,
+        .level = level,
+        .layer = static_cast<u32>(view.range.base.layer),
+        .msaa = info.num_samples > 1 || image->HostSamples() > 1,
+        .rescaled = rescaled,
+        .host_format = DescribeTexture(texture).format,
+    };
+}
+
+void RasterizerMetal::FrameDumpPass(const Framebuffer* framebuffer,
+                                    std::span<const u64> shader_hashes) {
+    std::array<FrameDump::Source, NUM_RT> colors;
+    size_t count = 0;
+    const auto& ids = texture_cache.GetRenderTargets().color_buffer_ids;
+    for (u32 slot = 0; slot < ids.size(); ++slot) {
+        if (!ids[slot]) {
+            continue;
+        }
+        if (const auto source = DumpSource(texture_cache.GetImageView(ids[slot]), slot)) {
+            colors[count++] = *source;
+        }
+    }
+    frame_dump.BeginPass(framebuffer, std::span(colors).first(count));
+    frame_dump.NoteDraw(shader_hashes);
+}
+
+namespace {
+
+/// read_gpu_memory: the first address space (the bound channel's first) that maps the whole range,
+/// read as the GPU reads it, without flushing GPU caches.
+VideoCore::Nx2Debug::GpuReadResult ReadGpuMemory(std::span<Tegra::MemoryManager* const> spaces,
+                                                 GPUVAddr address, u64 size) {
+    VideoCore::Nx2Debug::GpuReadResult result{};
+    if (spaces.empty()) {
+        result.error = "no GPU address space is bound yet";
+        return result;
+    }
+    for (Tegra::MemoryManager* const space : spaces) {
+        if (space->IsFullyMappedRange(address, size)) {
+            result.bytes.resize(size);
+            space->ReadBlockUnsafe(address, result.bytes.data(), size);
+            result.address_space = space->GetID();
+            return result;
+        }
+    }
+    constexpr u64 page_mask = 0xfff;
+    const GPUVAddr end = address + size;
+    GPUVAddr first = address;
+    while (first < end) {
+        const GPUVAddr next = (std::min)((first | page_mask) + 1, end);
+        if (!spaces.front()->IsFullyMappedRange(first, next - first)) {
+            break;
+        }
+        first = next;
+    }
+    result.error = fmt::format("GPU address {:#x} is not mapped (the first unmapped byte in the "
+                               "bound channel's address space; {} address spaces checked)",
+                               first, spaces.size());
+    return result;
+}
+
+} // Anonymous namespace
+
 void RasterizerMetal::TickFrame() {
     VideoCommon::FeatureCensus::Tick();
+    if (VideoCore::Nx2Debug::HasRequests()) {
+        if (const auto capture = VideoCore::Nx2Debug::TakeCapture()) {
+            frame_dump.Arm(capture->id, capture->directory);
+        }
+        if (const auto change = VideoCore::Nx2Debug::TakeRejectChange()) {
+            pipeline_cache.RefreshDebugRejections(change->unrejected);
+            VideoCore::Nx2Debug::NoteRejectApplied(change->generation);
+        }
+        while (const auto read = VideoCore::Nx2Debug::TakeGpuRead()) {
+            std::vector<Tegra::MemoryManager*> spaces;
+            if (gpu_memory != nullptr) {
+                spaces.push_back(gpu_memory);
+            }
+            {
+                std::scoped_lock lock{config_mutex};
+                for (const auto& [id, space] : address_spaces) {
+                    if (space.gpu_memory != gpu_memory) {
+                        spaces.push_back(space.gpu_memory);
+                    }
+                }
+            }
+            VideoCore::Nx2Debug::FinishGpuRead(read->id,
+                                               ReadGpuMemory(spaces, read->gpu_address, read->size));
+        }
+    }
+    frame_dump.TickFrame();
     ++oot_frame;
     if (!graphics_report_logged && oot_frame == 600) {
         graphics_report_logged = true;
@@ -4730,6 +4878,11 @@ std::optional<DisplayTexture> RasterizerMetal::AccelerateDisplay(
                      static_cast<u32>(config.pixel_format), config.native_tiling);
         }
         return std::nullopt;
+    }
+    if (frame_dump.Capturing()) {
+        if (const auto source = DumpSource(*image_view, 0)) {
+            frame_dump.CapturePresent(*source);
+        }
     }
     const auto& resolution = Settings::values.resolution_info;
     DisplayTexture texture{

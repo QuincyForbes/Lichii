@@ -43,6 +43,14 @@ public:
     void Present(id<MTLCommandBuffer> command_buffer, id<CAMetalDrawable> drawable,
                  bool guest_frame);
 
+    /// Presents `drawable` with `command_buffer` once the one before has been shown for
+    /// `hold_seconds` (frame generation spaces its frames itself; no guest pacing).
+    void PresentHeld(id<MTLCommandBuffer> command_buffer, id<CAMetalDrawable> drawable,
+                     f64 hold_seconds);
+
+    /// The main screen's refresh period in ns, 0 when it can't be read.
+    [[nodiscard]] f64 DisplayRefreshNs();
+
     /// Since the last call: guest frames presented, those held for pacing, and the refreshes
     /// each was held for ("Metal pacing:" line); empty without pacing.
     [[nodiscard]] std::string TakePacingLine();

@@ -29,14 +29,21 @@
 #include "common/scope_exit.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
+#include "core/hle/service/nvnflinger/hwc_layer.h"
 #include "video_core/capture.h"
 #include "video_core/framebuffer_config.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_perf.h"
+#ifdef HAS_RESHADE
+#include "video_core/post_processing/fx_chain.h"
+#endif
 #include "video_core/render_probe.h"
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_formats.h"
+#include "video_core/renderer_metal/metal_frame_gen.h"
+#include "video_core/renderer_metal/metal_post_process.h"
 #include "video_core/renderer_metal/metal_present.h"
 #include "video_core/renderer_metal/metal_rasterizer.h"
 #include "video_core/renderer_metal/metal_resources.h"
@@ -326,6 +333,27 @@ struct RendererMetal::Impl {
                     u32 target_format, const Layout::FramebufferLayout& layout,
                     bool apply_filters);
 
+#ifdef HAS_LSFG
+    /// Frame generation (FSR 3 or MetalFX): the layers drawn into a texture of our own, the
+    /// generated frames and then the real one blitted to drawables, each held for its share of
+    /// the real frame interval (Vulkan's Composite and present thread). Whether a real frame was
+    /// drawn.
+    bool CompositeGenerated(std::span<const Tegra::FramebufferConfig> framebuffers,
+                            id<CAMetalDrawable> drawable,
+                            const Layout::FramebufferLayout& layout);
+
+    /// `texture` into `drawable` and presented on its own command buffer, after the previous
+    /// drawable has been shown `hold_seconds`.
+    void PresentTexture(TextureHandle texture, id<CAMetalDrawable> drawable,
+                        const Layout::FramebufferLayout& layout, f64 hold_seconds, bool guest);
+
+    FrameGen frame_gen{device, scheduler};
+    Object compose;
+    std::array<u32, 2> compose_size{};
+    bool refresh_published{};
+    u64 generated_since_report{};
+#endif
+
     /// Vulkan's RenderAppletCaptureLayer: the LastFrame layer stack drawn into the capture texture
     /// (1280x720 RGBA8) each frame, for GetAppletCaptureBuffer.
     void RenderAppletCapture(std::span<const Tegra::FramebufferConfig> framebuffers);
@@ -369,6 +397,9 @@ struct RendererMetal::Impl {
     std::vector<MemoryLayer> memory_layers;
     SpatialUpscaler spatial;
     PresentPasses present{device, scheduler};
+#ifdef HAS_RESHADE
+    PostProcess post_process{device, scheduler};
+#endif
 
     std::chrono::steady_clock::time_point report_start = std::chrono::steady_clock::now();
     u64 presented{};
@@ -451,6 +482,10 @@ RendererMetal::RendererMetal(Core::Frontend::EmuWindow& emu_window,
                              std::unique_ptr<Core::Frontend::GraphicsContext> context_)
     : RendererBase(emu_window, std::move(context_)), gpu{gpu_},
       impl{std::make_unique<Impl>(emu_window, gpu_, device_memory)} {
+#ifdef HAS_RESHADE
+    // The post-processing chain the settings name, as Vulkan's renderer loads it.
+    VideoCore::FxChain::Instance().LoadFromSettings();
+#endif
     LOG_WARNING(Render_Metal,
                 "Metal renderer (experimental): draws, compute dispatches, occlusion queries, "
                 "tessellation and mesh shaders (emulated) run on Metal; geometry shaders and "
@@ -510,6 +545,17 @@ bool RendererMetal::Impl::DrawLayers(std::span<const Tegra::FramebufferConfig> f
             };
             passes_source = present.AntiAlias(
                 passes_source, Settings::values.anti_aliasing.GetValue());
+#ifdef HAS_RESHADE
+            // The post-processing chain (Vulkan's Layer::ConfigureDraw): the guest's own layers,
+            // not the applet's, before the upscaler.
+            const bool is_applet = (framebuffer.layer_stack_mask &
+                                    Service::Nvnflinger::LayerStackBit(
+                                        Service::Nvnflinger::LayerStackId::Recording)) == 0;
+            if (!is_applet && PostProcess::Wanted()) {
+                passes_source.texture =
+                    post_process.Apply(passes_source.texture, passes_source.size);
+            }
+#endif
             passes_source = present.Upscale(
                 passes_source, filter,
                 {static_cast<u32>(screen_width), static_cast<u32>(screen_height)});
@@ -562,6 +608,110 @@ bool RendererMetal::Impl::DrawLayers(std::span<const Tegra::FramebufferConfig> f
     return drawn;
 }
 
+#ifdef HAS_LSFG
+void RendererMetal::Impl::PresentTexture(TextureHandle texture, id<CAMetalDrawable> drawable,
+                                         const Layout::FramebufferLayout& layout,
+                                         f64 hold_seconds, bool guest) {
+    const std::array<s32, 4> rect{0, 0, static_cast<s32>(layout.width),
+                                  static_cast<s32>(layout.height)};
+    scheduler.Blit(BlitPass{
+        .src = texture,
+        .src_rect = rect,
+        .dst = {.texture = (__bridge void*)drawable.texture},
+        .dst_format = DrawableFormat(),
+        .dst_rect = rect,
+        .dst_width = layout.width,
+        .dst_height = layout.height,
+        .linear = false,
+        .keep_dst = false,
+    });
+    const id<MTLCommandBuffer> command_buffer =
+        (__bridge id<MTLCommandBuffer>)scheduler.CommandBuffer();
+    swapchain.PresentHeld(command_buffer, drawable, hold_seconds);
+    scheduler.NotePresent(guest);
+    // Each present on a command buffer of its own: the hold counts from the one before.
+    scheduler.Flush();
+    ++presented;
+}
+
+bool RendererMetal::Impl::CompositeGenerated(std::span<const Tegra::FramebufferConfig> framebuffers,
+                                             id<CAMetalDrawable> drawable,
+                                             const Layout::FramebufferLayout& layout) {
+    const std::array<u32, 2> size{layout.width, layout.height};
+    if (!compose || compose_size != size) {
+        scheduler.Finish();
+        compose = CreateTexture(device, {.kind = TextureKind::e2D,
+                                         .format = DrawableFormat(),
+                                         .width = size[0],
+                                         .height = size[1],
+                                         .render_target = true});
+        compose_size = size;
+    }
+    if (!compose) {
+        return false;
+    }
+    const Attachment target{.texture = compose.Get()};
+    const bool drawn = DrawLayers(framebuffers, target, DrawableFormat(), layout, true);
+    if (!drawn) {
+        ClearPass clear{};
+        clear.color[0] = target;
+        clear.clear_color[0] = true;
+        clear.color_value[0] = {0.06, 0.09, 0.22, 1.0};
+        clear.width = layout.width;
+        clear.height = layout.height;
+        scheduler.Clear(clear);
+    }
+    if (!refresh_published) {
+        refresh_published = true;
+        if (const f64 refresh_ns = swapchain.DisplayRefreshNs(); refresh_ns > 0.0) {
+            // The pacer follows the display: no more frames than it shows.
+            VideoCommon::Nx2Perf::g_display_refresh_ns.store(static_cast<long long>(refresh_ns),
+                                                            std::memory_order_relaxed);
+        }
+    }
+    std::array<u32, 2> guest_size{};
+    if (!framebuffers.empty()) {
+        const auto& guest = framebuffers.front();
+        const bool cropped = !guest.crop_rect.IsEmpty();
+        guest_size = {cropped ? static_cast<u32>(guest.crop_rect.GetWidth()) : guest.width,
+                      cropped ? static_cast<u32>(guest.crop_rect.GetHeight()) : guest.height};
+    }
+    const size_t count =
+        frame_gen.Process(compose.Get(), size, DrawableFormat(), guest_size);
+    // Each generated frame gets an equal share of the real frame interval before the next
+    // present (zortos293/Lichii#783).
+    const f64 spacing = static_cast<f64>((std::min)(frame_gen.FrameInterval(), 0.1f)) /
+                        static_cast<f64>(count + 1);
+    id<CAMetalDrawable> next = drawable;
+    f64 hold = 0.0;
+    for (size_t generation = 0; generation < count; ++generation) {
+        const TextureHandle generated = frame_gen.Generate(generation);
+        if (generated == nullptr) {
+            break;
+        }
+        if (next == nil) {
+            next = swapchain.NextDrawable(layout.width, layout.height);
+        }
+        if (next == nil) {
+            break;
+        }
+        PresentTexture(generated, next, layout, hold, false);
+        next = nil;
+        ++generated_since_report;
+        hold = spacing;
+    }
+    if (next == nil) {
+        next = swapchain.NextDrawable(layout.width, layout.height);
+    }
+    if (next != nil) {
+        PresentTexture(compose.Get(), next, layout, hold, drawn);
+    } else {
+        ++skipped;
+    }
+    return drawn;
+}
+#endif
+
 void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
     SCOPE_EXIT {
         render_window.OnFrameDisplayed();
@@ -594,6 +744,12 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
         const id<CAMetalDrawable> drawable =
             impl->swapchain.NextDrawable(layout.width, layout.height);
         if (drawable != nil) {
+#ifdef HAS_LSFG
+            if (FrameGen::Wanted()) {
+                impl->CompositeGenerated(framebuffers, drawable, layout);
+            } else
+#endif
+            {
             const Attachment target{.texture = (__bridge void*)drawable.texture};
             const bool drawn =
                 impl->DrawLayers(framebuffers, target, DrawableFormat(), layout, true);
@@ -613,6 +769,7 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
             impl->scheduler.NotePresent(drawn);
             impl->scheduler.Flush();
             ++impl->presented;
+            }
         } else {
             ++impl->skipped;
             impl->scheduler.Flush();
@@ -657,6 +814,13 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
         if (const std::string coverage = Coverage::TakeLine(); !coverage.empty()) {
             LOG_INFO(Render_Metal, "Perf Metal coverage: {}", coverage);
         }
+#ifdef HAS_LSFG
+        if (const u64 generated = std::exchange(impl->generated_since_report, u64{0});
+            generated != 0) {
+            LOG_INFO(Render_Metal, "Perf Metal frame generation: {} generated frames in {} s ({})",
+                     generated, 10, impl->frame_gen.LastMaker());
+        }
+#endif
         if (const auto mesh = impl->rasterizer.TakeMeshCounts();
             mesh.native_draws + mesh.emulated_draws != 0) {
             LOG_INFO(Render_Metal,

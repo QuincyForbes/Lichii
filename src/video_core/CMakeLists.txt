@@ -648,12 +648,15 @@ set(METAL_RENDERER_CXX_SOURCES
     renderer_metal/metal_draw_desc.cpp
     renderer_metal/metal_fence_manager.cpp
     renderer_metal/metal_formats.cpp
+    renderer_metal/metal_frame_dump.cpp
+    renderer_metal/metal_frame_gen.cpp
     renderer_metal/metal_index_convert.cpp
     renderer_metal/metal_ocarina.cpp
     renderer_metal/metal_pipeline_cache.cpp
     renderer_metal/metal_pipeline_check.cpp
     renderer_metal/metal_pipeline_files.cpp
     renderer_metal/metal_pipeline_translate.cpp
+    renderer_metal/metal_post_process.cpp
     renderer_metal/metal_present.cpp
     renderer_metal/metal_rasterizer.cpp
     renderer_metal/metal_shader_translate.cpp
@@ -677,6 +680,7 @@ if (ENABLE_METAL)
     set(METAL_RENDERER_SOURCES
         renderer_metal/metal_archive.mm
         renderer_metal/metal_device.mm
+        renderer_metal/metal_frame_gen_metalfx.mm
         renderer_metal/metal_graphics.mm
         renderer_metal/metal_object.mm
         renderer_metal/metal_resources.mm
@@ -698,6 +702,9 @@ if (ENABLE_METAL)
         renderer_metal/metal_draw_desc.h
         renderer_metal/metal_fence_manager.h
         renderer_metal/metal_formats.h
+        renderer_metal/metal_frame_dump.h
+        renderer_metal/metal_frame_gen.h
+        renderer_metal/metal_frame_gen_metalfx.h
         renderer_metal/metal_graphics.h
         renderer_metal/metal_index_convert.h
         renderer_metal/metal_mesh_indirect.h
@@ -708,6 +715,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_present.h
         renderer_metal/metal_pipeline_files.h
         renderer_metal/metal_pipeline_translate.h
+        renderer_metal/metal_post_process.h
         renderer_metal/metal_rasterizer.h
         renderer_metal/metal_resources.h
         renderer_metal/metal_scheduler.h
@@ -758,9 +766,11 @@ if (ENABLE_METAL)
         endforeach()
         add_executable(lichii-metal-smoke renderer_metal/metal_smoke.mm
                        renderer_metal/metal_smoke_probe.h renderer_metal/metal_smoke_probe.mm
+                       renderer_metal/metal_smoke_present.h renderer_metal/metal_smoke_present.mm
                        renderer_metal/metal_smoke_textures.h renderer_metal/metal_smoke_textures.mm
                        ${METAL_SMOKE_HEADERS})
         set_source_files_properties(renderer_metal/metal_smoke.mm
+                                    renderer_metal/metal_smoke_present.mm
                                     renderer_metal/metal_smoke_probe.mm
                                     renderer_metal/metal_smoke_textures.mm PROPERTIES
             LANGUAGE CXX
@@ -775,6 +785,9 @@ elseif (LICHII_METAL_COMPILE_CHECK)
     add_library(video_core_metal_check OBJECT ${METAL_RENDERER_CXX_SOURCES}
                 renderer_metal/metal_replay.cpp)
     target_link_libraries(video_core_metal_check PRIVATE video_core spirv-cross-msl)
+    if (TARGET reshadefx::reshadefx)
+        target_link_libraries(video_core_metal_check PRIVATE reshadefx::reshadefx)
+    endif()
     add_dependencies(video_core_metal_check host_shaders)
     target_include_directories(video_core_metal_check PRIVATE ${HOST_SHADERS_INCLUDE})
 

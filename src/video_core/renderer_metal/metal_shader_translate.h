@@ -107,6 +107,9 @@ struct Options {
     /// depth2d<float>, the type Metal declares depth formats with (as the blit shaders do).
     /// A shared image type changes for all its users.
     std::vector<std::pair<u32, u32>> depth_images;
+    /// Vertex stage: no point size output (Metal refuses one in a triangle or line pipeline;
+    /// ReShade's vertex programs write 1).
+    bool drop_point_size{};
 };
 
 struct Result {

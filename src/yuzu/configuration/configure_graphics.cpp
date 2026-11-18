@@ -1026,9 +1026,16 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     }
 #endif
 
+    // The native Metal renderer runs FSR 3 and MetalFX frame generation (not LSFG).
+#ifdef LICHII_METAL_RENDERER
+    const bool metal = GetCurrentGraphicsBackend() == Settings::RendererBackend::Metal;
+#else
+    constexpr bool metal = false;
+#endif
 #ifdef HAS_LSFG
-    ConfigurationShared::SetUnavailable(frame_gen_widget,
-                                        vulkan ? QString() : tr("Needs the Vulkan renderer."));
+    ConfigurationShared::SetUnavailable(
+        frame_gen_widget,
+        vulkan || metal ? QString() : tr("Needs the Vulkan or Metal renderer."));
 #else
     // Not in this build.
     if (frame_gen_widget != nullptr) {
@@ -1038,8 +1045,10 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
 
 #ifdef LICHII_METALFX
     const bool metalfx = vulkan;
+    const bool metalfx_frame_gen = vulkan || metal;
 #else
     constexpr bool metalfx = false;
+    constexpr bool metalfx_frame_gen = false;
 #endif
     // The entries of the lists that can't run here show only while one is the current value.
     const auto gate_item = [&](QComboBox* combobox, u32 enumeration, u32 value, bool offered) {
@@ -1058,7 +1067,9 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     gate_item(scaling_filter_combobox, Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
               static_cast<u32>(Settings::ScalingFilter::MetalFxSpatial), metalfx);
     gate_item(frame_gen_type_combobox, Settings::EnumMetadata<Settings::FrameGenType>::Index(),
-              static_cast<u32>(Settings::FrameGenType::MetalFx), metalfx);
+              static_cast<u32>(Settings::FrameGenType::MetalFx), metalfx_frame_gen);
+    gate_item(frame_gen_type_combobox, Settings::EnumMetadata<Settings::FrameGenType>::Index(),
+              static_cast<u32>(Settings::FrameGenType::Lsfg), !metal);
     gate_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
               static_cast<u32>(Settings::Upscaler::MetalFx), metalfx);
     gate_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
