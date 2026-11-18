@@ -54,33 +54,11 @@ TEST_CASE("Nx2Perf lists of names", "[nx2_perf]") {
             (DefaultOffMask() & ~(Bit(Opt::FrontRun) | Bit(Opt::DownloadBatch))));
 }
 
-TEST_CASE("compute_rebuild_async: on by default", "[nx2_perf]") {
-    REQUIRE(opt_names[Index(Opt::ComputeRebuildAsync)] == "compute_rebuild_async");
-    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::ComputeRebuildAsync)));
-    REQUIRE(!IsOff(ParseOffMask(false, "", ""), Index(Opt::ComputeRebuildAsync)));
-    REQUIRE(ParseOffMask(false, "", "compute_rebuild_async") == Bit(Opt::ComputeRebuildAsync));
-}
-
-TEST_CASE("compute_preload_variants: on by default", "[nx2_perf]") {
-    REQUIRE(opt_names[Index(Opt::ComputePreloadVariants)] == "compute_preload_variants");
-    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::ComputePreloadVariants)));
-    REQUIRE(!IsOff(ParseOffMask(false, "", ""), Index(Opt::ComputePreloadVariants)));
-    REQUIRE(ParseOffMask(false, "", "compute_preload_variants") ==
-            Bit(Opt::ComputePreloadVariants));
-}
-
-TEST_CASE("stale_target_skip: on by default", "[nx2_perf]") {
-    REQUIRE(opt_names[Index(Opt::StaleTargetSkip)] == "stale_target_skip");
-    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::StaleTargetSkip)));
-    REQUIRE(!IsOff(ParseOffMask(false, "", ""), Index(Opt::StaleTargetSkip)));
-    REQUIRE(ParseOffMask(false, "", "stale_target_skip") == Bit(Opt::StaleTargetSkip));
-}
-
-TEST_CASE("geometry_consistency and build_order_priority: on by default", "[nx2_perf]") {
+TEST_CASE("geometry_consistency: named, and off at start (EDEN_NX2_PERF_ON turns it on)",
+          "[nx2_perf]") {
     REQUIRE(opt_names[Index(Opt::GeometryConsistency)] == "geometry_consistency");
-    REQUIRE(opt_names[Index(Opt::BuildOrderPriority)] == "build_order_priority");
-    REQUIRE(opt_names[Index(Opt::ReplayDiskRecordings)] == "replay_disk_recordings");
     REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::GeometryConsistency)));
-    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::BuildOrderPriority)));
-    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::ReplayDiskRecordings)));
+    REQUIRE(ParseOffMask(false, "", "geometry_consistency") == Bit(Opt::GeometryConsistency));
+    REQUIRE(!IsOff(ParseOffMask(false, "geometry_consistency", "", Bit(Opt::GeometryConsistency)),
+                   Index(Opt::GeometryConsistency)));
 }

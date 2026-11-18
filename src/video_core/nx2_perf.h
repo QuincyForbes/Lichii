@@ -57,16 +57,11 @@ enum class Opt : unsigned {
     /// Split back, Ampere: submits recorded draws while the front waits for the back or the
     /// host GPU has run dry, so a command list copy waits only for the tail behind it
     SubmitWhileWaited,
-    /// Pipeline eviction keeps the ones built at boot that this session has not drawn with yet
-    PipelineKeepPreloaded,
     /// Native 64 KiB uniform banks: guest bytes compared with the shadow on the frame's first
     /// bind only, not on every draw (a later CPU rewrite in the frame shows one frame late)
     BankOncePerFrame,
     /// GPUDirtyMemoryManager::Gather returns without its locks when nothing was collected
     DirtyGatherFast,
-    /// Texture handles of one draw stage read through one translated constant buffer page,
-    /// not a GPU page walk per handle
-    HandlePageCache,
     /// Split front: a native macro call whose MME DMA read only feeds its last writes (render
     /// enable) runs without waiting for the back; the back writes those from the real words
     DmaForward,
@@ -79,29 +74,10 @@ enum class Opt : unsigned {
     /// Diagnostics (EDEN_NX2_DIAG*): the back counts draws in a thread-local table with cached
     /// ablate/inspect answers and folds them into the shared state under one lock
     DiagDrawLite,
-    /// Async shaders: once a frame spent its budget building pipelines at run time, a draw that
-    /// may be skipped while its pipeline builds is skipped without building it (built next frame)
-    ShaderBuildBudget,
-    /// Stale-slot compute rebuilds keep dispatching the previous pipeline while the replacement
-    /// compiles on a worker thread, swapping it in once IsBuilt() is true
-    ComputeRebuildAsync,
-    /// Boot disk-cache loading compiles every persisted compute translation with a distinct
-    /// MappedStoragePointerKeys and swaps to a built alternate on a stale-slot trigger
-    ComputePreloadVariants,
-    /// Async shaders: skip a small no-depth draw instead of waiting when its color target already
-    /// holds an earlier frame's output and was not fully cleared this frame; treat indirect draws
-    /// (draw_element_count == 0) as not small
-    StaleTargetSkip,
     /// Async shaders: when a depth-tested color draw is skipped, record its geometry identity and
     /// skip depth-only draws for the same geometry for up to 2 frames or until the material
     /// pipeline is built
     GeometryConsistency,
-    /// Async shaders: reserve half the per-frame shader build budget for G-buffer draws and the
-    /// highest-priority deferred keys from the previous frame (G-buffer first, then by draw count)
-    BuildOrderPriority,
-    /// Async shaders: keep FileEnvironments of graphics pipelines skipped at boot and replay their
-    /// translation and compilation on background workers on first skippable use
-    ReplayDiskRecordings,
     /// Native 64 KiB banks: per-frame set checked first
     BankCheck,
     /// Quarantined (never on): pending writes are not a proof of safe early MME reads
@@ -122,10 +98,9 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "macro_read_cb_overlay", "macro_read_writer_set", "preflush_aging", "eager_publish",
     "front_same_first", "front_class_table", "front_run", "macro_batch", "macro_borrow",
     "macro_state", "download_batch", "pipeline_fast_cache", "draw_preamble", "bind_memo",
-    "submit_while_waited", "pipeline_keep_preloaded", "bank_once_per_frame", "dirty_gather_fast",
-    "handle_page_cache", "dma_forward", "draw_begin_coalesce", "pending_wake", "diag_draw_lite",
-    "shader_build_budget", "compute_rebuild_async", "compute_preload_variants", "stale_target_skip",
-    "geometry_consistency", "build_order_priority", "replay_disk_recordings", "bank_check",
+    "submit_while_waited", "bank_once_per_frame", "dirty_gather_fast",
+    "dma_forward", "draw_begin_coalesce", "pending_wake", "diag_draw_lite",
+    "geometry_consistency", "bank_check",
     "split_overlap", "frames_ahead", "write_intersections", "async_pipelines",
     "unswizzle_workers",
 };

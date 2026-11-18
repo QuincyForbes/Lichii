@@ -1780,6 +1780,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     }
     texture_cache.UpdateRenderTargets(false);
     TrackOcarinaCamera();
+    NoteCameraMotionDraw();
     UpdateOcarinaJitter();
     if (TargetlessReachEnabled() && texture_cache.HasNoRenderTargets()) {
         texture_cache.BoundTargetlessFramebuffer(
@@ -2731,7 +2732,8 @@ void RasterizerMetal::TrackOotTonemappedImage() {
 }
 
 bool RasterizerMetal::OcarinaTemporalEnabled() {
-    if (!OcarinaTemporal::Enabled() ||
+    // The camera-motion path takes Ocarina instead when it is switched on.
+    if (CameraMotionUpscaleEnabled() || !OcarinaTemporal::Enabled() ||
         Settings::GetCurrentProgramID() != VideoCommon::OotNetwork::ProgramId) {
         return false;
     }
@@ -2829,6 +2831,218 @@ void RasterizerMetal::TrackOcarinaCamera() {
                                   sizeof(oot_motion.current));
     device_memory.ReadBlockUnsafe(*device_addr + 0x180, oot_motion.previous.data(),
                                   sizeof(oot_motion.previous));
+}
+
+bool RasterizerMetal::CameraMotionUpscaleEnabled() {
+    if (!camera_motion_enabled) {
+        static const bool switched_on = [] {
+            const char* const value = std::getenv("EDEN_NX2_METAL_OOT_CAMERA_MOTION");
+            return value != nullptr && value[0] == '1';
+        }();
+        camera_motion_enabled = switched_on &&
+                                Settings::GetCurrentProgramID() ==
+                                    VideoCommon::OotNetwork::ProgramId &&
+                                TemporalUpscaler::IsSupported(device);
+    }
+    return *camera_motion_enabled;
+}
+
+bool RasterizerMetal::UsesCameraMotionUpscale() const {
+    return camera_motion_enabled.value_or(false);
+}
+
+// Vulkan's NoteCameraMotionDraw without the jitter: notes the camera and depth buffer of a draw
+// by the scene's perspective camera, for AccelerateCameraMotionUpscale.
+void RasterizerMetal::NoteCameraMotionDraw() {
+    namespace Ocarina = VideoCommon::OcarinaUpscale;
+    auto& motion = camera_motion;
+    if (!motion.armed) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    const bool sample_query_only =
+        regs.zpass_pixel_count_enable != 0 && !regs.depth_write_enabled && !regs.stencil_enable &&
+        (regs.rt_control.count == 0 || regs.rt[0].format == Tegra::RenderTargetFormat::NONE ||
+         (regs.color_mask[0].R == 0 && regs.color_mask[0].G == 0 && regs.color_mask[0].B == 0 &&
+          regs.color_mask[0].A == 0));
+    const bool excluded_draw =
+        sample_query_only ||
+        maxwell3d->draw_manager.draw_state.topology == Maxwell::PrimitiveTopology::Points;
+    const GPUVAddr depth = !excluded_draw && regs.zeta_enable &&
+                                   regs.viewport_scale_offset_enabled &&
+                                   regs.zeta.format == Tegra::DepthFormat::Z32_FLOAT
+                               ? regs.zeta.Address()
+                               : 0;
+    const std::array<u32, 2> depth_size{regs.zeta_size.width, regs.zeta_size.height};
+    const auto& camera = maxwell3d->state.shader_stages[0].const_buffers[Ocarina::CameraBuffer];
+    if (depth == 0 || !camera.enabled || camera.size < Ocarina::CameraBytes) {
+        return;
+    }
+    auto& cached = motion.camera;
+    if (camera.address != cached.address) {
+        cached.address = camera.address;
+        cached.perspective = false;
+        if (gpu_memory->IsFullyMappedRange(camera.address, Ocarina::CameraBytes)) {
+            std::array<f32, 16> projection;
+            gpu_memory->ReadBlockUnsafe(camera.address + Ocarina::ProjectionOffset,
+                                        projection.data(), sizeof(projection));
+            cached.perspective = Ocarina::IsPerspective(projection);
+            gpu_memory->ReadBlockUnsafe(camera.address + Ocarina::ViewProjectionOffset,
+                                        cached.view_projection.data(),
+                                        sizeof(cached.view_projection));
+        }
+    }
+    if (!cached.perspective) {
+        return;
+    }
+    CameraMotionScene* scene = nullptr;
+    for (size_t i = 0; i < motion.num_scenes; ++i) {
+        CameraMotionScene& candidate = motion.scenes[i];
+        if (candidate.depth == depth && candidate.depth_info.size.width == depth_size[0] &&
+            candidate.depth_info.size.height == depth_size[1]) {
+            scene = &candidate;
+        }
+    }
+    if (!scene) {
+        const auto area = [](const CameraMotionScene& record) {
+            return u64{record.depth_info.size.width} * record.depth_info.size.height;
+        };
+        if (motion.num_scenes < motion.scenes.size()) {
+            scene = &motion.scenes[motion.num_scenes++];
+        } else if (CameraMotionScene& smallest =
+                       *std::ranges::min_element(motion.scenes, {}, area);
+                   area(smallest) < u64{depth_size[0]} * depth_size[1]) {
+            scene = &smallest;
+        }
+        if (scene) {
+            *scene = CameraMotionScene{};
+            scene->depth = depth;
+            scene->depth_info =
+                VideoCommon::ImageInfo(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+        }
+    }
+    if (!scene) {
+        return;
+    }
+    // Viewport 0 as the draw makes it (Vulkan's GetViewportState; no jitter).
+    const bool rescaled = texture_cache.IsRescaling();
+    const auto& transform = regs.viewport_transform[0];
+    Viewport viewport{};
+    viewport.x = transform.translate_x - transform.scale_x;
+    viewport.width = transform.scale_x * 2.0f;
+    viewport.y = transform.translate_y - transform.scale_y;
+    viewport.height = transform.scale_y * 2.0f;
+    if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
+        viewport.y += static_cast<f32>(regs.surface_clip.height);
+        viewport.height = -viewport.height;
+    }
+    if (transform.swizzle.y == Maxwell::ViewportSwizzle::NegativeY) {
+        viewport.y += viewport.height;
+        viewport.height = -viewport.height;
+    }
+    const f32 reduce_z = regs.depth_mode == Maxwell::DepthMode::MinusOneToOne ? 1.0f : 0.0f;
+    viewport.znear = transform.translate_z - transform.scale_z * reduce_z;
+    viewport.zfar = transform.translate_z + transform.scale_z;
+    if (rescaled) {
+        const f32 scale = Settings::values.resolution_info.up_factor;
+        viewport.x *= scale;
+        viewport.y *= scale;
+        viewport.width *= scale;
+        viewport.height *= scale;
+    }
+    scene->camera = camera.address;
+    scene->view_projection = cached.view_projection;
+    scene->viewport = viewport;
+    scene->depth_minus_one = regs.depth_mode == Maxwell::DepthMode::MinusOneToOne;
+    scene->rescaled = rescaled;
+    ++scene->draws;
+}
+
+// Vulkan's AccelerateCameraMotionUpscale with MetalFX (TextureCacheRuntime::
+// UpscaleWithCameraMotion) as the upscaler and no jitter, which Metal's MetalFX path leaves off by
+// default too.
+bool RasterizerMetal::AccelerateCameraMotionUpscale(const Tegra::Engines::Fermi2D::Surface& src,
+                                                    const Tegra::Engines::Fermi2D::Surface& dst) {
+    namespace Ocarina = VideoCommon::OcarinaUpscale;
+    auto& motion = camera_motion;
+    motion.armed = true;
+    const CameraMotionScene* scene = nullptr;
+    for (size_t i = 0; i < motion.num_scenes; ++i) {
+        const CameraMotionScene& candidate = motion.scenes[i];
+        if (candidate.draws > 0 && candidate.depth_info.size.width == src.width &&
+            candidate.depth_info.size.height == src.height &&
+            (!scene || candidate.draws > scene->draws)) {
+            scene = &candidate;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto finish = [&](bool done) {
+        motion.num_scenes = 0;
+        motion.camera = {};
+        if (!done) {
+            motion.previous_screen.reset();
+        }
+        return done;
+    };
+    if (!scene) {
+        return finish(false);
+    }
+    const Viewport& viewport = scene->viewport;
+    const f32 width = static_cast<f32>(
+        scene->rescaled ? Settings::values.resolution_info.ScaleUp(src.width) : src.width);
+    const f32 height = static_cast<f32>(
+        scene->rescaled ? Settings::values.resolution_info.ScaleUp(src.height) : src.height);
+    if (std::abs(viewport.x) > 0.5f || std::abs(viewport.width - width) > 0.5f ||
+        std::abs(std::min(viewport.y, viewport.y + viewport.height)) > 0.5f ||
+        std::abs(std::abs(viewport.height) - height) > 0.5f) {
+        return finish(false);
+    }
+    const f32 depth_offset = scene->depth_minus_one ? (viewport.znear + viewport.zfar) * 0.5f
+                                                     : viewport.znear;
+    const f32 depth_scale = scene->depth_minus_one ? (viewport.zfar - viewport.znear) * 0.5f
+                                                    : viewport.zfar - viewport.znear;
+    const Ocarina::Matrix screen = Ocarina::ScreenMatrix(
+        Ocarina::ViewportMatrix(viewport.x, viewport.y, viewport.width, viewport.height, 1.0f,
+                                depth_offset, depth_scale),
+        scene->view_projection);
+    const std::array<u32, 2> size{src.width, src.height};
+    bool reset = !motion.previous_screen || motion.previous_depth != scene->depth ||
+                 motion.previous_size != size || motion.previous_rescaled != scene->rescaled ||
+                 !motion.last_evaluation ||
+                 now - *motion.last_evaluation > std::chrono::milliseconds{250};
+    std::optional<std::array<f32, 16>> reprojection;
+    if (!reset) {
+        reprojection = Ocarina::Reprojection(*motion.previous_screen, screen);
+    }
+    if (!reprojection) {
+        reset = true;
+        reprojection = std::array<f32, 16>{1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+                                           0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    }
+    bool done;
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        done = texture_cache.CameraMotionUpscale(
+            dst, src, scene->depth_info, scene->depth,
+            {static_cast<u32>(width), static_cast<u32>(height)}, *reprojection, {}, reset);
+    }
+    if (motion.evaluations < 4 || (!done && motion.evaluations < 64)) {
+        LOG_INFO(Render_Metal,
+                 "Ocarina of Time anti-aliasing: MetalFX camera-motion upscale {} ({}x{} -> {}x{}, "
+                 "{} draws, reset {})",
+                 done ? "applied" : "unavailable; the game's own runs", src.width, src.height,
+                 dst.width, dst.height, scene->draws, reset);
+    }
+    ++motion.evaluations;
+    if (!done) {
+        return finish(false);
+    }
+    motion.previous_screen = screen;
+    motion.previous_depth = scene->depth;
+    motion.previous_size = size;
+    motion.previous_rescaled = scene->rescaled;
+    motion.last_evaluation = now;
+    return finish(true);
 }
 
 void RasterizerMetal::TrackOcarinaDepth() {
@@ -3470,6 +3684,14 @@ void RasterizerMetal::DispatchCompute() {
     }();
     if (!encode) {
         Coverage::Refuse(Coverage::Work::Dispatch, "EDEN_NX2_METAL_DISPATCH=0");
+        return;
+    }
+    // Ocarina's anti-aliasing through the camera-motion upscale (EDEN_NX2_METAL_OOT_CAMERA_MOTION),
+    // as Vulkan's DispatchCompute does with NVIDIA DLSS. The hash is the program's lowered one.
+    if (kepler_compute->IsNativeMode() && CameraMotionUpscaleEnabled() &&
+        kepler_compute->ProcessOcarinaUpscale(Settings::GetCurrentProgramID(), 0,
+                                              pipeline->Key().unique_hash)) {
+        Coverage::Note(Coverage::Work::Dispatch, Coverage::Path::Replaced);
         return;
     }
     StageProgram& program = pipeline->Program();

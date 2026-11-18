@@ -95,7 +95,7 @@
 #include "core/hle/service/nx2_present_pacer.h"
 #include "core/hle/service/nx2_video_ready.h"
 #include "core/hle/service/nx2_frame_interval.h"
-#include "core/hle/service/nx2_oot_time.h"
+#include "video_core/nx2_diag.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/server_manager.h"
 #include "core/hle/service/service.h"
@@ -2041,10 +2041,6 @@ private:
         VideoCommon::Nx2Spikes::OnPresent(entered, waited, composited, paced);
         Nx2Sampler::NotePresent();
         if (const auto* const process = system.ApplicationProcess(); process != nullptr) {
-            if (const u64 address = process->GetOotDeltaAddress(); address != 0) {
-                system.ApplicationMemory().Write32(
-                    address, std::bit_cast<u32>(m_oot_frame_delta.Update(entered)));
-            }
             UpdateFrameInterval(*process, entered);
         }
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
@@ -2263,7 +2259,6 @@ private:
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     Nx2PresentPacer m_present_pacer;
     u32 m_swap_word{};
-    Nx2OotTime::FrameDelta m_oot_frame_delta;
     Nx2FrameInterval::Controller m_frame_interval;
     std::optional<u32> m_game_frame_interval; ///< The game's value while Eden owns the interval
     u32 m_frame_interval_presents{};
@@ -2899,17 +2894,29 @@ private:
     // nx2-frame-<n>.tga in <dir> (lets hidden test runs check the output; idea from changes.patch).
     void CaptureFrame() {
         static const char* const directory = std::getenv("EDEN_NX2_FRAME_CAPTURE");
+        // With EDEN_NX2_DIAG_DIR a draw-list capture also saves the next present as capture-<n>.tga.
+        std::string diag_capture;
+        if (VideoCommon::Nx2Diag::Active() && !VideoCommon::Nx2Diag::DrawListDir().empty()) {
+            if (const auto id = VideoCommon::Nx2Diag::Diagnostics::Get().TakeScreenshotRequest()) {
+                diag_capture = fmt::format("{}/capture-{}.tga",
+                                           VideoCommon::Nx2Diag::DrawListDir().string(), *id);
+            }
+        }
         static const u64 every = [] {
             const char* value = std::getenv("EDEN_NX2_FRAME_CAPTURE_EVERY");
             return value != nullptr ? (std::max)(u64{1}, static_cast<u64>(std::strtoull(value, nullptr, 10))) : u64{120};
         }();
-        if (directory == nullptr || (m_presents % every) != 1 % every || m_capture_pending->exchange(true)) {
+        const bool diag_requested = !diag_capture.empty();
+        if ((directory == nullptr && !diag_requested) ||
+            (!diag_requested && (m_presents % every) != 1 % every) ||
+            m_capture_pending->exchange(true)) {
             return;
         }
         const auto layout = Layout::DefaultFrameLayout(1280, 720);
         auto pixels = std::make_shared<std::vector<u8>>(layout.width * layout.height * 4);
-        const std::string path =
-            fmt::format("{}/nx2-frame-{:05}.tga", directory, m_presents);
+        const std::string path = diag_requested
+                                     ? diag_capture
+                                     : fmt::format("{}/nx2-frame-{:05}.tga", directory, m_presents);
         auto pending = m_capture_pending; // the screenshot callback can outlive the session
         system.GPU().Renderer().RequestScreenshot(
             pixels->data(),

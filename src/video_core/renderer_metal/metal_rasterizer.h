@@ -20,6 +20,8 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/oot_network.h"
+#include "video_core/ocarina_upscale.h"
+#include "video_core/texture_cache/image_info.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_metal/metal_bind_memo.h"
 #include "video_core/renderer_metal/metal_buffer_cache.h"
@@ -142,6 +144,9 @@ public:
                                    const Tegra::Texture::TICEntry* depth,
                                    std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
                                    bool use_history) override;
+    bool AccelerateCameraMotionUpscale(const Tegra::Engines::Fermi2D::Surface& src,
+                                       const Tegra::Engines::Fermi2D::Surface& dst) override;
+    [[nodiscard]] bool UsesCameraMotionUpscale() const override;
     VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
@@ -705,6 +710,39 @@ private:
                    (height == extent[1] || height == image_extent[1]);
         }
     } oot_motion;
+    /// EDEN_NX2_METAL_OOT_CAMERA_MOTION=1 (off by default): Ocarina's anti-aliasing replaced the way
+    /// Vulkan replaces it with NVIDIA DLSS (KeplerCompute::ProcessOcarinaUpscale), with MetalFX as
+    /// the upscaler, instead of O02's TryOcarinaTemporal. Needs MetalFX; the scene tracking below is
+    /// Vulkan's CameraMotion without the jitter.
+    [[nodiscard]] bool CameraMotionUpscaleEnabled();
+    void NoteCameraMotionDraw();
+    struct CameraMotionScene {
+        GPUVAddr depth{};
+        VideoCommon::ImageInfo depth_info;
+        GPUVAddr camera{};
+        std::array<f32, 16> view_projection{};
+        Viewport viewport{};
+        bool depth_minus_one{};
+        bool rescaled{};
+        u32 draws{};
+    };
+    struct CameraMotion {
+        bool armed{};
+        std::array<CameraMotionScene, 16> scenes;
+        size_t num_scenes{};
+        struct {
+            GPUVAddr address{};
+            bool perspective{};
+            std::array<f32, 16> view_projection{};
+        } camera;
+        std::optional<VideoCommon::OcarinaUpscale::Matrix> previous_screen;
+        GPUVAddr previous_depth{};
+        std::array<u32, 2> previous_size{};
+        bool previous_rescaled{};
+        std::optional<std::chrono::steady_clock::time_point> last_evaluation;
+        u32 evaluations{};
+    } camera_motion;
+    std::optional<bool> camera_motion_enabled;
     /// EDEN_NX2_DLSS_JITTER as on Vulkan: the frame MetalFX last replaced the upscale in, the
     /// phase count for its scale, the offset of this frame's scene draws and the one applied.
     std::optional<u64> oot_temporal_frame;

@@ -130,7 +130,6 @@ add_executable(tests
     core/nx2_frame_interval.cpp
     video_core/upload_batch.cpp
     video_core/texture_swizzle.cpp
-    core/nx2_oot_time.cpp
     video_core/unbacked_image_policy.cpp
     core/gpu_dirty_memory_manager.cpp
     video_core/macro_dma_forward.cpp

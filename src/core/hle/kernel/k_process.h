@@ -124,7 +124,6 @@ private:
 
     std::atomic<s64> m_cpu_time{};
     std::atomic_bool m_mkw_dynamic_fps_patch_applied{};
-    std::atomic<u64> m_oot_delta_address{};
     std::atomic<u64> m_frame_interval_address{};
     std::atomic<u64> m_frame_interval_source_address{};
     std::atomic<s64> m_num_process_switches{};
@@ -196,15 +195,6 @@ public:
 
     void SetMkwDynamicFpsPatchApplied(bool applied) {
         m_mkw_dynamic_fps_patch_applied.store(applied, std::memory_order_relaxed);
-    }
-
-    /// Where the present path writes Ocarina of Time's frame delta, or 0 without its patch.
-    u64 GetOotDeltaAddress() const {
-        return m_oot_delta_address.load(std::memory_order_relaxed);
-    }
-
-    void SetOotDeltaAddress(u64 address) {
-        m_oot_delta_address.store(address, std::memory_order_relaxed);
     }
 
     /// Hyrule Warriors' frame interval global (see nx2_frame_interval.h), or 0 when not found.

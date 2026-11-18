@@ -39,6 +39,7 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
+#include "video_core/stage_cache.h"
 
 namespace Core {
 class System;
@@ -253,6 +254,22 @@ private:
 
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
 
+    /// Nx2Perf geometry_consistency (EDEN_NX2_PERF_ON=geometry_consistency, off by default): when a
+    /// depth-tested colour draw is skipped for its unbuilt pipeline, the depth-only draws of the
+    /// same geometry are skipped too for up to two frames or until that pipeline is built, so
+    /// shadows and prepasses don't show without their material pass.
+    void RecordSkippedGeometry(const GraphicsPipeline* pipeline) const noexcept;
+    [[nodiscard]] bool ShouldSkipDepthOnlyGeometry() const noexcept;
+    void ClearSkippedGeometryIfDrawn() const noexcept;
+    static constexpr size_t SkippedGeometryTableSize = 256;
+    struct SkippedGeometryEntry {
+        u64 key{};
+        u64 frame{};
+        const GraphicsPipeline* pipeline{};
+    };
+    mutable std::array<SkippedGeometryEntry, SkippedGeometryTableSize> skipped_geometry{};
+    mutable u64 last_skipped_geometry_frame{~u64{}};
+
     /// Whether the current draw may be skipped while its pipeline is not ready (native draws
     /// unless EDEN_NX2_ASYNC_DISCARD=0, and the legacy heuristic; full-screen passes never; with
     /// EDEN_NX2_ASYNC_DISCARD=2 only into recurring render targets). Answered once per lookup.
@@ -296,7 +313,11 @@ private:
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
         std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr,
-        bool libraries_only = false, bool held_build = false);
+        bool libraries_only = false, bool held_build = false, bool parallel_stages = false);
+
+    /// Runs task(0..count-1) on the translation workers and the calling thread; rethrows the
+    /// first exception.
+    void RunInParallel(size_t count, const std::function<void(size_t)>& task);
 
     /// Builds a disk-cached graphics pipeline from the first of its records (newest first) that
     /// loads. When none does, the GPU thread's build of it is stored again.
@@ -465,6 +486,11 @@ private:
 
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;
+    /// EDEN_NX2_STAGE_CACHE: native stages reused across pipelines (stage_cache.h), and with
+    /// translation workers the stages of a queued pipeline translated at once.
+    VideoCommon::StageCache stage_cache;
+    std::unique_ptr<Common::ThreadWorker> translation_workers;
+    std::atomic<u64> parallel_stage_pipelines{}; ///< Pipelines whose stages translated in parallel
     /// EDEN_NX2_PIPELINE_HOLD_BOOST: builds the pipelines a draw waits for, at the waiter's
     /// priority. Null with the switch at 0.
     std::unique_ptr<Common::ThreadWorker> held_workers;

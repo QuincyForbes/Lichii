@@ -2760,54 +2760,6 @@ typename P::Framebuffer* TextureCache<P>::GetFramebuffer() {
 }
 
 template <class P>
-bool TextureCache<P>::ColorTargetWrittenBefore(bool require_uncleared) noexcept {
-    if (!maxwell3d) {
-        return false;
-    }
-    const auto& regs = maxwell3d->regs;
-    if (regs.rt_control.count == 0) {
-        return false;
-    }
-    const auto& rt = regs.rt[0];
-    const GPUVAddr gpu_addr = rt.Address();
-    if (gpu_addr == 0 || rt.format == Tegra::RenderTargetFormat::NONE) {
-        return false;
-    }
-    std::scoped_lock lock{mutex};
-    ImageId image_id{};
-    if (!maxwell3d->dirty.flags[VideoCommon::Dirty::RenderTargets] &&
-        !maxwell3d->dirty.flags[VideoCommon::Dirty::ColorBuffer0]) {
-        image_id = rt_image_id[0];
-    } else {
-        const ImageInfo info(rt, regs.anti_alias_samples_mode);
-        if (info.format == PixelFormat::Invalid || info.size.width == 0 || info.size.height == 0 ||
-            info.size.depth == 0 || info.size.width > 65536 || info.size.height > 65536 ||
-            info.size.depth > 2048 || info.resources.layers <= 0 || info.resources.layers > 2048) {
-            return false;
-        }
-        image_id = FindImage(info, gpu_addr, RelaxedOptions{});
-    }
-    if (!image_id) {
-        return false;
-    }
-    const ImageBase& image = slot_images[image_id];
-    const u64 current_frame = frame_tick + 1;
-    return image.first_written_frame != 0 && image.first_written_frame < current_frame &&
-           (!require_uncleared || image.cleared_frame != current_frame);
-}
-
-template <class P>
-bool TextureCache<P>::ColorTargetHasPriorFrameOutput() noexcept {
-    return ColorTargetWrittenBefore(true);
-}
-
-template <class P>
-bool TextureCache<P>::ColorTargetWrittenBeforeThisFrame() noexcept {
-    return ColorTargetWrittenBefore(false);
-}
-
-
-template <class P>
 ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
     auto& table =
         compute ? channel_state->compute_image_table : channel_state->graphics_image_table;

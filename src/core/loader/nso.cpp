@@ -30,7 +30,6 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/service/nx2_frame_interval.h"
-#include "core/hle/service/nx2_oot_time.h"
 #include "core/loader/nso.h"
 #include "core/memory.h"
 #include "core/oot_zstd_hook.h"
@@ -502,16 +501,6 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         flush_run();
     }
     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
-    if (name == "main" && process.GetProgramId() == Service::Nx2OotTime::ProgramId) {
-        const size_t hook = module_start + Service::Nx2OotTime::HookOffset;
-        u32 word = 0;
-        if (codeset.memory.size() >= hook + sizeof(word)) {
-            std::memcpy(&word, codeset.memory.data() + hook, sizeof(word));
-        }
-        process.SetOotDeltaAddress(word == Service::Nx2OotTime::HookInstruction
-                                       ? load_base + module_start + Service::Nx2OotTime::DeltaOffset
-                                       : 0);
-    }
     if (frame_interval_offset != 0) {
         process.SetFrameIntervalAddresses(load_base + module_start + frame_interval_offset,
                                           load_base + module_start + frame_interval_source_offset);

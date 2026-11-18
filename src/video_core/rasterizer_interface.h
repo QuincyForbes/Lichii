@@ -278,6 +278,14 @@ public:
         return false;
     }
 
+    /// Whether the camera-motion upscale above replaces Ocarina's anti-aliasing here: NVIDIA DLSS
+    /// running (the default) or a renderer's own temporal upscaler (Metal's
+    /// EDEN_NX2_METAL_OOT_CAMERA_MOTION). Apart from UsesNvidiaDlss so the games' own DLSS
+    /// networks keep their behaviour.
+    [[nodiscard]] virtual bool UsesCameraMotionUpscale() const {
+        return UsesNvidiaDlss();
+    }
+
     /// Whether a game's own DLSS network can run here: its matrix multiplies are emulated with
     /// 32-wide shuffles, and its output must be checkable (ProbeGameDlssOutput).
     [[nodiscard]] virtual bool SupportsGameDlssNetwork() const {
