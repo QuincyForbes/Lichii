@@ -1601,15 +1601,19 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     }
     for (const auto& desc : info.image_descriptors) {
         for (u32 element = 0; element < desc.count; ++element) {
-            ImageView& image_view = texture_cache.GetImageView(views[view++].id);
+            const size_t view_index = view++;
+            ImageView& image_view = texture_cache.GetImageView(views[view_index].id);
             if (desc.is_written) {
                 texture_cache.MarkModification(image_view.image_id);
             }
             if (texture_slot < texture_slots.size()) {
                 scheduler.BindTexture(
                     metal_stage, texture_slots[texture_slot],
-                    OrPlaceholder(image_view, image_view.StorageHandle(desc.type, desc.format),
-                                  desc.type));
+                    view_index == byte_shadow_view
+                        ? byte_shadow_texture
+                        : OrPlaceholder(image_view,
+                                        image_view.StorageHandle(desc.type, desc.format),
+                                        desc.type));
             }
             ++texture_slot;
         }
@@ -2279,6 +2283,17 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     DrawState draw{};
     draw.pipeline = state;
     draw.depth_stencil = depth_stencil_state.Get();
+    for (size_t index = 0; index < state_desc.blend.size(); ++index) {
+        if (state_desc.blend[index].write_mask != 0) {
+            draw.color_written |= static_cast<u8>(1U << index);
+        } else {
+            draw.color_written &= static_cast<u8>(~(1U << index));
+        }
+    }
+    draw.depth_written = depth_stencil.depth_test != 0 && depth_stencil.depth_write != 0;
+    draw.stencil_written =
+        depth_stencil.stencil_test != 0 &&
+        (depth_stencil.front.write_mask != 0 || depth_stencil.back.write_mask != 0);
     // Viewport i, as Vulkan's GetViewportState makes it (the shader flips y for Metal).
     const auto make_viewport = [&](size_t index) {
         Viewport viewport{};
@@ -3431,6 +3446,42 @@ void RasterizerMetal::Clear(u32 layer_count) {
     ++clears;
 }
 
+namespace {
+
+/// The host memory ranges under guest memory [address, address + size), merged where they join
+/// (Vulkan's ByteAddressedMappedRanges).
+std::vector<std::pair<DAddr, u64>> MappedRanges(Tegra::MemoryManager& memory, GPUVAddr address,
+                                                u64 size) {
+    if (size == 0 || address > (std::numeric_limits<u64>::max)() - size ||
+        !memory.IsWithinGPUAddressRange(address + size - 1)) {
+        throw Shader::RuntimeError("Unknown packed surface access range {:#x}+{:#x}", address,
+                                   size);
+    }
+    std::vector<std::pair<DAddr, u64>> ranges;
+    while (size != 0) {
+        const u64 count = (std::min)(size, 0x1000 - (address & 0xfff));
+        const auto mapped = memory.GpuToCpuAddress(address);
+        if (!mapped || *mapped > (std::numeric_limits<u64>::max)() - count) {
+            throw Shader::RuntimeError("Unmapped packed surface access range at {:#x}", address);
+        }
+        if (!ranges.empty() && ranges.back().first + ranges.back().second == *mapped) {
+            ranges.back().second += count;
+        } else {
+            ranges.emplace_back(*mapped, count);
+        }
+        address += count;
+        size -= count;
+    }
+    return ranges;
+}
+
+bool RangesOverlap(const std::pair<DAddr, u64>& a, const std::pair<DAddr, u64>& b) {
+    return a.second != 0 && b.second != 0 &&
+           (a.first < b.first ? b.first - a.first < a.second : a.first - b.first < b.second);
+}
+
+} // Anonymous namespace
+
 void RasterizerMetal::DispatchCompute() {
     ++dispatches;
     if (InvalidateBeforeUse()) {
@@ -3677,14 +3728,119 @@ void RasterizerMetal::DispatchCompute() {
         // Committed in the middle of the dispatch: what the buffer cache noted as used is gone.
         scheduler.BlockAhead();
     }
+    // G19: a program that addresses a packed R16 surface bytewise declares it as an R32 image of
+    // half the width. Vulkan's shadow: the texels go through a buffer into an R32Uint texture
+    // the program binds, and back after the dispatch.
+    Object shadow_texture;
+    Object shadow_bridge;
+    TextureHandle shadow_original{};
+    u32 shadow_width = 0;
+    u32 shadow_height = 0;
+    byte_shadow_view = ~size_t{0};
+    byte_shadow_texture = nullptr;
+    {
+        size_t image_index = Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                             Shader::NumDescriptors(info.image_buffer_descriptors) +
+                             Shader::NumDescriptors(info.texture_descriptors);
+        for (const auto& desc : info.image_descriptors) {
+            for (u32 element = 0; element < desc.count; ++element, ++image_index) {
+                if (!desc.is_byte_addressed ||
+                    texture_cache.GetImageView(views[image_index].id).format !=
+                        VideoCore::Surface::PixelFormat::R16_FLOAT) {
+                    continue;
+                }
+                if (byte_shadow_view != ~size_t{0} || !kepler_compute->IsNativeMode() ||
+                    indirect || desc.count != 1 || desc.is_read || !desc.is_written ||
+                    desc.type != Shader::TextureType::Color2D ||
+                    desc.format != Shader::ImageFormat::R32_UINT || info.uses_global_memory) {
+                    throw Shader::RuntimeError(
+                        "Unsupported packed R16 surface dispatch or unbounded global access");
+                }
+                byte_shadow_view = image_index;
+            }
+        }
+    }
+    if (byte_shadow_view != ~size_t{0}) {
+        const ImageView& target_view = texture_cache.GetImageView(views[byte_shadow_view].id);
+        const Image* const target = target_view.BackingImage();
+        const VideoCommon::Extent3D size = target_view.size;
+        if (target == nullptr || size.width < 2 || (size.width & 1) != 0 || size.height == 0 ||
+            size.depth != 1 || target_view.Samples() != 1 ||
+            texture_cache.IsRescaling(target_view) || target->info.type != VideoCommon::ImageType::e2D ||
+            target->info.resources.levels != 1 || target->info.resources.layers != 1 ||
+            target->info.size != size || target->info.format != target_view.format ||
+            target_view.ImageHandle() != target->Handle() || target->Handle() == nullptr ||
+            qmd.grid_dim_x == 0 || qmd.grid_dim_y == 0 || qmd.grid_dim_z == 0) {
+            throw Shader::RuntimeError("Unsupported packed R16 byte-addressed image binding");
+        }
+        // The shadow replaces the surface for the dispatch: no other binding may alias it.
+        const auto target_ranges =
+            MappedRanges(*gpu_memory, target->gpu_addr, target->guest_size_bytes);
+        for (size_t index = 0; index < views.size(); ++index) {
+            if (index == byte_shadow_view) {
+                continue;
+            }
+            const ImageView& peer = texture_cache.GetImageView(views[index].id);
+            if (peer.IsBuffer()) {
+                continue;
+            }
+            const Image* const image = peer.BackingImage();
+            if (image == nullptr) {
+                throw Shader::RuntimeError("Unknown packed R16 surface peer image at binding {}",
+                                           index);
+            }
+            for (const auto& a : target_ranges) {
+                for (const auto& b :
+                     MappedRanges(*gpu_memory, image->gpu_addr, image->guest_size_bytes)) {
+                    if (RangesOverlap(a, b)) {
+                        throw Shader::RuntimeError(
+                            "Aliased packed R16 surface peer image at binding {}", index);
+                    }
+                }
+            }
+        }
+        shadow_width = size.width / 2;
+        shadow_height = size.height;
+        shadow_texture = CreateTexture(device, {.kind = TextureKind::e2D,
+                                                .format = Fmt::R32Uint,
+                                                .width = shadow_width,
+                                                .height = shadow_height,
+                                                .shader_write = true});
+        shadow_bridge = CreateBuffer(device, u64{size.width} * size.height * 2, false, nullptr);
+        if (!shadow_texture || !shadow_bridge) {
+            throw Shader::RuntimeError("Packed R16 surface shadow not made");
+        }
+        shadow_original = target->Handle();
+        const u32 bytes_per_row = size.width * 2;
+        scheduler.CopyTextureToBuffer(shadow_original, 0, 0, {}, {size.width, size.height, 1},
+                                      shadow_bridge.Get(), 0, bytes_per_row, 0);
+        scheduler.BreakBlits();
+        scheduler.CopyBufferToTexture(shadow_bridge.Get(), 0, bytes_per_row, 0,
+                                      shadow_texture.Get(), 0, 0, {},
+                                      {shadow_width, shadow_height, 1});
+        scheduler.BreakBlits();
+        byte_shadow_texture = shadow_texture.Get();
+    }
     scheduler.BeginCompute(state);
     BindStageResources(program, ShaderStage::Compute, bindings, texel_views, views, samplers, 0,
                        0);
+    byte_shadow_view = ~size_t{0};
+    byte_shadow_texture = nullptr;
     const std::array<u32, 3> group_size{qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z};
     if (indirect) {
         scheduler.DispatchIndirect(indirect_buffer, indirect_offset, group_size);
     } else {
         scheduler.Dispatch({qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z}, group_size);
+    }
+    if (shadow_texture) {
+        const u32 bytes_per_row = shadow_width * 4;
+        scheduler.CopyTextureToBuffer(shadow_texture.Get(), 0, 0, {},
+                                      {shadow_width, shadow_height, 1}, shadow_bridge.Get(), 0,
+                                      bytes_per_row, 0);
+        scheduler.BreakBlits();
+        scheduler.CopyBufferToTexture(shadow_bridge.Get(), 0, bytes_per_row, 0, shadow_original,
+                                      0, 0, {}, {shadow_width * 2, shadow_height, 1});
+        scheduler.BreakBlits();
     }
     Coverage::Note(Coverage::Work::Dispatch, Coverage::Path::Native);
 }

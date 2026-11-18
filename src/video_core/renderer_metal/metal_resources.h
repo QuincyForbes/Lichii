@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -93,6 +94,31 @@ void InAutoreleasePool(const std::function<void()>& work);
 [[nodiscard]] u32 DrawableFormat();
 
 [[nodiscard]] Object CreateTexture(const Device& device, const TextureDesc& desc);
+
+/// A texture of a sparse heap (G18): memory only for the tiles mapped (Scheduler::
+/// UpdateSparseTiles), unmapped tiles read zero (sparse tier 2).
+struct SparseTexture {
+    Object texture;
+    Object heap;
+    u32 tile_width{};  ///< Texels
+    u32 tile_height{};
+    u32 tile_bytes{};
+    u32 tail_level{};  ///< First level of the mip tail (the level count when there is none)
+    u32 tail_tiles{};  ///< Tiles the mip tail maps
+    u64 heap_bytes{};  ///< What the heap holds: the most tiles that can be mapped
+};
+
+/// Whether the device has tier 2 sparse textures (Apple6+ on a Metal 4 OS).
+[[nodiscard]] bool SupportsSparseTextures(const Device& device);
+
+/// A 2D single-sampled texture over a sparse heap of `heap_bytes`; empty where the device has no
+/// tier 2 sparse textures or Metal refuses.
+[[nodiscard]] std::optional<SparseTexture> CreateSparseTexture(const Device& device,
+                                                               const TextureDesc& desc,
+                                                               u64 heap_bytes);
+
+/// Bytes of a sparse heap that tiles are mapped to.
+[[nodiscard]] u64 SparseHeapUsedBytes(const void* heap);
 
 /// A view of `texture` in another format, type, range or swizzle; nil on failure.
 [[nodiscard]] Object CreateTextureView(TextureHandle texture, u32 format, TextureKind kind,

@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Portions from nxnative (https://github.com/seedds/nxnative), Copyright (c) 2026 seedds, MIT
+// License (LICENSES/MIT.txt): rb_swap, rb_swap_rows and the unwritten-attachment store rule.
 
 #include <algorithm>
 #include <array>
@@ -44,6 +46,17 @@ constexpr u32 MaxRenderTargetSize = 16384;
 constexpr u32 BufferSlots = 31;
 constexpr u32 TextureSlots = 96;
 constexpr u32 SamplerSlots = 16;
+
+/// EDEN_NX2_METAL_UNWRITTEN_STORE (on unless 0), on Apple GPUs: an attachment a pass loads and
+/// no draw of it can write is not stored again (MTLStoreActionDontCare; the tile it would write
+/// back holds what memory has already). nxnative's DM_NVN_UNWRITTEN_DC (MIT, nvn_mtl.m sd_finish).
+bool UnwrittenStoresEnabled(const Device& device) {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_UNWRITTEN_STORE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled && device.AppleFamily() != 0;
+}
 
 /// Metal checks a slot past a stage's tables in its validation layer only.
 bool SlotFits(u32 slot, u32 slots, const char* kind) {
@@ -365,6 +378,32 @@ fragment DepthStencilOut depth_stencil_from_buffer(ClearOut in [[stage_in]],
                                                    device const uint* words [[buffer(0)]],
                                                    constant DepthCopyParams& p [[buffer(1)]]) {
     return DepthFromWords(uint2(int2(in.position.xy) - p.origin), words, p);
+}
+
+// nxnative dm/gfx/msl/rb_swap.metal (MIT, Copyright (c) 2026 seedds): the red / blue exchange of
+// the 565 family, or reversed nibbles (shift 4), in place on rows of 16-bit texels.
+struct SwapParams {
+    uint offset;
+    uint width;
+    uint height;
+    uint row_bytes;
+    uint image_bytes;
+    uint shift;
+};
+
+kernel void swap_packed(uint3 id [[thread_position_in_grid]],
+                        device uchar* bytes [[buffer(0)]],
+                        constant SwapParams& p [[buffer(1)]]) {
+    if (id.x >= p.width || id.y >= p.height) {
+        return;
+    }
+    device ushort* texel = (device ushort*)(bytes + p.offset + id.z * p.image_bytes +
+                                            id.y * p.row_bytes) + id.x;
+    const uint v = *texel;
+    const uint m = 31u | (31u << p.shift);
+    *texel = p.shift == 4
+                 ? ushort(v << 12 | (v & 0xf0u) << 4 | (v >> 4 & 0xf0u) | v >> 12)
+                 : ushort((v & ~m) | (v & 31u) << p.shift | (v >> p.shift & 31u));
 }
 
 kernel void depth_to_buffer(uint2 id [[thread_position_in_grid]],
@@ -960,12 +999,44 @@ struct Scheduler::Impl {
         }
     }
 
+    /// Sets the store actions BeginRendering left open (EDEN_NX2_METAL_UNWRITTEN_STORE).
+    void FinishStores() {
+        if (deferred_color == 0 && !deferred_depth && !deferred_stencil) {
+            return;
+        }
+        // A pass whose draws never set their state is taken to write everything.
+        const u8 color = pass_state_set ? written_color : 0xFF;
+        const bool depth = !pass_state_set || written_depth;
+        const bool stencil = !pass_state_set || written_stencil;
+        const auto action = [this](bool written) {
+            if (!written) {
+                ++stores_dropped;
+            }
+            return written ? MTLStoreActionStore : MTLStoreActionDontCare;
+        };
+        for (u32 index = 0; index < 8; ++index) {
+            if ((deferred_color >> index) & 1U) {
+                [render setColorStoreAction:action((color >> index) & 1U) atIndex:index];
+            }
+        }
+        if (deferred_depth) {
+            [render setDepthStoreAction:action(depth)];
+        }
+        if (deferred_stencil) {
+            [render setStencilStoreAction:action(stencil)];
+        }
+        deferred_color = 0;
+        deferred_depth = false;
+        deferred_stencil = false;
+    }
+
     void EndEncoder() {
         if (blit != nil) {
             [blit endEncoding];
             blit = nil;
         }
         if (render != nil) {
+            FinishStores();
             [render endEncoding];
             render = nil;
         }
@@ -1441,6 +1512,7 @@ struct Scheduler::Impl {
     std::unordered_map<u64, id<MTLRenderPipelineState>> scale_pipelines;
     std::unordered_map<u64, id<MTLRenderPipelineState>> depth_upload_pipelines;
     id<MTLComputePipelineState> depth_download = nil;
+    id<MTLComputePipelineState> swap_packed = nil;
     id<MTLBuffer> zero_buffer = nil;
     id<MTLCommandBuffer> command_buffer = nil;
     id<MTLBlitCommandEncoder> blit = nil;
@@ -1461,6 +1533,17 @@ struct Scheduler::Impl {
     StageBindings mesh_bound;
     DrawState render_state{};
     bool render_state_valid{};
+    /// P07: attachments the open pass loaded (not cleared) have their store action decided when
+    /// it ends: stored when a draw could write them, dropped otherwise. Bits are colour
+    /// targets; the pass's draws OR what they can write into `written_*`.
+    u8 deferred_color{};
+    bool deferred_depth{};
+    bool deferred_stencil{};
+    u8 written_color{};
+    bool written_depth{};
+    bool written_stencil{};
+    bool pass_state_set{};
+    u64 stores_dropped{};
     StageBindings compute_bound;
     const void* compute_pipeline{};
     StageBindings kernel_bound;
@@ -2351,6 +2434,68 @@ bool Scheduler::DepthToBuffer(TextureHandle src_handle, u32 level, u32 slice, Of
     return true;
 }
 
+bool Scheduler::UpdateSparseTiles(TextureHandle texture_handle,
+                                  std::span<const SparseTileOp> ops) {
+    const id<MTLTexture> texture = AsTexture(texture_handle);
+    if (texture == nil || ops.empty()) {
+        return texture != nil;
+    }
+    impl->FlushClear();
+    impl->EndEncoder();
+    ++impl->encoders;
+    ++impl->segment_encoders;
+    const id<MTLResourceStateCommandEncoder> encoder = [impl->Commands() resourceStateCommandEncoder];
+    encoder.label = @"Sparse tiles";
+    for (const SparseTileOp& op : ops) {
+        [encoder updateTextureMapping:texture
+                                 mode:op.map ? MTLSparseTextureMappingModeMap
+                                             : MTLSparseTextureMappingModeUnmap
+                               region:MTLRegionMake2D(op.x, op.y, op.width, op.height)
+                             mipLevel:op.level
+                                slice:0];
+    }
+    [encoder endEncoding];
+    return true;
+}
+
+bool Scheduler::SwapPacked(BufferHandle buffer, u64 offset, u32 width, u32 rows, u32 images,
+                           u32 bytes_per_row, u32 bytes_per_image, u32 shift) {
+    if (buffer == nullptr || width == 0 || rows == 0 || images == 0 || offset % 2 != 0 ||
+        offset + u64{images} * bytes_per_image > UINT32_MAX) {
+        return false;
+    }
+    impl->FlushClear();
+    Impl& state = *impl;
+    if (state.swap_packed == nil && state.library != nil) {
+        NSError* error = nil;
+        state.swap_packed = [state.device.GetDevice()
+            newComputePipelineStateWithFunction:[state.library newFunctionWithName:@"swap_packed"]
+                                          error:&error];
+        if (state.swap_packed == nil) {
+            LOG_ERROR(Render_Metal, "Metal: packed texel swap kernel failed: {}",
+                      error.localizedDescription.UTF8String);
+        }
+    }
+    if (state.swap_packed == nil) {
+        return false;
+    }
+    state.EndEncoder();
+    state.NoteInOrder(buffer);
+    ++state.encoders;
+    ++state.segment_encoders;
+    const id<MTLComputeCommandEncoder> encoder = [state.Commands() computeCommandEncoder];
+    encoder.label = @"Packed texel swap";
+    [encoder setComputePipelineState:state.swap_packed];
+    [encoder setBuffer:AsBuffer(buffer) offset:0 atIndex:0];
+    const std::array<u32, 6> params{static_cast<u32>(offset), width, rows, bytes_per_row,
+                                    bytes_per_image, shift};
+    [encoder setBytes:params.data() length:sizeof(params) atIndex:1];
+    [encoder dispatchThreadgroups:MTLSizeMake((width + 31) / 32, (rows + 7) / 8, images)
+            threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+    [encoder endEncoding];
+    return true;
+}
+
 bool Scheduler::ScaleNearest(const ScalePass& scale) {
     impl->FlushClear();
     const id<MTLTexture> src = AsTexture(scale.src);
@@ -2458,6 +2603,10 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
             impl->FlushClear();
         }
     }
+    const bool defer_stores = UnwrittenStoresEnabled(impl->device);
+    u8 defer_color = 0;
+    bool defer_depth = false;
+    bool defer_stencil = false;
     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
     for (size_t index = 0; index < targets.color.size(); ++index) {
         if (targets.color[index].texture == nullptr) {
@@ -2471,6 +2620,9 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
             const auto& value = clear->color_value[index];
             color.loadAction = MTLLoadActionClear;
             color.clearColor = MTLClearColorMake(value[0], value[1], value[2], value[3]);
+        } else if (defer_stores) {
+            color.storeAction = MTLStoreActionUnknown;
+            defer_color |= static_cast<u8>(1U << index);
         }
     }
     if (targets.has_depth) {
@@ -2480,6 +2632,9 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
         if (clear && clear->clear_depth) {
             pass.depthAttachment.loadAction = MTLLoadActionClear;
             pass.depthAttachment.clearDepth = clear->depth_value;
+        } else if (defer_stores) {
+            pass.depthAttachment.storeAction = MTLStoreActionUnknown;
+            defer_depth = true;
         }
     }
     if (targets.has_stencil) {
@@ -2489,6 +2644,9 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
         if (clear && clear->clear_stencil) {
             pass.stencilAttachment.loadAction = MTLLoadActionClear;
             pass.stencilAttachment.clearStencil = clear->stencil_value;
+        } else if (defer_stores) {
+            pass.stencilAttachment.storeAction = MTLStoreActionUnknown;
+            defer_stencil = true;
         }
     }
     // Draws without attachments (occlusion queries) still need a size, within Metal's limit.
@@ -2542,6 +2700,13 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
     }
     pass.visibilityResultBuffer = impl->visibility;
     impl->render = impl->RenderEncoder(pass);
+    impl->deferred_color = defer_color;
+    impl->deferred_depth = defer_depth;
+    impl->deferred_stencil = defer_stencil;
+    impl->written_color = 0;
+    impl->written_depth = false;
+    impl->written_stencil = false;
+    impl->pass_state_set = false;
     impl->render_targets = targets;
     impl->visibility_slot = -1;
     impl->vertex_bound = {};
@@ -2585,6 +2750,10 @@ u64* Scheduler::VisibilityResults() noexcept {
     return static_cast<u64*>(impl->visibility.contents);
 }
 
+u64 Scheduler::StoresDropped() const noexcept {
+    return impl->stores_dropped;
+}
+
 u64 Scheduler::RenderPassSerial() const noexcept {
     return impl->render_pass_serial;
 }
@@ -2594,6 +2763,10 @@ void Scheduler::SetDrawState(const DrawState& state) {
     if (encoder == nil) {
         return;
     }
+    impl->pass_state_set = true;
+    impl->written_color |= state.color_written;
+    impl->written_depth = impl->written_depth || state.depth_written;
+    impl->written_stencil = impl->written_stencil || state.stencil_written;
     // What the encoder has from the draw before stays as it is (EDEN_NX2_METAL_STATE_CACHE).
     const bool cached = DrawStateCacheEnabled() && impl->render_state_valid;
     const DrawState& last = impl->render_state;

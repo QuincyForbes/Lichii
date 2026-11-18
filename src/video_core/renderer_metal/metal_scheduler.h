@@ -6,6 +6,7 @@
 #include <array>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 
 #include "common/common_types.h"
@@ -213,6 +214,23 @@ struct DrawState {
     std::array<Scissor, 15> more_scissors{};
     /// Triangles drawn as their edges (MTLTriangleFillModeLines).
     bool fill_lines{};
+    /// What the draw can write of the pass's attachments (colour targets by index, depth,
+    /// stencil); what no draw of a pass writes and the pass did not clear is not stored again
+    /// (P07, EDEN_NX2_METAL_UNWRITTEN_STORE).
+    u8 color_written{0xFF};
+    bool depth_written{true};
+    bool stencil_written{true};
+};
+
+/// A region of a sparse texture's tiles to map to its heap or unmap (G18); in tiles. At a mip
+/// tail's level the region is the tail's tiles in x, one row.
+struct SparseTileOp {
+    u32 x{};
+    u32 y{};
+    u32 width{1};
+    u32 height{1};
+    u32 level{};
+    bool map{true};
 };
 
 /// Records Metal work in submission order on one command queue. Copies go to one blit encoder
@@ -353,6 +371,19 @@ public:
     /// The other way: a kernel reads depth (and stencil) and writes the guest's bytes.
     bool DepthToBuffer(TextureHandle src, u32 level, u32 slice, Offset3D origin, Extent3D extent,
                        BufferHandle dst, u64 offset, u32 bytes_per_row, DepthLayout layout);
+
+    /// Store actions dropped so far for attachments a pass loaded and no draw of it wrote (P07).
+    [[nodiscard]] u64 StoresDropped() const noexcept;
+
+    /// Maps or unmaps tiles of a sparse texture (CreateSparseTexture), in order with the work
+    /// recorded before and after it.
+    bool UpdateSparseTiles(TextureHandle texture, std::span<const SparseTileOp> ops);
+
+    /// Exchanges red and blue (or reverses the nibbles, shift 4) of 16-bit texels in place in
+    /// `buffer`: `images` images of `rows` rows of `width` texels (PackedSwapShift), on the GPU
+    /// timeline: after the copies recorded before it, before those recorded after it.
+    bool SwapPacked(BufferHandle buffer, u64 offset, u32 width, u32 rows, u32 images,
+                    u32 bytes_per_row, u32 bytes_per_image, u32 shift);
 
     /// Resolves layer `src_slice` of multisampled `src` into dst with a render pass's resolve
     /// store action (the average of colour samples; sample 0 of depth, stencil kept). The

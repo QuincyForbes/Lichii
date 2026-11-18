@@ -19,6 +19,8 @@
 #include <thread>
 #include <vector>
 
+#include <fmt/format.h>
+
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_buffer_cache.h"
@@ -1027,12 +1029,324 @@ int RunSamplers() {
 
 } // Anonymous namespace
 
+/// E09, E10: the 16-bit packed formats Metal has with red and blue exchanged are render targets
+/// holding Metal's order; the swap on the way to guest memory (Scheduler::SwapPacked, and
+/// SwapPackedTexels on the CPU) gives the guest's bits (red at bit 0).
+int RunPackedTargets() {
+    using VideoCore::Surface::PixelFormat;
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    struct Case {
+        PixelFormat format;
+        std::array<double, 4> color;
+        uint16_t metal; ///< what Metal's render target holds for the colour
+        uint16_t guest; ///< and the guest's bits
+        const char* name;
+    };
+    const std::array<Case, 4> cases{{
+        {PixelFormat::B5G6R5_UNORM, {1, 0, 0, 1}, 0xF800, 0x001F, "B5G6R5"},
+        {PixelFormat::B5G6R5_UNORM, {0, 0, 1, 1}, 0x001F, 0xF800, "B5G6R5 blue"},
+        {PixelFormat::A1B5G5R5_UNORM, {1, 0, 0, 1}, 0xFC00, 0x801F, "A1B5G5R5"},
+        {PixelFormat::A4B4G4R4_UNORM, {1, 0, 0, 0}, 0xF000, 0x000F, "A4B4G4R4"},
+    }};
+    int failed = 0;
+    std::string report;
+    for (const Case& test : cases) {
+        const Metal::FormatInfo host = Metal::SurfaceFormat(device, test.format, false);
+        const bool plain = host.attachable && host.swizzle == Metal::IdentitySwizzle &&
+                           Metal::PackedSwapShift(test.format) != 0;
+        const Object target = Metal::CreateTexture(device, {.kind = TextureKind::e2D,
+                                                            .format = host.format,
+                                                            .width = 8,
+                                                            .height = 8,
+                                                            .render_target = host.attachable});
+        auto [back, back_bytes] = SharedBuffer(device, 8 * 8 * 2);
+        if (!plain || !target || back_bytes == nullptr) {
+            report += std::string{" "} + test.name + " NOT A TARGET";
+            ++failed;
+            continue;
+        }
+        Metal::ClearPass clear{};
+        clear.color[0] = {.texture = target.Get()};
+        clear.clear_color[0] = true;
+        clear.color_value[0] = test.color;
+        clear.width = 8;
+        clear.height = 8;
+        scheduler.Clear(clear);
+        scheduler.BreakBlits();
+        scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {8, 8, 1}, back.Get(), 0, 16, 0);
+        scheduler.BreakBlits();
+        scheduler.Finish();
+        uint16_t metal_texel{};
+        std::memcpy(&metal_texel, back_bytes, 2);
+        // GPU swap in place, then the CPU's over the same bytes must undo it.
+        const bool gpu = scheduler.SwapPacked(back.Get(), 0, 8, 8, 1, 16, 128,
+                                              Metal::PackedSwapShift(test.format));
+        scheduler.Finish();
+        uint16_t guest_texel{};
+        std::memcpy(&guest_texel, back_bytes, 2);
+        Metal::SwapPackedTexels(back_bytes, 8, 8, 1, 16, 128, Metal::PackedSwapShift(test.format));
+        uint16_t again{};
+        std::memcpy(&again, back_bytes, 2);
+        const bool ok = metal_texel == test.metal && gpu && guest_texel == test.guest &&
+                        again == test.metal;
+        if (!ok) {
+            ++failed;
+            report += fmt::format(" {} WRONG (metal {:04x} want {:04x}, guest {:04x} want {:04x})",
+                                  test.name, metal_texel, test.metal, guest_texel, test.guest);
+        }
+    }
+    std::printf("metal-smoke: packed 16-bit render targets (B5G6R5, A1B5G5R5, A4B4G4R4) hold "
+                "Metal's order, swapped to guest bits on the GPU and CPU:%s %s\n",
+                report.c_str(), failed == 0 ? "PASS" : "FAIL");
+    return failed == 0 ? 0 : 1;
+}
+
+constexpr const char* ShadowSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void add_one_per_half(uint2 id [[thread_position_in_grid]],
+                             texture2d<uint, access::read_write> image [[texture(0)]]) {
+    image.write(image.read(id) + 0x00010001u, id);
+}
+)";
+
+/// G19: a packed R16 surface a program addresses bytewise goes through an R32Uint shadow of half
+/// the width (RasterizerMetal::DispatchCompute): texels through a buffer into the shadow, the
+/// program works on it, and back.
+int RunByteShadow() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const id<MTLDevice> mtl = device.GetDevice();
+    constexpr uint32_t Width = 8;
+    constexpr uint32_t Height = 4;
+    const Object original = Metal::CreateTexture(device, {.kind = TextureKind::e2D,
+                                                          .format = Metal::Fmt::R16Float,
+                                                          .width = Width,
+                                                          .height = Height});
+    const Object shadow = Metal::CreateTexture(device, {.kind = TextureKind::e2D,
+                                                        .format = Metal::Fmt::R32Uint,
+                                                        .width = Width / 2,
+                                                        .height = Height,
+                                                        .shader_write = true});
+    auto [bridge, bridge_bytes] = SharedBuffer(device, Width * Height * 2);
+    NSError* error = nil;
+    const id<MTLLibrary> library = [mtl newLibraryWithSource:@(ShadowSource)
+                                                     options:[MTLCompileOptions new]
+                                                       error:&error];
+    const id<MTLComputePipelineState> kernel =
+        library != nil ? [mtl newComputePipelineStateWithFunction:
+                                  [library newFunctionWithName:@"add_one_per_half"]
+                                                            error:&error]
+                       : nil;
+    if (!original || !shadow || bridge_bytes == nullptr || kernel == nil) {
+        std::printf("metal-smoke: FAIL byte-addressed shadow: textures, buffer or kernel (%s)\n",
+                    error != nil ? error.localizedDescription.UTF8String : "made");
+        return 1;
+    }
+    std::array<uint16_t, Width * Height> texels{};
+    for (uint32_t index = 0; index < texels.size(); ++index) {
+        texels[index] = static_cast<uint16_t>(0x1000 + index * 3);
+    }
+    std::memcpy(bridge_bytes, texels.data(), sizeof(texels));
+    scheduler.CopyBufferToTexture(bridge.Get(), 0, Width * 2, 0, original.Get(), 0, 0, {},
+                                  {Width, Height, 1});
+    scheduler.Finish();
+    // In: the original's bytes through the bridge into the shadow.
+    std::memset(bridge_bytes, 0, sizeof(texels));
+    scheduler.CopyTextureToBuffer(original.Get(), 0, 0, {}, {Width, Height, 1}, bridge.Get(), 0,
+                                  Width * 2, 0);
+    scheduler.BreakBlits();
+    scheduler.CopyBufferToTexture(bridge.Get(), 0, Width * 2, 0, shadow.Get(), 0, 0, {},
+                                  {Width / 2, Height, 1});
+    scheduler.Finish();
+    const id<MTLCommandQueue> queue = [mtl newCommandQueue];
+    const id<MTLCommandBuffer> commands = [queue commandBuffer];
+    const id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
+    [encoder setComputePipelineState:kernel];
+    [encoder setTexture:Metal::AsTexture(shadow.Get()) atIndex:0];
+    [encoder dispatchThreads:MTLSizeMake(Width / 2, Height, 1)
+        threadsPerThreadgroup:MTLSizeMake(4, 4, 1)];
+    [encoder endEncoding];
+    [commands commit];
+    [commands waitUntilCompleted];
+    // Out: the shadow's texels through the bridge into the original, then read back.
+    scheduler.CopyTextureToBuffer(shadow.Get(), 0, 0, {}, {Width / 2, Height, 1}, bridge.Get(), 0,
+                                  Width * 2, 0);
+    scheduler.BreakBlits();
+    scheduler.CopyBufferToTexture(bridge.Get(), 0, Width * 2, 0, original.Get(), 0, 0, {},
+                                  {Width, Height, 1});
+    scheduler.BreakBlits();
+    std::memset(bridge_bytes, 0, sizeof(texels));
+    scheduler.CopyTextureToBuffer(original.Get(), 0, 0, {}, {Width, Height, 1}, bridge.Get(), 0,
+                                  Width * 2, 0);
+    scheduler.Finish();
+    uint32_t wrong = 0;
+    for (uint32_t index = 0; index < texels.size(); ++index) {
+        uint16_t value{};
+        std::memcpy(&value, bridge_bytes + index * 2, 2);
+        wrong += value == static_cast<uint16_t>(texels[index] + 1) ? 0 : 1;
+    }
+    const bool passed = wrong == 0;
+    std::printf("metal-smoke: packed R16 surface through its R32 shadow: %u of %u halves wrong: "
+                "%s\n",
+                wrong, Width * Height, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// G18: a texture over a sparse heap takes memory for the tiles mapped only; a mapped tile holds
+/// what is written to it, an unmapped one reads zero, and unmapping gives the page back.
+int RunSparseTiles() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    if (!Metal::SupportsSparseTextures(device)) {
+        std::printf("metal-smoke: sparse tiles: this GPU or OS has no tier 2 sparse textures: "
+                    "SKIP\n");
+        return 0;
+    }
+    constexpr uint32_t Size = 2048;
+    auto sparse = Metal::CreateSparseTexture(device, {.kind = TextureKind::e2D,
+                                                      .format = Metal::Fmt::R8Unorm,
+                                                      .width = Size,
+                                                      .height = Size}, 4u << 20);
+    if (!sparse) {
+        std::printf("metal-smoke: FAIL sparse tiles: texture not made\n");
+        return 1;
+    }
+    const uint32_t tw = sparse->tile_width;
+    const uint32_t th = sparse->tile_height;
+    auto [upload, upload_bytes] = SharedBuffer(device, size_t{tw} * th);
+    auto [back, back_bytes] = SharedBuffer(device, size_t{tw} * th * 2);
+    if (upload_bytes == nullptr || back_bytes == nullptr) {
+        return 1;
+    }
+    for (uint32_t index = 0; index < tw * th; ++index) {
+        upload_bytes[index] = static_cast<uint8_t>(index * 7 + 1);
+    }
+    const uint64_t before = Metal::SparseHeapUsedBytes(sparse->heap.Get());
+    const std::array<Metal::SparseTileOp, 1> map{{{.x = 1, .y = 1, .width = 1, .height = 1}}};
+    scheduler.UpdateSparseTiles(sparse->texture.Get(), map);
+    scheduler.CopyBufferToTexture(upload.Get(), 0, tw, 0, sparse->texture.Get(), 0, 0,
+                                  {tw, th, 0}, {tw, th, 1});
+    scheduler.BreakBlits();
+    scheduler.CopyTextureToBuffer(sparse->texture.Get(), 0, 0, {tw, th, 0}, {tw, th, 1},
+                                  back.Get(), 0, tw, 0);
+    scheduler.CopyTextureToBuffer(sparse->texture.Get(), 0, 0, {tw * 3, th * 3, 0}, {tw, th, 1},
+                                  back.Get(), size_t{tw} * th, tw, 0);
+    scheduler.Finish();
+    const uint64_t mapped_bytes = Metal::SparseHeapUsedBytes(sparse->heap.Get());
+    const bool mapped_ok = std::memcmp(back_bytes, upload_bytes, size_t{tw} * th) == 0;
+    bool unmapped_zero = true;
+    for (uint32_t index = 0; index < tw * th; ++index) {
+        unmapped_zero = unmapped_zero && back_bytes[size_t{tw} * th + index] == 0;
+    }
+    const std::array<Metal::SparseTileOp, 1> unmap{{{.x = 1, .y = 1, .map = false}}};
+    scheduler.UpdateSparseTiles(sparse->texture.Get(), unmap);
+    scheduler.Finish();
+    const uint64_t after = Metal::SparseHeapUsedBytes(sparse->heap.Get());
+    const bool passed = mapped_ok && unmapped_zero && before == 0 &&
+                        mapped_bytes == sparse->tile_bytes && after == 0;
+    std::printf("metal-smoke: sparse tiles (%ux%u texels, %u bytes): mapped tile %s, unmapped "
+                "reads %s, heap used %llu -> %llu -> %llu bytes: %s\n",
+                tw, th, sparse->tile_bytes, mapped_ok ? "holds its data" : "WRONG",
+                unmapped_zero ? "zero" : "NOT ZERO", static_cast<unsigned long long>(before),
+                static_cast<unsigned long long>(mapped_bytes),
+                static_cast<unsigned long long>(after), passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// P07: an attachment a pass loads and no draw of it writes is not stored again on Apple GPUs
+/// (MTLStoreActionDontCare), and what the image held before is still there afterwards; one a draw
+/// writes is stored.
+int RunUnwrittenStore() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const id<MTLDevice> mtl = device.GetDevice();
+    NSError* error = nil;
+    const id<MTLLibrary> library = [mtl newLibraryWithSource:@(LayerSource)
+                                                     options:[MTLCompileOptions new]
+                                                       error:&error];
+    const auto make = [&](MTLColorWriteMask mask) {
+        MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+        desc.vertexFunction = [library newFunctionWithName:@"layer_vertex"];
+        desc.fragmentFunction = [library newFunctionWithName:@"layer_fragment"];
+        desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        desc.colorAttachments[0].writeMask = mask;
+        desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+        return Metal::Retain(library != nil ? [mtl newRenderPipelineStateWithDescriptor:desc
+                                                                                    error:&error]
+                                            : nil);
+    };
+    const Object writes = make(MTLColorWriteMaskAll);
+    const Object keeps = make(MTLColorWriteMaskNone);
+    const Object depth_stencil =
+        Metal::Retain([mtl newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]]);
+    constexpr uint32_t Side = 4;
+    const Object target = Metal::CreateTexture(device, {.kind = TextureKind::e2D,
+                                                        .format = Rgba8,
+                                                        .width = Side,
+                                                        .height = Side,
+                                                        .render_target = true});
+    auto [back, back_bytes] = SharedBuffer(device, Side * Side * 4);
+    if (!writes || !keeps || !target || back_bytes == nullptr) {
+        std::printf("metal-smoke: FAIL unwritten store: %s\n",
+                    error != nil ? error.localizedDescription.UTF8String : "textures");
+        return 1;
+    }
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = Side;
+    targets.height = Side;
+    const auto draw = [&](const Object& pipeline, uint8_t written) {
+        scheduler.BeginRendering(targets);
+        Metal::DrawState state{};
+        state.pipeline = pipeline.Get();
+        state.depth_stencil = depth_stencil.Get();
+        state.viewport = {0.0f, 0.0f, float(Side), float(Side), 0.0f, 1.0f};
+        state.scissor = {0, 0, Side, Side};
+        state.color_written = written;
+        scheduler.SetDrawState(state);
+        scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 3, 1, 0);
+        scheduler.EndRendering();
+    };
+    // Cleared to blue, drawn red (stored); a pass drawing nothing to it (not stored, twice).
+    Metal::ClearPass clear{};
+    clear.color[0] = {.texture = target.Get()};
+    clear.clear_color[0] = true;
+    clear.color_value[0] = {0, 0, 1, 1};
+    clear.width = Side;
+    clear.height = Side;
+    scheduler.Clear(clear);
+    scheduler.BreakBlits();
+    const uint64_t before = scheduler.StoresDropped();
+    draw(writes, 0x01);
+    const uint64_t after_write = scheduler.StoresDropped();
+    draw(keeps, 0x00);
+    draw(keeps, 0x00);
+    const uint64_t after_keep = scheduler.StoresDropped();
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {Side, Side, 1}, back.Get(), 0,
+                                  Side * 4, 0);
+    scheduler.Finish();
+    uint32_t texel = 0;
+    std::memcpy(&texel, back_bytes + (Side + 1) * 4, sizeof(texel));
+    const uint64_t expected = device.AppleFamily() != 0 ? 2 : 0;
+    const bool passed = texel == 0xFF0000FFU && after_write == before &&
+                        after_keep - after_write == expected;
+    std::printf("metal-smoke: unwritten attachments: image %08x (red), %llu stores dropped (%llu "
+                "expected on this GPU): %s\n",
+                texel, static_cast<unsigned long long>(after_keep - after_write),
+                static_cast<unsigned long long>(expected), passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 int RunAll() {
     int result = 0;
     for (const auto test : {RunSampleCopies, RunScaleNearest, RunDepthBytes, RunConversions, RunGuards,
                             RunSamplesAndPlaceholders, RunExpandedFormats, RunSrgbStorage,
                             RunLayeredTarget, RunMultiRange, RunCrossThreadWait,
-                            RunSamplers}) {
+                            RunSamplers, RunPackedTargets, RunByteShadow, RunSparseTiles,
+                            RunUnwrittenStore}) {
         const int outcome = test();
         result = result != 0 ? result : outcome;
     }

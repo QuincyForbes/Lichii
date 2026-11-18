@@ -15,6 +15,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/dlss_contract.h"
+#include "video_core/nx2.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_formats.h"
@@ -224,6 +225,47 @@ namespace {
                     clip(depth, offset.z, extent.depth)};
 }
 
+// EDEN_NX2_METAL_SPARSE=0: large images over Switch 2 sparse regions are made whole.
+[[nodiscard]] bool SparseTilesEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_SPARSE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// A large single 2D image in a Switch 2 sparse region (title 1's world-sized R8/RG16/R16 masks,
+// 170-341 MB, of which the game maps a few MiB) gets memory by sparse tile where the guest memory
+// under it can hold data (Vulkan's UsesSparseTiles). Formats of one texel per block.
+[[nodiscard]] bool UsesSparseTiles(const Device& device, const ImageInfo& info,
+                                   const FormatInfo& host, bool converted, GPUVAddr gpu_addr) {
+    if (!SparseTilesEnabled() || converted || host.format == 0 || !SupportsSparseTextures(device) ||
+        info.type != ImageType::e2D || info.resources.layers != 1 || info.num_samples != 1 ||
+        info.size.depth != 1 || info.block.width != 0 ||
+        VideoCore::Surface::DefaultBlockWidth(info.format) != 1 ||
+        VideoCore::Surface::DefaultBlockHeight(info.format) != 1 ||
+        VideoCore::Surface::GetFormatType(info.format) !=
+            VideoCore::Surface::SurfaceType::ColorTexture) {
+        return false;
+    }
+    const u32 size = VideoCommon::CalculateGuestSizeInBytes(info);
+    return size >= (32U << 20) && Tegra::Nx2InSparseRegion(gpu_addr, size);
+}
+
+/// The sparse heap of an image of `guest_bytes`: an eighth of the image, the most that is
+/// mapped for the game's masks (EDEN_NX2_METAL_SPARSE_MIB sets it), within 16 and 256 MiB.
+[[nodiscard]] u64 SparseHeapBytes(u32 guest_bytes) {
+    static const u64 forced = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_SPARSE_MIB");
+        return value != nullptr ? u64{std::strtoull(value, nullptr, 10)} << 20 : u64{0};
+    }();
+    if (forced != 0) {
+        return forced;
+    }
+    return std::clamp<u64>(Common::AlignUp(guest_bytes / 8, u64{1} << 20), u64{16} << 20,
+                           u64{256} << 20);
+}
+
 } // Anonymous namespace
 
 TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
@@ -258,12 +300,14 @@ u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
 }
 
 bool TextureCacheRuntime::ShouldReinterpret(Image& dst, Image& src) const noexcept {
-    return dst.HostFormat().format != src.HostFormat().format;
+    // Two formats of one Metal format keep their guest bits apart when one of them is swapped.
+    return dst.HostFormat().format != src.HostFormat().format ||
+           dst.PackedShift() != src.PackedShift();
 }
 
 void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                                     std::span<const VideoCommon::ImageCopy> copies) {
-    if (dst.HostFormat().format != src.HostFormat().format) {
+    if (ShouldReinterpret(dst, src)) {
         ReinterpretImage(dst, src, copies);
         return;
     }
@@ -447,6 +491,16 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
                                               src_3d ? bytes_per_image : 0U);
             }
             scheduler.BreakBlits();
+            if (const u32 shift = src.PackedShift(); shift != 0) {
+                scheduler.SwapPacked(reinterpret_buffer.Get(), 0, blocks_x, blocks_y,
+                                     src_3d ? extent.depth : 1U, bytes_per_row,
+                                     bytes_per_image, shift);
+            }
+            if (const u32 shift = dst.PackedShift(); shift != 0) {
+                scheduler.SwapPacked(reinterpret_buffer.Get(), 0, blocks_x, blocks_y,
+                                     dst_3d ? dst_extent.depth : 1U, bytes_per_row,
+                                     bytes_per_image, shift);
+            }
             if (dst_depth) {
                 scheduler.DepthFromBuffer(reinterpret_buffer.Get(), 0, bytes_per_row,
                                           dst.Handle(), dst_level, dst_slice,
@@ -742,6 +796,9 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         flags |= ImageFlagBits::CostlyLoad;
     }
     host_format = SurfaceFormat(runtime->device, info.format, converted);
+    if (info.type != ImageType::Buffer && !converted) {
+        packed_shift = PackedSwapShift(info.format);
+    }
     if (info.type == ImageType::Buffer) {
         // Texel buffers are views of the buffer cache's buffers (milestone 3).
         return;
@@ -781,6 +838,37 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                          (FormatsExpanded() && LinearTwin(host_format.format) != 0)) &&
                         samples == 1,
     };
+    if (UsesSparseTiles(runtime->device, info, host_format, converted, gpu_addr_)) {
+        if (std::optional<SparseTexture> made = CreateSparseTexture(
+                runtime->device, desc, SparseHeapBytes(VideoCommon::CalculateGuestSizeInBytes(info)))) {
+            texture = std::move(made->texture);
+            sparse = SparseTiles{
+                .heap = std::move(made->heap),
+                .tile_width = made->tile_width,
+                .tile_height = made->tile_height,
+                .tile_bytes = made->tile_bytes,
+                .tail_level = made->tail_level,
+                .tail_tiles = made->tail_tiles,
+                .heap_bytes = made->heap_bytes,
+            };
+            for (u32 level = 0; level < sparse.tail_level; ++level) {
+                const u32 width = (std::max)(desc.width >> level, 1U);
+                const u32 height = (std::max)(desc.height >> level, 1U);
+                sparse.mapped.emplace_back(size_t{Common::DivCeil(width, sparse.tile_width)} *
+                                               Common::DivCeil(height, sparse.tile_height),
+                                           false);
+            }
+            flags |= ImageFlagBits::Unbacked | ImageFlagBits::SparseTiles;
+            bytes = sparse.heap_bytes;
+            runtime->allocated_bytes += bytes;
+            LOG_INFO(Render_Metal,
+                     "Metal: sparse tiled image {:#x}: {}x{} {} levels, tile {}x{}, mip tail from "
+                     "{}, heap {} MiB",
+                     gpu_addr_, desc.width, desc.height, desc.levels, sparse.tile_width,
+                     sparse.tile_height, sparse.tail_level, sparse.heap_bytes >> 20);
+            return;
+        }
+    }
     texture = CreateTexture(runtime->device, desc);
     if (!texture) {
         LOG_ERROR(Render_Metal, "Metal: texture {}x{}x{} format {} levels {} layers {} failed",
@@ -1063,6 +1151,70 @@ std::optional<DepthLayout> Image::DepthBytesLayout() const {
     }
 }
 
+bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
+    if (!texture || sparse.tile_width == 0) {
+        return false;
+    }
+    std::vector<SparseTileOp> ops;
+    std::vector<std::pair<u32, size_t>> fresh; // Tiles this call maps: level, index
+    bool needs_tail = false;
+    u64 added = 0;
+    for (const VideoCommon::LevelRect& rect : rects) {
+        const u32 level = static_cast<u32>(rect.level);
+        if (level >= sparse.tail_level) {
+            needs_tail = true;
+            continue;
+        }
+        if (rect.width == 0 || rect.height == 0) {
+            continue;
+        }
+        const u32 width = (std::max)(desc.width >> level, 1U);
+        const u32 tiles_x = Common::DivCeil(width, sparse.tile_width);
+        for (u32 ty = rect.y / sparse.tile_height;
+             ty <= (rect.y + rect.height - 1) / sparse.tile_height; ++ty) {
+            for (u32 tx = rect.x / sparse.tile_width;
+                 tx <= (rect.x + rect.width - 1) / sparse.tile_width; ++tx) {
+                const size_t index = size_t{ty} * tiles_x + tx;
+                if (sparse.mapped[level][index]) {
+                    continue;
+                }
+                sparse.mapped[level][index] = true; // Not mapped twice within this call
+                fresh.emplace_back(level, index);
+                ops.push_back({.x = tx, .y = ty, .width = 1, .height = 1, .level = level});
+                added += sparse.tile_bytes;
+            }
+        }
+    }
+    const bool tail = needs_tail && sparse.tail_level < desc.levels && !sparse.tail_mapped;
+    if (tail) {
+        ops.push_back({.x = 0, .y = 0, .width = sparse.tail_tiles, .height = 1,
+                       .level = sparse.tail_level});
+        added += u64{sparse.tail_tiles} * sparse.tile_bytes;
+    }
+    // A failed bind leaves the tiles as they were, so the next call tries them again.
+    const auto roll_back = [&] {
+        for (const auto& [level, index] : fresh) {
+            sparse.mapped[level][index] = false;
+        }
+    };
+    if (sparse.bound_bytes + added > sparse.heap_bytes) {
+        LOG_WARNING(Render_Metal, "Metal: sparse tiled image {:#x}: its {} MiB heap is full",
+                    gpu_addr, sparse.heap_bytes >> 20);
+        roll_back();
+        return false;
+    }
+    if (ops.empty()) {
+        return true;
+    }
+    if (!runtime->scheduler.UpdateSparseTiles(texture.Get(), ops)) {
+        roll_back();
+        return false;
+    }
+    sparse.bound_bytes += added;
+    sparse.tail_mapped = sparse.tail_mapped || tail;
+    return true;
+}
+
 void Image::UploadMemory(BufferHandle buffer, size_t offset,
                          std::span<const VideoCommon::BufferImageCopy> copies) {
     if (!CanCopyWithBuffers()) {
@@ -1116,8 +1268,42 @@ void Image::UploadMemory(BufferHandle buffer, size_t offset,
     }
 }
 
+template <typename F>
+void Image::ForEachCopyRegion(std::span<const VideoCommon::BufferImageCopy> copies,
+                              F&& region) const {
+    const bool is_3d = info.type == ImageType::e3D;
+    for (const VideoCommon::BufferImageCopy& copy : copies) {
+        if (copy.image_subresource.base_level >= info.resources.levels) {
+            continue;
+        }
+        const Extent3D extent = ClipExtent(info, 0, 0, copy.image_subresource.base_level,
+                                           copy.image_offset, copy.image_extent);
+        if (extent.width == 0 || extent.height == 0 || extent.depth == 0) {
+            continue;
+        }
+        const auto [bytes_per_row, bytes_per_image] = CopyPitches(copy);
+        const s32 layers = is_3d ? 1 : (std::max)(copy.image_subresource.num_layers, 1);
+        for (s32 layer = 0; layer < layers; ++layer) {
+            region(copy.buffer_offset + u64{bytes_per_image} * layer, extent.width, extent.height,
+                   is_3d ? extent.depth : 1U, bytes_per_row, bytes_per_image);
+        }
+    }
+}
+
 void Image::UploadMemory(const StagingBufferRef& map,
                          std::span<const VideoCommon::BufferImageCopy> copies) {
+    if (packed_shift != 0 && CanCopyWithBuffers()) {
+        // Guest bytes into Metal's order, on the CPU: the staging buffer is this upload's own.
+        ForEachCopyRegion(copies, [&](u64 offset, u32 width, u32 rows, u32 images, u32 row_bytes,
+                                      u32 image_bytes) {
+            const u64 end = offset + u64{images - 1} * image_bytes + u64{rows - 1} * row_bytes +
+                            u64{width} * 2;
+            if (end <= map.mapped_span.size()) {
+                SwapPackedTexels(map.mapped_span.data() + offset, width, rows, images, row_bytes,
+                                 image_bytes, packed_shift);
+            }
+        });
+    }
     UploadMemory(map.buffer, map.offset, copies);
 }
 
@@ -1176,6 +1362,18 @@ void Image::DownloadMemory(std::span<BufferHandle> buffers, std::span<size_t> of
                     offsets[index] + copy.buffer_offset + u64{bytes_per_image} * layer,
                     bytes_per_row, is_3d ? bytes_per_image : 0U);
             }
+        }
+        if (packed_shift != 0) {
+            // Metal's order into the guest's, in the buffer, after the copies.
+            ForEachCopyRegion(copies, [&](u64 offset, u32 width, u32 rows, u32 images,
+                                          u32 row_bytes, u32 image_bytes) {
+                if (!runtime->scheduler.SwapPacked(buffers[index], offsets[index] + offset, width,
+                                                   rows, images, row_bytes, image_bytes,
+                                                   packed_shift)) {
+                    LOG_ONCE(warned_swap, "Metal: a download of {} keeps Metal's channel order",
+                             info.format);
+                }
+            });
         }
     }
 }

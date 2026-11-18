@@ -140,6 +140,19 @@ enum : u8 { Zero = 0, One = 1, Red = 2, Green = 3, Blue = 4, Alpha = 5 };
 /// VideoCommon::ExpandTexels); 0: the first gets no texture and the second is read as R8.
 [[nodiscard]] bool FormatsExpanded();
 
+/// For the 16-bit packed guest formats Metal has only with red and blue exchanged (B5G6R5,
+/// A1B5G5R5: the bit position of red in Metal's format, 11 and 10) or the four nibbles reversed
+/// (A4B4G4R4: 4): the host texture holds Metal's order and bytes are converted where they cross
+/// between it and guest memory (uploads, downloads, copies between formats). 0 for every other
+/// format.
+[[nodiscard]] u32 PackedSwapShift(VideoCore::Surface::PixelFormat format);
+
+/// Exchanges the 5-bit red and blue fields (or reverses the nibbles, shift 4) of `width` 16-bit
+/// texels in `rows` rows of `images` images, in place; the same conversion both ways. The GPU's
+/// version is Scheduler::SwapPacked (nxnative's rb_swap).
+void SwapPackedTexels(u8* data, u32 width, u32 rows, u32 images, size_t row_pitch,
+                      size_t image_pitch, u32 shift);
+
 /// The linear format of an sRGB one that shaders may write through a view (Metal writes no sRGB
 /// texture from a shader): textures of it get shader-write usage under EDEN_NX2_METAL_FORMATS.
 /// 0 for every other format.
