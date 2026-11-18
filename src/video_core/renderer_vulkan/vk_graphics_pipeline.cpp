@@ -1238,13 +1238,6 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
                                  rescaling, samplers_it, views_it, record ? &*record : nullptr);
         }
-        const auto& info{stage_infos[stage]};
-        if (!info.texture_descriptors.empty() || !info.image_descriptors.empty() ||
-            !info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty()) {
-            Profile::Scope scope{Profile::Zone::PushDescriptors};
-            PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling,
-                                 samplers_it, views_it);
-        }
     }};
     if constexpr (Spec::enabled_stages[0]) {
         prepare_stage(0);
