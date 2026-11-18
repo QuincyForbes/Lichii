@@ -156,6 +156,10 @@ void* GraphicsPipeline::VertexKernelState(const Device& device, size_t variant,
 }
 
 void* GraphicsPipeline::KernelState(const Device& device, MeshKernel& kernel) {
+    if (kernel.program.entry_point.empty()) {
+        // A tessellation pipeline without a control program.
+        return nullptr;
+    }
     if (kernel.state || kernel.failed) {
         return kernel.state.Get();
     }

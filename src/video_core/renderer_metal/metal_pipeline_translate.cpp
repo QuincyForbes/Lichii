@@ -211,9 +211,13 @@ void RefreshFixedState(GraphicsPipelineKey& key, const Maxwell& regs) {
             key.state |= static_cast<u32>(type) << (StateColorTypesShift + rt * 2);
         }
     }
+    const bool tessellation_points =
+        key.unique_hashes[3] != 0 &&
+        ((key.tessellation >> 4) & 3) ==
+            static_cast<u32>(Maxwell::Tessellation::OutputPrimitives::Points);
     if (static_cast<Maxwell::PrimitiveTopology>(key.topology) ==
             Maxwell::PrimitiveTopology::Points ||
-        regs.IsMeshEnabled()) {
+        tessellation_points || regs.IsMeshEnabled()) {
         key.point_size = std::bit_cast<u32>(regs.point_size);
     }
 }
@@ -292,6 +296,11 @@ void PipelineTranslator::RefreshKey(GraphicsPipelineKey& key, const Maxwell& reg
                                  (static_cast<u32>(tessellation.spacing.Value()) << 2) |
                                  (static_cast<u32>(tessellation.output_primitives.Value()) << 4)
                            : 0U;
+    if (key.unique_hashes[2] == 0 && key.unique_hashes[3] != 0) {
+        // Without a control program the patch's control points are the vertex outputs: the
+        // evaluation program is translated for their count (Vulkan's patch control points).
+        key.tessellation |= (std::clamp(regs.patch_vertices, 1U, 32U) - 1) << TessPatchShift;
+    }
     RefreshFixedState(key, regs);
 }
 
@@ -500,9 +509,9 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
         return emulated;
     }
     if (key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0) {
-        if (key.unique_hashes[2] == 0 || key.unique_hashes[3] == 0) {
+        if (key.unique_hashes[3] == 0) {
             static std::atomic<u32> unsupported_logged{};
-            Refuse(unsupported_logged, key.Hash(), "only one of the tessellation programs");
+            Refuse(unsupported_logged, key.Hash(), "a tessellation control program without an evaluation program");
             return std::nullopt;
         }
         return Tessellated(key, programs);
@@ -519,7 +528,12 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
         vertex_info.generic_input_types[attribute] = types[(key.attribute_types >> (attribute * 2)) & 3];
     }
     ApplyVertexState(vertex_info, key);
-    auto vertex = Translate(programs[1], ShaderTranslate::Stage::Vertex, bindings, vertex_info);
+    // Only a draw of points takes a point size.
+    ShaderTranslate::Options vertex_options = translate_options;
+    vertex_options.point_size_builtin = static_cast<Maxwell::PrimitiveTopology>(key.topology) ==
+                                        Maxwell::PrimitiveTopology::Points;
+    auto vertex = Translate(programs[1], ShaderTranslate::Stage::Vertex, bindings, vertex_info,
+                            &vertex_options);
     if (!vertex) {
         return std::nullopt;
     }
@@ -633,8 +647,10 @@ std::optional<TranslatedPipeline> PipelineTranslator::Mesh(
         profile, mesh.mesh, output_binding, has_task ? output_binding + 3 : ~0U,
         (key.state & StateDepthMinusOneToOne) != 0,
         FixedStateEnabled() && topology == 0 ? std::bit_cast<float>(key.point_size) : 1.0f);
+    ShaderTranslate::Options vertex_options = translate_options;
+    vertex_options.point_size_builtin = topology == 0;
     ShaderTranslate::Result vertex =
-        ShaderTranslate::SpirvToMsl(vertex_spirv, ShaderTranslate::Stage::Vertex, translate_options);
+        ShaderTranslate::SpirvToMsl(vertex_spirv, ShaderTranslate::Stage::Vertex, vertex_options);
     if (vertex.source.empty()) {
         Refuse(refused_logged, hash, "SPIR-V to MSL failed", vertex.error);
         return std::nullopt;
@@ -914,7 +930,12 @@ std::optional<TranslatedPipeline> PipelineTranslator::Tessellated(
     const auto spacing = static_cast<Spacing>((key.tessellation >> 2) & 3);
     const auto output = static_cast<OutputPrimitives>((key.tessellation >> 4) & 3);
     Shader::IR::Program& control = programs[2];
-    if (control.invocations == 0 || control.invocations > 32) {
+    // Without a control program the hardware takes the factors from registers and hands the
+    // vertex outputs to the evaluation program as the patch's control points.
+    const bool has_control = key.unique_hashes[2] != 0;
+    const u32 control_points = has_control ? control.invocations
+                                           : ((key.tessellation >> TessPatchShift) & 31U) + 1;
+    if (control_points == 0 || control_points > 32) {
         Refuse(refused_logged, hash, "tessellation control program's output vertex count");
         return std::nullopt;
     }
@@ -930,7 +951,7 @@ std::optional<TranslatedPipeline> PipelineTranslator::Tessellated(
                                                                 : Modes::Spacing::Equal,
                 .clockwise = output == OutputPrimitives::Triangles_CW,
                 .point_mode = output == OutputPrimitives::Points,
-                .output_vertices = control.invocations,
+                .output_vertices = control_points,
             },
     };
     Shader::Backend::Bindings bindings;
@@ -969,25 +990,37 @@ std::optional<TranslatedPipeline> PipelineTranslator::Tessellated(
     }
     const StageProgram& vertex = tessellation.vertex[0];
 
-    ShaderTranslate::Options control_options = translate_options;
-    control_options.inputs = vertex.outputs;
-    control_options.tessellation = tessellation.modes;
-    Shader::RuntimeInfo control_info;
-    control_info.previous_stage_stores = programs[1].info.stores;
-    control_info.previous_stage_legacy_stores_mapping = programs[1].info.legacy_stores_mapping;
-    control_info.y_negate = (key.state & StateLowerLeftOrigin) != 0;
-    auto control_program = Translate(control, ShaderTranslate::Stage::TessellationControl,
-                                     bindings, control_info, &control_options);
-    if (!control_program) {
-        return std::nullopt;
+    std::optional<StageProgram> control_program;
+    if (has_control) {
+        ShaderTranslate::Options control_options = translate_options;
+        control_options.inputs = vertex.outputs;
+        control_options.tessellation = tessellation.modes;
+        Shader::RuntimeInfo control_info;
+        control_info.previous_stage_stores = programs[1].info.stores;
+        control_info.previous_stage_legacy_stores_mapping = programs[1].info.legacy_stores_mapping;
+        control_info.y_negate = (key.state & StateLowerLeftOrigin) != 0;
+        control_program = Translate(control, ShaderTranslate::Stage::TessellationControl, bindings,
+                                    control_info, &control_options);
+        if (!control_program) {
+            return std::nullopt;
+        }
     }
+    const Shader::IR::Program& before_evaluation = has_control ? control : programs[1];
 
     ShaderTranslate::Options evaluation_options = translate_options;
-    evaluation_options.inputs = control_program->outputs;
+    evaluation_options.inputs = has_control ? control_program->outputs : vertex.outputs;
     evaluation_options.tessellation = tessellation.modes;
+    const bool emulated_domain =
+        domain == Domain::Isolines || tessellation.modes.point_mode;
+    // Only points take a point size (the emulated point mode writes the fixed state's).
+    evaluation_options.point_size_builtin = tessellation.modes.point_mode;
     Shader::RuntimeInfo evaluation_info;
-    evaluation_info.previous_stage_stores = control.info.stores;
-    evaluation_info.previous_stage_legacy_stores_mapping = control.info.legacy_stores_mapping;
+    if (FixedStateEnabled() && tessellation.modes.point_mode) {
+        evaluation_info.fixed_state_point_size = std::bit_cast<float>(key.point_size);
+    }
+    evaluation_info.previous_stage_stores = before_evaluation.info.stores;
+    evaluation_info.previous_stage_legacy_stores_mapping =
+        before_evaluation.info.legacy_stores_mapping;
     evaluation_info.tess_primitive = domain == Domain::Quads      ? Shader::TessPrimitive::Quads
                                      : domain == Domain::Isolines ? Shader::TessPrimitive::Isolines
                                                                   : Shader::TessPrimitive::Triangles;
@@ -1017,25 +1050,54 @@ std::optional<TranslatedPipeline> PipelineTranslator::Tessellated(
         fragment = std::move(*translated);
     }
     tessellation.vertex_stride = InterfaceStride(vertex.outputs, false);
-    tessellation.control_point_stride = InterfaceStride(control_program->outputs, false);
-    tessellation.patch_stride = InterfaceStride(control_program->outputs, true);
-    tessellation.control = MeshKernel{
-        .program = std::move(*control_program),
-        .workgroup_size = {control.invocations, 1, 1},
-    };
+    if (has_control) {
+        tessellation.control_point_stride = InterfaceStride(control_program->outputs, false);
+        tessellation.patch_stride = InterfaceStride(control_program->outputs, true);
+        tessellation.control = MeshKernel{
+            .program = std::move(*control_program),
+            .workgroup_size = {control.invocations, 1, 1},
+        };
+    } else {
+        tessellation.control_point_stride = tessellation.vertex_stride;
+        tessellation.factors_from_registers = true;
+    }
     static std::atomic<u32> logged{};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
         LOG_INFO(Render_Metal,
                  "Metal: tessellation pipeline {:016x} (control {:016x}, evaluation {:016x}): "
-                 "domain {}, spacing {}, output primitives {}, {} control points out",
+                 "domain {}, spacing {}, output primitives {}, {} control points {}",
                  hash, key.unique_hashes[2], key.unique_hashes[3], static_cast<u32>(domain),
-                 static_cast<u32>(spacing), static_cast<u32>(output), control.invocations);
+                 static_cast<u32>(spacing), static_cast<u32>(output), control_points,
+                 has_control ? "out" : "in, factors from registers");
     }
-    if (tessellation.modes.point_mode) {
-        static std::atomic<bool> warned{};
-        if (!warned.exchange(true)) {
-            LOG_WARNING(Render_Metal, "Metal: tessellation point mode is drawn as triangles");
+    if (emulated_domain) {
+        ShaderTranslate::DomainEmulation emulation = ShaderTranslate::EmulateDomain(
+            evaluation->msl, evaluation->entry_point, tessellation.modes);
+        if (!emulation.error.empty()) {
+            Refuse(refused_logged, hash, "tessellation domain emulation", emulation.error);
+            return std::nullopt;
         }
+        const auto kernel = [&](std::string entry) {
+            return MeshKernel{.program = {.stage = ShaderTranslate::Stage::Compute,
+                                          .msl = emulation.source,
+                                          .entry_point = std::move(entry)}};
+        };
+        Tessellation::Domain domain_kernels{
+            .count = kernel(emulation.count_entry),
+            .evaluate = kernel(emulation.evaluate_entry),
+        };
+        // The kernel is the evaluation program: its resources, buffers and information.
+        domain_kernels.evaluate.program.slots = evaluation->slots;
+        domain_kernels.evaluate.program.info = evaluation->info;
+        domain_kernels.evaluate.program.tessellation_slots = evaluation->tessellation_slots;
+        evaluation->msl = std::move(emulation.source);
+        evaluation->entry_point = emulation.vertex_entry;
+        evaluation->slots.clear();
+        evaluation->tessellation_slots = {};
+        emulation.source.clear();
+        emulation.vertex_entry.clear();
+        domain_kernels.emulation = std::move(emulation);
+        tessellation.domain = std::move(domain_kernels);
     }
     return TranslatedPipeline{
         .vertex = std::move(*evaluation),

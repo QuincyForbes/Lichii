@@ -737,6 +737,7 @@ if (ENABLE_METAL)
         set(METAL_SMOKE_HEADERS)
         foreach (SMOKE_FILE translate_smoke.comp texel_buffer_smoke.comp texture_1d_smoke.comp
                             tess_smoke.vert tess_smoke.tesc tess_smoke.tese
+                            tess_isolines.tesc tess_isolines.tese tess_points.tese tess_direct.vert
                             device_msl_smoke.vert device_msl_smoke.frag
                             native_mesh_smoke.task native_mesh_smoke.mesh native_mesh_smoke.frag)
             string(REPLACE "." "_" SMOKE_SHADER "${SMOKE_FILE}")

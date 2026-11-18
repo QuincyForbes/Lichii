@@ -45,6 +45,10 @@ struct ShaderPools {
     Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_block{32};
 };
 
+/// GraphicsPipelineKey::tessellation: where the patch control points of a pipeline without a
+/// control program are (minus one, five bits).
+inline constexpr u32 TessPatchShift = 8;
+
 struct GraphicsPipelineKey {
     std::array<u64, 6> unique_hashes{};
     /// Two bits per generic attribute (FixedPipelineState::DynamicAttributeTypes).
@@ -205,6 +209,19 @@ struct Tessellation {
     u32 vertex_stride{};
     u32 control_point_stride{};
     u32 patch_stride{};
+    /// Isolines, and the point mode of triangles and quads, which Metal's tessellator can't draw
+    /// (ShaderTranslate::EmulateDomain): the kernels evaluating the domain points, and the
+    /// pipeline's Vertex() reading what they wrote. The factors are those the control program
+    /// writes, in the layout Metal's quad patches have for isolines.
+    struct Domain {
+        ShaderTranslate::DomainEmulation emulation;
+        MeshKernel count;
+        MeshKernel evaluate; ///< The evaluation program's resources are the buffer cache's stage 2
+    };
+    std::optional<Domain> domain;
+    /// No control program (its kernel is empty): the vertex outputs are the control points, and
+    /// the factors are written from the registers (`modes.output_vertices` is their count).
+    bool factors_from_registers{};
 };
 
 /// What a graphics key's programs translate to (GraphicsPipeline's stages).

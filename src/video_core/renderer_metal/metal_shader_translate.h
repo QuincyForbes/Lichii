@@ -103,6 +103,10 @@ struct Options {
     TessellationModes tessellation{};
     /// Vertex kernel of an indexed draw: its index size (2 or 4), 0 for non-indexed.
     u32 vertex_index_size{};
+    /// The stage writes its point size. Metal accepts one only from draws of points (its
+    /// validation aborts otherwise), so a program drawing anything else is translated without
+    /// (MoltenVK's enable_point_size_builtin).
+    bool point_size_builtin{true};
     /// (set, binding) of sampled images that are bound to depth textures: they become
     /// depth2d<float>, the type Metal declares depth formats with (as the blit shaders do).
     /// A shared image type changes for all its users.
@@ -118,6 +122,46 @@ struct Result {
     TessellationSlots tessellation_slots{};
     std::string error;
 };
+
+/// An evaluation program drawn as lines or points, which Metal's tessellator can't: isolines, and
+/// the point mode of triangle and quad patches. The program's post-tessellation vertex function
+/// becomes a function the kernels call for every domain point (generated here from the patch's
+/// tessellation factors), the results go to a buffer, and a vertex function that reads it draws
+/// them as lines (a segment is two vertices) or points. The kernels' resources are the program's
+/// own at the same slots, then these buffers.
+struct DomainEmulation {
+    std::string source;         ///< MSL with the kernels and the vertex function
+    std::string count_entry;    ///< One thread: every patch's first vertex and the draw's size
+    std::string evaluate_entry; ///< A threadgroup of DomainThreads per patch
+    std::string vertex_entry;   ///< Vertex function (buffer 0: the evaluated vertices)
+    u32 vertex_stride{};        ///< Bytes of an evaluated vertex
+    u32 max_vertices_per_patch{};
+    bool lines{};               ///< Else points
+    u32 factors_slot{};         ///< Patch factors (the Metal layout of the domain, half floats)
+    u32 params_slot{};          ///< DomainParams
+    u32 offsets_slot{};         ///< A u32 for each patch and one more: where its vertices start
+    u32 args_slot{};            ///< Indirect arguments of the draw (4 words), written by the count
+    u32 output_slot{};          ///< The evaluated vertices
+    /// The program's own buffer of tessellation levels (it reads gl_TessLevel*), ~0 when unused.
+    u32 level_slot{~0U};
+    std::string error;
+};
+
+struct DomainParams {
+    u32 patches;
+    u32 capacity; ///< Evaluated vertices the output holds, all patches together
+    u32 reserved[2];
+};
+
+/// Threads of the evaluation kernel's threadgroup.
+inline constexpr u32 DomainThreads = 64;
+
+/// Turns the MSL of an evaluation program (Stage::TessellationEvaluation, translated for the
+/// domain, isolines as quads) into DomainEmulation. `modes` are its domain, spacing and point
+/// mode; lines are drawn for isolines unless the point mode is on.
+[[nodiscard]] DomainEmulation EmulateDomain(const std::string& evaluation_msl,
+                                            const std::string& entry_point,
+                                            const TessellationModes& modes);
 
 /// Resources are numbered per kind in (set, binding) order, which is the order the recompiler
 /// emits them and the buffer cache appends their bindings, so the pipeline binds in sequence.
