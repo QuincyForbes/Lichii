@@ -1026,7 +1026,7 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     }
 #endif
 
-    // The native Metal renderer runs FSR 3 and MetalFX frame generation (not LSFG).
+    // The native Metal renderer runs FSR 3, MetalFX and LSFG frame generation.
 #ifdef LICHII_METAL_RENDERER
     const bool metal = GetCurrentGraphicsBackend() == Settings::RendererBackend::Metal;
 #else
@@ -1068,8 +1068,6 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
               static_cast<u32>(Settings::ScalingFilter::MetalFxSpatial), metalfx);
     gate_item(frame_gen_type_combobox, Settings::EnumMetadata<Settings::FrameGenType>::Index(),
               static_cast<u32>(Settings::FrameGenType::MetalFx), metalfx_frame_gen);
-    gate_item(frame_gen_type_combobox, Settings::EnumMetadata<Settings::FrameGenType>::Index(),
-              static_cast<u32>(Settings::FrameGenType::Lsfg), !metal);
     gate_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
               static_cast<u32>(Settings::Upscaler::MetalFx), metalfx);
     gate_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),

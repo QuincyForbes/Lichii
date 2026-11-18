@@ -20,6 +20,8 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/frame_gen/lossless_dll.h"
+#include "video_core/renderer_metal/metal_lsfg.h"
 #include "video_core/renderer_metal/metal_object.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
@@ -35,8 +37,7 @@ public:
     explicit FrameGen(const Device& device, Scheduler& scheduler);
     ~FrameGen();
 
-    /// Whether the settings ask for a frame generation Metal runs: frame_gen on with FSR 3 or
-    /// MetalFX (LSFG is not ported).
+    /// Whether the settings ask for frame generation (FSR 3, MetalFX or LSFG).
     [[nodiscard]] static bool Wanted();
 
     /// The real frame was drawn into `frame` (`size` and `format` of the window's drawable):
@@ -71,8 +72,10 @@ private:
     };
 
     bool Prepare();
+    /// LSFG: the DLL's shaders loaded; false (logged once) when it is not installed.
+    bool PrepareLsfg();
     bool BuildProgram(Program& program, std::span<const u32> code);
-    void Rebuild(std::array<u32, 2> size, u32 format, f32 flow_scale);
+    void Rebuild(std::array<u32, 2> size, u32 format, f32 flow_scale, bool lsfg_type);
     /// One of the two compute programs: `textures` by shader binding, the push constants, and the
     /// grid in 16 x 16 groups.
     bool Dispatch(const Program& program, std::span<const TextureHandle> textures,
@@ -81,6 +84,11 @@ private:
     const Device& device;
     Scheduler& scheduler;
     std::unique_ptr<FrameInterpolator> interpolator;
+    std::unique_ptr<LsfgChain> lsfg;
+    VideoCore::FrameGen::ShaderModules lsfg_modules;
+    bool lsfg_loaded{};
+    bool lsfg_failed{};
+    bool built_lsfg{};
 
     Program flow;
     Program interpolation;

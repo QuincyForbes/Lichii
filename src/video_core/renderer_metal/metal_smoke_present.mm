@@ -22,6 +22,7 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "video_core/frame_gen/lossless_dll.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/post_processing/fx_chain.h"
 #include "video_core/post_processing/fx_effect.h"
@@ -623,6 +624,69 @@ int RunFsr3Upscale() {
     return finite && worst < 0.08 ? 0 : 1;
 }
 
+/// N19: LSFG with the user's Lossless Scaling DLL. Without it (this runner has none) the case
+/// says SKIP for the passes and checks that the chain degrades: no frames, no crash. With it, the
+/// moving square's generated frame must have it between the two positions.
+int RunLsfg() {
+#ifdef HAS_LSFG
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr uint32_t Size = 128;
+    constexpr uint32_t Format = Metal::Fmt::BGRA8Unorm;
+    const auto square = [&](uint32_t left) {
+        return Picture(device, scheduler, Format, Size, Size, [left](uint32_t x, uint32_t y) {
+            const bool inside = x >= left && x < left + 12 && y >= 58 && y < 70;
+            const uint8_t value = inside ? 255 : 0;
+            return std::array<uint8_t, 4>{value, value, value, 255};
+        });
+    };
+    std::vector<Object> pictures;
+    for (const uint32_t left : {40U, 40U, 44U, 48U, 52U, 56U, 60U, 64U}) {
+        pictures.push_back(square(left));
+    }
+    Settings::values.frame_gen.SetValue(true);
+    Settings::values.frame_gen_multiplier.SetValue(2);
+    Settings::values.frame_gen_type.SetValue(Settings::FrameGenType::Lsfg);
+    const bool installed = VideoCore::FrameGen::GetInstalledLosslessStatus() ==
+                           VideoCore::FrameGen::LosslessStatus::Ok;
+    Metal::FrameGen frame_gen(device, scheduler);
+    size_t count = 0;
+    Metal::TextureHandle generated = nullptr;
+    for (const Object& frame : pictures) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{16});
+        count = frame_gen.Process(frame.Get(), {Size, Size}, Format, {Size, Size});
+        if (count == 1) {
+            generated = frame_gen.Generate(0);
+        }
+    }
+    scheduler.Finish();
+    int result = 0;
+    if (!installed) {
+        std::printf("metal-smoke: LSFG: SKIP the passes (Lossless.dll is not installed); without "
+                    "it %zu frames planned, none generated: %s\n",
+                    count, count == 0 && generated == nullptr ? "PASS" : "FAIL");
+        result = count == 0 && generated == nullptr ? 0 : 1;
+    } else if (generated == nullptr) {
+        std::printf("metal-smoke: LSFG: %zu frames planned, none made: FAIL\n", count);
+        result = 1;
+    } else {
+        const auto bytes = ReadBack(device, scheduler, generated, Size, Size, 4);
+        const auto at = [&](uint32_t x) {
+            return bytes.empty() ? 0 : static_cast<int>(bytes[(uint64_t{64} * Size + x) * 4 + 1]);
+        };
+        const bool lit = at(66) > 128 && at(56) < 60;
+        std::printf("metal-smoke: LSFG: columns 56 %d, 62 %d, 66 %d (the square was at 60..71 then "
+                    "64..75): %s\n",
+                    at(56), at(62), at(66), lit ? "PASS" : "FAIL");
+        result = lit ? 0 : 1;
+    }
+    Settings::values.frame_gen.SetValue(false);
+    return result;
+#else
+    return 0;
+#endif
+}
+
 int RunAll() {
     if (std::getenv("LICHII_SMOKE_LOG") != nullptr) {
         Common::Log::Initialize();
@@ -630,7 +694,7 @@ int RunAll() {
         Common::Log::Start();
     }
     int result = 0;
-    for (const auto test : {RunPostProcess, RunFrameDump, RunFlashWatch, RunFrameGen, RunFsr3Upscale}) {
+    for (const auto test : {RunPostProcess, RunFrameDump, RunFlashWatch, RunFrameGen, RunLsfg, RunFsr3Upscale}) {
         const int outcome = test();
         result = result != 0 ? result : outcome;
     }

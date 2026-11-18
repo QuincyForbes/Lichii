@@ -86,18 +86,23 @@ FrameGen::FrameGen(const Device& device_, Scheduler& scheduler_)
 FrameGen::~FrameGen() = default;
 
 bool FrameGen::Wanted() {
-    if (!Settings::values.frame_gen.GetValue()) {
+    return Settings::values.frame_gen.GetValue();
+}
+
+bool FrameGen::PrepareLsfg() {
+    if (lsfg_loaded || lsfg_failed) {
+        return lsfg_loaded;
+    }
+    const auto status = VideoCore::FrameGen::LoadShaderModules(lsfg_modules);
+    if (status != VideoCore::FrameGen::LosslessStatus::Ok) {
+        lsfg_failed = true;
+        LOG_WARNING(Render_Metal, "LSFG unavailable: Lossless.dll status {} (no frames are "
+                                  "generated)",
+                    static_cast<u32>(status));
         return false;
     }
-    const auto type = Settings::values.frame_gen_type.GetValue();
-    if (type == Settings::FrameGenType::Lsfg) {
-        static bool logged = false;
-        if (!std::exchange(logged, true)) {
-            LOG_WARNING(Render_Metal, "Frame generation: LSFG is not ported to Metal; pick FSR 3 "
-                                      "or MetalFX (no frames are generated)");
-        }
-        return false;
-    }
+    LOG_INFO(Render_Metal, "LSFG shaders loaded: {} modules", lsfg_modules.size());
+    lsfg_loaded = true;
     return true;
 }
 
@@ -139,24 +144,31 @@ bool FrameGen::Prepare() {
     return prepared;
 }
 
-void FrameGen::Rebuild(std::array<u32, 2> size, u32 format, f32 scale) {
+void FrameGen::Rebuild(std::array<u32, 2> size, u32 format, f32 scale, bool lsfg_type) {
     scheduler.Finish();
     built_size = size;
     built_format = format;
     flow_scale = scale;
     flow_size = {(std::max)(1U, size[0] / 2), (std::max)(1U, size[1] / 2)};
+    lsfg.reset();
+    built_lsfg = lsfg_type;
     for (Object& frame : frames) {
+        if (lsfg_type) {
+            break;
+        }
         frame = CreateTexture(device, {.kind = TextureKind::e2D,
                                        .format = format,
                                        .width = size[0],
                                        .height = size[1]});
     }
     // R16G16F: per current pixel, the offset in flow texels to the previous frame.
-    motion = CreateTexture(device, {.kind = TextureKind::e2D,
-                                    .format = Fmt::RG16Float,
-                                    .width = flow_size[0],
-                                    .height = flow_size[1],
-                                    .shader_write = true});
+    if (!lsfg_type) {
+        motion = CreateTexture(device, {.kind = TextureKind::e2D,
+                                        .format = Fmt::RG16Float,
+                                        .width = flow_size[0],
+                                        .height = flow_size[1],
+                                        .shader_write = true});
+    }
     generated = CreateTexture(device, {.kind = TextureKind::e2D,
                                        .format = format,
                                        .width = size[0],
@@ -170,6 +182,16 @@ void FrameGen::Rebuild(std::array<u32, 2> size, u32 format, f32 scale) {
     last_count = 0;
     warm_streak = 0;
     interpolator_count = 0;
+    if (lsfg_type) {
+        lsfg = std::make_unique<LsfgChain>(device, scheduler, lsfg_modules, size, format, scale);
+        if (!lsfg->Valid()) {
+            LOG_WARNING(Render_Metal, "LSFG: a program or image could not be made; no frames "
+                                      "are generated");
+            lsfg.reset();
+            failed = true;
+        }
+        return;
+    }
     if (!frames[0] || !frames[1] || !motion || !generated) {
         failed = true;
         LOG_WARNING(Render_Metal, "Metal: frame generation textures not made for {}x{}", size[0],
@@ -216,7 +238,8 @@ size_t FrameGen::Process(TextureHandle frame, std::array<u32, 2> size, u32 forma
         plan = {};
         return 0;
     }
-    if (!Prepare()) {
+    const bool lsfg_type = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Lsfg;
+    if (lsfg_type ? !PrepareLsfg() : !Prepare()) {
         unavailable = true;
         return 0;
     }
@@ -232,8 +255,10 @@ size_t FrameGen::Process(TextureHandle frame, std::array<u32, 2> size, u32 forma
     peak_guest = {(std::max)(peak_guest[0], guest_size[0]), (std::max)(peak_guest[1], guest_size[1])};
 
     const f32 scale = ConfiguredFlowScale(peak_guest, size);
-    if (!frames[0] || built_size != size || built_format != format) {
-        Rebuild(size, format, scale);
+    // Only LSFG uses the flow scale (the chain's size); the other chains keep their history.
+    if (!generated || built_size != size || built_format != format || built_lsfg != lsfg_type ||
+        (lsfg_type && flow_scale != scale)) {
+        Rebuild(size, format, scale, lsfg_type);
         if (failed) {
             unavailable = true;
             return 0;
@@ -249,6 +274,19 @@ size_t FrameGen::Process(TextureHandle frame, std::array<u32, 2> size, u32 forma
     const bool generating = warm && warm_streak >= RECURRENCE_FRAMES && plan.generations > 0;
     last_generations = plan.generations;
 
+    if (lsfg_type) {
+        // Vulkan's FrameGen::Process for LSFG: every frame is copied in, the shared passes run
+        // once the chain is warm.
+        scheduler.CopyTexture(frame, 0, 0, {}, {size[0], size[1], 1}, lsfg->Input(count), 0, 0,
+                              {});
+        if (warm) {
+            lsfg->DispatchShared(count);
+        }
+        last_count = count;
+        has_history = true;
+        flow_valid = generating;
+        return generating ? last_generations : 0;
+    }
     // Vulkan's Fsr3FrameGen::Process without the NVIDIA hardware.
     const std::array<u32, 3> extent{size[0], size[1], 1};
     const auto copy_to = [&](Object& destination) {
@@ -295,6 +333,13 @@ size_t FrameGen::Process(TextureHandle frame, std::array<u32, 2> size, u32 forma
 TextureHandle FrameGen::Generate(size_t generation) {
     if (!has_history || !flow_valid || failed || !generated) {
         return nullptr;
+    }
+    if (lsfg) {
+        lsfg->DispatchGeneration(last_count, last_generations, generation, generated.Get(),
+                                 built_size);
+        last_maker = "LSFG";
+        ++generated_frames;
+        return generated.Get();
     }
     // MetalFX makes only the frame halfway between two: 3x and 4x stay with FSR 3.
     if (last_generations == 1 &&
