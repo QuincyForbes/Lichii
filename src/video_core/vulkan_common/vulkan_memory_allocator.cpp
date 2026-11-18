@@ -560,7 +560,10 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
     u32 memory_type{};
     {
         std::scoped_lock lk{buffer_type_mutex};
-        const auto key = (u64{ci.usage} << 32) | ci.flags;
+        // The usage is part of the key: DeviceLocal and Stream buffers with the same Vulkan usage
+        // bits need different memory types, and a cached DeviceLocal (unmapped) type handed to a
+        // Stream buffer left it without a host mapping (null writes in the staging uploads).
+        const auto key = (u64{ci.usage} << 32) | (u64{static_cast<u32>(usage)} << 28) | ci.flags;
         if (const auto it = buffer_memory_types.find(key); it != buffer_memory_types.end()) {
             memory_type = it->second;
         } else if (vmaFindMemoryTypeIndexForBufferInfo(allocator, &ci, &alloc_ci, &memory_type) ==
@@ -577,8 +580,19 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
     VmaAllocationCreateInfo pool_ci = alloc_ci;
     pool_ci.pool = pool;
     pool_ci.memoryTypeBits = 0;
-    return vmaCreateBuffer(allocator, &ci, &pool_ci, &handle, &allocation, &alloc_info) ==
-           VK_SUCCESS;
+    if (vmaCreateBuffer(allocator, &ci, &pool_ci, &handle, &allocation, &alloc_info) !=
+        VK_SUCCESS) {
+        return false;
+    }
+    if (usage != MemoryUsage::DeviceLocal && alloc_info.pMappedData == nullptr) [[unlikely]] {
+        // A host-written buffer must be mapped: use the default pools instead.
+        vmaDestroyBuffer(allocator, handle, allocation);
+        handle = VK_NULL_HANDLE;
+        allocation = VK_NULL_HANDLE;
+        alloc_info = {};
+        return false;
+    }
+    return true;
 }
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const {

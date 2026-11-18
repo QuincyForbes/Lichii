@@ -1776,6 +1776,15 @@ void LoadPipelines(
         LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
                   Common::FS::PathToUTF8String(filename));
     }
+} catch (...) {
+    // A cache cut short by a crash mid-write threw past the ios_base::failure handler on macOS
+    // (std::terminate at every launch of the game). Whatever it threw, drop the damaged cache.
+    LOG_ERROR(Common_Filesystem, "Damaged pipeline cache {}, deleting it",
+              Common::FS::PathToUTF8String(filename));
+    if (!Common::FS::RemoveFile(filename)) {
+        LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
+                  Common::FS::PathToUTF8String(filename));
+    }
 }
 
 } // namespace VideoCommon

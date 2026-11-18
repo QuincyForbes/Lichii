@@ -1659,6 +1659,14 @@ const typename P::ImageView& TextureCache<P>::GetImageView(ImageViewId id) const
 
 template <class P>
 typename P::ImageView& TextureCache<P>::GetImageView(ImageViewId id) noexcept {
+    if (!slot_image_views.contains(id)) [[unlikely]] {
+        // As GetSampler: an id that names no view (unset or freed) would read past the slots.
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+            LOG_ERROR(HW_GPU, "Invalid image view id {:#x}, using the null view", id.index);
+        }
+        return slot_image_views[NULL_IMAGE_VIEW_ID];
+    }
     return slot_image_views[id];
 }
 
@@ -1717,6 +1725,9 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
                 view.id = last_id;
             } else {
                 view.id = VisitImageView(view.index, compute);
+                if (!view.id) [[unlikely]] {
+                    view.id = NULL_IMAGE_VIEW_ID;
+                }
                 last_index = view.index;
                 last_id = view.id;
             }
@@ -1752,6 +1763,11 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
     const auto& regs = maxwell3d->regs;
     for (ImageViewInOut& view : views) {
         if (view.id == NULL_IMAGE_VIEW_ID || view.blacklist) {
+            continue;
+        }
+        if (!slot_image_views.contains(view.id)) [[unlikely]] {
+            // An unset or freed id (seen from the binding memo's partial resolve): bind nothing.
+            view.id = NULL_IMAGE_VIEW_ID;
             continue;
         }
         const ImageViewBase& image_view = slot_image_views[view.id];

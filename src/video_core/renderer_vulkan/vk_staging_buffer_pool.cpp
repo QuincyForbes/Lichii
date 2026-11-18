@@ -8,6 +8,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -673,6 +674,16 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
                     "buffers and retrying",
                     buffer_ci.size >> 20, e.what(), freed);
         buffer = memory_allocator.CreateBuffer(buffer_ci, alloc_usage);
+    }
+    if (usage != MemoryUsage::DeviceLocal && buffer.Mapped().empty() &&
+        alloc_usage != usage) [[unlikely]] {
+        // The rebar (Stream) memory came back without a host mapping: staging is written by the
+        // CPU, so take plain host memory instead.
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+            LOG_WARNING(Render_Vulkan, "Unmapped stream staging buffer; using host memory");
+        }
+        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
     }
     VideoCommon::Churn::Add(VideoCommon::Churn::StagingBuffers);
     VideoCommon::Churn::Add(VideoCommon::Churn::StagingBytes, buffer_ci.size);
