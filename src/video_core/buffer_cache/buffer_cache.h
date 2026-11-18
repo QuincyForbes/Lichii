@@ -3344,7 +3344,21 @@ void BufferCache<P>::UpdateVertexBuffers() {
     static_assert(Dirty::VertexBuffer31 < 64, "vertex buffer flags must fit in the first word");
     u32 dirty_vb_mask = static_cast<u32>(flags_words[0] >> Dirty::VertexBuffer0);
     if (const u32 unsupported = dirty_vb_mask & ~VERTEX_BUFFER_MASK; unsupported != 0) {
-        LOG_WARNING(HW_GPU, "Ignoring unsupported vertex streams, mask={:#x}", unsupported);
+        // Only streams the guest enabled matter (a full invalidation, e.g. a channel switch,
+        // marks all 32 dirty), and once each: formatting it on every draw was a real cost.
+        static u32 reported = 0;
+        u32 enabled_unsupported = 0;
+        for (u32 index = NUM_VERTEX_BUFFERS; index < 32; ++index) {
+            if ((unsupported & (1u << index)) != 0 &&
+                maxwell3d->regs.vertex_streams[index].enable != 0) {
+                enabled_unsupported |= 1u << index;
+            }
+        }
+        if ((enabled_unsupported & ~reported) != 0) {
+            reported |= enabled_unsupported;
+            LOG_WARNING(HW_GPU, "Ignoring enabled vertex streams past {}: mask={:#x}",
+                        NUM_VERTEX_BUFFERS, enabled_unsupported);
+        }
         for (u32 index = NUM_VERTEX_BUFFERS; index < 32; ++index) {
             flags[Dirty::VertexBuffer0 + index] = false;
         }

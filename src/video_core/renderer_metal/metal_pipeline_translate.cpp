@@ -361,7 +361,10 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
         .supported_subgroup_stages = ~0U,
         .support_viewport_index_layer_non_geometry = true,
         .support_viewport_mask = false,
-        .support_typeless_image_loads = false,
+        // MSL reads a storage texture of any format (the view is the image's own, StorageHandle):
+        // with false, every format-less image load was replaced by zero (compute lighting and
+        // post-process passes read black).
+        .support_typeless_image_loads = true,
         .support_demote_to_helper_invocation = true,
         .support_int64_atomics = false,
         .support_float32_atomic_add = true,
@@ -405,7 +408,10 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
         // A guest geometry passthrough program stays as it is (its stores are all the fold into
         // the vertex program reads); one that can't fold is refused with the geometry stage.
         .support_geometry_shader_passthrough = true,
-        .support_conditional_barrier = false,
+        // Kept, as Vulkan keeps them (MoltenVK included): with false, ConditionalBarrierPass deleted
+        // every barrier inside an if or a loop, and compute passes sharing threadgroup memory
+        // across loop steps (tiled lighting, reductions, blurs) raced.
+        .support_conditional_barrier = true,
     };
     host_info.ApplyDescriptorLimitPolicy();
     translate_options.ios = ios;

@@ -90,6 +90,16 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
     constexpr bool CAN_CHUNK = BYTES_PER_PIXEL <= CHUNK_BYTES && CHUNK_BYTES % BYTES_PER_PIXEL == 0;
     constexpr u32 CHUNK_COLUMNS = CAN_CHUNK ? CHUNK_BYTES / BYTES_PER_PIXEL : 1;
 
+    // The swizzled offsets come from the image's block layout, which a guest (or a guess of the
+    // texture cache) can make reach past the guest memory supplied: a copy outside either buffer
+    // is skipped. Without this a 1920x1080 target read 64 MiB past its 8 MiB of guest data.
+    const size_t swizzled_size = TO_LINEAR ? output.size() : input.size();
+    const size_t linear_size = TO_LINEAR ? input.size() : output.size();
+    const auto in_bounds = [&](u32 swizzled_offset, u32 unswizzled_offset, u32 bytes) {
+        return size_t{swizzled_offset} + bytes <= swizzled_size &&
+               size_t{unswizzled_offset} + bytes <= linear_size;
+    };
+
     for (u32 slice = 0; slice < depth; ++slice) {
         const u32 z = slice + origin_z;
         const u32 offset_z = (z >> block_depth) * slice_size +
@@ -119,9 +129,12 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
 
                     const u32 unswizzled_offset = line_offset + column * BYTES_PER_PIXEL;
 
-                    u8* const dst = &output[TO_LINEAR ? swizzled_offset : unswizzled_offset];
-                    const u8* const src = &input[TO_LINEAR ? unswizzled_offset : swizzled_offset];
-                    std::memcpy(dst, src, CHUNK_BYTES);
+                    if (in_bounds(swizzled_offset, unswizzled_offset, CHUNK_BYTES)) [[likely]] {
+                        u8* const dst = &output[TO_LINEAR ? swizzled_offset : unswizzled_offset];
+                        const u8* const src =
+                            &input[TO_LINEAR ? unswizzled_offset : swizzled_offset];
+                        std::memcpy(dst, src, CHUNK_BYTES);
+                    }
                     // The same advance CHUNK_COLUMNS pixel steps make: the masked add carries
                     // through the permuted bits like the per-pixel increments do.
                     incrpdep<x_bits, CHUNK_BYTES>(swizzled_x);
@@ -139,6 +152,9 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
 
                 const u32 unswizzled_offset = line_offset + column * BYTES_PER_PIXEL;
 
+                if (!in_bounds(swizzled_offset, unswizzled_offset, BYTES_PER_PIXEL)) [[unlikely]] {
+                    continue;
+                }
                 u8* const dst = &output[TO_LINEAR ? swizzled_offset : unswizzled_offset];
                 const u8* const src = &input[TO_LINEAR ? unswizzled_offset : swizzled_offset];
 

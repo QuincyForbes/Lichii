@@ -924,18 +924,30 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
         size_t guest_layer_offset = 0;
 
         for (s32 layer = 0; layer < info.resources.layers; ++layer) {
+            // Guest data shorter than the layout says (unmapped tail, a layout guessed for the
+            // memory): what lies past it stays as it is rather than being read out of bounds.
+            const size_t src_begin = guest_offset + guest_layer_offset;
+            if (src_begin >= input.size() ||
+                size_t{host_offset} + host_bytes_per_layer > output.size()) [[unlikely]] {
+                guest_layer_offset += layer_stride;
+                host_offset += host_bytes_per_layer;
+                continue;
+            }
             const std::span<u8> dst = output.subspan(host_offset);
-            const std::span<const u8> src = input.subspan(guest_offset + guest_layer_offset);
+            const std::span<const u8> src = input.subspan(src_begin);
+            // Short: only the generic untile checks each copy against the data it has.
+            const bool short_source = src.size() < level_sizes[level];
             // EDEN_NX2_EXP8 bit 4: large 2D levels untiled in bands on the transcode workers too
             // (only from the texture cache's own thread, which passes a worker).
-            const bool banded = worker && info.type == ImageType::e2D && info.num_samples == 1 &&
+            const bool banded = !short_source && worker && info.type == ImageType::e2D &&
+                                info.num_samples == 1 &&
                                 (VideoCore::Nx2Debug::Experiment(8) & 4) != 0 &&
                                 Tegra::Texture::TryUnswizzleBands(
                                     dst.first(host_bytes_per_layer), src.first(level_sizes[level]),
                                     1U << bpp_log2, num_tiles.width, num_tiles.height,
                                     num_tiles.depth, block.height, block.depth, stride_alignment,
                                     gpu_memory.UsesNativeTiling(), Nx2Perf::Verify());
-            if (!banded && (!worker || !Nx2Perf::On(Nx2Perf::Opt::UnswizzleWorkers) ||
+            if (!banded && (short_source || !worker || !Nx2Perf::On(Nx2Perf::Opt::UnswizzleWorkers) ||
                 info.type != ImageType::e2D || info.num_samples != 1 ||
                 !worker->TryUnswizzle(
                     dst.first(host_bytes_per_layer), src.first(level_sizes[level]), 1U << bpp_log2,
