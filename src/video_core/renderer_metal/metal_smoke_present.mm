@@ -30,6 +30,7 @@
 #include "video_core/renderer_metal/metal_flash_watch.h"
 #include "video_core/renderer_metal/metal_frame_dump.h"
 #include "video_core/renderer_metal/metal_frame_gen.h"
+#include "video_core/renderer_metal/metal_fsr3_upscaler.h"
 #include "video_core/renderer_metal/metal_post_process.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
@@ -550,6 +551,78 @@ int RunFlashWatch() {
     return armed && flashed && outputs && tiles ? 0 : 1;
 }
 
+/// O04: FSR 3.1 (the SDK's nine passes through the translator) upscales a still horizontal
+/// gradient 64x64 -> 128x128 over several frames; the output follows the gradient.
+int RunFsr3Upscale() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr uint32_t Render = 64;
+    constexpr uint32_t Display = 128;
+    const Object color = Picture(device, scheduler, Metal::Fmt::RGBA8Unorm, Render, Render,
+                                 [](uint32_t x, uint32_t) {
+                                     const uint8_t value = static_cast<uint8_t>(x * 4);
+                                     return std::array<uint8_t, 4>{value, value, value, 255};
+                                 });
+    const Object motion = Picture(device, scheduler, Metal::Fmt::RG16Float, Render, Render,
+                                  [](uint32_t, uint32_t) { return std::array<uint8_t, 4>{0, 0, 0, 0}; });
+    const Object depth = Metal::CreateTexture(device, {.kind = Metal::TextureKind::e2D,
+                                                       .format = Metal::Fmt::Depth32Float,
+                                                       .width = Render,
+                                                       .height = Render,
+                                                       .render_target = true});
+    if (!color || !motion || !depth) {
+        std::printf("metal-smoke: FAIL FSR 3.1 textures\n");
+        return 1;
+    }
+    Metal::ClearPass clear{};
+    clear.depth = {.texture = depth.Get()};
+    clear.clear_depth = true;
+    clear.depth_value = 0.5;
+    clear.width = Render;
+    clear.height = Render;
+    scheduler.Clear(clear);
+    scheduler.Finish();
+    Metal::Fsr3Upscaler upscaler(device, scheduler);
+    if (!upscaler.Prepare()) {
+        std::printf("metal-smoke: FSR 3.1 passes not built: FAIL\n");
+        return 1;
+    }
+    Metal::TextureHandle out = nullptr;
+    for (int frame = 0; frame < 6; ++frame) {
+        out = upscaler.Upscale({.color = color.Get(),
+                                .depth = depth.Get(),
+                                .motion = motion.Get(),
+                                .render_size = {Render, Render},
+                                .upscale_size = {Display, Display},
+                                .jitter = {0.0f, 0.0f},
+                                .motion_vector_scale = {1.0f, 1.0f},
+                                .frame_time_ms = 16.0f,
+                                .reset = frame == 0,
+                                .sharpen = false,
+                                .sharpness = 1.0f});
+        scheduler.Flush();
+    }
+    if (out == nullptr) {
+        std::printf("metal-smoke: FSR 3.1: no output: FAIL\n");
+        return 1;
+    }
+    const auto bytes = ReadBack(device, scheduler, out, Display, Display, 8);
+    double worst = 0.0;
+    bool finite = !bytes.empty();
+    for (uint32_t x = 8; x < Display - 8; x += 8) {
+        uint16_t bits;
+        std::memcpy(&bits, bytes.data() + (uint64_t{64} * Display + x) * 8, 2);
+        const float value = Half(bits);
+        finite = finite && std::isfinite(value);
+        const double expected = (x / 2.0 * 4.0) / 255.0;
+        worst = (std::max)(worst, std::abs(value - expected));
+    }
+    std::printf("metal-smoke: FSR 3.1 upscale 64x64 -> 128x128, a gradient over 6 frames: worst "
+                "difference %.3f from the gradient: %s\n",
+                worst, finite && worst < 0.08 ? "PASS" : "FAIL");
+    return finite && worst < 0.08 ? 0 : 1;
+}
+
 int RunAll() {
     if (std::getenv("LICHII_SMOKE_LOG") != nullptr) {
         Common::Log::Initialize();
@@ -557,7 +630,7 @@ int RunAll() {
         Common::Log::Start();
     }
     int result = 0;
-    for (const auto test : {RunPostProcess, RunFrameDump, RunFlashWatch, RunFrameGen}) {
+    for (const auto test : {RunPostProcess, RunFrameDump, RunFlashWatch, RunFrameGen, RunFsr3Upscale}) {
         const int outcome = test();
         result = result != 0 ? result : outcome;
     }

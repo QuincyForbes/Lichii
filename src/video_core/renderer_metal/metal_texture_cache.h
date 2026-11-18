@@ -31,6 +31,7 @@ class Device;
 class Framebuffer;
 class Image;
 class ImageView;
+class Fsr3Upscaler;
 class PresentPasses;
 class Sampler;
 
@@ -152,6 +153,9 @@ public:
     bool temporal_unsupported{};
     std::optional<std::chrono::steady_clock::time_point> temporal_last_evaluation;
     std::unique_ptr<PresentPasses> present_passes;
+    std::unique_ptr<Fsr3Upscaler> fsr3;
+    bool fsr3_unsupported{};
+    std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
     bool standin_failed{};
     u64 standin_frames{};
 
@@ -161,6 +165,11 @@ private:
                                 ImageView& input_color, ImageView& motion_vectors,
                                 ImageView& depth_view, std::array<u32, 2> render_size,
                                 std::array<f32, 2> jitter, std::array<f32, 2> motion_scale);
+    /// FSR 3.1 in place of the game's DLSS (Vulkan's UpscaleWithFsr3), before the stand-in.
+    bool Fsr3TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& input_color,
+                             ImageView& motion_vectors, ImageView& depth_view,
+                             std::array<u32, 2> render_size, std::array<f32, 2> jitter,
+                             std::array<f32, 2> motion_scale);
     bool TemporalStandIn(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& input_color,
                          ImageView& motion_vectors, std::array<u32, 2> render_size,
                          std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,

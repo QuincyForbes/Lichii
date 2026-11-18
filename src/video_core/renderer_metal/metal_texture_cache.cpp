@@ -6,6 +6,7 @@
 #include <bit>
 #include <cstdlib>
 #include <optional>
+#include <string_view>
 
 #include <fmt/format.h>
 
@@ -18,6 +19,7 @@
 #include "video_core/ocarina_upscale.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_formats.h"
+#include "video_core/renderer_metal/metal_fsr3_upscaler.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_present.h"
@@ -552,7 +554,20 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
 }
 
 bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
-    return Settings::MetalFxTemporalChosen() && !temporal_unsupported;
+    // FSR 3.1 replaces DLSS; the temporal stand-in only runs when FSR cannot (no depth, a GPU
+    // without what its passes need, a failed start). EDEN_NX2_DLSS_REPLACEMENT=standin forces
+    // the stand-in for A/B runs, as on Vulkan.
+    static const bool force_standin = [] {
+        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        return value != nullptr && std::string_view{value} == "standin";
+    }();
+    if (force_standin) {
+        return false;
+    }
+    if (Settings::MetalFxTemporalChosen() && !temporal_unsupported) {
+        return true;
+    }
+    return !fsr3_unsupported;
 }
 
 bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst,
@@ -568,8 +583,108 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                                render_size, jitter, motion_scale)) {
         return true;
     }
+    if (use_history && depth != nullptr && WantsTemporalUpscaleDepth() && !fsr3_unsupported &&
+        Fsr3TemporalUpscale(dst_framebuffer, dst, input_color, motion_vectors, *depth,
+                            render_size, jitter, motion_scale)) {
+        return true;
+    }
     return TemporalStandIn(dst_framebuffer, dst, input_color, motion_vectors, render_size, jitter,
                            motion_scale, use_history);
+}
+
+bool TextureCacheRuntime::Fsr3TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst,
+                                              ImageView& input_color, ImageView& motion_vectors,
+                                              ImageView& depth_view,
+                                              std::array<u32, 2> render_size,
+                                              std::array<f32, 2> jitter,
+                                              std::array<f32, 2> motion_scale) {
+    using PixelFormat = VideoCore::Surface::PixelFormat;
+    namespace DlssContract = VideoCommon::DlssContract;
+    constexpr bool use_history = true;
+    ImageView* const depth = &depth_view;
+    const auto plain = [](const ImageView& view) {
+        return view.range.base.level == 0 && view.range.base.layer == 0;
+    };
+    const auto fits = [](const ImageView& view, std::array<u32, 2> requested) {
+        return DlssContract::FitsExtent(requested, {view.size.width, view.size.height});
+    };
+    const std::array<u32, 2> output_size{dst_framebuffer->Width(), dst_framebuffer->Height()};
+    if (!plain(dst) || !plain(input_color) || !plain(motion_vectors) || !plain(*depth) ||
+        dst_framebuffer->Samples() != 1 || !IsColor(dst.HostClass()) ||
+        !fits(input_color, render_size) || !fits(dst, output_size) ||
+        !fits(motion_vectors, render_size) || !fits(*depth, render_size) ||
+        motion_vectors.format != PixelFormat::R16G16_FLOAT ||
+        depth->format != PixelFormat::D32_FLOAT || input_color.ImageHandle() == dst.ImageHandle() ||
+        !DlssContract::ValidColorFormats(input_color.format, dst.format, use_history) ||
+        !DlssContract::ValidGeometry(render_size, output_size, jitter, motion_scale)) {
+        return false;
+    }
+    if (!fsr3) {
+        fsr3 = std::make_unique<Fsr3Upscaler>(device, scheduler);
+    }
+    if (!fsr3->Prepare()) {
+        LOG_WARNING(Render_Metal, "FSR 3.1 needs shaders this GPU lacks; using the temporal "
+                                  "stand-in");
+        fsr3_unsupported = true;
+        return false;
+    }
+    // A gap in the evaluations (a menu, a movie, a load) starts the history again.
+    const auto now = std::chrono::steady_clock::now();
+    const f32 frame_time_ms =
+        fsr3_last_evaluation
+            ? std::chrono::duration<f32, std::milli>(now - *fsr3_last_evaluation).count()
+            : 1000.0f / 30.0f;
+    const bool reset = !fsr3_last_evaluation || frame_time_ms > 250.0f;
+    fsr3_last_evaluation = now;
+    // FSR's own RCAS, set by the sharpness slider as on Vulkan; EDEN_NX2_TEMPORAL_SHARPEN
+    // overrides it.
+    static const char* const sharpen_override = std::getenv("EDEN_NX2_TEMPORAL_SHARPEN");
+    const int slider = Settings::values.fsr_sharpening_slider.GetValue();
+    bool sharpen = slider < 200;
+    f32 stops = static_cast<f32>(slider) / 100.0f;
+    if (sharpen_override != nullptr) {
+        sharpen = std::string_view{sharpen_override} != "off";
+        stops = static_cast<f32>(std::strtod(sharpen_override, nullptr));
+    }
+    const TextureHandle output = fsr3->Upscale({
+        .color = input_color.Handle(Shader::TextureType::Color2D),
+        .depth = depth->Handle(Shader::TextureType::Color2D),
+        .motion = motion_vectors.Handle(Shader::TextureType::Color2D),
+        .render_size = render_size,
+        .upscale_size = output_size,
+        .jitter = jitter,
+        .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
+                                motion_scale[1] * static_cast<f32>(render_size[1])},
+        .frame_time_ms = frame_time_ms,
+        .reset = reset,
+        .sharpen = sharpen,
+        .sharpness = 1.0f - stops / 2.0f,
+    });
+    const s32 width = static_cast<s32>(output_size[0]);
+    const s32 height = static_cast<s32>(output_size[1]);
+    if (output == nullptr ||
+        !scheduler.Blit(BlitPass{
+            .src = output,
+            .src_rect = {0, 0, width, height},
+            .dst = dst.RenderTarget(),
+            .dst_format = dst.HostFormat(),
+            .dst_rect = {0, 0, width, height},
+            .dst_width = output_size[0],
+            .dst_height = output_size[1],
+            .linear = false,
+            .keep_dst = true,
+        })) {
+        LOG_WARNING(Render_Metal, "FSR 3.1 evaluation unavailable; using the temporal stand-in");
+        fsr3_unsupported = true;
+        return false;
+    }
+    static bool logged{};
+    if (!logged) {
+        logged = true;
+        LOG_INFO(Render_Metal, "Metal: DLSS replaced by FSR 3.1: {}x{} -> {}x{}", render_size[0],
+                 render_size[1], output_size[0], output_size[1]);
+    }
+    return true;
 }
 
 bool TextureCacheRuntime::TemporalStandInEnabled() {

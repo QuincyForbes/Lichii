@@ -651,6 +651,7 @@ set(METAL_RENDERER_CXX_SOURCES
     renderer_metal/metal_formats.cpp
     renderer_metal/metal_frame_dump.cpp
     renderer_metal/metal_frame_gen.cpp
+    renderer_metal/metal_fsr3_upscaler.cpp
     renderer_metal/metal_index_convert.cpp
     renderer_metal/metal_ocarina.cpp
     renderer_metal/metal_pipeline_cache.cpp
@@ -707,6 +708,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_frame_dump.h
         renderer_metal/metal_frame_gen.h
         renderer_metal/metal_frame_gen_metalfx.h
+        renderer_metal/metal_fsr3_upscaler.h
         renderer_metal/metal_graphics.h
         renderer_metal/metal_index_convert.h
         renderer_metal/metal_mesh_indirect.h
