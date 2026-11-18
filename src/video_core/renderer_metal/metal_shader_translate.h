@@ -106,6 +106,11 @@ struct Options {
     /// Vertex stage: Vulkan's clip space has y down, Metal's y up; flipping in the shader keeps
     /// the viewports Vulkan's.
     bool flip_vertex_y{true};
+    /// Every float add, subtract and multiply through fma (SPIRV-Cross invariant_float_math), so
+    /// two programs computing a position the same way get the same bits whatever the compiler
+    /// fuses or reorders. Vertex, mesh and evaluation stages get it anyway
+    /// (EDEN_NX2_METAL_INVARIANT_POSITION); set for the mesh emulation's mesh kernel.
+    bool invariant_float_math{};
     /// Tessellation stages: what the stage before writes (its Result::outputs), so the buffer
     /// between them has one layout on both sides.
     std::vector<InterfaceVariable> inputs;

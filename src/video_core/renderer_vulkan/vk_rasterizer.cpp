@@ -2253,6 +2253,11 @@ void RasterizerVulkan::DrawTexture() {
     const auto& sampler = texture_cache.GetSampler(draw_texture_state.src_sampler, false);
     const auto& texture = texture_cache.GetImageView(draw_texture_state.src_texture);
     const auto* framebuffer = texture_cache.GetFramebuffer();
+    // No render target (OoT's register state while entering Kokiri Forest): nothing to draw to.
+    if (framebuffer == nullptr) [[unlikely]] {
+        LOG_WARNING(Render_Vulkan, "DrawTexture skipped: no render target");
+        return;
+    }
     if (frame_dump.Capturing() || flash_watch.WatchesPasses()) {
         FrameDumpPass(framebuffer);
     }

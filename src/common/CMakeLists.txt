@@ -329,6 +329,10 @@ if (lz4_ADDED)
 endif()
 
 target_link_libraries(common PUBLIC fmt::fmt stb::headers Threads::Threads)
+if (APPLE)
+    # device_power_state.cpp reads the battery through IOKit's power source functions.
+    target_link_libraries(common PUBLIC "-framework IOKit" "-framework CoreFoundation")
+endif()
 target_link_libraries(common PRIVATE lz4::lz4 zstd::zstd)
 
 # Please refer to src/common/demangle.cpp

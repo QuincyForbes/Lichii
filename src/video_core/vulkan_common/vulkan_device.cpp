@@ -573,6 +573,15 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     CollectPhysicalMemoryInfo();
     CollectToolingInfo();
 
+    // EDEN_NX2_MVK_ALIASING=0: no descriptor aliasing in any MoltenVK pipeline. By default only
+    // pipelines whose descriptors go into a Metal argument buffer are emitted without it
+    // (PipelineCache::CreateGraphicsPipeline): keeping it elsewhere is worth ~10 fps in OoT.
+    if (is_mvk && [] {
+            const char* const value = std::getenv("EDEN_NX2_MVK_ALIASING");
+            return value != nullptr && value[0] == '0';
+        }()) {
+        has_broken_descriptor_aliasing = true;
+    }
     if (is_qualcomm) {
         must_emulate_scaled_formats = true;
         LOG_WARNING(Render_Vulkan, "Qualcomm drivers require scaled vertex format emulation.");

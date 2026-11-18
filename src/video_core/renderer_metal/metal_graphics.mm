@@ -477,11 +477,14 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
         archive->NoteBuild(hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                      std::chrono::steady_clock::now() - start)
                                                      .count()));
-        if (!hit) {
+        // A pipeline with no fragment function (depth only) is not archived: Metal then refuses
+        // to serialize the whole archive ("expecting 'fragment' stage in pipeline no. N"), so
+        // nothing was ever saved.
+        if (!hit && descriptor.fragmentFunction != nil && descriptor.rasterizationEnabled) {
             auto* const copy = [descriptor copy];
-                archive->DeferAdd([binary, copy] {
-                    return [binary addRenderPipelineFunctionsWithDescriptor:copy error:nil] == YES;
-                });
+            archive->DeferAdd([binary, copy] {
+                return [binary addRenderPipelineFunctionsWithDescriptor:copy error:nil] == YES;
+            });
         }
     }
     return Retain(state);
@@ -558,7 +561,7 @@ Object CreateMeshRenderPipelineState(const Device& device, const RenderPipelineD
         archive->NoteBuild(hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                      std::chrono::steady_clock::now() - start)
                                                      .count()));
-        if (!hit) {
+        if (!hit && descriptor.fragmentFunction != nil && descriptor.rasterizationEnabled) {
             if (@available(iOS 18.0, macOS 15.0, *)) {
                 auto* const copy = [descriptor copy];
                 archive->DeferAdd([binary, copy] {

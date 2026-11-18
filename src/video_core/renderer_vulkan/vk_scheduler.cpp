@@ -1317,6 +1317,10 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     }
     before_pass_open = std::exchange(before_pass_split, false);
     const bool after_compute = std::exchange(compute_writes_pending, false);
+    // A pass that begins with a clear (or discard) writes its attachments before any draw.
+    render_pass_depth_written = clear_value_count != 0 || depth_clear || depth_discard ||
+                                framebuffer->RenderPassKeyBase().depth_stencil_clear ||
+                                framebuffer->RenderPassKeyBase().depth_stencil_discard;
     Record([this, renderpass, framebuffer_handle, render_area, values, clear_value_count,
             after_compute, time_pass, shape](vk::CommandBuffer cmdbuf) {
         if (time_pass) {
@@ -1409,6 +1413,8 @@ bool Scheduler::DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot,
 
 bool Scheduler::DeferDepthStencilClear(const Framebuffer* framebuffer, const VkClearValue& value) {
     if (RenderPassMatches(framebuffer)) {
+        // The caller clears the attachment in the open pass.
+        render_pass_depth_written = true;
         return false;
     }
     if (IsRenderPassActive()) {
@@ -1984,6 +1990,7 @@ void Scheduler::EndRenderPass()
         ++recording_epoch;
         fragment_barrier.Reset();
         render_pass_has_stores = false;
+        render_pass_depth_written = false;
         last_pass_framebuffer = state.framebuffer;
         last_pass_num_views = state.num_views;
         last_pass_views = state.views;

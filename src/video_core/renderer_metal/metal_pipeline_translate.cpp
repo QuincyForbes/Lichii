@@ -89,6 +89,15 @@ constexpr u32 StateColorTypesShift = 8;
     return enabled;
 }
 
+/// EDEN_NX2_METAL_SHUFFLE_RELATIVE=0: guest SHFL.UP/DOWN/BFLY through the absolute shuffle again.
+[[nodiscard]] bool ShuffleRelativeEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_SHUFFLE_RELATIVE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 /// Two bits per generic attribute: 0 disabled (or constant), 1 float, 2 signed, 3 unsigned
 /// integer, by Maxwell's VertexAttribute::Type. Normalized and scaled types read as floats. This
 /// is the table FixedPipelineState::DynamicAttributeTypes had before b8d5405b1a packed it into the
@@ -342,7 +351,7 @@ size_t ComputePipelineKey::Hash() const noexcept {
 }
 
 PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_mesh_)
-    : native_mesh{native_mesh_ && NativeMeshEnabled()} {
+    : native_mesh{native_mesh_ && NativeMeshEnabled()}, native_mesh_capable{native_mesh_} {
     // What Apple GPUs run through SPIRV-Cross (MoltenVK's defaults for Apple7+).
     profile = Shader::Profile{
         .supported_spirv = 0x00010300,
@@ -358,6 +367,10 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
         .support_vertex_instance_id = false,
         .support_float_controls = false,
         .support_vote = true,
+        // Metal has simd_shuffle_up/down/xor (SPIRV-Cross's ShuffleUp/Down/Xor), as MoltenVK
+        // reports VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT: without, every relative shuffle
+        // computed its source lane and went through the absolute shuffle.
+        .support_shuffle_relative = ShuffleRelativeEnabled(),
         .supported_subgroup_stages = ~0U,
         .support_viewport_index_layer_non_geometry = true,
         .support_viewport_mask = false,
@@ -613,6 +626,20 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
             native_cause = "the device has no Metal 3 mesh pipelines (or EDEN_NX2_METAL_MESH_NATIVE=0)";
         }
         std::optional<TranslatedPipeline> emulated = Mesh(key, programs, mesh_index);
+        if (!native && !emulated && !native_mesh && native_mesh_capable) {
+            // The emulation is the default path; what it can't take still gets Metal's mesh
+            // stage when the device has one (else the pipeline's draws were all refused).
+            std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> native_programs;
+            size_t native_index = 0;
+            if (TranslatePrograms(key, envs, native_programs, native_index)) {
+                native = NativeMeshPipeline(key, native_programs, native_index);
+            }
+            if (native) {
+                cause.clear();
+                detail.clear();
+                emulated.emplace();
+            }
+        }
         if (!native) {
             return emulated;
         }
@@ -1102,8 +1129,12 @@ std::optional<TranslatedPipeline> PipelineTranslator::Mesh(
     const std::array<size_t, 2> kernel_programs{1, mesh_index};
     for (size_t kernel = 0; kernel < (has_task ? 2U : 1U); ++kernel) {
         const size_t index = kernel_programs[kernel];
-        auto translated =
-            Translate(programs[index], ShaderTranslate::Stage::Compute, bindings, kernel_info);
+        // The mesh program's kernel computes the positions: exact as a vertex program's
+        // (ShaderTranslate::Options::invariant_float_math).
+        ShaderTranslate::Options kernel_options = translate_options;
+        kernel_options.invariant_float_math = index == mesh_index;
+        auto translated = Translate(programs[index], ShaderTranslate::Stage::Compute, bindings,
+                                    kernel_info, &kernel_options);
         if (!translated) {
             return std::nullopt;
         }
@@ -1184,8 +1215,11 @@ std::optional<TranslatedPipeline> PipelineTranslator::Mesh(
 
 bool NativeMeshEnabled() {
     static const bool enabled = [] {
+        // Off unless EDEN_NX2_METAL_MESH_NATIVE=1: in OoT (Link's house) native mesh pipelines
+        // lit the wall leaves almost black and ran at 33 fps, against correctly lit leaves at
+        // 36-40 fps through the compute emulation (the path MoltenVK takes too).
         const char* const value = std::getenv("EDEN_NX2_METAL_MESH_NATIVE");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     return enabled;
 }

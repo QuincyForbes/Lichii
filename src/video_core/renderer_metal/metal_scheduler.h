@@ -236,6 +236,27 @@ struct SparseTileOp {
     bool map{true};
 };
 
+/// Why a command buffer was committed: Flush's callers, and the command buffers a tick commits
+/// before its last one (Split, Ahead). Counted for the renderer's "Metal commits:" line.
+enum class CommitReason : u8 {
+    Other,
+    Present,
+    ListEnd,       ///< FlushCommands: a guest command list ended
+    Fence,         ///< FenceTick: a fence with downloads or queries
+    FenceDeferred, ///< FlushDeferred: work a fence or a list end left pending, before a wait
+    Idle,          ///< FlushDeferredFromIdle: the split's back ran out of work
+    Wait,          ///< Wait on the tick being recorded
+    Finish,
+    Staging,
+    DrawBudget,
+    ListCopy,
+    Query,
+    Condition,
+    Split,
+    Ahead,
+    Count,
+};
+
 /// Records Metal work in submission order on one command queue. Copies go to one blit encoder
 /// until a render pass needs the command buffer, instead of an encoder per command; a command
 /// buffer is committed by Flush. Ticks number the command buffers: a resource used in tick N is
@@ -255,7 +276,7 @@ public:
     [[nodiscard]] bool IsFree(u64 tick) const noexcept;
 
     /// Waits for `tick` on the CPU, committing it first when it is the one being recorded.
-    void Wait(u64 tick);
+    void Wait(u64 tick, CommitReason reason = CommitReason::Wait);
 
     /// Whether `tick` was committed. From any thread.
     [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept;
@@ -263,14 +284,50 @@ public:
     /// Waits for a committed `tick` on the CPU. From any thread (Wait is the recording thread's).
     void WaitSubmitted(u64 tick);
 
+    /// Waits for `tick` on the CPU from any thread, never recording or committing (the fencing
+    /// thread, EDEN_NX2_METAL_ASYNC_FENCES). A tick not committed yet must be one the owner
+    /// commits on its own: a fence's (FenceTick) or one marked with RequestCommit. The split's
+    /// back is asked to run its idle hook, which commits such work between entries.
+    void WaitCompleted(u64 tick);
+
+    /// Wait on the thread that owns the scheduler (GpuSplit::OwnsScheduler), else WaitCompleted.
+    void WaitAnyThread(u64 tick, CommitReason reason = CommitReason::Wait);
+
+    /// Owner: another thread will wait for the tick being recorded (WaitCompleted). It is left
+    /// pending as a fence's work (FenceTick): the next commit, FlushDeferred or the back's idle
+    /// hook commits it.
+    void RequestCommit();
+
+    /// The GPU thread split, seen through functions the fence manager installs so the scheduler
+    /// itself doesn't link the split (the smoke test links the scheduler alone). Defaults: no
+    /// split, the caller owns the scheduler.
+    struct SplitHooks {
+        bool (*back_running)() = nullptr;
+        bool (*on_back_thread)() = nullptr;
+        bool (*owns_scheduler)() = nullptr;
+        void (*request_idle_hook)() = nullptr;
+    };
+    static void SetSplitHooks(const SplitHooks& hooks) noexcept;
+
+    /// Shutdown: WaitCompleted returns at once from now on (nothing will commit any more).
+    void AbandonWaits();
+
     /// Whether anything was recorded since the last Flush.
     [[nodiscard]] bool HasPendingWork() const noexcept;
 
     /// Commits the command buffer being recorded (even when empty) and returns its tick.
-    u64 Flush();
+    /// EDEN_NX2_METAL_EMPTY_SKIP: with nothing recorded and every earlier tick done on the GPU,
+    /// the tick is retired without a command buffer.
+    u64 Flush(CommitReason reason = CommitReason::Other);
 
     /// Flush, then wait for the GPU to finish everything.
-    void Finish();
+    void Finish(CommitReason reason = CommitReason::Finish);
+
+    /// A guest command list ended (FlushCommands) with work recorded: whether it may stay
+    /// pending for a later commit (EDEN_NX2_METAL_LIST_END_DEFER, on the split's back while the
+    /// GPU still has that many command buffers of earlier work). The back's idle hook, a fence,
+    /// a wait or the next list end once the GPU caught up commits it.
+    bool DeferListEnd();
 
     /// The tick a guest fence queued now waits for. Pending work is committed for it; with none
     /// it is the last tick committed, and no command buffer is made (EDEN_NX2_METAL_FENCE_IDLE).
@@ -301,8 +358,9 @@ public:
                     bool ahead = false);
 
     /// EDEN_NX2_METAL_AHEAD: a segment is what one command buffer of a tick records in order.
-    /// Uploads and kernels that do not depend on it go into two command buffers of their own,
-    /// committed before it (uploads, then kernels), so they do not end its render encoder.
+    /// Uploads and kernels that do not depend on it go into one command buffer of their own in
+    /// recording order (EDEN_NX2_METAL_MERGE_AHEAD=0: two, uploads then kernels), committed
+    /// before it, so they do not end its render encoder.
     [[nodiscard]] u64 SegmentSerial() const noexcept;
 
     /// Whether a copy may go ahead of the segment. The caller answers for the destination not
@@ -314,6 +372,8 @@ public:
 
     /// Whether a kernel of a draw into `targets` may go ahead of the segment: nothing but the
     /// render pass on them was recorded in it, so the kernel sees what it would see in order.
+    /// EDEN_NX2_METAL_AHEAD_ANY: also after other work; each buffer the kernel then binds is
+    /// checked against the segment's in-order work, and a conflict moves it back in order.
     [[nodiscard]] bool CanRecordAhead(const RenderTargetSet& targets) const noexcept;
 
     /// Nothing more goes ahead in this segment (its record of what was used is incomplete).
@@ -422,6 +482,11 @@ public:
     /// Ends the open render encoder: the next BeginRendering loads what it stored.
     void EndRendering();
 
+    /// Whether the open render encoder may have written its depth or stencil attachment (a
+    /// load-action clear, or a draw with depth writes or a writing stencil test); true when no
+    /// encoder is open.
+    [[nodiscard]] bool RenderPassWroteDepthStencil() const noexcept;
+
     /// Slots of the visibility result buffer every draw render pass carries (occlusion queries).
     static constexpr u32 VisibilitySlots = 16384;
 
@@ -519,6 +584,12 @@ public:
     /// kernels recorded ahead (EDEN_NX2_METAL_AHEAD), fences that took no command buffer
     /// (EDEN_NX2_METAL_FENCE_IDLE).
     [[nodiscard]] std::array<u64, 11> TakeCounts() noexcept;
+
+    /// Since the last call, per frame (`frames`): command buffers committed by reason
+    /// ("Metal commits:"), and render passes ended by what ended them plus those begun by kind
+    /// ("Metal pass ends:").
+    [[nodiscard]] std::string TakeCommitLine(double frames);
+    [[nodiscard]] std::string TakePassEndLine(double frames);
 
     /// A drawable was presented, with a guest layer on it or not (the progress trace: the first
     /// of each, and the heartbeat that runs until the first guest frame).

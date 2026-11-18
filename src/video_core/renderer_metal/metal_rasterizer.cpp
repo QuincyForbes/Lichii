@@ -247,7 +247,7 @@ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 
     buffer_cache.Nx2CollectListCopies(true);
     const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
-        scheduler.Flush();
+        scheduler.Flush(CommitReason::ListCopy);
     }
     buffer_cache.Nx2CollectListCopies(false);
     return copied;
@@ -562,17 +562,17 @@ void RasterizerMetal::FlushWork() {
     draw_flush.budget = flush_draws;
     if (draw_flush.Note()) {
         ++draw_flushes;
-        scheduler.Flush();
+        scheduler.Flush(CommitReason::DrawBudget);
         return;
     }
     if (!staging_pool.WantsFlush()) {
         return;
     }
     ++staging_flushes;
-    const u64 tick = scheduler.Flush();
+    const u64 tick = scheduler.Flush(CommitReason::Staging);
     if (staging_pool.OverCap()) {
         ++staging_waits;
-        scheduler.Wait(tick);
+        scheduler.Wait(tick, CommitReason::Staging);
         staging_pool.Trim();
     }
 }
@@ -1499,6 +1499,27 @@ RasterizerMetal::MeshArena& RasterizerMetal::AcquireMeshArena() {
         u32 words;
         std::memcpy(&words, arena.counter_contents, sizeof(words));
         const u64 needed = u64{words} * sizeof(u32);
+        {
+            // As Vulkan's "Mesh emulation arenas" line: what the task draws of a command buffer
+            // asked the distribution pass for. None at all means the task kernels launched no
+            // mesh workgroups (grass, vine glow), whatever the draws' group counts.
+            static u64 arenas_counted{};
+            static u64 arenas_empty{};
+            static u64 most_words{};
+            ++arenas_counted;
+            arenas_empty += words == 0 ? 1 : 0;
+            most_words = (std::max)(most_words, u64{words});
+            if (arenas_counted % 600 == 0) {
+                LOG_WARNING(Render_Metal,
+                            "Metal: mesh emulation arenas: the last 600 command buffers with task "
+                            "draws asked for at most {:.1f} MiB, {} of them for nothing ({} MiB "
+                            "arenas)",
+                            static_cast<double>(most_words * sizeof(u32)) / (1 << 20),
+                            arenas_empty, mesh_arena_size >> 20);
+                arenas_empty = 0;
+                most_words = 0;
+            }
+        }
         if (needed > arena.size && mesh_arena_size < MaxArenaSize) {
             mesh_arena_size = (std::min)(std::bit_ceil(needed + needed / 4), MaxArenaSize);
             LOG_INFO(Render_Metal,
@@ -1633,6 +1654,62 @@ void RasterizerMetal::PrepareSampleGrids(const Shader::Info& info,
             }
         }
     }
+}
+
+bool RasterizerMetal::NeedsReducingVariant(const StageProgram& program,
+                                           std::span<const VideoCommon::ImageViewInOut> views,
+                                           std::span<const VideoCommon::SamplerId> samplers) {
+    if (program.reduction_slot == ~0U) {
+        return false;
+    }
+    // Metal's sampler states reduce with linear min, mag and mip filters (CreateSampler; not with
+    // EDEN_NX2_METAL_SAMPLERS=0, which makes plain ones): bit 2 of SamplerReductionBits, the
+    // others only being set with linear min and mag filters.
+    static const bool native_reduction = [this] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_SAMPLERS");
+        return SamplerBiasSupported(device) && (value == nullptr || value[0] != '0');
+    }();
+    const Shader::Info& info = program.info;
+    // As BindStageResources: texel buffers and image buffers first.
+    size_t view = Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                  Shader::NumDescriptors(info.image_buffer_descriptors);
+    size_t sampler = 0;
+    for (const auto& desc : info.texture_descriptors) {
+        for (u32 element = 0; element < desc.count; ++element, ++view, ++sampler) {
+            if (sampler >= samplers.size()) {
+                return false;
+            }
+            const u64 bits = texture_cache.GetSampler(samplers[sampler]).ReductionBits();
+            if ((bits & 3) == 0) {
+                continue;
+            }
+            // An integer view takes a nearest sampler variant (Sampler::HandleFor): no reduction.
+            if (native_reduction && (bits & 4) != 0 && view < views.size() &&
+                !VideoCore::Surface::IsPixelFormatInteger(
+                    texture_cache.GetImageView(views[view].id).format)) {
+                continue;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string RasterizerMetal::TakeReductionLine() {
+    const ReductionCounts counts = std::exchange(reduction_counts, ReductionCounts{});
+    const auto [queued, built, refused] = pipeline_cache.TakeReducingBuildCounts();
+    if (counts.plain_draws + counts.reducing_draws + counts.skipped + counts.plain_dispatches +
+            counts.reducing_dispatches + counts.plain_refused_dispatches + queued ==
+        0) {
+        return {};
+    }
+    return fmt::format(
+        "draws plain {} reducing {} (vertex {}, pixel {}), skipped while a reducing function "
+        "builds {}, stages drawn plain as Metal refused theirs {}; dispatches plain {} reducing {} "
+        "(plain as refused {}); reducing functions queued {} built {} refused {}",
+        counts.plain_draws, counts.reducing_draws, counts.reducing_vertex,
+        counts.reducing_fragment, counts.skipped, counts.plain_refused, counts.plain_dispatches,
+        counts.reducing_dispatches, counts.plain_refused_dispatches, queued, built, refused);
 }
 
 void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage metal_stage,
@@ -2223,8 +2300,40 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         state_desc.topology_class = 2;
         state_desc.expand = 1;
     }
+    // EDEN_NX2_METAL_REDUCTION_VARIANTS: the render vertex and pixel functions without the
+    // sampler reduction rewrite, unless this draw's samplers need it.
+    u32 reducing = 0;
+    bool has_variants = false;
+    if (native == nullptr && ReductionVariantsEnabled()) {
+        for (size_t index = 0; index < programs.size(); ++index) {
+            if (absent(index)) {
+                continue;
+            }
+            StageProgram* const program = programs[index];
+            const bool is_vertex = program == &pipeline.Vertex() && state_desc.expand == 0;
+            const bool is_fragment = program == &pipeline.Fragment();
+            if ((!is_vertex && !is_fragment) || !program->reduction_variants) {
+                continue;
+            }
+            has_variants = true;
+            if (!NeedsReducingVariant(*program, std::span(views).subspan(first_view[index]),
+                                      std::span(samplers).subspan(first_sampler[index]))) {
+                continue;
+            }
+            bool variant_building = false;
+            if (pipeline_cache.ReducingFunction(pipeline, *program, variant_building) != nullptr) {
+                reducing |= is_vertex ? ReducingVertex : ReducingFragment;
+            } else if (variant_building) {
+                ++reduction_counts.skipped;
+                prepare_refusal = "sampler reduction variant still building";
+                return false;
+            } else {
+                ++reduction_counts.plain_refused;
+            }
+        }
+    }
     bool state_building = false;
-    void* state = pipeline_cache.RenderState(pipeline, state_desc, state_building);
+    void* state = pipeline_cache.RenderState(pipeline, state_desc, state_building, reducing);
     if (state == nullptr && !state_building && native == nullptr && PipelineCheckEnabled()) {
         // A state Metal refused is drawn without blending and alpha to coverage, what a target
         // format most often refuses, rather than leaving a hole.
@@ -2233,7 +2342,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             blend.enable = 0;
         }
         fallback.alpha_to_coverage = 0;
-        state = pipeline_cache.RenderState(pipeline, fallback, state_building);
+        state = pipeline_cache.RenderState(pipeline, fallback, state_building, reducing);
         if (state != nullptr) {
             Coverage::NoteGuard("refused pipeline drawn without blending");
         }
@@ -2247,6 +2356,11 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         return false;
     }
     prepare_refusal = {};
+    if (has_variants) {
+        ++(reducing != 0 ? reduction_counts.reducing_draws : reduction_counts.plain_draws);
+        reduction_counts.reducing_vertex += (reducing & ReducingVertex) != 0 ? 1 : 0;
+        reduction_counts.reducing_fragment += (reducing & ReducingFragment) != 0 ? 1 : 0;
+    }
 
     const DepthStencilDesc depth_stencil =
         DepthStencilState(regs, targets.has_depth, targets.has_stencil);
@@ -2333,7 +2447,46 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                 (std::max)(u64{mesh_workgroups} * mesh->block_words * sizeof(u32), u64{16}), 16);
         }
         // After the arena: getting one may wait for a command buffer.
-        const bool mesh_ahead = record_ahead(true);
+        // EDEN_NX2_METAL_MESH_TASK_IN_ORDER=1 (A/B, off: did not bring the grass back): the
+        // kernels of a pipeline with a task program run in order, after the game's work so far,
+        // as Vulkan's emulation runs them behind a full memory barrier.
+        static const bool task_in_order = [] {
+            const char* const value = std::getenv("EDEN_NX2_METAL_MESH_TASK_IN_ORDER");
+            return value != nullptr && value[0] == '1';
+        }();
+        const bool mesh_ahead = !(has_task && task_in_order) && record_ahead(true);
+        {
+            // The first draws of each task pipeline: what decides whether its pixels land.
+            static std::mutex logged_mutex;
+            static std::vector<u64> logged_pipelines;
+            const u64 pipeline_hash = pipeline.Key().Hash();
+            std::scoped_lock logged_lock{logged_mutex};
+            if (has_task && logged_pipelines.size() < 24 &&
+                std::ranges::find(logged_pipelines, pipeline_hash) == logged_pipelines.end()) {
+                logged_pipelines.push_back(pipeline_hash);
+                LOG_WARNING(
+                    Render_Metal,
+                    "Metal: task mesh draw {:016x} (task {:016x}, mesh {:016x}, pixel {:016x}): "
+                    "{} groups, kernels {}; depth test {} func {:#x} write {}, cull {} face {:#x} "
+                    "front {:#x}, rasterize {}, alpha test {} func {:#x}, alpha to coverage {}, "
+                    "blend0 {} mask0 {}{}{}{}, colour formats {:#x} {:#x} {:#x} {:#x}, depth "
+                    "target {}, {}x{}",
+                    pipeline_hash, pipeline.Key().unique_hashes[1],
+                    pipeline.Key().unique_hashes[mesh->mesh_stage + 1],
+                    pipeline.Key().unique_hashes[5], mesh_workgroups,
+                    mesh_ahead ? "ahead" : "in order", regs.depth_test_enable,
+                    static_cast<u32>(regs.depth_test_func), regs.depth_write_enabled,
+                    regs.gl_cull_test_enabled, static_cast<u32>(regs.gl_cull_face),
+                    static_cast<u32>(regs.gl_front_face), regs.rasterize_enable,
+                    regs.alpha_test_enabled, static_cast<u32>(regs.alpha_test_func),
+                    regs.anti_alias_alpha_control.alpha_to_coverage.Value(), regs.blend.enable[0],
+                    regs.color_mask[0].R.Value(), regs.color_mask[0].G.Value(),
+                    regs.color_mask[0].B.Value(), regs.color_mask[0].A.Value(),
+                    static_cast<u32>(regs.rt[0].format), static_cast<u32>(regs.rt[1].format),
+                    static_cast<u32>(regs.rt[2].format), static_cast<u32>(regs.rt[3].format),
+                    targets.has_depth, targets.width, targets.height);
+            }
+        }
         const auto begin_kernel = [&](size_t index, MeshKernel& kernel, void* kernel_state) {
             scheduler.BeginCompute(kernel_state, mesh_ahead);
             BindStageResources(kernel.program, ShaderStage::Compute, stage_bindings[index],
@@ -3146,6 +3299,27 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             draw.more_viewports[index - 1] = make_viewport(index);
             draw.more_scissors[index - 1] = make_scissor(index);
         }
+    }
+    // A mesh function's positions reach Metal without the y flip a vertex function's get:
+    // SPIRV-Cross (emit_mesh_outputs) applies Options::flip_vertex_y only to a Position that is a
+    // member of a gl_MeshPerVertexEXT block, and the recompiler declares it as a plain
+    // `vec4[max_vertices]` BuiltIn Position array. Unflipped, every natively drawn task/mesh draw
+    // lands mirrored (and, as its winding flips with it, culled where it should be kept): OoT's
+    // grass blades, leaves and vine glow. Flipping the viewport gives the same window coordinates
+    // (and facing) as the vertex path's flipped positions. EDEN_NX2_METAL_MESH_FLIP_Y=0: as before
+    // (for when the translation flips mesh positions itself).
+    static const bool mesh_flip_y = EnvironmentOn("EDEN_NX2_METAL_MESH_FLIP_Y");
+    if (mesh_flip_y && native != nullptr) {
+        const auto flip = [](Viewport& viewport) {
+            viewport.y += viewport.height;
+            viewport.height = -viewport.height;
+        };
+        flip(draw.viewport);
+        for (size_t index = 1; index < draw.viewport_count; ++index) {
+            flip(draw.more_viewports[index - 1]);
+        }
+        LOG_ONCE(logged_mesh_flip_y, "Metal: native mesh draws flip the viewport's y "
+                                     "(EDEN_NX2_METAL_MESH_FLIP_Y=0 turns it off)");
     }
     // Triangles drawn as lines when the faces the draw keeps are (Metal has one fill mode for
     // both; a point fill mode it has not).
@@ -5104,7 +5278,18 @@ void RasterizerMetal::DispatchCompute() {
         scheduler.BreakBlits();
         byte_shadow_texture = shadow_texture.Get();
     }
-    scheduler.BeginCompute(state);
+    void* dispatch_state = state;
+    if (program.reduction_variants && ReductionVariantsEnabled()) {
+        if (!NeedsReducingVariant(program, views, samplers)) {
+            ++reduction_counts.plain_dispatches;
+        } else if (void* const reducing_state = pipeline->ReducingState(device)) {
+            dispatch_state = reducing_state;
+            ++reduction_counts.reducing_dispatches;
+        } else {
+            ++reduction_counts.plain_refused_dispatches;
+        }
+    }
+    scheduler.BeginCompute(dispatch_state);
     BindStageResources(program, ShaderStage::Compute, bindings, texel_views, views, samplers, 0,
                        0);
     byte_shadow_view = ~size_t{0};
@@ -5392,7 +5577,7 @@ u32 RasterizerMetal::AllocateVisibilitySlot() {
     next_visibility_slot = (next_visibility_slot + 1) % Scheduler::VisibilitySlots;
     // A lap later: the GPU wrote the slot long ago, but make sure.
     if (!scheduler.IsFree(visibility_ticks[slot])) {
-        scheduler.Wait(visibility_ticks[slot]);
+        scheduler.Wait(visibility_ticks[slot], CommitReason::Query);
     }
     visibility_ticks[slot] = scheduler.CurrentTick();
     scheduler.VisibilityResults()[slot] = 0;
@@ -5436,7 +5621,7 @@ void RasterizerMetal::ResolvePixelCounter() {
     if (pixel_slots.empty()) {
         return;
     }
-    scheduler.Wait(visibility_ticks[pixel_slots.back()]);
+    scheduler.Wait(visibility_ticks[pixel_slots.back()], CommitReason::Query);
     const u64* const results = scheduler.VisibilityResults();
     u64 samples = 0;
     for (const u32 slot : pixel_slots) {
@@ -5453,7 +5638,7 @@ void RasterizerMetal::ResolvePixelCounter() {
 void RasterizerMetal::ResolveGeometryCounters() {
     // The primitives the geometry draws' compactions listed: read once the GPU is done with them.
     for (const GeometryReadback& readback : geometry_readbacks) {
-        scheduler.Wait(readback.tick);
+        scheduler.Wait(readback.tick, CommitReason::Query);
         u32 indices = 0;
         std::memcpy(&indices, readback.args.mapped_span.data(), sizeof(indices));
         const u32 per_primitive = readback.topology == 1 ? 1U : readback.topology == 6 ? 2U : 3U;
@@ -5510,6 +5695,11 @@ void RasterizerMetal::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
     // draws: Metal's fences complete at once below High accuracy, and a callback summing the
     // slots right away read the zeros AllocateVisibilitySlot left there (every report was 0).
     // A read before then (macro DMA, conditional rendering) flushes it (FlushQueryResults).
+    if (FenceManager::AsyncFences()) {
+        // The operation runs on the fencing thread, which can't commit: the report's tick is
+        // committed by the next commit point (EDEN_NX2_METAL_ASYNC_FENCES).
+        scheduler.RequestCommit();
+    }
     fence_manager.SyncOperation([this, report_address, serial, async_slot] {
         WritePendingReport(report_address, serial);
         Tegra::g_nx2_async_reports_completed[async_slot].fetch_add(1, std::memory_order_release);
@@ -5526,7 +5716,12 @@ bool RasterizerMetal::WritePendingReport(DAddr address, u64 serial) {
         }
         report = it->second;
     }
-    scheduler.Wait(report.tick);
+    if (FenceManager::AsyncFences()) {
+        // From the fencing thread (a fence operation) too: it waits without committing.
+        scheduler.WaitAnyThread(report.tick, CommitReason::Query);
+    } else {
+        scheduler.Wait(report.tick, CommitReason::Query);
+    }
     const u64* const results = scheduler.VisibilityResults();
     u64 samples = 0;
     for (const u32 slot : report.slots) {
@@ -5649,7 +5844,7 @@ void RasterizerMetal::FlushAll() {}
 
 void RasterizerMetal::SubmitListCopies(u64 writer) {
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick(), writer)) {
-        scheduler.Flush();
+        scheduler.Flush(CommitReason::ListCopy);
     }
 }
 
@@ -6141,7 +6336,7 @@ bool RasterizerMetal::AccelerateConditionalRendering() {
         }
         for (const u64 tick : ticks) {
             if (tick != 0) {
-                scheduler.Wait(tick);
+                scheduler.Wait(tick, CommitReason::Condition);
             }
         }
         const u64* const results = scheduler.VisibilityResults();
@@ -6196,7 +6391,7 @@ bool RasterizerMetal::ConditionHoldsOnCpu() {
     if (!gpu_condition.resolved) {
         for (const u64 tick : gpu_condition.ticks) {
             if (tick != 0) {
-                scheduler.Wait(tick);
+                scheduler.Wait(tick, CommitReason::Condition);
             }
         }
         gpu_condition.holds =
@@ -6290,8 +6485,8 @@ bool RasterizerMetal::DrawUnderCondition(u32 primitive, bool indexed, u32 count,
 }
 
 void RasterizerMetal::FlushCommands() {
-    if (scheduler.HasPendingWork()) {
-        scheduler.Flush();
+    if (scheduler.HasPendingWork() && !scheduler.DeferListEnd()) {
+        scheduler.Flush(CommitReason::ListEnd);
     }
 }
 

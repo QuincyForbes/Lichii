@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "common/bit_field.h"
 #include "common/common_types.h"
 #include "shader_recompiler/exception.h"
@@ -24,7 +26,12 @@ void MOV(TranslatorVisitor& v, u64 insn, const IR::U32& src, bool is_mov32i = fa
         v.X(mov.dest_reg, src);
         return;
     }
-    if (mask == 0) {
+    // EDEN_NX2_MASKED_MOV=0: drop masked moves as before (A/B switch).
+    static const bool lane_masked = [] {
+        const char* const value = std::getenv("EDEN_NX2_MASKED_MOV");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (mask == 0 || !lane_masked) {
         return;
     }
     // Quad lane mask: bit N enables the move for lane N of each quad (lane id & 3); the other

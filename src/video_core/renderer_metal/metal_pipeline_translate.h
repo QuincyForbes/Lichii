@@ -136,6 +136,14 @@ struct StageProgram {
     Object library;
     Object function;
     bool build_failed{};
+    /// EDEN_NX2_METAL_REDUCTION_VARIANTS: `function` was built from msl_without_reduction (no
+    /// sampler reduction rewrite) and `msl` is kept; the function with the rewrite is built from
+    /// it for the first draw whose samplers reduce in a way Metal's sampler states don't
+    /// (PipelineCache::ReducingFunction, ComputePipeline::ReducingState).
+    bool reduction_variants{};
+    bool reducing_failed{};
+    Object reducing_library;
+    Object reducing_function;
 };
 
 /// A compute kernel of the mesh emulation.
@@ -193,7 +201,7 @@ struct NativeMesh {
     bool failed{};
 };
 
-/// EDEN_NX2_METAL_MESH_NATIVE (default on; 0: every task/mesh pipeline takes the emulation).
+/// EDEN_NX2_METAL_MESH_NATIVE (default off; 1: task/mesh pipelines as Metal 3 mesh pipelines).
 [[nodiscard]] bool NativeMeshEnabled();
 
 /// EDEN_NX2_METAL_MESH_PER_PRIMITIVE=1: a mesh program that writes per-primitive generics is built
@@ -429,6 +437,8 @@ private:
     std::string detail;
     std::string native_cause;
     bool native_mesh{};
+    /// The device has Metal 3 mesh pipelines (whatever EDEN_NX2_METAL_MESH_NATIVE says).
+    bool native_mesh_capable{};
     /// TranslatePrograms folded the key's geometry program into the vertex program.
     bool folded_geometry{};
 };

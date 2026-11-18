@@ -817,6 +817,7 @@ if (ENABLE_METAL)
             LANGUAGE CXX
             COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
         target_include_directories(lichii-metal-smoke PRIVATE ${METAL_SMOKE_DIR})
+        target_sources(lichii-metal-smoke PRIVATE renderer_metal/metal_smoke_stubs.cpp)
         target_link_libraries(lichii-metal-smoke PRIVATE video_core "-framework Metal"
                               "-framework Foundation")
     endif()

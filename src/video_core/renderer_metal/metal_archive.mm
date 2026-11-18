@@ -82,11 +82,16 @@ void PipelineArchive::DeferAdd(std::function<bool()> add) {
 
 bool PipelineArchive::Open(const Device& device, const std::filesystem::path& path) {
     static const bool enabled = [] {
+        // Off unless EDEN_NX2_METAL_ARCHIVE=1: adding a pipeline compiles it a second time under
+        // the archive's exclusive lock, which every builder's lookup waits on. In an OoT lab run
+        // with a cold cache that kept pipelines 20 s (up to 121 s) from ready at 0.2 fps, against
+        // gameplay within seconds without the archive; the archive saved ~5 s a boot, and macOS
+        // already caches compiled functions for the process.
         const char* const value = std::getenv("EDEN_NX2_METAL_ARCHIVE");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     if (!enabled) {
-        LOG_INFO(Render_Metal, "Metal: pipeline archive off (EDEN_NX2_METAL_ARCHIVE=0)");
+        LOG_INFO(Render_Metal, "Metal: pipeline archive off (EDEN_NX2_METAL_ARCHIVE=1 turns it on)");
         return false;
     }
     Save();

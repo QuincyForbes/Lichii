@@ -344,7 +344,19 @@ void TextureCacheRuntime::BarrierFeedbackLoop() {
         const char* const value = std::getenv("EDEN_NX2_METAL_FRAGMENT_BARRIER");
         return value == nullptr || value[0] != '0';
     }();
+    // The draw samples the bound depth/stencil texture: ending the pass makes what its earlier
+    // draws wrote visible. If none wrote it (nor a load-action clear), memory already holds what
+    // the attachment has, and Metal allows sampling the attachment while nothing writes it, as
+    // Vulkan's (Eglantine bdaf482d3f). EDEN_NX2_METAL_DEPTH_READ_KEEP_PASS=0 ends it every time.
+    static const bool keep_pass = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_DEPTH_READ_KEEP_PASS");
+        return value == nullptr || value[0] != '0';
+    }();
     if (enabled && scheduler.IsRendering()) {
+        if (keep_pass && !scheduler.RenderPassWroteDepthStencil()) {
+            Coverage::NoteGuard("depth feedback loop pass kept");
+            return;
+        }
         scheduler.EndRendering();
         Coverage::NoteGuard("depth feedback loop pass ends");
     }

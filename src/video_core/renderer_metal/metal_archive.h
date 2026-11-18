@@ -37,7 +37,7 @@ public:
     PipelineArchive& operator=(const PipelineArchive&) = delete;
 
     /// Opens the archive file (an empty archive when it is missing or Metal can't read it).
-    /// EDEN_NX2_METAL_ARCHIVE=0 leaves it closed.
+    /// Closed unless EDEN_NX2_METAL_ARCHIVE=1.
     bool Open(const Device& device, const std::filesystem::path& path);
 
     [[nodiscard]] bool IsOpen() const noexcept;

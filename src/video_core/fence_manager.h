@@ -57,6 +57,18 @@ class FenceManager {
     static constexpr bool can_async_check = Traits::HAS_ASYNC_CHECK;
 
 public:
+    /// Whether fences are released on the fencing thread (else on the thread that makes them).
+    /// HAS_ASYNC_CHECK, unless the backend decides at run time with Traits::AsyncCheck() (read
+    /// once; Metal's EDEN_NX2_METAL_ASYNC_FENCES). Constant for the others.
+    static bool AsyncFences() {
+        if constexpr (requires { Traits::AsyncCheck(); }) {
+            return can_async_check && Traits::AsyncCheck();
+        } else {
+            return can_async_check;
+        }
+    }
+
+public:
     /// Notify the fence manager about a new frame
     void TickFrame() {
         std::unique_lock lock(ring_guard);
@@ -65,7 +77,7 @@ public:
 
     // Unlike other fences, this one doesn't
     void SignalOrdering() {
-        if constexpr (!can_async_check) {
+        if (!AsyncFences()) {
             TryReleasePendingFences<false>();
         }
         std::scoped_lock lock{buffer_cache.mutex};
@@ -93,7 +105,7 @@ public:
         // The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
         // at each command list end): read once, every decision of this fence uses one value.
         const bool delay_fence = force_completion || DelayFences();
-        if constexpr (!can_async_check) {
+        if (!AsyncFences()) {
             TryReleasePendingFences<false>();
         }
         auto [should_flush, committed_flushes] = CommitCacheFlushes();
@@ -110,7 +122,7 @@ public:
         should_flush |= force_completion || query_cache.HasUncommittedFlushes();
         query_cache.CommitAsyncFlushes();
         const bool stubbed = !should_flush && committed_flushes == 0;
-        if constexpr (can_async_check) {
+        if (AsyncFences()) {
             if (stubbed && FenceFold()) {
                 if (!delay_fence) {
                     func();
@@ -124,7 +136,7 @@ public:
             }
         }
         TFence new_fence = CreateFence(!should_flush);
-        if constexpr (can_async_check) {
+        if (AsyncFences()) {
             guard.lock();
         }
         {
@@ -135,7 +147,7 @@ public:
             pending_operations.emplace_back(TakeUncommittedOperations());
         }
         pending_flushes.push_back(committed_flushes);
-        if constexpr (can_async_check) {
+        if (AsyncFences()) {
             pending_query_pops.push_back(1);
         }
         QueueFence(new_fence);
@@ -148,7 +160,7 @@ public:
         if (should_flush) {
             rasterizer.FlushCommands();
         }
-        if constexpr (can_async_check) {
+        if (AsyncFences()) {
             // The fencing thread waits for the host GPU while it has fences: it needs waking (a
             // system call) only when it waits for fences to be made (zortos293/Lichii#1516).
             const bool wake = !WakeOnlyWaiting() || fence_thread_waiting;
@@ -187,7 +199,7 @@ public:
     }
 
     void WaitPendingFences([[maybe_unused]] bool force) {
-        if constexpr (!can_async_check) {
+        if (!AsyncFences()) {
             TryReleasePendingFences<true>();
         } else {
             if (!force) {
@@ -279,14 +291,14 @@ protected:
                           TQueryCache& query_cache_)
         : rasterizer{rasterizer_}, gpu{gpu_}, syncpoint_manager{gpu.Host1x().GetSyncpointManager()},
           texture_cache{texture_cache_}, buffer_cache{buffer_cache_}, query_cache{query_cache_} {
-        if constexpr (can_async_check) {
+        if (AsyncFences()) {
             fence_thread =
                 std::jthread([this](std::stop_token token) { ReleaseThreadFunc(token); });
         }
     }
 
     virtual ~FenceManager() {
-        if constexpr (can_async_check) {
+        if (AsyncFences()) {
             fence_thread.request_stop();
             cv.notify_all();
             fence_thread.join();

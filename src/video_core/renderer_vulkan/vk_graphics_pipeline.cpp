@@ -1605,6 +1605,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (writes_storage) {
         scheduler.NoteRenderPassStores();
     }
+    // Depth writes, or a stencil test (its operations can write): what the feedback loop
+    // barrier (TextureCacheRuntime::BarrierFeedbackLoop) has to make visible.
+    if (maxwell3d->regs.zeta_enable != 0 &&
+        (maxwell3d->regs.depth_write_enabled != 0 || maxwell3d->regs.stencil_enable != 0)) {
+        scheduler.NoteDepthStencilWrite();
+    }
     const bool built{IsBuilt()};
     if (!built) {
         // Wait for the pipeline to be built
@@ -1853,10 +1859,31 @@ void GraphicsPipeline::FillStates(PipelineStates& s) const {
             if (!attribute.enabled || !stage_infos[0].loads.Generic(index)) {
                 continue;
             }
+            // Register state the game left mid-transition (OoT entering Kokiri Forest) can name
+            // an invalid type or size, or a stream with no binding; MoltenVK's pipeline
+            // validation then aborts the process (and the pipeline cache rebuilt it every boot).
+            // Such an attribute is left out: the shader reads it as disabled.
+            const VkFormat format =
+                attribute.Type() == Maxwell::VertexAttribute::Type::UnusedEnumDoNotUseBecauseItWillGoAway
+                    ? VK_FORMAT_UNDEFINED
+                    : MaxwellToVK::VertexFormat(device, attribute.Type(), attribute.Size());
+            const bool bound = std::ranges::any_of(vertex_bindings, [&](const auto& binding) {
+                return binding.binding == attribute.buffer;
+            });
+            if (format == VK_FORMAT_UNDEFINED || !bound) [[unlikely]] {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Vertex attribute {} left out (type {}, size {}, stream {})",
+                                index, static_cast<u32>(attribute.Type()),
+                                static_cast<u32>(attribute.Size()), attribute.buffer.Value());
+                }
+                continue;
+            }
             vertex_attributes.push_back({
                 .location = static_cast<u32>(index),
                 .binding = attribute.buffer,
-                .format = MaxwellToVK::VertexFormat(device, attribute.Type(), attribute.Size()),
+                .format = format,
                 .offset = attribute.offset,
             });
         }
@@ -2076,8 +2103,33 @@ void GraphicsPipeline::FillStates(PipelineStates& s) const {
             write_mask |= mask[i] ? mask_table[i] : 0;
         }
         write_mask &= ColorOutputMask(index);
+        // Register state left mid-transition (OoT entering Kokiri Forest) can enable blending
+        // where it is invalid, and MoltenVK's pipeline validation then aborts the process (the
+        // pipeline cache rebuilt it at every boot): blending an integer target, or a dual-source
+        // factor on a target other than 0. Blending is left off there.
+        bool blend_enable = blend.enable != 0;
+        if (blend_enable) {
+            const auto is_src1 = [](Maxwell::Blend::Factor factor) {
+                const VkBlendFactor vk = MaxwellToVK::BlendFactor(factor);
+                return vk == VK_BLEND_FACTOR_SRC1_COLOR ||
+                       vk == VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR ||
+                       vk == VK_BLEND_FACTOR_SRC1_ALPHA ||
+                       vk == VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+            };
+            const auto rt_format = VideoCore::Surface::TryPixelFormatFromRenderTargetFormat(
+                static_cast<Tegra::RenderTargetFormat>(key.state.color_formats[index]));
+            const bool integer =
+                rt_format && VideoCore::Surface::IsPixelFormatInteger(*rt_format);
+            const bool src1_elsewhere =
+                index != 0 && (is_src1(blend.SourceRGBFactor()) || is_src1(blend.DestRGBFactor()) ||
+                               is_src1(blend.SourceAlphaFactor()) ||
+                               is_src1(blend.DestAlphaFactor()));
+            if (integer || src1_elsewhere) [[unlikely]] {
+                blend_enable = false;
+            }
+        }
         cb_attachments.push_back({
-            .blendEnable = blend.enable != 0,
+            .blendEnable = blend_enable,
             .srcColorBlendFactor = MaxwellToVK::BlendFactor(blend.SourceRGBFactor()),
             .dstColorBlendFactor = MaxwellToVK::BlendFactor(blend.DestRGBFactor()),
             .colorBlendOp = MaxwellToVK::BlendEquation(blend.EquationRGB()),

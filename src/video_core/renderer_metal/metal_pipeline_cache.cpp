@@ -53,10 +53,13 @@ constexpr bool TranslateForIos = false;
 
 constexpr size_t MaxPrograms = 6;
 
-/// The MSL of a built function is not read again (EDEN_NX2_METAL_PIPELINE_FILE=0 keeps it).
+/// The MSL of a built function is not read again (EDEN_NX2_METAL_PIPELINE_FILE=0 keeps it),
+/// but for the reducing variant's, until it is built.
 void ReleaseSource(StageProgram& program) {
     if (PipelineFiles::Mode() != 0) {
-        std::string{}.swap(program.msl);
+        if (!program.reduction_variants) {
+            std::string{}.swap(program.msl);
+        }
         std::string{}.swap(program.msl_without_reduction);
     }
 }
@@ -135,7 +138,21 @@ Object SharedLibrary(const Device& device, const std::string& source, std::strin
     return Object{RetainObject(entry->library.Get())};
 }
 
-void BuildProgramLibrary(const Device& device, StageProgram& program, std::string& error) {
+/// `plain_first` (the programs that may take a reducing variant): with
+/// EDEN_NX2_METAL_REDUCTION_VARIANTS, a program with the rewrite is built from the MSL without
+/// it, and keeps `msl` for its reducing variant.
+void BuildProgramLibrary(const Device& device, StageProgram& program, std::string& error,
+                         bool plain_first = false) {
+    if (plain_first && ReductionVariantsEnabled() && program.reduction_slot != ~0U &&
+        !program.msl.empty() && !program.msl_without_reduction.empty()) {
+        program.library = SharedLibrary(device, program.msl_without_reduction, error);
+        if (program.library) {
+            program.reduction_variants = true;
+            return;
+        }
+        // As before: the rewritten text first, then the plain one.
+        error.clear();
+    }
     program.library = SharedLibrary(device, program.msl, error);
     if (!program.library) {
         DumpRefusedProgram(program.msl, error);
@@ -162,6 +179,14 @@ u64 NanosecondsSince(std::chrono::steady_clock::time_point start) {
 }
 
 } // Anonymous namespace
+
+bool ReductionVariantsEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_REDUCTION_VARIANTS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
 
 u32 AsyncPipelineThreads() {
     static const u32 threads = [] {
@@ -474,10 +499,11 @@ bool GraphicsPipeline::BuildFunctions(const Device& device) {
             return false;
         }
         std::string error;
-        BuildProgramLibrary(device, *stage, error);
+        BuildProgramLibrary(device, *stage, error, stage != expansion);
         stage->function = stage->library ? CreateFunction(stage->library.Get(), stage->entry_point)
                                          : Object{};
         if (!stage->function) {
+            stage->reduction_variants = false;
             stage->build_failed = true;
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -509,15 +535,20 @@ std::optional<MeshFunctions> GraphicsPipeline::NativeFunctions() const noexcept 
     };
 }
 
-u64 GraphicsPipeline::StateHash(RenderPipelineDesc& desc) const noexcept {
+u64 GraphicsPipeline::StateHash(RenderPipelineDesc& desc, u32 reducing) const noexcept {
     if (const std::optional<MeshFunctions> native = NativeFunctions()) {
         desc.vertex_function = native->mesh_function;
         desc.fragment_function = native->fragment_function;
     } else {
+        // A reducing function asked for and not built: the plain one.
+        const auto pick = [](const StageProgram& program, bool want_reducing) {
+            return want_reducing && program.reducing_function ? program.reducing_function.Get()
+                                                              : program.function.Get();
+        };
         desc.vertex_function = desc.expand != 0 && xfb && xfb->expand
                                    ? xfb->render.function.Get()
-                                   : vertex.function.Get();
-        desc.fragment_function = fragment.function.Get();
+                                   : pick(vertex, (reducing & ReducingVertex) != 0);
+        desc.fragment_function = pick(fragment, (reducing & ReducingFragment) != 0);
     }
     return Common::CityHash64(reinterpret_cast<const char*>(&desc), sizeof(desc));
 }
@@ -530,8 +561,9 @@ std::optional<void*> GraphicsPipeline::FindState(u64 hash) const {
     return it->second.Get();
 }
 
-void* GraphicsPipeline::RenderState(const Device& device, RenderPipelineDesc& desc) {
-    const u64 hash = StateHash(desc);
+void* GraphicsPipeline::RenderState(const Device& device, RenderPipelineDesc& desc,
+                                    u32 reducing) {
+    const u64 hash = StateHash(desc, reducing);
     if (const std::optional<void*> found = FindState(hash)) {
         return *found;
     }
@@ -588,7 +620,7 @@ void* ComputePipeline::State(const Device& device) {
         return state.Get();
     }
     std::string error;
-    BuildProgramLibrary(device, program, error);
+    BuildProgramLibrary(device, program, error, true);
     program.function =
         program.library ? CreateFunction(program.library.Get(), program.entry_point) : Object{};
     if (program.function) {
@@ -596,6 +628,7 @@ void* ComputePipeline::State(const Device& device) {
         ReleaseSource(program);
     }
     if (!state) {
+        program.reduction_variants = false;
         failed = true;
         static std::atomic<u32> logged{};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -604,6 +637,36 @@ void* ComputePipeline::State(const Device& device) {
         }
     }
     return state.Get();
+}
+
+void* ComputePipeline::ReducingState(const Device& device) {
+    if (reducing_state || !state || !program.reduction_variants || program.reducing_failed) {
+        return reducing_state.Get();
+    }
+    std::string error;
+    program.reducing_library = SharedLibrary(device, program.msl, error);
+    program.reducing_function =
+        program.reducing_library
+            ? CreateFunction(program.reducing_library.Get(), program.entry_point)
+            : Object{};
+    if (program.reducing_function) {
+        reducing_state =
+            CreateComputePipelineState(device, program.reducing_function.Get(), error, archive);
+    }
+    if (!reducing_state) {
+        program.reducing_failed = true;
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Metal,
+                        "Metal: compute {:016x} with its sampler reduction rewrite refused ({}); "
+                        "dispatched without it",
+                        key.unique_hash, error);
+        }
+    }
+    if (PipelineFiles::Mode() != 0) {
+        std::string{}.swap(program.msl);
+    }
+    return reducing_state.Get();
 }
 
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory,
@@ -711,6 +774,9 @@ void PipelineCache::EvictUnusedPipelines() {
     std::unordered_set<const GraphicsPipeline*> building_states;
     for (const auto& [state_key, build] : state_builds) {
         building_states.insert(state_key.first);
+    }
+    for (const auto& [program, build] : reducing_builds) {
+        building_states.insert(build->pipeline);
     }
     for (const auto& [key, pipeline] : graphics_cache) {
         if (pipeline == nullptr) {
@@ -1249,12 +1315,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::BuildInBackground(bool& pending
 }
 
 void* PipelineCache::RenderState(GraphicsPipeline& pipeline, RenderPipelineDesc& desc,
-                                 bool& building_state) {
+                                 bool& building_state, u32 reducing) {
     building_state = false;
     if (!builders) {
-        return pipeline.RenderState(device, desc);
+        return pipeline.RenderState(device, desc, reducing);
     }
-    const u64 hash = pipeline.StateHash(desc);
+    const u64 hash = pipeline.StateHash(desc, reducing);
     if (const std::optional<void*> found = pipeline.FindState(hash)) {
         return *found;
     }
@@ -1263,7 +1329,7 @@ void* PipelineCache::RenderState(GraphicsPipeline& pipeline, RenderPipelineDesc&
     if (it == state_builds.end()) {
         if (!MayBeSkipped()) {
             // Nothing queued and the draw waits: built here as before.
-            return pipeline.RenderState(device, desc);
+            return pipeline.RenderState(device, desc, reducing);
         }
         auto build = std::make_shared<StateBuild>();
         build->desc = desc;
@@ -1294,6 +1360,84 @@ void* PipelineCache::RenderState(GraphicsPipeline& pipeline, RenderPipelineDesc&
     state_builds.erase(it);
     return pipeline.AdoptState(hash, build->desc, std::move(build->state), build->error,
                                build->native.has_value());
+}
+
+void PipelineCache::RunReducingBuild(ReducingBuild& build) const {
+    build.library = SharedLibrary(device, build.msl, build.error);
+    build.function = build.library ? CreateFunction(build.library.Get(), build.entry_point)
+                                   : Object{};
+    if (!build.library) {
+        DumpRefusedProgram(build.msl, build.error);
+    }
+    std::string{}.swap(build.msl);
+}
+
+void* PipelineCache::AdoptReducing(StageProgram& program, ReducingBuild& build) {
+    if (build.function) {
+        program.reducing_library = std::move(build.library);
+        program.reducing_function = std::move(build.function);
+        ++reducing_built;
+        return program.reducing_function.Get();
+    }
+    program.reducing_failed = true;
+    ++reducing_refused;
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_WARNING(Render_Metal,
+                    "Metal: {:016x} with its sampler reduction rewrite refused ({}); drawn "
+                    "without it",
+                    build.program_hash, build.error);
+    }
+    return nullptr;
+}
+
+void* PipelineCache::ReducingFunction(GraphicsPipeline& pipeline, StageProgram& program,
+                                      bool& building_variant) {
+    building_variant = false;
+    if (program.reducing_function) {
+        return program.reducing_function.Get();
+    }
+    if (!program.reduction_variants || program.reducing_failed) {
+        return nullptr;
+    }
+    const auto make_build = [&] {
+        auto build = std::make_shared<ReducingBuild>();
+        build->pipeline = &pipeline;
+        // The plain function was built: the rewritten MSL is not read again but here.
+        build->msl = PipelineFiles::Mode() != 0 ? std::move(program.msl) : program.msl;
+        build->entry_point = program.entry_point;
+        build->program_hash =
+            pipeline.Key().unique_hashes[&program == &pipeline.Vertex() ? 1 : 5];
+        return build;
+    };
+    auto it = reducing_builds.find(&program);
+    if (it == reducing_builds.end()) {
+        if (!builders || !MayBeSkipped()) {
+            // Nothing queued and the draw waits: built here.
+            const std::shared_ptr<ReducingBuild> build = make_build();
+            InAutoreleasePool([&] { RunReducingBuild(*build); });
+            return AdoptReducing(program, *build);
+        }
+        std::shared_ptr<ReducingBuild> build = make_build();
+        ReducingBuild* const raw = build.get();
+        build->job = std::make_shared<PipelineBuildJob>([this, raw](PipelineTranslator&) {
+            InAutoreleasePool([&] { RunReducingBuild(*raw); });
+        });
+        builders->QueueWork([build](PipelineTranslator* worker) { build->job->Run(*worker); });
+        it = reducing_builds.emplace(&program, std::move(build)).first;
+        ++reducing_queued;
+    }
+    if (!it->second->job->IsDone()) {
+        if (MayBeSkipped()) {
+            ++build_stats.skipped;
+            building_variant = true;
+            return nullptr;
+        }
+        Hold(*it->second->job);
+    }
+    const std::shared_ptr<ReducingBuild> build = std::move(it->second);
+    reducing_builds.erase(it);
+    return AdoptReducing(program, *build);
 }
 
 std::string PipelineCache::TakeBuildLine() {

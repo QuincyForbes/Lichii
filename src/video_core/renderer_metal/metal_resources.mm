@@ -618,7 +618,30 @@ namespace {
 Object CreateLibrary(const Device& device, std::string_view source, std::string& error) {
     MTLCompileOptions* options = [MTLCompileOptions new];
     // The recompiler marks what must stay exact (NoContraction); the rest may use fast math.
-    if (@available(iOS 18.0, macOS 15.0, *)) {
+    // EDEN_NX2_METAL_FAST_MATH=1: full fast math (A/B).
+    static const bool full_fast_math = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_FAST_MATH");
+        return value != nullptr && value[0] == '1';
+    }();
+    // EDEN_NX2_METAL_SAFE_MATH=1: no fast math at all, positions invariant across programs (A/B:
+    // a depth pre-pass and an EQUAL-tested colour pass of the same geometry must agree bit for
+    // bit).
+    static const bool safe_math = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_SAFE_MATH");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (safe_math) {
+        if (@available(iOS 18.0, macOS 15.0, *)) {
+            options.mathMode = MTLMathModeSafe;
+        } else {
+            options.fastMathEnabled = NO;
+        }
+        if (@available(iOS 14.0, macOS 11.0, *)) {
+            options.preserveInvariance = YES;
+        }
+    } else if (full_fast_math) {
+        options.fastMathEnabled = YES;
+    } else if (@available(iOS 18.0, macOS 15.0, *)) {
         // Relaxed keeps fast math's reassociation but still honours NaN and Inf, as MoltenVK
         // does; full fast math let one NaN (normalize(0), 0 * inf in specular terms) spread
         // through the lighting and bloom passes into white blobs.

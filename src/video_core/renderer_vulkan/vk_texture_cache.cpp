@@ -1526,6 +1526,17 @@ void TextureCacheRuntime::EraseResolveShadow(VkImage msaa_image) {
 }
 
 void TextureCacheRuntime::BarrierFeedbackLoop() {
+    // The draw samples the bound depth/stencil image: ending the pass makes what earlier draws
+    // of the pass wrote to it visible. If none of them wrote it, there is nothing to make
+    // visible (Eglantine bdaf482d3f). Off unless EDEN_NX2_DEPTH_READ_KEEP_PASS=1: depth clears
+    // recorded inside an open pass (RasterizerVulkan::Clear) do not note their write yet.
+    static const bool keep_pass = [] {
+        const char* const value = std::getenv("EDEN_NX2_DEPTH_READ_KEEP_PASS");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (keep_pass && scheduler.IsRenderPassActive() && !scheduler.RenderPassWroteDepthStencil()) {
+        return;
+    }
     scheduler.RequestOutsideRenderPassOperationContext();
 }
 
@@ -5212,6 +5223,10 @@ VkImageView ImageView::StorageView(Shader::TextureType texture_type,
 }
 
 bool ImageView::IsRescaled() const noexcept {
+    // The null view (a garbled or unbound texture id) has no image.
+    if (slot_images == nullptr || !image_id) {
+        return false;
+    }
     return (*slot_images)[image_id].IsRescaled();
 }
 

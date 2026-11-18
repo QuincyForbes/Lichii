@@ -232,6 +232,11 @@ public:
     /// draws), for the renderer's 10 s report; empty when nothing was.
     [[nodiscard]] std::string TakeGpuDecisionLine();
 
+    /// EDEN_NX2_METAL_REDUCTION_VARIANTS since the last call: draws and dispatches of programs
+    /// with the sampler reduction rewrite, with their plain or reducing function, for the
+    /// renderer's 10 s report; empty when there were none.
+    [[nodiscard]] std::string TakeReductionLine();
+
     [[nodiscard]] PipelineCache& Pipelines() noexcept {
         return pipeline_cache;
     }
@@ -461,6 +466,13 @@ private:
     size_t byte_shadow_view = ~size_t{0};
     TextureHandle byte_shadow_texture{};
 
+    /// Whether the program's samplers for this draw or dispatch need its function with the
+    /// sampler reduction rewrite: a min / max reduction Metal's sampler state doesn't apply
+    /// (no MTLSamplerDescriptor reductionMode, or a nearest or no mip filter, or an integer view).
+    [[nodiscard]] bool NeedsReducingVariant(const StageProgram& program,
+                                            std::span<const VideoCommon::ImageViewInOut> views,
+                                            std::span<const VideoCommon::SamplerId> samplers);
+
     void BindStageResources(StageProgram& program, ShaderStage metal_stage,
                             std::span<const Binding> pending,
                             std::span<const TextureHandle> texel_buffer_views,
@@ -641,6 +653,18 @@ private:
 
     u64 draws{};
     u64 draws_with_pipeline{};
+    /// TakeReductionLine's counts.
+    struct ReductionCounts {
+        u64 plain_draws{};
+        u64 reducing_draws{};
+        u64 reducing_vertex{};
+        u64 reducing_fragment{};
+        u64 skipped{};       ///< Draws skipped while a reducing function builds
+        u64 plain_refused{}; ///< Stages drawn plain: Metal refused the reducing function
+        u64 plain_dispatches{};
+        u64 reducing_dispatches{};
+        u64 plain_refused_dispatches{};
+    } reduction_counts;
     u64 draws_encoded{};
     u64 draws_converted{};
     u64 mesh_draws{};

@@ -215,6 +215,7 @@ private:
     /// A native mesh pipeline whose driver build failed (MoltenVK refusing the Metal mesh
     /// function): replaced in the cache by the same draw through the compute emulation.
     [[nodiscard]] GraphicsPipeline* EmulateFailedNativeMesh(GraphicsPipeline* failed);
+    [[nodiscard]] GraphicsPipeline* RebuildWithoutAliasing(GraphicsPipeline* failed);
 
     /// FixedPipelineState::Refresh of graphics_key, keeping only the vertex attribute types the
     /// bound programs read (see VideoCommon::KeyedAttributeTypes).
@@ -433,6 +434,9 @@ private:
     std::vector<std::shared_ptr<ShaderPools>> spare_pools;
 
     Shader::Profile profile;
+    /// `profile` for compute programs: without descriptor aliasing on MoltenVK
+    /// (EDEN_NX2_MVK_COMPUTE_ALIASING).
+    Shader::Profile compute_profile;
     Shader::HostTranslateInfo host_info;
 
     std::filesystem::path pipeline_cache_filename;
@@ -449,6 +453,9 @@ private:
     /// Keys of native mesh pipelines the driver refused: built with the compute emulation.
     std::unordered_set<u64> failed_native_mesh;
     std::mutex failed_native_mesh_mutex;
+    /// MoltenVK pipelines that failed with descriptor aliasing, rebuilt without it.
+    std::unordered_set<u64> no_alias_pipelines;
+    std::mutex no_alias_mutex;
     std::atomic<bool> emulated_native_mesh{};
     std::unordered_map<u64, u8> used_pipelines; ///< Key hash -> sessions since it was last used
     std::unordered_set<const GraphicsPipeline*> used_this_session;

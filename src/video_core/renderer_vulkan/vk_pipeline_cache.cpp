@@ -875,12 +875,60 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_user_clip_distances = device.GetMaxUserClipDistances()
     };
+    // MoltenVK runs with MVK_CONFIG_FAST_MATH_ENABLED=2 (vulkan_library.cpp): Metal fast math
+    // unless a shader declares SignedZeroInfNanPreserve. When MoltenVK does not report
+    // shaderSignedZeroInfNanPreserveFloat32 the recompiler never declares it, every shader got
+    // full fast math, and one NaN (normalize(0), 0 * inf in a specular term) went through the
+    // lighting and bloom passes as white glowing blobs (Ocarina's vines in Link's house). The
+    // Metal backend avoids the same thing with MTLMathModeRelaxed (metal_resources.mm).
+    // EDEN_NX2_MVK_NAN_PRESERVE=0: back to the device's reported float controls (A/B).
+    if (driver_id == VK_DRIVER_ID_MOLTENVK) {
+        static const bool nan_preserve = [] {
+            const char* const value = std::getenv("EDEN_NX2_MVK_NAN_PRESERVE");
+            return value == nullptr || value[0] != '0';
+        }();
+        LOG_INFO(Render_Vulkan,
+                 "MoltenVK float controls: extension {}, SignedZeroInfNanPreserve fp16 {} fp32 "
+                 "{}; NaN-preserving shaders (EDEN_NX2_MVK_NAN_PRESERVE) {}",
+                 device.IsKhrShaderFloatControlsSupported(),
+                 profile.support_fp16_signed_zero_nan_preserve,
+                 profile.support_fp32_signed_zero_nan_preserve, nan_preserve ? "on" : "off");
+        if (nan_preserve) {
+            profile.support_float_controls = true;
+            profile.support_fp32_signed_zero_nan_preserve = true;
+            profile.support_fp16_signed_zero_nan_preserve =
+                profile.support_fp16_signed_zero_nan_preserve || device.IsFloat16Supported();
+        }
+    }
     profile.support_cooperative_hmma =
         device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
     profile.support_cooperative_hmma_16x16x16 =
         !profile.support_cooperative_hmma && device.IsCooperativeHmma16x16x16Supported();
     if (profile.support_cooperative_hmma_16x16x16) {
         LOG_INFO(Render_Vulkan, "Guest tensor operations run on 16x16x16 cooperative matrices");
+    }
+
+    // MoltenVK compute programs are emitted with one type per storage buffer, as the native Metal
+    // backend emits every program (support_descriptor_aliasing = false there). With aliasing, a
+    // buffer the program reads and writes as words, floats and vectors becomes several typed MSL
+    // pointers to the same memory, which Metal's compiler may treat as not aliasing: the
+    // reductions, histograms and accumulations of the luminance, bloom, fog and lighting passes
+    // could read a word before the store through another type landed (OoT's Kokiri Forest blew
+    // out to white on MoltenVK only). Graphics pipelines keep aliasing (~10 fps in OoT).
+    // EDEN_NX2_MVK_COMPUTE_ALIASING=1 keeps aliasing in compute programs too (A/B).
+    compute_profile = profile;
+    if (device.IsMoltenVK() && profile.support_descriptor_aliasing) {
+        static const bool keep_compute_aliasing = [] {
+            const char* const value = std::getenv("EDEN_NX2_MVK_COMPUTE_ALIASING");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (!keep_compute_aliasing) {
+            compute_profile.support_descriptor_aliasing = false;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "MoltenVK compute programs: descriptor aliasing {} "
+                 "(EDEN_NX2_MVK_COMPUTE_ALIASING)",
+                 keep_compute_aliasing ? "kept" : "off, one type per storage buffer");
     }
 
     host_info = Shader::HostTranslateInfo{
@@ -2102,7 +2150,47 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         pipeline->Failed()) [[unlikely]] {
         return EmulateFailedNativeMesh(pipeline);
     }
+    if (pipeline != nullptr && device.IsMoltenVK() && profile.support_descriptor_aliasing &&
+        pipeline->Failed()) [[unlikely]] {
+        return RebuildWithoutAliasing(pipeline);
+    }
     return pipeline;
+}
+
+GraphicsPipeline* PipelineCache::RebuildWithoutAliasing(GraphicsPipeline* failed) {
+    const auto it = graphics_cache.find(graphics_key);
+    if (it == graphics_cache.end() || it->second.get() != failed) {
+        return failed;
+    }
+    const u64 hash = graphics_key.Hash();
+    {
+        std::scoped_lock lock{no_alias_mutex};
+        if (!no_alias_pipelines.insert(hash).second) {
+            return failed; // Failed without aliasing too.
+        }
+    }
+    // MoltenVK refuses a storage buffer declared with several types at one binding in a Metal
+    // argument buffer ("Full mutable aliasing of argument buffer descriptors only works on Metal
+    // 3+"): a few OoT pipelines failed to build and their draws were skipped. The pipeline is
+    // built again with one type per buffer; the others keep aliasing (~10 fps in OoT).
+    std::unique_ptr<GraphicsPipeline> rebuilt = CreateGraphicsPipeline();
+    LOG_WARNING(Render_Vulkan, "Pipeline {:016x} failed to build; {} without descriptor aliasing",
+                hash, rebuilt ? "built again" : "not built again");
+    if (!rebuilt) {
+        return failed;
+    }
+    used_this_session.erase(failed);
+    RetireTranslatedPipeline(std::move(it->second));
+    it->second = std::move(rebuilt);
+    for (auto& [key, pipeline] : graphics_cache) {
+        if (pipeline) {
+            pipeline->ClearTransitions();
+        }
+    }
+    clean.pipeline = nullptr;
+    current_pipeline = it->second.get();
+    current_pipeline->MarkUsed(frame_count);
+    return BuiltPipeline(current_pipeline);
 }
 
 GraphicsPipeline* PipelineCache::EmulateFailedNativeMesh(GraphicsPipeline* failed) {
@@ -4721,6 +4809,19 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> deferred_runtime_infos;
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
 
+    // A MoltenVK pipeline that failed with descriptor aliasing (RebuildWithoutAliasing) is
+    // emitted with one type per storage buffer.
+    std::optional<Shader::Profile> argument_buffer_profile;
+    if (device.IsMoltenVK() && profile.support_descriptor_aliasing) {
+        std::scoped_lock lock{no_alias_mutex};
+        if (no_alias_pipelines.contains(key.Hash())) {
+            argument_buffer_profile = profile;
+            argument_buffer_profile->support_descriptor_aliasing = false;
+        }
+    }
+    const Shader::Profile& stage_profile{argument_buffer_profile ? *argument_buffer_profile
+                                                                 : profile};
+
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
     for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0; index < Maxwell::MaxShaderProgram;
@@ -4783,13 +4884,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (emit_pools) {
             deferred_runtime_infos[stage_index] = runtime_info;
             if (VideoCommon::Nx2Perf::Verify()) {
-                reference_spirv[stage_index] = EmitSPIRV(profile, runtime_info, program, binding);
+                reference_spirv[stage_index] =
+                    EmitSPIRV(stage_profile, runtime_info, program, binding);
             }
         } else {
             const auto begin = std::chrono::steady_clock::now();
             modules[stage_index] = EmitShaderModuleCached(
-                stage_cache, reuse, index, StageCacheable(program, mesh_emulation.has_value(), index),
-                device, profile, runtime_info, program, binding, key.unique_hashes[index],
+                stage_cache, reuse, index,
+                !argument_buffer_profile &&
+                    StageCacheable(program, mesh_emulation.has_value(), index),
+                device, stage_profile, runtime_info, program, binding, key.unique_hashes[index],
                 stage_index, {}, use_libraries ? &spirv_hashes[stage_index] : nullptr);
             if (build_in_parallel) {
                 AddRuntimeSpirvTime(0, begin);
@@ -4818,8 +4922,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 infos[stage] = &job->programs[stage + 1].info;
             }
         }
-        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes, use_libraries](
+        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes, use_libraries,
+                       argument_buffer_profile](
                           std::array<u128, Maxwell::MaxShaderStage>& stage_hashes) mutable {
+            const Shader::Profile& job_profile{argument_buffer_profile ? *argument_buffer_profile
+                                                                       : profile};
             const auto begin = std::chrono::steady_clock::now();
             std::array<vk::ShaderModule, Maxwell::MaxShaderStage> stage_modules;
             Shader::Backend::Bindings stage_binding;
@@ -4828,8 +4935,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     PrepareStageBindings(stage_binding, stage, use_libraries);
                     stage_modules[stage] = EmitShaderModuleCached(
                         stage_cache, job->reuse, stage + 1,
-                        StageCacheable(job->programs[stage + 1], job->mesh_emulated, stage + 1),
-                        device, profile, *job->runtime_infos[stage], job->programs[stage + 1],
+                        !argument_buffer_profile &&
+                            StageCacheable(job->programs[stage + 1], job->mesh_emulated, stage + 1),
+                        device, job_profile, *job->runtime_infos[stage], job->programs[stage + 1],
                         stage_binding, hashes[stage + 1], stage, job->reference_spirv[stage],
                         use_libraries ? &stage_hashes[stage] : nullptr);
                 }
@@ -5365,7 +5473,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                     max_shared_memory / 1024);
         program.shared_memory_size = max_shared_memory;
     }
-    std::vector<u32> code{EmitSPIRV(profile, program)};
+    std::vector<u32> code{EmitSPIRV(compute_profile, program)};
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 

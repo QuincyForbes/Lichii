@@ -630,7 +630,7 @@ void RendererMetal::Impl::PresentTexture(TextureHandle texture, id<CAMetalDrawab
     swapchain.PresentHeld(command_buffer, drawable, hold_seconds);
     scheduler.NotePresent(guest);
     // Each present on a command buffer of its own: the hold counts from the one before.
-    scheduler.Flush();
+    scheduler.Flush(CommitReason::Present);
     ++presented;
 }
 
@@ -767,12 +767,12 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                 (__bridge id<MTLCommandBuffer>)impl->scheduler.CommandBuffer();
             impl->swapchain.Present(command_buffer, drawable, drawn);
             impl->scheduler.NotePresent(drawn);
-            impl->scheduler.Flush();
+            impl->scheduler.Flush(CommitReason::Present);
             ++impl->presented;
             }
         } else {
             ++impl->skipped;
-            impl->scheduler.Flush();
+            impl->scheduler.Flush(CommitReason::Present);
         }
     }
     ++m_current_frame;
@@ -840,6 +840,10 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
             !decisions.empty()) {
             LOG_INFO(Render_Metal, "Perf Metal GPU decisions: {}", decisions);
         }
+        if (const std::string reduction = impl->rasterizer.TakeReductionLine();
+            !reduction.empty()) {
+            LOG_INFO(Render_Metal, "Perf Metal sampler reduction variants: {}", reduction);
+        }
         // The pipeline archive: builds it served, and the build time that saved so far (each hit
         // at the average miss's cost, less what the hit took).
         PipelineArchive& archive = impl->rasterizer.Pipelines().Archive();
@@ -869,6 +873,8 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                  static_cast<f64>(impl->scheduler.TakeGpuNanoseconds()) / 1e6 / frames,
                  static_cast<f64>(command_buffers) / frames, static_cast<f64>(encoders) / frames,
                  static_cast<f64>(passes) / frames, static_cast<f64>(work.draws_encoded) / frames);
+        LOG_INFO(Render_Metal, "Metal commits: {}", impl->scheduler.TakeCommitLine(frames));
+        LOG_INFO(Render_Metal, "Metal pass ends: {}", impl->scheduler.TakePassEndLine(frames));
         if (const u64 present_passes = impl->present.TakePasses(); present_passes != 0) {
             LOG_INFO(Render_Metal,
                      "Metal present filters: {:.1f} passes per frame (scaling filter {}, "

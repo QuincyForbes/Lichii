@@ -49,6 +49,17 @@ class Device;
 /// A pipeline build handed to the builder threads (metal_build_job.h).
 using PipelineBuildJob = BuildJob<PipelineTranslator>;
 
+/// EDEN_NX2_METAL_REDUCTION_VARIANTS (default on; 0: every program samples through the sampler
+/// reduction rewrite as before): the vertex, pixel and compute programs with the rewrite are
+/// built without it, and with it only for the draws and dispatches whose samplers need it.
+/// EDEN_NX2_METAL_SAMPLER_REDUCTION=0 still makes no rewrite at all.
+[[nodiscard]] bool ReductionVariantsEnabled();
+
+/// Bits of RenderState's and StateHash's `reducing`: the stage's function with the sampler
+/// reduction rewrite (StageProgram::reducing_function) instead of its plain one.
+inline constexpr u32 ReducingVertex = 1;
+inline constexpr u32 ReducingFragment = 2;
+
 class GraphicsPipeline {
 public:
     explicit GraphicsPipeline(const GraphicsPipelineKey& key, StageProgram vertex,
@@ -173,10 +184,13 @@ public:
     /// The MTLRenderPipelineState for these targets, blending and vertex layout (desc's function
     /// fields are filled in here), made on first use; null when Metal refuses it. While Native()
     /// is there, its mesh pipeline state; when Metal refuses that, Native() becomes null.
-    [[nodiscard]] void* RenderState(const Device& device, RenderPipelineDesc& desc);
+    /// `reducing`: ReducingVertex / ReducingFragment, the stages drawn with their reducing
+    /// function (built already: PipelineCache::ReducingFunction).
+    [[nodiscard]] void* RenderState(const Device& device, RenderPipelineDesc& desc,
+                                    u32 reducing = 0);
 
     /// Fills desc's function fields; the hash render states are kept by.
-    [[nodiscard]] u64 StateHash(RenderPipelineDesc& desc) const noexcept;
+    [[nodiscard]] u64 StateHash(RenderPipelineDesc& desc, u32 reducing = 0) const noexcept;
 
     /// The state made for `hash`, if one was asked for (null when Metal refused it).
     [[nodiscard]] std::optional<void*> FindState(u64 hash) const;
@@ -233,10 +247,16 @@ public:
     /// The MTLComputePipelineState, made on first use; null (logged once) when it fails.
     [[nodiscard]] void* State(const Device& device);
 
+    /// With Program().reduction_variants, after State: the state of the kernel with the sampler
+    /// reduction rewrite, made here on first use (compute is a small share of the builds); null
+    /// when Metal refuses it (the dispatch then takes State()).
+    [[nodiscard]] void* ReducingState(const Device& device);
+
 private:
     ComputePipelineKey key;
     StageProgram program;
     Object state;
+    Object reducing_state;
     PipelineArchive* archive{};
     bool failed{};
     bool used{};
@@ -306,10 +326,24 @@ public:
     /// (EDEN_NX2_METAL_ASYNC_PIPELINES): null and `building` while a draw that may be skipped
     /// waits for it, else built or waited for here. Null without `building`: Metal refused it.
     [[nodiscard]] void* RenderState(GraphicsPipeline& pipeline, RenderPipelineDesc& desc,
-                                    bool& building);
+                                    bool& building, u32 reducing = 0);
 
     /// The 10 s "Perf Metal pipelines:" line, empty when nothing was built or waited for.
     [[nodiscard]] std::string TakeBuildLine();
+
+    /// A stage program's function with the sampler reduction rewrite (its plain one was built:
+    /// StageProgram::reduction_variants), built on the builder threads on first use like a new
+    /// render state: null and `building` while a draw that may be skipped waits for it, else built
+    /// or waited for here. Null without `building`: Metal refused it (the draw takes the plain
+    /// function).
+    [[nodiscard]] void* ReducingFunction(GraphicsPipeline& pipeline, StageProgram& program,
+                                         bool& building);
+
+    /// Reducing functions queued, built and refused since the last call.
+    [[nodiscard]] std::array<u64, 3> TakeReducingBuildCounts() noexcept {
+        return {std::exchange(reducing_queued, 0), std::exchange(reducing_built, 0),
+                std::exchange(reducing_refused, 0)};
+    }
 
 private:
     struct GraphicsBuild {
@@ -328,6 +362,24 @@ private:
         std::string error;
         std::shared_ptr<PipelineBuildJob> job;
     };
+
+    /// A reducing function on the builder threads (ReducingFunction).
+    struct ReducingBuild {
+        const GraphicsPipeline* pipeline{};
+        std::string msl;
+        std::string entry_point;
+        u64 program_hash{};
+        Object library;
+        Object function;
+        std::string error;
+        std::shared_ptr<PipelineBuildJob> job;
+    };
+
+    /// Builds what `build` holds (any thread).
+    void RunReducingBuild(ReducingBuild& build) const;
+
+    /// Moves a finished build into its program; the program's reducing function or null.
+    void* AdoptReducing(StageProgram& program, ReducingBuild& build);
 
     struct BuildStats {
         u64 queued{};
@@ -418,6 +470,12 @@ private:
     ::Common::unordered_map<GraphicsPipelineKey, std::shared_ptr<GraphicsBuild>> graphics_builds;
     /// Render states on the builder threads by pipeline and state hash (draw's thread only).
     std::map<std::pair<const GraphicsPipeline*, u64>, std::shared_ptr<StateBuild>> state_builds;
+    /// Reducing functions on the builder threads by program (draw's thread only); their
+    /// pipelines are not evicted meanwhile.
+    std::map<const StageProgram*, std::shared_ptr<ReducingBuild>> reducing_builds;
+    u64 reducing_queued{};
+    u64 reducing_built{};
+    u64 reducing_refused{};
     /// Last: stopped before the pipelines and the archive its tasks use go.
     std::unique_ptr<::Common::StatefulThreadWorker<PipelineTranslator>> builders;
 };

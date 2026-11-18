@@ -5731,11 +5731,13 @@ int RunAhead() {
     const bool ahead = SwitchOn("EDEN_NX2_METAL_AHEAD");
     const bool splitting = ahead && SwitchOn("EDEN_NX2_METAL_AHEAD_SPLIT");
     const uint64_t clear_passes = SwitchOn("EDEN_NX2_METAL_CLEAR_FOLD") ? 0 : 1;
+    // EDEN_NX2_METAL_MERGE_AHEAD: the copy and the kernel share one command buffer.
+    const bool merged = ahead && SwitchOn("EDEN_NX2_METAL_MERGE_AHEAD");
     const bool counted =
         ahead ? open_after_copy && open_after_kernel && !noted_ahead &&
                     passes == 2 + clear_passes && ahead_copies == 1 && ahead_kernels == 1 &&
                     split == splitting && splits == (splitting ? 1U : 0U) &&
-                    command_buffers == (splitting ? 4U : 3U)
+                    command_buffers == (splitting ? 4U : 3U) - (merged ? 1U : 0U)
               : !open_after_copy && !open_after_kernel && noted_ahead &&
                     passes == 3 + clear_passes && ahead_copies == 0 && ahead_kernels == 0 &&
                     !split && splits == 0 && command_buffers == 1;

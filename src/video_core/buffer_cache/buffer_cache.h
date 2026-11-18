@@ -3382,7 +3382,17 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     const u64 native_size = native ? maxwell3d->regs.NativeVertexStreamSize(index) : 0;
     if (native && array.enable != 0 && native_size > (std::numeric_limits<u32>::max)()) {
-        throw std::runtime_error("Native vertex stream exceeds supported 32-bit buffer size");
+        // A stream register the draw doesn't read can hold stale values (OoT mesh draws on
+        // entering Kokiri Forest: a > 4 GiB size). Throwing here ended the emulator; bind
+        // nothing to the stream instead, as for a disabled one.
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(HW_GPU, "Vertex stream {} of {:#x} bytes at {:#x} left unbound", index,
+                        native_size, gpu_addr_begin);
+        }
+        channel_state->vertex_buffers[index] = NULL_BINDING;
+        UpdateVertexBufferSlot(index, NULL_BINDING);
+        return;
     }
     const GPUVAddr gpu_addr_end = native ? gpu_addr_begin + native_size : limit.Address() + 1;
     GeometryMemo& memo = vertex_memo[index];

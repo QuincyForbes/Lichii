@@ -44,6 +44,72 @@ constexpr u32 MetalSamplerSlots = 16;
 [[nodiscard]] u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point,
                                           bool fragment, u32 buffer_slot);
 
+/// EDEN_NX2_METAL_OPTNONE_HELPERS=1: keeps SPIRV-Cross's [[clang::optnone]] spvFAdd/spvFSub/
+/// spvFMul (A/B against InlinePreciseHelpers).
+[[nodiscard]] bool OptnoneHelpersKept() {
+    static const bool kept = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_OPTNONE_HELPERS");
+        return value != nullptr && value[0] == '1';
+    }();
+    return kept;
+}
+
+/// EDEN_NX2_METAL_INVARIANT_POSITION=0: vertex, mesh and evaluation stages get the inlined
+/// helpers and no invariant_float_math, as the other stages.
+[[nodiscard]] bool InvariantPositionEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_INVARIANT_POSITION");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// EDEN_NX2_METAL_SPILL_CONSTANT=0: spilled uniform buffers read as `const device` again.
+[[nodiscard]] bool SpillConstantEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_SPILL_CONSTANT");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// The recompiler marks every guest FADD/FMUL/FFMA NoContraction, and SPIRV-Cross writes each
+/// such operation as a call to a [[clang::optnone]] helper (fma(l, r, 0), fma(1, l, r)). An
+/// optnone function is also noinline: the AIR kept one real call per arithmetic operation, with
+/// the arguments stored to and reloaded from private memory, and nothing (constant folding,
+/// CSE, vectorization, scheduling) crossed them. The helpers become inline plain operations in
+/// a scope where clang may neither contract nor reassociate (#pragma clang fp): the AIR then
+/// carries fmul/fadd without the `contract` and `reassoc` flags, which keeps each operation
+/// separately rounded as NoContraction asks, and everything around it is optimized normally.
+void InlinePreciseHelpers(std::string& source) {
+    if (OptnoneHelpersKept() || source.find("[[clang::optnone]]") == std::string::npos) {
+        return;
+    }
+    const auto replace = [&](std::string_view from, std::string_view to) {
+        for (size_t at = source.find(from); at != std::string::npos;
+             at = source.find(from, at + to.size())) {
+            source.replace(at, from.size(), to);
+        }
+    };
+    constexpr std::string_view Pragma = "#pragma clang fp contract(off) reassociate(off)\n";
+    replace("[[clang::optnone]] T spvFAdd(T l, T r)\n{\n    return fma(T(1), l, r);\n}",
+            std::string("inline T spvFAdd(T l, T r)\n{\n") + std::string(Pragma) +
+                "    return l + r;\n}");
+    replace("[[clang::optnone]] T spvFSub(T l, T r)\n{\n    return fma(T(-1), r, l);\n}",
+            std::string("inline T spvFSub(T l, T r)\n{\n") + std::string(Pragma) +
+                "    return l - r;\n}");
+    replace("[[clang::optnone]] T spvFMul(T l, T r)\n{\n    return fma(l, r, T(0));\n}",
+            std::string("inline T spvFMul(T l, T r)\n{\n") + std::string(Pragma) +
+                "    return l * r;\n}");
+    // The matrix forms are written with explicit fma (exact whatever the optimizer does).
+    replace("[[clang::optnone]] vec<T, Cols> spvFMulVectorMatrix",
+            "inline vec<T, Cols> spvFMulVectorMatrix");
+    replace("[[clang::optnone]] vec<T, Rows> spvFMulMatrixVector",
+            "inline vec<T, Rows> spvFMulMatrixVector");
+    replace("[[clang::optnone]] matrix<T, RCols, LRows> spvFMulMatrixMatrix",
+            "inline matrix<T, RCols, LRows> spvFMulMatrixMatrix");
+}
+
 [[nodiscard]] spv::ExecutionModel Model(Stage stage) {
     switch (stage) {
     case Stage::Vertex:
@@ -308,6 +374,17 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
         msl.capture_output_to_buffer = tess_vertex || tess_control;
         msl.multi_patch_workgroup = tess_vertex || tess_control || tess_evaluation;
         msl.raw_buffer_tese_input = tess_evaluation;
+        // Stages whose arithmetic makes a position keep every float add, subtract and multiply
+        // exact and unfused (SPIRV-Cross's [[clang::optnone]] fma helpers, as MoltenVK runs
+        // them; InlinePreciseHelpers is skipped for them): a depth pre-pass and the colour pass
+        // that tests EQUAL against it are different programs, and Ocarina's grass and vine glow
+        // vanished when Metal's compiler fused or reordered their positions differently
+        // (EDEN_NX2_METAL_INVARIANT_POSITION=0: as before).
+        const bool invariant_position =
+            InvariantPositionEnabled() &&
+            (options.invariant_float_math || stage == Stage::Vertex || stage == Stage::Mesh ||
+             tess_vertex || tess_evaluation);
+        msl.invariant_float_math = msl.invariant_float_math || invariant_position;
         switch (options.vertex_index_size) {
         case 2:
             msl.vertex_index_type = spirv_cross::CompilerMSL::Options::IndexType::UInt16;
@@ -547,6 +624,9 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
         }
 
         result.source = compiler.compile();
+        if (!invariant_position) {
+            InlinePreciseHelpers(result.source);
+        }
         if (stage == Stage::Object) {
             // SPIRV-Cross gives an object function with no stage outputs an empty main0_out
             // return type, and Metal accepts only void ("invalid return type 'main0_out' for
@@ -1232,6 +1312,7 @@ bool SpillBuffers(std::string& source, const std::string& entry_point, u32 spill
                 // address read from the table.
                 std::string base;
                 bool is_const = false;
+                bool is_constant_space = false;
                 size_t cursor = 0;
                 const std::string& type = parameter->type;
                 while (cursor < type.size()) {
@@ -1240,6 +1321,7 @@ bool SpillBuffers(std::string& source, const std::string& entry_point, u32 spill
                         type.substr(cursor, end == std::string::npos ? end : end - cursor);
                     if (word == "constant" || word == "const") {
                         is_const = true;
+                        is_constant_space = is_constant_space || word == "constant";
                     } else if (word != "device") {
                         base += (base.empty() ? "" : " ") + word;
                     }
@@ -1250,7 +1332,13 @@ bool SpillBuffers(std::string& source, const std::string& entry_point, u32 spill
                 }
                 const bool is_reference = base.back() == '&';
                 base.pop_back();
-                const std::string qualifier = is_const ? "const device " : "device ";
+                // A uniform buffer stays in the constant address space (Metal 3 takes a GPU
+                // address for `constant` pointers as for `device` ones): read as `const device`,
+                // each of its loads went through the device memory path instead of the constant
+                // (uniform) one the GPU keeps for buffers every thread reads alike.
+                const std::string qualifier = is_constant_space && SpillConstantEnabled()
+                                                  ? "constant "
+                                                  : (is_const ? "const device " : "device ");
                 const std::string cast = "reinterpret_cast<" + qualifier + base + "*>(spvSpill[" +
                                          std::to_string(index - SpillBase) + "])";
                 declarations += "    " + qualifier + base + (is_reference ? "& " : "* ") +

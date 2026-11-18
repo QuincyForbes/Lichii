@@ -223,9 +223,12 @@ ImageInfo::ImageInfo(const Maxwell3D::Regs::Zeta& zt, const Maxwell3D::Regs::Zet
         pitch = size.width * BytesPerBlock(format);
     } else if (zt.tile_mode.dim_control ==
                Maxwell3D::Regs::TileMode::DimensionControl::DefineDepthSize) {
-        ASSERT(zt_size.dim_control == Maxwell3D::Regs::ZetaSize::DimensionControl::ArraySizeIsOne);
-        type = ImageType::e3D;
-        size.depth = zt_size.depth;
+        // A depth target is never a 3D image on the host: Vulkan's depth formats are 2D only and
+        // MoltenVK aborts the process on a 3D one ("depth/stencil formats may only be used with
+        // 2D images"; OoT's register state while entering Kokiri Forest). Its slices are the
+        // layers of a 2D array instead.
+        type = ImageType::e2D;
+        resources.layers = (std::max)(zt_size.depth.Value(), 1U);
     } else {
         rescaleable = block.depth == 0;
         downscaleable = size.height > 512;

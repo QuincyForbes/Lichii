@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <memory>
 
 #include "common/logging.h"
@@ -78,6 +79,9 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     } catch (const std::runtime_error& exception) {
         scope.Cancel();
         LOG_ERROR(HW_GPU, "Failed to initialize GPU: {}", exception.what());
+        // The log is written asynchronously and the failed boot can end the process before it
+        // is flushed, so the reason also goes to stderr.
+        std::fprintf(stderr, "Failed to initialize GPU: %s\n", exception.what());
         gpu.reset();
     }
 }
