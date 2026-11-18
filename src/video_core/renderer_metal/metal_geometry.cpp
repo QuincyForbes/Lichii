@@ -356,13 +356,84 @@ kernel void geo_records(device const {0}_out* src [[buffer({1})]], device float*
         return;
     }}
     const uint p = n / j.vertices;
-    const uint s = (p / j.primitives) * j.count + (p % j.primitives) * j.step + n % j.vertices;
+    uint s = (p / j.primitives) * j.count + (p % j.primitives) * j.step + n % j.vertices;
+    if (j.vertices == 6 && j.step == 2) {{
+        // Triangle strips with adjacency: Vulkan's vertex order of primitive i of n.
+        const uint i = p % j.primitives, c = n % 6, m = j.primitives;
+        int v[6];
+        const int b = int(2 * i);
+        if (m == 1) {{
+            const int t[6] = {{0, 1, 2, 5, 4, 3}};
+            for (uint k = 0; k < 6; k++) v[k] = t[k];
+        }} else if (i == 0) {{
+            const int t[6] = {{0, 1, 2, 6, 4, 3}};
+            for (uint k = 0; k < 6; k++) v[k] = t[k];
+        }} else if (i < m - 1) {{
+            if (i % 2 == 1) {{
+                const int t[6] = {{0, 3, 4, 6, 2, -2}};
+                for (uint k = 0; k < 6; k++) v[k] = b + t[k];
+            }} else {{
+                const int t[6] = {{0, -2, 2, 6, 4, 3}};
+                for (uint k = 0; k < 6; k++) v[k] = b + t[k];
+            }}
+        }} else if (i % 2 == 1) {{
+            const int t[6] = {{0, 3, 4, 5, 2, -2}};
+            for (uint k = 0; k < 6; k++) v[k] = b + t[k];
+        }} else {{
+            const int t[6] = {{0, -2, 2, 5, 4, 3}};
+            for (uint k = 0; k < 6; k++) v[k] = b + t[k];
+        }}
+        s = (p / j.primitives) * j.count + uint(v[c]);
+    }}
     device const {0}_out& v = src[s];
     device float* r = dst + ulong(n) * {4}u;
 {5}}}
 )",
                        entry, RecordsSourceSlot, RecordsOutputSlot, RecordsCountSlot,
                        plan.InputStride(), body);
+}
+
+std::string XfbSource(const Plan& plan, const Xfb::Layout& layout,
+                      const std::map<IR::Attribute, IR::Attribute>& legacy_mapping) {
+    std::string body;
+    for (const Xfb::Varying& varying : Xfb::Varyings(layout)) {
+        for (u32 component = 0; component < varying.components; ++component) {
+            u32 word = varying.attribute + component;
+            const auto mapped = legacy_mapping.find(static_cast<IR::Attribute>(word));
+            if (mapped != legacy_mapping.end()) {
+                word = static_cast<u32>(mapped->second);
+            }
+            const auto slot = SlotOf(plan.output_words, word);
+            body += fmt::format("    *(device float*)(dst{} + ulong(n) * {}u + {}u) = {};\n",
+                                varying.buffer, layout.Stride(varying.buffer),
+                                varying.offset + component * 4,
+                                slot ? fmt::format("r[{}]", *slot) : std::string{"0.0f"});
+        }
+    }
+    return fmt::format(R"(
+struct GeometryXfbParams {{ uint capacity[4]; uint written[4]; uint vertices; }};
+kernel void geo_xfb(device const float* rec [[buffer(0)]], device const uint* list [[buffer(1)]],
+                    device uchar* dst0 [[buffer(2)]], device uchar* dst1 [[buffer(3)]],
+                    device uchar* dst2 [[buffer(4)]], device uchar* dst3 [[buffer(5)]],
+                    device const uint* args [[buffer(6)]], constant GeometryXfbParams& j [[buffer(7)]],
+                    uint n [[thread_position_in_grid]]) {{
+    const uint stride[4] = {{{0}u, {1}u, {2}u, {3}u}};
+    uint count = args[0];
+    for (uint b = 0; b < 4; b++) {{
+        if (stride[b] != 0) {{
+            const uint room = j.capacity[b] - min(j.capacity[b], j.written[b]);
+            count = min(count, room / stride[b]);
+        }}
+    }}
+    count -= count % j.vertices;
+    if (n >= count) {{
+        return;
+    }}
+    device const float* r = rec + ulong(list[n]) * {4}u;
+{5}}}
+)",
+                       layout.Stride(0), layout.Stride(1), layout.Stride(2), layout.Stride(3),
+                       plan.OutputStride(), body);
 }
 
 std::string ReaderSource(const Plan& plan, bool convert_depth, bool flip_y,

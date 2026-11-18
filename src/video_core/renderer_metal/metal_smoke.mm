@@ -2442,11 +2442,13 @@ int RunGeometryPipelines() {
     Shader::ObjectPool<IR::Inst> insts{1024};
     Shader::ObjectPool<IR::Block> blocks{32};
 
-    enum class Kind { Instances, Invocations, ClipLayer, Adjacency, Passthrough };
+    enum class Kind { Instances, Invocations, ClipLayer, Adjacency, Passthrough, Capture };
     struct Result {
         bool ran{};
         std::array<Texel, 4> probes{};
         std::array<Texel, 4> layer_probes{};
+        bool capture_ok{};
+        uint32_t captured{};
     };
     const auto finish = [&](IR::Program& program, IR::IREmitter& ir, IR::Block* body) {
         IR::Block* const tail = blocks.Create(insts);
@@ -2547,6 +2549,21 @@ int RunGeometryPipelines() {
         key.unique_hashes[4] = 1;
         key.topology = static_cast<uint32_t>(topology);
         key.attribute_types = 1;
+        if (kind == Kind::Capture) {
+            // The quad's position (28..31) into capture buffer 0, 16 bytes a vertex.
+            VideoCommon::TransformFeedbackState state{};
+            state.layouts[0] = {.stream = 0, .varying_count = 4, .stride = 16};
+            for (uint32_t index = 0; index < 4; ++index) {
+                auto& entry = state.varyings[0][0];
+                switch (index) {
+                case 0: entry.attribute0.Assign(28); break;
+                case 1: entry.attribute1.Assign(29); break;
+                case 2: entry.attribute2.Assign(30); break;
+                default: entry.attribute3.Assign(31); break;
+                }
+            }
+            std::memcpy(key.xfb.words.data(), &state, sizeof(state));
+        }
         std::array<IR::Program, Maxwell::MaxShaderProgram> programs;
         programs[1] = make_vertex(kind == Kind::Passthrough);
         if (kind == Kind::Passthrough) {
@@ -2705,6 +2722,48 @@ int RunGeometryPipelines() {
         pack(count_kernel, groups);
         pack(scan_kernel, 1);
         pack(write_kernel, groups);
+        if (kind == Kind::Capture) {
+            // Transform feedback of the compacted output: room for six vertices, then asked for
+            // with room for four (a whole triangle only).
+            const Metal::Object xfb_function = function_of(kernel_library, std::string{Metal::Geometry::XfbEntry});
+            const Metal::Object xfb_state =
+                xfb_function ? Metal::CreateComputePipelineState(device, xfb_function.Get(), error)
+                             : Metal::Object{};
+            if (!xfb_state) {
+                std::printf("metal-smoke: FAIL geometry xfb kernel: %s\n", error.c_str());
+                return result;
+            }
+            uint8_t* capture_data = nullptr;
+            const Metal::Object capture_buffer = buffer(96, &capture_data);
+            std::memset(capture_data, 0xAB, 96);
+            Metal::Geometry::XfbParams xfb_params{};
+            xfb_params.capacity = {96, 0, 0, 0};
+            xfb_params.vertices = 3;
+            scheduler.BeginCompute(xfb_state.Get());
+            bind(Metal::Geometry::XfbRecordsSlot, output);
+            bind(Metal::Geometry::XfbListSlot, list);
+            for (uint32_t slot = 0; slot < 4; ++slot) {
+                bind(Metal::Geometry::XfbBufferSlot + slot, capture_buffer);
+            }
+            bind(Metal::Geometry::XfbArgsSlot, args);
+            scheduler.BindBytes(Metal::ShaderStage::Compute, Metal::Geometry::XfbParamsSlot, &xfb_params, sizeof(xfb_params));
+            scheduler.Dispatch({(capacity + 63) / 64, 1, 1}, {64, 1, 1});
+            scheduler.Finish();
+            // Triangle strip v0 v1 v2 v3 as triangles: (v0 v1 v2), then (v2 v1 v3).
+            const float quad[4][4]{{-0.2f, -0.2f, 0.0f, 1.0f}, {0.2f, -0.2f, 0.0f, 1.0f},
+                                   {-0.2f, 0.2f, 0.0f, 1.0f}, {0.2f, 0.2f, 0.0f, 1.0f}};
+            const int order[6]{0, 1, 2, 2, 1, 3};
+            result.capture_ok = true;
+            for (uint32_t vertex = 0; vertex < 6; ++vertex) {
+                float got[4];
+                std::memcpy(got, capture_data + vertex * 16, sizeof(got));
+                for (uint32_t c = 0; c < 4; ++c) {
+                    result.capture_ok = result.capture_ok && std::fabs(got[c] - quad[order[vertex]][c]) < 1e-5f;
+                }
+            }
+            result.captured = Metal::Xfb::CapturedVertices(
+                reinterpret_cast<const uint32_t*>(arguments)[0], 3, {16, 0, 0, 0}, {96, 0, 0, 0}, {});
+        }
 
         const bool layered = kind == Kind::ClipLayer || kind == Kind::Passthrough;
         const uint32_t layers = layered ? 2 : 1;
@@ -2765,6 +2824,8 @@ int RunGeometryPipelines() {
         case Kind::Adjacency:
             result.probes = {at(0, 0.0f, 0.0f), at(0, -0.5f, 0.0f), at(0, 0.5f, 0.0f), at(0, 0.0f, 0.6f)};
             break;
+        case Kind::Capture:
+            break;
         case Kind::Passthrough:
             result.probes = {at(1, 0.0f, -0.3f), at(0, 0.0f, -0.3f), at(1, -0.7f, 0.7f), at(0, -0.7f, 0.7f)};
             break;
@@ -2801,12 +2862,100 @@ int RunGeometryPipelines() {
     const bool passthrough_ok = passed_through.ran && is(passed_through.probes[0], true) &&
                                 is(passed_through.probes[1], false) &&
                                 is(passed_through.probes[3], false);
-    const bool passed = instances_ok && invocations_ok && layer_ok && adjacency_ok && passthrough_ok;
+    const Result capture = run(Kind::Capture, Maxwell::PrimitiveTopology::Points, 1, 1, one_point);
+    const bool capture_ok = capture.ran && capture.capture_ok && capture.captured == 6;
+    const bool passed = instances_ok && invocations_ok && layer_ok && adjacency_ok &&
+                        passthrough_ok && capture_ok;
     std::printf("metal-smoke: geometry pipelines end to end (instances %s, invocations %s, clip "
-                "distance and layer %s, lines with adjacency %s, lowered passthrough %s): %s\n",
+                "distance and layer %s, lines with adjacency %s, lowered passthrough %s, transform "
+                "feedback of the output %s): %s\n",
                 instances_ok ? "ok" : "WRONG", invocations_ok ? "ok" : "WRONG",
                 layer_ok ? "ok" : "WRONG", adjacency_ok ? "ok" : "WRONG",
-                passthrough_ok ? "ok" : "WRONG", passed ? "PASS" : "FAIL");
+                passthrough_ok ? "ok" : "WRONG", capture_ok ? "ok" : "WRONG", passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// Triangle strips with adjacency: the records kernel's vertex order of each primitive against
+/// Vulkan's table (drawing.adoc, "Triangle Strips With Adjacency"), worked out by hand for a
+/// strip of 10 vertices (three primitives: the first, a middle odd one, the last even one) and
+/// one of 6 (a single primitive).
+int RunGeometryAdjacencyStrip() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    Metal::Geometry::Plan plan;
+    plan.input_vertices = 6;
+    plan.input_step = 2;
+    plan.input_words = {static_cast<uint32_t>(Shader::IR::Attribute::PositionX)};
+    Metal::ShaderTranslate::InterfaceVariable position;
+    position.builtin = 0;
+    position.vecsize = 4;
+    position.name = "gl_Position";
+    const std::array<Metal::ShaderTranslate::InterfaceVariable, 1> outputs{position};
+    const std::string source = std::string{"#include <metal_stdlib>\nusing namespace metal;\n"
+                                           "struct fake_out { float4 gl_Position; };\n"} +
+                               Metal::Geometry::RecordsSource(plan, "fake", outputs, {});
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, source, error);
+    const Metal::Object function =
+        library ? Metal::CreateFunction(library.Get(), std::string{Metal::Geometry::RecordsEntry})
+                : Metal::Object{};
+    const Metal::Object kernel =
+        function ? Metal::CreateComputePipelineState(device, function.Get(), error) : Metal::Object{};
+    if (!kernel) {
+        std::printf("metal-smoke: FAIL adjacency strip kernel: %s\n%s\n", error.c_str(), source.c_str());
+        return 1;
+    }
+    const auto order = [&](uint32_t count) {
+        const uint32_t primitives = plan.Primitives(count);
+        uint8_t* src = nullptr;
+        uint8_t* dst = nullptr;
+        const Metal::Object vertices = Metal::CreateBuffer(device, count * 16, true, &src);
+        const Metal::Object records =
+            Metal::CreateBuffer(device, std::max<uint32_t>(primitives * 6 * 4, 16), true, &dst);
+        std::memset(src, 0, count * 16);
+        for (uint32_t i = 0; i < count; ++i) {
+            const float x = static_cast<float>(i);
+            std::memcpy(src + i * 16, &x, sizeof(x));
+        }
+        const Metal::Geometry::RecordsParams params{primitives * 6, 6, 2, count, primitives};
+        scheduler.BeginCompute(kernel.Get());
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::Geometry::RecordsSourceSlot,
+                             vertices.Get(), 0);
+        scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::Geometry::RecordsOutputSlot,
+                             records.Get(), 0);
+        scheduler.BindBytes(Metal::ShaderStage::Compute, Metal::Geometry::RecordsCountSlot,
+                            &params, sizeof(params));
+        scheduler.Dispatch({(params.records + 63) / 64, 1, 1}, {64, 1, 1});
+        scheduler.Finish();
+        std::vector<int> result;
+        for (uint32_t i = 0; i < primitives * 6; ++i) {
+            float value;
+            std::memcpy(&value, dst + i * 4, sizeof(value));
+            result.push_back(static_cast<int>(value));
+        }
+        return result;
+    };
+    const std::vector<int> expected10{0, 1, 2, 6, 4, 3,   // i = 0
+                                      2, 5, 6, 8, 4, 0,   // i = 1, odd, middle
+                                      4, 2, 6, 9, 8, 7};  // i = 2, even, last
+    const std::vector<int> expected6{0, 1, 2, 5, 4, 3};
+    const std::vector<int> got10 = order(10);
+    const std::vector<int> got6 = order(6);
+    const bool passed = got10 == expected10 && got6 == expected6 && plan.Primitives(10) == 3 &&
+                        plan.Primitives(6) == 1 && plan.Primitives(5) == 0;
+    std::printf("metal-smoke: geometry triangle strip with adjacency vertex order (10 vertices: 3 "
+                "primitives, 6 vertices: 1, against Vulkan's table): %s\n",
+                passed ? "PASS" : "FAIL");
+    if (!passed) {
+        for (const int value : got10) {
+            std::printf("%d ", value);
+        }
+        std::printf("| ");
+        for (const int value : got6) {
+            std::printf("%d ", value);
+        }
+        std::printf("\n");
+    }
     return passed ? 0 : 1;
 }
 
@@ -5600,7 +5749,7 @@ int main(int argc, char** argv) {
                                  RunTexture1D,
                                  RunMeshEmulation, RunMeshDistribution, RunIndexRewrite,
                                  RunOcarinaBilinear, RunPipelineArchive,
-                                 RunDepthBlit, RunTessellation, RunTransformFeedback, RunGeometryPassthrough, RunGeometryCompute, RunGeometryPipelines, RunDepthStencilBlit,
+                                 RunDepthBlit, RunTessellation, RunTransformFeedback, RunGeometryPassthrough, RunGeometryCompute, RunGeometryPipelines, RunGeometryAdjacencyStrip, RunDepthStencilBlit,
                                  RunPipelineCheck, RunDeviceMsl, RunNativeMesh, RunBlockCopy,
                                  RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,

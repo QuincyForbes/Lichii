@@ -298,7 +298,7 @@ void PipelineTranslator::RefreshKey(GraphicsPipelineKey& key, const Maxwell& reg
                                  (static_cast<u32>(tessellation.output_primitives.Value()) << 4)
                            : 0U;
     RefreshFixedState(key, regs);
-    key.xfb = Xfb::MakeLayout(regs, topology);
+    key.xfb = Xfb::MakeLayout(regs, topology, key.unique_hashes[4] != 0);
 }
 
 size_t GraphicsPipelineKey::Hash() const noexcept {
@@ -724,6 +724,13 @@ std::optional<TranslatedPipeline> PipelineTranslator::GeometryPipeline(
         for (u32 buffer = 0; buffer < Geometry::ExtraBuffers; ++buffer) {
             geometry.extra_slots[buffer] =
                 buffers[buffers.size() - Geometry::ExtraBuffers + buffer].index;
+        }
+    }
+    if (key.xfb.Active()) {
+        // The capture of the geometry output: the compacted list's vertices into the buffers.
+        kernel->msl += Geometry::XfbSource(*plan, key.xfb, geometry_legacy);
+        for (u32 buffer = 0; buffer < Xfb::MaxBuffers; ++buffer) {
+            geometry.xfb_stride[buffer] = key.xfb.Stride(buffer);
         }
     }
     geometry.kernel = MeshKernel{.program = std::move(*kernel),

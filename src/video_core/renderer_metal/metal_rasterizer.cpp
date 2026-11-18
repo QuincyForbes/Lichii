@@ -2456,6 +2456,10 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         pack(geometry_count_kernel, groups);
         pack(geometry_scan_kernel, 1);
         pack(geometry_write_kernel, groups);
+        if (geo->xfb_stride != std::array<u32, Xfb::MaxBuffers>{}) {
+            CaptureGeometryOutput(pipeline, *geo, geo_draw.output, geo_draw.indices, geo_draw.args,
+                                  input_primitives);
+        }
         ++geometry_draws;
         geometry_primitives += input_primitives;
         if (geometry_readbacks.size() >= 4096) {
@@ -2907,6 +2911,75 @@ void RasterizerMetal::DrawIndirect() {
         }
     }
     ++draws_encoded;
+}
+
+void RasterizerMetal::CaptureGeometryOutput(GraphicsPipeline& pipeline, GeometryCompute& geo,
+                                            const StagingBufferRef& output,
+                                            const StagingBufferRef& list,
+                                            const StagingBufferRef& args, u32 primitives) {
+    // The compaction's count is only on the GPU, and the byte offsets of the next draw depend on
+    // it: the capture is dispatched with the clamp inside the kernel, and the CPU waits for the
+    // count (one command buffer wait a draw that captures).
+    void* const kernel = pipeline.GeometryXfbState(device);
+    const auto& feedbacks = buffer_cache_runtime.TransformFeedbacks();
+    const auto& regs = maxwell3d->regs;
+    Geometry::XfbParams params{};
+    params.vertices = geo.plan.output_topology == 1 ? 1U : geo.plan.output_topology == 6 ? 2U : 3U;
+    for (u32 buffer = 0; buffer < Xfb::MaxBuffers; ++buffer) {
+        if (geo.xfb_stride[buffer] == 0) {
+            continue;
+        }
+        if (feedbacks[buffer].buffer == nullptr || feedbacks[buffer].size == 0) {
+            LOG_ONCE(warned_geometry_xfb, "Metal: a geometry transform feedback capture was skipped (buffer unbound)");
+            return;
+        }
+        const auto& binding = regs.transform_feedback.buffers[buffer];
+        const GPUVAddr base = binding.Address() + binding.start_offset;
+        if (xfb_state.base[buffer] != base) {
+            xfb_state.base[buffer] = base;
+            xfb_state.written[buffer] = 0;
+        }
+        xfb_state.start[buffer] = static_cast<u32>(binding.start_offset);
+        xfb_state.stride[buffer] = geo.xfb_stride[buffer];
+        params.capacity[buffer] = static_cast<u32>(binding.size);
+        params.written[buffer] = xfb_state.written[buffer];
+    }
+    xfb_state.topology = geo.plan.output_topology == 1   ? Maxwell::PrimitiveTopology::Points
+                         : geo.plan.output_topology == 6 ? Maxwell::PrimitiveTopology::Lines
+                                                         : Maxwell::PrimitiveTopology::Triangles;
+    if (kernel == nullptr) {
+        return;
+    }
+    scheduler.BeginCompute(kernel, false);
+    scheduler.BindBuffer(ShaderStage::Compute, Geometry::XfbRecordsSlot, output.buffer,
+                         static_cast<u32>(output.offset));
+    scheduler.BindBuffer(ShaderStage::Compute, Geometry::XfbListSlot, list.buffer,
+                         static_cast<u32>(list.offset));
+    for (u32 buffer = 0; buffer < Xfb::MaxBuffers; ++buffer) {
+        // A buffer the layout doesn't use still gets one bound.
+        const u32 used = geo.xfb_stride[buffer] != 0 ? buffer : 0;
+        scheduler.BindBuffer(ShaderStage::Compute, Geometry::XfbBufferSlot + buffer,
+                             feedbacks[used].buffer,
+                             feedbacks[used].offset + (geo.xfb_stride[used] != 0 ? xfb_state.written[used] : 0U));
+    }
+    scheduler.BindBuffer(ShaderStage::Compute, Geometry::XfbArgsSlot, args.buffer,
+                         static_cast<u32>(args.offset));
+    scheduler.BindBytes(ShaderStage::Compute, Geometry::XfbParamsSlot, &params,
+                        static_cast<u32>(sizeof(params)));
+    // One thread for each index the compaction could have listed.
+    const u32 threads = primitives * geo.plan.invocations * geo.plan.max_vertices * 3;
+    scheduler.Dispatch({(threads + Geometry::GroupSize - 1) / Geometry::GroupSize, 1, 1},
+                       {Geometry::GroupSize, 1, 1});
+    scheduler.Wait(scheduler.CurrentTick());
+    u32 listed = 0;
+    std::memcpy(&listed, args.mapped_span.data(), sizeof(listed));
+    const u32 captured =
+        Xfb::CapturedVertices(listed, params.vertices, geo.xfb_stride, params.capacity, xfb_state.written);
+    for (u32 buffer = 0; buffer < Xfb::MaxBuffers; ++buffer) {
+        xfb_state.written[buffer] += captured * geo.xfb_stride[buffer];
+    }
+    ++xfb_captures;
+    xfb_vertices_captured += captured;
 }
 
 void RasterizerMetal::EnsureGeometryKernels() {

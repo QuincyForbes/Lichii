@@ -267,6 +267,25 @@ std::pair<void*, void*> GraphicsPipeline::GeometryKernelStates(const Device& dev
     return {it->second.Get(), geometry->records[variant].Get()};
 }
 
+void* GraphicsPipeline::GeometryXfbState(const Device& device) {
+    if (!geometry || !geometry->kernel.program.library) {
+        return nullptr;
+    }
+    if (!geometry->xfb_state) {
+        std::string error;
+        const Object function = CreateFunction(geometry->kernel.program.library.Get(),
+                                               std::string{Geometry::XfbEntry});
+        if (function) {
+            geometry->xfb_state = CreateComputePipelineState(device, function.Get(), error, archive);
+        }
+        if (!geometry->xfb_state) {
+            LOG_ERROR(Render_Metal, "Metal: geometry transform feedback kernel of {:016x} failed: {}",
+                      key.unique_hashes[4], error);
+        }
+    }
+    return geometry->xfb_state.Get();
+}
+
 void* GraphicsPipeline::KernelState(const Device& device, MeshKernel& kernel) {
     if (kernel.state || kernel.failed) {
         return kernel.state.Get();

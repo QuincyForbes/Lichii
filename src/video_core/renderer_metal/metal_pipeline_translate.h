@@ -242,6 +242,10 @@ struct GeometryCompute {
     std::array<u32, Geometry::ExtraBuffers> extra_slots{};
     /// Bytes per captured vertex between the capture and records kernels (an upper bound).
     u32 vertex_stride{};
+    /// Transform feedback of the geometry output: the strides of the buffers it captures into
+    /// (all zero without), the kernel is Geometry::XfbEntry in the geometry kernel's MSL.
+    std::array<u32, Xfb::MaxBuffers> xfb_stride{};
+    Object xfb_state;
 };
 
 /// What a graphics key's programs translate to (GraphicsPipeline's stages).
