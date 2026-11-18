@@ -215,6 +215,9 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     case Settings::FramePacingMode::Target_120:
         scheduler.Wait(resource_ticks[image_index], 120.0, may_flush);
         break;
+    case Settings::FramePacingMode::Unlocked:
+        scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+        break;
     }
     };
 

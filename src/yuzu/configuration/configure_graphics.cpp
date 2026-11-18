@@ -249,7 +249,8 @@ void ConfigureGraphics::PopulateVSyncModeSelection(bool use_setting) {
               backend == Settings::RendererBackend::OpenGL_SPIRV) &&
              (global_vsync_mode == Settings::VSyncMode::Immediate ||
               global_vsync_mode == Settings::VSyncMode::Fifo)) ||
-            backend == Settings::RendererBackend::Vulkan);
+            backend == Settings::RendererBackend::Vulkan ||
+            backend == Settings::RendererBackend::Metal);
     }
 }
 
@@ -1037,8 +1038,13 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
 #endif
 
 #ifdef LICHII_METALFX
-    const bool metalfx = vulkan;
+    // Spatial and temporal MetalFX run on the native Metal renderer too; frame generation only on
+    // Vulkan (docs/nx2/metal-coverage.md N06, O03, N09).
+    const bool metalfx =
+        vulkan || GetCurrentGraphicsBackend() == Settings::RendererBackend::Metal;
+    const bool metalfx_frame_gen = vulkan;
 #else
+    constexpr bool metalfx_frame_gen = false;
     constexpr bool metalfx = false;
 #endif
     // The entries of the lists that can't run here show only while one is the current value.
@@ -1058,7 +1064,7 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     gate_item(scaling_filter_combobox, Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
               static_cast<u32>(Settings::ScalingFilter::MetalFxSpatial), metalfx);
     gate_item(frame_gen_type_combobox, Settings::EnumMetadata<Settings::FrameGenType>::Index(),
-              static_cast<u32>(Settings::FrameGenType::MetalFx), metalfx);
+              static_cast<u32>(Settings::FrameGenType::MetalFx), metalfx_frame_gen);
     gate_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
               static_cast<u32>(Settings::Upscaler::MetalFx), metalfx);
     gate_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),

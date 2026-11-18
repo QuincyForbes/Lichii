@@ -67,6 +67,12 @@ endif()
 # TODO(crueter)
 target_link_libraries(qt_common PRIVATE Qt6::Widgets)
 
+if (ENABLE_METAL)
+    # shared_translation.cpp lists the Metal backend only when this is set; video_core defines it
+    # for itself but qt_common does not link video_core.
+    target_compile_definitions(qt_common PUBLIC LICHII_METAL_RENDERER)
+endif()
+
 target_compile_definitions(qt_common PUBLIC
     # Use QStringBuilder for string concatenation to reduce
     # the overall number of temporary strings created.

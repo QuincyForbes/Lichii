@@ -724,21 +724,21 @@ void MainWindow::MigrateFriztiSettings() {
 
 void MainWindow::AskOotFrameRate() {
     QMessageBox box(this);
-    box.setWindowTitle(tr("Ocarina of Time frame rate"));
+    box.setWindowTitle(tr("Frame rate"));
     box.setIcon(QMessageBox::Question);
-    box.setText(tr("Which frame rate should Ocarina of Time run at?"));
+    box.setText(tr("Which frame rate should games run at?"));
     box.setInformativeText(
         tr("60 FPS needs a fast, recent CPU.\n"
-           "30 FPS is for lower-end PCs. The game keeps its normal speed either way.\n\n"
+           "30 FPS is for lower-end PCs. Games keep their normal speed either way.\n\n"
            "Switch any time with the FPS button at the bottom of the window, or in Configure > "
-           "Graphics > Frame rate (also Unlocked, up to the frame rate limit)."));
+           "Graphics > Frame rate target (also 90, 120 and Unlocked)."));
     QPushButton* const fps60 = box.addButton(tr("60 FPS"), QMessageBox::AcceptRole);
     QPushButton* const fps30 = box.addButton(tr("30 FPS (lower-end PCs)"), QMessageBox::AcceptRole);
     box.setDefaultButton(fps60);
     box.exec();
-    Settings::values.oot_frame_rate.SetValue(box.clickedButton() == fps30
-                                                 ? Settings::OotFrameRate::Fps30
-                                                 : Settings::OotFrameRate::Fps60);
+    Settings::values.frame_pacing_mode.SetValue(box.clickedButton() == fps30
+                                                    ? Settings::FramePacingMode::Target_30
+                                                    : Settings::FramePacingMode::Target_60);
     Settings::values.oot_fps_asked.SetValue(true);
     UpdateOotFpsButton();
     config->SaveAllValues();
@@ -5375,67 +5375,37 @@ void MainWindow::UpdateGPUAccuracyButton() {
     gpu_accuracy_button->setChecked(gpu_accuracy != Settings::GpuAccuracy::Low);
 }
 
-// Shows and cycles Settings oot_frame_rate: 60 -> 30 -> Unlocked -> 60.
+// The FPS button at the bottom of the window: the shared frame target (frame_pacing_mode) every
+// game follows. It shows the active choice and opens the list of the others.
 void MainWindow::UpdateOotFpsButton() {
-    using Settings::OotFrameRate;
-    const auto rate = Settings::values.oot_frame_rate.GetValue();
-    oot_fps_button->setChecked(rate != OotFrameRate::Fps60);
-    const char* forced_hz = std::getenv("EDEN_NX2_VSYNC_HZ");
-    const u32 limit_hz =
-        forced_hz != nullptr
-            ? static_cast<u32>((std::max)(std::strtoll(forced_hz, nullptr, 10), 1LL))
-            : (std::max<u32>)(Settings::values.frame_rate_limit.GetValue(), 1);
-    const bool unlocked =
-        !Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0;
-    if (unlocked) {
-        oot_fps_button->setEnabled(false);
-        oot_fps_button->setText(tr("FPS UNLOCKED"));
-        oot_fps_button->setToolTip(tr("Ocarina of Time %1: %2 is off, so it has no effect. Turn "
-                                      "it back on (Toggle Framerate Limit hotkey or Settings > "
-                                      "%3).")
-                                       .arg(UiText::SettingLabel("oot_frame_rate"),
-                                            UiText::SettingLabel("speed_limit"),
-                                            UiText::Text("page.system")));
-        return;
-    }
+    using Settings::FramePacingMode;
+    const auto mode = Settings::values.frame_pacing_mode.GetValue();
+    const auto names = UiText::ChoiceNames<FramePacingMode>();
+    oot_fps_button->setCheckable(false);
     oot_fps_button->setEnabled(true);
-    const auto names = UiText::ChoiceNames<OotFrameRate>();
-    switch (rate) {
-    case OotFrameRate::Fps30:
-    case OotFrameRate::Fps60:
-        oot_fps_button->setText(names.at(rate).toUpper());
-        break;
-    case OotFrameRate::Unlocked:
-        oot_fps_button->setText(tr("%1 FPS MAX").arg(limit_hz));
-        break;
-    }
+    oot_fps_button->setText(names.at(mode).toUpper());
     oot_fps_button->setToolTip(
-        tr("Ocarina of Time %1. Click to switch: %2, %3, %4 (%5 = %6 Hz%7). It takes effect at "
-           "once.")
-            .arg(UiText::SettingLabel("oot_frame_rate"), names.at(OotFrameRate::Fps60),
-                 names.at(OotFrameRate::Fps30), names.at(OotFrameRate::Unlocked),
-                 UiText::SettingLabel("frame_rate_limit"))
-            .arg(limit_hz)
-            .arg(forced_hz != nullptr ? tr(", EDEN_NX2_VSYNC_HZ") : QString{}));
+        tr("%1: the frame rate every game aims for. Click to change it. %2 leaves it to the "
+           "emulator, %3 removes the cap.")
+            .arg(UiText::SettingLabel("frame_pacing_mode"), names.at(FramePacingMode::Target_Auto),
+                 names.at(FramePacingMode::Unlocked)));
 }
 
 void MainWindow::OnToggleOotFrameRate() {
-    using Settings::OotFrameRate;
-    auto& rate = Settings::values.oot_frame_rate;
-    switch (rate.GetValue()) {
-    case OotFrameRate::Fps60:
-        rate.SetValue(OotFrameRate::Fps30);
-        break;
-    case OotFrameRate::Fps30:
-        rate.SetValue(OotFrameRate::Unlocked);
-        break;
-    case OotFrameRate::Unlocked:
-        rate.SetValue(OotFrameRate::Fps60);
-        break;
+    using Settings::FramePacingMode;
+    QMenu menu;
+    for (const auto& [mode, name] : UiText::ChoiceNames<FramePacingMode>()) {
+        QAction* const action = menu.addAction(name);
+        action->setCheckable(true);
+        action->setChecked(mode == Settings::values.frame_pacing_mode.GetValue());
+        connect(action, &QAction::triggered, this, [this, mode] {
+            Settings::values.frame_pacing_mode.SetValue(mode);
+            Settings::values.oot_fps_asked.SetValue(true);
+            UpdateOotFpsButton();
+            config->SaveAllValues();
+        });
     }
-    Settings::values.oot_fps_asked.SetValue(true);
-    UpdateOotFpsButton();
-    config->SaveAllValues();
+    menu.exec(oot_fps_button->mapToGlobal(QPoint(0, -menu.sizeHint().height())));
 }
 
 void MainWindow::UpdateDockedButton() {

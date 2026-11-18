@@ -443,7 +443,7 @@ const Setting kSettings[] = {
                                               "{setting:frame_rate_limit}. The game keeps its normal "
                                               "speed at each (its time step follows real time).\n"
                                               "Takes effect at once."),
-     Desktop | IOS},
+     Nowhere},
     {"mkw_frame_rate",
      QT_TRANSLATE_NOOP("ConfigurationShared", "Frame Rate"),
      QT_TRANSLATE_NOOP("ConfigurationShared", "{choice:mkw_frame_rate.Game}: no change. "
@@ -551,9 +551,9 @@ const Setting kSettings[] = {
                                               "GPUs without ASTC.")},
     {"frame_pacing_mode",
      QT_TRANSLATE_NOOP("ConfigurationShared", "Frame Rate Target"),
-     QT_TRANSLATE_NOOP("ConfigurationShared", "Controls how the emulator manages frame pacing to "
-                                              "reduce stuttering and make the frame rate smoother and "
-                                              "more consistent."),
+     QT_TRANSLATE_NOOP("ConfigurationShared", "The frame rate every game aims for (also the FPS "
+                                              "button at the bottom of the window). Unlocked removes "
+                                              "the cap. Auto leaves pacing to the emulator."),
      Desktop | IOS},
     {"vram_usage_mode",
      QT_TRANSLATE_NOOP("ConfigurationShared", "VRAM Usage Mode"),
@@ -1584,6 +1584,7 @@ const Choice kChoices[] = {
     CHOICE(FramePacingMode, Target_60, QT_TRANSLATE_NOOP("ConfigurationShared", "60 FPS")),
     CHOICE(FramePacingMode, Target_90, QT_TRANSLATE_NOOP("ConfigurationShared", "90 FPS")),
     CHOICE(FramePacingMode, Target_120, QT_TRANSLATE_NOOP("ConfigurationShared", "120 FPS")),
+    CHOICE(FramePacingMode, Unlocked, QT_TRANSLATE_NOOP("ConfigurationShared", "Unlocked")),
     CHOICE(VramUsageMode, Conservative, QT_TRANSLATE_NOOP("ConfigurationShared", "Conservative")),
     CHOICE(VramUsageMode, Aggressive, QT_TRANSLATE_NOOP("ConfigurationShared", "Aggressive")),
     CHOICE(RendererBackend, Vulkan, QT_TRANSLATE_NOOP("ConfigurationShared", "Vulkan")),

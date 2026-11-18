@@ -480,17 +480,52 @@ namespace {
 constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
 }
 
+namespace {
+// Ocarina of Time follows the shared frame target (frame_pacing_mode); only Auto falls back to its
+// own stored oot_frame_rate (the device profile default).
+OotFrameRate OcarinaRate() {
+    switch (values.frame_pacing_mode.GetValue()) {
+    case FramePacingMode::Target_30:
+        return OotFrameRate::Fps30;
+    case FramePacingMode::Target_60:
+        return OotFrameRate::Fps60;
+    case FramePacingMode::Target_90:
+    case FramePacingMode::Target_120:
+    case FramePacingMode::Unlocked:
+        return OotFrameRate::Unlocked;
+    case FramePacingMode::Target_Auto:
+        break;
+    }
+    return values.oot_frame_rate.GetValue();
+}
+} // namespace
+
+// The vsync rate every game starts frames on: the shared frame target (frame_pacing_mode), or the
+// frame_rate_limit setting with Auto. Ocarina of Time stays at 60 unless the target is above it
+// (OcarinaHalfRate covers 30).
 u16 FrameRateLimit() {
-    if (GetCurrentProgramID() == OcarinaOfTimeId &&
-        values.oot_frame_rate.GetValue() != OotFrameRate::Unlocked) {
+    if (GetCurrentProgramID() == OcarinaOfTimeId && OcarinaRate() != OotFrameRate::Unlocked) {
         return 60;
+    }
+    switch (values.frame_pacing_mode.GetValue()) {
+    case FramePacingMode::Target_30:
+        return 30;
+    case FramePacingMode::Target_60:
+        return 60;
+    case FramePacingMode::Target_90:
+        return 90;
+    case FramePacingMode::Target_120:
+        return 120;
+    case FramePacingMode::Unlocked:
+        return 240;
+    case FramePacingMode::Target_Auto:
+        break;
     }
     return values.frame_rate_limit.GetValue();
 }
 
 bool OcarinaHalfRate(u64 program_id) {
-    return program_id == OcarinaOfTimeId &&
-           values.oot_frame_rate.GetValue() == OotFrameRate::Fps30;
+    return program_id == OcarinaOfTimeId && OcarinaRate() == OotFrameRate::Fps30;
 }
 
 OcarinaDlssMode OcarinaDlssModeFor(OotResolution resolution) {

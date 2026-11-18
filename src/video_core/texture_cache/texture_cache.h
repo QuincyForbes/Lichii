@@ -3426,6 +3426,23 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
     }
 }
 
+// A staging buffer whose memory is not host-mapped (or a short one) can't take an upload: the
+// CPU would write through a null span (GPU thread crash in UnswizzleTexture).
+inline bool StagingUsable(std::span<u8> mapped, u64 needed) {
+    if (mapped.data() != nullptr && mapped.size_bytes() >= needed) {
+        return true;
+    }
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+        LOG_ERROR(HW_GPU,
+                  "Texture upload skipped: staging buffer {} ({} of {} bytes mapped); retried "
+                  "at the next use",
+                  mapped.data() == nullptr ? "is not host-mapped" : "is too small",
+                  mapped.size_bytes(), needed);
+    }
+    return false;
+}
+
 template <class P>
 void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     if (False(image.flags & ImageFlagBits::CpuModified)) {
@@ -3521,6 +3538,12 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         if (upload_trace) [[unlikely]] {
             staging_end = std::chrono::steady_clock::now();
         }
+        if (!StagingUsable(staging.mapped_span, MapSizeBytes(image))) {
+            // Retried at the next use instead of writing through a null or short mapping.
+            image.flags |= ImageFlagBits::CpuModified;
+            runtime.TransitionImageLayout(image);
+            return;
+        }
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
     }
@@ -3586,6 +3609,10 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
             continue; // padding between levels or layers
         }
         auto staging = runtime.UploadStagingBuffer(plan.total_host_bytes);
+        if (!StagingUsable(staging.mapped_span, plan.total_host_bytes)) {
+            image.flags |= ImageFlagBits::CpuModified;
+            break;
+        }
         ExecuteUnswizzlePlan(*gpu_memory, plan, staging.mapped_span);
         image.UploadMemory(staging, plan.copies);
     }
