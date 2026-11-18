@@ -272,6 +272,11 @@ public:
         return packed_shift;
     }
 
+    /// A5B5G5R1: an RGBA8 texture, moved to and from the guest's words by kernels.
+    [[nodiscard]] bool IsPack5551() const noexcept {
+        return pack5551;
+    }
+
     u64 allocation_tick{};
 
 private:
@@ -301,6 +306,7 @@ private:
 
     TextureCacheRuntime* runtime{};
     u32 packed_shift{};
+    bool pack5551{};
     SparseTiles sparse;
     Object texture;
     /// The texture at the scaled size, made on the first ScaleUp.

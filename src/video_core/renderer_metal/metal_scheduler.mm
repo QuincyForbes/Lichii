@@ -406,6 +406,43 @@ kernel void swap_packed(uint3 id [[thread_position_in_grid]],
                  : ushort((v & ~m) | (v & 31u) << p.shift | (v >> p.shift & 31u));
 }
 
+// A5B5G5R1 (guest bits: alpha 15-11, blue 10-6, green 5-1, a 1-bit red at 0) is an RGBA8 texture
+// on the host; these two move whole regions between it and the guest's 16-bit words.
+struct PackParams {
+    uint2 origin;
+    uint2 extent;
+    uint row_words;
+};
+
+kernel void pack5551_from_buffer(uint2 id [[thread_position_in_grid]],
+                                 texture2d<float, access::write> dst [[texture(0)]],
+                                 device const ushort* words [[buffer(0)]],
+                                 constant PackParams& p [[buffer(1)]]) {
+    if (any(id >= p.extent)) {
+        return;
+    }
+    const uint v = words[id.y * p.row_words + id.x];
+    const float a = float((v >> 11) & 31u) / 31.0;
+    const float b = float((v >> 6) & 31u) / 31.0;
+    const float g = float((v >> 1) & 31u) / 31.0;
+    dst.write(float4(float(v & 1u), g, b, a), p.origin + id);
+}
+
+kernel void pack5551_to_buffer(uint2 id [[thread_position_in_grid]],
+                               texture2d<float> src [[texture(0)]],
+                               device ushort* words [[buffer(0)]],
+                               constant PackParams& p [[buffer(1)]]) {
+    if (any(id >= p.extent)) {
+        return;
+    }
+    const float4 c = src.read(p.origin + id);
+    const uint r = c.r >= 0.5 ? 1u : 0u;
+    const uint g = uint(round(saturate(c.g) * 31.0));
+    const uint b = uint(round(saturate(c.b) * 31.0));
+    const uint a = uint(round(saturate(c.a) * 31.0));
+    words[id.y * p.row_words + id.x] = ushort((a << 11) | (b << 6) | (g << 1) | r);
+}
+
 kernel void depth_to_buffer(uint2 id [[thread_position_in_grid]],
                             depth2d<float> depth [[texture(0)]],
                             texture2d<uint> stencil [[texture(1)]],
@@ -1513,6 +1550,8 @@ struct Scheduler::Impl {
     std::unordered_map<u64, id<MTLRenderPipelineState>> depth_upload_pipelines;
     id<MTLComputePipelineState> depth_download = nil;
     id<MTLComputePipelineState> swap_packed = nil;
+    id<MTLComputePipelineState> pack5551_from = nil;
+    id<MTLComputePipelineState> pack5551_to = nil;
     id<MTLBuffer> zero_buffer = nil;
     id<MTLCommandBuffer> command_buffer = nil;
     id<MTLBlitCommandEncoder> blit = nil;
@@ -2454,6 +2493,59 @@ bool Scheduler::UpdateSparseTiles(TextureHandle texture_handle,
                              mipLevel:op.level
                                 slice:0];
     }
+    [encoder endEncoding];
+    return true;
+}
+
+bool Scheduler::Pack5551(bool to_buffer, TextureHandle texture_handle, u32 level, u32 slice,
+                         Offset3D origin, Extent3D extent, BufferHandle buffer, u64 offset,
+                         u32 bytes_per_row) {
+    const id<MTLTexture> texture = AsTexture(texture_handle);
+    if (texture == nil || buffer == nullptr || extent.width == 0 || extent.height == 0 ||
+        offset % 2 != 0 || bytes_per_row % 2 != 0 ||
+        (texture.textureType != MTLTextureType2D && texture.textureType != MTLTextureType2DArray)) {
+        return false;
+    }
+    impl->FlushClear();
+    Impl& state = *impl;
+    id<MTLComputePipelineState> pipeline = to_buffer ? state.pack5551_to : state.pack5551_from;
+    if (pipeline == nil && state.library != nil) {
+        NSError* error = nil;
+        pipeline = [state.device.GetDevice()
+            newComputePipelineStateWithFunction:
+                [state.library newFunctionWithName:to_buffer ? @"pack5551_to_buffer"
+                                                             : @"pack5551_from_buffer"]
+                                          error:&error];
+        if (pipeline == nil) {
+            LOG_ERROR(Render_Metal, "Metal: A5B5G5R1 kernel failed: {}",
+                      error.localizedDescription.UTF8String);
+        } else if (to_buffer) {
+            state.pack5551_to = pipeline;
+        } else {
+            state.pack5551_from = pipeline;
+        }
+    }
+    const id<MTLTexture> view = [texture newTextureViewWithPixelFormat:texture.pixelFormat
+                                                           textureType:MTLTextureType2D
+                                                                levels:NSMakeRange(level, 1)
+                                                                slices:NSMakeRange(slice, 1)];
+    if (pipeline == nil || view == nil) {
+        return false;
+    }
+    state.EndEncoder();
+    state.NoteInOrder(buffer);
+    ++state.encoders;
+    ++state.segment_encoders;
+    const id<MTLComputeCommandEncoder> encoder = [state.Commands() computeCommandEncoder];
+    encoder.label = @"A5B5G5R1 copy";
+    [encoder setComputePipelineState:pipeline];
+    [encoder setTexture:view atIndex:0];
+    [encoder setBuffer:AsBuffer(buffer) offset:offset atIndex:0];
+    const std::array<u32, 6> params{origin.x, origin.y, extent.width, extent.height,
+                                    bytes_per_row / 2, 0};
+    [encoder setBytes:params.data() length:sizeof(params) atIndex:1];
+    [encoder dispatchThreadgroups:MTLSizeMake((extent.width + 7) / 8, (extent.height + 7) / 8, 1)
+            threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
     [encoder endEncoding];
     return true;
 }

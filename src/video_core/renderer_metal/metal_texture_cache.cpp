@@ -302,7 +302,7 @@ u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
 bool TextureCacheRuntime::ShouldReinterpret(Image& dst, Image& src) const noexcept {
     // Two formats of one Metal format keep their guest bits apart when one of them is swapped.
     return dst.HostFormat().format != src.HostFormat().format ||
-           dst.PackedShift() != src.PackedShift();
+           dst.PackedShift() != src.PackedShift() || dst.IsPack5551() != src.IsPack5551();
 }
 
 void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
@@ -424,7 +424,8 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
         return IsColor(image.HostFormat().format_class) ||
                (CopiesEnabled() && image.CanCopyWithBuffers());
     };
-    if (dst.Handle() == nullptr || src.Handle() == nullptr || converted ||
+    if (dst.Handle() == nullptr || src.Handle() == nullptr || converted || src.IsPack5551() ||
+        dst.IsPack5551() ||
         src.info.num_samples != 1 || dst.info.num_samples != 1 || !copyable(src) ||
         !copyable(dst) || !blocks_fit ||
         VideoCore::Surface::BytesPerBlock(src_format) !=
@@ -798,6 +799,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     host_format = SurfaceFormat(runtime->device, info.format, converted);
     if (info.type != ImageType::Buffer && !converted) {
         packed_shift = PackedSwapShift(info.format);
+        pack5551 = info.format == PixelFormat::A5B5G5R1_UNORM;
     }
     if (info.type == ImageType::Buffer) {
         // Texel buffers are views of the buffer cache's buffers (milestone 3).
@@ -1240,6 +1242,17 @@ void Image::UploadMemory(BufferHandle buffer, size_t offset,
         const auto [bytes_per_row, bytes_per_image] = CopyPitches(copy);
         const s32 layers = is_3d ? 1 : (std::max)(copy.image_subresource.num_layers, 1);
         for (s32 layer = 0; layer < layers; ++layer) {
+            if (pack5551 && !is_3d && !multisampled) {
+                if (!runtime->scheduler.Pack5551(
+                        false, target, static_cast<u32>(copy.image_subresource.base_level),
+                        static_cast<u32>(copy.image_subresource.base_layer + layer),
+                        ToOffset(copy.image_offset), extent, buffer,
+                        offset + copy.buffer_offset + u64{bytes_per_image} * layer,
+                        bytes_per_row)) {
+                    LOG_ONCE(warned_pack, "Metal: an upload of {} was dropped", info.format);
+                }
+                continue;
+            }
             if (depth_layout) {
                 if (!runtime->scheduler.DepthFromBuffer(
                         buffer, offset + copy.buffer_offset + u64{bytes_per_image} * layer,
@@ -1343,6 +1356,17 @@ void Image::DownloadMemory(std::span<BufferHandle> buffers, std::span<size_t> of
             const auto [bytes_per_row, bytes_per_image] = CopyPitches(copy);
             const s32 layers = is_3d ? 1 : (std::max)(copy.image_subresource.num_layers, 1);
             for (s32 layer = 0; layer < layers; ++layer) {
+                if (pack5551 && !is_3d && !multisampled) {
+                    if (!runtime->scheduler.Pack5551(
+                            true, source, static_cast<u32>(copy.image_subresource.base_level),
+                            static_cast<u32>(copy.image_subresource.base_layer + layer),
+                            ToOffset(copy.image_offset), extent, buffers[index],
+                            offsets[index] + copy.buffer_offset + u64{bytes_per_image} * layer,
+                            bytes_per_row)) {
+                        LOG_ONCE(warned_pack, "Metal: a download of {} was dropped", info.format);
+                    }
+                    continue;
+                }
                 if (depth_layout) {
                     if (!runtime->scheduler.DepthToBuffer(
                             source, static_cast<u32>(copy.image_subresource.base_level),

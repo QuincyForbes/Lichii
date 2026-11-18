@@ -18,9 +18,6 @@ using VideoCore::Surface::PixelFormat;
 
 namespace {
 
-// zortos293's TryTransformSwizzleIfNeeded: A5B5G5R1 as R5G5B5A1 read A<->R, G<->B.
-constexpr std::array<u8, 4> SwapSpecial{Swizzle::Alpha, Swizzle::Blue, Swizzle::Green,
-                                        Swizzle::Red};
 
 struct Entry {
     u32 format;
@@ -50,7 +47,9 @@ Entry Lookup(PixelFormat format) {
     case PixelFormat::A2B10G10R10_UINT: return {Fmt::RGB10A2Uint, A, S};
     case PixelFormat::A2R10G10B10_UNORM: return {Fmt::BGR10A2Unorm, A, N};
     case PixelFormat::A1B5G5R5_UNORM: return {Fmt::BGR5A1Unorm, A, N};
-    case PixelFormat::A5B5G5R1_UNORM: return {Fmt::A1BGR5Unorm, N, N, SwapSpecial};
+    // 5 bits of alpha on top and a 1-bit red: no Metal format has them, so an RGBA8 texture
+    // converted to and from the guest's words by kernels (Scheduler::Pack5551).
+    case PixelFormat::A5B5G5R1_UNORM: return {Fmt::RGBA8Unorm, A, S};
     case PixelFormat::R8_UNORM: return {Fmt::R8Unorm, A, S};
     case PixelFormat::R8_SNORM: return {Fmt::R8Snorm, A, S};
     case PixelFormat::R8_SINT: return {Fmt::R8Sint, A, S};
@@ -242,6 +241,11 @@ FormatInfo SurfaceFormat(PixelFormat format, bool converted) {
         // VideoCommon::ExpandTexels.
         case PixelFormat::R32G32B32_FLOAT: decoded = Fmt::RGBA32Float; break;
         case PixelFormat::G4R4_UNORM: decoded = Fmt::RG8Unorm; break;
+        // VideoCommon::DecodeEtc.
+        case PixelFormat::EAC_R11_UNORM: decoded = Fmt::R16Unorm; break;
+        case PixelFormat::EAC_R11_SNORM: decoded = Fmt::R16Snorm; break;
+        case PixelFormat::EAC_R11G11_UNORM: decoded = Fmt::RG16Unorm; break;
+        case PixelFormat::EAC_R11G11_SNORM: decoded = Fmt::RG16Snorm; break;
         default: break;
         }
         return FormatInfo{

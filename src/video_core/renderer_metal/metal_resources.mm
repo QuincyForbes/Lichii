@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -11,6 +13,7 @@
 #include "common/alignment.h"
 #include "common/div_ceil.h"
 #include "common/logging.h"
+#include "video_core/texture_cache/decode_etc.h"
 #include "video_core/renderer_metal/metal_archive.h"
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_device.h"
@@ -247,6 +250,12 @@ bool IsConverted(const Device& device, PixelFormat format) {
     }
     if (VideoCore::Surface::IsPixelFormatBCn(format)) {
         return !device.SupportsBCTextures();
+    }
+    if (VideoCommon::IsEtcFormat(format)) {
+        // Apple GPUs read ETC2 and EAC; Intel and AMD Macs don't (decoded on the CPU,
+        // VideoCommon::DecodeEtc). EDEN_NX2_METAL_ETC=cpu decodes them on any GPU.
+        const char* const value = std::getenv("EDEN_NX2_METAL_ETC");
+        return device.AppleFamily() == 0 || (value != nullptr && std::strcmp(value, "cpu") == 0);
     }
     // Metal has no 96-bit and no 8-bit 4:4 format.
     if (VideoCommon::IsExpandedFormat(format)) {
