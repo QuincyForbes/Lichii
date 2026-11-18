@@ -948,6 +948,16 @@ void RegsOfRecord(Maxwell& regs, const Record& record) {
                                                           : Tess::OutputPrimitives::Triangles_CCW);
     regs.patch_vertices = state.patch_control_points_minus_one.Value() + 1;
     regs.point_size = std::bit_cast<f32>(state.point_size);
+    if (state.dynamic_state.logic_op_enable != 0) {
+        regs.logic_op.enable = 1;
+        regs.logic_op.op = Vulkan::FixedPipelineState::UnpackLogicOp(
+            state.dynamic_state.logic_op.Value());
+    }
+    if (state.viewport_swizzles[0] != 0) {
+        // A stored swizzle of viewport 0 (zero: the record has none).
+        regs.viewport_scale_offset_enabled = 1;
+        regs.viewport_transform[0].swizzle.raw = state.viewport_swizzles[0];
+    }
     if (record.has_mesh) {
         regs.reg_array[Maxwell::MeshControl] = 1;
     }

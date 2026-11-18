@@ -325,6 +325,10 @@ private:
     /// game asks (pipelines with flat inputs; EDEN_NX2_METAL_PROVOKING_LAST=0: never).
     [[nodiscard]] bool ProvokingLastWanted(const GraphicsPipeline& pipeline);
 
+    /// Whether an indexed draw of a strip with the restart off has its 16-bit indices widened,
+    /// so that 0xFFFF stays a vertex (Metal restarts strips at it).
+    [[nodiscard]] bool RestartOffWidens(bool is_indexed);
+
     /// Counts a draw not done, and logs the cause with the draw's state the first time.
     void RefuseDraw(std::string_view cause);
 

@@ -61,6 +61,11 @@ struct GraphicsPipelineKey {
     u32 state{};
     u32 alpha_test_ref{}; ///< float bits, zero unless the test compares with it
     u32 point_size{};     ///< float bits, zero unless points are drawn
+    /// Raster state the programs are patched for (metal_raster_patch.h). Bits 0-3: the logic
+    /// operation (VkLogicOp) when `logic_formats` is not zero; bits 8-19: viewport 0's swizzle
+    /// when the vertex program does it.
+    u32 raster{};
+    u32 logic_formats{}; ///< 4 bits per colour target: RasterPatch::LogicFormat
 
     bool operator==(const GraphicsPipelineKey&) const noexcept = default;
 
@@ -281,11 +286,17 @@ private:
     std::optional<TranslatedPipeline> Tessellated(const GraphicsPipelineKey& key,
                                                   std::span<Shader::IR::Program> programs);
 
+    /// The raster state of `key` done in the program's MSL (logic operation, viewport swizzle).
+    void PatchRasterState(std::string& msl, ShaderTranslate::Stage stage,
+                          const GraphicsPipelineKey& key);
+
     [[nodiscard]] std::optional<StageProgram> Translate(
         Shader::IR::Program& program, ShaderTranslate::Stage stage,
         Shader::Backend::Bindings& bindings, const Shader::RuntimeInfo& runtime_info,
         const ShaderTranslate::Options* options = nullptr);
 
+    /// The key Graphics is translating: its raster state patches the MSL Translate makes.
+    const GraphicsPipelineKey* patch_key{};
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
     ShaderTranslate::Options translate_options;

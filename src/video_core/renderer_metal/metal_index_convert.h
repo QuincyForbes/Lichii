@@ -30,6 +30,10 @@ using Topology = Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology;
 /// Whether the provoking vertex rewrite takes the topology (triangle lists and strips).
 [[nodiscard]] bool RotatesForProvokingVertex(Topology topology) noexcept;
 
+/// Whether Metal restarts the topology's strips at the all-ones index when it draws them as they
+/// are (the rewritten ones carry no restart).
+[[nodiscard]] bool RestartsStrips(Topology topology) noexcept;
+
 /// What the rewritten list is drawn as: Triangles for quads, quad strips, fans, polygons and
 /// triangle adjacency (and strips with `provoking_last`), LineStrip for line loops and line
 /// strips with adjacency, Lines for lines with adjacency, the topology itself otherwise.

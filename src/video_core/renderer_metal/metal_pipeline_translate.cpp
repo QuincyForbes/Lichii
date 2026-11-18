@@ -23,6 +23,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/feature_census.h"
 #include "video_core/renderer_metal/metal_pipeline_translate.h"
+#include "video_core/renderer_metal/metal_raster_patch.h"
 #include "video_core/renderer_metal/metal_switches.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
@@ -167,6 +168,8 @@ void RefreshFixedState(GraphicsPipelineKey& key, const Maxwell& regs) {
     key.state = 0;
     key.alpha_test_ref = 0;
     key.point_size = 0;
+    key.raster = 0;
+    key.logic_formats = 0;
     if (!FixedStateEnabled()) {
         return;
     }
@@ -215,6 +218,17 @@ void RefreshFixedState(GraphicsPipelineKey& key, const Maxwell& regs) {
             Maxwell::PrimitiveTopology::Points ||
         regs.IsMeshEnabled()) {
         key.point_size = std::bit_cast<u32>(regs.point_size);
+    }
+    if (key.unique_hashes[5] != 0) {
+        const RasterPatch::LogicState logic = RasterPatch::LogicStateOf(regs);
+        key.raster |= logic.op;
+        key.logic_formats = logic.formats;
+    }
+    if (RasterPatch::ViewportSwizzleEnabled() && regs.viewport_scale_offset_enabled != 0) {
+        const u32 swizzle = regs.viewport_transform[0].swizzle.raw & 0x7777;
+        if (RasterPatch::SwizzleInProgram(swizzle)) {
+            key.raster |= swizzle << 8;
+        }
     }
 }
 
@@ -374,6 +388,29 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
     translate_options.apple_family = apple_family;
 }
 
+void PipelineTranslator::PatchRasterState(std::string& msl, ShaderTranslate::Stage stage,
+                                          const GraphicsPipelineKey& key) {
+    static std::atomic<u32> failed{};
+    const auto note = [&](const char* what) {
+        if (failed.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Metal, "Metal: {} not applied to the program of pipeline {:016x}",
+                        what, key.Hash());
+        }
+    };
+    if (stage == ShaderTranslate::Stage::Fragment && key.logic_formats != 0) {
+        const RasterPatch::LogicState logic{.op = key.raster & 15, .formats = key.logic_formats};
+        if (!RasterPatch::ApplyLogicOp(msl, logic)) {
+            note("the logic operation");
+        }
+    } else if ((stage == ShaderTranslate::Stage::Vertex ||
+                stage == ShaderTranslate::Stage::TessellationEvaluation) &&
+               ((key.raster >> 8) & 0xFFF) != 0) {
+        if (!RasterPatch::ApplyViewportSwizzle(msl, (key.raster >> 8) & 0xFFF)) {
+            note("the viewport swizzle");
+        }
+    }
+}
+
 std::optional<StageProgram> PipelineTranslator::Translate(
     Shader::IR::Program& program, ShaderTranslate::Stage stage,
     Shader::Backend::Bindings& bindings, const Shader::RuntimeInfo& runtime_info,
@@ -382,6 +419,9 @@ std::optional<StageProgram> PipelineTranslator::Translate(
     const std::vector<u32> spirv = EmitSPIRV(profile, runtime_info, program, bindings);
     ShaderTranslate::Result result = ShaderTranslate::SpirvToMsl(
         spirv, stage, options != nullptr ? *options : translate_options);
+    if (!result.source.empty() && patch_key != nullptr) {
+        PatchRasterState(result.source, stage, *patch_key);
+    }
     if (result.source.empty()) {
         static std::atomic<u32> logged{};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -468,6 +508,13 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
     cause.clear();
     detail.clear();
     native_cause.clear();
+    patch_key = &key;
+    struct ClearKey {
+        const GraphicsPipelineKey*& key;
+        ~ClearKey() {
+            key = nullptr;
+        }
+    } clear_key{patch_key};
     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
     size_t mesh_index = 0;
     if (!TranslatePrograms(key, envs, programs, mesh_index)) {

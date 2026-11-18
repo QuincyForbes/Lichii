@@ -665,6 +665,9 @@ bool ClearFitsTargets(const ClearPass& clear, const RenderTargetSet& targets) {
 
 struct Scheduler::Impl {
     explicit Impl(const Device& device_) : device{device_}, queue{device_.GetQueue()} {
+        if (@available(macOS 26.0, iOS 26.0, *)) {
+            depth_bounds = [device_.GetDevice() supportsFamily:MTLGPUFamilyApple10];
+        }
         NSError* error = nil;
         library = [device.GetDevice() newLibraryWithSource:@(BlitSource) options:nil error:&error];
         if (library == nil) {
@@ -1461,6 +1464,8 @@ struct Scheduler::Impl {
     StageBindings mesh_bound;
     DrawState render_state{};
     bool render_state_valid{};
+    /// The device's GPU has the depth bounds test (the Apple10 family).
+    bool depth_bounds{};
     StageBindings compute_bound;
     const void* compute_pipeline{};
     StageBindings kernel_bound;
@@ -2673,6 +2678,13 @@ void Scheduler::SetDrawState(const DrawState& state) {
     if (changed(last.depth_bias != state.depth_bias || last.slope_scale != state.slope_scale ||
                 last.bias_clamp != state.bias_clamp)) {
         [encoder setDepthBias:state.depth_bias slopeScale:state.slope_scale clamp:state.bias_clamp];
+    }
+    if (impl->depth_bounds && changed(last.depth_bounds_min != state.depth_bounds_min ||
+                                      last.depth_bounds_max != state.depth_bounds_max)) {
+        if (@available(macOS 26.0, iOS 26.0, *)) {
+            // A public Metal 4-era call, but the GPU must have the test: its family is checked.
+            [encoder setDepthTestMinBound:state.depth_bounds_min maxBound:state.depth_bounds_max];
+        }
     }
     if (changed(last.stencil_front_ref != state.stencil_front_ref ||
                 last.stencil_back_ref != state.stencil_back_ref)) {

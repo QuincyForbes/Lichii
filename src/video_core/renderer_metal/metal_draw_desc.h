@@ -18,6 +18,15 @@ namespace Metal {
 void FillRegisterState(RenderPipelineDesc& desc, const Maxwell& regs,
                        Maxwell::PrimitiveTopology topology, bool mesh);
 
+/// The topology a draw is drawn with: the guest's, or Points for triangles whose polygon mode is
+/// point (Metal has no point fill mode: the vertices are drawn as points, each once per index).
+/// EDEN_NX2_METAL_POINT_FILL=0: as the guest's.
+[[nodiscard]] Maxwell::PrimitiveTopology DrawTopology(const Tegra::Engines::Maxwell3D& engine);
+
+/// DrawTopology from the registers and the guest's topology.
+[[nodiscard]] Maxwell::PrimitiveTopology PointFillTopology(const Maxwell& regs,
+                                                           Maxwell::PrimitiveTopology topology);
+
 /// A vertex stream's layout; `bound`: the stream has a buffer.
 void FillStream(RenderPipelineDesc& desc, const Maxwell& regs, size_t index, bool bound,
                 u32 stride);

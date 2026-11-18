@@ -27,6 +27,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/renderer_metal/metal_draw_desc.h"
 #include "video_core/renderer_metal/metal_pipeline_cache.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_switches.h"
@@ -689,8 +690,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         refusal = "shader programs not in guest memory";
         return nullptr;
     }
-    PipelineTranslator::RefreshKey(graphics_key, maxwell3d->regs,
-                                   maxwell3d->draw_manager.draw_state.topology);
+    PipelineTranslator::RefreshKey(graphics_key, maxwell3d->regs, DrawTopology(*maxwell3d));
     if (current_pipeline != nullptr && current_pipeline->Key() == graphics_key) {
         current_pipeline->SetLastUse(frame_count);
         return current_pipeline;

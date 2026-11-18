@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "video_core/renderer_metal/metal_draw_desc.h"
+#include "video_core/renderer_metal/metal_raster_patch.h"
 
 namespace Metal {
 
@@ -23,15 +24,50 @@ u32 TopologyClass(Maxwell::PrimitiveTopology topology) {
     }
 }
 
+Maxwell::PrimitiveTopology DrawTopology(const Tegra::Engines::Maxwell3D& engine) {
+    return PointFillTopology(engine.regs, engine.draw_manager.draw_state.topology);
+}
+
+Maxwell::PrimitiveTopology PointFillTopology(const Maxwell& regs,
+                                             Maxwell::PrimitiveTopology topology) {
+    switch (topology) {
+    case Maxwell::PrimitiveTopology::Triangles:
+    case Maxwell::PrimitiveTopology::TriangleStrip:
+    case Maxwell::PrimitiveTopology::TriangleFan:
+    case Maxwell::PrimitiveTopology::Quads:
+    case Maxwell::PrimitiveTopology::QuadStrip:
+    case Maxwell::PrimitiveTopology::Polygon:
+        break;
+    default:
+        return topology;
+    }
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_POINT_FILL");
+        return value == nullptr || value[0] != '0';
+    }();
+    // Both faces in point mode; a cull of both faces draws nothing and stays with the guest's.
+    const bool culls_all = regs.gl_cull_test_enabled != 0 &&
+                           regs.gl_cull_face == Maxwell::CullFace::FrontAndBack;
+    return enabled && !culls_all && regs.polygon_mode_front == Maxwell::PolygonMode::Point &&
+                   regs.polygon_mode_back == Maxwell::PolygonMode::Point
+               ? Maxwell::PrimitiveTopology::Points
+               : topology;
+}
+
 void FillRegisterState(RenderPipelineDesc& desc, const Maxwell& regs,
                        Maxwell::PrimitiveTopology topology, bool mesh) {
+    // A logic operation replaces blending where the pixel program does it (RasterPatch).
+    const RasterPatch::LogicState logic = RasterPatch::LogicStateOf(regs);
     for (size_t rt = 0; rt < Maxwell::NumRenderTargets; ++rt) {
         const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : rt];
         BlendTargetState& blend = desc.blend[rt];
         blend.write_mask = (mask.R != 0 ? 1U : 0U) | (mask.G != 0 ? 2U : 0U) |
                            (mask.B != 0 ? 4U : 0U) | (mask.A != 0 ? 8U : 0U);
         const bool per_target = regs.blend_per_target_enabled != 0;
-        blend.enable = regs.blend.enable[per_target ? rt : 0] != 0 ? 1U : 0U;
+        blend.enable = regs.blend.enable[per_target ? rt : 0] != 0 &&
+                               logic.Format(rt) == RasterPatch::LogicFormat::None
+                           ? 1U
+                           : 0U;
         if (per_target) {
             const auto& src = regs.blend_per_target[rt];
             blend.color_op = src.color_op;
