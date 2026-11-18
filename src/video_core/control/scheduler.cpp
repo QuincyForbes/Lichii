@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -62,7 +65,8 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
     }
 }
 
-void Scheduler::ResumePending(GPU& gpu) {
+bool Scheduler::ResumePending(GPU& gpu) {
+    bool any_moved = false;
     // Running one channel can release the semaphore another waits for: retry until none moves.
     for (bool progress = true; progress;) {
         progress = false;
@@ -72,20 +76,30 @@ void Scheduler::ResumePending(GPU& gpu) {
             // pending: resuming it again counted as progress forever and the GPU thread never
             // reached its stop request (closing the game hung).
             if (!dma_pusher.system.IsPoweredOn()) {
-                return;
+                return any_moved;
             }
             if (!dma_pusher.HasPendingAcquire() || !dma_pusher.CanResumeAcquire()) {
                 continue;
             }
             BindChannel(gpu, state->bind_id);
             dma_pusher.DispatchCalls();
+            if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                split.Publish();
+            }
             progress = true;
+            any_moved = true;
+        }
+    }
+    if (any_moved) {
+        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+            split.Publish();
         }
     }
     std::erase_if(pending_channels, [](const auto& state) {
         return !state->payload->dma_pusher.HasPendingAcquire();
     });
     any_pending.store(!pending_channels.empty(), std::memory_order_release);
+    return any_moved;
 }
 
 void Scheduler::DeclareChannel(std::shared_ptr<ChannelState> new_channel) {

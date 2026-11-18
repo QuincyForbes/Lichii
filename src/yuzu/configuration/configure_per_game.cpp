@@ -43,6 +43,7 @@
 #include <QScreen>
 #include <QScrollArea>
 #include <QShowEvent>
+#include <QSignalBlocker>
 #include <QStandardPaths>
 #include <QString>
 #include <QTimer>
@@ -50,6 +51,7 @@
 #include <QtConcurrent/QtConcurrentRun>
 
 #include "common/fs/fs_util.h"
+#include "common/game_presets.h"
 #include "common/settings_enums.h"
 #include "common/settings_input.h"
 #include "common/string_util.h"
@@ -71,6 +73,7 @@
 #include "yuzu/configuration/configure_applets.h"
 #include "yuzu/configuration/configure_audio.h"
 #include "yuzu/configuration/configure_cpu.h"
+#include "yuzu/configuration/configure_frame_generation.h"
 #include "yuzu/configuration/configure_graphics.h"
 #include "yuzu/configuration/configure_graphics_advanced.h"
 #include "yuzu/configuration/configure_graphics_extensions.h"
@@ -78,6 +81,7 @@
 #include "yuzu/configuration/configure_network.h"
 #include "yuzu/configuration/configure_per_game.h"
 #include "yuzu/configuration/configure_per_game_addons.h"
+#include "yuzu/configuration/configure_per_game_tweaks.h"
 #include "yuzu/configuration/configure_system.h"
 #include "yuzu/configuration/recommended_settings.h"
 #include "yuzu/util/lichii_style.h"
@@ -371,45 +375,44 @@ int ScoreCandidateTitle(const std::string& candidate, const std::string& query) 
 } // namespace
 
 ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::string& file_name,
-                                   std::vector<VkDeviceInfo::Record>& vk_device_records,
+                                   std::vector<VkDeviceInfo::Record>& vk_device_records_,
                                    Core::System& system_)
     : QDialog(parent), ui(std::make_unique<Ui::ConfigurePerGame>()),
       file_path(std::filesystem::path(Common::FS::ToU8String(file_name))), title_id{title_id_},
       system{system_},
       builder{std::make_unique<ConfigurationShared::Builder>(this, !system_.IsPoweredOn())},
-      tab_group{std::make_shared<std::vector<ConfigurationShared::Tab*>>()} {
+      tab_group{std::make_shared<std::vector<ConfigurationShared::Tab*>>()},
+      vk_device_records{vk_device_records_} {
     // The tabs list only the settings that apply to this game.
     Settings::SetConfiguringProgramId(title_id);
     const auto config_file_name = title_id == 0 ? Common::FS::PathToUTF8String(file_path.filename())
                                                 : fmt::format("{:016X}", title_id);
     game_config = std::make_unique<QtConfig>(config_file_name, Config::ConfigType::PerGameConfig);
     addons_tab = std::make_unique<ConfigurePerGameAddons>(system_, this);
-    audio_tab = std::make_unique<ConfigureAudio>(system_, tab_group, *builder, this);
-    cpu_tab = std::make_unique<ConfigureCpu>(system_, tab_group, *builder, this);
-    graphics_advanced_tab =
-        std::make_unique<ConfigureGraphicsAdvanced>(system_, tab_group, *builder, this);
-    graphics_extensions_tab =
-        std::make_unique<ConfigureGraphicsExtensions>(system_, tab_group, *builder, this);
-    graphics_tab = std::make_unique<ConfigureGraphics>(
-        system_, vk_device_records, [&]() { graphics_advanced_tab->ExposeComputeOption(); },
-        [](Settings::AspectRatio, Settings::ResolutionSetup) {}, tab_group, *builder, this);
     input_tab = std::make_unique<ConfigureInputPerGame>(system_, game_config.get(), this);
-    system_tab = std::make_unique<ConfigureSystem>(system_, tab_group, *builder, this);
     network_tab = std::make_unique<ConfigureNetwork>(system_, this);
-    applets_tab = std::make_unique<ConfigureApplets>(system_, tab_group, *builder, this);
+    BuildSettingTabs();
+    if (ConfigurePerGameTweaks::HasContent(title_id)) {
+        tweaks_tab = std::make_unique<ConfigurePerGameTweaks>(title_id, system_, *builder, this);
+        connect(tweaks_tab.get(), &ConfigurePerGameTweaks::ApplyRecommendedRequested, this,
+                &ConfigurePerGame::ApplyRecommendedSettings);
+    }
 
     ui->setupUi(this);
+    AddTabs();
 
     UiText::ApplyCatalogue(this);
 
-    const auto make_scroll_page = [this](QWidget* page) {
-        auto* area = new QScrollArea(this);
-        area->setFrameShape(QFrame::NoFrame);
-        area->setWidgetResizable(true);
-        area->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
-        area->setWidget(page);
-        return area;
-    };
+    if (tweaks_tab != nullptr) {
+        connect(ui->tabWidget, &QTabWidget::currentChanged, this, [this](int index) {
+            if (index >= 0 && tweaks_tab != nullptr &&
+                ui->tabWidget->widget(index)->isAncestorOf(tweaks_tab.get()) &&
+                !system.IsPoweredOn()) {
+                ApplySettingTabs();
+                tweaks_tab->RefreshRecommendations();
+            }
+        });
+    }
 
     // Let the Info sidebar scroll vertically on high-DPI screens shorter than its full height.
     auto* info_scroll = new QScrollArea(this);
@@ -421,25 +424,6 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
     info_scroll->setWidget(ui->groupBox);
     ui->horizontalLayout->insertWidget(0, info_scroll);
 
-    // The iOS app's Game Settings order and names: the settings pages as in Settings, then the
-    // game's content.
-    // A tab title shows "&" as "&&".
-    const auto tab = [](std::string_view id) {
-        return UiText::Text(id).replace(QLatin1Char('&'), QStringLiteral("&&"));
-    };
-    ui->tabWidget->addTab(make_scroll_page(graphics_tab.get()), tab("page.graphics"));
-    ui->tabWidget->addTab(make_scroll_page(graphics_advanced_tab.get()),
-                          tab("section.advanced_graphics"));
-    ui->tabWidget->addTab(make_scroll_page(audio_tab.get()), tab("page.audio"));
-    ui->tabWidget->addTab(make_scroll_page(system_tab.get()), tab("page.system"));
-    ui->tabWidget->addTab(make_scroll_page(cpu_tab.get()), tab("section.cpu"));
-    ui->tabWidget->addTab(make_scroll_page(input_tab.get()), tab("page.controls"));
-    ui->tabWidget->addTab(make_scroll_page(addons_tab.get()), tab("game.addons"));
-    ui->tabWidget->addTab(make_scroll_page(network_tab.get()), tab("section.network"));
-    ui->tabWidget->addTab(make_scroll_page(applets_tab.get()), tab("category.LibraryApplet"));
-    ui->tabWidget->addTab(make_scroll_page(graphics_extensions_tab.get()),
-                          tab("section.hacks_extensions"));
-    ui->tabWidget->setUsesScrollButtons(true);
 
     // What the iOS app says at the top of a game's settings.
     QLabel* const overrides_note =
@@ -508,7 +492,7 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
     reset->setObjectName(QStringLiteral("lichiiDestructive"));
     reset->setToolTip(tr("Gives this game the recommended settings for this device and removes "
                          "its other overrides."));
-    connect(reset, &QAbstractButton::clicked, this, [this, &vk_device_records] {
+    connect(reset, &QAbstractButton::clicked, this, [this] {
         if (RecommendedSettings::ConfirmAndResetGame(this, *builder, vk_device_records)) {
             game_config->SaveAllValues();
             if (system.IsPoweredOn()) {
@@ -523,6 +507,9 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
 }
 
 ConfigurePerGame::~ConfigurePerGame() {
+    // Deleting the tab pages makes the tab widget switch tabs; don't run the handler on a
+    // half-destroyed dialog.
+    ui->tabWidget->blockSignals(true);
     if (detect_cancel) {
         detect_cancel->store(true);
     }
@@ -539,9 +526,109 @@ void ConfigurePerGame::done(int result) {
     QDialog::done(result);
 }
 
-void ConfigurePerGame::ApplyConfiguration() {
+void ConfigurePerGame::BuildSettingTabs() {
+    tab_group->clear();
+    audio_tab = std::make_unique<ConfigureAudio>(system, tab_group, *builder, this);
+    cpu_tab = std::make_unique<ConfigureCpu>(system, tab_group, *builder, this);
+    graphics_advanced_tab =
+        std::make_unique<ConfigureGraphicsAdvanced>(system, tab_group, *builder, this);
+    graphics_extensions_tab =
+        std::make_unique<ConfigureGraphicsExtensions>(system, tab_group, *builder, this);
+    graphics_tab = std::make_unique<ConfigureGraphics>(
+        system, vk_device_records, [&]() { graphics_advanced_tab->ExposeComputeOption(); },
+        [](Settings::AspectRatio, Settings::ResolutionSetup) {}, tab_group, *builder, this);
+    system_tab = std::make_unique<ConfigureSystem>(system, tab_group, *builder, this);
+    applets_tab = std::make_unique<ConfigureApplets>(system, tab_group, *builder, this);
+}
+
+void ConfigurePerGame::AddTabs() {
+    // The pages wrap the persistent tabs in scroll areas: take them back out, so the areas can
+    // go without taking the tabs with them.
+    while (ui->tabWidget->count() > 0) {
+        QWidget* const page = ui->tabWidget->widget(0);
+        ui->tabWidget->removeTab(0);
+        if (auto* const old_area = qobject_cast<QScrollArea*>(page)) {
+            if (QWidget* const inner = old_area->takeWidget()) {
+                inner->setParent(this);
+                inner->hide();
+            }
+            old_area->deleteLater();
+        }
+    }
+    const auto make_scroll_page = [this](QWidget* page) {
+        auto* area = new QScrollArea(this);
+        area->setFrameShape(QFrame::NoFrame);
+        area->setWidgetResizable(true);
+        area->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        area->setWidget(page);
+        return area;
+    };
+
+    // The iOS app's Game Settings order and names: the settings pages as in Settings, then the
+    // game's content.
+    // A tab title shows "&" as "&&".
+    const auto tab = [](std::string_view id) {
+        return UiText::Text(id).replace(QLatin1Char('&'), QStringLiteral("&&"));
+    };
+    ui->tabWidget->addTab(make_scroll_page(graphics_tab.get()), tab("page.graphics"));
+    ui->tabWidget->addTab(make_scroll_page(graphics_advanced_tab.get()),
+                          tab("section.advanced_graphics"));
+    ui->tabWidget->addTab(make_scroll_page(audio_tab.get()), tab("page.audio"));
+    ui->tabWidget->addTab(make_scroll_page(system_tab.get()), tab("page.system"));
+    ui->tabWidget->addTab(make_scroll_page(cpu_tab.get()), tab("section.cpu"));
+    ui->tabWidget->addTab(make_scroll_page(input_tab.get()), tab("page.controls"));
+    ui->tabWidget->addTab(make_scroll_page(addons_tab.get()), tab("game.addons"));
+    if (tweaks_tab != nullptr) {
+        ui->tabWidget->addTab(make_scroll_page(tweaks_tab.get()), tr("Tweaks"));
+    }
+    ui->tabWidget->addTab(make_scroll_page(network_tab.get()), tab("section.network"));
+    ui->tabWidget->addTab(make_scroll_page(applets_tab.get()), tab("category.LibraryApplet"));
+    ui->tabWidget->addTab(make_scroll_page(graphics_extensions_tab.get()),
+                          tab("section.hacks_extensions"));
+    ui->tabWidget->setUsesScrollButtons(true);
+}
+
+void ConfigurePerGame::ApplySettingTabs() {
     for (const auto tab : *tab_group) {
         tab->ApplyConfiguration();
+    }
+}
+
+void ConfigurePerGame::ApplyRecommendedSettings(const std::set<std::string>& keys) {
+    const auto* preset = Settings::FindGamePreset(title_id);
+    if (preset == nullptr || keys.empty() || system.IsPoweredOn()) {
+        return;
+    }
+    // Keep the edits made in the other tabs, then rebuild them to show the new values.
+    ApplySettingTabs();
+    Settings::SetRecommendedSettings(Settings::values, *preset, false, &keys);
+
+    const int current = ui->tabWidget->currentIndex();
+    {
+        [[maybe_unused]] const QSignalBlocker blocker(ui->tabWidget);
+        // The tabs are rebuilt below: take the old ones out of their scroll areas first.
+        while (ui->tabWidget->count() > 0) {
+            QWidget* const page = ui->tabWidget->widget(0);
+            ui->tabWidget->removeTab(0);
+            if (auto* const old_area = qobject_cast<QScrollArea*>(page)) {
+                if (QWidget* const inner = old_area->takeWidget()) {
+                    inner->setParent(this);
+                    inner->hide();
+                }
+                old_area->deleteLater();
+            }
+        }
+        BuildSettingTabs();
+        AddTabs();
+        ui->tabWidget->setCurrentIndex(current);
+    }
+    tweaks_tab->RefreshRecommendations();
+}
+
+void ConfigurePerGame::ApplyConfiguration() {
+    ApplySettingTabs();
+    if (tweaks_tab != nullptr) {
+        tweaks_tab->ApplyConfiguration();
     }
     addons_tab->ApplyConfiguration();
     input_tab->ApplyConfiguration();

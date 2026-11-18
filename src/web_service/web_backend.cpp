@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -11,9 +14,7 @@
 #include <fmt/ranges.h>
 #include "common/httplib.h"
 
-#ifdef YUZU_BUNDLED_OPENSSL
-#include <openssl/cert.h>
-#endif
+#include "common/net/ca_store.h"
 
 #include "common/logging.h"
 #include "web_service/web_backend.h"
@@ -77,9 +78,7 @@ struct Client::Impl {
             cli->set_connection_timeout(TIMEOUT_SECONDS);
             cli->set_read_timeout(TIMEOUT_SECONDS);
             cli->set_write_timeout(TIMEOUT_SECONDS);
-#ifdef YUZU_BUNDLED_OPENSSL
-            cli->load_ca_cert_store(kCert, sizeof(kCert));
-#endif
+            Common::Net::ConfigureCaStore(*cli);
         }
         if (!cli->is_valid()) {
             LOG_ERROR(WebService, "Invalid URL {}", host + path);

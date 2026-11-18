@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -19,6 +22,7 @@
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/texture_cache/accelerated_swizzle.h"
+#include "video_core/texture_cache/plain_unswizzle.h"
 
 namespace VideoCommon {
 struct SwizzleParameters;
@@ -68,6 +72,17 @@ public:
 private:
     Scheduler& scheduler;
     StagingBufferPool& staging_pool;
+    ComputePassDescriptorQueue& descriptor_queue;
+};
+
+class PlainUnswizzlePass final : public ComputePass {
+public:
+    PlainUnswizzlePass(const Device& device, Scheduler& scheduler, DescriptorPool& descriptor_pool,
+                      ComputePassDescriptorQueue& descriptor_queue);
+    void Dispatch(VkBuffer source, VkDeviceSize offset, VkBuffer destination,
+                  const VideoCommon::PlainUnswizzleParameters& parameters, u32 guard_bytes = 0);
+private:
+    Scheduler& scheduler;
     ComputePassDescriptorQueue& descriptor_queue;
 };
 

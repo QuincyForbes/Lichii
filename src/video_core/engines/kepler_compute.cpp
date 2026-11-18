@@ -132,7 +132,9 @@ void KeplerCompute::ConsumeSinkImpl(Core::System& system) {
         if ((method & SplitPlainTag) != 0) {
             // GpuSplit::SinkMethod (EDEN_NX2_COMPUTE_SINK): as CallMethod's native plain path.
             method &= ~SplitPlainTag;
-            native_registers[method] = value;
+            if (method < native_registers.size()) {
+                native_registers[method] = value;
+            }
         }
         if (method < Regs::NUM_REGS) {
             regs.reg_array[method] = value;
@@ -158,6 +160,16 @@ void KeplerCompute::ApplyPairs(Core::System& system, const u64* pairs, u32 count
     }
 }
 
+void KeplerCompute::CallStateMethod(Core::System& system, u32 method, u32 method_argument) {
+    (void)system;
+    if (method < native_registers.size()) {
+        native_registers[method] = method_argument;
+    }
+    if (method < Regs::NUM_REGS) {
+        regs.reg_array[method] = method_argument;
+    }
+}
+
 // SET_REPORT_SEMAPHORE_A-D (0x6c0-0x6c3): address high/low, payload, then operation in bits 1:0
 // (release / acquire / report only / trap), reduction enable bit 3 with the op in bits 11:9, and
 // a one-word (no timestamp) structure in bit 28. NVN2 releases queue syncs from compute this way.
@@ -176,11 +188,18 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
         LOG_WARNING(HW_GPU, "Native compute report semaphore operation {} not supported", operation);
         return;
     }
+    if (address == 0) {
+        return;
+    }
     if ((argument >> 3) & 1) {
         const u32 reduction = (argument >> 9) & 7;
         rasterizer->SignalFence([this, address, payload, reduction] {
-            memory_manager.Write<u32>(address, ReduceSemaphore(reduction, false,
-                                                               memory_manager.Read<u32>(address), payload));
+            const u32 value = ReduceSemaphore(reduction, false,
+                                              memory_manager.Read<u32>(address), payload);
+            memory_manager.Write<u32>(address, value);
+            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+            }
         });
         return;
     }
@@ -520,16 +539,18 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             return true;
         }
         native_macro->native_execution_failed = true;
-        std::array<u32, 128> qmd{};
-        if (memory_manager.IsFullyMappedRange(qmd_address, sizeof(qmd))) {
-            memory_manager.ReadBlockUnsafe(qmd_address, qmd.data(), sizeof(qmd));
-        }
         // Log a failing program's first few dispatches only (QMD words 48-49 hold its code
         // address); it fails the same way every frame.
         static std::unordered_map<u64, u32> failures;
-        const u64 program = (u64{qmd[49]} << 32) | qmd[48];
-        if (failures[program ^ std::hash<std::string>{}(std::string{error})]++ >= 2) {
+        const u64 failure_key =
+            (error == "native shader dispatch required" ? regs.code_loc.Address() : qmd_address) ^
+            std::hash<std::string_view>{}(error);
+        if (failures[failure_key]++ >= 2) {
             return true;
+        }
+        std::array<u32, 128> qmd{};
+        if (memory_manager.IsFullyMappedRange(qmd_address, sizeof(qmd))) {
+            memory_manager.ReadBlockUnsafe(qmd_address, qmd.data(), sizeof(qmd));
         }
         LOG_ERROR(HW_GPU, "Native QMD failed: {}", error);
         if (qmd_diagnostics && memory_manager.IsFullyMappedRange(qmd_address, sizeof(qmd))) {
@@ -618,6 +639,19 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
 
 void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) {
     if (native_mode) {
+        if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) [[unlikely]] {
+            ReleaseFront();
+        }
+        if (method < native_plain_methods.size() && native_plain_methods[method]) {
+            if (amount > 0) {
+                const u32 last = base_start[amount - 1];
+                native_registers[method] = last;
+                if (method < Regs::NUM_REGS) {
+                    regs.reg_array[method] = last;
+                }
+            }
+            return;
+        }
         for (u32 i = 0; i < amount; ++i) CallMethod(system, method, base_start[i], methods_pending - i <= 1);
         return;
     }
@@ -766,7 +800,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
             return from_width >= 64 && to_width > from_width && to_width <= from_width * 4 &&
                    (cross_a > cross_b ? cross_a - cross_b : cross_b - cross_a) * 32 <= cross_a;
         };
-        const auto [reads, stores] = NativeImageHandles(regs.code_loc.Address());
+        const auto& [reads, stores] = NativeImageHandles(regs.code_loc.Address());
         std::optional<Texture::TICEntry> replacement_input;
         std::optional<Texture::TICEntry> replacement_output;
         if (native_upscale_input && network_skip_remaining > 0 && !stores.empty()) {
@@ -922,10 +956,11 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
             LOG_ERROR(HW_GPU, "Native compute shader rejected: {}", error.what());
         }
         dispatched = false;
+        const bool matrix_multiply =
+            std::string_view{error.what()}.find("matrix multiply") != std::string_view::npos;
         if (dlss_chain.active) {
             ++dlss_chain.rejected;
-        } else if (std::string_view{error.what()}.find("matrix multiply") !=
-                   std::string_view::npos) {
+        } else if (matrix_multiply) {
             DescribeNativeResources(qmd);
             LOG_ERROR(HW_GPU, "Native tensor dispatch is unsupported; no validated replacement was available");
         }
@@ -1353,10 +1388,12 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
 }
 
 std::atomic<u32> g_nx2_trace_draws_after_upscale{};
+std::atomic<u64> g_nx2_scene_target{};
+std::atomic<u64> g_nx2_scene_target_size{};
 
 // The cbuf0 byte offsets of the texture handles a native program reads (TEX, TLD, TLD4, TXD) and
 // the surface handles it stores to (SUST.P), from its code up to the first unconditional EXIT.
-std::pair<std::vector<u32>, std::vector<u32>> KeplerCompute::NativeImageHandles(GPUVAddr program) {
+const std::pair<std::vector<u32>, std::vector<u32>>& KeplerCompute::NativeImageHandles(GPUVAddr program) {
     static std::unordered_map<GPUVAddr, std::pair<std::vector<u32>, std::vector<u32>>> cache;
     if (const auto it = cache.find(program); it != cache.end()) {
         return it->second;
@@ -1394,7 +1431,7 @@ std::pair<std::vector<u32>, std::vector<u32>> KeplerCompute::NativeImageHandles(
 
 void KeplerCompute::RememberNativeUpscaleInput() {
     native_upscale_input.reset();
-    const auto [reads, stores] = NativeImageHandles(regs.code_loc.Address());
+    const auto& [reads, stores] = NativeImageHandles(regs.code_loc.Address());
     if (reads.size() != 1 || !stores.empty()) return;
     const auto& cbuf = launch_description.const_buffer_config[0];
     if (reads.front() + sizeof(u32) > cbuf.size.Value()) return;
@@ -1422,6 +1459,7 @@ void KeplerCompute::RememberDlssMotionVectors() {
         return;
     }
     const auto image = [&](u32 offset) -> std::optional<Texture::TICEntry> {
+        if (offset + sizeof(u32) > cbuf.size.Value()) return std::nullopt;
         const u32 tic_index = memory_manager.Read<u32>(cbuf_address + offset) & 0xfffff;
         if (tic_index > regs.tic.limit || !memory_manager.IsFullyMappedRange(
                 regs.tic.Address() + u64{tic_index} * sizeof(Texture::TICEntry),
@@ -2124,8 +2162,16 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
                                          u32 methods_pending, const GPUVAddr* segment) {
     auto& fs = Front(split);
     if (method >= 0xe00 && method < fs.registers.size()) {
-        for (u32 i = 0; i < amount; ++i) {
-            FrontCallMethod(system, split, method, base_start[i], methods_pending - i <= 1, segment);
+        if (!fs.executing_macro) {
+            if (method & 1) {
+                LOG_ERROR(HW_GPU, "Native compute macro starts on argument method");
+                return;
+            }
+            fs.executing_macro = method;
+        }
+        fs.parameters.insert(fs.parameters.end(), base_start, base_start + amount);
+        if (amount >= methods_pending) {
+            FrontRunMacro(system, split, fs);
         }
         return;
     }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -92,6 +95,16 @@ public:
 
     [[nodiscard]] u64 CommandBufferEpoch() const noexcept {
         return command_buffer_epoch;
+    }
+
+    void InvalidateInputState() {
+        (*flags)[Dirty::VertexInput] = true;
+        (*flags)[Dirty::PrimitiveRestartEnable] = true;
+        for (std::size_t index = VideoCommon::Dirty::VertexBuffer0;
+             index <= VideoCommon::Dirty::VertexBuffer31; ++index) {
+            (*flags)[index] = true;
+        }
+        current_topology = INVALID_TOPOLOGY;
     }
 
     void InvalidateInputState() {

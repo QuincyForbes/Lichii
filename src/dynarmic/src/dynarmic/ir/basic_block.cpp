@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -72,7 +75,7 @@ void Block::Reset(LocationDescriptor location_) noexcept {
     ASSERT(instructions.size() == 0);
 }
 
-static std::string TerminalToString(const Term::Terminal& terminal_variant) noexcept {
+static std::string TerminalToString([[maybe_unused]] const Term::Terminal& terminal_variant) noexcept {
     // struct : boost::static_visitor<std::string> {
     //     std::string operator()(const std::monostate&) const {
     //         return "<invalid>";

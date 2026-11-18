@@ -34,6 +34,7 @@
 
 #include <fmt/ostream.h>
 
+#include "common/driver_shader_cache.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -70,6 +71,10 @@
 #endif
 #include "yuzu_cmd/emu_window/emu_window_sdl3_null.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3_vk.h"
+#ifdef YUZU_ENABLE_MCP
+#include "mcp/server.h"
+#include "yuzu_cmd/mcp_host_cli.h"
+#endif
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/resource.h>
@@ -421,6 +426,11 @@ struct SdlState {
     Core::LaunchParams ios_launch_template;
     Core::SystemResultStatus ios_load_result{Core::SystemResultStatus::Success};
     std::unique_ptr<IosBootSession> ios_boot;
+#endif
+#ifdef YUZU_ENABLE_MCP
+    // Built-in MCP server (only with --mcp): destroyed before the system shuts down.
+    std::unique_ptr<CliMcpHost> mcp_host;
+    std::unique_ptr<Mcp::Server> mcp_server;
 #endif
 };
 
@@ -1218,6 +1228,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         return BuildWarm(state->system, argc, argv) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
     }
 
+    if (argc > 1 && std::string_view{argv[1]} == "--build-warm") {
+        return BuildWarm(state->system, argc, argv) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
+
     int option_index = 0;
 #ifdef _WIN32
     int argc_w;
@@ -1267,6 +1281,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         Common::Log::SetGlobalFilter(filter);
     }
 #endif
+    // Before anything loads a GPU driver.
+    Common::ConfigureDriverShaderCache(Settings::values.private_driver_shader_cache.GetValue(),
+                                       Settings::values.driver_shader_cache_size.GetValue());
+    Common::CreateDriverShaderCacheFolder();
 
     Core::ApplyLaunchParams(lp);
 
@@ -1634,6 +1652,31 @@ static void StartGame(SdlState* state, [[maybe_unused]] const Core::LaunchParams
         restart_requested = true;
     });
 
+    // A game executing a program (e.g. restarting after a settings change) writes its launch state
+    // to the restart handoff and quits with kRestartExitCode; the launcher boots the same file again
+    // with EDEN_CLI_RESTART_HANDOFF set. Mirrors MainWindow::OnExecuteProgram.
+    state->system.RegisterExecuteProgramCallback([system = &state->system](std::size_t program_index) {
+        RestartHandoff handoff{
+            .program_index = static_cast<s32>(program_index),
+            .user_channel = system->GetUserChannel(),
+        };
+        const u64 previous_program_id = system->GetApplicationProcessProgramID();
+        if (previous_program_id > static_cast<u64>(Service::AM::AppletProgramId::MaxProgramId)) {
+            handoff.previous_program_index =
+                static_cast<s32>(previous_program_id - FileSys::GetBaseTitleID(previous_program_id));
+            handoff.program_id = previous_program_id;
+        }
+        // Without the handoff, a relaunch would boot as a frontend launch and clear temp storage.
+        if (!WriteRestartHandoff(handoff)) {
+            LOG_CRITICAL(Frontend, "ExecuteProgram: could not write {}, not restarting",
+                         Common::FS::PathToUTF8String(RestartHandoffPath()));
+            return;
+        }
+        LOG_INFO(Frontend, "ExecuteProgram: program index {}, exiting with code {} to restart",
+                 program_index, kRestartExitCode);
+        restart_requested = true;
+    });
+
     // QLaunch launched applications (should) now reload shader cache.
     static std::mutex shader_cache_reload_mutex;
     state->system.RegisterApplicationChangedCallback([state](u64 changed_program_id) {
@@ -1669,6 +1712,24 @@ static void StartGame(SdlState* state, [[maybe_unused]] const Core::LaunchParams
 #ifdef LICHII_IOS_UI
     if (ios_app) {
         IosFrontend::SetState(run ? LICHII_EMU_RUNNING : LICHII_EMU_PAUSED);
+    }
+#endif
+
+#ifdef YUZU_ENABLE_MCP
+    // eden-cli starts the MCP server only when asked (--mcp), so unattended runs never collide
+    // with a desktop emulator holding the port.
+    if (lp.mcp_enable) {
+        Mcp::ServerConfig mcp_config;
+        mcp_config.port = lp.mcp_port.value_or(Settings::values.mcp_port.GetValue());
+        mcp_config.allow_writes = lp.mcp_allow_writes || Settings::values.mcp_allow_writes.GetValue();
+        mcp_config.bearer_token = Settings::values.mcp_token.GetValue();
+        state->mcp_host = std::make_unique<CliMcpHost>(state->system, state->input_subsystem);
+        state->mcp_server =
+            std::make_unique<Mcp::Server>(state->system, *state->mcp_host, std::move(mcp_config));
+        if (const std::string error = state->mcp_server->Start(); !error.empty()) {
+            LOG_ERROR(Frontend, "MCP server: {}", error);
+            state->mcp_server.reset();
+        }
     }
 #endif
 }
@@ -1950,6 +2011,14 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     }
 #endif
     RunKeyScript(state->input_subsystem, state->system);
+#ifdef YUZU_ENABLE_MCP
+    if (state->mcp_host) {
+        state->mcp_host->DrainMainThread();
+        if (state->mcp_host->QuitRequested()) {
+            return SDL_APP_SUCCESS;
+        }
+    }
+#endif
     if (state->emu_window) {
         state->emu_window->ApplyPendingTitle();
     }
@@ -2022,6 +2091,10 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         state->ios_boot->thread.detach();
         return;
     }
+#endif
+#ifdef YUZU_ENABLE_MCP
+    state->mcp_server.reset(); // stops serving before the system goes away
+    state->mcp_host.reset();
 #endif
     state->system.DetachDebugger();
     // SDL calls this even when SDL_AppInit never powered the system on (no ROM given, --help or

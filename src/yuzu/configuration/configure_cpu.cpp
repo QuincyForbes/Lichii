@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -78,7 +81,8 @@ void ConfigureCpu::Setup(const ConfigurationShared::Builder& builder) {
         } else if (setting->Id() == Settings::values.cpu_backend.Id()) {
             backend_layout->addWidget(widget);
             backend_combobox = widget->combobox;
-        } else if (setting->Id() == Settings::values.cpu_ticks.Id()) {
+        } else if (setting->Id() == Settings::values.cpu_ticks.Id() ||
+                   setting->Id() == Settings::values.prefer_3d_vcache.Id()) {
             ui->general_layout->addWidget(widget);
         } else {
             // Presently, all other settings here are unsafe checkboxes

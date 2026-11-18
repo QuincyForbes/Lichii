@@ -50,8 +50,40 @@ constexpr size_t INST_SIZE = sizeof(u64);
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 
-// The shader hash of lowered native code (frame dump "shaders", pipeline cache keys), with a
-// version tag that isolates this experimental ABI.
+// A version tag in the hash isolates this experimental ABI.
+u64 NativeShaderHash(std::span<const u64> code) {
+    return Common::CityHash64(reinterpret_cast<const char*>(code.data()),
+                              code.size() * sizeof(u64)) ^
+           0x4f554e4345000002ULL;
+}
+
+std::vector<u64> LayOutLoweredNativeCode(std::span<const u64> header,
+                                         [[maybe_unused]] std::span<const Shader::Ampere::Instruction> native,
+                                         Shader::Ampere::LoweredProgram& lowered) {
+    std::vector<u64> code(header.begin(), header.end());
+    for (const u64 instruction : lowered.instructions) {
+        if ((code.size() * sizeof(u64)) % 32 == 0) {
+            code.push_back(0); // Maxwell scheduling word, absent from native instructions.
+        }
+        code.push_back(instruction);
+    }
+    // Keep the original padding ABI, then retain the native address map as
+    // unreachable data. Existing disk-cache serialization carries it with code.
+    code.push_back(0);
+    Shader::Ampere::AppendNativeAddressMap(code, lowered.source_instruction_offsets);
+    return code;
+}
+
+static u64 MakeCbufKey(u32 index, u32 offset) {
+    return (static_cast<u64>(index) << 32) | offset;
+}
+
+// Pointer-table entries share the classification map with plain constant buffer pointers.
+static u64 MakeIndirectCbufKey(u32 index, u32 offset, u32 indirect) {
+    return (u64{1} << 63) | (static_cast<u64>(indirect & 0x3fffff) << 40) |
+           MakeCbufKey(index, offset);
+}
+
 // Constant buffer slots that held a null pointer when the program was translated and were
 // therefore not bound as storage buffers. A later non-null value makes the translation stale.
 static std::vector<std::pair<u32, u32>> NullStoragePointerSlots(
@@ -82,21 +114,6 @@ static std::vector<u64> MappedStoragePointerKeys(
     }
     std::ranges::sort(keys);
     return keys;
-}
-
-static u64 NativeShaderHash(std::span<const u64> code) {
-    return Common::CityHash64(reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u64)) ^
-           0x4f554e4345000002ULL;
-}
-
-static u64 MakeCbufKey(u32 index, u32 offset) {
-    return (static_cast<u64>(index) << 32) | offset;
-}
-
-// Pointer-table entries share the classification map with plain constant buffer pointers.
-static u64 MakeIndirectCbufKey(u32 index, u32 offset, u32 indirect) {
-    return (u64{1} << 63) | (static_cast<u64>(indirect & 0x3fffff) << 40) |
-           MakeCbufKey(index, offset);
 }
 
 static Shader::TextureType ConvertTextureType(const Tegra::Texture::TICEntry& entry) {
@@ -826,29 +843,15 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     result->texture_bound = lowered.required_texture_buffer;
     result->source_size = native_header_size + lowered.source_size;
     result->trap_prefix.assign(native.begin(), native.begin() + trap_count);
-    auto& lowered_code = result->code;
-    // Kept for as long as the program is cached (the native programs of a game add up to tens
-    // of MiB): exactly the words it needs, not what push_back's growth leaves over.
-    size_t code_words = sizeof(sph) / sizeof(u64);
-    for (size_t i = 0; i < lowered.instructions.size(); ++i) {
-        code_words += (code_words * sizeof(u64)) % 32 == 0 ? 2 : 1;
+    std::array<u64, sizeof(sph) / sizeof(u64)> header;
+    std::memcpy(header.data(), &sph, sizeof(sph));
+    result->code = LayOutLoweredNativeCode(header, native, lowered);
+    // What Analyze returns for this program once the environment holds the lowered code.
+    const u64 shader_hash = NativeShaderHash(result->code);
+    if (VideoCommon::Nx2Diag::Active()) {
+        VideoCommon::Nx2Diag::Diagnostics::Get().RegisterProgram(
+            program_base, result->native_program_key, shader_hash);
     }
-    code_words += 1 + (lowered.source_instruction_offsets.empty()
-                           ? 0
-                           : lowered.source_instruction_offsets.size() + 2);
-    lowered_code.reserve(code_words);
-    lowered_code.resize(sizeof(sph) / sizeof(u64));
-    std::memcpy(lowered_code.data(), &sph, sizeof(sph));
-    for (const u64 instruction : lowered.instructions) {
-        if ((lowered_code.size() * sizeof(u64)) % 32 == 0) {
-            lowered_code.push_back(0); // Maxwell scheduling word, absent from native instructions.
-        }
-        lowered_code.push_back(instruction);
-    }
-    // Keep the original padding ABI, then retain the native address map as
-    // unreachable data. Existing disk-cache serialization carries it with code.
-    lowered_code.push_back(0);
-    Shader::Ampere::AppendNativeAddressMap(lowered_code, lowered.source_instruction_offsets);
     // EDEN_NX2_REJECT_HASH=<hash>,...: like EDEN_NX2_REJECT, but by native program key (shader
     // dump file names) or shader hash (frame dump "shaders"), which stay the same between runs.
     if (static const std::string reject_hashes = [] {
@@ -858,7 +861,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
             return list;
         }();
         !reject_hashes.empty()) {
-        for (const u64 hash : {result->native_program_key, NativeShaderHash(lowered_code)}) {
+        for (const u64 hash : {result->native_program_key, shader_hash}) {
             if (reject_hashes.find(fmt::format(",{:016x},", hash)) != std::string::npos) {
                 throw Shader::RuntimeError("Native shader at {:#x} ({:016x}) rejected by EDEN_NX2_REJECT_HASH",
                                            program_base, hash);
@@ -867,7 +870,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     }
     // The same list, changed at runtime by the debug server (docs/nx2/debug-mcp.md).
     if (VideoCore::Nx2Debug::AnyRejected()) {
-        for (const u64 hash : {result->native_program_key, NativeShaderHash(lowered_code)}) {
+        for (const u64 hash : {result->native_program_key, shader_hash}) {
             if (VideoCore::Nx2Debug::IsRejected(hash)) {
                 throw Shader::RuntimeError("Native shader at {:#x} ({:016x}) rejected by the debug server",
                                            program_base, hash);
@@ -1720,6 +1723,17 @@ void LoadPipelines(
         .read(reinterpret_cast<char*>(&cache_version), sizeof(cache_version));
     if (magic_number != MAGIC_NUMBER || cache_version != expected_cache_version) {
         file.close();
+        if (cache_version != expected_cache_version && magic_number == MAGIC_NUMBER) {
+            std::filesystem::path backup = filename;
+            backup += fmt::format(".v{}", cache_version);
+            std::error_code ec;
+            std::filesystem::rename(filename, backup, ec);
+            if (!ec) {
+                LOG_INFO(Common_Filesystem, "Renamed old pipeline cache (v{}) to {}",
+                         cache_version, Common::FS::PathToUTF8String(backup));
+                return;
+            }
+        }
         if (Common::FS::RemoveFile(filename)) {
             if (magic_number != MAGIC_NUMBER) {
                 LOG_ERROR(Common_Filesystem, "Invalid pipeline cache file");

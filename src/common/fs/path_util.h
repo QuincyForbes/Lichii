@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -257,6 +260,18 @@ void SetAppDirectory(const std::string& app_directory);
  * @returns The filesystem path associated with the LegacyPath enum as a UTF-8 encoded std::string.
  */
 [[nodiscard]] std::string GetLegacyPathString(EmuPath legacy_path);
+
+/**
+ * Gets the directory that holds a title's Vulkan pipeline cache files.
+ * Mario Kart World keeps them in a subdirectory of its shader cache directory.
+ *
+ * @param shader_dir Shader cache directory
+ * @param title_id Title ID
+ *
+ * @returns The Vulkan pipeline cache directory of the title.
+ */
+[[nodiscard]] std::filesystem::path GetVulkanPipelineCacheDir(
+    const std::filesystem::path& shader_dir, u64 title_id);
 
 /**
  * Sets a new filesystem path associated with the EdenPath enum.

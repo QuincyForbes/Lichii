@@ -6,7 +6,10 @@
 
 #include <QApplication>
 
+#include "common/driver_shader_cache.h"
 #include "common/fs/path_util.h"
+#include "common/settings.h"
+#include "frontend_common/config.h"
 #include "frontend_common/nx2_switches.h"
 #include "startup_checks.h"
 
@@ -31,6 +34,10 @@
 #include "main_window.h"
 #ifdef ENABLE_UPDATE_CHECKER
 #include "updater/update_dialog.h"
+#endif
+
+#ifdef YUZU_CRASH_DUMPS
+#include "yuzu/breakpad.h"
 #endif
 
 #ifdef _WIN32
@@ -92,6 +99,12 @@ int main(int argc, char* argv[]) {
     Updater::PrepareLaunch();
 #endif
     FrontendCommon::LoadNx2Switches(argv[0]);
+    // Before StartupChecks: its Vulkan check is the first thing to load a GPU driver. The config
+    // isn't loaded yet, so the setting is read from the file.
+    Config::ReadGlobalSettingEarly("qt-config", Settings::values.private_driver_shader_cache);
+    Config::ReadGlobalSettingEarly("qt-config", Settings::values.driver_shader_cache_size);
+    Common::ConfigureDriverShaderCache(Settings::values.private_driver_shader_cache.GetValue(),
+                                       Settings::values.driver_shader_cache_size.GetValue());
 #if YUZU_ROOM
     bool launch_room = false;
     for (int i = 1; i < argc; i++) {

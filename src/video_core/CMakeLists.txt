@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -133,12 +136,19 @@ add_library(video_core STATIC
     nx2_debug_control.h
     nx2_frame_fence.h
     nx2_diag.h
+    nx2_gpu_latency.h
     nx2_profile.h
     nx2_qmd_prediction.cpp
     nx2_qmd_prediction.h
     nx2_perf.h
     nx2_download_trace.h
     pending_maps.h
+    nx2_spikes.cpp
+    nx2_spikes.h
+    nx2_timeline.cpp
+    nx2_timeline.h
+    nx2_perf.cpp
+    ocarina_upscale.h
     present.h
     pte_kind.h
     query_cache/bank_base.h
@@ -189,6 +199,8 @@ add_library(video_core STATIC
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
     renderer_vulkan/pipeline_build.h
+    renderer_vulkan/pipeline_cache_dir.cpp
+    renderer_vulkan/pipeline_cache_dir.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
     renderer_vulkan/pipeline_shader_emission.h
@@ -211,7 +223,11 @@ add_library(video_core STATIC
     renderer_vulkan/vk_dlss_network_probe.h
     renderer_vulkan/vk_ocarina_camera_motion.cpp
     renderer_vulkan/vk_ocarina_camera_motion.h
+    renderer_vulkan/vk_camera_motion_pass.cpp
+    renderer_vulkan/vk_camera_motion_pass.h
     renderer_vulkan/vk_compute_pipeline.cpp
+    renderer_vulkan/vk_driver_build_report.cpp
+    renderer_vulkan/vk_driver_build_report.h
     renderer_vulkan/vk_compute_pipeline.h
     renderer_vulkan/vk_cooperative_hmma_test.cpp
     renderer_vulkan/vk_cooperative_hmma_test.h
@@ -244,6 +260,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_query_cache.cpp
     renderer_vulkan/vk_query_cache.h
     renderer_vulkan/vk_rasterizer.cpp
+    renderer_vulkan/upload_batch.h
     renderer_vulkan/vk_rasterizer.h
     renderer_vulkan/submission_policy.h
     renderer_vulkan/vk_render_pass_cache.cpp
@@ -298,6 +315,8 @@ add_library(video_core STATIC
     shader_cache.h
     shader_environment.cpp
     shader_environment.h
+    stage_cache.cpp
+    stage_cache.h
     shader_handle_program.h
     shader_notify.cpp
     shader_notify.h

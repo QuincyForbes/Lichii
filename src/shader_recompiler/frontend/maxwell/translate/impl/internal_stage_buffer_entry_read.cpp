@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -60,7 +63,7 @@ void TranslatorVisitor::ISBERD(u64 insn) {
         BitField<0, 8, IR::Reg> dest_reg;
         BitField<8, 8, IR::Reg> src_reg;
         BitField<8, 8, u32> src_reg_num;
-        BitField<24, 8, u32> imm;
+        BitField<24, 7, u32> imm;
         BitField<31, 1, u64> skew;
         BitField<32, 1, u64> o;
         BitField<33, 2, Mode> mode;

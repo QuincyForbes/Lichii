@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -242,15 +245,17 @@ void RemoveAddOnContent(u64 program_id, InstalledEntryType type) {
 
 void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) {
     const auto shader_cache_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
-    const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
+    const auto default_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
+    const auto vulkan_folder_path =
+        Common::FS::GetVulkanPipelineCacheDir(shader_cache_dir, program_id);
     const auto target_file = [&] {
         switch (target) {
         case GameListRemoveTarget::GlShaderCache:
             return VideoCommon::VersionedPipelineCachePath(
-                shader_cache_folder_path, "opengl", VideoCommon::OpenGLPipelineCacheVersion);
+                default_folder_path, "opengl", VideoCommon::OpenGLPipelineCacheVersion);
         case GameListRemoveTarget::VkShaderCache:
             return VideoCommon::VersionedPipelineCachePath(
-                shader_cache_folder_path, "vulkan", VideoCommon::VulkanPipelineCacheVersion);
+                vulkan_folder_path, "vulkan", VideoCommon::VulkanPipelineCacheVersion);
         default:
             return std::filesystem::path{};
         }
@@ -272,9 +277,9 @@ void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) 
 
 void RemoveVulkanDriverPipelineCache(u64 program_id) {
     const auto shader_cache_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
-    const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
     const auto target_file = VideoCommon::VersionedPipelineCachePath(
-        shader_cache_folder_path, "vulkan_pipelines", VideoCommon::VulkanPipelineCacheVersion);
+        Common::FS::GetVulkanPipelineCacheDir(shader_cache_dir, program_id), "vulkan_pipelines",
+        VideoCommon::VulkanPipelineCacheVersion);
 
     if (!Common::FS::Exists(target_file)) {
         return;

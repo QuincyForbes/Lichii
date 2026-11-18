@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 include(TargetArchitectureSpecificSources)
@@ -72,6 +75,7 @@ add_library(dynarmic STATIC
     frontend/imm.cpp
     frontend/imm.h
     interface/halt_reason.h
+    interface/jit_stats.h
     interface/exclusive_monitor.h
     interface/optimization_flags.h
     ir/acc_type.h

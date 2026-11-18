@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -80,12 +83,14 @@ public:
                 return;
             }
             const u32 next = item.next;
+            // func may Insert or Free, which can reallocate the pool: don't pass a reference into it.
+            const ObjectType obj = item.obj;
             if constexpr (RETURNS_BOOL) {
-                if (func(item.obj)) {
+                if (func(obj)) {
                     return;
                 }
             } else {
-                func(item.obj);
+                func(obj);
             }
             iterator = next;
         }

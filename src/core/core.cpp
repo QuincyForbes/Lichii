@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -22,10 +25,12 @@
 #include "common/settings_enums.h"
 #include "common/shutdown_progress.h"
 #include "common/string_util.h"
+#include "common/thread.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 
 #include "launch_timestamp_cache.h"
+#include "core/arm/debug.h"
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/debugger/debugger.h"
@@ -48,7 +53,9 @@
 #include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_resource_limit.h"
+#include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scheduler.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/service/acc/profile_manager.h"
@@ -80,6 +87,7 @@
 #include "network/network.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/nx2_diag.h"
+#include "video_core/nx2_spikes.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
 
@@ -189,6 +197,50 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
            metadata.IsSwitch2();
 }
 
+/// Frame spike recorder source: every application thread's CPU ticks, counting the running
+/// thread of each core up to now (the kernel only adds a thread's time when it switches out).
+bool ReadGuestThreadTicks(void* user, std::vector<VideoCommon::Nx2Spikes::GuestThreadTicks>& out,
+                          u64& clock) {
+    auto& system = *static_cast<System*>(user);
+    auto& kernel = system.Kernel();
+    Kernel::KProcess* const process = kernel.ApplicationProcess();
+    if (process == nullptr) {
+        return false;
+    }
+    clock = system.CoreTiming().GetClockTicks();
+    std::array<std::pair<const Kernel::KThread*, s64>, Hardware::NUM_CPU_CORES> running{};
+    for (size_t core = 0; core < running.size(); ++core) {
+        const Kernel::KScheduler& scheduler = kernel.Scheduler(core);
+        running[core] = {scheduler.GetSchedulerCurrentThread(), scheduler.GetLastContextSwitchTime()};
+    }
+    Kernel::KScopedLightLock lock{process->GetListLock()};
+    for (const Kernel::KThread& thread : process->GetThreadList()) {
+        u64 ticks = static_cast<u64>(thread.GetCpuTime());
+        for (const auto& [current, since] : running) {
+            if (current == &thread && static_cast<s64>(clock) > since) {
+                ticks += clock - static_cast<u64>(since);
+            }
+        }
+        out.push_back({thread.GetThreadId(), ticks, thread.GetActiveCore()});
+    }
+    return true;
+}
+
+std::string GuestThreadName(void* user, u64 id) {
+    auto& system = *static_cast<System*>(user);
+    Kernel::KProcess* const process = system.Kernel().ApplicationProcess();
+    if (process == nullptr) {
+        return {};
+    }
+    Kernel::KScopedLightLock lock{process->GetListLock()};
+    for (const Kernel::KThread& thread : process->GetThreadList()) {
+        if (thread.GetThreadId() == id) {
+            return GetThreadName(&thread).value_or("");
+        }
+    }
+    return {};
+}
+
 } // namespace
 
 struct System::Impl {
@@ -282,15 +334,16 @@ struct System::Impl {
 
         timezone_service->SetDeviceLocationName(name);
 
-        u64 time_offset = 0;
+        s64 time_offset = 0;
         if (Settings::values.custom_rtc_enabled) {
             time_offset = Settings::values.custom_rtc_offset.GetValue();
         }
 
         const auto posix_time = std::chrono::system_clock::now().time_since_epoch();
-        const u64 current_time =
-            +std::chrono::duration_cast<std::chrono::seconds>(posix_time).count();
-        const u64 new_time = current_time + time_offset;
+        const s64 current_time =
+            std::chrono::duration_cast<std::chrono::seconds>(posix_time).count();
+        const s64 target_time = current_time + time_offset;
+        const u64 new_time = static_cast<u64>((std::max<s64>)(0, target_time));
 
         Service::PSC::Time::SystemClockContext context{};
         settings_service->SetUserSystemClockContext(context);
@@ -536,6 +589,7 @@ struct System::Impl {
         }
         // Waiting for GPU before initializing CPU
         cpu_manager.Initialize();
+        VideoCommon::Nx2Spikes::SetGuestThreadSource({ReadGuestThreadTicks, GuestThreadName, &system});
 
         // Initialize cheat engine
         if (cheat_engine) {
@@ -586,6 +640,7 @@ struct System::Impl {
 
     void ShutdownMainProcess() {
         LOG_INFO(Core, "Shutdown: begin");
+        VideoCommon::Nx2Spikes::SetGuestThreadSource({});
         debug_service.reset();
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
@@ -1250,6 +1305,7 @@ void System::NotifyApplicationChanged(u64 program_id) {
 
 void System::ApplySettings() {
     impl->RefreshTime(*this);
+    Common::RefreshThreadPolicies();
 
     if (IsPoweredOn()) {
         Renderer().RefreshBaseSettings();

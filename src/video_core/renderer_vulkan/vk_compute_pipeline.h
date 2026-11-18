@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -81,6 +84,15 @@ public:
         return static_cast<bool>(pipeline);
     }
 
+    /// Whether no build of this pipeline is left queued on a worker thread, which holds it
+    [[nodiscard]] bool IsBuildTaskDone() const noexcept {
+        return build_task_done.load(std::memory_order::acquire);
+    }
+
+    [[nodiscard]] bool IsBuilt() const noexcept {
+        return is_built.load(std::memory_order::acquire);
+    }
+
     [[nodiscard]] u64 ShaderHash() const noexcept {
         return shader_hash;
     }
@@ -94,9 +106,12 @@ public:
         u32 tic;
         VideoCommon::ImageViewId id;
         VideoCommon::SamplerId sampler;
+        bool gpu_modified{};
+        bool recent_gpu_modified{};
     };
 
-    /// The textures sampled by the last configured dispatch, kept while a sampled frame dump runs.
+    /// Sampled textures, kept during frame dumps or writer diagnostics. Diagnostic state is
+    /// captured before the dispatch's own storage-image writes are marked.
     [[nodiscard]] std::span<const SampledImage> SampledImages() const noexcept {
         return sampled_images;
     }
@@ -113,18 +128,21 @@ public:
     /// Advances the frame window of EDEN_NX2_UPSCALER_TRACE
     static void TickUpscalerTrace();
 
-    /// Whether no build of this pipeline is left queued on a worker thread, which holds it
-    [[nodiscard]] bool IsBuildTaskDone() const noexcept {
-        return build_task_done.load(std::memory_order::acquire);
-    }
-
-    [[nodiscard]] bool IsBuilt() const noexcept {
-        return is_built.load(std::memory_order::acquire);
-    }
-
     /// Whether the build ended without creating a pipeline (driver rejected the shader).
     [[nodiscard]] bool BuildFailed() const noexcept {
         return is_built.load(std::memory_order::acquire) && !pipeline;
+    }
+
+    [[nodiscard]] size_t StorageBufferCount() const noexcept {
+        return info.storage_buffers_descriptors.size();
+    }
+
+    [[nodiscard]] u32 StorageImageCount() const noexcept {
+        u32 count{};
+        for (const auto& desc : info.image_descriptors) {
+            count += desc.count;
+        }
+        return count;
     }
 
 private:
@@ -138,6 +156,8 @@ private:
     Shader::Info info;
     u64 shader_hash{};
     u32 num_descriptor_entries{};
+    bool has_image_resources{false};
+    bool has_rescaling_push_constants{false};
     boost::container::small_vector<VideoCommon::ImageViewId, 8> written_images;
     std::vector<SampledImage> sampled_images;
     std::vector<VideoCommon::ImageViewInOut> bound_images;
@@ -153,6 +173,7 @@ private:
     DescriptorBufferLayout descriptor_buffer_layout;
     std::vector<u32> binding_kinds; ///< EDEN_NX2_BINDMEMO: per texture/image view, in read order
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
+    std::vector<u8> last_descriptor_bytes;
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};

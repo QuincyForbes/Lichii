@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <atomic>
 #include <cstring>
 #include <limits>
@@ -21,7 +22,6 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
-#include "video_core/engines/maxwell_3d.h"
 #include "video_core/feature_census.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
@@ -35,6 +35,7 @@
 #include "video_core/query_dma.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
+#include "video_core/macro_dma_forward.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
 #endif
@@ -88,7 +89,7 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
         memory_write_mask[i] = true;
     }
     fast_maxwell3d = VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Method) && !record_write_history &&
-                     !g_trace_first_method_writes;
+                     !g_trace_first_method_writes && !VideoCommon::Nx2Profile::Enabled();
     const char* skip_same = std::getenv("EDEN_NX2_SKIP_SAME");
     skip_same_value_writes = skip_same == nullptr || skip_same[0] != '0';
     perf_verify = VideoCommon::Nx2Perf::Verify();
@@ -559,6 +560,25 @@ void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {
     }
 }
 
+void Maxwell3D::CallStateMethod(Core::System&, u32 method, u32 method_argument) {
+    DEBUG_ASSERT(executing_macro == 0);
+    DEBUG_ASSERT(method < MacroRegistersStart && !execution_mask[method]);
+    RecordWrite(method, method_argument, 1, 1);
+    if (g_trace_first_method_writes) [[unlikely]] {
+        TraceFirstMethodWrite(method, method_argument);
+    }
+    if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::MethodWrites, 1);
+        if (regs.reg_array[method] == method_argument) {
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::SameValueWrites, 1);
+        }
+    }
+    const u32 argument = ProcessShadowRam(method, method_argument);
+    if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
+        ProcessDirtyRegisters(method, argument);
+    }
+}
+
 void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
     if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) [[unlikely]] {
         ReleaseFront();
@@ -751,6 +771,74 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         memory_manager.WriteWordsCached(destination, values.data(), count);
     }
     regs.const_buffer.offset += static_cast<u32>(bytes);
+}
+
+
+size_t Maxwell3D::CallStateMethodRun(const u64* entry, size_t max_words) {
+    const auto control = shadow_state.shadow_ram_control;
+    const bool skip_same = SkipSameValueWrites();
+    size_t count = 0;
+    if (control == Regs::ShadowRamControl::Track ||
+        control == Regs::ShadowRamControl::TrackWithFilter) {
+        do {
+            const u64 word = entry[count];
+            const u32 method = static_cast<u32>((word >> 8) & 0xffff);
+            const u32 value = static_cast<u32>(word >> 32);
+            shadow_state.reg_array[method] = value;
+            if (!skip_same || regs.reg_array[method] != value) {
+                ProcessDirtyRegisters(method, value);
+            }
+            ++count;
+            if (count >= max_words) {
+                break;
+            }
+            const u64 next = entry[count];
+            const u32 next_method = static_cast<u32>((next >> 8) & 0xffff);
+            if ((next & 0x2f) != 2 || next_method >= Regs::NUM_REGS ||
+                execution_mask[next_method]) {
+                break;
+            }
+        } while (true);
+    } else if (control == Regs::ShadowRamControl::Replay) {
+        do {
+            const u64 word = entry[count];
+            const u32 method = static_cast<u32>((word >> 8) & 0xffff);
+            const u32 value = shadow_state.reg_array[method];
+            if (!skip_same || regs.reg_array[method] != value) {
+                ProcessDirtyRegisters(method, value);
+            }
+            ++count;
+            if (count >= max_words) {
+                break;
+            }
+            const u64 next = entry[count];
+            const u32 next_method = static_cast<u32>((next >> 8) & 0xffff);
+            if ((next & 0x2f) != 2 || next_method >= Regs::NUM_REGS ||
+                execution_mask[next_method]) {
+                break;
+            }
+        } while (true);
+    } else {
+        do {
+            const u64 word = entry[count];
+            const u32 method = static_cast<u32>((word >> 8) & 0xffff);
+            const u32 value = static_cast<u32>(word >> 32);
+            if (!skip_same || regs.reg_array[method] != value) {
+                ProcessDirtyRegisters(method, value);
+            }
+            ++count;
+            if (count >= max_words) {
+                break;
+            }
+            const u64 next = entry[count];
+            const u32 next_method = static_cast<u32>((next >> 8) & 0xffff);
+            if ((next & 0x2f) != 2 || next_method >= Regs::NUM_REGS ||
+                execution_mask[next_method]) {
+                break;
+            }
+        } while (true);
+    }
+    return count;
 }
 
 void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
@@ -1202,6 +1290,30 @@ struct Maxwell3D::FrontState {
         }
     };
     DmaMicroCache dma_cache;
+    /// Nx2Perf dma_forward: registers the back writes from DMA words the front never read
+    /// (regs holds a stale value), and macros (by index) seen doing an MME DMA read.
+    std::bitset<Regs::NUM_REGS> unknown_regs;
+    u32 unknown_count{};
+    std::bitset<256> dma_macros;
+    void MarkUnknown(u32 method) {
+        if (!unknown_regs[method]) {
+            unknown_regs[method] = true;
+            ++unknown_count;
+        }
+    }
+    void ForgetUnknown(u32 method) {
+        if (unknown_regs[method]) {
+            unknown_regs[method] = false;
+            --unknown_count;
+        }
+    }
+    /// Takes a forwarded register's value (and shadow copy) from the back, after draining it.
+    void Learn(Maxwell3D& engine, VideoCommon::GpuSplit& split, u32 method) {
+        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+        regs[method] = engine.regs.reg_array[method];
+        shadow[method] = engine.shadow_state.reg_array[method];
+        ForgetUnknown(method);
+    }
     u64 calls{};
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
     /// then can it have a deferred instanced draw to issue at the end of a macro.
@@ -1256,6 +1368,23 @@ struct Maxwell3D::FrontState {
     /// the front didn't read (FrontDrawFromGpuArguments): regs holds older values until each is
     /// written again, so a write of the same value isn't dropped.
     u32 vertex_arguments_unknown{};
+    bool same_first{};  ///< Nx2Perf FrontSameFirst, read once
+    bool class_table{}; ///< Nx2Perf FrontClassTable, read once
+    bool draw_begin_coalesce{}; ///< Nx2Perf DrawBeginCoalesce, read once
+    bool verify{};      ///< Nx2Perf::Verify(), read once
+    /// MacroReadWriterSet (FrontDrawEffect): the last lookup of the programs the registers bind,
+    /// valid while those registers, the program epoch, the proofs and the GPU map are unchanged.
+    bool draw_key_valid{};
+    bool draw_key_native{};
+    bool draw_non_writer{};
+    u64 draw_key_epoch{};
+    u64 draw_key_version{};
+    u64 draw_key_map{};
+    /// Since draw_pending was last cleared: a draw the back issues may use any register state
+    /// the front had meanwhile (state writes wait in its method sink), so one writer state or a
+    /// change of program epoch makes every entry until then a writer.
+    bool draw_window_writer{};
+    u64 draw_window_epoch{};
 };
 
 namespace {
@@ -1272,6 +1401,21 @@ bool WritesGuestMemory(u32 method) {
     return method == MAXWELL3D_REG_INDEX(launch_dma) ||
            method == MAXWELL3D_REG_INDEX(inline_data) ||
            method == MAXWELL3D_REG_INDEX(report_semaphore.query);
+}
+
+// The front macro switches (Nx2Perf), read once.
+struct FrontMacroSwitches {
+    bool batch;
+    bool borrow;
+    bool keep_state;
+    bool verify;
+};
+const FrontMacroSwitches& FrontMacroOptions() {
+    using VideoCommon::Nx2Perf::On;
+    using VideoCommon::Nx2Perf::Opt;
+    static const FrontMacroSwitches switches{On(Opt::MacroBatch), On(Opt::MacroBorrow),
+                                             On(Opt::MacroState), VideoCommon::Nx2Perf::Verify()};
+    return switches;
 }
 
 // Executable methods ProcessMethodCall handles itself; the rest go to the draw manager.
@@ -1331,6 +1475,13 @@ VideoCommon::GpuSplit::Effect FrontMethodEffect(u32 method) {
     case MAXWELL3D_REG_INDEX(bind_groups[3].raw_config):
     case MAXWELL3D_REG_INDEX(bind_groups[4].raw_config):
     case MAXWELL3D_REG_INDEX(report_semaphore.query):
+    case MAXWELL3D_REG_INDEX(wait_for_idle):
+    case MAXWELL3D_REG_INDEX(render_enable.mode):
+    case MAXWELL3D_REG_INDEX(clear_report_value):
+    case MAXWELL3D_REG_INDEX(sync_info):
+    case MAXWELL3D_REG_INDEX(fragment_barrier):
+    case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
+    case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
         return Effect::None;
     default:
         return FrontHandledOutsideDrawManager(method) ? Effect::Unknown : Effect::Gpu;
@@ -1344,12 +1495,37 @@ GPUVAddr ConstBufferWriteAddress(std::span<const u32> regs) {
            regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
 }
 
+// How many of the next constant buffer data words land before the bank's end (ProcessCBMultiData
+// drops the rest).
+u32 ConstBufferRoomWords(std::span<const u32> regs) {
+    const u32 offset = regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
+    const u32 size = regs[MAXWELL3D_REG_INDEX(const_buffer.size)];
+    return offset < size ? (size - offset) / sizeof(u32) : 0;
+}
+
 // A report and what it may write: payload and timestamp.
 GPUVAddr ReportAddress(std::span<const u32> regs) {
     return (GPUVAddr{regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
            regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
 }
 constexpr u64 ReportBytes = 16;
+
+// Counters and timed releases are written when the host query completes, not when the back runs
+// them: early MME DMA reads of their bytes wait until the back ran the report and the result
+// landed (lichii #179, 166c21d96c). Short payload releases land when the back runs them.
+void NoteLateReport(VideoCommon::GpuSplit& split, const MemoryManager& memory,
+                    std::span<const u32> regs) {
+    using Report = Maxwell3D::Regs::ReportSemaphore;
+    decltype(Report::query) query{};
+    query.raw = regs[MAXWELL3D_REG_INDEX(report_semaphore.query)];
+    if (query.operation == Report::Operation::Release && query.short_query != 0 &&
+        query.report == Report::Report::Payload) {
+        return;
+    }
+    if (const auto device = memory.GpuToCpuAddress(ReportAddress(regs))) {
+        split.NoteAsyncWrite(*device, ReportBytes);
+    }
+}
 
 // EDEN_NX2_SPLIT_SKIP=0: send state writes that keep the register's value too.
 bool FrontSkipSame() {
@@ -1360,7 +1536,188 @@ bool FrontSkipSame() {
     return skip;
 }
 
+[[nodiscard]] constexpr bool IsDrawMethod(u32 method) noexcept {
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(draw.end):
+    case MAXWELL3D_REG_INDEX(index_buffer32_first):
+    case MAXWELL3D_REG_INDEX(index_buffer16_first):
+    case MAXWELL3D_REG_INDEX(index_buffer8_first):
+    case MAXWELL3D_REG_INDEX(index_buffer32_subsequent):
+    case MAXWELL3D_REG_INDEX(index_buffer16_subsequent):
+    case MAXWELL3D_REG_INDEX(index_buffer8_subsequent):
+    case MAXWELL3D_REG_INDEX(vertex_array_instance_first):
+    case MAXWELL3D_REG_INDEX(vertex_array_instance_subsequent):
+    case MAXWELL3D_REG_INDEX(draw_texture.src_y0):
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Nx2Perf FrontClassTable: the four functions above for each method, in one byte.
+constexpr u8 ClassOutsideDrawManager = 1 << 0;
+constexpr u32 ClassEffectShift = 1; ///< Two bits: GpuSplit::Effect
+constexpr u8 ClassDraw = 1 << 3;
+constexpr u8 ClassCbData = 1 << 4;
+
+u8 ComputeFrontClass(u32 method) {
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    return static_cast<u8>(
+        (FrontHandledOutsideDrawManager(method) ? ClassOutsideDrawManager : 0) |
+        (static_cast<u8>(FrontMethodEffect(method)) << ClassEffectShift) |
+        (IsDrawMethod(method) ? ClassDraw : 0) |
+        (method >= cb_data && method < cb_data + 16 ? ClassCbData : 0));
+}
+
+const std::array<u8, Maxwell3D::Regs::NUM_REGS> front_class_table = [] {
+    std::array<u8, Maxwell3D::Regs::NUM_REGS> table{};
+    for (u32 method = 0; method < table.size(); ++method) {
+        table[method] = ComputeFrontClass(method);
+    }
+    return table;
+}();
+
+// The method's class from the table; with PERF_VERIFY, from the functions (logs differences).
+u8 FrontClass(u32 method, bool verify) {
+    const u8 cls = front_class_table[method];
+    if (verify) [[unlikely]] {
+        const u8 old = ComputeFrontClass(method);
+        if (old != cls) {
+            static std::atomic<u32> reports{};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 64) {
+                LOG_ERROR(HW_GPU, "Nx2Perf front: class table method {:#x} has {:#x}, functions {:#x}",
+                          method, cls, old);
+            }
+            return old;
+        }
+    }
+    return cls;
+}
+
+VideoCommon::GpuSplit::Effect ClassEffect(u8 cls) {
+    return static_cast<VideoCommon::GpuSplit::Effect>((cls >> ClassEffectShift) & 3);
+}
+
+// MacroReadWriterSet: the registers Nx2DrawProgramsOf reads.
+[[nodiscard]] constexpr bool IsDrawProgramRegister(u32 method) noexcept {
+    constexpr u32 pipelines = MAXWELL3D_REG_INDEX(pipelines);
+    constexpr u32 pipelines_end =
+        pipelines + static_cast<u32>(sizeof(Maxwell3D::Regs::pipelines) / sizeof(u32));
+    constexpr u32 program_region = MAXWELL3D_REG_INDEX(program_region);
+    return (method >= pipelines && method < pipelines_end) || method == program_region ||
+           method == program_region + 1 || method == MAXWELL3D_REG_INDEX(rasterize_enable) ||
+           method == MAXWELL3D_REG_INDEX(transform_feedback_enabled) ||
+           method == Maxwell3D::Regs::MeshControl;
+}
+
+// Draw manager methods that only draw with the bound pipeline (or do nothing): a clear and a
+// texture draw go through the texture cache instead and stay GPU work of unknown effect.
+[[nodiscard]] bool FrontDrawsOnly(u32 method) noexcept {
+    return !FrontHandledOutsideDrawManager(method) &&
+           method != MAXWELL3D_REG_INDEX(clear_surface) &&
+           method != MAXWELL3D_REG_INDEX(draw_texture.src_y0);
+}
+
+// The effect of an executable method's entry: what it had before (effect, a deferred draw), the
+// method's class, and what the method may write (draw_effect for a draws-only method).
+template <typename DrawEffect>
+VideoCommon::GpuSplit::Effect FrontExecEffect(VideoCommon::GpuSplit::Effect effect, u32 method,
+                                              u8 cls, bool class_table, DrawEffect&& draw_effect) {
+    using Effect = VideoCommon::GpuSplit::Effect;
+    using VideoCommon::SplitWriteTracker;
+    effect = SplitWriteTracker::Combine(effect,
+                                        class_table ? ClassEffect(cls) : FrontMethodEffect(method));
+    Effect method_effect = FrontMethodEffect(method);
+    if (method_effect == Effect::Gpu && FrontDrawsOnly(method)) {
+        method_effect = draw_effect();
+    }
+    return SplitWriteTracker::Combine(effect, method_effect);
+}
+
 } // Anonymous namespace
+
+bool Maxwell3D::Nx2DrawProgramsOf(const Regs& regs, bool native, u64 memory_id, u64 map_serial,
+                                  Tegra::Nx2DrawPrograms& out) {
+    // As ShaderCache::RefreshStages resolves them. Without rasterization (no pixel program),
+    // with transform feedback or with task and mesh programs a draw counts as a writer.
+    if (regs.rasterize_enable == 0 || regs.transform_feedback_enabled != 0 ||
+        (native && regs.IsMeshEnabled())) {
+        return false;
+    }
+    out = {};
+    out.memory_id = memory_id;
+    out.map_serial = map_serial;
+    out.native = native;
+    const GPUVAddr base_addr = regs.program_region.Address();
+    for (size_t index = 0; index < Regs::MaxShaderProgram; ++index) {
+        if (!regs.IsShaderConfigEnabled(index)) {
+            continue;
+        }
+        const auto& config = regs.pipelines[index];
+        const GPUVAddr address =
+            native ? (static_cast<u64>(config.reserved[0] & 0xff) << 32) | config.reserved[1]
+                   : base_addr + config.offset;
+        // Bit 63 tells an enabled program at address 0 from a disabled slot.
+        out.addresses[index] = address | (u64{1} << 63);
+    }
+    return true;
+}
+
+VideoCommon::SplitWriteTracker::Effect Maxwell3D::FrontDrawEffect(VideoCommon::GpuSplit& split,
+                                                                  FrontState& fs) {
+    using Effect = VideoCommon::SplitWriteTracker::Effect;
+    if (!VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::MacroReadWriterSet) ||
+        fs.draw_window_writer) {
+        return Effect::Gpu;
+    }
+    // The epoch before the proofs: a proof found below then holds for this epoch or is stale.
+    const u64 epoch = Tegra::g_nx2_code_epoch.load(std::memory_order_acquire);
+    const u64 version = Tegra::Nx2NonWriters().version.load(std::memory_order_acquire);
+    const u64 map = memory_manager.GetMapSerial();
+    const bool native = GetNativeMacroEngine().native_turing;
+    if (!fs.draw_key_valid || fs.draw_key_epoch != epoch || fs.draw_key_version != version ||
+        fs.draw_key_map != map || fs.draw_key_native != native) {
+        fs.draw_key_valid = true;
+        fs.draw_key_epoch = epoch;
+        fs.draw_key_version = version;
+        fs.draw_key_map = map;
+        fs.draw_key_native = native;
+        Tegra::Nx2DrawPrograms programs;
+        fs.draw_non_writer =
+            Nx2DrawProgramsOf(reinterpret_cast<const Regs&>(fs.regs), native,
+                              memory_manager.GetID(), map, programs) &&
+            Tegra::Nx2IsNonWriterDraw(programs, epoch);
+    }
+    if (!fs.draw_non_writer || (fs.draw_window_epoch != 0 && fs.draw_window_epoch != epoch)) {
+        fs.draw_window_writer = true;
+        return Effect::Gpu;
+    }
+    fs.draw_window_epoch = epoch;
+    split.DrawEpoch(epoch);
+    return Effect::Draw;
+}
+
+bool Maxwell3D::FrontIsWriterDraw(const Regs& regs) {
+    if (regs.rasterize_enable == 0) {
+        return true;
+    }
+    if (regs.transform_feedback_enabled != 0) {
+        return true;
+    }
+    if (!Tegra::g_nx2_has_graphics_writer_shaders.load(std::memory_order_acquire)) {
+        return false;
+    }
+    for (std::size_t stage = 0; stage < Regs::MaxShaderProgram; ++stage) {
+        if (!regs.IsShaderConfigEnabled(stage)) {
+            continue;
+        }
+        const u32 addr_low = regs.pipelines[stage].reserved[1];
+        if (Tegra::Nx2IsGraphicsWriterShader(addr_low)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSplit& split) {
     if (!front) [[unlikely]] {
@@ -1380,6 +1737,11 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         front->oot_macros = oot_macros_on && OotMacros::HasHandlers();
         front->oot_dump = OotMacros::DumpEnabled();
         front->oot_generation.fill(~u64{0});
+        front->same_first = VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FrontSameFirst);
+        front->class_table = VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FrontClassTable);
+        front->draw_begin_coalesce =
+            VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::DrawBeginCoalesce);
+        front->verify = VideoCommon::Nx2Perf::Verify();
         front->executing_macro = executing_macro;
         front->parameters = std::move(macro_params);
         macro_params.clear();
@@ -1474,6 +1836,44 @@ void Maxwell3D::FrontReportSameWrites(FrontState& fs) {
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                            u32 argument, bool is_last_call, bool from_macro) {
     namespace Profile = VideoCommon::Nx2Profile;
+    if (Profile::Enabled()) [[unlikely]] {
+        // The uniform stream is the bulk of what a native title writes: count it separately.
+        constexpr u32 cb_first = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+        if (method >= cb_first && method < cb_first + 16) {
+            Profile::Add(Profile::Counter::CbWords, 1);
+        }
+    }
+    if (fs.unknown_count != 0 && fs.unknown_regs[method]) [[unlikely]] {
+        // dma_forward: a tracked write sets both the register and its shadow copy again; any
+        // other mode keeps or reads one of them, so take the back's values first.
+        if (fs.control == Regs::ShadowRamControl::Track ||
+            fs.control == Regs::ShadowRamControl::TrackWithFilter) {
+            fs.ForgetUnknown(method);
+        } else {
+            fs.Learn(*this, split, method);
+        }
+    }
+    // Nx2Perf FrontSameFirst: the same-value state write skip below, decided first. Outside
+    // Replay the value is the argument, and a tracked shadow RAM keeps it only if it holds it.
+    // Not while vertex_buffer.first/.count hold values older than the back's (FrontDrawFromGpuArguments).
+    bool same_first = false;
+    if (fs.same_first && fs.vertex_arguments_unknown == 0) {
+        const bool tracked = fs.control == Regs::ShadowRamControl::Track ||
+                             fs.control == Regs::ShadowRamControl::TrackWithFilter;
+        same_first = !execution_mask[method] && fs.skip_same &&
+                     fs.control != Regs::ShadowRamControl::Replay &&
+                     fs.regs[method] == argument && (!tracked || fs.shadow[method] == argument);
+        if (same_first && !fs.verify) {
+            if (Profile::Enabled()) [[unlikely]] {
+                Profile::Add(Profile::Counter::MethodWrites, 1);
+                Profile::Add(from_macro ? Profile::Counter::MacroWrites
+                                        : Profile::Counter::DirectWrites, 1);
+                Profile::Add(Profile::Counter::SameValueWrites, 1);
+                Profile::Add(Profile::Counter::DroppedSameFirst, 1);
+            }
+            return;
+        }
+    }
     // As ProcessShadowRam does on the back.
     u32 value = argument;
     bool shadow_kept = true;
@@ -1493,6 +1893,18 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             shadow_kept = false; // Sent even if regs holds the value: the back's may differ.
         }
     }
+    if (fs.same_first && fs.verify) [[unlikely]] {
+        const bool old_skip = !execution_mask[method] && fs.regs[method] == value &&
+                              shadow_kept && fs.skip_same;
+        if (old_skip != same_first) {
+            static std::atomic<u32> reports{};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 64) {
+                LOG_ERROR(HW_GPU, "Nx2Perf front: same-first method {:#x} argument {:#x} skip {}, "
+                          "old {} (control {}, regs {:#x})", method, argument, same_first, old_skip,
+                          static_cast<u32>(fs.control), fs.regs[method]);
+            }
+        }
+    }
     // EXP14 / SuperMacro: an unchanged state register (6.6M of Ocarina's 11.4M macro writes a
     // second) is dropped before the checks below, as the same-value skip further down would.
     if (!execution_mask[method] && fs.regs[method] == value && shadow_kept && fs.skip_same &&
@@ -1505,11 +1917,12 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     }
     if (Profile::Enabled()) [[unlikely]] {
         Profile::Add(Profile::Counter::MethodWrites, 1);
+        Profile::Add(from_macro ? Profile::Counter::MacroWrites : Profile::Counter::DirectWrites, 1);
     }
-    if (method == MAXWELL3D_REG_INDEX(shadow_ram_control) && FrontVerifyEnabled()) [[unlikely]] {
-        fs.control_writes[fs.control_count++ % fs.control_writes.size()] = {
-            argument, static_cast<u32>(fs.control), from_macro ? 2U : 1U};
-    }
+    using Effect = VideoCommon::GpuSplit::Effect;
+    // What the entry may write on the back (FrontDmaRead): any method may issue a deferred
+    // instanced draw first.
+    Effect effect = fs.draw_pending ? FrontDrawEffect(split, fs) : Effect::None;
     // From zortos293/Lichii#178 (tibzejoker): instance loop writes the back would ignore.
     if (execution_mask[method] && FrontSkipsLoopWrite(fs, method, value, shadow_kept)) {
         if (Profile::Enabled()) [[unlikely]] {
@@ -1532,11 +1945,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     }
     // What a constant buffer upload word or a report writes, for the front's macro memory reads.
     const auto [write_begin, write_end] = FrontWriteRange(fs, method, 1);
-    using Effect = VideoCommon::GpuSplit::Effect;
-    // What the entry may write on the back (FrontDmaRead): any method may issue a deferred
-    // instanced draw first.
-    Effect effect = fs.draw_pending ? Effect::Gpu : Effect::None;
     std::optional<GPUVAddr> cb_write;
+    u32 cb_room{};
+    u8 cls = 0;
     if (!execution_mask[method]) {
         // Nothing would change on the back: CallMethod and ConsumeSinkImpl skip same-value state
         // writes, and the shadow RAM (tracked by default) holds the value already.
@@ -1551,10 +1962,25 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             return;
         }
         fs.regs[method] = value;
+        if (IsDrawProgramRegister(method)) {
+            fs.draw_key_valid = false;
+        }
     } else {
+        if (method == MAXWELL3D_REG_INDEX(shadow_ram_control) && FrontVerifyEnabled()) [[unlikely]] {
+            fs.control_writes[fs.control_count++ % fs.control_writes.size()] = {
+                argument, static_cast<u32>(fs.control), from_macro ? 2U : 1U};
+        }
+        if (Profile::Enabled() && fs.regs[method] == value) [[unlikely]] {
+            Profile::AddSameExecutable(method);
+        }
         fs.regs[method] = value;
         FrontTrackIndexDraws(fs, method);
-        effect = VideoCommon::SplitWriteTracker::Combine(effect, FrontMethodEffect(method));
+        cls = fs.class_table ? FrontClass(method, fs.verify) : u8{0};
+        if (IsDrawProgramRegister(method)) {
+            fs.draw_key_valid = false;
+        }
+        effect = FrontExecEffect(effect, method, cls, fs.class_table,
+                                 [&] { return FrontDrawEffect(split, fs); });
         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
         switch (method) {
         case MAXWELL3D_REG_INDEX(shadow_ram_control):
@@ -1582,10 +2008,13 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             fs.regs[MAXWELL3D_REG_INDEX(shadow_scratch)] = 1;
             break;
         default:
-            if (method >= cb_data && method < cb_data + 16) {
+            if (fs.class_table ? (cls & ClassCbData) != 0
+                               : method >= cb_data && method < cb_data + 16) {
                 cb_write = ConstBufferWriteAddress(fs.regs);
+                cb_room = ConstBufferRoomWords(fs.regs);
                 fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += sizeof(u32);
-            } else if (!FrontHandledOutsideDrawManager(method)) {
+            } else if (fs.class_table ? (cls & ClassOutsideDrawManager) == 0
+                                      : !FrontHandledOutsideDrawManager(method)) {
                 fs.draw_pending = true;
             }
             break;
@@ -1600,7 +2029,23 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         split.Defer([this, more] { draw_manager.draw_state.instance_count += more; },
                     VideoCommon::GpuSplit::Effect::Gpu);
     }
-    if (from_macro && (execution_mask[method] || !VideoCommon::GpuSplit::MacroSink())) {
+    const auto is_draw = [&] {
+        return fs.class_table ? (cls & ClassDraw) != 0 : IsDrawMethod(method);
+    };
+    if (fs.draw_begin_coalesce && method == MAXWELL3D_REG_INDEX(draw.begin) &&
+        ((value >> 26) & 3) == 1) [[unlikely]] {
+        // Nx2Perf draw_begin_coalesce: an instance loop's begin right after the same one only
+        // counts one more instance on the back (DrawManager::AddInstances). With Verify it is
+        // sent anyway, flagged for the back to check.
+        if (split.RepeatableMethod(this, method, argument, is_last_call, from_macro, effect,
+                                   fs.verify) &&
+            Profile::Enabled()) [[unlikely]] {
+            Profile::Add(Profile::Counter::DrawBeginCoalesced, 1);
+        }
+        if (!from_macro && is_draw() && FrontIsWriterDraw(fs.regs)) {
+            split.NoteWriter();
+        }
+    } else if (from_macro && (execution_mask[method] || !VideoCommon::GpuSplit::MacroSink())) {
         split.MacroWrite(this, method, argument, effect);
     } else {
         // EDEN_NX2_MACRO_SINK: a macro's state write goes to the back's method sink as the
@@ -1617,13 +2062,18 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         if (from_macro) {
             split.CountBatched(VideoCommon::GpuSplit::Batched::MacroSunk);
         }
+        if (!from_macro && is_draw() && FrontIsWriterDraw(fs.regs)) {
+            split.NoteWriter();
+        }
     }
     if (cb_write) {
         fs.dma_cache.Invalidate();
-        split.NoteWrite(memory_manager, *cb_write, sizeof(u32));
+        // The back writes the value after its shadow RAM step (ProcessCBData), as `value` here.
+        split.NoteConstBufferWrite(memory_manager, *cb_write, &value, 1, (std::min)(cb_room, 1U));
     } else if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
         fs.dma_cache.Invalidate();
         split.NoteWrite(memory_manager, ReportAddress(fs.regs), ReportBytes);
+        NoteLateReport(split, memory_manager, fs.regs);
     }
     if (write_end != 0) {
         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
@@ -1694,14 +2144,22 @@ void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& spl
         }
         return;
     }
+    if (front_run_record != nullptr) [[unlikely]] {
+        front_run_record->push_back({method, argument, is_last_call ? 1U : 0U});
+    }
     FrontWrite(split, fs, method, argument, is_last_call, false);
 }
 
-void Maxwell3D::FrontWriteRun(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
-                              const u32* words, u32 count, bool ends_method) {
+void Maxwell3D::FrontCallMethodRun(Core::System& system, VideoCommon::GpuSplit& split,
+                                   u32 method, const u32* words, u32 count, bool incrementing,
+                                   u32 methods_pending) {
+    // FrontCallMethod for each word, as DmaPusher::ProcessCommands calls it word by word.
+    DEBUG_ASSERT(count <= methods_pending &&
+                 (incrementing ? method + count : method + 1) <= MacroRegistersStart);
     auto& fs = Front(system, split);
     for (u32 i = 0; i < count; ++i) {
-        FrontWrite(split, fs, method + i, words[i], ends_method && i + 1 == count, false);
+        FrontWrite(split, fs, incrementing ? method + i : method, words[i],
+                   methods_pending - i <= 1, false);
     }
 }
 
@@ -1710,6 +2168,28 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                                      u32 methods_pending) {
     auto& fs = Front(system, split);
     if (method >= MacroRegistersStart) {
+        const auto& options = FrontMacroOptions();
+        if (options.borrow && amount != 0 && amount == methods_pending &&
+            fs.executing_macro == 0 && fs.parameters.empty()) {
+            // The whole call in this run: the macro reads the words where they are.
+            fs.executing_macro = method;
+            if (!options.verify) [[likely]] {
+                FrontRunMacro(system, split, fs, {base_start, amount});
+                return;
+            }
+            static std::vector<u32> copy;
+            copy.assign(base_start, base_start + amount);
+            FrontRunMacro(system, split, fs, {base_start, amount});
+            static u64 differences{};
+            if (std::memcmp(copy.data(), base_start, amount * sizeof(u32)) != 0 &&
+                ++differences <= 64) {
+                LOG_ERROR(HW_GPU,
+                          "Nx2Perf macro: macro {:#x}'s {} borrowed parameters changed during "
+                          "the call ({} calls so far)",
+                          method, amount, differences);
+            }
+            return;
+        }
         if (fs.executing_macro == 0) {
             fs.executing_macro = method;
             fs.dma_cache.Invalidate();
@@ -1746,10 +2226,13 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                fs.control == Regs::ShadowRamControl::TrackWithFilter;
     };
     using Effect = VideoCommon::GpuSplit::Effect;
-    Effect effect = fs.draw_pending ? Effect::Gpu : Effect::None;
+    Effect effect = fs.draw_pending ? FrontDrawEffect(split, fs) : Effect::None;
     std::optional<GPUVAddr> cb_write;
+    u32 cb_room{};
+    const u8 cls = fs.class_table ? FrontClass(method, fs.verify) : u8{0};
     if (method >= cb_data && method < cb_data + 16) {
         cb_write = ConstBufferWriteAddress(fs.regs);
+        cb_room = ConstBufferRoomWords(fs.regs);
         fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += amount * sizeof(u32);
     } else if (method == MAXWELL3D_REG_INDEX(inline_data)) {
         // Upload data only.
@@ -1758,6 +2241,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                 method == MAXWELL3D_REG_INDEX(inline_index_2x16.even) ||
                 method == MAXWELL3D_REG_INDEX(inline_index_4x8.index0)) &&
                fs.control != Regs::ShadowRamControl::Replay) {
+        FrontTrackInstanceLoop(fs, method, 0);
         if (amount != 0) {
             const u32 last = base_start[amount - 1];
             if (tracked()) {
@@ -1766,7 +2250,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             fs.regs[method] = last;
         }
         fs.draw_pending = true;
-        effect = VideoCommon::SplitWriteTracker::Combine(effect, Effect::Gpu);
+        effect = VideoCommon::SplitWriteTracker::Combine(effect, FrontDrawEffect(split, fs));
     } else {
         // CallMethod for each word, macro uploads among them (load_mme.instruction). A word may
         // change the shadow RAM mode for the next (a run of SET_SHADOW_RAM_CONTROL writes).
@@ -1783,10 +2267,15 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                 value = fs.shadow[method];
             }
             fs.regs[method] = value;
+            FrontTrackInstanceLoop(fs, method, value); // DrawBegin runs for every word
+            if (IsDrawProgramRegister(method)) {
+                fs.draw_key_valid = false;
+            }
             if (!execution_mask[method]) {
                 continue;
             }
-            effect = VideoCommon::SplitWriteTracker::Combine(effect, FrontMethodEffect(method));
+            effect = FrontExecEffect(effect, method, cls, fs.class_table,
+                                     [&] { return FrontDrawEffect(split, fs); });
             switch (method) {
             case MAXWELL3D_REG_INDEX(shadow_ram_control):
                 fs.control = static_cast<Regs::ShadowRamControl>(argument);
@@ -1811,7 +2300,8 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                 fs.regs[MAXWELL3D_REG_INDEX(shadow_scratch)] = 1;
                 break;
             default:
-                if (!FrontHandledOutsideDrawManager(method)) {
+                if (fs.class_table ? (cls & ClassOutsideDrawManager) == 0
+                                   : !FrontHandledOutsideDrawManager(method)) {
                     fs.draw_pending = true;
                 }
                 break;
@@ -1824,6 +2314,10 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                     VideoCommon::GpuSplit::Effect::Gpu);
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr, effect);
+    if ((fs.class_table ? (cls & ClassDraw) != 0 : IsDrawMethod(method)) &&
+        FrontIsWriterDraw(fs.regs)) {
+        split.NoteWriter();
+    }
     if (write_end != 0) {
         // Uploaded words, unless the shadow RAM replays other values for them on the back.
         const bool upload = method >= cb_data && method < cb_data + 16 &&
@@ -1835,9 +2329,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
     }
     if (cb_write) {
-        split.NoteWrite(memory_manager, *cb_write, u64{amount} * sizeof(u32));
+        split.NoteConstBufferWrite(memory_manager, *cb_write, base_start, amount,
+                                   (std::min)(cb_room, amount));
     } else if (method == MAXWELL3D_REG_INDEX(report_semaphore.query) && amount != 0) {
         split.NoteWrite(memory_manager, ReportAddress(fs.regs), ReportBytes);
+        NoteLateReport(split, memory_manager, fs.regs);
     }
     if (WritesGuestMemory(method) && amount != 0) {
         FrontNoteMemoryWrite(split, fs, method, base_start, amount);
@@ -1845,7 +2341,8 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
-                              FrontState& fs) {
+                              FrontState& fs, std::span<const u32> borrowed) {
+    namespace Profile = VideoCommon::Nx2Profile;
     const u32 method = fs.executing_macro;
     fs.executing_macro = 0;
     fs.dma_cache.Invalidate();
@@ -1853,26 +2350,175 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     const auto positions = GetNativeMacroPositions();
     const u32 slot = ((method - MacroRegistersStart) >> 1) & 0x7f;
     const u32 start = positions[slot];
-    VideoCommon::Nx2Profile::CountMethod(method, false);
-    // EDEN_NX2_MACRO_TRACE=<method>: the first calls of that macro, parameters and writes.
-    static const u32 traced = [] {
+    Profile::CountMethod(method, false);
+#ifdef ARCHITECTURE_x86_64
+    const auto& options = FrontMacroOptions();
+#else
+    // No borrowed parameters without the JIT (nothing else reads them).
+    if (!borrowed.empty()) {
+        fs.parameters.assign(borrowed.begin(), borrowed.end());
+        borrowed = {};
+    }
+#endif
+    const bool profile = Profile::Enabled();
+    // EDEN_NX2_MACRO_TRACE=<macro index>: log the first 32 calls of one macro (its parameters,
+    // every write in order, the words its DMA reads return) and its code once.
+    static const u32 trace_macro = [] {
         const char* value = std::getenv("EDEN_NX2_MACRO_TRACE");
-        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 16)) : 0U;
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : ~0U;
     }();
     static u32 traced_calls{};
-    const bool trace = traced != 0 && method == traced &&
-                       std::ranges::any_of(fs.parameters, [](u32 p) { return p != 0; }) &&
-                       traced_calls++ < 8;
-    std::string trace_text;
+    const bool trace = trace_macro != ~0U && ((method - MacroRegistersStart) >> 1) == trace_macro &&
+                       traced_calls < 32;
+    std::string trace_line;
     if (trace) [[unlikely]] {
-        trace_text = fmt::format("3D macro {:#x} start {:#x} params", traced, start);
-        for (const u32 p : fs.parameters) {
-            trace_text += fmt::format(" {:x}", p);
+        if (traced_calls == 0) {
+            std::string code;
+            for (u32 pc = start; pc < start + 96 && pc * 3 + 2 < engine.native_code.size(); ++pc) {
+                code += fmt::format(" {:08x}{:08x}{:08x}", engine.native_code[pc * 3 + 2],
+                                    engine.native_code[pc * 3 + 1], engine.native_code[pc * 3]);
+            }
+            LOG_INFO(HW_GPU, "Nx2 macro trace {:#x}: start {:#x}, code (96-bit words):{}",
+                     trace_macro, start, code);
         }
-        trace_text += " writes";
+        const std::span<const u32> parameters =
+            borrowed.empty() ? std::span<const u32>{fs.parameters} : borrowed;
+        trace_line = "params";
+        for (size_t i = 0; i < parameters.size() && i < 24; ++i) {
+            trace_line += fmt::format(" {:#x}", parameters[i]);
+        }
+        trace_line += " | writes";
     }
-    {
-        VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
+    u64 writes_before{};
+    u64 same_before{};
+    u64 ring_before{};
+    u32 dma_reads{};
+    if (profile) [[unlikely]] {
+        writes_before = Profile::CounterValue(Profile::Counter::MethodWrites);
+        same_before = Profile::CounterValue(Profile::Counter::SameValueWrites);
+        ring_before = split.WritePosition();
+    }
+    const u32 macro_index = (method - MacroRegistersStart) >> 1;
+    bool forwarded_call = false;
+#ifdef ARCHITECTURE_x86_64
+    // Nx2Perf dma_forward: a macro that did an MME DMA read before is dry-run first. When its
+    // DMA words only feed its last writes (render enable: macro 0x16 in Ocarina of Time), the
+    // front sends the other writes and doesn't wait; the back reads the words in ring order,
+    // after the same flushes FrontDmaRead waits for, and writes those values.
+    namespace DmaForward = VideoCommon::DmaForward;
+    // Analyzed on demand: a shadow RAM replay call uses a static plan.
+    std::optional<DmaForward::Plan> analyzed_plan;
+    const DmaForward::Plan* dma_plan = nullptr;
+    bool verify_forward = false;
+    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::DmaForward) && !trace &&
+        macro_index < fs.dma_macros.size() && fs.dma_macros[macro_index]) [[unlikely]] {
+        Profile::Scope profile_scope{Profile::Zone::Macro};
+        static u64 forwarded_calls{};
+        static u64 fallen_back{};
+        static std::array<std::string_view, 8> reasons_logged{};
+        const std::span<const u32> parameters =
+            borrowed.empty() ? std::span<const u32>{fs.parameters} : borrowed;
+        const auto read_register = [&fs](u32 address, bool& unknown) -> u32 {
+            if (address >= Regs::NUM_REGS) {
+                unknown = false;
+                return 0;
+            }
+            unknown = fs.unknown_count != 0 && fs.unknown_regs[address];
+            return fs.regs[address];
+        };
+        const auto forwardable = [](u32 address) {
+            return address == MAXWELL3D_REG_INDEX(render_enable.mode);
+        };
+        const auto analyze = [&](auto&& read) {
+            return DmaForward::Analyze(std::span<const u32>{engine.native_code}, start, parameters,
+                                       std::span<const u32>{native_data_ram}, MacroRegistersStart,
+                                       read, forwardable);
+        };
+        if (fs.control == Regs::ShadowRamControl::Replay) {
+            // The back would write the shadow copy, not the words.
+            static const DmaForward::Plan replay_plan = [] {
+                DmaForward::Plan plan;
+                plan.reason = "shadow RAM replay";
+                return plan;
+            }();
+            dma_plan = &replay_plan;
+        } else {
+            dma_plan = &analyzed_plan.emplace(analyze(read_register));
+        }
+        if (!dma_plan->eligible) {
+            ++fallen_back;
+            const auto logged = std::ranges::find(reasons_logged, dma_plan->reason);
+            const auto free = std::ranges::find(reasons_logged, std::string_view{});
+            if (logged == reasons_logged.end() && free != reasons_logged.end()) {
+                *free = dma_plan->reason;
+                LOG_INFO(HW_GPU, "Nx2Perf dma_forward: macro {:#x} not forwarded: {}", macro_index,
+                         dma_plan->reason);
+            }
+        } else if (VideoCommon::Nx2Perf::Verify()) {
+            verify_forward = true; // The old path runs; its writes are compared below.
+        } else {
+            // The back's half: the read's flushes, the words, the forwarded writes.
+            struct ForwardRead {
+                static void Run(Maxwell3D* engine, GPUVAddr source, u32 dma_words, u32* words) {
+                    auto& memory = engine->memory_manager;
+                    const size_t bytes = size_t{dma_words} * sizeof(u32);
+                    if (memory.IsMemoryDirty(source, bytes, VideoCommon::CacheType::BufferCache)) {
+                        memory.FlushRegion(source, bytes, VideoCommon::CacheType::BufferCache);
+                    }
+                    memory.FlushQueryResults(source, bytes);
+                    memory.ReadWordsUnsafe(source, words, dma_words);
+                }
+            };
+            struct ForwardCall {
+                Maxwell3D* engine;
+                Core::System* system;
+                DmaForward::Snapshot snapshot;
+                void operator()() const {
+                    std::array<u32, DmaForward::MaxDmaWords> words{};
+                    ForwardRead::Run(engine, snapshot.dma_source, snapshot.dma_words,
+                                     words.data());
+                    const bool ok = DmaForward::Recompute(
+                        snapshot, std::span<const u32>{words.data(), snapshot.dma_words},
+                        MacroRegistersStart, [this](u32 forwarded_method, u32 value) {
+                            engine->ConsumeSink(*system);
+                            engine->CallMethod(*system, forwarded_method, value, true);
+                        });
+                    static u32 failures{};
+                    if (!ok && failures++ < 16) {
+                        LOG_ERROR(HW_GPU, "Nx2Perf dma_forward: the back's run of a forwarded "
+                                          "macro call failed or made other writes");
+                    }
+                }
+            };
+            for (size_t i = 0; i < dma_plan->num_writes; ++i) {
+                const DmaForward::Write& write = dma_plan->writes[i];
+                if (write.forwarded) {
+                    if (i == dma_plan->snapshot.first_forwarded) {
+                        split.Defer(ForwardCall{this, &system, dma_plan->snapshot});
+                    }
+                    fs.MarkUnknown(write.method);
+                    continue;
+                }
+                // The DMA read's own write goes to the back as before; the read doesn't happen.
+                FrontWrite(split, fs, write.method, write.value, true, true);
+            }
+            for (size_t i = 0; i < dma_plan->num_ram_writes; ++i) {
+                native_data_ram[dma_plan->ram_writes[i].first] = dma_plan->ram_writes[i].second;
+            }
+            forwarded_call = true;
+            if ((++forwarded_calls & 0xffff) == 0) {
+                LOG_INFO(HW_GPU, "Nx2Perf dma_forward: {} macro calls forwarded, {} not",
+                         forwarded_calls, fallen_back);
+            }
+        }
+    }
+    std::array<std::array<u32, 2>, DmaForward::MaxWrites> verify_writes{};
+    size_t verify_count{};
+    std::array<u32, DmaForward::MaxDmaWords> verify_words{};
+    u32 verify_word_count{};
+#endif
+    if (!forwarded_call) {
+        Profile::Scope profile_scope{Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
         OotMacros::Id replacement = OotMacros::Id::None;
         if (!trace && (fs.oot_macros || fs.oot_dump) && slot < fs.oot_macro.size()) {
@@ -1894,15 +2540,131 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 fs.oot_writes.clear();
             }
         }
+        if (replacement != OotMacros::Id::None && !borrowed.empty() && fs.parameters.empty()) {
+            // The replacement reads fs.parameters.
+            fs.parameters.assign(borrowed.begin(), borrowed.end());
+            borrowed = {};
+        }
         if (replacement == OotMacros::Id::None ||
             !FrontRunOotMacro(split, fs, method, replacement)) {
+#ifdef ARCHITECTURE_x86_64
+            if (!engine.native_jit) {
+                engine.native_jit = std::make_shared<TuringMacroJit>();
+            }
+            engine.native_jit->Prepare(engine.native_code, engine.native_code_generation,
+                                       options.batch);
+            const size_t parameter_count = borrowed.empty() ? fs.parameters.size() : borrowed.size();
+            const auto same_value = [&fs, this](u32 address, u32 value) {
+                if (execution_mask[address] || !fs.skip_same) {
+                    return false;
+                }
+                if (fs.control == Regs::ShadowRamControl::Track ||
+                    fs.control == Regs::ShadowRamControl::TrackWithFilter) {
+                    return fs.shadow[address] == value && fs.regs[address] == value;
+                }
+                const u32 stored =
+                    fs.control == Regs::ShadowRamControl::Replay ? fs.shadow[address] : value;
+                return fs.regs[address] == stored;
+            };
+            const auto front_read = [&](u32 address) {
+                if (address >= Regs::NUM_REGS) {
+                    return 0U;
+                }
+                if (fs.unknown_count != 0 && fs.unknown_regs[address]) [[unlikely]] {
+                    fs.Learn(*this, split, address);
+                }
+                return fs.regs[address];
+            };
+            const auto front_emit = [&](u32 address, u32 value) {
+                if (trace) [[unlikely]] {
+                    trace_line += fmt::format(" {:#x}={:#x}", address, value);
+                }
+                if (verify_forward && verify_count < verify_writes.size()) [[unlikely]] {
+                    verify_writes[verify_count++] = {address, value};
+                }
+                if (address >= MacroRegistersStart) {
+                    return false;
+                }
+                if (!options.batch || !same_value(address, value)) {
+                    FrontWrite(split, fs, address, value, true, true);
+                } else if (!options.verify) [[likely]] {
+                    if (profile) [[unlikely]] {
+                        Profile::Add(Profile::Counter::MethodWrites, 1);
+                        Profile::Add(Profile::Counter::SameValueWrites, 1);
+                    }
+                } else {
+                    const u64 ring = split.WritePosition();
+                    const u32 reg = fs.regs[address];
+                    const u32 shadow = fs.shadow[address];
+                    const auto control = fs.control;
+                    FrontWrite(split, fs, address, value, true, true);
+                    static u64 differences{};
+                    if ((split.WritePosition() != ring || fs.regs[address] != reg ||
+                         fs.shadow[address] != shadow || fs.control != control) &&
+                        ++differences <= 64) {
+                        LOG_ERROR(HW_GPU,
+                                  "Nx2Perf macro: macro {:#x} write {:#x} = {:#x} taken as same "
+                                  "value: register {:#x} -> {:#x}, shadow {:#x} -> {:#x}, ring "
+                                  "words {} ({} so far)",
+                                  method, address, value, reg, fs.regs[address], shadow,
+                                  fs.shadow[address], split.WritePosition() - ring, differences);
+                    }
+                }
+                // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
+                if (address == 0x157 || address == 0x158) {
+                    // The read waits for the back, which may write the borrowed words.
+                    if (!borrowed.empty() && fs.parameters.empty()) {
+                        fs.parameters.assign(borrowed.begin(), borrowed.end());
+                    }
+                    ++dma_reads;
+                    if (macro_index < fs.dma_macros.size()) {
+                        fs.dma_macros[macro_index] = true;
+                    }
+                    const size_t parameters_before = fs.parameters.size();
+                    FrontDmaRead(split, fs, method, address, value);
+                    if (verify_forward && address == 0x158) [[unlikely]] {
+                        for (size_t i = parameters_before;
+                             i < fs.parameters.size() && verify_word_count < verify_words.size();
+                             ++i) {
+                            verify_words[verify_word_count++] = fs.parameters[i];
+                        }
+                    }
+                    if (trace) [[unlikely]] {
+                        trace_line += " [dma";
+                        if (address == 0x158) {
+                            for (size_t i = parameters_before; i < fs.parameters.size(); ++i) {
+                                trace_line += fmt::format(" {:#x}", fs.parameters[i]);
+                            }
+                        } else {
+                            const u32 ram = fs.regs[0x156];
+                            for (u32 i = 0; i < value && ram + i < native_data_ram.size(); ++i) {
+                                trace_line += fmt::format(" ram[{:#x}]={:#x}", ram + i,
+                                                          native_data_ram[ram + i]);
+                            }
+                        }
+                        trace_line += "]";
+                    }
+                }
+                return true;
+            };
+            const TuringMacroJit::Options jit_options{.batch_emits = options.batch,
+                                                      .keep_state = options.keep_state};
+            const auto result = engine.native_jit->Execute(start, fs.parameters, borrowed,
+                                                           std::span<u32>{native_data_ram},
+                                                           front_read, front_emit, jit_options);
+            if (!result.success) {
+                engine.native_execution_failed = true;
+                LOG_ERROR(HW_GPU, "Native MME (JIT, split front) failed: start={:#x}, consumed={}/{}, error={}",
+                          start, result.consumed, parameter_count, result.error);
+            }
+#else
             const auto parameter_count = fs.parameters.size();
             const auto read = [&fs](u32 address) {
                 return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
             };
             const auto emit = [&](u32 address, u32 value) {
                 if (trace) [[unlikely]] {
-                    trace_text += fmt::format(" {:x}={:x}", address, value);
+                    trace_line += fmt::format(" {:#x}={:#x}", address, value);
                 }
                 if (address >= MacroRegistersStart) {
                     return false;
@@ -1910,23 +2672,11 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 FrontWrite(split, fs, address, value, true, true);
                 // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
                 if (address == 0x157 || address == 0x158) {
+                    ++dma_reads;
                     FrontDmaRead(split, fs, method, address, value);
                 }
                 return true;
             };
-#ifdef ARCHITECTURE_x86_64
-            if (!engine.native_jit) {
-                engine.native_jit = std::make_shared<TuringMacroJit>();
-            }
-            engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
-            const auto result = engine.native_jit->Execute(
-                start, fs.parameters, std::span<u32>{native_data_ram}, read, emit);
-            if (!result.success) {
-                engine.native_execution_failed = true;
-                LOG_ERROR(HW_GPU, "Native MME (split front) failed: start={:#x}, consumed={}/{}, error={}",
-                          start, result.consumed, parameter_count, result.error);
-            }
-#else
             static const bool use_memo = [] {
                 const char* value = std::getenv("EDEN_NX2_MME_MEMO");
                 return value == nullptr || value[0] != '0';
@@ -1985,9 +2735,42 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             }
 #endif
         }
+#ifdef ARCHITECTURE_x86_64
+        if (verify_forward) [[unlikely]] {
+            // The forwarded path's answer against this drained run's.
+            static u64 checked{};
+            static u64 differed{};
+            bool same = verify_count == dma_plan->num_writes;
+            for (size_t i = 0; same && i < dma_plan->snapshot.first_forwarded; ++i) {
+                same = verify_writes[i] ==
+                       std::array<u32, 2>{dma_plan->writes[i].method, dma_plan->writes[i].value};
+            }
+            size_t index = dma_plan->snapshot.first_forwarded;
+            const bool ran = DmaForward::Recompute(
+                dma_plan->snapshot, std::span<const u32>{verify_words.data(), verify_word_count},
+                MacroRegistersStart, [&](u32 forwarded_method, u32 value) {
+                    same = same && index < verify_count &&
+                           verify_writes[index] == std::array<u32, 2>{forwarded_method, value};
+                    ++index;
+                });
+            same = same && ran;
+            ++checked;
+            if (!same && differed++ < 64) {
+                LOG_ERROR(HW_GPU, "Nx2Perf dma_forward: macro {:#x} call differs from the drained "
+                                  "run ({} writes, plan {}; {} differences in {} calls)",
+                          macro_index, verify_count, dma_plan->num_writes, differed, checked);
+            }
+            if ((checked & 0xffff) == 0) {
+                LOG_INFO(HW_GPU, "Nx2Perf dma_forward: {} calls checked, {} differed", checked,
+                         differed);
+            }
+        }
+#endif
     }
     if (trace) [[unlikely]] {
-        LOG_INFO(HW_GPU, "{}", trace_text);
+        LOG_INFO(HW_GPU, "Nx2 macro trace {:#x} call {}: {}", trace_macro, traced_calls,
+                 trace_line);
+        ++traced_calls;
     }
     fs.parameters.clear();
     if (fs.pending_instances != 0) {
@@ -1996,10 +2779,22 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                     VideoCommon::GpuSplit::Effect::Gpu);
     }
     if (fs.draw_pending) {
+        const auto finish_effect = FrontDrawEffect(split, fs);
         fs.draw_pending = false;
         fs.loop_count_sent = false;
+        fs.draw_window_writer = false;
+        fs.draw_window_epoch = 0;
         split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
-                    VideoCommon::GpuSplit::Effect::Gpu);
+                    finish_effect);
+        if (FrontIsWriterDraw(fs.regs)) {
+            split.NoteWriter();
+        }
+    }
+    if (profile) [[unlikely]] {
+        Profile::AddMacro((method - MacroRegistersStart) >> 1,
+                          Profile::CounterValue(Profile::Counter::MethodWrites) - writes_before,
+                          Profile::CounterValue(Profile::Counter::SameValueWrites) - same_before,
+                          split.WritePosition() - ring_before, dma_reads);
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
@@ -2370,6 +3165,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     const u32 ram = fs.regs[0x156];
     const u32 words = std::min<u32>(count, 0x1000);
     const size_t read_bytes = size_t{words} * sizeof(u32);
+    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::MacroReadEarly) &&
+        FrontDmaReadEarly(split, fs, macro, method, source, ram, words)) {
+        return;
+    }
     static const bool full_drain = std::getenv("EDEN_NX2_MACRO_DMA_DRAIN") != nullptr;
     const auto flush_if_dirty = [&] {
         if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
@@ -2731,28 +3530,90 @@ bool Maxwell3D::FrontDmaReadEarly(VideoCommon::GpuSplit& split, FrontState& fs, 
         return false;
     }
     const u64 consumed = split.SettleWrites();
+    // MacroReadWriterSet: wait only for the entries that can write memory, not for the draws
+    // the back proved write none (checked again below, once the wait is over).
+    const bool writer_set =
+        VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::MacroReadWriterSet);
     std::array<u64, 5> pages;
+    std::array<std::pair<u64, u64>, 5> read_ranges; // device bytes read in each page
+    std::array<u64, 5> read_offsets;                 // their byte offsets in the read
     size_t page_count = 0;
-    u64 target = 0;
-    u64 write_target = 0;
+    using WriteKind = VideoCommon::SplitWriteTracker::WriteKind;
     for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + bytes; page += 0x1000) {
         const std::optional<DAddr> device = memory_manager.GpuToCpuAddress(page);
-        if (page_count == pages.size() || !device || Tegra::Nx2IsGpuWritten(*device)) {
+        if (page_count == pages.size() || !device || Tegra::Nx2IsGpuWrittenRegion(*device) ||
+            Tegra::Nx2IsGpuWritten(*device)) {
             return false;
         }
         const u64 device_page = *device & ~u64{0xfff};
+        const GPUVAddr read_begin = (std::max)(page, source);
+        const GPUVAddr read_end = (std::min)(page + 0x1000, source + bytes);
+        read_ranges[page_count] = {device_page + (read_begin - page), read_end - read_begin};
+        read_offsets[page_count] = read_begin - source;
         pages[page_count++] = device_page;
-        target = (std::max)(target, split.ReadTarget(device_page, device_page + 0x1000));
-        write_target = (std::max)(write_target,
-                                  split.Writes().LastWriteTo(device_page, device_page + 0x1000));
+    }
+    u64 target = 0;
+    u64 write_target = 0;
+    u64 other_write_target = 0; // noted writes other than constant buffer data
+    for (size_t i = 0; i < page_count; ++i) {
+        const u64 begin = pages[i];
+        const u64 end = pages[i] + 0x1000;
+        target = (std::max)(target, writer_set ? split.Writes().WriterReadTarget(begin, end)
+                                               : split.ReadTarget(begin, end));
+        write_target = (std::max)(write_target, split.Writes().LastWriteTo(begin, end));
+        other_write_target = (std::max)(other_write_target,
+                                        split.Writes().LastWriteTo(begin, end, WriteKind::Other));
+    }
+    // MacroReadCbOverlay: when the only queued writes noted to these pages are constant buffer
+    // data, wait only for the unknown and GPU writers, then lay the queued words over what memory
+    // holds. Invariant: after those, the entries still queued write the read bytes only through
+    // noted writes (Effect::None), so no writer but the queued constant buffer words (kept in
+    // order, by device address like the tracker) touches them before the back runs those words.
+    // Async writes are checked below as before.
+    const bool cb_overlay =
+        VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::MacroReadCbOverlay);
+    const u64 unlocalized_target =
+        (std::max)(split.Writes().LastUnknown(), split.Writes().LastGpu());
+    const bool overlay = cb_overlay && write_target > unlocalized_target &&
+                         other_write_target == 0 && split.ConstBufferWordsKept(consumed);
+    if (overlay) {
+        target = unlocalized_target;
     }
     const auto wait_reason = target == split.Writes().LastUnknown()
                                  ? Profile::Counter::DmaReadsWaitUnknown
                              : target == write_target ? Profile::Counter::DmaReadsWaitWrite
                                                       : Profile::Counter::DmaReadsWaitGpu;
     split.WaitUntil(target, VideoCommon::DrainSite::MacroDmaWrites);
+    const u64 consumed_now = split.ConsumedNow();
+    // Draws still queued that the read did not wait for: their proofs must still hold (no
+    // program dropped or deferred-written since they were classified), and no queued write
+    // before them may reach proven code (the shader cache applies those at the next draw).
+    const bool skipped_draws = writer_set && split.Writes().LastGpu() > consumed_now;
+    if (skipped_draws) {
+        const u64 epoch = Tegra::g_nx2_code_epoch.load(std::memory_order_acquire);
+        if (!split.Writes().DrawsValid(consumed_now, epoch) ||
+            split.Writes().AnyPendingWrite(consumed_now, split.Writes().LastGpu(),
+                                           [](u64 begin, u64 end) {
+                                               return Tegra::Nx2IsProvenCode(begin, end - begin);
+                                           })) {
+            if (Profile::Enabled()) {
+                Profile::Add(overlay ? Profile::Counter::DmaReadsOverlayFallback
+                                     : Profile::Counter::DmaReadsWriterSetFallback,
+                             1);
+            }
+            return false;
+        }
+    }
     for (size_t i = 0; i < page_count; ++i) {
-        if (Tegra::Nx2IsGpuWritten(pages[i])) {
+        if (Tegra::Nx2IsGpuWrittenRegion(pages[i]) || Tegra::Nx2IsGpuWritten(pages[i])) {
+            return false;
+        }
+        // A counter report or delayed release to these bytes: read early only once the back ran
+        // it and its result landed. The words in memory are then what a drained read sees.
+        const auto [range_begin, range_size] = read_ranges[i];
+        if (const u64 async_position = split.HasAsyncWrite(range_begin, range_size);
+            async_position != 0 && (async_position > consumed_now ||
+                                    !Tegra::Nx2AsyncReportsSettled(range_begin, range_size))) {
             return false;
         }
     }
@@ -2761,34 +3622,99 @@ bool Maxwell3D::FrontDmaReadEarly(VideoCommon::GpuSplit& split, FrontState& fs, 
         Profile::Add(Profile::Counter::DmaReadsEarly, 1);
         if (target > consumed) {
             Profile::Add(wait_reason, 1);
+            if (wait_reason == Profile::Counter::DmaReadsWaitWrite && cb_overlay) {
+                Profile::Add(other_write_target != 0 ? Profile::Counter::DmaReadsWaitWriteOther
+                             : !split.ConstBufferWordsKept(consumed)
+                                 ? Profile::Counter::DmaReadsWaitWriteCbLost
+                                 : Profile::Counter::DmaReadsWaitWriteCbOlder,
+                             1);
+            }
         }
+        if (skipped_draws) {
+            Profile::Add(Profile::Counter::DmaReadsWriterSet, 1);
+        }
+        if (overlay) {
+            Profile::Add(target > consumed ? Profile::Counter::DmaReadsOverlayWaited
+                                           : Profile::Counter::DmaReadsOverlayNoWait,
+                         1);
+        }
+    }
+    // Words the back ran up to consumed_now are in memory; the newer ones come from the overlay.
+    const auto apply_overlay = [&](u32* out) {
+        for (size_t i = 0; i < page_count; ++i) {
+            split.OverlayConstBufferWords(consumed_now, read_ranges[i].first, read_ranges[i].second,
+                                          reinterpret_cast<u8*>(out) + read_offsets[i]);
+        }
+    };
+    if (!VideoCommon::Nx2Perf::Verify()) [[likely]] {
+        if (overlay) {
+            auto& words_read = fs.dma_words;
+            words_read.resize(words);
+            memory_manager.ReadWordsUnsafe(source, words_read.data(), words);
+            apply_overlay(words_read.data());
+            if (method == 0x158) {
+                fs.parameters.insert(fs.parameters.end(), words_read.begin(), words_read.end());
+            } else if (ram < native_data_ram.size()) {
+                const size_t copy_words = (std::min<size_t>)(words, native_data_ram.size() - ram);
+                std::memcpy(native_data_ram.data() + ram, words_read.data(),
+                            copy_words * sizeof(u32));
+            }
+            return true;
+        }
+        if (method == 0x158) {
+            const size_t old_size = fs.parameters.size();
+            fs.parameters.resize(old_size + words);
+            memory_manager.ReadWordsUnsafe(source, fs.parameters.data() + old_size, words);
+        } else if (ram < native_data_ram.size()) {
+            const size_t copy_words = (std::min<size_t>)(words, native_data_ram.size() - ram);
+            memory_manager.ReadWordsUnsafe(source, native_data_ram.data() + ram, copy_words);
+        }
+        return true;
     }
     auto& read = fs.dma_words;
     read.resize(words);
-    for (u32 i = 0; i < words; ++i) {
-        read[i] = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+    memory_manager.ReadWordsUnsafe(source, read.data(), words);
+    if (overlay) {
+        apply_overlay(read.data());
     }
-    if (perf_verify) {
-        // The old path: drain, flush, read again. Its words are the ones used.
-        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
-        if (memory_manager.IsMemoryDirty(source, bytes, VideoCommon::CacheType::BufferCache)) {
-            split.Run(
-                [memory = &memory_manager, source, bytes] {
-                    memory->FlushRegion(source, bytes, VideoCommon::CacheType::BufferCache);
-                },
-                VideoCommon::DrainSite::MacroDmaFlush);
-        }
-        static u32 logged{};
-        for (u32 i = 0; i < words; ++i) {
-            const u32 drained = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
-            if (drained != read[i] && logged < 64) {
+    // The old path: drain, flush, read again. Its words are the ones used.
+    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    const bool verify_flush_buffers =
+        memory_manager.IsMemoryDirty(source, bytes, VideoCommon::CacheType::BufferCache);
+    split.Run(
+        [memory = &memory_manager, source, bytes, verify_flush_buffers] {
+            if (verify_flush_buffers) {
+                memory->FlushRegion(source, bytes, VideoCommon::CacheType::BufferCache);
+            }
+            memory->FlushQueryResults(source, bytes);
+        },
+        VideoCommon::DrainSite::MacroDmaFlush);
+    static u32 logged{};
+    static u64 writer_set_reads{};
+    static u64 writer_set_mismatches{};
+    bool mismatch = false;
+    for (u32 i = 0; i < words; ++i) {
+        const u32 drained = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+        if (drained != read[i]) {
+            mismatch = true;
+            if (logged < 64) {
                 ++logged;
                 LOG_ERROR(HW_GPU,
-                          "Nx2Perf split: macro {:#x} DMA read of {} words at {:#x}: word {} is "
+                          "Nx2Perf {}: macro {:#x} DMA read of {} words at {:#x}: word {} is "
                           "{:#x} without the drain, {:#x} after it",
-                          macro, words, source, i, read[i], drained);
+                          skipped_draws ? "macro_read_writer_set" : "split", macro, words, source,
+                          i, read[i], drained);
             }
-            read[i] = drained;
+        }
+        read[i] = drained;
+    }
+    if (skipped_draws) {
+        writer_set_mismatches += mismatch ? 1 : 0;
+        if ((++writer_set_reads & 4095) == 0 || (mismatch && writer_set_mismatches <= 64)) {
+            LOG_INFO(HW_GPU,
+                     "Nx2Perf macro_read_writer_set: {} early reads past queued proven draws, {} "
+                     "differed from the drained read",
+                     writer_set_reads, writer_set_mismatches);
         }
     }
     for (u32 i = 0; i < words; ++i) {
@@ -2841,12 +3767,22 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
         }
     }
     for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
+        if (fs.unknown_count != 0 && fs.unknown_regs[i]) {
+            // Forwarded (dma_forward): the back's values are the right ones.
+            fs.regs[i] = expected[i];
+            fs.shadow[i] = shadow_state.reg_array[i];
+            fs.ForgetUnknown(i);
+            continue;
+        }
         if (fs.regs[i] != expected[i]) {
             if (differences++ < 64) {
                 LOG_WARNING(HW_GPU, "Split front register {:#x}: front {:#x}, back {:#x}", i,
                             fs.regs[i], expected[i]);
             }
             fs.regs[i] = expected[i];
+            // The front's draw states were wrong: trust none of them until the window ends.
+            fs.draw_key_valid = false;
+            fs.draw_window_writer = true;
         }
     }
     if (fs.control != shadow_state.shadow_ram_control) {

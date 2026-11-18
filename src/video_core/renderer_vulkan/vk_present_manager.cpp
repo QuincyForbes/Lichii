@@ -5,7 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <thread>
+#include <vector>
 
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
@@ -276,6 +278,23 @@ Frame* PresentManager::GetRenderFrame() {
     frame->generated_async = false;
 
     return frame;
+}
+
+Frame* PresentManager::TryGetRenderFrame() {
+    std::unique_lock lock{free_mutex};
+    if (free_queue.empty()) {
+        return nullptr;
+    }
+
+    for (auto it = free_queue.begin(); it != free_queue.end(); ++it) {
+        Frame* frame = *it;
+        if (frame->present_done.GetStatus() == VK_SUCCESS) {
+            free_queue.erase(it);
+            frame->present_done.Reset();
+            return frame;
+        }
+    }
+    return nullptr;
 }
 
 void PresentManager::Present(Frame* frame) {

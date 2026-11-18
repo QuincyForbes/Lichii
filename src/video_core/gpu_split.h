@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -42,7 +45,9 @@ namespace VideoCommon {
 enum class DrainSite : u32 {
     Other,
     FetchDrain,     ///< EDEN_NX2_FETCH_DRAIN: before every entry
-    Acquire,        ///< A semaphore acquire reads the value the back may release
+    Acquire,        ///< A semaphore acquire reads the value the back may release (other paths)
+    AcquireTrigger, ///< The same, an Ampere semaphore trigger acquire checked when parsed
+    AcquirePoll,    ///< The same, a pending acquire polled (Puller::CanResumeAcquire)
     SemaphoreFlush, ///< The acquired semaphore is in the buffer cache
     FenceRelease,   ///< The puller's acquires release the pending fences
     ListWriters,    ///< GPU-written command lists: the dispatches and copies sent before them
@@ -63,7 +68,8 @@ enum class DrainSite : u32 {
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
-    "other",       "fetch drain",     "acquire",    "semaphore flush", "fence release",
+    "other",       "fetch drain",     "acquire",    "acquire trigger", "acquire poll",
+    "semaphore flush", "fence release",
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma writes",
     "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
@@ -212,11 +218,18 @@ public:
     [[nodiscard]] bool BackRunning() const {
         return back_running.load(std::memory_order_acquire);
     }
-    /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
+    /// Any thread: has the back call the idle hook soon, between entries or before it sleeps.
     void RequestIdleHook() {
         hook_requested.store(true, std::memory_order_seq_cst);
         wake.fetch_add(1, std::memory_order_seq_cst);
         WakeOne(wake);
+    }
+    /// Any thread, a hint (relaxed loads): whether the front waits for the back now, for a ring
+    /// position (WaitFor), a drain or a submission (hook_requested), or asleep in Backoff.
+    [[nodiscard]] bool FrontWaitsForBack() const {
+        return wait_target.load(std::memory_order_relaxed) != ~u64{0} ||
+               hook_requested.load(std::memory_order_relaxed) ||
+               front_waiting.load(std::memory_order_relaxed);
     }
 
     /// Starts the back thread once the split is wanted (EDEN_NX2_SPLIT=1, a Switch 2 title,
@@ -228,6 +241,7 @@ public:
     /// `segment`: the engine's current_dma_segment for the call, when the engine reads it.
     /// `effect`: what the entry may write (SplitWriteTracker; unknown unless the caller knows).
     using Effect = SplitWriteTracker::Effect;
+    using WriteKind = SplitWriteTracker::WriteKind;
     void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
                 const GPUVAddr* segment, Effect effect = Effect::Unknown) {
         SelectEngine(engine);
@@ -296,6 +310,41 @@ public:
         Commit(2, Effect::None);
     }
 
+    /// Nx2Perf draw_begin_coalesce: Method (MacroWrite when `direct`) for an executable write
+    /// whose immediate repeat the back can apply from a count (DrawManager::AddInstances). The
+    /// write is counted into the last entry (bits 24-30) when that one is the same word, sent by
+    /// this function, followed by nothing, still unpublished and below 127 repeats; otherwise it
+    /// is sent. With `verify` it is always sent, flagged Repeatable when it would have been
+    /// counted. Returns whether it was (or would have been) counted.
+    bool RepeatableMethod(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
+                          bool is_last, bool direct, Effect effect, bool verify) {
+        const u64 word = static_cast<u64>(Kind::Method) |
+                         (direct ? IsLast | Direct : (is_last ? IsLast : 0)) |
+                         (u64{method & 0xffff} << 8) | (u64{argument} << 32);
+        // The entry at write_position - 1 is unpublished while published_local is below it.
+        const bool repeat =
+            repeat_end == write_position && engine == front_engine &&
+            published_local < write_position &&
+            (ring[(write_position - 1) & RingMask] & ~(Repeatable | RepeatMask)) == word &&
+            (ring[(write_position - 1) & RingMask] & RepeatMask) != RepeatMask;
+        if (repeat && !verify) {
+            ring[(write_position - 1) & RingMask] += RepeatOne;
+            writes.Entry(effect, write_position);
+            if (eager_publish && back_idle.load(std::memory_order_relaxed)) {
+                Publish();
+            }
+            return true;
+        }
+        SelectEngine(engine);
+        u64* const entry = Reserve(1);
+        // Reserve may have wrapped: then the flagged entry would not follow the first one.
+        const bool flagged = repeat && write_position == repeat_end;
+        entry[0] = word | (flagged ? Repeatable : 0);
+        Commit(1, effect);
+        repeat_end = write_position;
+        return flagged;
+    }
+
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     template <typename Func>
     void Defer(const Func& func, Effect effect = Effect::Unknown) {
@@ -358,6 +407,9 @@ public:
         last_writer_position = write_position;
         if (!classified) {
             NoteUnboundedWriter(WriterKind::Other);
+        }
+        if (eager_publish) {
+            Publish(); // the fetch that waits for this entry usually follows within microseconds
         }
     }
     /// Compute or copy work just sent may write any memory.
@@ -718,10 +770,6 @@ public:
             words -= count;
         }
     }
-    /// The back's position, for OverlayQueuedWrites: take it before reading guest memory.
-    [[nodiscard]] u64 ConsumedNow() {
-        return consumed.load(std::memory_order_acquire);
-    }
     /// Applies to `out` (the words at device address `begin`, read from guest memory after
     /// `since` = ConsumedNow()) the queued writes the front knows the words of. False when an
     /// overlapping queued write's words are unknown (the caller waits instead).
@@ -732,27 +780,6 @@ public:
     /// Whether a noted write that overlaps [begin, begin + size) is still queued (or too many
     /// are queued to tell).
     bool HasQueuedWritesTo(u64 begin, u64 size);
-    /// Front: a write that lands when a host query completes or a fence signals (counter
-    /// reports, timed releases), not when the back runs it (Tegra::Nx2AsyncReportsSettled).
-    void NoteAsyncWrite(u64 begin, u64 size) {
-        for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
-            async_writes[slot] = write_position;
-        }
-    }
-    /// Front: the ring position of the newest async write noted to these bytes, or 0.
-    [[nodiscard]] u64 HasAsyncWrite(u64 begin, u64 size) const {
-        u64 newest = 0;
-        if (async_writes.empty()) {
-            return newest;
-        }
-        for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
-            if (const auto it = async_writes.find(slot); it != async_writes.end()) {
-                newest = (std::max)(newest, it->second);
-            }
-        }
-        return newest;
-    }
-
     /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
     /// commands after it are fetched.
@@ -866,8 +893,35 @@ public:
         return oldest != 0;
     }
     /// The entry just sent also writes [address, address + size) of `memory`, noted by device
-    /// page (other mappings may alias it, and the caches keep state per page).
-    void NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);
+    /// page (other mappings may alias it, and the caches keep state per page). Returns whether
+    /// it was noted by range (not as an unknown write).
+    bool NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
+                   WriteKind kind = WriteKind::Other);
+    /// The entry just sent writes the constant buffer data `words` (`count` of them, the first
+    /// `stored` land: the rest fall past the bank) at `address`. With MacroReadCbOverlay the
+    /// stored words are kept by device address until the back ran the entry
+    /// (OverlayConstBufferWords).
+    void NoteConstBufferWrite(const Tegra::MemoryManager& memory, GPUVAddr address,
+                              const u32* words, u32 count, u32 stored);
+    /// Whether every constant buffer word queued after `consumed_position` is kept (none was
+    /// dropped).
+    [[nodiscard]] bool ConstBufferWordsKept(u64 consumed_position) const {
+        return cb_words_lost <= consumed_position;
+    }
+    /// Copies the kept constant buffer words queued after `consumed_position` over the bytes
+    /// `out` holds for the device range [begin, begin + size), oldest first: the newest wins.
+    void OverlayConstBufferWords(u64 consumed_position, u64 begin, u64 size, u8* out) const;
+    /// The next entry's Effect::Draw was classified with this program epoch (MacroReadWriterSet).
+    void DrawEpoch(u64 epoch) {
+        writes.DrawEpoch(epoch);
+    }
+    /// The entry just sent invalidates the device range [begin, begin + size) of the caches
+    /// (MacroReadWriterSet: early reads check it against proven programs, as a noted write).
+    void NoteDeviceRange(u64 begin, u64 size) {
+        if (size != 0) {
+            writes.Write(begin, begin + size, write_position);
+        }
+    }
     /// The entry just sent writes guest memory the front can't tell.
     void NoteUnknownWrite() {
         writes.Entry(Effect::Unknown, write_position);
@@ -875,6 +929,39 @@ public:
     /// Waits for the queued functions (GPU memory maps among them) before the front translates
     /// addresses, then drops the pending writes the back has run. Returns the back's position.
     u64 SettleWrites();
+    /// Drops the pending writes the back has run. Returns the back's position.
+    u64 RetireWrites();
+    /// Front: a write that lands when a host query completes or a fence signals (counter
+    /// reports, delayed releases), not when the back runs it (Tegra::Nx2AsyncReportsSettled).
+    /// Call it after the entry that issues the write was sent.
+    void NoteAsyncWrite(u64 begin, u64 size) {
+        for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
+            // Positions only grow: a bucket holds the newest of the slots that share it.
+            async_writes[AsyncWriteBucket(slot)] = write_position;
+        }
+        any_async_write = true;
+    }
+    /// Front: the ring position of the newest async write noted to these bytes, or 0. Slots
+    /// share buckets, so this may be newer than the bytes' own last write or report one they
+    /// never had: callers then only wait longer or take the drained path.
+    [[nodiscard]] u64 HasAsyncWrite(u64 begin, u64 size) const {
+        u64 newest = 0;
+        if (!any_async_write) {
+            return newest;
+        }
+        for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
+            newest = (std::max)(newest, async_writes[AsyncWriteBucket(slot)]);
+        }
+        return newest;
+    }
+    /// Front: the ring position after the last entry sent.
+    [[nodiscard]] u64 WritePosition() const {
+        return write_position;
+    }
+    /// The back's position right now.
+    [[nodiscard]] u64 ConsumedNow() const {
+        return consumed.load(std::memory_order_acquire);
+    }
     /// Ring position the back must pass to execute possible writers of [begin, end).
     /// Deferred fence writes can still be pending afterwards.
     [[nodiscard]] u64 ReadTarget(u64 begin, u64 end) const {
@@ -912,7 +999,15 @@ private:
     static inline bool ring_pairs{};
     static constexpr u32 MaxPairs = 4096;
 
-    std::unordered_map<u64, u64> async_writes; ///< Front: 16-byte slot -> ring position
+    /// Method, EDEN_NX2_PERF_VERIFY with draw_begin_coalesce: the front would have counted this
+    /// entry into the one before it (RepeatableMethod). Bit 31: bit 7 is Sink's.
+    static constexpr u64 Repeatable = u64{1} << 31;
+    /// Method: how many more times the back calls it, right after the first (RepeatableMethod),
+    /// in bits 24-30 (up to 127)
+    static constexpr u64 RepeatOne = u64{1} << 24;
+    static constexpr u64 RepeatMask = u64{0x7f} << 24;
+    static_assert(((u64{0xf} | IsLast | HasSegment | Direct) & Repeatable) == 0 &&
+                  ((u64{0xffff} << 8) & RepeatMask) == 0);
 
     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
     static constexpr size_t RingMask = RingWords - 1;
@@ -939,10 +1034,14 @@ private:
         write_position += words;
         writes.Entry(effect, write_position);
         const size_t pending = write_position - published_local;
+        // EagerPublish: while the back has nothing to do, every entry goes out at once instead of
+        // waiting for the next 256-word batch (the back idled while the front filled it, then the
+        // front waited for the back to catch up).
         if (pending >= publish_every ||
             back_waiting.load(std::memory_order_relaxed) ||
             (pending >= 8 &&
-             consumed.load(std::memory_order_relaxed) == published_local)) {
+             consumed.load(std::memory_order_relaxed) == published_local) ||
+            (eager_publish && back_idle.load(std::memory_order_relaxed))) {
             Publish();
         }
     }
@@ -957,6 +1056,8 @@ private:
 
     /// One step of a front wait for the back to consume `target`.
     void Backoff(u32 spins, u64 target);
+    /// The idle hook (deferred submits), timed as its own profiler zone.
+    void RunIdleHook();
     /// After the back stored `consumed`: wakes a front sleeping in Backoff once past wait_target.
     void NotifyFront(u64 position) {
         if (front_waiting.load(std::memory_order_seq_cst) &&
@@ -965,13 +1066,28 @@ private:
             WakeOne(front_wake);
         }
     }
+    /// The same without a position: wakes a front sleeping in Backoff.
+    void NotifyFront() {
+        if (front_waiting.load(std::memory_order_seq_cst)) {
+            front_wake.fetch_add(1, std::memory_order_seq_cst);
+            WakeOne(front_wake);
+        }
+    }
 
     void BackLoop(std::stop_token stop_token);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
     size_t Execute(const u64* entry, size_t words);
+    /// A Method entry with a repeat count (RepeatableMethod): the call, then the repeats.
+    void ExecuteRepeated(u64 head);
+    /// EDEN_NX2_PERF_VERIFY with draw_begin_coalesce: checks that a Repeatable entry directly
+    /// follows the same word.
+    void VerifyRepeat(u64 head);
 
     Core::System* system{};
     bool active{};
+    bool eager_publish{}; ///< Nx2Perf::Opt::EagerPublish, read once at Start
+    /// Nx2Perf::Verify() with draw_begin_coalesce, read once at Start before the back starts
+    bool verify_repeats{};
     bool front_macros{};
     std::unique_ptr<u64[]> ring;
 
@@ -1146,6 +1262,15 @@ private:
     u64 MemoryWriterTarget(u64 done, GPUVAddr begin, GPUVAddr end, u32& target_method);
     u64 last_function_position{};
     SplitWriteTracker writes;
+    /// MacroReadCbOverlay: queued constant buffer words, oldest first, popped by RetireWrites.
+    struct ConstBufferWord {
+        u64 device;
+        u64 position;
+        u32 value;
+    };
+    static constexpr size_t MaxConstBufferWords = 4096;
+    std::deque<ConstBufferWord> cb_words;
+    u64 cb_words_lost{}; ///< Newest position of a constant buffer word not kept
     /// NoteWrite's last translation: memory manager, GPU page, device page, the function
     /// position it was made at (a later function may remap).
     const Tegra::MemoryManager* note_memory{};
@@ -1154,6 +1279,8 @@ private:
     u64 note_function{};
     u64 published_local{};
     u64 consumed_cache{};
+    /// RepeatableMethod: the ring position after the last entry it sent
+    u64 repeat_end{~u64{0}};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
@@ -1175,6 +1302,12 @@ private:
     bool dispatch_confirmed{};
     bool dispatch_unbounded{};
     static inline thread_local bool recording_dispatch{};
+    /// VerifyRepeat: the last entry's word, the Repeatable entries seen and those that did not
+    /// follow the same word, since the last report
+    u64 verify_previous{};
+    u64 verify_mergeable{};
+    u64 verify_mismatches{};
+    u64 verify_report_ns{};
 
     /// Whether the back is done with the Vulkan scheduler until it gets more work: set after its
     /// idle hook ran, cleared before it executes entries.
@@ -1248,9 +1381,19 @@ private:
     // always touched together by both threads, so they share a block.
     alignas(128) std::atomic<u64> published{};
     alignas(128) std::atomic<u64> consumed{};
+    /// Front: newest ring position per bucket of 16-byte slots (AsyncWriteBucket). An unordered
+    /// map kept every slot ever reported for the whole session: in Ocarina of Time its inserts
+    /// were ~6% of the front's working time (counter reports at ever-new addresses).
+    static constexpr size_t AsyncWriteBuckets = size_t{1} << 16;
+    [[nodiscard]] static size_t AsyncWriteBucket(u64 slot) {
+        return static_cast<size_t>((slot ^ (slot >> 16) ^ (slot >> 32)) & (AsyncWriteBuckets - 1));
+    }
+    std::vector<u64> async_writes = std::vector<u64>(AsyncWriteBuckets);
+    bool any_async_write{};
     /// A position the front waits for (WaitFor): the back stores `consumed` once past it.
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
     alignas(128) std::atomic<bool> back_waiting{};
+    std::atomic<bool> back_idle{}; ///< The back is spinning or sleeping for work (EagerPublish)
     std::atomic<u32> wake{};
     /// The front sleeps in Backoff (#161: instead of yielding).
     alignas(128) std::atomic<bool> front_waiting{};

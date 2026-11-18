@@ -65,6 +65,10 @@ struct GpuSplitTestAccess {
         GpuSplit::recording_dispatch = false;
     }
 
+    static u64 Word(const GpuSplit& split, u64 position) {
+        return split.ring[position & GpuSplit::RingMask];
+    }
+
     static u64 NearWrap() {
         return GpuSplit::RingWords - 1;
     }
@@ -346,6 +350,49 @@ TEST_CASE("Maxwell3D constant buffer word runs match single CallMethod writes",
             break;
         }
         }
+        f.Compare();
+    }
+}
+
+TEST_CASE("Maxwell3D state method runs match single CallMethod writes",
+          "[video_core][maxwell_fast_method]") {
+    Fixture f;
+    std::mt19937 rng{19};
+    constexpr u64 kind_method = 2;
+    constexpr u64 is_last = 1ULL << 4;
+    constexpr u64 has_segment = 1ULL << 5;
+    constexpr u64 direct = 1ULL << 6;
+    for (u32 step = 0; step < 5000; ++step) {
+        CAPTURE(step);
+        if (rng() % 6 == 0) {
+            f.Call(ShadowControl, rng() % 4, true);
+            f.Compare();
+            continue;
+        }
+        const size_t run_len = 1 + rng() % 32;
+        std::vector<u64> ring(run_len + 1);
+        for (size_t i = 0; i < run_len; ++i) {
+            const u32 method = f.state_methods[rng() % f.state_methods.size()];
+            const u32 arg = RandomArgument(rng, method, f.slow);
+            const u64 flags = (rng() % 2 == 0 ? is_last : 0) | (rng() % 2 == 0 ? direct : 0);
+            ring[i] = kind_method | flags | (u64{method} << 8) | (u64{arg} << 32);
+            f.slow.CallMethod(f.system, method, arg, (flags & is_last) != 0);
+        }
+        // Append a stopper entry (executable method, HasSegment, or non-Method kind).
+        switch (rng() % 3) {
+        case 0:
+            ring[run_len] = kind_method | (u64{DrawBegin} << 8);
+            break;
+        case 1:
+            ring[run_len] =
+                kind_method | has_segment | (u64{f.state_methods[0]} << 8) | (u64{1} << 32);
+            break;
+        default:
+            ring[run_len] = 3; // Kind::Multi
+            break;
+        }
+        const size_t consumed = f.fast.CallStateMethodRun(ring.data(), ring.size());
+        REQUIRE(consumed == run_len);
         f.Compare();
     }
 }
@@ -764,6 +811,94 @@ TEST_CASE("GpuSplit CB batching preserves words at the GPU address space end",
     f.Compare();
 }
 
+TEST_CASE("GpuSplit draw.begin repeat counts match separate entries",
+          "[video_core][split_writes][draw_begin_coalesce]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    constexpr auto None = VideoCommon::GpuSplit::Effect::None;
+    constexpr u32 first = 4;                  // InstanceId::First (bits 26-27), triangles
+    constexpr u32 subsequent = (1u << 26) | 4; // InstanceId::Subsequent
+    for (const u32 repeats : {0u, 1u, 254u, 255u, 256u, 600u}) {
+        for (const bool counted_on_fast : {true, false}) {
+            CAPTURE(repeats, counted_on_fast);
+            Fixture f;
+            Maxwell3D& counted_engine = counted_on_fast ? f.fast : f.slow;
+            Maxwell3D& separate_engine = counted_on_fast ? f.slow : f.fast;
+            VideoCommon::GpuSplit counted;
+            VideoCommon::GpuSplit separate;
+            Access::Initialize(counted, f.system);
+            Access::Initialize(separate, f.system);
+            counted.MacroWrite(&counted_engine, DrawBegin, first);
+            separate.MacroWrite(&separate_engine, DrawBegin, first);
+            for (u32 i = 0; i <= repeats; ++i) {
+                REQUIRE(counted.RepeatableMethod(&counted_engine, DrawBegin, subsequent, true,
+                                                 true, None, false) == (i % 256 != 0));
+                separate.MacroWrite(&separate_engine, DrawBegin, subsequent);
+            }
+            // The engine entry, the first begin, then one entry per 256 subsequent ones, each
+            // counting up to 255 repeats.
+            const u64 entries = repeats / 256 + 1;
+            REQUIRE(Access::End(counted) == 3 + entries);
+            for (u64 i = 0; i < entries; ++i) {
+                const u64 word = Access::Word(counted, 3 + i);
+                REQUIRE(((word >> 24) & 0xff) == (std::min)(repeats - i * 256, u64{255}));
+                REQUIRE(((word >> 8) & 0xffff) == DrawBegin);
+                REQUIRE(static_cast<u32>(word >> 32) == subsequent);
+            }
+            for (auto* split : {&counted, &separate}) {
+                u64 position{};
+                while (position < Access::End(*split)) {
+                    position = Access::Execute(*split, position, Access::End(*split));
+                }
+            }
+            REQUIRE(counted_engine.draw_manager.draw_state.instance_count == repeats + 1);
+            REQUIRE(counted_engine.draw_manager.draw_state.draw_mode ==
+                    Maxwell3D::DrawManager::DrawMode::Instance);
+            f.Compare();
+        }
+    }
+}
+
+TEST_CASE("GpuSplit counts a draw.begin repeat only into the unpublished entry before it",
+          "[video_core][split_writes][draw_begin_coalesce]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    constexpr auto None = VideoCommon::GpuSplit::Effect::None;
+    constexpr u32 subsequent = (1u << 26) | 4;
+    Fixture f;
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    const auto repeat = [&](u32 argument, bool verify) {
+        return split.RepeatableMethod(&f.fast, DrawBegin, argument, true, true, None, verify);
+    };
+    REQUIRE(!repeat(subsequent, false));
+    REQUIRE(repeat(subsequent, false));
+    REQUIRE(Access::End(split) == 3);
+    split.Publish();
+    REQUIRE(!repeat(subsequent, false));
+    REQUIRE(Access::End(split) == 4);
+    split.MacroWrite(&f.fast, DrawEnd, 0);
+    REQUIRE(!repeat(subsequent, false));
+    REQUIRE(!repeat(subsequent | 1, false));
+    // A different call kind (not from a macro) is another word.
+    REQUIRE(!split.RepeatableMethod(&f.fast, DrawBegin, subsequent | 1, true, false, None, false));
+    REQUIRE(Access::End(split) == 8);
+    // Verify: sent, flagged (bit 7), not counted.
+    REQUIRE(!repeat(subsequent, true));
+    REQUIRE(repeat(subsequent, true));
+    REQUIRE(repeat(subsequent, true));
+    REQUIRE(Access::End(split) == 11);
+    REQUIRE(((Access::Word(split, 8) >> 7) & 1) == 0);
+    for (const u64 position : {9ULL, 10ULL}) {
+        const u64 word = Access::Word(split, position);
+        REQUIRE(((word >> 7) & 1) == 1);
+        REQUIRE(((word >> 24) & 0xff) == 0);
+    }
+    u64 position{};
+    while (position < Access::End(split)) {
+        position = Access::Execute(split, position, Access::End(split));
+    }
+    REQUIRE(f.fast.draw_manager.draw_state.instance_count == 9);
+}
+
 TEST_CASE("Maxwell3D fast method dispatch cost", "[.][maxwell_fast_method_bench]") {
     Fixture f;
     // Per draw, as the back thread sees Ocarina's: state writes the front did not drop, a
@@ -779,12 +914,12 @@ TEST_CASE("Maxwell3D fast method dispatch cost", "[.][maxwell_fast_method_bench]
         stream.emplace_back(CbData + 1, 0);
         stream.emplace_back(CbData + 2, draw * 3);
         for (const u32 stage : {0u, 2u, 4u}) {
-            stream.emplace_back(MAXWELL3D_REG_INDEX(bind_groups[0].raw_config) + stage * 8,
+            stream.emplace_back(static_cast<u32>(MAXWELL3D_REG_INDEX(bind_groups[0].raw_config)) + stage * 8,
                                 1 | (rng() % 8) << 4);
         }
         stream.emplace_back(DrawBegin, 0);
-        stream.emplace_back(MAXWELL3D_REG_INDEX(vertex_buffer.first), rng() % 4);
-        stream.emplace_back(MAXWELL3D_REG_INDEX(vertex_buffer.count), 3 + rng() % 4);
+        stream.emplace_back(static_cast<u32>(MAXWELL3D_REG_INDEX(vertex_buffer.first)), rng() % 4);
+        stream.emplace_back(static_cast<u32>(MAXWELL3D_REG_INDEX(vertex_buffer.count)), 3 + rng() % 4);
         stream.emplace_back(DrawEnd, 0);
     }
     const auto run = [&](Maxwell3D& engine) {

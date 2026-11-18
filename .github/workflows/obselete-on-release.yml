@@ -1,0 +1,35 @@
+name: Mark issues obsolete on release
+
+on:
+  release:
+    types: [released] # fires for published stable releases only, not pre-releases or drafts
+
+permissions:
+  issues: write
+
+jobs:
+  mark-obsolete:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure label exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh label create obsolete --color CFD3D7 \
+            --description "Issue predates the latest release" --force
+
+      - name: Label all open issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh issue list --state open --limit 1000 \
+            --search '-label:enhancement -label:accessibility -label:deferred -label:help-wanted -label:obsolete' \
+            --json number --jq '.[].number' |
+          while read -r n; do
+            gh issue edit "$n" --add-label obsolete
+            gh issue comment "$n" --body "A new release (\`$TAG\`) is out. Please check if this still applies. If it does, leave a comment within 7 days or this issue will be closed as not planned."
+            sleep 1
+          done

@@ -47,6 +47,11 @@ namespace Tegra::Engines {
 /// Draws left to trace after an upscale fallback (debug aid).
 extern std::atomic<u32> g_nx2_trace_draws_after_upscale;
 
+/// Colour target 0 of the latest depth-tested 3D draw to a float target (the scene image), and its
+/// size as width << 32 | height. Star Fox's cutscene network reads the frame drawn there.
+extern std::atomic<u64> g_nx2_scene_target;
+extern std::atomic<u64> g_nx2_scene_target_size;
+
 /**
  * This Engine is known as GK104_Compute. Documentation can be found in:
  * https://github.com/envytools/envytools/blob/master/rnndb/graph/gk104_compute.xml
@@ -66,15 +71,6 @@ public:
 
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
-
-    /// Whether a write to `method` can write memory (a dispatch, upload or report): with the
-    /// native class, every method besides those that only store their value; macros always.
-    [[nodiscard]] bool MayWriteMemory(u32 method) const {
-        if (method >= native_plain_methods.size()) {
-            return true;
-        }
-        return native_mode ? !native_plain_methods[method] : execution_mask[method];
-    }
 
     /// The channel's MME data RAM, shared with its 3D engine.
     void SetNativeDataRam(std::array<u32, 0xc00>* data_ram) { native_data_ram = data_ram; }
@@ -247,6 +243,8 @@ public:
     /// Write the value to the register identified by method.
     void CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) override;
 
+    void CallStateMethod(Core::System& system, u32 method, u32 method_argument) override;
+
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 
@@ -263,6 +261,8 @@ public:
     /// The base game's output passes, recognized by their code before translation.
     bool BypassOotBaseNetwork();
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
+    /// Whether the current native dispatch belongs to a recognized game DLSS evaluation.
+    bool IsDlssDispatch() const { return native_mode && dlss_chain.active; }
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod for native compute engines: runs their macros and macro
@@ -314,7 +314,7 @@ private:
     void CheckDlssNetwork();
     [[nodiscard]] VideoCore::GameDlssReason GameDlssBlocker() const;
     void UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReason blocker);
-    std::pair<std::vector<u32>, std::vector<u32>> NativeImageHandles(GPUVAddr program);
+    const std::pair<std::vector<u32>, std::vector<u32>>& NativeImageHandles(GPUVAddr program);
     void RememberNativeUpscaleInput();
 
     /// This frame's DLSS evaluation (Fortune's Weave): whether its passes all ran, and whether
@@ -370,6 +370,19 @@ private:
     bool native_mme_dumped{};
     std::optional<u32> native_executing_macro_logged;
     bool native_mode{};
+
+public:
+    /// Whether this method may write guest memory: dispatches, uploads and reports. Plain native
+    /// state does not.
+    [[nodiscard]] bool MayWriteMemory(u32 method) const {
+        if (method >= native_plain_methods.size()) {
+            return true;
+        }
+        return native_mode ? !native_plain_methods[method]
+                           : method < execution_mask.size() && execution_mask[method];
+    }
+
+private:
     NativeMacroContext* native_context{};
     bool native_compute_uploaded{};
     MacroEngine* native_macro{};

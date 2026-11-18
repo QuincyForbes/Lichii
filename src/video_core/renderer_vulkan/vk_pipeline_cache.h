@@ -143,6 +143,17 @@ public:
     ~PipelineCache();
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
+    /// Nx2Perf MacroReadWriterSet: the program epoch the current programs were resolved in
+    /// (0: none) and their device code ranges.
+    [[nodiscard]] u64 Nx2ResolvedEpoch() const noexcept {
+        return nx2_resolved_epoch;
+    }
+    [[nodiscard]] u64 Nx2ResolvedMap() const noexcept {
+        return nx2_resolved_map;
+    }
+    [[nodiscard]] const auto& Nx2CodeRanges() const noexcept {
+        return nx2_code_ranges;
+    }
 
     /// The programs of the last full lookup (the feature census, for a draw without a pipeline).
     [[nodiscard]] const std::array<u64, 6>& LookupHashes() const noexcept {

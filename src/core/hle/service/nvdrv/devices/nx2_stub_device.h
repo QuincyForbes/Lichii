@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -221,18 +224,21 @@ public:
         device_ranges[cpu_address] = {size, device_address};
     }
 
-    std::optional<u64> DeviceAddressOf(u64 cpu_address) {
+    std::optional<u64> DeviceAddressOf(u64 cpu_address, u64 size = 1) {
         std::scoped_lock lk{device_mutex};
+        if (size == 0) {
+            return std::nullopt;
+        }
         auto it = device_ranges.upper_bound(cpu_address);
-        if (it == device_ranges.begin()) {
-            return std::nullopt;
+        while (it != device_ranges.begin()) {
+            --it;
+            const auto& [start, range] = *it;
+            const u64 offset = cpu_address - start;
+            if (offset < range.first && size <= range.first - offset) {
+                return range.second + offset;
+            }
         }
-        --it;
-        const auto& [start, range] = *it;
-        if (cpu_address - start >= range.first) {
-            return std::nullopt;
-        }
-        return range.second + (cpu_address - start);
+        return std::nullopt;
     }
 
     std::optional<u64> GpuAddressOf(u32 handle, u64 offset) {

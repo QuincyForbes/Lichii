@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -196,6 +199,7 @@ ENUM(SpeedMode, Standard, Turbo, Slow);
 ENUM(FrameGenType, Lsfg, Fsr3, MetalFx);
 ENUM(FrameGenMotion, Auto, Shader);
 ENUM(FrameGenFlowQuality, Fast, Medium, Best);
+ENUM(ColdHintMode, Off, WhenRamIsLow, Always);
 
 template <typename Type>
 inline std::string_view CanonicalizeEnum(Type id) {

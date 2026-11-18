@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -26,8 +29,8 @@ class Scheduler {
 public:
     void Push(GPU& gpu, s32 channel, CommandList&& entries);
 
-    /// Runs channels whose pending semaphore acquire is now met.
-    void ResumePending(GPU& gpu);
+    /// Runs channels whose pending semaphore acquire is now met. Returns whether any channel moved.
+    bool ResumePending(GPU& gpu);
     [[nodiscard]] bool HasPendingChannels() const {
         return !pending_channels.empty();
     }

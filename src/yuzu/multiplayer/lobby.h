@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: Copyright 2017 Citra Emulator Project
@@ -78,9 +81,10 @@ private slots:
 signals:
     void StateChanged(const Network::RoomMember::State&);
     void SaveConfig();
+    /// Asks the main window to open Configuration > System > Profiles.
+    void RequestProfileConfiguration();
 
 private:
-    std::string GetProfileUsername();
 
     /**
      * Removes all entries in the Lobby before refreshing.

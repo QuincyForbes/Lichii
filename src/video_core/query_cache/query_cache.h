@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -30,6 +33,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/query_cache/bank_base.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_cache/query_base.h"
@@ -687,6 +691,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
 
 template <typename Traits>
 void QueryCacheBase<Traits>::UnregisterPending() {
+    if (impl->pending_unregister.empty()) {
+        return;
+    }
     const auto gen_caching_indexing = [](VAddr cur_addr) {
         return std::make_pair<u64, u32>(cur_addr >> Core::DEVICE_PAGEBITS,
                                         static_cast<u32>(cur_addr & Core::DEVICE_PAGEMASK));
@@ -743,6 +750,9 @@ void QueryCacheBase<Traits>::UnregisterPending() {
             if (it2 != it1->second.end()) {
                 if (it2->second.raw == loc.raw) {
                     it1->second.erase(it2);
+                    if (it1->second.empty()) {
+                        cached_queries.erase(it1);
+                    }
                 }
             }
         }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -54,6 +57,11 @@ public:
 
     /// Called after each successful write of a config file.
     static inline std::function<void(const Config&)> on_written;
+
+    /// Reads one global setting from <config dir>/<config_name>.ini, for a setting that must
+    /// apply before the config loads. Leaves it unchanged when the file doesn't set it.
+    static void ReadGlobalSettingEarly(const std::string& config_name,
+                                       Settings::BasicSetting& setting);
 
 protected:
     explicit Config(ConfigType config_type = ConfigType::GlobalConfig);

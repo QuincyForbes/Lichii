@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -115,6 +118,7 @@ public:
     u64 rdtsc_ns_factor;
     std::atomic<u64> cntpct_rdtsc_factor;
     u64 gputick_rdtsc_factor;
+    u64 base_rdtsc{};
     bool invariant;
 #elif defined(ARCHITECTURE_arm64) && defined(__SIZEOF_INT128__)
     using FactorType = unsigned __int128;

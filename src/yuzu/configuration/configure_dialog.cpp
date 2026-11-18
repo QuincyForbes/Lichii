@@ -31,6 +31,7 @@
 #include "yuzu/configuration/configure_debug_tab.h"
 #include "yuzu/configuration/configure_dialog.h"
 #include "yuzu/configuration/configure_filesystem.h"
+#include "yuzu/configuration/configure_frame_generation.h"
 #include "yuzu/configuration/configure_general.h"
 #include "yuzu/configuration/configure_graphics.h"
 #include "yuzu/configuration/configure_graphics_advanced.h"
@@ -39,6 +40,7 @@
 #include "yuzu/configuration/configure_input.h"
 #include "yuzu/configuration/configure_input_player.h"
 #include "yuzu/configuration/configure_network.h"
+#include "yuzu/configuration/configure_performance.h"
 #include "yuzu/configuration/configure_profile_manager.h"
 #include "yuzu/configuration/configure_system.h"
 #include "yuzu/configuration/configure_ui.h"
@@ -76,6 +78,11 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
           nullptr, *builder, this)},
       hotkeys_tab{std::make_unique<ConfigureHotkeys>(system_.HIDCore(), this)},
       network_tab{std::make_unique<ConfigureNetwork>(system_, this)},
+      performance_state{std::make_unique<Performance::State>()},
+      performance_gpu_tab{
+          std::make_unique<ConfigureGpu>(*performance_state, vk_device_records, this)},
+      performance_shaders_tab{std::make_unique<ConfigureShaders>(system_, *builder, this)},
+      performance_ram_tab{std::make_unique<ConfigureRam>(system_, *builder, this)},
       profile_tab{std::make_unique<ConfigureProfileManager>(system_, this)},
       system_tab{std::make_unique<ConfigureSystem>(system_, nullptr, *builder, this)},
       web_tab{std::make_unique<ConfigureWeb>(this)}, input_subsystem{input_subsystem_} {
@@ -183,7 +190,11 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
     ui->buttonBox->setFocus();
 }
 
-ConfigureDialog::~ConfigureDialog() = default;
+ConfigureDialog::~ConfigureDialog() {
+    // Deleting the tab pages makes the tab widget switch tabs; don't run the handler on a
+    // half-destroyed dialog.
+    ui->tabWidget->blockSignals(true);
+}
 
 void ConfigureDialog::SetConfiguration() {}
 
@@ -201,6 +212,9 @@ void ConfigureDialog::ApplyConfiguration() {
     graphics_tab->ApplyConfiguration();
     graphics_advanced_tab->ApplyConfiguration();
     graphics_extensions_tab->ApplyConfiguration();
+    performance_state->Apply();
+    performance_shaders_tab->ApplyConfiguration();
+    performance_ram_tab->ApplyConfiguration();
     audio_tab->ApplyConfiguration();
     debug_tab_tab->ApplyConfiguration();
     web_tab->ApplyConfiguration();
@@ -320,6 +334,13 @@ void ConfigureDialog::PopulateSelectionList() {
          true},
         {Text("page.audio"), QStringLiteral("volume-2"), {}, {},
          {{Text("page.audio"), audio_tab.get()}}},
+        {tr("Performance"),
+         QStringLiteral("gauge"),
+         {},
+         {},
+         {{tr("GPU"), performance_gpu_tab.get()},
+          {tr("Shaders"), performance_shaders_tab.get()},
+          {tr("RAM"), performance_ram_tab.get()}}},
         {Text("page.system"),
          QStringLiteral("cpu"),
          {},
@@ -597,6 +618,17 @@ void ConfigureDialog::OpenSearchResult(QListWidgetItem* item) {
             widget->style()->polish(widget);
         });
     });
+}
+
+void ConfigureDialog::SelectProfilesTab() {
+    for (std::size_t i = 0; i < pages.size(); ++i) {
+        for (const auto& [title, tab] : pages[i].sections) {
+            if (tab == profile_tab.get()) {
+                SelectPage(static_cast<int>(i));
+                return;
+            }
+        }
+    }
 }
 
 void ConfigureDialog::OnLanguageChanged(const QString& locale) {

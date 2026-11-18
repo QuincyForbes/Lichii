@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -25,6 +28,7 @@ class ConfigureAudio;
 class ConfigureCpu;
 class ConfigureDebugTab;
 class ConfigureFilesystem;
+class ConfigureFrameGeneration;
 class ConfigureGeneral;
 class ConfigureGraphics;
 class ConfigureGraphicsAdvanced;
@@ -34,6 +38,10 @@ class ConfigureInput;
 class ConfigureProfileManager;
 class ConfigureSystem;
 class ConfigureNetwork;
+class ConfigureGpu;
+class ConfigurePerformance;
+class ConfigureShaders;
+class ConfigureRam;
 class ConfigureUi;
 class ConfigureWeb;
 
@@ -43,6 +51,10 @@ class QListWidget;
 class QListWidgetItem;
 class QScrollArea;
 class HotkeyRegistry;
+
+namespace Performance {
+class State;
+}
 
 namespace InputCommon {
 class InputSubsystem;
@@ -63,6 +75,9 @@ public:
     ~ConfigureDialog() override;
 
     void ApplyConfiguration();
+
+    /// Selects the Profiles tab of the System category.
+    void SelectProfilesTab();
 
 private slots:
     void OnLanguageChanged(const QString& locale);
@@ -130,11 +145,16 @@ private:
     std::unique_ptr<ConfigureGeneral> general_tab;
     std::unique_ptr<ConfigureGraphicsAdvanced> graphics_advanced_tab;
     std::unique_ptr<ConfigureGraphicsExtensions> graphics_extensions_tab;
+    std::unique_ptr<ConfigureFrameGeneration> frame_gen_tab;
     std::unique_ptr<ConfigureUi> ui_tab;
     std::unique_ptr<ConfigureGraphics> graphics_tab;
     std::unique_ptr<ConfigureHotkeys> hotkeys_tab;
     std::unique_ptr<ConfigureInput> input_tab;
     std::unique_ptr<ConfigureNetwork> network_tab;
+    std::unique_ptr<Performance::State> performance_state;
+    std::unique_ptr<ConfigureGpu> performance_gpu_tab;
+    std::unique_ptr<ConfigureShaders> performance_shaders_tab;
+    std::unique_ptr<ConfigureRam> performance_ram_tab;
     std::unique_ptr<ConfigureProfileManager> profile_tab;
     std::unique_ptr<ConfigureSystem> system_tab;
     std::unique_ptr<ConfigureWeb> web_tab;

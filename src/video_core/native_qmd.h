@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
@@ -9,6 +12,8 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+
+#include "video_core/nx2_perf.h"
 
 namespace Tegra {
 
@@ -41,6 +46,7 @@ public:
     std::function<void(std::string_view, Address, std::int32_t)> trace;
     // Optional diagnostics: called with the QMD, slot and raw words of a release it skips.
     std::function<void(Address, std::size_t, std::span<const Word, 4>)> skipped_release;
+    bool nx2_perf = VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::QmdScratch);
     // QMD V03_00 release flags: 7:0 address high, 19 membar, 22:20 reduction op, 23 enable,
     // 25:24 reduction format, 26 reduction enable, 28:27 non-blocking interrupt, 29 64-bit
     // payload, 31:30 structure size (0 four words with timestamp, 1 one word, 2 two words).
@@ -58,7 +64,8 @@ public:
     std::string_view Signal(Address address, Word argument, Read read, Release release, Dispatch dispatch) {
         struct Pending { Address address; Word action; Word count; };
         std::string_view error;
-        std::array<Pending, 256> pending{};
+        std::array<Pending, 256> pending;
+        if (!nx2_perf || VideoCommon::Nx2Perf::Verify()) pending = {};
         std::size_t count = 1;
         pending[0] = {address, argument & 15, ((argument >> 14) & 0x3ff) + 1};
         for (std::size_t i = 0; i < count; ++i) {

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -6,10 +9,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include "common/settings.h"
 #include "core/file_sys/errors.h"
+#include "core/hle/kernel/k_process.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/fsp/fs_i_storage.h"
 #include "core/hle/service/filesystem/fsp/fs_read_trace.h"
@@ -41,11 +46,23 @@ Result IStorage::Read(
         R_SUCCEED();
     }
 
-    // The 40 MB/s throttle emulates a Switch 1 card (Eden cbd4cf2d8c, Mario Strikers' intro).
-    // Switch 2 storage is many times faster, and a Switch 2 title that streams a movie with
-    // hundreds of reads a second (Ocarina of Time's opening: 300-460) sleeps most of each second
-    // on the thread that also hands decoder images back, so its video falls seconds behind.
-    if (!Settings::CurrentProgramIsSwitch2()) {
+    // Custom (EDEN_NX2_FS_READ_MBPS=<n>): the emulated storage speed in MB/s for this read
+    // throttle. 0 turns it off. Default: 40 MB/s (a Switch 1 card, Eden cbd4cf2d8c, Mario
+    // Strikers' intro), 100 MB/s for Switch 2 titles.
+    // Ocarina of Time streams its opening video with hundreds of 64 KiB reads a second on the
+    // thread that also returns decoder images, so at 40 MB/s that thread sleeps most of the time
+    // and the video falls seconds behind its audio (at 100 MB/s it drops about as many late frames
+    // as with no throttle). Reads that complete with no delay at all break Hyrule Warriors: Age of
+    // Imprisonment at boot: it follows null and wild pointers from ~8 s on and never leaves its
+    // first loading screen (it boots at 100 and 200 MB/s, not at 300 or 400).
+    static const s64 forced_bytes_per_second = [] {
+        const char* value = std::getenv("EDEN_NX2_FS_READ_MBPS");
+        return value != nullptr ? std::strtoll(value, nullptr, 10) * 1'000'000 : s64{-1};
+    }();
+    const s64 bytes_per_second = forced_bytes_per_second >= 0 ? forced_bytes_per_second
+                                 : Settings::CurrentProgramIsSwitch2() ? Switch2ReadBytesPerSecond
+                                                                       : ReadBytesPerSecond;
+    if (bytes_per_second > 0) {
         const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now().time_since_epoch())
                                .count();
@@ -56,7 +73,7 @@ Result IStorage::Read(
         const s64 after_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now().time_since_epoch())
                                  .count();
-        const s64 cost_ns = std::min(length, MaxChargedReadSize) * 1'000'000'000 / ReadBytesPerSecond;
+        const s64 cost_ns = std::min(length, MaxChargedReadSize) * 1'000'000'000 / bytes_per_second;
         next_read_tick_ns.store(after_ns + cost_ns, std::memory_order_relaxed);
     }
 

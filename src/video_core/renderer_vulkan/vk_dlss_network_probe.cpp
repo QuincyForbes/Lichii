@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -174,6 +177,7 @@ std::optional<VideoCore::GameDlssProbe> DlssNetworkProbe::Probe(VkImageView inpu
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
                                read_results);
     });
+    scheduler.InvalidateDescriptorBuffer();
     ticks[next] = scheduler.CurrentTick();
     next = (next + 1) % SLOTS;
     return result;

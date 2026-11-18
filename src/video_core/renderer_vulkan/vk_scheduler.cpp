@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -435,6 +438,7 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
+    VideoCommon::Nx2Profile::AddFlush();
     // When flushing, we only send data to the worker thread; no waiting is necessary.
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
     AllocateNewContext();
@@ -534,34 +538,34 @@ bool Scheduler::WaitSubmitted(u64 tick, std::source_location location) {
     split.RequestIdleHook();
     // No time limit: the back can spend seconds on one entry (a large shader's translation),
     // and a fence reported as submitted before it is would release its downloads too early.
+    // Woken by SubmitExecution (it was a 50 us sleep poll, ~1 ms per check on Windows).
     const auto start = std::chrono::steady_clock::now();
-    auto next_log = start + std::chrono::seconds{2};
-    for (u32 spins = 0; !IsSubmitted(tick); ++spins) {
+    for (;;) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        submitted_ticks.Wait(
+            tick + 1, std::chrono::microseconds{5}, deadline,
+            [&] { return IsSubmitted(tick) || !split.BackRunning(); }, std::chrono::milliseconds{1});
+        if (IsSubmitted(tick)) {
+            return true;
+        }
         if (!split.BackRunning()) {
             return IsSubmitted(tick);
         }
-        if (const auto now = std::chrono::steady_clock::now(); now >= next_log) {
-            next_log = now + std::chrono::seconds{2};
-            // The back serves the request between entries: one that never does is blocked in
-            // an entry. Name the wait when it is a tracked one (BackWaitScope).
-            const char* const back_site = VideoCommon::back_wait_site.load(std::memory_order_relaxed);
-            LOG_WARNING(Render_Vulkan,
-                        "Waited {} s for the GPU thread to submit tick {} (submitted up to {}); "
-                        "GPU back thread blocked in: {}",
-                        std::chrono::duration_cast<std::chrono::seconds>(now - start).count(),
-                        tick, master_semaphore->CurrentTick() - 1,
-                        back_site != nullptr ? back_site
-                                             : "no tracked wait (an untracked lock or wait, or "
-                                               "a long entry)");
-            split.RequestIdleHook();
-        }
-        if (spins < 64 && Common::PollYield()) {
-            std::this_thread::yield();
-        } else {
-            std::this_thread::sleep_for(std::chrono::microseconds{50});
-        }
+        // The back serves the request between entries: one that never does is blocked in
+        // an entry. Name the wait when it is a tracked one (BackWaitScope).
+        const char* const back_site = VideoCommon::back_wait_site.load(std::memory_order_relaxed);
+        LOG_WARNING(Render_Vulkan,
+                    "Waited {} s for the GPU thread to submit tick {} (submitted up to {}); "
+                    "GPU back thread blocked in: {}",
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count(),
+                    tick, master_semaphore->CurrentTick() - 1,
+                    back_site != nullptr ? back_site
+                                         : "no tracked wait (an untracked lock or wait, or "
+                                           "a long entry)");
+        split.RequestIdleHook();
     }
-    return true;
 }
 
 void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
@@ -1492,7 +1496,7 @@ void Scheduler::RequestOutsideRenderPassKeepClear(std::span<const VkImage> touch
     RequestOutsideRenderPassOperationContext(location);
 }
 
-bool Scheduler::UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
+bool Scheduler::UpdateGraphicsPipelineImpl(GraphicsPipeline* pipeline) {
     if (state.graphics_pipeline == pipeline) {
         if (pipeline && pipeline->UsesExtendedDynamicState() &&
             state.needs_state_enable_refresh) {
@@ -1526,15 +1530,6 @@ bool Scheduler::UpdateRescaling(bool is_rescaling, bool mesh_layout) {
     state.rescaling_defined = true;
     state.is_rescaling = is_rescaling;
     state.mesh_layout = mesh_layout;
-    return true;
-}
-
-bool Scheduler::UpdateDescriptorBufferChunk(u32 descriptor_chunk) {
-    if (state.descriptor_buffer_bound && descriptor_chunk == state.descriptor_buffer_chunk) {
-        return false;
-    }
-    state.descriptor_buffer_bound = true;
-    state.descriptor_buffer_chunk = descriptor_chunk;
     return true;
 }
 
@@ -1862,6 +1857,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     InvalidateState();
     // The worker closes the command buffer before the pass with this submission.
     before_pass_split = false;
+    draws_since_submit = 0;
 
     if (!wait_semaphore && next_wait_semaphore.load(std::memory_order_relaxed)) {
         wait_semaphore = next_wait_semaphore.exchange(VK_NULL_HANDLE, std::memory_order_acq_rel);
@@ -1878,8 +1874,15 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         if (pass_time_pool) {
             PassTimesSubmitted(signal_value);
         }
+        static constexpr VkMemoryBarrier READ_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
         upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WRITE_BARRIER);
         upload_cmdbuf.End();
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
         if (trace_gpu_recording) {
             cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_query_pool,
                                  trace_gpu_count * 2 + 1);
@@ -1946,6 +1949,8 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     chunk->MarkSubmit();
     DispatchWork();
     has_pending_commands = false;
+    // Handed to the worker: wakes threads in WaitSubmitted.
+    submitted_ticks.AdvanceAtLeast(master_semaphore->CurrentTick());
     return signal_value;
 }
 

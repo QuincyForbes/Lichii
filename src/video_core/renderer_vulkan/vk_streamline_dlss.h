@@ -79,11 +79,13 @@ private:
     const Device& device;
     Scheduler& scheduler;
     MemoryAllocator& memory_allocator;
-    void* set_options{}; ///< slDLSSSetOptions
+    void* set_options{};          ///< slDLSSSetOptions
+    void* get_optimal_settings{}; ///< slDLSSGetOptimalSettings
     VkExtent2D render_extent{};
     VkExtent2D upscale_extent{};
     bool hdr_input = true;
     u32 frame_index{};
+    u32 current_mode{};
     vk::Image output_image;
     vk::ImageView output_view;
     vk::Sampler point_sampler;

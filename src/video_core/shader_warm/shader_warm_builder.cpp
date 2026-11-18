@@ -24,6 +24,7 @@
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
 #include "core/file_sys/nup_container.h"
@@ -45,6 +46,9 @@ constexpr std::string_view StageReading = "Reading game files";
 constexpr std::string_view StageExtracting = "Extracting shaders";
 constexpr std::string_view StageConverting = "Converting";
 constexpr std::string_view StageWriting = "Writing";
+/// Share of the progress bar for reading and extracting the archives; conversions run alongside
+/// and only their tail after the last archive shows in the rest.
+constexpr double ExtractionShare = 0.95;
 /// Conversions in flight (each holds a copy of its program).
 constexpr size_t MaxPendingJobs = 2048;
 constexpr u32 PrecachedPipelinesMagic = 0x31504750; // "PGP1"
@@ -87,7 +91,7 @@ struct GameFiles {
 /// Opens the game file and collects its RomFS trees into `game`. Returns the error text when the
 /// file cannot be opened or has no RomFS.
 std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_path,
-                                    GameFiles& game) {
+                                    GameFiles& game, std::stop_token stop) {
     FileSys::VirtualFilesystem filesystem = system.GetFilesystem();
     if (filesystem == nullptr) {
         filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
@@ -112,6 +116,9 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
         }
         std::sort(packages.begin(), packages.end());
         for (const size_t package : packages) {
+            if (stop.stop_requested()) {
+                return "Stopped";
+            }
             if (auto dir = game.nup->GetRomFSDir(package)) {
                 game.romfs.push_back(std::move(dir));
             }
@@ -124,6 +131,9 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
         FileSys::VirtualFile romfs;
         if (game.loader->ReadRomFS(romfs) != Loader::ResultStatus::Success || romfs == nullptr) {
             return "Cannot read the game's RomFS (are the keys installed?)";
+        }
+        if (stop.stop_requested()) {
+            return "Stopped";
         }
         if (auto dir = FileSys::ExtractRomFS(romfs)) {
             game.romfs.push_back(std::move(dir));
@@ -320,7 +330,7 @@ void WriteWarmCount(const fs::path& warm_file, u64 entries) {
         return;
     }
     std::ofstream out(WarmCountPath(warm_file), std::ios::trunc);
-    out << entries << ' ' << size << '\n';
+    out << entries << ' ' << size << ' ' << WarmBuilderVersion << '\n';
 }
 
 } // Anonymous namespace
@@ -400,6 +410,60 @@ bool WarmPending(u64 title_id) {
     const auto file = ComputeWarmPath(title_id);
     std::error_code ec;
     return !fs::exists(file, ec) || !fs::exists(WarmMarkerPath(file), ec);
+}
+
+bool HasWarmFile(u64 title_id) {
+    std::error_code ec;
+    return fs::exists(ComputeWarmPath(title_id), ec);
+}
+
+std::optional<std::string> WarmFilesStale(const fs::path& warm_file) {
+    std::error_code ec;
+    if (!fs::exists(warm_file, ec)) {
+        return "none built yet";
+    }
+    {
+        std::ifstream in(warm_file, std::ios::binary);
+        std::array<char, 8> magic{};
+        u32 version{};
+        in.read(magic.data(), magic.size()).read(reinterpret_cast<char*>(&version), sizeof(version));
+        if (!in || version != WarmCacheVersion) {
+            return "built for another cache version";
+        }
+    }
+    std::ifstream in(WarmCountPath(warm_file));
+    u64 entries{};
+    u64 size{};
+    u32 builder{};
+    if (!(in >> entries >> size >> builder) || builder != WarmBuilderVersion) {
+        return "built by an older version";
+    }
+    if (fs::file_size(warm_file, ec) != size || ec) {
+        return "changed since it was built";
+    }
+    return std::nullopt;
+}
+
+bool RefreshWarmFiles(Core::System& system, u64 title_id, std::stop_token stop) {
+    if (title_id == 0 || !Settings::CurrentProgramIsSwitch2() ||
+        Settings::values.precache_shaders.GetValue() != Settings::PrecacheShaders::Always) {
+        return false;
+    }
+    const auto reason = WarmFilesStale(ComputeWarmPath(title_id));
+    if (!reason) {
+        return false;
+    }
+    const std::string& file_path = system.GetCurrentApplicationFilePath();
+    if (file_path.empty()) {
+        return false;
+    }
+    fs::path game_path = Common::FS::ToU8String(file_path);
+    // Loose dumps run from their exefs folder; the loader opens its main.
+    if (std::error_code ec; fs::is_directory(game_path, ec)) {
+        game_path /= "main";
+    }
+    LOG_INFO(Render_Vulkan, "Shader precache for {:016x}: {}, building it", title_id, *reason);
+    return BuildWarmFiles(system, game_path, title_id, {}, std::move(stop)).ok;
 }
 
 void RequestWarmBeforeStart(bool before_start) {
@@ -527,10 +591,36 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
                           const std::function<void(const Progress&)>& progress,
                           std::stop_token stop) {
     Result result;
+    u64 total_bytes = 0;
+    u64 bytes_done = 0;
+    size_t seq = 0;
+    size_t consumed = 0;
+    double reported_fraction = 0.0;
+    auto last_report = std::chrono::steady_clock::time_point{};
     const auto report = [&](std::string_view stage, size_t done, size_t total) {
-        if (progress) {
-            progress(Progress{std::string(stage), done, total});
+        if (!progress) {
+            return;
         }
+        const auto now = std::chrono::steady_clock::now();
+        const bool last = total != 0 && done == total;
+        if (!last && now - last_report < std::chrono::milliseconds{50}) {
+            return;
+        }
+        last_report = now;
+        const double extracted =
+            total_bytes != 0 ? static_cast<double>(bytes_done) / static_cast<double>(total_bytes)
+                             : 0.0;
+        double fraction = ExtractionShare * extracted;
+        if (stage == StageConverting) {
+            fraction = ExtractionShare + (1.0 - ExtractionShare) *
+                                             (seq != 0 ? static_cast<double>(consumed) /
+                                                             static_cast<double>(seq)
+                                                       : 1.0);
+        } else if (stage == StageWriting) {
+            fraction = last ? 1.0 : reported_fraction;
+        }
+        reported_fraction = std::max(reported_fraction, std::min(fraction, 1.0));
+        progress(Progress{std::string(stage), done, total, reported_fraction, seq});
     };
     const auto begin = std::chrono::steady_clock::now();
     report(StageReading, 0, 0);
@@ -599,12 +689,15 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     }
 
     GameFiles game;
-    if (const auto error = OpenGame(system, game_path, game)) {
+    if (const auto error = OpenGame(system, game_path, game, stop)) {
         return fail(*error);
     }
+    if (stop.stop_requested()) {
+        return fail("Stopped");
+    }
 
-    // Archive list, in the offline pipeline's order: every *.bfsha.zs and *.sarc.zs of each
-    // package, then each package's Effect/*.vsetb.byml.zs, sorted by path inside a package.
+    // Archive list, in the offline pipeline's order: every shader archive of each package, then
+    // each package's effects, sorted by path inside a package (see ClassifyGameFile).
     std::vector<ArchiveFile> archives;
     std::vector<ArchiveFile> effects;
     ZstdDictionaries dictionaries;
@@ -616,14 +709,18 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
                   [](const ArchiveFile& a, const ArchiveFile& b) { return a.path < b.path; });
         std::vector<ArchiveFile> package_effects;
         for (auto& file : files) {
-            if (EndsWith(file.path, ".bfsha.zs") || EndsWith(file.path, ".sarc.zs")) {
+            switch (ClassifyGameFile(file.path)) {
+            case GameFileKind::ShaderArchive:
                 archives.push_back(file);
-            } else if (file.path.starts_with("Effect/") &&
-                       file.path.find('/', 7) == std::string::npos &&
-                       EndsWith(file.path, ".vsetb.byml.zs")) {
+                break;
+            case GameFileKind::Effect:
                 package_effects.push_back(file);
-            } else if (file.path == "Pack/ZsDic.pack.zs") {
+                break;
+            case GameFileKind::ZstdDictionaries:
                 dictionary_pack = file.file; // the newest package wins
+                break;
+            case GameFileKind::Other:
+                break;
             }
         }
         effects.insert(effects.end(), package_effects.begin(), package_effects.end());
@@ -639,6 +736,12 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     // Without archives the file is written empty: the precache then has only the pipeline cache
     // of earlier sessions to build.
     result.archives = archives.size();
+    for (const auto& archive : archives) {
+        total_bytes += archive.file->GetSize();
+    }
+    if (stop.stop_requested()) {
+        return fail("Stopped");
+    }
     LOG_INFO(Render_Vulkan, "Shader precache build: {} archives, {} zstd dictionaries",
              archives.size(), dictionaries.Count());
 
@@ -673,7 +776,6 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     std::vector<HeldVertex> held_vertices;
     size_t archive_errors = 0;
     size_t member_errors = 0;
-    size_t seq = 0;
 
     const size_t threads =
         options.threads != 0
@@ -683,7 +785,6 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
 
     // Consumes finished conversions in submission order (first program wins on equal keys).
     std::vector<std::pair<bool, size_t>> job_kinds; // graphics?, graphics program index
-    size_t consumed = 0;
     const auto consume = [&](JobResult&& r) {
         const auto [is_graphics, index] = job_kinds[consumed++];
         if (!r.ok) {
@@ -741,8 +842,11 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
             converter.reset();
             return fail("Stopped");
         }
-        report(StageExtracting, archive_index, archives.size());
         const auto& archive = archives[archive_index];
+        // Half of an archive's share when read, the rest when walked.
+        const u64 archive_bytes = archive.file->GetSize();
+        bytes_done += archive_bytes / 2;
+        report(StageExtracting, archive_index, archives.size());
         const auto data = archive.file->ReadAllBytes();
         const auto name = archive.path.substr(archive.path.rfind('/') + 1);
         const auto on_record = [&](const ShaderRecord& record) {
@@ -797,11 +901,12 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
             LOG_DEBUG(Render_Vulkan, "Shader precache: {}: {}", archive.path, error);
         };
         try {
-            WalkArchive(data, name, &dictionaries, on_record, on_member_error);
+            WalkArchive(data, name, &dictionaries, on_record, on_member_error, stop);
         } catch (const ArchiveError& e) {
             ++archive_errors;
             LOG_WARNING(Render_Vulkan, "Shader precache: {}: {}", archive.path, e.what());
         }
+        bytes_done += archive_bytes - archive_bytes / 2;
         drain(false);
     }
     report(StageExtracting, archives.size(), archives.size());

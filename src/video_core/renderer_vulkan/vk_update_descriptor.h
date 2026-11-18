@@ -37,6 +37,7 @@ union DescriptorUpdateEntry {
     VkBufferView texel_buffer;
     DescriptorAddress address;
 };
+static_assert(sizeof(DescriptorUpdateEntry) == 24);
 
 class UpdateDescriptorQueue final {
     // This should be plenty for the vast majority of cases. Most desktop platforms only

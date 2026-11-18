@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -18,6 +21,7 @@
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/vk_driver_build_report.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -235,6 +239,11 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             has_storage_ptr_textures |= is_ptr;
         }
     }
+    has_rescaling_push_constants =
+        !info.texture_descriptors.empty() || !info.image_descriptors.empty();
+    has_image_resources = has_rescaling_push_constants ||
+                          !info.texture_buffer_descriptors.empty() ||
+                          !info.image_buffer_descriptors.empty();
 
     DescriptorLayoutBuilder builder{device};
     builder.Add(info, VK_SHADER_STAGE_COMPUTE_BIT);
@@ -253,6 +262,8 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             uses_descriptor_buffer = false;
             descriptor_buffer_layout = {};
             descriptor_set_layout = builder.CreateDescriptorSetLayout(false);
+        } else {
+            last_descriptor_payload.reserve(num_descriptor_entries);
         }
     }
     pipeline_layout = builder.CreatePipelineLayout(*descriptor_set_layout);
@@ -265,7 +276,9 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         }
     }
 
-    auto func{[this, shader_notify, pipeline_statistics] {
+    const auto queued_at = std::chrono::steady_clock::now();
+    auto func{[this, shader_notify, pipeline_statistics, queued_at] {
+        const auto started_at = std::chrono::steady_clock::now();
         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
             .pNext = nullptr,
@@ -273,10 +286,10 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         };
         // Only warp-level ops observe the subgroup size. Forcing 32 on other shaders makes Intel
         // compile SIMD32, which can spill a register-heavy kernel for minutes (Mario Kart World).
-        const bool uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
-                                   info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
-                                   info.uses_quad_shuffles || info.uses_fswzadd ||
-                                   info.uses_cooperative_matrix;
+        // A shader that lost a conditional barrier counts too: it relies on a whole warp running
+        // in step, and at a smaller subgroup size it reads stale shared memory, which shows as
+        // banding over the image in Mario Kart World on Intel's Windows driver.
+        const bool uses_warp_ops = info.UsesWarpOps() || info.uses_cooperative_matrix;
         VkPipelineCreateFlags flags{};
         if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
             flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
@@ -311,7 +324,10 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .basePipelineIndex = 0,
         };
         try {
+            const auto build_begin = std::chrono::steady_clock::now();
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            DriverBuildReport::Record(DriverBuildReport::Kind::Compute,
+                                      std::chrono::steady_clock::now() - build_begin);
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
@@ -337,6 +353,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         // Nothing reads the module once the pipeline exists; the driver keeps its SPIR-V while it
         // lives.
         spv_module.reset();
+        ReportPipelineBuild("Compute", shader_hash, queued_at, started_at);
         std::scoped_lock lock{build_mutex};
         is_built = true;
         build_condvar.notify_one();
@@ -387,6 +404,10 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                 std::optional<ByteAddressedShadow>& shadow,
                                 BindCommand* deferred_bind) {
     shadow.reset();
+    static const bool writer_deps = [] {
+        const char* value = std::getenv("EDEN_NX2_WRITER_DEPS");
+        return value != nullptr && value[0] == '1';
+    }();
     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
 
     buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
@@ -564,13 +585,16 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         bound_images.assign(views.begin(), views.end());
     }
     // An upscale pass's input is the scene the overlay names, also when the game's own pass draws.
-    if (record_sampled || deferred_bind || CanReplaceOcarinaUpscale()) {
+    if (record_sampled || writer_deps || deferred_bind || CanReplaceOcarinaUpscale()) {
         sampled_images.clear();
         const size_t first = Shader::NumDescriptors(info.texture_buffer_descriptors) +
                              Shader::NumDescriptors(info.image_buffer_descriptors);
         for (size_t index = first; index < first + Shader::NumDescriptors(info.texture_descriptors);
              ++index) {
-            sampled_images.push_back({views[index].index, views[index].id, samplers[index - first]});
+            const auto state = writer_deps ? texture_cache.Nx2ViewWrittenState(views[index].id)
+                                           : std::pair{false, false};
+            sampled_images.push_back({views[index].index, views[index].id, samplers[index - first],
+                                      state.first, state.second});
         }
     }
 
@@ -732,9 +756,14 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.RecordState([this](vk::CommandBuffer) {
+            const auto begin = std::chrono::steady_clock::now();
             RunBuild();
-            std::unique_lock lock{build_mutex};
-            build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+            {
+                std::unique_lock lock{build_mutex};
+                build_condvar.wait(lock,
+                                   [this] { return is_built.load(std::memory_order::relaxed); });
+            }
+            ReportPipelineBuildWait("Compute", shader_hash, begin);
         });
     }
 
@@ -764,20 +793,28 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             LOG_DEBUG(Render_Vulkan, "Failed to reserve descriptor memory, skipping dispatch");
             return false;
         }
-        WriteDescriptorBuffer(device, descriptor_buffer_layout, descriptor_data, alloc.host);
+        const bool can_diff = has_last_descriptor_buffer &&
+                              last_descriptor_buffer_generation == alloc.generation &&
+                              last_descriptor_payload.size() == num_descriptor_entries;
+        if (last_descriptor_payload.size() != num_descriptor_entries) {
+            last_descriptor_payload.resize(num_descriptor_entries);
+        }
+        WriteDescriptorBuffer(device, descriptor_buffer_layout, descriptor_data, alloc.host,
+                              last_descriptor_payload, last_descriptor_bytes, can_diff);
         descriptor_buffer_offset = alloc.offset;
         descriptor_buffer_chunk = alloc.chunk;
         has_last_descriptor_buffer = true;
         last_descriptor_buffer_offset = alloc.offset;
         last_descriptor_buffer_chunk = alloc.chunk;
         last_descriptor_buffer_generation = alloc.generation;
-        last_descriptor_payload.assign(descriptor_data,
-                                       descriptor_data + num_descriptor_entries);
     }
 
     const bool bind_descriptor_buffer{
         uses_descriptor_buffer &&
         (deferred_bind || scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk))};
+    if (descriptor_set_layout && !uses_descriptor_buffer) {
+        scheduler.InvalidateDescriptorBuffer();
+    }
 
     if (shadow) {
         image_index = Shader::NumDescriptors(info.texture_buffer_descriptors) +
@@ -793,7 +830,10 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         }
     }
 
-    const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
+    const bool is_rescaling = has_rescaling_push_constants;
+    if (is_rescaling) {
+        scheduler.InvalidateDescriptorBuffer();
+    }
     auto bind = [this, descriptor_data, is_rescaling, descriptor_buffer_offset,
                       descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {

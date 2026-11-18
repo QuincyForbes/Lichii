@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -93,6 +96,8 @@ enum class RelaxedOptions : u32 {
     Format = 1 << 1,
     Samples = 1 << 2,
     ForceBrokenViews = 1 << 3,
+    SingleLayerStride = 1 << 4,
+    RenderTarget = 1 << 5,
 };
 DECLARE_ENUM_FLAG_OPERATORS(RelaxedOptions)
 
@@ -168,13 +173,14 @@ struct ImageCopy {
     Extent3D extent;
 };
 
-/// A rectangle of one mip level, in texels.
+/// A rectangle of one mip level and array layer, in texels.
 struct LevelRect {
     s32 level;
     u32 x;
     u32 y;
     u32 width;
     u32 height;
+    s32 layer{};
 };
 
 struct BufferImageCopy {

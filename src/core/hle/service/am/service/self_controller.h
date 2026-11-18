@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -30,7 +33,7 @@ public:
     ~ISelfController() override;
 
 private:
-    void GetNx2GraphicsSystemSession(HLERequestContext& ctx);
+    void GetGraphicsSupervisor(HLERequestContext& ctx);
     Result Exit();
     Result LockExit();
     Result UnlockExit();

@@ -134,9 +134,22 @@ public:
         });
     }
 
+    /// Nx2Perf bind_memo: bumped whenever CPU-modified bits may be set (cpu) and whenever
+    /// GPU-modified bits change (gpu). A binding synced clean stays clean while cpu is unchanged.
+    [[nodiscard]] u64 CpuEpoch() const noexcept {
+        return cpu_epoch;
+    }
+    [[nodiscard]] u64 GpuEpoch() const noexcept {
+        return gpu_epoch;
+    }
+    void BumpGpuEpoch() noexcept {
+        ++gpu_epoch;
+    }
+
     /// Mark region as CPU modified, notifying the device_tracker about this change
     /// @param written False when no guest write is behind the mark (it never turns a page hot)
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size, bool written = true) {
+        ++cpu_epoch;
         IteratePages<true>(dirty_cpu_addr, query_size,
                            [this, written](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::CPU, true, manager->cpu_addr + offset, size, written);
@@ -213,6 +226,7 @@ public:
     /// @return True when a hot page uploaded in this epoch (EDEN_NX2_HOT_PAGES) lost that state:
     ///         it reads as CPU-modified again although no guest write was reported
     bool MarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        ++gpu_epoch;
         bool hot_page_dirtied = false;
         IteratePages<true>(dirty_cpu_addr, query_size,
                            [&hot_page_dirtied](Manager* manager, u64 offset, size_t size) {
@@ -231,6 +245,7 @@ public:
 
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        ++gpu_epoch;
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::GPU, false, manager->cpu_addr + offset, size);
         });
@@ -255,12 +270,14 @@ public:
 
     /// Flushes cached CPU writes, and notify the device_tracker about the deltas
     void FlushCachedWrites(VAddr query_cpu_addr, u64 query_size) noexcept {
+        ++cpu_epoch;
         IteratePages<false>(query_cpu_addr, query_size, [](Manager* manager, [[maybe_unused]] u64 offset, [[maybe_unused]] size_t size) {
             manager->FlushCachedWrites();
         });
     }
 
     void FlushCachedWrites() noexcept {
+        ++cpu_epoch;
         for (auto id : cached_pages) {
             top_tier[id]->FlushCachedWrites();
         }
@@ -287,6 +304,7 @@ public:
     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
     template <typename Func>
     void ForEachDownloadRange(VAddr query_cpu_range, u64 query_size, bool clear, Func&& func) {
+        gpu_epoch += clear ? 1 : 0;
         IteratePages<false>(query_cpu_range, query_size, [&func, clear](Manager* manager, u64 offset, size_t size) {
             manager->ForEachModifiedRange(Type::GPU, clear, manager->cpu_addr + offset, size, func);
         });
@@ -294,6 +312,7 @@ public:
 
     template <typename Func>
     void ForEachDownloadRangeAndClear(VAddr query_cpu_range, u64 query_size, Func&& func) {
+        ++gpu_epoch;
         IteratePages<false>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
             manager->ForEachModifiedRange(Type::GPU, true, manager->cpu_addr + offset, size, func);
         });
@@ -418,6 +437,7 @@ private:
     }
 
     void CreateRegion(std::size_t page_index) {
+        ++cpu_epoch; // A new manager starts with every page CPU-modified
         const VAddr base_cpu_addr = page_index << HIGHER_PAGE_BITS;
         top_tier[page_index] = GetNewManager(base_cpu_addr);
     }
@@ -447,6 +467,8 @@ private:
     std::vector<Manager*> window_managers;
     u32 window_frames = 0;
     DeviceTracker* device_tracker = nullptr;
+    u64 cpu_epoch{};
+    u64 gpu_epoch{};
 };
 
 } // namespace VideoCommon

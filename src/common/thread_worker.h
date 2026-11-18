@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -133,6 +136,19 @@ public:
         wait_condition.wait(lock, [this] {
             return workers_stopped >= workers_queued || work_done >= work_scheduled;
         });
+    }
+
+    /// Tasks queued or running.
+    [[nodiscard]] size_t PendingWork() const noexcept {
+        return work_scheduled.load(std::memory_order_relaxed) -
+               work_done.load(std::memory_order_relaxed);
+    }
+
+    // Drops tasks no worker has started. Running tasks still finish.
+    void ClearRequests() {
+        std::scoped_lock lock{queue_mutex};
+        work_scheduled -= requests.size();
+        requests = std::queue<Task>{};
     }
 
 private:

@@ -604,6 +604,30 @@ TEST_CASE("Consumed read traps rearm on the next GPU write", "[cpu_readback][rea
     REQUIRE(traps.Arm(c, PAGE * 2));
 }
 
+TEST_CASE("A GPU write notifies the core of its unarmed pages only", "[cpu_readback][read_traps]") {
+    VideoCommon::ReadTrapTracker traps;
+    std::vector<Range> parts;
+    const auto collect = [&](u64 address, u64 size) { parts.emplace_back(address, size); };
+    REQUIRE(traps.Arm(c, PAGE * 4, collect));
+    REQUIRE(parts == std::vector<Range>{{c, PAGE * 4}});
+
+    // CPU reads consumed the second and the last page: a rewrite of the buffer arms just those.
+    traps.Subtract(c + PAGE, PAGE);
+    traps.Subtract(c + PAGE * 3, PAGE);
+    parts.clear();
+    REQUIRE(traps.Arm(c, PAGE * 4, collect));
+    REQUIRE(parts == std::vector<Range>{{c + PAGE, PAGE}, {c + PAGE * 3, PAGE}});
+
+    // A write that also reaches past the armed range notifies the new part.
+    traps.Subtract(c, PAGE);
+    parts.clear();
+    REQUIRE(traps.Arm(c, PAGE * 6, collect));
+    REQUIRE(parts == std::vector<Range>{{c, PAGE}, {c + PAGE * 4, PAGE * 2}});
+    parts.clear();
+    REQUIRE_FALSE(traps.Arm(c, PAGE * 6, collect));
+    REQUIRE(parts.empty());
+}
+
 TEST_CASE("MemoryTracker: a GPU rewrite needs a fresh CPU readback", "[cpu_readback]") {
     RasterizerInterface rasterizer;
     MemoryTracker tracker{rasterizer};
@@ -702,6 +726,32 @@ TEST_CASE("MemoryTracker: cached writes preserve tracking counts") {
     REQUIRE(memory_track->IsRegionCpuModified(c + PAGE * 4, PAGE));
     memory_track->MarkRegionAsCpuModified(c, WORD * 2);
     REQUIRE(rasterizer.Count() == 0);
+}
+
+TEST_CASE("MemoryTracker: a clean range stays clean across other writes", "[video_core][nx2_perf]") {
+    // Writes elsewhere and GPU marks move the global epochs, but an upload walk over a range
+    // without CPU bits finds nothing and changes no page counts.
+    RasterizerInterface rasterizer;
+    MemoryTracker tracker{rasterizer};
+    tracker.UnmarkRegionAsCpuModified(c, WORD * 2);
+    const u64 cpu_epoch = tracker.CpuEpoch();
+    const u64 gpu_epoch = tracker.GpuEpoch();
+    tracker.MarkRegionAsCpuModified(c + WORD, PAGE);
+    tracker.MarkRegionAsGpuModified(c + PAGE, PAGE);
+    REQUIRE(tracker.CpuEpoch() != cpu_epoch);
+    REQUIRE(tracker.GpuEpoch() != gpu_epoch);
+    REQUIRE_FALSE(tracker.IsRegionCpuModified(c, PAGE * 4));
+
+    const auto update_calls = rasterizer.UpdateCalls();
+    const unsigned count = rasterizer.Count();
+    bool uploaded = false;
+    tracker.ForEachUploadRange(c, PAGE * 4, [&](u64, u64) { uploaded = true; });
+    REQUIRE_FALSE(uploaded);
+    REQUIRE(rasterizer.UpdateCalls() == update_calls);
+    REQUIRE(rasterizer.Count() == count);
+
+    tracker.MarkRegionAsCpuModified(c + PAGE * 3, 1);
+    REQUIRE(tracker.IsRegionCpuModified(c, PAGE * 4));
 }
 
 TEST_CASE("DeviceMemoryManager: UpdatePagesCachedBatch basic") {

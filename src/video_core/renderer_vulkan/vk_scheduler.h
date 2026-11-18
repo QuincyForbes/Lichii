@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -28,6 +31,7 @@
 #include "common/polyfill_thread.h"
 #include "common/nx2_timeline.h"
 #include "common/perf_report.h"
+#include "common/progress_counter.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_wait_site.h"
@@ -89,6 +93,20 @@ public:
     /// Whether everything up to tick has been handed to the worker for submission.
     [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept {
         return tick < master_semaphore->CurrentTick();
+    }
+
+    /// Nx2Perf submit_while_waited: FlushWork counts its draws; only a submission (Flush,
+    /// Finish) resets the count, not a deferred FlushCommands.
+    void NoteDraw() noexcept {
+        ++draws_since_submit;
+    }
+    [[nodiscard]] u32 DrawsSinceSubmit() const noexcept {
+        return draws_since_submit;
+    }
+    /// Whether the host GPU has finished everything submitted so far (reads the semaphore).
+    [[nodiscard]] bool GpuCaughtUp() {
+        master_semaphore->Refresh();
+        return master_semaphore->KnownGpuTick() + 1 >= master_semaphore->CurrentTick();
     }
 
     /// Waits for the worker thread to finish executing everything. After this function returns it's
@@ -244,7 +262,12 @@ public:
     bool RenderPassMatches(const Framebuffer* framebuffer) const;
 
     /// Update the pipeline to the current execution context.
-    bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
+    bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
+        if (state.graphics_pipeline == pipeline && !state.needs_state_enable_refresh) [[likely]] {
+            return false;
+        }
+        return UpdateGraphicsPipelineImpl(pipeline);
+    }
 
     /// Worker thread only: whether the bound graphics pipeline failed to build, so the draws
     /// recorded after it must be dropped instead of reaching the driver without a pipeline.
@@ -259,7 +282,22 @@ public:
     bool UpdateRescaling(bool is_rescaling, bool mesh_layout);
 
     /// Returns true when the descriptor buffer chunk has to be bound into the command buffer.
-    bool UpdateDescriptorBufferChunk(u32 descriptor_chunk);
+    bool UpdateDescriptorBufferChunk(u32 descriptor_chunk) {
+        if (state.descriptor_buffer_bound && descriptor_chunk == state.descriptor_buffer_chunk)
+            [[likely]] {
+            return false;
+        }
+        state.descriptor_buffer_bound = true;
+        state.descriptor_buffer_chunk = descriptor_chunk;
+        return true;
+    }
+
+    /// Marks the descriptor buffer as unbound (e.g. after vkCmdBindDescriptorSets on any bind
+    /// point, which Vulkan specifies unbinds all descriptor buffers across all bind points).
+    void InvalidateDescriptorBuffer() {
+        state.descriptor_buffer_bound = false;
+        state.rescaling_defined = false;
+    }
 
     /// Draws of pipelines with the plain graphics layout (one push constant range, the same for
     /// all of them): returns true when the draw has to push its rescaling words, false when the
@@ -487,6 +525,8 @@ private:
     std::chrono::steady_clock::time_point last_flush{};
     std::chrono::steady_clock::time_point flush_pending_since{};
     bool flush_pending{};
+    /// The master semaphore's current tick as of the last submission (WaitSubmitted waits on it).
+    Common::ProgressCounter submitted_ticks;
 
     class Command {
     public:
@@ -632,6 +672,8 @@ private:
     void PassTimeWorkEnd(vk::CommandBuffer cmdbuf, u32 record);
     void ReportPassTimes();
     void NotePassEnd(const std::source_location& location);
+
+    bool UpdateGraphicsPipelineImpl(GraphicsPipeline* pipeline);
 
     /// If a deferred clear is pending.
     void RealizeDeferredClear();
@@ -814,6 +856,7 @@ private:
     u64 recording_epoch = 0;
     bool index_buffer_bound = false; ///< Worker thread: in current_cmdbuf
     u64 unbound_index_draws = 0;     ///< Worker thread
+    u32 draws_since_submit = 0;
 
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -246,6 +249,7 @@ private:
     vk::ShaderModule temporal_upscale_frag;
     vk::ShaderModule temporal_sharpen_frag;
     vk::ShaderModule blit_color_srgb_to_linear_frag;
+    vk::ShaderModule blit_color_square_frag;
     vk::ShaderModule blit_color_msaa_frag;
     vk::ShaderModule blit_depth_stencil_frag;
     vk::ShaderModule blit_depth_frag;

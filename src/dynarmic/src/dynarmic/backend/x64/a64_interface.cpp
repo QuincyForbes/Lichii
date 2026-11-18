@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -31,6 +34,7 @@
 #include "dynarmic/common/atomic.h"
 #include "dynarmic/frontend/A64/translate/a64_translate.h"
 #include "dynarmic/interface/A64/a64.h"
+#include "dynarmic/interface/jit_stats.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/opt_passes.h"
 
@@ -321,6 +325,7 @@ private:
         const u64 start_ns = counted ? ::Common::PerfReport::NowNs() : 0;
         const size_t start_used = counted ? block_of_code.UsedBytes() : 0;
         // JIT Compile
+        const auto compile_start = std::chrono::steady_clock::now();
         const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
@@ -338,6 +343,12 @@ private:
             ::Common::PerfReport::NoteJitCompile(conf.processor_id, compile_ns);
             ::Common::PerfReport::NoteJitUse(conf.processor_id, used, block_of_code.CacheSize());
         }
+        g_jit_stats.blocks_compiled.fetch_add(1, std::memory_order_relaxed);
+        g_jit_stats.compile_ns.fetch_add(
+            std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - compile_start)
+                              .count()),
+            std::memory_order_relaxed);
         return entrypoint;
     }
 

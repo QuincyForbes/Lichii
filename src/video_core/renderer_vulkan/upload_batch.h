@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #pragma once
 
 #include <span>
@@ -11,10 +14,13 @@
 
 namespace Vulkan {
 
-/// Consecutive in-order stream-buffer uploads (Scheduler::RecordUpload) coalesced into one
-/// command with one read barrier before and one write barrier after (zortos293/Lichii#1245).
+/// Uploads in order (Scheduler::RecordUpload) waiting to be recorded as one command: their
+/// copies run between one barrier before and one after. Copies of one batch may run in any
+/// order and at once, so a batch never holds two copies that write the same bytes, or one that
+/// writes a buffer another reads.
 class UploadBatch {
 public:
+    /// Copies with the same source and destination, consecutive in `copies`.
     struct Group {
         VkBuffer src;
         VkBuffer dst;
@@ -22,12 +28,17 @@ public:
         u32 count;
     };
 
+    /// More copies than this go in a later batch. It bounds CanAdd's checks on the recording
+    /// thread, at the cost of two barriers per this many uploads.
     static constexpr size_t MaxCopies = 64;
 
     [[nodiscard]] bool Empty() const noexcept {
         return copies.empty();
     }
 
+    /// Whether these copies can join the batch: it has room, they read no buffer a copy in it
+    /// writes and write none it reads, and they write no byte of dst that a copy in it writes.
+    /// Otherwise the batch is recorded first.
     [[nodiscard]] bool CanAdd(VkBuffer src, VkBuffer dst,
                               std::span<const VkBufferCopy> new_copies) const {
         if (copies.size() + new_copies.size() > MaxCopies) {
@@ -53,6 +64,12 @@ public:
         return true;
     }
 
+    /// Records a batch: the barrier before an in-order buffer copy (BufferCacheRuntime::
+    /// CopyBuffer's), the copies, and the barrier after one, made to reach transfers as well.
+    /// Recorded one by one, the barriers between two uploads ordered the copies before them
+    /// ahead of the copies after them, which CanAdd makes needless, and ahead of all later work:
+    /// graphics and compute through the barrier after a copy, transfers (in later submissions
+    /// too) through the barrier before the next one. The barrier after the batch does both.
     static void Record(vk::CommandBuffer cmdbuf, std::span<const VkBufferCopy> batch_copies,
                        std::span<const Group> batch_groups) {
         static constexpr VkMemoryBarrier READ_BARRIER{

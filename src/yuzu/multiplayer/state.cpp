@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: Copyright 2018 Citra Emulator Project
@@ -242,6 +245,8 @@ void MultiplayerState::OnViewLobby() {
     if (lobby == nullptr) {
         lobby = new Lobby(this, game_list_model, announce_multiplayer_session, system);
         connect(lobby, &Lobby::SaveConfig, this, &MultiplayerState::OnSaveConfig);
+        connect(lobby, &Lobby::RequestProfileConfiguration, this,
+                &MultiplayerState::RequestProfileConfiguration);
     }
     lobby->RefreshLobby();
     BringWidgetToFront(lobby);
@@ -251,6 +256,8 @@ void MultiplayerState::OnCreateRoom() {
     if (host_room == nullptr) {
         host_room = new HostRoomWindow(this, game_list_model, announce_multiplayer_session, system);
         connect(host_room, &HostRoomWindow::SaveConfig, this, &MultiplayerState::OnSaveConfig);
+        connect(host_room, &HostRoomWindow::RequestProfileConfiguration, this,
+                &MultiplayerState::RequestProfileConfiguration);
     }
     BringWidgetToFront(host_room);
 }
@@ -315,6 +322,8 @@ void MultiplayerState::OnDirectConnectToRoom() {
         direct_connect = new DirectConnectWindow(system, this);
         connect(direct_connect, &DirectConnectWindow::SaveConfig, this,
                 &MultiplayerState::OnSaveConfig);
+        connect(direct_connect, &DirectConnectWindow::RequestProfileConfiguration, this,
+                &MultiplayerState::RequestProfileConfiguration);
     }
     BringWidgetToFront(direct_connect);
 }

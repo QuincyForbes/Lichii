@@ -1683,8 +1683,10 @@ void Device::RemoveUnsuitableExtensions() {
     RemoveExtensionFeatureIfUnsuitable(extensions.depth_clip_control, features.depth_clip_control,
                                        VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
 
-    // VK_EXT_descriptor_buffer
-    extensions.descriptor_buffer = features.descriptor_buffer.descriptorBuffer;
+    // VK_EXT_descriptor_buffer (EDEN_NX2_NO_DESCRIPTOR_BUFFER=1 falls back to descriptor sets, for A/B
+    // tests of GPU faults)
+    extensions.descriptor_buffer = features.descriptor_buffer.descriptorBuffer &&
+                                   std::getenv("EDEN_NX2_NO_DESCRIPTOR_BUFFER") == nullptr;
     RemoveExtensionFeatureIfUnsuitable(extensions.descriptor_buffer, features.descriptor_buffer,
                                        VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
 
@@ -1853,8 +1855,13 @@ void Device::RemoveUnsuitableExtensions() {
     features.mesh_shader.primitiveFragmentShadingRateMeshShader = VK_FALSE;
     features.mesh_shader.meshShaderQueries = VK_FALSE;
     extensions.mesh_shader = features.mesh_shader.taskShader && features.mesh_shader.meshShader;
-    // EDEN_NX2_FORCE_MESH_FALLBACK=1 (or EDEN_NX2_NO_MESH_SHADER=1): leave VK_EXT_mesh_shader
+    // The use_mesh_shaders setting or EDEN_NX2_FORCE_MESH_FALLBACK=1: leave VK_EXT_mesh_shader
     // disabled, so task/mesh draws take the compute fallback a device without it uses.
+    if (extensions.mesh_shader && !Settings::values.use_mesh_shaders.GetValue()) {
+        LOG_INFO(Render_Vulkan, "Mesh shaders turned off in the settings: VK_EXT_mesh_shader "
+                                "disabled");
+        extensions.mesh_shader = false;
+    }
     if (extensions.mesh_shader && (std::getenv("EDEN_NX2_FORCE_MESH_FALLBACK") != nullptr ||
                                    std::getenv("EDEN_NX2_NO_MESH_SHADER") != nullptr)) {
         LOG_WARNING(Render_Vulkan, "Mesh fallback forced: VK_EXT_mesh_shader disabled");

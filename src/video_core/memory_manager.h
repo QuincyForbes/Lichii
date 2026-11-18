@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -81,6 +84,16 @@ public:
 
     template <typename T>
     [[nodiscard]] T Read(GPUVAddr addr) const;
+
+    /// One 4 KiB page's host pointer for repeated small reads (ReadU32). Valid only while the
+    /// mappings cannot change, e.g. within one draw's setup on the GPU thread.
+    struct ReadPageCache {
+        GPUVAddr page{~GPUVAddr{0}};
+        const u8* pointer{};
+    };
+
+    /// Read<u32>, translating the address's page only when it differs from the cached one.
+    [[nodiscard]] u32 ReadU32(GPUVAddr addr, ReadPageCache& cache) const;
 
     template <typename T>
     void Write(GPUVAddr addr, T data);
@@ -182,6 +195,12 @@ public:
     GPUVAddr MapSparse(GPUVAddr gpu_addr, std::size_t size, bool is_big_pages = true);
     void Unmap(GPUVAddr gpu_addr, std::size_t size);
 
+    /// Writes the query reports in the range to guest memory, waiting for pending host results.
+    void FlushQueryResults(GPUVAddr gpu_addr, size_t size) const;
+
+    /// Publish cached writes before changing the translation or its device backing.
+    void PreserveMapping(GPUVAddr gpu_addr, std::size_t size);
+
     void FlushRegion(GPUVAddr gpu_addr, size_t size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
 
@@ -209,6 +228,10 @@ public:
     size_t GetMemoryLayoutSize(GPUVAddr gpu_addr,
                                size_t max_size = (std::numeric_limits<size_t>::max)()) const;
 
+    [[nodiscard]] u64 GetMapSerial() const noexcept {
+        return MapSerial(); // The name the upstream callers use
+    }
+
     /// GetMemoryLayoutSize from the kind map under its lock (the answer with Nx2Perf off).
     size_t GetMemoryLayoutSizeUncached(GPUVAddr gpu_addr) const;
 
@@ -217,8 +240,11 @@ public:
     /// Leaves the caches' invalidation of a range already written for the next FlushCaching
     /// (before every draw, dispatch, clear and copy), merged with neighbouring ranges.
     void AccumulateInvalidation(GPUVAddr gpu_addr, std::size_t size) {
+        NoteDeferredCodeWrite(gpu_addr, size);
         accumulator.Add(gpu_addr, size);
     }
+    /// Nx2Perf MacroReadWriterSet: an invalidation left for FlushCaching reaches proven code.
+    void NoteDeferredCodeWrite(GPUVAddr gpu_addr, std::size_t size) const;
 
     const u8* GetSpan(const GPUVAddr src_addr, const std::size_t size) const;
     u8* GetSpan(const GPUVAddr src_addr, const std::size_t size);
@@ -263,10 +289,10 @@ private:
 
     const u64 address_space_bits;
     GPUVAddr split_address;
-    const u64 page_bits;
+    static constexpr size_t page_bits{12};
+    static constexpr size_t page_size{1ULL << page_bits};
+    static constexpr size_t page_mask{page_size - 1ULL};
     u64 address_space_size;
-    u64 page_size;
-    u64 page_mask;
     u64 page_table_mask;
     static constexpr u64 cpu_page_bits{12};
 

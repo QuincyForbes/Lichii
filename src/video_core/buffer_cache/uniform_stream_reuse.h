@@ -16,6 +16,7 @@
 #endif
 
 #include "common/common_types.h"
+#include "video_core/nx2_draw_stats.h"
 #include "video_core/nx2_profile.h"
 
 namespace VideoCommon {
@@ -98,6 +99,15 @@ public:
         u32 serial{}; ///< the copy's serial then; 0: none
     };
 
+    /// What the compute stage bound last for a constant buffer (compute binds are not tracked by
+    /// the copy table): `ref` was filled from `bytes` on scheduler tick `tick`.
+    struct ComputeSlot {
+        Ref ref{};
+        u64 tick{};
+        u32 size{}; ///< 0: nothing copied
+        std::array<u8, MaxBytes> bytes{};
+    };
+
     UniformStreamReuse() : bytes{new u8[NumCopies * MaxBytes]} {}
 
     void Reset() noexcept {
@@ -113,6 +123,10 @@ public:
             stage.fill(Slot{});
         }
         mru.fill(0);
+        for (ComputeSlot& slot : compute_slots) {
+            slot.size = 0;
+            slot.tick = 0;
+        }
     }
 
     [[nodiscard]] u8* Bytes(size_t copy) noexcept {
@@ -134,6 +148,7 @@ public:
     std::array<std::array<Slot, NumSlots>, NumStages> slots{};
     std::array<u8, NumSets> mru{}; ///< per set: the way used last
     std::unique_ptr<u8[]> bytes;   ///< MaxBytes per copy
+    std::array<ComputeSlot, NumSlots> compute_slots{};
     std::array<u8, MaxBytes> scratch{};
 };
 
@@ -372,6 +387,36 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
     // After the allocation: the tick the stream region is tagged with is the one current now.
     copy.tick = runtime.CurrentTick();
     slot = typename Reuse::Slot{static_cast<u32>(target), copy.serial};
+    return true;
+}
+
+template <class Runtime, class DeviceMemory>
+[[nodiscard]] bool BindSmallComputeUniformReusing(Runtime& runtime, DeviceMemory& device_memory,
+                                                  u32 index, u32 binding_index, u64 device_addr,
+                                                  u32 size) {
+    using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
+    if (size == 0 || size > Reuse::MaxBytes || index >= Reuse::NumSlots) {
+        return false;
+    }
+    Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
+    typename Reuse::ComputeSlot& slot = reuse.compute_slots[index];
+    u8* const scratch = reuse.scratch.data();
+    device_memory.ReadBlockUnsafe(device_addr, scratch, size);
+
+    const bool same_bytes =
+        slot.size == size && std::memcmp(slot.bytes.data(), scratch, size) == 0;
+    if (same_bytes && slot.tick == runtime.CurrentTick()) {
+        runtime.RebindStreamUniform(slot.ref, size);
+        return true;
+    }
+    const std::span<u8> span = runtime.BindMappedUniformBuffer(0, binding_index, size);
+    std::memcpy(span.data(), scratch, size);
+    slot.ref = runtime.LastStreamUniformRef();
+    slot.tick = runtime.CurrentTick();
+    if (!same_bytes) {
+        slot.size = size;
+        std::memcpy(slot.bytes.data(), scratch, size);
+    }
     return true;
 }
 

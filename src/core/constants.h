@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -15,6 +18,6 @@
 namespace Core::Constants {
 
 // ACC Service - An Eden Profile Picture JPEG used as user icon in absentia of real one.
-extern const std::array<u8, 5099> ACCOUNT_BACKUP_JPEG;
+extern const std::array<u8, 9894> ACCOUNT_BACKUP_JPEG;
 
 } // namespace Core::Constants
