@@ -4102,8 +4102,8 @@ private:
                     m_sync.write.Add(write_end - write_start);
                 }
                 // Even an image written during a flush counts: the client waits for its value.
-                m_outputs.push_back({image, width, height, frame.pts, frame.end, write_end,
-                                     after_drop});
+                m_outputs.push_back({image, width, height, frame.pts, frame.end,
+                                     after_drop, write_end});
                 if (frame.end) {
                     m_stream_ended = true;
                     m_end_queued = false;

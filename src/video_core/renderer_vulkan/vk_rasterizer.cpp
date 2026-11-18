@@ -887,7 +887,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const u64 skipped_lookups = PipelineCache::SkippedLookups();
     GraphicsPipeline* const pipeline{[&] {
         Profile::Scope scope{Profile::Zone::PipelineLookup};
-        return pipeline_cache.CurrentGraphicsPipeline(is_indexed);
+        return pipeline_cache.CurrentGraphicsPipeline();
     }()};
     if (VideoCommon::FeatureCensus::Enabled()) {
         VideoCommon::FeatureCensus::NoteDraw(

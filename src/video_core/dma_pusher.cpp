@@ -161,10 +161,10 @@ namespace {
 bool WritesMemory(Engines::EngineInterface* engine, Engines::EngineTypes type, u32 method,
                   u32 count) {
     if (type == Engines::EngineTypes::KeplerCompute) {
-        return static_cast<const Engines::KeplerCompute&>(engine).MayWriteMemory(method);
+        return static_cast<const Engines::KeplerCompute&>(*engine).MayWriteMemory(method);
     }
     if (type == Engines::EngineTypes::MaxwellDMA) {
-        return method < engine.execution_mask.size() && engine.execution_mask[method];
+        return method < engine->execution_mask.size() && engine->execution_mask[method];
     }
     return false;
 }

@@ -2270,28 +2270,6 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         if (mesh_emulation && mesh_emulation->has_task && stage == mesh_emulation->mesh_stage) {
             continue; // the mesh program runs as a compute shader
         }
-        // Mesh emulation: stage 0 is the vertex shader reading the compute pass's output.
-        const bool emulated_vertex{mesh_emulation && stage == 0};
-        auto& stage_ci =
-            shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
-                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .stage = emulated_vertex
-                             ? VK_SHADER_STAGE_VERTEX_BIT
-                             : StageFlag(stage_infos[stage],
-                                         MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
-                .module = emulated_vertex ? *mesh_vertex_module : *spv_modules[stage],
-                .pName = "main",
-                .pSpecializationInfo = nullptr,
-            });
-        const Shader::Info& info{stage_infos[stage]};
-        if ((stage_ci.stage == VK_SHADER_STAGE_MESH_BIT_EXT ||
-             stage_ci.stage == VK_SHADER_STAGE_TASK_BIT_EXT) &&
-            info.UsesWarpOps() && device.IsExtSubgroupSizeControlSupported() &&
-            device.IsGuestWarpSizeSupported(stage_ci.stage)) {
-            stage_ci.pNext = &subgroup_size_ci;
-        }
         const Shader::Info& info{stage_infos[stage]};
         // Mesh emulation: stage 0 is the vertex shader reading the compute pass's output.
         const bool emulated_vertex{mesh_emulation && stage == 0};

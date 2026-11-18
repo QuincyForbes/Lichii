@@ -168,7 +168,6 @@ public:
     /// Largest range a storage buffer binding may have
     u64 GetMaxStorageBufferRange() const;
 
-    u64 GetMaxStorageBufferRange() const;
 
     [[nodiscard]] StagingBufferRef UploadStagingBuffer(size_t size);
 

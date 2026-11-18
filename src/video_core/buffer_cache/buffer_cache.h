@@ -203,7 +203,6 @@ template <class P>
 void BufferCache<P>::TickFrame() {
     // Read once per frame: FindBuffer asked for it on every binding of every draw.
     fence_behavior_accurate = Settings::IsGPUFenceBehaviorAccurate();
-    VideoCommon::g_hot_page_epoch.fetch_add(1, std::memory_order_relaxed);
     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
     if (!channel_state) {
         return;
@@ -1446,13 +1445,6 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
 }
 
 template <class P>
-void BufferCache<P>::UnbindComputeTextureBuffers() {
-    channel_state->enabled_compute_texture_buffers = 0;
-    channel_state->written_compute_texture_buffers = 0;
-    channel_state->image_compute_texture_buffers = 0;
-}
-
-template <class P>
 void BufferCache<P>::BindComputeTextureBuffer(size_t tbo_index, GPUVAddr gpu_addr, u32 size,
                                               PixelFormat format, bool is_written, bool is_image) {
     if (tbo_index >= channel_state->compute_texture_buffers.size()) [[unlikely]] {
@@ -2548,7 +2540,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     }
     Nx2Profile::Scope cached_scope{Nx2Profile::Zone::BindUniformCached};
     BindMemo* const memo =
-        BindMemoEnabled() && has_host_buffer ? &uniform_bind_memo[stage][index] : nullptr;
+        BindMemoEnabled() && has_host_buffer ? &uniform_sync_memo[stage][index] : nullptr;
     const bool memo_hit = memo != nullptr && BindMemoHit(*memo, buffer, binding.buffer_id,
                                                          device_addr, size, offset, "uniform",
                                                          stage, index);
@@ -3372,7 +3364,6 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         UpdateVertexBufferSlot(index, memo.binding);
         return;
     }
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
     const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
     u32 size = address_size; // TODO: Analyze stride and number of vertices
     if (array.enable == 0 || size == 0) {

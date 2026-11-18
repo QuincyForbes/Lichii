@@ -167,8 +167,10 @@ inline constexpr u64 DefaultOffMask() {
 }
 
 /// The off-mask from EDEN_NX2_PERF_SAFE (safe), EDEN_NX2_PERF_ON (on) and EDEN_NX2_PERF_OFF (off).
-inline u64 ParseOffMask(bool safe, std::string_view on, std::string_view off) {
-    u64 mask = (safe ? DefaultOffMask() : u64{0}) | Bit(Opt::FenceFlush) | Bit(Opt::FragmentBarrier);
+/// `base_off` switches start off (EDEN_NX2_PERF_ON can turn them on), `forced_off` stay off.
+inline u64 ParseOffMask(bool safe, std::string_view on, std::string_view off, u64 base_off = 0,
+                        u64 forced_off = 0) {
+    u64 mask = (safe ? DefaultOffMask() : u64{0}) | base_off;
     while (!on.empty()) {
         const size_t comma = on.find(',');
         const std::string_view name = on.substr(0, comma);
@@ -194,10 +196,7 @@ inline u64 ParseOffMask(bool safe, std::string_view on, std::string_view off) {
         }
         off = comma == std::string_view::npos ? std::string_view{} : off.substr(comma + 1);
     }
-    mask |= Bit(Opt::SplitOverlap);
-    if (const char* value = std::getenv("EDEN_NX2_PERF_FRAMES_AHEAD"); value && value[0] == '0') {
-        mask |= Bit(Opt::FramesAhead);
-    }
+    mask |= forced_off;
     return mask;
 }
 

@@ -8,6 +8,7 @@
 #include <functional>
 #include <vector>
 
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 
 #include "common/page_table.h"
@@ -113,6 +114,7 @@ struct Runtime {
         return type == VideoCommon::QueryType::Payload ? &streamer : nullptr;
     }
     void Bind3DEngine(Tegra::Engines::Maxwell3D*) {}
+    void Barriers(bool) {}
 
     template <typename T>
     void SyncValues(std::span<T> values) {
@@ -171,6 +173,12 @@ TEST_CASE("Nx2Perf compute: reused payload upload scratch preserves query filter
         REQUIRE(runtime.syncs == syncs + (expected.empty() ? 0U : 1U));
         if (!expected.empty()) {
             REQUIRE(runtime.synced.size() == expected.size());
+            // The streamer writes the newest report of each address first: compare by address.
+            const auto by_address = [](const auto& lhs, const auto& rhs) {
+                return lhs.address < rhs.address;
+            };
+            std::ranges::sort(runtime.synced, by_address);
+            std::ranges::sort(expected, by_address);
             for (size_t index = 0; index < expected.size(); ++index) {
                 REQUIRE(runtime.synced[index].address == expected[index].address);
                 REQUIRE(runtime.synced[index].value == expected[index].value);

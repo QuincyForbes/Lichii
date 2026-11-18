@@ -107,16 +107,6 @@ public:
         current_topology = INVALID_TOPOLOGY;
     }
 
-    void InvalidateInputState() {
-        (*flags)[Dirty::VertexInput] = true;
-        (*flags)[Dirty::PrimitiveRestartEnable] = true;
-        for (std::size_t index = VideoCommon::Dirty::VertexBuffer0;
-             index <= VideoCommon::Dirty::VertexBuffer31; ++index) {
-            (*flags)[index] = true;
-        }
-        current_topology = INVALID_TOPOLOGY;
-    }
-
     void InvalidateViewports() {
         (*flags)[Dirty::Viewports] = true;
     }

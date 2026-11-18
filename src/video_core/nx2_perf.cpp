@@ -24,8 +24,13 @@ u64 InitOffMask() {
     [[maybe_unused]] static const bool initialized = [] {
         const char* on_list = std::getenv("EDEN_NX2_PERF_ON");
         const char* off_list = std::getenv("EDEN_NX2_PERF_OFF");
+        u64 forced_off = Bit(Opt::SplitOverlap);
+        if (const char* value = std::getenv("EDEN_NX2_PERF_FRAMES_AHEAD"); value && value[0] == '0') {
+            forced_off |= Bit(Opt::FramesAhead);
+        }
         const u64 mask = ParseOffMask(std::getenv("EDEN_NX2_PERF_SAFE") != nullptr,
-                                      on_list ? on_list : "", off_list ? off_list : "");
+                                      on_list ? on_list : "", off_list ? off_list : "",
+                                      Bit(Opt::FenceFlush) | Bit(Opt::FragmentBarrier), forced_off);
         std::string state;
         for (size_t i = 0; i < opt_names.size(); ++i) {
             state += fmt::format(" {}={}", opt_names[i], Enabled() && !IsOff(mask, i) ? "on" : "off");

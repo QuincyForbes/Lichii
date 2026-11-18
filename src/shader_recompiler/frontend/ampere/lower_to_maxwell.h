@@ -1618,7 +1618,27 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{operation} << 29) | (u64{dimension} << 33) | (u64{offset} << 36));
             break;
         }
-        case 0x59f: { // SURED (bound descriptor): SUATOM's layout without a destination or fault predicate.
+        case 0x59f: { // SURED, bound descriptor.
+            {
+                // U32 buffer or 2D reductions (the captured Yoshi and Ocarina shaders) keep their
+                // Maxwell SURED: operand 0-7, coordinates 8-15, operation 24, U32 = 0 at 20,
+                // type 33 (1 = buffer, 3 = 2D), bound offset 36, bound 51.
+                const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
+                const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
+                const u32 dimension = insn.Bits(61, 3);
+                if ((insn.words[2] & ~0x03800000U) == 0x0010e000 && (dimension == 1 || dimension == 3) &&
+                    binding < 18 && offset <= 0x1fff && !insn.Bits(59, 2) && coordinate <= 253) {
+                    if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
+                        return fail(index, "native surface descriptor buffer conflict");
+                    result.required_texture_buffer = binding;
+                    emit(0xeb40000000000000ULL | predicate | data | (u64{coordinate} << 8) |
+                         (u64{insn.Bits(87, 3)} << 24) | (u64{dimension} << 33) | (u64{offset} << 36) |
+                         (u64{1} << 51));
+                    break;
+                }
+            }
+            // Other dimensions, S32 and the remaining operations: SUATOM's layout without a
+            // destination or fault predicate.
             // Coordinates 24, data 32, descriptor 40..58, dimension 61..63 (Maxwell's codes), type 73..75
             // (U32/S32) and the operation at 87..90 (ADD..XOR). Lowered to SUATOM with the result in RZ.
             const u32 coordinate = insn.Bits(24, 8), data = insn.Bits(32, 8);

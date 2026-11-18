@@ -143,6 +143,8 @@ public:
     ~PipelineCache();
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
+    /// The bound vertex shader is the Switch 2 indirect reset program (drawn by host writes).
+    [[nodiscard]] bool IsIndirectResetShader() const;
     /// Nx2Perf MacroReadWriterSet: the program epoch the current programs were resolved in
     /// (0: none) and their device code ranges.
     [[nodiscard]] u64 Nx2ResolvedEpoch() const noexcept {

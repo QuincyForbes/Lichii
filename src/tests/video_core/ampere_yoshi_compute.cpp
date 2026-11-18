@@ -69,12 +69,23 @@ TEST_CASE("Yoshi captured SURED uses a buffer coordinate and descriptor", "[ampe
                   (0xeb48002000000506ULL | (u64{guard} << 16) | (u64{dimension} << 33)));
         }
     }
-    for (const u32 dimension : {0U, 2U, 4U, 5U, 6U, 7U}) {
+    for (const u32 dimension : {6U, 7U}) {
         auto instruction = Reduction;
         instruction.words[1] = (instruction.words[1] & 0x1fffffffU) | (dimension << 29);
         REQUIRE_FALSE(LowerToMaxwell(std::array{instruction, Exit}));
     }
+    // The other dimensions are lowered to SUATOM with the result in RZ, not to SURED.
+    for (const u32 dimension : {0U, 2U, 4U, 5U}) {
+        auto instruction = Reduction;
+        instruction.words[1] = (instruction.words[1] & 0x1fffffffU) | (dimension << 29);
+        const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+        if (lowered) {
+            CHECK((lowered.instructions[0] >> 56) == 0xea);
+        }
+    }
     auto unsupported = Reduction;
-    unsupported.words[2] |= 0x200;
-    REQUIRE_FALSE(LowerToMaxwell(std::array{unsupported, Exit}));
+    unsupported.words[2] |= 0x200; // S32: lowered to SUATOM with the result in RZ
+    const auto signed_lowered = LowerToMaxwell(std::array{unsupported, Exit});
+    REQUIRE(signed_lowered);
+    CHECK((signed_lowered.instructions[0] >> 56) == 0xea);
 }

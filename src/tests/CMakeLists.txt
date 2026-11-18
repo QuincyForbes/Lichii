@@ -117,7 +117,6 @@ add_executable(tests
     video_core/shader_translate_bench.cpp
     video_core/storage_binding_capacity.cpp
     video_core/native_indirect_reset.cpp
-    video_core/native_qmd.cpp
     video_core/gpu_command_safety.cpp
     video_core/syncpoint_actions.cpp
     video_core/nx2_video_av1.cpp

@@ -817,7 +817,7 @@ TEST_CASE("GpuSplit draw.begin repeat counts match separate entries",
     constexpr auto None = VideoCommon::GpuSplit::Effect::None;
     constexpr u32 first = 4;                  // InstanceId::First (bits 26-27), triangles
     constexpr u32 subsequent = (1u << 26) | 4; // InstanceId::Subsequent
-    for (const u32 repeats : {0u, 1u, 254u, 255u, 256u, 600u}) {
+    for (const u32 repeats : {0u, 1u, 126u, 127u, 128u, 254u, 255u, 256u, 380u}) {
         for (const bool counted_on_fast : {true, false}) {
             CAPTURE(repeats, counted_on_fast);
             Fixture f;
@@ -831,16 +831,16 @@ TEST_CASE("GpuSplit draw.begin repeat counts match separate entries",
             separate.MacroWrite(&separate_engine, DrawBegin, first);
             for (u32 i = 0; i <= repeats; ++i) {
                 REQUIRE(counted.RepeatableMethod(&counted_engine, DrawBegin, subsequent, true,
-                                                 true, None, false) == (i % 256 != 0));
+                                                 true, None, false) == (i % 128 != 0));
                 separate.MacroWrite(&separate_engine, DrawBegin, subsequent);
             }
-            // The engine entry, the first begin, then one entry per 256 subsequent ones, each
-            // counting up to 255 repeats.
-            const u64 entries = repeats / 256 + 1;
+            // The engine entry, the first begin, then one entry per 128 subsequent ones, each
+            // counting up to 127 repeats (bits 24-30; bit 31 flags a verified repeat).
+            const u64 entries = repeats / 128 + 1;
             REQUIRE(Access::End(counted) == 3 + entries);
             for (u64 i = 0; i < entries; ++i) {
                 const u64 word = Access::Word(counted, 3 + i);
-                REQUIRE(((word >> 24) & 0xff) == (std::min)(repeats - i * 256, u64{255}));
+                REQUIRE(((word >> 24) & 0x7f) == (std::min)(repeats - i * 128, u64{127}));
                 REQUIRE(((word >> 8) & 0xffff) == DrawBegin);
                 REQUIRE(static_cast<u32>(word >> 32) == subsequent);
             }
@@ -881,16 +881,16 @@ TEST_CASE("GpuSplit counts a draw.begin repeat only into the unpublished entry b
     // A different call kind (not from a macro) is another word.
     REQUIRE(!split.RepeatableMethod(&f.fast, DrawBegin, subsequent | 1, true, false, None, false));
     REQUIRE(Access::End(split) == 8);
-    // Verify: sent, flagged (bit 7), not counted.
+    // Verify: sent, flagged (bit 31), not counted.
     REQUIRE(!repeat(subsequent, true));
     REQUIRE(repeat(subsequent, true));
     REQUIRE(repeat(subsequent, true));
     REQUIRE(Access::End(split) == 11);
-    REQUIRE(((Access::Word(split, 8) >> 7) & 1) == 0);
+    REQUIRE(((Access::Word(split, 8) >> 31) & 1) == 0);
     for (const u64 position : {9ULL, 10ULL}) {
         const u64 word = Access::Word(split, position);
-        REQUIRE(((word >> 7) & 1) == 1);
-        REQUIRE(((word >> 24) & 0xff) == 0);
+        REQUIRE(((word >> 31) & 1) == 1);
+        REQUIRE(((word >> 24) & 0x7f) == 0);
     }
     u64 position{};
     while (position < Access::End(split)) {

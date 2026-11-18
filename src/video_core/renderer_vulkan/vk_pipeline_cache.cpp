@@ -1964,6 +1964,15 @@ void PipelineCache::RefreshGraphicsKey() {
         vertex_attribute_types, graphics_key.unique_hashes, vertex_attribute_masks);
 }
 
+bool PipelineCache::IsIndirectResetShader() const {
+    constexpr size_t vertex_b = static_cast<size_t>(Maxwell::ShaderType::VertexB);
+    constexpr u64 reset_key = 0x72fd62555e7196cdULL;
+    const auto* info = shader_infos[vertex_b];
+    return maxwell3d->regs.IsShaderConfigEnabled(vertex_b) && info && info->lowered_native &&
+           info->lowered_native->source_size == 128 + 11 * 16 &&
+           info->lowered_native->native_program_key == reset_key;
+}
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     GraphicsPipeline* const pipeline = CurrentGraphicsPipelineLookup();
     if (pipeline != nullptr && pipeline->IsMeshPipeline() && !pipeline->IsEmulatedMesh() &&
@@ -2235,7 +2244,6 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
         // Do not keep writing to the previous title's cache files.
         pipeline_cache_filename.clear();
-        mesh_pipeline_cache_filename.clear();
         used_pipelines_filename.clear();
         vulkan_pipeline_cache_filename.clear();
         return;

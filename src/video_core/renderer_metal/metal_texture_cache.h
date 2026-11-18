@@ -91,6 +91,12 @@ public:
                    Tegra::Engines::Fermi2D::Filter filter,
                    Tegra::Engines::Fermi2D::Operation operation);
 
+    /// Not available on Metal (the Vulkan runtime's DLSS camera-motion pass): the caller keeps its own.
+    bool UpscaleWithCameraMotion(Framebuffer*, ImageView&, ImageView&, std::array<u32, 2>,
+                                 const std::array<f32, 16>&, std::array<f32, 2>, bool) {
+        return false;
+    }
+
     /// MetalFX temporal upscaling in place of the game's DLSS (the MetalFX Temporal scaling
     /// filter), else Vulkan's temporal stand-in (EDEN_NX2_METAL_TEMPORAL_STANDIN); false leaves
     /// the game's own upscaler.

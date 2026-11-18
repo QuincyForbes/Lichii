@@ -183,7 +183,6 @@ public:
     VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     bool AccelerateCameraMotionUpscale(const Tegra::Engines::Fermi2D::Surface& src,
                                        const Tegra::Engines::Fermi2D::Surface& dst) override;
-                                       const Tegra::Engines::Fermi2D::Surface& dst) override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;

@@ -155,12 +155,6 @@ struct Values {
     Setting<std::string> skipped_update_tag{linkage, {}, "skipped_update_tag", Category::Ui};
     Setting<unsigned long long> update_remind_at{linkage, 0, "update_remind_at", Category::Ui};
 
-    // Unset until a tagged release or daily build first runs, then only the user changes it
-    Setting<Settings::UpdateChannel> update_channel{linkage, Settings::UpdateChannel::Unset,
-                                                    "update_channel", Category::UiGeneral};
-    // Tag of the release the user chose not to be reminded of
-    Setting<std::string> skipped_update{linkage, {}, "skipped_update", Category::Ui};
-
     // Linux/MinGW may support (requires libdl support)
     SwitchableSetting<bool> enable_gamemode{linkage,
 #ifndef _MSC_VER

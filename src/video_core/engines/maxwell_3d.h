@@ -3261,11 +3261,6 @@ public:
     void CallConstBufferWords(Core::System& system, const u32* methods, const u32* arguments,
                               u32 count);
 
-    /// GpuSplit's back (fast_maxwell3d): CallMethod for each of up to 64 single writes to the
-    /// constant buffer data registers, uploaded in one memory write within a device page.
-    void CallConstBufferWords(Core::System& system, const u32* methods, const u32* arguments,
-                              u32 count);
-
     /// GpuSplit's back (fast_maxwell3d): processes a contiguous run of non-executable state
     /// register writes from the SPSC ring in one loop.
     size_t CallStateMethodRun(const u64* entry, size_t max_words);

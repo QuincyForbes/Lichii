@@ -1213,7 +1213,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const ImageViewInfo& info, Im
 ImageView::ImageView(TextureCacheRuntime&, const ImageInfo& info, const ImageViewInfo& view_info,
                      GPUVAddr gpu_addr_)
     : VideoCommon::ImageViewBase{info, view_info, gpu_addr_},
-      buffer_size{VideoCommon::CalculateGuestSizeInBytes(info)} {}
+      buffer_size{static_cast<u32>(VideoCommon::CalculateGuestSizeInBytes(info))} {}
 
 ImageView::ImageView(TextureCacheRuntime&, const ImageInfo& info, const ImageViewInfo& view_info)
     : VideoCommon::ImageViewBase{info, view_info, 0} {}
