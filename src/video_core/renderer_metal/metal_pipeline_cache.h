@@ -27,6 +27,8 @@
 #include "common/polyfill_thread.h"
 #include "common/thread_worker.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/shader_environment.h"
+#include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/renderer_metal/metal_archive.h"
 #include "video_core/renderer_metal/metal_build_job.h"
 #include "video_core/renderer_metal/metal_graphics.h"
@@ -263,6 +265,13 @@ public:
     /// they were drawn with, on worker threads (EDEN_NX2_METAL_PIPELINE_FILE=0: archive only).
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
+
+    /// Shader precache: queues the compute programs of the title's precache file (built from the
+    /// game files by the frontend) that are not built yet. Returns the marker to write once they
+    /// are built, empty when there is nothing to do.
+    std::optional<VideoCommon::ShaderWarm::WarmStamp> QueuePrecacheFile(
+        u64 title_id, u32 apple_family,
+        const std::function<void(const ComputePipelineKey&, VideoCommon::FileEnvironment)>& queue);
 
     /// Once a frame: the used pipelines list is written within EDEN_NX2_USED_PIPELINES_SAVE_S
     /// (default 10) of a pipeline's first use and when the app leaves the foreground, the archive

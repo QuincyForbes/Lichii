@@ -12,6 +12,8 @@
 
 #include <spirv_msl.hpp>
 
+#include "common/large_stack.h"
+
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
 
@@ -219,7 +221,46 @@ bool DeviceMslEnabled() {
     return enabled;
 }
 
+namespace {
+Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Options& options);
+
+/// The deepest nesting of (), [] and {} in `source` (what Metal's parser limits to 256).
+[[nodiscard]] u32 MaxBracketNesting(std::string_view source) {
+    u32 depth = 0;
+    u32 deepest = 0;
+    for (const char c : source) {
+        if (c == '(' || c == '[' || c == '{') {
+            deepest = (std::max)(deepest, ++depth);
+        } else if ((c == ')' || c == ']' || c == '}') && depth != 0) {
+            --depth;
+        }
+    }
+    return deepest;
+}
+} // Anonymous namespace
+
 Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& options) {
+    // SPIRV-Cross recurses through a program's control flow: large game shaders overflowed the
+    // 512 KiB stack of the worker threads.
+    Result result;
+    Common::RunOnLargeStack([&] {
+        result = SpirvToMslOnThisStack(spirv, stage, options);
+        // SPIRV-Cross inlines single-use expressions, and a long chain of them nests one call in
+        // the next: Metal's parser stops at 256 brackets ("bracket nesting level exceeded"), and
+        // the program was refused. Such a program is translated again with temporaries.
+        constexpr u32 SafeNesting = 192;
+        if (!options.force_temporary && !result.source.empty() &&
+            MaxBracketNesting(result.source) > SafeNesting) {
+            Options flat = options;
+            flat.force_temporary = true;
+            result = SpirvToMslOnThisStack(spirv, stage, flat);
+        }
+    });
+    return result;
+}
+
+namespace {
+Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Options& options) {
     Result result;
     try {
         std::vector<u32> words(spirv.begin(), spirv.end());
@@ -274,6 +315,7 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
         }
         compiler.set_msl_options(msl);
         auto common = compiler.get_common_options();
+        common.force_temporary = common.force_temporary || options.force_temporary;
         common.vertex.flip_vert_y =
             (stage == Stage::Vertex || stage == Stage::Mesh || tess_evaluation) &&
             options.flip_vertex_y;
@@ -502,9 +544,13 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
             !(stage == Stage::Vertex && buffers + 1 > options.first_vertex_buffer_slot)) {
             const auto points = compiler.get_entry_points_and_stages();
             if (!points.empty()) {
+                std::string plain = result.source;
                 result.reduction_slot = RewriteSamplerReduction(
                     result.source, compiler.get_cleansed_entry_point_name(points.front().name, model),
                     stage == Stage::Fragment, buffers);
+                if (result.reduction_slot != ~0U) {
+                    result.source_without_reduction = std::move(plain);
+                }
             }
         }
         if (tess_vertex || tess_control || tess_evaluation) {
@@ -522,6 +568,7 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
     }
     return result;
 }
+} // Anonymous namespace
 
 namespace {
 
@@ -1252,8 +1299,12 @@ u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point,
         }
     }
     bool rewritten = false;
-    for (auto it = calls.rbegin(); it != calls.rend(); ++it) {
-        const auto [begin, end] = *it;
+    // From the last call back: a call nested in another's arguments (a sample whose coordinate
+    // is another sample) comes after it, and rewriting it lengthens the outer call, whose end
+    // is moved along below; with the end left where it was, the outer rewrite cut the source in
+    // the wrong place and Metal refused the program.
+    for (size_t index = calls.size(); index-- != 0;) {
+        const auto [begin, end] = calls[index];
         const size_t dot = source.find('.', begin);
         const std::string texture = source.substr(begin, dot - begin);
         const std::string_view inner = std::string_view(source).substr(
@@ -1280,10 +1331,17 @@ u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point,
         }
         const std::string slot = std::to_string(samplers[sampler]);
         const std::string original = source.substr(begin, end - begin);
-        source.replace(begin, end - begin,
-                       "(spvReducing(spvReduction, " + slot + "u) ? spvReducedSample(" + texture +
-                           ", " + sampler + ", " + coordinate + ", " + lod + ", spvReduction, " +
-                           slot + "u) : " + original + ")");
+        const std::string replacement =
+            "(spvReducing(spvReduction, " + slot + "u) ? spvReducedSample(" + texture + ", " +
+            sampler + ", " + coordinate + ", " + lod + ", spvReduction, " + slot + "u) : " +
+            original + ")";
+        source.replace(begin, end - begin, replacement);
+        const size_t added = replacement.size() - (end - begin);
+        for (size_t outer = 0; outer < index; ++outer) {
+            if (calls[outer].second >= end) {
+                calls[outer].second += added;
+            }
+        }
         rewritten = true;
     }
     if (!rewritten) {

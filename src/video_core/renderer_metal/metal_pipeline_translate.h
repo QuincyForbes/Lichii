@@ -115,6 +115,8 @@ namespace Metal {
 struct StageProgram {
     ShaderTranslate::Stage stage{};
     std::string msl;
+    /// ShaderTranslate::Result::source_without_reduction: built when `msl` is refused.
+    std::string msl_without_reduction;
     std::string entry_point;
     std::vector<ShaderTranslate::ResourceSlot> slots;
     Shader::Info info;

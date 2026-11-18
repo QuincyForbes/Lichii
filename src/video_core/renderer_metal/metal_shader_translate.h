@@ -130,10 +130,16 @@ struct Options {
     /// Vertex stage: no point size output (Metal refuses one in a triangle or line pipeline;
     /// ReShade's vertex programs write 1).
     bool drop_point_size{};
+    /// Every expression in a temporary (SPIRV-Cross force_temporary). SpirvToMsl sets it itself
+    /// for a program whose inlined expressions nest past what Metal parses.
+    bool force_temporary{};
 };
 
 struct Result {
     std::string source;      ///< MSL; empty on failure
+    /// The MSL before the sampler reduction rewrite, when one was made: the rewrite is textual,
+    /// and where Metal refuses its output the program builds from this instead (no reduction).
+    std::string source_without_reduction;
     std::string entry_point; ///< Function name in the MSL
     std::vector<ResourceSlot> slots;
     /// Tessellation stages: what this stage writes for the next one.

@@ -22,6 +22,7 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/platform_events.h"
+#include "common/settings.h"
 #include "common/thread_worker.h"
 #include "video_core/async_translate.h"
 #include "video_core/engines/kepler_compute.h"
@@ -33,6 +34,8 @@
 #include "video_core/renderer_metal/metal_switches.h"
 #include "video_core/renderer_metal/metal_work_policy.h"
 #include "video_core/shader_environment.h"
+#include "video_core/shader_warm/shader_warm_builder.h"
+#include "video_core/shader_warm/warm_records.h"
 
 namespace Metal {
 
@@ -52,6 +55,27 @@ constexpr size_t MaxPrograms = 6;
 void ReleaseSource(StageProgram& program) {
     if (PipelineFiles::Mode() != 0) {
         std::string{}.swap(program.msl);
+        std::string{}.swap(program.msl_without_reduction);
+    }
+}
+
+/// Builds the program's library; where Metal refuses the MSL with the sampler reduction rewrite
+/// (a textual rewrite that some expressions defeat), from the MSL without it: the program then
+/// samples with Metal's own reduction instead of being skipped. `error` keeps the first error.
+void BuildProgramLibrary(const Device& device, StageProgram& program, std::string& error) {
+    program.library = CreateLibrary(device, program.msl, error);
+    if (program.library || program.msl_without_reduction.empty()) {
+        return;
+    }
+    std::string retry_error;
+    program.library = CreateLibrary(device, program.msl_without_reduction, retry_error);
+    if (program.library) {
+        program.reduction_slot = ~0U;
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Metal,
+                        "Metal: program built without its sampler reduction rewrite ({})", error);
+        }
     }
 }
 
@@ -122,7 +146,7 @@ void* GraphicsPipeline::VertexKernelState(const Device& device, size_t variant,
     }
     std::string error;
     if (!program.function) {
-        program.library = CreateLibrary(device, program.msl, error);
+        BuildProgramLibrary(device, program, error);
         program.function = program.library
                                ? CreateFunction(program.library.Get(), program.entry_point)
                                : Object{};
@@ -169,7 +193,7 @@ std::pair<void*, void*> GraphicsPipeline::XfbKernelStates(const Device& device, 
     }
     std::string error;
     if (!program.function) {
-        program.library = CreateLibrary(device, program.msl, error);
+        BuildProgramLibrary(device, program, error);
         const Object gather =
             program.library ? CreateFunction(program.library.Get(), std::string{Xfb::GatherEntry})
                             : Object{};
@@ -224,7 +248,7 @@ std::pair<void*, void*> GraphicsPipeline::GeometryKernelStates(const Device& dev
     }
     std::string error;
     if (!program.function) {
-        program.library = CreateLibrary(device, program.msl, error);
+        BuildProgramLibrary(device, program, error);
         const Object records =
             program.library
                 ? CreateFunction(program.library.Get(), std::string{Geometry::RecordsEntry})
@@ -299,7 +323,7 @@ void* GraphicsPipeline::KernelState(const Device& device, MeshKernel& kernel) {
     }
     StageProgram& program = kernel.program;
     std::string error;
-    program.library = CreateLibrary(device, program.msl, error);
+    BuildProgramLibrary(device, program, error);
     program.function =
         program.library ? CreateFunction(program.library.Get(), program.entry_point) : Object{};
     if (program.function) {
@@ -338,7 +362,7 @@ bool GraphicsPipeline::BuildNativeFunctions(const Device& device) {
             continue;
         }
         std::string error;
-        stage->library = CreateLibrary(device, stage->msl, error);
+        BuildProgramLibrary(device, *stage, error);
         stage->function = stage->library ? CreateFunction(stage->library.Get(), stage->entry_point)
                                          : Object{};
         if (!stage->function) {
@@ -374,7 +398,7 @@ bool GraphicsPipeline::BuildFunctions(const Device& device) {
             return false;
         }
         std::string error;
-        stage->library = CreateLibrary(device, stage->msl, error);
+        BuildProgramLibrary(device, *stage, error);
         stage->function = stage->library ? CreateFunction(stage->library.Get(), stage->entry_point)
                                          : Object{};
         if (!stage->function) {
@@ -488,7 +512,7 @@ void* ComputePipeline::State(const Device& device) {
         return state.Get();
     }
     std::string error;
-    program.library = CreateLibrary(device, program.msl, error);
+    BuildProgramLibrary(device, program, error);
     program.function =
         program.library ? CreateFunction(program.library.Get(), program.entry_point) : Object{};
     if (program.function) {
@@ -640,6 +664,87 @@ void PipelineCache::EvictUnusedPipelines() {
                       : std::string{});
 }
 
+namespace {
+/// What a Metal precache marker records in place of a Vulkan driver: "MTL" and the Apple GPU
+/// family (the Metal binary archive itself notices a new OS or GPU and rebuilds what it holds).
+/// Vulkan's markers never match it, so switching backends precaches once more for the other one.
+[[nodiscard]] std::optional<VideoCommon::ShaderWarm::WarmStamp> MetalWarmStamp(
+    const std::filesystem::path& warm_file, u64 entries, u32 apple_family) {
+    return VideoCommon::ShaderWarm::CurrentWarmStamp(warm_file, entries, 0x4D544C00U,
+                                                     apple_family,
+                                                     VideoCommon::ShaderWarm::WarmCacheVersion);
+}
+} // Anonymous namespace
+
+std::optional<VideoCommon::ShaderWarm::WarmStamp> PipelineCache::QueuePrecacheFile(
+    u64 title_id, u32 apple_family,
+    const std::function<void(const ComputePipelineKey&, VideoCommon::FileEnvironment)>& queue) {
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    const std::filesystem::path warm_file = ShaderWarm::ComputeWarmPath(title_id);
+    const std::string path = Common::FS::PathToUTF8String(warm_file);
+    std::error_code ec;
+    if (!std::filesystem::exists(warm_file, ec)) {
+        LOG_INFO(Render_Metal, "Metal shader precache: no precache file at {} (Build Shader "
+                               "Precache in the game's menu makes one)",
+                 path);
+        return std::nullopt;
+    }
+    const auto current = MetalWarmStamp(warm_file, 0, apple_family);
+    const auto marker = ShaderWarm::ReadWarmMarker(warm_file);
+    if (current && marker && marker->Matches(*current)) {
+        LOG_INFO(Render_Metal, "Metal shader precache: compute programs already built");
+        return std::nullopt;
+    }
+    // Its own reader, as Vulkan's: the disk cache loader deletes a file it rejects.
+    size_t entries = 0;
+    size_t queued = 0;
+    try {
+        std::ifstream file(warm_file, std::ios::binary | std::ios::ate);
+        file.exceptions(std::ifstream::failbit);
+        const auto end = file.tellg();
+        file.seekg(0, std::ios::beg);
+        std::array<char, 8> magic;
+        u32 version{};
+        file.read(magic.data(), magic.size())
+            .read(reinterpret_cast<char*>(&version), sizeof(version));
+        constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
+        if (magic != expected_magic || version != ShaderWarm::WarmCacheVersion) {
+            LOG_WARNING(Render_Metal,
+                        "Metal shader precache: {} is not a version {} file; build it again",
+                        path, ShaderWarm::WarmCacheVersion);
+            return std::nullopt;
+        }
+        static const VideoCommon::GuessMissing guess{};
+        while (file.tellg() != end) {
+            u32 num_envs{};
+            file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+            VideoCommon::FileEnvironment env;
+            env.Deserialize(file);
+            if (num_envs != 1 || env.ShaderStage() != Shader::Stage::Compute) {
+                LOG_WARNING(Render_Metal, "Metal shader precache: unexpected entry in {}", path);
+                return std::nullopt;
+            }
+            ComputePipelineKey key;
+            file.read(reinterpret_cast<char*>(&key), sizeof(key));
+            ++entries;
+            // Programs in the pipeline records were queued already.
+            if (!disk_compute.insert(key).second) {
+                continue;
+            }
+            // The precache file records no reads: guesses stand in for them.
+            env.SetGuessMissing(&guess);
+            queue(key, std::move(env));
+            ++queued;
+        }
+    } catch (const std::exception& e) {
+        LOG_WARNING(Render_Metal, "Metal shader precache: reading {} failed: {}", path, e.what());
+        return std::nullopt;
+    }
+    LOG_INFO(Render_Metal, "Metal shader precache: {} compute programs in {}, {} new to build",
+             entries, path, queued);
+    return MetalWarmStamp(warm_file, entries, apple_family);
+}
+
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                       const VideoCore::DiskResourceLoadCallback& callback) {
     OpenArchive(title_id);
@@ -658,6 +763,16 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         LOG_WARNING(Render_Metal, "Metal: the last boot build of pipelines did not finish; "
                                   "nothing is built ahead in this run");
     }
+    // Shader precache (precache_shaders Always, Ask answered yes, or a Build Shaders launch):
+    // every recorded pipeline is built, not only those of the recent sessions, and the compute
+    // programs found in the game files (the precache file the frontend builds) too, so the game
+    // does not stop to compile them when it first uses them. The Metal binary archive keeps what
+    // was built, so later boots load it.
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    const bool precache =
+        build && (ShaderWarm::PrecacheBeforeStart(Settings::values.precache_shaders.GetValue(),
+                                                  ShaderWarm::TakeWarmBeforeStart()) ||
+                  ShaderWarm::BuildOnlyRequested());
     std::unordered_map<GraphicsPipelineKey, std::vector<RenderPipelineDesc>> states;
     if (build) {
         for (const PipelineFiles::StateRecord& record : files.LoadStates()) {
@@ -675,6 +790,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         bool has_loaded{};
     } state;
     size_t unlisted = 0;
+    std::optional<ShaderWarm::WarmStamp> precache_stamp;
     const size_t num_workers = (std::max)(std::thread::hardware_concurrency(), 2U) - 1;
     const u32 apple_family = DeviceAppleFamily(device);
     const bool mesh_shaders = DeviceSupportsMeshShaders(device);
@@ -690,12 +806,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 callback(VideoCore::LoadCallbackStage::Build, state.built, state.total);
             }
         };
-        const auto load_compute = [&](std::ifstream& file, VideoCommon::FileEnvironment env) {
-            ComputePipelineKey key;
-            file.read(reinterpret_cast<char*>(&key), sizeof(key));
-            if (!disk_compute.insert(key).second || !build) {
-                return;
-            }
+        const auto queue_compute = [&](const ComputePipelineKey& key,
+                                       VideoCommon::FileEnvironment env) {
             {
                 std::scoped_lock lock{state.mutex};
                 ++state.total;
@@ -725,6 +837,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 finish();
             });
         };
+        const auto load_compute = [&](std::ifstream& file, VideoCommon::FileEnvironment env) {
+            ComputePipelineKey key;
+            file.read(reinterpret_cast<char*>(&key), sizeof(key));
+            if (!disk_compute.insert(key).second || !build) {
+                return;
+            }
+            queue_compute(key, std::move(env));
+        };
         const auto load_graphics = [&](std::ifstream& file,
                                        std::vector<VideoCommon::FileEnvironment> envs) {
             GraphicsPipelineKey key;
@@ -732,7 +852,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             if (!disk_graphics.insert(key).second || !build || envs.size() > MaxPrograms) {
                 return;
             }
-            if (!files.BuildAtBoot(key.Hash())) {
+            if (!precache && !files.BuildAtBoot(key.Hash())) {
                 ++unlisted;
                 return;
             }
@@ -802,6 +922,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         };
         VideoCommon::LoadPipelines(stop_loading, files.Records(), PipelineFiles::RecordsVersion,
                                    load_compute, load_graphics);
+        if (precache) {
+            precache_stamp = QueuePrecacheFile(title_id, apple_family, queue_compute);
+        }
         {
             std::scoped_lock lock{state.mutex};
             if (callback) {
@@ -815,6 +938,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         return;
     }
     files.EndBoot();
+    if (precache_stamp && !stop_loading.stop_requested()) {
+        // Done for this GPU: the next precache boot skips the file until it or the GPU changes.
+        static_cast<void>(ShaderWarm::WriteWarmMarker(ShaderWarm::ComputeWarmPath(title_id),
+                                                      *precache_stamp));
+    }
     const PipelineArchive::Counts counts = archive.Totals();
     LOG_INFO(Render_Metal,
              "Metal: boot pipelines: {} of {} built ({} graphics with {} render states, {} "

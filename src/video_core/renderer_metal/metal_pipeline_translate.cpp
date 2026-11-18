@@ -471,6 +471,7 @@ std::optional<StageProgram> PipelineTranslator::FromSpirv(std::span<const u32> s
     return StageProgram{
         .stage = stage,
         .msl = std::move(result.source),
+        .msl_without_reduction = std::move(result.source_without_reduction),
         .entry_point = std::move(result.entry_point),
         .slots = std::move(result.slots),
         .info = program.info,
@@ -1613,13 +1614,18 @@ std::optional<StageProgram> PipelineTranslator::Compute(u64 unique_hash,
         Refuse(logged, unique_hash, "SPIR-V to MSL failed", result.error);
         return std::nullopt;
     }
+    // Every field FromSpirv sets: without the spill tables' slots a kernel's spilled buffers
+    // and samplers were never bound.
     return StageProgram{
         .stage = ShaderTranslate::Stage::Compute,
         .msl = std::move(result.source),
+        .msl_without_reduction = std::move(result.source_without_reduction),
         .entry_point = std::move(result.entry_point),
         .slots = std::move(result.slots),
         .info = program.info,
         .reduction_slot = result.reduction_slot,
+        .spill_slot = result.spill_slot,
+        .sampler_spill_slot = result.sampler_spill_slot,
     };
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Metal, "Metal: {}", exception.what());
