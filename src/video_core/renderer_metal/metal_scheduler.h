@@ -372,6 +372,20 @@ public:
     bool DepthToBuffer(TextureHandle src, u32 level, u32 slice, Offset3D origin, Extent3D extent,
                        BufferHandle dst, u64 offset, u32 bytes_per_row, DepthLayout layout);
 
+    /// Q27: `shadow` (single-sampled, 2D array, the same format and size) is `msaa`'s resolve
+    /// shadow: passes drawing into the multisampled texture resolve into it, and a pass that
+    /// begins with a clear does not store the samples (EDEN_NX2_MSAA_DISCARD); whatever needs
+    /// the samples later gets them restored from the shadow. A null shadow removes it.
+    void SetResolveShadow(TextureHandle msaa, TextureHandle shadow);
+
+    /// The shadow of `msaa` while it holds the resolve of its samples (nothing wrote them since
+    /// its last pass), else null.
+    [[nodiscard]] TextureHandle ResolveShadow(TextureHandle msaa) const noexcept;
+
+    /// Passes that did not store their samples, and the restores that followed.
+    [[nodiscard]] u64 SamplesDropped() const noexcept;
+    [[nodiscard]] u64 SamplesRestored() const noexcept;
+
     /// Store actions dropped so far for attachments a pass loaded and no draw of it wrote (P07).
     [[nodiscard]] u64 StoresDropped() const noexcept;
 

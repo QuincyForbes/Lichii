@@ -567,6 +567,17 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                            src_region.end.y == dst_region.end.y &&
                            dst_region.end.x == static_cast<s32>(dst.size.width) &&
                            dst_region.end.y == static_cast<s32>(dst.size.height);
+        // Q27: the resolve its passes made already, while nothing wrote the samples since.
+        if (whole && src.HostFormat() == dst.HostFormat()) {
+            const Attachment target = dst.RenderTarget();
+            if (const TextureHandle shadow = scheduler.ResolveShadow(src.ImageHandle());
+                shadow != nullptr && target.depth_plane == 0) {
+                scheduler.CopyTexture(shadow, 0, static_cast<u32>(src.range.base.layer), {},
+                                      {dst.size.width, dst.size.height, 1}, target.texture,
+                                      target.level, target.slice, {});
+                return;
+            }
+        }
         if (whole && src.HostFormat() == dst.HostFormat() &&
             scheduler.Resolve(src.ImageHandle(), static_cast<u32>(src.range.base.layer),
                               dst.RenderTarget(), dst.size.width, dst.size.height)) {
@@ -889,12 +900,35 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         return;
     }
     bytes = AllocatedSize(texture.Get());
+    // Q27: a multisampled colour image gets a single-sampled shadow its passes resolve into, which
+    // BlitImage's resolves consume (EDEN_NX2_METAL_MSAA_SHADOW=0: none).
+    static const bool shadows_enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_MSAA_SHADOW");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (shadows_enabled && desc.samples > 1 && info.type == ImageType::e2D &&
+        host_format.attachable && host_format.format_class == FormatClass::Float &&
+        MsaaEnabled()) {
+        resolve_shadow = CreateTexture(runtime->device, TextureDesc{.kind = TextureKind::e2DArray,
+                                                                    .format = desc.format,
+                                                                    .width = desc.width,
+                                                                    .height = desc.height,
+                                                                    .layers = desc.layers,
+                                                                    .render_target = true});
+        if (resolve_shadow) {
+            bytes += AllocatedSize(resolve_shadow.Get());
+            runtime->scheduler.SetResolveShadow(texture.Get(), resolve_shadow.Get());
+        }
+    }
     runtime->allocated_bytes += bytes;
 }
 
 Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBase{params} {}
 
 Image::~Image() {
+    if (resolve_shadow && runtime != nullptr) {
+        runtime->scheduler.SetResolveShadow(texture.Get(), nullptr);
+    }
     if (texture && runtime != nullptr) {
         runtime->allocated_bytes -= bytes + scaled_bytes;
     }

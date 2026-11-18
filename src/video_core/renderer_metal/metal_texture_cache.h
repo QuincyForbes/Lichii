@@ -308,6 +308,7 @@ private:
     TextureCacheRuntime* runtime{};
     u32 packed_shift{};
     u32 pack16{};
+    Object resolve_shadow; ///< Q27: the single-sampled resolve of a multisampled colour image
     SparseTiles sparse;
     Object texture;
     /// The texture at the scaled size, made on the first ScaleUp.

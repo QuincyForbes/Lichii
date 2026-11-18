@@ -58,6 +58,16 @@ bool UnwrittenStoresEnabled(const Device& device) {
     return enabled && device.AppleFamily() != 0;
 }
 
+/// EDEN_NX2_MSAA_DISCARD=0 (as Vulkan's): MSAA passes keep their samples even when they begin
+/// with a clear; otherwise such a pass resolves into the image's shadow and does not store them.
+bool MsaaDiscardEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_MSAA_DISCARD");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 /// Metal checks a slot past a stage's tables in its validation layer only.
 bool SlotFits(u32 slot, u32 slots, const char* kind) {
     if (slot < slots || !PipelineCheckEnabled()) {
@@ -404,6 +414,13 @@ kernel void swap_packed(uint3 id [[thread_position_in_grid]],
     *texel = p.shift == 4
                  ? ushort(v << 12 | (v & 0xf0u) << 4 | (v >> 4 & 0xf0u) | v >> 12)
                  : ushort((v & ~m) | (v & 31u) << p.shift | (v >> p.shift & 31u));
+}
+
+// A resolve shadow's colour into every sample of its multisampled texture (RestoreSamples).
+fragment float4 restore_samples_float(ClearOut in [[stage_in]],
+                                      texture2d_array<float> src [[texture(0)]],
+                                      constant uint& layer [[buffer(0)]]) {
+    return src.read(uint2(in.position.xy), layer);
 }
 
 // The 16-bit packed formats as RGBA8 on the host (Pack16Mode); these move whole regions between
@@ -1093,6 +1110,103 @@ struct Scheduler::Impl {
         deferred_stencil = false;
     }
 
+    /// Q27: a multisampled colour texture's single-sampled resolve shadow. `valid`: it holds the
+    /// resolve of the samples as they are; `dropped`: the samples were not stored (the pass
+    /// cleared them and resolved, MTLStoreActionMultisampleResolve), so anything that needs them
+    /// restores them from the shadow first.
+    struct ShadowEntry {
+        void* shadow{};
+        bool valid{};
+        bool dropped{};
+    };
+    std::unordered_map<void*, ShadowEntry> shadows;
+    u64 samples_dropped{};
+    u64 samples_restored{};
+
+    id<MTLRenderPipelineState> RestorePipeline(MTLPixelFormat format, NSUInteger samples) {
+        const u64 key = (u64{1} << 62) | (static_cast<u64>(format) << 8) | static_cast<u64>(samples);
+        if (const auto it = scale_pipelines.find(key); it != scale_pipelines.end()) {
+            return it->second;
+        }
+        id<MTLRenderPipelineState> pipeline = nil;
+        if (library != nil) {
+            MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+            desc.label = @"Restore samples";
+            desc.vertexFunction = [library newFunctionWithName:@"clear_vertex"];
+            desc.fragmentFunction = [library newFunctionWithName:@"restore_samples_float"];
+            desc.rasterSampleCount = samples;
+            desc.colorAttachments[0].pixelFormat = format;
+            NSError* error = nil;
+            pipeline = [device.GetDevice() newRenderPipelineStateWithDescriptor:desc error:&error];
+        }
+        scale_pipelines.emplace(key, pipeline);
+        return pipeline;
+    }
+
+    /// The samples of `texture` written back from its shadow (each sample the resolved colour).
+    void RestoreSamples(void* texture, ShadowEntry& entry) {
+        entry.dropped = false;
+        const id<MTLTexture> dst = AsTexture(texture);
+        const id<MTLTexture> src = AsTexture(entry.shadow);
+        if (dst == nil || src == nil) {
+            return;
+        }
+        FlushClear();
+        const id<MTLRenderPipelineState> pipeline = RestorePipeline(dst.pixelFormat, dst.sampleCount);
+        if (pipeline == nil) {
+            return;
+        }
+        ++samples_restored;
+        const u32 width = static_cast<u32>(dst.width);
+        const u32 height = static_cast<u32>(dst.height);
+        for (u32 layer = 0; layer < dst.arrayLength; ++layer) {
+            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            ApplyAttachment(pass.colorAttachments[0],
+                            Attachment{.texture = texture, .level = 0, .slice = layer});
+            pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            pass.renderTargetWidth = width;
+            pass.renderTargetHeight = height;
+            const id<MTLRenderCommandEncoder> encoder = RenderEncoder(pass);
+            if (encoder == nil) {
+                return;
+            }
+            [encoder setRenderPipelineState:pipeline];
+            [encoder setViewport:MTLViewport{0.0, 0.0, static_cast<f64>(width),
+                                             static_cast<f64>(height), 0.0, 1.0}];
+            const f32 depth_value = 0.0f;
+            [encoder setVertexBytes:&depth_value length:sizeof(depth_value) atIndex:0];
+            [encoder setFragmentTexture:src atIndex:0];
+            [encoder setFragmentBytes:&layer length:sizeof(layer) atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [encoder endEncoding];
+        }
+    }
+
+    /// Something reads the samples of `texture`.
+    void SamplesNeeded(const void* texture) {
+        if (shadows.empty()) {
+            return;
+        }
+        if (const auto it = shadows.find(const_cast<void*>(texture));
+            it != shadows.end() && it->second.dropped) {
+            RestoreSamples(it->first, it->second);
+        }
+    }
+
+    /// Something writes part or all of the samples of `texture`: the resolve no longer holds.
+    void Written(const void* texture) {
+        if (shadows.empty()) {
+            return;
+        }
+        if (const auto it = shadows.find(const_cast<void*>(texture)); it != shadows.end()) {
+            if (it->second.dropped) {
+                RestoreSamples(it->first, it->second);
+            }
+            it->second.valid = false;
+        }
+    }
+
     void EndEncoder() {
         if (blit != nil) {
             [blit endEncoding];
@@ -1206,6 +1320,10 @@ struct Scheduler::Impl {
             }
             MTLRenderPassColorAttachmentDescriptor* color = pass.colorAttachments[index];
             ApplyAttachment(color, clear.color[index]);
+            if (const auto shadow = shadows.find(clear.color[index].texture); shadow != shadows.end()) {
+                shadow->second.valid = false;
+                shadow->second.dropped = false;
+            }
             const auto& value = clear.color_value[index];
             color.loadAction = MTLLoadActionClear;
             color.storeAction = MTLStoreActionStore;
@@ -1946,6 +2064,7 @@ void Scheduler::FillBuffer(BufferHandle dst, u64 offset, u64 size, u8 value) {
 void Scheduler::CopyBufferToTexture(BufferHandle src, u64 offset, u32 bytes_per_row,
                                     u32 bytes_per_image, TextureHandle dst, u32 level, u32 slice,
                                     Offset3D origin, Extent3D extent) {
+    impl->Written(dst);
     if (src == nullptr || dst == nullptr) {
         return;
     }
@@ -1984,6 +2103,8 @@ void Scheduler::CopyTextureToBuffer(TextureHandle src, u32 level, u32 slice, Off
 void Scheduler::CopyTexture(TextureHandle src, u32 src_level, u32 src_slice, Offset3D src_origin,
                             Extent3D extent, TextureHandle dst, u32 dst_level, u32 dst_slice,
                             Offset3D dst_origin) {
+    impl->SamplesNeeded(src);
+    impl->Written(dst);
     if (src == nullptr || dst == nullptr) {
         return;
     }
@@ -2052,6 +2173,8 @@ void Scheduler::Clear(const ClearPass& clear) {
 }
 
 bool Scheduler::ClearRectangle(const ClearRect& clear) {
+    impl->Written(clear.color.texture);
+    impl->Written(clear.depth.texture);
     impl->FlushClear();
     const id<MTLTexture> color = clear.color_mask != 0 ? AsTexture(clear.color.texture) : nil;
     const id<MTLTexture> depth =
@@ -2135,6 +2258,8 @@ bool Scheduler::ClearRectangle(const ClearRect& clear) {
 }
 
 bool Scheduler::Blit(const BlitPass& blit) {
+    impl->Written(blit.dst.texture);
+    impl->SamplesNeeded(blit.src);
     impl->FlushClear();
     const id<MTLTexture> src = AsTexture(blit.src);
     if (src == nil || blit.dst.texture == nullptr) {
@@ -2226,6 +2351,8 @@ bool Scheduler::Blit(const BlitPass& blit) {
 }
 
 bool Scheduler::CopySamples(const SampleCopy& copy, bool expand) {
+    impl->SamplesNeeded(copy.src);
+    impl->Written(copy.dst.texture);
     impl->FlushClear();
     const id<MTLTexture> src = AsTexture(copy.src);
     const id<MTLTexture> dst = AsTexture(copy.dst.texture);
@@ -2283,6 +2410,8 @@ bool Scheduler::CopySamples(const SampleCopy& copy, bool expand) {
 }
 
 bool Scheduler::Convert(const ConvertPass& convert) {
+    impl->Written(convert.dst.texture);
+    impl->SamplesNeeded(convert.src);
     impl->FlushClear();
     const id<MTLTexture> src = AsTexture(convert.src);
     if (src == nil || convert.dst.texture == nullptr) {
@@ -2615,6 +2744,8 @@ bool Scheduler::SwapPacked(BufferHandle buffer, u64 offset, u32 width, u32 rows,
 }
 
 bool Scheduler::ScaleNearest(const ScalePass& scale) {
+    impl->SamplesNeeded(scale.src);
+    impl->Written(scale.dst.texture);
     impl->FlushClear();
     const id<MTLTexture> src = AsTexture(scale.src);
     const id<MTLTexture> dst = AsTexture(scale.dst.texture);
@@ -2669,6 +2800,7 @@ bool Scheduler::ScaleNearest(const ScalePass& scale) {
 bool Scheduler::Resolve(TextureHandle src_handle, u32 src_slice, const Attachment& dst, u32 width,
                         u32 height) {
     impl->FlushClear();
+    impl->SamplesNeeded(src_handle);
     const id<MTLTexture> src = AsTexture(src_handle);
     const id<MTLTexture> target = AsTexture(dst.texture);
     if (src == nil || target == nil || src.sampleCount < 2 || target.sampleCount != 1 ||
@@ -2734,11 +2866,39 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
         ApplyAttachment(color, targets.color[index]);
         color.loadAction = MTLLoadActionLoad;
         color.storeAction = MTLStoreActionStore;
-        if (clear && clear->clear_color[index]) {
+        const bool cleared = clear && clear->clear_color[index];
+        // Q27: a multisampled colour target with a resolve shadow resolves in the pass.
+        bool resolving = false;
+        if (!impl->shadows.empty()) {
+            if (const auto shadow = impl->shadows.find(targets.color[index].texture);
+                shadow != impl->shadows.end()) {
+                Impl::ShadowEntry& entry = shadow->second;
+                if (!cleared && entry.dropped) {
+                    impl->RestoreSamples(shadow->first, entry);
+                }
+                if (targets.layers == 1) {
+                    resolving = true;
+                    color.resolveTexture = AsTexture(entry.shadow);
+                    color.resolveLevel = 0;
+                    color.resolveSlice = targets.color[index].slice;
+                    const bool drop = MsaaDiscardEnabled() && cleared;
+                    color.storeAction = drop ? MTLStoreActionMultisampleResolve
+                                             : MTLStoreActionStoreAndMultisampleResolve;
+                    entry.valid = true;
+                    entry.dropped = drop;
+                    if (drop) {
+                        ++impl->samples_dropped;
+                    }
+                } else {
+                    entry.valid = false;
+                }
+            }
+        }
+        if (cleared) {
             const auto& value = clear->color_value[index];
             color.loadAction = MTLLoadActionClear;
             color.clearColor = MTLClearColorMake(value[0], value[1], value[2], value[3]);
-        } else if (defer_stores) {
+        } else if (defer_stores && !resolving) {
             color.storeAction = MTLStoreActionUnknown;
             defer_color |= static_cast<u8>(1U << index);
         }
@@ -2866,6 +3026,30 @@ BufferHandle Scheduler::VisibilityBuffer() const noexcept {
 
 u64* Scheduler::VisibilityResults() noexcept {
     return static_cast<u64*>(impl->visibility.contents);
+}
+
+void Scheduler::SetResolveShadow(TextureHandle msaa, TextureHandle shadow) {
+    if (msaa == nullptr) {
+        return;
+    }
+    if (shadow == nullptr) {
+        impl->shadows.erase(msaa);
+    } else {
+        impl->shadows[msaa] = Impl::ShadowEntry{.shadow = shadow};
+    }
+}
+
+TextureHandle Scheduler::ResolveShadow(TextureHandle msaa) const noexcept {
+    const auto it = impl->shadows.find(msaa);
+    return it != impl->shadows.end() && it->second.valid ? it->second.shadow : nullptr;
+}
+
+u64 Scheduler::SamplesDropped() const noexcept {
+    return impl->samples_dropped;
+}
+
+u64 Scheduler::SamplesRestored() const noexcept {
+    return impl->samples_restored;
 }
 
 u64 Scheduler::StoresDropped() const noexcept {

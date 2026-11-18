@@ -1661,6 +1661,122 @@ int RunFallbackTable() {
     return ok ? 0 : 1;
 }
 
+/// Q27: a multisampled target's passes resolve into its shadow. (a) With the discard on a pass
+/// that begins with a clear does not store its samples and a resolve reader sees the right pixels
+/// from the shadow; (b) a later pass that loads the samples still sees them; (c) a write to the
+/// samples after the resolve invalidates the shadow.
+int RunMsaaShadow() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const id<MTLDevice> mtl = device.GetDevice();
+    NSError* error = nil;
+    const id<MTLLibrary> library = [mtl newLibraryWithSource:@(LayerSource)
+                                                     options:[MTLCompileOptions new]
+                                                       error:&error];
+    const auto make = [&](MTLColorWriteMask mask) {
+        MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+        desc.vertexFunction = [library newFunctionWithName:@"layer_vertex"];
+        desc.fragmentFunction = [library newFunctionWithName:@"layer_fragment"];
+        desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        desc.colorAttachments[0].writeMask = mask;
+        desc.rasterSampleCount = 4;
+        desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+        return Metal::Retain(library != nil ? [mtl newRenderPipelineStateWithDescriptor:desc
+                                                                                    error:&error]
+                                            : nil);
+    };
+    const Object writes = make(MTLColorWriteMaskAll);
+    const Object keeps = make(MTLColorWriteMaskNone);
+    const Object depth_stencil =
+        Metal::Retain([mtl newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]]);
+    constexpr uint32_t Side = 4;
+    const Object samples = Metal::CreateTexture(device, {.kind = TextureKind::e2DMultisampleArray,
+                                                         .format = Rgba8,
+                                                         .width = Side,
+                                                         .height = Side,
+                                                         .samples = 4,
+                                                         .render_target = true});
+    const Object shadow = Metal::CreateTexture(device, {.kind = TextureKind::e2DArray,
+                                                        .format = Rgba8,
+                                                        .width = Side,
+                                                        .height = Side,
+                                                        .render_target = true});
+    const Object resolved = Metal::CreateTexture(device, {.kind = TextureKind::e2DArray,
+                                                          .format = Rgba8,
+                                                          .width = Side,
+                                                          .height = Side,
+                                                          .render_target = true});
+    auto [back, back_bytes] = SharedBuffer(device, Side * Side * 4 * 3);
+    if (!writes || !keeps || !samples || !shadow || !resolved || back_bytes == nullptr) {
+        std::printf("metal-smoke: FAIL MSAA shadow: %s\n",
+                    error != nil ? error.localizedDescription.UTF8String : "textures");
+        return 1;
+    }
+    scheduler.SetResolveShadow(samples.Get(), shadow.Get());
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = samples.Get()};
+    targets.width = Side;
+    targets.height = Side;
+    const auto draw = [&](const Object& pipeline) {
+        scheduler.BeginRendering(targets);
+        Metal::DrawState state{};
+        state.pipeline = pipeline.Get();
+        state.depth_stencil = depth_stencil.Get();
+        state.viewport = {0.0f, 0.0f, float(Side), float(Side), 0.0f, 1.0f};
+        state.scissor = {0, 0, Side, Side};
+        scheduler.SetDrawState(state);
+        scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 3, 1, 0);
+        scheduler.EndRendering();
+    };
+    const auto texel = [&](size_t slot) {
+        uint32_t value = 0;
+        std::memcpy(&value, back_bytes + slot * Side * Side * 4 + (Side + 1) * 4, sizeof(value));
+        return value;
+    };
+    // (a) Cleared blue, drawn red: the samples are dropped, the shadow holds red.
+    Metal::ClearPass clear{};
+    clear.color[0] = {.texture = samples.Get()};
+    clear.clear_color[0] = true;
+    clear.color_value[0] = {0, 0, 1, 1};
+    clear.width = Side;
+    clear.height = Side;
+    scheduler.Clear(clear);
+    draw(writes);
+    const bool valid_after_pass = scheduler.ResolveShadow(samples.Get()) == shadow.Get();
+    const uint64_t dropped = scheduler.SamplesDropped();
+    scheduler.CopyTextureToBuffer(shadow.Get(), 0, 0, {}, {Side, Side, 1}, back.Get(), 0, Side * 4,
+                                  0);
+    // (b) A pass that loads the samples and draws nothing: they come back from the shadow.
+    draw(keeps);
+    const uint64_t restored = scheduler.SamplesRestored();
+    scheduler.Resolve(samples.Get(), 0, {.texture = resolved.Get()}, Side, Side);
+    scheduler.CopyTextureToBuffer(resolved.Get(), 0, 0, {}, {Side, Side, 1}, back.Get(),
+                                  Side * Side * 4, Side * 4, 0);
+    // (c) A write to the samples invalidates the shadow.
+    Metal::ClearRect rect{};
+    rect.color = {.texture = samples.Get()};
+    rect.color_mask = 0xF;
+    rect.color_value = {0, 1, 0, 1};
+    rect.rect = {0, 0, Side, Side};
+    rect.width = Side;
+    rect.height = Side;
+    const bool cleared = scheduler.ClearRectangle(rect);
+    const bool invalid_after_write = scheduler.ResolveShadow(samples.Get()) == nullptr;
+    scheduler.Finish();
+    const uint32_t from_shadow = texel(0);
+    const uint32_t from_samples = texel(1);
+    const bool discard = dropped == 1;
+    const bool passed = valid_after_pass && cleared && invalid_after_write && from_shadow == 0xFF0000FFU &&
+                        from_samples == 0xFF0000FFU && restored == 1 && discard;
+    std::printf("metal-smoke: MSAA resolve shadow: pass valid %s, %llu pass(es) dropped samples, "
+                "resolve reader from the shadow %08x (red), loading pass restored %llu time(s) and "
+                "resolves to %08x (red), a write invalidates it %s: %s\n",
+                valid_after_pass ? "yes" : "NO", static_cast<unsigned long long>(dropped),
+                from_shadow, static_cast<unsigned long long>(restored), from_samples,
+                invalid_after_write ? "yes" : "NO", passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 int RunAll() {
     int result = 0;
     for (const auto test : {RunSampleCopies, RunScaleNearest, RunDepthBytes, RunConversions, RunGuards,
@@ -1668,7 +1784,8 @@ int RunAll() {
                             RunLayeredTarget, RunMultiRange, RunCrossThreadWait,
                             RunSamplers, RunPackedTargets, RunByteShadow, RunSparseTiles,
                             RunUnwrittenStore, RunEtcDecode,
-                            RunPacked5551, RunPacked16Forced, RunFallbackTable}) {
+                            RunPacked5551, RunPacked16Forced, RunFallbackTable,
+                            RunMsaaShadow}) {
         const int outcome = test();
         result = result != 0 ? result : outcome;
     }
