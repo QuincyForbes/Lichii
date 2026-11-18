@@ -43,6 +43,7 @@
 #include "video_core/nx2_indirect_grid.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/query_cache/query_cache.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/oot_network.h"
 #include "video_core/render_probe.h"
@@ -5419,6 +5420,13 @@ void RasterizerMetal::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         QueryFallback(gpu_addr, type, flags, payload, subreport);
         return;
     }
+    if (type == VideoCommon::QueryType::ZPassPixelCount64 &&
+        VideoCommon::OotOcclusionOff(program_id)) {
+        // As Vulkan's query cache: Ocarina's occlusion reports read "visible"
+        // (EDEN_NX2_OOT_OCCLUSION_OFF=0 counts them).
+        QueryFallback(gpu_addr, VideoCommon::QueryType::Payload, flags, 1, subreport);
+        return;
+    }
     if (!gpu_memory) {
         return;
     }
@@ -5431,30 +5439,84 @@ void RasterizerMetal::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
     }
     ++occlusion_queries;
     const bool wide = True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
-    // A condition that reads the report before its fence decides on the GPU from these slots.
+    // A condition that reads the report before it is written decides on the GPU from these slots.
     const u64 serial = ++report_serial;
+    const DAddr report_address = *address;
     {
         std::scoped_lock lock{pending_reports_mutex};
-        pending_reports.insert_or_assign(*address, PendingReport{.slots = occlusion_slots,
-                                                                 .wide = wide,
-                                                                 .tick = scheduler.CurrentTick(),
-                                                                 .serial = serial});
+        pending_reports.insert_or_assign(report_address,
+                                         PendingReport{.slots = occlusion_slots,
+                                                       .wide = wide,
+                                                       .tick = scheduler.CurrentTick(),
+                                                       .serial = serial});
     }
-    // Written once the GPU has finished the draws counted so far (the fence's command buffer
-    // ends their render pass, so later draws count into new slots).
-    SignalFence([this, address = *address, wide, serial, slots = occlusion_slots] {
-        const u64* const results = scheduler.VisibilityResults();
-        u64 samples = 0;
-        for (const u32 slot : slots) {
-            samples += results[slot];
-        }
-        WriteQueryResult(address, wide, samples);
-        std::scoped_lock lock{pending_reports_mutex};
-        if (const auto it = pending_reports.find(address);
-            it != pending_reports.end() && it->second.serial == serial) {
-            pending_reports.erase(it);
-        }
+    // Later draws count into a new slot: the report must not see their samples (a render pass
+    // goes on past the report when no fence ends its command buffer).
+    occlusion_pass = ~u64{0};
+    // The split's front treats the words as final only once the write ran (Nx2AsyncReportsSettled).
+    const u64 async_slot = Tegra::Nx2AsyncReportSlot(report_address);
+    Tegra::g_nx2_async_reports_issued[async_slot].fetch_add(1, std::memory_order_release);
+    // Written behind the next fence, after waiting for the command buffer that holds the counted
+    // draws: Metal's fences complete at once below High accuracy, and a callback summing the
+    // slots right away read the zeros AllocateVisibilitySlot left there (every report was 0).
+    // A read before then (macro DMA, conditional rendering) flushes it (FlushQueryResults).
+    fence_manager.SyncOperation([this, report_address, serial, async_slot] {
+        WritePendingReport(report_address, serial);
+        Tegra::g_nx2_async_reports_completed[async_slot].fetch_add(1, std::memory_order_release);
     });
+}
+
+bool RasterizerMetal::WritePendingReport(DAddr address, u64 serial) {
+    PendingReport report;
+    {
+        std::scoped_lock lock{pending_reports_mutex};
+        const auto it = pending_reports.find(address);
+        if (it == pending_reports.end() || (serial != 0 && it->second.serial != serial)) {
+            return false;
+        }
+        report = it->second;
+    }
+    scheduler.Wait(report.tick);
+    const u64* const results = scheduler.VisibilityResults();
+    u64 samples = 0;
+    for (const u32 slot : report.slots) {
+        samples += results[slot];
+    }
+    WriteQueryResult(address, report.wide, samples);
+    std::scoped_lock lock{pending_reports_mutex};
+    if (const auto it = pending_reports.find(address);
+        it != pending_reports.end() && it->second.serial == report.serial) {
+        pending_reports.erase(it);
+    }
+    return true;
+}
+
+bool RasterizerMetal::HasPendingQueries(DAddr addr, u64 size) {
+    std::scoped_lock lock{pending_reports_mutex};
+    for (const auto& [address, report] : pending_reports) {
+        if (address < addr + size && addr < address + (report.wide ? 16 : 4)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void RasterizerMetal::FlushQueryResults(DAddr addr, u64 size) {
+    if (addr == 0 || size == 0) {
+        return;
+    }
+    boost::container::small_vector<DAddr, 8> addresses;
+    {
+        std::scoped_lock lock{pending_reports_mutex};
+        for (const auto& [address, report] : pending_reports) {
+            if (address < addr + size && addr < address + (report.wide ? 16 : 4)) {
+                addresses.push_back(address);
+            }
+        }
+    }
+    for (const DAddr address : addresses) {
+        WritePendingReport(address, 0);
+    }
 }
 
 void RasterizerMetal::NoteUnmappedReport(GPUVAddr gpu_addr, VideoCommon::QueryType type) {
@@ -5591,6 +5653,9 @@ void RasterizerMetal::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType w
     if (True(which & VideoCommon::CacheType::BufferCache)) {
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.DownloadMemory(addr, size);
+    }
+    if (True(which & VideoCommon::CacheType::QueryCache)) {
+        FlushQueryResults(addr, size);
     }
 }
 
@@ -6652,6 +6717,10 @@ void RasterizerMetal::BindChannel(Tegra::Control::ChannelState& channel) {
     texture_cache.BindToChannel(channel_id);
     buffer_cache.BindToChannel(channel_id);
     pipeline_cache.BindToChannel(channel_id);
+    // As Vulkan's StateTracker::InvalidateState on a channel switch: the render targets, buffers,
+    // descriptors and shaders the caches hold are the previous channel's, so the new channel's
+    // first draw must rebuild all of them even where its own registers did not change.
+    channel.payload->maxwell_3d.dirty.flags.set();
 }
 
 void RasterizerMetal::ReleaseChannel(s32 channel_id) {

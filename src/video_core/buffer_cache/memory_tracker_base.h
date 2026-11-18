@@ -191,6 +191,9 @@ public:
                 manager->ReleaseHotClean(func);
             }
             epoch_managers.clear();
+            // Released pages read CPU-modified again: bind memos keyed on the epoch must
+            // re-synchronize them (a memo hit skipped the upload of a rewritten hot page).
+            ++cpu_epoch;
             HotPages::Add(HotPages::g_counters.epochs, 1);
         }
         if (!new_frame || ++window_frames < HotPages::WindowFrames) {

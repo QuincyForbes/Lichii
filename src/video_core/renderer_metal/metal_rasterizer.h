@@ -110,6 +110,8 @@ public:
     void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
     void FlushRegion(DAddr addr, u64 size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+    void FlushQueryResults(DAddr addr, u64 size) override;
+    bool HasPendingQueries(DAddr addr, u64 size) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void InvalidateRegion(DAddr addr, u64 size,
@@ -611,6 +613,9 @@ private:
     };
     std::mutex pending_reports_mutex;
     std::unordered_map<DAddr, PendingReport> pending_reports;
+    /// Writes the pending report at `address` (the one made with `serial`; 0 = any) once the GPU
+    /// has written its slots. False when there is none.
+    bool WritePendingReport(DAddr address, u64 serial);
     u64 report_serial{};
     /// The condition decided on the GPU (EDEN_NX2_METAL_GPU_CONDITION).
     struct GpuCondition {

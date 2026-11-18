@@ -1844,8 +1844,15 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
         }
     };
 
+    // The cached answer holds only for the same views: the bindings serial changes with the
+    // texture pool, not with what a draw samples (a draw sampling the depth target after one that
+    // didn't reused "no loop" and got no barrier).
+    u64 views_key = 0xcbf29ce484222325ULL ^ views.size();
+    for (const auto& view : views) {
+        views_key = (views_key ^ view.id.index) * 0x100000001b3ULL;
+    }
     if (render_targets_serial == last_feedback_loop_serial &&
-        texture_bindings_serial == last_feedback_texture_serial) {
+        views_key == last_feedback_texture_serial) {
         if (last_feedback_loop_result) {
             barrier();
         }
@@ -1857,7 +1864,7 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
 
     if (rt_active_mask == 0) {
         last_feedback_loop_serial = render_targets_serial;
-        last_feedback_texture_serial = texture_bindings_serial;
+        last_feedback_texture_serial = views_key;
         last_feedback_loop_result = false;
         return;
     }
@@ -1909,7 +1916,7 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
     }();
 
     last_feedback_loop_serial = render_targets_serial;
-    last_feedback_texture_serial = texture_bindings_serial;
+    last_feedback_texture_serial = views_key;
     last_feedback_loop_result = requires_barrier;
     if (requires_barrier) {
         barrier();
@@ -7047,10 +7054,12 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
             continue;
         }
         if (image.modification_tick < aliased_image.modification_tick) {
-            most_recent_tick = (std::max)(most_recent_tick, aliased_image.modification_tick);
             if (rt_settled && IsActiveRenderTarget(aliased.id)) {
+                // Not copied now: its tick must not count, or the image would read as up to
+                // date and never take this alias's data once the target is unbound.
                 continue;
             }
+            most_recent_tick = (std::max)(most_recent_tick, aliased_image.modification_tick);
             aliased_images.push_back(&aliased);
             any_rescaled |= True(aliased_image.flags & ImageFlagBits::Rescaled);
             any_modified |= True(aliased_image.flags & ImageFlagBits::GpuModified);
@@ -7478,6 +7487,10 @@ void TextureCache<P>::CreateChannel(struct Tegra::Control::ChannelState& channel
     const auto& this_as_ref = address_spaces[channel.memory_manager->GetID()];
     this_state->gpu_page_table = &gpu_page_table_storage[this_as_ref.storage_id * 2];
     this_state->sparse_page_table = &gpu_page_table_storage[this_as_ref.storage_id * 2 + 1];
+    // Memos match on the channel state's address, and a new channel can be built in the slot of
+    // an erased one (another address space): none of the old memos may match it.
+    BumpBindingEpoch();
+    rt_lookup_memos = {};
 }
 
 /// Bind a channel for execution.

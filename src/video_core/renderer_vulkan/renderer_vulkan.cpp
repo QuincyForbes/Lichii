@@ -299,6 +299,9 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     RenderAppletCaptureLayer(framebuffers);
 
     if (!render_window.IsShown()) {
+        // The capture pass bound its own pipeline, descriptors, viewport and push constants and
+        // no flush follows here: the next guest draw must not trust the tracked state.
+        scheduler.InvalidateState();
         return;
     }
 
@@ -471,6 +474,8 @@ vk::Buffer RendererVulkan::RenderToBuffer(std::span<const Tegra::FramebufferConf
 
     const MemoryTagScope memory_tag{MemoryTag::Readback};
     auto dst_buffer = CreateWrappedBuffer(memory_allocator, buffer_size, MemoryUsage::Download);
+    // With no layer to draw, nothing else ends the guest's open render pass first.
+    scheduler.RequestOutsideRenderPassOperationContext();
     blit_capture.DrawToFrame(device, rasterizer, &frame, framebuffers, layout, 1, format);
 
     scheduler.RequestOutsideRenderPassOperationContext();

@@ -234,12 +234,19 @@ bool MetByQueuedRelease(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     }
     u32 miss = 0;
     const auto payload = split.QueuedReleasePayload(*device, acquire.address, &miss);
+    // The release already ran: guest memory holds its word unless something sent after it may
+    // still change the word (a copy or compute write, an unranged writer, a GPU-written page).
+    // CurrentReleaseWord declines those; reading memory directly let a stale word meet the
+    // acquire while a queued write would lower it.
     if (!payload && miss == 2 && !VideoCore::Nx2Debug::DelayedFences() &&
-        !memory.OverlapsNativeSyncpointShim(acquire.address, sizeof(u32)) &&
-        acquire.Matches(memory.Read<u32>(acquire.address))) {
-        split.NoteSync();
-        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquiresQueued, 1);
-        return true;
+        !memory.OverlapsNativeSyncpointShim(acquire.address, sizeof(u32))) {
+        if (const auto word = split.CurrentReleaseWord(memory, *device, acquire.address, 0,
+                                                       nullptr);
+            word && acquire.Matches(*word)) {
+            split.NoteSync();
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquiresQueued, 1);
+            return true;
+        }
     }
     if (miss_out) {
         *miss_out = payload ? 4 : miss;

@@ -1238,6 +1238,17 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
                                  rescaling, samplers_it, views_it, record ? &*record : nullptr);
         }
+        // Lost in the upstream merge (3f4066e203): shaders drawn with the viewport transform
+        // off read the render area to place their vertices, and got 0 from the push constant.
+        if (stage_infos[stage].uses_render_area) {
+            render_area.uses_render_area = true;
+            // Switch 2 titles may never program the surface clip; use colour target 0 then.
+            const u32 clip_width = regs.surface_clip.width;
+            const u32 clip_height = regs.surface_clip.height;
+            const bool clip_set = clip_width != 0 && clip_height != 0;
+            render_area.words = {static_cast<f32>(clip_set ? clip_width : u32{regs.rt[0].width}),
+                                 static_cast<f32>(clip_set ? clip_height : u32{regs.rt[0].height})};
+        }
     }};
     if constexpr (Spec::enabled_stages[0]) {
         prepare_stage(0);
@@ -1634,7 +1645,10 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     // A pipeline that may still fail to build returns from the command below before its pushes.
     bool push_rescaling_words{true};
     bool push_render_area{render_area.uses_render_area};
-    if (IsMeshPipeline() || mesh_emulation || !PushConstantReuseEnabled()) {
+    // The render area shares offset 0 with the rescaling words (pushed after them, it wins):
+    // neither can be assumed still pushed around such a draw, so the reuse is skipped for it.
+    if (IsMeshPipeline() || mesh_emulation || !PushConstantReuseEnabled() ||
+        render_area.uses_render_area) {
         scheduler.ForgetGraphicsPushConstants();
     } else {
         const bool lands{built && pipeline && !build->Failed()};

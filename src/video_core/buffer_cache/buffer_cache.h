@@ -2523,8 +2523,12 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 streamed = VideoCommon::BindSmallUniformReusing(
                     runtime, device_memory, stage, index, binding_index, device_addr, size,
                     VideoCore::Nx2Debug::Experiment(17) != 0,
-                    // No write to a hot page is seen: serial 0 makes every bind compare its bytes.
-                    memory_tracker.IsRegionHot(device_addr, size) ? 0 : cb_write_serial,
+                    // No write to a hot page is seen, nor to a CPU-modified one (its protection
+                    // is off, later writes don't trap): serial 0 makes the bind compare its bytes.
+                    memory_tracker.IsRegionHot(device_addr, size) ||
+                            memory_tracker.IsRegionCpuModified(device_addr, size)
+                        ? 0
+                        : cb_write_serial,
                     UboPageGen(device_addr, size), [this, device_addr, size](u64& gen) {
                         return UboRangeClean(device_addr, size, gen);
                     });
@@ -4831,6 +4835,12 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
                           staging_pointer.data() == nullptr ? "is not host-mapped" : "is too small",
                           staging_pointer.size_bytes(), total_size_bytes);
             }
+            // ForEachUploadRange already cleared these ranges: mark them modified again so the
+            // next sync uploads them instead of trusting stale host data.
+            for (const BufferCopy& copy : copies) {
+                memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddr() + copy.dst_offset,
+                                                       copy.size, false);
+            }
             return;
         }
         for (BufferCopy& copy : copies) {
@@ -4914,6 +4924,13 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
             .size = copy_size,
         }};
         u8* const src_pointer = upload_staging.mapped_span.data();
+        if (src_pointer == nullptr || upload_staging.mapped_span.size_bytes() < copy_size)
+            [[unlikely]] {
+            // Unmapped staging (as MappedUploadMemory): leave the range to the next sync.
+            LOG_ERROR(HW_GPU, "Inline upload skipped: staging buffer not host-mapped");
+            memory_tracker.MarkRegionAsCpuModified(dest_address, copy_size, false);
+            return;
+        }
         std::memcpy(src_pointer, inlined_buffer.data(), copy_size);
         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);

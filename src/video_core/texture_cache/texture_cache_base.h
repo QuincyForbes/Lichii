@@ -1041,7 +1041,7 @@ private:
         binding_memo_epoch = ++binding_clock;
     }
     u64 last_feedback_loop_serial = 0;
-    u64 last_feedback_texture_serial = 0;
+    u64 last_feedback_texture_serial = 0; ///< Hash of the views of the last check
     bool last_feedback_loop_result = false;
     bool feedback_depth_dirty = true;
     FramebufferId last_framebuffer_id{};

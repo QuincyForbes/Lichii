@@ -178,7 +178,12 @@ StagingBufferRef StagingBufferPool::Stream(size_t size, size_t alignment) {
     }
     const u64 first = offset / stream_region_size;
     const u64 tick = scheduler.CurrentTick();
-    if (stream_ticks[first] != tick && offset % stream_region_size == 0) {
+    if (offset % stream_region_size == 0) {
+        if (stream_ticks[first] == tick) {
+            // A whole lap within one command buffer: the region holds data this unsubmitted
+            // command buffer still reads, so it can't be reused yet. Take a pooled buffer.
+            return Request(size);
+        }
         // Entering a region: the GPU must be done with what it held a lap ago.
         scheduler.Wait(stream_ticks[first]);
     }
