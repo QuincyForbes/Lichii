@@ -312,7 +312,8 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
       buffer_cache{device_memory_, buffer_cache_runtime}, pipeline_cache{device_memory_, device_},
       ocarina{device_, scheduler_}, ocarina_temporal{device_, scheduler_},
       accelerate_dma{buffer_cache, texture_cache, scheduler_},
-      fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_} {
+      fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_},
+      frame_dump{device_, scheduler_}, flash_watch{device_, scheduler_} {
     pipeline_cache.SetSkipCheck([this] { return DrawMayBeSkipped(); });
     Common::PlatformEvents::SetGraphicsMemoryReport([this] { return GraphicsMemoryReport(); });
     // Fence work left pending (EDEN_NX2_FENCE_FLUSH_US) is committed when the split's back goes
@@ -2764,6 +2765,54 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         // Committed in the middle of the draw: what the buffer cache noted as used is gone.
         scheduler.BlockAhead();
     }
+    if (flash_watch.WatchesPasses()) {
+        FlashWatchPass(framebuffer, {&pipeline.Key().unique_hashes[1], 5});
+    }
+    if (frame_dump.Capturing()) {
+        FrameDumpPass(framebuffer, {&pipeline.Key().unique_hashes[1], 5});
+        if (frame_dump.CapturingSampled()) {
+            if (frame_dump.CapturingTextures()) {
+                std::vector<FrameDump::Sampled> sampled;
+                for (size_t index = 0; index < stages.size(); ++index) {
+                    if (absent(index)) {
+                        continue;
+                    }
+                    const Shader::Info& info = programs[index]->info;
+                    size_t view = first_view[index];
+                    for (const auto& desc : info.texture_buffer_descriptors) {
+                        view += desc.count;
+                    }
+                    for (const auto& desc : info.image_buffer_descriptors) {
+                        view += desc.count;
+                    }
+                    size_t sampler = first_sampler[index];
+                    for (const auto& desc : info.texture_descriptors) {
+                        for (u32 element = 0; element < desc.count; ++element, ++view, ++sampler) {
+                            if (view < views.size() && sampler < samplers.size()) {
+                                sampled.push_back(DumpSampled(static_cast<u32>(stages[index]),
+                                                              views[view].index, views[view].id,
+                                                              samplers[sampler]));
+                            }
+                        }
+                    }
+                }
+                frame_dump.NoteSampled(sampled);
+            }
+            FrameDumpBuffers(false, pipeline.Key().unique_hashes);
+            const auto& draw_state = maxwell3d->draw_manager.draw_state;
+            frame_dump.NoteDrawRecord({
+                .mesh = mesh_workgroups != 0,
+                .indirect = false,
+                .first = is_indexed ? draw_state.index_buffer.first : draw_state.vertex_buffer.first,
+                .elements =
+                    is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count,
+                .instances = draw_state.instance_count,
+                .alpha_test = regs.alpha_test_enabled ? static_cast<u32>(regs.alpha_test_func) : 0,
+                .alpha_ref = regs.alpha_test_ref,
+                .alpha_to_coverage = regs.anti_alias_alpha_control.alpha_to_coverage != 0,
+            });
+        }
+    }
     scheduler.BeginRendering(targets);
     if (writes_storage) {
         pass_stores = scheduler.RenderPassSerial();
@@ -3908,6 +3957,12 @@ void RasterizerMetal::RefuseDraw(std::string_view cause) {
     if (maxwell3d != nullptr && maxwell3d->GetNativeMacroEngine().native_turing) {
         maxwell3d->GetNativeMacroEngine().native_execution_failed = true;
     }
+    if (frame_dump.Capturing()) {
+        const auto& regs = maxwell3d->regs;
+        const auto& hashes = pipeline_cache.LookupHashes();
+        frame_dump.NoteSkipped(false, hashes[5] != 0 ? hashes[5] : hashes[1], regs.rt[0].Address(),
+                               cause);
+    }
     Coverage::Refuse(Coverage::Work::Draw, cause, [this] { return DescribeDraw(); });
 }
 
@@ -4179,6 +4234,11 @@ void RasterizerMetal::DispatchCompute() {
                                  qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
                                  qmd.grid_dim_z.Value());
                          });
+        if (frame_dump.Capturing()) {
+            frame_dump.NoteSkipped(true, pipeline != nullptr ? pipeline->Key().unique_hash : 0,
+                                   0, pipeline == nullptr ? pipeline_cache.Refusal()
+                                                          : std::string_view{"kernel not built"});
+        }
         // As OpenGL and Vulkan report it: KeplerCompute::DispatchNativeCompute takes a silent
         // return for a successful dispatch.
         if (kepler_compute->IsNativeMode()) {
@@ -4513,6 +4573,84 @@ void RasterizerMetal::DispatchCompute() {
         scheduler.CopyBufferToTexture(shadow_bridge.Get(), 0, bytes_per_row, 0, shadow_original,
                                       0, 0, {}, {shadow_width * 2, shadow_height, 1});
         scheduler.BreakBlits();
+    }
+    if (frame_dump.CapturingSampled()) {
+        if (frame_dump.CapturingTextures()) {
+            std::vector<FrameDump::Sampled> sampled;
+            size_t sampled_view = 0;
+            for (const auto& desc : info.texture_buffer_descriptors) {
+                sampled_view += desc.count;
+            }
+            for (const auto& desc : info.image_buffer_descriptors) {
+                sampled_view += desc.count;
+            }
+            size_t sampled_sampler = 0;
+            for (const auto& desc : info.texture_descriptors) {
+                for (u32 element = 0; element < desc.count;
+                     ++element, ++sampled_view, ++sampled_sampler) {
+                    if (sampled_view < views.size() && sampled_sampler < samplers.size()) {
+                        sampled.push_back(DumpSampled(5, views[sampled_view].index,
+                                                      views[sampled_view].id,
+                                                      samplers[sampled_sampler]));
+                    }
+                }
+            }
+            frame_dump.NoteDispatchSampled(pipeline->Key().unique_hash, sampled);
+        }
+        FrameDumpBuffers(true, std::array{pipeline->Key().unique_hash});
+        std::optional<std::array<u32, 3>> indirect_grid;
+        if (indirect) {
+            indirect_grid = std::array{gpu_memory->Read<u32>(*indirect),
+                                       gpu_memory->Read<u32>(*indirect + 4),
+                                       gpu_memory->Read<u32>(*indirect + 8)};
+        }
+        frame_dump.NoteLaunch(pipeline->Key().unique_hash,
+                              {qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z},
+                              {qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z}, indirect,
+                              indirect_grid);
+    }
+    if (frame_dump.Capturing() || flash_watch.WatchesPasses()) {
+        // The images the program writes, read back after it (the storage images are the last
+        // views, after the texel buffers and the sampled textures).
+        size_t view_index = 0;
+        for (const auto& desc : info.texture_buffer_descriptors) {
+            view_index += desc.count;
+        }
+        for (const auto& desc : info.image_buffer_descriptors) {
+            view_index += desc.count;
+        }
+        for (const auto& desc : info.texture_descriptors) {
+            view_index += desc.count;
+        }
+        std::vector<FrameDump::Source> written;
+        std::vector<FlashWatch::Source> watched;
+        u32 slot = 0;
+        for (const auto& desc : info.image_descriptors) {
+            for (u32 element = 0; element < desc.count; ++element, ++slot) {
+                if (desc.is_written && view_index + element < views.size() &&
+                    views[view_index + element].id) {
+                    ImageView& written_view =
+                        texture_cache.GetImageView(views[view_index + element].id);
+                    if (frame_dump.Capturing()) {
+                        if (const auto source = DumpSource(written_view, slot)) {
+                            written.push_back(*source);
+                        }
+                    }
+                    if (flash_watch.WatchesPasses()) {
+                        if (const auto source = FlashSource(written_view, slot)) {
+                            watched.push_back(*source);
+                        }
+                    }
+                }
+            }
+            view_index += desc.count;
+        }
+        if (frame_dump.Capturing()) {
+            frame_dump.CaptureDispatch(pipeline->Key().unique_hash, written);
+        }
+        if (flash_watch.WatchesPasses()) {
+            flash_watch.NoteDispatch(pipeline->Key().unique_hash, watched);
+        }
     }
     Coverage::Note(Coverage::Work::Dispatch, Coverage::Path::Native);
 }
@@ -5533,8 +5671,249 @@ void RasterizerMetal::FlushCommands() {
     }
 }
 
+std::optional<FrameDump::Source> RasterizerMetal::DumpSource(const ImageView& view,
+                                                              u32 slot) {
+    const Image* const image = view.BackingImage();
+    if (image == nullptr || image->info.type == VideoCommon::ImageType::Buffer ||
+        image->info.type == VideoCommon::ImageType::e3D) {
+        return std::nullopt;
+    }
+    const auto& info = image->info;
+    const TextureHandle texture = image->Handle();
+    if (texture == nullptr) {
+        return std::nullopt;
+    }
+    const bool rescaled = image->IsRescaled();
+    const auto& resolution = Settings::values.resolution_info;
+    const u32 width = rescaled ? resolution.ScaleUp(info.size.width) : info.size.width;
+    const u32 height = rescaled ? resolution.ScaleUp(info.size.height) : info.size.height;
+    const u32 level = static_cast<u32>(view.range.base.level);
+    return FrameDump::Source{
+        .texture = texture,
+        .format = VideoCore::Surface::BytesPerBlock(view.format) ==
+                          VideoCore::Surface::BytesPerBlock(info.format)
+                      ? view.format
+                      : info.format,
+        .width = std::max(1U, width >> level),
+        .height = std::max(1U, height >> level),
+        .gpu_addr = image->gpu_addr,
+        .slot = slot,
+        .level = level,
+        .layer = static_cast<u32>(view.range.base.layer),
+        .msaa = info.num_samples > 1 || image->HostSamples() > 1,
+        .rescaled = rescaled,
+        .host_format = DescribeTexture(texture).format,
+    };
+}
+
+FrameDump::Sampled RasterizerMetal::DumpSampled(u32 stage, u32 tic,
+                                                VideoCommon::ImageViewId view_id,
+                                                VideoCommon::SamplerId sampler_id) {
+    FrameDump::Sampled out{.stage = stage, .tic = tic};
+    if (!view_id) {
+        out.null = true;
+        return out;
+    }
+    const ImageView& view = texture_cache.GetImageView(view_id);
+    const Image* const image = view.BackingImage();
+    if (image == nullptr) {
+        out.null = true;
+        return out;
+    }
+    out.source = DumpSource(view, 0);
+    out.key_addr = image->gpu_addr;
+    out.key_extra = (static_cast<u32>(view.format) << 16) |
+                    (static_cast<u32>(view.range.base.level) << 8) |
+                    static_cast<u32>(view.range.base.layer);
+    out.width = image->info.size.width;
+    out.height = image->info.size.height;
+    out.format = static_cast<u32>(image->info.format);
+    out.block_compressed = VideoCore::Surface::DefaultBlockWidth(image->info.format) != 1;
+    if (sampler_id) {
+        const auto& tsc = texture_cache.GetSampler(sampler_id).Descriptor();
+        std::array<u32, 8> words;
+        static_assert(sizeof(words) == sizeof(tsc));
+        std::memcpy(words.data(), &tsc, sizeof(words));
+        std::string text;
+        for (const u32 word : words) {
+            text += fmt::format("{}\"{:08x}\"", text.empty() ? "" : ",", word);
+        }
+        out.sampler = fmt::format(
+            R"(,"sampler":{{"mag":{},"min":{},"mip":{},"wrap":[{},{},{}],"compare":{},"tsc":[{}]}})",
+            static_cast<u32>(tsc.mag_filter.Value()), static_cast<u32>(tsc.min_filter.Value()),
+            static_cast<u32>(tsc.mipmap_filter.Value()), static_cast<u32>(tsc.wrap_u.Value()),
+            static_cast<u32>(tsc.wrap_v.Value()), static_cast<u32>(tsc.wrap_p.Value()),
+            tsc.depth_compare_enabled.Value() != 0, text);
+    }
+    return out;
+}
+
+bool RasterizerMetal::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
+    static constexpr u32 BUFFER_CAP = 4U << 20;
+    if (!frame_dump.CapturingBuffers()) {
+        return false;
+    }
+    std::vector<FrameDump::BoundBuffer> bound;
+    buffer_cache.ForEachBoundBuffer(compute, [&](u32 stage, bool storage, u32 index, bool written,
+                                                 const auto& binding, u32 bound_size,
+                                                 const auto* host, u32 host_offset) {
+        const u32 size = (std::min)(bound_size, BUFFER_CAP);
+        const bool gpu_modified = buffer_cache.IsRegionGpuModified(binding.device_addr, size);
+        FrameDump::BoundBuffer& buffer = bound.emplace_back(FrameDump::BoundBuffer{
+            .stage = stage,
+            .storage = storage,
+            .index = index,
+            .written = written,
+            .gpu_addr = binding.gpu_addr,
+            .device_addr = binding.device_addr,
+            .bound_size = bound_size,
+            .size = size,
+            .gpu_modified = gpu_modified,
+            .host = host ? host->Handle() : nullptr,
+            .host_offset = host_offset,
+            .guest = {},
+        });
+        if (!gpu_modified || !host) {
+            buffer.guest.resize(size);
+            device_memory.ReadBlockUnsafe(binding.device_addr, buffer.guest.data(), size);
+        }
+        static const bool host_too = std::getenv("EDEN_NX2_FRAME_DUMP_HOST") != nullptr;
+        buffer.also_host = host_too && host && !gpu_modified && (storage || bound_size > 4096);
+    });
+    return frame_dump.NoteBuffers(compute, shader_hashes, bound);
+}
+
+std::optional<FlashWatch::Source> RasterizerMetal::FlashSource(ImageView& view, u32 slot) {
+    using namespace VideoCore::Surface;
+    const Image* const image = view.BackingImage();
+    if (image == nullptr) {
+        return std::nullopt;
+    }
+    const auto& info = image->info;
+    if (info.type == VideoCommon::ImageType::Buffer || info.num_samples > 1 ||
+        GetFormatType(view.format) != SurfaceType::ColorTexture ||
+        IsPixelFormatInteger(view.format) || DefaultBlockWidth(view.format) != 1) {
+        return std::nullopt;
+    }
+    const TextureHandle texture = view.Handle(Shader::TextureType::Color2D);
+    if (texture == nullptr) {
+        return std::nullopt;
+    }
+    const bool rescaled = image->IsRescaled();
+    const auto& resolution = Settings::values.resolution_info;
+    const u32 width = rescaled ? resolution.ScaleUp(info.size.width) : info.size.width;
+    const u32 height = rescaled ? resolution.ScaleUp(info.size.height) : info.size.height;
+    const u32 level = static_cast<u32>(view.range.base.level);
+    return FlashWatch::Source{
+        .texture = texture,
+        .format = view.format,
+        .width = (std::max)(1U, width >> level),
+        .height = (std::max)(1U, height >> level),
+        .gpu_addr = image->gpu_addr,
+        .slot = slot,
+    };
+}
+
+void RasterizerMetal::FlashWatchPass(const Framebuffer* framebuffer,
+                                     std::span<const u64> shader_hashes) {
+    std::array<FlashWatch::Source, NUM_RT> colors;
+    size_t count = 0;
+    const auto& ids = texture_cache.GetRenderTargets().color_buffer_ids;
+    for (u32 slot = 0; slot < ids.size(); ++slot) {
+        if (!ids[slot]) {
+            continue;
+        }
+        if (const auto source = FlashSource(texture_cache.GetImageView(ids[slot]), slot)) {
+            colors[count++] = *source;
+        }
+    }
+    flash_watch.BeginPass(framebuffer, std::span(colors).first(count));
+    flash_watch.NoteDraw(shader_hashes);
+}
+
+void RasterizerMetal::FrameDumpPass(const Framebuffer* framebuffer,
+                                    std::span<const u64> shader_hashes) {
+    std::array<FrameDump::Source, NUM_RT> colors;
+    size_t count = 0;
+    const auto& ids = texture_cache.GetRenderTargets().color_buffer_ids;
+    for (u32 slot = 0; slot < ids.size(); ++slot) {
+        if (!ids[slot]) {
+            continue;
+        }
+        if (const auto source = DumpSource(texture_cache.GetImageView(ids[slot]), slot)) {
+            colors[count++] = *source;
+        }
+    }
+    frame_dump.BeginPass(framebuffer, std::span(colors).first(count));
+    frame_dump.NoteDraw(shader_hashes);
+}
+
+namespace {
+
+/// read_gpu_memory: the first address space (the bound channel's first) that maps the whole range,
+/// read as the GPU reads it, without flushing GPU caches.
+VideoCore::Nx2Debug::GpuReadResult ReadGpuMemory(std::span<Tegra::MemoryManager* const> spaces,
+                                                 GPUVAddr address, u64 size) {
+    VideoCore::Nx2Debug::GpuReadResult result{};
+    if (spaces.empty()) {
+        result.error = "no GPU address space is bound yet";
+        return result;
+    }
+    for (Tegra::MemoryManager* const space : spaces) {
+        if (space->IsFullyMappedRange(address, size)) {
+            result.bytes.resize(size);
+            space->ReadBlockUnsafe(address, result.bytes.data(), size);
+            result.address_space = space->GetID();
+            return result;
+        }
+    }
+    constexpr u64 page_mask = 0xfff;
+    const GPUVAddr end = address + size;
+    GPUVAddr first = address;
+    while (first < end) {
+        const GPUVAddr next = (std::min)((first | page_mask) + 1, end);
+        if (!spaces.front()->IsFullyMappedRange(first, next - first)) {
+            break;
+        }
+        first = next;
+    }
+    result.error = fmt::format("GPU address {:#x} is not mapped (the first unmapped byte in the "
+                               "bound channel's address space; {} address spaces checked)",
+                               first, spaces.size());
+    return result;
+}
+
+} // Anonymous namespace
+
 void RasterizerMetal::TickFrame() {
     VideoCommon::FeatureCensus::Tick();
+    if (VideoCore::Nx2Debug::HasRequests()) {
+        if (const auto capture = VideoCore::Nx2Debug::TakeCapture()) {
+            frame_dump.Arm(capture->id, capture->directory, capture->sampled, capture->buffers);
+        }
+        if (const auto change = VideoCore::Nx2Debug::TakeRejectChange()) {
+            pipeline_cache.RefreshDebugRejections(change->unrejected);
+            VideoCore::Nx2Debug::NoteRejectApplied(change->generation);
+        }
+        while (const auto read = VideoCore::Nx2Debug::TakeGpuRead()) {
+            std::vector<Tegra::MemoryManager*> spaces;
+            if (gpu_memory != nullptr) {
+                spaces.push_back(gpu_memory);
+            }
+            {
+                std::scoped_lock lock{config_mutex};
+                for (const auto& [id, space] : address_spaces) {
+                    if (space.gpu_memory != gpu_memory) {
+                        spaces.push_back(space.gpu_memory);
+                    }
+                }
+            }
+            VideoCore::Nx2Debug::FinishGpuRead(read->id,
+                                               ReadGpuMemory(spaces, read->gpu_address, read->size));
+        }
+    }
+    frame_dump.TickFrame();
+    flash_watch.TickFrame();
     ++oot_frame;
     if (!graphics_report_logged && oot_frame == 600) {
         graphics_report_logged = true;
@@ -5796,6 +6175,16 @@ std::optional<DisplayTexture> RasterizerMetal::AccelerateDisplay(
                      static_cast<u32>(config.pixel_format), config.native_tiling);
         }
         return std::nullopt;
+    }
+    if (frame_dump.Capturing()) {
+        if (const auto source = DumpSource(*image_view, 0)) {
+            frame_dump.CapturePresent(*source);
+        }
+    }
+    if (flash_watch.Enabled()) {
+        if (const auto source = FlashSource(*image_view, 0)) {
+            flash_watch.NotePresent(*source);
+        }
     }
     const auto& resolution = Settings::values.resolution_info;
     DisplayTexture texture{

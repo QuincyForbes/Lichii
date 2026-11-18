@@ -247,7 +247,7 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
             msl.fixed_subgroup_size = 32;
             msl.sample_dref_lod_array_as_grad = options.ios && options.msl_major < 3;
         }
-        msl.enable_point_size_builtin = options.point_size_builtin;
+        msl.enable_point_size_builtin = options.point_size_builtin && !options.drop_point_size;
         const bool tess_vertex = stage == Stage::VertexForTessellation;
         const bool tess_control = stage == Stage::TessellationControl;
         const bool tess_evaluation = stage == Stage::TessellationEvaluation;

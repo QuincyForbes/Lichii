@@ -143,6 +143,25 @@ void Swapchain::Present(id<MTLCommandBuffer> command_buffer, id<CAMetalDrawable>
     }
 }
 
+void Swapchain::PresentHeld(id<MTLCommandBuffer> command_buffer, id<CAMetalDrawable> drawable,
+                            f64 hold_seconds) {
+    if (hold_seconds > 0.0) {
+        [command_buffer presentDrawable:drawable afterMinimumDuration:hold_seconds];
+    } else {
+        [command_buffer presentDrawable:drawable];
+    }
+}
+
+f64 Swapchain::DisplayRefreshNs() {
+    if (pacer.refresh_ns == 0.0) {
+        pacer.refresh_ns = ScreenRefreshNs();
+        if (pacer.refresh_ns == 0.0) {
+            pacer.refresh_ns = -1.0; // unknown
+        }
+    }
+    return (std::max)(pacer.refresh_ns, 0.0);
+}
+
 std::string Swapchain::TakePacingLine() {
     if (paced_frames == 0) {
         return {};

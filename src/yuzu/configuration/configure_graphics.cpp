@@ -1027,9 +1027,16 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     }
 #endif
 
+    // The native Metal renderer runs FSR 3, MetalFX and LSFG frame generation.
+#ifdef LICHII_METAL_RENDERER
+    const bool metal = GetCurrentGraphicsBackend() == Settings::RendererBackend::Metal;
+#else
+    constexpr bool metal = false;
+#endif
 #ifdef HAS_LSFG
-    ConfigurationShared::SetUnavailable(frame_gen_widget,
-                                        vulkan ? QString() : tr("Needs the Vulkan renderer."));
+    ConfigurationShared::SetUnavailable(
+        frame_gen_widget,
+        vulkan || metal ? QString() : tr("Needs the Vulkan or Metal renderer."));
 #else
     // Not in this build.
     if (frame_gen_widget != nullptr) {
@@ -1038,14 +1045,14 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
 #endif
 
 #ifdef LICHII_METALFX
-    // Spatial and temporal MetalFX run on the native Metal renderer too; frame generation only on
-    // Vulkan (docs/nx2/metal-coverage.md N06, O03, N09).
-    const bool metalfx =
-        vulkan || GetCurrentGraphicsBackend() == Settings::RendererBackend::Metal;
-    const bool metalfx_frame_gen = vulkan;
+    // Spatial, temporal and frame generation MetalFX run on the native Metal renderer too
+    // (docs/nx2/metal-coverage.md N06, O03, N09).
+    const bool metalfx = vulkan || metal;
+    const bool metalfx_frame_gen = vulkan || metal;
 #else
     constexpr bool metalfx_frame_gen = false;
     constexpr bool metalfx = false;
+    constexpr bool metalfx_frame_gen = false;
 #endif
     // The entries of the lists that can't run here show only while one is the current value.
     const auto gate_item = [&](QComboBox* combobox, u32 enumeration, u32 value, bool offered) {

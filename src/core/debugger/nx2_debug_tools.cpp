@@ -191,6 +191,14 @@ bool IsVulkan() {
     return Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
 }
 
+/// The renderers that take the debug server's graphics requests at their frame end: Vulkan's
+/// TickFrame and the native Metal renderer's.
+bool HasGraphicsHooks() {
+    const auto backend = Settings::values.renderer_backend.GetValue();
+    return backend == Settings::RendererBackend::Vulkan ||
+           backend == Settings::RendererBackend::Metal;
+}
+
 /// Waits for a future in short slices so a stopping server does not wait out the timeout.
 template <typename T>
 bool WaitReady(const ToolState& state, std::future<T>& future, std::chrono::milliseconds timeout) {
@@ -233,7 +241,11 @@ json Status(ToolState& state, const json& params) {
         {"build", std::string{Common::g_build_fullname}},
         {"scm_rev", std::string{Common::g_scm_rev}},
         {"switch2", Settings::CurrentProgramIsSwitch2()},
-        {"renderer", IsVulkan() ? "vulkan" : "other"},
+        {"renderer", IsVulkan() ? "vulkan"
+                         : Settings::values.renderer_backend.GetValue() ==
+                                   Settings::RendererBackend::Metal
+                             ? "metal"
+                             : "other"},
         {"powered_on", state.system.IsPoweredOn()},
         {"paused", state.system.IsPaused()},
         {"presents", after},
@@ -372,8 +384,8 @@ json LogFilter(ToolState& state, const json& params) {
 }
 
 json CaptureFrame(ToolState& state, const json& params) {
-    if (!IsVulkan()) {
-        throw std::runtime_error{"frame capture needs the Vulkan renderer"};
+    if (!HasGraphicsHooks()) {
+        throw std::runtime_error{"frame capture needs the Vulkan or Metal renderer"};
     }
     const u64 id = ++state.captures;
     const auto directory = state.dump_directory / fmt::format("capture-{}-{:03}", state.session, id);
@@ -433,8 +445,8 @@ json CaptureFrame(ToolState& state, const json& params) {
 }
 
 json RejectShaders(ToolState&, const json& params) {
-    if (!IsVulkan()) {
-        throw std::runtime_error{"runtime rejection needs the Vulkan renderer"};
+    if (!HasGraphicsHooks()) {
+        throw std::runtime_error{"runtime rejection needs the Vulkan or Metal renderer"};
     }
     std::vector<u64> hashes;
     for (const json& hash : params.value("hashes", json::array())) {
@@ -636,8 +648,8 @@ json SearchMemory(ToolState& state, const json& params) {
 }
 
 json ReadGpuMemory(ToolState& state, const json& params) {
-    if (!IsVulkan()) {
-        throw std::runtime_error{"GPU memory reads need the Vulkan renderer"};
+    if (!HasGraphicsHooks()) {
+        throw std::runtime_error{"GPU memory reads need the Vulkan or Metal renderer"};
     }
     const u64 address = AddressParam(params, "gpu_address");
     const u64 size = ReadSize(params, address);

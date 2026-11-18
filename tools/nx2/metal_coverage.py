@@ -98,9 +98,8 @@ def check_references(rows, show_lines):
 
 def check_tests(rows):
     """Every smoke case and probe a row names exists in the smoke test's sources."""
-    smoke = "".join((METAL / name).read_text(encoding="utf-8", errors="replace")
-                    for name in ("metal_smoke.mm", "metal_smoke_textures.mm",
-                                 "metal_smoke_raster.mm"))
+    smoke = "".join(path.read_text(encoding="utf-8", errors="replace")
+                    for path in sorted(METAL.glob("metal_smoke*.mm")))
     units = "".join(path.read_text(encoding="utf-8", errors="replace")
                     for path in (ROOT / "src" / "tests").rglob("*.cpp"))
     probes = (METAL / "metal_smoke_probe.mm").read_text(encoding="utf-8", errors="replace")
