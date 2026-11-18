@@ -5,6 +5,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -63,6 +64,27 @@
 namespace Metal {
 
 namespace {
+
+/// IEEE half precision, rounded to nearest (tessellation factors are halves; 0..64 here).
+[[nodiscard]] u16 FloatToHalf(float value) {
+    if (!(value > 0.0f)) {
+        return 0;
+    }
+    value = (std::min)(value, 65504.0f);
+    const u32 bits = std::bit_cast<u32>(value);
+    const int exponent = static_cast<int>((bits >> 23) & 0xFF) - 127;
+    if (exponent < -14) {
+        // Subnormal halves: multiples of 2^-24.
+        return static_cast<u16>(std::lround(value * 16777216.0f));
+    }
+    u32 half = (static_cast<u32>(exponent + 15) << 10) | ((bits & 0x7FFFFF) >> 13);
+    // Round to nearest even; a carry out of the mantissa moves the exponent, as it should.
+    const u32 rest = bits & 0x1FFF;
+    if (rest > 0x1000 || (rest == 0x1000 && (half & 1) != 0)) {
+        ++half;
+    }
+    return static_cast<u16>(half);
+}
 /// Logs a message the first time `flag` is seen unset.
 #define LOG_ONCE(flag, ...)                                                                        \
     do {                                                                                           \
@@ -640,10 +662,6 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
             .index_buffer = nullptr,
             .index_offset = 0,
         };
-        if (tess_draw.count == 0 || instance_count == 0) {
-            Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
-            return;
-        }
         // The base vertex is added to the indices (EDEN_NX2_METAL_TESS_BASE_VERTEX=0: ignored,
         // as before).
         static const bool tess_base = EnvironmentOn("EDEN_NX2_METAL_TESS_BASE_VERTEX");
@@ -652,23 +670,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         } else if (is_indexed && draw_state.base_index != 0) {
             LOG_ONCE(warned_tess_base, "Metal: tessellated draws ignore a base vertex");
         }
-        gpu_memory->FlushCaching();
-        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
-        SCOPE_EXIT {
-            FinishTexelWritebacks();
-        };
-        if (!PrepareDraw(*pipeline, is_indexed, 0, &tess_draw)) {
-            NoteUnprepared();
-            return;
-        }
-        CountOcclusion();
-        scheduler.SetTessellationFactorBuffer(tess_buffers.factors.buffer,
-                                              tess_buffers.factors.offset);
-        scheduler.DrawPatches(tess_buffers.output_points, tess_buffers.patches);
-        ++draws_encoded;
-        ++tessellated_draws;
-        tessellated_patches += tess_buffers.patches;
-        Coverage::Note(Coverage::Work::Draw, Coverage::Path::TessellationKernels);
+        DrawTessellated(*pipeline, is_indexed, tess_draw);
         return;
     }
     const bool u8_indices =
@@ -972,6 +974,82 @@ bool RasterizerMetal::DrawMesh(GraphicsPipeline& pipeline, bool is_indexed,
     mesh_groups += groups.count;
     Coverage::Note(Coverage::Work::Draw, Coverage::Path::MeshCompute);
     return true;
+}
+
+void RasterizerMetal::DrawTessellated(GraphicsPipeline& pipeline, bool is_indexed,
+                                       TessellationDraw& tess_draw) {
+    if (tess_draw.count == 0 || tess_draw.instances == 0) {
+        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        return;
+    }
+    gpu_memory->FlushCaching();
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    SCOPE_EXIT {
+        FinishTexelWritebacks();
+    };
+    if (!PrepareDraw(pipeline, is_indexed, 0, &tess_draw)) {
+        NoteUnprepared();
+        return;
+    }
+    CountOcclusion();
+    if (const Tessellation* const tess = pipeline.Tess(); tess->domain) {
+        // The lines or points the kernels evaluated, their count in the arguments the count
+        // kernel wrote.
+        const std::optional<u32> primitive = PrimitiveType(
+            tess->domain->emulation.lines ? Maxwell::PrimitiveTopology::Lines
+                                          : Maxwell::PrimitiveTopology::Points);
+        scheduler.DrawIndirect(*primitive, tess_buffers.args.buffer, tess_buffers.args.offset);
+    } else {
+        scheduler.SetTessellationFactorBuffer(tess_buffers.factors.buffer,
+                                              tess_buffers.factors.offset);
+        scheduler.DrawPatches(tess_buffers.output_points, tess_buffers.patches);
+    }
+    ++draws_encoded;
+    ++tessellated_draws;
+    tessellated_patches += tess_buffers.patches;
+    Coverage::Note(Coverage::Work::Draw, Coverage::Path::TessellationKernels);
+}
+
+void RasterizerMetal::DrawTessellatedIndirect(GraphicsPipeline& pipeline) {
+    index_rewrite = {};
+    indirect_plan = {};
+    mesh_indirect = {};
+    const auto& params = maxwell3d->draw_manager.indirect_state;
+    const size_t stride = params.stride != 0 ? params.stride
+                                             : (params.is_indexed ? 5 : 4) * sizeof(u32);
+    // The kernels are sized from the arguments on the CPU, as the mesh emulation's: the records
+    // (and their count) as guest memory has them once the caches wrote back what the GPU wrote
+    // there, one tessellated draw each.
+    const auto read_word = [this](GPUVAddr address) {
+        if (const std::optional<DAddr> device_address = gpu_memory->GpuToCpuAddress(address)) {
+            FlushRegion(*device_address, sizeof(u32), VideoCommon::CacheType::BufferCache);
+        }
+        return gpu_memory->Read<u32>(address);
+    };
+    size_t count = params.max_draw_counts;
+    if (params.include_count) {
+        count = (std::min)(count, size_t{read_word(params.count_start_address)});
+        ++indirect_counts_read;
+    }
+    for (size_t draw = 0; draw < count; ++draw) {
+        const GPUVAddr record = params.indirect_start_address + draw * stride;
+        TessellationDraw tess_draw{};
+        tess_draw.count = read_word(record);
+        tess_draw.instances = read_word(record + 1 * sizeof(u32));
+        if (params.is_indexed) {
+            tess_draw.first_index = read_word(record + 2 * sizeof(u32));
+            tess_draw.base_vertex = static_cast<s32>(read_word(record + 3 * sizeof(u32)));
+            tess_draw.first_instance = read_word(record + 4 * sizeof(u32));
+            // The indices of every record come from guest memory (the buffer cache binds the
+            // range of the whole call), widened to 32 bits with the record's base vertex added.
+            tess_draw.index_size = 4;
+            tess_draw.widen_indices = true;
+        } else {
+            tess_draw.first = read_word(record + 2 * sizeof(u32));
+            tess_draw.first_instance = read_word(record + 3 * sizeof(u32));
+        }
+        DrawTessellated(pipeline, params.is_indexed, tess_draw);
+    }
 }
 
 void RasterizerMetal::DrawMeshIndirect(GraphicsPipeline& pipeline) {
@@ -1529,12 +1607,29 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     const Shader::Info& info = program.info;
     std::vector<u32> texture_slots;
     std::vector<u32> sampler_slots;
+    std::vector<u64> spill_table;
     size_t next_buffer = 0;
     for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
         for (u32 element = 0; element < slot.count; ++element) {
             const u32 slot_index = slot.index + element;
             switch (slot.kind) {
             case ShaderTranslate::ResourceKind::Buffer:
+                if (slot.spill != ~0U) {
+                    // Read through the table of addresses bound after the loop.
+                    while (next_buffer < pending.size() &&
+                           pending[next_buffer].kind != Binding::Kind::Buffer) {
+                        ++next_buffer;
+                    }
+                    if (spill_table.size() <= slot.spill) {
+                        spill_table.resize(slot.spill + 1, 0);
+                    }
+                    if (next_buffer < pending.size()) {
+                        spill_table[slot.spill] = scheduler.UseBuffer(
+                            metal_stage, pending[next_buffer].buffer, pending[next_buffer].offset);
+                        ++next_buffer;
+                    }
+                    break;
+                }
                 if (slot.set == ShaderTranslate::PushConstantSet) {
                     // Shader::Backend::SPIRV::RescalingLayout (rescaling_words) or
                     // RenderAreaLayout.
@@ -1568,6 +1663,10 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
         }
     }
 
+    if (program.spill_slot != ~0U && !spill_table.empty()) {
+        scheduler.BindBytes(metal_stage, program.spill_slot, spill_table.data(),
+                            static_cast<u32>(spill_table.size() * sizeof(u64)));
+    }
     // Texture slots in binding order: texel buffers, image buffers, textures, images.
     const size_t texel_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors) +
                                  Shader::NumDescriptors(info.image_buffer_descriptors);
@@ -1579,6 +1678,7 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     size_t texture_slot = texel_buffers;
     size_t view = texel_buffers;
     size_t sampler = 0;
+    u64 reduction_modes = 0;
     for (const auto& desc : info.texture_descriptors) {
         for (u32 element = 0; element < desc.count; ++element) {
             ImageView& image_view = texture_cache.GetImageView(views[view++].id);
@@ -1596,8 +1696,16 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                     texture_cache.GetSampler(samplers[sampler])
                         .HandleFor(image_view, desc.is_depth));
             }
+            if (sampler < sampler_slots.size() && sampler_slots[sampler] < 16) {
+                reduction_modes |= texture_cache.GetSampler(samplers[sampler]).ReductionBits()
+                                   << (sampler_slots[sampler] * 4);
+            }
             ++sampler;
         }
+    }
+    if (program.reduction_slot != ~0U) {
+        scheduler.BindBytes(metal_stage, program.reduction_slot, &reduction_modes,
+                            static_cast<u32>(sizeof(reduction_modes)));
     }
     for (const auto& desc : info.image_descriptors) {
         for (u32 element = 0; element < desc.count; ++element) {
@@ -1646,7 +1754,8 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         : has_task        ? &mesh->mesh.program
         : tess != nullptr ? &tess->control.program
                           : nullptr,
-        tess != nullptr ? &pipeline.Vertex() : nullptr,
+        tess != nullptr ? (tess->domain ? &tess->domain->evaluate.program : &pipeline.Vertex())
+                        : nullptr,
         native != nullptr ? &native->fragment : &pipeline.Fragment()};
     prepare_refusal = {};
     if (tess != nullptr && tess_draw == nullptr) {
@@ -2163,8 +2272,18 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         const u32 patches = vertices / input_points;
         void* const vertex_kernel =
             pipeline.VertexKernelState(device, vertex_variant, layout_desc);
-        void* const control_kernel = pipeline.KernelState(device, tess->control);
-        if (vertex_kernel == nullptr || control_kernel == nullptr || patches == 0) {
+        // Without a control program the vertex outputs are the control points and the factors
+        // come from the registers (and the same for every patch).
+        const bool from_registers = tess->factors_from_registers;
+        void* const control_kernel =
+            from_registers ? nullptr : pipeline.KernelState(device, tess->control);
+        void* const count_kernel =
+            tess->domain ? pipeline.KernelState(device, tess->domain->count) : nullptr;
+        void* const evaluate_kernel =
+            tess->domain ? pipeline.KernelState(device, tess->domain->evaluate) : nullptr;
+        if (vertex_kernel == nullptr || (!from_registers && control_kernel == nullptr) ||
+            (tess->domain && (count_kernel == nullptr || evaluate_kernel == nullptr)) ||
+            patches == 0) {
             if (patches != 0) {
                 prepare_refusal = "tessellation kernel not built by Metal";
             }
@@ -2215,21 +2334,58 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         const u32 point_slots = groups * group_size;
         const bool quads =
             tess->modes.primitive != ShaderTranslate::TessellationModes::Primitive::Triangles;
+        const u32 factor_patches = from_registers ? patches : groups * patches_per_group;
         tess_buffers = {
             .vertices = stream(u64{vertices} * tess->vertex_stride),
-            .control_points = stream(u64{point_slots} * tess->control_point_stride),
+            .control_points = from_registers
+                                  ? StagingBufferRef{}
+                                  : stream(u64{point_slots} * tess->control_point_stride),
             .patch_constants = stream(u64{groups * patches_per_group} * tess->patch_stride),
             // MTLQuadTessellationFactorsHalf (isolines too) or MTLTriangleTessellationFactorsHalf.
-            .factors = stream(u64{groups * patches_per_group} * (quads ? 12U : 8U)),
+            .factors = stream(u64{factor_patches} * (quads ? 12U : 8U)),
             .patches = patches,
             .output_points = output_points,
         };
+        if (from_registers) {
+            tess_buffers.control_points = tess_buffers.vertices;
+            const auto& lod = regs.tessellation.lod;
+            // Edge factors 0-2 (0-3) and the inside ones, as the control kernel's factors are.
+            const std::array<u16, 6> half_levels{
+                FloatToHalf(lod.outer[0]), FloatToHalf(lod.outer[1]), FloatToHalf(lod.outer[2]),
+                FloatToHalf(lod.outer[3]), FloatToHalf(lod.inner[0]), FloatToHalf(lod.inner[1])};
+            std::array<u16, 6> one_patch{};
+            if (quads) {
+                one_patch = half_levels;
+            } else {
+                one_patch = {half_levels[0], half_levels[1], half_levels[2], half_levels[4], 0, 0};
+            }
+            const size_t patch_bytes = quads ? 12 : 8;
+            u8* const out = tess_buffers.factors.mapped_span.data();
+            for (u32 patch = 0; patch < patches; ++patch) {
+                std::memcpy(out + patch * patch_bytes, one_patch.data(), patch_bytes);
+            }
+        }
         const auto bind = [&](ShaderStage metal_stage, u32 slot, const StagingBufferRef& buffer) {
             if (slot != ~0U) {
                 scheduler.BindBuffer(metal_stage, slot, buffer.buffer,
                                      static_cast<u32>(buffer.offset));
             }
         };
+        std::array<u32, 4> domain_params{};
+        if (tess->domain) {
+            const ShaderTranslate::DomainEmulation& emulation = tess->domain->emulation;
+            // As many evaluated vertices as the patches can have, within a bound of memory
+            // (the count kernel truncates what does not fit).
+            constexpr u64 MaxDomainBytes = u64{8} << 20;
+            const u32 capacity = static_cast<u32>((std::max)(
+                (std::min)(u64{patches} * emulation.max_vertices_per_patch,
+                           MaxDomainBytes / emulation.vertex_stride),
+                u64{2}));
+            tess_buffers.captured = stream(u64{capacity} * emulation.vertex_stride);
+            tess_buffers.offsets = stream((u64{patches} + 1) * sizeof(u32));
+            tess_buffers.args = stream(4 * sizeof(u32));
+            domain_params = {patches, capacity, 0, 0};
+        }
         const bool tess_ahead = record_ahead(true);
         scheduler.BeginCompute(vertex_kernel, tess_ahead);
         BindStageResources(*programs[0], ShaderStage::Compute, stage_bindings[0], texel_views[0],
@@ -2250,22 +2406,53 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                                   tess_draw->count, tess_draw->first_instance,
                                   tess_draw->instances);
 
-        scheduler.BeginCompute(control_kernel, tess_ahead);
-        BindStageResources(*programs[1], ShaderStage::Compute, stage_bindings[1], texel_views[1],
-                           std::span(views).subspan(first_view[1]),
-                           std::span(samplers).subspan(first_sampler[1]), targets.width,
-                           targets.height);
-        const ShaderTranslate::TessellationSlots& control_slots = programs[1]->tessellation_slots;
-        bind(ShaderStage::Compute, control_slots.input, tess_buffers.vertices);
-        bind(ShaderStage::Compute, control_slots.output, tess_buffers.control_points);
-        bind(ShaderStage::Compute, control_slots.patch_output, tess_buffers.patch_constants);
-        bind(ShaderStage::Compute, control_slots.tess_factors, tess_buffers.factors);
-        if (control_slots.indirect_params != ~0U) {
-            const std::array<u32, 2> params{input_points, patches};
-            scheduler.BindBytes(ShaderStage::Compute, control_slots.indirect_params, params.data(),
-                                static_cast<u32>(sizeof(params)));
+        if (!from_registers) {
+            scheduler.BeginCompute(control_kernel, tess_ahead);
+            BindStageResources(*programs[1], ShaderStage::Compute, stage_bindings[1], texel_views[1],
+                               std::span(views).subspan(first_view[1]),
+                               std::span(samplers).subspan(first_sampler[1]), targets.width,
+                               targets.height);
+            const ShaderTranslate::TessellationSlots& control_slots = programs[1]->tessellation_slots;
+            bind(ShaderStage::Compute, control_slots.input, tess_buffers.vertices);
+            bind(ShaderStage::Compute, control_slots.output, tess_buffers.control_points);
+            bind(ShaderStage::Compute, control_slots.patch_output, tess_buffers.patch_constants);
+            bind(ShaderStage::Compute, control_slots.tess_factors, tess_buffers.factors);
+            if (control_slots.indirect_params != ~0U) {
+                const std::array<u32, 2> params{input_points, patches};
+                scheduler.BindBytes(ShaderStage::Compute, control_slots.indirect_params, params.data(),
+                                    static_cast<u32>(sizeof(params)));
+            }
+            scheduler.Dispatch({groups, 1, 1}, {group_size, 1, 1});
         }
-        scheduler.Dispatch({groups, 1, 1}, {group_size, 1, 1});
+        if (tess->domain) {
+            // The patches' domain points, evaluated into a buffer the draw reads as lines or
+            // points: the count kernel sizes it, one threadgroup a patch evaluates.
+            const ShaderTranslate::DomainEmulation& emulation = tess->domain->emulation;
+            scheduler.BeginCompute(count_kernel, tess_ahead);
+            bind(ShaderStage::Compute, emulation.factors_slot, tess_buffers.factors);
+            scheduler.BindBytes(ShaderStage::Compute, emulation.params_slot, domain_params.data(),
+                                static_cast<u32>(sizeof(domain_params)));
+            bind(ShaderStage::Compute, emulation.offsets_slot, tess_buffers.offsets);
+            bind(ShaderStage::Compute, emulation.args_slot, tess_buffers.args);
+            scheduler.Dispatch({1, 1, 1}, {1, 1, 1});
+
+            scheduler.BeginCompute(evaluate_kernel, tess_ahead);
+            BindStageResources(*programs[2], ShaderStage::Compute, stage_bindings[2],
+                               texel_views[2], std::span(views).subspan(first_view[2]),
+                               std::span(samplers).subspan(first_sampler[2]), targets.width,
+                               targets.height);
+            const ShaderTranslate::TessellationSlots& evaluation_slots =
+                programs[2]->tessellation_slots;
+            bind(ShaderStage::Compute, evaluation_slots.input, tess_buffers.control_points);
+            bind(ShaderStage::Compute, evaluation_slots.patch_input, tess_buffers.patch_constants);
+            bind(ShaderStage::Compute, emulation.level_slot, tess_buffers.factors);
+            bind(ShaderStage::Compute, emulation.factors_slot, tess_buffers.factors);
+            scheduler.BindBytes(ShaderStage::Compute, emulation.params_slot, domain_params.data(),
+                                static_cast<u32>(sizeof(domain_params)));
+            bind(ShaderStage::Compute, emulation.offsets_slot, tess_buffers.offsets);
+            bind(ShaderStage::Compute, emulation.output_slot, tess_buffers.captured);
+            scheduler.Dispatch({patches, 1, 1}, {ShaderTranslate::DomainThreads, 1, 1});
+        }
     }
 
     if (scheduler.SegmentSerial() != draw_segment) {
@@ -2418,12 +2605,18 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             scheduler.BindVertexBuffer(slot, buffer, offset);
         });
     }
+    if (tess != nullptr && tess->domain) {
+        // The evaluated vertices the vertex function draws.
+        scheduler.BindBuffer(ShaderStage::Vertex, 0, tess_buffers.captured.buffer,
+                             static_cast<u32>(tess_buffers.captured.offset));
+    }
 
     // Each stage's buffers (appended by the buffer cache in binding order), textures, samplers
     // and images, into the slots the translator gave them.
     for (size_t index = 0; index < stages.size(); ++index) {
         // Kernels were bound when they were dispatched.
-        if (absent(index) || (index == 1 && native == nullptr) || (index == 0 && tess != nullptr)) {
+        if (absent(index) || (index == 1 && native == nullptr) || (index == 0 && tess != nullptr) ||
+            (index == 2 && tess != nullptr && tess->domain)) {
             continue;
         }
         ShaderStage metal_stage = index == 3 ? ShaderStage::Fragment : ShaderStage::Vertex;
@@ -2501,8 +2694,7 @@ void RasterizerMetal::DrawIndirect() {
         return;
     }
     if (pipeline->Tess() != nullptr) {
-        // The kernels need the vertex count on the CPU.
-        RefuseDraw("indirect tessellated draw");
+        DrawTessellatedIndirect(*pipeline);
         return;
     }
     const bool u8_indices = params.is_indexed && maxwell3d->regs.index_buffer.format ==

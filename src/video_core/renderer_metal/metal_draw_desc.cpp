@@ -87,7 +87,7 @@ VertexProgramUse VertexUse(const StageProgram& program) {
         use.loaded |= program.info.loads.Generic(index) ? 1U << index : 0U;
     }
     for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
-        if (slot.kind == ShaderTranslate::ResourceKind::Buffer) {
+        if (slot.kind == ShaderTranslate::ResourceKind::Buffer && slot.spill == ~0U) {
             use.resource_slots = (std::max)(use.resource_slots, slot.index + slot.count);
         }
     }
@@ -104,6 +104,12 @@ VertexProgramUse VertexUse(const StageProgram& program) {
 void ApplyTessellation(RenderPipelineDesc& desc, const Tessellation& tessellation) {
     std::ranges::fill(desc.attributes, VertexAttributeState{});
     std::ranges::fill(desc.streams, VertexStreamState{});
+    if (tessellation.domain) {
+        // Drawn from the evaluated vertices as lines or points, not by Metal's tessellator.
+        desc.tessellation = 0;
+        desc.topology_class = tessellation.domain->emulation.lines ? 1U : 0U;
+        return;
+    }
     using Spacing = ShaderTranslate::TessellationModes::Spacing;
     // MTLTessellationPartitionModeInteger, FractionalOdd, FractionalEven; MTLWinding reversed, as
     // Vulkan's domain origin is the upper left (MoltenVK does the same).

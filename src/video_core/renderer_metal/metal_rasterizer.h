@@ -250,6 +250,11 @@ private:
         s32 base_vertex;
     };
 
+    /// A tessellation pipeline's draw: its kernels, then the patches.
+    void DrawTessellated(GraphicsPipeline& pipeline, bool is_indexed, TessellationDraw& tess_draw);
+    /// The same for DrawIndirect's records, read on the CPU.
+    void DrawTessellatedIndirect(GraphicsPipeline& pipeline);
+
     /// Before a draw, clear or dispatch: commits the command buffer being recorded once the
     /// staging buffers it took pass the pool's mark, and waits for it when the pool is over its
     /// cap (EDEN_NX2_METAL_STAGING_BOUND).
@@ -613,6 +618,10 @@ private:
         StagingBufferRef control_points;
         StagingBufferRef patch_constants;
         StagingBufferRef factors;
+        /// Emulated domains: the evaluated vertices, where each patch's start, the draw's arguments.
+        StagingBufferRef captured;
+        StagingBufferRef offsets;
+        StagingBufferRef args;
         u32 patches{};
         u32 output_points{};
     } tess_buffers;

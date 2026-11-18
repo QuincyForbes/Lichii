@@ -15,10 +15,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "sampler_smoke_frag_spv.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_buffer_cache.h"
@@ -28,6 +30,7 @@
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
+#include "video_core/renderer_metal/metal_shader_translate.h"
 #include "video_core/renderer_metal/metal_smoke_textures.h"
 #include "video_core/renderer_metal/metal_staging_buffer_pool.h"
 #include "video_core/texture_cache/decode_bc.h"
@@ -879,12 +882,29 @@ int RunSamplers() {
     const id<MTLLibrary> library = [mtl newLibraryWithSource:@(SamplerSource)
                                                      options:[MTLCompileOptions new]
                                                        error:&error];
+    // The pixel program is translated as the renderer's are, with the min / max reduction that
+    // Metal's samplers do not apply on every device done in the shader.
+    Metal::ShaderTranslate::Options translate_options;
+    translate_options.sampler_reduction = true;
+    const Metal::ShaderTranslate::Result translated = Metal::ShaderTranslate::SpirvToMsl(
+        std::span<const uint32_t>(SAMPLER_SMOKE_FRAG_SPV), Metal::ShaderTranslate::Stage::Fragment,
+        translate_options);
+    const id<MTLLibrary> fragment_library =
+        translated.source.empty() ? nil
+                                  : [mtl newLibraryWithSource:@(translated.source.c_str())
+                                                      options:[MTLCompileOptions new]
+                                                        error:&error];
+    if (translated.reduction_slot == ~0U) {
+        std::printf("metal-smoke: FAIL samplers: no reduction slot: %s\n", translated.error.c_str());
+        return 1;
+    }
     MTLRenderPipelineDescriptor* pipeline_desc = [MTLRenderPipelineDescriptor new];
     pipeline_desc.vertexFunction = [library newFunctionWithName:@"sampler_vertex"];
-    pipeline_desc.fragmentFunction = [library newFunctionWithName:@"sampler_fragment"];
+    pipeline_desc.fragmentFunction = [fragment_library
+        newFunctionWithName:@(translated.entry_point.c_str())];
     pipeline_desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
     const id<MTLRenderPipelineState> pipeline =
-        library != nil ? [mtl newRenderPipelineStateWithDescriptor:pipeline_desc error:&error] : nil;
+        fragment_library != nil ? [mtl newRenderPipelineStateWithDescriptor:pipeline_desc error:&error] : nil;
     if (pipeline == nil) {
         std::printf("metal-smoke: FAIL samplers: %s\n",
                     error != nil ? error.localizedDescription.UTF8String : "no pipeline");
@@ -940,6 +960,8 @@ int RunSamplers() {
         [encoder setFragmentTexture:source atIndex:0];
         [encoder setFragmentSamplerState:Metal::AsSampler(sampler.Get()) atIndex:0];
         [encoder setFragmentBytes:p.data() length:sizeof(p) atIndex:0];
+        const uint64_t modes = Metal::SamplerReductionBits(tsc);
+        [encoder setFragmentBytes:&modes length:sizeof(modes) atIndex:translated.reduction_slot];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [encoder endEncoding];
         [commands commit];

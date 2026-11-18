@@ -378,6 +378,25 @@ bool SamplerBiasSupported(const Device& device) {
     return false;
 }
 
+u64 SamplerReductionBits(const Tegra::Texture::TSCEntry& tsc) {
+    using Tegra::Texture::SamplerReduction;
+    using Tegra::Texture::TextureFilter;
+    using Tegra::Texture::TextureMipmapFilter;
+    const SamplerReduction reduction = tsc.reduction_filter.Value();
+    if (reduction == SamplerReduction::WeightedAverage ||
+        tsc.mag_filter.Value() != TextureFilter::Linear ||
+        tsc.min_filter.Value() != TextureFilter::Linear) {
+        return 0;
+    }
+    u64 bits = reduction == SamplerReduction::Min ? 1 : 2;
+    if (tsc.mipmap_filter.Value() == TextureMipmapFilter::Linear) {
+        bits |= 4;
+    } else if (tsc.mipmap_filter.Value() == TextureMipmapFilter::Nearest) {
+        bits |= 8;
+    }
+    return bits;
+}
+
 Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc,
                      const SamplerOptions& options) {
     using Tegra::Texture::SamplerReduction;

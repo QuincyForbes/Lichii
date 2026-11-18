@@ -374,6 +374,9 @@ class Sampler {
 public:
     explicit Sampler(TextureCacheRuntime&, const Tegra::Texture::TSCEntry&);
 
+    /// SamplerReductionBits of the guest sampler.
+    [[nodiscard]] u64 ReductionBits() const noexcept;
+
     /// The sampler state without the changes a view asks for.
     [[nodiscard]] void* Handle() const noexcept {
         return sampler.Get();

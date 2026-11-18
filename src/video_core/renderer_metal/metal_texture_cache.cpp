@@ -1431,6 +1431,10 @@ f32 TextureCacheRuntime::OcarinaLodBias() {
     return *ocarina_lod_bias;
 }
 
+u64 Sampler::ReductionBits() const noexcept {
+    return SamplerReductionBits(tsc);
+}
+
 Sampler::Sampler(TextureCacheRuntime& runtime_, const Tegra::Texture::TSCEntry& config)
     : device{&runtime_.device}, runtime{&runtime_}, tsc{config} {
     using Tegra::Texture::SamplerReduction;
