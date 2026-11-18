@@ -381,6 +381,7 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
     host_info.ApplyDescriptorLimitPolicy();
     translate_options.ios = ios;
     translate_options.apple_family = apple_family;
+    translate_options.sampler_reduction = ShaderTranslate::SamplerReductionEnabled();
 }
 
 std::optional<StageProgram> PipelineTranslator::Translate(
@@ -408,6 +409,7 @@ std::optional<StageProgram> PipelineTranslator::Translate(
         .info = program.info,
         .outputs = std::move(result.outputs),
         .tessellation_slots = result.tessellation_slots,
+        .reduction_slot = result.reduction_slot,
     };
 }
 
@@ -1131,6 +1133,7 @@ std::optional<StageProgram> PipelineTranslator::Compute(u64 unique_hash,
         .entry_point = std::move(result.entry_point),
         .slots = std::move(result.slots),
         .info = program.info,
+        .reduction_slot = result.reduction_slot,
     };
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Metal, "Metal: {}", exception.what());

@@ -133,6 +133,11 @@ struct SamplerOptions {
 /// filters.
 [[nodiscard]] bool SamplerBiasSupported(const Device& device);
 
+/// What a guest sampler adds to the shader's mask (ShaderTranslate::Options::sampler_reduction),
+/// before it is shifted to its slot: bit 0 min, bit 1 max (only with linear min and mag filters),
+/// bit 2 a linear mip filter, bit 3 a nearest one. Zero for the weighted average.
+[[nodiscard]] u64 SamplerReductionBits(const Tegra::Texture::TSCEntry& tsc);
+
 /// A bilinear sampler clamping to the edge, for the renderer's own passes.
 [[nodiscard]] Object CreateLinearClampSampler(const Device& device);
 

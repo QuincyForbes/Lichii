@@ -109,6 +109,8 @@ struct StageProgram {
     /// Tessellation stages: what the stage writes for the next one, and its own buffer slots.
     std::vector<ShaderTranslate::InterfaceVariable> outputs;
     ShaderTranslate::TessellationSlots tessellation_slots{};
+    /// Buffer slot of the sampler reduction mask (Options::sampler_reduction), ~0 without.
+    u32 reduction_slot{~0U};
     /// The MTLLibrary and MTLFunction, made on first use (BuildFunctions).
     Object library;
     Object function;

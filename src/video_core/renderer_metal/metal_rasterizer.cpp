@@ -1657,6 +1657,7 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     size_t texture_slot = texel_buffers;
     size_t view = texel_buffers;
     size_t sampler = 0;
+    u64 reduction_modes = 0;
     for (const auto& desc : info.texture_descriptors) {
         for (u32 element = 0; element < desc.count; ++element) {
             ImageView& image_view = texture_cache.GetImageView(views[view++].id);
@@ -1674,8 +1675,16 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                     texture_cache.GetSampler(samplers[sampler])
                         .HandleFor(image_view, desc.is_depth));
             }
+            if (sampler < sampler_slots.size() && sampler_slots[sampler] < 16) {
+                reduction_modes |= texture_cache.GetSampler(samplers[sampler]).ReductionBits()
+                                   << (sampler_slots[sampler] * 4);
+            }
             ++sampler;
         }
+    }
+    if (program.reduction_slot != ~0U) {
+        scheduler.BindBytes(metal_stage, program.reduction_slot, &reduction_modes,
+                            static_cast<u32>(sizeof(reduction_modes)));
     }
     for (const auto& desc : info.image_descriptors) {
         for (u32 element = 0; element < desc.count; ++element) {

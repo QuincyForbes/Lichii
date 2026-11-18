@@ -19,6 +19,11 @@ namespace Metal::ShaderTranslate {
 
 namespace {
 
+/// Routes the 2D samples of an entry function through spvReducedSample (see
+/// Options::sampler_reduction); the buffer slot of the mask, or ~0 when nothing was rewritten.
+[[nodiscard]] u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point,
+                                          bool fragment, u32 buffer_slot);
+
 [[nodiscard]] spv::ExecutionModel Model(Stage stage) {
     switch (stage) {
     case Stage::Vertex:
@@ -162,6 +167,14 @@ struct Declared {
 };
 
 } // Anonymous namespace
+
+bool SamplerReductionEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_SAMPLER_REDUCTION");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
 
 bool DeviceMslEnabled() {
     static const bool enabled = [] {
@@ -374,6 +387,17 @@ Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& option
         }
 
         result.source = compiler.compile();
+        const bool reducible = stage == Stage::Vertex || stage == Stage::Fragment ||
+                               stage == Stage::Compute;
+        if (reducible && options.sampler_reduction && !resources.sampled_images.empty() &&
+            !(stage == Stage::Vertex && buffers + 1 > options.first_vertex_buffer_slot)) {
+            const auto points = compiler.get_entry_points_and_stages();
+            if (!points.empty()) {
+                result.reduction_slot = RewriteSamplerReduction(
+                    result.source, compiler.get_cleansed_entry_point_name(points.front().name, model),
+                    stage == Stage::Fragment, buffers);
+            }
+        }
         if (tess_vertex || tess_control) {
             result.outputs = StageOutputs(compiler, resources);
         }
@@ -659,6 +683,146 @@ struct MslMember {
     alignment = scalar * (lanes == 3 ? 4 : lanes);
     size = scalar * lanes;
     return true;
+}
+
+} // Anonymous namespace
+
+
+namespace {
+
+constexpr std::string_view ReductionPrelude = R"msl(
+// Sampler reduction (min and max of the texels a linear sample weighs), four bits per sampler
+// slot: bit 0 min, bit 1 max, bit 2 linear mip filter, bit 3 nearest mip filter.
+static bool spvReducing(ulong modes, uint slot) {
+    return ((modes >> (slot * 4u)) & 3ul) != 0ul;
+}
+
+static float4 spvReduceTaps(texture2d<float> t, sampler s, float2 uv, uint mip, bool use_max) {
+    const float2 size = float2(float(t.get_width(mip)), float(t.get_height(mip)));
+    const float2 base = floor(uv * size - 0.5f);
+    const float2 inverse = 1.0f / size;
+    const float mip_level = float(mip);
+    // A linear sample at a texel's centre is that texel, whatever the addressing does outside.
+    const float4 a = t.sample(s, (base + 0.5f) * inverse, level(mip_level));
+    const float4 b = t.sample(s, (base + float2(1.5f, 0.5f)) * inverse, level(mip_level));
+    const float4 c = t.sample(s, (base + float2(0.5f, 1.5f)) * inverse, level(mip_level));
+    const float4 d = t.sample(s, (base + 1.5f) * inverse, level(mip_level));
+    return use_max ? max(max(a, b), max(c, d)) : min(min(a, b), min(c, d));
+}
+
+static float4 spvReducedSample(texture2d<float> t, sampler s, float2 uv, float lod, ulong modes,
+                               uint slot) {
+    const uint bits = uint((modes >> (slot * 4u)) & 15ul);
+    const bool use_max = (bits & 2u) != 0u;
+    const uint last = t.get_num_mip_levels() - 1u;
+    if ((bits & 12u) == 0u) {
+        return spvReduceTaps(t, s, uv, 0u, use_max);
+    }
+    lod = clamp(lod, 0.0f, float(last));
+    if ((bits & 4u) != 0u) {
+        const uint low = uint(floor(lod));
+        const float4 a = spvReduceTaps(t, s, uv, low, use_max);
+        if (low >= last || lod == float(low)) {
+            return a;
+        }
+        const float4 b = spvReduceTaps(t, s, uv, low + 1u, use_max);
+        return use_max ? max(a, b) : min(a, b);
+    }
+    return spvReduceTaps(t, s, uv, min(uint(floor(lod + 0.5f)), last), use_max);
+}
+)msl";
+
+u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point, bool fragment,
+                            u32 buffer_slot) {
+    const std::string needle = " " + entry_point + "(";
+    const size_t at = source.find(needle);
+    if (at == std::string::npos) {
+        return ~0U;
+    }
+    const size_t open = at + needle.size() - 1;
+    const size_t close = MatchingBracket(source, open);
+    const size_t body_close = close == std::string::npos ? close : source.find('{', close);
+    if (close == std::string::npos || body_close == std::string::npos) {
+        return ~0U;
+    }
+    std::unordered_map<std::string, bool> textures; // 2D float textures by name
+    std::unordered_map<std::string, u32> samplers;  // sampler slot by name
+    for (const std::string_view text :
+         SplitParameters(std::string_view(source).substr(open + 1, close - open - 1))) {
+        const auto parameter = ParseParameter(text);
+        if (!parameter) {
+            continue;
+        }
+        if (parameter->type == "texture2d<float>" && parameter->attribute.starts_with("texture(")) {
+            textures[parameter->name] = true;
+        } else if (parameter->type == "sampler" && parameter->attribute.starts_with("sampler(")) {
+            samplers[parameter->name] = static_cast<u32>(std::atoi(parameter->attribute.c_str() + 8));
+        }
+    }
+    if (textures.empty() || samplers.empty()) {
+        return ~0U;
+    }
+    // The samples in the body, from the end so the positions before them hold.
+    std::vector<std::pair<size_t, size_t>> calls; // begin of the object, end of the call
+    const std::string call = ".sample(";
+    for (size_t found = source.find(call, body_close); found != std::string::npos;
+         found = source.find(call, found + call.size())) {
+        size_t begin = found;
+        while (begin > body_close && IsIdentifier(source[begin - 1])) {
+            --begin;
+        }
+        if (begin == found || !textures.contains(source.substr(begin, found - begin))) {
+            continue;
+        }
+        const size_t end = MatchingBracket(source, found + call.size() - 1);
+        if (end != std::string::npos) {
+            calls.emplace_back(begin, end + 1);
+        }
+    }
+    bool rewritten = false;
+    for (auto it = calls.rbegin(); it != calls.rend(); ++it) {
+        const auto [begin, end] = *it;
+        const size_t dot = source.find('.', begin);
+        const std::string texture = source.substr(begin, dot - begin);
+        const std::string_view inner = std::string_view(source).substr(
+            dot + call.size(), end - 1 - (dot + call.size()));
+        const std::vector<std::string_view> arguments = SplitParameters(inner);
+        if (arguments.size() < 2 || arguments.size() > 3 ||
+            !samplers.contains(std::string(arguments[0]))) {
+            continue;
+        }
+        const std::string sampler(arguments[0]);
+        const std::string coordinate(arguments[1]);
+        const std::string implicit = fragment ? texture + ".calculate_unclamped_lod(" + sampler +
+                                                    ", " + coordinate + ")"
+                                              : "0.0f";
+        std::string lod;
+        if (arguments.size() == 2) {
+            lod = implicit;
+        } else if (arguments[2].starts_with("level(") && arguments[2].ends_with(")")) {
+            lod = "(" + std::string(arguments[2].substr(6, arguments[2].size() - 7)) + ")";
+        } else if (arguments[2].starts_with("bias(") && arguments[2].ends_with(")")) {
+            lod = implicit + " + (" + std::string(arguments[2].substr(5, arguments[2].size() - 6)) + ")";
+        } else {
+            continue;
+        }
+        const std::string slot = std::to_string(samplers[sampler]);
+        const std::string original = source.substr(begin, end - begin);
+        source.replace(begin, end - begin,
+                       "(spvReducing(spvReduction, " + slot + "u) ? spvReducedSample(" + texture +
+                           ", " + sampler + ", " + coordinate + ", " + lod + ", spvReduction, " +
+                           slot + "u) : " + original + ")");
+        rewritten = true;
+    }
+    if (!rewritten) {
+        return ~0U;
+    }
+    source.insert(close, ", constant ulong& spvReduction [[buffer(" + std::to_string(buffer_slot) +
+                             ")]]");
+    const size_t using_at = source.find("using namespace metal;");
+    source.insert(using_at == std::string::npos ? 0 : using_at + 22,
+                  "\n" + std::string(ReductionPrelude));
+    return buffer_slot;
 }
 
 } // Anonymous namespace

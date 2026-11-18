@@ -107,6 +107,11 @@ struct Options {
     /// validation aborts otherwise), so a program drawing anything else is translated without
     /// (MoltenVK's enable_point_size_builtin).
     bool point_size_builtin{true};
+    /// Sampled 2D textures of vertex, fragment and compute programs are read through
+    /// spvReducedSample when the sampler asks for a min or max reduction (Metal's own
+    /// MTLSamplerReductionMode is ignored on some devices): the bits of each sampler in a buffer
+    /// at Result::reduction_slot (SamplerReductionBits).
+    bool sampler_reduction{};
     /// (set, binding) of sampled images that are bound to depth textures: they become
     /// depth2d<float>, the type Metal declares depth formats with (as the blit shaders do).
     /// A shared image type changes for all its users.
@@ -120,6 +125,9 @@ struct Result {
     /// Tessellation stages: what this stage writes for the next one.
     std::vector<InterfaceVariable> outputs;
     TessellationSlots tessellation_slots{};
+    /// The 64-bit mask of sampler reduction bits (four per MSL sampler slot) the program reads,
+    /// ~0 when no sample was rewritten.
+    u32 reduction_slot{~0U};
     std::string error;
 };
 
@@ -166,6 +174,9 @@ inline constexpr u32 DomainThreads = 64;
 /// Resources are numbered per kind in (set, binding) order, which is the order the recompiler
 /// emits them and the buffer cache appends their bindings, so the pipeline binds in sequence.
 [[nodiscard]] Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& options);
+
+/// EDEN_NX2_METAL_SAMPLER_REDUCTION (default on): Options::sampler_reduction for the guest's programs.
+[[nodiscard]] bool SamplerReductionEnabled();
 
 /// EDEN_NX2_METAL_MSL_DEVICE: the MSL uses what Options::apple_family has (default on).
 [[nodiscard]] bool DeviceMslEnabled();
