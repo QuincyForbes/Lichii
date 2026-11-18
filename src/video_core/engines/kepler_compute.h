@@ -258,6 +258,10 @@ public:
     /// dispatch of the game's network is skipped, or its output pass replaced by a copy of the
     /// tonemapped image.
     bool BypassOotNetwork(u64 program_id, u64 native_key);
+    /// NVIDIA DLSS (DLAA and Super Resolution) in place of Ocarina of Time's post-tonemap
+    /// anti-aliasing / upscaling (ocarina_upscale.h), when the setting is on: true when it
+    /// replaced this dispatch (the network's last pass).
+    bool ProcessOcarinaUpscale(u64 program_id, u64 native_key, u64 shader_hash);
     /// The base game's output passes, recognized by their code before translation.
     bool BypassOotBaseNetwork();
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
@@ -350,6 +354,8 @@ private:
     /// copy (the network's matrix passes cost tens of milliseconds per frame). Cleared after the
     /// copy.
     std::optional<Texture::TICEntry> native_upscale_input;
+    /// The tonemapped frame Ocarina of Time's anti-aliasing reads (ProcessOcarinaUpscale).
+    std::optional<Texture::TICEntry> ocarina_input;
     /// Native dispatches left to skip while a retained network is being replaced (bounded, so a
     /// non-network pass cannot silence the engine forever).
     u32 network_skip_remaining{};

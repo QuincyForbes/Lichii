@@ -190,7 +190,8 @@ public:
         return size;
     }
 
-    [[nodiscard]] ComputePipeline* CurrentComputePipeline();
+    /// native_key: the program's native key (0 when it is not a lowered native program).
+    [[nodiscard]] ComputePipeline* CurrentComputePipeline(u64& native_key);
 
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);

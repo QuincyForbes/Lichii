@@ -2366,9 +2366,10 @@ void RasterizerVulkan::DispatchCompute() {
         flash_watch.EndPass();
     }
 
+    u64 native_key{};
     ComputePipeline* const pipeline{[&] {
         try {
-            return pipeline_cache.CurrentComputePipeline();
+            return pipeline_cache.CurrentComputePipeline(native_key);
         } catch (const Shader::Exception& error) {
             if (frame_dump.Capturing()) {
                 frame_dump.NoteSkipped(true,
@@ -2390,6 +2391,11 @@ void RasterizerVulkan::DispatchCompute() {
             }
             throw Shader::RuntimeError("Native compute pipeline unavailable");
         }
+        return;
+    }
+    if (kepler_compute->IsNativeMode() &&
+        kepler_compute->ProcessOcarinaUpscale(Settings::GetCurrentProgramID(), native_key,
+                                              pipeline->ShaderHash())) {
         return;
     }
     if (VideoCommon::FeatureCensus::Enabled()) {
