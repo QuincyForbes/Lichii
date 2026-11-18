@@ -1936,7 +1936,9 @@ template <class P>
 SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
     auto& table =
         compute ? channel_state->compute_sampler_table : channel_state->graphics_sampler_table;
-    if (index > table.current_limit) {
+    // A limit within 512k of 2^32 gets a 1024-entry table (DescriptorTable::Refresh), so the
+    // limit alone doesn't bound the index.
+    if (index > table.current_limit || index >= table.bound_ids.size()) {
         LOG_TRACE(HW_GPU, "Invalid sampler index={}", index);
         return NULL_SAMPLER_ID;
     }
@@ -2374,6 +2376,15 @@ const typename P::Sampler& TextureCache<P>::GetSampler(SamplerId id) const noexc
 
 template <class P>
 typename P::Sampler& TextureCache<P>::GetSampler(SamplerId id) noexcept {
+    if (!slot_samplers.contains(id)) [[unlikely]] {
+        // An id that names no sampler would read unconstructed slot storage (a null device
+        // in Sampler::Emplace). Bind the null sampler instead.
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+            LOG_ERROR(HW_GPU, "Invalid sampler id {:#x}, using the null sampler", id.index);
+        }
+        return slot_samplers[NULL_SAMPLER_ID];
+    }
     return slot_samplers[id];
 }
 
@@ -2765,7 +2776,7 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
     index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit,
                                                gpu_memory->UsesNativeTiling());
-    if (index > table.current_limit) {
+    if (index > table.current_limit || index >= table.bound_ids.size()) {
         LOG_TRACE(HW_GPU, "Invalid image view index={}", index);
         return NULL_IMAGE_VIEW_ID;
     }
