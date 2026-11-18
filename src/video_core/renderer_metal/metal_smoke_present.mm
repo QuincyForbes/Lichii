@@ -27,6 +27,7 @@
 #include "video_core/post_processing/fx_effect.h"
 #include "video_core/renderer_metal/metal_device.h"
 #include "video_core/renderer_metal/metal_formats.h"
+#include "video_core/renderer_metal/metal_flash_watch.h"
 #include "video_core/renderer_metal/metal_frame_dump.h"
 #include "video_core/renderer_metal/metal_frame_gen.h"
 #include "video_core/renderer_metal/metal_post_process.h"
@@ -473,6 +474,82 @@ int RunFrameGen() {
 #endif
 }
 
+/// N21: a presented picture that is dark except for one bright frame, and a pass target and a
+/// dispatch image that flash with it, through the tile reduction and the analysis of the frames
+/// around it; a flash_<frame>.jsonl and .tiles come out and name the presented flash.
+int RunFlashWatch() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const std::filesystem::path root =
+        std::filesystem::temp_directory_path() / "lichii-smoke-flash-watch";
+    std::filesystem::remove_all(root);
+    setenv("EDEN_NX2_FLASH_WATCH", root.c_str(), 1);
+    constexpr uint32_t Size = 64;
+    const auto flat = [&](uint8_t value) {
+        return Picture(device, scheduler, Metal::Fmt::RGBA8Unorm, Size, Size,
+                       [value](uint32_t, uint32_t) { return std::array<uint8_t, 4>{value, value, value, 255}; });
+    };
+    const Object dark = flat(40);
+    const Object bright = flat(240);
+    if (!dark || !bright) {
+        std::printf("metal-smoke: FAIL flash watch textures\n");
+        return 1;
+    }
+    constexpr size_t FlashFrame = 3;
+    bool armed = false;
+    {
+        Metal::FlashWatch watch(device, scheduler);
+        armed = watch.Enabled() && watch.WatchesPasses();
+        for (size_t frame = 0; frame < 9; ++frame) {
+            const Object& picture = frame == FlashFrame ? bright : dark;
+            Metal::FlashWatch::Source source{
+                .texture = picture.Get(),
+                .format = VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM,
+                .width = Size,
+                .height = Size,
+                .gpu_addr = 0x1000,
+                .slot = 0,
+            };
+            const std::array<Metal::FlashWatch::Source, 1> colors{source};
+            watch.BeginPass(&watch, colors);
+            const std::array<uint64_t, 1> hashes{0xabcdULL};
+            watch.NoteDraw(hashes);
+            watch.NoteDispatch(0x7777, colors);
+            watch.NotePresent(source);
+            watch.TickFrame();
+            scheduler.Flush();
+        }
+        scheduler.Finish();
+        for (int i = 0; i < 4; ++i) {
+            watch.TickFrame();
+        }
+    }
+    unsetenv("EDEN_NX2_FLASH_WATCH");
+    std::string report;
+    size_t tile_bytes = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(root)) {
+        const std::string name = entry.path().filename().string();
+        if (name.ends_with(".jsonl")) {
+            report = ReadFile(entry.path());
+        } else if (name.ends_with(".tiles")) {
+            tile_bytes = std::filesystem::file_size(entry.path());
+        }
+    }
+    const bool flashed = report.find("\"kind\":\"flash\"") != std::string::npos &&
+                         report.find("\"frame\":3,") != std::string::npos &&
+                         report.find("\"trigger\":\"present:") != std::string::npos;
+    const bool outputs = Count(report, "\"kind\":\"output\"") == 3 &&
+                         report.find("\"type\":\"pass\"") != std::string::npos &&
+                         report.find("\"type\":\"dispatch\"") != std::string::npos;
+    // 3 outputs of 32 x 18 tiles, 16 bytes each, in 5 frames.
+    const bool tiles = tile_bytes == size_t{3} * 32 * 18 * 16 * 5;
+    std::printf("metal-smoke: flash watch: armed %d, report for frame 3 naming the present %d, %zu "
+                "outputs, tiles file %zu bytes: %s\n",
+                armed, flashed, Count(report, "\"kind\":\"output\""), tile_bytes,
+                armed && flashed && outputs && tiles ? "PASS" : "FAIL");
+    return armed && flashed && outputs && tiles ? 0 : 1;
+}
+
 int RunAll() {
     if (std::getenv("LICHII_SMOKE_LOG") != nullptr) {
         Common::Log::Initialize();
@@ -480,7 +557,7 @@ int RunAll() {
         Common::Log::Start();
     }
     int result = 0;
-    for (const auto test : {RunPostProcess, RunFrameDump, RunFrameGen}) {
+    for (const auto test : {RunPostProcess, RunFrameDump, RunFlashWatch, RunFrameGen}) {
         const int outcome = test();
         result = result != 0 ? result : outcome;
     }

@@ -25,6 +25,7 @@
 #include "video_core/renderer_metal/metal_buffer_cache.h"
 #include "video_core/renderer_metal/metal_condition.h"
 #include "video_core/renderer_metal/metal_fence_manager.h"
+#include "video_core/renderer_metal/metal_flash_watch.h"
 #include "video_core/renderer_metal/metal_frame_dump.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_index_convert.h"
@@ -451,6 +452,10 @@ private:
                                                  VideoCommon::SamplerId sampler);
     /// The uniform and storage buffers bound for the last draw or dispatch.
     bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
+    /// A colour image the flash watch reduces (empty when it can't).
+    [[nodiscard]] std::optional<FlashWatch::Source> FlashSource(ImageView& view, u32 slot);
+    /// Starts the flash watch's pass for the draw about to open its render pass.
+    void FlashWatchPass(const Framebuffer* framebuffer, std::span<const u64> shader_hashes);
     /// Starts the frame dump's pass for the draw about to open its render pass.
     void FrameDumpPass(const Framebuffer* framebuffer, std::span<const u64> shader_hashes);
 
@@ -489,6 +494,8 @@ private:
     FenceManager fence_manager;
     /// EDEN_NX2_FRAME_DUMP and the debug server's capture_frame.
     FrameDump frame_dump;
+    /// EDEN_NX2_FLASH_WATCH.
+    FlashWatch flash_watch;
     /// Guest writes that found the buffer cache's lock held (EDEN_NX2_WRITE_HANDOFF).
     VideoCommon::Nx2WriteHandoff write_handoff;
 

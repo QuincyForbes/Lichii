@@ -647,6 +647,7 @@ set(METAL_RENDERER_CXX_SOURCES
     renderer_metal/metal_coverage.cpp
     renderer_metal/metal_draw_desc.cpp
     renderer_metal/metal_fence_manager.cpp
+    renderer_metal/metal_flash_watch.cpp
     renderer_metal/metal_formats.cpp
     renderer_metal/metal_frame_dump.cpp
     renderer_metal/metal_frame_gen.cpp
@@ -701,6 +702,7 @@ if (ENABLE_METAL)
         renderer_metal/metal_device.h
         renderer_metal/metal_draw_desc.h
         renderer_metal/metal_fence_manager.h
+        renderer_metal/metal_flash_watch.h
         renderer_metal/metal_formats.h
         renderer_metal/metal_frame_dump.h
         renderer_metal/metal_frame_gen.h

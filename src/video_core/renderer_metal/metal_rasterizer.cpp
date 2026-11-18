@@ -289,7 +289,7 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
       ocarina{device_, scheduler_}, ocarina_temporal{device_, scheduler_},
       accelerate_dma{buffer_cache, texture_cache, scheduler_},
       fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_},
-      frame_dump{device_, scheduler_} {
+      frame_dump{device_, scheduler_}, flash_watch{device_, scheduler_} {
     pipeline_cache.SetSkipCheck([this] { return DrawMayBeSkipped(); });
     Common::PlatformEvents::SetGraphicsMemoryReport([this] { return GraphicsMemoryReport(); });
     // Fence work left pending (EDEN_NX2_FENCE_FLUSH_US) is committed when the split's back goes
@@ -2273,6 +2273,9 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         // Committed in the middle of the draw: what the buffer cache noted as used is gone.
         scheduler.BlockAhead();
     }
+    if (flash_watch.WatchesPasses()) {
+        FlashWatchPass(framebuffer, {&pipeline.Key().unique_hashes[1], 5});
+    }
     if (frame_dump.Capturing()) {
         FrameDumpPass(framebuffer, {&pipeline.Key().unique_hashes[1], 5});
         if (frame_dump.CapturingSampled()) {
@@ -3778,7 +3781,7 @@ void RasterizerMetal::DispatchCompute() {
                               {qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z}, indirect,
                               indirect_grid);
     }
-    if (frame_dump.Capturing()) {
+    if (frame_dump.Capturing() || flash_watch.WatchesPasses()) {
         // The images the program writes, read back after it (the storage images are the last
         // views, after the texel buffers and the sampled textures).
         size_t view_index = 0;
@@ -3792,20 +3795,34 @@ void RasterizerMetal::DispatchCompute() {
             view_index += desc.count;
         }
         std::vector<FrameDump::Source> written;
+        std::vector<FlashWatch::Source> watched;
         u32 slot = 0;
         for (const auto& desc : info.image_descriptors) {
             for (u32 element = 0; element < desc.count; ++element, ++slot) {
                 if (desc.is_written && view_index + element < views.size() &&
                     views[view_index + element].id) {
-                    if (const auto source = DumpSource(
-                            texture_cache.GetImageView(views[view_index + element].id), slot)) {
-                        written.push_back(*source);
+                    ImageView& written_view =
+                        texture_cache.GetImageView(views[view_index + element].id);
+                    if (frame_dump.Capturing()) {
+                        if (const auto source = DumpSource(written_view, slot)) {
+                            written.push_back(*source);
+                        }
+                    }
+                    if (flash_watch.WatchesPasses()) {
+                        if (const auto source = FlashSource(written_view, slot)) {
+                            watched.push_back(*source);
+                        }
                     }
                 }
             }
             view_index += desc.count;
         }
-        frame_dump.CaptureDispatch(pipeline->Key().unique_hash, written);
+        if (frame_dump.Capturing()) {
+            frame_dump.CaptureDispatch(pipeline->Key().unique_hash, written);
+        }
+        if (flash_watch.WatchesPasses()) {
+            flash_watch.NoteDispatch(pipeline->Key().unique_hash, watched);
+        }
     }
     Coverage::Note(Coverage::Work::Dispatch, Coverage::Path::Native);
 }
@@ -4700,6 +4717,54 @@ bool RasterizerMetal::FrameDumpBuffers(bool compute, std::span<const u64> shader
     return frame_dump.NoteBuffers(compute, shader_hashes, bound);
 }
 
+std::optional<FlashWatch::Source> RasterizerMetal::FlashSource(ImageView& view, u32 slot) {
+    using namespace VideoCore::Surface;
+    const Image* const image = view.BackingImage();
+    if (image == nullptr) {
+        return std::nullopt;
+    }
+    const auto& info = image->info;
+    if (info.type == VideoCommon::ImageType::Buffer || info.num_samples > 1 ||
+        GetFormatType(view.format) != SurfaceType::ColorTexture ||
+        IsPixelFormatInteger(view.format) || DefaultBlockWidth(view.format) != 1) {
+        return std::nullopt;
+    }
+    const TextureHandle texture = view.Handle(Shader::TextureType::Color2D);
+    if (texture == nullptr) {
+        return std::nullopt;
+    }
+    const bool rescaled = image->IsRescaled();
+    const auto& resolution = Settings::values.resolution_info;
+    const u32 width = rescaled ? resolution.ScaleUp(info.size.width) : info.size.width;
+    const u32 height = rescaled ? resolution.ScaleUp(info.size.height) : info.size.height;
+    const u32 level = static_cast<u32>(view.range.base.level);
+    return FlashWatch::Source{
+        .texture = texture,
+        .format = view.format,
+        .width = (std::max)(1U, width >> level),
+        .height = (std::max)(1U, height >> level),
+        .gpu_addr = image->gpu_addr,
+        .slot = slot,
+    };
+}
+
+void RasterizerMetal::FlashWatchPass(const Framebuffer* framebuffer,
+                                     std::span<const u64> shader_hashes) {
+    std::array<FlashWatch::Source, NUM_RT> colors;
+    size_t count = 0;
+    const auto& ids = texture_cache.GetRenderTargets().color_buffer_ids;
+    for (u32 slot = 0; slot < ids.size(); ++slot) {
+        if (!ids[slot]) {
+            continue;
+        }
+        if (const auto source = FlashSource(texture_cache.GetImageView(ids[slot]), slot)) {
+            colors[count++] = *source;
+        }
+    }
+    flash_watch.BeginPass(framebuffer, std::span(colors).first(count));
+    flash_watch.NoteDraw(shader_hashes);
+}
+
 void RasterizerMetal::FrameDumpPass(const Framebuffer* framebuffer,
                                     std::span<const u64> shader_hashes) {
     std::array<FrameDump::Source, NUM_RT> colors;
@@ -4782,6 +4847,7 @@ void RasterizerMetal::TickFrame() {
         }
     }
     frame_dump.TickFrame();
+    flash_watch.TickFrame();
     ++oot_frame;
     if (!graphics_report_logged && oot_frame == 600) {
         graphics_report_logged = true;
@@ -5047,6 +5113,11 @@ std::optional<DisplayTexture> RasterizerMetal::AccelerateDisplay(
     if (frame_dump.Capturing()) {
         if (const auto source = DumpSource(*image_view, 0)) {
             frame_dump.CapturePresent(*source);
+        }
+    }
+    if (flash_watch.Enabled()) {
+        if (const auto source = FlashSource(*image_view, 0)) {
+            flash_watch.NotePresent(*source);
         }
     }
     const auto& resolution = Settings::values.resolution_info;
