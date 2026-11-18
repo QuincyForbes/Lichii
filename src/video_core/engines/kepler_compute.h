@@ -265,8 +265,6 @@ public:
     /// The base game's output passes, recognized by their code before translation.
     bool BypassOotBaseNetwork();
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
-    /// Whether the current native dispatch belongs to a recognized game DLSS evaluation.
-    bool IsDlssDispatch() const { return native_mode && dlss_chain.active; }
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod for native compute engines: runs their macros and macro

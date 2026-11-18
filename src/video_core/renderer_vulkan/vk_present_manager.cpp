@@ -280,23 +280,6 @@ Frame* PresentManager::GetRenderFrame() {
     return frame;
 }
 
-Frame* PresentManager::TryGetRenderFrame() {
-    std::unique_lock lock{free_mutex};
-    if (free_queue.empty()) {
-        return nullptr;
-    }
-
-    for (auto it = free_queue.begin(); it != free_queue.end(); ++it) {
-        Frame* frame = *it;
-        if (frame->present_done.GetStatus() == VK_SUCCESS) {
-            free_queue.erase(it);
-            frame->present_done.Reset();
-            return frame;
-        }
-    }
-    return nullptr;
-}
-
 void PresentManager::Present(Frame* frame) {
     if (!use_present_thread && Settings::values.frame_gen.GetValue()) {
         // Frame generation was turned on while a game runs. Earlier frames were presented here,

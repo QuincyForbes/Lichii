@@ -946,6 +946,15 @@ void TextureCache<P>::TickFrame() {
     if constexpr (requires { runtime.CurrentTick(); }) {
         while (!gpu_sentenced_images.empty() &&
                runtime.IsFree(gpu_sentenced_images.front().tick)) {
+            // EDEN_NX2_IMAGE_ALLOCATION_REUSE: the GPU is done with it, so its VkImage goes to
+            // the runtime's allocation pool (AcquireImageAllocation) for the next image of its
+            // shape. It takes the image only when that is on and the image qualifies; otherwise
+            // EXP42 below may give it to the older pool (ReleaseToPool).
+            if constexpr (requires { runtime.RecycleImage(gpu_sentenced_images.front().image,
+                                                          gpu_sentenced_images.front().tick); }) {
+                runtime.RecycleImage(gpu_sentenced_images.front().image,
+                                     gpu_sentenced_images.front().tick);
+            }
             // EXP42: the GPU is done with it, so its VkImage may go to the runtime's pool for
             // the next image of its shape (fable_answer_12 2B).
             if constexpr (requires(Image& image) { image.ReleaseToPool(); }) {

@@ -1467,11 +1467,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // too, so the deferred submit can't overlap whatever the front does next.
                 if (!back_quiet.load(std::memory_order_relaxed)) {
                     if (idle_hook != nullptr) {
-                        Nx2Profile::Scope hook_scope{Nx2Profile::Zone::BackIdleHook};
-                        ForgetFencesQuiet();
-                        if (idle_hook(idle_argument, false) && Common::PerfReport::Enabled()) {
-                            idle_submit_ns = Common::PerfReport::NowNs();
-                        }
+                        RunIdleHook();
                     }
                     back_quiet.store(true, std::memory_order_release);
                 }

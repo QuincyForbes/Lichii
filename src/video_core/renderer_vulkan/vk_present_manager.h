@@ -67,9 +67,6 @@ public:
     /// Returns the last used presentation frame
     Frame* GetRenderFrame();
 
-    /// Returns a free presentation frame if its present fence is already signaled, or nullptr
-    Frame* TryGetRenderFrame();
-
     /// Pushes a frame for presentation
     void Present(Frame* frame);
 

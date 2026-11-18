@@ -67,6 +67,7 @@
 #include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
+#include "video_core/renderer_vulkan/pipeline_cache_dir.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_cooperative_hmma_test.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -2239,9 +2240,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
     }
 
-    const auto shader_dir{Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir)};
-    const auto base_dir{shader_dir / fmt::format("{:016x}", title_id)};
-    if (!Common::FS::CreateDir(shader_dir) || !Common::FS::CreateDir(base_dir)) {
+    // The folder the Qt side's shader cache actions use too (Common::FS::GetVulkanPipelineCacheDir:
+    // a subfolder for games whose cache an earlier build wrote wrong).
+    const auto base_dir{
+        CreatePipelineCacheDir(Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir), title_id)};
+    if (base_dir.empty()) {
         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
         // Do not keep writing to the previous title's cache files.
         pipeline_cache_filename.clear();
@@ -2370,6 +2373,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                      key.unique_hash),
                 .build = [this, key, envs_ = std::move(candidates)]() mutable {
                     ShaderPools pools;
+                    // Built and dropped, never bound: only the driver's cache keeps it, and the
+                    // build report counts it apart from the game's own builds.
+                    const DriverBuildReport::PrecacheScope precache_scope;
                     for (auto& env : envs_) {
                         pools.ReleaseContents();
                         if (CreateComputePipeline(pools, key, env, nullptr, false).pipeline) {
