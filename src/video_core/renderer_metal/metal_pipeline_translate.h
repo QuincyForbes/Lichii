@@ -129,6 +129,9 @@ struct StageProgram {
     u32 spill_slot{~0U};
     /// Buffer slot of the table of spilled samplers' resource IDs, ~0 without.
     u32 sampler_spill_slot{~0U};
+    /// Buffer slot of the table of spilled texture and sampler arrays, ~0 without; its entries.
+    u32 array_spill_slot{~0U};
+    u32 array_spill_entries{};
     /// The MTLLibrary and MTLFunction, made on first use (BuildFunctions).
     Object library;
     Object function;

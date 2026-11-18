@@ -62,8 +62,27 @@ void ReleaseSource(StageProgram& program) {
 /// Builds the program's library; where Metal refuses the MSL with the sampler reduction rewrite
 /// (a textual rewrite that some expressions defeat), from the MSL without it: the program then
 /// samples with Metal's own reduction instead of being skipped. `error` keeps the first error.
+/// EDEN_NX2_METAL_DUMP_FAILED=<folder>: the MSL of each program Metal refuses goes there
+/// (failed-N.metal, the error at its end), for looking at what the translation produced.
+void DumpRefusedProgram(const std::string& msl, const std::string& error) {
+    static const char* const folder = std::getenv("EDEN_NX2_METAL_DUMP_FAILED");
+    if (folder == nullptr || folder[0] == '\0') {
+        return;
+    }
+    static std::atomic<u32> count{};
+    const u32 index = count.fetch_add(1, std::memory_order_relaxed);
+    if (index >= 64) {
+        return;
+    }
+    std::ofstream file(std::filesystem::path{folder} / fmt::format("failed-{}.metal", index));
+    file << msl << "\n// Metal refused it: " << error << '\n';
+}
+
 void BuildProgramLibrary(const Device& device, StageProgram& program, std::string& error) {
     program.library = CreateLibrary(device, program.msl, error);
+    if (!program.library) {
+        DumpRefusedProgram(program.msl, error);
+    }
     if (program.library || program.msl_without_reduction.empty()) {
         return;
     }

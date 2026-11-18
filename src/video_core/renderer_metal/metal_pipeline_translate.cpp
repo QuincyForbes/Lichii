@@ -480,6 +480,8 @@ std::optional<StageProgram> PipelineTranslator::FromSpirv(std::span<const u32> s
         .reduction_slot = result.reduction_slot,
         .spill_slot = result.spill_slot,
         .sampler_spill_slot = result.sampler_spill_slot,
+        .array_spill_slot = result.array_spill_slot,
+        .array_spill_entries = result.array_spill_entries,
     };
 }
 
@@ -1626,6 +1628,8 @@ std::optional<StageProgram> PipelineTranslator::Compute(u64 unique_hash,
         .reduction_slot = result.reduction_slot,
         .spill_slot = result.spill_slot,
         .sampler_spill_slot = result.sampler_spill_slot,
+        .array_spill_slot = result.array_spill_slot,
+        .array_spill_entries = result.array_spill_entries,
     };
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Metal, "Metal: {}", exception.what());

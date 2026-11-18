@@ -51,8 +51,11 @@ struct ResourceSlot {
     u32 index{};
     u32 count{1}; ///< Slots from index on (descriptor arrays)
     /// Spilled buffers (Options::spill_buffers): the entry of the table of addresses the program
-    /// reads it through; spilled samplers: the entry of the sampler table. ~0 for the others.
+    /// reads it through; spilled samplers: the entry of the sampler table; spilled texture and
+    /// sampler arrays (in_array_table): the first entry in the array table. ~0 for the others.
     u32 spill{~0U};
+    /// A texture or sampler array read from the table at Result::array_spill_slot.
+    bool in_array_table{};
 };
 
 /// A stage output the next tessellation stage reads from a buffer: a location, or a builtin.
@@ -153,6 +156,11 @@ struct Result {
     /// The table of spilled samplers (past Metal's 16 sampler slots): one MTLResourceID (8 bytes)
     /// each, in ResourceSlot::spill order of the sampler slots; ~0 without spills.
     u32 sampler_spill_slot{~0U};
+    /// The table of spilled texture and sampler arrays (past Metal's 128 textures or 16 samplers,
+    /// e.g. a bindless array of 1020): MTLResourceIDs, 8 bytes each, ~0 without.
+    u32 array_spill_slot{~0U};
+    /// Its size in entries.
+    u32 array_spill_entries{};
     std::string error;
 };
 

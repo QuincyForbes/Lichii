@@ -3319,6 +3319,36 @@ void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture) 
     }
 }
 
+u64 Scheduler::UseTexture(ShaderStage stage, TextureHandle texture, bool write) {
+    if (texture == nullptr) {
+        return 0;
+    }
+    const id<MTLTexture> metal_texture = AsTexture(texture);
+    const MTLResourceUsage usage =
+        write ? (MTLResourceUsageRead | MTLResourceUsageWrite) : MTLResourceUsageRead;
+    switch (stage) {
+    case ShaderStage::Vertex:
+    case ShaderStage::Fragment:
+    case ShaderStage::Object:
+    case ShaderStage::Mesh:
+        if (impl->render != nil) {
+            const MTLRenderStages stages =
+                stage == ShaderStage::Vertex     ? MTLRenderStageVertex
+                : stage == ShaderStage::Fragment ? MTLRenderStageFragment
+                : stage == ShaderStage::Object   ? MTLRenderStageObject
+                                                 : MTLRenderStageMesh;
+            [impl->render useResource:metal_texture usage:usage stages:stages];
+        }
+        break;
+    case ShaderStage::Compute:
+        if (impl->active_compute != nil) {
+            [impl->active_compute useResource:metal_texture usage:usage];
+        }
+        break;
+    }
+    return metal_texture.gpuResourceID._impl;
+}
+
 u64 Scheduler::SamplerResourceId(void* sampler) noexcept {
     if (sampler == nullptr) {
         return 0;

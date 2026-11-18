@@ -32,6 +32,13 @@
 #include "yuzu/hotkeys.h"
 #include "yuzu/user_data_migration.h"
 
+// SIGTERM closes the window as the user would (the game is stopped first). Linux had it; macOS
+// did not, so a terminated process tore the running emulation down from exit() and aborted.
+#if defined(__unix__) || defined(__APPLE__)
+#define EDEN_SIG_INTERRUPTS 1
+#include <QSocketNotifier>
+#endif
+
 #ifdef __unix__
 #include <QDBusObjectPath>
 #include <QSocketNotifier>
@@ -339,7 +346,7 @@ private:
     std::string CreateTASFramesString(
         std::array<size_t, InputCommon::TasInput::PLAYER_NUMBER> frames) const;
 
-#ifdef __unix__
+#ifdef EDEN_SIG_INTERRUPTS
     void SetupSigInterrupts();
     static void HandleSigInterrupt(int);
     void OnSigInterruptNotifierActivated();
@@ -714,7 +721,7 @@ private:
     // True if TAS recording dialog is visible
     bool is_tas_recording_dialog_active{};
 
-#ifdef __unix__
+#ifdef EDEN_SIG_INTERRUPTS
     QSocketNotifier* sig_interrupt_notifier;
     static std::array<int, 3> sig_interrupt_fds;
 #endif

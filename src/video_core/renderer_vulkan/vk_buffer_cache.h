@@ -242,29 +242,34 @@ public:
         stream_uniform_readable = bytes;
     }
 
+    /// The bytes the next BindMappedUniformBuffer of `size` allocates: its size padded to what
+    /// the shader may read (UniformPadMode). Reusing an earlier allocation needs at least this.
+    [[nodiscard]] u32 StreamUniformAllocationSize(u32 size) const noexcept {
+        const u32 readable = stream_uniform_readable;
+        const bool indexed = readable == 0 || readable >= 65536U;
+        switch (UniformPadMode()) {
+        case UniformPad::None:
+            return size;
+        case UniformPad::Readable:
+        case UniformPad::Poison:
+            return (std::max)(size, readable != 0 ? readable : 65536U);
+        case UniformPad::Static:
+            return indexed ? size : (std::max)(size, readable);
+        case UniformPad::Bank:
+            return (std::max)(size, 65536U);
+        }
+        return size;
+    }
+
     std::span<u8> BindMappedUniformBuffer([[maybe_unused]] size_t stage,
                                           [[maybe_unused]] u32 binding_index,
                                           u32 size) {
+        const u32 allocation_size = StreamUniformAllocationSize(size);
         const u32 readable = std::exchange(stream_uniform_readable, 0U);
         // Indexed reads: the shader's used size is the whole bank.
         const bool indexed = readable == 0 || readable >= 65536U;
         if (indexed && size < 65536U) {
             Common::PerfReport::Add(Common::PerfReport::UniformIndexedBinds);
-        }
-        u32 allocation_size = size;
-        switch (UniformPadMode()) {
-        case UniformPad::None:
-            break;
-        case UniformPad::Readable:
-        case UniformPad::Poison:
-            allocation_size = (std::max)(size, readable != 0 ? readable : 65536U);
-            break;
-        case UniformPad::Static:
-            allocation_size = indexed ? size : (std::max)(size, readable);
-            break;
-        case UniformPad::Bank:
-            allocation_size = (std::max)(size, 65536U);
-            break;
         }
         const StagingBufferRef ref = staging_pool.Request(allocation_size, MemoryUsage::Upload);
         Common::PerfReport::Add(Common::PerfReport::UniformStreamBytes, allocation_size);

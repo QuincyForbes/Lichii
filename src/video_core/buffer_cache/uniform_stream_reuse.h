@@ -91,6 +91,9 @@ public:
         u64 page_gen{};
         u32 size{};    ///< 0: nothing copied
         u32 serial{};
+        /// Bytes allocated (the size padded to what the binding shader could read): a shader
+        /// that may read further needs a new allocation, the padding past this is not zero.
+        u32 allocated{};
     };
 
     /// The copy a (stage, constant buffer) slot bound last.
@@ -242,6 +245,10 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
     typename Reuse::Slot& slot = reuse.slots[stage][index];
     const u64 tick = runtime.CurrentTick();
+    u32 needed = size;
+    if constexpr (requires { runtime.StreamUniformAllocationSize(size); }) {
+        needed = runtime.StreamUniformAllocationSize(size);
+    }
     const auto rebind = [&](size_t copy_index) {
         const typename Reuse::Copy& copy = reuse.copies[copy_index];
         runtime.RebindStreamUniform(copy.ref, size);
@@ -267,7 +274,7 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
         slot_copy = slot.copy;
         typename Reuse::Copy& copy = reuse.copies[slot_copy];
         if (copy.tick == tick && copy.address == device_addr && copy.size == size &&
-            is_verified_clean(copy)) [[likely]] {
+            copy.allocated >= needed && is_verified_clean(copy)) [[likely]] {
             if constexpr (requires { device_memory.GetSpan(device_addr, size); }) {
                 if (UniformInPlaceCompareEnabled()) {
                     Nx2Profile::Add(Nx2Profile::Counter::UboInPlaceSame, 1);
@@ -283,7 +290,7 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
             const size_t copy_index = base + way;
             typename Reuse::Copy& copy = reuse.copies[copy_index];
             if (copy_index != slot_copy && copy.address == device_addr && copy.size == size &&
-                copy.tick == tick && is_verified_clean(copy)) {
+                copy.tick == tick && copy.allocated >= needed && is_verified_clean(copy)) {
                 reuse.mru[set] = static_cast<u8>(way);
                 if constexpr (requires { device_memory.GetSpan(device_addr, size); }) {
                     if (UniformInPlaceCompareEnabled()) {
@@ -331,7 +338,8 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
                                : Profile::Counter::UboInPlaceChanged,
                      1);
     }
-    if (slot_same && reuse.copies[slot_copy].tick == tick) {
+    if (slot_same && reuse.copies[slot_copy].tick == tick &&
+        reuse.copies[slot_copy].allocated >= needed) {
         return rebind(slot_copy);
     }
     size_t target = stage * Reuse::NumSlots + index;
@@ -342,7 +350,7 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
             const size_t copy_index = base + way;
             const typename Reuse::Copy& copy = reuse.copies[copy_index];
             if (copy_index != slot_copy && copy.address == device_addr && copy.size == size &&
-                copy.tick == tick && same_bytes(copy_index)) {
+                copy.tick == tick && copy.allocated >= needed && same_bytes(copy_index)) {
                 reuse.mru[set] = static_cast<u8>(way);
                 return rebind(copy_index);
             }
@@ -384,6 +392,7 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
     const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
     std::memcpy(span.data(), reuse.Bytes(target), size);
     copy.ref = runtime.LastStreamUniformRef();
+    copy.allocated = needed;
     // After the allocation: the tick the stream region is tagged with is the one current now.
     copy.tick = runtime.CurrentTick();
     slot = typename Reuse::Slot{static_cast<u32>(target), copy.serial};

@@ -220,6 +220,12 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 
 #endif
 
+#if defined(__APPLE__)
+#include <csignal>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include "qt_common/gamemode.h"
 
 #ifdef _WIN32
@@ -430,7 +436,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         }
     }
 
-#ifdef __unix__
+#ifdef EDEN_SIG_INTERRUPTS
     SetupSigInterrupts();
 #endif
 
@@ -1169,7 +1175,7 @@ MainWindow::~MainWindow() {
         delete render_window;
     }
 
-#ifdef __unix__
+#ifdef EDEN_SIG_INTERRUPTS
     ::close(sig_interrupt_fds[0]);
     ::close(sig_interrupt_fds[1]);
 #endif
@@ -2396,7 +2402,7 @@ void MainWindow::OnPrepareForSleep(bool prepare_sleep) {
     }
 }
 
-#ifdef __unix__
+#ifdef EDEN_SIG_INTERRUPTS
 std::array<int, 3> MainWindow::sig_interrupt_fds{0, 0, 0};
 
 void MainWindow::SetupSigInterrupts() {
@@ -2442,7 +2448,7 @@ void MainWindow::OnSigInterruptNotifierActivated() {
 
     emit SigInterrupt();
 }
-#endif // __unix__
+#endif // EDEN_SIG_INTERRUPTS
 
 void MainWindow::PreventOSSleep() {
 #ifdef _WIN32

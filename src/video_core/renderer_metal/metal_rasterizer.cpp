@@ -1648,6 +1648,20 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     std::vector<u64> sampler_table;
     /// Marks a sampler_slots entry as an entry of the spilled samplers' table.
     constexpr u32 SpilledSamplerFlag = 0x8000'0000U;
+    /// Marks a texture_slots or sampler_slots entry as an entry of the array table.
+    constexpr u32 ArrayEntryFlag = 0x4000'0000U;
+    std::vector<u64> array_table(program.array_spill_slot != ~0U ? program.array_spill_entries
+                                                                 : 0U);
+    const auto bind_texture = [&](u32 slot_value, TextureHandle texture, bool write) {
+        if ((slot_value & ArrayEntryFlag) != 0) {
+            const u32 entry = slot_value & ~ArrayEntryFlag;
+            if (entry < array_table.size()) {
+                array_table[entry] = scheduler.UseTexture(metal_stage, texture, write);
+            }
+            return;
+        }
+        scheduler.BindTexture(metal_stage, slot_value, texture);
+    };
     size_t next_buffer = 0;
     for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
         for (u32 element = 0; element < slot.count; ++element) {
@@ -1694,12 +1708,14 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                 }
                 break;
             case ShaderTranslate::ResourceKind::Texture:
-                texture_slots.push_back(slot_index);
+                texture_slots.push_back(slot.in_array_table ? ArrayEntryFlag | (slot.spill + element)
+                                                            : slot_index);
                 break;
             case ShaderTranslate::ResourceKind::Sampler:
-                // A spilled sampler is read from the table (an entry, flagged).
-                sampler_slots.push_back(slot.spill != ~0U ? SpilledSamplerFlag | slot.spill
-                                                          : slot_index);
+                // A spilled sampler is read from a table (an entry, flagged).
+                sampler_slots.push_back(slot.in_array_table ? ArrayEntryFlag | (slot.spill + element)
+                                        : slot.spill != ~0U ? SpilledSamplerFlag | slot.spill
+                                                            : slot_index);
                 break;
             }
         }
@@ -1713,9 +1729,9 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     const size_t texel_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors) +
                                  Shader::NumDescriptors(info.image_buffer_descriptors);
     for (size_t element = 0; element < texel_buffers && element < texture_slots.size(); ++element) {
-        scheduler.BindTexture(metal_stage, texture_slots[element],
-                              element < texel_buffer_views.size() ? texel_buffer_views[element]
-                                                                  : nullptr);
+        bind_texture(texture_slots[element],
+                     element < texel_buffer_views.size() ? texel_buffer_views[element] : nullptr,
+                     false);
     }
     size_t texture_slot = texel_buffers;
     size_t view = texel_buffers;
@@ -1725,17 +1741,22 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
         for (u32 element = 0; element < desc.count; ++element) {
             ImageView& image_view = texture_cache.GetImageView(views[view++].id);
             if (texture_slot < texture_slots.size()) {
-                scheduler.BindTexture(
-                    metal_stage, texture_slots[texture_slot],
-                    OrPlaceholder(image_view, image_view.SampledHandle(desc.type,
-                                                                       desc.is_multisample),
-                                  desc.type));
+                bind_texture(texture_slots[texture_slot],
+                             OrPlaceholder(image_view,
+                                           image_view.SampledHandle(desc.type, desc.is_multisample),
+                                           desc.type),
+                             false);
             }
             ++texture_slot;
             if (sampler < sampler_slots.size()) {
                 void* const handle = texture_cache.GetSampler(samplers[sampler])
                                          .HandleFor(image_view, desc.is_depth);
-                if ((sampler_slots[sampler] & SpilledSamplerFlag) != 0) {
+                if ((sampler_slots[sampler] & ArrayEntryFlag) != 0) {
+                    const u32 entry = sampler_slots[sampler] & ~ArrayEntryFlag;
+                    if (entry < array_table.size()) {
+                        array_table[entry] = Scheduler::SamplerResourceId(handle);
+                    }
+                } else if ((sampler_slots[sampler] & SpilledSamplerFlag) != 0) {
                     const u32 entry = sampler_slots[sampler] & ~SpilledSamplerFlag;
                     if (sampler_table.size() <= entry) {
                         sampler_table.resize(entry + 1, 0);
@@ -1768,15 +1789,25 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                 texture_cache.MarkModification(image_view.image_id);
             }
             if (texture_slot < texture_slots.size()) {
-                scheduler.BindTexture(
-                    metal_stage, texture_slots[texture_slot],
-                    view_index == byte_shadow_view
-                        ? byte_shadow_texture
-                        : OrPlaceholder(image_view,
-                                        image_view.StorageHandle(desc.type, desc.format),
-                                        desc.type));
+                bind_texture(texture_slots[texture_slot],
+                             view_index == byte_shadow_view
+                                 ? byte_shadow_texture
+                                 : OrPlaceholder(image_view,
+                                                 image_view.StorageHandle(desc.type, desc.format),
+                                                 desc.type),
+                             desc.is_written);
             }
             ++texture_slot;
+        }
+    }
+    if (!array_table.empty()) {
+        // Past setBytes' 4 KiB: the table goes through the stream buffer.
+        const size_t bytes = array_table.size() * sizeof(u64);
+        const StagingBufferRef table = staging_pool.Stream(bytes, 8);
+        if (table.mapped_span.size() >= bytes) {
+            std::memcpy(table.mapped_span.data(), array_table.data(), bytes);
+            scheduler.BindBuffer(metal_stage, program.array_spill_slot, table.buffer,
+                                 static_cast<u32>(table.offset));
         }
     }
 }

@@ -453,6 +453,9 @@ public:
     /// The sampler's MTLResourceID, what a program reads from a table of spilled samplers
     /// (ShaderTranslate::Result::sampler_spill_slot). 0 for none.
     [[nodiscard]] static u64 SamplerResourceId(void* sampler) noexcept;
+    /// A texture read (or written) through a table of resource IDs: made resident for the stage
+    /// on the current encoder, its MTLResourceID returned (0 for none).
+    [[nodiscard]] u64 UseTexture(ShaderStage stage, TextureHandle texture, bool write);
 
     /// primitive: MTLPrimitiveType.
     void Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 instance_count,

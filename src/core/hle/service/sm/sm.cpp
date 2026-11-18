@@ -44,12 +44,18 @@ ServiceManager::ServiceManager(Kernel::KernelCore& kernel_) : kernel{kernel_} {
 }
 
 ServiceManager::~ServiceManager() {
-    for (auto& [name, port] : service_ports) {
-        port->Close(kernel);
-    }
-
-    if (deferral_event) {
-        deferral_event->Close(kernel);
+    // Normally destroyed by System::ShutdownMainProcess. At process exit with a game still
+    // running (the process was terminated), the System is destroyed by exit() instead and the
+    // kernel's scheduler lock can throw here, which aborted the process (std::terminate from a
+    // destructor). Nothing outlives the process: give up on closing then.
+    try {
+        for (auto& [name, port] : service_ports) {
+            port->Close(kernel);
+        }
+        if (deferral_event) {
+            deferral_event->Close(kernel);
+        }
+    } catch (...) {
     }
 }
 

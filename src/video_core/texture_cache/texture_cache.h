@@ -970,10 +970,15 @@ void TextureCache<P>::TickFrame() {
     if (std::ranges::any_of(feedback_shadows, idle_shadow)) {
         // Views and images may still be referenced by submitted draws.
         runtime.Finish();
+        bool erased_shadow = false;
         std::erase_if(feedback_shadows, [&](const FeedbackShadow& entry) {
             if (!idle_shadow(entry)) {
                 return false;
             }
+            // As every other image deletion: memos and table entries of it are stale from here
+            // (its slot and view slots are reused by the next images made).
+            BumpBindingSerial(entry.id);
+            erased_shadow = true;
             const auto& image = slot_images[entry.id];
             RemoveImageViewReferences(image.image_view_ids);
             for (const ImageViewId id : image.image_view_ids) {
@@ -983,6 +988,12 @@ void TextureCache<P>::TickFrame() {
             slot_images.erase(entry.id);
             return true;
         });
+        if (erased_shadow) {
+            for (size_t c : active_channel_ids) {
+                channel_storage[c].graphics_image_table.Invalidate();
+                channel_storage[c].compute_image_table.Invalidate();
+            }
+        }
     }
     // If we can obtain the memory info, use it instead of the estimate.
     if (runtime.CanReportMemoryUsage()) {
@@ -2223,6 +2234,17 @@ typename TextureCache<P>::BindingMemo* TextureCache<P>::FindBinding(const Bindin
                 continue;
             }
         }
+        if (has_image && rt_active_mask != 0) {
+            // The image is a bound colour target: the full path samples a copy of it instead
+            // (ReplaceColorFeedbackViews), which the recorded payload would skip.
+            bool is_color_target = false;
+            for (size_t i = 0; i < NUM_RT; ++i) {
+                is_color_target |= (rt_active_mask & (1u << i)) != 0 && rt_image_id[i] == image_id;
+            }
+            if (is_color_target) {
+                continue;
+            }
+        }
         if (memo.touch_tick != frame_tick) {
             if (has_image) {
                 CheckCrossFrameUse(slot_images[image_id], false, false);
@@ -2618,6 +2640,27 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
             rt_cleared_undrawn_mask &= ~depth_bit;
         }
     };
+    // Every draw that writes a target moves its modification tick, not only the first of the
+    // render frame (PrepareImageView marks that one): alias ordering (SynchronizeAliases, the
+    // binding memos' alias check, RenderTargetsStillPrepared) compares these ticks, and a target
+    // drawn again after an alias was synchronized read as older than it.
+    const auto touch_draw_targets = [&] {
+        for (size_t index = 0; index < NUM_RT; ++index) {
+            const ImageViewId id = render_targets.color_buffer_ids[index];
+            if (id && color_modified(index)) {
+                const ImageViewBase& view = slot_image_views[id];
+                if (!view.IsBuffer()) {
+                    slot_images[view.image_id].modification_tick = ++modification_tick;
+                }
+            }
+        }
+        if (const ImageViewId id = render_targets.depth_buffer_id; id && depth_modified) {
+            const ImageViewBase& view = slot_image_views[id];
+            if (!view.IsBuffer()) {
+                slot_images[view.image_id].modification_tick = ++modification_tick;
+            }
+        }
+    };
     const auto prepare_draw_targets = [&] {
         // Targets kept across frames are marked modified again once a render frame, so their
         // last_write_frame follows the clock (relocation's same-frame rule, cross-frame guards).
@@ -2653,9 +2696,11 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         }
         if (RenderTargetsStillPrepared()) {
             note_draw_after_clear();
+            touch_draw_targets();
             return;
         }
         prepare_draw_targets();
+        touch_draw_targets();
         return;
     }
 
@@ -2710,8 +2755,10 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         prepare_clear_targets();
     } else if (!RenderTargetsStillPrepared()) {
         prepare_draw_targets();
+        touch_draw_targets();
     } else {
         note_draw_after_clear();
+        touch_draw_targets();
     }
 }
 

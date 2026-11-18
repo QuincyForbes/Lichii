@@ -33,6 +33,11 @@ constexpr u32 SpillBase = 1000;
 [[nodiscard]] bool SpillSamplers(std::string& source, const std::string& entry_point,
                                  u32 spilled, u32 table_slot);
 constexpr u32 SamplerSpillBase = 2000;
+/// Spilled texture and sampler arrays: MSL indices from ArraySpillBase + their first table entry.
+[[nodiscard]] bool SpillArrays(std::string& source, const std::string& entry_point, u32 table_slot);
+constexpr u32 ArraySpillBase = 100000;
+/// Metal's texture slots per stage (0-127).
+constexpr u32 MetalTextureSlots = 128;
 /// Metal's sampler slots per stage (0-15).
 constexpr u32 MetalSamplerSlots = 16;
 
@@ -409,10 +414,30 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                                        (resource.kind == ResourceKind::Texture && resource.combined);
             total_samplers += takes_sampler ? resource.count : 0;
         }
+        u32 total_textures = 0;
+        for (const Declared& resource : declared) {
+            total_textures += resource.kind == ResourceKind::Texture ? resource.count : 0;
+        }
+        // Arrays (bindless tables, Ocarina's volume lookup reads 1020 3D textures) go to a table
+        // of resource IDs when the program has more than Metal's slots of their kind.
+        const bool spill_texture_arrays = total_textures > MetalTextureSlots;
+        const bool spill_sampler_arrays = total_samplers > MetalSamplerSlots;
+        u32 array_entries = 0;
+        const auto spill_array = [&](const Declared& resource, ResourceKind kind) {
+            const u32 first = array_entries;
+            array_entries += resource.count;
+            result.slots.push_back(
+                {resource.set, resource.binding, kind, 0, resource.count, first, true});
+            return ArraySpillBase + first;
+        };
         const bool spill_samplers = total_samplers > MetalSamplerSlots;
         u32 spilled_samplers = 0;
         const auto assign_sampler = [&](spirv_cross::MSLResourceBinding& binding,
                                         const Declared& resource) {
+            if (spill_sampler_arrays && resource.count > 1) {
+                binding.msl_sampler = spill_array(resource, ResourceKind::Sampler);
+                return;
+            }
             if (spill_samplers && resource.count == 1 && samplers >= MetalSamplerSlots) {
                 binding.msl_sampler = SamplerSpillBase + spilled_samplers;
                 result.slots.push_back({resource.set, resource.binding, ResourceKind::Sampler, 0,
@@ -451,10 +476,14 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                 buffers += resource.count;
                 break;
             case ResourceKind::Texture:
-                binding.msl_texture = textures;
-                result.slots.push_back(
-                    {resource.set, resource.binding, resource.kind, textures, resource.count});
-                textures += resource.count;
+                if (spill_texture_arrays && resource.count > 1) {
+                    binding.msl_texture = spill_array(resource, ResourceKind::Texture);
+                } else {
+                    binding.msl_texture = textures;
+                    result.slots.push_back(
+                        {resource.set, resource.binding, resource.kind, textures, resource.count});
+                    textures += resource.count;
+                }
                 if (resource.combined) {
                     assign_sampler(binding, resource);
                 }
@@ -480,6 +509,10 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
         }
         if (spilled_samplers != 0) {
             result.sampler_spill_slot = buffers++;
+        }
+        if (array_entries != 0) {
+            result.array_spill_slot = buffers++;
+            result.array_spill_entries = array_entries;
         }
         // The tessellation stages' own buffers, after their resources (the vertex kernel's
         // vertex buffers take slots from first_vertex_buffer_slot down, as a vertex stage's).
@@ -514,6 +547,23 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
         }
 
         result.source = compiler.compile();
+        if (stage == Stage::Object) {
+            // SPIRV-Cross gives an object function with no stage outputs an empty main0_out
+            // return type, and Metal accepts only void ("invalid return type 'main0_out' for
+            // object function"): every task-shader pipeline fell back to the compute emulation.
+            constexpr std::string_view empty_output = "struct main0_out\n{\n};";
+            if (result.source.find(empty_output) != std::string::npos) {
+                const auto replace_all = [&](std::string_view from, std::string_view to) {
+                    for (size_t at = result.source.find(from); at != std::string::npos;
+                         at = result.source.find(from, at + to.size())) {
+                        result.source.replace(at, from.size(), to);
+                    }
+                };
+                replace_all("[[object]] main0_out ", "[[object]] void ");
+                replace_all("    main0_out out = {};\n", "");
+                replace_all("return out;", "return;");
+            }
+        }
         if (spilled != 0) {
             const auto points = compiler.get_entry_points_and_stages();
             if (points.empty() ||
@@ -522,6 +572,17 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                               spilled, result.spill_slot)) {
                 result.source.clear();
                 result.error = "buffers spilled to a table not understood";
+                return result;
+            }
+        }
+        if (array_entries != 0) {
+            const auto points = compiler.get_entry_points_and_stages();
+            if (points.empty() ||
+                !SpillArrays(result.source,
+                             compiler.get_cleansed_entry_point_name(points.front().name, model),
+                             result.array_spill_slot)) {
+                result.source.clear();
+                result.error = "texture or sampler arrays spilled to a table not understood";
                 return result;
             }
         }
@@ -540,7 +601,7 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                                stage == Stage::Compute;
         // The reduction rewrite reads the entry's [[sampler(n)]] parameters: not with spills.
         if (reducible && options.sampler_reduction && !resources.sampled_images.empty() &&
-            spilled_samplers == 0 &&
+            spilled_samplers == 0 && array_entries == 0 &&
             !(stage == Stage::Vertex && buffers + 1 > options.first_vertex_buffer_slot)) {
             const auto points = compiler.get_entry_points_and_stages();
             if (!points.empty()) {
@@ -997,14 +1058,31 @@ static float3 spvTriangleCorner(spvFactors_t f, uint tri, uint corner) {
 [[nodiscard]] std::vector<std::string_view> SplitParameters(std::string_view text) {
     std::vector<std::string_view> parts;
     int depth = 0;
+    // Template brackets apart: '<' opens one only right after an identifier (as_type<float>,
+    // texture2d<float, access::write>), not in a comparison or shift (a <= b, a < b, a << b),
+    // whose '<' and '>' counted as brackets split an argument at a comma inside float2(...).
+    int angles = 0;
     size_t begin = 0;
+    const auto identifier = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+    };
     for (size_t at = 0; at < text.size(); ++at) {
         const char c = text[at];
-        if (c == '(' || c == '[' || c == '<' || c == '{') {
+        const char before = at != 0 ? text[at - 1] : ' ';
+        const char after = at + 1 < text.size() ? text[at + 1] : ' ';
+        if (c == '<') {
+            if (identifier(before) && after != '=' && after != '<') {
+                ++angles;
+            }
+        } else if (c == '>') {
+            if (angles > 0 && before != '-' && before != ' ' && after != '=') {
+                --angles;
+            }
+        } else if (c == '(' || c == '[' || c == '{') {
             ++depth;
-        } else if (c == ')' || c == ']' || c == '>' || c == '}') {
+        } else if (c == ')' || c == ']' || c == '}') {
             --depth;
-        } else if (c == ',' && depth == 0) {
+        } else if (c == ',' && depth == 0 && angles == 0) {
             parts.push_back(Trim(text.substr(begin, at - begin)));
             begin = at + 1;
         }
@@ -1191,6 +1269,63 @@ bool SpillBuffers(std::string& source, const std::string& entry_point, u32 spill
     source.replace(open + 1, close - open - 1, parameters);
     const size_t brace = source.find('{', open + 1 + parameters.size());
     source.insert(source.find('\n', brace) + 1, declarations);
+    return true;
+}
+
+bool SpillArrays(std::string& source, const std::string& entry_point, u32 table_slot) {
+    const std::string needle = " " + entry_point + "(";
+    const size_t at = source.find(needle);
+    if (at == std::string::npos) {
+        return false;
+    }
+    const size_t open = at + needle.size() - 1;
+    const size_t close = MatchingBracket(source, open);
+    if (close == std::string::npos || source.find('{', close) == std::string::npos) {
+        return false;
+    }
+    std::string parameters;
+    std::string declarations;
+    std::string members;
+    for (const std::string_view text :
+         SplitParameters(std::string_view(source).substr(open + 1, close - open - 1))) {
+        const auto parameter = ParseParameter(text);
+        if (!parameter) {
+            return false;
+        }
+        const bool texture = parameter->attribute.starts_with("texture(");
+        const bool sampler = parameter->attribute.starts_with("sampler(");
+        if (texture || sampler) {
+            const u32 index = static_cast<u32>(
+                std::atoi(parameter->attribute.c_str() + (texture ? 8 : 8)));
+            if (index >= ArraySpillBase) {
+                if (!parameter->type.starts_with("array<")) {
+                    return false;
+                }
+                // In the table (Metal 3: the resource IDs written by the CPU), and a reference
+                // to it under the parameter's name.
+                members += "    " + parameter->type + " " + parameter->name + " [[id(" +
+                           std::to_string(index - ArraySpillBase) + ")]];\n";
+                declarations += "    constant " + parameter->type + "& " + parameter->name +
+                                " = spvArrayTable." + parameter->name + ";\n";
+                continue;
+            }
+        }
+        parameters += (parameters.empty() ? "" : ", ") + std::string(text);
+    }
+    if (members.empty()) {
+        return false;
+    }
+    parameters += (parameters.empty() ? "" : ", ") +
+                  std::string("constant spvArraySpill& spvArrayTable [[buffer(") +
+                  std::to_string(table_slot) + ")]]";
+    source.replace(open + 1, close - open - 1, parameters);
+    const size_t brace = source.find('{', open + 1 + parameters.size());
+    source.insert(source.find('\n', brace) + 1, declarations);
+    constexpr std::string_view using_line = "using namespace metal;\n";
+    const size_t using_at = source.find(using_line);
+    const size_t insert_at =
+        using_at != std::string::npos ? using_at + using_line.size() : source.rfind('\n', at) + 1;
+    source.insert(insert_at, "\nstruct spvArraySpill\n{\n" + members + "};\n\n");
     return true;
 }
 
