@@ -474,7 +474,13 @@ TEST_CASE("Maxwell F2I byte destinations saturate and extend", "[shader][maxwell
 
 TEST_CASE("Maxwell saturating conversions emit with native and lowered float64",
           "[shader][maxwell][numeric_backend]") {
-    for (u32 backend = 0; backend < 3; ++backend) {
+#ifdef HAS_OPENGL
+    constexpr u32 backend_count = 3;
+#else
+    // The GLSL and GLASM backends are only built with OpenGL (HAS_OPENGL).
+    constexpr u32 backend_count = 1;
+#endif
+    for (u32 backend = 0; backend < backend_count; ++backend) {
         for (bool float64 : {false, true}) {
             for (const auto& [destination, format] : std::array{
                      std::pair{0U, 1U}, std::pair{0U, 2U}, std::pair{0U, 3U}, std::pair{2U, 2U}}) {
@@ -522,12 +528,14 @@ TEST_CASE("Maxwell saturating conversions emit with native and lowered float64",
                     profile.support_int64 = true;
                     if (backend == 0) {
                         REQUIRE_FALSE(Shader::Backend::SPIRV::EmitSPIRV(profile, program).empty());
+#ifdef HAS_OPENGL
                     } else if (backend == 1) {
                         REQUIRE_FALSE(Shader::Backend::GLSL::EmitGLSL(profile, program).empty());
                     } else {
                         Shader::RuntimeInfo runtime{};
                         runtime.glasm_use_storage_buffers = true;
                         REQUIRE_FALSE(Shader::Backend::GLASM::EmitGLASM(profile, runtime, program).empty());
+#endif
                     }
                 }
             }
