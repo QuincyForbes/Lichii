@@ -16,6 +16,7 @@
 #include "core/core.h"
 #include "yuzu/configuration/configure_frame_generation.h"
 #include "yuzu/configuration/shared_widget.h"
+#include "qt_common/config/catalog_text.h"
 
 namespace {
 
@@ -32,7 +33,7 @@ ConfigureFrameGeneration::ConfigureFrameGeneration(
     const Core::System& system_, std::shared_ptr<std::vector<ConfigurationShared::Tab*>> group_,
     const ConfigurationShared::Builder& builder, QWidget* parent)
     : Tab(group_, parent), system{system_} {
-    setAccessibleName(tr("Frame Generation"));
+    setAccessibleName(UiText::SettingLabel("frame_gen"));
 
     auto* outer = new QVBoxLayout(this);
     outer->setContentsMargins(0, 0, 0, 0);
@@ -45,7 +46,7 @@ ConfigureFrameGeneration::ConfigureFrameGeneration(
     auto* layout = new QVBoxLayout(content);
     scroll->setWidget(content);
 
-    auto* box = new QGroupBox(tr("Frame Generation"), content);
+    auto* box = new QGroupBox(UiText::SettingLabel("frame_gen"), content);
     auto* box_layout = new QVBoxLayout(box);
     auto* description = new QLabel(
         tr("Inserts generated frames between the frames a game renders, for smoother motion at "

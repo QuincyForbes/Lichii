@@ -58,11 +58,6 @@ fs::path TitleDir(u64 title_id) {
            fmt::format("{:016x}", title_id);
 }
 
-/// True when `text` ends with `suffix`.
-bool EndsWith(std::string_view text, std::string_view suffix) {
-    return text.size() >= suffix.size() && text.substr(text.size() - suffix.size()) == suffix;
-}
-
 struct ArchiveFile {
     std::string path; ///< Inside the RomFS, '/' separated (the archive identity)
     FileSys::VirtualFile file;

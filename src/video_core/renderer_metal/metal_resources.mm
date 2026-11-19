@@ -324,9 +324,11 @@ bool SupportsSparseTextures(const Device& device) {
     if (device.AppleFamily() < 6) {
         return false;
     }
+#if LICHII_METAL_SAMPLER_BIAS // an older SDK can't check the texture's tier
     if (@available(macOS 26.0, iOS 26.0, *)) {
         return true;
     }
+#endif
     return false;
 }
 
@@ -357,11 +359,13 @@ std::optional<SparseTexture> CreateSparseTexture(const Device& device, const Tex
     if (texture == nil) {
         return std::nullopt;
     }
+#if LICHII_METAL_SAMPLER_BIAS // sparseTextureTier came with the same 26 SDKs
     if (@available(macOS 26.0, iOS 26.0, *)) {
         if (texture.sparseTextureTier != MTLTextureSparseTier2) {
             return std::nullopt;
         }
     }
+#endif
     const u32 levels = desc.levels;
     const u32 tail_level = static_cast<u32>((std::min)(static_cast<u32>(texture.firstMipmapInTail),
                                                        levels));

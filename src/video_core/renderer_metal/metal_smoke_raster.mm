@@ -571,6 +571,7 @@ int RunRestartOff(const Context& context) {
 /// 0.5 over a target whose stored depth is 0.5 is drawn with bounds around it and not with bounds
 /// above it. Skipped on GPUs without the test.
 int RunDepthBounds(const Context& context) {
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
     if (@available(macOS 26.0, iOS 26.0, *)) {
         if (![context.device supportsFamily:MTLGPUFamilyApple10]) {
             std::printf("metal-smoke: depth bounds: SKIP (the GPU is not an Apple10 family one; "
@@ -639,7 +640,10 @@ int RunDepthBounds(const Context& context) {
                     ok ? "PASS" : "FAIL");
         return ok ? 0 : 1;
     }
-    std::printf("metal-smoke: depth bounds: SKIP (the OS is older than 26)\n");
+#else
+    (void)context;
+#endif
+    std::printf("metal-smoke: depth bounds: SKIP (the OS or SDK is older than 26)\n");
     return 0;
 }
 

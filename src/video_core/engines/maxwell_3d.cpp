@@ -2398,7 +2398,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         same_before = Profile::CounterValue(Profile::Counter::SameValueWrites);
         ring_before = split.WritePosition();
     }
-    const u32 macro_index = (method - MacroRegistersStart) >> 1;
+    [[maybe_unused]] const u32 macro_index = (method - MacroRegistersStart) >> 1;
     bool forwarded_call = false;
 #ifdef ARCHITECTURE_x86_64
     // Nx2Perf dma_forward: a macro that did an MME DMA read before is dry-run first. When its

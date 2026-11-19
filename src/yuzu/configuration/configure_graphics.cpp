@@ -1050,7 +1050,6 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     const bool metalfx = vulkan || metal;
     const bool metalfx_frame_gen = vulkan || metal;
 #else
-    constexpr bool metalfx_frame_gen = false;
     constexpr bool metalfx = false;
     constexpr bool metalfx_frame_gen = false;
 #endif

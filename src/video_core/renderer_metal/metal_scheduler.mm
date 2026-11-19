@@ -913,9 +913,13 @@ bool ClearFitsTargets(const ClearPass& clear, const RenderTargetSet& targets) {
 
 struct Scheduler::Impl {
     explicit Impl(const Device& device_) : device{device_}, queue{device_.GetQueue()} {
+        // MTLGPUFamilyApple10 and setDepthTestMinBound:maxBound: came with the macOS / iOS 26
+        // SDKs; an older SDK builds without the depth bounds test.
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
         if (@available(macOS 26.0, iOS 26.0, *)) {
             depth_bounds = [device_.GetDevice() supportsFamily:MTLGPUFamilyApple10];
         }
+#endif
         NSError* error = nil;
         library = [device.GetDevice() newLibraryWithSource:@(BlitSource) options:nil error:&error];
         if (library == nil) {
@@ -3809,10 +3813,12 @@ void Scheduler::SetDrawState(const DrawState& state) {
     }
     if (impl->depth_bounds && changed(last.depth_bounds_min != state.depth_bounds_min ||
                                       last.depth_bounds_max != state.depth_bounds_max)) {
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
         if (@available(macOS 26.0, iOS 26.0, *)) {
             // A public Metal 4-era call, but the GPU must have the test: its family is checked.
             [encoder setDepthTestMinBound:state.depth_bounds_min maxBound:state.depth_bounds_max];
         }
+#endif
     }
     if (changed(last.stencil_front_ref != state.stencil_front_ref ||
                 last.stencil_back_ref != state.stencil_back_ref)) {

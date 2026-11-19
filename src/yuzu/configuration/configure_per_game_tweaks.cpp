@@ -18,6 +18,7 @@
 #include "yuzu/configuration/configure_per_game_tweaks.h"
 #include "yuzu/configuration/shared_widget.h"
 #include "yuzu/recommended_settings_dialog.h"
+#include "qt_common/config/catalog_text.h"
 
 ConfigurePerGameTweaks::ConfigurePerGameTweaks(u64 title_id, const Core::System& system_,
                                                const ConfigurationShared::Builder& builder,
@@ -38,7 +39,7 @@ ConfigurePerGameTweaks::ConfigurePerGameTweaks(u64 title_id, const Core::System&
     scroll->setWidget(content);
 
     if (const auto* preset = Settings::FindGamePreset(title_id)) {
-        auto* box = new QGroupBox(tr("Recommended Settings"), content);
+        auto* box = new QGroupBox(UiText::Text("page.recommended"), content);
         auto* box_layout = new QVBoxLayout(box);
         box_layout->setSpacing(8);
 
