@@ -6,8 +6,9 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstring>
 #include <limits>
-#include <vector>
+#include <utility>
 
 #include "common/assert.h"
 #include "common/fs/file.h"
@@ -38,6 +39,9 @@ namespace fs = std::filesystem;
 namespace {
 
 #ifdef _WIN32
+
+constexpr std::intptr_t kPreadUninitialized = 0;
+constexpr std::intptr_t kPreadUnavailable = -1;
 
 /**
  * Converts the file access mode and file type enums to a file access mode wide string.
@@ -221,29 +225,29 @@ IOFile::~IOFile() {
     Close();
 }
 
-IOFile::IOFile(IOFile&& other) noexcept {
-    std::swap(file_path, other.file_path);
-    std::swap(file_access_mode, other.file_access_mode);
-    std::swap(file_type, other.file_type);
-    std::swap(file, other.file);
+IOFile::IOFile(IOFile&& other) noexcept
+    : file_path{std::move(other.file_path)},
+      file_access_mode{std::exchange(other.file_access_mode, {})},
+      file_type{std::exchange(other.file_type, {})},
+      file{std::exchange(other.file, nullptr)} {
 #ifdef _WIN32
-    const auto a = pread_handle.load(std::memory_order_relaxed);
-    const auto b = other.pread_handle.load(std::memory_order_relaxed);
-    pread_handle.store(b, std::memory_order_relaxed);
-    other.pread_handle.store(a, std::memory_order_relaxed);
+    pread_handle.store(other.pread_handle.exchange(kPreadUninitialized, std::memory_order_acq_rel),
+                       std::memory_order_release);
 #endif
 }
 
 IOFile& IOFile::operator=(IOFile&& other) noexcept {
-    std::swap(file_path, other.file_path);
-    std::swap(file_access_mode, other.file_access_mode);
-    std::swap(file_type, other.file_type);
-    std::swap(file, other.file);
+    if (this == &other) {
+        return *this;
+    }
+    Close();
+    file_path = std::move(other.file_path);
+    file_access_mode = std::exchange(other.file_access_mode, {});
+    file_type = std::exchange(other.file_type, {});
+    file = std::exchange(other.file, nullptr);
 #ifdef _WIN32
-    const auto a = pread_handle.load(std::memory_order_relaxed);
-    const auto b = other.pread_handle.load(std::memory_order_relaxed);
-    pread_handle.store(b, std::memory_order_relaxed);
-    other.pread_handle.store(a, std::memory_order_relaxed);
+    pread_handle.store(other.pread_handle.exchange(kPreadUninitialized, std::memory_order_acq_rel),
+                       std::memory_order_release);
 #endif
     return *this;
 }
@@ -275,14 +279,16 @@ void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, File
     } else {
         _wfopen_s(&file, path.c_str(), AccessModeToWStr(mode, type));
     }
-#elif __ANDROID__
+#elif defined(__ANDROID__)
     if (Android::IsContentUri(path)) {
         ASSERT_MSG(mode == FileAccessMode::Read, "Content URI file access is for read-only!");
         const auto fd = Android::OpenContentUri(path, Android::OpenMode::Read);
         if (fd != -1) {
             file = fdopen(fd, "r");
-            const auto error_num = errno;
-            if (error_num != 0 && file == nullptr) {
+            if (file == nullptr) {
+                const auto error_num = errno;
+                close(fd);
+                errno = error_num;
                 LOG_ERROR(Common_Filesystem, "Error opening file: {}, error: {}", path.c_str(),
                           strerror(error_num));
             }
@@ -303,12 +309,19 @@ void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, File
     }
 }
 
-void IOFile::Close() {
 #ifdef _WIN32
-    const std::intptr_t handle = pread_handle.exchange(0, std::memory_order_acq_rel);
-    if (handle != 0 && handle != -1) {
+void IOFile::ClosePreadHandle() noexcept {
+    const std::intptr_t handle =
+        pread_handle.exchange(kPreadUninitialized, std::memory_order_acq_rel);
+    if (handle != kPreadUninitialized && handle != kPreadUnavailable) {
         CloseHandle(reinterpret_cast<HANDLE>(handle));
     }
+}
+#endif
+
+void IOFile::Close() {
+#ifdef _WIN32
+    ClosePreadHandle();
 #endif
     if (!IsOpen()) {
         return;
@@ -337,14 +350,14 @@ size_t IOFile::ReadBytesAt(std::span<u8> data, u64 offset) const {
     }
 #ifdef _WIN32
     std::intptr_t raw_handle = pread_handle.load(std::memory_order_acquire);
-    if (raw_handle == 0) {
+    if (raw_handle == kPreadUninitialized) {
         if (file_access_mode == FileAccessMode::Read && file_type == FileType::BinaryFile) {
             const HANDLE opened = CreateFileW(
                 file_path.c_str(), GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
             if (opened != INVALID_HANDLE_VALUE && opened != nullptr) {
-                std::intptr_t expected = 0;
+                std::intptr_t expected = kPreadUninitialized;
                 const auto desired = reinterpret_cast<std::intptr_t>(opened);
                 if (pread_handle.compare_exchange_strong(expected, desired,
                                                          std::memory_order_acq_rel)) {
@@ -354,19 +367,20 @@ size_t IOFile::ReadBytesAt(std::span<u8> data, u64 offset) const {
                     raw_handle = expected;
                 }
             } else {
-                std::intptr_t expected = 0;
-                if (pread_handle.compare_exchange_strong(expected, -1, std::memory_order_acq_rel)) {
-                    raw_handle = -1;
+                std::intptr_t expected = kPreadUninitialized;
+                if (pread_handle.compare_exchange_strong(expected, kPreadUnavailable,
+                                                         std::memory_order_acq_rel)) {
+                    raw_handle = kPreadUnavailable;
                 } else {
                     raw_handle = expected;
                 }
             }
         } else {
-            raw_handle = -1;
-            pread_handle.store(-1, std::memory_order_release);
+            raw_handle = kPreadUnavailable;
+            pread_handle.store(kPreadUnavailable, std::memory_order_release);
         }
     }
-    if (raw_handle != -1 && raw_handle != 0) {
+    if (raw_handle != kPreadUnavailable && raw_handle != kPreadUninitialized) {
         struct OverlappedEvent {
             HANDLE handle{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
             ~OverlappedEvent() {
@@ -397,7 +411,12 @@ size_t IOFile::ReadBytesAt(std::span<u8> data, u64 offset) const {
                     const DWORD err = GetLastError();
                     if (err == ERROR_IO_PENDING) {
                         ok = GetOverlappedResult(handle, &ov, &bytes_read, TRUE);
-                        if (!ok && GetLastError() == ERROR_HANDLE_EOF) {
+                        if (!ok) {
+                            const DWORD wait_err = GetLastError();
+                            if (wait_err != ERROR_HANDLE_EOF) {
+                                CancelIoEx(handle, &ov);
+                                GetOverlappedResult(handle, &ov, &bytes_read, TRUE);
+                            }
                             break;
                         }
                     } else if (err == ERROR_HANDLE_EOF) {
@@ -416,11 +435,21 @@ size_t IOFile::ReadBytesAt(std::span<u8> data, u64 offset) const {
         }
     }
     std::scoped_lock lk{io_mutex};
-    if (offset > static_cast<u64>((std::numeric_limits<s64>::max)()) ||
-        !Seek(static_cast<s64>(offset))) {
+    if (offset > static_cast<u64>((std::numeric_limits<s64>::max)())) {
         return 0;
     }
-    return ReadSpan(data);
+    const s64 saved_pos = ftello(file);
+    if (!Seek(static_cast<s64>(offset))) {
+        if (saved_pos >= 0) {
+            fseeko(file, saved_pos, SEEK_SET);
+        }
+        return 0;
+    }
+    const size_t bytes_read = ReadSpan(data);
+    if (saved_pos >= 0) {
+        fseeko(file, saved_pos, SEEK_SET);
+    }
+    return bytes_read;
 #else
     const int fd = fileno(file);
     if (fd < 0) {
@@ -447,12 +476,10 @@ size_t IOFile::ReadBytesAt(std::span<u8> data, u64 offset) const {
 }
 
 std::string IOFile::ReadString(size_t length) const {
-    std::vector<char> string_buffer(length);
-
-    const auto chars_read = ReadSpan<char>(string_buffer);
-    const auto string_size = chars_read != length ? chars_read : length;
-
-    return std::string{string_buffer.data(), string_size};
+    std::string out(length, '\0');
+    const size_t chars_read = ReadSpan<char>(out);
+    out.resize(chars_read);
+    return out;
 }
 
 size_t IOFile::WriteString(std::span<const char> string) const {
@@ -466,11 +493,7 @@ bool IOFile::Flush() const {
 
     errno = 0;
 
-#ifdef _WIN32
     const auto flush_result = std::fflush(file) == 0;
-#else
-    const auto flush_result = std::fflush(file) == 0;
-#endif
 
     if (!flush_result) {
         const auto ec = std::error_code{errno, std::generic_category()};

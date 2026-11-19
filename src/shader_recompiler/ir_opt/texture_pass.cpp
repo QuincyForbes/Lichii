@@ -410,23 +410,46 @@ static inline bool IsTexturePixelFormatIntegerCached(Environment& env,
 }
 
 
-std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block);
+struct InstContextKey {
+    const IR::Inst* inst;
+    const IR::Block* conditional_header;
+    constexpr bool operator==(const InstContextKey&) const noexcept = default;
+};
+
+struct InstContextKeyHash {
+    size_t operator()(const InstContextKey& k) const noexcept {
+        const size_t h1{std::hash<const IR::Inst*>{}(k.inst)};
+        const size_t h2{std::hash<const IR::Block*>{}(k.conditional_header)};
+        return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+    }
+};
+
+using TrackCacheMap =
+    ::Common::unordered_map<InstContextKey, std::optional<ConstBufferAddr>, InstContextKeyHash>;
+
+std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env,
+                                     const HostTranslateInfo& host_info, const IR::Block* block,
+                                     TrackCacheMap& track_cache);
 static inline std::optional<ConstBufferAddr> TrackCached(const IR::Value& v, Environment& env,
                                                          const HostTranslateInfo& host_info,
-                                                         const IR::Block* block) {
+                                                         const IR::Block* block,
+                                                         TrackCacheMap& track_cache) {
     if (const IR::Inst* inst = v.TryInstRecursive()) {
-        const Environment::TrackCacheKey key{inst, ConditionalHeader(block)};
-        if (auto it = env.track_cache.find(key); it != env.track_cache.end()) {
+        const InstContextKey key{inst, ConditionalHeader(block)};
+        if (auto it = track_cache.find(key); it != track_cache.end()) {
             return it->second;
         }
-        auto found = Track(v, env, host_info, block);
-        env.track_cache.emplace(key, found);
+        auto found = Track(v, env, host_info, block, track_cache);
+        track_cache.emplace(key, found);
         return found;
     }
-    return Track(v, env, host_info, block);
+    return Track(v, env, host_info, block, track_cache);
 }
 
-std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block);
+std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environment& env,
+                                                 const HostTranslateInfo& host_info,
+                                                 const IR::Block* block,
+                                                 TrackCacheMap& track_cache);
 
 bool IsMemoryLoad(IR::Opcode opcode) {
     switch (opcode) {
@@ -452,7 +475,9 @@ bool IsFloatValue(const IR::Inst& inst) {
     return (inst.Type() & floats) != IR::Type::Void;
 }
 
-std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block) {
+std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env,
+                                     const HostTranslateInfo& host_info, const IR::Block* block,
+                                     TrackCacheMap& track_cache) {
     // A value loaded from memory is not a constant buffer word, whatever its address is built
     // from: the search does not look into a load's operands (a handle read from a storage
     // buffer would otherwise be taken from the buffer's address in the constant buffer).
@@ -467,7 +492,8 @@ std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, c
     while (!queue.empty()) {
         const IR::Inst* const inst{queue.front()};
         queue.pop();
-        if (const std::optional result = TryGetConstBuffer(inst, env, host_info, block)) {
+        if (const std::optional result =
+                TryGetConstBuffer(inst, env, host_info, block, track_cache)) {
             return result;
         }
         if (IsMemoryLoad(inst->GetOpcode())) {
@@ -1033,13 +1059,16 @@ std::optional<u32> TryGetConstant(IR::Value& value, Environment& env) {
     return ReadCbufCached(env, index_number, offset_number);
 }
 
-std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block) {
+std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environment& env,
+                                                 const HostTranslateInfo& host_info,
+                                                 const IR::Block* block,
+                                                 TrackCacheMap& track_cache) {
     switch (inst->GetOpcode()) {
     default:
         return std::nullopt;
     case IR::Opcode::BitwiseOr32: {
-        std::optional lhs{TrackCached(inst->Arg(0), env, host_info, block)};
-        std::optional rhs{TrackCached(inst->Arg(1), env, host_info, block)};
+        std::optional lhs{TrackCached(inst->Arg(0), env, host_info, block, track_cache)};
+        std::optional rhs{TrackCached(inst->Arg(1), env, host_info, block, track_cache)};
         if (!lhs || !rhs) {
             return std::nullopt;
         }
@@ -1071,7 +1100,7 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
         if (!shift.IsImmediate()) {
             return std::nullopt;
         }
-        std::optional lhs{TrackCached(inst->Arg(0), env, host_info, block)};
+        std::optional lhs{TrackCached(inst->Arg(0), env, host_info, block, track_cache)};
         if (lhs) {
             lhs->shift_left = shift.U32();
         }
@@ -1099,7 +1128,7 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
                 return std::nullopt;
             } while (false);
         }
-        std::optional lhs{TrackCached(op1, env, host_info, block)};
+        std::optional lhs{TrackCached(op1, env, host_info, block, track_cache)};
         if (lhs) {
             lhs->shift_left = static_cast<u32>(std::countr_zero(op2.U32()));
         }
@@ -1174,24 +1203,12 @@ struct BuiltHandleProgram {
     int budget{};
 };
 
-struct HandleMemoKey {
-    const IR::Inst* inst;
-    const IR::Block* conditional_header;
-    bool allow_table;
-    constexpr bool operator==(const HandleMemoKey&) const noexcept = default;
+struct HandleMemoEntry {
+    std::optional<BuiltHandleProgram> direct;
+    std::optional<BuiltHandleProgram> table;
 };
 
-struct HandleMemoKeyHash {
-    size_t operator()(const HandleMemoKey& k) const noexcept {
-        const size_t h1{std::hash<const IR::Inst*>{}(k.inst)};
-        const size_t h2{std::hash<const IR::Block*>{}(k.conditional_header)};
-        return (h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2))) ^
-               (k.allow_table ? 1ULL : 0ULL);
-    }
-};
-
-using HandleMemoMap =
-    ::Common::unordered_map<HandleMemoKey, BuiltHandleProgram, HandleMemoKeyHash>;
+using HandleMemoMap = ::Common::unordered_map<InstContextKey, HandleMemoEntry, InstContextKeyHash>;
 
 BuiltHandleProgram BuildOrMemoizeHandleProgram(const IR::Value& handle_val, const IR::Block* block,
                                                bool allow_table, HandleMemoMap& memo) {
@@ -1239,28 +1256,26 @@ BuiltHandleProgram BuildOrMemoizeHandleProgram(const IR::Value& handle_val, cons
         }
         return res;
     }
-    const IR::Block* const cond_header{ConditionalHeader(block)};
-    const HandleMemoKey direct_key{handle_inst, cond_header, false};
-    auto direct_it{memo.find(direct_key)};
-    if (direct_it == memo.end()) {
-        direct_it = memo.emplace(direct_key, build_once(false)).first;
+    HandleMemoEntry& entry{memo[InstContextKey{handle_inst, ConditionalHeader(block)}]};
+    if (!entry.direct) {
+        entry.direct.emplace(build_once(false));
     }
-    if (direct_it->second.built || !allow_table) {
-        return direct_it->second;
+    if (entry.direct->built || !allow_table) {
+        return *entry.direct;
     }
-    const HandleMemoKey table_key{handle_inst, cond_header, true};
-    auto table_it{memo.find(table_key)};
-    if (table_it == memo.end()) {
-        table_it = memo.emplace(table_key, build_once(true)).first;
+    if (!entry.table) {
+        entry.table.emplace(build_once(true));
     }
-    return table_it->second;
+    return *entry.table;
 }
 
 TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst,
-                     const HostTranslateInfo& host_info, HandleMemoMap& handle_memo) {
+                     const HostTranslateInfo& host_info, TrackCacheMap& track_cache,
+                     HandleMemoMap& handle_memo) {
     ConstBufferAddr addr;
     if (IsBindless(inst)) {
-        const std::optional<ConstBufferAddr> track_addr{TrackCached(inst.Arg(0), env, host_info, block)};
+        const std::optional<ConstBufferAddr> track_addr{
+            TrackCached(inst.Arg(0), env, host_info, block, track_cache)};
 
         if (track_addr) {
             addr = *track_addr;
@@ -1285,8 +1300,8 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst,
                 // Not computable for a whole draw (a handle that changes in a loop): keep the
                 // earlier search through loads, which at least gives the shader a texture.
                 const std::optional<ConstBufferAddr> legacy{IR::BreadthFirstSearch(inst.Arg(0),
-                    [&env, &host_info, block](const IR::Inst* candidate) {
-                        return TryGetConstBuffer(candidate, env, host_info, block);
+                    [&env, &host_info, block, &track_cache](const IR::Inst* candidate) {
+                        return TryGetConstBuffer(candidate, env, host_info, block, track_cache);
                     }, [&](IR::Value operand) { return ResolveConditionalPhi(operand, block); })};
                 if (!legacy) {
                     throw NotImplementedException("Failed to track bindless texture constant buffer (stopped at {}, budget {})",
@@ -1556,7 +1571,6 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     // reset per-pass caches
     env.cbuf_word_cache.clear();
     env.handle_cache.clear();
-    env.track_cache.clear();
     TextureInstVector to_replace;
     g_handle_programs = &program.info.handle_programs;
     g_program = &program;
@@ -1566,13 +1580,18 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         g_program = nullptr;
         g_dominance.reset();
     };
-    HandleMemoMap handle_memo;
-    for (IR::Block* const block : program.post_order_blocks) {
-        for (IR::Inst& inst : block->Instructions()) {
-            if (!IsTextureInstruction(inst)) {
-                continue;
+    {
+        // Scoped to the read-only discovery phase so no IR::Inst* or IR::Block* key outlives
+        // instruction mutations below or the pass itself.
+        TrackCacheMap track_cache;
+        HandleMemoMap handle_memo;
+        for (IR::Block* const block : program.post_order_blocks) {
+            for (IR::Inst& inst : block->Instructions()) {
+                if (!IsTextureInstruction(inst)) {
+                    continue;
+                }
+                to_replace.push_back(MakeInst(env, block, inst, host_info, track_cache, handle_memo));
             }
-            to_replace.push_back(MakeInst(env, block, inst, host_info, handle_memo));
         }
     }
     if (g_handle_table_arrays != 0) {

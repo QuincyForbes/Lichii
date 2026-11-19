@@ -363,7 +363,7 @@ public:
     }
 
     /// Retains `object` at most once per chunk, avoiding per-bind atomic ARC retain/release bounces.
-    void* Keep(id object) {
+    void* Keep(__unsafe_unretained id object) {
         if (object == nil) {
             return nullptr;
         }

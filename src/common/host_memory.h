@@ -231,7 +231,8 @@ public:
     }
 
     bool IsInVirtualRange(void* address) const noexcept {
-        return address >= virtual_base && address < virtual_base + virtual_size;
+        return virtual_base != nullptr && address >= virtual_base &&
+               static_cast<size_t>(static_cast<const u8*>(address) - virtual_base) < virtual_size;
     }
 
 private:
@@ -240,6 +241,16 @@ private:
     size_t ClipToVirtualSize(size_t virtual_offset, size_t length) const noexcept {
         return virtual_offset >= virtual_size ? 0 : (std::min)(length, virtual_size - virtual_offset);
     }
+
+    /// The part of [physical_offset, physical_offset + length) inside the backing starts at
+    /// physical_offset; returns its length.
+    size_t ClipToBackingSize(size_t physical_offset, size_t length) const noexcept {
+        return physical_offset >= backing_size ? 0
+                                               : (std::min)(length, backing_size - physical_offset);
+    }
+
+    template <typename Pred, typename Body>
+    void ForEachGranuleRun(size_t begin, size_t end, Pred&& match, Body&& body) const;
 
 #ifdef __APPLE__
     /// Zeroes [offset, offset + length) of the backing without giving its pages RAM. False when
@@ -260,6 +271,7 @@ private:
     size_t virtual_base_offset{};
 
     static constexpr size_t GranuleShift = 16; ///< 64 KiB of backing per state byte
+    static constexpr size_t GranuleSize = size_t{1} << GranuleShift;
     static constexpr u8 GranuleUsed = 1 << 0;   ///< Handed out at least once
     static constexpr u8 GranuleDirty = 1 << 1;  ///< May hold non-zero data
     static constexpr u8 GranuleReleased = 1 << 2; ///< Apple: given back with MADV_FREE_REUSABLE

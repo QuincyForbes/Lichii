@@ -6,6 +6,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/common_types.h"
@@ -21,6 +22,77 @@ enum class GpuVendor { Unknown, Nvidia, Amd, Intel, Apple, Qualcomm, Other };
 // Apple phones and tablets, by memory first: Switch 2 games get a 12 GB memory layout, and iOS
 // gives an app about 55-70 % of the device's memory.
 enum class Tier { Unsupported, Low, Mid, High, Ultra, Desktop };
+
+// Khronos Vulkan VkDriverId ABI constants (kept here so common does not depend on vulkan_core.h).
+inline constexpr u32 VkDriverAmdProprietary = 1;
+inline constexpr u32 VkDriverAmdOpenSource = 2;
+inline constexpr u32 VkDriverMesaRadv = 3;
+inline constexpr u32 VkDriverNvidiaProprietary = 4;
+inline constexpr u32 VkDriverIntelProprietaryWindows = 5;
+inline constexpr u32 VkDriverIntelOpenSourceMesa = 6;
+inline constexpr u32 VkDriverQualcommProprietary = 8;
+inline constexpr u32 VkDriverMoltenVk = 14;
+inline constexpr u32 VkDriverMesaTurnip = 18;
+
+/// Maps a Vulkan VkDriverId value to GpuVendor.
+[[nodiscard]] constexpr GpuVendor VendorFromVulkanDriver(u32 driver_id) noexcept {
+    switch (driver_id) {
+    case VkDriverNvidiaProprietary:
+        return GpuVendor::Nvidia;
+    case VkDriverAmdProprietary:
+    case VkDriverAmdOpenSource:
+    case VkDriverMesaRadv:
+        return GpuVendor::Amd;
+    case VkDriverIntelProprietaryWindows:
+    case VkDriverIntelOpenSourceMesa:
+        return GpuVendor::Intel;
+    case VkDriverMoltenVk:
+        return GpuVendor::Apple;
+    case VkDriverQualcommProprietary:
+    case VkDriverMesaTurnip:
+        return GpuVendor::Qualcomm;
+    default:
+        return driver_id == 0 ? GpuVendor::Unknown : GpuVendor::Other;
+    }
+}
+
+/// Whether a Vulkan extension indicates RTX ray-tracing / tensor-core hardware on workstation
+/// parts whose marketing name omits "RTX".
+[[nodiscard]] constexpr bool IsNvidiaRtxExtension(std::string_view extension_name) noexcept {
+    return extension_name == "VK_KHR_ray_tracing_pipeline" ||
+           extension_name == "VK_KHR_cooperative_matrix";
+}
+
+/// Tensor cores came with RTX; GTX 16 cards are Turing without them. Ray tracing pipelines and
+/// cooperative matrices cover RTX / workstation parts whose name lacks "RTX".
+[[nodiscard]] constexpr bool IsNvidiaDlssCapable(u32 driver_id, std::string_view device_name,
+                                                 bool has_rtx_extension = false) noexcept {
+    return driver_id == VkDriverNvidiaProprietary &&
+           (device_name.find("RTX") != std::string_view::npos || has_rtx_extension);
+}
+
+[[nodiscard]] inline bool IsNvidiaDlssCapable(u32 driver_id, std::string_view device_name,
+                                              std::span<const std::string> extensions) noexcept {
+    if (driver_id != VkDriverNvidiaProprietary) {
+        return false;
+    }
+    if (device_name.find("RTX") != std::string_view::npos) {
+        return true;
+    }
+    for (const auto& ext : extensions) {
+        if (IsNvidiaRtxExtension(ext)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Scores a GPU adapter so discrete GPUs outrank virtual/other adapters, which outrank integrated
+/// GPUs, breaking ties by device-local VRAM.
+[[nodiscard]] constexpr u64 ScoreGpuDevice(bool discrete, bool integrated, u64 vram_mib) noexcept {
+    const u64 tier = discrete ? 2ULL : (integrated ? 0ULL : 1ULL);
+    return (tier << 48) | (vram_mib & ((1ULL << 48) - 1ULL));
+}
 
 struct Device {
     Os os = Os::Other;

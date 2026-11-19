@@ -109,10 +109,17 @@ public:
             TryReleasePendingFences<false>();
         }
         auto [should_flush, committed_flushes] = CommitCacheFlushes();
-        if (Nx2Profile::Enabled()) [[unlikely]] {
-            NoteFenceDecision(delay_fence, committed_flushes);
-        }
-        if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
+        if (Nx2Profile::Enabled()) {
+            const FenceDecision decision = ClassifyFence(delay_fence, committed_flushes);
+            NoteFenceDecision(decision);
+            if (decision == FenceDecision::Skipped) {
+                ++skipped_fences;
+                Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
+                func();
+                rasterizer.InvalidateGPUCache();
+                return;
+            }
+        } else if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
             func();
             rasterizer.InvalidateGPUCache();
@@ -122,18 +129,12 @@ public:
         should_flush |= force_completion || query_cache.HasUncommittedFlushes();
         query_cache.CommitAsyncFlushes();
         const bool stubbed = !should_flush && committed_flushes == 0;
-        if (AsyncFences()) {
-            if (stubbed && FenceFold()) {
-                if (!delay_fence) {
-                    func();
-                }
-                FoldStubbedFence(delay_fence, func);
-                if (delay_fence) {
-                    SubmitDeferredWork();
-                }
-                rasterizer.InvalidateGPUCache();
-                return;
+        if (AsyncFences() && stubbed && FenceFold() && FoldStubbedFence(delay_fence, func)) {
+            if (delay_fence) {
+                SubmitDeferredWork();
             }
+            rasterizer.InvalidateGPUCache();
+            return;
         }
         TFence new_fence = CreateFence(!should_flush);
         if (AsyncFences()) {
@@ -478,7 +479,7 @@ private:
         return enabled;
     }
 
-    void FoldStubbedFence(bool delay_fence, std::function<void()>& func) {
+    bool FoldStubbedFence(bool delay_fence, std::function<void()>& func) {
         std::unique_lock lock{guard};
         if (!fences.empty()) {
             {
@@ -494,7 +495,11 @@ private:
             }
             ++pending_query_pops.back();
             work_epoch.fetch_add(1, std::memory_order_release);
-            return;
+            lock.unlock();
+            if (!delay_fence) {
+                func();
+            }
+            return true;
         }
         if (!fence_thread_busy && !inline_running && GpuSplit::OnBackThread()) {
             inline_running = true;
@@ -506,6 +511,9 @@ private:
                 operations = TakeUncommittedOperations();
             }
             lock.unlock();
+            if (!delay_fence) {
+                func();
+            }
             query_cache.PopAsyncFlushes();
             for (auto& operation : operations) {
                 operation();
@@ -526,27 +534,9 @@ private:
             if (queued) {
                 cv.notify_all();
             }
-            return;
+            return true;
         }
-        TFence new_fence = CreateFence(true);
-        {
-            std::scoped_lock ops_lock{uncommitted_guard};
-            if (delay_fence) {
-                uncommitted_operations.emplace_back(std::move(func));
-            }
-            pending_operations.emplace_back(TakeUncommittedOperations());
-        }
-        pending_flushes.push_back(0);
-        pending_query_pops.push_back(1);
-        QueueFence(new_fence);
-        fences.push(std::move(new_fence));
-        fences_in_flight.fetch_add(1, std::memory_order_relaxed);
-        work_epoch.fetch_add(1, std::memory_order_release);
-        const bool wake = !WakeOnlyWaiting() || fence_thread_waiting;
-        lock.unlock();
-        if (wake) {
-            cv.notify_all();
-        }
+        return false;
     }
 
     /// EDEN_NX2_FENCE_CUTS=0: every new fence wakes the fencing thread, waiting or not.
@@ -653,29 +643,43 @@ private:
     /// titles have no queries or queued operations either. Making, queueing and retiring them
     /// cost the GPU thread ~5% and woke the fencing thread for each. One in 64 is still made, so
     /// the operations fences carry along (query slot cleanup) keep running.
-    // With the GPU profile on: why fences are made rather than skipped, logged every 5 s.
-    // Called before SkipEmptyFence, which it mirrors without changing its state.
-    void NoteFenceDecision(bool delay_fence, size_t committed_flushes) {
-        static std::array<u64, 6> counts{};
-        static auto since = std::chrono::steady_clock::now();
-        size_t reason = 5; // would be skipped
+    enum class FenceDecision : size_t {
+        Delayed,
+        CommittedFlushes,
+        SkipCap,
+        QueryWork,
+        UncommittedOps,
+        Skipped,
+        Count,
+    };
+
+    FenceDecision ClassifyFence(bool delay_fence, size_t committed_flushes) {
         if (delay_fence) {
-            reason = 0;
-        } else if (committed_flushes != 0) {
-            reason = 1;
-        } else if constexpr (requires { query_cache.HasPendingFenceWork(); }) {
-            if (skipped_fences >= 64) {
-                reason = 2;
-            } else if (query_cache.HasPendingFenceWork()) {
-                reason = 3;
-            } else {
-                std::scoped_lock lock{uncommitted_guard};
-                reason = uncommitted_operations.empty() ? 5 : 4;
-            }
-        } else {
-            reason = 2;
+            return FenceDecision::Delayed;
         }
-        ++counts[reason];
+        if (committed_flushes != 0) {
+            return FenceDecision::CommittedFlushes;
+        }
+        if constexpr (requires { query_cache.HasPendingFenceWork(); }) {
+            if (skipped_fences >= 64) {
+                return FenceDecision::SkipCap;
+            }
+            if (query_cache.HasPendingFenceWork()) {
+                return FenceDecision::QueryWork;
+            }
+            std::scoped_lock lock{uncommitted_guard};
+            return uncommitted_operations.empty() ? FenceDecision::Skipped
+                                                  : FenceDecision::UncommittedOps;
+        } else {
+            return FenceDecision::SkipCap;
+        }
+    }
+
+    // With the GPU profile on: why fences are made rather than skipped, logged every 5 s.
+    void NoteFenceDecision(FenceDecision decision) {
+        static std::array<u64, static_cast<size_t>(FenceDecision::Count)> counts{};
+        static auto since = std::chrono::steady_clock::now();
+        ++counts[static_cast<size_t>(decision)];
         const auto now = std::chrono::steady_clock::now();
         const double window = std::chrono::duration<double>(now - since).count();
         if (window < 5.0) {
@@ -693,21 +697,11 @@ private:
     }
 
     bool SkipEmptyFence() {
-        if constexpr (requires { query_cache.HasPendingFenceWork(); }) {
-            if (skipped_fences >= 64 || query_cache.HasPendingFenceWork()) {
-                return false;
-            }
-            {
-                std::scoped_lock lock{uncommitted_guard};
-                if (!uncommitted_operations.empty()) {
-                    return false;
-                }
-            }
-            ++skipped_fences;
-            return true;
-        } else {
+        if (ClassifyFence(false, 0) != FenceDecision::Skipped) {
             return false;
         }
+        ++skipped_fences;
+        return true;
     }
 
     std::queue<TFence> fences;

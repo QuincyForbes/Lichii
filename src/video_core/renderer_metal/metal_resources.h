@@ -46,6 +46,8 @@ struct TextureDesc {
     bool render_target{};
     bool shader_write{};
     bool pixel_format_view{true};
+
+    bool operator==(const TextureDesc&) const noexcept = default;
 };
 
 /// MTLTextureSwizzleRed..Alpha: the identity.

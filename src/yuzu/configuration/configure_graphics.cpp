@@ -101,6 +101,39 @@ QString BuiltinPatchGames() {
     return JoinOrNone(names);
 }
 
+void SetComboItemAvailability(QComboBox* combobox, u32 value, bool visible, bool enabled,
+                              const QString& disabled_tooltip = {}) {
+    if (combobox == nullptr) {
+        return;
+    }
+    const int row = combobox->findData(value);
+    if (row < 0) {
+        return;
+    }
+    const bool is_current = combobox->currentIndex() == row;
+    const bool keep_visible = visible || is_current;
+    if (auto* const view = qobject_cast<QListView*>(combobox->view())) {
+        view->setRowHidden(row, !keep_visible);
+    }
+    if (auto* const model = qobject_cast<QStandardItemModel*>(combobox->model())) {
+        if (QStandardItem* const item = model->item(row)) {
+            item->setEnabled((visible && enabled) || is_current);
+            item->setToolTip(enabled ? QString() : disabled_tooltip);
+        }
+    }
+}
+
+template <typename E>
+void GateComboItem(QComboBox* combobox, E value, bool offered) {
+    SetComboItemAvailability(combobox, static_cast<u32>(value), offered, offered);
+}
+
+template <typename E>
+void EnableComboItem(QComboBox* combobox, E value, bool enabled,
+                     const QString& disabled_tooltip = {}) {
+    SetComboItemAvailability(combobox, static_cast<u32>(value), true, enabled, disabled_tooltip);
+}
+
 } // namespace
 
 ConfigureGraphics::ConfigureGraphics(
@@ -273,6 +306,17 @@ void ConfigureGraphics::UpdateDeviceSelection(int device) {
     if (GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan) {
         vulkan_device = device;
     }
+}
+
+void ConfigureGraphics::SelectVulkanDevice(int device) {
+    if (device < 0 || vulkan_device_combobox == nullptr ||
+        device >= vulkan_device_combobox->count()) {
+        return;
+    }
+    vulkan_device_combobox->setCurrentIndex(device);
+    UpdateDeviceSelection(device);
+    PopulateVSyncModeSelection(false);
+    UpdateFeatureAvailability();
 }
 
 ConfigureGraphics::~ConfigureGraphics() = default;
@@ -452,16 +496,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                                 records[cur].dlss_capable) {
                                 return;
                             }
-                            for (size_t i = 0; i < records.size(); ++i) {
-                                if (records[i].dlss_capable &&
-                                    static_cast<int>(i) < vulkan_device_combobox->count()) {
-                                    vulkan_device_combobox->setCurrentIndex(static_cast<int>(i));
-                                    UpdateDeviceSelection(static_cast<int>(i));
-                                    PopulateVSyncModeSelection(false);
-                                    UpdateFeatureAvailability();
-                                    break;
-                                }
-                            }
+                            SelectVulkanDevice(VkDeviceInfo::FindBestDevice(
+                                records, [](const auto& r) { return r.dlss_capable; }));
                         });
             }
         } else if (setting->Id() == Settings::values.nvidia_dlss_quality.Id()) {
@@ -580,35 +616,17 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                 const int cur = vulkan_device_combobox->currentIndex();
                 const auto* cur_rec =
                     cur >= 0 && size_t(cur) < records.size() ? &records[cur] : nullptr;
-                int switch_to = -1;
                 if (chosen == Settings::Upscaler::Dlss &&
                     (cur_rec == nullptr || !cur_rec->dlss_capable)) {
-                    for (size_t i = 0; i < records.size(); ++i) {
-                        if (records[i].dlss_capable) {
-                            switch_to = static_cast<int>(i);
-                            break;
-                        }
-                    }
+                    SelectVulkanDevice(VkDeviceInfo::FindBestDevice(
+                        records, [](const auto& r) { return r.dlss_capable; }));
                 } else if (chosen == Settings::Upscaler::Fsr4 &&
                            (cur_rec == nullptr || !cur_rec->fsr4_capable)) {
-                    for (size_t i = 0; i < records.size(); ++i) {
-                        if (records[i].fsr4_capable &&
-                            (switch_to < 0 || !records[i].integrated)) {
-                            switch_to = static_cast<int>(i);
-                            if (!records[i].integrated) {
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (switch_to >= 0 && switch_to < vulkan_device_combobox->count()) {
-                    vulkan_device_combobox->setCurrentIndex(switch_to);
-                    UpdateDeviceSelection(switch_to);
-                    PopulateVSyncModeSelection(false);
-                    UpdateFeatureAvailability();
+                    SelectVulkanDevice(VkDeviceInfo::FindBestDevice(
+                        records, [](const auto& r) { return r.fsr4_capable; }));
                 }
             });
-#if defined(EGLANTINE_STREAMLINE) || defined(_WIN32) || defined(__linux__)
+#if defined(EGLANTINE_STREAMLINE) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
             QWidget* group = new QWidget(this);
             QVBoxLayout* group_layout = new QVBoxLayout(group);
             group_layout->setContentsMargins(0, 0, 0, 0);
@@ -618,7 +636,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             nvidia_dlss_panel = new NvidiaDlssPanel(group);
             group_layout->addWidget(nvidia_dlss_panel);
 #endif
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
             amd_fsr4_panel = new AmdFsr4Panel(group);
             group_layout->addWidget(amd_fsr4_panel);
 #endif
@@ -788,12 +806,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         hold_graphics[Settings::values.frame_gen_type.Id()] = group;
 
         const auto show_row = [this, row] {
-            const auto& types = combobox_translations.at(
-                Settings::EnumMetadata<Settings::FrameGenType>::Index());
-            const int index = frame_gen_type_combobox->currentIndex();
-            row->setVisible(index >= 0 && size_t(index) < types.size() &&
-                            static_cast<Settings::FrameGenType>(types[index].first) ==
-                                Settings::FrameGenType::Lsfg);
+            row->setVisible(frame_gen_type_combobox->currentData().toUInt() ==
+                            static_cast<u32>(Settings::FrameGenType::Lsfg));
         };
         show_row();
         connect(frame_gen_type_combobox, qOverload<int>(&QComboBox::currentIndexChanged), row,
@@ -899,23 +913,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     discrete_gpu_hint_widget->setVisible(false);
     api_grid_layout->addWidget(discrete_gpu_hint_widget);
     connect(use_discrete_btn, &QPushButton::clicked, this, [this] {
-        if (vulkan_device_combobox == nullptr) {
-            return;
-        }
-        int best = -1;
-        u64 best_vram = 0;
-        for (size_t i = 0; i < records.size(); ++i) {
-            if (!records[i].integrated && (best < 0 || records[i].vram_mib > best_vram)) {
-                best = static_cast<int>(i);
-                best_vram = records[i].vram_mib;
-            }
-        }
-        if (best >= 0 && best < vulkan_device_combobox->count()) {
-            vulkan_device_combobox->setCurrentIndex(best);
-            UpdateDeviceSelection(best);
-            PopulateVSyncModeSelection(false);
-            UpdateFeatureAvailability();
-        }
+        SelectVulkanDevice(VkDeviceInfo::FindBestDiscreteDevice(records));
     });
 
     // Background color is too specific to build into the new system, so we manage it here
@@ -983,15 +981,6 @@ const QString ConfigureGraphics::TranslateVSyncMode(VkPresentModeKHR mode,
     default:
         return {};
     }
-}
-
-int ConfigureGraphics::FindIndex(u32 enumeration, int value) const {
-    for (u32 i = 0; enumeration < combobox_translations.size() &&
-                    i < combobox_translations.at(enumeration).size();
-         i++)
-        if (combobox_translations.at(enumeration)[i].first == u32(value))
-            return i;
-    return -1;
 }
 
 void ConfigureGraphics::ApplyConfiguration() {
@@ -1087,32 +1076,11 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     [[maybe_unused]] const VkDeviceInfo::Record* record =
         device >= 0 && size_t(device) < records.size() ? &records[device] : nullptr;
 
-    int best_discrete_index = -1;
-    u64 best_discrete_vram = 0;
-    int best_rtx_index = -1;
-    u64 best_rtx_vram = 0;
-    int best_fsr4_index = -1;
-    u64 best_fsr4_vram = 0;
-    for (size_t i = 0; i < records.size(); ++i) {
-        if (!records[i].integrated &&
-            (best_discrete_index < 0 || records[i].vram_mib > best_discrete_vram)) {
-            best_discrete_index = static_cast<int>(i);
-            best_discrete_vram = records[i].vram_mib;
-        }
-        if (records[i].dlss_capable &&
-            (best_rtx_index < 0 || records[i].vram_mib > best_rtx_vram)) {
-            best_rtx_index = static_cast<int>(i);
-            best_rtx_vram = records[i].vram_mib;
-        }
-        if (records[i].fsr4_capable &&
-            (best_fsr4_index < 0 ||
-             (!records[i].integrated && records[best_fsr4_index].integrated) ||
-             (records[i].integrated == records[best_fsr4_index].integrated &&
-              records[i].vram_mib > best_fsr4_vram))) {
-            best_fsr4_index = static_cast<int>(i);
-            best_fsr4_vram = records[i].vram_mib;
-        }
-    }
+    const int best_discrete_index = VkDeviceInfo::FindBestDiscreteDevice(records);
+    [[maybe_unused]] const int best_rtx_index =
+        VkDeviceInfo::FindBestDevice(records, [](const auto& r) { return r.dlss_capable; });
+    [[maybe_unused]] const int best_fsr4_index =
+        VkDeviceInfo::FindBestDevice(records, [](const auto& r) { return r.fsr4_capable; });
 
     if (discrete_gpu_hint_widget != nullptr && discrete_gpu_hint_label != nullptr) {
         const bool show_hint = vulkan && record != nullptr && record->integrated &&
@@ -1217,7 +1185,7 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
         }
     }
 #endif
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
     if (amd_fsr4_panel != nullptr) {
         const VkDeviceInfo::Record* fsr4_record =
             fsr4_selected_capable ? record
@@ -1258,93 +1226,26 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     constexpr bool metalfx = false;
     constexpr bool metalfx_frame_gen = false;
 #endif
-    // Platform-unrelated entries hide (and are disabled in the model so mouse-wheel/arrow-key
-    // navigation skips them) unless currently chosen.
-    const auto gate_item = [&](QComboBox* combobox, u32 enumeration, u32 value, bool offered) {
-        if (combobox == nullptr) {
-            return;
-        }
-        const auto found = combobox_translations.find(enumeration);
-        if (found == combobox_translations.end()) {
-            return;
-        }
-        auto* view = qobject_cast<QListView*>(combobox->view());
-        auto* model = qobject_cast<QStandardItemModel*>(combobox->model());
-        const auto& items = found->second;
-        for (size_t i = 0; i < items.size(); ++i) {
-            if (items[i].first != value) {
-                continue;
-            }
-            const bool keep = offered || combobox->currentIndex() == static_cast<int>(i);
-            if (view != nullptr) {
-                view->setRowHidden(static_cast<int>(i), !keep);
-            }
-            if (model != nullptr) {
-                if (QStandardItem* item = model->item(static_cast<int>(i))) {
-                    item->setEnabled(keep);
-                }
-            }
-        }
-    };
-    // Desktop hardware-gated options stay visible on Windows/Linux so users can see them and read
-    // why they are enabled or disabled in the tooltip.
-    [[maybe_unused]] const auto enable_item = [&](QComboBox* combobox, u32 enumeration, u32 value,
-                                                  bool enabled, const QString& disabled_tooltip) {
-        if (combobox == nullptr) {
-            return;
-        }
-        const auto found = combobox_translations.find(enumeration);
-        if (found == combobox_translations.end()) {
-            return;
-        }
-        auto* view = qobject_cast<QListView*>(combobox->view());
-        auto* model = qobject_cast<QStandardItemModel*>(combobox->model());
-        const auto& items = found->second;
-        for (size_t i = 0; i < items.size(); ++i) {
-            if (items[i].first != value) {
-                continue;
-            }
-            if (view != nullptr) {
-                view->setRowHidden(static_cast<int>(i), false);
-            }
-            if (model != nullptr) {
-                if (QStandardItem* item = model->item(static_cast<int>(i))) {
-                    const bool selectable =
-                        enabled || combobox->currentIndex() == static_cast<int>(i);
-                    item->setEnabled(selectable);
-                    item->setToolTip(enabled ? QString() : disabled_tooltip);
-                }
-            }
-        }
-    };
-
-    gate_item(scaling_filter_combobox, Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
-              static_cast<u32>(Settings::ScalingFilter::MetalFxSpatial), metalfx);
-    gate_item(frame_gen_type_combobox, Settings::EnumMetadata<Settings::FrameGenType>::Index(),
-              static_cast<u32>(Settings::FrameGenType::MetalFx), metalfx_frame_gen);
-    gate_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
-              static_cast<u32>(Settings::Upscaler::MetalFx), metalfx);
+    // Platform-unrelated entries hide unless currently chosen; desktop hardware-gated entries stay
+    // visible on Windows/Linux with an explanatory disabled tooltip.
+    GateComboItem(scaling_filter_combobox, Settings::ScalingFilter::MetalFxSpatial, metalfx);
+    GateComboItem(frame_gen_type_combobox, Settings::FrameGenType::MetalFx, metalfx_frame_gen);
+    GateComboItem(upscaler_combobox, Settings::Upscaler::MetalFx, metalfx);
 #ifdef __APPLE__
-    gate_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
-              static_cast<u32>(Settings::Upscaler::Dlss), false);
-    gate_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
-              static_cast<u32>(Settings::Upscaler::Fsr4), false);
-    gate_item(frame_gen_type_combobox, Settings::EnumMetadata<Settings::FrameGenType>::Index(),
-              static_cast<u32>(Settings::FrameGenType::NvidiaDlssG), false);
+    GateComboItem(upscaler_combobox, Settings::Upscaler::Dlss, false);
+    GateComboItem(upscaler_combobox, Settings::Upscaler::Fsr4, false);
+    GateComboItem(frame_gen_type_combobox, Settings::FrameGenType::NvidiaDlssG, false);
 #else
-    enable_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
-                static_cast<u32>(Settings::Upscaler::Dlss), dlss_offered,
-                tr("Requires Windows, the Vulkan renderer, and an NVIDIA GeForce RTX GPU."));
-    enable_item(
-        upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
-        static_cast<u32>(Settings::Upscaler::Fsr4), fsr4_offered,
+    EnableComboItem(upscaler_combobox, Settings::Upscaler::Dlss, dlss_offered,
+                    tr("Requires Windows, the Vulkan renderer, and an NVIDIA GeForce RTX GPU."));
+    EnableComboItem(
+        upscaler_combobox, Settings::Upscaler::Fsr4, fsr4_offered,
         tr("Requires an AMD Radeon RX 6000/7000/9000 or Ryzen RDNA 3+ GPU on Vulkan (falls back "
            "to %1).")
             .arg(UiText::ChoiceLabel("upscaler", "Fsr3")));
-    enable_item(frame_gen_type_combobox, Settings::EnumMetadata<Settings::FrameGenType>::Index(),
-                static_cast<u32>(Settings::FrameGenType::NvidiaDlssG), dlss_offered,
-                tr("Requires %1 on an NVIDIA GeForce RTX 40/50 GPU.")
-                    .arg(UiText::ChoiceLabel("upscaler", "Dlss")));
+    EnableComboItem(frame_gen_type_combobox, Settings::FrameGenType::NvidiaDlssG, dlss_offered,
+                    tr("Requires %1 on an NVIDIA GeForce RTX 40/50 GPU.")
+                        .arg(UiText::ChoiceLabel("upscaler", "Dlss")));
 #endif
 }
 
@@ -1367,23 +1268,9 @@ void ConfigureGraphics::UpdateLosslessStatus() {
     if (lossless_status_label != nullptr) {
         lossless_status_label->setText(problem.isEmpty() ? tr("Lossless.dll found.") : problem);
     }
-    if (frame_gen_type_combobox == nullptr) {
-        return;
-    }
     // Without the file LSFG generates nothing; the item stays selectable if it is already chosen.
-    auto* model = qobject_cast<QStandardItemModel*>(frame_gen_type_combobox->model());
-    const auto& types =
-        combobox_translations.at(Settings::EnumMetadata<Settings::FrameGenType>::Index());
-    for (size_t i = 0; model != nullptr && i < types.size(); ++i) {
-        if (static_cast<Settings::FrameGenType>(types[i].first) != Settings::FrameGenType::Lsfg) {
-            continue;
-        }
-        if (QStandardItem* item = model->item(static_cast<int>(i))) {
-            item->setEnabled(problem.isEmpty() ||
-                             frame_gen_type_combobox->currentIndex() == static_cast<int>(i));
-            item->setToolTip(problem);
-        }
-    }
+    EnableComboItem(frame_gen_type_combobox, Settings::FrameGenType::Lsfg, problem.isEmpty(),
+                    problem);
 #endif
 }
 

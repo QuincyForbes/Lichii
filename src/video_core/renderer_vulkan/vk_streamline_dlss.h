@@ -101,7 +101,6 @@ private:
     u32 frame_index{};
     Settings::DlssQuality quality_mode{Settings::DlssQuality::Auto};
     u32 current_preset{~0u};
-    u32 current_mode{~0u};
     u32 evaluated_mode{};
     u32 evaluated_preset{};
     vk::Image output_image;

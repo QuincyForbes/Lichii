@@ -248,8 +248,10 @@ void PresentManager::LogPacing(const Frame* frame, std::chrono::steady_clock::du
                  "Frame gen pacing (10 s): {} real and {} generated presents, spacing {:.2f} ms "
                  "after each generated frame, {:.2f} ms average wait and present",
                  pacing_log.real, pacing_log.generated,
-                 pacing_log.generated ? ms(pacing_log.spacing) / pacing_log.generated : 0.0,
-                 total ? ms(pacing_log.present_time) / total : 0.0);
+                 pacing_log.generated
+                     ? ms(pacing_log.spacing) / static_cast<double>(pacing_log.generated)
+                     : 0.0,
+                 total ? ms(pacing_log.present_time) / static_cast<double>(total) : 0.0);
         pacing_log = {.since = now};
     }
 }

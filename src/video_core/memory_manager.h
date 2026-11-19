@@ -284,6 +284,9 @@ private:
         boost::container::small_vector<
             std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>&
             result) const;
+    void AppendSubmappedDeviceRange(
+        GPUVAddr gpu_addr, std::size_t size,
+        boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>& result) const;
 
     /// Rebuilds the runs through the big pages a page table operation touched.
     void UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size);

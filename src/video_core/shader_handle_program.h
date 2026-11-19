@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <span>
 #include <utility>
+#include <vector>
 
 #include "common/common_types.h"
 #include "shader_recompiler/shader_info.h"
@@ -17,6 +19,71 @@ using HandleProgram = std::vector<u32>;
 } // namespace Shader
 
 namespace VideoCommon {
+
+/// Per-draw/dispatch 4-slot 4 KiB guest page cache for constant and storage buffer handle reads.
+/// Valid while GPU page mappings do not change (within a single draw or dispatch setup).
+struct DescriptorPageCache {
+    static constexpr size_t NUM_SLOTS = 4;
+    static constexpr GPUVAddr PAGE_BITS = 12;
+    static constexpr GPUVAddr PAGE_BYTES = GPUVAddr{1} << PAGE_BITS;
+    static constexpr GPUVAddr PAGE_MASK = PAGE_BYTES - 1;
+    static constexpr GPUVAddr INVALID_PAGE = ~GPUVAddr{0};
+
+    explicit DescriptorPageCache(const Tegra::MemoryManager& gpu_memory_) noexcept
+        : gpu_memory{gpu_memory_} {}
+
+    void Reset() noexcept {
+        pages.fill(INVALID_PAGE);
+    }
+
+    [[nodiscard]] u32 ReadHandleWord(GPUVAddr addr) noexcept {
+        const GPUVAddr page_offset = addr & PAGE_MASK;
+        if (page_offset <= PAGE_BYTES - sizeof(u32)) {
+            if (const u8* const host = LookupPage(addr)) {
+                u32 value;
+                std::memcpy(&value, host + page_offset, sizeof(u32));
+                return value;
+            }
+        }
+        return gpu_memory.ReadHandleWord(addr);
+    }
+
+    [[nodiscard]] u64 ReadHandleU64(GPUVAddr addr) noexcept {
+        const GPUVAddr page_offset = addr & PAGE_MASK;
+        if (page_offset <= PAGE_BYTES - sizeof(u64)) {
+            if (const u8* const host = LookupPage(addr)) {
+                u64 value;
+                std::memcpy(&value, host + page_offset, sizeof(u64));
+                return value;
+            }
+        }
+        return u64{ReadHandleWord(addr)} | (u64{ReadHandleWord(addr + sizeof(u32))} << 32);
+    }
+
+    [[nodiscard]] u32 operator()(GPUVAddr addr) noexcept {
+        return ReadHandleWord(addr);
+    }
+
+private:
+    [[nodiscard]] const u8* LookupPage(GPUVAddr addr) noexcept {
+        const GPUVAddr page = addr >> PAGE_BITS;
+        const size_t slot = static_cast<size_t>(page ^ (page >> 4)) & (NUM_SLOTS - 1);
+        const u8* host = hosts[slot];
+        if (pages[slot] != page) {
+            const GPUVAddr page_addr = addr & ~PAGE_MASK;
+            host = gpu_memory.OverlapsNativeSyncpointShim(page_addr, PAGE_BYTES)
+                       ? nullptr
+                       : gpu_memory.GetPointerForDescriptor(page_addr);
+            pages[slot] = host != nullptr ? page : INVALID_PAGE;
+            hosts[slot] = host;
+        }
+        return host;
+    }
+
+    const Tegra::MemoryManager& gpu_memory;
+    std::array<GPUVAddr, NUM_SLOTS> pages{INVALID_PAGE, INVALID_PAGE, INVALID_PAGE, INVALID_PAGE};
+    std::array<const u8*, NUM_SLOTS> hosts{};
+};
 
 /// The texture handle a shader reads from a storage buffer, computed from the current constant
 /// buffer and storage buffer words (Shader::Info::handle_programs). cbuf_address(index) is the
@@ -45,8 +112,12 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_mem
                        return 0U;
                    }
                    const auto read_u64 = [&](GPUVAddr addr) -> u64 {
-                       return u64{gpu_memory.ReadHandleWord(addr)} |
-                              (u64{gpu_memory.ReadHandleWord(addr + sizeof(u32))} << 32);
+                       if constexpr (requires(GPUVAddr a) { gpu_memory.ReadHandleU64(a); }) {
+                           return gpu_memory.ReadHandleU64(addr);
+                       } else {
+                           return u64{gpu_memory.ReadHandleWord(addr)} |
+                                  (u64{gpu_memory.ReadHandleWord(addr + sizeof(u32))} << 32);
+                       }
                    };
                    GPUVAddr base{read_u64(cbuf + descriptor.cbuf_offset)};
                    if (base != 0 && descriptor.indirect_offset != ~0U) {

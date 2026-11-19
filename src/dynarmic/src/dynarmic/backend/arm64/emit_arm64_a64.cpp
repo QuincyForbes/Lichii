@@ -7,7 +7,6 @@
  */
 
 #include <bit>
-#include <cstdlib>
 #include <oaknut/oaknut.hpp>
 
 #include "dynarmic/backend/arm64/a64_jitstate.h"
@@ -25,18 +24,6 @@ namespace Dynarmic::Backend::Arm64 {
 
 using namespace oaknut::util;
 
-namespace {
-
-bool ReuseHostFlagsOn() {
-    static const bool on = [] {
-        const char* const value = std::getenv("EDEN_NX2_JIT_FLAGS");
-        return value == nullptr || value[0] != '0';
-    }();
-    return on;
-}
-
-}  // namespace
-
 oaknut::Label EmitA64Cond(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Cond cond) {
     oaknut::Label pass;
     if (ctx.conf.enable_cycle_counting || !ReuseHostFlagsOn() || ctx.ebi.nzcv_live_pos == nullptr ||
@@ -44,6 +31,7 @@ oaknut::Label EmitA64Cond(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Con
         code.LDR(Wscratch0, Xstate, offsetof(A64JitState, cpsr_nzcv));
         code.MSR(oaknut::SystemReg::NZCV, Xscratch0);
     }
+    ctx.ebi.nzcv_live_pos = nullptr;
     code.B(static_cast<oaknut::Cond>(cond), pass);
     return pass;
 }
@@ -249,7 +237,7 @@ void EmitIR<IR::Opcode::A64SetNZCVRaw>(oaknut::CodeGenerator& code, EmitContext&
 template<>
 void EmitIR<IR::Opcode::A64SetNZCV>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
-    const bool from_flags = ReuseHostFlagsOn() && !args[0].IsImmediate() &&
+    const bool from_flags = !ctx.conf.enable_cycle_counting && ReuseHostFlagsOn() && !args[0].IsImmediate() &&
                             args[0].CurrentLocationKind(ctx.reg_alloc) == HostLoc::Kind::Flags;
     auto Wnzcv = ctx.reg_alloc.ReadW(args[0]);
     RegAlloc::Realize(Wnzcv);
@@ -258,36 +246,123 @@ void EmitIR<IR::Opcode::A64SetNZCV>(oaknut::CodeGenerator& code, EmitContext& ct
     ctx.ebi.nzcv_live_pos = from_flags ? code.xptr<const void*>() : nullptr;
 }
 
-template<>
-void EmitIR<IR::Opcode::A64GetW>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+namespace {
+
+template<std::size_t bitsize>
+void EmitA64GetGpr(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    static_assert(bitsize == 32 || bitsize == 64);
     const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
 
-    auto Wresult = ctx.reg_alloc.WriteW(inst);
-    RegAlloc::Realize(Wresult);
+    auto Rresult = ctx.reg_alloc.WriteReg<bitsize>(inst);
+    RegAlloc::Realize(Rresult);
 
-    // TODO: Detect if Gpr vs Fpr is more appropriate
-
-    code.LDR(Wresult, Xstate, offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg));
+    code.LDR(Rresult, Xstate, offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg));
     if (flags_live) {
         ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
     }
 }
 
-template<>
-void EmitIR<IR::Opcode::A64GetX>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+template<std::size_t bitsize>
+void EmitA64SetGpr(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    static_assert(bitsize == 32 || bitsize == 64);
     const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
+    const std::size_t reg_off = offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg);
 
-    auto Xresult = ctx.reg_alloc.WriteX(inst);
-    RegAlloc::Realize(Xresult);
-
-    // TODO: Detect if Gpr vs Fpr is more appropriate
-
-    code.LDR(Xresult, Xstate, offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg));
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (args[1].IsImmediate()) {
+        const u64 imm = bitsize == 32 ? u64{args[1].GetImmediateU32()} : args[1].GetImmediateU64();
+        if (imm == 0) {
+            code.STR(XZR, Xstate, reg_off);
+        } else {
+            code.MOV(Xscratch0, imm);
+            code.STR(Xscratch0, Xstate, reg_off);
+        }
+    } else if constexpr (bitsize == 32) {
+        auto Wvalue = ctx.reg_alloc.ReadW(args[1]);
+        RegAlloc::Realize(Wvalue);
+        code.MOV(*Wvalue, Wvalue);
+        code.STR(Wvalue->toX(), Xstate, reg_off);
+    } else if (args[1].IsInFpr(ctx.reg_alloc)) {
+        auto Dvalue = ctx.reg_alloc.ReadD(args[1]);
+        RegAlloc::Realize(Dvalue);
+        code.STR(Dvalue, Xstate, reg_off);
+    } else {
+        auto Xvalue = ctx.reg_alloc.ReadX(args[1]);
+        RegAlloc::Realize(Xvalue);
+        code.STR(Xvalue, Xstate, reg_off);
+    }
     if (flags_live) {
         ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
     }
+}
+
+template<std::size_t bitsize>
+void EmitA64SetScalarVec(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    static_assert(bitsize == 32 || bitsize == 64);
+    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const A64::Vec vec = inst->GetArg(0).GetA64VecRef();
+    const std::size_t reg_off = offsetof(A64JitState, vec) + sizeof(u64) * 2 * static_cast<size_t>(vec);
+
+    if (args[1].IsImmediate()) {
+        const u64 imm = bitsize == 32 ? u64{args[1].GetImmediateU32()} : args[1].GetImmediateU64();
+        if (imm == 0) {
+            code.STR(XZR, Xstate, reg_off);
+        } else {
+            code.MOV(Xscratch0, imm);
+            code.STR(Xscratch0, Xstate, reg_off);
+        }
+    } else if (args[1].IsInGpr(ctx.reg_alloc)) {
+        auto Rvalue = ctx.reg_alloc.ReadReg<bitsize>(args[1]);
+        RegAlloc::Realize(Rvalue);
+        code.STR(Rvalue, Xstate, reg_off);
+        if constexpr (bitsize == 32) {
+            code.STR(WZR, Xstate, reg_off + 4);
+        }
+    } else {
+        auto Vvalue = ctx.reg_alloc.ReadVec<bitsize>(args[1]);
+        RegAlloc::Realize(Vvalue);
+        code.STR(Vvalue, Xstate, reg_off);
+        if constexpr (bitsize == 32) {
+            code.STR(WZR, Xstate, reg_off + 4);
+        }
+    }
+    code.STR(XZR, Xstate, reg_off + 8);
+    if (flags_live) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
+}
+
+void EmitFlushCycles(oaknut::CodeGenerator& code, EmitContext& ctx) {
+    if (!ctx.conf.enable_cycle_counting) {
+        return;
+    }
+    code.LDR(X1, SP, offsetof(StackLayout, cycles_to_run));
+    code.SUB(X1, X1, Xticks);
+    EmitRelocation(code, ctx, LinkTarget::AddTicks);
+}
+
+void EmitReloadCycles(oaknut::CodeGenerator& code, EmitContext& ctx) {
+    if (!ctx.conf.enable_cycle_counting) {
+        return;
+    }
+    EmitRelocation(code, ctx, LinkTarget::GetTicksRemaining);
+    code.STR(X0, SP, offsetof(StackLayout, cycles_to_run));
+    code.MOV(Xticks, X0);
+}
+
+}  // namespace
+
+template<>
+void EmitIR<IR::Opcode::A64GetW>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    EmitA64GetGpr<32>(code, ctx, inst);
+}
+
+template<>
+void EmitIR<IR::Opcode::A64GetX>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    EmitA64GetGpr<64>(code, ctx, inst);
 }
 
 template<>
@@ -340,85 +415,22 @@ void EmitIR<IR::Opcode::A64GetFPSR>(oaknut::CodeGenerator&, EmitContext& ctx, IR
 
 template<>
 void EmitIR<IR::Opcode::A64SetW>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
-    const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
-
-    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
-
-    auto Wvalue = ctx.reg_alloc.ReadW(args[1]);
-    RegAlloc::Realize(Wvalue);
-
-    // TODO: Detect if Gpr vs Fpr is more appropriate
-    code.MOV(*Wvalue, Wvalue);
-    code.STR(Wvalue->toX(), Xstate, offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg));
-    if (flags_live) {
-        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
-    }
+    EmitA64SetGpr<32>(code, ctx, inst);
 }
 
 template<>
 void EmitIR<IR::Opcode::A64SetX>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
-    const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
-
-    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
-
-    auto Xvalue = ctx.reg_alloc.ReadX(args[1]);
-    RegAlloc::Realize(Xvalue);
-
-    // TODO: Detect if Gpr vs Fpr is more appropriate
-
-    code.STR(Xvalue, Xstate, offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg));
-    if (flags_live) {
-        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
-    }
+    EmitA64SetGpr<64>(code, ctx, inst);
 }
 
 template<>
 void EmitIR<IR::Opcode::A64SetS>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
-    const A64::Vec vec = inst->GetArg(0).GetA64VecRef();
-    const std::size_t reg_off = offsetof(A64JitState, vec) + sizeof(u64) * 2 * static_cast<size_t>(vec);
-
-    if (args[1].IsImmediate() && args[1].GetImmediateU32() == 0) {
-        code.STR(XZR, Xstate, reg_off);
-        code.STR(XZR, Xstate, reg_off + 8);
-        return;
-    }
-    if (args[1].IsInGpr(ctx.reg_alloc)) {
-        auto Wvalue = ctx.reg_alloc.ReadW(args[1]);
-        RegAlloc::Realize(Wvalue);
-        code.STR(Wvalue, Xstate, reg_off);
-    } else {
-        auto Svalue = ctx.reg_alloc.ReadS(args[1]);
-        RegAlloc::Realize(Svalue);
-        code.STR(Svalue, Xstate, reg_off);
-    }
-    code.STR(WZR, Xstate, reg_off + 4);
-    code.STR(XZR, Xstate, reg_off + 8);
+    EmitA64SetScalarVec<32>(code, ctx, inst);
 }
 
 template<>
 void EmitIR<IR::Opcode::A64SetD>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
-    const A64::Vec vec = inst->GetArg(0).GetA64VecRef();
-    const std::size_t reg_off = offsetof(A64JitState, vec) + sizeof(u64) * 2 * static_cast<size_t>(vec);
-
-    if (args[1].IsImmediate() && args[1].GetImmediateU64() == 0) {
-        code.STR(XZR, Xstate, reg_off);
-        code.STR(XZR, Xstate, reg_off + 8);
-        return;
-    }
-    if (args[1].IsInGpr(ctx.reg_alloc)) {
-        auto Xvalue = ctx.reg_alloc.ReadX(args[1]);
-        RegAlloc::Realize(Xvalue);
-        code.STR(Xvalue, Xstate, reg_off);
-    } else {
-        auto Dvalue = ctx.reg_alloc.ReadD(args[1]);
-        RegAlloc::Realize(Dvalue);
-        code.STR(Dvalue, Xstate, reg_off);
-    }
-    code.STR(XZR, Xstate, reg_off + 8);
+    EmitA64SetScalarVec<64>(code, ctx, inst);
 }
 
 template<>
@@ -469,20 +481,10 @@ void EmitIR<IR::Opcode::A64CallSupervisor>(oaknut::CodeGenerator& code, EmitCont
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.PrepareForCall();
 
-    if (ctx.conf.enable_cycle_counting) {
-        code.LDR(X1, SP, offsetof(StackLayout, cycles_to_run));
-        code.SUB(X1, X1, Xticks);
-        EmitRelocation(code, ctx, LinkTarget::AddTicks);
-    }
-
+    EmitFlushCycles(code, ctx);
     code.MOV(W1, args[0].GetImmediateU32());
     EmitRelocation(code, ctx, LinkTarget::CallSVC);
-
-    if (ctx.conf.enable_cycle_counting) {
-        EmitRelocation(code, ctx, LinkTarget::GetTicksRemaining);
-        code.STR(X0, SP, offsetof(StackLayout, cycles_to_run));
-        code.MOV(Xticks, X0);
-    }
+    EmitReloadCycles(code, ctx);
 }
 
 template<>
@@ -490,21 +492,11 @@ void EmitIR<IR::Opcode::A64ExceptionRaised>(oaknut::CodeGenerator& code, EmitCon
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.PrepareForCall();
 
-    if (ctx.conf.enable_cycle_counting) {
-        code.LDR(X1, SP, offsetof(StackLayout, cycles_to_run));
-        code.SUB(X1, X1, Xticks);
-        EmitRelocation(code, ctx, LinkTarget::AddTicks);
-    }
-
+    EmitFlushCycles(code, ctx);
     code.MOV(X1, args[0].GetImmediateU64());
     code.MOV(X2, args[1].GetImmediateU64());
     EmitRelocation(code, ctx, LinkTarget::ExceptionRaised);
-
-    if (ctx.conf.enable_cycle_counting) {
-        EmitRelocation(code, ctx, LinkTarget::GetTicksRemaining);
-        code.STR(X0, SP, offsetof(StackLayout, cycles_to_run));
-        code.MOV(Xticks, X0);
-    }
+    EmitReloadCycles(code, ctx);
 }
 
 template<>
@@ -566,7 +558,14 @@ void EmitIR<IR::Opcode::A64GetCNTPCT>(oaknut::CodeGenerator& code, EmitContext& 
 
         code.ISB();
         code.MRS(*Xresult, oaknut::SystemReg::CNTVCT_EL0);
-        if (ctx.conf.cntpct_scale_hi == 0) {
+        if (ctx.conf.cntpct_scale_lo == 0) {
+            if (ctx.conf.cntpct_scale_hi == 0) {
+                code.MOV(*Xresult, XZR);
+            } else if (ctx.conf.cntpct_scale_hi != 1) {
+                code.MOV(Xscratch0, ctx.conf.cntpct_scale_hi);
+                code.MUL(*Xresult, *Xresult, Xscratch0);
+            }
+        } else if (ctx.conf.cntpct_scale_hi == 0) {
             code.MOV(Xscratch0, ctx.conf.cntpct_scale_lo);
             code.UMULH(*Xresult, *Xresult, Xscratch0);
         } else if (ctx.conf.cntpct_scale_hi == 1) {
@@ -583,13 +582,9 @@ void EmitIR<IR::Opcode::A64GetCNTPCT>(oaknut::CodeGenerator& code, EmitContext& 
     }
 
     ctx.reg_alloc.PrepareForCall();
-    if (!ctx.conf.wall_clock_cntpct && ctx.conf.enable_cycle_counting) {
-        code.LDR(X1, SP, offsetof(StackLayout, cycles_to_run));
-        code.SUB(X1, X1, Xticks);
-        EmitRelocation(code, ctx, LinkTarget::AddTicks);
-        EmitRelocation(code, ctx, LinkTarget::GetTicksRemaining);
-        code.STR(X0, SP, offsetof(StackLayout, cycles_to_run));
-        code.MOV(Xticks, X0);
+    if (!ctx.conf.wall_clock_cntpct) {
+        EmitFlushCycles(code, ctx);
+        EmitReloadCycles(code, ctx);
     }
     EmitRelocation(code, ctx, LinkTarget::GetCNTPCT);
     ctx.reg_alloc.DefineAsRegister(inst, X0);

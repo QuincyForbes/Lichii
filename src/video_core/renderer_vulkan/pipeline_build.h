@@ -222,10 +222,11 @@ public:
         : state{std::make_shared<State>(std::move(task))} {
         if (!workers) {
             (void)state->Run(CurrentPipelineBuilder());
-        } else if (!held_workers || !held_workers->TryQueueWork([state = state] {
-                       (void)state->Run(PipelineBuilder::Held);
+        } else if (!held_workers || !held_workers->TryQueueWork([build_state = state] {
+                       (void)build_state->Run(PipelineBuilder::Held);
                    })) {
-            workers->QueueWork([state = state] { (void)state->Run(PipelineBuilder::Worker); });
+            workers->QueueWork(
+                [build_state = state] { (void)build_state->Run(PipelineBuilder::Worker); });
         }
     }
 

@@ -270,6 +270,9 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& ho
 void BufferCacheRuntime::BindTransformFeedbackBuffer(u32 index, BufferHandle buffer, u32 offset,
                                                      u32 size) {
     if (index < feedback_states.size()) {
+        if (write_hook != nullptr && buffer != nullptr && size != 0) {
+            write_hook(write_hook_user, buffer, offset, size);
+        }
         feedback_states[index] = VertexState{buffer, offset, size, 0};
     }
 }

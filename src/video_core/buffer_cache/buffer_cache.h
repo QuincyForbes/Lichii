@@ -1488,12 +1488,11 @@ bool BufferCache<P>::ShouldWaitAsyncFlushes() const noexcept {
 }
 
 template <class P>
-void BufferCache<P>::CommitAsyncFlushesHigh() {
+bool BufferCache<P>::TryCommitAsyncFlushes() {
     AccumulateFlushes();
 
     if (committed_gpu_modified_ranges.empty()) {
-        async_buffers.emplace_back(std::optional<Async_Buffer>{});
-        return;
+        return false;
     }
 
     auto it = committed_gpu_modified_ranges.begin();
@@ -1551,8 +1550,7 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
     }
     committed_gpu_modified_ranges.clear();
     if (downloads.empty()) {
-        async_buffers.emplace_back(std::optional<Async_Buffer>{});
-        return;
+        return false;
     }
     Nx2Profile::Add(Nx2Profile::Counter::DownloadBytes, total_size_bytes);
     Nx2Profile::Add(Nx2Profile::Counter::DownloadCopies, downloads.size());
@@ -1588,7 +1586,7 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
             }
             Nx2Profile::Add(Nx2Profile::Counter::DownloadBytesOnDmaPages, on_dma_pages);
         }
-        if (Nx2DownloadTrace::g_enabled) [[unlikely]] {
+        if (Nx2DownloadTrace::g_enabled) {
             Nx2DownloadTrace::Copied(orig_device_addr, copy.size);
         }
         // Exact ranges even when batched: gap bytes reach staging, never guest memory.
@@ -1631,21 +1629,19 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
     }
     pending_download_ranges.emplace_back(std::move(download_ranges));
     async_buffers.emplace_back(download_staging);
+    return true;
+}
+
+template <class P>
+void BufferCache<P>::CommitAsyncFlushesHigh() {
+    if (!TryCommitAsyncFlushes()) {
+        async_buffers.emplace_back(std::optional<Async_Buffer>{});
+    }
 }
 
 template <class P>
 void BufferCache<P>::CommitAsyncFlushes() {
     CommitAsyncFlushesHigh();
-}
-
-template <class P>
-bool BufferCache<P>::TryCommitAsyncFlushes() {
-    CommitAsyncFlushesHigh();
-    if (!async_buffers.empty() && !async_buffers.back().has_value()) {
-        async_buffers.pop_back();
-        return false;
-    }
-    return !async_buffers.empty();
 }
 
 template <class P>
@@ -1736,6 +1732,9 @@ bool BufferCache<P>::Nx2VerifyDownloadBatch(const Nx2Downloads& downloads,
 
 template <class P>
 void BufferCache<P>::Nx2CountDownloadAges(DAddr device_addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
     using Nx2Profile::Counter;
     constexpr u64 block_size = u64{1} << NX2_PREFLUSH_BLOCK_BITS;
     const DAddr end = device_addr + size;
@@ -1758,6 +1757,9 @@ void BufferCache<P>::Nx2CountDownloadAges(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::Nx2StampPreflushBlocks(DAddr begin, DAddr end, bool marked) {
+    if (begin >= end) {
+        return;
+    }
     const bool aging = Nx2Perf::On(Nx2Perf::Opt::PreflushAging);
     for (u64 block = begin >> NX2_PREFLUSH_BLOCK_BITS;
          block <= (end - 1) >> NX2_PREFLUSH_BLOCK_BITS; ++block) {
@@ -1772,13 +1774,13 @@ void BufferCache<P>::Nx2StampPreflushBlocks(DAddr begin, DAddr end, bool marked)
         }
         const auto [it, inserted] =
             nx2_preflush_blocks.try_emplace(block, Nx2PreflushBlock{.last_read_frame = frame_tick});
-        if (inserted || !aging) {
+        if (inserted) {
             continue;
         }
         Nx2PreflushBlock& entry = it->second;
         entry.last_read_frame = frame_tick;
         entry.unread_write_frames = 0;
-        if (!entry.dropped) {
+        if (!aging || !entry.dropped) {
             continue;
         }
         // Dropped too early: the read flushed (stalled). Keep the mark twice as long next time.
@@ -3313,13 +3315,18 @@ void BufferCache<P>::UpdateIndexBuffer() {
 }
 
 template <class P>
-bool BufferCache<P>::ReuseGeometry(const GeometryMemo& memo, GPUVAddr begin, GPUVAddr end,
-                                   u64 extra) const {
+bool BufferCache<P>::GeometryMemoEnabled() noexcept {
     static const bool geometry_memo = [] {
         const char* value = std::getenv("EDEN_NX2_BUFCACHE_GEOMEMO");
         return value == nullptr || value[0] != '0';
     }();
-    return geometry_memo && memo.epoch == binding_epoch && memo.begin == begin &&
+    return geometry_memo;
+}
+
+template <class P>
+bool BufferCache<P>::ReuseGeometry(const GeometryMemo& memo, GPUVAddr begin, GPUVAddr end,
+                                   u64 extra) const {
+    return GeometryMemoEnabled() && memo.epoch == binding_epoch && memo.begin == begin &&
            memo.end == end && memo.extra == extra &&
            memo.channel == static_cast<const void*>(channel_state) &&
            memo.as_id == gpu_memory->GetID() && memo.map_serial == gpu_memory->MapSerial() &&
@@ -3338,6 +3345,67 @@ void BufferCache<P>::StoreGeometry(GeometryMemo& memo, GPUVAddr begin, GPUVAddr 
         .end = end,
         .extra = extra,
         .binding = binding,
+    };
+}
+
+template <class P>
+bool BufferCache<P>::ReuseIndirectDraw(const IndirectDrawMemo& memo, GPUVAddr gpu_addr,
+                                       size_t size, Binding& binding) const noexcept {
+    if (!GeometryMemoEnabled() || fence_behavior_accurate || size == 0 ||
+        size > (std::numeric_limits<u32>::max)()) {
+        return false;
+    }
+    const u64 map_serial = gpu_memory->MapSerial();
+    if (memo.epoch != binding_epoch || memo.channel != static_cast<const void*>(channel_state) ||
+        memo.as_id != gpu_memory->GetID() || memo.map_serial != map_serial ||
+        gpu_addr < memo.gpu_begin || gpu_addr > memo.gpu_end || size > memo.gpu_end - gpu_addr) {
+        return false;
+    }
+    binding = Binding{
+        .device_addr = memo.device_begin + (gpu_addr - memo.gpu_begin),
+        .gpu_addr = gpu_addr,
+        .map_serial = map_serial,
+        .size = static_cast<u32>(size),
+        .buffer_id = memo.buffer_id,
+    };
+    return true;
+}
+
+template <class P>
+void BufferCache<P>::StoreIndirectDraw(IndirectDrawMemo& memo, GPUVAddr gpu_addr, u32 size,
+                                       DAddr device_addr, BufferId buffer_id, u64 map_serial) {
+    if (size == 0 || buffer_id == NULL_BUFFER_ID || gpu_addr > ~GPUVAddr{0} - size) {
+        return;
+    }
+    GPUVAddr gpu_begin = gpu_addr;
+    GPUVAddr gpu_end = gpu_addr + size;
+    DAddr device_begin = device_addr;
+    const Buffer& buffer = slot_buffers[buffer_id];
+    const GPUVAddr page_gpu_addr = gpu_addr & ~GPUVAddr{Core::DEVICE_PAGEMASK};
+    const u64 in_page = gpu_addr - page_gpu_addr;
+    if (device_addr >= in_page && device_addr - in_page >= buffer.CpuAddr()) {
+        const DAddr page_device_addr = device_addr - in_page;
+        const u64 buffer_end = buffer.CpuAddr() + buffer.SizeBytes();
+        if (buffer_end > page_device_addr) {
+            const size_t max_bytes =
+                static_cast<size_t>((std::min<u64>)(buffer_end - page_device_addr, 64_MiB));
+            const size_t contiguous = gpu_memory->MaxContinuousRange(page_gpu_addr, max_bytes);
+            if (contiguous >= in_page + u64{size}) {
+                gpu_begin = page_gpu_addr;
+                gpu_end = page_gpu_addr + contiguous;
+                device_begin = page_device_addr;
+            }
+        }
+    }
+    memo = IndirectDrawMemo{
+        .epoch = binding_epoch,
+        .map_serial = map_serial,
+        .as_id = gpu_memory->GetID(),
+        .channel = channel_state,
+        .gpu_begin = gpu_begin,
+        .gpu_end = gpu_end,
+        .device_begin = device_begin,
+        .buffer_id = buffer_id,
     };
 }
 
@@ -3454,24 +3522,50 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
 
 template <class P>
 void BufferCache<P>::UpdateDrawIndirect() {
-    const auto update = [this](GPUVAddr gpu_addr, size_t size, Binding& binding) {
+    const auto update = [this](GPUVAddr gpu_addr, size_t size, Binding& binding,
+                               IndirectDrawMemo& memo) {
+        Binding cached{};
+        const bool memo_hit = ReuseIndirectDraw(memo, gpu_addr, size, cached);
+        if (memo_hit && !Nx2Perf::Verify()) {
+            binding = cached;
+            return;
+        }
         const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
-        if (!device_addr) {
+        if (!device_addr || size > (std::numeric_limits<u32>::max)()) {
             binding = NULL_BINDING;
             return;
         }
+        const u32 byte_size = static_cast<u32>(size);
+        const u64 map_serial = gpu_memory->MapSerial();
+        const BufferId buffer_id = FindBuffer(*device_addr, byte_size, false);
         binding = Binding{
             .device_addr = *device_addr,
-            .size = static_cast<u32>(size),
-            .buffer_id = FindBuffer(*device_addr, static_cast<u32>(size), false),
+            .gpu_addr = gpu_addr,
+            .map_serial = map_serial,
+            .size = byte_size,
+            .buffer_id = buffer_id,
         };
+        if (memo_hit) {
+            if (cached.device_addr != *device_addr || cached.buffer_id != buffer_id) {
+                static std::atomic<u32> reports{};
+                if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_ERROR(HW_GPU,
+                              "Nx2Perf indirect buffer memo mismatch: {:#x}+{:#x} kept {:#x} "
+                              "buffer {}, found {:#x} buffer {}",
+                              gpu_addr, byte_size, cached.device_addr, cached.buffer_id.index,
+                              *device_addr, buffer_id.index);
+                }
+            }
+            return;
+        }
+        StoreIndirectDraw(memo, gpu_addr, byte_size, *device_addr, buffer_id, map_serial);
     };
     if (current_draw_indirect->include_count) {
         update(current_draw_indirect->count_start_address, sizeof(u32),
-               channel_state->count_buffer_binding);
+               channel_state->count_buffer_binding, indirect_count_memo);
     }
     update(current_draw_indirect->indirect_start_address, current_draw_indirect->buffer_size,
-           channel_state->indirect_buffer_binding);
+           channel_state->indirect_buffer_binding, indirect_buffer_memo);
 }
 
 template <class P>
@@ -5243,6 +5337,8 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     channel_state->unresolved_uniform_buffers.fill(~u32{0});
     std::ranges::for_each(channel_state->storage_buffers, replace);
     replace(channel_state->transform_feedback_buffers);
+    scalar_replace(channel_state->count_buffer_binding);
+    scalar_replace(channel_state->indirect_buffer_binding);
     replace(channel_state->compute_uniform_buffers);
     replace(channel_state->compute_storage_buffers);
 
@@ -5275,6 +5371,8 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
         other.unresolved_uniform_buffers.fill(~u32{0});
         std::ranges::for_each(other.storage_buffers, replace);
         replace(other.transform_feedback_buffers);
+        scalar_replace(other.count_buffer_binding);
+        scalar_replace(other.indirect_buffer_binding);
         replace(other.compute_uniform_buffers);
         replace(other.compute_storage_buffers);
         if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {

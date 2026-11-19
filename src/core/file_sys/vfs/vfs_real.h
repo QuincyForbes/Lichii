@@ -9,10 +9,12 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <utility>
 #include "common/intrusive_list.h"
 #include "core/file_sys/fs_filesystem.h"
 #include "core/file_sys/vfs/vfs.h"
@@ -26,6 +28,7 @@ namespace FileSys {
 struct FileReference : public Common::IntrusiveListBaseNode<FileReference> {
     std::shared_ptr<Common::FS::IOFile> file{};
     u32 in_flight{};
+    u32 closing_waiters{};
 };
 
 class RealVfsFile;
@@ -54,21 +57,77 @@ public:
 
 private:
     using ReferenceListType = Common::IntrusiveListBaseTraits<FileReference>::ListType;
-    std::map<std::string, std::weak_ptr<VfsFile>, std::less<>> cache;
+    std::map<std::string, std::weak_ptr<RealVfsFile>, std::less<>> cache;
     ReferenceListType open_references;
     ReferenceListType closed_references;
     std::mutex list_lock;
+    std::condition_variable unpin_cv;
     size_t num_open_files{};
     // TODO: Workaround for improper dtor() ordering on clang + FreeBSD
     bool in_dtor = false;
 
 private:
     friend class RealVfsFile;
+
+    class PinnedFile {
+    public:
+        PinnedFile() = default;
+        PinnedFile(RealVfsFilesystem* base_, FileReference* reference_,
+                   std::shared_ptr<Common::FS::IOFile> file_) noexcept
+            : base{base_}, reference{reference_}, file{std::move(file_)} {}
+
+        PinnedFile(const PinnedFile&) = delete;
+        PinnedFile& operator=(const PinnedFile&) = delete;
+
+        PinnedFile(PinnedFile&& other) noexcept
+            : base{std::exchange(other.base, nullptr)},
+              reference{std::exchange(other.reference, nullptr)},
+              file{std::move(other.file)} {}
+
+        PinnedFile& operator=(PinnedFile&& other) noexcept {
+            if (this != &other) {
+                Reset();
+                base = std::exchange(other.base, nullptr);
+                reference = std::exchange(other.reference, nullptr);
+                file = std::move(other.file);
+            }
+            return *this;
+        }
+
+        ~PinnedFile() {
+            Reset();
+        }
+
+        explicit operator bool() const noexcept {
+            return file != nullptr;
+        }
+
+        Common::FS::IOFile* operator->() const noexcept {
+            return file.get();
+        }
+
+    private:
+        void Reset() noexcept {
+            file.reset();
+            if (base != nullptr && reference != nullptr) {
+                base->UnpinReference(*reference);
+                base = nullptr;
+                reference = nullptr;
+            }
+        }
+
+        RealVfsFilesystem* base{};
+        FileReference* reference{};
+        std::shared_ptr<Common::FS::IOFile> file{};
+    };
+
+    void EnsureReferenceOpenLocked(const std::string& path, OpenMode perms,
+                                   FileReference& reference);
     std::unique_lock<std::mutex> RefreshReference(const std::string& path, OpenMode perms,
                                                   FileReference& reference);
-    std::shared_ptr<Common::FS::IOFile> PinReference(const std::string& path, OpenMode perms,
-                                                     FileReference& reference);
-    void UnpinReference(FileReference& reference);
+    PinnedFile PinReference(const std::string& path, OpenMode perms, FileReference& reference);
+    void UnpinReference(FileReference& reference) noexcept;
+    void EvictCachedPath(const std::string& path);
     void DropReference(std::unique_ptr<FileReference>&& reference, const std::string& path);
 
 private:

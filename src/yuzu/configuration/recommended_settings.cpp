@@ -80,16 +80,8 @@ Settings::DeviceProfile::Device HostDevice(const std::vector<VkDeviceInfo::Recor
         !records.empty()) {
         u32 target = index < records.size() ? index : 0;
         if (records[target].integrated && records.size() > 1) {
-            u64 best_vram = 0;
-            int best_discrete = -1;
-            for (size_t i = 0; i < records.size(); ++i) {
-                if (!records[i].integrated &&
-                    (best_discrete < 0 || records[i].vram_mib > best_vram)) {
-                    best_discrete = static_cast<int>(i);
-                    best_vram = records[i].vram_mib;
-                }
-            }
-            if (best_discrete >= 0) {
+            if (const int best_discrete = VkDeviceInfo::FindBestDiscreteDevice(records);
+                best_discrete >= 0) {
                 target = static_cast<u32>(best_discrete);
                 device.recommended_vulkan_device = target;
             }
@@ -103,26 +95,7 @@ Settings::DeviceProfile::Device HostDevice(const std::vector<VkDeviceInfo::Recor
 #ifdef EGLANTINE_STREAMLINE
         device.dlss_capable = record.dlss_capable;
 #endif
-        switch (record.driver_id) {
-        case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
-            device.gpu_vendor = Profile::GpuVendor::Nvidia;
-            break;
-        case VK_DRIVER_ID_AMD_PROPRIETARY:
-        case VK_DRIVER_ID_AMD_OPEN_SOURCE:
-        case VK_DRIVER_ID_MESA_RADV:
-            device.gpu_vendor = Profile::GpuVendor::Amd;
-            break;
-        case VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS:
-        case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:
-            device.gpu_vendor = Profile::GpuVendor::Intel;
-            break;
-        case VK_DRIVER_ID_MOLTENVK:
-            device.gpu_vendor = Profile::GpuVendor::Apple;
-            break;
-        default:
-            device.gpu_vendor = Profile::GpuVendor::Other;
-            break;
-        }
+        device.gpu_vendor = Profile::VendorFromVulkanDriver(static_cast<u32>(record.driver_id));
     }
     return device;
 }

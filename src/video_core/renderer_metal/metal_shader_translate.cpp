@@ -23,18 +23,21 @@ namespace {
 
 /// Routes the 2D samples of an entry function through spvReducedSample (see
 /// Options::sampler_reduction); the buffer slot of the mask, or ~0 when nothing was rewritten.
+enum class SpillStatus : u8 { Failed, Unused, Rewritten };
 /// Moves the entry function's spilled buffers (MSL buffer indices from SpillBase) to reads
-/// through a table of addresses at `table_slot`; false when a parameter is not understood.
-[[nodiscard]] bool SpillBuffers(std::string& source, const std::string& entry_point, u32 spilled,
-                                u32 table_slot);
+/// through a table of addresses at `table_slot`; Failed when a parameter is not understood.
+[[nodiscard]] SpillStatus SpillBuffers(std::string& source, const std::string& entry_point,
+                                       u32 spilled, u32 table_slot);
 constexpr u32 SpillBase = 1000;
 /// Moves the entry function's spilled samplers (MSL sampler indices from SamplerSpillBase) to
 /// reads from a table of their resource IDs at `table_slot` (Metal 3 argument buffer).
-[[nodiscard]] bool SpillSamplers(std::string& source, const std::string& entry_point,
-                                 u32 spilled, u32 table_slot);
+[[nodiscard]] SpillStatus SpillSamplers(std::string& source, const std::string& entry_point,
+                                        u32 spilled, u32 table_slot);
 constexpr u32 SamplerSpillBase = 2000;
 /// Spilled texture and sampler arrays: MSL indices from ArraySpillBase + their first table entry.
-[[nodiscard]] bool SpillArrays(std::string& source, const std::string& entry_point, u32 table_slot);
+[[nodiscard]] SpillStatus SpillArrays(std::string& source, const std::string& entry_point,
+                                      u32 table_slot, u32 total_entries,
+                                      std::span<const ResourceSlot> slots);
 constexpr u32 ArraySpillBase = 100000;
 /// Metal's texture slots per stage on Apple GPUs (0-95).
 constexpr u32 MetalTextureSlots = 96;
@@ -662,28 +665,48 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
             FlipMeshPositionY(result.source);
         }
         if (spilled != 0) {
-            if (cleansed_entry.empty() ||
-                !SpillBuffers(result.source, cleansed_entry, spilled, result.spill_slot)) {
+            const SpillStatus status =
+                cleansed_entry.empty()
+                    ? SpillStatus::Failed
+                    : SpillBuffers(result.source, cleansed_entry, spilled, result.spill_slot);
+            if (status == SpillStatus::Failed) {
                 result.source.clear();
                 result.error = "buffers spilled to a table not understood";
                 return result;
             }
+            if (status == SpillStatus::Unused) {
+                result.spill_slot = ~0U;
+            }
         }
         if (array_entries != 0) {
-            if (cleansed_entry.empty() ||
-                !SpillArrays(result.source, cleansed_entry, result.array_spill_slot)) {
+            const SpillStatus status =
+                cleansed_entry.empty()
+                    ? SpillStatus::Failed
+                    : SpillArrays(result.source, cleansed_entry, result.array_spill_slot,
+                                  result.array_spill_entries, result.slots);
+            if (status == SpillStatus::Failed) {
                 result.source.clear();
                 result.error = "texture or sampler arrays spilled to a table not understood";
                 return result;
             }
+            if (status == SpillStatus::Unused) {
+                result.array_spill_slot = ~0U;
+                result.array_spill_entries = 0;
+            }
         }
         if (spilled_samplers != 0) {
-            if (cleansed_entry.empty() ||
-                !SpillSamplers(result.source, cleansed_entry, spilled_samplers,
-                               result.sampler_spill_slot)) {
+            const SpillStatus status =
+                cleansed_entry.empty()
+                    ? SpillStatus::Failed
+                    : SpillSamplers(result.source, cleansed_entry, spilled_samplers,
+                                    result.sampler_spill_slot);
+            if (status == SpillStatus::Failed) {
                 result.source.clear();
                 result.error = "samplers spilled to a table not understood";
                 return result;
+            }
+            if (status == SpillStatus::Unused) {
+                result.sampler_spill_slot = ~0U;
             }
         }
         const bool reducible = stage == Stage::Vertex || stage == Stage::Fragment ||
@@ -1473,18 +1496,18 @@ static float4 spvReducedSample(texture2d<float> t, sampler s, float2 uv, float l
 )msl";
 
 
-bool SpillBuffers(std::string& source, const std::string& entry_point, u32 spilled,
-                  u32 table_slot) {
+SpillStatus SpillBuffers(std::string& source, const std::string& entry_point, u32 spilled,
+                         u32 table_slot) {
     const std::string needle = " " + entry_point + "(";
     const size_t at = source.find(needle);
     if (at == std::string::npos) {
-        return false;
+        return SpillStatus::Failed;
     }
     const size_t open = at + needle.size() - 1;
     const size_t close = MatchingBracket(source, open);
     const size_t body_open = close == std::string::npos ? close : source.find('{', close);
     if (close == std::string::npos || body_open == std::string::npos) {
-        return false;
+        return SpillStatus::Failed;
     }
     std::string parameters;
     std::string declarations;
@@ -1493,7 +1516,7 @@ bool SpillBuffers(std::string& source, const std::string& entry_point, u32 spill
          SplitParameters(std::string_view(source).substr(open + 1, close - open - 1))) {
         const auto parameter = ParseParameter(text);
         if (!parameter) {
-            return false;
+            return SpillStatus::Failed;
         }
         if (parameter->attribute.starts_with("buffer(")) {
             const u32 index = static_cast<u32>(std::atoi(parameter->attribute.c_str() + 7));
@@ -1518,7 +1541,7 @@ bool SpillBuffers(std::string& source, const std::string& entry_point, u32 spill
                     cursor = end == std::string::npos ? type.size() : end + 1;
                 }
                 if (base.empty() || (base.back() != '&' && base.back() != '*')) {
-                    return false;
+                    return SpillStatus::Failed;
                 }
                 const bool is_reference = base.back() == '&';
                 base.pop_back();
@@ -1539,52 +1562,75 @@ bool SpillBuffers(std::string& source, const std::string& entry_point, u32 spill
         }
         parameters += (parameters.empty() ? "" : ", ") + std::string(text);
     }
-    if (found != spilled) {
-        return false;
+    if (found == 0) {
+        return SpillStatus::Unused;
+    }
+    if (found > spilled) {
+        return SpillStatus::Failed;
     }
     parameters += (parameters.empty() ? "" : ", ") + std::string("constant ulong* spvSpill [[buffer(") +
                   std::to_string(table_slot) + ")]]";
     source.replace(open + 1, close - open - 1, parameters);
     const size_t brace = source.find('{', open + 1 + parameters.size());
     source.insert(source.find('\n', brace) + 1, declarations);
-    return true;
+    return SpillStatus::Rewritten;
 }
 
-bool SpillArrays(std::string& source, const std::string& entry_point, u32 table_slot) {
+SpillStatus SpillArrays(std::string& source, const std::string& entry_point, u32 table_slot,
+                        u32 total_entries, std::span<const ResourceSlot> slots) {
     const std::string needle = " " + entry_point + "(";
     const size_t at = source.find(needle);
     if (at == std::string::npos) {
-        return false;
+        return SpillStatus::Failed;
     }
     const size_t open = at + needle.size() - 1;
     const size_t close = MatchingBracket(source, open);
     if (close == std::string::npos || source.find('{', close) == std::string::npos) {
-        return false;
+        return SpillStatus::Failed;
     }
+    struct SpilledMember {
+        u32 id;
+        u32 count;
+        std::string type;
+        std::string name;
+    };
+    std::vector<SpilledMember> spilled_members;
     std::string parameters;
     std::string declarations;
-    std::string members;
     for (const std::string_view text :
          SplitParameters(std::string_view(source).substr(open + 1, close - open - 1))) {
         const auto parameter = ParseParameter(text);
         if (!parameter) {
-            return false;
+            return SpillStatus::Failed;
         }
         const bool texture = parameter->attribute.starts_with("texture(");
         const bool sampler = parameter->attribute.starts_with("sampler(");
         if (texture || sampler) {
-            const u32 index = static_cast<u32>(
-                std::atoi(parameter->attribute.c_str() + (texture ? 8 : 8)));
+            const u32 index = static_cast<u32>(std::atoi(parameter->attribute.c_str() + 8));
             if (index >= ArraySpillBase) {
                 const bool is_array = parameter->type.starts_with("array<");
-                if (!is_array && !parameter->type.starts_with("texture") &&
-                    !parameter->type.starts_with("depth")) {
-                    return false;
+                const bool valid_type =
+                    texture ? (is_array || parameter->type.starts_with("texture") ||
+                               parameter->type.starts_with("depth"))
+                            : (is_array || parameter->type == "sampler");
+                if (!valid_type) {
+                    return SpillStatus::Failed;
                 }
-                // In the table (Metal 3: the resource IDs written by the CPU), and a reference
-                // or local handle to it under the parameter's name.
-                members += "    " + parameter->type + " " + parameter->name + " [[id(" +
-                           std::to_string(index - ArraySpillBase) + ")]];\n";
+                const u32 entry_id = index - ArraySpillBase;
+                const ResourceKind wanted_kind =
+                    texture ? ResourceKind::Texture : ResourceKind::Sampler;
+                u32 count = 0;
+                for (const ResourceSlot& slot : slots) {
+                    if (slot.in_array_table && slot.kind == wanted_kind && slot.spill == entry_id) {
+                        count = slot.count;
+                        break;
+                    }
+                }
+                if (count == 0 || entry_id + count > total_entries) {
+                    return SpillStatus::Failed;
+                }
+                spilled_members.push_back(
+                    {entry_id, count, parameter->type, parameter->name});
                 declarations += (is_array ? "    constant " + parameter->type + "& "
                                           : "    " + parameter->type + " ") +
                                 parameter->name + " = spvArrayTable." + parameter->name + ";\n";
@@ -1593,8 +1639,32 @@ bool SpillArrays(std::string& source, const std::string& entry_point, u32 table_
         }
         parameters += (parameters.empty() ? "" : ", ") + std::string(text);
     }
-    if (members.empty()) {
-        return false;
+    if (spilled_members.empty()) {
+        return SpillStatus::Unused;
+    }
+    // Argument buffer struct [[id(n)]] attributes must be strictly increasing, and unused entries
+    // omitted by SPIRV-Cross are padded so CPU array_table[n] lands at byte offset n * 8.
+    std::ranges::sort(spilled_members, {}, &SpilledMember::id);
+    std::string members;
+    u32 cursor = 0;
+    for (const SpilledMember& member : spilled_members) {
+        if (member.id < cursor) {
+            return SpillStatus::Failed;
+        }
+        if (member.id > cursor) {
+            members += "    array<ulong, " + std::to_string(member.id - cursor) + "> _spvPad" +
+                       std::to_string(cursor) + " [[id(" + std::to_string(cursor) + ")]];\n";
+        }
+        members += "    " + member.type + " " + member.name + " [[id(" +
+                   std::to_string(member.id) + ")]];\n";
+        cursor = member.id + member.count;
+    }
+    if (cursor > total_entries) {
+        return SpillStatus::Failed;
+    }
+    if (cursor < total_entries) {
+        members += "    array<ulong, " + std::to_string(total_entries - cursor) + "> _spvPad" +
+                   std::to_string(cursor) + " [[id(" + std::to_string(cursor) + ")]];\n";
     }
     parameters += (parameters.empty() ? "" : ", ") +
                   std::string("constant spvArraySpill& spvArrayTable [[buffer(") +
@@ -1606,21 +1676,24 @@ bool SpillArrays(std::string& source, const std::string& entry_point, u32 table_
     const size_t using_at = source.find(using_line);
     const size_t insert_at =
         using_at != std::string::npos ? using_at + using_line.size() : source.rfind('\n', at) + 1;
-    source.insert(insert_at, "\nstruct spvArraySpill\n{\n" + members + "};\n\n");
-    return true;
+    source.insert(insert_at,
+                  "\nstruct spvArraySpill\n{\n" + members +
+                      "};\nstatic_assert(sizeof(spvArraySpill) == " +
+                      std::to_string(u64{total_entries} * 8) + "ul, \"spvArraySpill layout\");\n\n");
+    return SpillStatus::Rewritten;
 }
 
-bool SpillSamplers(std::string& source, const std::string& entry_point, u32 spilled,
-                   u32 table_slot) {
+SpillStatus SpillSamplers(std::string& source, const std::string& entry_point, u32 spilled,
+                          u32 table_slot) {
     const std::string needle = " " + entry_point + "(";
     const size_t at = source.find(needle);
     if (at == std::string::npos) {
-        return false;
+        return SpillStatus::Failed;
     }
     const size_t open = at + needle.size() - 1;
     const size_t close = MatchingBracket(source, open);
     if (close == std::string::npos || source.find('{', close) == std::string::npos) {
-        return false;
+        return SpillStatus::Failed;
     }
     std::string parameters;
     std::string declarations;
@@ -1629,13 +1702,13 @@ bool SpillSamplers(std::string& source, const std::string& entry_point, u32 spil
          SplitParameters(std::string_view(source).substr(open + 1, close - open - 1))) {
         const auto parameter = ParseParameter(text);
         if (!parameter) {
-            return false;
+            return SpillStatus::Failed;
         }
         if (parameter->attribute.starts_with("sampler(")) {
             const u32 index = static_cast<u32>(std::atoi(parameter->attribute.c_str() + 8));
             if (index >= SamplerSpillBase && index < SamplerSpillBase + spilled) {
                 if (parameter->type != "sampler") {
-                    return false;
+                    return SpillStatus::Failed;
                 }
                 // A local copy of the table's sampler under the parameter's name (Metal 3:
                 // samplers made with supportArgumentBuffers, their gpuResourceID in the table).
@@ -1647,8 +1720,11 @@ bool SpillSamplers(std::string& source, const std::string& entry_point, u32 spil
         }
         parameters += (parameters.empty() ? "" : ", ") + std::string(text);
     }
-    if (found != spilled) {
-        return false;
+    if (found == 0) {
+        return SpillStatus::Unused;
+    }
+    if (found > spilled) {
+        return SpillStatus::Failed;
     }
     parameters += (parameters.empty() ? "" : ", ") +
                   std::string("constant spvSamplerSpill& spvSamplerTable [[buffer(") +
@@ -1664,7 +1740,7 @@ bool SpillSamplers(std::string& source, const std::string& entry_point, u32 spil
     const size_t insert_at =
         using_at != std::string::npos ? using_at + using_line.size() : source.rfind('\n', at) + 1;
     source.insert(insert_at, "\n" + table_type);
-    return true;
+    return SpillStatus::Rewritten;
 }
 
 u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point, bool fragment,

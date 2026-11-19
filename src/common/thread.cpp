@@ -63,7 +63,6 @@
 
 #ifdef __linux__
 #include <sys/resource.h>
-#include <algorithm>
 #include <fstream>
 
 namespace {
@@ -105,14 +104,8 @@ int NiceValueForPriority(Common::ThreadPriority priority) {
 
 #ifdef __ANDROID__
 #include <sys/utsname.h>
-#include <atomic>
 #include <cerrno>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <mutex>
-#include <vector>
 
 namespace {
 constexpr size_t ANDROID_MINIMUM_PERFORMANCE_CORES = 4;
@@ -553,25 +546,33 @@ void SelectCurrentThreadCpuSets(const std::vector<ULONG>& ids) {
     }
 }
 
-/// Masks of processor group 0's logical processors that share a `relation` (a physical core, or
-/// with RelationCache an L3 cache).
-std::vector<KAFFINITY> GroupZeroMasks(LOGICAL_PROCESSOR_RELATIONSHIP relation) {
-    std::vector<KAFFINITY> result;
+std::vector<u8> QueryLogicalProcessorInfo(LOGICAL_PROCESSOR_RELATIONSHIP relation) {
     DWORD length = 0;
     GetLogicalProcessorInformationEx(relation, nullptr, &length);
+    if (length == 0) {
+        return {};
+    }
     std::vector<u8> buffer(length);
     auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
-    if (length == 0 || !GetLogicalProcessorInformationEx(relation, info, &length)) {
-        return result;
+    if (!GetLogicalProcessorInformationEx(relation, info, &length)) {
+        return {};
     }
-    for (DWORD offset = 0; offset < length;) {
-        auto* entry =
-            reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
-        if (entry->Relationship == RelationProcessorCore && entry->Processor.GroupCount > 0 &&
-            entry->Processor.GroupMask[0].Group == 0) {
-            result.push_back(entry->Processor.GroupMask[0].Mask);
-        } else if (entry->Relationship == RelationCache && entry->Cache.Level == 3 &&
-                   entry->Cache.GroupMask.Group == 0) {
+    buffer.resize(length);
+    return buffer;
+}
+
+/// Masks of processor group 0's logical processors that share an L3 cache.
+std::vector<KAFFINITY> GroupZeroL3Masks() {
+    std::vector<KAFFINITY> result;
+    const std::vector<u8> buffer = QueryLogicalProcessorInfo(RelationCache);
+    for (size_t offset = 0; offset < buffer.size();) {
+        const auto* entry = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
+            buffer.data() + offset);
+        if (entry->Size == 0) {
+            break;
+        }
+        if (entry->Relationship == RelationCache && entry->Cache.Level == 3 &&
+            entry->Cache.Type != CacheInstruction && entry->Cache.GroupMask.Group == 0) {
             result.push_back(entry->Cache.GroupMask.Mask);
         }
         offset += entry->Size;
@@ -585,16 +586,8 @@ thread_local int t_guest_core_index = -1;
 
 Common::ThreadPinning::Topology ReadPinningTopology() {
     Common::ThreadPinning::Topology topology;
-    DWORD length = 0;
-    GetLogicalProcessorInformationEx(RelationAll, nullptr, &length);
-    std::vector<u8> buffer(length);
-    if (length == 0 ||
-        !GetLogicalProcessorInformationEx(
-            RelationAll, reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()),
-            &length)) {
-        return topology;
-    }
-    for (DWORD offset = 0; offset < length;) {
+    const std::vector<u8> buffer = QueryLogicalProcessorInfo(RelationAll);
+    for (size_t offset = 0; offset < buffer.size();) {
         const auto* entry = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
             buffer.data() + offset);
         if (entry->Size == 0) {
@@ -626,6 +619,23 @@ Common::ThreadPinning::Topology ReadPinningTopology() {
 
 namespace Common {
 
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
+namespace {
+bool IsVCachePinningEnabled() {
+    static const int env_override = [] {
+        if (const char* env = std::getenv("EDEN_NX2_VCACHE")) {
+            return env[0] == '0' ? 0 : 1;
+        }
+        return -1;
+    }();
+    if (env_override >= 0) {
+        return env_override != 0;
+    }
+    return Settings::values.prefer_3d_vcache.GetValue();
+}
+} // Anonymous namespace
+#endif
+
 #ifdef _WIN32
 namespace {
 
@@ -644,14 +654,8 @@ const Win32CacheTopology& GetWin32CacheTopology() {
             result.process_mask == 0) {
             return result;
         }
-        DWORD length = 0;
-        GetLogicalProcessorInformationEx(RelationAll, nullptr, &length);
-        if (length == 0) {
-            return result;
-        }
-        std::vector<u8> buffer(length);
-        auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
-        if (!GetLogicalProcessorInformationEx(RelationAll, info, &length)) {
+        const std::vector<u8> buffer = QueryLogicalProcessorInfo(RelationAll);
+        if (buffer.empty()) {
             return result;
         }
         DWORD max_l3_size = 0;
@@ -665,7 +669,7 @@ const Win32CacheTopology& GetWin32CacheTopology() {
         u8 first_efficiency_class = 0;
         bool has_efficiency_class = false;
         bool uniform_efficiency_class = true;
-        for (DWORD offset = 0; offset < length;) {
+        for (size_t offset = 0; offset < buffer.size();) {
             const auto* entry =
                 reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
             if (entry->Size == 0) {
@@ -752,19 +756,6 @@ const Win32CacheTopology& GetWin32CacheTopology() {
         return result;
     }();
     return topology;
-}
-
-bool IsVCachePinningEnabled() {
-    static const int env_override = [] {
-        if (const char* env = std::getenv("EDEN_NX2_VCACHE")) {
-            return env[0] == '0' ? 0 : 1;
-        }
-        return -1;
-    }();
-    if (env_override >= 0) {
-        return env_override != 0;
-    }
-    return Settings::values.prefer_3d_vcache.GetValue();
 }
 
 enum class Win32CoreGroup {
@@ -923,19 +914,6 @@ const LinuxCacheTopology& GetLinuxCacheTopology() {
     return topology;
 }
 
-bool IsVCachePinningEnabled() {
-    static const int env_override = [] {
-        if (const char* env = std::getenv("EDEN_NX2_VCACHE")) {
-            return env[0] == '0' ? 0 : 1;
-        }
-        return -1;
-    }();
-    if (env_override >= 0) {
-        return env_override != 0;
-    }
-    return Settings::values.prefer_3d_vcache.GetValue();
-}
-
 struct LinuxThreadPolicy {
     pid_t tid;
     LinuxCoreGroup group;
@@ -1067,12 +1045,14 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 }
 
 void SetCurrentThreadName(const char* name) {
+    if (name == nullptr) {
+        return;
+    }
     Nx2SampleProfile::OnThreadNamed(name);
 #ifdef _WIN32
-    if (name != nullptr && std::strncmp(name, "CPUCore_", 8) == 0 && name[8] >= '0' &&
-        name[8] <= '9') {
+    if (std::strncmp(name, "CPUCore_", 8) == 0 && name[8] >= '0' && name[8] <= '9') {
         t_guest_core_index = std::atoi(name + 8);
-    } else if (name != nullptr && std::strcmp(name, "CPUThread") == 0) {
+    } else if (std::strcmp(name, "CPUThread") == 0) {
         t_guest_core_index = -1;
     }
 #endif
@@ -1166,7 +1146,7 @@ struct FrameWorkgroupMember {
     ~FrameWorkgroupMember() {
         const FrameWorkgroup& workgroup = AppleFrameWorkgroup();
         if (interval_open) {
-            os_workgroup_interval_finish(workgroup.group, nullptr);
+            static_cast<void>(os_workgroup_interval_finish(workgroup.group, nullptr));
         }
         if (joined) {
             os_workgroup_leave(workgroup.group, &token);
@@ -1218,7 +1198,7 @@ void TickFrameWorkgroup() {
         return;
     }
     if (t_frame_workgroup.interval_open) {
-        os_workgroup_interval_finish(workgroup.group, nullptr);
+        static_cast<void>(os_workgroup_interval_finish(workgroup.group, nullptr));
     }
     const u64 now = mach_absolute_time();
     t_frame_workgroup.interval_open =
@@ -1230,11 +1210,16 @@ void TickFrameWorkgroup() {
 void SetCurrentThreadToPerformanceCores(bool frame_critical) {
 #if defined(__APPLE__)
     if (!frame_critical) {
-        static const bool demote = [] {
+        static const int env_override = [] {
             const char* const value = std::getenv("EDEN_NX2_APPLE_HELPER_QOS");
-            return value != nullptr && value[0] != '\0' ? value[0] != '0'
-                                                         : g_apple_helper_qos.load(std::memory_order_relaxed);
+            if (value == nullptr || value[0] == '\0') {
+                return -1;
+            }
+            return value[0] != '0' ? 1 : 0;
         }();
+        const bool demote = env_override >= 0
+                                ? env_override != 0
+                                : g_apple_helper_qos.load(std::memory_order_relaxed);
         if (demote) {
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
             return;
@@ -1348,7 +1333,7 @@ u64 BackgroundWorkCpuMask() {
     }
     // Several L3 caches (Ryzen 9 with two CCDs): the other CCD's cores, so the work does not
     // evict what the GPU threads keep in theirs, when that leaves enough of them.
-    static const std::vector<KAFFINITY> l3_caches = GroupZeroMasks(RelationCache);
+    static const std::vector<KAFFINITY> l3_caches = GroupZeroL3Masks();
     u64 other_caches = rest;
     for (const KAFFINITY cache : l3_caches) {
         if ((static_cast<u64>(cache) & pinned) != 0) {
@@ -1577,24 +1562,18 @@ void PollThreadPolicies() {
 #endif
 }
 
-#ifdef ARCHITECTURE_x86_64
-// On Linux and UNIX systems, a futex would nominally be used to cover the costs
-// the idea is that it's intuitivelly cheaper to use a direct instruction as opposed to a full futex call
-// the underlying libc++ implementation uses pthread_cond_timedwait which MAY invoke a futex
-// Let's pretend the OS is too expensive to jump into, and avoid ANY context switches
-// this should *IN THEORY* lower CPU usage while just waiting for stuff effectively
-// For windows the minimal quanta resolution is about 500us, and normal CRT cond var is 1.5ms(?)
-// so may as well avoid that too
-// Let's just give ALL platforms the same mechanisms (almost) for when they have umonitor OR waitpkg
+#if defined(_WIN32) && defined(ARCHITECTURE_x86_64)
+// On Windows the minimal quanta resolution is about 500us, and normal CRT cond var is ~1.5ms,
+// so avoid context switches when hardware user-level monitor/wait instructions are available.
 #ifdef __clang__
 __attribute__((target("waitpkg,mwaitx")))
 #elif defined(__GNUC__)
 #pragma GCC target("waitpkg")
 #pragma GCC target("mwaitx")
 #endif
+#endif
 bool Event::WaitFor(const std::chrono::nanoseconds time) {
 #ifdef _WIN32
-    auto const& caps = Common::g_cpu_caps;
     const auto deadline = EventWaitDeadline(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()), time);
@@ -1602,6 +1581,8 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
         return deadline - std::chrono::duration_cast<std::chrono::nanoseconds>(
                               std::chrono::steady_clock::now().time_since_epoch());
     };
+#ifdef ARCHITECTURE_x86_64
+    auto const& caps = Common::g_cpu_caps;
     const u64 ticks_per_second = Common::g_wall_clock.NsToTicks(std::chrono::seconds{1});
     if (caps.monitorx) {
         while (true) {
@@ -1610,20 +1591,21 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
             _mm_monitorx(reinterpret_cast<u64*>(std::addressof(is_set)), 0, 0);
             if (!is_set.load()) {
                 const u32 cycles = MwaitxTimeoutCycles(remaining(), ticks_per_second);
-                if (cycles != 0) {
-                    // See here: https://github.com/torvalds/linux/blob/948a64995aca6820abefd17f1a4258f5835c5ad9/arch/x86/lib/delay.c#L93
-                    // MWAITX accepts a 32-bit input timer which determines the total number of cycles to wait for
-                    // NOT THE TOTAL ABSOLUTE TSC VALUE, it's just a delta
-                    // BIT[1] = use a timer
-                    // Hint = 0: Use C1 state when sleepy (means slower wakeup but better savings)
-                    _mm_mwaitx(1 << 1, 0u, cycles);
-                    continue;
-                } else
-                    return false; //timeout
+                if (cycles == 0) {
+                    return false; // timeout
+                }
+                // See here: https://github.com/torvalds/linux/blob/948a64995aca6820abefd17f1a4258f5835c5ad9/arch/x86/lib/delay.c#L93
+                // MWAITX accepts a 32-bit input timer which determines the total number of cycles to wait for
+                // NOT THE TOTAL ABSOLUTE TSC VALUE, it's just a delta
+                // BIT[1] = use a timer
+                // Hint = 0: Use C1 state when sleepy (means slower wakeup but better savings)
+                _mm_mwaitx(1 << 1, 0u, cycles);
+                continue;
             }
             bool expected = true;
-            if (is_set.compare_exchange_weak(expected, false, std::memory_order_release))
+            if (is_set.compare_exchange_weak(expected, false, std::memory_order_release)) {
                 return true;
+            }
         }
     }
     if (caps.waitpkg) {
@@ -1635,18 +1617,22 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
                 // limit (IA32_UMWAIT_CONTROL). Wait again until the deadline, as for MWAITX. The
                 // bounded budget keeps the absolute TSC deadline from wrapping.
                 const u32 cycles = MwaitxTimeoutCycles(remaining(), ticks_per_second);
-                if (cycles == 0)
+                if (cycles == 0) {
                     return false; // timeout
+                }
                 _umwait(0, Common::X64::FencedRDTSC() + cycles); // umwait is absolute time!!!
                 continue;
             }
             bool expected = true;
-            if (is_set.compare_exchange_weak(expected, false, std::memory_order_release))
+            if (is_set.compare_exchange_weak(expected, false, std::memory_order_release)) {
                 return true;
+            }
         }
     }
-    while (!is_set.load() && remaining() > std::chrono::nanoseconds::zero())
+#endif
+    while (!is_set.load() && remaining() > std::chrono::nanoseconds::zero()) {
         Common::Windows::SleepForOneTick();
+    }
     bool expected = true;
     return is_set.compare_exchange_strong(expected, false, std::memory_order_release);
 #else
@@ -1654,33 +1640,13 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
     const auto now = std::chrono::steady_clock::now();
     const auto deadline = std::chrono::steady_clock::time_point{EventWaitDeadline(
         std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()), time)};
-    if (!condvar.wait_until(lk, deadline, [this] { return is_set.load(); }))
+    if (!condvar.wait_until(lk, deadline, [this] { return is_set.load(); })) {
         return false;
+    }
     is_set = false;
     return true;
 #endif
 }
-#else
-bool Event::WaitFor(const std::chrono::nanoseconds time) {
-#ifdef _WIN32
-    auto const end = Common::g_wall_clock.GetTimeNS() + time;
-    while (!is_set.load() && end > Common::g_wall_clock.GetTimeNS())
-        Common::Windows::SleepForOneTick();
-    if (is_set.load())
-        Reset();
-    return true;
-#else
-    std::unique_lock lk{mutex};
-    const auto now = std::chrono::steady_clock::now();
-    const auto deadline = std::chrono::steady_clock::time_point{EventWaitDeadline(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()), time)};
-    if (!condvar.wait_until(lk, deadline, [this] { return is_set.load(); }))
-        return false;
-    is_set = false;
-    return true;
-#endif
-}
-#endif
 
 #ifdef _WIN32
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION

@@ -322,6 +322,7 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
 void ThreadManager::NotifyShutdown() {
     if (thread.joinable()) {
         thread.request_stop();
+        Tegra::Nx2PendingWake::Get().Notify();
         thread.join();
     }
     VideoCommon::GpuSplit::Get().Stop();

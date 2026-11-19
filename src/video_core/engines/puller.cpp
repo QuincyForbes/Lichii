@@ -213,6 +213,60 @@ void DrainBack(VideoCommon::DrainSite site = VideoCommon::DrainSite::Acquire) {
     VideoCommon::GpuSplit::Get().Drain(site);
 }
 
+// Shared safety checks for reading a settled semaphore word directly from guest memory without
+// draining the split: 4-byte aligned GPU/device addresses, outside the native syncpoint shim,
+// no pending GMMU function, queued writer, queued release, in-flight async report, or GPU-written
+// page/region.
+bool SettledSemaphoreChecks(const MemoryManager& memory, GPUVAddr address,
+                            std::optional<DAddr> known_device = std::nullopt) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active() || VideoCore::Nx2Debug::DelayedFences() ||
+        (address % sizeof(u32)) != 0 ||
+        memory.OverlapsNativeSyncpointShim(address, sizeof(u32))) {
+        return false;
+    }
+    const u64 done = split.ConsumedNow();
+    if (split.LastFunctionPosition() > done) {
+        return false;
+    }
+    const auto device = known_device ? known_device : memory.GpuToCpuAddress(address);
+    if (!device || (*device % sizeof(u32)) != 0) {
+        return false;
+    }
+    if (u32 method = 0; split.QueuedWriterKind(address, address + sizeof(u32), method) != 0) {
+        return false;
+    }
+    if (split.MayBeWrittenSince(done, *device, sizeof(u32))) {
+        return false;
+    }
+    u32 miss = 0;
+    if (split.QueuedReleasePayload(*device, address, &miss).has_value() || miss == 3 ||
+        split.QueuedReleaseTo(*device, done).has_value()) {
+        return false;
+    }
+    if (const u64 async_position = split.HasAsyncWrite(*device, sizeof(u32));
+        async_position != 0 &&
+        (async_position > done || !Nx2AsyncReportsSettled(*device, sizeof(u32)))) {
+        return false;
+    }
+    return !Nx2MayBeGpuWritten(*device, sizeof(u32));
+}
+
+bool AddSemaphoreWaiter(DmaPusher& dma_pusher, const void* owner,
+                        const Puller::PendingAcquire& acquire) {
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+    if (!device) {
+        return true;
+    }
+    u32* watched_word =
+        reinterpret_cast<u32*>(dma_pusher.memory_manager.GetPointer(acquire.address));
+    if (reinterpret_cast<uintptr_t>(watched_word) % alignof(u32) != 0) {
+        watched_word = nullptr;
+    }
+    return Nx2SemaphoreWaiters::Get().Add(owner, *device, acquire.value, acquire.operation,
+                                          watched_word);
+}
+
 // EDEN_NX2_ACQUIRE_PRECHECK=1: a GEQUAL acquire whose word already holds the value continues
 // without draining the split, if nothing queued for the back may write the word (a release that
 // lowers it, a fence action) and no GPU work ever wrote its page (then no cache holds a newer word
@@ -238,19 +292,13 @@ bool MetByQueuedRelease(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     }
     u32 miss = 0;
     const auto payload = split.QueuedReleasePayload(*device, acquire.address, &miss);
-    // The release already ran: guest memory holds its word unless something sent after it may
-    // still change the word (a copy or compute write, an unranged writer, a GPU-written page).
-    // CurrentReleaseWord declines those; reading memory directly let a stale word meet the
-    // acquire while a queued write would lower it.
-    if (!payload && miss == 2 && !VideoCore::Nx2Debug::DelayedFences() &&
-        !memory.OverlapsNativeSyncpointShim(acquire.address, sizeof(u32))) {
-        if (const auto word = split.CurrentReleaseWord(memory, *device, acquire.address, 0,
-                                                       nullptr);
-            word && acquire.Matches(*word)) {
-            split.NoteSync();
-            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquiresQueued, 1);
-            return true;
-        }
+    // The release already ran: guest memory holds its word once settled (nothing sent after it
+    // may still change the word, no pending GMMU function or async report, and not GPU-written).
+    if (!payload && miss == 2 && SettledSemaphoreChecks(memory, acquire.address, *device) &&
+        acquire.Matches(memory.Read<u32>(acquire.address))) {
+        split.NoteSync();
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquiresQueued, 1);
+        return true;
     }
     if (miss_out) {
         *miss_out = payload ? 4 : miss;
@@ -454,49 +502,12 @@ bool EqualMetWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& a
         const char* setting = std::getenv("EDEN_NX2_ACQUIRE_EQUAL");
         return setting == nullptr || setting[0] != '0';
     }();
-    auto& split = VideoCommon::GpuSplit::Get();
-    if (!enabled || !split.Active() || VideoCore::Nx2Debug::DelayedFences()) {
-        return false;
-    }
-    const GPUVAddr address = acquire.address;
-    if ((address % sizeof(u32)) != 0) {
-        return false;
-    }
     auto& memory = dma_pusher.memory_manager;
-    if (memory.OverlapsNativeSyncpointShim(address, sizeof(u32))) {
+    if (!enabled || !SettledSemaphoreChecks(memory, acquire.address) ||
+        !acquire.Matches(memory.Read<u32>(acquire.address))) {
         return false;
     }
-    const u64 done = split.ConsumedNow();
-    if (split.LastFunctionPosition() > done) {
-        return false;
-    }
-    const auto device = memory.GpuToCpuAddress(address);
-    if (!device || (*device % sizeof(u32)) != 0) {
-        return false;
-    }
-    if (u32 method = 0; split.QueuedWriterKind(address, address + sizeof(u32), method) != 0) {
-        return false;
-    }
-    if (split.MayBeWrittenSince(done, *device, sizeof(u32))) {
-        return false;
-    }
-    u32 miss = 0;
-    if (split.QueuedReleasePayload(*device, address, &miss).has_value() || miss == 3 ||
-        split.QueuedReleaseTo(*device, done).has_value()) {
-        return false;
-    }
-    if (const u64 async_position = split.HasAsyncWrite(*device, sizeof(u32));
-        async_position != 0 &&
-        (async_position > done || !Nx2AsyncReportsSettled(*device, sizeof(u32)))) {
-        return false;
-    }
-    if (Nx2MayBeGpuWritten(*device, sizeof(u32))) {
-        return false;
-    }
-    if (!acquire.Matches(memory.Read<u32>(address))) {
-        return false;
-    }
-    split.NoteSync();
+    VideoCommon::GpuSplit::Get().NoteSync();
     VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquiresFast, 1);
     return true;
 }
@@ -1211,15 +1222,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             if (stats.suspended >= AcquireLearning::Streak &&
                 !acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
                 AcquireLearning::early_suspends.fetch_add(1, std::memory_order_relaxed);
-                if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
-                    u32* watched_word =
-                        reinterpret_cast<u32*>(dma_pusher.memory_manager.GetPointer(acquire.address));
-                    if (reinterpret_cast<uintptr_t>(watched_word) % alignof(u32) != 0) {
-                        watched_word = nullptr;
-                    }
-                    Nx2SemaphoreWaiters::Get().Add(this, *device, acquire.value, acquire.operation,
-                                                   watched_word);
-                }
+                AddSemaphoreWaiter(dma_pusher, this, acquire);
                 pending_acquire = acquire;
                 dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
                 VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
@@ -1272,13 +1275,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         // even if a later one overwrites it. The word in memory is watched for the guest CPU's
         // stores (Nx2SemaphoreWaiters::WordStored).
         auto& waiters = Nx2SemaphoreWaiters::Get();
-        u32* watched_word =
-            reinterpret_cast<u32*>(dma_pusher.memory_manager.GetPointer(acquire.address));
-        if (reinterpret_cast<uintptr_t>(watched_word) % alignof(u32) != 0) {
-            watched_word = nullptr;
-        }
-        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
-            device && !waiters.Add(this, *device, acquire.value, acquire.operation, watched_word)) {
+        if (!AddSemaphoreWaiter(dma_pusher, this, acquire)) {
             if (static std::atomic<u32> full{}; full.fetch_add(1) < 8) {
                 LOG_ERROR(HW_GPU, "Channel {} waits on semaphore {:#x} unlatched: {} channels wait",
                           dma_pusher.channel_state.bind_id, acquire.address,

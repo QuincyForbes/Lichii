@@ -85,6 +85,10 @@ inline void NotePresent(u32 swap_interval = 0) {
     std::scoped_lock lock{Detail::g_pacing_mutex};
     auto& [last, on_since, intervals, count, since_off, need, drops] = Detail::g_pacing;
     const auto now = Clock::now();
+    if (last == Clock::time_point{}) {
+        last = now;
+        return;
+    }
     intervals[count++ % Window] = std::chrono::duration<double, std::milli>(now - last).count();
     last = now;
     ++since_off;

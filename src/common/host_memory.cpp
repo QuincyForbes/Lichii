@@ -118,6 +118,25 @@ namespace Common {
 [[maybe_unused]] constexpr int BackingAttempts = 5; // fastmem backing allocation tries (Windows)
 [[maybe_unused]] constexpr size_t HugePageSize = 0x200000;
 
+namespace {
+
+[[maybe_unused]] bool IsZeroRange(const u8* data, size_t size) noexcept {
+    // A cache line at a time: most pages that are not zero say so in their first line.
+    const auto* words = reinterpret_cast<const u64*>(data);
+    for (size_t i = 0; i < size / sizeof(u64); i += 8) {
+        const u64 bits = words[i] | words[i + 1] | words[i + 2] | words[i + 3] | words[i + 4] |
+                         words[i + 5] | words[i + 6] | words[i + 7];
+        if (bits != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[maybe_unused]] bool IsZeroPage(const u8* page) noexcept {
+    return IsZeroRange(page, PageAlignment);
+}
+
 #ifdef LICHII_IOS_MACH_MEMORY
 // The guest object moved to the media ledger: task_info has what of it is resident and
 // compressed, without a counting pass.
@@ -142,6 +161,8 @@ constexpr bool FileGuestDefault = false;
     return value == nullptr || value[0] == '\0' ? fallback : value[0] != '0';
 }
 #endif
+
+} // namespace
 
 #ifdef _WIN32
 
@@ -338,6 +359,7 @@ public:
             LOG_CRITICAL(HW_Memory, "Failed to map {} MiB of virtual memory", backing_size >> 20);
             return false;
         }
+        backing_mapped = true;
         // Allocate virtual address placeholder
         for (int attempt = 0; attempt < 8 && !virtual_base; ++attempt) {
             if (attempt > 0) {
@@ -516,6 +538,7 @@ private:
             if (g_reserved_views.empty()) {
                 g_committed_bytes.store(0, std::memory_order_relaxed);
             }
+            reserved = false;
         }
         if (!placeholders.empty()) {
             for (const auto& placeholder : placeholders) {
@@ -525,22 +548,32 @@ private:
                 }
             }
             Coalesce(0, virtual_size);
+            placeholders.clear();
+            placeholder_host_pointers.clear();
         }
         if (virtual_base) {
             if (!VirtualFree(virtual_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(HW_Memory, "Failed to free virtual memory");
             }
+            virtual_base = nullptr;
         }
         if (backing_base) {
-            if (!pfn_UnmapViewOfFile2(process, backing_base, MEM_PRESERVE_PLACEHOLDER)) {
-                LOG_CRITICAL(HW_Memory, "Failed to unmap backing memory placeholder");
+            if (backing_mapped) {
+                if (!pfn_UnmapViewOfFile2(process, backing_base, MEM_PRESERVE_PLACEHOLDER)) {
+                    LOG_CRITICAL(HW_Memory, "Failed to unmap backing memory placeholder");
+                }
+                backing_mapped = false;
             }
             if (!VirtualFreeEx(process, backing_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(HW_Memory, "Failed to free backing memory");
             }
+            backing_base = nullptr;
         }
-        if (!CloseHandle(backing_handle)) {
-            LOG_CRITICAL(HW_Memory, "Failed to free backing memory file handle");
+        if (backing_handle) {
+            if (!CloseHandle(backing_handle)) {
+                LOG_CRITICAL(HW_Memory, "Failed to free backing memory file handle");
+            }
+            backing_handle = nullptr;
         }
     }
 
@@ -661,6 +694,7 @@ private:
 
     HANDLE process{};        ///< Current process handle
     HANDLE backing_handle{}; ///< File based backing memory
+    bool backing_mapped{};   ///< Whether backing_base view has been mapped
 
     DynamicLibrary kernelbase_dll;
     PFN_CreateFileMapping2 pfn_CreateFileMapping2{};
@@ -845,6 +879,10 @@ public:
                     &backing_entry, MACH_PORT_NULL);
             }
             if (kr != KERN_SUCCESS && ledger_tagged) {
+                if (backing_entry != MACH_PORT_NULL) {
+                    mach_port_deallocate(mach_task_self(), backing_entry);
+                    backing_entry = MACH_PORT_NULL;
+                }
                 LOG_WARNING(HW_Memory, "Ledger-tagged guest memory refused ({}): untagged",
                             mach_error_string(kr));
                 ledger_tagged = false;
@@ -1012,7 +1050,7 @@ public:
         fd = memfd_create("HostMemory", 0);
 #endif
         bool use_anon = false;
-        if (fd <= 0) {
+        if (fd < 0) {
             LOG_WARNING(Common_Memory, "memfd_create: {}", strerror(errno));
             use_anon = true;
         }
@@ -1020,16 +1058,16 @@ public:
             // Defined to extend the file with zeros
             int ret = ftruncate(fd, backing_size);
             if (ret != 0) {
-                LOG_WARNING(Common_Memory, "ftruncate: {} (likely out-of-emory)", strerror(errno));
+                LOG_WARNING(Common_Memory, "ftruncate: {} (likely out-of-memory)", strerror(errno));
                 use_anon = true;
             }
         }
         if (use_anon) {
             LOG_WARNING(Common_Memory, "Using private mappings instead of shared ones");
             backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_NOCORE, -1, 0));
-            if (fd > 0) {
-                fd = -1;
+            if (fd >= 0) {
                 close(fd);
+                fd = -1;
             }
         } else {
             backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOCORE, fd, 0));
@@ -1088,14 +1126,12 @@ public:
         // Intersect the range with our address space.
         const size_t intended_offset = virtual_offset;
         AdjustMap(&virtual_offset, &length);
-        if (length != 0) {
-            host_offset += virtual_offset - intended_offset;
+        if (length == 0) {
+            return;
         }
+        host_offset += virtual_offset - intended_offset;
 
         if (page_states) {
-            if (length == 0) {
-                return;
-            }
             std::scoped_lock lk{page_states_mutex};
             const size_t first = StateIndex(virtual_offset);
             const u32 state = PageMapped | PermissionBits(perms);
@@ -1107,8 +1143,10 @@ public:
             return;
         }
 
+        u8* const target = VirtualAddress(virtual_offset);
+
         // We are removing a placeholder.
-        free_manager.AllocateBlock(virtual_base + virtual_offset, length);
+        free_manager.AllocateBlock(target, length);
 
         // Deduce mapping protection flags.
         int prot_flags = PROT_NONE;
@@ -1121,11 +1159,11 @@ public:
             prot_flags |= PROT_EXEC;
 #endif
 #ifdef LICHII_IOS_MACH_MEMORY
-        ASSERT_MSG(MapBackingView(virtual_base + virtual_offset, length, host_offset, prot_flags),
+        ASSERT_MSG(MapBackingView(target, length, host_offset, prot_flags),
                    "vm_map failed for {:#x} bytes at offset {:#x}", length, virtual_offset);
 #else
         int flags = (fd >= 0 ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED;
-        void* ret = mmap(virtual_base + virtual_offset, length, prot_flags, flags, fd, host_offset);
+        void* ret = mmap(target, length, prot_flags, flags, fd, host_offset);
         ASSERT_MSG(ret != MAP_FAILED, "mmap: {} {}", strerror(errno), fd);
 #endif
     }
@@ -1136,11 +1174,11 @@ public:
 
         // Intersect the range with our address space.
         AdjustMap(&virtual_offset, &length);
+        if (length == 0) {
+            return;
+        }
 
         if (page_states) {
-            if (length == 0) {
-                return;
-            }
             std::scoped_lock lk{page_states_mutex};
             std::fill_n(page_states + StateIndex(virtual_offset), length / PageAlignment, 0u);
             UpdateHostPages(virtual_offset, length);
@@ -1149,7 +1187,7 @@ public:
 
         // Merge with any adjacent placeholder mappings.
         auto [merged_pointer, merged_size] =
-            free_manager.FreeBlock(virtual_base + virtual_offset, length);
+            free_manager.FreeBlock(VirtualAddress(virtual_offset), length);
 
 #ifdef LICHII_IOS_MACH_MEMORY
         ASSERT_MSG(ReserveRange(merged_pointer, merged_size), "vm_allocate failed for {:#x} bytes",
@@ -1163,31 +1201,19 @@ public:
     void Protect(size_t virtual_offset, size_t length, bool read, bool write, bool execute) {
         // Intersect the range with our address space.
         AdjustMap(&virtual_offset, &length);
+        if (length == 0) {
+            return;
+        }
 
+        const u32 bits = (read ? PageRead : 0u) | (write ? PageWrite : 0u) |
+                         (execute ? PageExecute : 0u);
         if (page_states) {
-            if (length == 0) {
-                return;
-            }
-            const u32 bits = (read ? PageRead : 0u) | (write ? PageWrite : 0u) |
-                             (execute ? PageExecute : 0u);
             std::scoped_lock lk{page_states_mutex};
             ProtectHostPages(virtual_offset, length, bits);
             return;
         }
 
-        int flags = PROT_NONE;
-        if (read) {
-            flags |= PROT_READ;
-        }
-        if (write) {
-            flags |= PROT_WRITE;
-        }
-#ifdef HAS_NCE
-        if (execute) {
-            flags |= PROT_EXEC;
-        }
-#endif
-        int ret = mprotect(virtual_base + virtual_offset, length, flags);
+        const int ret = mprotect(VirtualAddress(virtual_offset), length, ProtectionFlags(bits));
         ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
     }
 
@@ -1416,36 +1442,67 @@ public:
 private:
     /// Release all resources in the object
     void Release() {
+#ifdef LICHII_IOS_MACH_MEMORY
+        ResumeWorld();
+#endif
         if (page_states != nullptr) {
             munmap(page_states, page_states_size);
+            page_states = nullptr;
+            page_states_size = 0;
         }
 
-        if (virtual_map_base != MAP_FAILED) {
-            int ret = munmap(virtual_map_base, virtual_size);
+        if (virtual_map_base != reinterpret_cast<u8*>(MAP_FAILED)) {
+#ifdef LICHII_IOS_MACH_MEMORY
+            const kern_return_t kr = vm_deallocate(
+                mach_task_self(), reinterpret_cast<vm_address_t>(virtual_map_base), virtual_size);
+            ASSERT_MSG(kr == KERN_SUCCESS, "vm_deallocate failed: {}", mach_error_string(kr));
+#else
+            const int ret = munmap(virtual_map_base, virtual_size);
             ASSERT_MSG(ret == 0, "munmap failed: {}", strerror(errno));
+#endif
+            virtual_map_base = reinterpret_cast<u8*>(MAP_FAILED);
+            virtual_base = reinterpret_cast<u8*>(MAP_FAILED);
         }
 
-        if (backing_base != MAP_FAILED) {
-            int ret = munmap(backing_base, backing_size);
+        if (backing_base != reinterpret_cast<u8*>(MAP_FAILED)) {
+#ifdef LICHII_IOS_MACH_MEMORY
+            if (backing_entry != MACH_PORT_NULL || Chunked()) {
+                const kern_return_t kr = vm_deallocate(
+                    mach_task_self(), reinterpret_cast<vm_address_t>(backing_base), backing_size);
+                ASSERT_MSG(kr == KERN_SUCCESS, "vm_deallocate failed: {}", mach_error_string(kr));
+            } else {
+                const int ret = munmap(backing_base, backing_size);
+                ASSERT_MSG(ret == 0, "munmap failed: {}", strerror(errno));
+            }
+#else
+            const int ret = munmap(backing_base, backing_size);
             ASSERT_MSG(ret == 0, "munmap failed: {}", strerror(errno));
+#endif
+            backing_base = reinterpret_cast<u8*>(MAP_FAILED);
         }
 
 #ifdef LICHII_IOS_MACH_MEMORY
-        if (file_backed && fd != -1) {
-            // The last close of a file writes its dirty pages out before it is freed (vclean:
-            // ubc_msync UBC_PUSHALL | UBC_SYNC), gigabytes for a guest that is going away.
-            // Truncating discards them unwritten (ubc_setsize: MEMORY_OBJECT_RETURN_NONE).
-            const auto start = std::chrono::steady_clock::now();
-            const bool truncated = ftruncate(fd, 0) == 0;
-            LOG_INFO(HW_Memory, "Guest file: {} in {} ms", truncated ? "discarded" : "not discarded",
-                     std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now() - start)
-                         .count());
+        if (file_backed) {
+            PlatformEvents::SetGuestInFile(false);
+            if (fd != -1) {
+                // The last close of a file writes its dirty pages out before it is freed (vclean:
+                // ubc_msync UBC_PUSHALL | UBC_SYNC), gigabytes for a guest that is going away.
+                // Truncating discards them unwritten (ubc_setsize: MEMORY_OBJECT_RETURN_NONE).
+                const auto start = std::chrono::steady_clock::now();
+                const bool truncated = ftruncate(fd, 0) == 0;
+                LOG_INFO(HW_Memory, "Guest file: {} in {} ms",
+                         truncated ? "discarded" : "not discarded",
+                         std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count());
+            }
+            file_backed = false;
         }
 #endif
         if (fd != -1) {
-            int ret = close(fd);
+            const int ret = close(fd);
             ASSERT_MSG(ret == 0, "close failed: {}", strerror(errno));
+            fd = -1;
         }
 #ifdef LICHII_IOS_MACH_MEMORY
         if (backing_entry != MACH_PORT_NULL) {
@@ -1458,6 +1515,9 @@ private:
             }
         }
         chunk_entries.clear();
+        g_guest_media_ledger.store(false, std::memory_order_relaxed);
+        ledger_tagged = false;
+        free_zero = false;
 #endif
     }
 
@@ -1738,18 +1798,6 @@ private:
         return true;
     }
 
-    static bool IsZeroRange(const u8* data, size_t size) {
-        const auto* words = reinterpret_cast<const u64*>(data);
-        for (size_t i = 0; i < size / sizeof(u64); i += 8) {
-            const u64 bits = words[i] | words[i + 1] | words[i + 2] | words[i + 3] | words[i + 4] |
-                             words[i + 5] | words[i + 6] | words[i + 7];
-            if (bits != 0) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     /// Empties a chunk and makes it non-volatile again.
     kern_return_t Purge(size_t chunk) {
         const vm_address_t address = reinterpret_cast<vm_address_t>(backing_base + chunk * ChunkSize);
@@ -1923,6 +1971,16 @@ private:
     }
 #endif
 
+    u8* VirtualAddress(size_t virtual_offset) const noexcept {
+        return virtual_base != nullptr ? virtual_base + virtual_offset
+                                       : reinterpret_cast<u8*>(virtual_offset);
+    }
+
+    size_t VirtualEndBound() const noexcept {
+        return (virtual_base != nullptr ? 0 : reinterpret_cast<size_t>(virtual_map_base)) +
+               virtual_size;
+    }
+
     void AdjustMap(size_t* virtual_offset, size_t* length) {
         if (virtual_base != nullptr) {
             return;
@@ -1930,12 +1988,13 @@ private:
 
         // If we are direct mapped, we want to make sure we are operating on a region
         // that is in range of our virtual mapping.
-        size_t intended_start = *virtual_offset;
-        size_t intended_end = intended_start + *length;
-        size_t address_space_start = reinterpret_cast<size_t>(virtual_map_base);
-        size_t address_space_end = address_space_start + virtual_size;
+        const size_t intended_start = *virtual_offset;
+        const size_t intended_end =
+            *length > ~size_t{0} - intended_start ? ~size_t{0} : intended_start + *length;
+        const size_t address_space_start = reinterpret_cast<size_t>(virtual_map_base);
+        const size_t address_space_end = address_space_start + virtual_size;
 
-        if (address_space_start > intended_end || intended_start > address_space_end) {
+        if (address_space_start >= intended_end || intended_start >= address_space_end) {
             *virtual_offset = 0;
             *length = 0;
         } else {
@@ -2003,10 +2062,19 @@ private:
     }
 
     void UpdateHostPages(size_t virtual_offset, size_t length) {
+        if (length == 0) {
+            return;
+        }
+        const size_t max_end = VirtualEndBound();
+        const size_t virtual_end =
+            length > max_end - virtual_offset ? max_end : virtual_offset + length;
         const size_t begin = AlignDown(virtual_offset, host_page_size);
-        const size_t end = AlignUp(virtual_offset + length, host_page_size);
+        const size_t end = AlignUp(virtual_end, host_page_size);
+        if (begin >= end) {
+            return;
+        }
         const auto apply = [&](size_t run_begin, size_t run_end, const HostPage& page) {
-            u8* const address = virtual_base + run_begin;
+            u8* const address = VirtualAddress(run_begin);
             const size_t size = run_end - run_begin;
             if (!page.mapped) {
 #ifdef LICHII_IOS_MACH_MEMORY
@@ -2042,11 +2110,20 @@ private:
     }
 
     void ProtectHostPages(size_t virtual_offset, size_t length, u32 bits) {
-        const size_t virtual_end = virtual_offset + length;
+        if (length == 0) {
+            return;
+        }
+        const size_t max_end = VirtualEndBound();
+        const size_t virtual_end =
+            length > max_end - virtual_offset ? max_end : virtual_offset + length;
         const size_t begin = AlignDown(virtual_offset, host_page_size);
         const size_t end = AlignUp(virtual_end, host_page_size);
+        if (begin >= end) {
+            return;
+        }
+        const int target_prot = ProtectionFlags(bits);
         const auto apply_protect = [&](size_t run_begin, size_t run_end, int prot) {
-            u8* const address = virtual_base + run_begin;
+            u8* const address = VirtualAddress(run_begin);
             const size_t size = run_end - run_begin;
             const int ret = mprotect(address, size, prot);
 #ifdef LICHII_IOS_MACH_MEMORY
@@ -2073,12 +2150,22 @@ private:
             const size_t sub_end = (std::min)(virtual_end, offset + host_page_size);
             u32* const states = page_states + StateIndex(sub_begin);
             for (size_t i = 0; i < (sub_end - sub_begin) / PageAlignment; ++i) {
-                states[i] = (states[i] & ~PagePermissionMask) | bits;
+                if ((states[i] & PageMapped) != 0) {
+                    states[i] = (states[i] & ~PagePermissionMask) | bits;
+                }
             }
-            const HostPage after = ResolveHostPage(offset);
-            const bool changed =
-                after.mapped && !(before.mapped == after.mapped && before.prot == after.prot);
-            if (!changed) {
+            if (!before.mapped) {
+                if (has_run) {
+                    apply_protect(run_begin, offset, run.prot);
+                    has_run = false;
+                }
+                continue;
+            }
+            const HostPage after =
+                (sub_begin == offset && sub_end == offset + host_page_size)
+                    ? HostPage{true, before.host_offset, target_prot}
+                    : ResolveHostPage(offset);
+            if (before.prot == after.prot) {
                 if (has_run) {
                     apply_protect(run_begin, offset, run.prot);
                     has_run = false;
@@ -2141,13 +2228,14 @@ private:
 HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
     : backing_size(backing_size_)
     , virtual_size(virtual_size_)
-    , num_granules(Common::DivCeil(backing_size_, size_t{1} << GranuleShift))
+    , num_granules(Common::DivCeil(backing_size_, GranuleSize))
 {
     granules = std::make_unique<std::atomic<u8>[]>(num_granules);
 #if defined(__OPENORBIS__) || defined(__managarm__)
     LOG_WARNING(HW_Memory, "Platform doesn't support fastmem");
     backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     virtual_base = nullptr;
+    virtual_size = 0;
 #else
     // Try to allocate a fastmem arena.
     impl = std::make_unique<HostMemory::Impl>(AlignUp(backing_size, PageAlignment), AlignUp(virtual_size, PageAlignment) + HugePageSize);
@@ -2173,6 +2261,7 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
         fallback_buffer = true;
         backing_base = static_cast<u8*>(impl->Allocate(backing_size));
         virtual_base = nullptr;
+        virtual_size = 0;
         impl.reset();
     }
 #endif
@@ -2180,11 +2269,12 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
 
 HostMemory::~HostMemory() {
 #ifdef _WIN32
-    if (fallback_buffer) {
-        VirtualFree(backing_base, backing_size, MEM_RELEASE);
+    if (fallback_buffer && backing_base != nullptr) {
+        VirtualFree(backing_base, 0, MEM_RELEASE);
     }
 #else
-    if (fallback_buffer && backing_base != nullptr) {
+    if (fallback_buffer && backing_base != nullptr &&
+        backing_base != reinterpret_cast<u8*>(MAP_FAILED)) {
         munmap(backing_base, backing_size);
     }
 #endif
@@ -2203,7 +2293,7 @@ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, M
     ASSERT(virtual_offset % PageAlignment == 0);
     ASSERT(host_offset % PageAlignment == 0);
     ASSERT(length % PageAlignment == 0);
-    ASSERT(host_offset + length <= backing_size);
+    ASSERT(host_offset <= backing_size && length <= backing_size - host_offset);
     length = ClipToVirtualSize(virtual_offset, length);
     if (length == 0 || !virtual_base || !impl) {
         return;
@@ -2387,12 +2477,16 @@ ColdHintAction HostMemory::HintCold(size_t physical_offset, size_t length,
 #endif
     // Paging out reclaims synchronously (compressing into zram, writing swap, unmapping), which
     // also slows the threads touching nearby memory: work in pieces and pause between them.
+    const size_t backing_len = ClipToBackingSize(physical_offset, length);
+    if (backing_len == 0) {
+        return ColdHintAction::None;
+    }
     static constexpr size_t Piece = size_t{8} << 20;
     static constexpr auto Budget = std::chrono::milliseconds{2};
-    const auto hint = [page_out, length](u8* address) {
+    const auto hint = [page_out](u8* address, size_t span_len) {
         auto slice_start = std::chrono::steady_clock::now();
-        for (size_t done = 0; done < length;) {
-            const size_t size = std::min(Piece, length - done);
+        for (size_t done = 0; done < span_len;) {
+            const size_t size = std::min(Piece, span_len - done);
 #ifdef _WIN32
             // Unlocking pages that are not locked takes them out of the working set.
             VirtualUnlock(address + done, size);
@@ -2406,9 +2500,11 @@ ColdHintAction HostMemory::HintCold(size_t physical_offset, size_t length,
             }
         }
     };
-    hint(backing_base + physical_offset);
-    if (virtual_offset && virtual_base != nullptr && *virtual_offset + length <= virtual_size) {
-        hint(virtual_base + *virtual_offset);
+    hint(backing_base + physical_offset, backing_len);
+    if (virtual_offset && virtual_base != nullptr) {
+        if (const size_t view_len = ClipToVirtualSize(*virtual_offset, length); view_len != 0) {
+            hint(virtual_base + *virtual_offset, view_len);
+        }
     }
     return page_out ? ColdHintAction::PagedOut : ColdHintAction::MarkedCold;
 }
@@ -2423,19 +2519,6 @@ std::atomic<HostMemory::GuestAccounting> g_scanned_accounting{};
 [[maybe_unused]] std::atomic<u64> g_trimmed_zero_bytes{};
 [[maybe_unused]] std::atomic<u64> g_scanned_handed_out_bytes{};
 std::atomic<s64> g_scanned_at_ns{};
-
-[[maybe_unused]] bool IsZeroPage(const u8* page) {
-    // A cache line at a time: most pages that are not zero say so in their first line.
-    const auto* words = reinterpret_cast<const u64*>(page);
-    for (size_t i = 0; i < PageAlignment / sizeof(u64); i += 8) {
-        const u64 bits = words[i] | words[i + 1] | words[i + 2] | words[i + 3] | words[i + 4] |
-                         words[i + 5] | words[i + 6] | words[i + 7];
-        if (bits != 0) {
-            return false;
-        }
-    }
-    return true;
-}
 
 #ifdef __APPLE__
 /// Zeroes a range of a mapped file, writing only to the pages that hold something: a write makes
@@ -2464,22 +2547,23 @@ size_t ZeroNonZeroPages(u8* data, size_t length) {
 #endif
 
 #ifdef _WIN32
-/// Addresses of the pages in this process's working set, entries[0] being the count; empty on
-/// failure.
-std::vector<ULONG_PTR> QueryWorkingSetPages() {
-    std::vector<ULONG_PTR> entries(size_t{1} << 22);
+/// Fills `entries` with this process's working-set entries (`entries[1..=count]`) and returns the
+/// page count, or nullopt on failure. Preserves `entries` buffer capacity for callers that reuse it.
+std::optional<size_t> QueryWorkingSetPages(std::vector<ULONG_PTR>& entries, size_t min_entries) {
+    if (entries.size() < min_entries) {
+        entries.resize(min_entries);
+    }
     for (int attempt = 0;; ++attempt) {
         if (K32QueryWorkingSet(GetCurrentProcess(), entries.data(),
                                static_cast<DWORD>(entries.size() * sizeof(ULONG_PTR)))) {
             break;
         }
         if (GetLastError() != ERROR_BAD_LENGTH || attempt == 3) {
-            return {};
+            return std::nullopt;
         }
-        entries.assign((std::max)(entries.size() * 2, size_t{entries[0]} + (size_t{1} << 18)), 0);
+        entries.resize((std::max)(entries.size() * 2, size_t{entries[0]} + (size_t{1} << 18)));
     }
-    entries.resize((std::min)(size_t{entries[0]}, entries.size() - 1) + 1);
-    return entries;
+    return (std::min)(size_t{entries[0]}, entries.size() - 1);
 }
 #endif
 } // namespace
@@ -2490,14 +2574,15 @@ std::vector<bool> HostMemory::ResidentPages() const {
     }
     std::vector<bool> resident(backing_size / PageAlignment);
 #ifdef _WIN32
-    const std::vector<ULONG_PTR> entries = QueryWorkingSetPages();
-    if (entries.empty()) {
+    std::vector<ULONG_PTR> entries;
+    const auto count = QueryWorkingSetPages(entries, size_t{1} << 22);
+    if (!count) {
         return {};
     }
     const auto backing_begin = reinterpret_cast<uintptr_t>(backing_base);
     const auto view_begin = reinterpret_cast<uintptr_t>(impl ? impl->virtual_base : nullptr);
     const size_t view_size = impl ? impl->virtual_size : 0;
-    for (size_t i = 1; i < entries.size(); ++i) {
+    for (size_t i = 1; i <= *count; ++i) {
         const uintptr_t page = entries[i] & ~uintptr_t{PageAlignment - 1};
         if (page - backing_begin < backing_size) {
             resident[(page - backing_begin) / PageAlignment] = true;
@@ -2678,20 +2763,11 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
     ZeroTrimState local;
     ZeroTrimState& s = state != nullptr ? *state : local;
     auto& entries = s.entries;
-    if (entries.size() < (size_t{1} << 20)) {
-        entries.resize(size_t{1} << 20);
+    const auto count_opt = QueryWorkingSetPages(entries, size_t{1} << 20);
+    if (!count_opt) {
+        return {0, 0};
     }
-    for (int attempt = 0;; ++attempt) {
-        if (K32QueryWorkingSet(GetCurrentProcess(), entries.data(),
-                               static_cast<DWORD>(entries.size() * sizeof(ULONG_PTR)))) {
-            break;
-        }
-        if (GetLastError() != ERROR_BAD_LENGTH || attempt == 3) {
-            return {0, 0};
-        }
-        entries.resize((std::max)(entries.size() * 2, size_t{entries[0]} + (size_t{1} << 18)));
-    }
-    const size_t count = (std::min)(size_t{entries[0]}, entries.size() - 1);
+    const size_t count = *count_opt;
     const auto backing_begin = reinterpret_cast<uintptr_t>(backing_base);
     const auto view_begin = reinterpret_cast<uintptr_t>(impl ? impl->virtual_base : nullptr);
     const size_t view_size = impl ? impl->virtual_size : 0;
@@ -2865,14 +2941,6 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
 #ifdef MINCORE_PAGED_OUT
     counted |= MINCORE_PAGED_OUT;
 #endif
-    const auto is_zero = [page_size](const u8* page) {
-        for (size_t offset = 0; offset < page_size; offset += PageAlignment) {
-            if (!IsZeroPage(page + offset)) {
-                return false;
-            }
-        }
-        return true;
-    };
     size_t resident = 0;
     // In the compressor: counted like a page in RAM, whatever it compressed to.
     size_t compressed = 0;
@@ -2886,7 +2954,7 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
         }
         for (size_t index = first; index < end; ++index) {
             u8* const page = backing_base + index * page_size;
-            if (!is_zero(page)) {
+            if (!IsZeroRange(page, page_size)) {
                 // A compare-exchange of a word with itself stores it (an idempotent RMW can be
                 // compiled to a load), so the page counts as written again.
                 auto* const word = reinterpret_cast<u64*>(page);
@@ -2938,7 +3006,7 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
 #ifdef LICHII_IOS_MACH_MEMORY
                 unmap_touched = true;
 #endif
-                zero = is_zero(backing_base + index * page_size);
+                zero = IsZeroRange(backing_base + index * page_size, page_size);
                 if (!zero) {
                     trimmed_pages[index] = false;
                 }
@@ -3100,7 +3168,31 @@ bool HostMemory::ZeroWithoutFaulting(size_t offset, size_t length) {
 }
 #endif
 
+template <typename Pred, typename Body>
+void HostMemory::ForEachGranuleRun(size_t begin, size_t end, Pred&& match, Body&& body) const {
+    if (begin >= end) {
+        return;
+    }
+    const size_t last_index = (end - 1) >> GranuleShift;
+    for (size_t index = begin >> GranuleShift; index <= last_index;) {
+        if (!match(granules[index].load(std::memory_order_acquire))) {
+            ++index;
+            continue;
+        }
+        size_t run_end_index = index + 1;
+        while (run_end_index <= last_index &&
+               match(granules[run_end_index].load(std::memory_order_acquire))) {
+            ++run_end_index;
+        }
+        const size_t run_begin = (std::max)(begin, index << GranuleShift);
+        const size_t run_end = (std::min)(end, run_end_index << GranuleShift);
+        body(index, run_end_index, run_begin, run_end);
+        index = run_end_index;
+    }
+}
+
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
+    length = ClipToBackingSize(physical_offset, length);
     if (length == 0) {
         return;
     }
@@ -3120,91 +3212,81 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
         return value == nullptr || value[0] != '0';
     }();
 #endif
-    constexpr size_t GranuleSize = size_t{1} << GranuleShift;
-    const size_t end = physical_offset + length;
-    const size_t last_index = (end - 1) >> GranuleShift;
-    for (size_t offset = physical_offset; offset < end;) {
-        const size_t index = offset >> GranuleShift;
-        if ((granules[index].load(std::memory_order_acquire) & GranuleDirty) == 0) {
-            offset = (std::min)((index + 1) << GranuleShift, end);
-            continue;
-        }
-        // Coalesce adjacent dirty granules into a single [run_begin, run_end) clear span.
-        size_t run_end_index = index + 1;
-        while (run_end_index <= last_index &&
-               (granules[run_end_index].load(std::memory_order_acquire) & GranuleDirty) != 0) {
-            ++run_end_index;
-        }
-        const size_t run_begin = offset;
-        const size_t run_end = (std::min)(run_end_index << GranuleShift, end);
-        const size_t whole_begin = Common::AlignUp(run_begin, GranuleSize);
-        const size_t whole_end = Common::AlignDown(run_end, GranuleSize);
-        bool cleared = false;
+    ForEachGranuleRun(
+        physical_offset, physical_offset + length,
+        [](u8 state) { return (state & GranuleDirty) != 0; },
+        [&](size_t index, size_t run_end_index, size_t run_begin, size_t run_end) {
+            const size_t whole_begin = Common::AlignUp(run_begin, GranuleSize);
+            const size_t whole_end = Common::AlignDown(run_end, GranuleSize);
+            bool cleared = false;
 #ifdef __APPLE__
-        cleared = ZeroWithoutFaulting(run_begin, run_end - run_begin);
-        if (!cleared && FileBacked()) {
-            const size_t written = ZeroNonZeroPages(backing_base + run_begin, run_end - run_begin);
-            g_zero_filled_bytes.fetch_add(written, std::memory_order_relaxed);
-            cleared = true;
-            static std::atomic<bool> logged{};
-            if (!logged.exchange(true, std::memory_order_relaxed)) {
-                LOG_INFO(HW_Memory, "Guest file: first clear ({:#x} bytes at file offset {:#x}, "
-                                    "{:#x} of them held data and were rewritten)",
-                         run_end - run_begin, run_begin, written);
-            }
-        }
-        for (size_t g = index; g < run_end_index;) {
-            const bool released = (granules[g].fetch_and(static_cast<u8>(~GranuleReleased),
-                                                         std::memory_order_acq_rel) &
-                                   GranuleReleased) != 0;
-            if (!cleared && released) {
-                size_t reuse_end = g + 1;
-                while (reuse_end < run_end_index &&
-                       (granules[reuse_end].fetch_and(static_cast<u8>(~GranuleReleased),
-                                                      std::memory_order_acq_rel) &
-                        GranuleReleased) != 0) {
-                    ++reuse_end;
+            cleared = ZeroWithoutFaulting(run_begin, run_end - run_begin);
+            if (!cleared && FileBacked()) {
+                const size_t written =
+                    ZeroNonZeroPages(backing_base + run_begin, run_end - run_begin);
+                g_zero_filled_bytes.fetch_add(written, std::memory_order_relaxed);
+                cleared = true;
+                static std::atomic<bool> logged{};
+                if (!logged.exchange(true, std::memory_order_relaxed)) {
+                    LOG_INFO(HW_Memory,
+                             "Guest file: first clear ({:#x} bytes at file offset {:#x}, "
+                             "{:#x} of them held data and were rewritten)",
+                             run_end - run_begin, run_begin, written);
                 }
-                const size_t reuse_begin_off = g << GranuleShift;
-                const size_t reuse_end_off = (std::min)(reuse_end << GranuleShift, backing_size);
-                madvise(backing_base + reuse_begin_off, reuse_end_off - reuse_begin_off,
-                        MADV_FREE_REUSE);
-                g = reuse_end;
-            } else {
-                ++g;
             }
-        }
+            for (size_t g = index; g < run_end_index;) {
+                const bool released = (granules[g].fetch_and(static_cast<u8>(~GranuleReleased),
+                                                             std::memory_order_acq_rel) &
+                                       GranuleReleased) != 0;
+                if (!cleared && released) {
+                    size_t reuse_end = g + 1;
+                    while (reuse_end < run_end_index &&
+                           (granules[reuse_end].fetch_and(static_cast<u8>(~GranuleReleased),
+                                                          std::memory_order_acq_rel) &
+                            GranuleReleased) != 0) {
+                        ++reuse_end;
+                    }
+                    const size_t reuse_begin_off = g << GranuleShift;
+                    const size_t reuse_end_off = (std::min)(reuse_end << GranuleShift, backing_size);
+                    madvise(backing_base + reuse_begin_off, reuse_end_off - reuse_begin_off,
+                            MADV_FREE_REUSE);
+                    g = reuse_end;
+                } else {
+                    ++g;
+                }
+            }
 #endif
 #ifdef __linux__
-        if (whole_begin < whole_end && punch && impl &&
-            impl->PunchHole(whole_begin, whole_end - whole_begin)) {
-            if (run_begin < whole_begin) {
-                std::memset(backing_base + run_begin, 0, whole_begin - run_begin);
+            if (whole_begin < whole_end && punch && impl &&
+                impl->PunchHole(whole_begin, whole_end - whole_begin)) {
+                if (run_begin < whole_begin) {
+                    std::memset(backing_base + run_begin, 0, whole_begin - run_begin);
+                }
+                if (whole_end < run_end) {
+                    std::memset(backing_base + whole_end, 0, run_end - whole_end);
+                }
+                g_zero_filled_bytes.fetch_add((whole_begin - run_begin) + (run_end - whole_end),
+                                              std::memory_order_relaxed);
+                cleared = true;
             }
-            if (whole_end < run_end) {
-                std::memset(backing_base + whole_end, 0, run_end - whole_end);
-            }
-            g_zero_filled_bytes.fetch_add(
-                (whole_begin - run_begin) + (run_end - whole_end), std::memory_order_relaxed);
-            cleared = true;
-        }
 #endif
-        if (!cleared) {
-            std::memset(backing_base + run_begin, 0, run_end - run_begin);
-            g_zero_filled_bytes.fetch_add(run_end - run_begin, std::memory_order_relaxed);
-        }
-        if (whole_begin < whole_end) {
-            const size_t whole_begin_index = whole_begin >> GranuleShift;
-            const size_t whole_end_index = whole_end >> GranuleShift;
-            for (size_t g = whole_begin_index; g < whole_end_index; ++g) {
-                granules[g].fetch_and(static_cast<u8>(~GranuleDirty), std::memory_order_release);
+            if (!cleared) {
+                std::memset(backing_base + run_begin, 0, run_end - run_begin);
+                g_zero_filled_bytes.fetch_add(run_end - run_begin, std::memory_order_relaxed);
             }
-        }
-        offset = run_end;
-    }
+            if (whole_begin < whole_end) {
+                const size_t whole_begin_index = whole_begin >> GranuleShift;
+                const size_t whole_end_index = whole_end >> GranuleShift;
+                for (size_t g = whole_begin_index; g < whole_end_index; ++g) {
+                    granules[g].fetch_and(static_cast<u8>(~GranuleDirty),
+                                          std::memory_order_release);
+                }
+            }
+        });
 }
 
 void HostMemory::MarkUsed(size_t physical_offset, size_t length) {
+    length = ClipToBackingSize(physical_offset, length);
     if (length == 0) {
         return;
     }
@@ -3220,6 +3302,7 @@ void HostMemory::MarkUsed(size_t physical_offset, size_t length) {
 }
 
 void HostMemory::MarkDirty(size_t physical_offset, size_t length) {
+    length = ClipToBackingSize(physical_offset, length);
     if (length == 0) {
         return;
     }
@@ -3244,15 +3327,14 @@ void HostMemory::ReleaseFreed(size_t physical_offset, size_t length) {
 #else
     constexpr bool hint_free = false;
 #endif
+    length = ClipToBackingSize(physical_offset, length);
     if (!enabled || length == 0 || backing_base == nullptr || (PagesCountedOnce() && !hint_free)) {
         return;
     }
     // Whole granules only: the rest of a partial one may still be in use. They stay Dirty, so the
     // next allocation clears them whatever the OS left in them.
-    constexpr size_t GranuleSize = size_t{1} << GranuleShift;
     const size_t first = Common::AlignUp(physical_offset, GranuleSize);
-    const size_t end = (std::min)(Common::AlignDown(physical_offset + length, GranuleSize),
-                                  Common::AlignDown(backing_size, GranuleSize));
+    const size_t end = Common::AlignDown(physical_offset + length, GranuleSize);
     if (first >= end) {
         return;
     }
@@ -3298,34 +3380,26 @@ void HostMemory::ForgetContents() {
 
 void HostMemory::Commit(size_t physical_offset, size_t length) {
 #ifdef _WIN32
-    if (!commit_on_use || length == 0 || physical_offset >= backing_size) {
+    length = ClipToBackingSize(physical_offset, length);
+    if (!commit_on_use || length == 0) {
         return;
     }
-    const size_t last = ((std::min)(physical_offset + length, backing_size) - 1) >> GranuleShift;
-    size_t index = physical_offset >> GranuleShift;
-    while (index <= last) {
-        if ((granules[index].load(std::memory_order_acquire) & GranuleCommitted) != 0) {
-            ++index;
-            continue;
-        }
-        // One VirtualAlloc for each run of granules not committed yet.
-        size_t run_end = index + 1;
-        while (run_end <= last &&
-               (granules[run_end].load(std::memory_order_acquire) & GranuleCommitted) == 0) {
-            ++run_end;
-        }
-        if (impl->CommitBacking(index << GranuleShift, run_end << GranuleShift)) {
-            u64 newly = 0;
-            for (size_t granule = index; granule < run_end; ++granule) {
-                if ((granules[granule].fetch_or(GranuleCommitted, std::memory_order_release) &
-                     GranuleCommitted) == 0) {
-                    ++newly;
+    // One VirtualAlloc for each run of granules not committed yet.
+    ForEachGranuleRun(
+        physical_offset, physical_offset + length,
+        [](u8 state) { return (state & GranuleCommitted) == 0; },
+        [this](size_t index, size_t run_end, size_t, size_t) {
+            if (impl->CommitBacking(index << GranuleShift, run_end << GranuleShift)) {
+                u64 newly = 0;
+                for (size_t granule = index; granule < run_end; ++granule) {
+                    if ((granules[granule].fetch_or(GranuleCommitted, std::memory_order_release) &
+                         GranuleCommitted) == 0) {
+                        ++newly;
+                    }
                 }
+                g_committed_bytes.fetch_add(newly << GranuleShift, std::memory_order_relaxed);
             }
-            g_committed_bytes.fetch_add(newly << GranuleShift, std::memory_order_relaxed);
-        }
-        index = run_end;
-    }
+        });
 #else
     static_cast<void>(physical_offset);
     static_cast<void>(length);

@@ -164,6 +164,11 @@ public:
         write_hook = hook;
         write_hook_user = user;
     }
+    void NotifyWrite(BufferHandle buffer, u64 offset, u64 size) noexcept {
+        if (write_hook != nullptr && buffer != nullptr && size != 0) {
+            write_hook(write_hook_user, buffer, offset, size);
+        }
+    }
 
     void PostCopyBarrier() {}
 
@@ -205,7 +210,10 @@ public:
         bindings.push_back({Binding::Kind::Buffer, buffer.Handle(), offset, size, {}});
     }
 
-    void BindStorageBuffer(const Buffer& buffer, u32 offset, u32 size, bool) {
+    void BindStorageBuffer(const Buffer& buffer, u32 offset, u32 size, bool is_written) {
+        if (is_written && write_hook != nullptr && size != 0) {
+            write_hook(write_hook_user, buffer.Handle(), offset, size);
+        }
         bindings.push_back({Binding::Kind::Buffer, buffer.Handle(), offset, size, {}});
     }
 

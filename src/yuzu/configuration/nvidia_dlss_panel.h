@@ -15,8 +15,10 @@
 #include <QString>
 #include <QWidget>
 
+class QHideEvent;
 class QLabel;
 class QPushButton;
+class QShowEvent;
 class QTimer;
 
 class NvidiaDlssPanel : public QWidget {

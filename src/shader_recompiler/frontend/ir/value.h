@@ -140,9 +140,7 @@ public:
     }
 
     /// Determines if there is a pseudo-operation associated with this instruction.
-    [[nodiscard]] bool HasAssociatedPseudoOperation() const noexcept {
-        return associated_insts != nullptr;
-    }
+    [[nodiscard]] bool HasAssociatedPseudoOperation() const noexcept;
 
     /// Determines whether or not this instruction may have side effects.
     [[nodiscard]] bool MayHaveSideEffects() const noexcept;
@@ -260,6 +258,11 @@ struct AssociatedInsts {
     Inst* sign_inst{};
     Inst* carry_inst{};
     Inst* overflow_inst{};
+
+    [[nodiscard]] bool Empty() const noexcept {
+        return zero_inst == nullptr && sign_inst == nullptr && carry_inst == nullptr &&
+               overflow_inst == nullptr;
+    }
 };
 
 using U1 = TypedValue<Type::U1>;

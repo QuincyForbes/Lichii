@@ -18,6 +18,7 @@
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/vk_fsr4_upscaler.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_upscaler_common.h"
 #include "video_core/vulkan_common/ffx_runtime.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -34,17 +35,6 @@
 
 namespace Vulkan {
 namespace {
-constexpr VkFormat OUTPUT_FORMAT = VK_FORMAT_R16G16B16A16_SFLOAT;
-constexpr VkImageUsageFlags OUTPUT_USAGE = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                           VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-constexpr VkImageSubresourceRange COLOR_RANGE{
-    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-    .baseMipLevel = 0,
-    .levelCount = 1,
-    .baseArrayLayer = 0,
-    .layerCount = 1,
-};
 
 FfxApiResource Resource(VkImage image, VkFormat format, VkExtent2D size, u32 usage, u32 state) {
     FfxApiResource resource{};
@@ -61,35 +51,10 @@ FfxApiResource Resource(VkImage image, VkFormat format, VkExtent2D size, u32 usa
     return resource;
 }
 
-VkImageMemoryBarrier Barrier(VkImage image, VkImageSubresourceRange range, VkAccessFlags src_access,
-                             VkAccessFlags dst_access, VkImageLayout old_layout,
-                             VkImageLayout new_layout) {
-    return VkImageMemoryBarrier{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = src_access,
-        .dstAccessMask = dst_access,
-        .oldLayout = old_layout,
-        .newLayout = new_layout,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = image,
-        .subresourceRange = range,
-    };
-}
-
-VkImageMemoryBarrier Barrier(const Fsr4Upscaler::Image& image, VkAccessFlags src_access,
-                             VkAccessFlags dst_access, VkImageLayout old_layout,
-                             VkImageLayout new_layout) {
-    VkImageSubresourceRange range = image.range;
-    range.aspectMask = image.barrier_aspect;
-    return Barrier(image.image, range, src_access, dst_access, old_layout, new_layout);
-}
-
 void Message(uint32_t type, const wchar_t* message) {
     std::string text;
     for (const wchar_t* c = message; c && *c; ++c) {
-        text.push_back(*c < 128 ? static_cast<char>(*c) : '?');
+        text.push_back(*c > 0 && *c < 128 ? static_cast<char>(*c) : '?');
     }
     if (type == FFX_API_MESSAGE_TYPE_ERROR) {
         LOG_ERROR(Render_Vulkan, "FSR 4: {}", text);
@@ -248,26 +213,7 @@ Fsr4Upscaler::Fsr4Upscaler(const Device& device_, Scheduler& scheduler_,
     provider_id = provider->id;
     provider_name = provider->name;
     FfxRuntime::SetAvailable(true, provider_name);
-    point_sampler = device.GetLogical().CreateSampler(VkSamplerCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .magFilter = VK_FILTER_NEAREST,
-        .minFilter = VK_FILTER_NEAREST,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .mipLodBias = 0.0f,
-        .anisotropyEnable = VK_FALSE,
-        .maxAnisotropy = 1.0f,
-        .compareEnable = VK_FALSE,
-        .compareOp = VK_COMPARE_OP_NEVER,
-        .minLod = 0.0f,
-        .maxLod = VK_LOD_CLAMP_NONE,
-        .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
-        .unnormalizedCoordinates = VK_FALSE,
-    });
+    point_sampler = CreateUpscalerSampler(device, VK_FILTER_NEAREST);
     if (profile == Profile::OcarinaLdr) {
         CreateExposure();
     }
@@ -365,63 +311,28 @@ void Fsr4Upscaler::CreateExposure() {
     });
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([image = *exposure_image](vk::CommandBuffer cmdbuf) {
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                               0,
-                               Barrier(image, COLOR_RANGE, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                                       VK_IMAGE_LAYOUT_UNDEFINED,
-                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL));
+        cmdbuf.PipelineBarrier(
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+            MakeUpscalerImageBarrier(image, UPSCALER_COLOR_RANGE, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                     VK_IMAGE_LAYOUT_UNDEFINED,
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL));
         VkClearColorValue one{};
         one.float32[0] = 1.0f;
-        cmdbuf.ClearColorImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, one, COLOR_RANGE);
+        cmdbuf.ClearColorImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, one,
+                               UPSCALER_COLOR_RANGE);
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                               Barrier(image, COLOR_RANGE, VK_ACCESS_TRANSFER_WRITE_BIT,
-                                       VK_ACCESS_SHADER_READ_BIT,
-                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+                               MakeUpscalerImageBarrier(image, UPSCALER_COLOR_RANGE,
+                                                        VK_ACCESS_TRANSFER_WRITE_BIT,
+                                                        VK_ACCESS_SHADER_READ_BIT,
+                                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
     });
 }
 
 void Fsr4Upscaler::CreateOutput(VkExtent2D upscale_size) {
-    if (output_image) {
-        scheduler.Finish(); // the old output may still be in use
-    }
-    const MemoryTagScope memory_tag{MemoryTag::Upscaler};
-    output_image = memory_allocator.CreateImage(VkImageCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .imageType = VK_IMAGE_TYPE_2D,
-        .format = OUTPUT_FORMAT,
-        .extent = {upscale_size.width, upscale_size.height, 1},
-        .mipLevels = 1,
-        .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = OUTPUT_USAGE,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .queueFamilyIndexCount = 0,
-        .pQueueFamilyIndices = nullptr,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-    });
-    output_view = device.GetLogical().CreateImageView(VkImageViewCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .image = *output_image,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = OUTPUT_FORMAT,
-        .components{},
-        .subresourceRange = COLOR_RANGE,
-    });
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([image = *output_image](vk::CommandBuffer cmdbuf) {
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                               Barrier(image, COLOR_RANGE, 0,
-                                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                                       VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL));
-    });
+    CreateUpscalerOutput(device, memory_allocator, scheduler, upscale_size, output_image,
+                         output_view);
 }
 
 bool Fsr4Upscaler::Upscale(const Inputs& in) {
@@ -467,7 +378,7 @@ bool Fsr4Upscaler::Upscale(const Inputs& in) {
                                      image_extent(*in.reactive), 0,
                                      FFX_API_RESOURCE_STATE_COMPUTE_READ);
     }
-    dispatch.output = Resource(*output_image, OUTPUT_FORMAT, in.upscale_size,
+    dispatch.output = Resource(*output_image, UPSCALER_OUTPUT_FORMAT, in.upscale_size,
                                FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     dispatch.jitterOffset = {in.jitter[0], in.jitter[1]};
     dispatch.motionVectorScale = {in.motion_vector_scale[0], in.motion_vector_scale[1]};
@@ -492,25 +403,17 @@ bool Fsr4Upscaler::Upscale(const Inputs& in) {
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([this, in, dispatch,
                       output = *output_image](vk::CommandBuffer cmdbuf) {
-        constexpr VkAccessFlags WRITES =
-            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         // The inputs stay in GENERAL otherwise; FSR 4 reads them as sampled images.
         boost::container::static_vector<VkImageMemoryBarrier, 5> to_read{
-            Barrier(in.color, WRITES, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
-            Barrier(in.depth, WRITES, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
-            Barrier(in.motion_vectors, WRITES, VK_ACCESS_SHADER_READ_BIT,
-                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
-            Barrier(output, COLOR_RANGE, VK_ACCESS_SHADER_READ_BIT,
-                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL),
+            MakeUpscalerInputToReadBarrier(in.color),
+            MakeUpscalerInputToReadBarrier(in.depth),
+            MakeUpscalerInputToReadBarrier(in.motion_vectors),
+            MakeUpscalerImageBarrier(output, UPSCALER_COLOR_RANGE, VK_ACCESS_SHADER_READ_BIT,
+                                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL),
         };
         if (in.reactive) {
-            to_read.push_back(Barrier(*in.reactive, WRITES, VK_ACCESS_SHADER_READ_BIT,
-                                      VK_IMAGE_LAYOUT_GENERAL,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+            to_read.push_back(MakeUpscalerInputToReadBarrier(*in.reactive));
         }
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, to_read);
@@ -530,21 +433,15 @@ bool Fsr4Upscaler::Upscale(const Inputs& in) {
         }
 
         boost::container::static_vector<VkImageMemoryBarrier, 5> back{
-            Barrier(in.color, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
-            Barrier(in.depth, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
-            Barrier(in.motion_vectors, VK_ACCESS_SHADER_READ_BIT,
-                    VK_ACCESS_SHADER_READ_BIT | WRITES,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
-            Barrier(output, COLOR_RANGE, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL),
+            MakeUpscalerInputToGeneralBarrier(in.color),
+            MakeUpscalerInputToGeneralBarrier(in.depth),
+            MakeUpscalerInputToGeneralBarrier(in.motion_vectors),
+            MakeUpscalerImageBarrier(output, UPSCALER_COLOR_RANGE, VK_ACCESS_SHADER_WRITE_BIT,
+                                     VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                                     VK_IMAGE_LAYOUT_GENERAL),
         };
         if (in.reactive) {
-            back.push_back(Barrier(*in.reactive, VK_ACCESS_SHADER_READ_BIT,
-                                   VK_ACCESS_SHADER_READ_BIT | WRITES,
-                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                   VK_IMAGE_LAYOUT_GENERAL));
+            back.push_back(MakeUpscalerInputToGeneralBarrier(*in.reactive));
         }
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, {}, {}, back);

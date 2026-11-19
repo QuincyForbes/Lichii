@@ -20,6 +20,7 @@
 
 #include "common/common_types.h"
 #include "common/fs/file.h"
+#include "common/scope_exit.h"
 #include "core/file_sys/vfs/vfs_types.h"
 #include "core/file_sys/vfs/vfs_vector.h"
 #include "core/loader/loader.h"
@@ -68,21 +69,56 @@ struct NupDecompressCache {
     }
 
     void Insert(std::size_t file_index, const DataPtr& data) {
-        if (!data || index.contains(file_index)) {
+        if (!data || data->size() > cap || index.contains(file_index)) {
             return;
         }
         const std::size_t data_size = data->size();
-        while (bytes + data_size > cap && !lru.empty()) {
+        while (!lru.empty() && data_size > cap - bytes) {
             bytes -= lru.back().second->size();
             index.erase(lru.back().first);
             lru.pop_back();
         }
-        if (bytes + data_size > cap) {
-            return;
-        }
         bytes += data_size;
         lru.emplace_front(file_index, data);
         index.emplace(file_index, lru.begin());
+    }
+
+    template <typename Loader>
+    DataPtr GetOrLoad(std::size_t file_index, Loader&& loader) {
+        std::unique_lock lock{mutex};
+        if (DataPtr cached = Find(file_index)) {
+            return cached;
+        }
+        if (const auto it = in_flight.find(file_index); it != in_flight.end()) {
+            auto waiter = it->second;
+            waiter->cv.wait(lock, [&waiter] { return waiter->done; });
+            static_cast<void>(Find(file_index));
+            return waiter->result;
+        }
+
+        auto leader = std::make_shared<InFlight>();
+        in_flight.emplace(file_index, leader);
+        lock.unlock();
+
+        DataPtr built;
+        SCOPE_EXIT {
+            {
+                std::scoped_lock finish_lock{mutex};
+                leader->result = built;
+                leader->done = true;
+                in_flight.erase(file_index);
+                if (built) {
+                    try {
+                        Insert(file_index, built);
+                    } catch (...) {
+                    }
+                }
+            }
+            leader->cv.notify_all();
+        };
+
+        built = loader();
+        return built;
     }
 
     std::shared_ptr<NupSpillFile> GetSpill(std::size_t file_index) {

@@ -43,9 +43,11 @@ DeviceMemory::DeviceMemory()
 }
 
 DeviceMemory::~DeviceMemory() {
-#ifdef __APPLE__
-    // The thread looks at the process's memory regions: it ends before the ranges are forgotten.
+#if defined(_WIN32) || defined(__APPLE__)
+    // The thread looks at the process's memory regions: stop and join it before releasing ranges.
     zero_trim_thread = {};
+#endif
+#ifdef __APPLE__
     Common::PlatformEvents::SetGuestMemoryRanges(nullptr, 0, nullptr, 0);
 #endif
 }
@@ -87,7 +89,6 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     Common::HostMemory::ZeroTrimState state;
     std::chrono::seconds interval = 5s;
     u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
-    [[maybe_unused]] u32 seconds_since_frame = 0;
     // Apple: footprint growth since the last pass that starts the next one 2 s later (a game
     // clearing its heap while booting) rather than after the backed-off interval.
     constexpr u64 Growth = u64{256} << 20;
@@ -121,18 +122,19 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     if (counts_only) {
         interval = CountInterval;
     }
-    // Ledger-tagged: a pass that marks the resident zero pages free, under memory pressure, with
-    // little left, or every FreeInterval, at most every FreeBackoff, once the game draws.
-    [[maybe_unused]] const bool frees = buffer.FreesZeroPages();
-    [[maybe_unused]] constexpr std::chrono::seconds FreeInterval = 120s;
-    [[maybe_unused]] constexpr std::chrono::seconds FreeBackoff = 30s;
-    [[maybe_unused]] auto free_next = std::chrono::steady_clock::now() + FreeBackoff;
-    [[maybe_unused]] auto free_periodic = std::chrono::steady_clock::now() + FreeInterval;
     // A pass started by memory pressure that gave back next to nothing keeps the next signals
     // from starting one for this long.
     constexpr std::chrono::seconds PressureBackoff = 30s;
     auto pressure_pass_next = std::chrono::steady_clock::time_point{};
 #ifdef __APPLE__
+    u32 seconds_since_frame = 0;
+    // Ledger-tagged: a pass that marks the resident zero pages free, under memory pressure, with
+    // little left, or every FreeInterval, at most every FreeBackoff, once the game draws.
+    const bool frees = buffer.FreesZeroPages();
+    constexpr std::chrono::seconds FreeInterval = 120s;
+    constexpr std::chrono::seconds FreeBackoff = 30s;
+    auto free_next = std::chrono::steady_clock::now() + FreeBackoff;
+    auto free_periodic = std::chrono::steady_clock::now() + FreeInterval;
     // What the footprint is made of, every 30 s, at a memory warning (at most every 10 s) and
     // when little is left. On by default on iOS; EDEN_NX2_MEMORY_REPORT=1 elsewhere, =0 off.
     const char* const report_env = std::getenv("EDEN_NX2_MEMORY_REPORT");
@@ -164,9 +166,9 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             Common::PlatformEvents::PollMemoryPressure();
             const u32 now = Common::PlatformEvents::MemoryPressureGeneration();
             const auto tick = std::chrono::steady_clock::now();
+            const u64 left = Common::PlatformEvents::AvailableProcessMemory();
             bool closing = false;
-            if (const u64 left = Common::PlatformEvents::AvailableProcessMemory();
-                left != 0 && left < Imminent) {
+            if (left != 0 && left < Imminent) {
                 if (!imminent_reported) {
                     imminent_reported = true;
                     closing = true;
@@ -194,7 +196,6 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
 #ifdef __APPLE__
                 if (frees && g_nx2_present_count.load(std::memory_order_relaxed) != 0 &&
                     tick >= free_next) {
-                    const u64 left = Common::PlatformEvents::AvailableProcessMemory();
                     if (pressed || closing || (left != 0 && left < Tight) || tick >= free_periodic) {
                         // Not urgent: the other threads run between its stops.
                         state.free_zero = true;
@@ -299,8 +300,8 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             resident_logged = resident;
         }
         // Windows: pages found zero for the first time go on the next pass if they stay zero.
-        const size_t pending = state.zero_before.size() * 0x1000 - (std::min)(
-            trimmed, state.zero_before.size() * 0x1000);
+        const size_t zero_before_bytes = state.zero_before.size() * 0x1000;
+        const size_t pending = zero_before_bytes - (std::min)(trimmed, zero_before_bytes);
         if (counts_only) {
             if (!boot && !tight && !imminent) {
                 continue;

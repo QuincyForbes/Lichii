@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
-#include <limits>
 #include <span>
 
 #include "audio_core/adsp/apps/audio_renderer/command_list_processor.h"
@@ -24,31 +22,33 @@ static void ApplyMix(std::span<s32> output, std::span<const s32> input, const f3
                      const u32 sample_count) {
     const Common::FixedPoint<64 - Q, Q> volume{volume_};
     const s64 gain_raw = volume.to_raw();
+    if (gain_raw == 0) {
+        return;
+    }
     constexpr s64 frac_mask = Common::FixedPoint<64 - Q, Q>::fractional_mask;
+    const auto scale_sample = [gain_raw](const s32 sample) noexcept -> u32 {
+        const s64 scaled = s64{sample} * gain_raw;
+        return static_cast<u32>((scaled + ((scaled & frac_mask) >> 1)) >> Q);
+    };
     s32* const out = output.data();
     const s32* const in = input.data();
     if (out != in) {
         s32* __restrict dst = out;
         const s32* __restrict src = in;
         for (u32 i = 0; i < sample_count; i++) {
-            const s64 scaled = s64{src[i]} * gain_raw;
-            dst[i] = static_cast<s32>(s64{dst[i]} + ((scaled + ((scaled & frac_mask) >> 1)) >> Q));
+            dst[i] = static_cast<s32>(static_cast<u32>(dst[i]) + scale_sample(src[i]));
         }
     } else {
         for (u32 i = 0; i < sample_count; i++) {
-            const s64 scaled = s64{out[i]} * gain_raw;
-            out[i] = static_cast<s32>(s64{out[i]} + ((scaled + ((scaled & frac_mask) >> 1)) >> Q));
+            out[i] = static_cast<s32>(static_cast<u32>(out[i]) + scale_sample(out[i]));
         }
     }
 }
 
 void MixCommand::Dump([[maybe_unused]] const AudioRenderer::CommandListProcessor& processor,
                       std::string& string) {
-    string += fmt::format("MixCommand");
-    string += fmt::format("\n\tinput {:02X}", input_index);
-    string += fmt::format("\n\toutput {:02X}", output_index);
-    string += fmt::format("\n\tvolume {:.8f}", volume);
-    string += "\n";
+    string += fmt::format("MixCommand\n\tinput {:02X}\n\toutput {:02X}\n\tvolume {:.8f}\n",
+                          input_index, output_index, volume);
 }
 
 void MixCommand::Process(const AudioRenderer::CommandListProcessor& processor) {

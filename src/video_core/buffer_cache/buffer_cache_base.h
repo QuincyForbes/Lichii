@@ -944,7 +944,8 @@ private:
     void ChangeRegister(BufferId buffer_id);
 
     void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
-        if (buffer_id != NULL_BUFFER_ID) {
+        if (buffer_id != NULL_BUFFER_ID && buffer.lru_touched_tick != frame_tick) {
+            buffer.lru_touched_tick = frame_tick;
             lru_cache.Touch(buffer.getLRUID(), frame_tick);
         }
     }
@@ -1510,11 +1511,34 @@ private:
     };
     IndexBufferMemo index_buffer_memo;
 
+    /// Cached resolution for UpdateDrawIndirect(), spanning the contiguous mapped GPU range of
+    /// the resolved Buffer so consecutive sub-draws in a multi-draw indirect buffer hit in O(1).
+    struct IndirectDrawMemo {
+        u64 epoch{};
+        u64 map_serial{};
+        size_t as_id{};
+        const void* channel{};
+        GPUVAddr gpu_begin{};
+        GPUVAddr gpu_end{};
+        DAddr device_begin{};
+        BufferId buffer_id{};
+    };
+    IndirectDrawMemo indirect_buffer_memo{};
+    IndirectDrawMemo indirect_count_memo{};
+
+    [[nodiscard]] static bool GeometryMemoEnabled() noexcept;
+
     [[nodiscard]] bool ReuseGeometry(const GeometryMemo& memo, GPUVAddr begin, GPUVAddr end,
                                      u64 extra) const;
 
     void StoreGeometry(GeometryMemo& memo, GPUVAddr begin, GPUVAddr end, u64 extra,
                        const Binding& binding);
+
+    [[nodiscard]] bool ReuseIndirectDraw(const IndirectDrawMemo& memo, GPUVAddr gpu_addr,
+                                         size_t size, Binding& binding) const noexcept;
+
+    void StoreIndirectDraw(IndirectDrawMemo& memo, GPUVAddr gpu_addr, u32 size, DAddr device_addr,
+                           BufferId buffer_id, u64 map_serial);
 
     /// EDEN_NX2_TABLE_POINTER_TRACE: last table entry and size bound per table pointer slot.
     std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;

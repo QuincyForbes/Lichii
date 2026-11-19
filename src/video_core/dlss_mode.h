@@ -21,7 +21,7 @@ struct Range {
     Extent max;
 };
 
-constexpr bool Fits(Extent render, Extent output, Quality mode, Range range) {
+[[nodiscard]] constexpr bool Fits(Extent render, Extent output, Quality mode, Range range) {
     return render.width != 0 && render.height != 0 && output.width != 0 && output.height != 0 &&
            render.width >= range.min.width && render.width <= range.max.width &&
            render.height >= range.min.height && render.height <= range.max.height &&
@@ -29,7 +29,7 @@ constexpr bool Fits(Extent render, Extent output, Quality mode, Range range) {
             (render.width == output.width && render.height == output.height));
 }
 
-constexpr Quality Preferred(Extent render, Extent output) {
+[[nodiscard]] constexpr Quality Preferred(Extent render, Extent output) {
     const float ratio =
         output.width ? static_cast<float>(render.width) / static_cast<float>(output.width) : 0.0f;
     if (ratio >= 0.99f) {
@@ -54,7 +54,8 @@ struct Selection {
 };
 
 template <typename Query>
-Selection Select(Quality requested, Extent render, Extent output, Query&& query) {
+[[nodiscard]] constexpr Selection Select(Quality requested, Extent render, Extent output,
+                                         Query&& query) {
     std::optional<Range> requested_range;
     if (requested != Quality::Auto) {
         requested_range = query(requested);
@@ -63,8 +64,15 @@ Selection Select(Quality requested, Extent render, Extent output, Query&& query)
         }
     }
     const auto preferred = Preferred(render, output);
+    bool tried_preferred = false;
     for (const auto mode : {preferred, Quality::Quality, Quality::Balanced, Quality::Performance,
                             Quality::UltraPerformance, Quality::Dlaa}) {
+        if (mode == requested || (tried_preferred && mode == preferred)) {
+            continue;
+        }
+        if (mode == preferred) {
+            tried_preferred = true;
+        }
         if (const auto range = query(mode); range && Fits(render, output, mode, *range)) {
             return {mode, requested_range, requested != Quality::Auto};
         }

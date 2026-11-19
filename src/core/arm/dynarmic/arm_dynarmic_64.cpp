@@ -55,15 +55,39 @@ bool Nx2EnvOn(const char* name) {
     return value == nullptr || value[0] != '0';
 }
 
+#if defined(ARCHITECTURE_x86_64)
 // Fast dispatch table size: unset = 2^16 entries, 4-way set associative (1 MiB per core instead of
 // 16 MiB); "0" = the old direct-mapped 2^20 table; a number 8-24 = that many bits, 4-way.
-[[maybe_unused]] u32 Nx2DispatchBits() {
+u32 Nx2DispatchBits() {
     const char* value = std::getenv("EDEN_NX2_JIT_DISPATCH");
     if (value == nullptr || value[0] == '\0' || (value[0] == '1' && value[1] == '\0')) {
         return 16;
     }
     const long bits = std::strtol(value, nullptr, 10);
     return bits >= 8 && bits <= 24 ? u32(bits) : 0;
+}
+#endif
+
+void HostSpinPause() noexcept {
+#if defined(ARCHITECTURE_x86_64) || defined(_M_X64) || defined(__x86_64__)
+    _mm_pause();
+    _mm_pause();
+#elif defined(__APPLE__) && (defined(ARCHITECTURE_arm64) || defined(__aarch64__))
+    __builtin_arm_isb(0xF);
+#elif defined(ARCHITECTURE_arm64) || defined(__aarch64__)
+    asm volatile("yield");
+#endif
+}
+
+u32 DefaultCodeCacheBytes() {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // Carved out of the debugger-prepared JIT pool (common/ios_jit.h).
+    return u32(Common::IosJit::CodeCacheBytes());
+#elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+    return u32(128_MiB);
+#else
+    return u32(512_MiB);
+#endif
 }
 
 // arm64 hosts: LDXR/STXR in fastmem (dynarmic inline_exclusives) instead of a memory callback
@@ -437,28 +461,27 @@ u64 DynarmicCallbacks64::ReadValue(u64 vaddr, size_t size) {
     }
     return value;
 }
+Dynarmic::A64::Vector DynarmicCallbacks64::Read128Value(u64 vaddr) {
+    CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Read);
+    return {m_memory.Read64(vaddr), m_memory.Read64(vaddr + 8)};
+}
+
 Dynarmic::A64::Vector DynarmicCallbacks64::MemoryRead128(u64 vaddr) {
     ++m_slow_reads;
-    const auto read = [&]() -> Dynarmic::A64::Vector {
-        CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Read);
-        return {m_memory.Read64(vaddr), m_memory.Read64(vaddr + 8)};
-    };
-    if (m_slow_breakdown) [[unlikely]] {
-        return SlowAccessCall(ClassifySlowAccess(vaddr, 16), false, vaddr, read);
+    if (m_slow_breakdown) {
+        return SlowAccessCall(ClassifySlowAccess(vaddr, 16), false, vaddr,
+                              [&] { return Read128Value(vaddr); });
     }
-    return read();
+    return Read128Value(vaddr);
 }
 
 Dynarmic::A64::Vector DynarmicCallbacks64::MemoryReadExclusive128(u64 vaddr) {
     ++m_slow_reads;
-    const auto read = [&]() -> Dynarmic::A64::Vector {
-        CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Read);
-        return {m_memory.Read64(vaddr), m_memory.Read64(vaddr + 8)};
-    };
-    if (m_slow_breakdown) [[unlikely]] {
-        return SlowAccessCall(Common::PerfReport::SlowAccess::Exclusive, false, vaddr, read);
+    if (m_slow_breakdown) {
+        return SlowAccessCall(Common::PerfReport::SlowAccess::Exclusive, false, vaddr,
+                              [&] { return Read128Value(vaddr); });
     }
-    return read();
+    return Read128Value(vaddr);
 }
 
 std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
@@ -651,16 +674,9 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
         ++m_spin_hints;
         // A guest spin-wait hint: give the SMT sibling the core for a moment, as GetCNTPCT does.
         // EDEN_NX2_HINT_PAUSE=0 turns it off.
-        [[maybe_unused]] static const bool hint_pause = Nx2EnvOn("EDEN_NX2_HINT_PAUSE");
+        static const bool hint_pause = Nx2EnvOn("EDEN_NX2_HINT_PAUSE");
         if (hint_pause) {
-#if defined(_M_X64) || defined(__x86_64__)
-            _mm_pause();
-            _mm_pause();
-#elif defined(__APPLE__) && defined(__aarch64__)
-            __builtin_arm_isb(0xF);
-#elif defined(__aarch64__)
-            asm volatile("yield");
-#endif
+            HostSpinPause();
         }
         return;
     }
@@ -729,14 +745,7 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
         return true;
     }();
     if (pause_spins && ticks - m_last_cntpct < m_spin_ticks) {
-#if defined(_M_X64) || defined(__x86_64__)
-        _mm_pause();
-        _mm_pause();
-#elif defined(__APPLE__) && defined(__aarch64__)
-        __builtin_arm_isb(0xF);
-#elif defined(__aarch64__)
-        asm volatile("yield");
-#endif
+        HostSpinPause();
         // A poll that has run for the whole gate waits for a time or for another thread, not
         // for itself: sleep an eighth of the run so far (cap/min below) so the host core can run
         // something else. The guest then reads the counter after the sleep. On a phone with two
@@ -855,11 +864,13 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // Timing
     config.wall_clock_cntpct = m_uses_wall_clock;
     config.enable_cycle_counting = !m_uses_wall_clock;
-#if defined(ARCHITECTURE_x86_64)
+#if defined(ARCHITECTURE_x86_64) || (defined(ARCHITECTURE_arm64) && defined(__SIZEOF_INT128__))
     if (m_uses_wall_clock && Common::g_wall_clock.IsNative() &&
-        Settings::values.cpu_clock.GetValue() == Settings::CpuClock::Normal &&
+        (Settings::values.cpu_clock.GetValue() == Settings::CpuClock::Normal ||
+         Settings::CurrentProgramIsSwitch2()) &&
         !Settings::values.sync_core_speed.GetValue() &&
         Nx2EnvOn("EDEN_NX2_INLINE_CNTPCT")) {
+#if defined(ARCHITECTURE_x86_64)
         config.inline_cntpct_tsc_base = Common::g_wall_clock.base_rdtsc;
         config.inline_cntpct_tsc_factor =
             Common::g_wall_clock.cntpct_rdtsc_factor.load(std::memory_order_relaxed);
@@ -867,29 +878,19 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
             config.inline_cntpct_last_ticks = &m_cb->m_last_cntpct;
             config.inline_cntpct_spin_ticks = static_cast<u32>(m_cb->m_spin_ticks);
         }
-    }
-#elif defined(ARCHITECTURE_arm64) && defined(__SIZEOF_INT128__)
-    if (m_uses_wall_clock && Common::g_wall_clock.IsNative() &&
-        Settings::values.cpu_clock.GetValue() == Settings::CpuClock::Normal &&
-        !Settings::values.sync_core_speed.GetValue() &&
-        !ClockPollSleepSetting().Enabled() &&
-        Nx2EnvOn("EDEN_NX2_INLINE_CNTPCT")) {
-        const auto factor = Common::g_wall_clock.GetGuestCNTFRQFactor();
-        config.inline_cntpct = true;
-        config.cntpct_scale_lo = static_cast<u64>(factor);
-        config.cntpct_scale_hi = static_cast<u64>(factor >> 64);
+#elif defined(ARCHITECTURE_arm64)
+        if (!ClockPollSleepSetting().Enabled()) {
+            const auto factor = Common::g_wall_clock.GetGuestCNTFRQFactor();
+            config.inline_cntpct = true;
+            config.cntpct_scale_lo = static_cast<u64>(factor);
+            config.cntpct_scale_hi = static_cast<u64>(factor >> 64);
+        }
+#endif
     }
 #endif
 
     // Code cache size
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-    // Carved out of the debugger-prepared JIT pool (common/ios_jit.h).
-    config.code_cache_size = std::uint32_t(Common::IosJit::CodeCacheBytes());
-#elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
-    config.code_cache_size = std::uint32_t(128_MiB);
-#else
-    config.code_cache_size = std::uint32_t(512_MiB);
-#endif
+    config.code_cache_size = DefaultCodeCacheBytes();
 #if !(defined(__APPLE__) && TARGET_OS_IPHONE)
     // EDEN_NX2_JIT_CACHE_MIB=<n>: a phone-sized code cache per core, to see how often it fills.
     if (const char* const cache_mib = std::getenv("EDEN_NX2_JIT_CACHE_MIB")) {
@@ -898,10 +899,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         }
     }
 #endif
+    const JitFaultPolicy fault_policy = GetJitFaultPolicy();
     config.code_cache_evict_slice = JitEvictSliceBytes();
-    config.fastmem_shared_markers = GetJitFaultPolicy().shared_markers;
-    config.fastmem_block_after_faults = GetJitFaultPolicy().block_after_faults;
-    config.fastmem_load_fault_limit = GetJitFaultPolicy().load_fault_limit;
+    config.fastmem_shared_markers = fault_policy.shared_markers;
+    config.fastmem_block_after_faults = fault_policy.block_after_faults;
+    config.fastmem_load_fault_limit = fault_policy.load_fault_limit;
     config.inline_exclusives = InlineExclusives();
 
     // Allow memory fault handling to work
@@ -989,8 +991,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         if (Settings::values.cpuopt_unsafe_ignore_global_monitor) {
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
         }
-        config.optimizations |= Dynarmic::OptimizationFlag::CodeSpeed |
-                                Dynarmic::OptimizationFlag::DisableVerification;
+        config.optimizations |= Dynarmic::OptimizationFlag::CodeSpeed;
         break;
     // Safe optimisations
     case Settings::CpuAccuracy::Auto:
@@ -1012,6 +1013,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     case Settings::CpuAccuracy::Paranoid:
         config.unsafe_optimizations = false;
         config.optimizations = Dynarmic::no_optimizations;
+        config.inline_cntpct = false;
+        config.inline_cntpct_tsc_factor = 0;
+        config.inline_exclusives = false;
         break;
     case Settings::CpuAccuracy::Accurate:
     default:

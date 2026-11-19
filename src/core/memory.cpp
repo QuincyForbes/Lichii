@@ -29,7 +29,9 @@
 #include "common/assert.h"
 #include "common/atomic_ops.h"
 #include "common/common_types.h"
+#ifdef __ANDROID__
 #include "common/heap_tracker.h"
+#endif
 #include "common/logging.h"
 #include "common/page_table.h"
 #include "common/scope_exit.h"
@@ -204,16 +206,18 @@ struct Memory::Impl {
                        Common::MemoryPermission perms) {
         ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
         ASSERT_MSG((vaddr & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", vaddr);
+        static_cast<void>(page_table);
 
         if (!current_page_table->fastmem_arena) {
             return;
         }
 
-        u64 protect_bytes = 0, protect_begin = 0;
+        u64 protect_bytes = 0;
+        u64 protect_begin = 0;
 
-        current_page_table->entries.CommitRegion(vaddr >> YUZU_PAGEBITS, (vaddr + size) >> YUZU_PAGEBITS);
+        const auto& entries = std::as_const(current_page_table->entries);
         for (u64 addr = vaddr; addr < vaddr + size; addr += YUZU_PAGESIZE) {
-            const Common::PageType page_type = current_page_table->entries.GetUnchecked(addr >> YUZU_PAGEBITS).Type();
+            const Common::PageType page_type = entries[addr >> YUZU_PAGEBITS].Type();
             switch (page_type) {
             case Common::PageType::RasterizerCachedMemory:
                 if (protect_bytes > 0) {
@@ -222,27 +226,17 @@ struct Memory::Impl {
                 }
                 break;
             default:
-                if (protect_bytes == 0)
+                if (protect_bytes == 0) {
                     protect_begin = addr;
+                }
                 protect_bytes += YUZU_PAGESIZE;
+                break;
             }
         }
 
         if (protect_bytes > 0) {
             host_buffer->Protect(protect_begin, protect_bytes, perms);
         }
-    }
-
-    [[nodiscard]] u8* GetPointerFromRasterizerCachedMemory(u64 vaddr) const {
-        if (u64 paddr = current_page_table->entries[vaddr >> YUZU_PAGEBITS].Pointer(true); paddr)
-            return reinterpret_cast<u8*>(paddr) + vaddr;
-        return {};
-    }
-
-    [[nodiscard]] u8* GetPointerFromDebugMemory(u64 vaddr) const {
-        if (u64 paddr = current_page_table->entries[vaddr >> YUZU_PAGEBITS].Pointer(true); paddr)
-            return reinterpret_cast<u8*>(paddr) + vaddr;
-        return {};
     }
 
     u8 Read8(const Common::ProcessAddress addr) {
@@ -454,18 +448,24 @@ struct Memory::Impl {
         if (!AddressSpaceContains(*current_page_table, addr, size)) {
             return nullptr;
         }
-        const u64 first_page = addr >> YUZU_PAGEBITS;
-        const u64 last_page = (addr + (size != 0 ? size - 1 : 0)) >> YUZU_PAGEBITS;
-        const uintptr_t offset = current_page_table->entries[first_page].Pointer(true);
+        const std::size_t first_page = addr >> YUZU_PAGEBITS;
+        const std::size_t last_page = (addr + (size != 0 ? size - 1 : 0)) >> YUZU_PAGEBITS;
+        const auto* const entries =
+            current_page_table->entries.CommittedSpan(first_page, last_page);
+        if (entries == nullptr) {
+            return nullptr;
+        }
+        const uintptr_t offset = entries[0].Pointer(true);
         if (offset == 0) {
             return nullptr;
         }
-        for (u64 page = first_page + 1; page <= last_page; ++page) {
-            if (current_page_table->entries[page].Pointer(true) != offset) {
+        const std::size_t page_count = last_page - first_page + 1;
+        for (std::size_t i = 1; i < page_count; ++i) {
+            if (entries[i].Pointer(true) != offset) {
                 return nullptr;
             }
         }
-        return GetPointerSilent(addr);
+        return reinterpret_cast<u8*>(offset + addr);
     }
 
     bool WriteBlockImpl(const Common::ProcessAddress addr, const void* buffer, const std::size_t size, bool unsafe) {
@@ -484,21 +484,26 @@ struct Memory::Impl {
         });
     }
 
-    [[nodiscard]] const u8* GetSafeReadSpan(const Common::ProcessAddress src_addr,
-                                            const std::size_t size) {
-        const u64 addr = GetInteger(src_addr) & 0xffffffffffffULL;
+    template <typename OnCachedPage>
+    [[nodiscard]] u8* ResolveSafeSpan(const Common::ProcessAddress target_addr,
+                                      const std::size_t size, OnCachedPage&& on_cached) {
+        const u64 addr = GetInteger(target_addr) & 0xffffffffffffULL;
         if (size == 0 || !AddressSpaceContains(*current_page_table, addr, size)) {
             return nullptr;
         }
         const std::size_t first_page = addr >> YUZU_PAGEBITS;
         const std::size_t last_page = (addr + size - 1) >> YUZU_PAGEBITS;
-        current_page_table->entries.CommitRegion(first_page, last_page + 1);
+        const auto* const entries =
+            current_page_table->entries.CommittedSpan(first_page, last_page);
+        if (entries == nullptr) {
+            return nullptr;
+        }
 
+        const std::size_t page_count = last_page - first_page + 1;
         uintptr_t first_delta = 0;
         bool has_cached = false;
-        for (std::size_t p = first_page; p <= last_page; ++p) {
-            const auto [pointer, type, _] =
-                current_page_table->entries.GetUnchecked(p).PointerTypeBlock(true);
+        for (std::size_t i = 0; i < page_count; ++i) {
+            const auto [pointer, type, _] = entries[i].PointerTypeBlock(true);
             if (pointer == 0) {
                 return nullptr;
             }
@@ -507,7 +512,7 @@ struct Memory::Impl {
             } else if (type != Common::PageType::Memory) {
                 return nullptr;
             }
-            if (p == first_page) {
+            if (i == 0) {
                 first_delta = pointer;
             } else if (pointer != first_delta) {
                 return nullptr;
@@ -516,69 +521,38 @@ struct Memory::Impl {
 
         u8* const base_ptr = reinterpret_cast<u8*>(first_delta + addr);
         if (has_cached) {
-            const bool check_traps = ReadTrapsEnabled();
             const u64 end_addr = addr + size;
-            for (std::size_t p = first_page; p <= last_page; ++p) {
-                if (current_page_table->entries.GetUnchecked(p).Type() !=
-                    Common::PageType::RasterizerCachedMemory) {
+            for (std::size_t i = 0; i < page_count; ++i) {
+                if (entries[i].Type() != Common::PageType::RasterizerCachedMemory) {
                     continue;
                 }
-                const u64 p_begin = (std::max<u64>)(addr, u64{p} << YUZU_PAGEBITS);
-                const u64 p_end = (std::min<u64>)(end_addr, (u64{p} + 1) << YUZU_PAGEBITS);
+                const u64 page = first_page + i;
+                const u64 p_begin = (std::max<u64>)(addr, page << YUZU_PAGEBITS);
+                const u64 p_end = (std::min<u64>)(end_addr, (page + 1) << YUZU_PAGEBITS);
                 const std::size_t chunk = static_cast<std::size_t>(p_end - p_begin);
-                if (!check_traps || ReadTrapArmed(p_begin, chunk)) {
-                    HandleRasterizerDownload(p_begin, chunk, base_ptr + (p_begin - addr));
-                }
+                on_cached(p_begin, chunk, base_ptr + (p_begin - addr));
             }
         }
         return base_ptr;
     }
 
+    [[nodiscard]] const u8* GetSafeReadSpan(const Common::ProcessAddress src_addr,
+                                            const std::size_t size) {
+        const bool check_traps = ReadTrapsEnabled();
+        return ResolveSafeSpan(src_addr, size,
+                               [&](u64 p_begin, std::size_t chunk, u8* host_ptr) {
+                                   if (!check_traps || ReadTrapArmed(p_begin, chunk)) {
+                                       HandleRasterizerDownload(p_begin, chunk, host_ptr);
+                                   }
+                               });
+    }
+
     [[nodiscard]] u8* GetSafeWriteSpan(const Common::ProcessAddress dest_addr,
                                        const std::size_t size) {
-        const u64 addr = GetInteger(dest_addr) & 0xffffffffffffULL;
-        if (size == 0 || !AddressSpaceContains(*current_page_table, addr, size)) {
-            return nullptr;
-        }
-        const std::size_t first_page = addr >> YUZU_PAGEBITS;
-        const std::size_t last_page = (addr + size - 1) >> YUZU_PAGEBITS;
-        current_page_table->entries.CommitRegion(first_page, last_page + 1);
-
-        uintptr_t first_delta = 0;
-        bool has_cached = false;
-        for (std::size_t p = first_page; p <= last_page; ++p) {
-            const auto [pointer, type, _] =
-                current_page_table->entries.GetUnchecked(p).PointerTypeBlock(true);
-            if (pointer == 0) {
-                return nullptr;
-            }
-            if (type == Common::PageType::RasterizerCachedMemory) {
-                has_cached = true;
-            } else if (type != Common::PageType::Memory) {
-                return nullptr;
-            }
-            if (p == first_page) {
-                first_delta = pointer;
-            } else if (pointer != first_delta) {
-                return nullptr;
-            }
-        }
-
-        u8* const base_ptr = reinterpret_cast<u8*>(first_delta + addr);
-        if (has_cached) {
-            const u64 end_addr = addr + size;
-            for (std::size_t p = first_page; p <= last_page; ++p) {
-                if (current_page_table->entries.GetUnchecked(p).Type() !=
-                    Common::PageType::RasterizerCachedMemory) {
-                    continue;
-                }
-                const u64 p_begin = (std::max<u64>)(addr, u64{p} << YUZU_PAGEBITS);
-                const u64 p_end = (std::min<u64>)(end_addr, (u64{p} + 1) << YUZU_PAGEBITS);
-                const std::size_t chunk = static_cast<std::size_t>(p_end - p_begin);
-                HandleRasterizerWrite(p_begin, chunk, base_ptr + (p_begin - addr));
-            }
-        }
-        return base_ptr;
+        return ResolveSafeSpan(dest_addr, size,
+                               [&](u64 p_begin, std::size_t chunk, u8* host_ptr) {
+                                   HandleRasterizerWrite(p_begin, chunk, host_ptr);
+                               });
     }
 
     bool ZeroBlock(const Common::ProcessAddress addr, const std::size_t size) {
@@ -596,7 +570,7 @@ struct Memory::Impl {
     }
 
     bool CopyBlock(Common::ProcessAddress dest_addr, Common::ProcessAddress src_addr, const std::size_t size) {
-        return WalkBlock(dest_addr, size,
+        return WalkBlock(src_addr, size,
         [&](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
             LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})", GetInteger(current_vaddr), GetInteger(src_addr), size);
             ZeroBlock(dest_addr + offset, copy_amount);
@@ -605,7 +579,10 @@ struct Memory::Impl {
             WriteBlockImpl(dest_addr + offset, ptr, copy_amount, false);
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            HandleRasterizerDownload(GetInteger(current_vaddr), copy_amount, ptr);
+            const u64 raw_vaddr = GetInteger(current_vaddr);
+            if (!ReadTrapsEnabled() || ReadTrapArmed(raw_vaddr & 0xffffffffffffULL, copy_amount)) {
+                HandleRasterizerDownload(raw_vaddr, copy_amount, ptr);
+            }
             WriteBlockImpl(dest_addr + offset, ptr, copy_amount, false);
         });
     }
@@ -1043,16 +1020,13 @@ struct Memory::Impl {
             }
 
             page_table.entries.CommitRegion(base, end);
-            while (base != end) {
-                auto host_ptr = reinterpret_cast<u64>(system.DeviceMemory().GetPointer<u8>(target)) - (base << YUZU_PAGEBITS);;
-                auto& entry = page_table.entries.GetUnchecked(base);
-
-                entry.Store(false, type, current_block, host_ptr);
-                ASSERT_MSG(page_table.entries[base].Pointer(),
-                           "memory mapping base yield a nullptr within the table");
-
-                base += 1;
-                target += YUZU_PAGESIZE;
+            ASSERT_MSG(Common::PageTable::PageEntryData::ExtractPointer(
+                           Common::PageTable::PageEntryData::Data{false, type, current_block,
+                                                                  first_host_ptr}) != 0,
+                       "memory mapping base yield a nullptr within the table");
+            for (u64 page = base; page != end; ++page) {
+                page_table.entries.GetUnchecked(page).Store(false, type, current_block,
+                                                            first_host_ptr);
             }
         }
     }
@@ -1067,14 +1041,19 @@ struct Memory::Impl {
             if (auto pointer = Common::PageTable::PageEntryData::ExtractPointer(raw); pointer) [[likely]] {
                 return reinterpret_cast<u8*>(pointer + vaddr);
             } else {
+                const auto marked_ptr = [&]() -> u8* {
+                    const uintptr_t paddr =
+                        Common::PageTable::PageEntryData::ExtractPointer(raw, true);
+                    return paddr != 0 ? reinterpret_cast<u8*>(paddr + vaddr) : nullptr;
+                };
                 switch (static_cast<Common::PageType>(raw.type)) {
                 case Common::PageType::Memory:
                     ASSERT_MSG(false, "Mapped memory page without a pointer @ {:#016x}", vaddr);
                     return nullptr;
                 case Common::PageType::DebugMemory:
-                    return GetPointerFromDebugMemory(vaddr);
+                    return marked_ptr();
                 case Common::PageType::RasterizerCachedMemory: {
-                    u8* const host_ptr{GetPointerFromRasterizerCachedMemory(vaddr)};
+                    u8* const host_ptr{marked_ptr()};
                     if constexpr (std::is_invocable_v<G&, u8*>) {
                         on_rasterizer(host_ptr);
                     } else {

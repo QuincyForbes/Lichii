@@ -29,13 +29,10 @@
 #include "video_core/vulkan_common/streamline.h"
 #include "video_core/vulkan_common/streamline_api.h"
 #include "video_core/vulkan_common/streamline_frame_gen.h"
+#include "video_core/vulkan_common/win32_signature.h"
 
 #include <sl_helpers.h>
 #include <sl_security.h>
-
-#include <softpub.h>
-#include <wincrypt.h>
-#include <wintrust.h>
 
 namespace Vulkan::Streamline {
 namespace {
@@ -484,34 +481,7 @@ bool IsStreamlineModule(const std::filesystem::path& path) {
 }
 
 bool IsSignedByNvidia(const std::filesystem::path& path) {
-    const std::wstring file_path = std::filesystem::absolute(path).wstring();
-    WINTRUST_FILE_INFO file{};
-    file.cbStruct = sizeof(file);
-    file.pcwszFilePath = file_path.c_str();
-    WINTRUST_DATA data{};
-    data.cbStruct = sizeof(data);
-    data.dwUIChoice = WTD_UI_NONE;
-    data.fdwRevocationChecks = WTD_REVOKE_NONE;
-    data.dwUnionChoice = WTD_CHOICE_FILE;
-    data.pFile = &file;
-    data.dwStateAction = WTD_STATEACTION_VERIFY;
-    data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
-    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-    bool valid = WinVerifyTrust(nullptr, &action, &data) == ERROR_SUCCESS;
-    if (valid) {
-        CRYPT_PROVIDER_DATA* const provider = WTHelperProvDataFromStateData(data.hWVTStateData);
-        CRYPT_PROVIDER_SGNR* const signer =
-            provider ? WTHelperGetProvSignerFromChain(provider, 0, FALSE, 0) : nullptr;
-        CRYPT_PROVIDER_CERT* const cert = signer ? WTHelperGetProvCertFromChain(signer, 0) : nullptr;
-        wchar_t name[128]{};
-        valid = cert &&
-                CertGetNameStringW(cert->pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, name,
-                                   static_cast<DWORD>(std::size(name))) > 1 &&
-                std::wstring_view{name} == L"NVIDIA Corporation";
-    }
-    data.dwStateAction = WTD_STATEACTION_CLOSE;
-    WinVerifyTrust(nullptr, &action, &data);
-    return valid;
+    return HasValidAuthenticodeSigner(path, L"NVIDIA Corporation");
 }
 
 DlssFiles FindDlssFiles() {

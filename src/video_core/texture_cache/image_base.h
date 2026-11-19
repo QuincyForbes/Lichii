@@ -150,6 +150,8 @@ struct ImageBase {
     u8 relocation_guard_noted = 0;
     /// Render frames the GPU wrote the image in (saturating), for the collector's redrawn rule.
     u16 written_frames = 0;
+    /// Low 32 bits of frame_tick when relocation_guard_noted was last refreshed.
+    u32 relocation_guard_tick = 0;
 
     /// Asynchronous shaders' skip rule (EDEN_NX2_ASYNC_DISCARD=2, ClassifyClearedTarget): the
     /// render frames of the image's last two full clears that had a write between them (~0 =

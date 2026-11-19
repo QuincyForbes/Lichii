@@ -207,9 +207,10 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
 #else
     config.code_cache_size = std::uint32_t(512_MiB);
 #endif
+    const JitFaultPolicy fault_policy = GetJitFaultPolicy();
     config.code_cache_evict_slice = JitEvictSliceBytes();
-    config.fastmem_shared_markers = GetJitFaultPolicy().shared_markers;
-    config.fastmem_block_after_faults = GetJitFaultPolicy().block_after_faults;
+    config.fastmem_shared_markers = fault_policy.shared_markers;
+    config.fastmem_block_after_faults = fault_policy.block_after_faults;
 
     // Allow memory fault handling to work
     if (m_system.DebuggerEnabled()) {
@@ -381,7 +382,7 @@ void ArmDynarmic32::RewindBreakpointInstruction() {
 ArmDynarmic32::ArmDynarmic32(System& system, bool uses_wall_clock, Kernel::KProcess* process,
                              DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index)
     : ArmInterface{uses_wall_clock}, m_system{system}, m_exclusive_monitor{exclusive_monitor}
-    , m_cb(std::make_optional<DynarmicCallbacks32>(*this, process))
+    , m_cb(std::in_place, *this, process)
     , m_cp15(std::make_shared<DynarmicCP15>(*this)), m_core_index{core_index}
 {
     auto& page_table_impl = process->GetPageTable().GetBasePageTable().GetImpl();

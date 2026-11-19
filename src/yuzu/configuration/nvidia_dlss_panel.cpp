@@ -23,12 +23,15 @@
 #include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDir>
 #include <QHBoxLayout>
+#include <QHideEvent>
 #include <QLabel>
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QProgressDialog>
 #include <QPushButton>
+#include <QShowEvent>
 #include <QStringList>
 #include <QTimer>
 #include <QUrl>
@@ -319,7 +322,7 @@ QString Named(const QString& name, const std::string& version) {
 }
 
 QString PathText(const std::filesystem::path& path) {
-    return QString::fromStdWString(path.wstring());
+    return QDir::toNativeSeparators(QString::fromStdU16String(path.u16string()));
 }
 
 } // Anonymous namespace
@@ -379,13 +382,14 @@ NvidiaDlssPanel::NvidiaDlssPanel(QWidget* parent) : QWidget(parent) {
         std::filesystem::create_directories(folder, ec);
         QDesktopServices::openUrl(QUrl::fromLocalFile(PathText(folder)));
     });
-    Refresh();
 }
 
 void NvidiaDlssPanel::showEvent(QShowEvent* event) {
-    Refresh();
-    refresh_timer->start();
     QWidget::showEvent(event);
+    Refresh();
+    if (!refresh_timer->isActive()) {
+        refresh_timer->start();
+    }
 }
 
 void NvidiaDlssPanel::hideEvent(QHideEvent* event) {
@@ -394,9 +398,14 @@ void NvidiaDlssPanel::hideEvent(QHideEvent* event) {
 }
 
 void NvidiaDlssPanel::SetDevice(const QString& name, bool capable) {
+    if (device_name == name && device_capable == capable) {
+        return;
+    }
     device_name = name;
     device_capable = capable;
-    Refresh();
+    if (isVisible()) {
+        Refresh();
+    }
 }
 
 void NvidiaDlssPanel::SetFrameGenWanted(bool wanted) {
@@ -404,7 +413,9 @@ void NvidiaDlssPanel::SetFrameGenWanted(bool wanted) {
         return;
     }
     frame_gen_wanted = wanted;
-    Refresh();
+    if (isVisible()) {
+        Refresh();
+    }
 }
 
 void NvidiaDlssPanel::SetUpscalerSelected(bool selected) {
@@ -412,7 +423,9 @@ void NvidiaDlssPanel::SetUpscalerSelected(bool selected) {
         return;
     }
     upscaler_selected = selected;
-    Refresh();
+    if (isVisible()) {
+        Refresh();
+    }
 }
 
 void NvidiaDlssPanel::Refresh() {
@@ -735,16 +748,20 @@ void NvidiaDlssPanel::Download() {
         done += entries[i]->compressed;
         const std::filesystem::path target = folder / std::filesystem::path{wanted[i]}.filename();
         std::filesystem::path partial = target;
-        partial += L".download";
+        partial += ".download";
+        bool wrote_ok = false;
         {
             std::ofstream file(partial, std::ios::binary | std::ios::trunc);
             file.write(contents->data(), static_cast<std::streamsize>(contents->size()));
-            if (!file) {
-                discard();
-                progress.close();
-                fail("could not write " + Common::FS::PathToUTF8String(partial));
-                return;
-            }
+            file.flush();
+            wrote_ok = static_cast<bool>(file);
+        }
+        if (!wrote_ok) {
+            std::filesystem::remove(partial, ec);
+            discard();
+            progress.close();
+            fail("could not write " + Common::FS::PathToUTF8String(partial));
+            return;
         }
         // Streamline's own modules (sl.*) carry Streamline's signature; NVIDIA's other DLLs an
         // Authenticode one.
@@ -790,7 +807,7 @@ void NvidiaDlssPanel::Download() {
         std::filesystem::path backup;
         if (std::filesystem::exists(target, ec)) {
             backup = target;
-            backup += L".old";
+            backup += ".old";
             std::filesystem::remove(backup, ec);
             std::filesystem::rename(target, backup, ec);
         }

@@ -469,6 +469,7 @@ struct RendererMetal::Impl {
         bool worker_busy{};
         bool stop{};
     };
+    std::mutex swapchain_pacing_mutex;
     std::shared_ptr<AsyncPresentSync> async_sync = std::make_shared<AsyncPresentSync>();
     std::array<AsyncSlot, AsyncPresentSlots> async_slots{};
     size_t next_async_slot{};
@@ -478,6 +479,9 @@ struct RendererMetal::Impl {
     id<MTLSamplerState> async_present_sampler = nil;
     bool async_present_failed{};
 
+    void NoteDrawableWait(u64 waited_ns) noexcept;
+    void ClearAttachment(Attachment target, u32 width, u32 height,
+                         std::array<f64, 4> color);
     bool EnsureAsyncPresenter();
     void RunAsyncPresentWorker();
     bool SubmitAsyncPresent(std::span<const Tegra::FramebufferConfig> framebuffers,
@@ -691,22 +695,26 @@ bool RendererMetal::Impl::DrawLayers(std::span<const Tegra::FramebufferConfig> f
 void RendererMetal::Impl::PresentTexture(TextureHandle texture, id<CAMetalDrawable> drawable,
                                          const Layout::FramebufferLayout& layout,
                                          f64 hold_seconds, bool guest) {
-    const std::array<s32, 4> rect{0, 0, static_cast<s32>(layout.width),
-                                  static_cast<s32>(layout.height)};
+    const id<MTLTexture> dst_tex = drawable.texture;
+    const u32 dst_w = dst_tex != nil ? static_cast<u32>(dst_tex.width) : layout.width;
+    const u32 dst_h = dst_tex != nil ? static_cast<u32>(dst_tex.height) : layout.height;
     scheduler.Blit(BlitPass{
         .src = texture,
-        .src_rect = rect,
-        .dst = {.texture = (__bridge void*)drawable.texture},
+        .src_rect = {0, 0, static_cast<s32>(layout.width), static_cast<s32>(layout.height)},
+        .dst = {.texture = (__bridge void*)dst_tex},
         .dst_format = DrawableFormat(),
-        .dst_rect = rect,
-        .dst_width = layout.width,
-        .dst_height = layout.height,
-        .linear = false,
+        .dst_rect = {0, 0, static_cast<s32>(dst_w), static_cast<s32>(dst_h)},
+        .dst_width = dst_w,
+        .dst_height = dst_h,
+        .linear = dst_w != layout.width || dst_h != layout.height,
         .keep_dst = false,
     });
     const id<MTLCommandBuffer> command_buffer =
         (__bridge id<MTLCommandBuffer>)scheduler.CommandBuffer(true);
-    swapchain.PresentHeld(command_buffer, drawable, hold_seconds);
+    {
+        std::scoped_lock lock{swapchain_pacing_mutex};
+        swapchain.PresentHeld(command_buffer, drawable, hold_seconds);
+    }
     scheduler.NotePresent(guest);
     // Each present on a command buffer of its own: the hold counts from the one before.
     scheduler.Flush(CommitReason::Present);
@@ -733,17 +741,16 @@ bool RendererMetal::Impl::CompositeGenerated(std::span<const Tegra::FramebufferC
     const Attachment target{.texture = compose.Get()};
     const bool drawn = DrawLayers(framebuffers, target, DrawableFormat(), layout, true);
     if (!drawn) {
-        ClearPass clear{};
-        clear.color[0] = target;
-        clear.clear_color[0] = true;
-        clear.color_value[0] = {0.06, 0.09, 0.22, 1.0};
-        clear.width = layout.width;
-        clear.height = layout.height;
-        scheduler.Clear(clear);
+        ClearAttachment(target, layout.width, layout.height, {0.06, 0.09, 0.22, 1.0});
     }
     if (!refresh_published) {
         refresh_published = true;
-        if (const f64 refresh_ns = swapchain.DisplayRefreshNs(); refresh_ns > 0.0) {
+        f64 refresh_ns = 0.0;
+        {
+            std::scoped_lock lock{swapchain_pacing_mutex};
+            refresh_ns = swapchain.DisplayRefreshNs();
+        }
+        if (refresh_ns > 0.0) {
             // The pacer follows the display: no more frames than it shows.
             VideoCommon::Nx2Perf::g_display_refresh_ns.store(static_cast<long long>(refresh_ns),
                                                             std::memory_order_relaxed);
@@ -765,32 +772,59 @@ bool RendererMetal::Impl::CompositeGenerated(std::span<const Tegra::FramebufferC
     id<CAMetalDrawable> next = drawable;
     f64 hold = 0.0;
     for (size_t generation = 0; generation < count; ++generation) {
-        const TextureHandle generated = frame_gen.Generate(generation);
-        if (generated == nullptr) {
+        bool presented_gen = false;
+        @autoreleasepool {
+            const TextureHandle generated = frame_gen.Generate(generation);
+            if (generated != nullptr) {
+                if (next == nil) {
+                    next = swapchain.NextDrawable(layout.width, layout.height);
+                }
+                if (next != nil) {
+                    PresentTexture(generated, next, layout, hold, false);
+                    next = nil;
+                    ++generated_since_report;
+                    hold = spacing;
+                    presented_gen = true;
+                }
+            }
+        }
+        if (!presented_gen) {
             break;
         }
+    }
+    @autoreleasepool {
         if (next == nil) {
             next = swapchain.NextDrawable(layout.width, layout.height);
         }
-        if (next == nil) {
-            break;
+        if (next != nil) {
+            PresentTexture(compose.Get(), next, layout, hold, drawn);
+        } else {
+            skipped.fetch_add(1, std::memory_order_relaxed);
         }
-        PresentTexture(generated, next, layout, hold, false);
-        next = nil;
-        ++generated_since_report;
-        hold = spacing;
-    }
-    if (next == nil) {
-        next = swapchain.NextDrawable(layout.width, layout.height);
-    }
-    if (next != nil) {
-        PresentTexture(compose.Get(), next, layout, hold, drawn);
-    } else {
-        skipped.fetch_add(1, std::memory_order_relaxed);
     }
     return drawn;
 }
 #endif
+
+void RendererMetal::Impl::NoteDrawableWait(u64 waited_ns) noexcept {
+    drawable_wait_ns.fetch_add(waited_ns, std::memory_order_relaxed);
+    u64 prev_max = drawable_wait_max_ns.load(std::memory_order_relaxed);
+    while (waited_ns > prev_max &&
+           !drawable_wait_max_ns.compare_exchange_weak(prev_max, waited_ns,
+                                                       std::memory_order_relaxed)) {
+    }
+}
+
+void RendererMetal::Impl::ClearAttachment(Attachment target, u32 width, u32 height,
+                                          std::array<f64, 4> color) {
+    ClearPass clear{};
+    clear.color[0] = target;
+    clear.clear_color[0] = true;
+    clear.color_value[0] = color;
+    clear.width = width;
+    clear.height = height;
+    scheduler.Clear(clear);
+}
 
 bool RendererMetal::Impl::EnsureAsyncPresenter() {
     if (async_present_thread.joinable()) {
@@ -817,8 +851,8 @@ bool RendererMetal::Impl::EnsureAsyncPresenter() {
         async_present_pipeline = [mtl newRenderPipelineStateWithDescriptor:desc error:&error];
     }
     MTLSamplerDescriptor* sdesc = [MTLSamplerDescriptor new];
-    sdesc.minFilter = MTLSamplerMinMagFilterNearest;
-    sdesc.magFilter = MTLSamplerMinMagFilterNearest;
+    sdesc.minFilter = MTLSamplerMinMagFilterLinear;
+    sdesc.magFilter = MTLSamplerMinMagFilterLinear;
     sdesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
     sdesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
     async_present_sampler = [mtl newSamplerStateWithDescriptor:sdesc];
@@ -826,6 +860,9 @@ bool RendererMetal::Impl::EnsureAsyncPresenter() {
         async_present_sampler == nil) {
         LOG_WARNING(Render_Metal, "Metal: async present worker unavailable ({}); presenting inline",
                     error != nil ? error.localizedDescription.UTF8String : "resource init failed");
+        async_present_queue = nil;
+        async_present_pipeline = nil;
+        async_present_sampler = nil;
         async_present_failed = true;
         return false;
     }
@@ -844,7 +881,7 @@ void RendererMetal::Impl::RunAsyncPresentWorker() {
             async_sync->work_cv.wait(lock, [this] {
                 return async_sync->stop || !async_sync->jobs.empty();
             });
-            if (async_sync->jobs.empty()) {
+            if (async_sync->stop || async_sync->jobs.empty()) {
                 return;
             }
             job = async_sync->jobs.front();
@@ -858,40 +895,42 @@ void RendererMetal::Impl::RunAsyncPresentWorker() {
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - drawable_start)
                     .count());
-            drawable_wait_ns.fetch_add(waited, std::memory_order_relaxed);
-            u64 prev_max = drawable_wait_max_ns.load(std::memory_order_relaxed);
-            while (waited > prev_max &&
-                   !drawable_wait_max_ns.compare_exchange_weak(prev_max, waited,
-                                                               std::memory_order_relaxed)) {
-            }
+            NoteDrawableWait(waited);
             bool submitted_cb = false;
             if (drawable != nil) {
-                const id<MTLCommandBuffer> cb = [async_present_queue commandBuffer];
+                const id<MTLTexture> dst_tex = drawable.texture;
+                const u32 dst_w = dst_tex != nil ? static_cast<u32>(dst_tex.width) : 0;
+                const u32 dst_h = dst_tex != nil ? static_cast<u32>(dst_tex.height) : 0;
+                const id<MTLCommandBuffer> cb =
+                    (dst_w > 0 && dst_h > 0) ? [async_present_queue commandBuffer] : nil;
                 if (cb != nil) {
                     cb.label = @"Lichii present";
                     if (shared_event != nil && job.ready_tick != 0) {
                         [cb encodeWaitForEvent:shared_event value:job.ready_tick];
                     }
                     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-                    pass.colorAttachments[0].texture = drawable.texture;
+                    pass.colorAttachments[0].texture = dst_tex;
                     pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
                     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-                    pass.renderTargetWidth = job.width;
-                    pass.renderTargetHeight = job.height;
+                    pass.renderTargetWidth = dst_w;
+                    pass.renderTargetHeight = dst_h;
                     const id<MTLRenderCommandEncoder> enc =
                         [cb renderCommandEncoderWithDescriptor:pass];
                     if (enc != nil) {
                         enc.label = @"Present Blit";
                         [enc setRenderPipelineState:async_present_pipeline];
-                        [enc setViewport:MTLViewport{0.0, 0.0, static_cast<f64>(job.width),
-                                                     static_cast<f64>(job.height), 0.0, 1.0}];
-                        [enc setScissorRect:MTLScissorRect{0, 0, job.width, job.height}];
+                        [enc setViewport:MTLViewport{0.0, 0.0, static_cast<f64>(dst_w),
+                                                     static_cast<f64>(dst_h), 0.0, 1.0}];
+                        [enc setScissorRect:MTLScissorRect{0, 0, dst_w, dst_h}];
                         [enc setFragmentTexture:AsTexture(job.texture) atIndex:0];
                         [enc setFragmentSamplerState:async_present_sampler atIndex:0];
                         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
                         [enc endEncoding];
                     }
-                    swapchain.Present(cb, drawable, job.drawn);
+                    {
+                        std::scoped_lock lock{swapchain_pacing_mutex};
+                        swapchain.Present(cb, drawable, job.drawn);
+                    }
                     std::shared_ptr<AsyncPresentSync> sync_ref = async_sync;
                     const size_t slot_idx = job.slot_index;
                     [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
@@ -968,13 +1007,7 @@ bool RendererMetal::Impl::SubmitAsyncPresent(
     const Attachment target{.texture = slot.texture.Get()};
     const bool drawn = DrawLayers(framebuffers, target, DrawableFormat(), layout, true);
     if (!drawn) {
-        ClearPass clear{};
-        clear.color[0] = target;
-        clear.clear_color[0] = true;
-        clear.color_value[0] = {0.06, 0.09, 0.22, 1.0};
-        clear.width = layout.width;
-        clear.height = layout.height;
-        scheduler.Clear(clear);
+        ClearAttachment(target, layout.width, layout.height, {0.06, 0.09, 0.22, 1.0});
     }
     scheduler.NotePresent(drawn);
     const u64 ready_tick = scheduler.Flush(CommitReason::Present);
@@ -1011,6 +1044,10 @@ void RendererMetal::Impl::StopAsyncPresent() {
         {
             std::scoped_lock lock{async_sync->mutex};
             async_sync->stop = true;
+            for (const PresentJob& pending : async_sync->jobs) {
+                async_sync->slot_busy[pending.slot_index] = false;
+            }
+            async_sync->jobs.clear();
         }
         async_sync->work_cv.notify_all();
         async_present_thread.join();
@@ -1073,12 +1110,7 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                         std::chrono::steady_clock::now() - drawable_start)
                         .count());
                 VideoCommon::SplitStats::AddPresentBlock(waited);
-                impl->drawable_wait_ns.fetch_add(waited, std::memory_order_relaxed);
-                u64 prev_max = impl->drawable_wait_max_ns.load(std::memory_order_relaxed);
-                while (waited > prev_max &&
-                       !impl->drawable_wait_max_ns.compare_exchange_weak(
-                           prev_max, waited, std::memory_order_relaxed)) {
-                }
+                impl->NoteDrawableWait(waited);
             }
             if (drawable != nil) {
 #ifdef HAS_LSFG
@@ -1087,22 +1119,27 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                 } else
 #endif
                 {
-                    const Attachment target{.texture = (__bridge void*)drawable.texture};
+                    const id<MTLTexture> dst_tex = drawable.texture;
+                    const u32 dst_w =
+                        dst_tex != nil ? static_cast<u32>(dst_tex.width) : layout.width;
+                    const u32 dst_h =
+                        dst_tex != nil ? static_cast<u32>(dst_tex.height) : layout.height;
+                    Layout::FramebufferLayout draw_layout = layout;
+                    draw_layout.width = dst_w;
+                    draw_layout.height = dst_h;
+                    const Attachment target{.texture = (__bridge void*)dst_tex};
                     const bool drawn =
-                        impl->DrawLayers(framebuffers, target, DrawableFormat(), layout, true);
+                        impl->DrawLayers(framebuffers, target, DrawableFormat(), draw_layout, true);
                     if (!drawn) {
                         // Dark blue: the renderer runs, the guest has no framebuffer to show.
-                        ClearPass clear{};
-                        clear.color[0] = target;
-                        clear.clear_color[0] = true;
-                        clear.color_value[0] = {0.06, 0.09, 0.22, 1.0};
-                        clear.width = layout.width;
-                        clear.height = layout.height;
-                        impl->scheduler.Clear(clear);
+                        impl->ClearAttachment(target, dst_w, dst_h, {0.06, 0.09, 0.22, 1.0});
                     }
                     const id<MTLCommandBuffer> command_buffer =
                         (__bridge id<MTLCommandBuffer>)impl->scheduler.CommandBuffer(true);
-                    impl->swapchain.Present(command_buffer, drawable, drawn);
+                    {
+                        std::scoped_lock lock{impl->swapchain_pacing_mutex};
+                        impl->swapchain.Present(command_buffer, drawable, drawn);
+                    }
                     impl->scheduler.NotePresent(drawn);
                     impl->scheduler.Flush(CommitReason::Present);
                     impl->presented.fetch_add(1, std::memory_order_relaxed);
@@ -1234,7 +1271,12 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                      Settings::CanonicalizeEnum(Settings::values.scaling_filter.GetValue()),
                      Settings::CanonicalizeEnum(Settings::values.anti_aliasing.GetValue()));
         }
-        if (const std::string pacing = impl->swapchain.TakePacingLine(); !pacing.empty()) {
+        std::string pacing;
+        {
+            std::scoped_lock lock{impl->swapchain_pacing_mutex};
+            pacing = impl->swapchain.TakePacingLine();
+        }
+        if (!pacing.empty()) {
             LOG_INFO(Render_Metal, "Metal pacing: {}", pacing);
         }
         if (const auto memo = impl->rasterizer.TakeBindMemoCounts(); memo.hits + memo.misses != 0) {
@@ -1303,13 +1345,7 @@ void RendererMetal::Impl::RenderAppletCapture(
     }
     const Attachment target{.texture = applet_capture.Get()};
     if (!DrawLayers(layers, target, Fmt::RGBA8Unorm, VideoCore::Capture::Layout, false)) {
-        ClearPass clear{};
-        clear.color[0] = target;
-        clear.clear_color[0] = true;
-        clear.color_value[0] = {0.0, 0.0, 0.0, 1.0};
-        clear.width = LinearWidth;
-        clear.height = LinearHeight;
-        scheduler.Clear(clear);
+        ClearAttachment(target, LinearWidth, LinearHeight, {0.0, 0.0, 0.0, 1.0});
     }
 }
 
@@ -1355,13 +1391,7 @@ void RendererMetal::RenderScreenshot(std::span<const Tegra::FramebufferConfig> f
         if (impl->screenshot_target) {
             const Attachment target{.texture = impl->screenshot_target.Get()};
             if (!impl->DrawLayers(layers, target, Fmt::BGRA8Unorm, layout, true)) {
-                ClearPass clear{};
-                clear.color[0] = target;
-                clear.clear_color[0] = true;
-                clear.color_value[0] = {0.0, 0.0, 0.0, 1.0};
-                clear.width = layout.width;
-                clear.height = layout.height;
-                impl->scheduler.Clear(clear);
+                impl->ClearAttachment(target, layout.width, layout.height, {0.0, 0.0, 0.0, 1.0});
             }
             // B8G8R8A8 rows, as Vulkan's screenshot buffer.
             (void)impl->ReadTexture(

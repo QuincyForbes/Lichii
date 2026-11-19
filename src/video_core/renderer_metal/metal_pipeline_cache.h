@@ -31,6 +31,7 @@
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/renderer_metal/metal_archive.h"
 #include "video_core/renderer_metal/metal_build_job.h"
+#include "video_core/renderer_metal/metal_draw_desc.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_object.h"
 #include "video_core/renderer_metal/metal_pipeline_files.h"
@@ -149,6 +150,39 @@ public:
         return flat_inputs;
     }
 
+    /// Whether any render vertex or fragment stage has a separate sampler-reduction variant.
+    [[nodiscard]] bool HasReductionVariants() const noexcept {
+        return vertex.reduction_variants || fragment.reduction_variants ||
+               (native_mesh && native_mesh->fragment.reduction_variants);
+    }
+
+    /// Cached SanitizeVertexLayout summary of Vertex() (computed once after BuildFunctions).
+    [[nodiscard]] VertexProgramUse GetVertexUse() noexcept;
+
+    struct CachedRenderState {
+        void* state{};
+        u8 color_written{};
+        VertexSources vertex_sources{};
+        RenderStateMemoKey key{};
+    };
+
+    [[nodiscard]] const CachedRenderState* FindCachedRenderState(
+        const RenderStateMemoKey& memo_key) const noexcept {
+        if (cached_render_state.state != nullptr &&
+            cached_render_state.key.Matches(memo_key, IsMeshPipeline())) {
+            return &cached_render_state;
+        }
+        return nullptr;
+    }
+
+    void StoreCachedRenderState(const RenderStateMemoKey& memo_key, void* state, u8 color_written,
+                                const VertexSources& vertex_sources) noexcept {
+        cached_render_state.state = state;
+        cached_render_state.color_written = color_written;
+        cached_render_state.vertex_sources = vertex_sources;
+        cached_render_state.key = memo_key;
+    }
+
     /// Builds the stages' functions (Native()'s while it has them); false (logged once) when Metal
     /// rejects one.
     bool BuildFunctions(const Device& device);
@@ -217,6 +251,9 @@ public:
 
 private:
     bool BuildNativeFunctions(const Device& device);
+    void* StageInKernelState(const Device& device, const StageProgram& program, u32 kind_tag,
+                             size_t variant, u32 index_size, const RenderPipelineDesc& layout,
+                             std::string_view label);
 
     GraphicsPipelineKey key;
     StageProgram vertex;
@@ -234,8 +271,10 @@ private:
     bool used{};
     bool flat_inputs{};
     u64 last_use{};
+    std::optional<VertexProgramUse> cached_vertex_use;
+    CachedRenderState cached_render_state;
     ::Common::unordered_map<u64, Object> render_states;
-    /// Vertex kernel states by variant and vertex layout.
+    /// Vertex kernel states by kind, variant and vertex layout.
     ::Common::unordered_map<u64, Object> vertex_kernel_states;
 };
 

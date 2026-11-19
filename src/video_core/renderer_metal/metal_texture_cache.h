@@ -217,18 +217,17 @@ private:
     struct TextureDescHash {
         size_t operator()(const TextureDesc& d) const noexcept;
     };
-    struct TextureDescEqual {
-        bool operator()(const TextureDesc& a, const TextureDesc& b) const noexcept;
-    };
     struct PooledTexture {
         TextureDesc desc{};
         Object texture;
         u64 bytes{};
         u64 frame{};
     };
+    void PopOldestPooledTexture();
+
     std::list<PooledTexture> texture_pool_lru;
     std::unordered_map<TextureDesc, std::vector<std::list<PooledTexture>::iterator>,
-                       TextureDescHash, TextureDescEqual>
+                       TextureDescHash>
         texture_pool_index;
     u64 pooled_texture_bytes{};
     u64 pool_frame{};

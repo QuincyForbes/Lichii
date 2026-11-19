@@ -685,11 +685,16 @@ std::optional<u32> GpuSplit::CurrentReleaseWord(const Tegra::MemoryManager& memo
         }
         return payload;
     }
-    if (miss == 3 || Tegra::Nx2IsGpuWritten(device)) {
+    if (miss == 3 || Tegra::Nx2MayBeGpuWritten(device, sizeof(u32))) {
         return std::nullopt;
     }
     const u64 done = consumed.load(std::memory_order_acquire);
-    if (HasAsyncWrite(device, sizeof(u32)) > done || last_unranged_position > done ||
+    if (const u64 async_position = HasAsyncWrite(device, sizeof(u32));
+        async_position != 0 &&
+        (async_position > done || !Tegra::Nx2AsyncReportsSettled(device, sizeof(u32)))) {
+        return std::nullopt;
+    }
+    if (last_function_position > done || last_unranged_position > done ||
         WritersMayWriteSince(done, device, sizeof(u32))) {
         return std::nullopt;
     }

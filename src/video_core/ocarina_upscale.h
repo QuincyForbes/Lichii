@@ -14,6 +14,21 @@
 #include "common/settings_enums.h"
 #include "video_core/textures/texture.h"
 
+namespace VideoCommon::OcarinaUpscale {
+
+[[nodiscard]] constexpr f32 Halton(u32 index, u32 base) noexcept {
+    f32 result = 0.0f;
+    f32 fraction = 1.0f;
+    while (index > 0) {
+        fraction /= static_cast<f32>(base);
+        result += fraction * static_cast<f32>(index % base);
+        index /= base;
+    }
+    return result;
+}
+
+} // namespace VideoCommon::OcarinaUpscale
+
 namespace VideoCommon {
 
 enum class OcarinaUpscaleBackend { Native, Fsr, Dlss };
@@ -68,19 +83,10 @@ constexpr OcarinaUpscalePass FindOcarinaUpscalePass(u64 native_key, u64 shader_h
 /// the fraction of its right and bottom edges, so a negative offset loses the last column and row
 /// of every jittered draw there; on those drivers the offsets stay in [0, 1) instead of
 /// [-0.5, 0.5).
-inline std::array<f32, 2> OcarinaJitter(u32 index, bool truncated_viewport_edges) {
-    const auto halton = [](u32 value, u32 base) {
-        f32 fraction = 1.0f;
-        f32 result = 0.0f;
-        while (value > 0) {
-            fraction /= static_cast<f32>(base);
-            result += fraction * static_cast<f32>(value % base);
-            value /= base;
-        }
-        return result;
-    };
+[[nodiscard]] constexpr std::array<f32, 2> OcarinaJitter(u32 index,
+                                                         bool truncated_viewport_edges) noexcept {
     const f32 center = truncated_viewport_edges ? 0.0f : 0.5f;
-    return {halton(index, 2) - center, halton(index, 3) - center};
+    return {OcarinaUpscale::Halton(index, 2) - center, OcarinaUpscale::Halton(index, 3) - center};
 }
 
 constexpr OcarinaUpscaleBackend SelectOcarinaUpscaler(bool fsr_enabled, bool dlss_enabled,
@@ -247,28 +253,16 @@ using Matrix = std::array<f64, 16>; ///< Row-major 4x4.
            projection[15] == 0.0f && projection[12] == 0.0f && projection[13] == 0.0f;
 }
 
-[[nodiscard]] inline f32 Halton(u32 index, u32 base) {
-    f32 result = 0.0f;
-    f32 fraction = 1.0f;
-    while (index > 0) {
-        fraction /= static_cast<f32>(base);
-        result += fraction * static_cast<f32>(index % base);
-        index /= base;
-    }
-    return result;
-}
-
 /// The sample offset of a frame in render pixels (-0.5 to 0.5): Halton bases 2 and 3.
-[[nodiscard]] inline std::array<f32, 2> Jitter(u32 frame) {
-    const u32 index = frame % JitterPhases + 1;
-    return {Halton(index, 2) - 0.5f, Halton(index, 3) - 0.5f};
+[[nodiscard]] constexpr std::array<f32, 2> Jitter(u32 frame) noexcept {
+    return OcarinaJitter(frame % JitterPhases + 1, false);
 }
 
 /// Normalized device coordinates to render pixels and device depth: the viewport (x, y, width,
 /// height in render pixels; y_sign -1 when the device negates y before the viewport) and the
 /// depth range (device depth = depth_offset + depth_scale * NDC z).
-[[nodiscard]] inline Matrix ViewportMatrix(f32 x, f32 y, f32 width, f32 height, f32 y_sign,
-                                           f32 depth_offset, f32 depth_scale) {
+[[nodiscard]] constexpr Matrix ViewportMatrix(f32 x, f32 y, f32 width, f32 height, f32 y_sign,
+                                              f32 depth_offset, f32 depth_scale) noexcept {
     const f64 half_width = width * 0.5;
     const f64 half_height = height * 0.5;
     return {
@@ -279,7 +273,7 @@ using Matrix = std::array<f64, 16>; ///< Row-major 4x4.
     };
 }
 
-[[nodiscard]] inline Matrix Multiply(const Matrix& a, const Matrix& b) {
+[[nodiscard]] constexpr Matrix Multiply(const Matrix& a, const Matrix& b) noexcept {
     Matrix result{};
     for (size_t row = 0; row < 4; ++row) {
         for (size_t column = 0; column < 4; ++column) {

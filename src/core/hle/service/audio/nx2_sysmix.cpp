@@ -38,6 +38,20 @@ constexpr u64 ReadOffset = 0x44;
 constexpr u64 WriteOffset = 0x1004;
 constexpr u64 PayloadOffset = 0x1040;
 constexpr u32 BlockFrames = 240;
+constexpr u32 StereoChannels = 2;
+constexpr u32 SysmixSampleRate = AudioCore::TargetSampleRate;
+constexpr u32 InputCreationFlags = 2;
+constexpr u32 OutputCreationFlags = 0x24;
+constexpr u32 InputDeviceKind = 2;
+constexpr u32 CmdCreateStream = 1;
+constexpr u32 CmdSetEngaged = 700;
+constexpr u32 DataModeDisabled = 0;
+constexpr u32 DataModeThreshold = 2;
+constexpr u32 StreamStateClosed = 0;
+constexpr u32 StreamStateOpen = 1;
+constexpr u32 StreamStateEngaged = 2;
+constexpr u64 StatusLogIntervalTicks = 400;
+constexpr std::size_t MaxStreamNameBuffer = 0x100;
 
 u64 AlignUp(u64 value, u64 alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
@@ -118,7 +132,7 @@ bool IsVirtualOutputLoopbackIpc(Kernel::KernelCore& kernel, Kernel::KProcess& pr
             cmd_buf[idx + 2u] != match_cmd_id) {
             continue;
         }
-        if (match_cmd_id == 1u) {
+        if (match_cmd_id == CmdCreateStream) {
             if (idx + 12u > cmd_buf.size()) {
                 continue;
             }
@@ -126,19 +140,19 @@ bool IsVirtualOutputLoopbackIpc(Kernel::KernelCore& kernel, Kernel::KProcess& pr
             const u32 req_flags = cmd_buf[idx + 5u];
             const u64 req_buffer = u64{cmd_buf[idx + 8u]} | (u64{cmd_buf[idx + 9u]} << 32);
             const u64 req_size = u64{cmd_buf[idx + 10u]} | (u64{cmd_buf[idx + 11u]} << 32);
-            if (req_device != 2u || req_flags != stream_flags || req_buffer != stream_buffer ||
-                req_size != stream_size) {
+            if (req_device != InputDeviceKind || req_flags != stream_flags ||
+                req_buffer != stream_buffer || req_size != stream_size) {
                 continue;
             }
-        } else if (match_cmd_id == 700u) {
-            if (cmd_buf[idx + 4u] != stream_id || cmd_buf[idx + 5u] != 2u) {
+        } else if (match_cmd_id == CmdSetEngaged) {
+            if (cmd_buf[idx + 4u] != stream_id || cmd_buf[idx + 5u] != InputDeviceKind) {
                 continue;
             }
         }
         if (name_addr == 0 || name_size == 0) {
             return false;
         }
-        std::array<char, 0x100> raw_name{};
+        std::array<char, MaxStreamNameBuffer> raw_name{};
         const std::size_t to_read =
             static_cast<std::size_t>(std::min<u64>(name_size, raw_name.size() - 1));
         if (!memory.ReadBlock(name_addr, raw_name.data(), to_read)) {
@@ -159,9 +173,9 @@ struct SysmixOutput::Impl {
         : system{system_}, process{system.Kernel(), &process_}, sink{sink_},
           context{system, "sysmix"}, id{id_}, buffer{buffer_}, size{size_},
           creation_flags{creation_flags_}, input_stream{input_},
-          loopback_input{input_ && IsVirtualOutputLoopbackIpc(system_.Kernel(), process_, 1u,
-                                                              buffer_, size_, creation_flags_,
-                                                              id_)} {
+          loopback_input{input_ &&
+                         IsVirtualOutputLoopbackIpc(system_.Kernel(), process_, CmdCreateStream,
+                                                    buffer_, size_, creation_flags_, id_)} {
         state_event = context.CreateEvent("sysmix state");
         data_event = context.CreateEvent("sysmix data");
     }
@@ -236,7 +250,7 @@ struct SysmixOutput::Impl {
     /// Signal when captured input or free output space reaches the notification threshold.
     void Notify(u32 filled) {
         const auto available = input_stream ? filled : slots - 1 - filled;
-        if (data_mode == 2 && available >= static_cast<u32>(threshold)) {
+        if (data_mode == DataModeThreshold && available >= static_cast<u32>(threshold)) {
             data_event->Signal(system.Kernel());
         }
     }
@@ -300,7 +314,8 @@ SysmixOutput::~SysmixOutput() = default;
 /// Validate direction-specific creation flags and an aligned, mapped guest ring allocation.
 Result SysmixOutput::ValidateRegion(Kernel::KProcess& process, u64 buffer, u64 size,
                                     u32 creation_flags, bool input) {
-    R_UNLESS(creation_flags == (input ? 2U : 0x24U), ResultNotSupported);
+    R_UNLESS(creation_flags == (input ? InputCreationFlags : OutputCreationFlags),
+             ResultNotSupported);
     R_UNLESS(buffer != 0 && (buffer & 0xfff) == 0 && (size & 0xfff) == 0 && size >= 0x2000 &&
                  size <= std::numeric_limits<u64>::max() - buffer &&
                  process.GetMemory().IsValidVirtualAddressRange(buffer, size),
@@ -311,12 +326,13 @@ Result SysmixOutput::ValidateRegion(Kernel::KProcess& process, u64 buffer, u64 s
 bool SysmixOutput::IsFormatSupported(u32 sample_type, u32 channels, u32 rate) {
     return (sample_type == static_cast<u32>(AudioCore::SampleFormat::PcmInt16) ||
             sample_type == static_cast<u32>(AudioCore::SampleFormat::PcmFloat)) &&
-           channels == 2 && rate == 48000;
+           channels == StereoChannels && rate == SysmixSampleRate;
 }
 
 /// Accept 48 kHz S16 or F32 microphone capture with one or two guest channels.
 bool SysmixOutput::IsInputFormatSupported(u32 sample_type, u32 channels, u32 rate) {
-    return (channels == 1 || channels == 2) && IsFormatSupported(sample_type, 2, rate);
+    return (channels == 1 || channels == StereoChannels) &&
+           IsFormatSupported(sample_type, StereoChannels, rate);
 }
 
 bool SysmixOutput::IsInput() const {
@@ -408,8 +424,8 @@ Result SysmixOutput::SetEngaged(bool engaged) {
     }
     if (engaged) {
         if (p.input_stream && !p.loopback_input &&
-            IsVirtualOutputLoopbackIpc(p.system.Kernel(), *p.process, 700u, p.buffer, p.size,
-                                       p.creation_flags, p.id)) {
+            IsVirtualOutputLoopbackIpc(p.system.Kernel(), *p.process, CmdSetEngaged, p.buffer,
+                                       p.size, p.creation_flags, p.id)) {
             p.loopback_input = true;
             p.UseSilentInput(p.channels, false);
         }
@@ -431,7 +447,7 @@ Result SysmixOutput::SetEngaged(bool engaged) {
 Result SysmixOutput::SetDataNotification(u32 mode, s32 threshold) {
     auto& p = *impl;
     std::scoped_lock lock{p.mutex};
-    R_UNLESS(mode == 0 || mode == 2, ResultNotSupported);
+    R_UNLESS(mode == DataModeDisabled || mode == DataModeThreshold, ResultNotSupported);
     R_UNLESS(p.open && !p.faulted && threshold >= 0 && static_cast<u32>(threshold) < p.slots,
              ResultInvalidArgument);
     u32 read{}, write{}, filled{};
@@ -488,7 +504,8 @@ f32 SysmixOutput::GetGain() const {
 
 u32 SysmixOutput::GetState() const {
     std::scoped_lock lock{impl->mutex};
-    return impl->open && !impl->faulted ? (impl->engaged ? 2 : 1) : 0;
+    return impl->open && !impl->faulted ? (impl->engaged ? StreamStateEngaged : StreamStateOpen)
+                                        : StreamStateClosed;
 }
 
 /// Transfer bounded PCM between host audio and the guest ring, preserving cursor ownership.
@@ -564,7 +581,7 @@ void SysmixOutput::Pump() {
             return;
         }
         p.Notify(filled);
-        if (p.counters.admitted_blocks <= 3 || p.counters.ticks % 400 == 0) {
+        if (p.counters.admitted_blocks <= 3 || p.counters.ticks % StatusLogIntervalTicks == 0) {
             LOG_INFO(Service_Audio, "sysmix input {}: captured={} nonzero={} filled={}", p.id,
                      p.counters.accepted_frames, p.counters.nonzero_frames, filled);
         }
@@ -580,12 +597,14 @@ void SysmixOutput::Pump() {
     const u32 queued = refill_headroom ? p.host->GetQueueSize() : 0U;
     if (refill_headroom && queued >= queue_limit) {
         ++p.counters.backpressure;
-        if (p.counters.ticks % 400 == 0) {
+        if (p.counters.ticks % StatusLogIntervalTicks == 0) {
             p.LogStatus(filled);
         }
         return;
     }
-    bool log_status = p.counters.admitted_blocks < 3 || p.counters.ticks % 400 == 0;
+    auto& memory = p.process->GetMemory();
+    bool log_status = p.counters.admitted_blocks < 3 ||
+                      p.counters.ticks % StatusLogIntervalTicks == 0;
     for (u32 block_index = queued; block_index < queue_limit; ++block_index) {
         const u32 taken = std::min(filled, BlockFrames);
         // A short block is padded with silence. That is right for a real underrun, but while the
@@ -601,7 +620,6 @@ void SysmixOutput::Pump() {
         }
         const u32 first = std::min(taken, p.slots - read);
         const u32 second = taken - first;
-        auto& memory = p.process->GetMemory();
         if ((first && !memory.ReadBlock(p.buffer + PayloadOffset + u64{read} * p.frame_bytes,
                                         p.input.data(), first * p.frame_bytes)) ||
             (second &&
@@ -611,12 +629,11 @@ void SysmixOutput::Pump() {
             return;
         }
         p.counters.copied_frames += taken;
-        p.output.fill(0);
         u32 nonzero{};
         for (u32 frame = 0; frame < taken; ++frame) {
             bool audible{};
-            for (u32 channel = 0; channel < 2; ++channel) {
-                const u32 index = frame * 2 + channel;
+            for (u32 channel = 0; channel < StereoChannels; ++channel) {
+                const u32 index = frame * StereoChannels + channel;
                 f32 value;
                 if (p.format == AudioCore::SampleFormat::PcmInt16) {
                     s16 sample;
@@ -630,9 +647,14 @@ void SysmixOutput::Pump() {
                         static_cast<s32>(std::clamp(value * p.gain, -1.0f, 1.0f) * 32768.0f);
                     p.output[index] = static_cast<s16>(std::clamp(sample, -32768, 32767));
                     audible |= p.output[index] != 0;
+                } else {
+                    p.output[index] = 0;
                 }
             }
             nonzero += audible;
+        }
+        if (taken < BlockFrames) {
+            std::fill(p.output.begin() + taken * StereoChannels, p.output.end(), s16{0});
         }
         AudioCore::Sink::SinkBuffer block{BlockFrames, 0, p.counters.admitted_blocks, false};
         if (!p.host->TryAppendOutputBlock(block, p.output)) {
@@ -646,7 +668,7 @@ void SysmixOutput::Pump() {
                 LOG_INFO(Service_Audio, "sysmix stream {} host full: accepted={} blocks={}", p.id,
                          p.counters.accepted_frames, p.counters.admitted_blocks);
             }
-            if (p.counters.ticks % 400 == 0) {
+            if (p.counters.ticks % StatusLogIntervalTicks == 0) {
                 p.LogStatus(filled);
             }
             return;

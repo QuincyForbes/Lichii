@@ -689,6 +689,9 @@ public:
     /// set, is the semaphore in host memory (4-byte aligned), for WordStored.
     bool Add(const void* owner, u64 device_address, u32 value, u32 operation,
              u32* word = nullptr) {
+        if (owner == nullptr) {
+            return false;
+        }
         std::scoped_lock lk{mutex};
         Slot* free_slot = nullptr;
         for (Slot& slot : slots) {
@@ -717,26 +720,44 @@ public:
     }
 
     void Remove(const void* owner) {
-        if (count.load(std::memory_order_acquire) == 0) {
+        if (owner == nullptr || count.load(std::memory_order_acquire) == 0) {
             return;
         }
         std::scoped_lock lk{mutex};
+        const size_t active = count.load(std::memory_order_relaxed);
+        size_t seen = 0;
         for (Slot& slot : slots) {
-            if (slot.owner.load(std::memory_order_relaxed) == owner) {
+            const void* const current = slot.owner.load(std::memory_order_relaxed);
+            if (current == nullptr) {
+                continue;
+            }
+            if (current == owner) {
                 slot.owner.store(nullptr, std::memory_order_relaxed);
                 count.fetch_sub(1, std::memory_order_relaxed);
+            }
+            if (++seen >= active) {
+                break;
             }
         }
     }
 
     [[nodiscard]] bool Latched(const void* owner) const {
-        if (count.load(std::memory_order_acquire) == 0) {
+        const size_t active = count.load(std::memory_order_acquire);
+        if (owner == nullptr || active == 0) {
             return false;
         }
+        size_t seen = 0;
         for (const Slot& slot : slots) {
-            if (slot.owner.load(std::memory_order_relaxed) == owner) {
+            const void* const current = slot.owner.load(std::memory_order_relaxed);
+            if (current == nullptr) {
+                continue;
+            }
+            if (current == owner) {
                 // Acquire: what the engine wrote before the latch is visible after it.
                 return slot.latched.load(std::memory_order_acquire);
+            }
+            if (++seen >= active) {
+                break;
             }
         }
         return false;
@@ -745,18 +766,26 @@ public:
     /// GPU thread: whether a watched word changed in memory since it was added or since the last
     /// call. Guest CPU stores to a semaphore notify nothing; the thread checks this while it waits.
     [[nodiscard]] bool WordStored() {
-        if (count.load(std::memory_order_acquire) == 0) {
+        const size_t active = count.load(std::memory_order_acquire);
+        if (active == 0) {
             return false;
         }
         bool stored = false;
+        size_t seen = 0;
         for (Slot& slot : slots) {
-            if (slot.word == nullptr || slot.owner.load(std::memory_order_relaxed) == nullptr) {
+            if (slot.owner.load(std::memory_order_relaxed) == nullptr) {
                 continue;
             }
-            const u32 current = std::atomic_ref<u32>{*slot.word}.load(std::memory_order_relaxed);
-            if (current != slot.seen) {
-                slot.seen = current;
-                stored = true;
+            if (slot.word != nullptr) {
+                const u32 current =
+                    std::atomic_ref<u32>{*slot.word}.load(std::memory_order_relaxed);
+                if (current != slot.seen) {
+                    slot.seen = current;
+                    stored = true;
+                }
+            }
+            if (++seen >= active) {
+                break;
             }
         }
         return stored;
@@ -770,11 +799,18 @@ public:
         bool latched = false;
         {
             std::scoped_lock lk{mutex};
+            const size_t active = count.load(std::memory_order_relaxed);
+            size_t seen = 0;
             for (Slot& slot : slots) {
-                if (slot.owner.load(std::memory_order_relaxed) != nullptr &&
-                    slot.address == device_address && Matches(slot, value)) {
+                if (slot.owner.load(std::memory_order_relaxed) == nullptr) {
+                    continue;
+                }
+                if (slot.address == device_address && Matches(slot, value)) {
                     slot.latched.store(true, std::memory_order_release);
                     latched = true;
+                }
+                if (++seen >= active) {
+                    break;
                 }
             }
         }

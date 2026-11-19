@@ -305,12 +305,7 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
         return;
     }
     PreserveMapping(gpu_addr, size);
-    if (IsWithinGPUAddressRange(gpu_addr)) {
-        const std::size_t clamped = (std::min<u64>)(size, address_space_size - gpu_addr);
-        if (!SubmappedRangeFromRuns<false>(gpu_addr, clamped, page_stash)) {
-            GetSubmappedRangeImpl<false>(gpu_addr, clamped, page_stash);
-        }
-    }
+    AppendSubmappedDeviceRange(gpu_addr, size, page_stash);
 
     for (const auto& [map_addr, map_size] : page_stash) {
         rasterizer->UnmapMemory(map_addr, map_size);
@@ -974,10 +969,18 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
 
 void MemoryManager::UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size) {
     // Every entry the operation set lies in these big pages; the walk reads nothing else there.
+    if (size == 0 || !IsWithinGPUAddressRange(gpu_addr)) {
+        std::scoped_lock lock{runs_guard};
+        map_serial.fetch_add(1, std::memory_order_release);
+        return;
+    }
     const GPUVAddr begin = gpu_addr & ~big_page_mask;
-    const GPUVAddr end =
-        (std::min)(Common::AlignUp(gpu_addr + size, big_page_size), address_space_size);
-    if (size == 0 || begin >= end) {
+    const GPUVAddr clamped_end = gpu_addr + (std::min<u64>)(size, address_space_size - gpu_addr);
+    const GPUVAddr end = clamped_end >= address_space_size - big_page_mask
+                             ? address_space_size
+                             : Common::AlignUp(clamped_end, big_page_size);
+    if (begin >= end) {
+        std::scoped_lock lock{runs_guard};
         map_serial.fetch_add(1, std::memory_order_release);
         return;
     }
@@ -1289,9 +1292,12 @@ bool MemoryManager::SubmappedRangeFromRuns(
     boost::container::small_vector<
         std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result)
     const {
-    if (!VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Bounds) || size == 0 ||
+    if (!VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Bounds) ||
         !IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr) {
         return false;
+    }
+    if (size == 0) {
+        return true;
     }
     // A run is a maximal GPU range mapped to one device range, so the page walk ends a segment
     // exactly where a run ends: at an unmapped page or where the device address jumps.
@@ -1337,6 +1343,18 @@ bool MemoryManager::SubmappedRangeFromRuns(
     return true;
 }
 
+void MemoryManager::AppendSubmappedDeviceRange(
+    GPUVAddr gpu_addr, std::size_t size,
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>& result) const {
+    if (!IsWithinGPUAddressRange(gpu_addr) || size == 0) {
+        return;
+    }
+    const std::size_t clamped = (std::min<u64>)(size, address_space_size - gpu_addr);
+    if (!SubmappedRangeFromRuns<false>(gpu_addr, clamped, result)) {
+        GetSubmappedRangeImpl<false>(gpu_addr, clamped, result);
+    }
+}
+
 boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32>
 MemoryManager::GetSubmappedRange(GPUVAddr gpu_addr, std::size_t size) const {
     boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> result{};
@@ -1349,13 +1367,7 @@ MemoryManager::GetSubmappedRange(GPUVAddr gpu_addr, std::size_t size) const {
 boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>
 MemoryManager::GetSubmappedDeviceRange(GPUVAddr gpu_addr, std::size_t size) const {
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> result{};
-    if (!IsWithinGPUAddressRange(gpu_addr)) {
-        return result;
-    }
-    size = (std::min<u64>)(size, address_space_size - gpu_addr);
-    if (!SubmappedRangeFromRuns<false>(gpu_addr, size, result)) {
-        GetSubmappedRangeImpl<false>(gpu_addr, size, result);
-    }
+    AppendSubmappedDeviceRange(gpu_addr, size, result);
     return result;
 }
 
@@ -1449,13 +1461,7 @@ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, b
 void MemoryManager::FlushCaching() {
     // Flush from the invalidate accumulator
     if (accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
-        if (!IsWithinGPUAddressRange(addr)) {
-            return;
-        }
-        const std::size_t clamped = (std::min<u64>)(size, address_space_size - addr);
-        if (!SubmappedRangeFromRuns<false>(addr, clamped, page_stash2)) {
-            GetSubmappedRangeImpl<false>(addr, clamped, page_stash2);
-        }
+        AppendSubmappedDeviceRange(addr, size, page_stash2);
     })) {
         rasterizer->InnerInvalidation(page_stash2);
         page_stash2.clear();

@@ -2452,8 +2452,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 insn.Bits(76, 5) || insn.Bits(81, 3) != 7 || (insn.Bits(87, 3) != 1 && !level) || insn.Bits(91, 1) ||
                 mask == 0 || source_a == 255 || source_a + in_a > limit || source_b == 255 ||
                 source_b + (count - in_a) > limit ||
-                (uses_uniform_bank && dest != 255 && dest + (split ? (std::min)(components, 2U) : components) > limit) ||
-                (uses_uniform_bank && split && components > 2 && second_dest + components - 2 > limit))
+                (dest != 255 && dest + (split ? (std::min)(components, 2U) : components) > limit) ||
+                (split && components > 2 && second_dest + components - 2 > limit))
                 return fail(index, "native bindless texel fetch mode");
             const auto value = [&](u32 i) { return i < in_a ? source_a + i : source_b + (i - in_a); };
             const auto copy = [&](u32 target, u32 source) {

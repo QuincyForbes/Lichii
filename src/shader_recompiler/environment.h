@@ -22,7 +22,6 @@
 #include "shader_recompiler/frontend/ir/value.h"
 
 namespace Shader::IR {
-class Block;
 class Inst;
 }
 
@@ -176,23 +175,8 @@ protected:
     u32 start_address{};
     bool is_proprietary_driver{};
 public:
-    struct TrackCacheKey {
-        const IR::Inst* inst;
-        const IR::Block* conditional_header;
-        constexpr bool operator==(const TrackCacheKey&) const noexcept = default;
-    };
-    struct TrackCacheKeyHash {
-        size_t operator()(const TrackCacheKey& k) const noexcept {
-            const size_t h1{std::hash<const IR::Inst*>{}(k.inst)};
-            const size_t h2{std::hash<const IR::Block*>{}(k.conditional_header)};
-            return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
-        }
-    };
-
     ::Common::unordered_map<CbufWordKey, u32, CbufWordKeyHash> cbuf_word_cache;
     ::Common::unordered_map<HandleKey,  u32, HandleKeyHash> handle_cache;
-    ::Common::unordered_map<TrackCacheKey, std::optional<ConstBufferAddr>, TrackCacheKeyHash>
-        track_cache;
 };
 
 } // namespace Shader

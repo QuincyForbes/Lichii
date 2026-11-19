@@ -1,39 +1,42 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
 
 #ifdef _WIN32
 #include "common/httplib.h"
 #include "common/net/ca_store.h"
-#endif
-
-#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <optional>
-#include <string>
-#include <system_error>
 #include <utility>
 #include <vector>
-
 #include <QApplication>
 #include <QCryptographicHash>
-#include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
-#include <QDir>
-#include <QHBoxLayout>
-#include <QLabel>
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QProgressDialog>
+#include <fmt/format.h>
+#endif
+
+#include <filesystem>
+#include <string>
+#include <system_error>
+
+#include <QCoreApplication>
+#include <QDesktopServices>
+#include <QDir>
+#include <QHBoxLayout>
+#include <QHideEvent>
+#include <QLabel>
 #include <QPushButton>
+#include <QShowEvent>
 #include <QStringList>
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
-#include <fmt/format.h>
 
 #include "common/common_types.h"
 #include "common/fs/fs_util.h"
@@ -169,13 +172,14 @@ AmdFsr4Panel::AmdFsr4Panel(QWidget* parent) : QWidget(parent) {
         std::filesystem::create_directories(folder, ec);
         QDesktopServices::openUrl(QUrl::fromLocalFile(PathText(folder)));
     });
-    Refresh();
 }
 
 void AmdFsr4Panel::showEvent(QShowEvent* event) {
-    Refresh();
-    refresh_timer->start();
     QWidget::showEvent(event);
+    Refresh();
+    if (!refresh_timer->isActive()) {
+        refresh_timer->start();
+    }
 }
 
 void AmdFsr4Panel::hideEvent(QHideEvent* event) {
@@ -184,9 +188,14 @@ void AmdFsr4Panel::hideEvent(QHideEvent* event) {
 }
 
 void AmdFsr4Panel::SetDevice(const QString& name, bool capable) {
+    if (device_name == name && device_capable == capable) {
+        return;
+    }
     device_name = name;
     device_capable = capable;
-    Refresh();
+    if (isVisible()) {
+        Refresh();
+    }
 }
 
 void AmdFsr4Panel::SetUpscalerSelected(bool selected) {
@@ -194,7 +203,9 @@ void AmdFsr4Panel::SetUpscalerSelected(bool selected) {
         return;
     }
     upscaler_selected = selected;
-    Refresh();
+    if (isVisible()) {
+        Refresh();
+    }
 }
 
 void AmdFsr4Panel::Refresh() {
@@ -368,6 +379,7 @@ void AmdFsr4Panel::Download() {
         });
         if (progress.wasCanceled()) {
             discard();
+            progress.close();
             return;
         }
         if (!contents) {
@@ -392,16 +404,20 @@ void AmdFsr4Panel::Download() {
         }
         const std::filesystem::path target = folder / file.name;
         std::filesystem::path partial = target;
-        partial += L".download";
+        partial += ".download";
+        bool wrote_ok = false;
         {
             std::ofstream stream(partial, std::ios::binary | std::ios::trunc);
             stream.write(contents->data(), static_cast<std::streamsize>(contents->size()));
-            if (!stream) {
-                discard();
-                progress.close();
-                fail("could not write " + Common::FS::PathToUTF8String(partial));
-                return;
-            }
+            stream.flush();
+            wrote_ok = static_cast<bool>(stream);
+        }
+        if (!wrote_ok) {
+            std::filesystem::remove(partial, ec);
+            discard();
+            progress.close();
+            fail("could not write " + Common::FS::PathToUTF8String(partial));
+            return;
         }
         if (!FfxRuntime::HasSha256(partial, file.sha256) || !FfxRuntime::IsSignedByAmd(partial)) {
             std::filesystem::remove(partial, ec);
@@ -426,7 +442,7 @@ void AmdFsr4Panel::Download() {
         std::filesystem::path backup;
         if (std::filesystem::exists(target, ec)) {
             backup = target;
-            backup += L".old";
+            backup += ".old";
             std::filesystem::remove(backup, ec);
             std::filesystem::rename(target, backup, ec);
         }

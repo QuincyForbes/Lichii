@@ -251,17 +251,22 @@ constexpr VkPipelineRasterizationStateCreateInfo PIPELINE_RASTERIZATION_STATE_CR
     .depthBiasSlopeFactor = 0.0f,
     .lineWidth = 1.0f,
 };
-constexpr VkPipelineMultisampleStateCreateInfo PIPELINE_MULTISAMPLE_STATE_CREATE_INFO{
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-    .pNext = nullptr,
-    .flags = 0,
-    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
-    .sampleShadingEnable = VK_FALSE,
-    .minSampleShading = 0.0f,
-    .pSampleMask = nullptr,
-    .alphaToCoverageEnable = VK_FALSE,
-    .alphaToOneEnable = VK_FALSE,
-};
+constexpr VkPipelineMultisampleStateCreateInfo MakeMultisampleState(
+    VkSampleCountFlagBits samples, bool sample_shading = false) noexcept {
+    return VkPipelineMultisampleStateCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .rasterizationSamples = samples,
+        .sampleShadingEnable = sample_shading ? VK_TRUE : VK_FALSE,
+        .minSampleShading = sample_shading ? 1.0f : 0.0f,
+        .pSampleMask = nullptr,
+        .alphaToCoverageEnable = VK_FALSE,
+        .alphaToOneEnable = VK_FALSE,
+    };
+}
+constexpr VkPipelineMultisampleStateCreateInfo PIPELINE_MULTISAMPLE_STATE_CREATE_INFO =
+    MakeMultisampleState(VK_SAMPLE_COUNT_1_BIT);
 constexpr std::array DYNAMIC_STATES{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                                     VK_DYNAMIC_STATE_BLEND_CONSTANTS};
 constexpr VkPipelineDynamicStateCreateInfo PIPELINE_DYNAMIC_STATE_CREATE_INFO{
@@ -271,37 +276,47 @@ constexpr VkPipelineDynamicStateCreateInfo PIPELINE_DYNAMIC_STATE_CREATE_INFO{
     .dynamicStateCount = static_cast<u32>(DYNAMIC_STATES.size()),
     .pDynamicStates = DYNAMIC_STATES.data(),
 };
-constexpr VkPipelineColorBlendStateCreateInfo PIPELINE_COLOR_BLEND_STATE_EMPTY_CREATE_INFO{
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-    .pNext = nullptr,
-    .flags = 0,
-    .logicOpEnable = VK_FALSE,
-    .logicOp = VK_LOGIC_OP_CLEAR,
-    .attachmentCount = 0,
-    .pAttachments = nullptr,
-    .blendConstants = {0.0f, 0.0f, 0.0f, 0.0f},
-};
-constexpr VkPipelineColorBlendAttachmentState PIPELINE_COLOR_BLEND_ATTACHMENT_STATE{
-    .blendEnable = VK_FALSE,
-    .srcColorBlendFactor = VK_BLEND_FACTOR_ZERO,
-    .dstColorBlendFactor = VK_BLEND_FACTOR_ZERO,
-    .colorBlendOp = VK_BLEND_OP_ADD,
-    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
-    .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
-    .alphaBlendOp = VK_BLEND_OP_ADD,
-    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-};
-constexpr VkPipelineColorBlendStateCreateInfo PIPELINE_COLOR_BLEND_STATE_GENERIC_CREATE_INFO{
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-    .pNext = nullptr,
-    .flags = 0,
-    .logicOpEnable = VK_FALSE,
-    .logicOp = VK_LOGIC_OP_CLEAR,
-    .attachmentCount = 1,
-    .pAttachments = &PIPELINE_COLOR_BLEND_ATTACHMENT_STATE,
-    .blendConstants = {0.0f, 0.0f, 0.0f, 0.0f},
-};
+constexpr std::array<VkPipelineColorBlendAttachmentState, 8> DISABLED_COLOR_BLEND_ATTACHMENTS{};
+constexpr VkPipelineColorBlendStateCreateInfo MakeColorBlendState(
+    u32 attachment_count,
+    const VkPipelineColorBlendAttachmentState* attachments =
+        DISABLED_COLOR_BLEND_ATTACHMENTS.data()) noexcept {
+    return VkPipelineColorBlendStateCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .logicOpEnable = VK_FALSE,
+        .logicOp = VK_LOGIC_OP_CLEAR,
+        .attachmentCount = attachment_count,
+        .pAttachments = attachment_count > 0 ? attachments : nullptr,
+        .blendConstants = {0.0f, 0.0f, 0.0f, 0.0f},
+    };
+}
+constexpr VkPipelineColorBlendStateCreateInfo PIPELINE_COLOR_BLEND_STATE_EMPTY_CREATE_INFO =
+    MakeColorBlendState(0, nullptr);
+constexpr VkPipelineColorBlendAttachmentState MakeUnblendedColorAttachment(
+    VkColorComponentFlags write_mask) noexcept {
+    return VkPipelineColorBlendAttachmentState{
+        .blendEnable = VK_FALSE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+        .colorWriteMask = write_mask,
+    };
+}
+constexpr VkPipelineColorBlendAttachmentState PIPELINE_COLOR_BLEND_ATTACHMENT_STATE =
+    MakeUnblendedColorAttachment(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+constexpr VkPipelineColorBlendAttachmentState PIPELINE_COLOR_BLEND_RGB_ATTACHMENT_STATE =
+    MakeUnblendedColorAttachment(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                 VK_COLOR_COMPONENT_B_BIT);
+constexpr VkPipelineColorBlendStateCreateInfo PIPELINE_COLOR_BLEND_STATE_GENERIC_CREATE_INFO =
+    MakeColorBlendState(1, &PIPELINE_COLOR_BLEND_ATTACHMENT_STATE);
+constexpr VkPipelineColorBlendStateCreateInfo PIPELINE_COLOR_BLEND_STATE_RGB_CREATE_INFO =
+    MakeColorBlendState(1, &PIPELINE_COLOR_BLEND_RGB_ATTACHMENT_STATE);
 constexpr VkPipelineDepthStencilStateCreateInfo PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO{
     .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
     .pNext = nullptr,
@@ -1500,593 +1515,235 @@ void BlitImageHelper::ConvertDepthStencil(VkPipeline pipeline, const Framebuffer
     scheduler.InvalidateState();
 }
 
-VkPipeline BlitImageHelper::FindOrEmplaceColorPipeline(const BlitImagePipelineKey& key) {
-    const auto it = std::ranges::find(blit_color_keys, key);
-    if (it != blit_color_keys.end()) {
-        return *blit_color_pipelines[std::distance(blit_color_keys.begin(), it)];
-    }
-    blit_color_keys.push_back(key);
+[[nodiscard]] vk::Pipeline CreateBlitGraphicsPipeline(
+    const Device& device, VkShaderModule vertex_shader, VkShaderModule fragment_shader,
+    VkPipelineLayout layout, VkRenderPass renderpass,
+    const VkPipelineMultisampleStateCreateInfo* multisample_state,
+    const VkPipelineDepthStencilStateCreateInfo* depth_stencil_state,
+    const VkPipelineColorBlendStateCreateInfo* color_blend_state) {
+    const std::array stages = MakeStages(vertex_shader, fragment_shader);
+    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci =
+        GetPipelineInputAssemblyStateCreateInfo(device);
+    return device.GetLogical().CreateGraphicsPipeline(
+        VkGraphicsPipelineCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .stageCount = static_cast<u32>(stages.size()),
+            .pStages = stages.data(),
+            .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            .pInputAssemblyState = &input_assembly_ci,
+            .pTessellationState = nullptr,
+            .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            .pMultisampleState = multisample_state,
+            .pDepthStencilState = depth_stencil_state,
+            .pColorBlendState = color_blend_state,
+            .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            .layout = layout,
+            .renderPass = renderpass,
+            .subpass = 0,
+            .basePipelineHandle = VK_NULL_HANDLE,
+            .basePipelineIndex = 0,
+        },
+        device.StaticPipelineCache());
+}
 
-    using Operation = Tegra::Engines::Fermi2D::Operation;
-    const VkShaderModule fragment = key.operation == Operation::SrcCopySrgbToLinear
-                                        ? *blit_color_srgb_to_linear_frag
-                                    : key.operation == Operation::SrcCopySquare
-                                        ? *blit_color_square_frag
-                                        : *blit_color_to_color_frag;
-    const std::array stages = MakeStages(*full_screen_vert, fragment);
-    std::array<VkPipelineColorBlendAttachmentState, 8> blend_attachments{};
-    if (key.color_attachment_count > 0) {
-        blend_attachments[0] = VkPipelineColorBlendAttachmentState{
-            .blendEnable = VK_FALSE,
-            .srcColorBlendFactor = VK_BLEND_FACTOR_ZERO,
-            .dstColorBlendFactor = VK_BLEND_FACTOR_ZERO,
-            .colorBlendOp = VK_BLEND_OP_ADD,
-            .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
-            .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
-            .alphaBlendOp = VK_BLEND_OP_ADD,
-            .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-        };
+template <typename Key, typename Builder>
+[[nodiscard]] VkPipeline FindOrEmplacePipeline(std::vector<Key>& keys,
+                                               std::vector<vk::Pipeline>& pipelines,
+                                               const Key& key, Builder&& builder) {
+    const auto it = std::ranges::find(keys, key);
+    if (it != keys.end()) {
+        return *pipelines[static_cast<size_t>(std::distance(keys.begin(), it))];
     }
-    // TODO: programmable blending
-    const VkPipelineColorBlendStateCreateInfo color_blend_create_info{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .logicOpEnable = VK_FALSE,
-        .logicOp = VK_LOGIC_OP_CLEAR,
-        .attachmentCount = key.color_attachment_count,
-        .pAttachments = key.color_attachment_count > 0 ? blend_attachments.data() : nullptr,
-        .blendConstants = {0.0f, 0.0f, 0.0f, 0.0f},
-    };
-    const VkPipelineMultisampleStateCreateInfo multisample_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .rasterizationSamples = key.samples,
-        .sampleShadingEnable = VK_FALSE,
-        .minSampleShading = 0.0f,
-        .pSampleMask = nullptr,
-        .alphaToCoverageEnable = VK_FALSE,
-        .alphaToOneEnable = VK_FALSE,
-    };
-    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci = GetPipelineInputAssemblyStateCreateInfo(device);
-    blit_color_pipelines.push_back(device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stageCount = static_cast<u32>(stages.size()),
-        .pStages = stages.data(),
-        .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .pMultisampleState = &multisample_ci,
-        .pDepthStencilState = &PIPELINE_DEPTH_STENCIL_DISABLED_CREATE_INFO,
-        .pColorBlendState = &color_blend_create_info,
-        .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .layout = *one_texture_pipeline_layout,
-        .renderPass = key.renderpass,
-        .subpass = 0,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
-    }, device.StaticPipelineCache()));
-    return *blit_color_pipelines.back();
+    keys.push_back(key);
+    pipelines.push_back(builder());
+    return *pipelines.back();
+}
+
+VkPipeline BlitImageHelper::FindOrEmplaceColorPipeline(const BlitImagePipelineKey& key) {
+    return FindOrEmplacePipeline(blit_color_keys, blit_color_pipelines, key, [&] {
+        using Operation = Tegra::Engines::Fermi2D::Operation;
+        const VkShaderModule fragment = key.operation == Operation::SrcCopySrgbToLinear
+                                            ? *blit_color_srgb_to_linear_frag
+                                        : key.operation == Operation::SrcCopySquare
+                                            ? *blit_color_square_frag
+                                            : *blit_color_to_color_frag;
+        std::array<VkPipelineColorBlendAttachmentState, 8> blend_attachments{};
+        if (key.color_attachment_count > 0) {
+            blend_attachments[0] = PIPELINE_COLOR_BLEND_ATTACHMENT_STATE;
+        }
+        // TODO: programmable blending
+        const auto color_blend_ci =
+            MakeColorBlendState(key.color_attachment_count, blend_attachments.data());
+        const auto multisample_ci = MakeMultisampleState(key.samples);
+        return CreateBlitGraphicsPipeline(device, *full_screen_vert, fragment,
+                                          *one_texture_pipeline_layout, key.renderpass,
+                                          &multisample_ci,
+                                          &PIPELINE_DEPTH_STENCIL_DISABLED_CREATE_INFO,
+                                          &color_blend_ci);
+    });
 }
 
 VkPipeline BlitImageHelper::FindOrEmplaceTemporalUpscalePipeline(VkRenderPass renderpass) {
-    const auto it = std::ranges::find(temporal_upscale_keys, renderpass);
-    if (it != temporal_upscale_keys.end()) {
-        return *temporal_upscale_pipelines[std::distance(temporal_upscale_keys.begin(), it)];
-    }
-    temporal_upscale_keys.push_back(renderpass);
-    const std::array stages = MakeStages(*full_screen_vert, *temporal_upscale_frag);
-    const VkPipelineColorBlendAttachmentState blend_attachment{
-        .blendEnable = VK_FALSE,
-        .srcColorBlendFactor = VK_BLEND_FACTOR_ZERO,
-        .dstColorBlendFactor = VK_BLEND_FACTOR_ZERO,
-        .colorBlendOp = VK_BLEND_OP_ADD,
-        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
-        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
-        .alphaBlendOp = VK_BLEND_OP_ADD,
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                          VK_COLOR_COMPONENT_B_BIT,
-    };
-    const VkPipelineColorBlendStateCreateInfo color_blend_create_info{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .logicOpEnable = VK_FALSE,
-        .logicOp = VK_LOGIC_OP_CLEAR,
-        .attachmentCount = 1,
-        .pAttachments = &blend_attachment,
-        .blendConstants = {0.0f, 0.0f, 0.0f, 0.0f},
-    };
-    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci = GetPipelineInputAssemblyStateCreateInfo(device);
-    temporal_upscale_pipelines.push_back(device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stageCount = static_cast<u32>(stages.size()),
-        .pStages = stages.data(),
-        .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .pMultisampleState = &PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .pDepthStencilState = nullptr,
-        .pColorBlendState = &color_blend_create_info,
-        .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .layout = *temporal_upscale_pipeline_layout,
-        .renderPass = renderpass,
-        .subpass = 0,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
-    }, device.StaticPipelineCache()));
-    return *temporal_upscale_pipelines.back();
+    return FindOrEmplacePipeline(temporal_upscale_keys, temporal_upscale_pipelines, renderpass, [&] {
+        return CreateBlitGraphicsPipeline(
+            device, *full_screen_vert, *temporal_upscale_frag, *temporal_upscale_pipeline_layout,
+            renderpass, &PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, nullptr,
+            &PIPELINE_COLOR_BLEND_STATE_RGB_CREATE_INFO);
+    });
 }
 
 VkPipeline BlitImageHelper::FindOrEmplaceTemporalSharpenPipeline(VkRenderPass renderpass) {
-    const auto it = std::ranges::find(temporal_sharpen_keys, renderpass);
-    if (it != temporal_sharpen_keys.end()) {
-        return *temporal_sharpen_pipelines[std::distance(temporal_sharpen_keys.begin(), it)];
-    }
-    temporal_sharpen_keys.push_back(renderpass);
-    const std::array stages = MakeStages(*full_screen_vert, *temporal_sharpen_frag);
-    const VkPipelineColorBlendAttachmentState blend_attachment{
-        .blendEnable = VK_FALSE,
-        .srcColorBlendFactor = VK_BLEND_FACTOR_ZERO,
-        .dstColorBlendFactor = VK_BLEND_FACTOR_ZERO,
-        .colorBlendOp = VK_BLEND_OP_ADD,
-        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
-        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
-        .alphaBlendOp = VK_BLEND_OP_ADD,
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                          VK_COLOR_COMPONENT_B_BIT,
-    };
-    const VkPipelineColorBlendStateCreateInfo color_blend_create_info{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .logicOpEnable = VK_FALSE,
-        .logicOp = VK_LOGIC_OP_CLEAR,
-        .attachmentCount = 1,
-        .pAttachments = &blend_attachment,
-        .blendConstants = {0.0f, 0.0f, 0.0f, 0.0f},
-    };
-    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci = GetPipelineInputAssemblyStateCreateInfo(device);
-    temporal_sharpen_pipelines.push_back(device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stageCount = static_cast<u32>(stages.size()),
-        .pStages = stages.data(),
-        .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .pMultisampleState = &PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .pDepthStencilState = nullptr,
-        .pColorBlendState = &color_blend_create_info,
-        .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .layout = *temporal_sharpen_pipeline_layout,
-        .renderPass = renderpass,
-        .subpass = 0,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
-    }, device.StaticPipelineCache()));
-    return *temporal_sharpen_pipelines.back();
+    return FindOrEmplacePipeline(temporal_sharpen_keys, temporal_sharpen_pipelines, renderpass, [&] {
+        return CreateBlitGraphicsPipeline(
+            device, *full_screen_vert, *temporal_sharpen_frag, *temporal_sharpen_pipeline_layout,
+            renderpass, &PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, nullptr,
+            &PIPELINE_COLOR_BLEND_STATE_RGB_CREATE_INFO);
+    });
 }
 
 VkPipeline BlitImageHelper::FindOrEmplaceDepthStencilPipeline(const BlitImagePipelineKey& key) {
-    const auto it = std::ranges::find(blit_depth_stencil_keys, key);
-    if (it != blit_depth_stencil_keys.end()) {
-        return *blit_depth_stencil_pipelines[std::distance(blit_depth_stencil_keys.begin(), it)];
-    }
-    blit_depth_stencil_keys.push_back(key);
-    const std::array stages = MakeStages(*full_screen_vert, *blit_depth_stencil_frag);
-    std::array<VkPipelineColorBlendAttachmentState, 8> attachments{};
-    const VkPipelineColorBlendStateCreateInfo color_blend_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .logicOpEnable = VK_FALSE,
-        .logicOp = VK_LOGIC_OP_CLEAR,
-        .attachmentCount = key.color_attachment_count,
-        .pAttachments = key.color_attachment_count > 0 ? attachments.data() : nullptr,
-        .blendConstants = {0.0f, 0.0f, 0.0f, 0.0f},
-    };
-    const VkPipelineMultisampleStateCreateInfo multisample_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .rasterizationSamples = key.samples,
-        .sampleShadingEnable = VK_FALSE,
-        .minSampleShading = 0.0f,
-        .pSampleMask = nullptr,
-        .alphaToCoverageEnable = VK_FALSE,
-        .alphaToOneEnable = VK_FALSE,
-    };
-    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci = GetPipelineInputAssemblyStateCreateInfo(device);
-    blit_depth_stencil_pipelines.push_back(device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stageCount = static_cast<u32>(stages.size()),
-        .pStages = stages.data(),
-        .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .pMultisampleState = &multisample_ci,
-        .pDepthStencilState = &PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-        .pColorBlendState = &color_blend_ci,
-        .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .layout = *two_textures_pipeline_layout,
-        .renderPass = key.renderpass,
-        .subpass = 0,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
-    }, device.StaticPipelineCache()));
-    return *blit_depth_stencil_pipelines.back();
+    return FindOrEmplacePipeline(blit_depth_stencil_keys, blit_depth_stencil_pipelines, key, [&] {
+        const auto color_blend_ci = MakeColorBlendState(key.color_attachment_count);
+        const auto multisample_ci = MakeMultisampleState(key.samples);
+        return CreateBlitGraphicsPipeline(device, *full_screen_vert, *blit_depth_stencil_frag,
+                                          *two_textures_pipeline_layout, key.renderpass,
+                                          &multisample_ci, &PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+                                          &color_blend_ci);
+    });
 }
 
 VkPipeline BlitImageHelper::FindOrEmplaceClearColorPipeline(const BlitImagePipelineKey& key) {
-    const auto it = std::ranges::find(clear_color_keys, key);
-    if (it != clear_color_keys.end()) {
-        return *clear_color_pipelines[std::distance(clear_color_keys.begin(), it)];
-    }
-    clear_color_keys.push_back(key);
-    VkShaderModule frag_module = *clear_color_frag;
-    if (key.target_rt > 0 && key.target_rt < clear_color_mrt_frags.size()) {
-        if (!clear_color_mrt_frags[key.target_rt]) {
-            std::vector<u32> spv(std::begin(VULKAN_COLOR_CLEAR_FRAG_SPV),
-                                 std::end(VULKAN_COLOR_CLEAR_FRAG_SPV));
-            for (size_t i = 5; i < spv.size();) {
-                const u32 word_count = spv[i] >> 16;
-                const u32 opcode = spv[i] & 0xffff;
-                if (word_count == 0 || i + word_count > spv.size()) {
-                    break;
+    return FindOrEmplacePipeline(clear_color_keys, clear_color_pipelines, key, [&] {
+        VkShaderModule frag_module = *clear_color_frag;
+        if (key.target_rt > 0 && key.target_rt < clear_color_mrt_frags.size()) {
+            if (!clear_color_mrt_frags[key.target_rt]) {
+                std::vector<u32> spv(std::begin(VULKAN_COLOR_CLEAR_FRAG_SPV),
+                                     std::end(VULKAN_COLOR_CLEAR_FRAG_SPV));
+                for (size_t i = 5; i < spv.size();) {
+                    const u32 word_count = spv[i] >> 16;
+                    const u32 opcode = spv[i] & 0xffff;
+                    if (word_count == 0 || i + word_count > spv.size()) {
+                        break;
+                    }
+                    // OpDecorate (71) <id> Location (30) 0 -> target_rt
+                    if (opcode == 71 && word_count == 4 && spv[i + 2] == 30 && spv[i + 3] == 0) {
+                        spv[i + 3] = key.target_rt;
+                    }
+                    i += word_count;
                 }
-                // OpDecorate (71) <id> Location (30) 0 -> target_rt
-                if (opcode == 71 && word_count == 4 && spv[i + 2] == 30 && spv[i + 3] == 0) {
-                    spv[i + 3] = key.target_rt;
-                }
-                i += word_count;
+                clear_color_mrt_frags[key.target_rt] = BuildShader(device, spv);
             }
-            clear_color_mrt_frags[key.target_rt] = BuildShader(device, spv);
+            frag_module = *clear_color_mrt_frags[key.target_rt];
         }
-        frag_module = *clear_color_mrt_frags[key.target_rt];
-    }
-    const std::array stages = MakeStages(*clear_color_vert, frag_module);
-    std::array<VkPipelineColorBlendAttachmentState, 8> attachments{};
-    if (key.target_rt < attachments.size() && key.target_rt < key.color_attachment_count) {
-        const VkColorComponentFlags write_mask =
-            ((key.color_mask & 0x1) ? VK_COLOR_COMPONENT_R_BIT : 0) |
-            ((key.color_mask & 0x2) ? VK_COLOR_COMPONENT_G_BIT : 0) |
-            ((key.color_mask & 0x4) ? VK_COLOR_COMPONENT_B_BIT : 0) |
-            ((key.color_mask & 0x8) ? VK_COLOR_COMPONENT_A_BIT : 0);
-        attachments[key.target_rt] = VkPipelineColorBlendAttachmentState{
-            .blendEnable = VK_FALSE,
-            .srcColorBlendFactor = VK_BLEND_FACTOR_ZERO,
-            .dstColorBlendFactor = VK_BLEND_FACTOR_ZERO,
-            .colorBlendOp = VK_BLEND_OP_ADD,
-            .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
-            .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
-            .alphaBlendOp = VK_BLEND_OP_ADD,
-            .colorWriteMask = write_mask,
-        };
-    }
-    const VkPipelineColorBlendStateCreateInfo color_blend_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .logicOpEnable = VK_FALSE,
-        .logicOp = VK_LOGIC_OP_CLEAR,
-        .attachmentCount = key.color_attachment_count,
-        .pAttachments = key.color_attachment_count > 0 ? attachments.data() : nullptr,
-        .blendConstants = {0.0f, 0.0f, 0.0f, 0.0f},
-    };
-    const VkPipelineMultisampleStateCreateInfo multisample_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .rasterizationSamples = key.samples,
-        .sampleShadingEnable = VK_FALSE,
-        .minSampleShading = 0.0f,
-        .pSampleMask = nullptr,
-        .alphaToCoverageEnable = VK_FALSE,
-        .alphaToOneEnable = VK_FALSE,
-    };
-    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci = GetPipelineInputAssemblyStateCreateInfo(device);
-    clear_color_pipelines.push_back(device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stageCount = static_cast<u32>(stages.size()),
-        .pStages = stages.data(),
-        .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .pMultisampleState = &multisample_ci,
-        .pDepthStencilState = &PIPELINE_DEPTH_STENCIL_DISABLED_CREATE_INFO,
-        .pColorBlendState = &color_blend_ci,
-        .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .layout = *clear_color_pipeline_layout,
-        .renderPass = key.renderpass,
-        .subpass = 0,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
-    }, device.StaticPipelineCache()));
-    return *clear_color_pipelines.back();
+        std::array<VkPipelineColorBlendAttachmentState, 8> attachments{};
+        if (key.target_rt < attachments.size() && key.target_rt < key.color_attachment_count) {
+            const VkColorComponentFlags write_mask =
+                ((key.color_mask & 0x1) ? VK_COLOR_COMPONENT_R_BIT : 0) |
+                ((key.color_mask & 0x2) ? VK_COLOR_COMPONENT_G_BIT : 0) |
+                ((key.color_mask & 0x4) ? VK_COLOR_COMPONENT_B_BIT : 0) |
+                ((key.color_mask & 0x8) ? VK_COLOR_COMPONENT_A_BIT : 0);
+            attachments[key.target_rt] = MakeUnblendedColorAttachment(write_mask);
+        }
+        const auto color_blend_ci =
+            MakeColorBlendState(key.color_attachment_count, attachments.data());
+        const auto multisample_ci = MakeMultisampleState(key.samples);
+        return CreateBlitGraphicsPipeline(device, *clear_color_vert, frag_module,
+                                          *clear_color_pipeline_layout, key.renderpass,
+                                          &multisample_ci,
+                                          &PIPELINE_DEPTH_STENCIL_DISABLED_CREATE_INFO,
+                                          &color_blend_ci);
+    });
 }
 
 VkPipeline BlitImageHelper::FindOrEmplaceClearStencilPipeline(
     const BlitDepthStencilPipelineKey& key) {
-    const auto it = std::ranges::find(clear_stencil_keys, key);
-    if (it != clear_stencil_keys.end()) {
-        return *clear_stencil_pipelines[std::distance(clear_stencil_keys.begin(), it)];
-    }
-    clear_stencil_keys.push_back(key);
-    const std::array stages = MakeStages(*clear_color_vert, *clear_stencil_frag);
-    const auto stencil = VkStencilOpState{
-        .failOp = VK_STENCIL_OP_KEEP,
-        .passOp = VK_STENCIL_OP_REPLACE,
-        .depthFailOp = VK_STENCIL_OP_KEEP,
-        .compareOp = VK_COMPARE_OP_ALWAYS,
-        .compareMask = key.stencil_compare_mask,
-        .writeMask = key.stencil_mask,
-        .reference = key.stencil_ref,
-    };
-    const VkPipelineDepthStencilStateCreateInfo depth_stencil_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .depthTestEnable = key.depth_clear,
-        .depthWriteEnable = key.depth_clear,
-        .depthCompareOp = VK_COMPARE_OP_ALWAYS,
-        .depthBoundsTestEnable = VK_FALSE,
-        .stencilTestEnable = VK_TRUE,
-        .front = stencil,
-        .back = stencil,
-        .minDepthBounds = 0.0f,
-        .maxDepthBounds = 0.0f,
-    };
-    std::array<VkPipelineColorBlendAttachmentState, 8> attachments{};
-    const VkPipelineColorBlendStateCreateInfo color_blend_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .logicOpEnable = VK_FALSE,
-        .logicOp = VK_LOGIC_OP_CLEAR,
-        .attachmentCount = key.color_attachment_count,
-        .pAttachments = key.color_attachment_count > 0 ? attachments.data() : nullptr,
-        .blendConstants = {0.0f, 0.0f, 0.0f, 0.0f},
-    };
-    const VkPipelineMultisampleStateCreateInfo multisample_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .rasterizationSamples = key.samples,
-        .sampleShadingEnable = VK_FALSE,
-        .minSampleShading = 0.0f,
-        .pSampleMask = nullptr,
-        .alphaToCoverageEnable = VK_FALSE,
-        .alphaToOneEnable = VK_FALSE,
-    };
-    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci = GetPipelineInputAssemblyStateCreateInfo(device);
-    clear_stencil_pipelines.push_back(device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stageCount = static_cast<u32>(stages.size()),
-        .pStages = stages.data(),
-        .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .pMultisampleState = &multisample_ci,
-        .pDepthStencilState = &depth_stencil_ci,
-        .pColorBlendState = &color_blend_ci,
-        .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .layout = *clear_color_pipeline_layout,
-        .renderPass = key.renderpass,
-        .subpass = 0,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
-    }, device.StaticPipelineCache()));
-    return *clear_stencil_pipelines.back();
+    return FindOrEmplacePipeline(clear_stencil_keys, clear_stencil_pipelines, key, [&] {
+        const auto stencil = VkStencilOpState{
+            .failOp = VK_STENCIL_OP_KEEP,
+            .passOp = VK_STENCIL_OP_REPLACE,
+            .depthFailOp = VK_STENCIL_OP_KEEP,
+            .compareOp = VK_COMPARE_OP_ALWAYS,
+            .compareMask = key.stencil_compare_mask,
+            .writeMask = key.stencil_mask,
+            .reference = key.stencil_ref,
+        };
+        const VkPipelineDepthStencilStateCreateInfo depth_stencil_ci{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .depthTestEnable = key.depth_clear,
+            .depthWriteEnable = key.depth_clear,
+            .depthCompareOp = VK_COMPARE_OP_ALWAYS,
+            .depthBoundsTestEnable = VK_FALSE,
+            .stencilTestEnable = VK_TRUE,
+            .front = stencil,
+            .back = stencil,
+            .minDepthBounds = 0.0f,
+            .maxDepthBounds = 0.0f,
+        };
+        const auto color_blend_ci = MakeColorBlendState(key.color_attachment_count);
+        const auto multisample_ci = MakeMultisampleState(key.samples);
+        return CreateBlitGraphicsPipeline(device, *clear_color_vert, *clear_stencil_frag,
+                                          *clear_color_pipeline_layout, key.renderpass,
+                                          &multisample_ci, &depth_stencil_ci, &color_blend_ci);
+    });
 }
 
 VkPipeline BlitImageHelper::FindOrEmplaceBlitColorMSAAPipeline(const BlitMSAAPipelineKey& key) {
-    const auto it = std::ranges::find(blit_msaa_color_keys, key);
-    if (it != blit_msaa_color_keys.end()) {
-        return *blit_msaa_color_pipelines[std::distance(blit_msaa_color_keys.begin(), it)];
-    }
-    blit_msaa_color_keys.push_back(key);
-    const std::array stages = MakeStages(*full_screen_vert, *blit_color_msaa_frag);
-    const VkPipelineMultisampleStateCreateInfo multisample_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .rasterizationSamples = key.samples,
-        .sampleShadingEnable = VK_TRUE,
-        .minSampleShading = 1.0f,
-        .pSampleMask = nullptr,
-        .alphaToCoverageEnable = VK_FALSE,
-        .alphaToOneEnable = VK_FALSE,
-    };
-    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci = GetPipelineInputAssemblyStateCreateInfo(device);
-    blit_msaa_color_pipelines.push_back(device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stageCount = static_cast<u32>(stages.size()),
-        .pStages = stages.data(),
-        .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .pMultisampleState = &multisample_ci,
-        .pDepthStencilState = nullptr,
-        .pColorBlendState = &PIPELINE_COLOR_BLEND_STATE_GENERIC_CREATE_INFO,
-        .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .layout = *one_texture_pipeline_layout,
-        .renderPass = key.renderpass,
-        .subpass = 0,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
-    }, device.StaticPipelineCache()));
-    return *blit_msaa_color_pipelines.back();
+    return FindOrEmplacePipeline(blit_msaa_color_keys, blit_msaa_color_pipelines, key, [&] {
+        const auto multisample_ci = MakeMultisampleState(key.samples, true);
+        return CreateBlitGraphicsPipeline(device, *full_screen_vert, *blit_color_msaa_frag,
+                                          *one_texture_pipeline_layout, key.renderpass,
+                                          &multisample_ci, nullptr,
+                                          &PIPELINE_COLOR_BLEND_STATE_GENERIC_CREATE_INFO);
+    });
 }
 
 VkPipeline BlitImageHelper::FindOrEmplaceBlitDepthStencilMSAAPipeline(
     const BlitMSAAPipelineKey& key, bool blit_stencil) {
     auto& keys = blit_stencil ? blit_msaa_depth_stencil_keys : blit_msaa_depth_keys;
     auto& pipelines = blit_stencil ? blit_msaa_depth_stencil_pipelines : blit_msaa_depth_pipelines;
-    const auto it = std::ranges::find(keys, key);
-    if (it != keys.end()) {
-        return *pipelines[std::distance(keys.begin(), it)];
-    }
-    keys.push_back(key);
-    const std::array stages =
-        MakeStages(*full_screen_vert,
-                   blit_stencil ? *blit_depth_stencil_msaa_frag : *blit_depth_msaa_frag);
-    const VkPipelineMultisampleStateCreateInfo multisample_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .rasterizationSamples = key.samples,
-        .sampleShadingEnable = VK_TRUE,
-        .minSampleShading = 1.0f,
-        .pSampleMask = nullptr,
-        .alphaToCoverageEnable = VK_FALSE,
-        .alphaToOneEnable = VK_FALSE,
-    };
-    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci = GetPipelineInputAssemblyStateCreateInfo(device);
-    pipelines.push_back(device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stageCount = static_cast<u32>(stages.size()),
-        .pStages = stages.data(),
-        .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .pMultisampleState = &multisample_ci,
-        .pDepthStencilState = blit_stencil ? &PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO
-                                           : &PIPELINE_DEPTH_ONLY_STATE_CREATE_INFO,
-        .pColorBlendState = &PIPELINE_COLOR_BLEND_STATE_EMPTY_CREATE_INFO,
-        .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .layout = blit_stencil ? *two_textures_pipeline_layout : *one_texture_pipeline_layout,
-        .renderPass = key.renderpass,
-        .subpass = 0,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
-    }));
-    return *pipelines.back();
+    return FindOrEmplacePipeline(keys, pipelines, key, [&] {
+        const auto multisample_ci = MakeMultisampleState(key.samples, true);
+        return CreateBlitGraphicsPipeline(
+            device, *full_screen_vert,
+            blit_stencil ? *blit_depth_stencil_msaa_frag : *blit_depth_msaa_frag,
+            blit_stencil ? *two_textures_pipeline_layout : *one_texture_pipeline_layout,
+            key.renderpass, &multisample_ci,
+            blit_stencil ? &PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO
+                         : &PIPELINE_DEPTH_ONLY_STATE_CREATE_INFO,
+            &PIPELINE_COLOR_BLEND_STATE_EMPTY_CREATE_INFO);
+    });
 }
 
 VkPipeline BlitImageHelper::FindOrEmplaceBlitDepthPipeline(const BlitImagePipelineKey& key) {
-    const auto it = std::ranges::find(blit_depth_keys, key);
-    if (it != blit_depth_keys.end()) {
-        return *blit_depth_pipelines[std::distance(blit_depth_keys.begin(), it)];
-    }
-    blit_depth_keys.push_back(key);
-    const std::array stages = MakeStages(*full_screen_vert, *blit_depth_frag);
-    std::array<VkPipelineColorBlendAttachmentState, 8> attachments{};
-    const VkPipelineColorBlendStateCreateInfo color_blend_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .logicOpEnable = VK_FALSE,
-        .logicOp = VK_LOGIC_OP_CLEAR,
-        .attachmentCount = key.color_attachment_count,
-        .pAttachments = key.color_attachment_count > 0 ? attachments.data() : nullptr,
-        .blendConstants = {0.0f, 0.0f, 0.0f, 0.0f},
-    };
-    const VkPipelineMultisampleStateCreateInfo multisample_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .rasterizationSamples = key.samples,
-        .sampleShadingEnable = VK_FALSE,
-        .minSampleShading = 0.0f,
-        .pSampleMask = nullptr,
-        .alphaToCoverageEnable = VK_FALSE,
-        .alphaToOneEnable = VK_FALSE,
-    };
-    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci = GetPipelineInputAssemblyStateCreateInfo(device);
-    blit_depth_pipelines.push_back(device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stageCount = static_cast<u32>(stages.size()),
-        .pStages = stages.data(),
-        .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .pMultisampleState = &multisample_ci,
-        .pDepthStencilState = &PIPELINE_DEPTH_ONLY_STATE_CREATE_INFO,
-        .pColorBlendState = &color_blend_ci,
-        .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .layout = *one_texture_pipeline_layout,
-        .renderPass = key.renderpass,
-        .subpass = 0,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
-    }));
-    return *blit_depth_pipelines.back();
+    return FindOrEmplacePipeline(blit_depth_keys, blit_depth_pipelines, key, [&] {
+        const auto color_blend_ci = MakeColorBlendState(key.color_attachment_count);
+        const auto multisample_ci = MakeMultisampleState(key.samples);
+        return CreateBlitGraphicsPipeline(device, *full_screen_vert, *blit_depth_frag,
+                                          *one_texture_pipeline_layout, key.renderpass,
+                                          &multisample_ci, &PIPELINE_DEPTH_ONLY_STATE_CREATE_INFO,
+                                          &color_blend_ci);
+    });
 }
 
 VkPipeline BlitImageHelper::FindOrEmplaceResolveDepthStencilPipeline(VkRenderPass renderpass,
                                                                      bool resolve_stencil) {
     auto& keys = resolve_stencil ? resolve_depth_stencil_keys : resolve_depth_keys;
     auto& pipelines = resolve_stencil ? resolve_depth_stencil_pipelines : resolve_depth_pipelines;
-    const auto it = std::ranges::find(keys, renderpass);
-    if (it != keys.end()) {
-        return *pipelines[std::distance(keys.begin(), it)];
-    }
-    keys.push_back(renderpass);
-    const std::array stages =
-        MakeStages(*full_screen_vert,
-                   resolve_stencil ? *blit_depth_stencil_msaa_frag : *blit_depth_msaa_frag);
-    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci = GetPipelineInputAssemblyStateCreateInfo(device);
-    pipelines.push_back(device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stageCount = static_cast<u32>(stages.size()),
-        .pStages = stages.data(),
-        .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .pMultisampleState = &PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .pDepthStencilState = resolve_stencil ? &PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO
-                                              : &PIPELINE_DEPTH_ONLY_STATE_CREATE_INFO,
-        .pColorBlendState = &PIPELINE_COLOR_BLEND_STATE_EMPTY_CREATE_INFO,
-        .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .layout = resolve_stencil ? *two_textures_pipeline_layout : *one_texture_pipeline_layout,
-        .renderPass = renderpass,
-        .subpass = 0,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
-    }, device.StaticPipelineCache()));
-    return *pipelines.back();
+    return FindOrEmplacePipeline(keys, pipelines, renderpass, [&] {
+        return CreateBlitGraphicsPipeline(
+            device, *full_screen_vert,
+            resolve_stencil ? *blit_depth_stencil_msaa_frag : *blit_depth_msaa_frag,
+            resolve_stencil ? *two_textures_pipeline_layout : *one_texture_pipeline_layout,
+            renderpass, &PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            resolve_stencil ? &PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO
+                            : &PIPELINE_DEPTH_ONLY_STATE_CREATE_INFO,
+            &PIPELINE_COLOR_BLEND_STATE_EMPTY_CREATE_INFO);
+    });
 }
 
 void BlitImageHelper::CopyMSAADepth(RenderPassCache& render_pass_cache, VkImage dst_image,
@@ -2151,134 +1808,67 @@ void BlitImageHelper::CopyMSAADepth(RenderPassCache& render_pass_cache, VkImage 
 }
 
 VkPipeline BlitImageHelper::FindOrEmplaceMSAACopyPipeline(const MSAACopyPipelineKey& key) {
-    const auto it = std::ranges::find(msaa_copy_keys, key);
-    if (it != msaa_copy_keys.end()) {
-        return *msaa_copy_pipelines[std::distance(msaa_copy_keys.begin(), it)];
-    }
-    msaa_copy_keys.push_back(key);
-    VkShaderModule frag_module = key.msaa_to_non_msaa ? *convert_msaa_to_non_msaa_frag
-                                                     : *convert_non_msaa_to_msaa_frag;
-    if (key.format_class == MSAACopyFormatClass::SignedInteger) {
-        frag_module = key.msaa_to_non_msaa ? *convert_msaa_to_non_msaa_sint_frag
-                                           : *convert_non_msaa_to_msaa_sint_frag;
-    } else if (key.format_class == MSAACopyFormatClass::UnsignedInteger) {
-        frag_module = key.msaa_to_non_msaa ? *convert_msaa_to_non_msaa_uint_frag
-                                           : *convert_non_msaa_to_msaa_uint_frag;
-    }
-    const std::array stages = MakeStages(*clear_color_vert, frag_module);
-    const VkPipelineMultisampleStateCreateInfo multisample_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .rasterizationSamples = key.samples,
-        .sampleShadingEnable = key.msaa_to_non_msaa ? VK_FALSE : VK_TRUE,
-        .minSampleShading = key.msaa_to_non_msaa ? 0.0f : 1.0f,
-        .pSampleMask = nullptr,
-        .alphaToCoverageEnable = VK_FALSE,
-        .alphaToOneEnable = VK_FALSE,
-    };
-    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci = GetPipelineInputAssemblyStateCreateInfo(device);
-    msaa_copy_pipelines.push_back(device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stageCount = static_cast<u32>(stages.size()),
-        .pStages = stages.data(),
-        .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .pMultisampleState = &multisample_ci,
-        .pDepthStencilState = nullptr,
-        .pColorBlendState = &PIPELINE_COLOR_BLEND_STATE_GENERIC_CREATE_INFO,
-        .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .layout = *msaa_copy_pipeline_layout,
-        .renderPass = key.renderpass,
-        .subpass = 0,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
-    }, device.StaticPipelineCache()));
-    return *msaa_copy_pipelines.back();
+    return FindOrEmplacePipeline(msaa_copy_keys, msaa_copy_pipelines, key, [&] {
+        VkShaderModule frag_module = key.msaa_to_non_msaa ? *convert_msaa_to_non_msaa_frag
+                                                          : *convert_non_msaa_to_msaa_frag;
+        if (key.format_class == MSAACopyFormatClass::SignedInteger) {
+            frag_module = key.msaa_to_non_msaa ? *convert_msaa_to_non_msaa_sint_frag
+                                               : *convert_non_msaa_to_msaa_sint_frag;
+        } else if (key.format_class == MSAACopyFormatClass::UnsignedInteger) {
+            frag_module = key.msaa_to_non_msaa ? *convert_msaa_to_non_msaa_uint_frag
+                                               : *convert_non_msaa_to_msaa_uint_frag;
+        }
+        const auto multisample_ci = MakeMultisampleState(key.samples, !key.msaa_to_non_msaa);
+        return CreateBlitGraphicsPipeline(device, *clear_color_vert, frag_module,
+                                          *msaa_copy_pipeline_layout, key.renderpass,
+                                          &multisample_ci, nullptr,
+                                          &PIPELINE_COLOR_BLEND_STATE_GENERIC_CREATE_INFO);
+    });
 }
 
 VkPipeline BlitImageHelper::FindOrEmplaceMSAACopyDepthPipeline(const MSAACopyPipelineKey& key,
                                                                bool copy_stencil) {
     auto& keys = copy_stencil ? msaa_copy_depth_stencil_keys : msaa_copy_depth_keys;
     auto& pipelines = copy_stencil ? msaa_copy_depth_stencil_pipelines : msaa_copy_depth_pipelines;
-    const auto it = std::ranges::find(keys, key);
-    if (it != keys.end()) {
-        return *pipelines[std::distance(keys.begin(), it)];
-    }
-    keys.push_back(key);
-    VkShaderModule frag_module;
-    if (key.msaa_to_non_msaa) {
-        frag_module = copy_stencil ? *convert_msaa_to_non_msaa_depth_stencil_frag
-                                   : *convert_msaa_to_non_msaa_depth_frag;
-    } else {
-        frag_module = copy_stencil ? *convert_non_msaa_to_msaa_depth_stencil_frag
-                                   : *convert_non_msaa_to_msaa_depth_frag;
-    }
-    const std::array stages = MakeStages(*clear_color_vert, frag_module);
-    const VkPipelineMultisampleStateCreateInfo multisample_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .rasterizationSamples = key.samples,
-        .sampleShadingEnable = key.msaa_to_non_msaa ? VK_FALSE : VK_TRUE,
-        .minSampleShading = key.msaa_to_non_msaa ? 0.0f : 1.0f,
-        .pSampleMask = nullptr,
-        .alphaToCoverageEnable = VK_FALSE,
-        .alphaToOneEnable = VK_FALSE,
-    };
-    static constexpr VkStencilOpState REPLACE_STENCIL_OP{
-        .failOp = VK_STENCIL_OP_REPLACE,
-        .passOp = VK_STENCIL_OP_REPLACE,
-        .depthFailOp = VK_STENCIL_OP_REPLACE,
-        .compareOp = VK_COMPARE_OP_ALWAYS,
-        .compareMask = 0xFF,
-        .writeMask = 0xFF,
-        .reference = 0,
-    };
-    const VkPipelineDepthStencilStateCreateInfo depth_stencil_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .depthTestEnable = VK_TRUE,
-        .depthWriteEnable = VK_TRUE,
-        .depthCompareOp = VK_COMPARE_OP_ALWAYS,
-        .depthBoundsTestEnable = VK_FALSE,
-        .stencilTestEnable = copy_stencil ? VK_TRUE : VK_FALSE,
-        .front = copy_stencil ? REPLACE_STENCIL_OP : VkStencilOpState{},
-        .back = copy_stencil ? REPLACE_STENCIL_OP : VkStencilOpState{},
-        .minDepthBounds = 0.0f,
-        .maxDepthBounds = 0.0f,
-    };
-    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci =
-        GetPipelineInputAssemblyStateCreateInfo(device);
-    pipelines.push_back(device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stageCount = static_cast<u32>(stages.size()),
-        .pStages = stages.data(),
-        .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .pMultisampleState = &multisample_ci,
-        .pDepthStencilState = &depth_stencil_ci,
-        .pColorBlendState = &PIPELINE_COLOR_BLEND_STATE_EMPTY_CREATE_INFO,
-        .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .layout = copy_stencil ? *msaa_copy_depth_stencil_pipeline_layout
-                               : *msaa_copy_pipeline_layout,
-        .renderPass = key.renderpass,
-        .subpass = 0,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
-    }));
-    return *pipelines.back();
+    return FindOrEmplacePipeline(keys, pipelines, key, [&] {
+        VkShaderModule frag_module;
+        if (key.msaa_to_non_msaa) {
+            frag_module = copy_stencil ? *convert_msaa_to_non_msaa_depth_stencil_frag
+                                       : *convert_msaa_to_non_msaa_depth_frag;
+        } else {
+            frag_module = copy_stencil ? *convert_non_msaa_to_msaa_depth_stencil_frag
+                                       : *convert_non_msaa_to_msaa_depth_frag;
+        }
+        const auto multisample_ci = MakeMultisampleState(key.samples, !key.msaa_to_non_msaa);
+        static constexpr VkStencilOpState REPLACE_STENCIL_OP{
+            .failOp = VK_STENCIL_OP_REPLACE,
+            .passOp = VK_STENCIL_OP_REPLACE,
+            .depthFailOp = VK_STENCIL_OP_REPLACE,
+            .compareOp = VK_COMPARE_OP_ALWAYS,
+            .compareMask = 0xFF,
+            .writeMask = 0xFF,
+            .reference = 0,
+        };
+        const VkPipelineDepthStencilStateCreateInfo depth_stencil_ci{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .depthTestEnable = VK_TRUE,
+            .depthWriteEnable = VK_TRUE,
+            .depthCompareOp = VK_COMPARE_OP_ALWAYS,
+            .depthBoundsTestEnable = VK_FALSE,
+            .stencilTestEnable = copy_stencil ? VK_TRUE : VK_FALSE,
+            .front = copy_stencil ? REPLACE_STENCIL_OP : VkStencilOpState{},
+            .back = copy_stencil ? REPLACE_STENCIL_OP : VkStencilOpState{},
+            .minDepthBounds = 0.0f,
+            .maxDepthBounds = 0.0f,
+        };
+        return CreateBlitGraphicsPipeline(
+            device, *clear_color_vert, frag_module,
+            copy_stencil ? *msaa_copy_depth_stencil_pipeline_layout : *msaa_copy_pipeline_layout,
+            key.renderpass, &multisample_ci, &depth_stencil_ci,
+            &PIPELINE_COLOR_BLEND_STATE_EMPTY_CREATE_INFO);
+    });
 }
 
 void BlitImageHelper::ConvertDepthToColorPipeline(vk::Pipeline& pipeline, VkRenderPass renderpass) {
@@ -2295,30 +1885,13 @@ void BlitImageHelper::ConvertPipelineEx(vk::Pipeline& pipeline, VkRenderPass ren
     if (pipeline) {
         return;
     }
-    const std::array stages = MakeStages(*full_screen_vert, *module);
-    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci = GetPipelineInputAssemblyStateCreateInfo(device);
-    pipeline = device.GetLogical().CreateGraphicsPipeline(VkGraphicsPipelineCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stageCount = static_cast<u32>(stages.size()),
-        .pStages = stages.data(),
-        .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .pMultisampleState = &PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .pDepthStencilState = is_target_depth ? &PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO : nullptr,
-        .pColorBlendState = is_target_depth ? &PIPELINE_COLOR_BLEND_STATE_EMPTY_CREATE_INFO
-                                            : &PIPELINE_COLOR_BLEND_STATE_GENERIC_CREATE_INFO,
-        .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .layout = single_texture ? *one_texture_pipeline_layout : *two_textures_pipeline_layout,
-        .renderPass = renderpass,
-        .subpass = 0,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
-    }, device.StaticPipelineCache());
+    pipeline = CreateBlitGraphicsPipeline(
+        device, *full_screen_vert, *module,
+        single_texture ? *one_texture_pipeline_layout : *two_textures_pipeline_layout, renderpass,
+        &PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        is_target_depth ? &PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO : nullptr,
+        is_target_depth ? &PIPELINE_COLOR_BLEND_STATE_EMPTY_CREATE_INFO
+                        : &PIPELINE_COLOR_BLEND_STATE_GENERIC_CREATE_INFO);
 }
 
 void BlitImageHelper::ConvertPipelineColorTargetEx(vk::Pipeline& pipeline, VkRenderPass renderpass,
@@ -2332,36 +1905,10 @@ void BlitImageHelper::ConvertPipelineDepthTargetEx(vk::Pipeline& pipeline, VkRen
 }
 
 void BlitImageHelper::ConvertPipeline(vk::Pipeline& pipeline, VkRenderPass renderpass,
-                                    bool is_target_depth) {
-    if (pipeline) {
-        return;
-    }
-    VkShaderModule frag_shader =
-        is_target_depth ? *convert_float_to_depth_frag : *convert_depth_to_float_frag;
-    const std::array stages = MakeStages(*full_screen_vert, frag_shader);
-    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci = GetPipelineInputAssemblyStateCreateInfo(device);
-    pipeline = device.GetLogical().CreateGraphicsPipeline(VkGraphicsPipelineCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stageCount = static_cast<u32>(stages.size()),
-        .pStages = stages.data(),
-        .pVertexInputState = &PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = &PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .pRasterizationState = &PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .pMultisampleState = &PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .pDepthStencilState = is_target_depth ? &PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO : nullptr,
-        .pColorBlendState = is_target_depth ? &PIPELINE_COLOR_BLEND_STATE_EMPTY_CREATE_INFO
-                                          : &PIPELINE_COLOR_BLEND_STATE_GENERIC_CREATE_INFO,
-        .pDynamicState = &PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .layout = *one_texture_pipeline_layout,
-        .renderPass = renderpass,
-        .subpass = 0,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
-    }, device.StaticPipelineCache());
+                                      bool is_target_depth) {
+    ConvertPipelineEx(pipeline, renderpass,
+                      is_target_depth ? convert_float_to_depth_frag : convert_depth_to_float_frag,
+                      true, is_target_depth);
 }
 
 } // namespace Vulkan

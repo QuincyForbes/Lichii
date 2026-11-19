@@ -9,10 +9,12 @@
 
 #pragma once
 
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 #include "common/common_types.h"
+#include "common/device_profile.h"
 #include "common/settings_enums.h"
 #include "vulkan/vulkan_core.h"
 
@@ -102,6 +104,30 @@ public:
     const u32 vendor_id;
     const Capabilities capabilities;
 };
+
+/// Returns the highest-ranked device index matching `pred` (preferring discrete GPUs, then VRAM),
+/// or -1 when none matches.
+template <typename Pred>
+[[nodiscard]] int FindBestDevice(std::span<const Record> records, Pred&& pred) {
+    int best = -1;
+    u64 best_score = 0;
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        if (!pred(records[i])) {
+            continue;
+        }
+        const u64 score = Settings::DeviceProfile::ScoreGpuDevice(
+            !records[i].integrated, records[i].integrated, records[i].vram_mib);
+        if (best < 0 || score > best_score) {
+            best = static_cast<int>(i);
+            best_score = score;
+        }
+    }
+    return best;
+}
+
+[[nodiscard]] inline int FindBestDiscreteDevice(std::span<const Record> records) {
+    return FindBestDevice(records, [](const Record& r) { return !r.integrated; });
+}
 
 // TODO(crueter): Port some configure_graphics.cpp stuff
 void PopulateRecords(std::vector<Record>& records, QWindow* window);

@@ -70,6 +70,7 @@ public:
     bool CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type);
     void ReturnException(u64 pc, Dynarmic::HaltReason hr);
     u64 ReadValue(u64 vaddr, size_t size);
+    Dynarmic::A64::Vector Read128Value(u64 vaddr);
     template <typename T>
     bool WriteExclusive(u64 vaddr, T value, T expected);
     Common::PerfReport::SlowAccess ClassifySlowAccess(u64 vaddr, size_t size) const;

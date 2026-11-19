@@ -413,8 +413,10 @@ bool DmaPusher::Step() {
 
     if (prefetch_size > 0) {
         const std::span<const CommandHeader> commands{command_list.prefetch_command_list};
-        command_resume_offset +=
-            ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+        if (command_resume_offset < commands.size()) {
+            command_resume_offset +=
+                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+        }
         if (puller.HasPendingAcquire()) {
             return false;
         }
@@ -435,7 +437,12 @@ bool DmaPusher::Step() {
         synced = false;
     }
 
-    if (header.size > 0) {
+    if (header.size > 0 && command_resume_offset >= header.size) {
+        command_resume_offset = 0;
+        if (dma_state.method_count != 0) {
+            split_method_end = header.addr + header.size * sizeof(u32);
+        }
+    } else if (header.size > 0) {
         if (header.sync && g_nx2_ampere.load(std::memory_order_relaxed)) {
             VideoCommon::GpuSplit::Get().NoteSync();
         }
@@ -532,6 +539,17 @@ bool DmaPusher::Step() {
             gpu_written,
             !trust && use_safe &&
                 memory_manager.IsMemoryDirty(dma_state.dma_get, header.size * sizeof(u32)));
+        const auto process_from_resume = [&](std::span<const CommandHeader> commands) {
+            if (command_resume_offset < commands.size()) {
+                command_resume_offset +=
+                    ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+            } else {
+                command_resume_offset = header.size;
+                if (commands.size() < header.size) {
+                    ResetOpenMethod();
+                }
+            }
+        };
         const auto run_submitted_copy = [&] {
             std::span<const CommandHeader> commands{
                 command_list.submitted_words.data() +
@@ -545,25 +563,45 @@ bool DmaPusher::Step() {
             }
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Submitted);
-            command_resume_offset +=
-                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+            process_from_resume(commands);
+        };
+        const auto try_recycled_gpu_page = [&](bool had_live_gpu_data) {
+            if (had_live_gpu_data ||
+                HasDirtyFlushedPage(dma_state.dma_get, size_t{header.size} * sizeof(u32))) {
+                return false;
+            }
+            const bool entry_released = IsReleasedEntry(command_list, dma_pushbuffer_subindex);
+            if (entry_released && !has_copy) {
+                NoteReleasedEntry(ReleasedUse::ParseSkipped, command_list,
+                                  dma_pushbuffer_subindex);
+                ResetOpenMethod();
+                return true;
+            }
+            if (has_copy && (trust || entry_released)) {
+                if (entry_released) {
+                    NoteReleasedEntry(ReleasedUse::ParseUsedCopy, command_list,
+                                      dma_pushbuffer_subindex);
+                }
+                run_submitted_copy();
+                return true;
+            }
+            return false;
         };
         if (released && !has_copy) {
             NoteReleasedEntry(ReleasedUse::ParseSkipped, command_list, dma_pushbuffer_subindex);
             // A method left open would take the next entry's words as its data.
             ResetOpenMethod();
-        } else if (released && (!submitted || command_resume_offset != 0)) {
-            NoteReleasedEntry(ReleasedUse::ParseUsedCopy, command_list, dma_pushbuffer_subindex);
-            run_submitted_copy();
-        } else if (submitted) {
+        } else if (released || submitted) {
+            if (released && (!submitted || command_resume_offset != 0)) {
+                NoteReleasedEntry(ReleasedUse::ParseUsedCopy, command_list, dma_pushbuffer_subindex);
+            }
             run_submitted_copy();
         } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Safe);
-            command_resume_offset +=
-                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+            process_from_resume(commands);
         } else if (command_resume_offset == 0 && DrawFromGpuArguments(header)) {
             // The entry's words are a draw macro's parameters, left in GPU memory.
         } else if (gpu_written && command_resume_offset == 0 && header.size == 3 &&
@@ -606,27 +644,13 @@ bool DmaPusher::Step() {
         } else if (bool any_copied = false;
                    ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size),
                                           &any_copied)) {
-            const bool recycled_page =
-                !any_copied &&
-                !HasDirtyFlushedPage(dma_state.dma_get, size_t{header.size} * sizeof(u32));
-            const bool entry_released = IsReleasedEntry(command_list, dma_pushbuffer_subindex);
-            if (recycled_page && entry_released && !has_copy) {
-                NoteReleasedEntry(ReleasedUse::ParseSkipped, command_list,
-                                  dma_pushbuffer_subindex);
-                ResetOpenMethod();
-            } else if (recycled_page && has_copy && (trust || entry_released)) {
-                if (entry_released) {
-                    NoteReleasedEntry(ReleasedUse::ParseUsedCopy, command_list,
-                                      dma_pushbuffer_subindex);
-                }
-                run_submitted_copy();
-            } else {
+            if (!try_recycled_gpu_page(any_copied)) {
                 std::span<const CommandHeader> commands{command_headers.data(), header.size};
                 if (command_resume_offset == 0) {
                     commands = CheckEntryWords(header, commands, command_list,
                                                EntrySource::GpuWrittenCopy);
                 }
-                if (ListChangeTrace* const trace = ListChangeTrace::Get()) [[unlikely]] {
+                if (ListChangeTrace* const trace = ListChangeTrace::Get()) {
                     const u32 sub = dma_state.subchannel;
                     trace->Note(dma_state.dma_get, commands, dma_state.method, sub,
                                 dma_state.method_count,
@@ -635,28 +659,13 @@ bool DmaPusher::Step() {
                 }
                 RecordParsedEntry(header, commands);
                 Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
-                command_resume_offset +=
-                    ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+                process_from_resume(commands);
             }
         } else {
             bool had_gpu_writes = false;
             FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32),
                                     &had_gpu_writes);
-            const bool no_gpu_data =
-                !had_gpu_writes &&
-                !HasDirtyFlushedPage(dma_state.dma_get, size_t{header.size} * sizeof(u32));
-            const bool entry_released = IsReleasedEntry(command_list, dma_pushbuffer_subindex);
-            if (no_gpu_data && entry_released && !has_copy) {
-                NoteReleasedEntry(ReleasedUse::ParseSkipped, command_list,
-                                  dma_pushbuffer_subindex);
-                ResetOpenMethod();
-            } else if (no_gpu_data && has_copy && (trust || entry_released)) {
-                if (entry_released) {
-                    NoteReleasedEntry(ReleasedUse::ParseUsedCopy, command_list,
-                                      dma_pushbuffer_subindex);
-                }
-                run_submitted_copy();
-            } else {
+            if (!try_recycled_gpu_page(had_gpu_writes)) {
                 Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader,
                                               Tegra::Memory::GuestMemoryFlags::UnsafeRead>
                     headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
@@ -666,8 +675,7 @@ bool DmaPusher::Step() {
                 }
                 RecordParsedEntry(header, commands);
                 Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Slow);
-                command_resume_offset +=
-                    ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+                process_from_resume(commands);
             }
         }
         if (puller.HasPendingAcquire()) {

@@ -396,6 +396,8 @@ struct UserConfig {
     /// This tells the translator a wall clock will be used, thus allowing it
     /// to avoid writting certain unnecessary code only needed for cycle timers.
     bool wall_clock_cntpct = false;
+    /// arm64 backend, with wall_clock_cntpct: read CNTVCT_EL0 inline and scale by the 128-bit
+    /// fixed-point factor (cntpct_scale_hi:cntpct_scale_lo) >> 64 instead of calling GetCNTPCT.
     bool inline_cntpct = false;
     std::uint64_t cntpct_scale_lo = 0;
     std::uint64_t cntpct_scale_hi = 0;

@@ -299,6 +299,46 @@ GraphicsPipeline::GraphicsPipeline(const GraphicsPipelineKey& key_, StageProgram
     }
 }
 
+VertexProgramUse GraphicsPipeline::GetVertexUse() noexcept {
+    if (!cached_vertex_use) {
+        if (vertex.entry_point.empty()) {
+            return {};
+        }
+        const VertexProgramUse computed = VertexUse(vertex);
+        if (vertex.function) {
+            cached_vertex_use = computed;
+        }
+        return computed;
+    }
+    return *cached_vertex_use;
+}
+
+void* GraphicsPipeline::StageInKernelState(const Device& device, const StageProgram& program,
+                                           u32 kind_tag, size_t variant, u32 index_size,
+                                           const RenderPipelineDesc& layout,
+                                           std::string_view label) {
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(layout.attributes.data()),
+                                        sizeof(layout.attributes)) ^
+                     Common::CityHash64(reinterpret_cast<const char*>(layout.streams.data()),
+                                        sizeof(layout.streams)) ^
+                     (u64{variant} << 60) ^ (u64{kind_tag} << 58);
+    const auto [it, is_new] = vertex_kernel_states.try_emplace(hash);
+    if (is_new) {
+        std::string error;
+        it->second = CreateStageInComputePipelineState(
+            device, program.function.Get(), layout, index_size, program.tessellation_slots.index,
+            error, archive);
+        if (!it->second) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(Render_Metal, "Metal: {} of {:016x} refused: {}; {}", label,
+                          key.unique_hashes[1], error, Describe(layout));
+            }
+        }
+    }
+    return it->second.Get();
+}
+
 void* GraphicsPipeline::VertexKernelState(const Device& device, size_t variant,
                                           const RenderPipelineDesc& layout) {
     if (!tessellation || variant >= Tessellation::IndexSizes.size()) {
@@ -325,25 +365,8 @@ void* GraphicsPipeline::VertexKernelState(const Device& device, size_t variant,
         }
         ReleaseSource(program);
     }
-    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(layout.attributes.data()),
-                                        sizeof(layout.attributes)) ^
-                     Common::CityHash64(reinterpret_cast<const char*>(layout.streams.data()),
-                                        sizeof(layout.streams)) ^
-                     (u64{variant} << 60);
-    const auto [it, is_new] = vertex_kernel_states.try_emplace(hash);
-    if (is_new) {
-        it->second = CreateStageInComputePipelineState(
-            device, program.function.Get(), layout, Tessellation::IndexSizes[variant],
-            program.tessellation_slots.index, error, archive);
-        if (!it->second) {
-            static std::atomic<u32> logged{};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_ERROR(Render_Metal, "Metal: vertex kernel state of {:016x} refused: {}; {}",
-                          key.unique_hashes[1], error, Describe(layout));
-            }
-        }
-    }
-    return it->second.Get();
+    return StageInKernelState(device, program, 0, variant, Tessellation::IndexSizes[variant],
+                              layout, "vertex kernel state");
 }
 
 std::pair<void*, void*> GraphicsPipeline::XfbKernelStates(const Device& device, size_t variant,
@@ -378,26 +401,9 @@ std::pair<void*, void*> GraphicsPipeline::XfbKernelStates(const Device& device, 
         }
         ReleaseSource(program);
     }
-    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(layout.attributes.data()),
-                                        sizeof(layout.attributes)) ^
-                     Common::CityHash64(reinterpret_cast<const char*>(layout.streams.data()),
-                                        sizeof(layout.streams)) ^
-                     (u64{variant} << 60);
-    const auto [it, is_new] = vertex_kernel_states.try_emplace(hash);
-    if (is_new) {
-        it->second = CreateStageInComputePipelineState(
-            device, program.function.Get(), layout, XfbCapture::IndexSizes[variant],
-            program.tessellation_slots.index, error, archive);
-        if (!it->second) {
-            static std::atomic<u32> logged{};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_ERROR(Render_Metal,
-                          "Metal: transform feedback kernel state of {:016x} refused: {}; {}",
-                          key.unique_hashes[1], error, Describe(layout));
-            }
-        }
-    }
-    return {it->second.Get(), xfb->gather[variant].Get()};
+    return {StageInKernelState(device, program, 1, variant, XfbCapture::IndexSizes[variant], layout,
+                               "transform feedback kernel state"),
+            xfb->gather[variant].Get()};
 }
 
 std::pair<void*, void*> GraphicsPipeline::GeometryKernelStates(const Device& device,
@@ -435,25 +441,9 @@ std::pair<void*, void*> GraphicsPipeline::GeometryKernelStates(const Device& dev
         }
         ReleaseSource(program);
     }
-    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(layout.attributes.data()),
-                                        sizeof(layout.attributes)) ^
-                     Common::CityHash64(reinterpret_cast<const char*>(layout.streams.data()),
-                                        sizeof(layout.streams)) ^
-                     (u64{variant} << 60);
-    const auto [it, is_new] = vertex_kernel_states.try_emplace(hash);
-    if (is_new) {
-        it->second = CreateStageInComputePipelineState(
-            device, program.function.Get(), layout, GeometryCompute::IndexSizes[variant],
-            program.tessellation_slots.index, error, archive);
-        if (!it->second) {
-            static std::atomic<u32> logged{};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_ERROR(Render_Metal, "Metal: geometry capture kernel state of {:016x} refused: {}; {}",
-                          key.unique_hashes[1], error, Describe(layout));
-            }
-        }
-    }
-    return {it->second.Get(), geometry->records[variant].Get()};
+    return {StageInKernelState(device, program, 2, variant, GeometryCompute::IndexSizes[variant],
+                               layout, "geometry capture kernel state"),
+            geometry->records[variant].Get()};
 }
 
 void* GraphicsPipeline::GeometryXfbState(const Device& device, u32 stream) {
@@ -510,6 +500,7 @@ void GraphicsPipeline::FailNative(std::string_view reason) {
         return;
     }
     native_mesh->failed = true;
+    cached_render_state.state = nullptr;
     static std::atomic<u32> logged{};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
         // Warning: the iOS log shows Render.Metal from there.

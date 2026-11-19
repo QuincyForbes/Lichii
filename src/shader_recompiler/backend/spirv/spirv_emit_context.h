@@ -198,6 +198,10 @@ public:
     /// available and the writes it orders visible.
     [[nodiscard]] Id BarrierSemantics(spv::MemorySemanticsMask semantics);
 
+    /// Adds a continuation label inside the IR block currently being emitted and records it as the
+    /// block's outgoing SPIR-V predecessor for deferred OpPhi nodes.
+    void AddContinuationLabel(Id label);
+
     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
     [[nodiscard]] Id BitOffset16(const IR::Value& offset);
 
@@ -362,7 +366,7 @@ public:
     u32 descriptor_set{}; ///< Set of every resource of the stage (Bindings::descriptor_set)
 
     Id render_area_push_constant{};
-    u32 render_are_member_index{};
+    u32 render_area_member_index{};
 
     Id mesh_draw_base_push_constant{};
     u32 mesh_draw_base_member_index{};
@@ -499,6 +503,9 @@ public:
 
     // Sirit::Id doesn't play nice with *::set<>
     ::Common::unordered_set<u32> non_uniform_ids;
+
+    IR::Block* current_block{};
+    ::Common::unordered_map<const IR::Block*, Id> block_exit_labels;
 
     bool uses_nonuniform_sampled_image{};
     bool uses_nonuniform_storage_image{};

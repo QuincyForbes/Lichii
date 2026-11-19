@@ -39,6 +39,47 @@ struct VertexProgramUse {
 
 [[nodiscard]] VertexProgramUse VertexUse(const StageProgram& program);
 
+/// Post-FitAttachments target formats and sample count, with a precomputed hash.
+struct AttachmentFormatsKey {
+    u64 hash{};
+    std::array<u32, Maxwell::NumRenderTargets> color_formats{};
+    u32 depth_format{};
+    u32 stencil_format{};
+    u32 samples{};
+
+    bool operator==(const AttachmentFormatsKey&) const noexcept = default;
+};
+
+[[nodiscard]] AttachmentFormatsKey MakeAttachmentFormatsKey(
+    const std::array<u32, Maxwell::NumRenderTargets>& color_formats, u32 depth_format,
+    u32 stencil_format, u32 samples) noexcept;
+
+/// Compact key of everything RenderPipelineDesc + SanitizeVertexLayout read for a pipeline.
+struct RenderStateMemoKey {
+    AttachmentFormatsKey formats{};
+    u32 write_masks{}; ///< 4 bits per colour target (R 1 .. A 8)
+    u32 bound_streams_mask{};
+    u8 blend_enable_mask{};
+    u8 topology_class{};
+    u8 flags{}; ///< 0 rasterize, 1..2 alpha_to_coverage, 3 per_target, 4 native, 5..6 reducing, 7 checked
+    u8 used_attrib_count{};
+    u8 used_stream_count{};
+    std::array<u32, 6> common_blend{};
+    std::array<std::array<u32, 6>, Maxwell::NumRenderTargets> target_blend{};
+    std::array<u32, Maxwell::NumVertexAttributes> attrib_hex{};
+    std::array<u32, Maxwell::NumVertexArrays> stream_strides{};
+    std::array<u32, Maxwell::NumVertexArrays> stream_divisors{};
+
+    [[nodiscard]] bool Matches(const RenderStateMemoKey& other,
+                               bool mesh_pipeline) const noexcept;
+};
+
+/// Fills the non-vertex portion of `key` and `color_written` from the registers.
+void FillRenderStateMemoRegisters(RenderStateMemoKey& key, u8& color_written, const Maxwell& regs,
+                                  Maxwell::PrimitiveTopology topology,
+                                  const AttachmentFormatsKey& formats, bool native, u32 reducing,
+                                  bool checked) noexcept;
+
 /// A tessellation pipeline's render state: no vertex layout (its post-tessellation vertex
 /// function reads buffers), partition mode and winding.
 void ApplyTessellation(RenderPipelineDesc& desc, const Tessellation& tessellation);

@@ -75,6 +75,7 @@ private:
     void UpdateBackgroundColorButton(QColor color);
     void UpdateAPILayout();
     void UpdateDeviceSelection(int device);
+    void SelectVulkanDevice(int device);
 
     void RetrieveVulkanDevices();
 
@@ -89,8 +90,6 @@ private:
                                      Settings::RendererBackend backend) const;
 
     Settings::RendererBackend GetCurrentGraphicsBackend() const;
-
-    int FindIndex(u32 enumeration, int value) const;
 
     std::unique_ptr<Ui::ConfigureGraphics> ui;
     QColor bg_color;
@@ -110,14 +109,13 @@ private:
     const Core::System& system;
     const ConfigurationShared::ComboboxTranslationMap& combobox_translations;
 
-    QPushButton* api_restore_global_button;
-    QComboBox* vulkan_device_combobox;
-    QComboBox* api_combobox;
-    QComboBox* vsync_mode_combobox;
-    QPushButton* vsync_restore_global_button;
-    QWidget* vulkan_device_widget;
-    QWidget* api_widget;
-    QComboBox* aspect_ratio_combobox;
+    QPushButton* api_restore_global_button{};
+    QComboBox* vulkan_device_combobox{};
+    QComboBox* api_combobox{};
+    QComboBox* vsync_mode_combobox{};
+    QPushButton* vsync_restore_global_button{};
+    QWidget* vulkan_device_widget{};
+    QComboBox* aspect_ratio_combobox{};
     /// Not built on the per-game page of a game with its own resolution (Ocarina of Time).
     QComboBox* resolution_combobox{};
 

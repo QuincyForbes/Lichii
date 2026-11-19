@@ -21,7 +21,7 @@ constexpr u64 MinEvictionAge = 150;
 /// its margins and the host's commit leave). `override_age` (EDEN_NX2_TC_MIN_AGE) raises the age
 /// only while there is room, so a stale override can't stop eviction when memory is short (#1290).
 [[nodiscard]] constexpr u64 EvictionAge(u64 mode_age, u64 override_age, u64 usage, u64 limit,
-                                        bool out_of_memory) {
+                                        bool out_of_memory) noexcept {
     if (out_of_memory || limit == 0 || usage >= limit) {
         return mode_age;
     }
@@ -38,11 +38,11 @@ constexpr u64 RetentionBudgetRise = u64{16} << 20;
 /// only the block slack (0.5-0.8 GB) under the budget read last. Each drop took the process over
 /// the budget (Streamline: out of VRAM) and frames went from 10-13 ms to 35-80 ms.
 /// `held` is the last value (0 before the first check), `budget` the one read now.
-[[nodiscard]] constexpr u64 RetentionBudget(u64 held, u64 budget) {
-    if (held == 0 || budget <= held) {
+[[nodiscard]] constexpr u64 RetentionBudget(u64 held, u64 budget) noexcept {
+    if (held == 0 || budget <= held || budget - held <= RetentionBudgetRise) {
         return budget;
     }
-    return (std::min)(budget, held + RetentionBudgetRise);
+    return held + RetentionBudgetRise;
 }
 
 } // namespace VideoCommon

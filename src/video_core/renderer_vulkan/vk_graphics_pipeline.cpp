@@ -159,7 +159,8 @@ struct DrawReuseProbe {
                  "last frame {:.1f}%; same as the pipeline's previous draw: setup {:.1f}%, textures "
                  "{:.1f}%; without constant buffer addresses: seen last frame {:.1f}%, same as "
                  "previous {:.1f}%",
-                 static_cast<double>(draws) / frames, pct(full_seen), pct(textures_seen),
+                 static_cast<double>(draws) / static_cast<double>(frames), pct(full_seen),
+                 pct(textures_seen),
                  pct(full_same_previous), pct(textures_same_previous), pct(no_cbufs_seen),
                  pct(no_cbufs_same_previous));
         frames = draws = full_seen = textures_seen = full_same_previous = textures_same_previous = 0;
@@ -677,7 +678,7 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics,
-                emit_stages = std::move(emit_stages)] {
+                emit_fn = std::move(emit_stages)] {
         const auto begin = std::chrono::steady_clock::now();
         SCOPE_EXIT {
             if (shader_notify) {
@@ -686,9 +687,9 @@ GraphicsPipeline::GraphicsPipeline(
         };
         SimulateSlowBuild();
         try {
-            if (emit_stages) {
+            if (emit_fn) {
                 const auto emit_begin = std::chrono::steady_clock::now();
-                spv_modules = emit_stages(spirv_hashes);
+                spv_modules = emit_fn(spirv_hashes);
                 PipelineBuildStats::Get().emission_ns.fetch_add(
                     static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - emit_begin)
@@ -2824,30 +2825,36 @@ bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
     Common::ThreadWorker* const offload_pool = prefer_held ? held_workers : worker_thread;
     if (offload_pool != nullptr && !library_cache->IsReady(frag_key)) {
         parallel_frag = std::make_shared<ParallelPart>();
-        const auto make_task = [&] {
-            return [this, parallel_frag, &states, &frag_key, render_pass, frag_name] {
+        const auto make_task = [&](bool held) {
+            return [this, parallel_frag, &states, &frag_key, render_pass, frag_name, held] {
                 if (parallel_frag->claimed.exchange(true, std::memory_order_acq_rel)) {
                     return;
                 }
-                auto built = library_cache->GetOrCreate(
+                if (held) {
+                    RaiseHeldBuilderThread();
+                }
+                std::shared_ptr<const GplLibrary> built;
+                SCOPE_EXIT {
+                    {
+                        std::scoped_lock lock{parallel_frag->mutex};
+                        parallel_frag->library = std::move(built);
+                        parallel_frag->done = true;
+                    }
+                    parallel_frag->cv.notify_one();
+                };
+                built = library_cache->GetOrCreate(
                     GplPart::Fragment, frag_key,
                     [this, &states, render_pass] {
                         return MakeShaderLibrary(GplPart::Fragment, states, render_pass);
                     },
                     frag_name);
-                {
-                    std::scoped_lock lock{parallel_frag->mutex};
-                    parallel_frag->library = std::move(built);
-                    parallel_frag->done = true;
-                }
-                parallel_frag->cv.notify_one();
             };
         };
-        if (!prefer_held || !held_workers->TryQueueWork(make_task())) {
+        if (!prefer_held || !held_workers->TryQueueWork(make_task(true))) {
             if (worker_thread != nullptr) {
-                worker_thread->QueueWork(make_task());
+                worker_thread->QueueWork(make_task(false));
             } else {
-                offload_pool->QueueWork(make_task());
+                offload_pool->QueueWork(make_task(prefer_held));
             }
         }
     }

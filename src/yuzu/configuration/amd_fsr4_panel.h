@@ -7,13 +7,15 @@
 
 #pragma once
 
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
 
 #include <QString>
 #include <QWidget>
 
+class QHideEvent;
 class QLabel;
 class QPushButton;
+class QShowEvent;
 class QTimer;
 
 class AmdFsr4Panel : public QWidget {

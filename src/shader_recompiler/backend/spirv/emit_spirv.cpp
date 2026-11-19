@@ -174,10 +174,12 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
                 ctx.OpBranch(label);
             }
             current_block = node.data.block;
+            ctx.current_block = current_block;
             ctx.AddLabel(label);
             for (IR::Inst& inst : node.data.block->Instructions()) {
                 EmitInst(ctx, &inst);
             }
+            ctx.current_block = nullptr;
             break;
         }
         case IR::AbstractSyntaxNode::Type::If: {
@@ -579,31 +581,36 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
 }
 
 void PatchPhiNodes(IR::Program& program, EmitContext& ctx) {
-            // Flatten all leading PHIs from each block into a vector
-            std::vector<IR::Inst*> phi_instructions;
-            for (IR::Block* block : program.blocks) {
-                for (auto it = block->begin(); it != block->end(); ++it) {
-                    if (it->GetOpcode() != IR::Opcode::Phi)
-                        break;
-                    phi_instructions.push_back(&*it);
-                }
+    // Flatten all leading PHIs from each block into a vector
+    std::vector<IR::Inst*> phi_instructions;
+    for (IR::Block* block : program.blocks) {
+        for (auto it = block->begin(); it != block->end(); ++it) {
+            if (it->GetOpcode() != IR::Opcode::Phi) {
+                break;
             }
-
-            if (phi_instructions.empty()) {
-                return; // nothing to patch
-            }
-
-            // Start "before" first PHI; advance on phi_arg == 0
-            size_t phi_index = static_cast<size_t>(-1);
-
-            ctx.PatchDeferredPhi([&](size_t phi_arg, Id parent) -> std::pair<Id, Id> {
-                if (phi_arg == 0) {
-                    ++phi_index;
-                }
-                IR::Inst* phi = phi_instructions[phi_index];
-                return { ctx.Def(phi->Arg(phi_arg)), parent };
-            });
+            phi_instructions.push_back(&*it);
         }
+    }
+
+    if (phi_instructions.empty()) {
+        return; // nothing to patch
+    }
+
+    // Start "before" first PHI; advance on phi_arg == 0
+    size_t phi_index = static_cast<size_t>(-1);
+
+    ctx.PatchDeferredPhi([&](size_t phi_arg, Id parent) -> std::pair<Id, Id> {
+        if (phi_arg == 0) {
+            ++phi_index;
+        }
+        IR::Inst* const phi = phi_instructions[phi_index];
+        if (const auto it = ctx.block_exit_labels.find(phi->PhiBlock(phi_arg));
+            it != ctx.block_exit_labels.end()) {
+            parent = it->second;
+        }
+        return {ctx.Def(phi->Arg(phi_arg)), parent};
+    });
+}
 
 void RewriteOpcodes(std::vector<u32>& code, std::span<std::pair<u32, spv::Op>> rewrites) {
     if (rewrites.empty()) {

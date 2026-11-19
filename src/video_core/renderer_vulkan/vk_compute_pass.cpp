@@ -427,6 +427,7 @@ void PlainUnswizzlePass::Dispatch(VkBuffer source, VkDeviceSize offset, VkBuffer
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, after);
     });
+    scheduler.InvalidateDescriptorBuffer();
 }
 
 Uint8Pass::Uint8Pass(const Device& device_, Scheduler& scheduler_, DescriptorPool& descriptor_pool,

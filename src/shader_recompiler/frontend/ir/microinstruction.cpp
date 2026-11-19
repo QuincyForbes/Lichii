@@ -71,6 +71,10 @@ Inst::~Inst() {
     }
 }
 
+bool Inst::HasAssociatedPseudoOperation() const noexcept {
+    return associated_insts != nullptr && !associated_insts->Empty();
+}
+
 /// Returns true when the instruction must be kept even if its result is unused
 bool Inst::MayHaveSideEffects() const noexcept {
     switch (op) {
@@ -436,27 +440,21 @@ void Inst::UndoUse(const Value& value) {
     std::unique_ptr<AssociatedInsts>& assoc_inst{inst->associated_insts};
     switch (op) {
     case Opcode::GetZeroFromOp:
-        AllocAssociatedInsts(assoc_inst);
         RemovePseudoInstruction(assoc_inst->zero_inst, Opcode::GetZeroFromOp);
         break;
     case Opcode::GetSignFromOp:
-        AllocAssociatedInsts(assoc_inst);
         RemovePseudoInstruction(assoc_inst->sign_inst, Opcode::GetSignFromOp);
         break;
     case Opcode::GetCarryFromOp:
-        AllocAssociatedInsts(assoc_inst);
         RemovePseudoInstruction(assoc_inst->carry_inst, Opcode::GetCarryFromOp);
         break;
     case Opcode::GetOverflowFromOp:
-        AllocAssociatedInsts(assoc_inst);
         RemovePseudoInstruction(assoc_inst->overflow_inst, Opcode::GetOverflowFromOp);
         break;
     case Opcode::GetSparseFromOp:
-        AllocAssociatedInsts(assoc_inst);
         RemovePseudoInstruction(assoc_inst->sparse_inst, Opcode::GetSparseFromOp);
         break;
     case Opcode::GetInBoundsFromOp:
-        AllocAssociatedInsts(assoc_inst);
         RemovePseudoInstruction(assoc_inst->in_bounds_inst, Opcode::GetInBoundsFromOp);
         break;
     default:

@@ -4836,6 +4836,9 @@ public:
             m_syncpt_watch_state->alive = false;
             m_syncpt_watch_state->core_timing = nullptr;
         }
+        if (m_syncpt_memory != nullptr) {
+            system.Host1x().GetSyncpointManager().SetGuestMirror({});
+        }
         if (m_syncpt_request_thread.joinable()) {
             m_syncpt_request_thread.request_stop();
             if (m_syncpt_stop_event != nullptr) {
@@ -4858,8 +4861,9 @@ public:
                 }
             }
         }
-        if (m_syncpt_memory != nullptr) {
-            system.Host1x().GetSyncpointManager().SetGuestMirror({});
+        {
+            std::scoped_lock poll_lk{m_syncpt_poll_mutex};
+            m_syncpt_memory = nullptr;
         }
         if (m_syncpt_stop_event != nullptr) {
             m_context.CloseEvent(m_syncpt_stop_event);
@@ -5013,7 +5017,8 @@ private:
 
         auto rw = ctx.GetObjectFromHandle<Kernel::KTransferMemory>(ctx.GetCopyHandle(0));
         auto ro = ctx.GetObjectFromHandle<Kernel::KTransferMemory>(ctx.GetCopyHandle(1));
-        if (rw.IsNotNull() && ro.IsNotNull() && ro->GetSize() >= 0x2000) {
+        if (rw.IsNotNull() && ro.IsNotNull() && rw->GetSize() >= 0x1000 &&
+            ro->GetSize() >= 0x2000) {
             {
                 std::scoped_lock poll_lk{m_syncpt_poll_mutex};
                 m_syncpt_memory = &ro->GetOwner()->GetMemory();
@@ -5091,13 +5096,13 @@ private:
                 while (!stop_token.stop_requested()) {
                     s32 index{};
                     std::array<Kernel::KSynchronizationObject*, 2> objects{
-                        &m_syncpt_events[0]->GetReadableEvent(),
                         &m_syncpt_stop_event->GetReadableEvent(),
+                        &m_syncpt_events[0]->GetReadableEvent(),
                     };
                     const Result result = Kernel::KSynchronizationObject::Wait(
                         system.Kernel(), &index, objects.data(),
                         static_cast<s32>(objects.size()), -1);
-                    if (stop_token.stop_requested() || R_FAILED(result) || index != 0) {
+                    if (stop_token.stop_requested() || R_FAILED(result) || index != 1) {
                         break;
                     }
                     m_syncpt_events[0]->Clear(system.Kernel());

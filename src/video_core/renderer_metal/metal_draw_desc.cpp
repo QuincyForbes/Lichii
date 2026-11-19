@@ -3,11 +3,25 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
+#include "common/cityhash.h"
 #include "video_core/renderer_metal/metal_draw_desc.h"
 #include "video_core/renderer_metal/metal_raster_patch.h"
 
 namespace Metal {
+
+namespace {
+
+[[nodiscard]] bool AlphaToOneEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_ALPHA_TO_ONE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+} // Anonymous namespace
 
 u32 TopologyClass(Maxwell::PrimitiveTopology topology) {
     switch (topology) {
@@ -57,7 +71,8 @@ Maxwell::PrimitiveTopology PointFillTopology(const Maxwell& regs,
 void FillRegisterState(RenderPipelineDesc& desc, const Maxwell& regs,
                        Maxwell::PrimitiveTopology topology, bool mesh) {
     // A logic operation replaces blending where the pixel program does it (RasterPatch).
-    const RasterPatch::LogicState logic = RasterPatch::LogicStateOf(regs);
+    const RasterPatch::LogicState logic =
+        regs.logic_op.enable != 0 ? RasterPatch::LogicStateOf(regs) : RasterPatch::LogicState{};
     for (size_t rt = 0; rt < Maxwell::NumRenderTargets; ++rt) {
         const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : rt];
         BlendTargetState& blend = desc.blend[rt];
@@ -88,23 +103,140 @@ void FillRegisterState(RenderPipelineDesc& desc, const Maxwell& regs,
     desc.topology_class = TopologyClass(topology);
     desc.rasterize = regs.rasterize_enable != 0 ? 1U : 0U;
     // Alpha to one in bit 1 (EDEN_NX2_METAL_ALPHA_TO_ONE=0: not set, as before).
-    static const bool alpha_to_one = [] {
-        const char* const value = std::getenv("EDEN_NX2_METAL_ALPHA_TO_ONE");
-        return value == nullptr || value[0] != '0';
-    }();
     desc.alpha_to_coverage = (regs.anti_alias_alpha_control.alpha_to_coverage != 0 ? 1U : 0U) |
-                             (alpha_to_one && regs.anti_alias_alpha_control.alpha_to_one != 0
+                             (AlphaToOneEnabled() && regs.anti_alias_alpha_control.alpha_to_one != 0
                                   ? 2U
                                   : 0U);
+    if (mesh) {
+        desc.attributes = {};
+        return;
+    }
     for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
         const auto& input = regs.vertex_attrib_format[index];
         VertexAttributeState& attribute = desc.attributes[index];
-        attribute.enabled = input.constant != 0 || mesh ? 0U : 1U;
+        attribute.enabled = input.constant != 0 ? 0U : 1U;
         attribute.stream = input.buffer;
         attribute.offset = input.offset;
         attribute.type = input.type;
         attribute.size = input.size;
     }
+}
+
+AttachmentFormatsKey MakeAttachmentFormatsKey(
+    const std::array<u32, Maxwell::NumRenderTargets>& color_formats, u32 depth_format,
+    u32 stencil_format, u32 samples) noexcept {
+    std::array<u32, Maxwell::NumRenderTargets + 3> words{};
+    std::copy(color_formats.begin(), color_formats.end(), words.begin());
+    words[Maxwell::NumRenderTargets] = depth_format;
+    words[Maxwell::NumRenderTargets + 1] = stencil_format;
+    words[Maxwell::NumRenderTargets + 2] = samples;
+    return AttachmentFormatsKey{
+        .hash = Common::CityHash64(reinterpret_cast<const char*>(words.data()), sizeof(words)) |
+                1ULL,
+        .color_formats = color_formats,
+        .depth_format = depth_format,
+        .stencil_format = stencil_format,
+        .samples = samples,
+    };
+}
+
+bool RenderStateMemoKey::Matches(const RenderStateMemoKey& other,
+                                 bool mesh_pipeline) const noexcept {
+    if (formats.hash != other.formats.hash || write_masks != other.write_masks ||
+        blend_enable_mask != other.blend_enable_mask || topology_class != other.topology_class ||
+        flags != other.flags || formats != other.formats) {
+        return false;
+    }
+    if ((flags & (1U << 3)) != 0) {
+        if (target_blend != other.target_blend) {
+            return false;
+        }
+    } else if (common_blend != other.common_blend) {
+        return false;
+    }
+    if (mesh_pipeline) {
+        return true;
+    }
+    if (bound_streams_mask != other.bound_streams_mask ||
+        used_attrib_count != other.used_attrib_count ||
+        used_stream_count != other.used_stream_count) {
+        return false;
+    }
+    if (std::memcmp(attrib_hex.data(), other.attrib_hex.data(),
+                    size_t{used_attrib_count} * sizeof(u32)) != 0) {
+        return false;
+    }
+    return std::memcmp(stream_strides.data(), other.stream_strides.data(),
+                       size_t{used_stream_count} * sizeof(u32)) == 0 &&
+           std::memcmp(stream_divisors.data(), other.stream_divisors.data(),
+                       size_t{used_stream_count} * sizeof(u32)) == 0;
+}
+
+void FillRenderStateMemoRegisters(RenderStateMemoKey& key, u8& color_written, const Maxwell& regs,
+                                  Maxwell::PrimitiveTopology topology,
+                                  const AttachmentFormatsKey& formats, bool native, u32 reducing,
+                                  bool checked) noexcept {
+    key.formats = formats;
+    const auto pack_mask = [](const Maxwell::ColorMask& mask) noexcept -> u32 {
+        return (mask.R != 0 ? 1U : 0U) | (mask.G != 0 ? 2U : 0U) |
+               (mask.B != 0 ? 4U : 0U) | (mask.A != 0 ? 8U : 0U);
+    };
+    if (regs.color_mask_common != 0) {
+        const u32 mask0 = pack_mask(regs.color_mask[0]);
+        key.write_masks = mask0 * 0x11111111U;
+        color_written = mask0 != 0 ? 0xFFU : 0U;
+    } else {
+        u32 masks = 0;
+        u8 written = 0;
+        for (size_t rt = 0; rt < Maxwell::NumRenderTargets; ++rt) {
+            const u32 m = pack_mask(regs.color_mask[rt]);
+            masks |= m << (rt * 4);
+            written |= static_cast<u8>((m != 0 ? 1U : 0U) << rt);
+        }
+        key.write_masks = masks;
+        color_written = written;
+    }
+    const bool per_target = regs.blend_per_target_enabled != 0;
+    if (!per_target && regs.logic_op.enable == 0) {
+        key.blend_enable_mask = regs.blend.enable[0] != 0 ? 0xFFU : 0U;
+    } else {
+        const RasterPatch::LogicState logic =
+            regs.logic_op.enable != 0 ? RasterPatch::LogicStateOf(regs) : RasterPatch::LogicState{};
+        u8 enables = 0;
+        for (size_t rt = 0; rt < Maxwell::NumRenderTargets; ++rt) {
+            if (regs.blend.enable[per_target ? rt : 0] != 0 &&
+                logic.Format(rt) == RasterPatch::LogicFormat::None) {
+                enables |= static_cast<u8>(1U << rt);
+            }
+        }
+        key.blend_enable_mask = enables;
+    }
+    if (per_target) {
+        for (size_t rt = 0; rt < Maxwell::NumRenderTargets; ++rt) {
+            const auto& src = regs.blend_per_target[rt];
+            key.target_blend[rt] = {
+                static_cast<u32>(src.color_op),     static_cast<u32>(src.alpha_op),
+                static_cast<u32>(src.color_source), static_cast<u32>(src.color_dest),
+                static_cast<u32>(src.alpha_source), static_cast<u32>(src.alpha_dest),
+            };
+        }
+    } else {
+        key.common_blend = {
+            static_cast<u32>(regs.blend.color_op),     static_cast<u32>(regs.blend.alpha_op),
+            static_cast<u32>(regs.blend.color_source), static_cast<u32>(regs.blend.color_dest),
+            static_cast<u32>(regs.blend.alpha_source), static_cast<u32>(regs.blend.alpha_dest),
+        };
+    }
+    key.topology_class = static_cast<u8>(TopologyClass(topology));
+    const u32 alpha_to_coverage =
+        (regs.anti_alias_alpha_control.alpha_to_coverage != 0 ? 1U : 0U) |
+        (AlphaToOneEnabled() && regs.anti_alias_alpha_control.alpha_to_one != 0 ? 2U : 0U);
+    key.flags = static_cast<u8>((regs.rasterize_enable != 0 ? 1U : 0U) |
+                                (alpha_to_coverage << 1) |
+                                (per_target ? (1U << 3) : 0U) |
+                                (native ? (1U << 4) : 0U) |
+                                ((reducing & 3U) << 5) |
+                                (checked ? (1U << 7) : 0U));
 }
 
 void FillStream(RenderPipelineDesc& desc, const Maxwell& regs, size_t index, bool bound,

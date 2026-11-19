@@ -10,6 +10,7 @@
 #include <algorithm>
 
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "video_core/host1x/syncpoint_manager.h"
 
 namespace Tegra {
@@ -77,10 +78,16 @@ void SyncpointManager::DeregisterAction(std::list<RegisteredAction>& action_stor
 }
 
 void SyncpointManager::DeregisterGuestAction(u32 syncpoint_id, const ActionHandle& handle) {
+    if (syncpoint_id >= NUM_MAX_SYNCPOINTS) {
+        return;
+    }
     DeregisterAction(guest_action_storage[syncpoint_id], handle);
 }
 
 void SyncpointManager::DeregisterHostAction(u32 syncpoint_id, const ActionHandle& handle) {
+    if (syncpoint_id >= NUM_MAX_SYNCPOINTS) {
+        return;
+    }
     DeregisterAction(host_action_storage[syncpoint_id], handle);
 }
 
@@ -106,10 +113,16 @@ void SyncpointManager::IncrementHost(u32 syncpoint_id) {
 }
 
 void SyncpointManager::WaitGuest(u32 syncpoint_id, u32 expected_value) {
+    if (syncpoint_id >= NUM_MAX_SYNCPOINTS) {
+        return;
+    }
     Wait(syncpoints_guest[syncpoint_id], wait_guest_cv, expected_value);
 }
 
 void SyncpointManager::WaitHost(u32 syncpoint_id, u32 expected_value) {
+    if (syncpoint_id >= NUM_MAX_SYNCPOINTS) {
+        return;
+    }
     Wait(syncpoints_host[syncpoint_id], wait_host_cv, expected_value);
 }
 
@@ -138,6 +151,14 @@ void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_var
     DueActions due;
     due.pending.splice(due.pending.end(), action_storage, action_storage.begin(), end);
     due_actions.push_back(&due);
+    SCOPE_EXIT {
+        if (!lk.owns_lock()) {
+            lk.lock();
+        }
+        due.running = 0;
+        std::erase(due_actions, &due);
+        action_done_cv.notify_all();
+    };
     while (!due.pending.empty()) {
         std::function<void()> action{std::move(due.pending.front().action)};
         due.running = due.pending.front().id;
@@ -149,7 +170,6 @@ void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_var
         due.running = 0;
         action_done_cv.notify_all();
     }
-    std::erase(due_actions, &due);
 }
 
 void SyncpointManager::Wait(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,

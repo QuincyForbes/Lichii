@@ -20,8 +20,6 @@
 #include "audio_core/sink/input_processing.h"
 #include "audio_core/sink/sink_stream.h"
 #include "common/common_types.h"
-#include "common/fixed_point.h"
-#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -298,8 +296,7 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
             queued_buffers.store(0);
             release_cv.notify_one();
         }
-        for (size_t i = 0; i < num_frames; i++)
-            std::memset(&output_buffer[i * frame_size], 0, frame_size_bytes);
+        std::memset(output_buffer.data(), 0, num_frames * frame_size_bytes);
         return;
     }
 
@@ -316,11 +313,13 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
 
             if (!queue.TryPop(playing_buffer)) {
                 lk.unlock();
-                for (size_t i = frames_written; i < num_frames; i++) {
-                    if (type == StreamType::Sysmix) {
-                        std::memset(&output_buffer[i * frame_size], 0, frame_size_bytes);
-                    } else {
-                        std::memcpy(&output_buffer[i * frame_size], last_frame.data(), frame_size_bytes);
+                if (type == StreamType::Sysmix) {
+                    std::memset(&output_buffer[frames_written * frame_size], 0,
+                                (num_frames - frames_written) * frame_size_bytes);
+                } else {
+                    for (size_t i = frames_written; i < num_frames; i++) {
+                        std::memcpy(&output_buffer[i * frame_size], last_frame.data(),
+                                    frame_size_bytes);
                     }
                 }
                 frames_written = num_frames;
@@ -386,9 +385,17 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
 
 void SinkStream::UpdateSampleCount(std::size_t frames_added) {
     const s64 now_ns = system.CoreTiming().GetGlobalTimeNs().count();
+    u64 seq = sample_count_seq.load(std::memory_order_relaxed);
+    while ((seq & 1) != 0 ||
+           !sample_count_seq.compare_exchange_weak(seq, seq + 1, std::memory_order_acq_rel,
+                                                   std::memory_order_relaxed)) {
+        if ((seq & 1) != 0) {
+            seq = sample_count_seq.load(std::memory_order_relaxed);
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_release);
     const u64 prev_max = max_played_sample_count.load(std::memory_order_relaxed);
     const u64 next_max = prev_max + frames_added;
-    const u64 seq = sample_count_seq.fetch_add(1, std::memory_order_acq_rel);
     last_sample_count_update_ns.store(now_ns, std::memory_order_relaxed);
     min_played_sample_count.store(prev_max, std::memory_order_relaxed);
     max_played_sample_count.store(next_max, std::memory_order_relaxed);

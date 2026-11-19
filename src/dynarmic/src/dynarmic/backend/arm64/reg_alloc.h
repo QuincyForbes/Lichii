@@ -10,7 +10,6 @@
 
 #include <array>
 #include <optional>
-#include <random>
 #include <span>
 #include <utility>
 
@@ -20,8 +19,6 @@
 #include "common/common_types.h"
 #include "dynarmic/mcl/is_instance_of_template.hpp"
 #include <oaknut/oaknut.hpp>
-#include "common/container/unordered_map.h"
-#include "common/container/unordered_set.h"
 
 #include "dynarmic/backend/arm64/stack_layout.h"
 #include "dynarmic/ir/cond.h"
@@ -162,13 +159,15 @@ struct HostLocInfo final {
 class RegAlloc final {
 public:
     using ArgumentInfo = std::array<Argument, IR::max_arg_count>;
+    using OrderMasks = boost::container::static_vector<u32, 32>;
 
-    explicit RegAlloc(oaknut::CodeGenerator& code_, FpsrManager& fpsr_manager_, std::span<const int> gpr_order_, std::span<const int> fpr_order_) noexcept
-        : code{code_}
-        , fpsr_manager{fpsr_manager_}
-        , gpr_order{gpr_order_}
-        , fpr_order{fpr_order_}
-    {}
+    RegAlloc() noexcept = default;
+    explicit RegAlloc(oaknut::CodeGenerator& code_, FpsrManager& fpsr_manager_, std::span<const int> gpr_order_, std::span<const int> fpr_order_) noexcept {
+        Reset(code_, fpsr_manager_, gpr_order_, fpr_order_);
+    }
+
+    void Reset() noexcept;
+    void Reset(oaknut::CodeGenerator& code_, FpsrManager& fpsr_manager_, std::span<const int> gpr_order_, std::span<const int> fpr_order_) noexcept;
 
     ArgumentInfo GetArgumentInfo(IR::Inst* inst);
     bool WasValueDefined(IR::Inst* inst) const;
@@ -316,7 +315,7 @@ private:
     template<HostLoc::Kind kind> int RealizeWriteImpl(const IR::Inst* value);
     template<HostLoc::Kind kind> int RealizeReadWriteImpl(const IR::Value& read_value, const IR::Inst* write_value);
 
-    int AllocateRegister(const std::array<HostLocInfo, 32>& regs, std::span<const int> order) const;
+    int AllocateRegister(const std::array<HostLocInfo, 32>& regs, std::span<const int> order, const OrderMasks& order_masks, u64 active_mask) const;
     void SpillGpr(int index);
     void SpillFpr(int index);
     int FindFreeSpill() const;
@@ -328,10 +327,56 @@ private:
     HostLocInfo& ValueInfo(HostLoc host_loc);
     HostLocInfo& ValueInfo(const IR::Inst* value);
 
-    oaknut::CodeGenerator& code;
-    FpsrManager& fpsr_manager;
+    void RecordDefined(const IR::Inst* inst);
+    void MarkActive(HostLoc loc) noexcept {
+        switch (loc.kind) {
+        case HostLoc::Kind::Gpr:
+            active_gprs |= u64{1} << loc.index;
+            break;
+        case HostLoc::Kind::Fpr:
+            active_fprs |= u64{1} << loc.index;
+            break;
+        case HostLoc::Kind::Flags:
+            active_flags = true;
+            break;
+        case HostLoc::Kind::Spill:
+            active_spills |= u64{1} << loc.index;
+            break;
+        }
+    }
+    void ClearActive(HostLoc loc) noexcept {
+        switch (loc.kind) {
+        case HostLoc::Kind::Gpr:
+            active_gprs &= ~(u64{1} << loc.index);
+            break;
+        case HostLoc::Kind::Fpr:
+            active_fprs &= ~(u64{1} << loc.index);
+            break;
+        case HostLoc::Kind::Flags:
+            active_flags = false;
+            break;
+        case HostLoc::Kind::Spill:
+            active_spills &= ~(u64{1} << loc.index);
+            break;
+        }
+    }
+
+    oaknut::CodeGenerator& Code() noexcept { return *code_ptr; }
+    FpsrManager& Fpsr() noexcept { return *fpsr_manager_ptr; }
+
+    static_assert(SpillCount <= 64);
+
+    oaknut::CodeGenerator* code_ptr = nullptr;
+    FpsrManager* fpsr_manager_ptr = nullptr;
     std::span<const int> gpr_order;
     std::span<const int> fpr_order;
+    OrderMasks gpr_order_masks;
+    OrderMasks fpr_order_masks;
+
+    u64 active_gprs = 0;
+    u64 active_fprs = 0;
+    u64 active_spills = 0;
+    bool active_flags = false;
 
     std::array<HostLocInfo, 32> gprs;
     std::array<HostLocInfo, 32> fprs;
@@ -339,7 +384,7 @@ private:
     std::array<HostLocInfo, SpillCount> spills;
 
     mutable std::size_t alloc_candidate_index = 0;
-    ::Common::unordered_set<const IR::Inst*> defined_insts;
+    boost::container::small_vector<const IR::Inst*, 16> defined_insts;
 };
 
 template<typename T>
@@ -353,10 +398,21 @@ RAReg<T>::RAReg(RegAlloc& reg_alloc_, RWType rw_, const IR::Value& read_value_, 
 template<typename T>
 RAReg<T>::~RAReg() {
     if (rw != RWType::Write && !read_value.IsImmediate()) {
-        reg_alloc.ValueInfo(read_value.GetInst()).locked--;
+        const auto loc = reg_alloc.ValueLocation(read_value.GetInst());
+        ASSERT(loc);
+        auto& info = reg_alloc.ValueInfo(*loc);
+        info.locked--;
+        if (info.IsCompletelyEmpty()) {
+            reg_alloc.ClearActive(*loc);
+        }
     }
     if (reg) {
-        reg_alloc.ValueInfo(HostLoc{kind, reg->index()}).realized = false;
+        const HostLoc loc{kind, reg->index()};
+        auto& info = reg_alloc.ValueInfo(loc);
+        info.realized = false;
+        if (info.IsCompletelyEmpty()) {
+            reg_alloc.ClearActive(loc);
+        }
     }
 }
 

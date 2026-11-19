@@ -487,6 +487,32 @@ private:
                             std::span<const VideoCommon::SamplerId> samplers, u32 render_width,
                             u32 render_height);
 
+    struct DescriptorPageCache {
+        struct Page {
+            u64 page{~0ULL};
+            const u8* host{};
+        };
+        std::array<Page, 4> pages{};
+    };
+
+    template <typename CbufAddrFn>
+    void CollectStageDescriptors(const Shader::Info& info, bool compute, bool via_header_index,
+                                 bool use_bind_memo, CbufAddrFn&& cbuf_addr_of,
+                                 DescriptorPageCache& page_cache, std::vector<u32>& batch_handles,
+                                 std::vector<VideoCommon::ImageViewInOut>& views,
+                                 std::vector<u32>& sampler_handles,
+                                 std::vector<VideoCommon::SamplerId>& samplers);
+
+    void ResolveStageBindings(bool compute, bool blacklist, std::span<const u32> binding_kinds,
+                              std::span<VideoCommon::ImageViewInOut> views,
+                              std::span<const u32> sampler_handles,
+                              std::span<VideoCommon::SamplerId> samplers);
+
+    void AppendSampledDump(u32 stage, const Shader::Info& info,
+                           std::span<const VideoCommon::ImageViewInOut> views,
+                           std::span<const VideoCommon::SamplerId> samplers,
+                           std::vector<FrameDump::Sampled>& out);
+
     /// A colour image the frame dump reads back (null when it can't).
     [[nodiscard]] std::optional<FrameDump::Source> DumpSource(const ImageView& view, u32 slot);
     /// A texture a draw or dispatch samples, as the frame dump records it.
@@ -657,6 +683,16 @@ private:
     ::Common::unordered_map<u64, Object> depth_stencil_states;
     u64 last_depth_stencil_key{~u64{0}};
     void* last_depth_stencil_state{};
+    struct AttachmentFitMemo {
+        bool valid{};
+        u64 pass_serial{~u64{0}};
+        RenderTargetSet raw_targets{};
+        std::array<u32, Maxwell::NumRenderTargets> raw_color_formats{};
+        u32 raw_depth_format{};
+        u32 raw_samples{};
+        RenderTargetSet fitted_targets{};
+        AttachmentFormatsKey formats{};
+    } attachment_fit_memo;
     /// What an attribute of a vertex stream without a buffer reads, made on first use.
     Object zero_vertices;
 
@@ -734,29 +770,47 @@ private:
     /// Shader::Backend::SPIRV::RescalingLayout of the draw or dispatch being bound.
     std::array<u32, 8> rescaling_words{};
 
+    static constexpr size_t MaxConvertedIndexEntries = 256;
+    static constexpr u64 MaxConvertedIndexBytes = u64{32} << 20;
+    static constexpr u64 MaxSingleConvertedIndexBytes = MaxConvertedIndexBytes / 4;
+
     /// The GPU index rewrite of the draw being prepared.
     struct IndexRewrite {
         bool wanted{};
         bool only_ahead{};
+        bool cacheable{};
+        DAddr device_addr{};
         IndexConvert::RewriteParams params{};
         StagingBufferRef output;
         BufferHandle cached_buffer{};
         u32 cached_count{};
     } index_rewrite;
     struct ConvertedIndexEntry {
+        DAddr device_addr{};
         u64 offset{};
         u64 size{};
+        u64 buffer_bytes{};
+        u64 last_use{};
+        u64 last_frame{};
         u32 mode{};
         u32 index_size{};
         u32 restart{};
         u32 converted{};
         u32 hits{};
-        u64 last_frame{};
         Object buffer;
     };
     std::unordered_map<BufferHandle, std::vector<ConvertedIndexEntry>> converted_index_cache;
+    size_t converted_index_count{};
     u64 converted_index_bytes{};
+    u64 converted_index_clock{};
+    DAddr converted_index_min_addr{~DAddr{0}};
+    DAddr converted_index_max_addr{};
     void InvalidateConvertedIndices(BufferHandle buffer, u64 offset, u64 size);
+    void InvalidateConvertedIndicesAddr(DAddr addr, u64 size);
+    void RefreshConvertedIndexAddrBounds() noexcept;
+    void EvictConvertedIndexEntry();
+    [[nodiscard]] bool MakeRoomForConvertedIndexBytes(u64 needed_bytes,
+                                                      const ConvertedIndexEntry* keep) noexcept;
     Object index_kernel_library;
     Object index_kernel;
     Object index_strip_kernel;

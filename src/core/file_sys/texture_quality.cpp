@@ -212,14 +212,18 @@ struct TextureQualityState {
     TextureQualityState(u32 levels_, bool arrays_) : levels{levels_}, arrays{arrays_} {
         pressure_listener = Common::PlatformEvents::AddMemoryPressureListener([this] {
             std::scoped_lock lock{mutex};
-            lru.clear();
-            index.clear();
-            bytes = 0;
+            ClearLocked();
         });
     }
 
     ~TextureQualityState() {
         Common::PlatformEvents::RemoveMemoryPressureListener(pressure_listener);
+    }
+
+    void ClearLocked() noexcept {
+        lru.clear();
+        index.clear();
+        bytes = 0;
     }
 
     DataPtr Find(const void* key) {
@@ -236,7 +240,7 @@ struct TextureQualityState {
             return;
         }
         const std::size_t data_size = data->size();
-        while (bytes + data_size > CacheCap && !lru.empty()) {
+        while (!lru.empty() && data_size > CacheCap - bytes) {
             bytes -= lru.back().second->size();
             index.erase(lru.back().first);
             lru.pop_back();
@@ -244,6 +248,44 @@ struct TextureQualityState {
         bytes += data_size;
         lru.emplace_front(key, data);
         index.emplace(key, lru.begin());
+    }
+
+    template <typename Loader>
+    DataPtr GetOrLoad(const void* key, Loader&& loader) {
+        std::unique_lock lock{mutex};
+        if (DataPtr cached = Find(key)) {
+            return cached;
+        }
+        if (const auto it = in_flight.find(key); it != in_flight.end()) {
+            auto waiter = it->second;
+            waiter->cv.wait(lock, [&waiter] { return waiter->done; });
+            static_cast<void>(Find(key));
+            return waiter->result;
+        }
+
+        auto leader = std::make_shared<InFlight>();
+        in_flight.emplace(key, leader);
+        lock.unlock();
+
+        DataPtr built;
+        SCOPE_EXIT {
+            {
+                std::scoped_lock finish_lock{mutex};
+                leader->result = built;
+                leader->done = true;
+                in_flight.erase(key);
+                if (built) {
+                    try {
+                        Insert(key, built);
+                    } catch (...) {
+                    }
+                }
+            }
+            leader->cv.notify_all();
+        };
+
+        built = loader();
+        return built;
     }
 
     void Erase(const void* key) {
@@ -328,48 +370,18 @@ public:
         }
         length = std::min<std::size_t>(length, size - offset);
         const bool whole = offset == 0 && length == size;
-        TextureQualityState::DataPtr cached;
-        {
-            std::unique_lock lock{state->mutex};
-            cached = state->Find(this);
-            if (!cached) {
-                if (const auto it = state->in_flight.find(this); it != state->in_flight.end()) {
-                    auto waiter = it->second;
-                    waiter->cv.wait(lock, [&waiter] { return waiter->done; });
-                    cached = waiter->result;
-                    static_cast<void>(state->Find(this));
-                } else {
-                    auto leader = std::make_shared<TextureQualityState::InFlight>();
-                    state->in_flight.emplace(this, leader);
-                    lock.unlock();
-
-                    TextureQualityState::DataPtr built;
-                    SCOPE_EXIT {
-                        lock.lock();
-                        if (built) {
-                            state->Insert(this, built);
-                        }
-                        leader->result = built;
-                        leader->done = true;
-                        state->in_flight.erase(this);
-                        lock.unlock();
-                        leader->cv.notify_all();
-                    };
-
-                    const auto begin = std::chrono::steady_clock::now();
-                    auto reduced =
-                        ReduceZstdTexture(base->ReadAllBytes(), state->levels, state->arrays);
-                    const auto time = std::chrono::steady_clock::now() - begin;
-                    if (reduced && reduced->file.size() == size) {
-                        if (!counted.exchange(true)) {
-                            state->Count(*reduced, time, !whole);
-                        }
-                        built = std::make_shared<const std::vector<u8>>(std::move(reduced->file));
-                    }
-                    cached = built;
-                }
+        const TextureQualityState::DataPtr cached = state->GetOrLoad(this, [&]() {
+            const auto begin = std::chrono::steady_clock::now();
+            auto reduced = ReduceZstdTexture(base->ReadAllBytes(), state->levels, state->arrays);
+            const auto time = std::chrono::steady_clock::now() - begin;
+            if (!reduced || reduced->file.size() != size) {
+                return TextureQualityState::DataPtr{};
             }
-        }
+            if (!counted.exchange(true)) {
+                state->Count(*reduced, time, !whole);
+            }
+            return std::make_shared<const std::vector<u8>>(std::move(reduced->file));
+        });
         if (!cached || cached->size() != size) {
             LOG_ERROR(Common_Memory, "Texture quality: {} could not be reduced as planned",
                       GetName());

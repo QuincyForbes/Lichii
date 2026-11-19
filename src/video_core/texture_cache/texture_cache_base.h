@@ -487,6 +487,7 @@ public:
         TICEntry tic;
         TSCEntry tsc;
     };
+    static constexpr u32 BINDING_KIND_HANDLE_PROGRAM = 1U << 14;
     static constexpr u32 BINDING_KIND_COMPUTE = 1U << 31;
 
     /// What every binding of one draw or dispatch is looked up and recorded against.
@@ -824,6 +825,14 @@ private:
         GuardLoaded = 2,   ///< Rendered to without a clear in a frame after the GPU wrote it
         GuardCpuRead = 4,  ///< Read by the CPU (GetFlushArea, DownloadMemory)
     };
+    static constexpr std::array<u8, 3> RelocationGuardBits{
+        GuardSampled,
+        GuardLoaded,
+        GuardCpuRead,
+    };
+    [[nodiscard]] static constexpr size_t RelocationGuardSlot(RelocationGuard reason) noexcept {
+        return reason == GuardSampled ? 0 : (reason == GuardLoaded ? 1 : 2);
+    }
     struct RelocationShape {
         u8 guard{};
         bool candidate_logged{};
@@ -836,6 +845,8 @@ private:
         std::array<u64, 3> last_guard_frame{};
     };
     static constexpr u64 RelocationGuardDecayFrames = 600;
+    static constexpr u32 RelocationGuardRefreshFrames =
+        static_cast<u32>(RelocationGuardDecayFrames / 2);
     ::Common::unordered_map<u64, RelocationShape> relocation_shapes;
     ::Common::unordered_map<GPUVAddr, RelocationGuardedAddr> relocation_guarded_addresses;
     /// Since the last report (TickFrame, every 600 frames once a candidate was seen).
@@ -959,10 +970,65 @@ private:
             RenderFrame() <= image.last_write_frame + 1 || invalidate) {
             return;
         }
+        const u32 tick32 = static_cast<u32>(frame_tick);
+        if ((image.relocation_guard_noted & (GuardSampled | GuardLoaded)) != 0 &&
+            tick32 - image.relocation_guard_tick >= RelocationGuardRefreshFrames) {
+            image.relocation_guard_noted &= static_cast<u8>(~(GuardSampled | GuardLoaded));
+        }
         const RelocationGuard reason = is_modification ? GuardLoaded : GuardSampled;
         if ((image.relocation_guard_noted & reason) == 0 && RelocationShaped(image.info)) {
             NoteRelocationGuard(image, reason);
         }
+    }
+
+    [[nodiscard]] bool IsColorTargetWritten(size_t index) const noexcept {
+        if (maxwell3d == nullptr) {
+            return false;
+        }
+        const auto& regs = maxwell3d->regs;
+        return regs.rasterize_enable != 0 && index < regs.rt_control.count && index < NUM_RT &&
+               regs.color_mask[regs.color_mask_common ? 0 : index].raw != 0;
+    }
+
+    template <typename Func>
+    void ForEachWrittenColorTarget(Func&& func) const {
+        if (maxwell3d == nullptr || maxwell3d->regs.rasterize_enable == 0) {
+            return;
+        }
+        const auto& regs = maxwell3d->regs;
+        const u32 rt_count = (std::min<u32>)(regs.rt_control.count, NUM_RT);
+        for (u32 index = 0; index < rt_count; ++index) {
+            if (regs.color_mask[regs.color_mask_common ? 0 : index].raw == 0) {
+                continue;
+            }
+            const auto& rt = regs.rt[index];
+            const GPUVAddr rt_addr = rt.Address();
+            if (rt.format != Tegra::RenderTargetFormat::NONE && rt_addr != 0 &&
+                func(rt, rt_addr)) {
+                return;
+            }
+        }
+    }
+
+    [[nodiscard]] bool OverlapsWrittenColorTarget(const ImageBase& image) const noexcept {
+        bool overlaps = false;
+        ForEachWrittenColorTarget([&](const auto&, GPUVAddr rt_addr) {
+            if (image.OverlapsGPU(rt_addr, 1)) {
+                overlaps = true;
+                return true;
+            }
+            return false;
+        });
+        return overlaps;
+    }
+
+    [[nodiscard]] bool HasNewerAlias(const ImageBase& image) const noexcept {
+        for (const AliasedImage& alias : image.aliased_images) {
+            if (slot_images[alias.id].modification_tick > image.modification_tick) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Mark an image as modified from the GPU

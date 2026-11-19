@@ -202,7 +202,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
 #include "video_core/vulkan_common/ffx_runtime.h"
 #endif
 
@@ -5064,8 +5064,8 @@ void MainWindow::OnGameListConvertToNup(const std::string& game_path) {
 
     const auto cancel = nup_cancel;
     auto last_update = std::make_shared<std::chrono::steady_clock::time_point>();
-    nup_watcher.setFuture(QtConcurrent::run([this, root = *root, archive, delete_sources, metadata,
-                                             cancel, last_update] {
+    nup_watcher.setFuture(QtConcurrent::run([this, dump_root = *root, archive, delete_sources,
+                                             metadata, cancel, last_update] {
         std::string error;
         const auto on_progress = [this, last_update](const FileSys::Nup::PackProgress& progress) {
             const auto now = std::chrono::steady_clock::now();
@@ -5082,8 +5082,8 @@ void MainWindow::OnGameListConvertToNup(const std::string& game_path) {
                 Qt::QueuedConnection);
         };
         const auto result = FileSys::Nup::PackDump(
-            root, archive, {.delete_sources = delete_sources, .metadata = metadata}, on_progress,
-            cancel.get(), &error);
+            dump_root, archive, {.delete_sources = delete_sources, .metadata = metadata},
+            on_progress, cancel.get(), &error);
         QMetaObject::invokeMethod(
             this,
             [this, result, delete_sources, error] {
@@ -5845,45 +5845,66 @@ void MainWindow::UpdateStatusBar() {
 
     QString upscaler_text;
     QString upscaler_tooltip;
+    if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan) {
+        switch (Settings::values.upscaler.GetValue()) {
 #ifdef EGLANTINE_STREAMLINE
-    if (Settings::NvidiaDlssChosen()) {
-        const auto dlss = Vulkan::Streamline::GetSessionStatus();
-        if (dlss.available && dlss.frames > 0) {
-            upscaler_text = QStringLiteral("DLSS");
-            if (!dlss.mode_name.empty()) {
-                upscaler_text +=
-                    QLatin1Char(' ') + QString::fromStdString(dlss.mode_name).toUpper();
+        case Settings::Upscaler::Dlss: {
+            const auto dlss = Vulkan::Streamline::GetSessionStatus();
+            if (dlss.available && dlss.frames > 0) {
+                upscaler_text = QStringLiteral("DLSS");
+                if (!dlss.mode_name.empty()) {
+                    upscaler_text +=
+                        QLatin1Char(' ') + QString::fromStdString(dlss.mode_name).toUpper();
+                }
+                if (!dlss.preset_name.empty()) {
+                    upscaler_text +=
+                        QLatin1Char(' ') + QString::fromStdString(dlss.preset_name).toUpper();
+                }
+                upscaler_tooltip =
+                    tr("%1 (%2) active — %3 frames upscaled. Screen filter runs after it.")
+                        .arg(UiText::ChoiceLabel("upscaler", "Dlss"),
+                             dlss.version.empty() ? QStringLiteral("Streamline")
+                                                  : QString::fromStdString(dlss.version))
+                        .arg(dlss.frames);
             }
-            if (!dlss.preset_name.empty()) {
-                upscaler_text +=
-                    QLatin1Char(' ') + QString::fromStdString(dlss.preset_name).toUpper();
+            break;
+        }
+#endif
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
+        case Settings::Upscaler::Fsr4: {
+            const auto fsr4 = Vulkan::FfxRuntime::GetSessionStatus();
+            if (fsr4.available && fsr4.frames > 0) {
+                const QString ver = QString::fromStdString(fsr4.version);
+                upscaler_text = ver.startsWith(QStringLiteral("4."))
+                                    ? QStringLiteral("FSR %1").arg(ver)
+                                    : QStringLiteral("FSR 4");
+                upscaler_tooltip =
+                    tr("%1 active — %2 frames upscaled. Screen filter runs after it.")
+                        .arg(UiText::ChoiceLabel("upscaler", "Fsr4"))
+                        .arg(fsr4.frames);
             }
-            upscaler_tooltip =
-                tr("%1 (%2) active — %3 frames upscaled. Screen filter runs after it.")
-                    .arg(UiText::ChoiceLabel("upscaler", "Dlss"),
-                         dlss.version.empty() ? QStringLiteral("Streamline")
-                                              : QString::fromStdString(dlss.version))
-                    .arg(dlss.frames);
+            break;
+        }
+#endif
+        default:
+            break;
         }
     }
-#endif
-#if defined(_WIN32) || defined(__linux__)
-    if (upscaler_text.isEmpty() && Settings::AmdFsr4Chosen()) {
-        const auto fsr4 = Vulkan::FfxRuntime::GetSessionStatus();
-        if (fsr4.available && fsr4.frames > 0) {
-            const QString ver = QString::fromStdString(fsr4.version);
-            upscaler_text = ver.startsWith(QStringLiteral("4."))
-                                ? QStringLiteral("FSR %1").arg(ver)
-                                : QStringLiteral("FSR 4");
-            upscaler_tooltip = tr("%1 active — %2 frames upscaled. Screen filter runs after it.")
-                                   .arg(UiText::ChoiceLabel("upscaler", "Fsr4"))
-                                   .arg(fsr4.frames);
+    if (upscaler_text.isEmpty()) {
+        if (upscaler_status_label->isVisible()) {
+            upscaler_status_label->clear();
+            upscaler_status_label->setToolTip(QString{});
+            upscaler_status_label->setVisible(false);
+        }
+    } else {
+        if (upscaler_status_label->text() != upscaler_text) {
+            upscaler_status_label->setText(upscaler_text);
+        }
+        upscaler_status_label->setToolTip(upscaler_tooltip);
+        if (!upscaler_status_label->isVisible()) {
+            upscaler_status_label->setVisible(true);
         }
     }
-#endif
-    upscaler_status_label->setText(upscaler_text);
-    upscaler_status_label->setToolTip(upscaler_tooltip);
-    upscaler_status_label->setVisible(!upscaler_text.isEmpty());
 
     if (Settings::values.use_speed_limit.GetValue()) {
         emu_speed_label->setText(tr("Speed: %1% / %2%")
@@ -5947,8 +5968,8 @@ void MainWindow::UpdateStatusBar() {
 
 void MainWindow::UpdateGPUAccuracyButton() {
     const auto gpu_accuracy = Settings::values.gpu_accuracy.GetValue();
-    const auto gpu_accuracy_text =
-        UiText::ChoiceNames<Settings::GpuAccuracy>().find(gpu_accuracy)->second;
+    const auto gpu_accuracy_text = UiText::ChoiceLabel(
+        Settings::EnumMetadata<Settings::GpuAccuracy>::Index(), static_cast<u32>(gpu_accuracy));
     gpu_accuracy_button->setText(gpu_accuracy_text.toUpper());
     gpu_accuracy_button->setChecked(gpu_accuracy != Settings::GpuAccuracy::Low);
 }

@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/assert.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -260,6 +262,30 @@ struct GPU::Impl {
     void NotifyShutdown() {
         // Stops the GPU thread and the split's back (GpuSplit::Stop): no TickWork runs after it.
         gpu_thread.NotifyShutdown();
+        due_composites.Stop();
+        // Host1x outlives GPU in System::Shutdown: cancel any unreached composite fence actions
+        // (and wait for any in-flight one) before this Impl or renderer goes away.
+        boost::container::small_vector<
+            std::pair<u32, Host1x::SyncpointManager::ActionHandle>, 16>
+            pending_swap_handles;
+        {
+            std::scoped_lock swap_lock{request_swap_mutex};
+            swap_requests_stopped = true;
+            for (auto& req : swap_requests) {
+                for (const auto& entry : req.handles) {
+                    pending_swap_handles.push_back(entry);
+                }
+                req.handles.clear();
+                req.layers.clear();
+                req.pending_fences = 0;
+            }
+        }
+        if (!pending_swap_handles.empty()) {
+            auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
+            for (const auto& [id, handle] : pending_swap_handles) {
+                syncpoint_manager.DeregisterGuestAction(id, handle);
+            }
+        }
         {
             // The GPU threads stopped: no sync operation runs anymore. Guest threads still run
             // until the kernel suspends them, and one waiting for a read's flush (OnCPURead)
@@ -402,56 +428,91 @@ struct GPU::Impl {
     }
 
     void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers, std::vector<Service::Nvidia::NvFence>&& fences) {
-        const size_t num_fences{fences.size()};
-        size_t current_request_counter{};
-        if (num_fences != 0) {
-            std::unique_lock<std::mutex> lk(request_swap_mutex);
-            if (free_swap_counters.empty()) {
-                current_request_counter = request_swap_counters.size();
-                request_swap_counters.emplace_back(num_fences);
-            } else {
-                current_request_counter = free_swap_counters.front();
-                request_swap_counters[current_request_counter] = num_fences;
-                free_swap_counters.pop_front();
-            }
+        if (fences.empty()) {
+            pending_composite_fence = RequestSyncOperation(
+                [this, composite_layers = std::move(layers)]() mutable {
+                    CompositeOnOwner(std::move(composite_layers));
+                });
+            gpu_thread.TickGPU(is_async);
+            return;
         }
         pending_composite_fence = RequestSyncOperation(
-            [this, current_request_counter, num_fences, composite_layers = std::move(layers),
-             composite_fences = std::move(fences)] {
-                if (num_fences == 0) {
-                    CompositeOnOwner(composite_layers);
-                    return;
+            [this, composite_layers = std::move(layers),
+             composite_fences = std::move(fences)]() mutable {
+                const size_t num_fences = composite_fences.size();
+                u32 slot{};
+                u32 gen{};
+                {
+                    std::scoped_lock lk{request_swap_mutex};
+                    if (swap_requests_stopped) {
+                        return;
+                    }
+                    if (free_swap_counters.empty()) {
+                        slot = static_cast<u32>(swap_requests.size());
+                        swap_requests.emplace_back();
+                    } else {
+                        slot = free_swap_counters.front();
+                        free_swap_counters.pop_front();
+                    }
+                    auto& req = swap_requests[slot];
+                    gen = ++req.generation;
+                    req.pending_fences = num_fences;
+                    req.layers = std::move(composite_layers);
+                    req.handles.clear();
                 }
                 auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
-                const auto executer = [this, current_request_counter, composite_layers]() {
-                    {
-                        std::unique_lock<std::mutex> lk(request_swap_mutex);
-                        if (--request_swap_counters[current_request_counter] != 0) {
-                            return;
-                        }
-                        free_swap_counters.push_back(current_request_counter);
-                    }
-                    CompositeOnOwner(composite_layers);
-                };
                 for (size_t i = 0; i < num_fences; i++) {
-                    syncpoint_manager.RegisterGuestAction(composite_fences[i].id,
-                                                          composite_fences[i].value, executer);
+                    const u32 id = static_cast<u32>(composite_fences[i].id);
+                    const auto handle = syncpoint_manager.RegisterGuestAction(
+                        id, composite_fences[i].value,
+                        [this, slot, gen] { OnSwapFenceSignaled(slot, gen); });
+                    if (handle != 0) {
+                        std::scoped_lock lk{request_swap_mutex};
+                        auto& req = swap_requests[slot];
+                        if (!swap_requests_stopped && req.generation == gen &&
+                            req.pending_fences != 0) {
+                            req.handles.emplace_back(id, handle);
+                        }
+                    }
                 }
             });
         gpu_thread.TickGPU(is_async);
     }
 
+    void OnSwapFenceSignaled(u32 slot, u32 gen) {
+        VideoCommon::DueComposites::Layers ready_layers;
+        {
+            std::scoped_lock lk{request_swap_mutex};
+            auto& req = swap_requests[slot];
+            if (swap_requests_stopped || req.generation != gen || req.pending_fences == 0) {
+                return;
+            }
+            if (--req.pending_fences != 0) {
+                return;
+            }
+            ready_layers = std::move(req.layers);
+            req.handles.clear();
+            free_swap_counters.push_back(slot);
+        }
+        CompositeOnOwner(std::move(ready_layers));
+    }
+
     /// A present whose fences were all reached, on the thread that reached the last one. Every
     /// present goes through due_composites, so none overtakes one queued for the owner.
-    void CompositeOnOwner(const VideoCommon::DueComposites::Layers& layers) {
+    void CompositeOnOwner(VideoCommon::DueComposites::Layers&& layers) {
         const auto composite = [this](const VideoCommon::DueComposites::Layers& due_layers) {
             renderer->Composite(due_layers);
         };
         // A fence another thread reached waits for the owner's next tick. That thread may be one
         // the GPU threads wait for, so it doesn't wait.
         due_composites.Reached(
-            layers, VideoCommon::GpuSplit::OwnsScheduler(), composite, [this, composite] {
-                (void)RequestSyncOperation([this, composite] { due_composites.Run(composite); });
+            std::move(layers), VideoCommon::GpuSplit::OwnsScheduler(), composite, [this] {
+                (void)RequestSyncOperation([this] {
+                    due_composites.Run(
+                        [this](const VideoCommon::DueComposites::Layers& due_layers) {
+                            renderer->Composite(due_layers);
+                        });
+                });
                 gpu_thread.TickGPU(true);
             });
     }
@@ -527,9 +588,18 @@ struct GPU::Impl {
     Tegra::Control::ChannelState* current_channel;
     s32 bound_channel{-1};
 
-    std::deque<size_t> free_swap_counters;
-    std::deque<size_t> request_swap_counters;
+    struct SwapRequest {
+        size_t pending_fences{};
+        u32 generation{};
+        VideoCommon::DueComposites::Layers layers;
+        boost::container::small_vector<
+            std::pair<u32, Host1x::SyncpointManager::ActionHandle>, 4>
+            handles;
+    };
+    std::deque<u32> free_swap_counters;
+    std::deque<SwapRequest> swap_requests;
     std::mutex request_swap_mutex;
+    bool swap_requests_stopped{};
     VideoCommon::DueComposites due_composites;
     u64 pending_composite_fence{};
 };

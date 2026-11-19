@@ -443,8 +443,9 @@ CodePtr AddressSpace::Emit(IR::Block block) {
     UnprotectCodeMemory();
 
     EmitConfig emit_conf = GetEmitConfig();
-    if (!emit_conf.inline_cntpct && emit_conf.emit_terminal == EmitA64Terminal &&
-        prelude_info.exclusive_read_memory_8 != nullptr) {
+    // Forward UserConfig::inline_cntpct from A64AddressSpace's prelude trampoline literal (&conf).
+    if (!emit_conf.inline_cntpct && emit_conf.wall_clock_cntpct &&
+        emit_conf.emit_terminal == EmitA64Terminal && prelude_info.exclusive_read_memory_8 != nullptr) {
         const auto* tramp = static_cast<const u32*>(prelude_info.exclusive_read_memory_8);
         if ((tramp[0] & 0xFF00001FU) == 0x58000000U) {
             const std::size_t byte_off = ((tramp[0] >> 5) & 0x7FFFFU) * sizeof(u32);

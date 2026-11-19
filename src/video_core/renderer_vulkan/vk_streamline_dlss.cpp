@@ -21,6 +21,7 @@
 #include "video_core/dlss_mode.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
+#include "video_core/renderer_vulkan/vk_upscaler_common.h"
 #include "video_core/vulkan_common/streamline.h"
 #include "video_core/vulkan_common/streamline_api.h"
 #include "video_core/vulkan_common/streamline_frame_gen.h"
@@ -29,12 +30,6 @@
 
 namespace Vulkan {
 namespace {
-
-constexpr VkFormat OUTPUT_FORMAT = VK_FORMAT_R16G16B16A16_SFLOAT;
-// Streamline clears the output before DLSS writes it.
-constexpr VkImageUsageFlags OUTPUT_USAGE = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                           VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
 // slEvaluateFeature returns eWarnOutOfVRAM after it has evaluated DLSS, when the VRAM budget is
 // used up (commonInterface.cpp, slEvaluateFeatureInternal). The output is written; it is a warning.
@@ -145,25 +140,6 @@ sl::float4x4 Identity() {
     matrix.setRow(2, {0.0f, 0.0f, 1.0f, 0.0f});
     matrix.setRow(3, {0.0f, 0.0f, 0.0f, 1.0f});
     return matrix;
-}
-
-VkImageMemoryBarrier Barrier(const StreamlineDlssUpscaler::Image& image, VkAccessFlags src_access,
-                             VkAccessFlags dst_access, VkImageLayout old_layout,
-                             VkImageLayout new_layout) {
-    VkImageSubresourceRange range = image.range;
-    range.aspectMask = image.barrier_aspect;
-    return VkImageMemoryBarrier{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = src_access,
-        .dstAccessMask = dst_access,
-        .oldLayout = old_layout,
-        .newLayout = new_layout,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = image.image,
-        .subresourceRange = range,
-    };
 }
 
 using Matrix4 = std::array<std::array<f64, 4>, 4>;
@@ -427,30 +403,8 @@ StreamlineDlssUpscaler::StreamlineDlssUpscaler(const Device& device_, Scheduler&
     void(Streamline::GetApi().get_feature_function(sl::kFeatureDLSS, "slDLSSGetState", get_state));
     void(Streamline::GetApi().get_feature_function(sl::kFeatureDLSS, "slDLSSGetOptimalSettings",
                                                    get_optimal_settings));
-    VkSamplerCreateInfo sampler_info{
-        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .magFilter = VK_FILTER_NEAREST,
-        .minFilter = VK_FILTER_NEAREST,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .mipLodBias = 0.0f,
-        .anisotropyEnable = VK_FALSE,
-        .maxAnisotropy = 1.0f,
-        .compareEnable = VK_FALSE,
-        .compareOp = VK_COMPARE_OP_NEVER,
-        .minLod = 0.0f,
-        .maxLod = VK_LOD_CLAMP_NONE,
-        .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
-        .unnormalizedCoordinates = VK_FALSE,
-    };
-    point_sampler = device.GetLogical().CreateSampler(sampler_info);
-    sampler_info.magFilter = VK_FILTER_LINEAR;
-    sampler_info.minFilter = VK_FILTER_LINEAR;
-    linear_sampler = device.GetLogical().CreateSampler(sampler_info);
+    point_sampler = CreateUpscalerSampler(device, VK_FILTER_NEAREST);
+    linear_sampler = CreateUpscalerSampler(device, VK_FILTER_LINEAR);
 }
 
 StreamlineDlssUpscaler::~StreamlineDlssUpscaler() {
@@ -464,66 +418,8 @@ StreamlineDlssUpscaler::~StreamlineDlssUpscaler() {
 }
 
 void StreamlineDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {
-    if (output_image) {
-        scheduler.Finish(); // the old output may still be in use
-    }
-    const MemoryTagScope memory_tag{MemoryTag::Upscaler};
-    output_image = memory_allocator.CreateImage(VkImageCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .imageType = VK_IMAGE_TYPE_2D,
-        .format = OUTPUT_FORMAT,
-        .extent = {upscale_size.width, upscale_size.height, 1},
-        .mipLevels = 1,
-        .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = OUTPUT_USAGE,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .queueFamilyIndexCount = 0,
-        .pQueueFamilyIndices = nullptr,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-    });
-    output_view = device.GetLogical().CreateImageView(VkImageViewCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .image = *output_image,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = OUTPUT_FORMAT,
-        .components{},
-        .subresourceRange{
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        },
-    });
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([image = *output_image](vk::CommandBuffer cmdbuf) {
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                               VkImageMemoryBarrier{
-                                   .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                                   .pNext = nullptr,
-                                   .srcAccessMask = 0,
-                                   .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                                   .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                                   .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                   .image = image,
-                                   .subresourceRange{
-                                       .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                                       .baseMipLevel = 0,
-                                       .levelCount = 1,
-                                       .baseArrayLayer = 0,
-                                       .layerCount = 1,
-                                   },
-                               });
-    });
+    CreateUpscalerOutput(device, memory_allocator, scheduler, upscale_size, output_image,
+                         output_view);
 }
 
 bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
@@ -620,51 +516,28 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
         // The caller draws the output this frame even when DLSS writes nothing to it: clear it
         // then, rather than show undefined contents (FSR 3.1 takes over from the next frame).
         const auto clear_output = [&] {
-            const VkImageSubresourceRange range{
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            };
-            const auto barrier = [&](VkAccessFlags src_access, VkAccessFlags dst_access) {
-                return VkImageMemoryBarrier{
-                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    .pNext = nullptr,
-                    .srcAccessMask = src_access,
-                    .dstAccessMask = dst_access,
-                    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .image = output_image_handle,
-                    .subresourceRange = range,
-                };
-            };
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                                   barrier(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                                           VK_ACCESS_TRANSFER_WRITE_BIT));
+            cmdbuf.PipelineBarrier(
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                MakeUpscalerImageBarrier(output_image_handle, UPSCALER_COLOR_RANGE,
+                                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                                         VK_IMAGE_LAYOUT_GENERAL));
             cmdbuf.ClearColorImage(output_image_handle, VK_IMAGE_LAYOUT_GENERAL,
-                                   VkClearColorValue{}, range);
+                                   VkClearColorValue{}, UPSCALER_COLOR_RANGE);
             cmdbuf.PipelineBarrier(
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
-                barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT));
+                MakeUpscalerImageBarrier(output_image_handle, UPSCALER_COLOR_RANGE,
+                                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL));
         };
         sl::FrameToken* frame{};
 
-        constexpr VkAccessFlags WRITES =
-            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         // The inputs come from the game's draws and dispatches and stay in GENERAL otherwise;
         // DLSS reads them as sampled images.
         boost::container::static_vector<VkImageMemoryBarrier, 4> to_read{
-            Barrier(in.color, WRITES, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
-            Barrier(in.depth, WRITES, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
-            Barrier(in.motion_vectors, WRITES, VK_ACCESS_SHADER_READ_BIT,
-                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
+            MakeUpscalerInputToReadBarrier(in.color),
+            MakeUpscalerInputToReadBarrier(in.depth),
+            MakeUpscalerInputToReadBarrier(in.motion_vectors),
         };
 
         sl::Resource color = Resource(in.color.image, in.color.view, in.color.format,
@@ -678,8 +551,9 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                                        in.motion_vectors.format,
                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
                                        VK_IMAGE_USAGE_SAMPLED_BIT);
-        sl::Resource output = Resource(output_image_handle, output_view_handle, OUTPUT_FORMAT,
-                                       VK_IMAGE_LAYOUT_GENERAL, in.upscale_size, OUTPUT_USAGE);
+        sl::Resource output =
+            Resource(output_image_handle, output_view_handle, UPSCALER_OUTPUT_FORMAT,
+                     VK_IMAGE_LAYOUT_GENERAL, in.upscale_size, UPSCALER_OUTPUT_USAGE);
         const sl::Extent render_area{0, 0, in.render_size.width, in.render_size.height};
         const sl::Extent output_area{0, 0, in.upscale_size.width, in.upscale_size.height};
         // Local tags: everything stays put until the evaluation is recorded.
@@ -694,12 +568,9 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
         boost::container::static_vector<const sl::BaseStructure*, 6> inputs{
             &viewport, &color_tag, &depth_tag, &motion_tag, &output_tag};
         boost::container::static_vector<VkImageMemoryBarrier, 4> to_general{
-            Barrier(in.color, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
-            Barrier(in.depth, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
-            Barrier(in.motion_vectors, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
+            MakeUpscalerInputToGeneralBarrier(in.color),
+            MakeUpscalerInputToGeneralBarrier(in.depth),
+            MakeUpscalerInputToGeneralBarrier(in.motion_vectors),
         };
         std::optional<sl::Resource> bias;
         std::optional<sl::ResourceTag> bias_tag;
@@ -711,13 +582,8 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             bias_tag.emplace(&*bias, sl::kBufferTypeBiasCurrentColorHint,
                              sl::ResourceLifecycle::eValidUntilEvaluate, &render_area);
             inputs.push_back(&*bias_tag);
-            to_read.push_back(Barrier(image, WRITES, VK_ACCESS_SHADER_READ_BIT,
-                                      VK_IMAGE_LAYOUT_GENERAL,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
-            to_general.push_back(Barrier(image, VK_ACCESS_SHADER_READ_BIT,
-                                         VK_ACCESS_SHADER_READ_BIT | WRITES,
-                                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                         VK_IMAGE_LAYOUT_GENERAL));
+            to_read.push_back(MakeUpscalerInputToReadBarrier(image));
+            to_general.push_back(MakeUpscalerInputToGeneralBarrier(image));
         }
         const VkMemoryBarrier output_written{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,

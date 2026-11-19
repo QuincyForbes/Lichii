@@ -11,14 +11,16 @@
 
 namespace VideoCommon {
 
+inline constexpr u32 AmdVendorId = 0x1002;
+
 /// Whether a GPU is one AMD's FSR 4 runtime supports: Radeon RX 6000, 7000 and 9000 (and the
 /// matching Radeon PRO W cards), and the RDNA 3/3.5 integrated GPUs of Ryzen and Ryzen AI
 /// processors, on AMD's own Windows driver. Told apart by the Vulkan device name, which AMD's driver
 /// reports as for example "AMD Radeon RX 9070 XT" or "AMD Radeon(TM) 890M Graphics". AMD's runtime
 /// still decides at run time, so a wrong guess only shows or hides the option.
-constexpr bool IsFsr4CapableGpu(u32 vendor_id, bool amd_driver, std::string_view name) {
-    constexpr u32 amd_vendor = 0x1002;
-    if (vendor_id != amd_vendor || !amd_driver) {
+[[nodiscard]] constexpr bool IsFsr4CapableGpu(u32 vendor_id, bool amd_driver,
+                                              std::string_view name) {
+    if (vendor_id != AmdVendorId || !amd_driver) {
         return false;
     }
     const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
@@ -94,7 +96,7 @@ struct Fsr4PortSupport {
 };
 
 /// RDNA 2 GPUs and APUs by PCI device ID, as fsr4-vk tells them apart (runtime/resources.hpp).
-constexpr bool IsAmdRdna2DeviceId(u32 device_id) {
+[[nodiscard]] constexpr bool IsAmdRdna2DeviceId(u32 device_id) {
     return (device_id >= 0x73a0 && device_id <= 0x73ff) ||
            (device_id >= 0x7420 && device_id <= 0x743f) || device_id == 0x1506 ||
            device_id == 0x163f || device_id == 0x164e || device_id == 0x1681;
@@ -102,13 +104,13 @@ constexpr bool IsAmdRdna2DeviceId(u32 device_id) {
 
 /// Whether fsr4-vk runs on a GPU: an RDNA 2 or newer Radeon on RADV. CheckFsr4Port also checks
 /// the device's features.
-constexpr bool IsFsr4PortGpu(u32 vendor_id, u32 device_id, bool radv, bool mixed_dot4_accelerated) {
-    constexpr u32 amd_vendor = 0x1002;
-    return vendor_id == amd_vendor && radv &&
+[[nodiscard]] constexpr bool IsFsr4PortGpu(u32 vendor_id, u32 device_id, bool radv,
+                                           bool mixed_dot4_accelerated) {
+    return vendor_id == AmdVendorId && radv &&
            (mixed_dot4_accelerated || IsAmdRdna2DeviceId(device_id));
 }
 
-constexpr Fsr4PortSupport CheckFsr4Port(const Fsr4PortDevice& device) {
+[[nodiscard]] constexpr Fsr4PortSupport CheckFsr4Port(const Fsr4PortDevice& device) {
     if (!IsFsr4PortGpu(device.vendor_id, device.device_id, device.radv,
                        device.mixed_dot4_accelerated)) {
         return {std::nullopt, "needs an RDNA 2 or newer Radeon on Mesa's RADV driver"};

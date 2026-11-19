@@ -165,7 +165,7 @@ void LogHostWait(s64 now) {
     const auto wake = percentiles(w.wake_late);
     const auto event = percentiles(w.event_late);
     const auto one_shot = percentiles(w.one_shot_late);
-    const f64 seconds = static_cast<f64>(now - w.start) / 1e9;
+    const f64 seconds = (std::max)(1e-9, static_cast<f64>(now - w.start) / 1e9);
     const std::optional<u64> cpu = Common::CurrentThreadCpuTimeNs();
     const s64 override_ns = HostWaitMarginOverrideNs();
     const s64 reported_margin_us =
@@ -414,6 +414,7 @@ void CoreTiming::WaitForEvent(s64 next_time, void* hires_timer) {
 void CoreTiming::ClearPendingEvents() {
     std::scoped_lock lock{advance_lock, basic_lock};
     event_queue.clear();
+    t_next_one_shot_time.reset();
     armed_wait_time = (std::numeric_limits<s64>::max)();
     if (is_multicore) {
         Wake();
@@ -440,8 +441,9 @@ void CoreTiming::SyncPause(bool is_paused) {
             pause_event.Set();
         }
         Wake();
-        while (paused_set != is_paused)
-            ;
+        while (paused_set != is_paused) {
+            PauseHint();
+        }
     }
 
     if (!is_paused) {
@@ -460,29 +462,7 @@ bool CoreTiming::HasPendingEvents() const {
 
 void CoreTiming::ScheduleEvent(std::chrono::nanoseconds ns_into_future,
                                const std::shared_ptr<EventType>& event_type, bool absolute_time) {
-    bool should_wake = false;
-    {
-        std::scoped_lock scope{basic_lock};
-        const s64 target_time =
-            (absolute_time ? ns_into_future : GetGlobalTimeNs() + ns_into_future).count();
-        const bool was_empty = event_queue.empty();
-        const s64 prev_head =
-            was_empty ? (std::numeric_limits<s64>::max)() : event_queue.front().time;
-
-        event_queue.push_back(
-            Event{target_time, event_fifo_id++, event_type.get(), event_type, 0});
-        std::push_heap(event_queue.begin(), event_queue.end(), std::greater<>{});
-
-        if (is_multicore &&
-            (was_empty || target_time < prev_head || target_time < armed_wait_time)) {
-            armed_wait_time = (std::min)(armed_wait_time, target_time);
-            should_wake = true;
-        }
-    }
-
-    if (should_wake) {
-        Wake();
-    }
+    ScheduleLoopingEvent(ns_into_future, std::chrono::nanoseconds{0}, event_type, absolute_time);
 }
 
 void CoreTiming::RescheduleEvent(std::chrono::nanoseconds ns_into_future,

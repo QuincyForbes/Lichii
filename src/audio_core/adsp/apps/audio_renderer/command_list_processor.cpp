@@ -62,9 +62,9 @@ u64 CommandListProcessor::Process(u32 session_id) {
     for (u32 index = 0; index < command_count; index++) {
         auto& command{*reinterpret_cast<Renderer::ICommand*>(commands)};
 
-        if (command.magic != 0xCAFEBABE) {
-            LOG_ERROR(Service_Audio, "Command has invalid magic! Expected 0xCAFEBABE, got {:08X}",
-                      command.magic);
+        if (command.magic != Renderer::CommandMagic) {
+            LOG_ERROR(Service_Audio, "Command has invalid magic! Expected {:08X}, got {:08X}",
+                      Renderer::CommandMagic, command.magic);
             return system->CoreTiming().GetGlobalTimeUs().count() - start_time_;
         }
 

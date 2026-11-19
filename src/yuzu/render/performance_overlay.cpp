@@ -18,7 +18,7 @@
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
 #include "video_core/vulkan_common/ffx_runtime.h"
 #endif
 
@@ -234,54 +234,58 @@ const QColor BuildingColor{255, 214, 10};
 
 // What draws the picture, by the names Settings gives it.
 QString UpscalerLabel() {
-    if (Settings::values.upscaler.GetValue() == Settings::Upscaler::MetalFx) {
-        return UiText::ChoiceLabel(Settings::EnumMetadata<Settings::Upscaler>::Index(),
-                                   static_cast<u32>(Settings::Upscaler::MetalFx));
-    }
-    if (Settings::GameDlssNetworkChosen()) {
+    const u32 upscaler_enum = Settings::EnumMetadata<Settings::Upscaler>::Index();
+    switch (Settings::values.upscaler.GetValue()) {
+    case Settings::Upscaler::MetalFx:
+        return UiText::ChoiceLabel(upscaler_enum, static_cast<u32>(Settings::Upscaler::MetalFx));
+    case Settings::Upscaler::Game:
         return UiText::Text("overlay.game_dlss");
-    }
-    if (Settings::NvidiaDlssChosen()) {
+    case Settings::Upscaler::Dlss: {
         const QString dlss_name =
-            UiText::ChoiceLabel(Settings::EnumMetadata<Settings::Upscaler>::Index(),
-                                static_cast<u32>(Settings::Upscaler::Dlss));
+            UiText::ChoiceLabel(upscaler_enum, static_cast<u32>(Settings::Upscaler::Dlss));
 #ifdef EGLANTINE_STREAMLINE
-        // What NVIDIA DLSS does in this game, not just the setting.
-        const auto dlss = Vulkan::Streamline::GetSessionStatus();
-        if (dlss.available && dlss.frames > 0) {
-            QString label = dlss_name;
-            if (!dlss.mode_name.empty()) {
-                label += QLatin1Char(' ') + QString::fromStdString(dlss.mode_name);
+        if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan) {
+            // What NVIDIA DLSS does in this game, not just the setting.
+            const auto dlss = Vulkan::Streamline::GetSessionStatus();
+            if (dlss.available && dlss.frames > 0) {
+                QString label = dlss_name;
+                if (!dlss.mode_name.empty()) {
+                    label += QLatin1Char(' ') + QString::fromStdString(dlss.mode_name);
+                }
+                if (!dlss.preset_name.empty()) {
+                    label += QLatin1Char(' ') + QString::fromStdString(dlss.preset_name);
+                }
+                return label;
             }
-            if (!dlss.preset_name.empty()) {
-                label += QLatin1Char(' ') + QString::fromStdString(dlss.preset_name);
-            }
-            return label;
+            return dlss.available ? UiText::Text("overlay.dlss_idle").arg(dlss_name)
+                                  : UiText::Text("overlay.dlss_off").arg(dlss_name);
         }
-        return dlss.available ? UiText::Text("overlay.dlss_idle").arg(dlss_name)
-                              : UiText::Text("overlay.dlss_off").arg(dlss_name);
+        return UiText::Text("overlay.dlss_off").arg(dlss_name);
 #else
         return dlss_name;
 #endif
     }
-    if (Settings::AmdFsr4Chosen()) {
+    case Settings::Upscaler::Fsr4: {
         const QString fsr4_name =
-            UiText::ChoiceLabel(Settings::EnumMetadata<Settings::Upscaler>::Index(),
-                                static_cast<u32>(Settings::Upscaler::Fsr4));
-#if defined(_WIN32) || defined(__linux__)
-        const auto fsr4 = Vulkan::FfxRuntime::GetSessionStatus();
-        if (fsr4.available && fsr4.frames > 0) {
-            return fsr4_name;
+            UiText::ChoiceLabel(upscaler_enum, static_cast<u32>(Settings::Upscaler::Fsr4));
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
+        if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan) {
+            const auto fsr4 = Vulkan::FfxRuntime::GetSessionStatus();
+            if (fsr4.available && fsr4.frames > 0) {
+                return fsr4_name;
+            }
+            return fsr4.available ? UiText::Text("overlay.dlss_idle").arg(fsr4_name)
+                                  : UiText::Text("overlay.dlss_off").arg(fsr4_name);
         }
-        return fsr4.available ? UiText::Text("overlay.dlss_idle").arg(fsr4_name)
-                              : UiText::Text("overlay.dlss_off").arg(fsr4_name);
+        return UiText::Text("overlay.dlss_off").arg(fsr4_name);
 #else
         return fsr4_name;
 #endif
     }
-    if (Settings::values.upscaler.GetValue() == Settings::Upscaler::Fsr3) {
-        return UiText::ChoiceLabel(Settings::EnumMetadata<Settings::Upscaler>::Index(),
-                                   static_cast<u32>(Settings::Upscaler::Fsr3));
+    case Settings::Upscaler::Fsr3:
+        return UiText::ChoiceLabel(upscaler_enum, static_cast<u32>(Settings::Upscaler::Fsr3));
+    case Settings::Upscaler::Auto:
+        break;
     }
     return UiText::ChoiceLabel(Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
                                static_cast<u32>(Settings::values.scaling_filter.GetValue()));
@@ -412,13 +416,21 @@ QLabel* PerformanceOverlay::addLine(QFrame* card) {
 }
 
 void PerformanceOverlay::setLine(QLabel* line, const QString& text, const QColor& color) {
-    line->setVisible(!text.isEmpty());
-    if (text.isEmpty()) {
+    const bool visible = !text.isEmpty();
+    if (line->isVisible() != visible) {
+        line->setVisible(visible);
+    }
+    if (!visible) {
         return;
     }
-    line->setText(text);
-    line->setStyleSheet(color.isValid() ? QStringLiteral("color: %1;").arg(color.name())
-                                        : QString());
+    if (line->text() != text) {
+        line->setText(text);
+    }
+    const QString style = color.isValid() ? QStringLiteral("color: %1;").arg(color.name())
+                                          : QString();
+    if (line->styleSheet() != style) {
+        line->setStyleSheet(style);
+    }
 }
 
 void PerformanceOverlay::resetPosition(const QPoint& _) {
@@ -541,7 +553,8 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
                           : UiText::Text("overlay.screen").arg(screen_size));
     setLine(m_gpuAccuracy,
             UiText::Text("overlay.gpu_accuracy")
-                .arg(UiText::ChoiceNames<Settings::GpuAccuracy>()[Settings::values.current_gpu_accuracy]));
+                .arg(UiText::ChoiceLabel(Settings::EnumMetadata<Settings::GpuAccuracy>::Index(),
+                                         static_cast<u32>(Settings::values.current_gpu_accuracy))));
 
     double ram_used = -1.0;
     double ram_free = -1.0;

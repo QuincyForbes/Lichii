@@ -598,6 +598,13 @@ Id EmitContext::BarrierSemantics(spv::MemorySemanticsMask semantics) {
     return Const(static_cast<u32>(semantics));
 }
 
+void EmitContext::AddContinuationLabel(Id label) {
+    AddLabel(label);
+    if (current_block != nullptr) {
+        block_exit_labels.insert_or_assign(current_block, label);
+    }
+}
+
 void EmitContext::DefineCommonTypes(const Info& info) {
     void_id = TypeVoid();
 
@@ -839,7 +846,8 @@ void EmitContext::DefineAttributeMemAccess(const Info& info) {
             const auto& generic{input_generics.at(index)};
             const Id generic_id{generic.id};
             if (!ValidId(generic_id)) {
-                OpReturnValue(Const(0.0f));
+                OpReturnValue(OpSelect(F32[1], OpIEqual(U1, masked_index, Const(3U)), Const(1.0f),
+                                       f32_zero_value));
                 ++label_index;
                 continue;
             }
@@ -847,18 +855,20 @@ void EmitContext::DefineAttributeMemAccess(const Info& info) {
                 is_array ? OpAccessChain(generic.pointer_type, generic_id, vertex, masked_index)
                          : OpAccessChain(generic.pointer_type, generic_id, masked_index)};
             const Id value{OpLoad(generic.component_type, pointer)};
-            const Id result{[this, generic, value]() {
-                switch (generic.load_op) {
-                case InputGenericLoadOp::Bitcast:
-                    return OpBitcast(F32[1], value);
-                case InputGenericLoadOp::SToF:
-                    return OpConvertSToF(F32[1], value);
-                case InputGenericLoadOp::UToF:
-                    return OpConvertUToF(F32[1], value);
-                default:
-                    return value;
-                };
-            }()};
+            Id result{value};
+            switch (generic.load_op) {
+            case InputGenericLoadOp::Bitcast:
+                result = OpBitcast(F32[1], value);
+                break;
+            case InputGenericLoadOp::SToF:
+                result = OpConvertSToF(F32[1], value);
+                break;
+            case InputGenericLoadOp::UToF:
+                result = OpConvertUToF(F32[1], value);
+                break;
+            default:
+                break;
+            }
             OpReturnValue(result);
             ++label_index;
         }
@@ -1036,8 +1046,8 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     if (!info.uses_global_memory || !profile.support_int64) {
         return;
     }
-    // The storage buffer descriptors the functions being defined route among, and those functions
-    std::span<const u32> buffers;
+    // The routable storage buffer descriptors for the current route, and its defined functions
+    std::vector<u32> candidates;
     GlobalMemoryFunctions* functions{};
     using DefPtr = Id StorageDefinitions::*;
     static const spv::FunctionControlMask function_control = [] {
@@ -1055,6 +1065,10 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         profile.select_global_memory_buffer ? spv::FunctionControlMask::MaskNone : function_control};
     const spv::FunctionControlMask load_control{
         inline_mesh_loads ? spv::FunctionControlMask::Inline : helper_control};
+    const auto is_routable{[&](u32 desc_index) {
+        return info.native_global_bounds ||
+               UsesNvnStorageDescriptor(info, info.storage_buffers_descriptors[desc_index]);
+    }};
     const auto element{[&](Id pointer_type, Id ssbo, Id elem_index) {
         const Id pointer{OpAccessChain(pointer_type, ssbo, zero, elem_index)};
         if (non_uniform_ids.contains(ssbo.value)) {
@@ -1063,9 +1077,12 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         }
         return pointer;
     }};
+    const auto word_element{[&](Id ssbo_id, Id word_index, u32 i) {
+        const Id elem_index{i == 0 ? word_index : OpIAdd(U32[1], word_index, Const(i))};
+        return element(storage_types.U32.element, ssbo_id, elem_index);
+    }};
     enum class Routing { Load, Write, PerBuffer };
     struct Route {
-        std::vector<u32> candidates;
         Id route;
         Id route_base;
     };
@@ -1114,13 +1131,11 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                 U32[2], load_word(word_index), load_word(OpIAdd(U32[1], word_index, Const(1U))))};
             return OpBitwiseAnd(U64, OpBitcast(U64, pointer_words), Constant(U64, ssbo_align_mask));
         }};
-        std::vector<u32> candidates;
-        std::vector<Id> bases;
         Id route{Const(~0U)};
         Id route_base{Constant(U64, u64{0})};
         if (info.native_global_bounds) {
             Id best_distance{Constant(U64, ~u64{0})};
-            for (const u32 desc_index : buffers) {
+            for (const u32 desc_index : candidates) {
                 const Id base{base_address(desc_index)};
                 const Id distance{OpISub(U64, search_addr, base)};
                 const Id better{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, search_addr, base),
@@ -1128,31 +1143,26 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                 best_distance = OpSelect(U64, better, distance, best_distance);
                 route = OpSelect(U32[1], better, Const(desc_index), route);
                 route_base = OpSelect(U64, better, base, route_base);
-                candidates.push_back(desc_index);
-                bases.push_back(base);
             }
         } else {
-            std::vector<Id> holds;
-            for (const u32 desc_index : buffers) {
-                if (!UsesNvnStorageDescriptor(info, info.storage_buffers_descriptors[desc_index])) {
-                    continue;
-                }
+            std::vector<std::pair<Id, Id>> holds;
+            holds.reserve(candidates.size());
+            for (const u32 desc_index : candidates) {
                 const auto& ssbo{info.storage_buffers_descriptors[desc_index]};
                 const Id ssbo_addr{base_address(desc_index)};
                 const Id size{EmitGetCbufU32(*this, IR::Value{ssbo.cbuf_index},
                                              IR::Value{ssbo.cbuf_offset + 8})};
                 const Id ssbo_end{OpIAdd(U64, ssbo_addr, OpUConvert(U64, size))};
-                holds.push_back(OpLogicalAnd(U1, OpUGreaterThanEqual(U1, search_addr, ssbo_addr),
-                                             OpULessThan(U1, search_addr, ssbo_end)));
-                candidates.push_back(desc_index);
-                bases.push_back(ssbo_addr);
+                const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, search_addr, ssbo_addr),
+                                           OpULessThan(U1, search_addr, ssbo_end))};
+                holds.emplace_back(cond, ssbo_addr);
             }
             for (size_t i = holds.size(); i-- > 0;) {
-                route = OpSelect(U32[1], holds[i], Const(candidates[i]), route);
-                route_base = OpSelect(U64, holds[i], bases[i], route_base);
+                route = OpSelect(U32[1], holds[i].first, Const(candidates[i]), route);
+                route_base = OpSelect(U64, holds[i].first, holds[i].second, route_base);
             }
         }
-        return Route{std::move(candidates), route, route_base};
+        return Route{route, route_base};
     }};
     // With select_global_memory_buffer every access searches all bound buffers. NVIDIA compiles
     // that search slowly at each inlined access, so the search is one DontInline function and the
@@ -1164,15 +1174,12 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                                const StorageTypeDefinition& type_def, u32 shift, Id result_type,
                                Id fallback, Routing routing, auto&& callback) -> Id {
         const Id header_label{AddLabel()};
+        if (candidates.empty()) {
+            return fallback;
+        }
         const bool select{routing != Routing::PerBuffer && profile.select_global_memory_buffer};
         Route found_route;
         if (select && ValidId(search_function)) {
-            for (const u32 desc_index : buffers) {
-                if (info.native_global_bounds ||
-                    UsesNvnStorageDescriptor(info, info.storage_buffers_descriptors[desc_index])) {
-                    found_route.candidates.push_back(desc_index);
-                }
-            }
             const Id call_result{OpFunctionCall(U32[3], search_function, body_addr)};
             found_route.route = OpCompositeExtract(U32[1], call_result, 0U);
             found_route.route_base =
@@ -1180,21 +1187,20 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         } else {
             found_route = search(body_addr);
         }
-        const auto& [candidates, route, route_base] = found_route;
+        const auto& [route, route_base] = found_route;
         const bool has_value{result_type.value != void_id.value};
         if (select) {
-            if (candidates.empty()) {
-                return fallback;
-            }
-            AddCapability(spv::Capability::VariablePointersStorageBuffer);
             Id ssbo_id{ssbos[candidates[0]].*ssbo_member};
-            for (size_t i = 0; i < candidates.size(); ++i) {
-                const Id routed{OpIEqual(U1, route, Const(candidates[i]))};
-                ssbo_id = OpSelect(type_def.array, routed, ssbos[candidates[i]].*ssbo_member,
-                                   ssbo_id);
+            if (candidates.size() > 1) {
+                AddCapability(spv::Capability::VariablePointersStorageBuffer);
+                for (size_t i = 1; i < candidates.size(); ++i) {
+                    const Id routed{OpIEqual(U1, route, Const(candidates[i]))};
+                    ssbo_id = OpSelect(type_def.array, routed, ssbos[candidates[i]].*ssbo_member,
+                                       ssbo_id);
+                }
+                Decorate(ssbo_id, spv::Decoration::NonUniform);
+                non_uniform_ids.insert(ssbo_id.value);
             }
-            Decorate(ssbo_id, spv::Decoration::NonUniform);
-            non_uniform_ids.insert(ssbo_id.value);
             const Id found{OpINotEqual(U1, route, Const(~0U))};
             const Id offset{OpUConvert(U32[1], OpISub(U64, body_addr, route_base))};
             const Id ssbo_index{
@@ -1237,92 +1243,72 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         }
         return fallback;
     }};
-    const auto define_load{[&](DefPtr ssbo_member, const StorageTypeDefinition& type_def,
-                               Id load_type, u32 shift) {
-        const Id function_type{TypeFunction(load_type, U64)};
-        const Id func_id{OpFunction(load_type, load_control, function_type)};
+    const bool split_wide_calls{!profile.support_descriptor_aliasing && !info.native_global_bounds};
+    const auto define_rw{[&](bool is_write, DefPtr ssbo_member,
+                             const StorageTypeDefinition& type_def, Id rw_type, u32 shift) {
+        const Id ret_type{is_write ? void_id : rw_type};
+        const Id func_type{is_write ? TypeFunction(void_id, U64, rw_type)
+                                    : TypeFunction(rw_type, U64)};
+        const Id func_id{
+            OpFunction(ret_type, is_write ? helper_control : load_control, func_type)};
         const Id addr{OpFunctionParameter(U64)};
-        if (!profile.support_descriptor_aliasing && !info.native_global_bounds && shift > 2) {
+        const Id data{is_write ? OpFunctionParameter(rw_type) : Id{}};
+        const u32 word_count{shift > 2 ? (1U << (shift - 2)) : 1U};
+        if (split_wide_calls && shift > 2) {
             AddLabel();
-            std::array<Id, 4> words;
-            const u32 count = 1U << (shift - 2);
-            for (u32 i = 0; i < count; ++i) {
-                const Id word_address{OpIAdd(U64, addr, Constant(U64, i * sizeof(u32)))};
-                words[i] = OpFunctionCall(U32[1], functions->load_u32, word_address);
+            std::array<Id, 4> words{};
+            for (u32 i = 0; i < word_count; ++i) {
+                const Id word_addr{OpIAdd(U64, addr, Constant(U64, i * sizeof(u32)))};
+                if (is_write) {
+                    OpFunctionCall(void_id, functions->write_u32, word_addr,
+                                   OpCompositeExtract(U32[1], data, i));
+                } else {
+                    words[i] = OpFunctionCall(U32[1], functions->load_u32, word_addr);
+                }
             }
-            OpReturnValue(OpCompositeConstruct(load_type, std::span{words}.first(count)));
+            if (is_write) {
+                OpReturn();
+            } else {
+                OpReturnValue(OpCompositeConstruct(rw_type, std::span{words}.first(word_count)));
+            }
             OpFunctionEnd();
             return func_id;
         }
         // Native global accesses without descriptor aliasing, and accesses whose alignment is
-        // narrower than the vector width, search for the buffer once and load words from U32.
-        if (shift > 2 &&
-            (!profile.support_descriptor_aliasing || profile.min_ssbo_alignment < (1U << shift))) {
-            const u32 count = 1U << (shift - 2);
-            OpReturnValue(define_body(
-                &StorageDefinitions::U32, addr, storage_types.U32, 2, load_type,
-                ConstantNull(load_type), Routing::Load, [&](Id, Id ssbo_id, Id word_index) {
-                    std::array<Id, 4> words;
-                    for (u32 i = 0; i < count; ++i) {
-                        const Id elem_index{i == 0 ? word_index
-                                                   : OpIAdd(U32[1], word_index, Const(i))};
-                        words[i] =
-                            OpLoad(U32[1], element(storage_types.U32.element, ssbo_id, elem_index));
-                    }
-                    return OpCompositeConstruct(load_type, std::span{words}.first(count));
-                }));
-            OpFunctionEnd();
-            return func_id;
-        }
-        OpReturnValue(define_body(ssbo_member, addr, type_def, shift, load_type,
-                                  ConstantNull(load_type), Routing::Load,
-                                  [&](Id ssbo_pointer, Id, Id) {
-                                      return OpLoad(load_type, ssbo_pointer);
-                                  }));
-        OpFunctionEnd();
-        return func_id;
-    }};
-    const auto define_write{[&](DefPtr ssbo_member, const StorageTypeDefinition& type_def,
-                                Id write_type, u32 shift) {
-        const Id function_type{TypeFunction(void_id, U64, write_type)};
-        const Id func_id{OpFunction(void_id, helper_control, function_type)};
-        const Id addr{OpFunctionParameter(U64)};
-        const Id data{OpFunctionParameter(write_type)};
-        if (!profile.support_descriptor_aliasing && !info.native_global_bounds && shift > 2) {
-            AddLabel();
-            const u32 count = 1U << (shift - 2);
-            for (u32 i = 0; i < count; ++i) {
-                const Id word_address{OpIAdd(U64, addr, Constant(U64, i * sizeof(u32)))};
-                const Id word{OpCompositeExtract(U32[1], data, i)};
-                OpFunctionCall(void_id, functions->write_u32, word_address, word);
-            }
-            OpReturn();
-            OpFunctionEnd();
-            return func_id;
-        }
-        if (shift > 2 &&
-            (!profile.support_descriptor_aliasing || profile.min_ssbo_alignment < (1U << shift))) {
-            const u32 count = 1U << (shift - 2);
-            define_body(&StorageDefinitions::U32, addr, storage_types.U32, 2, void_id, Id{},
-                        Routing::Write, [&](Id, Id ssbo_id, Id word_index) {
-                            for (u32 i = 0; i < count; ++i) {
-                                const Id elem_index{i == 0 ? word_index
-                                                           : OpIAdd(U32[1], word_index, Const(i))};
-                                OpStore(element(storage_types.U32.element, ssbo_id, elem_index),
-                                        OpCompositeExtract(U32[1], data, i));
-                            }
-                            return Id{};
-                        });
-            OpReturn();
-            OpFunctionEnd();
-            return func_id;
-        }
-        define_body(ssbo_member, addr, type_def, shift, void_id, Id{}, Routing::Write,
-                    [&](Id ssbo_pointer, Id, Id) {
+        // narrower than the vector width, search for the buffer once and access words from U32.
+        const bool multi_word{
+            shift > 2 &&
+            (!profile.support_descriptor_aliasing || profile.min_ssbo_alignment < (1U << shift))};
+        const Id result{define_body(
+            multi_word ? &StorageDefinitions::U32 : ssbo_member, addr,
+            multi_word ? storage_types.U32 : type_def, multi_word ? 2U : shift, ret_type,
+            is_write ? Id{} : ConstantNull(rw_type), is_write ? Routing::Write : Routing::Load,
+            [&](Id ssbo_pointer, Id ssbo_id, Id word_index) -> Id {
+                if (is_write) {
+                    if (multi_word) {
+                        for (u32 i = 0; i < word_count; ++i) {
+                            OpStore(word_element(ssbo_id, word_index, i),
+                                    OpCompositeExtract(U32[1], data, i));
+                        }
+                    } else {
                         OpStore(ssbo_pointer, data);
-                        return Id{};
-                    });
-        OpReturn();
+                    }
+                    return Id{};
+                }
+                if (!multi_word) {
+                    return OpLoad(rw_type, ssbo_pointer);
+                }
+                std::array<Id, 4> words{};
+                for (u32 i = 0; i < word_count; ++i) {
+                    words[i] = OpLoad(U32[1], word_element(ssbo_id, word_index, i));
+                }
+                return OpCompositeConstruct(rw_type, std::span{words}.first(word_count));
+            })};
+        if (is_write) {
+            OpReturn();
+        } else {
+            OpReturnValue(result);
+        }
         OpFunctionEnd();
         return func_id;
     }};
@@ -1330,9 +1316,9 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         [&](DefPtr ssbo_member, const StorageTypeDefinition& type_def, Id rw_type, size_t size,
             bool need_load, bool need_write) {
             const u32 shift{static_cast<u32>(std::countr_zero(size))};
-            const Id load_func{need_load ? define_load(ssbo_member, type_def, rw_type, shift)
+            const Id load_func{need_load ? define_rw(false, ssbo_member, type_def, rw_type, shift)
                                          : Id{}};
-            const Id write_func{need_write ? define_write(ssbo_member, type_def, rw_type, shift)
+            const Id write_func{need_write ? define_rw(true, ssbo_member, type_def, rw_type, shift)
                                            : Id{}};
             return std::make_pair(load_func, write_func);
         }};
@@ -1467,18 +1453,23 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         OpFunctionEnd();
         return func_id;
     }};
-    const bool routes_atomics{
-        std::ranges::any_of(info.storage_buffers_descriptors, [&](const auto& descriptor) {
-            return info.native_global_bounds || UsesNvnStorageDescriptor(info, descriptor);
-        })};
     std::vector<u32> every_buffer(info.storage_buffers_descriptors.size());
     std::iota(every_buffer.begin(), every_buffer.end(), 0U);
+    const bool routes_atomics{std::ranges::any_of(every_buffer, is_routable)};
     for (size_t route_idx = 0; route_idx < global_memory_functions.size(); ++route_idx) {
-        buffers = route_idx == 0 ? std::span<const u32>{every_buffer}
-                                 : std::span<const u32>{program.global_memory_routes[route_idx - 1]};
+        const std::span<const u32> buffers{
+            route_idx == 0 ? std::span<const u32>{every_buffer}
+                           : std::span<const u32>{program.global_memory_routes[route_idx - 1]}};
+        candidates.clear();
+        for (const u32 desc_index : buffers) {
+            if (is_routable(desc_index)) {
+                candidates.push_back(desc_index);
+            }
+        }
+        search_function = Id{};
         functions = &global_memory_functions[route_idx];
         const Uses& use{uses[route_idx]};
-        if (search_call) {
+        if (search_call && !candidates.empty()) {
             bool any_select_atomic{routes_atomics && use.compare_exchange};
             for (size_t idx = 0; routes_atomics && idx < use.atomics.size(); ++idx) {
                 const auto kind = static_cast<GlobalAtomic>(idx);
@@ -1501,12 +1492,8 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                 OpFunctionEnd();
             }
         }
-        const bool non_native_word_load{!profile.support_descriptor_aliasing &&
-                                        !info.native_global_bounds &&
-                                        (use.loads[1] || use.loads[2])};
-        const bool non_native_word_write{!profile.support_descriptor_aliasing &&
-                                         !info.native_global_bounds &&
-                                         (use.writes[1] || use.writes[2])};
+        const bool non_native_word_load{split_wide_calls && (use.loads[1] || use.loads[2])};
+        const bool non_native_word_write{split_wide_calls && (use.writes[1] || use.writes[2])};
         std::tie(functions->load_u32, functions->write_u32) =
             define(&StorageDefinitions::U32, storage_types.U32, U32[1], sizeof(u32),
                    use.loads[0] || non_native_word_load,
@@ -1548,73 +1535,56 @@ void EmitContext::DefinePushConstants(const Info& info) {
         return;
     }
 
-    boost::container::static_vector<Id, 6> members{};
-    u32 member_index{0};
-    u32 mesh_draw_base_task_member{};
-    u32 mesh_draw_base_mesh_member{};
+    struct MemberDesc {
+        u32 offset;
+        std::string_view name;
+    };
+    boost::container::static_vector<Id, 6> member_types{};
+    boost::container::static_vector<MemberDesc, 6> member_descs{};
+    const auto add_member{[&](Id type, u32 offset, std::string_view name) {
+        const u32 index{static_cast<u32>(member_types.size())};
+        member_types.push_back(type);
+        member_descs.push_back({offset, name});
+        return index;
+    }};
 
     if (uses_rescaling) {
         rescaling_textures_type = TypeArray(U32[1], Const(NUM_TEXTURE_SCALING_WORDS));
         Decorate(rescaling_textures_type, spv::Decoration::ArrayStride, 4u);
-        members.push_back(rescaling_textures_type);
-        rescaling_textures_member_index = member_index++;
+        rescaling_textures_member_index =
+            add_member(rescaling_textures_type, RESCALING_LAYOUT_WORDS_OFFSET,
+                       "rescaling_textures");
 
         rescaling_images_type = TypeArray(U32[1], Const(NUM_IMAGE_SCALING_WORDS));
         Decorate(rescaling_images_type, spv::Decoration::ArrayStride, 4u);
-        members.push_back(rescaling_images_type);
-        rescaling_images_member_index = member_index++;
+        rescaling_images_member_index =
+            add_member(rescaling_images_type,
+                       static_cast<u32>(offsetof(RescalingLayout, rescaling_images)),
+                       "rescaling_images");
 
-        members.push_back(F32[1]);
-        rescaling_downfactor_member_index = member_index++;
+        rescaling_downfactor_member_index =
+            add_member(F32[1], RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, "down_factor");
     }
     if (uses_mesh_draw_base) {
-        members.push_back(U32[1]);
-        mesh_draw_base_task_member = member_index++;
-        members.push_back(U32[1]);
-        mesh_draw_base_mesh_member = member_index++;
-        mesh_draw_base_member_index =
-            stage == Stage::Task ? mesh_draw_base_task_member : mesh_draw_base_mesh_member;
+        const u32 task_member{add_member(
+            U32[1], MESH_DRAW_BASE_OFFSET + static_cast<u32>(offsetof(MeshDrawBaseLayout, task)),
+            "mesh_draw_base_task")};
+        const u32 mesh_member{add_member(
+            U32[1], MESH_DRAW_BASE_OFFSET + static_cast<u32>(offsetof(MeshDrawBaseLayout, mesh)),
+            "mesh_draw_base_mesh")};
+        mesh_draw_base_member_index = stage == Stage::Task ? task_member : mesh_member;
     }
     if (uses_render_area) {
-        members.push_back(F32[4]);
-        render_are_member_index = member_index++;
+        render_area_member_index = add_member(F32[4], RENDERAREA_LAYOUT_OFFSET, "render_area");
     }
 
-    const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
+    const Id push_constant_struct{
+        TypeStruct(std::span(member_types.data(), member_types.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
     Name(push_constant_struct, "PushConstants");
-
-    if (uses_rescaling) {
-        MemberDecorate(push_constant_struct, rescaling_textures_member_index,
-                       spv::Decoration::Offset,
-                       static_cast<u32>(offsetof(RescalingLayout, rescaling_textures)));
-        MemberName(push_constant_struct, rescaling_textures_member_index, "rescaling_textures");
-
-        MemberDecorate(push_constant_struct, rescaling_images_member_index,
-                       spv::Decoration::Offset,
-                       static_cast<u32>(offsetof(RescalingLayout, rescaling_images)));
-        MemberName(push_constant_struct, rescaling_images_member_index, "rescaling_images");
-
-        MemberDecorate(push_constant_struct, rescaling_downfactor_member_index,
-                       spv::Decoration::Offset,
-                       static_cast<u32>(offsetof(RescalingLayout, down_factor)));
-        MemberName(push_constant_struct, rescaling_downfactor_member_index, "down_factor");
-    }
-    if (uses_mesh_draw_base) {
-        MemberDecorate(push_constant_struct, mesh_draw_base_task_member, spv::Decoration::Offset,
-                       MESH_DRAW_BASE_OFFSET +
-                           static_cast<u32>(offsetof(MeshDrawBaseLayout, task)));
-        MemberName(push_constant_struct, mesh_draw_base_task_member, "mesh_draw_base_task");
-
-        MemberDecorate(push_constant_struct, mesh_draw_base_mesh_member, spv::Decoration::Offset,
-                       MESH_DRAW_BASE_OFFSET +
-                           static_cast<u32>(offsetof(MeshDrawBaseLayout, mesh)));
-        MemberName(push_constant_struct, mesh_draw_base_mesh_member, "mesh_draw_base_mesh");
-    }
-    if (uses_render_area) {
-        MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset,
-                       RENDERAREA_LAYOUT_OFFSET);
-        MemberName(push_constant_struct, render_are_member_index, "render_area");
+    for (u32 i = 0; i < static_cast<u32>(member_descs.size()); ++i) {
+        MemberDecorate(push_constant_struct, i, spv::Decoration::Offset, member_descs[i].offset);
+        MemberName(push_constant_struct, i, member_descs[i].name);
     }
 
     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};

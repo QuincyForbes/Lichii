@@ -20,7 +20,7 @@ void EmitDemoteToHelperInvocation(EmitContext& ctx) {
         ctx.OpBranchConditional(ctx.true_value, kill_label, impossible_label);
         ctx.AddLabel(kill_label);
         ctx.OpKill();
-        ctx.AddLabel(impossible_label);
+        ctx.AddContinuationLabel(impossible_label);
     }
 }
 

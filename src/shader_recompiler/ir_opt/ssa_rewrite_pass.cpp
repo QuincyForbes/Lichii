@@ -559,6 +559,23 @@ bool IsPrePassTextureInstruction(const IR::Inst& inst) noexcept {
         return false;
     }
 }
+bool HasExternalUses(const IR::Inst& inst) noexcept {
+    if (!inst.HasUses()) {
+        return false;
+    }
+    if (inst.GetOpcode() != IR::Opcode::Phi) {
+        return true;
+    }
+    int self_uses{};
+    const size_t num_args{inst.NumArgs()};
+    for (size_t i = 0; i < num_args; ++i) {
+        const IR::Value arg{inst.Arg(i)};
+        if (!arg.IsImmediate() && arg.Inst() == &inst) {
+            ++self_uses;
+        }
+    }
+    return inst.UseCount() > self_uses;
+}
 } // Anonymous namespace
 
 void SsaRewritePass(IR::Program& program) {
@@ -578,19 +595,27 @@ void SsaRewritePass(IR::Program& program) {
         }
     }
     // Prune dead side-effect-free instructions (including SetRegister, SetPred, SetGotoVariable,
-    // Set*Flag, and Identity instructions from trivial phis and replaced reads) before the
-    // remaining IR passes walk the program. Keep pre-pass texture ops until DeadCodeEliminationPass
-    // so TexturePass still sees standalone texture snippets without outputs.
-    for (IR::Block* const block : program.post_order_blocks) {
-        auto it{block->end()};
-        while (it != block->begin()) {
-            --it;
-            if (!it->HasUses() && !it->MayHaveSideEffects() && !IsPrePassTextureInstruction(*it)) {
-                it->Invalidate();
-                it = block->Instructions().erase(it);
+    // Set*Flag, and Identity instructions from trivial phis and replaced reads) in reverse
+    // instruction / post-order block order so dead chains cascade in one linear sweep, repeating
+    // only when erasing a loop-header Phi releases back-edge operands in already-visited blocks.
+    // Keep pre-pass texture ops until DeadCodeEliminationPass so TexturePass still sees standalone
+    // texture snippets without outputs.
+    bool phi_erased{};
+    do {
+        phi_erased = false;
+        for (IR::Block* const block : program.post_order_blocks) {
+            auto it{block->end()};
+            while (it != block->begin()) {
+                --it;
+                if (!HasExternalUses(*it) && !it->MayHaveSideEffects() &&
+                    !IsPrePassTextureInstruction(*it)) {
+                    phi_erased |= it->GetOpcode() == IR::Opcode::Phi;
+                    it->Invalidate();
+                    it = block->Instructions().erase(it);
+                }
             }
         }
-    }
+    } while (phi_erased);
 }
 
 } // namespace Shader::Optimization

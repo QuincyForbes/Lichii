@@ -8,6 +8,7 @@
 
 #include "dynarmic/backend/arm64/emit_arm64.h"
 
+#include <cstdlib>
 #include <span>
 #include <oaknut/oaknut.hpp>
 
@@ -213,6 +214,14 @@ static void EmitAddCycles(oaknut::CodeGenerator& code, EmitContext& ctx, std::si
 void (*g_emit_stats)(unsigned opcode, bool deferred, std::size_t bytes) = nullptr;
 #endif
 
+bool ReuseHostFlagsOn() noexcept {
+    static const bool on = [] {
+        const char* const value = std::getenv("EDEN_NX2_JIT_FLAGS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+
 EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const EmitConfig& conf, FastmemManager& fastmem_manager) {
 #ifdef DYNARMIC_EMIT_STATS
     const auto stat_offset = [&] { return reinterpret_cast<std::uintptr_t>(code.xptr<CodePtr>()); };
@@ -231,13 +240,14 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
     }
 
     EmittedBlockInfo ebi;
+    ebi.entry_point = code.xptr<CodePtr>();
+    ebi.nzcv_live_pos = nullptr;
 
     FpsrManager fpsr_manager{code, conf.state_fpsr_offset};
-    RegAlloc reg_alloc{code, fpsr_manager, std::span<const int>{GPR_ORDER.begin(), GPR_ORDER.size()},
-                       std::span<const int>{FPR_ORDER.begin(), FPR_ORDER.size()}};
+    thread_local RegAlloc reg_alloc;
+    reg_alloc.Reset(code, fpsr_manager, std::span<const int>{GPR_ORDER.begin(), GPR_ORDER.size()},
+                    std::span<const int>{FPR_ORDER.begin(), FPR_ORDER.size()});
     EmitContext ctx{block, reg_alloc, conf, ebi, fpsr_manager, fastmem_manager, {}};
-
-    ebi.entry_point = code.xptr<CodePtr>();
 
     if (ctx.block.GetCondition() == IR::Cond::AL) {
         ASSERT(!ctx.block.HasConditionFailedLocation());
@@ -250,6 +260,7 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
         conf.emit_condition_failed_terminal(code, ctx);
 
         code.l(pass);
+        ebi.nzcv_live_pos = nullptr;
     }
 #ifdef DYNARMIC_EMIT_STATS
     stat(~0u, false);
@@ -284,6 +295,7 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
 
         if (conf.very_verbose_debugging_output) {
             EmitVerboseDebuggingOutput(code, ctx);
+            ebi.nzcv_live_pos = nullptr;
         }
 #ifdef DYNARMIC_EMIT_STATS
         stat(static_cast<unsigned>(inst->GetOpcode()), false);

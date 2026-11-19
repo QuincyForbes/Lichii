@@ -28,6 +28,20 @@
 class QWindow;
 
 namespace VkDeviceInfo {
+static_assert(Settings::DeviceProfile::VkDriverAmdProprietary == VK_DRIVER_ID_AMD_PROPRIETARY);
+static_assert(Settings::DeviceProfile::VkDriverAmdOpenSource == VK_DRIVER_ID_AMD_OPEN_SOURCE);
+static_assert(Settings::DeviceProfile::VkDriverMesaRadv == VK_DRIVER_ID_MESA_RADV);
+static_assert(Settings::DeviceProfile::VkDriverNvidiaProprietary ==
+              VK_DRIVER_ID_NVIDIA_PROPRIETARY);
+static_assert(Settings::DeviceProfile::VkDriverIntelProprietaryWindows ==
+              VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS);
+static_assert(Settings::DeviceProfile::VkDriverIntelOpenSourceMesa ==
+              VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA);
+static_assert(Settings::DeviceProfile::VkDriverQualcommProprietary ==
+              VK_DRIVER_ID_QUALCOMM_PROPRIETARY);
+static_assert(Settings::DeviceProfile::VkDriverMoltenVk == VK_DRIVER_ID_MOLTENVK);
+static_assert(Settings::DeviceProfile::VkDriverMesaTurnip == VK_DRIVER_ID_MESA_TURNIP);
+
 Record::Record(std::string_view name_, const std::vector<VkPresentModeKHR>& vsync_modes_,
                bool has_broken_compute_, VkDriverId driver_id_, bool dlss_capable_,
                std::string_view driver_version_, bool integrated_, u64 vram_mib_,
@@ -109,13 +123,8 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
                             exception.what());
             }
 
-            // Tensor cores came with RTX; GTX 16 cards are Turing without them. Ray tracing
-            // pipelines and cooperative matrices cover RTX / workstation parts whose name lacks it.
-            const bool dlss_capable =
-                driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
-                (raw_name.find("RTX") != std::string::npos ||
-                 capabilities.HasExtension(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) ||
-                 capabilities.HasExtension(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME));
+            const bool dlss_capable = Settings::DeviceProfile::IsNvidiaDlssCapable(
+                static_cast<u32>(driverID), raw_name, capabilities.extensions);
 
 #if defined(_WIN32)
             const bool fsr4_capable = VideoCommon::IsFsr4CapableGpu(

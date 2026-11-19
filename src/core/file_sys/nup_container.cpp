@@ -179,6 +179,13 @@ enum MetaType : u16 {
     MetaLocalizedIcons = 0x000A,
 };
 
+struct ZstdDCtxDeleter {
+    void operator()(ZSTD_DCtx* dctx) const noexcept {
+        ZSTD_freeDCtx(dctx);
+    }
+};
+using ZstdDCtxPtr = std::unique_ptr<ZSTD_DCtx, ZstdDCtxDeleter>;
+
 bool Sha256(const u8* data, std::size_t size, std::array<u8, 0x20>& out) {
     unsigned int length = 0;
     EVP_Digest(data, size, out.data(), &length, EVP_sha256(), nullptr);
@@ -239,43 +246,12 @@ public:
             return ReadSpilled(data, length, offset);
         }
 
-        NupDecompressCache::DataPtr buffer;
-        {
-            std::unique_lock lock{cache->mutex};
-            buffer = cache->Find(cache_index);
-            if (!buffer) {
-                if (const auto it = cache->in_flight.find(cache_index);
-                    it != cache->in_flight.end()) {
-                    auto waiter = it->second;
-                    waiter->cv.wait(lock, [&waiter] { return waiter->done; });
-                    buffer = waiter->result;
-                    static_cast<void>(cache->Find(cache_index));
-                } else {
-                    auto leader = std::make_shared<NupDecompressCache::InFlight>();
-                    cache->in_flight.emplace(cache_index, leader);
-                    lock.unlock();
-
-                    NupDecompressCache::DataPtr decompressed;
-                    SCOPE_EXIT {
-                        lock.lock();
-                        if (decompressed) {
-                            cache->Insert(cache_index, decompressed);
-                        }
-                        leader->result = decompressed;
-                        leader->done = true;
-                        cache->in_flight.erase(cache_index);
-                        lock.unlock();
-                        leader->cv.notify_all();
-                    };
-
-                    if (std::vector<u8> scratch = Decompress(); !scratch.empty()) {
-                        decompressed =
-                            std::make_shared<const std::vector<u8>>(std::move(scratch));
-                    }
-                    buffer = decompressed;
-                }
+        const NupDecompressCache::DataPtr buffer = cache->GetOrLoad(cache_index, [&]() {
+            if (std::vector<u8> scratch = Decompress(); !scratch.empty()) {
+                return std::make_shared<const std::vector<u8>>(std::move(scratch));
             }
-        }
+            return NupDecompressCache::DataPtr{};
+        });
         if (!buffer || offset >= buffer->size()) {
             return 0;
         }
@@ -340,25 +316,37 @@ private:
         return avail;
     }
 
+    bool ValidExtent(const NupMembers::FileNode& node) const {
+        const u64 backing_size =
+            members->backing_size != 0 ? members->backing_size : members->backing->GetSize();
+        return node.extent_size <= backing_size &&
+               node.extent_offset <= backing_size - node.extent_size;
+    }
+
     void DecompressToFile(NupSpillFile& spill) const {
         const auto& backing = members->backing;
-        const u64 backing_size =
-            members->backing_size != 0 ? members->backing_size : backing->GetSize();
         const auto& cache = members->cache;
+        const auto& node = Node();
         const std::string_view name = Name();
-        const u64 extent_offset = Node().extent_offset;
-        const u64 extent_size = Node().extent_size;
-        const u64 uncompressed_size = Node().size;
+        const u64 extent_offset = node.extent_offset;
+        const u64 extent_size = node.extent_size;
+        const u64 uncompressed_size = node.size;
+        bool succeeded = false;
+        SCOPE_EXIT {
+            if (!succeeded) {
+                spill.file.Close();
+                if (!spill.path.empty()) {
+                    std::error_code ec;
+                    std::filesystem::remove(spill.path, ec);
+                    spill.path.clear();
+                }
+            }
+        };
         const auto fail = [&](const char* reason) {
             LOG_ERROR(Loader, "NUP zstd decompression of {} to a temporary file failed: {}", name,
                       reason);
-            spill.file.Close();
-            if (!spill.path.empty()) {
-                std::error_code ec;
-                std::filesystem::remove(spill.path, ec);
-            }
         };
-        if (extent_size > backing_size || extent_offset > backing_size - extent_size) {
+        if (!ValidExtent(node)) {
             return fail("extent out of range");
         }
 
@@ -372,8 +360,10 @@ private:
             return fail("cannot create the temporary file");
         }
 
-        std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{ZSTD_createDCtx(),
-                                                                  &ZSTD_freeDCtx};
+        ZstdDCtxPtr dctx{ZSTD_createDCtx()};
+        if (!dctx) {
+            return fail("cannot allocate zstd context");
+        }
         std::vector<u8> in_buffer(ZSTD_DStreamInSize());
         std::vector<u8> out_buffer(ZSTD_DStreamOutSize());
         u64 read = 0;
@@ -409,29 +399,25 @@ private:
         out.Close();
         spill.file.Open(spill.path, Common::FS::FileAccessMode::Read);
         if (!spill.file.IsOpen()) {
-            fail("cannot reopen the temporary file");
+            return fail("cannot reopen the temporary file");
         }
+        succeeded = true;
     }
 
     std::vector<u8> Decompress() const {
         const auto& backing = members->backing;
-        const u64 backing_size =
-            members->backing_size != 0 ? members->backing_size : backing->GetSize();
+        const auto& node = Node();
         const std::string_view name = Name();
-        const u64 extent_offset = Node().extent_offset;
-        const u64 extent_size = Node().extent_size;
-        const u64 uncompressed_size = Node().size;
-        if (extent_size > backing_size || extent_offset > backing_size - extent_size) {
+        if (!ValidExtent(node)) {
             return {};
         }
-        const auto compressed = backing->ReadBytes(static_cast<std::size_t>(extent_size),
-                                                   static_cast<std::size_t>(extent_offset));
-        if (compressed.size() != extent_size) {
+        const auto compressed = backing->ReadBytes(static_cast<std::size_t>(node.extent_size),
+                                                   static_cast<std::size_t>(node.extent_offset));
+        if (compressed.size() != node.extent_size) {
             return {};
         }
-        std::vector<u8> out(static_cast<std::size_t>(uncompressed_size));
-        thread_local std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{
-            ZSTD_createDCtx(), &ZSTD_freeDCtx};
+        std::vector<u8> out(static_cast<std::size_t>(node.size));
+        thread_local ZstdDCtxPtr dctx{ZSTD_createDCtx()};
         const auto zstd_begin = std::chrono::steady_clock::now();
         const std::size_t result =
             dctx ? ZSTD_decompressDCtx(dctx.get(), out.data(), out.size(), compressed.data(),

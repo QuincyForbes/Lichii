@@ -312,27 +312,23 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, Id vertex) {
     if (IR::IsGeneric(attr)) {
         const u32 index{IR::GenericAttributeIndex(attr)};
         const auto& generic{ctx.input_generics.at(index)};
-        if (!ValidId(generic.id) ||
-            (ctx.stage == Stage::Fragment &&
-             !ctx.runtime_info.previous_stage_stores.Generic(index, element))) {
+        if (!ValidId(generic.id) || !ctx.runtime_info.previous_stage_stores.Generic(index, element)) {
             // Attribute is disabled or varying component is not written
             return ctx.Const(element == 3 ? 1.0f : 0.0f);
         }
         const Id pointer{
             AttrPointer(ctx, generic.pointer_type, vertex, generic.id, ctx.Const(element))};
         const Id value{ctx.OpLoad(generic.component_type, pointer)};
-        return [&ctx, generic, value]() {
-            switch (generic.load_op) {
-            case InputGenericLoadOp::Bitcast:
-                return ctx.OpBitcast(ctx.F32[1], value);
-            case InputGenericLoadOp::SToF:
-                return ctx.OpConvertSToF(ctx.F32[1], value);
-            case InputGenericLoadOp::UToF:
-                return ctx.OpConvertUToF(ctx.F32[1], value);
-            default:
-                return value;
-            };
-        }();
+        switch (generic.load_op) {
+        case InputGenericLoadOp::Bitcast:
+            return ctx.OpBitcast(ctx.F32[1], value);
+        case InputGenericLoadOp::SToF:
+            return ctx.OpConvertSToF(ctx.F32[1], value);
+        case InputGenericLoadOp::UToF:
+            return ctx.OpConvertUToF(ctx.F32[1], value);
+        default:
+            return value;
+        }
     }
     switch (attr) {
     case IR::Attribute::PrimitiveId:
@@ -642,7 +638,7 @@ Id EmitResolutionDownFactor(EmitContext& ctx) {
 Id EmitRenderArea(EmitContext& ctx) {
     if (ctx.profile.unified_descriptor_binding) {
         const Id pointer_type{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.F32[4])};
-        const Id index{ctx.Const(ctx.render_are_member_index)};
+        const Id index{ctx.Const(ctx.render_area_member_index)};
         const Id pointer{ctx.OpAccessChain(pointer_type, ctx.render_area_push_constant, index)};
         return ctx.OpLoad(ctx.F32[4], pointer);
     } else {

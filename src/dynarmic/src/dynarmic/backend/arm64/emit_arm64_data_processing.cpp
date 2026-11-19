@@ -7,7 +7,6 @@
  */
 
 #include <cstddef>
-#include <cstdlib>
 
 #include <fmt/ostream.h>
 #include <oaknut/oaknut.hpp>
@@ -201,64 +200,69 @@ void EmitIR<IR::Opcode::TestBit>(oaknut::CodeGenerator& code, EmitContext& ctx, 
     code.UBFX(Xresult, Xoperand, args[1].GetImmediateU8(), 1);
 }
 
-namespace {
-
-bool ReuseDataProcFlagsOn() {
-    static const bool on = [] {
-        const char* const value = std::getenv("EDEN_NX2_JIT_FLAGS");
-        return value == nullptr || value[0] != '0';
+template<std::size_t bitsize>
+static void EmitConditionalSelect(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    static_assert(bitsize == 32 || bitsize == 64);
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const IR::Cond cond = args[0].GetImmediateCond();
+    const auto is_zero = [](const Argument& arg) {
+        return arg.IsImmediate() && (bitsize == 32 ? arg.GetImmediateU32() == 0 : arg.GetImmediateU64() == 0);
+    };
+    const bool then_zero = is_zero(args[1]);
+    const bool else_zero = is_zero(args[2]);
+    const auto zero_reg = [] {
+        if constexpr (bitsize == 32) {
+            return WZR;
+        } else {
+            return XZR;
+        }
     }();
-    return on;
-}
 
-}  // namespace
+    auto Rresult = ctx.reg_alloc.WriteReg<bitsize>(inst);
+
+    // TODO: FSEL for fprs
+    // Realize operands and spill flags BEFORE checking code.xptr() == nzcv_live_pos so any
+    // emitted move, load, spill, or MRS advances code.xptr() and forces an NZCV reload.
+    const auto emit_csel = [&](auto r_then, auto r_else) {
+        ctx.reg_alloc.SpillFlags();
+        const bool reuse_flags = !ctx.conf.enable_cycle_counting && ReuseHostFlagsOn();
+        const bool flags_live = reuse_flags && ctx.ebi.nzcv_live_pos != nullptr &&
+                                code.xptr<const void*>() == ctx.ebi.nzcv_live_pos;
+        if (!flags_live) {
+            code.LDR(Wscratch0, Xstate, ctx.conf.state_nzcv_offset);
+            code.MSR(oaknut::SystemReg::NZCV, Xscratch0);
+        }
+        code.CSEL(*Rresult, r_then, r_else, static_cast<oaknut::Cond>(cond));
+        ctx.ebi.nzcv_live_pos = reuse_flags ? code.xptr<const void*>() : nullptr;
+    };
+
+    if (then_zero && else_zero) {
+        RegAlloc::Realize(Rresult);
+        code.MOV(*Rresult, zero_reg);
+    } else if (then_zero) {
+        auto Relse = ctx.reg_alloc.ReadReg<bitsize>(args[2]);
+        RegAlloc::Realize(Rresult, Relse);
+        emit_csel(zero_reg, *Relse);
+    } else if (else_zero) {
+        auto Rthen = ctx.reg_alloc.ReadReg<bitsize>(args[1]);
+        RegAlloc::Realize(Rresult, Rthen);
+        emit_csel(*Rthen, zero_reg);
+    } else {
+        auto Rthen = ctx.reg_alloc.ReadReg<bitsize>(args[1]);
+        auto Relse = ctx.reg_alloc.ReadReg<bitsize>(args[2]);
+        RegAlloc::Realize(Rresult, Rthen, Relse);
+        emit_csel(*Rthen, *Relse);
+    }
+}
 
 template<>
 void EmitIR<IR::Opcode::ConditionalSelect32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    const bool flags_live = ReuseDataProcFlagsOn() && ctx.ebi.nzcv_live_pos != nullptr &&
-                            code.xptr<const void*>() == ctx.ebi.nzcv_live_pos;
-    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
-    const IR::Cond cond = args[0].GetImmediateCond();
-    auto Wresult = ctx.reg_alloc.WriteW(inst);
-    auto Wthen = ctx.reg_alloc.ReadW(args[1]);
-    auto Welse = ctx.reg_alloc.ReadW(args[2]);
-    RegAlloc::Realize(Wresult, Wthen, Welse);
-    ctx.reg_alloc.SpillFlags();
-
-    // TODO: FSEL for fprs
-
-    if (!flags_live) {
-        code.LDR(Wscratch0, Xstate, ctx.conf.state_nzcv_offset);
-        code.MSR(oaknut::SystemReg::NZCV, Xscratch0);
-    }
-    code.CSEL(Wresult, Wthen, Welse, static_cast<oaknut::Cond>(cond));
-    if (ReuseDataProcFlagsOn()) {
-        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
-    }
+    EmitConditionalSelect<32>(code, ctx, inst);
 }
 
 template<>
 void EmitIR<IR::Opcode::ConditionalSelect64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    const bool flags_live = ReuseDataProcFlagsOn() && ctx.ebi.nzcv_live_pos != nullptr &&
-                            code.xptr<const void*>() == ctx.ebi.nzcv_live_pos;
-    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
-    const IR::Cond cond = args[0].GetImmediateCond();
-    auto Xresult = ctx.reg_alloc.WriteX(inst);
-    auto Xthen = ctx.reg_alloc.ReadX(args[1]);
-    auto Xelse = ctx.reg_alloc.ReadX(args[2]);
-    RegAlloc::Realize(Xresult, Xthen, Xelse);
-    ctx.reg_alloc.SpillFlags();
-
-    // TODO: FSEL for fprs
-
-    if (!flags_live) {
-        code.LDR(Wscratch0, Xstate, ctx.conf.state_nzcv_offset);
-        code.MSR(oaknut::SystemReg::NZCV, Xscratch0);
-    }
-    code.CSEL(Xresult, Xthen, Xelse, static_cast<oaknut::Cond>(cond));
-    if (ReuseDataProcFlagsOn()) {
-        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
-    }
+    EmitConditionalSelect<64>(code, ctx, inst);
 }
 
 template<>

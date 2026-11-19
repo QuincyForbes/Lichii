@@ -98,30 +98,41 @@ void EmitLoadGlobalS16(EmitContext&) {
     throw NotImplementedException("SPIR-V Instruction");
 }
 
-Id EmitLoadGlobal32(EmitContext& ctx, IR::Inst* inst, Id address) {
+namespace {
+Id LoadGlobal(EmitContext& ctx, const IR::Inst& inst, Id result_type,
+              Id EmitContext::GlobalMemoryFunctions::*func_member, Id address) {
     if (ctx.profile.support_int64) {
-        return ctx.OpFunctionCall(ctx.U32[1], ctx.GlobalMemoryFunctionsOf(*inst).load_u32, address);
+        return ctx.OpFunctionCall(result_type, ctx.GlobalMemoryFunctionsOf(inst).*func_member,
+                                  address);
     }
     LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
-    return ctx.Const(0u);
+    return ctx.ConstantNull(result_type);
+}
+
+void WriteGlobal(EmitContext& ctx, const IR::Inst& inst,
+                 Id EmitContext::GlobalMemoryFunctions::*func_member, Id address, Id value) {
+    if (ctx.profile.support_int64) {
+        ctx.OpFunctionCall(ctx.void_id, ctx.GlobalMemoryFunctionsOf(inst).*func_member, address,
+                           value);
+        return;
+    }
+    LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
+}
+} // Anonymous namespace
+
+Id EmitLoadGlobal32(EmitContext& ctx, IR::Inst* inst, Id address) {
+    return LoadGlobal(ctx, *inst, ctx.U32[1], &EmitContext::GlobalMemoryFunctions::load_u32,
+                      address);
 }
 
 Id EmitLoadGlobal64(EmitContext& ctx, IR::Inst* inst, Id address) {
-    if (ctx.profile.support_int64) {
-        return ctx.OpFunctionCall(ctx.U32[2], ctx.GlobalMemoryFunctionsOf(*inst).load_u32x2,
-                                  address);
-    }
-    LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
-    return ctx.Const(0u, 0u);
+    return LoadGlobal(ctx, *inst, ctx.U32[2], &EmitContext::GlobalMemoryFunctions::load_u32x2,
+                      address);
 }
 
 Id EmitLoadGlobal128(EmitContext& ctx, IR::Inst* inst, Id address) {
-    if (ctx.profile.support_int64) {
-        return ctx.OpFunctionCall(ctx.U32[4], ctx.GlobalMemoryFunctionsOf(*inst).load_u32x4,
-                                  address);
-    }
-    LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
-    return ctx.Const(0u, 0u, 0u, 0u);
+    return LoadGlobal(ctx, *inst, ctx.U32[4], &EmitContext::GlobalMemoryFunctions::load_u32x4,
+                      address);
 }
 
 void EmitWriteGlobalU8(EmitContext&) {
@@ -141,30 +152,15 @@ void EmitWriteGlobalS16(EmitContext&) {
 }
 
 void EmitWriteGlobal32(EmitContext& ctx, IR::Inst* inst, Id address, Id value) {
-    if (ctx.profile.support_int64) {
-        ctx.OpFunctionCall(ctx.void_id, ctx.GlobalMemoryFunctionsOf(*inst).write_u32, address,
-                           value);
-        return;
-    }
-    LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
+    WriteGlobal(ctx, *inst, &EmitContext::GlobalMemoryFunctions::write_u32, address, value);
 }
 
 void EmitWriteGlobal64(EmitContext& ctx, IR::Inst* inst, Id address, Id value) {
-    if (ctx.profile.support_int64) {
-        ctx.OpFunctionCall(ctx.void_id, ctx.GlobalMemoryFunctionsOf(*inst).write_u32x2, address,
-                           value);
-        return;
-    }
-    LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
+    WriteGlobal(ctx, *inst, &EmitContext::GlobalMemoryFunctions::write_u32x2, address, value);
 }
 
 void EmitWriteGlobal128(EmitContext& ctx, IR::Inst* inst, Id address, Id value) {
-    if (ctx.profile.support_int64) {
-        ctx.OpFunctionCall(ctx.void_id, ctx.GlobalMemoryFunctionsOf(*inst).write_u32x4, address,
-                           value);
-        return;
-    }
-    LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
+    WriteGlobal(ctx, *inst, &EmitContext::GlobalMemoryFunctions::write_u32x4, address, value);
 }
 
 Id EmitLoadStorageU8(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset) {

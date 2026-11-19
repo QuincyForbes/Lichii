@@ -322,8 +322,10 @@ Object CreateTexture(const Device& device, const TextureDesc& desc) {
             return {};
         }
     }
-    MTLTextureDescriptor* descriptor = MakeTextureDescriptor(desc);
-    return Retain([device.GetDevice() newTextureWithDescriptor:descriptor]);
+    @autoreleasepool {
+        MTLTextureDescriptor* descriptor = MakeTextureDescriptor(desc);
+        return Retain([device.GetDevice() newTextureWithDescriptor:descriptor]);
+    }
 }
 
 bool SupportsSparseTextures(const Device& device) {
@@ -345,52 +347,53 @@ std::optional<SparseTexture> CreateSparseTexture(const Device& device, const Tex
     if (!SupportsSparseTextures(device) || desc.kind != TextureKind::e2D || desc.samples != 1) {
         return std::nullopt;
     }
-    const id<MTLDevice> mtl = device.GetDevice();
-    MTLTextureDescriptor* descriptor = MakeTextureDescriptor(desc);
-    const MTLSize tile = [mtl sparseTileSizeWithTextureType:descriptor.textureType
-                                                pixelFormat:descriptor.pixelFormat
-                                                sampleCount:1];
-    const u32 tile_bytes = static_cast<u32>([mtl sparseTileSizeInBytes]);
-    if (tile.width == 0 || tile.height == 0 || tile_bytes == 0) {
-        return std::nullopt;
-    }
-    MTLHeapDescriptor* heap_descriptor = [MTLHeapDescriptor new];
-    heap_descriptor.type = MTLHeapTypeSparse;
-    heap_descriptor.storageMode = MTLStorageModePrivate;
-    heap_descriptor.hazardTrackingMode = MTLHazardTrackingModeTracked;
-    heap_descriptor.size = Common::AlignUp(heap_bytes, u64{tile_bytes});
-    const id<MTLHeap> heap = [mtl newHeapWithDescriptor:heap_descriptor];
-    if (heap == nil) {
-        return std::nullopt;
-    }
-    const id<MTLTexture> texture = [heap newTextureWithDescriptor:descriptor];
-    if (texture == nil) {
-        return std::nullopt;
-    }
-#if LICHII_METAL_SAMPLER_BIAS // sparseTextureTier came with the same 26 SDKs
-    if (@available(macOS 26.0, iOS 26.0, *)) {
-        if (texture.sparseTextureTier != MTLTextureSparseTier2) {
+    @autoreleasepool {
+        const id<MTLDevice> mtl = device.GetDevice();
+        MTLTextureDescriptor* descriptor = MakeTextureDescriptor(desc);
+        const MTLSize tile = [mtl sparseTileSizeWithTextureType:descriptor.textureType
+                                                    pixelFormat:descriptor.pixelFormat
+                                                    sampleCount:1];
+        const u32 tile_bytes = static_cast<u32>([mtl sparseTileSizeInBytes]);
+        if (tile.width == 0 || tile.height == 0 || tile_bytes == 0) {
             return std::nullopt;
         }
-    }
+        MTLHeapDescriptor* heap_descriptor = [MTLHeapDescriptor new];
+        heap_descriptor.type = MTLHeapTypeSparse;
+        heap_descriptor.storageMode = MTLStorageModePrivate;
+        heap_descriptor.hazardTrackingMode = MTLHazardTrackingModeTracked;
+        heap_descriptor.size = Common::AlignUp(heap_bytes, u64{tile_bytes});
+        const id<MTLHeap> heap = [mtl newHeapWithDescriptor:heap_descriptor];
+        if (heap == nil) {
+            return std::nullopt;
+        }
+        const id<MTLTexture> texture = [heap newTextureWithDescriptor:descriptor];
+        if (texture == nil) {
+            return std::nullopt;
+        }
+#if LICHII_METAL_SAMPLER_BIAS // sparseTextureTier came with the same 26 SDKs
+        if (@available(macOS 26.0, iOS 26.0, *)) {
+            if (texture.sparseTextureTier != MTLTextureSparseTier2) {
+                return std::nullopt;
+            }
+        }
 #endif
-    const u32 levels = desc.levels;
-    const u32 tail_level = static_cast<u32>((std::min)(static_cast<u32>(texture.firstMipmapInTail),
-                                                       levels));
-    return SparseTexture{
-        .texture = Retain(texture),
-        .heap = Retain(heap),
-        .tile_width = static_cast<u32>(tile.width),
-        .tile_height = static_cast<u32>(tile.height),
-        .tile_bytes = tile_bytes,
-        .tail_level = tail_level,
-        .tail_tiles = tail_level < levels ? (std::max)(1U, static_cast<u32>(
-                                                               Common::DivCeil(
+        const u32 levels = desc.levels;
+        const u32 tail_level =
+            static_cast<u32>((std::min)(static_cast<u32>(texture.firstMipmapInTail), levels));
+        return SparseTexture{
+            .texture = Retain(texture),
+            .heap = Retain(heap),
+            .tile_width = static_cast<u32>(tile.width),
+            .tile_height = static_cast<u32>(tile.height),
+            .tile_bytes = tile_bytes,
+            .tail_level = tail_level,
+            .tail_tiles = tail_level < levels ? (std::max)(1U, static_cast<u32>(Common::DivCeil(
                                                                    u64{texture.tailSizeInBytes},
                                                                    u64{tile_bytes})))
-                                          : 0U,
-        .heap_bytes = static_cast<u64>(heap.size),
-    };
+                                              : 0U,
+            .heap_bytes = static_cast<u64>(heap.size),
+        };
+    }
 }
 
 u64 SparseHeapUsedBytes(const void* heap) {
@@ -437,14 +440,16 @@ Object CreateTextureView(TextureHandle texture, u32 format, TextureKind kind, u3
             return {};
         }
     }
-    const MTLTextureSwizzleChannels channels = MTLTextureSwizzleChannelsMake(
-        static_cast<MTLTextureSwizzle>(swizzle[0]), static_cast<MTLTextureSwizzle>(swizzle[1]),
-        static_cast<MTLTextureSwizzle>(swizzle[2]), static_cast<MTLTextureSwizzle>(swizzle[3]));
-    return Retain([base newTextureViewWithPixelFormat:static_cast<MTLPixelFormat>(format)
-                                          textureType:TextureType(kind)
-                                               levels:NSMakeRange(base_level, levels)
-                                               slices:NSMakeRange(base_layer, layers)
-                                              swizzle:channels]);
+    @autoreleasepool {
+        const MTLTextureSwizzleChannels channels = MTLTextureSwizzleChannelsMake(
+            static_cast<MTLTextureSwizzle>(swizzle[0]), static_cast<MTLTextureSwizzle>(swizzle[1]),
+            static_cast<MTLTextureSwizzle>(swizzle[2]), static_cast<MTLTextureSwizzle>(swizzle[3]));
+        return Retain([base newTextureViewWithPixelFormat:static_cast<MTLPixelFormat>(format)
+                                              textureType:TextureType(kind)
+                                                   levels:NSMakeRange(base_level, levels)
+                                                   slices:NSMakeRange(base_layer, layers)
+                                                  swizzle:channels]);
+    }
 }
 
 u32 TextureBufferAlignment(const Device& device, u32 format) {
@@ -458,39 +463,45 @@ Object CreateTextureBufferView(BufferHandle buffer, u64 offset, u32 elements, u3
     if (object == nil || elements == 0) {
         return {};
     }
-    MTLTextureUsage usage = MTLTextureUsageShaderRead;
-    if (writable) {
-        usage |= MTLTextureUsageShaderWrite;
+    @autoreleasepool {
+        MTLTextureUsage usage = MTLTextureUsageShaderRead;
+        if (writable) {
+            usage |= MTLTextureUsageShaderWrite;
+        }
+        MTLTextureDescriptor* descriptor = [MTLTextureDescriptor
+            textureBufferDescriptorWithPixelFormat:static_cast<MTLPixelFormat>(format)
+                                             width:elements
+                                   resourceOptions:object.resourceOptions
+                                             usage:usage];
+        return Retain([object newTextureWithDescriptor:descriptor
+                                                offset:offset
+                                           bytesPerRow:u64{elements} * bytes_per_texel]);
     }
-    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor
-        textureBufferDescriptorWithPixelFormat:static_cast<MTLPixelFormat>(format)
-                                         width:elements
-                               resourceOptions:object.resourceOptions
-                                         usage:usage];
-    return Retain([object newTextureWithDescriptor:descriptor
-                                            offset:offset
-                                       bytesPerRow:u64{elements} * bytes_per_texel]);
 }
 
 Object CreateBuffer(const Device& device, u64 size, bool shared, u8** contents) {
-    const MTLResourceOptions options =
-        shared ? (MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache)
-               : MTLResourceStorageModePrivate;
-    const id<MTLBuffer> buffer = [device.GetDevice() newBufferWithLength:(std::max)(size, u64{16})
-                                                                 options:options];
-    if (contents != nullptr) {
-        *contents = buffer != nil && shared ? static_cast<u8*>(buffer.contents) : nullptr;
+    @autoreleasepool {
+        const MTLResourceOptions options =
+            shared ? (MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache)
+                   : MTLResourceStorageModePrivate;
+        const id<MTLBuffer> buffer =
+            [device.GetDevice() newBufferWithLength:(std::max)(size, u64{16}) options:options];
+        if (contents != nullptr) {
+            *contents = buffer != nil && shared ? static_cast<u8*>(buffer.contents) : nullptr;
+        }
+        return Retain(buffer);
     }
-    return Retain(buffer);
 }
 
 Object CreateLinearClampSampler(const Device& device) {
-    MTLSamplerDescriptor* descriptor = [[MTLSamplerDescriptor alloc] init];
-    descriptor.minFilter = MTLSamplerMinMagFilterLinear;
-    descriptor.magFilter = MTLSamplerMinMagFilterLinear;
-    descriptor.sAddressMode = MTLSamplerAddressModeClampToEdge;
-    descriptor.tAddressMode = MTLSamplerAddressModeClampToEdge;
-    return Retain([device.GetDevice() newSamplerStateWithDescriptor:descriptor]);
+    @autoreleasepool {
+        MTLSamplerDescriptor* descriptor = [[MTLSamplerDescriptor alloc] init];
+        descriptor.minFilter = MTLSamplerMinMagFilterLinear;
+        descriptor.magFilter = MTLSamplerMinMagFilterLinear;
+        descriptor.sAddressMode = MTLSamplerAddressModeClampToEdge;
+        descriptor.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        return Retain([device.GetDevice() newSamplerStateWithDescriptor:descriptor]);
+    }
 }
 
 bool SamplerBiasSupported(const Device& device) {
@@ -556,75 +567,78 @@ Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc,
         }
         return MTLSamplerAddressModeRepeat;
     };
-    MTLSamplerDescriptor* descriptor = [MTLSamplerDescriptor new];
-    descriptor.minFilter = filter(tsc.min_filter.Value());
-    descriptor.magFilter = filter(tsc.mag_filter.Value());
-    switch (tsc.mipmap_filter.Value()) {
-    case TextureMipmapFilter::Nearest: descriptor.mipFilter = MTLSamplerMipFilterNearest; break;
-    case TextureMipmapFilter::Linear:
-        descriptor.mipFilter =
-            options.force_nearest ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterLinear;
-        break;
-    default: descriptor.mipFilter = MTLSamplerMipFilterNotMipmapped; break;
-    }
-    descriptor.sAddressMode = address(tsc.wrap_u.Value());
-    descriptor.tAddressMode = address(tsc.wrap_v.Value());
-    descriptor.rAddressMode = address(tsc.wrap_p.Value());
-    // Metal has three border colours and no custom one: the guest's nearest (exact for
-    // transparent black, opaque black and opaque white).
-    const auto border = options.srgb_border ? tsc.SrgbBorderColor() : tsc.BorderColor();
-    if (border[3] < 0.5f) {
-        descriptor.borderColor = MTLSamplerBorderColorTransparentBlack;
-    } else if (border[0] + border[1] + border[2] > 1.5f) {
-        descriptor.borderColor = MTLSamplerBorderColorOpaqueWhite;
-    } else {
-        descriptor.borderColor = MTLSamplerBorderColorOpaqueBlack;
-    }
-    if (tsc.depth_compare_enabled != 0 && !options.drop_compare) {
-        // Tegra's DepthCompareFunc has MTLCompareFunction's values.
-        descriptor.compareFunction = static_cast<MTLCompareFunction>(tsc.depth_compare_func.Value());
-    }
-    if (descriptor.mipFilter == MTLSamplerMipFilterNotMipmapped) {
-        descriptor.lodMinClamp = 0.0f;
-        descriptor.lodMaxClamp = 0.25f;
-    } else {
-        descriptor.lodMinClamp = tsc.MinLod();
-        descriptor.lodMaxClamp = (std::max)(tsc.MaxLod(), tsc.MinLod());
-        // Vulkan's EDEN_NX2_FORCE_LOD0 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): mipmapped
-        // samplers read the top level only (a debug aid for mip layout problems).
-        static const bool force_lod0 = VulkanSwitch("EDEN_NX2_FORCE_LOD0") != nullptr;
-        if (force_lod0) {
+    @autoreleasepool {
+        MTLSamplerDescriptor* descriptor = [MTLSamplerDescriptor new];
+        descriptor.minFilter = filter(tsc.min_filter.Value());
+        descriptor.magFilter = filter(tsc.mag_filter.Value());
+        switch (tsc.mipmap_filter.Value()) {
+        case TextureMipmapFilter::Nearest: descriptor.mipFilter = MTLSamplerMipFilterNearest; break;
+        case TextureMipmapFilter::Linear:
+            descriptor.mipFilter =
+                options.force_nearest ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterLinear;
+            break;
+        default: descriptor.mipFilter = MTLSamplerMipFilterNotMipmapped; break;
+        }
+        descriptor.sAddressMode = address(tsc.wrap_u.Value());
+        descriptor.tAddressMode = address(tsc.wrap_v.Value());
+        descriptor.rAddressMode = address(tsc.wrap_p.Value());
+        // Metal has three border colours and no custom one: the guest's nearest (exact for
+        // transparent black, opaque black and opaque white).
+        const auto border = options.srgb_border ? tsc.SrgbBorderColor() : tsc.BorderColor();
+        if (border[3] < 0.5f) {
+            descriptor.borderColor = MTLSamplerBorderColorTransparentBlack;
+        } else if (border[0] + border[1] + border[2] > 1.5f) {
+            descriptor.borderColor = MTLSamplerBorderColorOpaqueWhite;
+        } else {
+            descriptor.borderColor = MTLSamplerBorderColorOpaqueBlack;
+        }
+        if (tsc.depth_compare_enabled != 0 && !options.drop_compare) {
+            // Tegra's DepthCompareFunc has MTLCompareFunction's values.
+            descriptor.compareFunction =
+                static_cast<MTLCompareFunction>(tsc.depth_compare_func.Value());
+        }
+        if (descriptor.mipFilter == MTLSamplerMipFilterNotMipmapped) {
             descriptor.lodMinClamp = 0.0f;
             descriptor.lodMaxClamp = 0.25f;
-        }
-    }
-    f32 anisotropy = std::clamp(tsc.MaxAnisotropy(), 1.0f, 16.0f);
-    if (options.force_nearest) {
-        anisotropy = 1.0f;
-    } else if (options.reduce_anisotropy) {
-        anisotropy = static_cast<f32>(1U << tsc.max_anisotropy.Value());
-    }
-    descriptor.maxAnisotropy = static_cast<NSUInteger>(anisotropy);
-#if LICHII_METAL_SAMPLER_BIAS
-    if (@available(iOS 26.0, macOS 26.0, *)) {
-        if (!plain && SamplerBiasSupported(device)) {
-            descriptor.lodBias =
-                std::clamp(tsc.LodBias() + options.added_lod_bias, -15.0f, 15.0f);
-            switch (tsc.reduction_filter.Value()) {
-            case SamplerReduction::Min:
-                descriptor.reductionMode = MTLSamplerReductionModeMinimum;
-                break;
-            case SamplerReduction::Max:
-                descriptor.reductionMode = MTLSamplerReductionModeMaximum;
-                break;
-            default: break;
+        } else {
+            descriptor.lodMinClamp = tsc.MinLod();
+            descriptor.lodMaxClamp = (std::max)(tsc.MaxLod(), tsc.MinLod());
+            // Vulkan's EDEN_NX2_FORCE_LOD0 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): mipmapped
+            // samplers read the top level only (a debug aid for mip layout problems).
+            static const bool force_lod0 = VulkanSwitch("EDEN_NX2_FORCE_LOD0") != nullptr;
+            if (force_lod0) {
+                descriptor.lodMinClamp = 0.0f;
+                descriptor.lodMaxClamp = 0.25f;
             }
         }
-    }
+        f32 anisotropy = std::clamp(tsc.MaxAnisotropy(), 1.0f, 16.0f);
+        if (options.force_nearest) {
+            anisotropy = 1.0f;
+        } else if (options.reduce_anisotropy) {
+            anisotropy = static_cast<f32>(1U << tsc.max_anisotropy.Value());
+        }
+        descriptor.maxAnisotropy = static_cast<NSUInteger>(anisotropy);
+#if LICHII_METAL_SAMPLER_BIAS
+        if (@available(iOS 26.0, macOS 26.0, *)) {
+            if (!plain && SamplerBiasSupported(device)) {
+                descriptor.lodBias =
+                    std::clamp(tsc.LodBias() + options.added_lod_bias, -15.0f, 15.0f);
+                switch (tsc.reduction_filter.Value()) {
+                case SamplerReduction::Min:
+                    descriptor.reductionMode = MTLSamplerReductionModeMinimum;
+                    break;
+                case SamplerReduction::Max:
+                    descriptor.reductionMode = MTLSamplerReductionModeMaximum;
+                    break;
+                default: break;
+                }
+            }
+        }
 #endif
-    descriptor.normalizedCoordinates = YES;
-    descriptor.supportArgumentBuffers = YES;
-    return Retain([device.GetDevice() newSamplerStateWithDescriptor:descriptor]);
+        descriptor.normalizedCoordinates = YES;
+        descriptor.supportArgumentBuffers = YES;
+        return Retain([device.GetDevice() newSamplerStateWithDescriptor:descriptor]);
+    }
 }
 
 namespace {
@@ -636,112 +650,124 @@ namespace {
 } // Anonymous namespace
 
 Object CreateLibrary(const Device& device, std::string_view source, std::string& error) {
-    MTLCompileOptions* options = [MTLCompileOptions new];
-    // The recompiler marks what must stay exact (NoContraction); the rest may use fast math.
-    // EDEN_NX2_METAL_FAST_MATH=1: full fast math (A/B).
-    static const bool full_fast_math = [] {
-        const char* const value = std::getenv("EDEN_NX2_METAL_FAST_MATH");
-        return value != nullptr && value[0] == '1';
-    }();
-    // EDEN_NX2_METAL_SAFE_MATH=1: no fast math at all, positions invariant across programs (A/B:
-    // a depth pre-pass and an EQUAL-tested colour pass of the same geometry must agree bit for
-    // bit).
-    static const bool safe_math = [] {
-        const char* const value = std::getenv("EDEN_NX2_METAL_SAFE_MATH");
-        return value != nullptr && value[0] == '1';
-    }();
-    if (safe_math) {
-        if (@available(iOS 18.0, macOS 15.0, *)) {
-            options.mathMode = MTLMathModeSafe;
+    @autoreleasepool {
+        MTLCompileOptions* options = [MTLCompileOptions new];
+        // The recompiler marks what must stay exact (NoContraction); the rest may use fast math.
+        // EDEN_NX2_METAL_FAST_MATH=1: full fast math (A/B).
+        static const bool full_fast_math = [] {
+            const char* const value = std::getenv("EDEN_NX2_METAL_FAST_MATH");
+            return value != nullptr && value[0] == '1';
+        }();
+        // EDEN_NX2_METAL_SAFE_MATH=1: no fast math at all, positions invariant across programs
+        // (A/B: a depth pre-pass and an EQUAL-tested colour pass of the same geometry must agree
+        // bit for bit).
+        static const bool safe_math = [] {
+            const char* const value = std::getenv("EDEN_NX2_METAL_SAFE_MATH");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (safe_math) {
+            if (@available(iOS 18.0, macOS 15.0, *)) {
+                options.mathMode = MTLMathModeSafe;
+            } else {
+                options.fastMathEnabled = NO;
+            }
+            if (@available(iOS 14.0, macOS 11.0, *)) {
+                options.preserveInvariance = YES;
+            }
+        } else if (full_fast_math) {
+            options.fastMathEnabled = YES;
+        } else if (@available(iOS 18.0, macOS 15.0, *)) {
+            // Relaxed keeps fast math's reassociation but still honours NaN and Inf, as MoltenVK
+            // does; full fast math let one NaN (normalize(0), 0 * inf in specular terms) spread
+            // through the lighting and bloom passes into white blobs.
+            options.mathMode = MTLMathModeRelaxed;
         } else {
-            options.fastMathEnabled = NO;
+            options.fastMathEnabled = YES;
         }
-        if (@available(iOS 14.0, macOS 11.0, *)) {
-            options.preserveInvariance = YES;
+        NSError* ns_error = nil;
+        const id<MTLLibrary> library = [device.GetDevice() newLibraryWithSource:ToNSString(source)
+                                                                        options:options
+                                                                          error:&ns_error];
+        if (library == nil) {
+            error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
         }
-    } else if (full_fast_math) {
-        options.fastMathEnabled = YES;
-    } else if (@available(iOS 18.0, macOS 15.0, *)) {
-        // Relaxed keeps fast math's reassociation but still honours NaN and Inf, as MoltenVK
-        // does; full fast math let one NaN (normalize(0), 0 * inf in specular terms) spread
-        // through the lighting and bloom passes into white blobs.
-        options.mathMode = MTLMathModeRelaxed;
-    } else {
-        options.fastMathEnabled = YES;
+        return Retain(library);
     }
-    NSError* ns_error = nil;
-    const id<MTLLibrary> library = [device.GetDevice() newLibraryWithSource:ToNSString(source)
-                                                                    options:options
-                                                                      error:&ns_error];
-    if (library == nil) {
-        error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
-    }
-    return Retain(library);
 }
 
 Object CreateFunction(const void* library, std::string_view name) {
     const id<MTLLibrary> object = (__bridge id<MTLLibrary>)library;
-    return object != nil ? Retain([object newFunctionWithName:ToNSString(name)]) : Object{};
+    if (object == nil) {
+        return {};
+    }
+    @autoreleasepool {
+        return Retain([object newFunctionWithName:ToNSString(name)]);
+    }
 }
 
 Object CreateComputeState(const Device& device, MTLComputePipelineDescriptor* descriptor,
                           std::string& error, PipelineArchive* archive) {
-    const id<MTLBinaryArchive> binary =
-        archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
-    const auto start = std::chrono::steady_clock::now();
-    id<MTLComputePipelineState> state = nil;
-    std::shared_lock<std::shared_mutex> building;
-    if (binary != nil) {
-        building = std::shared_lock{archive->BuildMutex()};
-        descriptor.binaryArchives = @[ binary ];
-        state = [device.GetDevice()
-            newComputePipelineStateWithDescriptor:descriptor
-                                          options:MTLPipelineOptionFailOnBinaryArchiveMiss
-                                       reflection:nil
-                                            error:nil];
-    }
-    if (building.owns_lock()) {
-        // Release right after the probe: holding the archive lock across the fallback compile
-        // (and the writer-preferring lock of an addition) serialized every builder.
-        building.unlock();
-    }
-    const bool hit = state != nil;
-    if (!hit && descriptor.binaryArchives != nil) {
-        descriptor.binaryArchives = nil;
-    }
-    NSError* ns_error = nil;
-    if (!hit) {
-        state = [device.GetDevice() newComputePipelineStateWithDescriptor:descriptor
-                                                                  options:MTLPipelineOptionNone
-                                                               reflection:nil
-                                                                    error:&ns_error];
-    }
-    if (building.owns_lock()) {
-        building.unlock();
-    }
-    if (state == nil) {
-        error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
-        return {};
-    }
-    if (binary != nil) {
-        archive->NoteBuild(hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                     std::chrono::steady_clock::now() - start)
-                                                     .count()));
+    @autoreleasepool {
+        const id<MTLBinaryArchive> binary =
+            archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
+        const auto start = std::chrono::steady_clock::now();
+        id<MTLComputePipelineState> state = nil;
+        std::shared_lock<std::shared_mutex> building;
+        if (binary != nil) {
+            building = std::shared_lock{archive->BuildMutex()};
+            descriptor.binaryArchives = @[ binary ];
+            state = [device.GetDevice()
+                newComputePipelineStateWithDescriptor:descriptor
+                                              options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                           reflection:nil
+                                                error:nil];
+        }
+        if (building.owns_lock()) {
+            // Release right after the probe: holding the archive lock across the fallback compile
+            // (and the writer-preferring lock of an addition) serialized every builder.
+            building.unlock();
+        }
+        const bool hit = state != nil;
+        if (!hit && descriptor.binaryArchives != nil) {
+            descriptor.binaryArchives = nil;
+        }
+        NSError* ns_error = nil;
         if (!hit) {
-            auto* const copy = [descriptor copy];
+            state = [device.GetDevice() newComputePipelineStateWithDescriptor:descriptor
+                                                                      options:MTLPipelineOptionNone
+                                                                   reflection:nil
+                                                                        error:&ns_error];
+        }
+        if (building.owns_lock()) {
+            building.unlock();
+        }
+        if (state == nil) {
+            error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
+            return {};
+        }
+        if (binary != nil) {
+            archive->NoteBuild(
+                hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count()));
+            if (!hit) {
+                auto* const copy = [descriptor copy];
                 archive->DeferAdd([binary, copy] {
                     return [binary addComputePipelineFunctionsWithDescriptor:copy error:nil] == YES;
                 });
+            }
         }
+        return Retain(state);
     }
-    return Retain(state);
 }
 
 Object CreateComputePipelineState(const Device& device, const void* function, std::string& error,
                                   PipelineArchive* archive) {
-    MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
-    descriptor.computeFunction = (__bridge id<MTLFunction>)function;
-    return CreateComputeState(device, descriptor, error, archive);
+    @autoreleasepool {
+        MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
+        descriptor.computeFunction = (__bridge id<MTLFunction>)function;
+        return CreateComputeState(device, descriptor, error, archive);
+    }
 }
 
 u64 DeviceAllocatedSize(const Device& device) {
@@ -774,9 +800,9 @@ u64 AllocatedSize(const void* resource) {
 void SetLabel(const void* resource, std::string_view label) {
     const id<MTLResource> object = (__bridge id<MTLResource>)resource;
     if (object != nil) {
-        object.label = [[NSString alloc] initWithBytes:label.data()
-                                                length:label.size()
-                                              encoding:NSUTF8StringEncoding];
+        @autoreleasepool {
+            object.label = ToNSString(label);
+        }
     }
 }
 

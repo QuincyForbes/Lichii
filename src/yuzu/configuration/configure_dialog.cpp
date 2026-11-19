@@ -12,6 +12,7 @@
 #include <QGuiApplication>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListView>
 #include <QListWidget>
 #include <QScreen>
 #include <QScrollArea>
@@ -512,7 +513,11 @@ void ConfigureDialog::OnSearchChanged(const QString& text) {
                 const bool direct_match = matches(widget->Label()) || matches(key);
                 QString matched_choice;
                 if (!direct_match && widget->combobox != nullptr) {
+                    auto* const view = qobject_cast<QListView*>(widget->combobox->view());
                     for (int item_idx = 0; item_idx < widget->combobox->count(); ++item_idx) {
+                        if (view != nullptr && view->isRowHidden(item_idx)) {
+                            continue;
+                        }
                         const QString choice_text = widget->combobox->itemText(item_idx);
                         if (matches(choice_text)) {
                             matched_choice = choice_text;

@@ -92,7 +92,7 @@ void AlphaTest(EmitContext& ctx) {
     ctx.OpBranchConditional(condition, true_label, discard_label);
     ctx.AddLabel(discard_label);
     ctx.OpKill();
-    ctx.AddLabel(true_label);
+    ctx.AddContinuationLabel(true_label);
 }
 } // Anonymous namespace
 

@@ -538,7 +538,7 @@ bool FlashWatch::Reduce(Kind kind, u32 index, std::span<const Source> sources,
         return false;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([this, work = std::move(work), buffer = *slot.buffer](
+    scheduler.Record([this, items = std::move(work), buffer = *slot.buffer](
                          vk::CommandBuffer cmdbuf) {
         const VkMemoryBarrier before{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -549,7 +549,7 @@ bool FlashWatch::Reduce(Kind kind, u32 index, std::span<const Source> sources,
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, before);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
-        for (const auto& [view, push] : work) {
+        for (const auto& [view, push] : items) {
             const VkDescriptorSet set = descriptor_allocator.Commit();
             const VkDescriptorImageInfo image_info{
                 .sampler = *sampler,
@@ -603,6 +603,7 @@ bool FlashWatch::Reduce(Kind kind, u32 index, std::span<const Source> sources,
                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0,
                                after);
     });
+    scheduler.InvalidateDescriptorBuffer();
     return true;
 }
 

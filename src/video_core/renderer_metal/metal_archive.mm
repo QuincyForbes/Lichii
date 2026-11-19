@@ -44,6 +44,11 @@ PipelineArchive::~PipelineArchive() {
         impl->add_thread.join();
     }
     Save();
+    @autoreleasepool {
+        impl->archive = nil;
+        impl->mapped_data = nil;
+        impl->url = nil;
+    }
 }
 
 void PipelineArchive::DeferAdd(std::function<bool()> add) {

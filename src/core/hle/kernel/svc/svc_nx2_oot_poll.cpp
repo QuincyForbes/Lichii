@@ -67,10 +67,14 @@ constexpr u64 kCountOffset = 0x1E0;
 constexpr u64 kIssuedOffset = 0x108;    // w: loads issued by this walk (reset at 0x130E8)
 constexpr u64 kAllDoneOffset = 0x110;   // w: bit 0 = every entry was ready
 constexpr u64 kWalkCountOffset = 0x128; // w: entries this walk visits (snapshot at 0x130E0)
+constexpr u64 kStackSpan = kWalkCountOffset - kIssuedOffset + sizeof(u32);
+constexpr u64 kPageSize = 0x1000;
 
 constexpr s64 kMinSleepNs = 500'000;
 constexpr s64 kLimitMaxSleepNs = 16'000'000; // the game's own idle sleep in this loop
 constexpr s64 kDefaultMaxSleepNs = kLimitMaxSleepNs;
+constexpr s64 kDefaultSliceNs = 4'000'000;
+constexpr long long kMinSliceUs = 100;
 constexpr s64 kWalkFactor = 4;
 // A gap longer than this since the last return from the SVC is not one walk (the thread idled in
 // the 16 ms sleep or was preempted for long); such a walk gets the minimum sleep.
@@ -103,13 +107,13 @@ s64 SliceNs() {
     static const s64 ns = [] {
         const char* value = std::getenv("EDEN_NX2_OOT_POLL_SLICE");
         if (value == nullptr || value[0] == 0) {
-            return s64{4'000'000};
+            return kDefaultSliceNs;
         }
         const long long parsed = std::strtoll(value, nullptr, 10);
         if (parsed <= 0) {
             return s64{0};
         }
-        return static_cast<s64>((std::max)(parsed, 100LL)) * 1000;
+        return static_cast<s64>((std::max)(parsed, kMinSliceUs)) * 1000;
     }();
     return ns;
 }
@@ -138,13 +142,25 @@ struct WalkView {
 };
 
 bool Valid(Core::Memory::Memory& memory, u64 address, u64 size) {
-    return address != 0 && memory.IsValidVirtualAddressRange(address, size);
+    return address != 0 && size != 0 && address <= (std::numeric_limits<u64>::max)() - size &&
+           memory.IsValidVirtualAddressRange(address, size);
+}
+
+bool SamePageRange(u64 address, u64 size) {
+    return address != 0 && size != 0 && address <= (std::numeric_limits<u64>::max)() - size &&
+           (address ^ (address + size - 1)) < kPageSize;
 }
 
 struct ManagerFields {
     u32 state{};
     u32 head{};
     u32 count{};
+};
+
+struct StackFields {
+    u32 issued{};
+    u32 all_done{};
+    u32 walk_count{};
 };
 
 u32 LoadU32Le(const u8* ptr) {
@@ -154,10 +170,8 @@ u32 LoadU32Le(const u8* ptr) {
 }
 
 bool ReadManagerFields(Core::Memory::Memory& memory, u64 manager, ManagerFields& out) {
-    if (manager == 0 || manager > (std::numeric_limits<u64>::max)() - (kCountOffset + 4)) {
-        return false;
-    }
-    if ((manager ^ (manager + kCountOffset + 3)) < 0x1000) {
+    constexpr u64 kManagerSpan = kCountOffset + sizeof(u32);
+    if (SamePageRange(manager, kManagerSpan)) {
         if (const u8* const base = memory.GetPointerSilent(manager)) {
             out.state = LoadU32Le(base + kStateOffset);
             out.head = LoadU32Le(base + kHeadOffset);
@@ -165,7 +179,7 @@ bool ReadManagerFields(Core::Memory::Memory& memory, u64 manager, ManagerFields&
             return true;
         }
     }
-    if (!Valid(memory, manager, kCountOffset + 4)) {
+    if (!Valid(memory, manager, kManagerSpan)) {
         return false;
     }
     out.state = memory.Read32(manager + kStateOffset);
@@ -174,17 +188,44 @@ bool ReadManagerFields(Core::Memory::Memory& memory, u64 manager, ManagerFields&
     return true;
 }
 
+bool ReadStackFields(Core::Memory::Memory& memory, u64 sp, StackFields& out) {
+    if (sp == 0 || sp > (std::numeric_limits<u64>::max)() - (kIssuedOffset + kStackSpan)) {
+        return false;
+    }
+    const u64 stack_base = sp + kIssuedOffset;
+    if (SamePageRange(stack_base, kStackSpan)) {
+        if (const u8* const ptr = memory.GetPointerSilent(stack_base)) {
+            out.issued = LoadU32Le(ptr);
+            out.all_done = LoadU32Le(ptr + (kAllDoneOffset - kIssuedOffset));
+            out.walk_count = LoadU32Le(ptr + (kWalkCountOffset - kIssuedOffset));
+            return true;
+        }
+        return false;
+    }
+    if (!Valid(memory, stack_base, kStackSpan)) {
+        return false;
+    }
+    out.issued = memory.Read32(sp + kIssuedOffset);
+    out.all_done = memory.Read32(sp + kAllDoneOffset);
+    out.walk_count = memory.Read32(sp + kWalkCountOffset);
+    return true;
+}
+
 bool ExitPending(Core::Memory::Memory& memory, u64 main_base) {
+    if (main_base > (std::numeric_limits<u64>::max)() - kExitGotOffset) {
+        return false;
+    }
     const u64 got = main_base + kExitGotOffset;
-    if (!Valid(memory, got, 8)) {
+    if (!Valid(memory, got, sizeof(u64))) {
         return false;
     }
     const u64 global = memory.Read64(got);
-    if (!Valid(memory, global, 8)) {
+    if (!Valid(memory, global, sizeof(u64))) {
         return false;
     }
     const u64 object = memory.Read64(global);
-    if (object == 0 || !Valid(memory, object + kExitFlagOffset, 8)) {
+    if (object == 0 || object > (std::numeric_limits<u64>::max)() - kExitFlagOffset ||
+        !Valid(memory, object + kExitFlagOffset, sizeof(u64))) {
         return false;
     }
     return memory.Read64(object + kExitFlagOffset) != 0;
@@ -193,47 +234,26 @@ bool ExitPending(Core::Memory::Memory& memory, u64 main_base) {
 WalkView ReadWalk(Core::Memory::Memory& memory, const ThreadContext& ctx) {
     WalkView view{};
     // Only reached through `tbz w8, #0` with w8 = [sp+0x110]; anything else is not this frame.
-    if ((ctx.r[8] & 1) != 0) {
+    if ((ctx.r[8] & 1) != 0 || ctx.pc < kSvcReturnOffset) {
         return view;
     }
     const u64 main_base = ctx.pc - kSvcReturnOffset;
     static std::atomic<u64> verified_main_base{};
     if (verified_main_base.load(std::memory_order_relaxed) != main_base) {
-        if (!Valid(memory, main_base + kRescanBranchOffset, 4) ||
+        if (main_base > (std::numeric_limits<u64>::max)() - kSvcOffset ||
+            !Valid(memory, main_base + kRescanBranchOffset, sizeof(u32)) ||
             memory.Read32(main_base + kRescanBranchOffset) != kRescanBranch ||
-            !Valid(memory, main_base + kSvcOffset, 4) ||
+            !Valid(memory, main_base + kSvcOffset, sizeof(u32)) ||
             memory.Read32(main_base + kSvcOffset) != kSvcInstruction) {
             return view;
         }
         verified_main_base.store(main_base, std::memory_order_relaxed);
     }
     const u64 manager = ctx.r[19];
-    const u64 sp = ctx.sp;
     ManagerFields fields{};
-    if (!ReadManagerFields(memory, manager, fields)) {
-        return view;
-    }
-    u32 issued{};
-    u32 all_done{};
-    u32 walk_count{};
-    const u64 stack_base = sp + kIssuedOffset;
-    if (sp != 0 && sp <= (std::numeric_limits<u64>::max)() - (kIssuedOffset + 0x24) &&
-        (stack_base ^ (stack_base + 0x23)) < 0x1000) {
-        if (const u8* const ptr = memory.GetPointerSilent(stack_base)) {
-            issued = LoadU32Le(ptr);
-            all_done = LoadU32Le(ptr + (kAllDoneOffset - kIssuedOffset));
-            walk_count = LoadU32Le(ptr + (kWalkCountOffset - kIssuedOffset));
-        } else {
-            return view;
-        }
-    } else if (Valid(memory, stack_base, 0x24)) {
-        issued = memory.Read32(sp + kIssuedOffset);
-        all_done = memory.Read32(sp + kAllDoneOffset);
-        walk_count = memory.Read32(sp + kWalkCountOffset);
-    } else {
-        return view;
-    }
-    if ((all_done & 1) != 0) {
+    StackFields stack{};
+    if (!ReadManagerFields(memory, manager, fields) || !ReadStackFields(memory, ctx.sp, stack) ||
+        (stack.all_done & 1) != 0) {
         return view;
     }
     view.manager = manager;
@@ -241,9 +261,9 @@ WalkView ReadWalk(Core::Memory::Memory& memory, const ThreadContext& ctx) {
     view.count = fields.count;
     if (fields.state != kStateWalking) {
         view.outcome = Outcome::State;
-    } else if (issued != 0) {
+    } else if (stack.issued != 0) {
         view.outcome = Outcome::Progress;
-    } else if (view.count != walk_count) {
+    } else if (view.count != stack.walk_count) {
         view.outcome = Outcome::ListChanged;
     } else if (ExitPending(memory, main_base)) {
         view.outcome = Outcome::Exit;

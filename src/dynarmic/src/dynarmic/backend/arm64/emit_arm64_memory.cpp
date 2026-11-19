@@ -513,6 +513,43 @@ void EmitStoreAt(oaknut::CodeGenerator& code, int value_idx, oaknut::XReg Xptr, 
     }
 }
 
+template<std::size_t bitsize, typename RegT>
+void EmitWrappedReadFallback(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst,
+                             oaknut::XReg Xaddr, RegT Rvalue, bool ordered, oaknut::Label& end) {
+    code.MOV(Xscratch0, Xaddr);
+    EmitRelocation(code, ctx, WrappedReadMemoryLinkTarget(bitsize));
+    if (ordered) {
+        code.DMB(oaknut::BarrierOp::ISH);
+    }
+    if constexpr (bitsize == 128) {
+        code.MOV(Rvalue.B16(), Q0.B16());
+    } else {
+        code.MOV(Rvalue.toX(), Xscratch0);
+    }
+    ctx.conf.emit_check_memory_abort(code, ctx, inst, end);
+    code.B(end);
+}
+
+template<std::size_t bitsize, typename RegT>
+void EmitWrappedWriteFallback(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst,
+                              oaknut::XReg Xaddr, RegT Rvalue, bool ordered, oaknut::Label& end) {
+    code.MOV(Xscratch0, Xaddr);
+    if constexpr (bitsize == 128) {
+        code.MOV(Q0.B16(), Rvalue.B16());
+    } else {
+        code.MOV(Xscratch1, Rvalue.toX());
+    }
+    if (ordered) {
+        code.DMB(oaknut::BarrierOp::ISH);
+    }
+    EmitRelocation(code, ctx, WrappedWriteMemoryLinkTarget(bitsize));
+    if (ordered) {
+        code.DMB(oaknut::BarrierOp::ISH);
+    }
+    ctx.conf.emit_check_memory_abort(code, ctx, inst, end);
+    code.B(end);
+}
+
 template<std::size_t bitsize>
 void InlinePageTableEmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
@@ -543,18 +580,7 @@ void InlinePageTableEmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx
 
     ctx.deferred_emits.emplace_back([&code, &ctx, inst, Xaddr = *Xaddr, Rvalue = *Rvalue, ordered, fallback, end] {
         code.l(*fallback);
-        code.MOV(Xscratch0, Xaddr);
-        EmitRelocation(code, ctx, WrappedReadMemoryLinkTarget(bitsize));
-        if (ordered) {
-            code.DMB(oaknut::BarrierOp::ISH);
-        }
-        if constexpr (bitsize == 128) {
-            code.MOV(Rvalue.B16(), Q0.B16());
-        } else {
-            code.MOV(Rvalue.toX(), Xscratch0);
-        }
-        ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
-        code.B(*end);
+        EmitWrappedReadFallback<bitsize>(code, ctx, inst, Xaddr, Rvalue, ordered, *end);
     });
 
     code.l(*end);
@@ -590,22 +616,7 @@ void InlinePageTableEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ct
 
     ctx.deferred_emits.emplace_back([&code, &ctx, inst, Xaddr = *Xaddr, Rvalue = *Rvalue, ordered, fallback, end] {
         code.l(*fallback);
-        if constexpr (bitsize == 128) {
-            code.MOV(Xscratch0, Xaddr);
-            code.MOV(Q0.B16(), Rvalue.B16());
-        } else {
-            code.MOV(Xscratch0, Xaddr);
-            code.MOV(Xscratch1, Rvalue.toX());
-        }
-        if (ordered) {
-            code.DMB(oaknut::BarrierOp::ISH);
-        }
-        EmitRelocation(code, ctx, WrappedWriteMemoryLinkTarget(bitsize));
-        if (ordered) {
-            code.DMB(oaknut::BarrierOp::ISH);
-        }
-        ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
-        code.B(*end);
+        EmitWrappedWriteFallback<bitsize>(code, ctx, inst, Xaddr, Rvalue, ordered, *end);
     });
 
     code.l(*end);
@@ -697,18 +708,7 @@ void FastmemEmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::In
             });
 
         code.l(*fallback);
-        code.MOV(Xscratch0, Xaddr);
-        EmitRelocation(code, ctx, WrappedReadMemoryLinkTarget(bitsize));
-        if (ordered) {
-            code.DMB(oaknut::BarrierOp::ISH);
-        }
-        if constexpr (bitsize == 128) {
-            code.MOV(Rvalue.B16(), Q0.B16());
-        } else {
-            code.MOV(Rvalue.toX(), Xscratch0);
-        }
-        ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
-        code.B(*end);
+        EmitWrappedReadFallback<bitsize>(code, ctx, inst, Xaddr, Rvalue, ordered, *end);
     });
 
     code.l(*end);
@@ -756,22 +756,7 @@ void FastmemEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::I
             });
 
         code.l(*fallback);
-        if constexpr (bitsize == 128) {
-            code.MOV(Xscratch0, Xaddr);
-            code.MOV(Q0.B16(), Rvalue.B16());
-        } else {
-            code.MOV(Xscratch0, Xaddr);
-            code.MOV(Xscratch1, Rvalue.toX());
-        }
-        if (ordered) {
-            code.DMB(oaknut::BarrierOp::ISH);
-        }
-        EmitRelocation(code, ctx, WrappedWriteMemoryLinkTarget(bitsize));
-        if (ordered) {
-            code.DMB(oaknut::BarrierOp::ISH);
-        }
-        ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
-        code.B(*end);
+        EmitWrappedWriteFallback<bitsize>(code, ctx, inst, Xaddr, Rvalue, ordered, *end);
     });
 
     code.l(*end);
@@ -962,10 +947,18 @@ void FastmemEmitExclusiveReadMemory(oaknut::CodeGenerator& code, EmitContext& ct
     const auto fastmem_location = EmitMemoryLdr<bitsize>(code, Rvalue->index(), Xbase, Xoffset, ordered, ShouldExt32(ctx));
 
     code.l(*loaded);
-    code.MOV(Xscratch0, ctx.conf.exclusive_value_pointer);
-    code.STR(Rvalue->toX(), Xscratch0);
     code.MOV(Xscratch0, ctx.conf.exclusive_address_pointer);
-    code.STR(*Xaddr, Xscratch0);
+    const s64 value_disp = static_cast<s64>(ctx.conf.exclusive_value_pointer - ctx.conf.exclusive_address_pointer);
+    if (value_disp == 8) {
+        code.STP(*Xaddr, Rvalue->toX(), Xscratch0, 0);
+    } else if (value_disp >= 0 && (value_disp % 8) == 0 && value_disp <= 4095 * 8) {
+        code.STR(Rvalue->toX(), Xscratch0, static_cast<int>(value_disp));
+        code.STR(*Xaddr, Xscratch0);
+    } else {
+        code.STR(*Xaddr, Xscratch0);
+        code.MOV(Xscratch0, ctx.conf.exclusive_value_pointer);
+        code.STR(Rvalue->toX(), Xscratch0);
+    }
     code.MOV(Wscratch0, 1);
     code.STRB(Wscratch0, Xstate, ctx.conf.state_exclusive_state_offset);
 
@@ -1014,18 +1007,19 @@ void FastmemEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& c
             code.CMP(a.toW(), b.toW());
         }
     };
-    // Xscratch1 = the value this core's LDXR saw (Xscratch0 is used).
+    // Xscratch1 = the value this core's LDXR saw.
     const u64 value_pointer = ctx.conf.exclusive_value_pointer;
-    const auto load_expected = [&code, value_pointer] {
-        code.MOV(Xscratch1, value_pointer);
+    const s64 value_disp = static_cast<s64>(value_pointer - ctx.conf.exclusive_address_pointer);
+    const bool near_value = value_disp >= 0 && (value_disp % 8) == 0 && value_disp <= 4095;
+    const auto load_expected_at = [&code](oaknut::XReg Xptr, int offset) {
         if constexpr (bitsize == 8) {
-            code.LDRB(Wscratch1, Xscratch1);
+            code.LDRB(Wscratch1, Xptr, offset);
         } else if constexpr (bitsize == 16) {
-            code.LDRH(Wscratch1, Xscratch1);
+            code.LDRH(Wscratch1, Xptr, offset);
         } else if constexpr (bitsize == 32) {
-            code.LDR(Wscratch1, Xscratch1);
+            code.LDR(Wscratch1, Xptr, offset);
         } else {
-            code.LDR(Xscratch1, Xscratch1);
+            code.LDR(Xscratch1, Xptr, offset);
         }
     };
 
@@ -1037,7 +1031,12 @@ void FastmemEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& c
     code.LDR(Xscratch1, Xscratch0);
     code.CMP(Xscratch1, *Xaddr);
     code.B(NE, *end);
-    load_expected();
+    if (near_value) {
+        load_expected_at(Xscratch0, static_cast<int>(value_disp));
+    } else {
+        code.MOV(Xscratch1, value_pointer);
+        load_expected_at(Xscratch1, 0);
+    }
     // The expected value, kept for the compare after the CAS (and for the fallback).
     code.MOV(Xscratch2, Xscratch1);
     const auto [Xbase, Xoffset] = FastmemEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
@@ -1046,7 +1045,7 @@ void FastmemEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& c
     compare(Xscratch1, Xscratch2);
     code.CSET(Wstatus, NE);
 
-    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, Wstatus = *Wstatus, compare, load_expected, fallback, end, fastmem_location] {
+    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, Wstatus = *Wstatus, value_pointer, compare, load_expected_at, fallback, end, fastmem_location] {
         ctx.ebi.fastmem_patch_info.emplace(
             fastmem_location - ctx.ebi.entry_point,
             FastmemPatchInfo{
@@ -1065,7 +1064,8 @@ void FastmemEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& c
         code.DMB(oaknut::BarrierOp::ISH);
         // Xscratch0 is the old value; the call kept neither scratch register, so the expected
         // value is read from the monitor slot again (the callbacks do not touch it).
-        load_expected();
+        code.MOV(Xscratch1, value_pointer);
+        load_expected_at(Xscratch1, 0);
         compare(Xscratch0, Xscratch1);
         code.CSET(Wstatus, NE);
         ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
@@ -1112,6 +1112,31 @@ void EmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR:
     CallbackOnlyEmitExclusiveWriteMemory<bitsize>(code, ctx, inst);
 }
 
+template<std::size_t bitsize, typename RegT>
+static void EmitAtomicRmwCallback(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst,
+                                  oaknut::XReg Xaddr, RegT Roperand, RegT Rresult, u8 encoded_op, oaknut::Label& end) {
+    code.MOV(Xscratch0, Xaddr);
+    code.MOV(Xscratch1, Roperand.toX());
+    code.MOV(Xscratch2, u64(encoded_op & 0x0F));
+    code.STR(Xscratch2, Xstate, ctx.conf.state_atomic_scratch_offset);
+    EmitRelocation(code, ctx, WrappedAtomicRmwLinkTarget(bitsize));
+    code.DMB(oaknut::BarrierOp::ISH);
+    code.MOV(Rresult.toX(), Xscratch0);
+    ctx.conf.emit_check_memory_abort(code, ctx, inst, end);
+}
+
+template<std::size_t bitsize, typename RegT>
+static void EmitAtomicCasCallback(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst,
+                                  oaknut::XReg Xaddr, RegT Rexpected, RegT Rdesired, RegT Rresult, oaknut::Label& end) {
+    code.MOV(Xscratch0, Xaddr);
+    code.MOV(Xscratch1, Rexpected.toX());
+    code.STR(Rdesired.toX(), Xstate, ctx.conf.state_atomic_scratch_offset);
+    EmitRelocation(code, ctx, WrappedAtomicCasLinkTarget(bitsize));
+    code.DMB(oaknut::BarrierOp::ISH);
+    code.MOV(Rresult.toX(), Xscratch0);
+    ctx.conf.emit_check_memory_abort(code, ctx, inst, end);
+}
+
 template<std::size_t bitsize>
 void EmitAtomicRmwMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
@@ -1155,14 +1180,7 @@ void EmitAtomicRmwMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst
                 });
 
             code.l(*fallback);
-            code.MOV(Xscratch0, Xaddr);
-            code.MOV(Xscratch1, Roperand.toX());
-            code.MOV(Xscratch2, u64(encoded_op & 0x0F));
-            code.STR(Xscratch2, Xstate, ctx.conf.state_atomic_scratch_offset);
-            EmitRelocation(code, ctx, WrappedAtomicRmwLinkTarget(bitsize));
-            code.DMB(oaknut::BarrierOp::ISH);
-            code.MOV(Rresult.toX(), Xscratch0);
-            ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
+            EmitAtomicRmwCallback<bitsize>(code, ctx, inst, Xaddr, Roperand, Rresult, encoded_op, *end);
             code.B(*end);
         });
     } else if (ctx.conf.page_table_pointer != 0) {
@@ -1175,25 +1193,11 @@ void EmitAtomicRmwMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst
 
         ctx.deferred_emits.emplace_back([&code, &ctx, inst, Xaddr = *Xaddr, Roperand = *Roperand, Rresult = *Rresult, encoded_op, fallback, end] {
             code.l(*fallback);
-            code.MOV(Xscratch0, Xaddr);
-            code.MOV(Xscratch1, Roperand.toX());
-            code.MOV(Xscratch2, u64(encoded_op & 0x0F));
-            code.STR(Xscratch2, Xstate, ctx.conf.state_atomic_scratch_offset);
-            EmitRelocation(code, ctx, WrappedAtomicRmwLinkTarget(bitsize));
-            code.DMB(oaknut::BarrierOp::ISH);
-            code.MOV(Rresult.toX(), Xscratch0);
-            ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
+            EmitAtomicRmwCallback<bitsize>(code, ctx, inst, Xaddr, Roperand, Rresult, encoded_op, *end);
             code.B(*end);
         });
     } else {
-        code.MOV(Xscratch0, *Xaddr);
-        code.MOV(Xscratch1, Roperand->toX());
-        code.MOV(Xscratch2, u64(encoded_op & 0x0F));
-        code.STR(Xscratch2, Xstate, ctx.conf.state_atomic_scratch_offset);
-        EmitRelocation(code, ctx, WrappedAtomicRmwLinkTarget(bitsize));
-        code.DMB(oaknut::BarrierOp::ISH);
-        code.MOV(Rresult->toX(), Xscratch0);
-        ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
+        EmitAtomicRmwCallback<bitsize>(code, ctx, inst, *Xaddr, *Roperand, *Rresult, encoded_op, *end);
     }
 
     code.l(*end);
@@ -1242,13 +1246,7 @@ void EmitAtomicCasMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst
                 });
 
             code.l(*fallback);
-            code.MOV(Xscratch0, Xaddr);
-            code.MOV(Xscratch1, Rexpected.toX());
-            code.STR(Rdesired.toX(), Xstate, ctx.conf.state_atomic_scratch_offset);
-            EmitRelocation(code, ctx, WrappedAtomicCasLinkTarget(bitsize));
-            code.DMB(oaknut::BarrierOp::ISH);
-            code.MOV(Rresult.toX(), Xscratch0);
-            ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
+            EmitAtomicCasCallback<bitsize>(code, ctx, inst, Xaddr, Rexpected, Rdesired, Rresult, *end);
             code.B(*end);
         });
     } else if (ctx.conf.page_table_pointer != 0) {
@@ -1261,23 +1259,11 @@ void EmitAtomicCasMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst
 
         ctx.deferred_emits.emplace_back([&code, &ctx, inst, Xaddr = *Xaddr, Rexpected = *Rexpected, Rdesired = *Rdesired, Rresult = *Rresult, fallback, end] {
             code.l(*fallback);
-            code.MOV(Xscratch0, Xaddr);
-            code.MOV(Xscratch1, Rexpected.toX());
-            code.STR(Rdesired.toX(), Xstate, ctx.conf.state_atomic_scratch_offset);
-            EmitRelocation(code, ctx, WrappedAtomicCasLinkTarget(bitsize));
-            code.DMB(oaknut::BarrierOp::ISH);
-            code.MOV(Rresult.toX(), Xscratch0);
-            ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
+            EmitAtomicCasCallback<bitsize>(code, ctx, inst, Xaddr, Rexpected, Rdesired, Rresult, *end);
             code.B(*end);
         });
     } else {
-        code.MOV(Xscratch0, *Xaddr);
-        code.MOV(Xscratch1, Rexpected->toX());
-        code.STR(Rdesired->toX(), Xstate, ctx.conf.state_atomic_scratch_offset);
-        EmitRelocation(code, ctx, WrappedAtomicCasLinkTarget(bitsize));
-        code.DMB(oaknut::BarrierOp::ISH);
-        code.MOV(Rresult->toX(), Xscratch0);
-        ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
+        EmitAtomicCasCallback<bitsize>(code, ctx, inst, *Xaddr, *Rexpected, *Rdesired, *Rresult, *end);
     }
 
     code.l(*end);

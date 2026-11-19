@@ -8,6 +8,7 @@
 
 #include <deque>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "video_core/framebuffer_config.h"
@@ -26,10 +27,13 @@ public:
     /// once; another thread queues it and calls `hand_off`, which must have the owner call Run
     /// without waiting for it.
     template <typename Composite, typename HandOff>
-    void Reached(const Layers& layers, bool owner, Composite&& composite, HandOff&& hand_off) {
+    void Reached(Layers layers, bool owner, Composite&& composite, HandOff&& hand_off) {
         {
             std::scoped_lock lk{mutex};
-            due.push_back(layers);
+            if (stopped) {
+                return;
+            }
+            due.push_back(std::move(layers));
         }
         if (owner) {
             Run(composite);
@@ -42,7 +46,7 @@ public:
     template <typename Composite>
     void Run(Composite&& composite) {
         std::unique_lock lk{mutex};
-        while (!due.empty()) {
+        while (!stopped && !due.empty()) {
             const Layers layers = std::move(due.front());
             due.pop_front();
             lk.unlock();
@@ -51,9 +55,17 @@ public:
         }
     }
 
+    /// Drops uncomposited frames and rejects further presents during shutdown.
+    void Stop() {
+        std::scoped_lock lk{mutex};
+        stopped = true;
+        due.clear();
+    }
+
 private:
     std::mutex mutex;
     std::deque<Layers> due;
+    bool stopped{};
 };
 
 } // namespace VideoCommon

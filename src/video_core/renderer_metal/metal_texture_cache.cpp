@@ -278,7 +278,25 @@ namespace {
 
 [[nodiscard]] bool IsPoolableDesc(const TextureDesc& d) noexcept {
     return (d.kind == TextureKind::e2D || d.kind == TextureKind::e2DArray) && d.samples == 1 &&
-           d.depth == 1 && d.width > 0 && d.height > 0 && d.format != 0;
+           d.depth == 1 && d.width > 0 && d.height > 0 && d.levels > 0 && d.layers > 0 &&
+           d.format != 0;
+}
+
+/// Normalizes usage flags to match the exact MTLTextureUsage MakeTextureDescriptor applies, so
+/// pooled keys never hand a texture without MTLTextureUsagePixelFormatView to a view-needing Image
+/// or miss on pure-depth descriptors.
+[[nodiscard]] TextureDesc CanonicalPoolDesc(TextureDesc d) noexcept {
+    const bool pure_depth = d.format == Fmt::Depth32Float || d.format == Fmt::Depth16Unorm;
+    d.pixel_format_view = d.pixel_format_view && d.samples <= 1 && !pure_depth;
+    return d;
+}
+
+[[nodiscard]] bool IsPlainBaseView(const ImageView& view) noexcept {
+    return view.range.base.level == 0 && view.range.base.layer == 0;
+}
+
+[[nodiscard]] bool ViewFitsExtent(const ImageView& view, std::array<u32, 2> requested) noexcept {
+    return VideoCommon::DlssContract::FitsExtent(requested, {view.size.width, view.size.height});
 }
 
 constexpr u64 MaxTexturePoolBytes = u64{256} << 20;
@@ -301,15 +319,6 @@ size_t TextureCacheRuntime::TextureDescHash::operator()(const TextureDesc& d) co
     return static_cast<size_t>(h);
 }
 
-bool TextureCacheRuntime::TextureDescEqual::operator()(const TextureDesc& a,
-                                                       const TextureDesc& b) const noexcept {
-    return a.kind == b.kind && a.format == b.format && a.width == b.width &&
-           a.height == b.height && a.depth == b.depth && a.levels == b.levels &&
-           a.layers == b.layers && a.samples == b.samples &&
-           a.render_target == b.render_target && a.shader_write == b.shader_write &&
-           a.pixel_format_view == b.pixel_format_view;
-}
-
 TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
                                          StagingBufferPool& staging_buffer_pool_)
     : device{device_}, scheduler{scheduler_}, staging_buffer_pool{staging_buffer_pool_},
@@ -319,6 +328,19 @@ TextureCacheRuntime::~TextureCacheRuntime() = default;
 
 void TextureCacheRuntime::Finish() {
     scheduler.Finish();
+}
+
+void TextureCacheRuntime::PopOldestPooledTexture() {
+    const auto it = texture_pool_lru.begin();
+    if (const auto idx = texture_pool_index.find(it->desc); idx != texture_pool_index.end()) {
+        std::erase(idx->second, it);
+        if (idx->second.empty()) {
+            texture_pool_index.erase(idx);
+        }
+    }
+    pooled_texture_bytes -= (std::min)(pooled_texture_bytes, it->bytes);
+    texture_pool_lru.pop_front();
+    ++pool_evicted;
 }
 
 void TextureCacheRuntime::TickFrame() {
@@ -335,16 +357,7 @@ void TextureCacheRuntime::TickFrame() {
     }
     while (!texture_pool_lru.empty() &&
            pool_frame - texture_pool_lru.front().frame > MaxTexturePoolIdleFrames) {
-        auto it = texture_pool_lru.begin();
-        if (const auto idx = texture_pool_index.find(it->desc); idx != texture_pool_index.end()) {
-            std::erase(idx->second, it);
-            if (idx->second.empty()) {
-                texture_pool_index.erase(idx);
-            }
-        }
-        pooled_texture_bytes -= (std::min)(pooled_texture_bytes, it->bytes);
-        texture_pool_lru.pop_front();
-        ++pool_evicted;
+        PopOldestPooledTexture();
     }
 }
 
@@ -353,8 +366,9 @@ std::pair<Object, u64> TextureCacheRuntime::AcquireTexture(const TextureDesc& te
     if (out_from_pool != nullptr) {
         *out_from_pool = false;
     }
-    if (TexturePoolEnabled() && IsPoolableDesc(tex_desc)) {
-        if (const auto idx = texture_pool_index.find(tex_desc);
+    const TextureDesc canonical = CanonicalPoolDesc(tex_desc);
+    if (TexturePoolEnabled() && IsPoolableDesc(canonical)) {
+        if (const auto idx = texture_pool_index.find(canonical);
             idx != texture_pool_index.end() && !idx->second.empty()) {
             const auto lru_it = idx->second.back();
             idx->second.pop_back();
@@ -373,42 +387,34 @@ std::pair<Object, u64> TextureCacheRuntime::AcquireTexture(const TextureDesc& te
         }
         ++pool_misses;
     }
-    Object tex = CreateTexture(device, tex_desc);
+    Object tex = CreateTexture(device, canonical);
     const u64 tex_bytes = tex ? AllocatedSize(tex.Get()) : 0;
     return {std::move(tex), tex_bytes};
 }
 
 void TextureCacheRuntime::ReleaseTexture(const TextureDesc& tex_desc, Object&& tex,
                                          u64 tex_bytes) {
-    if (!TexturePoolEnabled() || !tex || !IsPoolableDesc(tex_desc) || tex_bytes == 0 ||
+    const TextureDesc canonical = CanonicalPoolDesc(tex_desc);
+    if (!TexturePoolEnabled() || !tex || !IsPoolableDesc(canonical) || tex_bytes == 0 ||
         tex_bytes > MaxTexturePoolBytes) {
         return;
     }
     TrimTexturePool(MaxTexturePoolBytes - tex_bytes);
     texture_pool_lru.push_back(PooledTexture{
-        .desc = tex_desc,
+        .desc = canonical,
         .texture = std::move(tex),
         .bytes = tex_bytes,
         .frame = pool_frame,
     });
     const auto lru_it = std::prev(texture_pool_lru.end());
-    texture_pool_index[tex_desc].push_back(lru_it);
+    texture_pool_index[canonical].push_back(lru_it);
     pooled_texture_bytes += tex_bytes;
     ++pool_recycled;
 }
 
 void TextureCacheRuntime::TrimTexturePool(u64 max_bytes) {
     while (!texture_pool_lru.empty() && pooled_texture_bytes > max_bytes) {
-        auto it = texture_pool_lru.begin();
-        if (const auto idx = texture_pool_index.find(it->desc); idx != texture_pool_index.end()) {
-            std::erase(idx->second, it);
-            if (idx->second.empty()) {
-                texture_pool_index.erase(idx);
-            }
-        }
-        pooled_texture_bytes -= (std::min)(pooled_texture_bytes, it->bytes);
-        texture_pool_lru.pop_front();
-        ++pool_evicted;
+        PopOldestPooledTexture();
     }
 }
 
@@ -819,17 +825,12 @@ bool TextureCacheRuntime::Fsr3TemporalUpscale(Framebuffer* dst_framebuffer, Imag
     namespace DlssContract = VideoCommon::DlssContract;
     constexpr bool use_history = true;
     ImageView* const depth = &depth_view;
-    const auto plain = [](const ImageView& view) {
-        return view.range.base.level == 0 && view.range.base.layer == 0;
-    };
-    const auto fits = [](const ImageView& view, std::array<u32, 2> requested) {
-        return DlssContract::FitsExtent(requested, {view.size.width, view.size.height});
-    };
     const std::array<u32, 2> output_size{dst_framebuffer->Width(), dst_framebuffer->Height()};
-    if (!plain(dst) || !plain(input_color) || !plain(motion_vectors) || !plain(*depth) ||
+    if (!IsPlainBaseView(dst) || !IsPlainBaseView(input_color) ||
+        !IsPlainBaseView(motion_vectors) || !IsPlainBaseView(*depth) ||
         dst_framebuffer->Samples() != 1 || !IsColor(dst.HostClass()) ||
-        !fits(input_color, render_size) || !fits(dst, output_size) ||
-        !fits(motion_vectors, render_size) || !fits(*depth, render_size) ||
+        !ViewFitsExtent(input_color, render_size) || !ViewFitsExtent(dst, output_size) ||
+        !ViewFitsExtent(motion_vectors, render_size) || !ViewFitsExtent(*depth, render_size) ||
         motion_vectors.format != PixelFormat::R16G16_FLOAT ||
         depth->format != PixelFormat::D32_FLOAT || input_color.ImageHandle() == dst.ImageHandle() ||
         !DlssContract::ValidColorFormats(input_color.format, dst.format, use_history) ||
@@ -923,21 +924,16 @@ bool TextureCacheRuntime::TemporalStandIn(Framebuffer* dst_framebuffer, ImageVie
         return false;
     }
     // Vulkan's checks for its stand-in (TextureCacheRuntime::TemporalUpscale).
-    const auto plain = [](const ImageView& view) {
-        return view.range.base.level == 0 && view.range.base.layer == 0;
-    };
-    const auto fits = [](const ImageView& view, std::array<u32, 2> requested) {
-        return DlssContract::FitsExtent(requested, {view.size.width, view.size.height});
-    };
     const std::array<u32, 2> output_size{dst_framebuffer->Width(), dst_framebuffer->Height()};
-    if (!plain(dst) || !plain(input_color) || dst_framebuffer->Samples() != 1 ||
-        !IsColor(dst.HostClass()) || !fits(input_color, render_size) || !fits(dst, output_size) ||
-        input_color.ImageHandle() == dst.ImageHandle() ||
+    if (!IsPlainBaseView(dst) || !IsPlainBaseView(input_color) || dst_framebuffer->Samples() != 1 ||
+        !IsColor(dst.HostClass()) || !ViewFitsExtent(input_color, render_size) ||
+        !ViewFitsExtent(dst, output_size) || input_color.ImageHandle() == dst.ImageHandle() ||
         !DlssContract::ValidColorFormats(input_color.format, dst.format, use_history) ||
         !DlssContract::ValidGeometry(render_size, output_size, jitter, motion_scale)) {
         return false;
     }
-    if (use_history && (!plain(motion_vectors) || !fits(motion_vectors, render_size) ||
+    if (use_history && (!IsPlainBaseView(motion_vectors) ||
+                        !ViewFitsExtent(motion_vectors, render_size) ||
                         motion_vectors.format != PixelFormat::R16G16_FLOAT ||
                         input_color.size.width != motion_vectors.size.width ||
                         input_color.size.height != motion_vectors.size.height)) {
@@ -981,17 +977,12 @@ bool TextureCacheRuntime::MetalFxTemporalUpscale(Framebuffer* dst_framebuffer, I
     constexpr bool use_history = true;
     ImageView* const depth = &depth_view;
     // Images are never rescaled on Metal: each view's size is its texture's.
-    const auto plain = [](const ImageView& view) {
-        return view.range.base.level == 0 && view.range.base.layer == 0;
-    };
-    const auto fits = [](const ImageView& view, std::array<u32, 2> requested) {
-        return DlssContract::FitsExtent(requested, {view.size.width, view.size.height});
-    };
     const std::array<u32, 2> output_size{dst_framebuffer->Width(), dst_framebuffer->Height()};
-    if (!plain(dst) || !plain(input_color) || !plain(motion_vectors) || !plain(*depth) ||
+    if (!IsPlainBaseView(dst) || !IsPlainBaseView(input_color) ||
+        !IsPlainBaseView(motion_vectors) || !IsPlainBaseView(*depth) ||
         dst_framebuffer->Samples() != 1 || !IsColor(dst.HostClass()) ||
-        !fits(input_color, render_size) || !fits(dst, output_size) ||
-        !fits(motion_vectors, render_size) || !fits(*depth, render_size) ||
+        !ViewFitsExtent(input_color, render_size) || !ViewFitsExtent(dst, output_size) ||
+        !ViewFitsExtent(motion_vectors, render_size) || !ViewFitsExtent(*depth, render_size) ||
         motion_vectors.format != PixelFormat::R16G16_FLOAT ||
         depth->format != PixelFormat::D32_FLOAT ||
         input_color.ImageHandle() == dst.ImageHandle() ||
@@ -1490,8 +1481,9 @@ TextureHandle Image::SampleGrid() {
             host_format.format != Fmt::Depth32Float && host_format.format != Fmt::Depth16Unorm;
         sample_grid = CreateTexture(runtime->device, grid);
         if (sample_grid) {
-            bytes += AllocatedSize(sample_grid.Get());
-            runtime->allocated_bytes += AllocatedSize(sample_grid.Get());
+            const u64 grid_bytes = AllocatedSize(sample_grid.Get());
+            bytes += grid_bytes;
+            runtime->allocated_bytes += grid_bytes;
         }
     }
     return sample_grid.Get();
@@ -1900,6 +1892,72 @@ ImageView::ImageView(TextureCacheRuntime&, const VideoCommon::NullImageViewParam
 
 ImageView::~ImageView() = default;
 
+namespace {
+
+struct ResolvedViewShape {
+    TextureKind kind{TextureKind::e2D};
+    u32 base_layer{};
+    u32 layers{1};
+};
+
+[[nodiscard]] std::optional<ResolvedViewShape> ResolveViewShape(
+    Shader::TextureType texture_type, TextureKind image_kind,
+    const VideoCommon::SubresourceRange& range) {
+    const bool multisample = image_kind == TextureKind::e2DMultisampleArray;
+    ResolvedViewShape shape{
+        .kind = TextureKind::e2D,
+        .base_layer = static_cast<u32>(range.base.layer),
+        .layers = static_cast<u32>(range.extent.layers),
+    };
+    switch (texture_type) {
+    case Shader::TextureType::Color1D:
+        shape.kind = PipelineCheckEnabled() ? TextureKind::e2D : TextureKind::e1D;
+        shape.layers = 1;
+        break;
+    case Shader::TextureType::ColorArray1D:
+        shape.kind = PipelineCheckEnabled() ? TextureKind::e2DArray : TextureKind::e1DArray;
+        break;
+    case Shader::TextureType::Color2D:
+    case Shader::TextureType::Color2DRect:
+        shape.kind = multisample ? TextureKind::e2DMultisample : TextureKind::e2D;
+        shape.layers = 1;
+        break;
+    case Shader::TextureType::ColorArray2D:
+        shape.kind = multisample ? TextureKind::e2DMultisampleArray : TextureKind::e2DArray;
+        break;
+    case Shader::TextureType::Color3D:
+        shape.kind = TextureKind::e3D;
+        shape.base_layer = 0;
+        shape.layers = 1;
+        break;
+    case Shader::TextureType::ColorCube:
+        shape.kind = TextureKind::Cube;
+        shape.layers = 6;
+        break;
+    case Shader::TextureType::ColorArrayCube:
+        shape.kind = TextureKind::CubeArray;
+        shape.layers = (std::max)(shape.layers / 6, 1U) * 6;
+        break;
+    default:
+        return std::nullopt;
+    }
+    // 3D images only have 3D views (2D slices of them are render targets, RenderTarget).
+    if ((image_kind == TextureKind::e3D) != (shape.kind == TextureKind::e3D)) {
+        shape.kind = image_kind == TextureKind::e3D ? TextureKind::e3D : TextureKind::e2D;
+        shape.base_layer = image_kind == TextureKind::e3D ? 0 : shape.base_layer;
+        shape.layers = 1;
+    }
+    // Nor does Metal view a multisampled texture as anything else (it aborts).
+    if (multisample && PipelineCheckEnabled() && shape.kind != TextureKind::e2DMultisample &&
+        shape.kind != TextureKind::e2DMultisampleArray) {
+        shape.kind = TextureKind::e2DMultisample;
+        shape.layers = 1;
+    }
+    return shape;
+}
+
+} // Anonymous namespace
+
 TextureHandle ImageView::Handle(Shader::TextureType texture_type) {
     if (image_texture == nullptr || texture_type == Shader::TextureType::Buffer) {
         return nullptr;
@@ -1908,57 +1966,14 @@ TextureHandle ImageView::Handle(Shader::TextureType texture_type) {
     if (view) {
         return view.Get();
     }
-    const bool multisample = image_kind == TextureKind::e2DMultisampleArray;
-    TextureKind view_kind = TextureKind::e2D;
-    u32 base_layer = static_cast<u32>(range.base.layer);
-    u32 layers = static_cast<u32>(range.extent.layers);
-    switch (texture_type) {
-    case Shader::TextureType::Color1D:
-        view_kind = PipelineCheckEnabled() ? TextureKind::e2D : TextureKind::e1D;
-        layers = 1;
-        break;
-    case Shader::TextureType::ColorArray1D:
-        view_kind = PipelineCheckEnabled() ? TextureKind::e2DArray : TextureKind::e1DArray;
-        break;
-    case Shader::TextureType::Color2D:
-    case Shader::TextureType::Color2DRect:
-        view_kind = multisample ? TextureKind::e2DMultisample : TextureKind::e2D;
-        layers = 1;
-        break;
-    case Shader::TextureType::ColorArray2D:
-        view_kind = multisample ? TextureKind::e2DMultisampleArray : TextureKind::e2DArray;
-        break;
-    case Shader::TextureType::Color3D:
-        view_kind = TextureKind::e3D;
-        base_layer = 0;
-        layers = 1;
-        break;
-    case Shader::TextureType::ColorCube:
-        view_kind = TextureKind::Cube;
-        layers = 6;
-        break;
-    case Shader::TextureType::ColorArrayCube:
-        view_kind = TextureKind::CubeArray;
-        layers = (std::max)(layers / 6, 1U) * 6;
-        break;
-    default:
+    const auto shape = ResolveViewShape(texture_type, image_kind, range);
+    if (!shape) {
         return nullptr;
     }
-    // 3D images only have 3D views (2D slices of them are render targets, RenderTarget).
-    if ((image_kind == TextureKind::e3D) != (view_kind == TextureKind::e3D)) {
-        view_kind = image_kind == TextureKind::e3D ? TextureKind::e3D : TextureKind::e2D;
-        base_layer = image_kind == TextureKind::e3D ? 0 : base_layer;
-        layers = 1;
-    }
-    // Nor does Metal view a multisampled texture as anything else (it aborts).
-    if (multisample && PipelineCheckEnabled() && view_kind != TextureKind::e2DMultisample &&
-        view_kind != TextureKind::e2DMultisampleArray) {
-        view_kind = TextureKind::e2DMultisample;
-        layers = 1;
-    }
-    view = CreateTextureView(image_texture, host_format, view_kind,
+    view = CreateTextureView(image_texture, host_format, shape->kind,
                              static_cast<u32>(range.base.level),
-                             static_cast<u32>(range.extent.levels), base_layer, layers, swizzle);
+                             static_cast<u32>(range.extent.levels), shape->base_layer,
+                             shape->layers, swizzle);
     return view.Get();
 }
 
@@ -1983,56 +1998,14 @@ TextureHandle ImageView::StorageHandle(Shader::TextureType texture_type,
             return existing.view ? existing.view.Get() : Handle(texture_type);
         }
     }
-    const bool multisample = image_kind == TextureKind::e2DMultisampleArray;
-    TextureKind view_kind = TextureKind::e2D;
-    u32 base_layer = static_cast<u32>(range.base.layer);
-    u32 layers = static_cast<u32>(range.extent.layers);
-    switch (texture_type) {
-    case Shader::TextureType::Color1D:
-        view_kind = PipelineCheckEnabled() ? TextureKind::e2D : TextureKind::e1D;
-        layers = 1;
-        break;
-    case Shader::TextureType::ColorArray1D:
-        view_kind = PipelineCheckEnabled() ? TextureKind::e2DArray : TextureKind::e1DArray;
-        break;
-    case Shader::TextureType::Color2D:
-    case Shader::TextureType::Color2DRect:
-        view_kind = multisample ? TextureKind::e2DMultisample : TextureKind::e2D;
-        layers = 1;
-        break;
-    case Shader::TextureType::ColorArray2D:
-        view_kind = multisample ? TextureKind::e2DMultisampleArray : TextureKind::e2DArray;
-        break;
-    case Shader::TextureType::Color3D:
-        view_kind = TextureKind::e3D;
-        base_layer = 0;
-        layers = 1;
-        break;
-    case Shader::TextureType::ColorCube:
-        view_kind = TextureKind::Cube;
-        layers = 6;
-        break;
-    case Shader::TextureType::ColorArrayCube:
-        view_kind = TextureKind::CubeArray;
-        layers = (std::max)(layers / 6, 1U) * 6;
-        break;
-    default:
+    const auto shape = ResolveViewShape(texture_type, image_kind, range);
+    if (!shape) {
         return nullptr;
     }
-    if ((image_kind == TextureKind::e3D) != (view_kind == TextureKind::e3D)) {
-        view_kind = image_kind == TextureKind::e3D ? TextureKind::e3D : TextureKind::e2D;
-        base_layer = image_kind == TextureKind::e3D ? 0 : base_layer;
-        layers = 1;
-    }
-    if (multisample && PipelineCheckEnabled() && view_kind != TextureKind::e2DMultisample &&
-        view_kind != TextureKind::e2DMultisampleArray) {
-        view_kind = TextureKind::e2DMultisample;
-        layers = 1;
-    }
-    Object storage = CreateTextureView(image_texture, view_format, view_kind,
+    Object storage = CreateTextureView(image_texture, view_format, shape->kind,
                                        static_cast<u32>(range.base.level),
-                                       static_cast<u32>(range.extent.levels), base_layer, layers,
-                                       IdentitySwizzle);
+                                       static_cast<u32>(range.extent.levels), shape->base_layer,
+                                       shape->layers, IdentitySwizzle);
     const TextureHandle result = storage ? storage.Get() : Handle(texture_type);
     storage_views.push_back(StorageVariant{
         .type = texture_type,

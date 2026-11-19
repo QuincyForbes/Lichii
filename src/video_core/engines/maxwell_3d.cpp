@@ -1742,10 +1742,6 @@ void Maxwell3D::ReleaseFront() {
 }
 
 void Maxwell3D::ClearPendingMacro() {
-    executing_macro = 0;
-    macro_params.clear();
-    macro_segments.clear();
-    current_macro_dirty = false;
     if (front) {
         front->executing_macro = 0;
         front->parameters.clear();
@@ -1759,7 +1755,12 @@ void Maxwell3D::ClearPendingMacro() {
                 current_macro_dirty = false;
             },
             VideoCommon::GpuSplit::Effect::None);
+        return;
     }
+    executing_macro = 0;
+    macro_params.clear();
+    macro_segments.clear();
+    current_macro_dirty = false;
 }
 
 namespace {
@@ -3036,12 +3037,8 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                     !engine.native_interpreter.read_registers &&
                     !engine.native_interpreter.reread_data_ram &&
                     code_generation == engine.native_code_generation) {
-                    const std::span<const u32> store_params =
-                        !borrowed.empty() && fs.parameters.empty()
-                            ? borrowed
-                            : std::span<const u32>{fs.parameters.data(), parameter_count};
                     engine.native_memo.Store(
-                        start, store_params, engine.native_interpreter.data_ram_reads,
+                        start, initial_params, engine.native_interpreter.data_ram_reads,
                         engine.native_interpreter.data_ram_writes, engine.native_writes);
                 }
                 if (!result.success) {
