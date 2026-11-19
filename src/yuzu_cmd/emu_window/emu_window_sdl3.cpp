@@ -199,7 +199,12 @@ bool EmuWindow_SDL3::IsShown() const {
 /// Called by the renderer on its thread after each presented frame: steps the TAS engine.
 void EmuWindow_SDL3::OnFrameDisplayed() {
     // Without this TAS scripts never advanced in eden-cli (only the Qt frontend called it).
-    input_subsystem->GetTas()->UpdateThread();
+    // There is no TAS engine on iOS (InputCommon registers none there): GetTas() is null, and
+    // stepping it crashed the renderer thread right after the first presented frame (SIGSEGV at
+    // 0x151, Tas::UpdateThread reading a member off the null engine).
+    if (auto* const tas = input_subsystem->GetTas()) {
+        tas->UpdateThread();
+    }
 }
 
 void EmuWindow_SDL3::OnResize() {

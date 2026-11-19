@@ -121,12 +121,17 @@ std::string CliMcpHost::WithTas(bool require_game,
         if (require_game && !system.IsPoweredOn()) {
             return "no game is running";
         }
+        // No TAS engine on iOS (InputCommon registers none there).
+        auto* const tas = input.GetTas();
+        if (tas == nullptr) {
+            return "TAS is not available on this platform";
+        }
         if (system.IsPoweredOn()) {
             system.HIDCore()
                 .GetEmulatedController(Core::HID::NpadIdType::Player1)
                 ->ResetSystemButtons();
         }
-        fn(*input.GetTas());
+        fn(*tas);
         return {};
     });
 }
