@@ -32,7 +32,8 @@ update.
 On 1.1.1, `ShaderCache::GetComputePipeline` asks `KeplerCompute::BypassOotNetwork` about every
 native compute dispatch (`DispatchReplaced` skips it):
 
-- the prepass and the network are skipped;
+- the prepass, the heavy pass after it (native key `9387db798781f081`, which feeds only the
+  network) and the network are skipped;
 - the output pass is replaced by an `AccelerateSurfaceCopy` of the tonemapped image into the output
   pass's own target (point filter, same size; format, size and block-linear layout from the output
   pass's texture descriptor at cb0+0xd0).
@@ -79,5 +80,4 @@ The game's constants (shader hashes, program keys, the cb0 offset) are in
   keys the bypass does nothing.
 - B10G11R11 has little precision in dark tones: without the network's smoothing some banding
   shows in deep shadows.
-- The heavy dispatch between the prepass and the network still runs; its result goes unused.
 - Vulkan only: other backends never learn the tonemapped image, so the setting has no effect there.

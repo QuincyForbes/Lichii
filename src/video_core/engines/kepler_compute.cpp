@@ -1466,8 +1466,9 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     if (tonemapped.Address() == 0) {
         return false;
     }
-    if (native_key == PrepassProgramKey || native_key == NetworkProgramKey) {
-        return state->output_replaced.load(std::memory_order_relaxed);
+    if (native_key == PrepassProgramKey || native_key == UnusedDispatchProgramKey ||
+        native_key == NetworkProgramKey) {
+        return IsSkippedNetworkPass(native_key, state->output_replaced.load(std::memory_order_relaxed));
     }
     const bool base_output = std::ranges::find(BaseOutputPrograms, native_key,
                                                &BaseOutputProgram::key) != BaseOutputPrograms.end();

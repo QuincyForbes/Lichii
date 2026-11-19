@@ -26,6 +26,9 @@ constexpr u64 ProgramId = 0x0400486024DEC000ULL;
 
 // Native program keys of the network's compute passes.
 constexpr u64 PrepassProgramKey = 0x8475d671e6967428ULL;
+// The heavy pass between the prepass and the network; it feeds only the network. Match the native
+// key, not this pass's lowered shader hash (d9ee412f00ce399a).
+constexpr u64 UnusedDispatchProgramKey = 0x9387db798781f081ULL;
 constexpr u64 NetworkProgramKey = 0x42593194bb0b2b32ULL;
 constexpr u64 OutputProgramKey = 0xda6df3e54c716df2ULL;
 
@@ -63,6 +66,14 @@ struct BypassState {
     Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig tonemapped{};
     std::atomic<bool> output_replaced{}; ///< the latest output pass was replaced
 };
+
+/// Whether a network pass is skipped: the prepass, the pass after it and the network run only for
+/// the output pass, so they are skipped while the output pass is being replaced.
+constexpr bool IsSkippedNetworkPass(u64 native_key, bool output_replaced) {
+    return output_replaced && (native_key == PrepassProgramKey ||
+                               native_key == UnusedDispatchProgramKey ||
+                               native_key == NetworkProgramKey);
+}
 
 inline bool BypassEnabled(u64 program_id) {
     return program_id == ProgramId &&
